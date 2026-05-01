@@ -50,14 +50,19 @@ Note naming, icon, reporting-line, and adapter conventions the company already f
 
 ### 4. Choose the instruction source (required)
 
-This is the single most important decision for hire quality. Pick exactly one path:
+This is the single most important decision for hire quality. The canonical templates live at **`packages/agents-md-templates/`** — copy from there, fill placeholders, lint against the same template, and submit:
 
-- **Exact template** — the role matches an entry in the template index. Use the matching file under `references/agents/` as the starting point.
-- **Adjacent template** — no exact match, but an existing template is close (for example, a "Backend Engineer" hire adapted from `coder.md`, or a "Content Designer" adapted from `uxdesigner.md`). Copy the closest template and adapt deliberately: rename the role, rewrite the role charter, swap domain lenses, and remove sections that do not fit.
+> Copy the matching template from `packages/agents-md-templates/<Role>.md` → fill `{{placeholders}}` → run `agents-md-lint --against-template packages/agents-md-templates/<Role>.md path/to/AGENTS.md` → submit the hire request.
+
+Pick exactly one path:
+
+- **Exact template** — the role matches an entry in the template index (Coder, QA, UXDesigner, SecurityEngineer). Copy `packages/agents-md-templates/<Role>.md` as the starting point and lint against it before submitting.
+- **Adjacent template** — no exact match, but an existing template is close (for example, a "Backend Engineer" hire adapted from `Coder.md`, or a "Content Designer" adapted from `UXDesigner.md`). Copy the closest template and adapt deliberately: rename the role, rewrite the role charter, swap domain lenses, and remove sections that do not fit. Skip `--against-template` for adjacent variants — note the divergence in the hire comment instead.
 - **Generic fallback** — no template is close. Use the baseline role guide to construct a new `AGENTS.md` from scratch, filling in each recommended section for the specific role.
 
-Template index and when-to-use guidance:
+Template index, decision flow, and authoring rules:
 `skills/paperclip-create-agent/references/agent-instruction-templates.md`
+(authoring guide: `packages/agents-md-templates/_authoring-guide.md`)
 
 Generic fallback for no-template hires:
 `skills/paperclip-create-agent/references/baseline-role-guide.md`
@@ -156,8 +161,10 @@ For each linked issue, either:
 
 ## References
 
-- Template index and how to apply a template: `skills/paperclip-create-agent/references/agent-instruction-templates.md`
-- Individual role templates: `skills/paperclip-create-agent/references/agents/`
+- Canonical role templates (copy from here): `packages/agents-md-templates/`
+- Template authoring rules and verbatim-region conventions: `packages/agents-md-templates/_authoring-guide.md`
+- Template index, decision flow, and adjacent/fallback guidance: `skills/paperclip-create-agent/references/agent-instruction-templates.md`
+- Back-compat role pointers (legacy stubs only — do not edit role copy here): `skills/paperclip-create-agent/references/agents/`
 - Generic baseline role guide (no-template fallback): `skills/paperclip-create-agent/references/baseline-role-guide.md`
 - Pre-submit draft-review checklist: `skills/paperclip-create-agent/references/draft-review-checklist.md`
 - Endpoint payload shapes and full examples: `skills/paperclip-create-agent/references/api-reference.md`
