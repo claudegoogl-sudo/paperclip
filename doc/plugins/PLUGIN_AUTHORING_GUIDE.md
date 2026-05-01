@@ -118,6 +118,20 @@ triggers, untrusted languages, or runtime multi-statement SQL. Runtime
 `ctx.db.query()` is restricted to `SELECT`; runtime `ctx.db.execute()` is
 restricted to namespace-local `INSERT`, `UPDATE`, and `DELETE`.
 
+> **Alpha — `ctx.db` SQL surface.** The runtime SQL validators are still
+> regex-based pending a real Postgres parser (PLA-94 F2). Two contracts you
+> must follow today:
+>
+> 1. **Every `FROM` and `JOIN` must be schema-qualified** (`ctx.db.namespace.tbl`
+>    or a whitelisted `public.tbl`). Unqualified refs — including CTE aliases
+>    — are rejected by `ctx.db.query`. As a defense in depth, every call also
+>    runs in a transaction with `SET LOCAL search_path TO <namespace>, pg_temp`,
+>    so even if a ref slips through it resolves inside your plugin's schema,
+>    not `public`.
+> 2. Do **not** build SQL by string-interpolating untrusted input. Use the
+>    `$1, $2, …` placeholder form with the `params` array on `ctx.db.query` /
+>    `ctx.db.execute`.
+
 ### Scoped plugin API routes
 
 Plugins can expose JSON-only routes under their own namespace:

@@ -69,6 +69,43 @@ describe("plugin database SQL validation", () => {
     ).toThrow(/namespace/i);
   });
 
+  it("rejects ctx.db.query with unqualified table refs", () => {
+    expect(() =>
+      validatePluginRuntimeQuery("SELECT * FROM agents", "plugin_test", ["issues"]),
+    ).toThrow(/qualified|namespace/i);
+    expect(() =>
+      validatePluginRuntimeQuery(
+        "SELECT m.id, (SELECT count(*) FROM cost_events) FROM plugin_test.rows m",
+        "plugin_test",
+        ["issues"],
+      ),
+    ).toThrow(/qualified|namespace/i);
+  });
+
+  it("allows ctx.db.query with EXTRACT(... FROM expr) syntax", () => {
+    expect(() =>
+      validatePluginRuntimeQuery(
+        "SELECT EXTRACT(DOW FROM created_at) AS d FROM plugin_test.rows",
+        "plugin_test",
+      ),
+    ).not.toThrow();
+  });
+
+  it("allows ctx.db.query with subquery and LATERAL operands", () => {
+    expect(() =>
+      validatePluginRuntimeQuery(
+        "SELECT s.id FROM (SELECT id FROM plugin_test.rows) s",
+        "plugin_test",
+      ),
+    ).not.toThrow();
+    expect(() =>
+      validatePluginRuntimeQuery(
+        "SELECT r.id FROM plugin_test.rows r, LATERAL (SELECT id FROM plugin_test.rows) s",
+        "plugin_test",
+      ),
+    ).not.toThrow();
+  });
+
   it("targets anonymous DO blocks without rejecting do-prefixed aliases", () => {
     expect(() =>
       validatePluginRuntimeQuery(
@@ -209,6 +246,30 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
       .from(pluginMigrations)
       .where(and(eq(pluginMigrations.pluginId, pluginId), eq(pluginMigrations.status, "applied")));
     expect(migrations).toHaveLength(1);
+  });
+
+  it("rejects runtime ctx.db.query with unqualified refs before reaching the database", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    const packageRoot = await createPluginPackage(
+      pluginManifest,
+      `CREATE TABLE ${namespace}.notes (id uuid PRIMARY KEY, body text NOT NULL);`,
+    );
+    const pluginId = await installPluginRecord(pluginManifest);
+    const pluginDb = pluginDatabaseService(db);
+    await pluginDb.applyMigrations(pluginId, pluginManifest, packageRoot);
+
+    // Even though `agents` exists in `public`, the application-layer validator
+    // must reject the unqualified read before any SQL is dispatched.
+    await expect(
+      pluginDb.query(pluginId, "SELECT id FROM agents"),
+    ).rejects.toThrow(/qualified|namespace/i);
+    await expect(
+      pluginDb.query(
+        pluginId,
+        `SELECT n.id, (SELECT count(*) FROM agents) FROM ${namespace}.notes n`,
+      ),
+    ).rejects.toThrow(/qualified|namespace/i);
   });
 
   it("rejects runtime writes to public core tables", async () => {
