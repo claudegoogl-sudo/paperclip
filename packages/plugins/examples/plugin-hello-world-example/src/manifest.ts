@@ -18,7 +18,7 @@ const manifest: PaperclipPluginManifestV1 = {
   displayName: "Hello World Widget (Example)",
   description: "Reference UI plugin that adds a simple Hello World widget to the Paperclip dashboard.",
   author: "Paperclip",
-  categories: ["ui"],
+  categories: ["example"],
   capabilities: ["ui.dashboardWidget.register"],
   entrypoints: {
     worker: "./dist/worker.js",

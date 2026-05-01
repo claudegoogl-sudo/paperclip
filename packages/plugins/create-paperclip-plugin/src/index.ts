@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 const VALID_TEMPLATES = ["default", "connector", "workspace", "environment"] as const;
 type PluginTemplate = (typeof VALID_TEMPLATES)[number];
-const VALID_CATEGORIES = new Set(["connector", "workspace", "automation", "ui", "environment"] as const);
+const VALID_CATEGORIES = new Set(["connector", "workspace", "automation", "ui", "environment", "example"] as const);
 
 export interface ScaffoldPluginOptions {
   pluginName: string;
@@ -15,7 +15,7 @@ export interface ScaffoldPluginOptions {
   displayName?: string;
   description?: string;
   author?: string;
-  category?: "connector" | "workspace" | "automation" | "ui" | "environment";
+  category?: "connector" | "workspace" | "automation" | "ui" | "environment" | "example";
   sdkPath?: string;
 }
 

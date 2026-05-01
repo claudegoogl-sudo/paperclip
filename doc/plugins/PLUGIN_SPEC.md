@@ -192,10 +192,17 @@ Plugins are:
 
 Plugin categories:
 
-- `connector`
-- `workspace`
-- `automation`
-- `ui`
+**Functional** (surfaced in the registry and install-consent UI):
+
+- `connector` — integrates an external service or data source
+- `workspace` — extends workspace surfaces (file browser, terminal, editor)
+- `automation` — adds background jobs, triggers, or workflow automation
+- `ui` — adds UI components (dashboard widgets, panels, launchers)
+
+**Informational only** (not surfaced as a discoverable functional category):
+
+- `example` — marks a reference or sample plugin; hosts SHOULD exclude this
+  category from the user-facing plugin registry and install-consent flows
 
 A plugin may declare more than one category.
 
@@ -319,7 +326,7 @@ export interface PaperclipPluginManifestV1 {
   version: string;
   displayName: string;
   description: string;
-  categories: Array<"connector" | "workspace" | "automation" | "ui">;
+  categories: Array<"connector" | "workspace" | "automation" | "ui" | "example">;
   minimumPaperclipVersion?: string;
   capabilities: string[];
   entrypoints: {

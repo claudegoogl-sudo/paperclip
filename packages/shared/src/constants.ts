@@ -557,6 +557,14 @@ export type PluginStatus = (typeof PLUGIN_STATUSES)[number];
  * Plugin classification categories. A plugin declares one or more categories
  * in its manifest to describe its primary purpose.
  *
+ * Functional categories (surfaced in the registry and install-consent UI):
+ *   `connector`, `workspace`, `automation`, `ui`
+ *
+ * Informational-only category (never surfaced as a discoverable functional
+ * category — used by reference and sample plugins to avoid polluting the
+ * functional registry):
+ *   `example`
+ *
  * @see PLUGIN_SPEC.md §6.2
  */
 export const PLUGIN_CATEGORIES = [
@@ -564,6 +572,7 @@ export const PLUGIN_CATEGORIES = [
   "workspace",
   "automation",
   "ui",
+  "example",
 ] as const;
 export type PluginCategory = (typeof PLUGIN_CATEGORIES)[number];
 
