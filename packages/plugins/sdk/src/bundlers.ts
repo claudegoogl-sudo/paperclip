@@ -53,19 +53,35 @@ export interface PluginBundlerPresets {
 }
 
 /**
+ * Bare specifiers a plugin UI bundle MUST keep external.
+ *
+ * The host plugin loader rewrites these specifiers to the host-provided
+ * implementations on the bridge registry (see `globalThis.__paperclipPluginBridge__`).
+ * Bundling them into the plugin would either duplicate React (breaking hooks)
+ * or shadow the host's SDK runtime so kit/hook calls would no longer reach the
+ * host design tokens.
+ *
+ * Frozen so a regression — e.g. someone removing `/ui/components` from the
+ * list — fails fast in tests rather than silently producing a bundle that
+ * inlines the kit stubs and throws at render time.
+ */
+export const UI_BUNDLER_EXTERNALS: readonly string[] = Object.freeze([
+  "@paperclipai/plugin-sdk/ui",
+  "@paperclipai/plugin-sdk/ui/hooks",
+  "@paperclipai/plugin-sdk/ui/components",
+  "react",
+  "react-dom",
+  "react/jsx-runtime",
+]);
+
+/**
  * Build esbuild/rollup baseline configs for plugin worker, manifest, and UI bundles.
  *
  * The presets intentionally externalize host/runtime deps (`react`, SDK packages)
  * to match the Paperclip plugin loader contract.
  */
 export function createPluginBundlerPresets(input: PluginBundlerPresetInput = {}): PluginBundlerPresets {
-  const uiExternal = [
-    "@paperclipai/plugin-sdk/ui",
-    "@paperclipai/plugin-sdk/ui/hooks",
-    "react",
-    "react-dom",
-    "react/jsx-runtime",
-  ];
+  const uiExternal = [...UI_BUNDLER_EXTERNALS];
 
   const outdir = input.outdir ?? "dist";
   const workerEntry = input.workerEntry ?? "src/worker.ts";
