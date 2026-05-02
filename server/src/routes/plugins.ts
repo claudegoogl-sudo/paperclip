@@ -66,6 +66,10 @@ import {
   getActorInfo,
 } from "./authz.js";
 import { validateInstanceConfig } from "../services/plugin-config-validator.js";
+import {
+  InvalidSecretRefAtPathError,
+  validateSecretRefsAtPaths,
+} from "../services/json-schema-secret-refs.js";
 import { badRequest, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
 
 /** UI slot declaration extracted from plugin manifest */
@@ -1931,6 +1935,25 @@ export function pluginRoutes(
         });
         return;
       }
+      // PLA-198 AC1/AC2: enforce that every `format: "secret-ref"` slot holds
+      // either a UUID-shaped sentinel or no value. Reject ingest with the
+      // structured `path=<dot.path> kind=opaque len=<N>` shape — never echo
+      // the offending value back into the response.
+      try {
+        validateSecretRefsAtPaths(body.configJson, schema);
+      } catch (err) {
+        if (err instanceof InvalidSecretRefAtPathError) {
+          res.status(400).json({
+            error: "Invalid secret reference at a format=\"secret-ref\" config slot",
+            path: err.path,
+            descriptor: err.descriptor,
+            // Pre-formatted message matching the documented `path=… kind=…` shape.
+            message: err.message,
+          });
+          return;
+        }
+        throw err;
+      }
     }
 
     try {
@@ -2037,6 +2060,23 @@ export function pluginRoutes(
           fieldErrors: validation.errors,
         });
         return;
+      }
+      // PLA-198 AC1/AC2: enforce structured rejection of malformed secret-ref
+      // values here too, so dry-run validation surfaces the same path context
+      // a save attempt would.
+      try {
+        validateSecretRefsAtPaths(body.configJson, schema);
+      } catch (err) {
+        if (err instanceof InvalidSecretRefAtPathError) {
+          res.status(400).json({
+            error: "Invalid secret reference at a format=\"secret-ref\" config slot",
+            path: err.path,
+            descriptor: err.descriptor,
+            message: err.message,
+          });
+          return;
+        }
+        throw err;
       }
     }
 

@@ -22,6 +22,8 @@ import {
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import {
   collectSecretRefPaths,
+  describeSecretRefValue,
+  InvalidSecretRefAtPathError,
   isUuidSecretRef,
   readConfigValueAtPath,
   writeConfigValueAtPath,
@@ -231,14 +233,28 @@ async function resolveConfigSecretRefsForRuntime(input: {
   let nextConfig = { ...input.config };
   for (const path of collectSecretRefPaths(input.schema)) {
     const current = readConfigValueAtPath(nextConfig, path);
-    if (typeof current !== "string") continue;
-    const trimmed = current.trim();
-    if (!isUuidSecretRef(trimmed)) continue;
-    nextConfig = writeConfigValueAtPath(
-      nextConfig,
-      path,
-      await secrets.resolveSecretValue(input.companyId, trimmed, "latest"),
-    );
+
+    // Unset / null / blank → skip; required-ness is enforced by JSON Schema.
+    if (current === undefined || current === null) continue;
+    if (typeof current === "string") {
+      if (current.length === 0) continue;
+      const trimmed = current.trim();
+      if (trimmed.length === 0) continue;
+      if (isUuidSecretRef(trimmed)) {
+        nextConfig = writeConfigValueAtPath(
+          nextConfig,
+          path,
+          await secrets.resolveSecretValue(input.companyId, trimmed, "latest"),
+        );
+        continue;
+      }
+    }
+
+    // PLA-198 AC1: a non-UUID, non-blank value sits in a `format: "secret-ref"`
+    // slot. Refuse to resolve it. The error carries `path=<dot.path>` and a
+    // redacted descriptor — never the raw value — so operators can locate the
+    // misconfigured slot without diffing the persisted environment.
+    throw new InvalidSecretRefAtPathError(path, describeSecretRefValue(current));
   }
   return nextConfig;
 }
