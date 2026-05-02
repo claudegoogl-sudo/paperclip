@@ -649,6 +649,24 @@ export const pluginManifestV1Schema = z.object({
         path: ["tools"],
       });
     }
+
+    // Tool names must not contain ':' — they are namespaced at runtime as
+    // `<plugin-id>:<tool-name>`, so a colon in the bare name produces a
+    // double-namespaced id like `platform.cad:cad:run_script`. Catching this
+    // at install/upgrade time prevents the kind of silent miswiring that
+    // surfaced in PLA-58 (and was masked by the manifest cache bug PLA-159).
+    manifest.tools.forEach((tool, index) => {
+      if (typeof tool.name === "string" && tool.name.includes(":")) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            `tool name "${tool.name}" must not contain ':' — tools are ` +
+            `namespaced as "<plugin-id>:<tool-name>" at runtime; use a bare ` +
+            `name like "${tool.name.split(":").pop() ?? tool.name}" instead`,
+          path: ["tools", index, "name"],
+        });
+      }
+    });
   }
 
   // environment driver keys must be unique within the plugin
