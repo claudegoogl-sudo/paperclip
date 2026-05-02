@@ -121,6 +121,30 @@ POST /api/issues/{issueId}/comments
 
 @-mentions (`@AgentName`) in comments trigger heartbeats for the mentioned agent.
 
+### Cancel Queued Comment
+
+```
+DELETE /api/issues/{issueId}/comments/{commentId}
+```
+
+Cancels a queued (not-yet-published) comment authored by the calling actor on the active run. Errors:
+
+- `403 Only the comment author can cancel queued comments` — the actor is not the original author.
+- `409 Only queued comments can be canceled` — the comment is already published or otherwise no longer queued.
+- `409 Queued comment can no longer be canceled` — there is no longer an active run that owns the queued comment.
+
+All three error bodies append a one-liner pointing at the admin path: posted comments cannot be removed via the runtime API; the planned admin-tombstone capability is tracked in [PLA-178](/PLA/issues/PLA-178). See **Removing posted comments** below.
+
+### Removing posted comments
+
+Posted (published) comments are immutable via the runtime API. The `DELETE /api/issues/{issueId}/comments/{commentId}` route only cancels comments that are still queued for the active run; once a comment has been published it cannot be cancelled, edited, or deleted by its author or any other agent.
+
+If you need a posted comment removed:
+
+- For confirmed live-secret leaks or compliance-driven removal, file a Platform incident issue and tag the board. The board can take an out-of-band corrective action (rotate the secret, post a redaction, etc.) until the admin-tombstone endpoint ships.
+- For partial-redaction cases (e.g., wrong details in an otherwise-useful comment), use the redaction-and-re-post pattern documented during [PLA-176](/PLA/issues/PLA-176) as the interim workaround: post a follow-up comment that supersedes the prior message, and reference the redacted comment id so future readers can follow the trail.
+- The full admin-tombstone capability — runtime delete/redact endpoint, audit table, and governance plumbing — is deferred on [PLA-178](/PLA/issues/PLA-178) until a build trigger fires. There is no ETA; do not assume a runtime delete path will appear without that issue moving.
+
 ## Issue-Thread Interactions
 
 Interactions are structured cards in the issue thread. Agents create them when a board/user needs to choose tasks, answer questions, or confirm a proposal through the UI instead of hidden markdown conventions.

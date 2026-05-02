@@ -3275,18 +3275,27 @@ export function issueRoutes(
         ? comment.authorAgentId === actor.agentId
         : comment.authorUserId === actor.actorId;
     if (!actorOwnsComment) {
-      res.status(403).json({ error: "Only the comment author can cancel queued comments" });
+      res.status(403).json({
+        error:
+          "Only the comment author can cancel queued comments. To remove or redact a posted comment, contact a board admin. The admin-tombstone endpoint is pending — see PLA-178.",
+      });
       return;
     }
 
     const activeRun = await resolveActiveIssueRun(issue);
     if (!activeRun) {
-      res.status(409).json({ error: "Queued comment can no longer be canceled" });
+      res.status(409).json({
+        error:
+          "Queued comment can no longer be canceled. To remove or redact a posted comment, contact a board admin. The admin-tombstone endpoint is pending — see PLA-178.",
+      });
       return;
     }
 
     if (!isQueuedIssueCommentForActiveRun({ comment, activeRun })) {
-      res.status(409).json({ error: "Only queued comments can be canceled" });
+      res.status(409).json({
+        error:
+          "Only queued comments can be canceled. To remove or redact a posted comment, contact a board admin. The admin-tombstone endpoint is pending — see PLA-178.",
+      });
       return;
     }
 

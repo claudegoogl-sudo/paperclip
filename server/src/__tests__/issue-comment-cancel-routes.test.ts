@@ -246,7 +246,9 @@ describe.sequential("issue comment cancel routes", () => {
       .delete("/api/issues/11111111-1111-4111-8111-111111111111/comments/comment-1");
 
     expect(res.status).toBe(409);
-    expect(res.body.error).toBe("Only queued comments can be canceled");
+    expect(res.body.error).toBe(
+      "Only queued comments can be canceled. To remove or redact a posted comment, contact a board admin. The admin-tombstone endpoint is pending — see PLA-178.",
+    );
     expect(mockIssueService.removeComment).not.toHaveBeenCalled();
   });
 
@@ -261,7 +263,9 @@ describe.sequential("issue comment cancel routes", () => {
       .delete("/api/issues/11111111-1111-4111-8111-111111111111/comments/comment-1");
 
     expect(res.status).toBe(403);
-    expect(res.body.error).toBe("Only the comment author can cancel queued comments");
+    expect(res.body.error).toBe(
+      "Only the comment author can cancel queued comments. To remove or redact a posted comment, contact a board admin. The admin-tombstone endpoint is pending — see PLA-178.",
+    );
     expect(mockIssueService.removeComment).not.toHaveBeenCalled();
   });
 });
