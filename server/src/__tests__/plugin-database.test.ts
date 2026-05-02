@@ -312,6 +312,50 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
     ).rejects.toThrow(/plugin namespace/i);
   });
 
+  // PLA-100: regression coverage for the layer-2 SET LOCAL search_path pin
+  // applied inside pluginDatabaseService.query/.execute. The validator-layer
+  // rejection (covered above) is the first line of defense; this test guards
+  // the second line so a future refactor cannot silently drop the pin while
+  // validator tests keep passing.
+  it("pins ctx.db.query and ctx.db.execute search_path to the plugin namespace", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    const packageRoot = await createPluginPackage(
+      pluginManifest,
+      `CREATE TABLE ${namespace}.notes (id uuid PRIMARY KEY, sp text NOT NULL);`,
+    );
+    const pluginId = await installPluginRecord(pluginManifest);
+    const pluginDb = pluginDatabaseService(db);
+    await pluginDb.applyMigrations(pluginId, pluginManifest, packageRoot);
+
+    // Postgres may return search_path identifiers either quoted or unquoted
+    // depending on whether the name needs quoting; compare as parsed parts.
+    const parseSearchPath = (value: string): string[] =>
+      value.split(",").map((part) => part.trim().replace(/^"(.*)"$/, "$1"));
+    const expectedSearchPath = [namespace, "pg_temp"];
+
+    // Layer-2 pin during ctx.db.execute: capture current_setting('search_path')
+    // into a column at INSERT time so we can read it back and confirm the pin
+    // was active inside the execute() transaction.
+    await pluginDb.execute(
+      pluginId,
+      `INSERT INTO ${namespace}.notes (id, sp) VALUES ($1, current_setting('search_path'))`,
+      [randomUUID()],
+    );
+
+    // Layer-2 pin during ctx.db.query: SELECT current_setting('search_path')
+    // in the result list — this evaluates under the txn's pinned search_path.
+    // Reading the captured column in the same query also covers the execute pin.
+    const rows = await pluginDb.query<{ runtime_sp: string; captured_sp: string }>(
+      pluginId,
+      `SELECT current_setting('search_path') AS runtime_sp, sp AS captured_sp FROM ${namespace}.notes LIMIT 1`,
+    );
+
+    expect(rows).toHaveLength(1);
+    expect(parseSearchPath(rows[0]!.runtime_sp)).toEqual(expectedSearchPath);
+    expect(parseSearchPath(rows[0]!.captured_sp)).toEqual(expectedSearchPath);
+  });
+
   it("records a failed migration when SQL escapes the plugin namespace", async () => {
     const pluginManifest = manifest("paperclip.escape");
     const packageRoot = await createPluginPackage(
