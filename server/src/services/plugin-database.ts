@@ -130,7 +130,7 @@ function stripStringsAndCommentsForScan(input: string): string {
 // stopgap intentionally errs conservative: unqualified relation refs are
 // rejected even when the ref is a CTE alias, because we cannot tell apart
 // CTEs from public-schema reads without proper parsing.
-function assertRuntimeQueryRefsQualified(statement: string): void {
+function assertRuntimeQueryRefsQualified(statement: string, caller = "ctx.db.query"): void {
   const text = stripStringsAndCommentsForScan(statement);
   const len = text.length;
   // Each `(` pushes whether the enclosed scope is a subquery (true) or a
@@ -189,7 +189,7 @@ function assertRuntimeQueryRefsQualified(statement: string): void {
     if (!qualified) {
       const offending = operand.match(/^[^,\s)]+/)?.[0] ?? "<expression>";
       throw new Error(
-        `ctx.db.query requires schema-qualified table references; "${offending}" is missing a namespace`,
+        `${caller} requires schema-qualified table references; "${offending}" is missing a namespace`,
       );
     }
     i = k;
@@ -331,6 +331,15 @@ export function validatePluginRuntimeExecute(query: string, namespace: string): 
   if (/\b(alter|create|drop|truncate)\b/.test(normalized)) {
     throw new Error("ctx.db.execute cannot contain DDL keywords");
   }
+  // PLA-99: every FROM/JOIN (including those inside subqueries) must reference
+  // a schema-qualified table. Without this, writes like
+  // `UPDATE plugin_test.tbl SET x = (SELECT y FROM agents)` slip past the
+  // extractQualifiedRefs check below, which only sees the top-level target.
+  // The Postgres-layer `SET LOCAL search_path` defense (PLA-98) would still
+  // fail-close at runtime, but the layered-defense story documented in
+  // PLUGIN_AUTHORING_GUIDE.md and sdk/README.md requires the application
+  // layer to reject these as well.
+  assertRuntimeQueryRefsQualified(statement, "ctx.db.execute");
 
   const refs = extractQualifiedRefs(statement);
   const target = refs.find((ref) => ["into", "update", "from"].includes(ref.keyword));

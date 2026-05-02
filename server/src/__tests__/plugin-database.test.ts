@@ -82,6 +82,30 @@ describe("plugin database SQL validation", () => {
     ).toThrow(/qualified|namespace/i);
   });
 
+  it("rejects ctx.db.execute with unqualified subquery refs (PLA-99)", () => {
+    expect(() =>
+      validatePluginRuntimeExecute(
+        "UPDATE plugin_test.tbl SET x = (SELECT y FROM agents) WHERE id = $1",
+        "plugin_test",
+      ),
+    ).toThrow(/qualified|namespace/i);
+    expect(() =>
+      validatePluginRuntimeExecute(
+        "DELETE FROM plugin_test.tbl WHERE id IN (SELECT id FROM cost_events)",
+        "plugin_test",
+      ),
+    ).toThrow(/qualified|namespace/i);
+  });
+
+  it("allows ctx.db.execute with fully-qualified subquery refs (PLA-99)", () => {
+    expect(() =>
+      validatePluginRuntimeExecute(
+        "UPDATE plugin_test.tbl SET x = (SELECT y FROM plugin_test.other) WHERE id = $1",
+        "plugin_test",
+      ),
+    ).not.toThrow();
+  });
+
   it("allows ctx.db.query with EXTRACT(... FROM expr) syntax", () => {
     expect(() =>
       validatePluginRuntimeQuery(
