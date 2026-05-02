@@ -41,8 +41,9 @@ import { getSecretProvider } from "../secrets/provider-registry.js";
 import { pluginRegistryService } from "./plugin-registry.js";
 import {
   collectSecretRefPaths,
+  InvalidSecretRefAtPathError,
   isUuidSecretRef,
-  readConfigValueAtPath,
+  validateSecretRefsAtPaths,
 } from "./json-schema-secret-refs.js";
 
 // ---------------------------------------------------------------------------
@@ -109,32 +110,35 @@ function invalidSecretRef(secretRef: unknown): Error {
  * Extract secret reference UUIDs from a plugin's configJson, scoped to only
  * the fields annotated with `format: "secret-ref"` in the schema.
  *
+ * When the schema declares `format: "secret-ref"` paths, every value at one
+ * of those paths must be either unset/blank or a UUID-shaped sentinel. Any
+ * other value triggers {@link InvalidSecretRefAtPathError} with the offending
+ * dotted JSON path and a redacted descriptor — the raw value is never echoed.
+ * See PLA-198 AC1/AC2.
+ *
  * When no schema is provided, falls back to collecting all UUID-shaped strings
  * (backwards-compatible for plugins without a declared instanceConfigSchema).
+ *
+ * @throws {InvalidSecretRefAtPathError} on a non-UUID value at a secret-ref slot.
  */
 export function extractSecretRefsFromConfig(
   configJson: unknown,
   schema?: Record<string, unknown> | null,
 ): Set<string> {
-  const refs = new Set<string>();
-  if (configJson == null || typeof configJson !== "object") return refs;
+  if (configJson == null || typeof configJson !== "object") return new Set<string>();
 
-  const secretPaths = collectSecretRefPaths(schema);
-
-  // If schema declares secret-ref paths, extract only those values.
-  if (secretPaths.size > 0) {
-    for (const dotPath of secretPaths) {
-      const current = readConfigValueAtPath(configJson as Record<string, unknown>, dotPath);
-      if (typeof current === "string" && isUuidSecretRef(current)) {
-        refs.add(current);
-      }
-    }
-    return refs;
+  // Schema-aware branch: enforce strict UUID-or-blank invariant per slot,
+  // surfacing path context on violation. This rejects malformed values at
+  // extraction time instead of silently dropping them and letting them
+  // resurface as context-free errors deep in the resolve handler.
+  if (schema && typeof schema === "object" && collectSecretRefPaths(schema).size > 0) {
+    return validateSecretRefsAtPaths(configJson, schema);
   }
 
   // Fallback: no schema or no secret-ref annotations — collect all UUIDs.
   // This preserves backwards compatibility for plugins that omit
   // instanceConfigSchema.
+  const refs = new Set<string>();
   function walkAll(value: unknown): void {
     if (typeof value === "string") {
       if (isUuidSecretRef(value)) refs.add(value);
@@ -148,6 +152,7 @@ export function extractSecretRefsFromConfig(
   walkAll(configJson);
   return refs;
 }
+
 
 // ---------------------------------------------------------------------------
 // Handler factory
@@ -287,8 +292,35 @@ export function createPluginSecretsHandler(
 
         const schema = (plugin?.manifestJson as unknown as Record<string, unknown> | null)
           ?.instanceConfigSchema as Record<string, unknown> | undefined;
-        cachedAllowedRefs = extractSecretRefsFromConfig(configRow?.configJson, schema);
-        cachedAllowedRefsExpiry = now + CONFIG_CACHE_TTL_MS;
+        try {
+          cachedAllowedRefs = extractSecretRefsFromConfig(configRow?.configJson, schema);
+          cachedAllowedRefsExpiry = now + CONFIG_CACHE_TTL_MS;
+        } catch (extractErr) {
+          // PLA-198 AC4: a malformed config (non-UUID at a `format: "secret-ref"`
+          // slot) reaches the resolve handler. Audit the structured path so the
+          // operator can locate and fix the slot, but never echo the value or
+          // pass the raw error message back to the worker — that would leak the
+          // ref-existence signal that the scope check is designed to hide.
+          if (extractErr instanceof InvalidSecretRefAtPathError) {
+            // eslint-disable-next-line no-console
+            console.warn(
+              "[plugin-secrets] invalid secret-ref at config path",
+              {
+                pluginId,
+                path: extractErr.path,
+                descriptor: extractErr.descriptor,
+              },
+            );
+            // Cache an empty allowed-refs set for the standard TTL so subsequent
+            // resolves consistently return "not found" until the operator fixes
+            // the config — without re-running schema extraction (and re-emitting
+            // the audit warning) on every call.
+            cachedAllowedRefs = new Set<string>();
+            cachedAllowedRefsExpiry = now + CONFIG_CACHE_TTL_MS;
+          } else {
+            throw extractErr;
+          }
+        }
       }
 
       if (!cachedAllowedRefs.has(trimmedRef)) {
