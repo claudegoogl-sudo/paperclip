@@ -49,6 +49,7 @@ import type {
   InitializeParams,
 } from "@paperclipai/plugin-sdk";
 import { logger } from "../middleware/logger.js";
+import { redactSensitiveText } from "../redaction.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -508,7 +509,11 @@ export function createPluginWorkerHandle(
         result: result ?? null,
       });
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : String(err);
+      // Defense-in-depth: even though the secrets handler now redacts
+      // rejected refs at the source (PLA-190), wrap any error message
+      // through redactSensitiveText before it reaches logs or the worker.
+      const rawErrorMessage = err instanceof Error ? err.message : String(err);
+      const errorMessage = redactSensitiveText(rawErrorMessage);
       log.error({ method, err: errorMessage }, "host handler error");
       try {
         sendMessage(
