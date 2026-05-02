@@ -151,6 +151,21 @@ export function formatWorkerFailureMessage(message: string, stderrExcerpt: strin
 }
 
 /**
+ * Defense-in-depth redaction for host-handler error messages before they
+ * reach `log.error` (server logs) and the JSON-RPC `error.message` returned
+ * to the worker. Even though the secrets handler now redacts rejected refs
+ * at the source (PLA-190), this chokepoint catches future host handlers
+ * that interpolate caller input into `Error.message`.
+ *
+ * Exported so the redaction wrap can be exercised by unit tests without
+ * spawning a real worker (PLA-197).
+ */
+export function redactHostHandlerErrorMessage(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  return redactSensitiveText(raw);
+}
+
+/**
  * Options for starting a worker process.
  */
 export interface WorkerStartOptions {
@@ -512,8 +527,7 @@ export function createPluginWorkerHandle(
       // Defense-in-depth: even though the secrets handler now redacts
       // rejected refs at the source (PLA-190), wrap any error message
       // through redactSensitiveText before it reaches logs or the worker.
-      const rawErrorMessage = err instanceof Error ? err.message : String(err);
-      const errorMessage = redactSensitiveText(rawErrorMessage);
+      const errorMessage = redactHostHandlerErrorMessage(err);
       log.error({ method, err: errorMessage }, "host handler error");
       try {
         sendMessage(
