@@ -372,6 +372,13 @@ only inside the plugin namespace. Runtime `ctx.db.query()` allows `SELECT` from
 `ctx.db.execute()` allows `INSERT`, `UPDATE`, and `DELETE` only against the
 plugin namespace.
 
+> **Alpha.** `ctx.db.query()` requires every `FROM`/`JOIN` to be
+> schema-qualified (e.g. `ctx.db.namespace.tbl`). Unqualified refs are
+> rejected. All calls run inside a transaction with
+> `SET LOCAL search_path TO <namespace>, pg_temp` as a second line of defense
+> (PLA-98). The validator is regex-based pending a real Postgres SQL parser —
+> see PLA-94 F2.
+
 ### Scoped API Routes
 
 Manifest-declared `apiRoutes` expose JSON routes under
