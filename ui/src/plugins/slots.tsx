@@ -217,7 +217,32 @@ function applyJsxRuntimeKey(
   return { ...(props ?? {}), key };
 }
 
-function getShimBlobUrl(specifier: "react" | "react-dom" | "react-dom/client" | "react/jsx-runtime" | "sdk-ui"): string {
+/**
+ * Re-export every name registered on `globalThis.__paperclipPluginBridge__.sdkUi`.
+ *
+ * The bridge `sdkUi` map carries both hooks and components — this shim is what
+ * plugin imports of `@paperclipai/plugin-sdk/ui`, `…/ui/hooks`, and
+ * `…/ui/components` resolve to. Names are enumerated at shim-build time so a
+ * new SDK component registered in `bridge-init.ts` is automatically exported
+ * with no loader change needed.
+ *
+ * Note: identifier validity is enforced by `bridge-init.ts` (component/hook
+ * names are valid JS identifiers), so we can splat them straight into the
+ * generated `export` list.
+ */
+function buildSdkUiShimSource(): string {
+  const sdkUi = globalThis.__paperclipPluginBridge__?.sdkUi ?? {};
+  const names = Object.keys(sdkUi).filter((n) => /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(n));
+  const decls = names.map((n) => `const ${n} = SDK.${n};`).join("\n        ");
+  const exports = names.length > 0 ? `export { ${names.join(", ")} };` : "";
+  return `
+        const SDK = globalThis.__paperclipPluginBridge__?.sdkUi ?? {};
+        ${decls}
+        ${exports}
+      `;
+}
+
+function getShimBlobUrl(specifier: "react" | "react-dom" | "react-dom/client" | "react/jsx-runtime" | "sdk-ui" | "sdk-ui-components"): string {
   if (shimBlobUrls[specifier]) return shimBlobUrls[specifier];
 
   let source: string;
@@ -255,11 +280,8 @@ function getShimBlobUrl(specifier: "react" | "react-dom" | "react-dom/client" | 
       `;
       break;
     case "sdk-ui":
-      source = `
-        const SDK = globalThis.__paperclipPluginBridge__?.sdkUi ?? {};
-        const { usePluginData, usePluginAction, useHostContext, usePluginStream, usePluginToast } = SDK;
-        export { usePluginData, usePluginAction, useHostContext, usePluginStream, usePluginToast };
-      `;
+    case "sdk-ui-components":
+      source = buildSdkUiShimSource();
       break;
   }
 
@@ -288,6 +310,8 @@ function rewriteBareSpecifiers(source: string): string {
     "'@paperclipai/plugin-sdk/ui'": `'${getShimBlobUrl("sdk-ui")}'`,
     '"@paperclipai/plugin-sdk/ui/hooks"': `"${getShimBlobUrl("sdk-ui")}"`,
     "'@paperclipai/plugin-sdk/ui/hooks'": `'${getShimBlobUrl("sdk-ui")}'`,
+    '"@paperclipai/plugin-sdk/ui/components"': `"${getShimBlobUrl("sdk-ui-components")}"`,
+    "'@paperclipai/plugin-sdk/ui/components'": `'${getShimBlobUrl("sdk-ui-components")}'`,
     '"react/jsx-runtime"': `"${getShimBlobUrl("react/jsx-runtime")}"`,
     "'react/jsx-runtime'": `'${getShimBlobUrl("react/jsx-runtime")}'`,
     '"react-dom/client"': `"${getShimBlobUrl("react-dom/client")}"`,

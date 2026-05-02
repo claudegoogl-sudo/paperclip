@@ -19,6 +19,11 @@ import {
   usePluginStream,
   usePluginToast,
 } from "./bridge.js";
+import {
+  ErrorBoundary,
+  Spinner,
+  StatusBadge,
+} from "./sdk-ui-components.js";
 
 // ---------------------------------------------------------------------------
 // Global bridge registry
@@ -59,11 +64,19 @@ export function initPluginBridge(
     react,
     reactDom,
     sdkUi: {
+      // Hooks — `@paperclipai/plugin-sdk/ui/hooks`.
       usePluginData,
       usePluginAction,
       useHostContext,
       usePluginStream,
       usePluginToast,
+      // Components — `@paperclipai/plugin-sdk/ui/components`. To add another
+      // SDK component, register it here and re-export it from the SDK
+      // package's `components.ts`. The loader shim is general and discovers
+      // names from this map at runtime, so no loader change is needed.
+      Spinner,
+      StatusBadge,
+      ErrorBoundary,
     },
   };
 }
