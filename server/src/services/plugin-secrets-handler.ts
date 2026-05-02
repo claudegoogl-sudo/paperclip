@@ -50,23 +50,53 @@ import {
 // ---------------------------------------------------------------------------
 
 /**
- * Create a sanitised error that never leaks secret material.
- * Only the ref identifier is included; never the resolved value.
+ * Produce a redacted, log-safe descriptor for an arbitrary secret-ref input.
+ *
+ * Callers reach the error path with caller-controlled values that may be
+ * secret-shaped (e.g. a raw GitHub PAT mistakenly passed as a ref). To prevent
+ * those values from being echoed into log lines or JSON-RPC `error.message`
+ * payloads, this helper never returns the raw input. It returns one of:
+ *
+ *   - `kind=undefined` / `kind=null`
+ *   - `kind=non-string type=<typeof>`
+ *   - `kind=empty`
+ *   - `kind=uuid value=<uuid>`  (UUID-shaped refs are the legitimate format
+ *     and are safe to echo back; they are not secret material.)
+ *   - `kind=opaque len=<N>`     (everything else — redacts secret-shaped input.)
+ *
+ * @see PLA-190 — host `secrets.resolve` rejected raw input echo defect.
  */
-function secretNotFound(secretRef: string): Error {
-  const err = new Error(`Secret not found: ${secretRef}`);
+function describeOpaqueRef(value: unknown): string {
+  if (value === undefined) return "kind=undefined";
+  if (value === null) return "kind=null";
+  if (typeof value !== "string") return `kind=non-string type=${typeof value}`;
+  if (value.length === 0) return "kind=empty";
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return `kind=whitespace len=${value.length}`;
+  if (isUuidSecretRef(trimmed)) return `kind=uuid value=${trimmed}`;
+  return `kind=opaque len=${value.length}`;
+}
+
+/**
+ * Create a sanitised error that never leaks secret material.
+ * The error message uses {@link describeOpaqueRef} to emit a length/kind
+ * descriptor instead of the raw input, so that secret-shaped refs that reach
+ * the rejection path are not echoed into logs or JSON-RPC error responses.
+ */
+function secretNotFound(secretRef: unknown): Error {
+  const err = new Error(`Secret not found: ${describeOpaqueRef(secretRef)}`);
   err.name = "SecretNotFoundError";
   return err;
 }
 
-function secretVersionNotFound(secretRef: string): Error {
-  const err = new Error(`No version found for secret: ${secretRef}`);
+function secretVersionNotFound(secretRef: unknown): Error {
+  const err = new Error(`No version found for secret: ${describeOpaqueRef(secretRef)}`);
   err.name = "SecretVersionNotFoundError";
   return err;
 }
 
-function invalidSecretRef(secretRef: string): Error {
-  const err = new Error(`Invalid secret reference: ${secretRef}`);
+function invalidSecretRef(secretRef: unknown): Error {
+  const err = new Error(`Invalid secret reference: ${describeOpaqueRef(secretRef)}`);
   err.name = "InvalidSecretRefError";
   return err;
 }
@@ -232,7 +262,7 @@ export function createPluginSecretsHandler(
       // 1. Validate the ref format
       // ---------------------------------------------------------------
       if (!secretRef || typeof secretRef !== "string" || secretRef.trim().length === 0) {
-        throw invalidSecretRef(secretRef ?? "<empty>");
+        throw invalidSecretRef(secretRef);
       }
 
       const trimmedRef = secretRef.trim();
