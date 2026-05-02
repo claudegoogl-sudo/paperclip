@@ -581,6 +581,110 @@ function resolveManifestPath(
   return null;
 }
 
+/**
+ * Read the `dependencies` map from a package.json in `dir`.
+ *
+ * Used to diff dependency state across an `npm install --save` invocation so
+ * that the loader can recover the *actual* installed package name when the
+ * spec passed to npm differs from the package's declared `name` (e.g.
+ * tarball, git, or URL specs). Returns an empty record when no package.json
+ * is present or when it has no `dependencies` field.
+ *
+ * Exported for tests.
+ */
+export async function readDependencyMap(
+  dir: string,
+): Promise<Record<string, string>> {
+  const pkgJson = await readPackageJson(dir);
+  if (!pkgJson) return {};
+  const deps = pkgJson["dependencies"];
+  if (!deps || typeof deps !== "object" || Array.isArray(deps)) return {};
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(deps)) {
+    if (typeof value === "string") out[key] = value;
+  }
+  return out;
+}
+
+/**
+ * Compute the on-disk `node_modules` path for a (possibly scoped) package.
+ */
+function packagePathForName(name: string, nodeModulesPath: string): string {
+  if (name.startsWith("@") && name.includes("/")) {
+    const [scope, local] = name.split("/");
+    return path.join(nodeModulesPath, scope!, local!);
+  }
+  return path.join(nodeModulesPath, name);
+}
+
+/**
+ * Determine the actual installed package name after `npm install <spec> --save`.
+ *
+ * For simple specs (`name`, `name@version`, `@scope/name`, `@scope/name@version`)
+ * the package name equals the spec stem and `node_modules/<name>` exists. For
+ * tarball / git / URL specs npm installs the package under the name declared in
+ * the package's own package.json, not the spec, so the spec-based lookup fails.
+ *
+ * Strategy:
+ * 1. Diff `dependencies` in the install dir's package.json before/after install.
+ *    `npm install --save` writes exactly one new entry whose key is the
+ *    canonical package name (the dep value is the original spec).
+ * 2. On reinstall/upgrade where the entry already existed, prefer a key whose
+ *    value matches the spec, then fall back to the spec stem.
+ *
+ * Exported for tests.
+ */
+export function resolveInstalledPackageName(args: {
+  spec: string;
+  packageNameHint: string;
+  beforeDeps: Record<string, string>;
+  afterDeps: Record<string, string>;
+}): string {
+  const { spec, packageNameHint, beforeDeps, afterDeps } = args;
+
+  // 1. New keys added by this install (--save writes one top-level dep).
+  const newKeys = Object.keys(afterDeps).filter((k) => !(k in beforeDeps));
+  if (newKeys.length === 1) return newKeys[0]!;
+
+  // 2. Reinstall/upgrade: an existing key whose recorded spec matches ours.
+  //    Compare the raw spec and the spec without an explicit @version suffix.
+  const candidatesByValue = Object.entries(afterDeps).filter(
+    ([, value]) => value === spec || value === packageNameHint,
+  );
+  if (candidatesByValue.length === 1) return candidatesByValue[0][0];
+
+  // 3. Simple npm-name spec: the spec stem (without @version) is itself a key.
+  const stem = stripVersionSuffix(packageNameHint);
+  if (stem in afterDeps) return stem;
+
+  // 4. Multiple new keys (transitive deps shouldn't surface here, but guard
+  //    anyway): prefer one that looks like a paperclip plugin convention.
+  if (newKeys.length > 1) {
+    const conventional = newKeys.find((name) => isPluginPackageName(name));
+    if (conventional) return conventional;
+    return newKeys[0]!;
+  }
+
+  // 5. Fallback: trust the original hint (preserves pre-PLA-103 behaviour for
+  //    simple npm names so failure modes don't regress).
+  return stem;
+}
+
+/**
+ * Strip an explicit npm `@version` suffix from a package spec.
+ * Preserves the leading `@` of scoped names.
+ */
+function stripVersionSuffix(spec: string): string {
+  if (spec.startsWith("@")) {
+    const slash = spec.indexOf("/");
+    if (slash === -1) return spec;
+    const at = spec.indexOf("@", slash);
+    return at === -1 ? spec : spec.slice(0, at);
+  }
+  const at = spec.indexOf("@");
+  return at === -1 ? spec : spec.slice(0, at);
+}
+
 function parseSemver(version: string): ParsedSemver | null {
   const match = version.match(
     /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/,
@@ -833,6 +937,11 @@ export function pluginLoader(
         "plugin-loader: fetching plugin from npm",
       );
 
+      // Snapshot dependencies before the install so we can recover the actual
+      // installed package name even when `spec` is a tarball / git / URL spec
+      // (npm installs those under the package's declared `name`, not the spec).
+      const beforeDeps = await readDependencyMap(targetInstallDir);
+
       try {
         // Use execFile (not exec) to avoid shell injection from package name/version.
         // --ignore-scripts prevents preinstall/install/postinstall hooks from
@@ -846,21 +955,22 @@ export function pluginLoader(
         throw new Error(`npm install failed for ${spec}: ${String(err)}`);
       }
 
+      const afterDeps = await readDependencyMap(targetInstallDir);
+
       // Resolve the package path after installation
       const nodeModulesPath = path.join(targetInstallDir, "node_modules");
-      resolvedPackageName = packageName!;
-
-      // Handle scoped packages
-      if (resolvedPackageName.startsWith("@")) {
-        const [scope, name] = resolvedPackageName.split("/");
-        resolvedPackagePath = path.join(nodeModulesPath, scope!, name!);
-      } else {
-        resolvedPackagePath = path.join(nodeModulesPath, resolvedPackageName);
-      }
+      resolvedPackageName = resolveInstalledPackageName({
+        spec,
+        packageNameHint: packageName!,
+        beforeDeps,
+        afterDeps,
+      });
+      resolvedPackagePath = packagePathForName(resolvedPackageName, nodeModulesPath);
 
       if (!existsSync(resolvedPackagePath)) {
         throw new Error(
-          `Package directory not found after installation: ${resolvedPackagePath}`,
+          `Package directory not found after installation: ${resolvedPackagePath} ` +
+            `(spec=${spec}, resolvedPackageName=${resolvedPackageName})`,
         );
       }
     }
