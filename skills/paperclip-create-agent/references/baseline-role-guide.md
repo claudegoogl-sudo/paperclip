@@ -1,6 +1,6 @@
 # Baseline Role Guide (No-Template Fallback)
 
-Use this guide when no template under `packages/agents-md-templates/` is a close fit for the role you are hiring. It gives you a concrete structure for drafting a new `AGENTS.md` from scratch without asking the board for prompt-writing help.
+Use this guide when no template under the [`agents-md-kit`](https://github.com/claudegoogl-sudo/agents-md-kit) extension repo (`templates/<Role>.md`) is a close fit for the role you are hiring. It gives you a concrete structure for drafting a new `AGENTS.md` from scratch without asking the board for prompt-writing help.
 
 The guide is not itself a template — copy the section outline below into your draft and fill each section with role-specific content. Aim for roughly 60–150 lines of `AGENTS.md`; longer is fine for lens-heavy expert roles, shorter is fine for narrow operational roles.
 

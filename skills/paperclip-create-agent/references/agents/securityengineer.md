@@ -1,7 +1,14 @@
 # Security Engineer Agent Template (Pointer)
 
-The canonical Security Engineer template now lives at `packages/agents-md-templates/SecurityEngineer.md`. Copy from there when hiring security engineers, fill in `{{placeholders}}`, and lint with `agents-md-lint --against-template packages/agents-md-templates/SecurityEngineer.md path/to/AGENTS.md` before submitting the hire request.
+The canonical Security Engineer template now lives in the [`agents-md-kit`](https://github.com/claudegoogl-sudo/agents-md-kit) extension repo at [`templates/SecurityEngineer.md`](https://github.com/claudegoogl-sudo/agents-md-kit/blob/main/templates/SecurityEngineer.md). The recommended new-hire flow is the kit's one-shot installer:
 
-Authoring rules and verbatim-region conventions: `packages/agents-md-templates/_authoring-guide.md`.
+```bash
+curl -fsSL https://raw.githubusercontent.com/claudegoogl-sudo/agents-md-kit/main/scripts/install.sh \
+  | bash -s -- --role SecurityEngineer --agent-name <Name> --company <Co> --manager-title <Title> --issue-prefix <PREFIX>
+```
+
+Then lint the generated `AGENTS.md` against the canonical template before submitting the hire request: `agents-md-lint --against-template <path-to-cloned-kit>/templates/SecurityEngineer.md AGENTS.md`.
+
+Authoring rules and verbatim-region conventions: [`templates/_authoring-guide.md`](https://github.com/claudegoogl-sudo/agents-md-kit/blob/main/templates/_authoring-guide.md).
 
 This file is kept as a back-compat pointer; do not edit role copy here.

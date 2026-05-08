@@ -1,14 +1,16 @@
 # Agent Instruction Templates
 
-The canonical `AGENTS.md` templates for Coder, QA, CTO, UXDesigner, and SecurityEngineer live at **`packages/agents-md-templates/`**. That kit is the single source of truth — it is what new hires copy from and what `agents-md-lint --against-template` validates live `AGENTS.md` files against.
+The canonical `AGENTS.md` templates for Coder, QA, CTO, UXDesigner, and SecurityEngineer live in the [`agents-md-kit`](https://github.com/claudegoogl-sudo/agents-md-kit) extension repo under [`templates/<Role>.md`](https://github.com/claudegoogl-sudo/agents-md-kit/tree/main/templates). That kit is the single source of truth — it is what new hires install from and what `agents-md-lint --against-template` validates live `AGENTS.md` files against.
 
-Authoring rules, verbatim-region conventions, and placeholder rules: [`packages/agents-md-templates/_authoring-guide.md`](../../../packages/agents-md-templates/_authoring-guide.md).
+Authoring rules, verbatim-region conventions, and placeholder rules: [`templates/_authoring-guide.md`](https://github.com/claudegoogl-sudo/agents-md-kit/blob/main/templates/_authoring-guide.md).
 
 Use this reference from step 4 of the hiring workflow. It tells you which template to start from, when to adapt versus build from scratch, and how lens density should differ across roles.
 
 ## Hire workflow (happy path)
 
-> Copy the matching template from `packages/agents-md-templates/<Role>.md` → fill `{{placeholders}}` → run `agents-md-lint --against-template packages/agents-md-templates/<Role>.md path/to/AGENTS.md` → submit the hire request.
+> Run `curl -fsSL https://raw.githubusercontent.com/claudegoogl-sudo/agents-md-kit/main/scripts/install.sh | bash -s -- --role <Role> --agent-name <Name> --company <Co> --manager-title <Title> --issue-prefix <PREFIX>` → review the generated `AGENTS.md` → run `agents-md-lint --against-template <path-to-cloned-kit>/templates/<Role>.md AGENTS.md` → submit the hire request.
+
+The installer downloads the matching template from the kit, fills `{{placeholders}}` from your CLI flags, and writes `AGENTS.md` in the current directory. For repeated authoring or CI use, clone the kit (`git clone https://github.com/claudegoogl-sudo/agents-md-kit`) and lint against the local copy.
 
 The legacy stubs at `references/agents/<role>.md` are kept only as back-compat pointers to the canonical kit. Do not edit role copy in those stubs.
 
@@ -16,8 +18,8 @@ The legacy stubs at `references/agents/<role>.md` are kept only as back-compat p
 
 ```
 role match?
-├── exact template exists       → copy it from packages/agents-md-templates/, replace placeholders, lint, submit
-├── adjacent template is close  → copy closest, adapt deliberately (charter, lenses, sections), lint, submit
+├── exact template exists       → install via agents-md-kit/scripts/install.sh, lint, submit
+├── adjacent template is close  → copy closest from kit, adapt deliberately (charter, lenses, sections), submit
 └── no template is close        → use references/baseline-role-guide.md to build from scratch
 ```
 
@@ -27,11 +29,11 @@ In the hire comment, state which path you took so the board can audit the reason
 
 | Template | Use when hiring | Typical adapter | Lens density |
 |---|---|---|---|
-| [`Coder`](../../../packages/agents-md-templates/Coder.md) ([stub](agents/coder.md)) | Software engineers who implement code, debug issues, write tests, and coordinate with QA/CTO | `codex_local`, `claude_local`, `cursor`, or another coding adapter | Low (operational) |
-| [`QA`](../../../packages/agents-md-templates/QA.md) ([stub](agents/qa.md)) | QA engineers who reproduce bugs, validate fixes, capture screenshots, and report actionable findings | `claude_local` or another browser-capable adapter | Low (operational) |
-| [`UXDesigner`](../../../packages/agents-md-templates/UXDesigner.md) ([stub](agents/uxdesigner.md)) | Product designers who produce UX specs, review interface quality, and evolve the design system | `codex_local`, `claude_local`, or another adapter with repo/design context | High (lens-heavy) |
-| [`SecurityEngineer`](../../../packages/agents-md-templates/SecurityEngineer.md) ([stub](agents/securityengineer.md)) | Security engineers who threat-model, review auth/crypto/input handling, triage supply-chain and LLM-agent risk, and drive remediations | `claude_local`, `codex_local`, or another adapter with repo context | High (lens-heavy) |
-| [`CTO`](../../../packages/agents-md-templates/CTO.md) | Drift-guard reference only — CTO hires escalate to the CEO/board and are not drafted from this skill | n/a (governance hire) | n/a |
+| [`Coder`](https://github.com/claudegoogl-sudo/agents-md-kit/blob/main/templates/Coder.md) ([stub](agents/coder.md)) | Software engineers who implement code, debug issues, write tests, and coordinate with QA/CTO | `codex_local`, `claude_local`, `cursor`, or another coding adapter | Low (operational) |
+| [`QA`](https://github.com/claudegoogl-sudo/agents-md-kit/blob/main/templates/QA.md) ([stub](agents/qa.md)) | QA engineers who reproduce bugs, validate fixes, capture screenshots, and report actionable findings | `claude_local` or another browser-capable adapter | Low (operational) |
+| [`UXDesigner`](https://github.com/claudegoogl-sudo/agents-md-kit/blob/main/templates/UXDesigner.md) ([stub](agents/uxdesigner.md)) | Product designers who produce UX specs, review interface quality, and evolve the design system | `codex_local`, `claude_local`, or another adapter with repo/design context | High (lens-heavy) |
+| [`SecurityEngineer`](https://github.com/claudegoogl-sudo/agents-md-kit/blob/main/templates/SecurityEngineer.md) ([stub](agents/securityengineer.md)) | Security engineers who threat-model, review auth/crypto/input handling, triage supply-chain and LLM-agent risk, and drive remediations | `claude_local`, `codex_local`, or another adapter with repo context | High (lens-heavy) |
+| [`CTO`](https://github.com/claudegoogl-sudo/agents-md-kit/blob/main/templates/CTO.md) | Drift-guard reference only — CTO hires escalate to the CEO/board and are not drafted from this skill | n/a (governance hire) | n/a |
 
 The `CTO.md` template is shipped in the kit so live CTO `AGENTS.md` files can be lint-checked for drift, but there is intentionally no inline stub under `references/agents/` — CTO hires go through the CEO/board governance path, not this skill's drafting flow.
 
@@ -51,20 +53,20 @@ If you are hiring a role that is not in this index, do not force a fit. Use the 
 
 ## How to apply an exact template
 
-1. Open the matching template under `packages/agents-md-templates/<Role>.md`.
-2. Copy that template into the new agent's instruction bundle (usually `AGENTS.md`). For hire requests using local managed-bundle adapters, send the adapted template as top-level `instructionsBundle.files["AGENTS.md"]`. Do not put new-agent instructions in `adapterConfig.promptTemplate`.
-3. Replace placeholders like `{{companyName}}`, `{{managerTitle}}`, `{{issuePrefix}}`, and URLs.
+1. Run the kit installer (or open the matching template at [`agents-md-kit/templates/<Role>.md`](https://github.com/claudegoogl-sudo/agents-md-kit/tree/main/templates) and copy by hand).
+2. Place the result in the new agent's instruction bundle (usually `AGENTS.md`). For hire requests using local managed-bundle adapters, send the adapted template as top-level `instructionsBundle.files["AGENTS.md"]`. Do not put new-agent instructions in `adapterConfig.promptTemplate`.
+3. Replace placeholders like `{{companyName}}`, `{{managerTitle}}`, `{{issuePrefix}}`, and URLs (the installer fills these from CLI flags; if you copied by hand, fill them yourself).
 4. Remove tools or workflows the target adapter cannot use.
 5. Keep the Paperclip heartbeat requirement and the task-comment requirement.
 6. Add role-specific skills or reference files only when they are actually installed or bundled.
-7. Lint the draft against the template before opening the hire: `agents-md-lint --against-template packages/agents-md-templates/<Role>.md path/to/AGENTS.md`.
+7. Lint the draft against the template before opening the hire: `agents-md-lint --against-template <path-to-cloned-kit>/templates/<Role>.md path/to/AGENTS.md`.
 8. Run the pre-submit checklist: `references/draft-review-checklist.md`.
 
 ## How to apply an adjacent template
 
 Use this when the requested role is close to an existing template but not the same (for example, "Backend Engineer" adapted from `Coder.md`, "Content Designer" adapted from `UXDesigner.md`, "Release Engineer" adapted from `QA.md`, or "AppSec Reviewer" adapted from `SecurityEngineer.md`).
 
-1. Start from the closest template in `packages/agents-md-templates/`.
+1. Start from the closest template in [`agents-md-kit/templates/`](https://github.com/claudegoogl-sudo/agents-md-kit/tree/main/templates).
 2. Rewrite the role title, charter, and capabilities for the new role — do not leave the source role's framing in place.
 3. Swap domain lenses to match the new discipline. Keep only lenses that actually apply.
 4. Remove sections that do not fit (for example, drop the UX visual-quality bar from a backend engineer template, or drop infrastructure lenses from an application-only security reviewer).
@@ -85,7 +87,7 @@ Lenses are the single biggest quality lever for expert roles and the single bigg
 
 Source: adjacent to `Coder.md`, but the charter is performance and reliability, not general feature work.
 
-1. Start from `packages/agents-md-templates/Coder.md`.
+1. Start from [`agents-md-kit/templates/Coder.md`](https://github.com/claudegoogl-sudo/agents-md-kit/blob/main/templates/Coder.md).
 2. Rewrite the charter around performance: owns latency and throughput budgets, profiles hot paths, proposes concrete fixes with before/after measurements, and blocks merges that regress SLO.
 3. Add a focused lens section (about 6–10 lenses), for example: Amdahl's Law, Tail-at-Scale, Little's Law (throughput = concurrency / latency), N+1 queries, hot-cold partitioning, cache coherence, GC pause budget, backpressure, SLO vs SLI vs SLA, observability-before-optimization.
 4. Add a "performance review bar" describing evidence expected in a PR: flamegraph or trace, baseline vs fixed numbers, test that fails on regression.
@@ -97,7 +99,7 @@ This produces a lens-heavy variant without pasting the SecurityEngineer or UXDes
 
 Source: adjacent to `SecurityEngineer.md`, but the scope is only supply-chain risk.
 
-1. Start from `packages/agents-md-templates/SecurityEngineer.md`.
+1. Start from [`agents-md-kit/templates/SecurityEngineer.md`](https://github.com/claudegoogl-sudo/agents-md-kit/blob/main/templates/SecurityEngineer.md).
 2. Rewrite the charter around supply-chain audit: watch lockfile changes, run `osv-scanner`/`npm audit`/`pip-audit`, triage CVEs, and file remediation tickets with owner and severity.
 3. Keep only the Supply chain, Secure SDLC, and Logging/monitoring lens groups. Drop AuthN/AuthZ, Cryptography, Web-specific hardening, Infrastructure, Rate limiting, Data protection. Those lenses would just add noise to the wake prompt for a pure dependency-audit role.
 4. Keep the Review bar and Remediation bar sections, since the role still produces concrete findings with severity and fix proposals.
@@ -109,7 +111,7 @@ The result is a compact, role-appropriate prompt that still cites lenses the aud
 
 Source: adjacent to `QA.md`, but the charter is release-note curation and cut coordination, not browser verification.
 
-1. Start from `packages/agents-md-templates/QA.md`.
+1. Start from [`agents-md-kit/templates/QA.md`](https://github.com/claudegoogl-sudo/agents-md-kit/blob/main/templates/QA.md).
 2. Rewrite the charter around release coordination: assemble release notes from merged PRs, confirm CI is green, tag the release, file follow-up tickets for known issues.
 3. Do not add a lens section at all. This role is operational; the baseline role guide explicitly allows roles without lenses when judgment is not the deliverable.
 4. Keep the comment-on-every-touch rule, the blocked/unblock rule, and the heartbeat-exit rule.
@@ -121,7 +123,7 @@ This keeps the role short and focused, and avoids a "lens paragraph that could a
 
 Source: adjacent to `UXDesigner.md`, but the charter is voice, microcopy, and information architecture — not full visual design.
 
-1. Start from `packages/agents-md-templates/UXDesigner.md`.
+1. Start from [`agents-md-kit/templates/UXDesigner.md`](https://github.com/claudegoogl-sudo/agents-md-kit/blob/main/templates/UXDesigner.md).
 2. Rewrite the charter around content: owns voice/tone, microcopy, and information architecture for product surfaces; reviews empty-state copy, error messages, and onboarding flows; pushes back on jargon and dark-pattern language.
 3. Keep lens groups: `IA & content`, `Forms & errors` (microcopy), `Behavioral science` (framing, defaults, anchoring), `Accessibility` (plain language, reading level), `Emotional & trust`, `Ethics` (dark-pattern copy).
 4. Drop lens groups: `Gestalt`, `Motion & perceived performance`, `Platform & context` (thumb zones), and most of `System & interaction` (Fitts's Law, Doherty Threshold) — these are visual/interaction lenses the content role does not apply.
