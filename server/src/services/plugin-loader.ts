@@ -29,7 +29,7 @@ import { readdir, readFile, rm, stat } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import type { Db } from "@paperclipai/db";
 import type {
@@ -52,6 +52,44 @@ import { pluginDatabaseService } from "./plugin-database.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// ---------------------------------------------------------------------------
+// Manifest dynamic-import cache-bust (PLA-159)
+// ---------------------------------------------------------------------------
+
+/**
+ * Load a plugin manifest module via dynamic `import()`, cache-busting on the
+ * file's mtime so that rebuilds during install/upgrade are observed without a
+ * host restart.
+ *
+ * Node's ESM loader keys cached modules by absolute specifier (URL). A bare
+ * `import('/.../manifest.js')` therefore returns the originally-imported
+ * module for the lifetime of the process, even if the file on disk has been
+ * rebuilt — every install/upgrade silently uses the stale manifest.
+ *
+ * Appending `?mtime=<mtimeMs>` to a `file://` URL is an ESM-spec-compliant way
+ * to make the specifier change when (and only when) the file changes:
+ * unchanged files keep the same URL → the cached import is reused → no perf
+ * regression; changed files get a fresh URL → a fresh import → the new
+ * manifest contents win.
+ *
+ * Returns the raw module's default export (or the module itself if there is
+ * no default), unvalidated. Validation is the caller's responsibility.
+ *
+ * Exported so the regression test in `plugin-loader.test.ts` can exercise the
+ * cache-bust property directly without spinning up the full install pipeline.
+ *
+ * @see PLA-159 — Host bug: plugin manifest re-import hits ESM cache
+ */
+export async function loadManifestModule(
+  manifestPath: string,
+): Promise<unknown> {
+  const fileStat = await stat(manifestPath);
+  const url = `${pathToFileURL(manifestPath).href}?mtime=${fileStat.mtimeMs}`;
+  const mod = (await import(url)) as Record<string, unknown>;
+  // The manifest may be the default export or the module namespace itself
+  return mod["default"] ?? mod;
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -924,6 +962,9 @@ export function pluginLoader(
   /**
    * Attempt to load and validate a plugin manifest from a resolved path.
    * Returns the manifest on success or throws with a descriptive error.
+   *
+   * Uses {@link loadManifestModule} so install/upgrade observe rebuilds on
+   * disk instead of a stale ESM-cached module — see PLA-159.
    */
   async function loadManifestFromPath(
     manifestPath: string,
@@ -931,10 +972,7 @@ export function pluginLoader(
     let raw: unknown;
 
     try {
-      // Dynamic import works for both .js (ESM) and .cjs (CJS) manifests
-      const mod = await import(manifestPath) as Record<string, unknown>;
-      // The manifest may be the default export or the module itself
-      raw = mod["default"] ?? mod;
+      raw = await loadManifestModule(manifestPath);
     } catch (err) {
       throw new Error(
         `Failed to load manifest module at ${manifestPath}: ${String(err)}`,
