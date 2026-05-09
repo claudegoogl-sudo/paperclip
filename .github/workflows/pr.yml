@@ -88,6 +88,13 @@ jobs:
       - name: Build
         run: pnpm build
 
+      # PLA-376 — exercise the create-paperclip-plugin scaffold's emitted
+      # release-time manifest validation gate. Uses the scaffold's `dist/`
+      # produced by the Build step above; runs the host plugin-manifest
+      # validator against a freshly-scaffolded plugin's wiring.
+      - name: Verify scaffold manifest-validation gate (PLA-376)
+        run: pnpm run test:scaffold-create-paperclip-plugin
+
       - name: Release canary dry run
         run: |
           git checkout -B master HEAD
