@@ -145,7 +145,7 @@ export type PluginToolDeclarationInput = z.infer<typeof pluginToolDeclarationSch
  * Tracked in PLA-122 (B4 UI stability contract) / PLA-123. Expand this list
  * as additional slot types reach the v1 host-rendered floor.
  */
-const PLUGIN_UI_SLOT_TYPES_V1_SUPPORTED = ["dashboardWidget"] as const;
+const PLUGIN_UI_SLOT_TYPES_V1_SUPPORTED = ["dashboardWidget", "page"] as const;
 
 /**
  * Validates a {@link PluginUiSlotDeclaration} — a UI extension slot the plugin
