@@ -16,6 +16,8 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { readForkBuildTagFromEnv, rewriteForkBuildDeps } from "./pack-public-packages.mjs";
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, "..");
 
@@ -104,7 +106,30 @@ if (Object.keys(sortedOptDeps).length > 0) {
   publishPkg.optionalDependencies = sortedOptDeps;
 }
 
-const output = JSON.stringify(publishPkg, null, 2) + "\n";
+// PLA-498: when building a fork-build release, rewrite the internal
+// @paperclipai/* deps to GitHub-Release tarball URLs so `npm install` on
+// the published CLI tarball can actually resolve them. None of these
+// packages exist on the public npm registry. The rewriter is a no-op for
+// canary/stable npm publishes (FORK_BUILD_TAG unset) — the bare-semver
+// deps stay as they are and resolve from the real registry.
+const forkBuildTag = readForkBuildTagFromEnv();
+let finalPublishPkg = publishPkg;
+if (forkBuildTag) {
+  // Build a workspaceVersions map covering only the @paperclipai/* deps
+  // we actually emit, so the rewriter never has to invent a version. The
+  // values were already pulled from each workspace's package.json above.
+  const workspaceVersions = new Map();
+  for (const [name, version] of Object.entries(sortedDeps)) {
+    if (name.startsWith("@paperclipai/")) workspaceVersions.set(name, version);
+  }
+  finalPublishPkg = rewriteForkBuildDeps(publishPkg, {
+    workspaceVersions,
+    releaseTag: forkBuildTag,
+  });
+  console.log(`  ✓  Rewrote @paperclipai/* deps for fork-build tag ${forkBuildTag}`);
+}
+
+const output = JSON.stringify(finalPublishPkg, null, 2) + "\n";
 const outPath = resolve(repoRoot, "cli/package.json");
 writeFileSync(outPath, output);
 
