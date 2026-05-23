@@ -446,6 +446,30 @@ export interface PluginDatabaseClient {
 }
 
 /**
+ * Permitted body shapes for `ctx.http.fetch`. Widened beyond
+ * `RequestInit.body` so plugins can pass binary payloads (FormData,
+ * Uint8Array, ArrayBuffer, Buffer) end-to-end without manual base64
+ * plumbing through the worker→host RPC.
+ */
+export type PluginHttpFetchBody =
+  | string
+  | Uint8Array
+  | ArrayBuffer
+  | Buffer
+  | FormData;
+
+/**
+ * `RequestInit`-shaped options accepted by `ctx.http.fetch`. Mirrors the
+ * fields the SDK forwards over the worker→host RPC, but with a widened
+ * `body` type to accept binary/multipart payloads.
+ */
+export interface PluginHttpFetchInit {
+  method?: string;
+  headers?: HeadersInit;
+  body?: PluginHttpFetchBody | null;
+}
+
+/**
  * `ctx.http` — make outbound HTTP requests.
  *
  * Requires `http.outbound` capability.
@@ -460,11 +484,23 @@ export interface PluginHttpClient {
    * Plugins may also use standard Node `fetch` or other libraries directly —
    * this client exists for host-managed tracing and audit logging.
    *
+   * The `init.body` field accepts strings as well as binary/multipart
+   * payloads (`Uint8Array`, `ArrayBuffer`, `Buffer`, `FormData`). Binary
+   * bodies travel as base64 over the worker→host RPC and are decoded back
+   * to bytes before they hit the wire, so byte-exact payloads (e.g.
+   * gzip-compressed JSON, gcode uploads) round-trip without corruption.
+   *
+   * When `init.body instanceof FormData` and the caller did not set a
+   * `Content-Type` header, the SDK fills in
+   * `multipart/form-data; boundary=<boundary>` to match what `fetch()`
+   * would emit natively.
+   *
    * @param url - Target URL
-   * @param init - Standard `RequestInit` options
+   * @param init - Standard `RequestInit`-shaped options; see
+   *               {@link PluginHttpFetchInit} for the widened `body` type.
    * @returns The response
    */
-  fetch(url: string, init?: RequestInit): Promise<Response>;
+  fetch(url: string, init?: PluginHttpFetchInit): Promise<Response>;
 }
 
 /**

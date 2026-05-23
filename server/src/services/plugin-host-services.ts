@@ -191,17 +191,42 @@ async function validateAndResolveFetchUrl(urlString: string): Promise<ValidatedF
   }
 }
 
+/**
+ * Body shape that the worker→host RPC forwards.
+ *
+ * `body` is always a string on the wire (JSON-RPC). `bodyEncoding` tells us
+ * how to interpret it before writing to the upstream socket:
+ *   - "utf8" (default if missing) — text body, written as-is.
+ *   - "base64" — binary body, decoded into a Buffer before write so byte
+ *                payloads (binary blobs, multipart) round-trip exactly.
+ */
+interface PluginFetchInit {
+  method?: string;
+  headers?: Record<string, string> | Headers | Array<[string, string]>;
+  body?: string;
+  bodyEncoding?: "utf8" | "base64";
+}
+
+function decodeFetchBody(init: PluginFetchInit | undefined): string | Buffer | undefined {
+  if (!init || init.body === undefined || init.body === null) return undefined;
+  if (init.bodyEncoding === "base64") {
+    if (typeof init.body !== "string") {
+      throw new Error("http.fetch: bodyEncoding='base64' requires body to be a base64 string");
+    }
+    return Buffer.from(init.body, "base64");
+  }
+  // Default / "utf8" — pass strings through. Coerce non-strings defensively
+  // (legacy callers occasionally send buffer-like objects without bodyEncoding).
+  return typeof init.body === "string" ? init.body : String(init.body);
+}
+
 function buildPinnedRequestOptions(
   target: ValidatedFetchTarget,
-  init?: RequestInit,
-): { options: HttpRequestOptions & { servername?: string }; body: string | undefined } {
-  const headers = new Headers(init?.headers);
+  init?: PluginFetchInit,
+): { options: HttpRequestOptions & { servername?: string }; body: string | Buffer | undefined } {
+  const headers = new Headers(init?.headers as HeadersInit | undefined);
   const method = init?.method ?? "GET";
-  const body = init?.body === undefined || init?.body === null
-    ? undefined
-    : typeof init.body === "string"
-      ? init.body
-      : String(init.body);
+  const body = decodeFetchBody(init);
 
   headers.set("Host", target.hostHeader);
   if (body !== undefined && !headers.has("content-length") && !headers.has("transfer-encoding")) {
@@ -234,7 +259,7 @@ function buildPinnedRequestOptions(
 
 async function executePinnedHttpRequest(
   target: ValidatedFetchTarget,
-  init: RequestInit | undefined,
+  init: PluginFetchInit | undefined,
   signal: AbortSignal,
 ): Promise<{ status: number; statusText: string; headers: Record<string, string>; body: string }> {
   const { options, body } = buildPinnedRequestOptions(target, init);
@@ -828,7 +853,7 @@ export function buildHostServices(
         const timeout = setTimeout(() => controller.abort(), PLUGIN_FETCH_TIMEOUT_MS);
 
         try {
-          const init = params.init as RequestInit | undefined;
+          const init = params.init as PluginFetchInit | undefined;
           return await executePinnedHttpRequest(target, init, controller.signal);
         } finally {
           clearTimeout(timeout);

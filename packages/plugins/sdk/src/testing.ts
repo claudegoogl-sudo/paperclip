@@ -529,7 +529,10 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
     http: {
       async fetch(url, init) {
         requireCapability(manifest, capabilitySet, "http.outbound");
-        return fetch(url, init);
+        // `PluginHttpFetchInit.body` is widened beyond native `RequestInit.body`
+        // (e.g. plain Buffer). Cast back for the global `fetch` — at runtime
+        // every value PluginHttpFetchBody accepts is also a valid BodyInit.
+        return fetch(url, init as RequestInit | undefined);
       },
     },
     secrets: {
