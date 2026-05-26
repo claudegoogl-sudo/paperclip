@@ -62,6 +62,9 @@ import {
   writePluginLocalFolderTextAtomic,
 } from "./plugin-local-folders.js";
 import { createPluginSecretsHandler } from "./plugin-secrets-handler.js";
+import { createPluginArtifactsHandler } from "./plugin-artifacts-handler.js";
+import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js";
+import type { StorageService } from "../storage/types.js";
 import { logActivity } from "./activity-log.js";
 import type { PluginEventBus } from "./plugin-event-bus.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
@@ -484,7 +487,12 @@ export function buildHostServices(
   pluginKey: string,
   eventBus: PluginEventBus,
   notifyWorker?: (method: string, params: unknown) => void,
-  options: { pluginWorkerManager?: PluginWorkerManager; manifest?: import("@paperclipai/shared").PaperclipPluginManifestV1 } = {},
+  options: {
+    pluginWorkerManager?: PluginWorkerManager;
+    manifest?: import("@paperclipai/shared").PaperclipPluginManifestV1;
+    storageService?: StorageService;
+    runContextRegistry?: PluginRunContextRegistry;
+  } = {},
 ): HostServices & { dispose(): void } {
   const registry = pluginRegistryService(db);
   const stateStore = pluginStateStore(db);
@@ -535,6 +543,34 @@ export function buildHostServices(
   const budgets = budgetService(db);
   const issueApprovals = issueApprovalService(db);
   const scopedBus = eventBus.forPlugin(pluginKey);
+
+  // PLA-574: artifacts.fetch handler — only available when storage + a
+  // run-context registry are wired. When absent (e.g. legacy test harnesses)
+  // the slot stays unwired and any call throws a clear error.
+  const artifactsHandler =
+    options.storageService && options.runContextRegistry
+      ? createPluginArtifactsHandler({
+          db,
+          pluginDbId: pluginId,
+          pluginKey,
+          storage: options.storageService,
+          attachments: {
+            async getAttachmentById(id: string) {
+              const row = await issues.getAttachmentById(id);
+              if (!row) return null;
+              return {
+                id: row.id,
+                companyId: row.companyId,
+                objectKey: row.objectKey,
+                contentType: row.contentType,
+                byteSize: row.byteSize,
+                originalFilename: row.originalFilename ?? null,
+              };
+            },
+          },
+          runContextRegistry: options.runContextRegistry,
+        })
+      : null;
 
   // Track active session event subscriptions for cleanup
   const activeSubscriptions = new Set<{ unsubscribe: () => void; timer: ReturnType<typeof setTimeout> }>();
@@ -1231,6 +1267,17 @@ export function buildHostServices(
     secrets: {
       async resolve(params) {
         return secretsHandler.resolve(params);
+      },
+    },
+
+    artifacts: {
+      async fetch(params) {
+        if (!artifactsHandler) {
+          throw new Error(
+            "artifacts.fetch is not available — host was built without a storage service or run-context registry",
+          );
+        }
+        return artifactsHandler.fetch(params);
       },
     },
 
