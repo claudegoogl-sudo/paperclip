@@ -22,6 +22,11 @@ const mockIssueService = vi.hoisted(() => ({
   update: vi.fn(),
   getByIdentifier: vi.fn(),
   assertCheckoutOwner: vi.fn(),
+  // PLA-141 introduced a clearOrphanCheckoutLocksIfTerminal call at the top of
+  // every issue mutation route. The PATCH /issues/:id guard test reaches that
+  // entry point and would otherwise 500 on an undefined-method TypeError before
+  // the environment-selection assertion under test runs.
+  clearOrphanCheckoutLocksIfTerminal: vi.fn(async () => false),
 }));
 
 const mockEnvironmentService = vi.hoisted(() => ({
@@ -163,6 +168,8 @@ describe.sequential("execution environment route guards", () => {
     mockIssueService.update.mockReset();
     mockIssueService.getByIdentifier.mockReset();
     mockIssueService.assertCheckoutOwner.mockReset();
+    mockIssueService.clearOrphanCheckoutLocksIfTerminal.mockReset();
+    mockIssueService.clearOrphanCheckoutLocksIfTerminal.mockResolvedValue(false);
     mockCompanyService.getById.mockReset();
     mockCompanyService.getById.mockResolvedValue({
       id: "company-1",

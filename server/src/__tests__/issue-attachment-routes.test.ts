@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { StorageService } from "../storage/types.js";
 
 const mockIssueService = vi.hoisted(() => ({
+  clearOrphanCheckoutLocksIfTerminal: vi.fn(async () => false),
   getById: vi.fn(),
   getByIdentifier: vi.fn(),
   createAttachment: vi.fn(),

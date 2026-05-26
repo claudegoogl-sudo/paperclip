@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const ASSIGNEE_AGENT_ID = "11111111-1111-4111-8111-111111111111";
 
 const mockIssueService = vi.hoisted(() => ({
+  clearOrphanCheckoutLocksIfTerminal: vi.fn(async () => false),
   getById: vi.fn(),
   update: vi.fn(),
   addComment: vi.fn(),
