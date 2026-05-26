@@ -3,6 +3,7 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockIssueService = vi.hoisted(() => ({
+  clearOrphanCheckoutLocksIfTerminal: vi.fn(async () => false),
   getById: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),

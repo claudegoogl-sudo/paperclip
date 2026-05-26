@@ -71,6 +71,7 @@ const mockIssueApprovalService = vi.hoisted(() => ({
 }));
 
 const mockIssueService = vi.hoisted(() => ({
+  clearOrphanCheckoutLocksIfTerminal: vi.fn(async () => false),
   list: vi.fn(),
 }));
 
