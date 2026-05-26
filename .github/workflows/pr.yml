@@ -96,6 +96,12 @@ jobs:
         run: pnpm run test:scaffold-create-paperclip-plugin
 
       - name: Release canary dry run
+        # PLA-552: Skip on PRs. The dry-run fetches the fork's own remote, which
+        # currently 403s because the fork's GitHub account is suspended (board
+        # handling separately). Real canary publishing runs in release.yml on
+        # push-to-master, so this PR-time dry-run is not a required signal.
+        # Reversible by deleting the `if:` line.
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         run: |
           git checkout -B master HEAD
           git checkout -- pnpm-lock.yaml
