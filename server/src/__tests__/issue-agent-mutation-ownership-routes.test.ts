@@ -12,6 +12,7 @@ const ownerRunId = "55555555-5555-4555-8555-555555555555";
 const mockIssueService = vi.hoisted(() => ({
   addComment: vi.fn(),
   assertCheckoutOwner: vi.fn(),
+  clearOrphanCheckoutLocksIfTerminal: vi.fn(async () => false),
   getAttachmentById: vi.fn(),
   getByIdentifier: vi.fn(),
   getById: vi.fn(),
@@ -252,6 +253,8 @@ describe("agent issue mutation checkout ownership", () => {
     mockCompanyService.getById.mockReset();
     mockIssueService.addComment.mockReset();
     mockIssueService.assertCheckoutOwner.mockReset();
+    mockIssueService.clearOrphanCheckoutLocksIfTerminal.mockReset();
+    mockIssueService.clearOrphanCheckoutLocksIfTerminal.mockResolvedValue(false);
     mockIssueService.getAttachmentById.mockReset();
     mockIssueService.getByIdentifier.mockReset();
     mockIssueService.getById.mockReset();
