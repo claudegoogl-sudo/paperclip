@@ -36,6 +36,7 @@ vi.mock("../adapters/index.js", () => ({
     supportsLocalAgentJwt: false,
   }),
   runningProcesses: new Map(),
+  listAdapterModelProfiles: async () => [],
 }));
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
