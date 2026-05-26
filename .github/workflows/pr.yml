@@ -96,6 +96,12 @@ jobs:
         run: pnpm run test:scaffold-create-paperclip-plugin
 
       - name: Release canary dry run
+        # PLA-551: skip on PRs. The dry-run step does `git fetch` over
+        # unauthenticated HTTPS against the fork origin, which 403s while the
+        # fork's GitHub account is suspended (PLA-549). Release canary is still
+        # exercised on push-to-master by .github/workflows/release.yml's
+        # verify_canary job, so PR runs do not need this signal.
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         run: |
           git checkout -B master HEAD
           git checkout -- pnpm-lock.yaml
