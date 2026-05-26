@@ -1289,6 +1289,16 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         runId: runCtx.runId ?? randomUUID(),
         companyId: runCtx.companyId ?? "company-test",
         projectId: runCtx.projectId ?? "project-test",
+        // PLA-574: provide a default artifacts client for tests that don't
+        // exercise cross-tenant fetches; throws if invoked so tests that do
+        // need it must inject their own client.
+        artifacts: runCtx.artifacts ?? {
+          fetch: async () => {
+            throw new Error(
+              "ctx.artifacts.fetch is not stubbed in this test — pass `runCtx.artifacts` to inject a mock",
+            );
+          },
+        },
       };
       return await handler(params, ctxToPass) as T;
     },
