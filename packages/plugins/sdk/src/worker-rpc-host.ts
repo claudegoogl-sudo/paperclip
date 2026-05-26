@@ -55,6 +55,8 @@ import type {
 import type {
   PluginContext,
   PluginEvent,
+  PluginHttpFetchBody,
+  PluginHttpFetchInit,
   PluginJobContext,
   PluginLauncherRegistration,
   ScopeKey,
@@ -174,6 +176,62 @@ interface EventRegistration {
 
 /** Default timeout for worker→host RPC calls. */
 const DEFAULT_RPC_TIMEOUT_MS = 30_000;
+
+// ---------------------------------------------------------------------------
+// HTTP fetch body serialization
+// ---------------------------------------------------------------------------
+
+function hasContentTypeHeader(headers: Record<string, string> | undefined): boolean {
+  if (!headers) return false;
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === "content-type") return true;
+  }
+  return false;
+}
+
+/**
+ * Convert a fetch body into the wire-format the host expects:
+ *   - string      → `{ body: <string>,   bodyEncoding: "utf8"   }`
+ *   - binary/Buf  → `{ body: <base64>,   bodyEncoding: "base64" }` (bytes preserved exactly)
+ *   - FormData    → multipart-encoded bytes (base64) + boundary content-type
+ *
+ * The host decodes based on `bodyEncoding`; a missing `bodyEncoding` is
+ * treated as `"utf8"` for backward compatibility with old worker callers.
+ */
+async function serializeFetchBody(
+  body: PluginHttpFetchBody,
+): Promise<{ body: string; bodyEncoding: "utf8" | "base64"; contentType: string | null }> {
+  if (typeof body === "string") {
+    return { body, bodyEncoding: "utf8", contentType: null };
+  }
+  // FormData → use the platform's Response Body serializer; it emits a
+  // valid multipart/form-data payload and a Content-Type with a fresh
+  // boundary, matching what `fetch()` would have produced natively.
+  if (typeof FormData !== "undefined" && body instanceof FormData) {
+    const res = new Response(body as unknown as BodyInit);
+    const buf = Buffer.from(await res.arrayBuffer());
+    return {
+      body: buf.toString("base64"),
+      bodyEncoding: "base64",
+      contentType: res.headers.get("content-type"),
+    };
+  }
+  if (Buffer.isBuffer(body)) {
+    return { body: body.toString("base64"), bodyEncoding: "base64", contentType: null };
+  }
+  if (body instanceof Uint8Array) {
+    const buf = Buffer.from(body.buffer, body.byteOffset, body.byteLength);
+    return { body: buf.toString("base64"), bodyEncoding: "base64", contentType: null };
+  }
+  if (body instanceof ArrayBuffer) {
+    const buf = Buffer.from(new Uint8Array(body));
+    return { body: buf.toString("base64"), bodyEncoding: "base64", contentType: null };
+  }
+  // Unknown body shape — fall back to string coercion to avoid throwing
+  // on exotic BodyInits we don't explicitly support. Old behaviour.
+  return { body: String(body), bodyEncoding: "utf8", contentType: null };
+}
+
 
 // ---------------------------------------------------------------------------
 // startWorkerRpcHost
@@ -444,7 +502,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       },
 
       http: {
-        async fetch(url: string, init?: RequestInit): Promise<Response> {
+        async fetch(url: string, init?: PluginHttpFetchInit): Promise<Response> {
           const serializedInit: Record<string, unknown> = {};
           if (init) {
             if (init.method) serializedInit.method = init.method;
@@ -459,13 +517,22 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
                 for (const [k, v] of init.headers) obj[k] = v;
                 serializedInit.headers = obj;
               } else {
-                serializedInit.headers = init.headers;
+                serializedInit.headers = { ...(init.headers as Record<string, string>) };
               }
             }
             if (init.body !== undefined && init.body !== null) {
-              serializedInit.body = typeof init.body === "string"
-                ? init.body
-                : String(init.body);
+              const serialized = await serializeFetchBody(init.body);
+              serializedInit.body = serialized.body;
+              serializedInit.bodyEncoding = serialized.bodyEncoding;
+              if (
+                serialized.contentType
+                && !hasContentTypeHeader(serializedInit.headers as Record<string, string> | undefined)
+              ) {
+                const headersObj =
+                  (serializedInit.headers as Record<string, string> | undefined) ?? {};
+                headersObj["Content-Type"] = serialized.contentType;
+                serializedInit.headers = headersObj;
+              }
             }
           }
 

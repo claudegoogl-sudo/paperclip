@@ -652,8 +652,23 @@ export interface WorkerToHostMethods {
   ];
 
   // HTTP
+  //
+  // `init.body` travels as a string over JSON-RPC. `bodyEncoding` tells the
+  // host how to decode it:
+  //   - "utf8"   (default if absent) — body is plain text, written as-is.
+  //   - "base64" — body is base64-encoded bytes, decoded to a Buffer before
+  //                being written on the wire. Used by the SDK for FormData,
+  //                Uint8Array, ArrayBuffer, and Buffer payloads.
   "http.fetch": [
-    params: { url: string; init?: Record<string, unknown> },
+    params: {
+      url: string;
+      init?: {
+        method?: string;
+        headers?: Record<string, string>;
+        body?: string;
+        bodyEncoding?: "utf8" | "base64";
+      };
+    },
     result: { status: number; statusText: string; headers: Record<string, string>; body: string },
   ];
 
