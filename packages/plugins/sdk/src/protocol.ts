@@ -813,6 +813,24 @@ export interface WorkerToHostMethods {
     result: string,
   ];
 
+  // Artifacts (attachment bytes)
+  //
+  // `runId` MUST be the runId of the currently-executing tool dispatch.
+  // The host looks up the active runContext keyed on (pluginDbId, runId)
+  // and uses the DISPATCHING agent (not the worker JWT) for authorization
+  // against the attachment's owning company. Bytes travel as base64 over
+  // JSON-RPC; the worker SDK decodes them to Uint8Array before returning
+  // to the plugin caller.
+  "artifacts.fetch": [
+    params: { attachmentId: string; runId: string },
+    result: {
+      filename: string;
+      contentType: string;
+      byteSize: number;
+      contentBase64: string;
+    },
+  ];
+
   // Activity
   "activity.log": [
     params: {

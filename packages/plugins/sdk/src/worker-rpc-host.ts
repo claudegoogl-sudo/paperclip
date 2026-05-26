@@ -1567,7 +1567,36 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     if (!entry) {
       throw new Error(`No tool handler registered for "${params.toolName}"`);
     }
-    return entry.fn(params.parameters, params.runContext);
+    // PLA-574: inject the per-runContext artifacts client. The wire-format
+    // runContext carries identity fields only; method shims are added here so
+    // tools can do `await ctx.artifacts.fetch(attachmentId)`. The host
+    // re-derives the dispatching agent's identity from (pluginDbId, runId);
+    // we only send the opaque runId — the worker is never trusted to assert
+    // who is calling.
+    const runId = params.runContext.runId;
+    const runCtxWithMethods: ToolRunContext = {
+      ...params.runContext,
+      artifacts: {
+        async fetch(attachmentId: string) {
+          if (typeof attachmentId !== "string" || attachmentId.length === 0) {
+            throw new Error(
+              "ctx.artifacts.fetch: attachmentId must be a non-empty string",
+            );
+          }
+          const result = await callHost("artifacts.fetch", {
+            attachmentId,
+            runId,
+          });
+          return {
+            bytes: new Uint8Array(Buffer.from(result.contentBase64, "base64")),
+            filename: result.filename,
+            contentType: result.contentType,
+            byteSize: result.byteSize,
+          };
+        },
+      },
+    };
+    return entry.fn(params.parameters, runCtxWithMethods);
   }
 
   function methodNotImplemented(method: string): Error & { code: number } {
