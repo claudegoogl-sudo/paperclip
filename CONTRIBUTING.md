@@ -47,6 +47,14 @@ Every PR must include a **Model Used** section specifying which AI model produce
 
 All tests must pass before a PR can be merged. Run them locally first and verify CI is green after pushing.
 
+#### Rerun policy for CI flakes
+
+CI is required to be green, but the `e2e` job in particular can occasionally fail on infrastructure (Playwright apt/dpkg hangs, embedded-Postgres deadlocks, Actions runner network blips) rather than on a real regression. The policy is:
+
+1. **A single rerun is allowed** for any infra-only failure (`gh run rerun --failed <run-id>`). Note the original failure in the PR thread before rerunning so reviewers have the audit trail.
+2. **If the same step fails twice in a row, treat it as a real failure** — investigate before merging, even if the logs look "infra-shaped". File a follow-up issue rather than retrying a third time.
+3. **Never disable a check to land a PR.** If a check is genuinely useless, remove it in its own PR with justification.
+
 ### Greptile Review
 
 We use [Greptile](https://greptile.com) for automated code review. Your PR must achieve a **5/5 Greptile score** with **all Greptile comments addressed** before it can be merged. If Greptile leaves comments, fix or respond to each one and request a re-review.
