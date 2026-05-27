@@ -58,6 +58,7 @@ import {
   workProductService,
 } from "../services/index.js";
 import { logger } from "../middleware/logger.js";
+import { retryOnTransientPgError } from "../services/pg-retry.js";
 import { conflict, forbidden, HttpError, notFound, unauthorized } from "../errors.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 import {
@@ -2126,42 +2127,50 @@ export function issueRoutes(
 
     let issue;
     try {
-      if (transition.decision && decisionId) {
-        const decision = transition.decision;
-        issue = await db.transaction(async (tx) => {
-          const updated = await svc.update(
-            id,
-            {
-              ...updateFields,
-              actorAgentId: actor.agentId ?? null,
-              actorUserId: actor.actorType === "user" ? actor.actorId : null,
-            },
-            tx,
-          );
-          if (!updated) return null;
+      // PLA-597: the issue PATCH path contends with concurrent heartbeat-run
+      // mutations (claim/release/cancel) on overlapping rows. Postgres
+      // occasionally aborts one transaction with deadlock 40P01; retry it from
+      // the app since the rollback leaves no partial state.
+      issue = await retryOnTransientPgError(
+        async () => {
+          if (transition.decision && decisionId) {
+            const decision = transition.decision;
+            return db.transaction(async (tx) => {
+              const updated = await svc.update(
+                id,
+                {
+                  ...updateFields,
+                  actorAgentId: actor.agentId ?? null,
+                  actorUserId: actor.actorType === "user" ? actor.actorId : null,
+                },
+                tx,
+              );
+              if (!updated) return null;
 
-          await tx.insert(issueExecutionDecisions).values({
-            id: decisionId,
-            companyId: updated.companyId,
-            issueId: updated.id,
-            stageId: decision.stageId,
-            stageType: decision.stageType,
+              await tx.insert(issueExecutionDecisions).values({
+                id: decisionId,
+                companyId: updated.companyId,
+                issueId: updated.id,
+                stageId: decision.stageId,
+                stageType: decision.stageType,
+                actorAgentId: actor.agentId ?? null,
+                actorUserId: actor.actorType === "user" ? actor.actorId : null,
+                outcome: decision.outcome,
+                body: decision.body,
+                createdByRunId: actor.runId ?? null,
+              });
+
+              return updated;
+            });
+          }
+          return svc.update(id, {
+            ...updateFields,
             actorAgentId: actor.agentId ?? null,
             actorUserId: actor.actorType === "user" ? actor.actorId : null,
-            outcome: decision.outcome,
-            body: decision.body,
-            createdByRunId: actor.runId ?? null,
           });
-
-          return updated;
-        });
-      } else {
-        issue = await svc.update(id, {
-          ...updateFields,
-          actorAgentId: actor.agentId ?? null,
-          actorUserId: actor.actorType === "user" ? actor.actorId : null,
-        });
-      }
+        },
+        { label: "patch_issue" },
+      );
     } catch (err) {
       if (err instanceof HttpError && err.status === 422) {
         logger.warn(

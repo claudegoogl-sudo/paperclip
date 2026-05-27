@@ -133,8 +133,29 @@ jobs:
       - name: Build
         run: pnpm build
 
-      - name: Install Playwright
-        run: npx playwright install --with-deps chromium
+      # PLA-597: split `playwright install --with-deps chromium` into a cached
+      # browser download and an apt `install-deps` step. Combined, a hung
+      # apt-get/dpkg silently consumed the full 30-minute job budget after the
+      # 167 MiB Chrome zip had already finished downloading. The cache also
+      # turns the browser download into a no-op on cache hit, removing the
+      # network dependency on cdn.playwright.dev entirely for the common path.
+      - name: Cache Playwright browser
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ms-playwright-${{ runner.os }}-
+
+      - name: Download Playwright browser (chromium)
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 5
+        run: npx playwright install chromium
+
+      - name: Install Playwright system deps (chromium)
+        timeout-minutes: 10
+        run: sudo npx playwright install-deps chromium
 
       - name: Generate Paperclip config
         run: |

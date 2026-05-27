@@ -29,7 +29,27 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
-      - run: npx playwright install --with-deps chromium
+
+      # PLA-597: cache the browser download and split the apt deps install so
+      # a hung apt-get does not eat the full 30-minute job budget, and so the
+      # download itself is a no-op on cache hit.
+      - name: Cache Playwright browser
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ms-playwright-${{ runner.os }}-
+
+      - name: Download Playwright browser (chromium)
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 5
+        run: npx playwright install chromium
+
+      - name: Install Playwright system deps (chromium)
+        timeout-minutes: 10
+        run: sudo npx playwright install-deps chromium
 
       - name: Run e2e tests
         run: pnpm run test:e2e
