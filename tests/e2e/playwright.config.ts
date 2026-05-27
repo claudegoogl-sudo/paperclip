@@ -17,6 +17,12 @@ export default defineConfig({
   testIgnore: ["multi-user.spec.ts", "multi-user-authenticated.spec.ts"],
   timeout: 60_000,
   retries: 0,
+  // PLA-597: pin CI to a single worker so spec files run strictly sequentially
+  // against the shared webServer. Cross-file parallelism is the only path that
+  // surfaces the heartbeat_runs / issues deadlock pair (PATCH /issues:done in
+  // one spec contends with a heartbeat-run lifecycle update in another). On a
+  // developer's machine we keep the default so the suite stays fast.
+  workers: process.env.CI ? 1 : undefined,
   use: {
     baseURL: BASE_URL,
     headless: true,
