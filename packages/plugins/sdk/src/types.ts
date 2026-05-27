@@ -210,6 +210,71 @@ export interface ToolRunContext {
   companyId: string;
   /** UUID of the project the run belongs to. */
   projectId: string;
+  /**
+   * Cross-tenant artifact fetch client. The host authorizes on behalf of
+   * the dispatching agent identified by `agentId` + `companyId`, not on
+   * behalf of the plugin worker's tenant. Use this from inside a tool
+   * handler to read attachments uploaded by an agent in another company.
+   *
+   * @see {@link ToolRunContextArtifactsClient}
+   * @see PLA-574 — host-mediated cross-tenant artifact fetch
+   */
+  artifacts: ToolRunContextArtifactsClient;
+}
+
+/**
+ * Resolved artifact (attachment) bytes returned by
+ * {@link ToolRunContextArtifactsClient.fetch}.
+ */
+export interface ToolRunContextArtifact {
+  /** Raw attachment bytes. */
+  bytes: Uint8Array;
+  /** Original filename if known, otherwise `"attachment"`. */
+  filename: string;
+  /** MIME content type. */
+  contentType: string;
+  /** Total size in bytes. */
+  byteSize: number;
+}
+
+/**
+ * `runCtx.artifacts` — fetch attachment bytes on behalf of the dispatching
+ * agent during a tool call.
+ *
+ * Authorization is performed against the **dispatching agent** (the agent
+ * identified by this `ToolRunContext`), not against the plugin worker's own
+ * tenant. The attachment is fetchable iff the dispatching agent has read
+ * access to the attachment-owning company. This enables a Platform-tenant
+ * worker to resolve a DPR-tenant attachment when a DPR agent dispatched the
+ * tool call.
+ *
+ * The host validates the runContext server-side before returning bytes,
+ * rate-limits per dispatching agent, and writes a six-field audit log entry
+ * on every call (success or deny). See PLA-574 for the threat model and
+ * sequencing constraints.
+ */
+export interface ToolRunContextArtifactsClient {
+  /**
+   * Fetch attachment bytes by ID.
+   *
+   * Returns `{ bytes, filename, contentType, byteSize }` on success.
+   *
+   * Throws on failure with a typed error code surfaced via JsonRpcCallError:
+   * - `runcontext_invalid` — the runContext was not server-validated or has
+   *   expired. Also surfaces if a worker tries to forge a runId.
+   * - `forbidden` — the dispatching agent does not have read access to the
+   *   attachment-owning company.
+   * - `not_found` — the attachment does not exist OR the dispatching agent
+   *   cannot see it (collapsed to a single error shape to prevent
+   *   enumeration via timing/error-shape oracles).
+   * - `rate_limited` — too many fetches from this dispatching agent (host
+   *   enforces both a global per-agent ceiling and a per-(agent, attachment
+   *   company) sub-bucket).
+   *
+   * @param attachmentId - The attachment UUID to fetch.
+   * @returns Attachment bytes + metadata.
+   */
+  fetch(attachmentId: string): Promise<ToolRunContextArtifact>;
 }
 
 /**

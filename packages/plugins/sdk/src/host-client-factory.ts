@@ -126,6 +126,26 @@ export interface HostServices {
     resolve(params: WorkerToHostMethods["secrets.resolve"][0]): Promise<string>;
   };
 
+  /**
+   * Provides `artifacts.fetch` — host-mediated cross-tenant attachment fetch.
+   *
+   * The service implementation is expected to:
+   * 1. Look up the runContext keyed on `(pluginId, runId)` (the factory passes
+   *    the runtime `pluginId` separately via closure when constructing the
+   *    `HostServices` for a given plugin).
+   * 2. Authorize against the dispatching agent's company, NOT the worker JWT.
+   * 3. Rate-limit per dispatching agent.
+   * 4. Audit-log with the six fields (attachmentId, attachmentCompanyId,
+   *    dispatchingAgentId, dispatchingAgentCompanyId, pluginInstanceId,
+   *    toolName).
+   * 5. Return base64-encoded bytes plus metadata.
+   *
+   * See PLA-574 for the threat model and the seven-point security checklist.
+   */
+  artifacts: {
+    fetch(params: WorkerToHostMethods["artifacts.fetch"][0]): Promise<WorkerToHostMethods["artifacts.fetch"][1]>;
+  };
+
   /** Provides `activity.log`. */
   activity: {
     log(params: {
@@ -303,6 +323,10 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
 
   // Secrets
   "secrets.resolve": "secrets.read-ref",
+
+  // Artifacts — no capability gate: tool-dispatch implies attachment-read
+  // (host enforces dispatching-agent authz via runContext lookup). See PLA-574.
+  "artifacts.fetch": null,
 
   // Activity
   "activity.log": "activity.log.write",
@@ -484,6 +508,11 @@ export function createHostClientHandlers(
     // Secrets
     "secrets.resolve": gated("secrets.resolve", async (params) => {
       return services.secrets.resolve(params);
+    }),
+
+    // Artifacts (PLA-574) — host enforces dispatching-agent authz via runContext
+    "artifacts.fetch": gated("artifacts.fetch", async (params) => {
+      return services.artifacts.fetch(params);
     }),
 
     // Activity
