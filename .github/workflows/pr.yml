@@ -133,8 +133,19 @@ jobs:
       - name: Build
         run: pnpm build
 
-      - name: Install Playwright
-        run: npx playwright install --with-deps chromium
+      # PLA-597: split `playwright install --with-deps chromium` into the
+      # browser download and the apt `install-deps` step. Combined, a hung
+      # apt-get/dpkg can silently consume the full 30-minute job budget after
+      # the 167 MiB Chrome zip has already finished downloading. Splitting it
+      # bounds each step individually so flakes surface in seconds, not in a
+      # job-timeout cancellation.
+      - name: Download Playwright browser (chromium)
+        timeout-minutes: 5
+        run: npx playwright install chromium
+
+      - name: Install Playwright system deps (chromium)
+        timeout-minutes: 10
+        run: sudo npx playwright install-deps chromium
 
       - name: Generate Paperclip config
         run: |

@@ -29,7 +29,15 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
-      - run: npx playwright install --with-deps chromium
+
+      # PLA-597: split browser download from apt deps so a hung apt-get does
+      # not silently eat the full 30-minute job budget.
+      - name: Download Playwright browser (chromium)
+        timeout-minutes: 5
+        run: npx playwright install chromium
+      - name: Install Playwright system deps (chromium)
+        timeout-minutes: 10
+        run: sudo npx playwright install-deps chromium
 
       - name: Run e2e tests
         run: pnpm run test:e2e
