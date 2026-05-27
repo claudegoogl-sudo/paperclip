@@ -682,6 +682,29 @@ Typed errors surfaced to the worker:
 
 See PLA-574 for the threat model and seven-point security checklist.
 
+**Composition with the §13 invocation-scope plumbing (PR #6547).** The
+`(pluginDbId, runId)` registry that backs this handler runs *alongside*, not
+instead of, the host-owned `paperclipInvocation` context that the
+`PluginWorkerManager` attaches to every outbound `executeTool`. Each layer
+catches what the other doesn't:
+
+- The invocation-scope check (`contextForWorkerMessage` →
+  `requireInvocationCompanyScope`) rejects a worker→host call whose echoed
+  `paperclipInvocationId` is missing, expired, or unknown — i.e. it bounds the
+  worker to the company the host actually dispatched into.
+- The `(pluginDbId, runId)` registry rejects a forged `runId` and resolves the
+  full dispatching-agent identity (agentId, companyId, runId, projectId,
+  toolName) that the worker is never trusted to assert. The
+  `artifacts.fetch` wire payload carries no `companyId`, so the company-scope
+  check is *quiet* for this method and the registry lookup is the sole source
+  of truth for the authz boundary.
+
+Keeping the registry as a separate concept costs ~107 LoC but preserves the
+audit-field richness (agent/run/project/tool) that #6547's `PluginInvocationScope`
+deliberately does not carry. The two mechanisms are compatible because the
+registry is keyed by host-issued identifiers, never by anything echoed by the
+worker.
+
 ## 14. SDK Surface
 
 Plugins do not talk to the DB directly.
