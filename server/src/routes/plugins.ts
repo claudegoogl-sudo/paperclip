@@ -727,7 +727,15 @@ export function pluginRoutes(
    * Errors: 501 if tool dispatcher is not configured
    */
   router.get("/plugins/tools", async (req, res) => {
-    assertBoardOrgAccess(req);
+    if (req.actor.type === "agent") {
+      if (!req.actor.companyId) {
+        res.status(403).json({ error: "Agent token missing company scope" });
+        return;
+      }
+      assertCompanyAccess(req, req.actor.companyId);
+    } else {
+      assertBoardOrgAccess(req);
+    }
 
     if (!toolDeps) {
       res.status(501).json({ error: "Plugin tool dispatch is not enabled" });
@@ -761,16 +769,54 @@ export function pluginRoutes(
    * - 502 if the plugin worker is unavailable or the RPC call fails
    */
   router.post("/plugins/tools/execute", async (req, res) => {
-    assertBoardOrgAccess(req);
+    const rawBody = (req.body ?? {}) as Record<string, unknown>;
+
+    // Body-shape adapter: v0.1.6 wake-comment clients send {name, parameters, runId};
+    // the legacy board shape is {tool, parameters, runContext}. Accept both so a
+    // single fork build serves v0.1.5 (board) and v0.1.6 (agent) callers without
+    // stranding already-deployed clients. Synthesised runContext fields are
+    // cross-checked below by validateToolRunContextScope.
+    const body = { ...rawBody } as unknown as PluginToolExecuteRequest & {
+      name?: unknown;
+      runId?: unknown;
+    };
+    if ((body.tool === undefined || body.tool === null) && typeof body.name === "string") {
+      body.tool = body.name;
+    }
+    if (
+      (body.runContext === undefined || body.runContext === null) &&
+      typeof body.runId === "string" &&
+      req.actor.type === "agent" &&
+      req.actor.agentId &&
+      req.actor.companyId
+    ) {
+      // ToolRunContext.artifacts is added downstream by the worker-rpc-host
+      // before the worker call (see worker-rpc-host.ts), so we don't synthesise
+      // it here — wire shape stays runId/agentId/companyId/projectId only.
+      body.runContext = {
+        runId: body.runId,
+        agentId: req.actor.agentId,
+        companyId: req.actor.companyId,
+        projectId: "onboarding-fallback",
+      } as ToolRunContext;
+    }
+
+    // Actor-branch guard: agent JWTs reach this route through their own branch;
+    // company scope is enforced by assertCompanyAccess, and validateToolRunContextScope
+    // below checks the run/agent/project tuple. Board callers keep the prior guard.
+    if (req.actor.type === "agent") {
+      const companyId = (body.runContext as ToolRunContext | undefined)?.companyId;
+      if (!companyId) {
+        res.status(400).json({ error: '"runContext.companyId" required for agent dispatch' });
+        return;
+      }
+      assertCompanyAccess(req, companyId);
+    } else {
+      assertBoardOrgAccess(req);
+    }
 
     if (!toolDeps) {
       res.status(501).json({ error: "Plugin tool dispatch is not enabled" });
-      return;
-    }
-
-    const body = (req.body as PluginToolExecuteRequest | undefined);
-    if (!body) {
-      res.status(400).json({ error: "Request body is required" });
       return;
     }
 

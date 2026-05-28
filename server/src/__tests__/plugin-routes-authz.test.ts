@@ -101,6 +101,17 @@ function boardActor(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function agentActor(overrides: Record<string, unknown> = {}) {
+  return {
+    type: "agent",
+    agentId: agentA,
+    companyId: companyA,
+    runId: runA,
+    source: "agent_jwt",
+    ...overrides,
+  };
+}
+
 function readyPlugin() {
   mockRegistry.getById.mockResolvedValue({
     id: pluginId,
@@ -541,5 +552,200 @@ describe.sequential("plugin tool and bridge authz", () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ runId: "run-1", jobId: "job-1" });
     expect(scheduler.triggerJob).toHaveBeenCalledWith("job-1", "manual");
+  });
+});
+
+describe.sequential("plugin tool dispatch for agent actors (PLA-39 / PLA-594)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("lets an agent JWT list plugin tools (GET /plugins/tools)", async () => {
+    const listToolsForAgent = vi.fn().mockReturnValue([{ name: "paperclip.example:search" }]);
+    const { app } = await createApp(agentActor(), {}, {
+      toolDeps: {
+        toolDispatcher: {
+          listToolsForAgent,
+          getTool: vi.fn(),
+          executeTool: vi.fn(),
+        },
+      },
+    });
+
+    const res = await request(app).get("/api/plugins/tools");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([{ name: "paperclip.example:search" }]);
+    expect(listToolsForAgent).toHaveBeenCalled();
+  });
+
+  it("executes a tool for an agent JWT using the legacy {tool, parameters, runContext} body", async () => {
+    const executeTool = vi.fn().mockResolvedValue({ content: "ok" });
+    const { app } = await createApp(agentActor(), {}, {
+      db: createSelectQueueDb([
+        [{ companyId: companyA }],
+        [{ companyId: companyA, agentId: agentA }],
+        [{ companyId: companyA }],
+      ]),
+      toolDeps: {
+        toolDispatcher: {
+          listToolsForAgent: vi.fn(),
+          getTool: vi.fn(() => ({ name: "paperclip.example:search" })),
+          executeTool,
+        },
+      },
+    });
+
+    const res = await request(app)
+      .post("/api/plugins/tools/execute")
+      .send({
+        tool: "paperclip.example:search",
+        parameters: { q: "test" },
+        runContext: {
+          agentId: agentA,
+          runId: runA,
+          companyId: companyA,
+          projectId: projectA,
+        },
+      });
+
+    expect(res.status).toBe(200);
+    expect(executeTool).toHaveBeenCalledWith(
+      "paperclip.example:search",
+      { q: "test" },
+      {
+        agentId: agentA,
+        runId: runA,
+        companyId: companyA,
+        projectId: projectA,
+      },
+    );
+  });
+
+  it("executes a tool for an agent JWT using the v0.1.6 {name, parameters, runId} body", async () => {
+    const executeTool = vi.fn().mockResolvedValue({ content: "ok" });
+    const { app } = await createApp(agentActor(), {}, {
+      db: createSelectQueueDb([
+        [{ companyId: companyA }],
+        [{ companyId: companyA, agentId: agentA }],
+        [{ companyId: companyA }],
+      ]),
+      toolDeps: {
+        toolDispatcher: {
+          listToolsForAgent: vi.fn(),
+          getTool: vi.fn(() => ({ name: "paperclip.example:search" })),
+          executeTool,
+        },
+      },
+    });
+
+    const res = await request(app)
+      .post("/api/plugins/tools/execute")
+      .send({
+        name: "paperclip.example:search",
+        parameters: { q: "test" },
+        runId: runA,
+      });
+
+    expect(res.status).toBe(200);
+    expect(executeTool).toHaveBeenCalledWith(
+      "paperclip.example:search",
+      { q: "test" },
+      expect.objectContaining({
+        agentId: agentA,
+        runId: runA,
+        companyId: companyA,
+        projectId: "onboarding-fallback",
+      }),
+    );
+  });
+
+  it("rejects an agent JWT trying to dispatch into another company", async () => {
+    const executeTool = vi.fn();
+    const { app } = await createApp(agentActor(), {}, {
+      toolDeps: {
+        toolDispatcher: {
+          listToolsForAgent: vi.fn(),
+          getTool: vi.fn(),
+          executeTool,
+        },
+      },
+    });
+
+    const res = await request(app)
+      .post("/api/plugins/tools/execute")
+      .send({
+        tool: "paperclip.example:search",
+        parameters: {},
+        runContext: {
+          agentId: agentA,
+          runId: runA,
+          companyId: companyB,
+          projectId: projectA,
+        },
+      });
+
+    expect(res.status).toBe(403);
+    expect(executeTool).not.toHaveBeenCalled();
+  });
+
+  it("rejects an agent JWT when neither runContext nor runId is present", async () => {
+    const executeTool = vi.fn();
+    const { app } = await createApp(agentActor(), {}, {
+      toolDeps: {
+        toolDispatcher: {
+          listToolsForAgent: vi.fn(),
+          getTool: vi.fn(),
+          executeTool,
+        },
+      },
+    });
+
+    const res = await request(app)
+      .post("/api/plugins/tools/execute")
+      .send({ tool: "paperclip.example:search", parameters: {} });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/runContext\.companyId/);
+    expect(executeTool).not.toHaveBeenCalled();
+  });
+
+  it("still rejects board callers with no company access (regression)", async () => {
+    const executeTool = vi.fn();
+    const { app } = await createApp(
+      {
+        type: "board",
+        userId: "user-1",
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds: [],
+      },
+      {},
+      {
+        toolDeps: {
+          toolDispatcher: {
+            listToolsForAgent: vi.fn(),
+            getTool: vi.fn(),
+            executeTool,
+          },
+        },
+      },
+    );
+
+    const res = await request(app)
+      .post("/api/plugins/tools/execute")
+      .send({
+        tool: "paperclip.example:search",
+        parameters: {},
+        runContext: {
+          agentId: agentA,
+          runId: runA,
+          companyId: companyA,
+          projectId: projectA,
+        },
+      });
+
+    expect(res.status).toBe(403);
+    expect(executeTool).not.toHaveBeenCalled();
   });
 });
