@@ -361,7 +361,28 @@ export function createPluginArtifactsHandler(
 
       // ---------- Gate 6: storage fetch + bounded read ----------
       const object = await storage.getObject(attachment.companyId, attachment.objectKey);
-      const buf = await readStreamToBuffer(object.stream, maxByteSize);
+      let buf: Buffer;
+      try {
+        buf = await readStreamToBuffer(object.stream, maxByteSize);
+      } catch (err) {
+        // Authz (Gate 4) already passed, so an oversize read is a deny by an
+        // *authorized* caller. Audit it for symmetry with the other deny
+        // gates — otherwise a plugin could repeatedly pull a large attachment
+        // to OOM-stress storage retrieval with zero audit signal (PLA-578 F1).
+        if (err instanceof ArtifactsError && err.code === "too_large") {
+          await audit({
+            outcome: "denied",
+            deniedReason: "too_large",
+            dispatchingAgentId: ctx.agentId,
+            dispatchingCompanyId: ctx.companyId,
+            attachmentCompanyId: attachment.companyId,
+            attachmentId,
+            runId,
+            toolName: ctx.toolName,
+          });
+        }
+        throw err;
+      }
 
       // ---------- Gate 7: audit success + return ----------
       await audit({

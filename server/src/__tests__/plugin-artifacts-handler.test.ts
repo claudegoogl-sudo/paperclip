@@ -260,6 +260,19 @@ describe("plugin-artifacts-handler — PLA-574", () => {
     await expect(
       handler.fetch({ attachmentId: "att-1", runId: "run-1" }),
     ).rejects.toMatchObject({ code: "too_large" });
+    // PLA-578 F1: the oversize deny must still emit a six-field audit so an
+    // authorized caller OOM-stressing storage retrieval leaves a signal.
+    expect(logActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        details: expect.objectContaining({
+          outcome: "denied",
+          deniedReason: "too_large",
+          attachmentCompanyId: "dpr-company",
+          toolName: "lookup-screenshot",
+        }),
+      }),
+    );
   });
 
   it("trust boundary: worker-supplied runId for another plugin's dispatch is rejected", async () => {
