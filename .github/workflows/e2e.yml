@@ -18,9 +18,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # PLA-597: do not specify `version:` here. package.json declares
+      # `packageManager: pnpm@9.15.4`; pnpm/action-setup@v4 errors with
+      # ERR_PNPM_BAD_PM_VERSION when both are present. Matches pr.yml which
+      # also lets the packageManager field win.
       - uses: pnpm/action-setup@v4
-        with:
-          version: 9
 
       - uses: actions/setup-node@v4
         with:
