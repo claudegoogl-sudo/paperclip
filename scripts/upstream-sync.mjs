@@ -227,7 +227,10 @@ async function main() {
 
   let mergeFailed = false;
   try {
-    git(["merge", "--no-ff", "-m", `sync(upstream): ${tag}`, `${UPSTREAM_REMOTE}/${tag}`]);
+    // `tag` is a release tag fetched into refs/tags/ by `git fetch upstream --tags`,
+    // not a branch — `${UPSTREAM_REMOTE}/${tag}` would resolve to a non-existent
+    // remote-tracking ref and abort the merge ("not something we can merge").
+    git(["merge", "--no-ff", "-m", `sync(upstream): ${tag}`, `refs/tags/${tag}`]);
   } catch {
     mergeFailed = true;
   }
