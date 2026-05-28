@@ -89,4 +89,13 @@ describe("retryOnTransientPgError", () => {
     ).rejects.toBe(err);
     expect(fn).toHaveBeenCalledTimes(3);
   });
+
+  it("defaults to 6 attempts when maxAttempts not provided (PLA-597 headroom)", async () => {
+    const err = makePgError("40P01", "deadlock detected");
+    const fn = vi.fn(async () => {
+      throw err;
+    });
+    await expect(retryOnTransientPgError(fn, { baseDelayMs: 1 })).rejects.toBe(err);
+    expect(fn).toHaveBeenCalledTimes(6);
+  });
 });

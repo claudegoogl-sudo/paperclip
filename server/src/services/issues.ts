@@ -44,6 +44,7 @@ import {
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { retryOnTransientPgError } from "./pg-retry.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
 import { getDefaultCompanyGoal } from "./goals.js";
@@ -2058,6 +2059,18 @@ export function issueService(db: Db) {
   }
 
   async function clearExecutionRunIfTerminal(issueId: string): Promise<boolean> {
+    // PLA-597: this helper takes overlapping locks on issues + heartbeat_runs
+    // and is called pre-authorization from multiple mutation routes; on its
+    // own it can deadlock against the heartbeat-run lifecycle and 500 the
+    // request before any other code runs. Wrap in retry so transient 40P01
+    // is invisible to callers.
+    return retryOnTransientPgError(
+      () => clearExecutionRunIfTerminalOnce(issueId),
+      { label: "clear_execution_run_if_terminal" },
+    );
+  }
+
+  async function clearExecutionRunIfTerminalOnce(issueId: string): Promise<boolean> {
     return db.transaction(async (tx) => {
       await tx.execute(
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
@@ -2114,6 +2127,16 @@ export function issueService(db: Db) {
    * Returns true if any column was cleared (used by tests; callers can ignore).
    */
   async function clearOrphanCheckoutLocksIfTerminal(issueId: string): Promise<boolean> {
+    // PLA-597: see clearExecutionRunIfTerminal — same lock-ordering risk.
+    // Every mutation route calls this pre-auth, so an unwrapped deadlock
+    // here surfaces as a 500 before the route's own retry can see it.
+    return retryOnTransientPgError(
+      () => clearOrphanCheckoutLocksIfTerminalOnce(issueId),
+      { label: "clear_orphan_checkout_locks_if_terminal" },
+    );
+  }
+
+  async function clearOrphanCheckoutLocksIfTerminalOnce(issueId: string): Promise<boolean> {
     return db.transaction(async (tx) => {
       await tx.execute(
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
