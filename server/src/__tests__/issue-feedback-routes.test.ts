@@ -94,6 +94,10 @@ function registerModuleMocks() {
     heartbeatService: () => mockHeartbeatService,
     issueApprovalService: () => ({}),
     issueReferenceService: () => mockIssueReferenceService,
+    issueRecoveryActionService: () => ({
+      getActiveForIssue: vi.fn(async () => null),
+      listActiveForIssues: vi.fn(async () => new Map()),
+    }),
     issueService: () => mockIssueService,
     issueThreadInteractionService: () => mockIssueThreadInteractionService,
     logActivity: mockLogActivity,

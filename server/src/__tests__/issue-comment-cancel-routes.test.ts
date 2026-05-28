@@ -87,6 +87,10 @@ function registerModuleMocks() {
     heartbeatService: () => mockHeartbeatService,
     instanceSettingsService: () => mockInstanceSettingsService,
     issueApprovalService: () => ({}),
+    issueRecoveryActionService: () => ({
+      getActiveForIssue: vi.fn(async () => null),
+      listActiveForIssues: vi.fn(async () => new Map()),
+    }),
     issueReferenceService: () => ({
       deleteDocumentSource: async () => undefined,
       diffIssueReferenceSummary: () => ({
