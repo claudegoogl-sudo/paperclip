@@ -38,7 +38,10 @@ export async function retryOnTransientPgError<T>(
   fn: () => Promise<T>,
   opts: RetryOnTransientPgErrorOptions = {},
 ): Promise<T> {
-  const maxAttempts = Math.max(1, opts.maxAttempts ?? 4);
+  // PLA-597: default 6 attempts × 25 ms × 2^(n-1) + jitter = ~1.6 s worst-case
+  // added latency, enough headroom for the CI-observed deadlock cluster where
+  // a single attempt was sometimes still racing the heartbeat-run lifecycle.
+  const maxAttempts = Math.max(1, opts.maxAttempts ?? 6);
   const baseDelayMs = Math.max(1, opts.baseDelayMs ?? 25);
   const label = opts.label ?? "pg_tx";
 
