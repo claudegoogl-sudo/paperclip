@@ -653,27 +653,41 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
       validatePluginRuntimeQuery(statement, namespace, plugin.manifestJson.database?.coreReadTables ?? []);
       // PLA-98: pin the connection's search_path to the plugin namespace so
       // any unqualified ref that slips past the validator resolves to the
-      // plugin's own schema, not `public`.
-      return db.transaction(async (tx) => {
-        await tx.execute(
+      // plugin's own schema, not `public`. SET LOCAL only holds inside a
+      // transaction, so open one when the client supports it; when `db` is
+      // already a transaction-scoped client (upstream v2026.525.0 made
+      // `transaction` optional on PluginDatabaseRootClient), pin on it directly
+      // since we are already inside the caller's transaction.
+      const runPinned = async (client: PluginDatabaseClient): Promise<T[]> => {
+        await client.execute(
           sql.raw(`SET LOCAL search_path TO ${quoteIdentifier(namespace)}, pg_temp`),
         );
-        const result = await tx.execute(bindSql(statement, params));
+        const result = await client.execute(bindSql(statement, params));
         return Array.from(result as Iterable<T>);
-      });
+      };
+      if (typeof db.transaction === "function") {
+        return db.transaction(async (tx) => runPinned(tx as PluginDatabaseClient));
+      }
+      return runPinned(db);
     },
 
     async execute(pluginId: string, statement: string, params?: unknown[]): Promise<{ rowCount: number }> {
       const namespace = await getRuntimeNamespace(pluginId);
       validatePluginRuntimeExecute(statement, namespace);
-      // PLA-98: same search_path pin as query() — defense in depth.
-      return db.transaction(async (tx) => {
-        await tx.execute(
+      // PLA-98: same search_path pin as query() — defense in depth. Guard the
+      // optional `transaction` (upstream v2026.525.0) and fall back to pinning
+      // on the caller's transaction-scoped client when nesting is unavailable.
+      const runPinned = async (client: PluginDatabaseClient): Promise<{ rowCount: number }> => {
+        await client.execute(
           sql.raw(`SET LOCAL search_path TO ${quoteIdentifier(namespace)}, pg_temp`),
         );
-        const result = await tx.execute(bindSql(statement, params));
+        const result = await client.execute(bindSql(statement, params));
         return { rowCount: Number((result as { count?: number | string }).count ?? 0) };
-      });
+      };
+      if (typeof db.transaction === "function") {
+        return db.transaction(async (tx) => runPinned(tx as PluginDatabaseClient));
+      }
+      return runPinned(db);
     },
   };
 }
