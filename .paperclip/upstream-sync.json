@@ -1,0 +1,10 @@
+{
+  "lastSyncedTag": "v2026.428.0",
+  "lastSyncedSha": "685ee84e4a9c33d37d3c9900cc810c3a9d2f373c",
+  "lastSyncedAt": "2026-05-28T00:00:00Z",
+  "etag": "W/\"7ddf56f0a51b2400604feb7ad43f7064160fc53717d7d70a133da167930220b1\"",
+  "lastCheckedAt": "2026-05-28T00:00:00Z",
+  "pendingPrUrl": null,
+  "lastConflictBuckets": { "clean": 1, "reviewable": 0, "escalation": 0 },
+  "_bootstrapNote": "Bootstrapped on PLA-603. lastSyncedTag is the latest upstream tag that's an ancestor of fork master (git merge-base origin/master upstream/master → 685ee84, closest preceding upstream tag v2026.428.0). ETag from upstream releases/latest at bootstrap time (then pointing at v2026.525.0) so the first scheduled tick gets a 304 and exits no-op. Sibling B's first non-dry-run tick will see ETag-mismatch on the next release and drive the first real sync; until then, dry-runs report 'no-op: still at v2026.428.0'."
+}
