@@ -37,6 +37,7 @@
     "smoke:openclaw-sse-standalone": "./scripts/smoke/openclaw-sse-standalone.sh",
     "smoke:terminal-bench-loop-skill": "node scripts/smoke/terminal-bench-loop-skill-smoke.mjs",
     "test:release-registry": "node --test scripts/verify-release-registry-state.test.mjs",
+    "test:upstream-sync": "node --test scripts/upstream-sync.test.mjs",
     "test:scaffold-create-paperclip-plugin": "node --test scripts/smoke-create-paperclip-plugin.test.mjs",
     "test:e2e": "npx playwright test --config tests/e2e/playwright.config.ts",
     "test:e2e:headed": "npx playwright test --config tests/e2e/playwright.config.ts --headed",
