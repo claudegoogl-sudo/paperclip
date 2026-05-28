@@ -85,6 +85,12 @@ jobs:
       - name: Verify release registry test coverage
         run: pnpm run test:release-registry
 
+      # PLA-620 — unit-test the upstream-sync routine's idempotency guard
+      # (no-op when a sync PR for the latest tag is already open). Mocks the
+      # GitHub pulls query, so no network/token is required.
+      - name: Verify upstream-sync idempotency (PLA-620)
+        run: pnpm run test:upstream-sync
+
       - name: Build
         run: pnpm build
 

@@ -11,6 +11,12 @@
  *   2. GET https://api.github.com/repos/paperclipai/paperclip/releases/latest
  *      with If-None-Match: <state.etag>. On 304 → "no-op: still at <tag>".
  *   3. On 200: if tag_name === state.lastSyncedTag, refresh ETag and exit 0.
+ *   3b. Idempotency (PLA-620): before any branch/push/PR work, no-op if a sync
+ *      PR for <tag> is already open on the fork. The state file only advances
+ *      when a sync PR *merges* (board-gated), so every tick between "opened"
+ *      and "merged" lands here again for the same tag — a re-run must converge,
+ *      not crash on a non-fast-forward push or a 422 "already exists". A stale
+ *      remote branch with no open PR is likewise left as-is for manual review.
  *   4. Otherwise: git fetch upstream, branch sync/upstream-<tag> off
  *      origin/master, merge upstream/<tag> --no-ff. On conflicts, invoke
  *      scripts/resolve-trivial-sync-conflicts.mjs; if anything is still
@@ -113,6 +119,52 @@ function bucketFor(files) {
   return "reviewable";
 }
 
+// Pure selection: given the array returned by the pulls list endpoint, pick the
+// open PR whose head is our sync branch on the fork. GitHub's `head` filter is
+// already scoped, but we re-check defensively (state + ref + fork owner).
+function pickOpenSyncPr(prs, branch) {
+  if (!Array.isArray(prs)) return null;
+  return (
+    prs.find(
+      (pr) =>
+        pr &&
+        pr.state === "open" &&
+        pr.head &&
+        pr.head.ref === branch &&
+        (!pr.head.repo || !pr.head.repo.owner || pr.head.repo.owner.login === FORK_OWNER),
+    ) ?? null
+  );
+}
+
+// Query the fork for an already-open sync PR for this branch. Returns the PR
+// object or null. Without a token we can't query, so we return null and let the
+// caller proceed (the PR-create step is itself token-gated). `fetchImpl` is
+// injectable for unit tests.
+async function findOpenSyncPr(branch, { token = process.env.GITHUB_TOKEN, fetchImpl = fetch } = {}) {
+  if (!token) return null;
+  const head = `${FORK_OWNER}:${branch}`;
+  const url =
+    `https://api.github.com/repos/${FORK_OWNER}/${FORK_REPO}/pulls` +
+    `?head=${encodeURIComponent(head)}&base=${FORK_BASE_BRANCH}&state=open`;
+  const res = await fetchImpl(url, {
+    headers: {
+      "User-Agent": `${FORK_OWNER}-upstream-sync`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      Authorization: `Bearer ${token}`,
+    },
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`pulls query ${res.status}: ${body.slice(0, 400)}`);
+  }
+  return pickOpenSyncPr(await res.json(), branch);
+}
+
+function remoteBranchExists(branch) {
+  return git(["ls-remote", "--heads", FORK_REMOTE, branch]).length > 0;
+}
+
 async function main() {
   const state = readState();
   const { release, status, etag: newEtag } = await fetchLatestRelease(state.etag);
@@ -139,12 +191,38 @@ async function main() {
     return 0;
   }
 
+  const branch = `sync/upstream-${tag}`;
+
+  // Idempotency (PLA-620): a sync PR for this tag may already be open from a
+  // prior tick. The state file only advances on *merge* (board-gated), so until
+  // then upstream stays ahead and we re-enter for the same tag. Re-running the
+  // branch/push/PR steps would fail on a non-fast-forward push or a 422
+  // "A pull request already exists" and crash the soak. A re-run must converge:
+  // if the PR is already open, this tick is a no-op (no branch, push, or PR).
+  const openPr = await findOpenSyncPr(branch);
+  if (openPr) {
+    console.log(`no-op: sync PR for ${tag} already open (${openPr.html_url})`);
+    return 0;
+  }
+
+  // Remote branch exists but no open PR (e.g. PR closed unmerged, or a prior
+  // tick pushed the branch but PR creation failed). Re-pushing a freshly merged
+  // branch would either fast-forward-fail or clobber the remote branch.
+  // Simplest convergent choice: do no harm — leave the branch and no-op so a
+  // human/board decides (delete to re-sync, or reopen the PR). Exit 0 keeps the
+  // soak alive rather than crashing.
+  if (remoteBranchExists(branch)) {
+    console.log(
+      `no-op: remote branch ${branch} exists but no open PR; leaving as-is for manual review`,
+    );
+    return 0;
+  }
+
   // Real sync path. Sibling B's cron will exercise this; the scaffold PR
   // intentionally does not run it.
   git(["fetch", UPSTREAM_REMOTE, "--tags"]);
   git(["fetch", FORK_REMOTE, FORK_BASE_BRANCH]);
 
-  const branch = `sync/upstream-${tag}`;
   git(["checkout", "-B", branch, `${FORK_REMOTE}/${FORK_BASE_BRANCH}`]);
 
   let mergeFailed = false;
@@ -217,9 +295,16 @@ async function main() {
   return 0;
 }
 
-main()
-  .then((code) => process.exit(code ?? 0))
-  .catch((err) => {
-    console.error(err.stack || String(err));
-    process.exit(1);
-  });
+const invokedDirectly =
+  process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (invokedDirectly) {
+  main()
+    .then((code) => process.exit(code ?? 0))
+    .catch((err) => {
+      console.error(err.stack || String(err));
+      process.exit(1);
+    });
+}
+
+export { findOpenSyncPr, pickOpenSyncPr, remoteBranchExists, main };
