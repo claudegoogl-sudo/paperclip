@@ -286,8 +286,12 @@ describe.sequential("plugin install and upgrade authz", () => {
     expect(mockLifecycle.unload).toHaveBeenCalledWith(pluginId, true);
   }, 20_000);
 
-  it("rejects plugin config saves that contain secret refs even for instance admins", async () => {
+  it("permits plugin config saves that contain secret refs (resolution is company-binding-gated; PLA-657)", async () => {
     readyPlugin();
+    mockRegistry.upsertConfig.mockResolvedValue({
+      pluginId,
+      configJson: { apiKeyRef: "77777777-7777-4777-8777-777777777777" },
+    });
 
     const { app } = await createApp({
       type: "board",
@@ -305,9 +309,14 @@ describe.sequential("plugin install and upgrade authz", () => {
         },
       });
 
-    expect(res.status).toBe(422);
-    expect(res.body.error).toMatch(/secret references are disabled/i);
-    expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
+    // The kill-switch's config-save half is lifted: a secret-ref in config is
+    // only a pointer. Resolution is authorized at call time against the
+    // dispatching company's company_secret_bindings (plugin-secrets-handler),
+    // so storing the ref grants no cross-company access.
+    expect(res.status).toBe(200);
+    expect(mockRegistry.upsertConfig).toHaveBeenCalledWith(pluginId, {
+      configJson: { apiKeyRef: "77777777-7777-4777-8777-777777777777" },
+    });
   }, 20_000);
 
   it("allows instance admins to upgrade plugins", async () => {
