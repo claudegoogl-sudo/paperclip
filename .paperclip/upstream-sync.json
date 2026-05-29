@@ -1,10 +1,10 @@
 {
-  "lastSyncedTag": "v2026.428.0",
-  "lastSyncedSha": "685ee84e4a9c33d37d3c9900cc810c3a9d2f373c",
-  "lastSyncedAt": "2026-05-28T00:00:00Z",
+  "lastSyncedTag": "v2026.525.0",
+  "lastSyncedSha": "2c4f9ed4d29ba1047f52a29d0ab6d73abe3e7a50",
+  "lastSyncedAt": "2026-05-29T05:28:59Z",
   "etag": "W/\"7ddf56f0a51b2400604feb7ad43f7064160fc53717d7d70a133da167930220b1\"",
-  "lastCheckedAt": "2026-05-28T00:00:00Z",
+  "lastCheckedAt": "2026-05-29T05:28:59Z",
   "pendingPrUrl": null,
   "lastConflictBuckets": { "clean": 1, "reviewable": 0, "escalation": 0 },
-  "_bootstrapNote": "Bootstrapped on PLA-603. lastSyncedTag is the latest upstream tag that's an ancestor of fork master (git merge-base origin/master upstream/master → 685ee84, closest preceding upstream tag v2026.428.0). ETag from upstream releases/latest at bootstrap time (then pointing at v2026.525.0) so the first scheduled tick gets a 304 and exits no-op. Sibling B's first non-dry-run tick will see ETag-mismatch on the next release and drive the first real sync; until then, dry-runs report 'no-op: still at v2026.428.0'."
+  "_syncNote": "v2026.525.0 upstream sync landed on fork master via PR #35 (merge commit 2c4f9ed4, lineage preserved); lastSyncedSha is that merge commit. ETag still reflects upstream releases/latest at v2026.525.0, so the next scheduled tick gets a 304 and exits no-op until upstream cuts a newer release. Supersedes the PLA-603 bootstrap note (was pinned at v2026.428.0)."
 }
