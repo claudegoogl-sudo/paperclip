@@ -116,6 +116,15 @@ function registerRouteMocks() {
       syncDocument: async () => undefined,
       syncIssue: async () => undefined,
     }),
+    issueRecoveryActionService: () => ({
+      getActiveForIssue: vi.fn(async () => null),
+      listActiveForIssues: vi.fn(async () => new Map()),
+    }),
+    issueThreadInteractionService: () => ({
+      listForIssue: vi.fn(async () => []),
+      expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
+      expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
+    }),
     issueService: () => mockIssueService,
     logActivity: mockLogActivity,
     projectService: () => ({}),

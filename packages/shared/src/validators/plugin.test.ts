@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { pluginManifestV1Schema } from "./plugin.js";
+import { PLUGIN_CAPABILITIES } from "../constants.js";
+import {
+  pluginManagedRoutineDeclarationSchema,
+  pluginManifestV1Schema,
+  pluginUiSlotDeclarationSchema,
+} from "./plugin.js";
 
 /**
  * v1 manifest UI slot floor (PLA-122 / PLA-123 / PLA-489): the host mounts
@@ -115,7 +120,7 @@ describe("plugin manifest UI slot type — v1 floor", () => {
       (issue) => issue.path.join(".") === "ui.slots.0.routePath",
     );
     expect(routePathIssue?.message).toBe(
-      "routePath is only supported for page slots",
+      "routePath is only supported for page, routeSidebar, and companySettingsPage slots",
     );
   });
 
@@ -131,4 +136,142 @@ describe("plugin manifest UI slot type — v1 floor", () => {
     );
     expect(result.success).toBe(false);
   });
+});
+
+describe("plugin capability constants", () => {
+  it("exposes each capability once", () => {
+    expect(new Set(PLUGIN_CAPABILITIES).size).toBe(PLUGIN_CAPABILITIES.length);
+  });
+});
+
+describe("plugin manifest validators", () => {
+  it("accepts existing-style plugins that do not request access or authorization capabilities", () => {
+    const parsed = pluginManifestV1Schema.parse({
+      id: "paperclip.compat-dashboard",
+      apiVersion: 1,
+      version: "0.1.0",
+      displayName: "Compat Dashboard",
+      description: "Dashboard-only plugin without access or authorization host APIs.",
+      author: "Paperclip",
+      categories: ["ui"],
+      capabilities: ["ui.dashboardWidget.register"],
+      entrypoints: {
+        worker: "./dist/worker.js",
+        ui: "./dist/ui.js",
+      },
+      ui: {
+        slots: [
+          {
+            type: "dashboardWidget",
+            id: "compat-dashboard",
+            displayName: "Compat Dashboard",
+            exportName: "CompatDashboard",
+          },
+        ],
+      },
+    });
+
+    expect(parsed.capabilities).toEqual(["ui.dashboardWidget.register"]);
+  });
+});
+
+describe("plugin managed routine validators", () => {
+  it("accepts core issue surface visibility values in routine templates", () => {
+    const parsed = pluginManagedRoutineDeclarationSchema.parse({
+      routineKey: "wiki.refresh",
+      title: "Refresh Wiki",
+      issueTemplate: { surfaceVisibility: "default" },
+    });
+
+    expect(parsed.issueTemplate?.surfaceVisibility).toBe("default");
+  });
+
+  it("rejects non-core issue surface visibility values in routine templates", () => {
+    const parsed = pluginManagedRoutineDeclarationSchema.safeParse({
+      routineKey: "wiki.refresh",
+      title: "Refresh Wiki",
+      issueTemplate: { surfaceVisibility: "normal" },
+    });
+
+    expect(parsed.success).toBe(false);
+  });
+});
+
+describe("plugin managed skill validators", () => {
+  const baseManifest = {
+    id: "paperclip.test-managed-skills",
+    apiVersion: 1,
+    version: "0.1.0",
+    displayName: "Managed Skills",
+    description: "Managed skills test plugin.",
+    author: "Paperclip",
+    categories: ["automation"],
+    entrypoints: { worker: "./dist/worker.js" },
+  } as const;
+
+  it("requires skills.managed when managed skills are declared", () => {
+    const parsed = pluginManifestV1Schema.safeParse({
+      ...baseManifest,
+      capabilities: [],
+      skills: [{ skillKey: "wiki-maintainer", displayName: "Wiki Maintainer" }],
+    });
+
+    expect(parsed.success).toBe(false);
+    if (parsed.success) return;
+    expect(parsed.error.issues.some((issue) => issue.message.includes("skills.managed"))).toBe(true);
+  });
+
+  it("accepts managed skills with the skills.managed capability", () => {
+    const parsed = pluginManifestV1Schema.parse({
+      ...baseManifest,
+      capabilities: ["skills.managed"],
+      skills: [{ skillKey: "wiki-maintainer", displayName: "Wiki Maintainer" }],
+    });
+
+    expect(parsed.skills?.[0]?.skillKey).toBe("wiki-maintainer");
+  });
+});
+
+// Upstream v2026.525.0 added host-rendered support for `routeSidebar`,
+// `detailTab`, `toolbarButton`, and `companySettingsPage` slots and shipped
+// acceptance tests for them. Our fork's v1 host-rendered floor
+// (PLUGIN_UI_SLOT_TYPES_V1_SUPPORTED = [dashboardWidget, page], PLA-122/123/489)
+// is enforced on the SAME `pluginUiSlotDeclarationSchema`, so it still narrows
+// install-time acceptance to dashboardWidget + page — these upstream slot types
+// are rejected at the manifest validator until the floor is expanded.
+//
+// This describe block pins the fork's current (stricter) behavior. The
+// floor-vs-upstream interaction is flagged to SecurityEngineer on PLA-623;
+// flip these to acceptance assertions if/when the floor is widened to admit the
+// upstream-rendered slot types. The upstream superRefine rules (routeSidebar
+// requires routePath, reserved company route protection, companySettingsPage
+// reserved-route shadowing) remain in plugin.ts as defense-in-depth and apply
+// once a type clears the floor.
+describe("plugin UI slot validators — gated by fork v1 floor", () => {
+  it.each([
+    "routeSidebar",
+    "detailTab",
+    "toolbarButton",
+    "companySettingsPage",
+  ])(
+    "rejects upstream-expanded slot type %s under the v1 host-rendered floor",
+    (slotType) => {
+      const parsed = pluginUiSlotDeclarationSchema.safeParse({
+        type: slotType,
+        id: "x-slot",
+        displayName: "X",
+        exportName: "XSlot",
+        routePath: "wiki",
+        entityTypes: ["execution_workspace"],
+      });
+
+      expect(parsed.success).toBe(false);
+      if (parsed.success) return;
+      expect(
+        parsed.error.issues.some((issue) =>
+          issue.message.startsWith(`Invalid slot type "${slotType}"`),
+        ),
+      ).toBe(true);
+    },
+  );
 });
