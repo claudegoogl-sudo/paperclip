@@ -204,9 +204,18 @@ export async function startServer(): Promise<StartedServer> {
       return;
     }
     if (!config.databaseUrl) {
-      throw new Error(
-        "authenticated public deployments require DATABASE_URL or config.database.connectionString; refusing embedded PostgreSQL fallback",
+      if (!config.allowEmbeddedPostgresPublic) {
+        throw new Error(
+          "authenticated public deployment refuses embedded PostgreSQL because " +
+            "PAPERCLIP_ALLOW_EMBEDDED_POSTGRES_PUBLIC=false; set DATABASE_URL to an external " +
+            "managed Postgres connection string or unset the flag to allow embedded PostgreSQL",
+        );
+      }
+      logger.warn(
+        "public deployment running on embedded PostgreSQL; external managed Postgres " +
+          "(DATABASE_URL or config.database.connectionString) is recommended for production",
       );
+      return;
     }
     if (!isPostgresConnectionString(config.databaseUrl)) {
       throw new Error(

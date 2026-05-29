@@ -63,6 +63,7 @@ export interface Config {
   databaseMode: DatabaseMode;
   databaseUrl: string | undefined;
   databaseMigrationUrl: string | undefined;
+  allowEmbeddedPostgresPublic: boolean;
   embeddedPostgresDataDir: string;
   embeddedPostgresPort: number;
   databaseBackupEnabled: boolean;
@@ -299,6 +300,11 @@ export function loadConfig(): Config {
     databaseMode: fileDatabaseMode,
     databaseUrl: process.env.DATABASE_URL ?? fileDbUrl,
     databaseMigrationUrl: process.env.DATABASE_MIGRATION_URL,
+    // Permissive by default: authenticated+public deployments on embedded
+    // PostgreSQL warn-and-continue (preserves the live host's posture). Only an
+    // explicit PAPERCLIP_ALLOW_EMBEDDED_POSTGRES_PUBLIC=false opts into the
+    // strict refuse-to-boot contract.
+    allowEmbeddedPostgresPublic: process.env.PAPERCLIP_ALLOW_EMBEDDED_POSTGRES_PUBLIC !== "false",
     embeddedPostgresDataDir: resolveHomeAwarePath(
       fileConfig?.database.embeddedPostgresDataDir ?? resolveDefaultEmbeddedPostgresDir(),
     ),

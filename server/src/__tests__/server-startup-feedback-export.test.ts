@@ -64,6 +64,7 @@ function buildTestConfig(overrides: Record<string, unknown> = {}) {
     authDisableSignUp: false,
     databaseMode: "postgres",
     databaseUrl: "postgres://paperclip:paperclip@127.0.0.1:5432/paperclip",
+    allowEmbeddedPostgresPublic: true,
     embeddedPostgresDataDir: "/tmp/paperclip-test-db",
     embeddedPostgresPort: 54329,
     databaseBackupEnabled: false,
@@ -199,6 +200,7 @@ vi.mock("../auth/better-auth.js", () => ({
 }));
 
 import { startServer } from "../index.ts";
+import { logger } from "../middleware/logger.js";
 
 describe("startServer feedback export wiring", () => {
   beforeEach(() => {
@@ -222,7 +224,7 @@ describe("startServer feedback export wiring", () => {
     });
   });
 
-  it("refuses authenticated public startup without an external database URL", async () => {
+  it("warns but does not refuse authenticated public startup on embedded PostgreSQL", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       deploymentExposure: "public",
       authBaseUrlMode: "explicit",
@@ -231,8 +233,36 @@ describe("startServer feedback export wiring", () => {
       databaseUrl: undefined,
     }));
 
+    // The cloud-DB contract guard must no longer reject embedded PostgreSQL for
+    // authenticated+public deployments; it warns and falls through to the
+    // embedded-postgres branch (restores pre-525 posture). The embedded boot
+    // itself is out of scope for this unit, so swallow whatever happens after
+    // the guard and assert only that it warned instead of throwing the contract.
+    let thrown: unknown;
+    await startServer().catch((err) => {
+      thrown = err;
+    });
+
+    expect(vi.mocked(logger.warn)).toHaveBeenCalledWith(
+      expect.stringContaining("public deployment running on embedded PostgreSQL"),
+    );
+    expect(String((thrown as Error | undefined)?.message ?? "")).not.toContain(
+      "refusing embedded PostgreSQL fallback",
+    );
+  });
+
+  it("refuses authenticated public startup on embedded PostgreSQL when allowEmbeddedPostgresPublic=false", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      deploymentExposure: "public",
+      authBaseUrlMode: "explicit",
+      authPublicBaseUrl: "https://tenant.example.com",
+      databaseMode: "embedded-postgres",
+      databaseUrl: undefined,
+      allowEmbeddedPostgresPublic: false,
+    }));
+
     await expect(startServer()).rejects.toThrow(
-      "authenticated public deployments require DATABASE_URL or config.database.connectionString",
+      "PAPERCLIP_ALLOW_EMBEDDED_POSTGRES_PUBLIC=false",
     );
     expect(createDbMock).not.toHaveBeenCalled();
   });

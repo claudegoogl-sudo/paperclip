@@ -18,6 +18,15 @@ export const RETRYABLE_PG_ERROR_CODES = new Set([
   PG_SERIALIZATION_FAILURE_CODE,
 ]);
 
+// PLA-638: drizzle-orm (>=0.36, this repo is on 0.45) no longer surfaces the
+// raw driver error — every failed query is rewrapped as a `DrizzleQueryError`
+// ("Failed query: ...") whose constructor has NO top-level `code`; the original
+// postgres.js `PostgresError` (the one carrying SQLSTATE 40P01) is stashed on
+// `.cause`. So a code check on the thrown error alone always missed the
+// deadlock and the retry never fired — the deadlock surfaced as a 500. Walk the
+// `.cause` chain (bounded depth, cycle-guarded) to find the real SQLSTATE.
+const MAX_CAUSE_DEPTH = 8;
+
 export interface RetryOnTransientPgErrorOptions {
   maxAttempts?: number;
   baseDelayMs?: number;
@@ -28,10 +37,33 @@ export interface RetryOnTransientPgErrorOptions {
   label?: string;
 }
 
+/**
+ * Returns the retryable SQLSTATE found anywhere in the error's `.cause` chain
+ * (the thrown error itself counts as depth 0), or `null` if none is present.
+ * Exposed so callers can log the resolved code even when the surfaced error is
+ * a wrapper without a top-level `code` (see MAX_CAUSE_DEPTH note above).
+ */
+export function findRetryablePgErrorCode(err: unknown): string | null {
+  let current: unknown = err;
+  const seen = new Set<unknown>();
+  for (
+    let depth = 0;
+    depth < MAX_CAUSE_DEPTH && current && typeof current === "object";
+    depth += 1
+  ) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === "string" && RETRYABLE_PG_ERROR_CODES.has(code)) {
+      return code;
+    }
+    current = (current as { cause?: unknown }).cause;
+  }
+  return null;
+}
+
 export function isRetryablePgError(err: unknown): boolean {
-  if (!err || typeof err !== "object") return false;
-  const code = (err as { code?: unknown }).code;
-  return typeof code === "string" && RETRYABLE_PG_ERROR_CODES.has(code);
+  return findRetryablePgErrorCode(err) !== null;
 }
 
 export async function retryOnTransientPgError<T>(
@@ -51,10 +83,10 @@ export async function retryOnTransientPgError<T>(
     try {
       return await fn();
     } catch (err) {
-      if (!isRetryablePgError(err) || attempt >= maxAttempts) {
+      const code = findRetryablePgErrorCode(err);
+      if (code === null || attempt >= maxAttempts) {
         throw err;
       }
-      const code = (err as { code?: string }).code;
       const jitter = Math.floor(Math.random() * baseDelayMs);
       const delay = baseDelayMs * Math.pow(2, attempt - 1) + jitter;
       logger.warn(

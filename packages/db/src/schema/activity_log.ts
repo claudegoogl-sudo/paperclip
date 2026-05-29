@@ -14,7 +14,8 @@ export const activityLog = pgTable(
     entityType: text("entity_type").notNull(),
     entityId: text("entity_id").notNull(),
     agentId: uuid("agent_id").references(() => agents.id),
-    runId: uuid("run_id").references(() => heartbeatRuns.id),
+    // fork-only divergence (migration 0090); re-submit upstream after PLA-585 thaw (tracking: PLA-644)
+    runId: uuid("run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
     details: jsonb("details").$type<Record<string, unknown>>(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
