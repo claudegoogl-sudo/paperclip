@@ -614,7 +614,12 @@ async function registerActionHandlers(ctx: PluginContext): Promise<void> {
     if (!secretRef) {
       throw new Error("No secret reference configured");
     }
-    const resolved = await ctx.secrets.resolve(secretRef);
+    // Secret resolution is scoped to the dispatching company of an active tool
+    // call: pass the `runCtx.runId` from a tool handler. This action accepts a
+    // `runId` param for demonstration; without a valid active-dispatch runId
+    // the host fails closed.
+    const runId = typeof params.runId === "string" ? params.runId : "";
+    const resolved = await ctx.secrets.resolve(secretRef, runId);
     pushRecord({
       level: "info",
       source: "secrets",

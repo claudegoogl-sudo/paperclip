@@ -73,10 +73,6 @@ import {
   requireLocalFolderDeclaration,
   setStoredLocalFolder,
 } from "../services/plugin-local-folders.js";
-import {
-  extractSecretRefPathsFromConfig,
-  PLUGIN_SECRET_REFS_DISABLED_MESSAGE,
-} from "../services/plugin-secrets-handler.js";
 import { badRequest, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
 
 /** UI slot declaration extracted from plugin manifest */
@@ -2109,12 +2105,11 @@ export function pluginRoutes(
     }
 
     try {
-      const secretRefsByPath = extractSecretRefPathsFromConfig(body.configJson, schema);
-      if (secretRefsByPath.size > 0) {
-        res.status(422).json({ error: PLUGIN_SECRET_REFS_DISABLED_MESSAGE });
-        return;
-      }
-
+      // Secret references in plugin config are now permitted: company-scoped
+      // resolution landed (PLA-655/PLA-657). The config value is only a pointer
+      // — resolution is authorized at call time against the dispatching
+      // company's `company_secret_bindings` by plugin-secrets-handler, so a ref
+      // sitting in (instance-wide) config never grants cross-company access.
       const result = await registry.upsertConfig(plugin.id, {
         configJson: body.configJson,
       });
