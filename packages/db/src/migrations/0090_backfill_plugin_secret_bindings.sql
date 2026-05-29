@@ -90,15 +90,21 @@ FROM (
   WHERE jsonb_typeof(p.manifest_json -> 'instanceConfigSchema') = 'object'
 ) srp
 JOIN LATERAL (
-  SELECT (pc.config_json #>> string_to_array(srp.config_path, '.')) AS ref, 0 AS src
+  SELECT (pc.config_json #>> string_to_array(srp.config_path, '.')) AS ref, 0 AS src,
+         NULL::uuid AS settings_company
   FROM "plugin_config" pc
   WHERE pc.plugin_id = srp.plugin_id
   UNION ALL
-  SELECT (pcs.settings_json #>> string_to_array(srp.config_path, '.')) AS ref, 1 AS src
+  SELECT (pcs.settings_json #>> string_to_array(srp.config_path, '.')) AS ref, 1 AS src,
+         pcs.company_id AS settings_company
   FROM "plugin_company_settings" pcs
   WHERE pcs.plugin_id = srp.plugin_id
 ) cand ON true
 JOIN "company_secrets" cs ON cs.id::text = lower(cand.ref)
 WHERE cand.ref ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+  -- Per-company settings (src=1) only bind a secret the settings-owning company
+  -- also owns; A referencing B's secret UUID is dropped. plugin_config (src=0) is
+  -- instance-wide with no company context, so it keeps owner-keying off the secret.
+  AND (cand.src = 0 OR cand.settings_company = cs.company_id)
 ORDER BY cs.company_id, srp.plugin_id, srp.config_path, cand.src, cs.id
 ON CONFLICT ("company_id", "target_type", "target_id", "config_path") DO NOTHING;

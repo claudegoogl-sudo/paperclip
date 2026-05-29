@@ -197,6 +197,36 @@ describeEmbeddedPostgres("0090 backfill company_secret_bindings", () => {
     });
   });
 
+  it("drops a per-company ref to another company's secret, keeps the owner-matched one", async () => {
+    // Company A's per-company settings reference A's OWN secret and (at a second
+    // secret-ref path) company B's secret UUID. The owner-match constraint keeps the
+    // A->A binding and drops the A->B one. On the pre-PLA-665 SQL the cross-owner ref
+    // fabricated a binding(company_id=B) that B never authored; this case fails there.
+    const pluginId = await insertPlugin({
+      type: "object",
+      properties: {
+        ownRef: { type: "string", format: "secret-ref" },
+        foreignRef: { type: "string", format: "secret-ref" },
+      },
+    });
+    const secretA = await insertSecret(companyA, "key-a");
+    const secretB = await insertSecret(companyB, "key-b");
+    await setCompanySettings(companyA, pluginId, { ownRef: secretA, foreignRef: secretB });
+
+    await runBackfill(connectionString);
+
+    const bindings = await listBindings();
+    expect(bindings).toHaveLength(1);
+    expect(bindings[0]).toMatchObject({
+      company_id: companyA,
+      secret_id: secretA,
+      target_id: pluginId,
+      config_path: "ownRef",
+    });
+    // The cross-owner ref must NOT fabricate a binding for B (or anyone).
+    expect(bindings.some((b) => b.secret_id === secretB)).toBe(false);
+  });
+
   it("is idempotent: a second run inserts nothing", async () => {
     const pluginId = await insertPlugin(SECRET_REF_SCHEMA);
     const secretId = await insertSecret(companyA, "cad-pat");
