@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { findOpenSyncPr, pickOpenSyncPr } from "./upstream-sync.mjs";
+import { findOpenSyncPr, pickOpenSyncPr, runActivationSoakGate } from "./upstream-sync.mjs";
 
 const FORK_OWNER = "claudegoogl-sudo";
 const TAG = "v2026.525.0";
@@ -66,4 +66,48 @@ test("findOpenSyncPr no-ops without a token and makes no network call", async ()
 test("findOpenSyncPr throws on a non-ok pulls response", async () => {
   const fetchImpl = async () => ({ ok: false, status: 403, text: async () => "rate limited" });
   await assert.rejects(() => findOpenSyncPr(BRANCH, { token: "t", fetchImpl }), /pulls query 403/);
+});
+
+// --- PLA-640: post-merge activation-soak gate -----------------------------
+
+test("runActivationSoakGate runs the soak and passes when it exits 0", () => {
+  let ran = false;
+  const result = runActivationSoakGate({
+    env: {},
+    runner: () => { ran = true; return 0; },
+    log: () => {},
+  });
+  assert.equal(ran, true);
+  assert.deepEqual(result, { ran: true, skipped: false });
+});
+
+test("runActivationSoakGate aborts the tick when the soak exits non-zero", () => {
+  assert.throws(
+    () => runActivationSoakGate({ env: {}, runner: () => 1, log: () => {} }),
+    /soak failed \(exit 1\); refusing to advance the sync tick — see PLA-640/,
+  );
+});
+
+test("runActivationSoakGate aborts when the runner throws (execFileSync non-zero)", () => {
+  assert.throws(
+    () => runActivationSoakGate({
+      env: {},
+      runner: () => { const e = new Error("Command failed"); e.status = 2; throw e; },
+      log: () => {},
+    }),
+    /soak failed \(exit 2\); refusing to advance the sync tick — see PLA-640/,
+  );
+});
+
+test("runActivationSoakGate skips loudly when PAPERCLIP_SYNC_SKIP_SOAK is set", () => {
+  const logs = [];
+  let ran = false;
+  const result = runActivationSoakGate({
+    env: { PAPERCLIP_SYNC_SKIP_SOAK: "1" },
+    runner: () => { ran = true; return 0; },
+    log: (m) => logs.push(m),
+  });
+  assert.equal(ran, false, "runner must NOT be invoked when skipping");
+  assert.deepEqual(result, { ran: false, skipped: true });
+  assert.equal(logs.some((l) => /skipped/.test(l)), true, "skip must be logged, never silent");
 });

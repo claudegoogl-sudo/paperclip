@@ -165,6 +165,61 @@ function remoteBranchExists(branch) {
   return git(["ls-remote", "--heads", FORK_REMOTE, branch]).length > 0;
 }
 
+// Default runner for the post-merge activation soak (PLA-640). Shells out to
+// scripts/plugin-activation-soak.mjs and returns its exit code. Kept separate
+// (and injectable) so the gate's pass/fail/skip logic can be unit-tested
+// without booting a host.
+function defaultSoakRunner() {
+  const res = execFileSync("node", [path.join("scripts", "plugin-activation-soak.mjs")], {
+    cwd: repoRoot,
+    stdio: "inherit",
+    env: process.env,
+  });
+  // execFileSync throws on non-zero; reaching here means exit 0.
+  void res;
+  return 0;
+}
+
+/**
+ * Post-sync plugin-activation soak gate (PLA-640, root cause PLA-639).
+ *
+ * An upstream-sync tick MUST NOT silently leave an installed plugin unable to
+ * activate. After a clean merge, run the activation soak (install + register +
+ * activate CAD/klipper against an isolated host, asserting `status: ready` and
+ * a non-ephemeral packagePath). If the soak fails — or cannot run because its
+ * prerequisites are missing — the tick is aborted (throws) rather than opening
+ * a PR for a build that would leave a plugin dead on the next restart.
+ *
+ * Escape hatch: set PAPERCLIP_SYNC_SKIP_SOAK=1 to skip (e.g. environments that
+ * intentionally run the soak elsewhere). Skipping is loud, never silent.
+ *
+ * @param {{ env?: NodeJS.ProcessEnv, runner?: () => number, log?: (msg: string) => void }} deps
+ * @returns {{ ran: boolean, skipped: boolean }}
+ */
+function runActivationSoakGate({ env = process.env, runner = defaultSoakRunner, log = console.log } = {}) {
+  const skip = env.PAPERCLIP_SYNC_SKIP_SOAK;
+  if (skip === "1" || skip === "true") {
+    log("soak: skipped via PAPERCLIP_SYNC_SKIP_SOAK (plugin-activation soak NOT run for this tick)");
+    return { ran: false, skipped: true };
+  }
+  let code;
+  try {
+    code = runner();
+  } catch (err) {
+    const detail = err && typeof err.status === "number" ? `exit ${err.status}` : String(err?.message ?? err);
+    throw new Error(
+      `plugin-activation soak failed (${detail}); refusing to advance the sync tick — see PLA-640`,
+    );
+  }
+  if (code !== 0) {
+    throw new Error(
+      `plugin-activation soak failed (exit ${code}); refusing to advance the sync tick — see PLA-640`,
+    );
+  }
+  log("soak: passed (CAD/klipper installed + activated to ready with persistent packagePath)");
+  return { ran: true, skipped: false };
+}
+
 async function main() {
   const state = readState();
   const { release, status, etag: newEtag } = await fetchLatestRelease(state.etag);
@@ -246,6 +301,11 @@ async function main() {
     git(["commit", "--no-edit"]);
   }
 
+  // PLA-640: gate the tick on a plugin-activation soak BEFORE advancing state
+  // or pushing. A failure here aborts the tick with no state mutation and no
+  // PR — the merge commit stays local and a fixed re-run can redo it.
+  runActivationSoakGate();
+
   const headSha = git(["rev-parse", "HEAD"]);
   const nextState = {
     ...state,
@@ -310,4 +370,4 @@ if (invokedDirectly) {
     });
 }
 
-export { findOpenSyncPr, pickOpenSyncPr, remoteBranchExists, main };
+export { findOpenSyncPr, pickOpenSyncPr, remoteBranchExists, runActivationSoakGate, main };
