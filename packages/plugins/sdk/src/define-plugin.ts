@@ -17,14 +17,17 @@
  *   async setup(ctx) {
  *     ctx.logger.info("Linear sync plugin starting");
  *
- *     // Subscribe to events
- *     ctx.events.on("issue.created", async (event) => {
+ *     // Register a tool. Secrets resolve against the dispatching company of the
+ *     // tool call — pass `runCtx.runId` so the host can authorize the ref.
+ *     ctx.tools.register("create-issue", { displayName: "Create issue" }, async (params, runCtx) => {
  *       const config = await ctx.config.get();
+ *       const apiKey = await ctx.secrets.resolve(config.apiKeyRef as string, runCtx.runId);
  *       await ctx.http.fetch(`https://api.linear.app/...`, {
  *         method: "POST",
- *         headers: { Authorization: `Bearer ${await ctx.secrets.resolve(config.apiKeyRef as string)}` },
- *         body: JSON.stringify({ title: event.payload.title }),
+ *         headers: { Authorization: `Bearer ${apiKey}` },
+ *         body: JSON.stringify(params),
  *       });
+ *       return { data: { ok: true } };
  *     });
  *
  *     // Register a job handler

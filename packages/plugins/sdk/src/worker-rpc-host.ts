@@ -631,8 +631,11 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       },
 
       secrets: {
-        async resolve(secretRef: string): Promise<string> {
-          return callHost("secrets.resolve", { secretRef });
+        async resolve(secretRef: string, runId: string): Promise<string> {
+          // `runId` identifies the active tool dispatch; the host re-derives the
+          // dispatching agent's company from it and never trusts the worker for
+          // company scope. Pass `runCtx.runId` from inside a tool handler.
+          return callHost("secrets.resolve", { secretRef, runId });
         },
       },
 

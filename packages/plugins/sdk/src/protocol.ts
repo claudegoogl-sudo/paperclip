@@ -823,8 +823,14 @@ export interface WorkerToHostMethods {
   ];
 
   // Secrets
+  //
+  // `runId` MUST be the runId of the currently-executing tool dispatch.
+  // The host looks up the active runContext keyed on (pluginDbId, runId) and
+  // authorizes resolution against the DISPATCHING agent's company (not the
+  // worker JWT), enforcing per-company `company_secret_bindings`. The worker is
+  // never trusted to assert which company is resolving. See PLA-655/PLA-657.
   "secrets.resolve": [
-    params: { secretRef: string },
+    params: { secretRef: string; runId: string },
     result: string,
   ];
 

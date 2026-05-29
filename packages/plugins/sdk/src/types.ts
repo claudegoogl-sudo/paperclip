@@ -738,26 +738,45 @@ export interface PluginHttpClient {
  *
  * Requires `secrets.read-ref` capability.
  *
- * Plugins store secret *references* in their config (e.g. a secret name).
+ * Plugins store secret *references* in their config (e.g. a secret UUID).
  * This client resolves the reference through the Paperclip secret provider
  * system and returns the resolved value at execution time.
+ *
+ * Resolution is scoped to the **dispatching company** of the active tool call:
+ * the host re-derives the company from the `runId` you pass (never from the
+ * worker) and authorizes the ref against that company's
+ * `company_secret_bindings`. Resolution is therefore only possible from inside
+ * a tool handler, where `runCtx.runId` is available. Calls without a valid
+ * active-dispatch `runId` fail closed.
  *
  * @see PLUGIN_SPEC.md §22 — Secrets
  */
 export interface PluginSecretsClient {
   /**
-   * Resolve a secret reference to its current value.
+   * Resolve a secret reference to its current value, scoped to the dispatching
+   * company of the active tool call.
    *
-   * The reference is a string identifier pointing to a secret configured
-   * in the Paperclip secret provider (e.g. `"MY_API_KEY"`).
+   * The reference is a secret UUID from the plugin's config. Pass the
+   * `runCtx.runId` of the currently-executing tool dispatch so the host can
+   * authorize resolution against the dispatching company.
    *
    * Secret values are resolved at call time and must never be cached or
    * written to logs, config, or other persistent storage.
    *
-   * @param secretRef - The secret reference string from plugin config
-   * @returns The resolved secret value
+   * Throws a typed error (surfaced via JsonRpcCallError):
+   * - `invalid_ref` — the ref is not a well-formed secret UUID.
+   * - `runcontext_invalid` — no active dispatch for this `runId` (e.g. called
+   *   outside a tool handler, or a forged/expired `runId`).
+   * - `not_found` — the ref is not bound for the dispatching company, does not
+   *   exist, or cannot be resolved (collapsed to one shape to prevent
+   *   cross-company existence enumeration).
+   * - `rate_limited` — too many resolutions from this dispatching agent.
+   *
+   * @param secretRef - The secret reference (UUID) from plugin config.
+   * @param runId - The `runCtx.runId` of the active tool dispatch.
+   * @returns The resolved secret value.
    */
-  resolve(secretRef: string): Promise<string>;
+  resolve(secretRef: string, runId: string): Promise<string>;
 }
 
 /**
