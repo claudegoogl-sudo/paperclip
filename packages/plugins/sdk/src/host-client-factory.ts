@@ -594,7 +594,20 @@ export function createHostClientHandlers(
     }
 
     const allowedCompanyId = readNonEmptyString(context?.invocationScope?.companyId);
-    if (!allowedCompanyId) return;
+    if (!allowedCompanyId) {
+      // Fail closed (Complete Mediation / Fail Securely): a company-scoped
+      // worker→host call arrived with no resolvable invocation scope — e.g. an
+      // idle-window call between dispatches where the host pinned no tenant.
+      // Deny rather than silently letting the tenant pin be bypassed.
+      // companies.list legitimately enumerates every company and carries no
+      // pin, so it stays allowed.
+      if (method === "companies.list") return;
+      throw new InvocationScopeDeniedError(
+        pluginId,
+        method,
+        "no active invocation scope; company-scoped calls must run within a dispatch",
+      );
+    }
 
     if (requested.kind === "all") {
       if (method === "companies.list") return;

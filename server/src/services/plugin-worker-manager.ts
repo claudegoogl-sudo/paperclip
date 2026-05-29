@@ -674,13 +674,25 @@ export function createPluginWorkerHandle(
         );
         return;
       }
-      const allowedCompanyId = context.invocationScope?.companyId;
-      if (allowedCompanyId && companyId !== allowedCompanyId) {
-        log.warn(
-          { method: notification.method, companyId, allowedCompanyId },
-          "dropping plugin stream notification outside invocation company scope",
-        );
-        return;
+      const allowedCompanyId = readNonEmptyString(context.invocationScope?.companyId);
+      if (companyId) {
+        // Fail closed (matches requireInvocationCompanyScope): a company-scoped
+        // stream notification with no resolvable invocation scope cannot be
+        // tenant-verified — drop it rather than forwarding it under no pin.
+        if (!allowedCompanyId) {
+          log.warn(
+            { method: notification.method, companyId },
+            "dropping company-scoped plugin stream notification with no resolvable invocation scope",
+          );
+          return;
+        }
+        if (companyId !== allowedCompanyId) {
+          log.warn(
+            { method: notification.method, companyId, allowedCompanyId },
+            "dropping plugin stream notification outside invocation company scope",
+          );
+          return;
+        }
       }
 
       // Track open channels so we can emit synthetic close on crash
