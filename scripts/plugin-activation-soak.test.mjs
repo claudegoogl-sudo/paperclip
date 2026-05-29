@@ -5,6 +5,7 @@ import test from "node:test";
 
 import {
   assertPersistentPath,
+  buildHostEnv,
   classifyPluginStatus,
   isEphemeralPath,
   parsePluginSpec,
@@ -102,6 +103,49 @@ test("resolveStagedPackageRoot is deterministic, persistent, and sanitizes scope
   const root = resolveStagedPackageRoot("/home/p/.paperclip/plugin-packages", "@platform/paperclip-klipper", "0.1.6");
   assert.equal(root, "/home/p/.paperclip/plugin-packages/platform-paperclip-klipper-0.1.6/package");
   assert.equal(isEphemeralPath(root, TMP), false);
+});
+
+test("buildHostEnv pins PAPERCLIP_CONFIG into the data dir — the PLA-650 isolation invariant", () => {
+  const dataDir = "/home/p/.paperclip-soak/data-123";
+  // A hostile/legacy inherited env: a live config + a live DATABASE_URL that
+  // MUST NOT reach the booted soak host.
+  const baseEnv = {
+    PAPERCLIP_CONFIG: "/x/.paperclip/config.json",
+    DATABASE_URL: "postgres://live-host/prod",
+    NODE_ENV: "test",
+    SOME_UNRELATED: "keepme",
+  };
+  const env = buildHostEnv({ dataDir, port: 4321, instanceId: "soak-fixed" }, baseEnv);
+
+  // PAPERCLIP_CONFIG is pinned under the data dir (NOT deleted) and OVERRIDES
+  // the inherited live path so no cwd-ancestor walk can reach ~/.paperclip.
+  assert.equal(env.PAPERCLIP_CONFIG, path.join(dataDir, "soak-config.json"));
+  assert.ok(
+    env.PAPERCLIP_CONFIG.startsWith(dataDir + path.sep),
+    "PAPERCLIP_CONFIG must live under the throwaway data dir",
+  );
+  assert.notEqual(env.PAPERCLIP_CONFIG, "/x/.paperclip/config.json");
+  assert.ok("PAPERCLIP_CONFIG" in env, "PAPERCLIP_CONFIG must be set, never deleted");
+
+  // Inherited live DATABASE_URL is dropped entirely (no empty-slot dotenv backfill).
+  assert.equal("DATABASE_URL" in env, false);
+
+  // Isolation knobs are pinned regardless of the inherited env.
+  assert.equal(env.PAPERCLIP_DEPLOYMENT_MODE, "local_trusted");
+  assert.equal(env.PAPERCLIP_DEPLOYMENT_EXPOSURE, "private");
+  assert.equal(env.HOST, "127.0.0.1");
+  assert.equal(env.PAPERCLIP_HOME, dataDir);
+  assert.equal(env.PORT, "4321");
+
+  // Unrelated inherited vars are preserved.
+  assert.equal(env.SOME_UNRELATED, "keepme");
+});
+
+test("buildHostEnv pins PAPERCLIP_CONFIG even when the base env has none set", () => {
+  const dataDir = "/srv/soak/data-9";
+  const env = buildHostEnv({ dataDir, port: 9, instanceId: "x" }, { NODE_ENV: "production" });
+  assert.equal(env.PAPERCLIP_CONFIG, path.join(dataDir, "soak-config.json"));
+  assert.equal("DATABASE_URL" in env, false);
 });
 
 test("parsePluginSpec parses name=tarball[:pluginKey]", () => {

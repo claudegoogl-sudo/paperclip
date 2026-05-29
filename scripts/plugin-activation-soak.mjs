@@ -181,6 +181,52 @@ export function parsePluginSpec(raw) {
   return { name, tarball: rest, pluginKey };
 }
 
+/**
+ * Build the isolated child-host environment. PURE (no I/O) so the isolation
+ * invariants are unit-testable.
+ *
+ * The critical hardening (PLA-650): PAPERCLIP_CONFIG is PINNED to a path under
+ * the throwaway data dir — it is NOT deleted. Deleting it let the host's config
+ * resolver (`resolvePaperclipConfigPath` -> `findConfigFileFromAncestors`) walk
+ * cwd's ancestors UPWARD; since `~/.paperclip` is an ancestor of the repo
+ * checkout, a stray/legacy `~/.paperclip/config.json` (or an operator/repo
+ * `.paperclip/config.json`) would silently feed the soak a LIVE
+ * `database.connectionString` + embeddedPostgresDataDir and run install/uninstall
+ * **purge** against the live registry. Pointing at `<dataDir>/soak-config.json`
+ * (which is never created) makes `readConfigFile()` return null deterministically
+ * -> embedded PG under PAPERCLIP_HOME, with no ancestor walk. Failure-closed and
+ * independent of cwd/operator layout. An inherited PAPERCLIP_CONFIG is
+ * OVERRIDDEN, never honored.
+ *
+ * DATABASE_URL is removed so config.ts's dotenv (override:false) cannot backfill
+ * the empty slot from a sibling `.paperclip/.env`, and so no inherited live URL
+ * leaks in.
+ *
+ * @param {{dataDir: string, port: number, instanceId?: string}} opts
+ * @param {NodeJS.ProcessEnv} baseEnv environment to inherit from (usually process.env)
+ */
+export function buildHostEnv(opts, baseEnv = process.env) {
+  const env = {
+    ...baseEnv,
+    PAPERCLIP_DEPLOYMENT_MODE: "local_trusted",
+    PAPERCLIP_DEPLOYMENT_EXPOSURE: "private",
+    HOST: "127.0.0.1",
+    PORT: String(opts.port),
+    PAPERCLIP_HOME: opts.dataDir,
+    PAPERCLIP_INSTANCE_ID: opts.instanceId ?? `soak-${process.pid}-${Date.now()}`,
+    PAPERCLIP_MIGRATION_AUTO_APPLY: "true",
+    // Pin (do NOT delete) config into the throwaway data dir; the file is never
+    // created, so the host resolves config -> null instead of walking cwd
+    // ancestors up to a live ~/.paperclip/config.json. See PLA-650.
+    PAPERCLIP_CONFIG: path.join(opts.dataDir, "soak-config.json"),
+    NODE_ENV: baseEnv.NODE_ENV ?? "production",
+  };
+  // Drop any inherited live DATABASE_URL: never point at the live database, and
+  // leave no empty slot for dotenv to backfill from a sibling .paperclip/.env.
+  delete env.DATABASE_URL;
+  return env;
+}
+
 // ---------------------------------------------------------------------------
 // Config / argument parsing
 // ---------------------------------------------------------------------------
@@ -302,23 +348,7 @@ function bootHost(opts) {
         `or pass --server-entry.`,
     );
   }
-  const env = {
-    ...process.env,
-    PAPERCLIP_DEPLOYMENT_MODE: "local_trusted",
-    PAPERCLIP_DEPLOYMENT_EXPOSURE: "private",
-    HOST: "127.0.0.1",
-    PORT: String(opts.port),
-    PAPERCLIP_HOME: opts.dataDir,
-    PAPERCLIP_INSTANCE_ID: `soak-${process.pid}-${Date.now()}`,
-    PAPERCLIP_MIGRATION_AUTO_APPLY: "true",
-    // Embedded Postgres lives in the isolated data dir — never touch the live
-    // instance's database. Explicitly unset any inherited DATABASE_URL.
-    DATABASE_URL: "",
-    PAPERCLIP_CONFIG: "",
-    NODE_ENV: process.env.NODE_ENV ?? "production",
-  };
-  delete env.DATABASE_URL;
-  delete env.PAPERCLIP_CONFIG;
+  const env = buildHostEnv(opts, process.env);
 
   const child = spawn(process.execPath, [opts.serverEntry], {
     cwd: repoRoot,
