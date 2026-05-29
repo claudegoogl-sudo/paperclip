@@ -53,6 +53,7 @@ For internet-facing deployment.
 - **URL**: explicit public URL required
 - **Security**: stricter deployment checks in doctor
 - **Bind**: usually `loopback` behind a reverse proxy; `lan/custom` is advanced
+- **Database**: an external managed Postgres (`DATABASE_URL`) is recommended for production. Without it the server warns and continues on embedded PostgreSQL. Set `PAPERCLIP_ALLOW_EMBEDDED_POSTGRES_PUBLIC=false` to make this strict — the server then refuses to boot until `DATABASE_URL` is set. See [Environment Variables](./environment-variables.md).
 
 ```sh
 pnpm paperclipai onboard
