@@ -64,6 +64,7 @@ function buildTestConfig(overrides: Record<string, unknown> = {}) {
     authDisableSignUp: false,
     databaseMode: "postgres",
     databaseUrl: "postgres://paperclip:paperclip@127.0.0.1:5432/paperclip",
+    allowEmbeddedPostgresPublic: true,
     embeddedPostgresDataDir: "/tmp/paperclip-test-db",
     embeddedPostgresPort: 54329,
     databaseBackupEnabled: false,
@@ -248,6 +249,22 @@ describe("startServer feedback export wiring", () => {
     expect(String((thrown as Error | undefined)?.message ?? "")).not.toContain(
       "refusing embedded PostgreSQL fallback",
     );
+  });
+
+  it("refuses authenticated public startup on embedded PostgreSQL when allowEmbeddedPostgresPublic=false", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      deploymentExposure: "public",
+      authBaseUrlMode: "explicit",
+      authPublicBaseUrl: "https://tenant.example.com",
+      databaseMode: "embedded-postgres",
+      databaseUrl: undefined,
+      allowEmbeddedPostgresPublic: false,
+    }));
+
+    await expect(startServer()).rejects.toThrow(
+      "PAPERCLIP_ALLOW_EMBEDDED_POSTGRES_PUBLIC=false",
+    );
+    expect(createDbMock).not.toHaveBeenCalled();
   });
 
   it("refuses authenticated public startup when DATABASE_URL is not a postgres URL", async () => {

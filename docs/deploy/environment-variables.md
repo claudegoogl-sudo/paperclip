@@ -14,6 +14,7 @@ All environment variables that Paperclip uses for server configuration.
 | `PAPERCLIP_BIND_HOST` | (unset) | Required when `PAPERCLIP_BIND=custom` |
 | `HOST` | `127.0.0.1` | Legacy host override; prefer `PAPERCLIP_BIND` for new setups |
 | `DATABASE_URL` | (embedded) | PostgreSQL connection string |
+| `PAPERCLIP_ALLOW_EMBEDDED_POSTGRES_PUBLIC` | `true` | When `false`, an `authenticated` + `public` deployment with no `DATABASE_URL` refuses to boot instead of falling back to embedded PostgreSQL. Default (`true`, or unset) warns and continues on embedded PostgreSQL. Set `false` to require an external managed Postgres in production. |
 | `PAPERCLIP_HOME` | `~/.paperclip` | Base directory for all Paperclip data |
 | `PAPERCLIP_INSTANCE_ID` | `default` | Instance identifier (for multiple local instances) |
 | `PAPERCLIP_DEPLOYMENT_MODE` | `local_trusted` | Runtime mode override |
