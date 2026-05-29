@@ -22,6 +22,10 @@ const INVOCATION_SCOPE_WORKER_ENTRYPOINT = path.join(
   "plugin-worker-invocation-scope.cjs",
 );
 const TERMINATED_WORKER_ENTRYPOINT = path.join(FIXTURES_DIR, "plugin-worker-terminated.cjs");
+const STREAM_SCOPE_WORKER_ENTRYPOINT = path.join(
+  FIXTURES_DIR,
+  "plugin-worker-stream-scope.cjs",
+);
 
 const TEST_MANIFEST: PaperclipPluginManifestV1 = {
   id: "test.plugin",
@@ -413,6 +417,51 @@ describe("plugin-worker-manager stderr failure context", () => {
       }
 
       expect(companiesGet).not.toHaveBeenCalled();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("drops company-scoped stream notifications with no resolvable invocation scope", async () => {
+    const onStreamNotification = vi.fn();
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: STREAM_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers: {},
+      onStreamNotification,
+    });
+
+    try {
+      await handle.start();
+
+      // performAction with an empty actor companyId derives no invocation
+      // scope, so the worker's stream notifications arrive with an empty host
+      // context ({}). The fixture emits a company-scoped notification (dropped)
+      // followed by a scope-less one (forwarded) so ordering is deterministic.
+      await expect(handle.call("performAction", {
+        key: "probe",
+        params: {},
+        actorContext: {
+          type: "agent",
+          userId: null,
+          agentId: "agent-1",
+          runId: "run-1",
+          companyId: "",
+        },
+        renderEnvironment: null,
+      })).resolves.toEqual({ ok: true });
+
+      const channels = onStreamNotification.mock.calls.map(
+        ([, params]) => (params as { channel?: string }).channel,
+      );
+      expect(channels).toContain("no-company");
+      expect(channels).not.toContain("scoped-dropped");
     } finally {
       await handle.stop().catch(() => undefined);
     }

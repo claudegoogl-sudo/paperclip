@@ -172,4 +172,91 @@ describe("createHostClientHandlers invocation company scope", () => {
     ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
     expect(searchAudit).not.toHaveBeenCalled();
   });
+
+  it("fails closed for a company-scoped call with no resolvable invocation scope", async () => {
+    const configure = vi.fn(async () => ({ ok: true }));
+    const services = {
+      localFolders: { configure },
+    } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["local.folders"],
+      services,
+    });
+
+    const params = { companyId: "company-a", folderKey: "root", path: "/tmp/x" };
+
+    // Empty context: no active invocation (e.g. an idle-window worker→host call).
+    await expect(
+      handlers["localFolders.configure"](params as never, {}),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    await expect(
+      handlers["localFolders.configure"](params as never, {}),
+    ).rejects.toMatchObject({
+      code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED,
+    });
+    // Context entirely omitted is denied too.
+    await expect(
+      handlers["localFolders.configure"](params as never),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    expect(configure).not.toHaveBeenCalled();
+  });
+
+  it("allows a company-scoped call inside a matching invocation and still rejects mismatches", async () => {
+    const configure = vi.fn(async () => ({ ok: true }));
+    const services = {
+      localFolders: { configure },
+    } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["local.folders"],
+      services,
+    });
+
+    await expect(
+      handlers["localFolders.configure"](
+        { companyId: "company-a", folderKey: "root", path: "/tmp/x" } as never,
+        { invocationScope: { companyId: "company-a" } },
+      ),
+    ).resolves.toEqual({ ok: true });
+    expect(configure).toHaveBeenCalledTimes(1);
+
+    await expect(
+      handlers["localFolders.configure"](
+        { companyId: "company-b", folderKey: "root", path: "/tmp/x" } as never,
+        { invocationScope: { companyId: "company-a" } },
+      ),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    expect(configure).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps companies.list and no-company methods working without an invocation scope", async () => {
+    const companiesList = vi.fn(async () => [
+      { id: "company-a", name: "Company A" },
+      { id: "company-b", name: "Company B" },
+    ]);
+    const configGet = vi.fn(async () => ({ value: 1 }));
+    const services = {
+      companies: { list: companiesList },
+      config: { get: configGet },
+    } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["companies.read"],
+      services,
+    });
+
+    // companies.list (kind "all") returns the full list when no scope resolves.
+    await expect(handlers["companies.list"]({}, {})).resolves.toEqual([
+      { id: "company-a", name: "Company A" },
+      { id: "company-b", name: "Company B" },
+    ]);
+    // A genuinely no-companyId method (kind "none") still passes with no scope.
+    await expect(
+      handlers["config.get"](undefined as never, {}),
+    ).resolves.toEqual({ value: 1 });
+  });
 });
