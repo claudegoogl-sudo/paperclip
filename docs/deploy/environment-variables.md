@@ -20,6 +20,20 @@ All environment variables that Paperclip uses for server configuration.
 | `PAPERCLIP_DEPLOYMENT_EXPOSURE` | `private` | Exposure policy when deployment mode is `authenticated` |
 | `PAPERCLIP_API_URL` | (auto-derived) | Paperclip API base URL. When set externally (e.g., via Kubernetes ConfigMap, load balancer, or reverse proxy), the server preserves the value instead of deriving it from the listen host and port. Useful for deployments where the public-facing URL differs from the local bind address. |
 
+## Run-path Integrity
+
+Optional boot-time self-checks for `paperclipai run`. They guard against a
+service unit silently launching the wrong binary — e.g. `ExecStart=/usr/bin/npx
+paperclipai run` resolving an upstream release from the public npm registry
+instead of the locally installed build. On every boot `paperclipai run` logs the
+detected build channel (`fork`/`upstream`) and version; these variables let an
+operator turn a mismatch into a fast, loud abort instead of a silent crash loop.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PAPERCLIP_REQUIRE_FORK_BUILD` | (unset) | When truthy (`1`/`true`/`yes`/`on`), abort at boot unless the running build carries a `-fork.<n>` version marker |
+| `PAPERCLIP_EXPECTED_VERSION` | (unset) | When set, abort at boot unless the running CLI version matches this value exactly |
+
 ## Secrets
 
 | Variable | Default | Description |
