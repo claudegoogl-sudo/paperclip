@@ -199,6 +199,7 @@ vi.mock("../auth/better-auth.js", () => ({
 }));
 
 import { startServer } from "../index.ts";
+import { logger } from "../middleware/logger.js";
 
 describe("startServer feedback export wiring", () => {
   beforeEach(() => {
@@ -222,7 +223,7 @@ describe("startServer feedback export wiring", () => {
     });
   });
 
-  it("refuses authenticated public startup without an external database URL", async () => {
+  it("warns but does not refuse authenticated public startup on embedded PostgreSQL", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       deploymentExposure: "public",
       authBaseUrlMode: "explicit",
@@ -231,10 +232,22 @@ describe("startServer feedback export wiring", () => {
       databaseUrl: undefined,
     }));
 
-    await expect(startServer()).rejects.toThrow(
-      "authenticated public deployments require DATABASE_URL or config.database.connectionString",
+    // The cloud-DB contract guard must no longer reject embedded PostgreSQL for
+    // authenticated+public deployments; it warns and falls through to the
+    // embedded-postgres branch (restores pre-525 posture). The embedded boot
+    // itself is out of scope for this unit, so swallow whatever happens after
+    // the guard and assert only that it warned instead of throwing the contract.
+    let thrown: unknown;
+    await startServer().catch((err) => {
+      thrown = err;
+    });
+
+    expect(vi.mocked(logger.warn)).toHaveBeenCalledWith(
+      expect.stringContaining("public deployment running on embedded PostgreSQL"),
     );
-    expect(createDbMock).not.toHaveBeenCalled();
+    expect(String((thrown as Error | undefined)?.message ?? "")).not.toContain(
+      "refusing embedded PostgreSQL fallback",
+    );
   });
 
   it("refuses authenticated public startup when DATABASE_URL is not a postgres URL", async () => {
