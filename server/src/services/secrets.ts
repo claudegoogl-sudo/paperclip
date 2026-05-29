@@ -41,6 +41,11 @@ import {
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import {
+  collectSecretRefPaths,
+  isUuidSecretRef,
+  readConfigValueAtPath,
+} from "./json-schema-secret-refs.js";
+import {
   checkSecretProviders,
   getSecretProvider,
   listSecretProviders,
@@ -2095,6 +2100,148 @@ export function secretService(db: Db) {
         );
       });
       return normalizedRefs;
+    },
+
+    /**
+     * Forward-path maintainer for plugin secret-ref bindings (model C, PLA-660).
+     *
+     * The one-time PLA-662 backfill (migration 0090) seeds bindings from config
+     * that predates company-scoped resolution; this is its live counterpart:
+     * every time plugin config is saved, each manifest field annotated
+     * `format: "secret-ref"` is reconciled into `company_secret_bindings` so the
+     * resolver (plugin-secrets-handler) authorizes it regardless of whether the
+     * config or the install landed first. Without it the backfill would be the
+     * sole writer and a late provision would never get a row.
+     *
+     * Key shape matches the backfill exactly:
+     * `(companyId, targetType="plugin", targetId=pluginId, configPath=<dot-path>)`.
+     *
+     * Company scoping mirrors the backfill's isolation guarantee:
+     *  - instance-wide `plugin_config` (no `companyId`): the binding's company is
+     *    the secret's TRUE owner, so it can never create an unresolvable
+     *    cross-company row.
+     *  - per-company `plugin_company_settings` (`companyId` set): a referenced
+     *    secret is bound only if it belongs to that company; cross-company or
+     *    orphan refs are skipped (no binding, no throw) — the resolver then
+     *    returns the same opaque `not_found`.
+     *
+     * Idempotent: re-saving identical config is a no-op (conflict → update to the
+     * same secretId); clearing or repointing a field removes/updates the row. A
+     * stale row that cannot be revoked (e.g. the old secret was hard-deleted so
+     * its owner is unknown) is harmless — the resolver's company-scoped resolve
+     * re-checks `secret.companyId === ctx.companyId` as defence in depth.
+     *
+     * NB: this is NOT `syncSecretRefsForTarget` — that helper deletes by config
+     * path-prefix (`env.%`), which never matches the flat, top-level config paths
+     * plugin secret-ref fields use (e.g. `githubPatSecretId`), so it would both
+     * collide on the unique index on re-save and never remove a cleared field.
+     *
+     * Never logs or returns secret values; only counts and non-secret ids.
+     */
+    syncPluginSecretBindings: async (input: {
+      /** `plugins.id` — the binding `targetId` and the resolver lookup key. */
+      pluginId: string;
+      /** The plugin manifest's `instanceConfigSchema` (or null). */
+      instanceConfigSchema: unknown;
+      /** Config as it was before this save (for revoking cleared/repointed refs). */
+      previousConfig: unknown;
+      /** Config as saved. */
+      nextConfig: unknown;
+      /** Set for per-company settings; omit for instance-wide `plugin_config`. */
+      companyId?: string;
+    }): Promise<{ bound: number; revoked: number }> => {
+      const paths = collectSecretRefPaths(asRecord(input.instanceConfigSchema));
+      if (paths.size === 0) return { bound: 0, revoked: 0 };
+
+      const refsAtPaths = (cfg: unknown): Map<string, string> => {
+        const out = new Map<string, string>();
+        const record = asRecord(cfg);
+        if (!record) return out;
+        for (const dotPath of paths) {
+          const value = readConfigValueAtPath(record, dotPath);
+          if (typeof value === "string" && isUuidSecretRef(value)) {
+            out.set(dotPath, value.toLowerCase());
+          }
+        }
+        return out;
+      };
+
+      const oldRefs = refsAtPaths(input.previousConfig);
+      const newRefs = refsAtPaths(input.nextConfig);
+
+      // Resolve the binding's owning company. For per-company settings the ref
+      // MUST belong to that company (else skip — never bind cross-company). For
+      // instance-wide config the owner is derived from the secret itself.
+      const ownerCompanyFor = async (
+        secretId: string,
+        source: Pick<Db | DbTransaction, "select">,
+      ): Promise<string | null> => {
+        const secret = await getById(secretId, source);
+        if (!secret) return null;
+        if (input.companyId && secret.companyId !== input.companyId) return null;
+        return secret.companyId;
+      };
+
+      let bound = 0;
+      let revoked = 0;
+
+      await db.transaction(async (tx) => {
+        // 1) Revoke bindings for paths that were cleared or repointed.
+        for (const [dotPath, oldValue] of oldRefs) {
+          if (newRefs.get(dotPath) === oldValue) continue; // unchanged
+          const oldOwner = input.companyId ?? (await ownerCompanyFor(oldValue, tx));
+          if (!oldOwner) continue; // cannot locate the row to revoke (harmless)
+          const deleted = await tx
+            .delete(companySecretBindings)
+            .where(
+              and(
+                eq(companySecretBindings.companyId, oldOwner),
+                eq(companySecretBindings.targetType, "plugin"),
+                eq(companySecretBindings.targetId, input.pluginId),
+                eq(companySecretBindings.configPath, dotPath),
+              ),
+            )
+            .returning({ id: companySecretBindings.id });
+          revoked += deleted.length;
+        }
+
+        // 2) Upsert bindings for the current refs.
+        for (const [dotPath, value] of newRefs) {
+          const owner = await ownerCompanyFor(value, tx);
+          if (!owner) continue; // orphan or cross-company → no binding
+          const upserted = await tx
+            .insert(companySecretBindings)
+            .values({
+              companyId: owner,
+              secretId: value,
+              targetType: "plugin",
+              targetId: input.pluginId,
+              configPath: dotPath,
+              versionSelector: "latest",
+              required: true,
+              label: "plugin-config",
+            })
+            .onConflictDoUpdate({
+              target: [
+                companySecretBindings.companyId,
+                companySecretBindings.targetType,
+                companySecretBindings.targetId,
+                companySecretBindings.configPath,
+              ],
+              set: { secretId: value, updatedAt: new Date() },
+            })
+            .returning({ id: companySecretBindings.id });
+          bound += upserted.length;
+        }
+      });
+
+      logger
+        .child({ service: "plugin-secret-bindings", pluginId: input.pluginId })
+        .debug(
+          { companyScope: input.companyId ?? "instance", bound, revoked },
+          "synced plugin secret-ref bindings",
+        );
+      return { bound, revoked };
     },
 
     syncEnvBindingsForTarget: async (

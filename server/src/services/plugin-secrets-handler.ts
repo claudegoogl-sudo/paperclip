@@ -68,7 +68,8 @@ import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js"
  * The binding target type used for plugin secret-ref bindings. A binding row
  * is `(companyId, targetType="plugin", targetId=<plugin install UUID>,
  * configPath=<manifest secret-ref path>, secretId)`. This is the per-company
- * allow-list surface SecurityEngineer required (PLA-656 Q3, model B).
+ * allow-list surface SecurityEngineer required (PLA-656 Q3, model C —
+ * `company_secret_bindings`).
  */
 export const PLUGIN_SECRET_BINDING_TARGET_TYPE = "plugin";
 

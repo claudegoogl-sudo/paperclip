@@ -28,6 +28,12 @@ import type {
   PluginWebhookDeliveryStatus,
 } from "@paperclipai/shared";
 import { conflict, notFound } from "../errors.js";
+import { secretService } from "./secrets.js";
+
+/** Read the manifest's `instanceConfigSchema` off a persisted plugins row. */
+function instanceConfigSchemaOf(plugin: { manifestJson: unknown }): unknown {
+  return (plugin.manifestJson as PaperclipPluginManifestV1 | null)?.instanceConfigSchema ?? null;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -303,27 +309,35 @@ export function pluginRegistryService(db: Db) {
         .where(eq(pluginConfig.pluginId, pluginId))
         .then((rows) => rows[0] ?? null);
 
-      if (existing) {
-        return db
-          .update(pluginConfig)
-          .set({
-            configJson: input.configJson,
-            lastError: null,
-            updatedAt: new Date(),
-          })
-          .where(eq(pluginConfig.pluginId, pluginId))
-          .returning()
-          .then((rows) => rows[0]);
-      }
+      const row = existing
+        ? await db
+            .update(pluginConfig)
+            .set({
+              configJson: input.configJson,
+              lastError: null,
+              updatedAt: new Date(),
+            })
+            .where(eq(pluginConfig.pluginId, pluginId))
+            .returning()
+            .then((rows) => rows[0])
+        : await db
+            .insert(pluginConfig)
+            .values({
+              pluginId,
+              configJson: input.configJson,
+            })
+            .returning()
+            .then((rows) => rows[0]);
 
-      return db
-        .insert(pluginConfig)
-        .values({
-          pluginId,
-          configJson: input.configJson,
-        })
-        .returning()
-        .then((rows) => rows[0]);
+      // Maintain company_secret_bindings for any secret-ref fields (PLA-660 model C).
+      await secretService(db).syncPluginSecretBindings({
+        pluginId,
+        instanceConfigSchema: instanceConfigSchemaOf(plugin),
+        previousConfig: existing?.configJson ?? null,
+        nextConfig: input.configJson,
+      });
+
+      return row;
     },
 
     /**
@@ -340,28 +354,39 @@ export function pluginRegistryService(db: Db) {
         .where(eq(pluginConfig.pluginId, pluginId))
         .then((rows) => rows[0] ?? null);
 
-      if (existing) {
-        const merged = { ...existing.configJson, ...input.configJson };
-        return db
-          .update(pluginConfig)
-          .set({
-            configJson: merged,
-            lastError: null,
-            updatedAt: new Date(),
-          })
-          .where(eq(pluginConfig.pluginId, pluginId))
-          .returning()
-          .then((rows) => rows[0]);
-      }
+      const nextConfig = existing
+        ? { ...existing.configJson, ...input.configJson }
+        : input.configJson;
 
-      return db
-        .insert(pluginConfig)
-        .values({
-          pluginId,
-          configJson: input.configJson,
-        })
-        .returning()
-        .then((rows) => rows[0]);
+      const row = existing
+        ? await db
+            .update(pluginConfig)
+            .set({
+              configJson: nextConfig,
+              lastError: null,
+              updatedAt: new Date(),
+            })
+            .where(eq(pluginConfig.pluginId, pluginId))
+            .returning()
+            .then((rows) => rows[0])
+        : await db
+            .insert(pluginConfig)
+            .values({
+              pluginId,
+              configJson: nextConfig,
+            })
+            .returning()
+            .then((rows) => rows[0]);
+
+      // Maintain company_secret_bindings for any secret-ref fields (PLA-660 model C).
+      await secretService(db).syncPluginSecretBindings({
+        pluginId,
+        instanceConfigSchema: instanceConfigSchemaOf(plugin),
+        previousConfig: existing?.configJson ?? null,
+        nextConfig,
+      });
+
+      return row;
     },
 
     /**
@@ -420,31 +445,41 @@ export function pluginRegistryService(db: Db) {
         ))
         .then((rows) => rows[0] ?? null);
 
-      if (existing) {
-        return db
-          .update(pluginCompanySettings)
-          .set({
-            enabled: input.enabled ?? existing.enabled,
-            settingsJson: input.settingsJson,
-            lastError: input.lastError ?? null,
-            updatedAt: new Date(),
-          })
-          .where(eq(pluginCompanySettings.id, existing.id))
-          .returning()
-          .then((rows) => rows[0]) as Promise<PluginCompanySettings>;
-      }
+      const row = (existing
+        ? await db
+            .update(pluginCompanySettings)
+            .set({
+              enabled: input.enabled ?? existing.enabled,
+              settingsJson: input.settingsJson,
+              lastError: input.lastError ?? null,
+              updatedAt: new Date(),
+            })
+            .where(eq(pluginCompanySettings.id, existing.id))
+            .returning()
+            .then((rows) => rows[0])
+        : await db
+            .insert(pluginCompanySettings)
+            .values({
+              pluginId,
+              companyId,
+              enabled: input.enabled ?? true,
+              settingsJson: input.settingsJson,
+              lastError: input.lastError ?? null,
+            })
+            .returning()
+            .then((rows) => rows[0])) as PluginCompanySettings;
 
-      return db
-        .insert(pluginCompanySettings)
-        .values({
-          pluginId,
-          companyId,
-          enabled: input.enabled ?? true,
-          settingsJson: input.settingsJson,
-          lastError: input.lastError ?? null,
-        })
-        .returning()
-        .then((rows) => rows[0]) as Promise<PluginCompanySettings>;
+      // Maintain company_secret_bindings for any secret-ref fields (PLA-660 model C).
+      // Per-company scope: only secrets owned by THIS company are bound.
+      await secretService(db).syncPluginSecretBindings({
+        pluginId,
+        instanceConfigSchema: instanceConfigSchemaOf(plugin),
+        previousConfig: (existing?.settingsJson as Record<string, unknown> | undefined) ?? null,
+        nextConfig: input.settingsJson,
+        companyId,
+      });
+
+      return row;
     },
 
     // ----- Entities -------------------------------------------------------
