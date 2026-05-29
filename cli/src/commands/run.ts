@@ -7,6 +7,8 @@ import pc from "picocolors";
 import { bootstrapCeoInvite } from "./auth-bootstrap-ceo.js";
 import { onboard } from "./onboard.js";
 import { doctor } from "./doctor.js";
+import { assertBuildIdentity, readIdentityEnv } from "../build-identity.js";
+import { cliVersion } from "../version.js";
 import { loadPaperclipEnvFile } from "../config/env.js";
 import { configExists, resolveConfigPath } from "../config/store.js";
 import type { PaperclipConfig } from "../config/schema.js";
@@ -50,6 +52,17 @@ export async function runCommand(opts: RunOptions): Promise<void> {
   p.log.message(pc.dim(`Home: ${paths.homeDir}`));
   p.log.message(pc.dim(`Instance: ${paths.instanceId}`));
   p.log.message(pc.dim(`Config: ${configPath}`));
+
+  // Announce the running build loudly so logs make the active binary legible,
+  // and fail fast if the operator pinned an expected build/version that this
+  // binary does not satisfy (e.g. systemd resolved upstream via npx). See PLA-632.
+  const identity = assertBuildIdentity(cliVersion, readIdentityEnv());
+  if (identity.ok) {
+    p.log.message(pc.dim(identity.message));
+  } else {
+    p.log.error(identity.message);
+    process.exit(1);
+  }
 
   if (!configExists(configPath)) {
     if (!process.stdin.isTTY || !process.stdout.isTTY) {
