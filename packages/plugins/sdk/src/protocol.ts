@@ -262,9 +262,21 @@ export type PluginRpcErrorCode =
 /**
  * Company scope attached by the host to one top-level plugin invocation.
  * Absence of this metadata means the invocation is instance/global scoped.
+ *
+ * `runId` / `agentId` are populated by the host for dispatch-style invocations
+ * (executeTool, performAction). They let the host correlate a worker→host
+ * callback back to the originating outer dispatch — for example, to fill in
+ * `runId` on a `secrets.resolve` call from a worker built against the
+ * pre-PLA-657 SDK that did not yet thread the runId itself. The values come
+ * entirely from the host-side dispatcher; the worker is never trusted to
+ * supply them.
  */
 export interface PluginInvocationScope {
   companyId: string;
+  /** Run UUID of the dispatching agent's heartbeat run. Optional. */
+  runId?: string;
+  /** UUID of the dispatching agent. Optional. */
+  agentId?: string;
 }
 
 /**

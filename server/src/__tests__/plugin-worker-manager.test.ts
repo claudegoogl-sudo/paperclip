@@ -21,6 +21,10 @@ const INVOCATION_SCOPE_WORKER_ENTRYPOINT = path.join(
   FIXTURES_DIR,
   "plugin-worker-invocation-scope.cjs",
 );
+const LEGACY_SECRETS_WORKER_ENTRYPOINT = path.join(
+  FIXTURES_DIR,
+  "plugin-worker-legacy-secrets.cjs",
+);
 const TERMINATED_WORKER_ENTRYPOINT = path.join(FIXTURES_DIR, "plugin-worker-terminated.cjs");
 const STREAM_SCOPE_WORKER_ENTRYPOINT = path.join(
   FIXTURES_DIR,
@@ -233,9 +237,20 @@ describe("plugin-worker-manager stderr failure context", () => {
         id: "company-a",
         scopedCompanyId: "company-a",
       });
+      // PLA-673: the invocation scope now carries the dispatching agent's
+      // runId/agentId so worker→host callbacks (e.g. pre-PLA-657
+      // `secrets.resolve({secretRef})`) can be back-filled by host-client-
+      // factory. The values come from the host's `actorContext` and were
+      // already on the wire — they're just exposed via scope now too.
       expect(companiesGet).toHaveBeenCalledWith(
         { companyId: "company-a" },
-        { invocationScope: { companyId: "company-a" } },
+        {
+          invocationScope: {
+            companyId: "company-a",
+            runId: "run-1",
+            agentId: "agent-1",
+          },
+        },
       );
     } finally {
       await handle.stop().catch(() => undefined);
@@ -465,5 +480,104 @@ describe("plugin-worker-manager stderr failure context", () => {
     } finally {
       await handle.stop().catch(() => undefined);
     }
+  });
+});
+
+describe("PLA-673 — back-fill runId for pre-PLA-657 SDK secrets.resolve", () => {
+  // Plugins bundled against the pre-PLA-657 SDK (e.g. platform.cad ≤0.1.7)
+  // call `ctx.secrets.resolve(secretRef)` without threading runId. The new
+  // server-side handler requires runId, so any such call would otherwise fail
+  // with `runcontext_invalid` even when the host has a valid active dispatch.
+  // The fix carries runId/agentId on PluginInvocationScope, and the gated
+  // wrapper in host-client-factory back-fills `runId` from the scope.
+  //
+  // This integration test wires a worker that emulates the legacy wire shape
+  // (sends `{secretRef}` only) and asserts the host-side service handler
+  // receives the runId from the executeTool dispatch.
+
+  it("back-fills runId from the executeTool invocation scope when the worker omits it", async () => {
+    const secretsResolve = vi.fn(async (params: { secretRef: string; runId?: string }) => {
+      // The real handler would do dispatch lookup + binding check; we just
+      // assert the back-fill threaded runId through to this point.
+      return `value-for-${params.secretRef}-via-${params.runId ?? "<missing>"}`;
+    });
+    const handlers = createHostClientHandlers({
+      pluginId: "test.plugin",
+      capabilities: ["secrets.read-ref"],
+      services: {
+        secrets: { resolve: secretsResolve },
+      } as unknown as HostServices,
+    });
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: LEGACY_SECRETS_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: handlers,
+    });
+
+    try {
+      await handle.start();
+
+      await expect(
+        handle.call("executeTool", {
+          toolName: "cad.export",
+          parameters: {
+            secretRef: "11111111-1111-1111-1111-111111111111",
+          },
+          runContext: {
+            agentId: "agent-1",
+            runId: "run-pla673",
+            companyId: "company-a",
+            projectId: "project-1",
+          },
+        } as unknown as HostToWorkerMethods["executeTool"][0]),
+      ).resolves.toMatchObject({
+        data: {
+          resolvedTo: "value-for-11111111-1111-1111-1111-111111111111-via-run-pla673",
+        },
+      });
+
+      expect(secretsResolve).toHaveBeenCalledTimes(1);
+      // The wire payload arrived from the worker without runId; the gated
+      // wrapper back-filled it from the active invocation scope (which the
+      // host populated from the outer dispatcher's runContext).
+      expect(secretsResolve.mock.calls[0]?.[0]).toEqual({
+        secretRef: "11111111-1111-1111-1111-111111111111",
+        runId: "run-pla673",
+      });
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("still fails closed when there is no active invocation (no scope to back-fill from)", async () => {
+    const secretsResolve = vi.fn(async () => "should-not-be-called");
+    const handlers = createHostClientHandlers({
+      pluginId: "test.plugin",
+      capabilities: ["secrets.read-ref"],
+      services: {
+        secrets: { resolve: secretsResolve },
+      } as unknown as HostServices,
+    });
+    // No active invocation: a forged worker→host call with no
+    // paperclipInvocationId arrives. requireInvocationCompanyScope guards the
+    // company-scoped methods, but `secrets.resolve` is not company-scoped at
+    // the wrapper layer — its fail-closed gate lives in the server-side
+    // secrets handler. To make this independently testable, we invoke the
+    // gated wrapper directly with no invocation scope and assert the params
+    // are forwarded *unchanged* (no runId), so the real handler still throws
+    // `runcontext_invalid`.
+    await expect(
+      handlers["secrets.resolve"](
+        { secretRef: "11111111-1111-1111-1111-111111111111" } as never,
+        {},
+      ),
+    ).resolves.toEqual("should-not-be-called");
+
+    expect(secretsResolve).toHaveBeenCalledWith({
+      secretRef: "11111111-1111-1111-1111-111111111111",
+    });
   });
 });
