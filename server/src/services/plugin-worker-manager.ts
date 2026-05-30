@@ -515,12 +515,35 @@ export function createPluginWorkerHandle(
 
     if (method === "performAction" && isRecord(params.actorContext)) {
       const companyId = readNonEmptyString(params.actorContext.companyId);
-      return companyId ? { companyId } : null;
+      if (!companyId) return null;
+      // Carry runId/agentId on the scope so a worker→host callback that omits
+      // them (e.g. pre-PLA-657 SDK `secrets.resolve(secretRef)`) can be back-
+      // filled from the host-validated active invocation rather than failing
+      // closed. Values come from the host's params, never from the worker.
+      const runId = readNonEmptyString(params.actorContext.runId);
+      const agentId = readNonEmptyString(params.actorContext.agentId);
+      return {
+        companyId,
+        ...(runId ? { runId } : {}),
+        ...(agentId ? { agentId } : {}),
+      };
     }
 
     if (method === "executeTool" && isRecord(params.runContext)) {
       const companyId = readNonEmptyString(params.runContext.companyId);
-      return companyId ? { companyId } : null;
+      if (!companyId) return null;
+      // PLA-673: thread the outer dispatcher's runId/agentId so worker→host
+      // callbacks that didn't include them can be reconstructed by the host.
+      // This preserves the PLA-657/PLA-574 security model — the runId is the
+      // host's own, taken from the dispatch the host issued, never trusted to
+      // the worker.
+      const runId = readNonEmptyString(params.runContext.runId);
+      const agentId = readNonEmptyString(params.runContext.agentId);
+      return {
+        companyId,
+        ...(runId ? { runId } : {}),
+        ...(agentId ? { agentId } : {}),
+      };
     }
 
     if (method === "onEvent" && isRecord(params.event)) {

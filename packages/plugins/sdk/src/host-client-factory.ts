@@ -554,6 +554,32 @@ export function createHostClientHandlers(
     return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
   }
 
+  /**
+   * Back-fill `runId` on a worker→host params record from the host-validated
+   * active invocation scope when the worker omitted it. PLA-657 changed the
+   * SDK signature of `ctx.secrets.resolve()` to require `runId`; plugins
+   * bundled against the pre-PLA-657 SDK still call without it, which would
+   * otherwise fail closed at the server's secrets handler (PLA-673). The
+   * runId we fill in here came from the host's own outer dispatch — never
+   * from the worker — so the security invariants of PLA-657/PLA-574 are
+   * preserved.
+   *
+   * Only writes when (a) the worker omitted `runId` AND (b) the invocation
+   * scope has a runId AND (c) the scope was validated by the host (the
+   * `invalidInvocationScope` branch is rejected upstream in
+   * `requireInvocationCompanyScope`).
+   */
+  function backfillDispatchRunId<P>(
+    params: P,
+    context: WorkerHostCallContext | undefined,
+  ): P {
+    if (!isRecord(params)) return params;
+    if (readNonEmptyString((params as Record<string, unknown>).runId)) return params;
+    const scopedRunId = readNonEmptyString(context?.invocationScope?.runId);
+    if (!scopedRunId) return params;
+    return { ...params, runId: scopedRunId } as P;
+  }
+
   function requestedCompanyScope(
     method: WorkerToHostMethodName,
     params: unknown,
@@ -733,13 +759,26 @@ export function createHostClientHandlers(
     }),
 
     // Secrets
-    "secrets.resolve": gated("secrets.resolve", async (params) => {
-      return services.secrets.resolve(params);
+    "secrets.resolve": gated("secrets.resolve", async (params, context) => {
+      // PLA-673 back-compat: plugins bundled against the pre-PLA-657 SDK send
+      // `{ secretRef }` with no `runId`. Back-fill from the host-validated
+      // active invocation scope (populated by the host's executeTool /
+      // performAction bracket in plugin-worker-manager.ts:deriveInvocationScope)
+      // so dispatch lookups succeed for legacy callers. The secrets handler's
+      // fail-closed throw still fires when there is no active invocation, so a
+      // forged worker→host call outside a tool dispatch keeps getting
+      // `runcontext_invalid`.
+      const enriched = backfillDispatchRunId(params, context);
+      return services.secrets.resolve(enriched);
     }),
 
     // Artifacts (PLA-574) — host enforces dispatching-agent authz via runContext
-    "artifacts.fetch": gated("artifacts.fetch", async (params) => {
-      return services.artifacts.fetch(params);
+    "artifacts.fetch": gated("artifacts.fetch", async (params, context) => {
+      // Same back-fill as secrets.resolve. The post-PLA-574 SDK threaded
+      // runId here from day one, so this only kicks in for legacy callers
+      // that bundled an older SDK.
+      const enriched = backfillDispatchRunId(params, context);
+      return services.artifacts.fetch(enriched);
     }),
 
     // Activity

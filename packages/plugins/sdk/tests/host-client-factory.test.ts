@@ -260,3 +260,113 @@ describe("createHostClientHandlers invocation company scope", () => {
     ).resolves.toEqual({ value: 1 });
   });
 });
+
+describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
+  // Pre-PLA-657 SDK plugins (e.g. cad-0.1.7) call `ctx.secrets.resolve(secretRef)`
+  // without threading runId. The new server-side handler requires runId, so
+  // the gated wrapper back-fills it from the host-validated active invocation
+  // scope (set by the host's executeTool / performAction bracket). The fail-
+  // closed throw still fires when no active invocation exists.
+
+  it("back-fills runId on secrets.resolve from the active invocation scope", async () => {
+    const resolve = vi.fn(async () => "resolved-value");
+    const services = {
+      secrets: { resolve },
+    } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services,
+    });
+
+    await handlers["secrets.resolve"](
+      { secretRef: "11111111-1111-1111-1111-111111111111" } as never,
+      { invocationScope: { companyId: "company-a", runId: "run-xyz" } },
+    );
+
+    expect(resolve).toHaveBeenCalledWith({
+      secretRef: "11111111-1111-1111-1111-111111111111",
+      runId: "run-xyz",
+    });
+  });
+
+  it("does NOT overwrite a runId the worker already provided", async () => {
+    const resolve = vi.fn(async () => "resolved-value");
+    const services = {
+      secrets: { resolve },
+    } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services,
+    });
+
+    await handlers["secrets.resolve"](
+      {
+        secretRef: "11111111-1111-1111-1111-111111111111",
+        runId: "worker-supplied-run",
+      } as never,
+      { invocationScope: { companyId: "company-a", runId: "run-xyz" } },
+    );
+
+    expect(resolve).toHaveBeenCalledWith({
+      secretRef: "11111111-1111-1111-1111-111111111111",
+      runId: "worker-supplied-run",
+    });
+  });
+
+  it("forwards untouched when no active invocation carries a runId", async () => {
+    const resolve = vi.fn(async () => "resolved-value");
+    const services = {
+      secrets: { resolve },
+    } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services,
+    });
+
+    await handlers["secrets.resolve"](
+      { secretRef: "11111111-1111-1111-1111-111111111111" } as never,
+      { invocationScope: { companyId: "company-a" } },
+    );
+
+    // No runId on scope → we pass through unchanged. The server-side handler
+    // will still throw `runcontext_invalid`, which is the desired fail-closed
+    // behaviour for an out-of-dispatch caller.
+    expect(resolve).toHaveBeenCalledWith({
+      secretRef: "11111111-1111-1111-1111-111111111111",
+    });
+  });
+
+  it("back-fills runId on artifacts.fetch symmetrically", async () => {
+    const fetch = vi.fn(async () => ({
+      filename: "a.txt",
+      contentType: "text/plain",
+      byteSize: 0,
+      contentBase64: "",
+    }));
+    const services = {
+      artifacts: { fetch },
+    } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: [],
+      services,
+    });
+
+    await handlers["artifacts.fetch"](
+      { attachmentId: "att-1" } as never,
+      { invocationScope: { companyId: "company-a", runId: "run-xyz" } },
+    );
+
+    expect(fetch).toHaveBeenCalledWith({
+      attachmentId: "att-1",
+      runId: "run-xyz",
+    });
+  });
+});
