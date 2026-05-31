@@ -36,6 +36,7 @@ import {
 import {
   decideEgress,
   EgressNotAllowedError,
+  formatOrigin,
   getHostMediatedEgress,
   type HandleEgressCapture,
 } from "../handle-egress.js";
@@ -101,6 +102,20 @@ export interface ToolExecutionResult {
   /** The result returned by the plugin's tool handler. */
   result: ToolResult;
 }
+
+/**
+ * PLA-734 — sink for would-deny egress observations. The chokepoint computes the
+ * NORMALIZED origin (scheme+host+port — never a raw URL) and the deduped, non-null
+ * bindings of a would-deny call and hands them off here fire-and-forget. The sink
+ * owns persistence + its own error isolation: harvesting MUST NOT affect the
+ * dispatch it rides on. In production this is backed by `recordEgressWouldDeny`;
+ * tests inject a fake to assert the chokepoint only ever emits parser output.
+ */
+export type EgressHarvestSink = (observation: {
+  companyId: string;
+  bindingIds: string[];
+  origin: string;
+}) => void;
 
 // ---------------------------------------------------------------------------
 // PluginToolRegistry interface
@@ -240,6 +255,7 @@ export interface PluginToolRegistry {
 export function createPluginToolRegistry(
   workerManager?: PluginWorkerManager,
   runContextRegistry?: PluginRunContextRegistry,
+  egressHarvestSink?: EgressHarvestSink,
 ): PluginToolRegistry {
   const log = logger.child({ service: "plugin-tool-registry" });
 
@@ -499,6 +515,37 @@ export function createPluginToolRegistry(
               },
               "egress would be denied under enforcement; binding is in log-only mode",
             );
+
+            // PLA-734 (option b) — persist a queryable would-deny observation so
+            // operators can seed this binding's allowlist before the enforce-flip.
+            // We persist the NORMALIZED origin only (scheme+host+port, via the
+            // egress parser that already produced `decision.origin`); a non-`ok`
+            // / null origin — a non-host-mediated or undeterminable destination —
+            // is dropped, never stored, because only path/query-free parser output
+            // is safe to keep (it cannot carry tokens/PII). Fire-and-forget: a
+            // harvest failure must never break the dispatch it rides on.
+            if (egressHarvestSink) {
+              const origin = formatOrigin(decision.origin);
+              if (origin) {
+                const bindingIds = [
+                  ...new Set(
+                    decision.wouldDeny
+                      .map((h) => h.bindingId)
+                      .filter((b): b is string => b !== null),
+                  ),
+                ];
+                if (bindingIds.length > 0) {
+                  try {
+                    egressHarvestSink({ companyId: runContext.companyId, bindingIds, origin });
+                  } catch (harvestErr) {
+                    log.warn(
+                      { err: harvestErr, action: "secret.egress_would_deny_harvest_failed" },
+                      "failed to record would-deny egress observation (non-fatal)",
+                    );
+                  }
+                }
+              }
+            }
           }
         }
         dispatchParameters = substituteHandles(runContext.runId, parameters);

@@ -33,11 +33,13 @@ import type { PluginLifecycleManager } from "./plugin-lifecycle.js";
 import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js";
 import {
   createPluginToolRegistry,
+  type EgressHarvestSink,
   type PluginToolRegistry,
   type RegisteredTool,
   type ToolListFilter,
   type ToolExecutionResult,
 } from "./plugin-tool-registry.js";
+import { recordEgressWouldDeny } from "./egress-harvest.js";
 import { pluginRegistryService } from "./plugin-registry.js";
 import { logger } from "../middleware/logger.js";
 
@@ -237,10 +239,25 @@ export function createPluginToolDispatcher(
   const { workerManager, lifecycleManager, db, runContextRegistry } = options;
   const log = logger.child({ service: "plugin-tool-dispatcher" });
 
+  // PLA-734 — db-backed would-deny egress harvest sink. Only wired when a db is
+  // available; the chokepoint calls it fire-and-forget, so persistence runs
+  // off the dispatch path and its failures are isolated here (a harvest write
+  // must never break tool execution).
+  const egressHarvestSink: EgressHarvestSink | undefined = db
+    ? (observation) => {
+        void recordEgressWouldDeny(db, observation).catch((err: unknown) => {
+          log.warn(
+            { err, action: "secret.egress_would_deny_harvest_failed" },
+            "failed to persist would-deny egress observation (non-fatal)",
+          );
+        });
+      }
+    : undefined;
+
   // Create the underlying tool registry, backed by the worker manager.
   // The run-context registry is threaded through so each `executeTool` call
   // records the dispatching agent's identity for the duration of the call.
-  const registry = createPluginToolRegistry(workerManager, runContextRegistry);
+  const registry = createPluginToolRegistry(workerManager, runContextRegistry, egressHarvestSink);
 
   // Track lifecycle event listeners so we can remove them on teardown
   let enabledListener: ((payload: { pluginId: string; pluginKey: string }) => void) | null = null;
