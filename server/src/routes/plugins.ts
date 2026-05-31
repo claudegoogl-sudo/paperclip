@@ -47,6 +47,8 @@ import {
 import { pluginRegistryService } from "../services/plugin-registry.js";
 import { pluginLifecycleManager } from "../services/plugin-lifecycle.js";
 import { getPluginUiContributionMetadata, pluginLoader } from "../services/plugin-loader.js";
+import { extractSecretRefPathsFromConfig } from "../services/plugin-secrets-handler.js";
+import { secretService } from "../services/secrets.js";
 import { logActivity } from "../services/activity-log.js";
 import { publishGlobalLiveEvent } from "../services/live-events.js";
 import { issueService } from "../services/issues.js";
@@ -2699,6 +2701,168 @@ export function pluginRoutes(
     });
 
     res.json(status);
+  });
+
+  // ===========================================================================
+  // PLA-677: Per-tenant plugin config overrides
+  //
+  // The instance-wide `plugin_config.configJson` is the default for the plugin.
+  // Each tenant may layer a per-company override on top via these routes; at
+  // dispatch time the worker's `ctx.config.get()` resolves the effective config
+  // (override-then-default) for the dispatching company. The companion binding
+  // table `company_secret_bindings` is kept in sync with this override only —
+  // cross-tenant rows are never affected by another tenant's write.
+  // ===========================================================================
+
+  /**
+   * GET /api/plugins/:pluginId/companies/:companyId/config-overrides
+   *
+   * Read the per-tenant plugin config override for the given company.
+   * Returns `{ pluginId, companyId, configJson }` where `configJson` may be
+   * an empty object when no override is set.
+   */
+  router.get("/plugins/:pluginId/companies/:companyId/config-overrides", async (req, res) => {
+    assertBoardOrgAccess(req);
+    const { pluginId, companyId } = req.params;
+    assertCompanyAccess(req, companyId);
+
+    const plugin = await resolvePlugin(registry, pluginId);
+    if (!plugin) {
+      res.status(404).json({ error: "Plugin not found" });
+      return;
+    }
+
+    const override = await registry.getCompanyConfigOverride(plugin.id, companyId);
+    res.json({
+      pluginId: plugin.id,
+      companyId,
+      configJson: override ?? {},
+    });
+  });
+
+  /**
+   * PUT /api/plugins/:pluginId/companies/:companyId/config-overrides
+   *
+   * Replace the per-tenant plugin config override (full-replace semantics).
+   * Validates `configJson` against the plugin's `instanceConfigSchema` and
+   * rejects any secret-ref UUID whose owning company differs from the route's
+   * `companyId` (422). Reconciles `company_secret_bindings` for THIS tenant
+   * only — cross-tenant binding rows are untouched.
+   *
+   * Errors:
+   * - 400 if body is missing or validation fails
+   * - 404 if the plugin is not found
+   * - 422 if any secret-ref UUID belongs to a different company
+   */
+  router.put("/plugins/:pluginId/companies/:companyId/config-overrides", async (req, res) => {
+    assertBoardOrgAccess(req);
+    const { pluginId, companyId } = req.params;
+    assertCompanyAccess(req, companyId);
+
+    const plugin = await resolvePlugin(registry, pluginId);
+    if (!plugin) {
+      res.status(404).json({ error: "Plugin not found" });
+      return;
+    }
+
+    const body = req.body as { configJson?: Record<string, unknown> } | undefined;
+    if (!body?.configJson || typeof body.configJson !== "object" || Array.isArray(body.configJson)) {
+      res.status(400).json({ error: '"configJson" is required and must be an object' });
+      return;
+    }
+
+    // devUiUrl is an instance-admin-only knob in the global config path; a
+    // per-tenant override has no business setting it.
+    if ("devUiUrl" in body.configJson) {
+      delete body.configJson.devUiUrl;
+    }
+
+    const schema = plugin.manifestJson?.instanceConfigSchema;
+    if (schema && Object.keys(schema).length > 0) {
+      const validation = validateInstanceConfig(body.configJson, schema);
+      if (!validation.valid) {
+        res.status(400).json({
+          error: "Configuration does not match the plugin's instanceConfigSchema",
+          fieldErrors: validation.errors,
+        });
+        return;
+      }
+    }
+
+    // Reject cross-company secret refs explicitly so the caller gets a 422
+    // instead of `syncPluginSecretBindings` silently skipping the binding.
+    const secretRefPaths = extractSecretRefPathsFromConfig(body.configJson, schema ?? undefined);
+    if (secretRefPaths.size > 0) {
+      const svc = secretService(db);
+      for (const secretId of secretRefPaths.keys()) {
+        const secret = await svc.getById(secretId);
+        if (!secret || secret.status === "deleted") {
+          res.status(422).json({
+            error: "Referenced secret not found",
+            details: { configPaths: [...(secretRefPaths.get(secretId) ?? [])] },
+          });
+          return;
+        }
+        if (secret.companyId !== companyId) {
+          res.status(422).json({
+            error: "Referenced secret must belong to the target company",
+            details: { configPaths: [...(secretRefPaths.get(secretId) ?? [])] },
+          });
+          return;
+        }
+      }
+    }
+
+    try {
+      const result = await registry.upsertCompanyConfigOverride(plugin.id, companyId, body.configJson);
+      await logPluginMutationActivity(req, "plugin.company_config_override.updated", plugin.id, {
+        pluginId: plugin.id,
+        pluginKey: plugin.pluginKey,
+        companyId,
+        secretRefPathCount: secretRefPaths.size,
+        configKeyCount: Object.keys(body.configJson).length,
+      });
+      res.json({
+        pluginId: plugin.id,
+        companyId,
+        configJson: (result.settingsJson as Record<string, unknown>).configOverrides ?? {},
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(400).json({ error: message });
+    }
+  });
+
+  /**
+   * DELETE /api/plugins/:pluginId/companies/:companyId/config-overrides
+   *
+   * Clear the per-tenant plugin config override. Revokes all of this tenant's
+   * `company_secret_bindings` rows for the plugin paths previously set in the
+   * override. Other companies' bindings are not touched.
+   */
+  router.delete("/plugins/:pluginId/companies/:companyId/config-overrides", async (req, res) => {
+    assertBoardOrgAccess(req);
+    const { pluginId, companyId } = req.params;
+    assertCompanyAccess(req, companyId);
+
+    const plugin = await resolvePlugin(registry, pluginId);
+    if (!plugin) {
+      res.status(404).json({ error: "Plugin not found" });
+      return;
+    }
+
+    const result = await registry.deleteCompanyConfigOverride(plugin.id, companyId);
+    await logPluginMutationActivity(req, "plugin.company_config_override.cleared", plugin.id, {
+      pluginId: plugin.id,
+      pluginKey: plugin.pluginKey,
+      companyId,
+      hadOverride: !!result,
+    });
+    res.json({
+      pluginId: plugin.id,
+      companyId,
+      configJson: {},
+    });
   });
 
   // ===========================================================================

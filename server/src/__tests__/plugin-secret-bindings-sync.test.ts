@@ -167,7 +167,11 @@ describeEmbeddedPostgres("secretService.syncPluginSecretBindings", () => {
     expect(await bindingsFor(pluginId)).toHaveLength(0);
   });
 
-  it("repoints to a new owner: revokes the old company row, binds the new", async () => {
+  it("PLA-677: cross-tenant repoint preserves the prior tenant's binding (multi-tenant safety)", async () => {
+    // Instance-wide save flipping the global config from companyA's secret to
+    // companyB's must NOT silently revoke companyA's binding row. Each tenant's
+    // row is independent at resolution time; the per-tenant write route is the
+    // authoritative path for revoking a specific tenant.
     const companyA = await seedCompany("A");
     const companyB = await seedCompany("B");
     const secretA = await seedSecret(companyA, "pat-a");
@@ -188,10 +192,41 @@ describeEmbeddedPostgres("secretService.syncPluginSecretBindings", () => {
       nextConfig: { githubPatSecretId: secretB },
     });
 
+    expect(repointed).toEqual({ bound: 1, revoked: 0 });
+    const rows = await bindingsFor(pluginId);
+    expect(rows).toHaveLength(2);
+    const byCompany = new Map(rows.map((r) => [r.companyId, r]));
+    expect(byCompany.get(companyA)).toMatchObject({ companyId: companyA, secretId: secretA });
+    expect(byCompany.get(companyB)).toMatchObject({ companyId: companyB, secretId: secretB });
+  });
+
+  it("same-tenant repoint still revokes-then-binds (no zombie rows)", async () => {
+    // Instance-wide save flipping the global config between two secrets owned
+    // by the SAME company is a legitimate update, not a tenant transition.
+    // The prior row is replaced by the new one.
+    const companyA = await seedCompany("A");
+    const secret1 = await seedSecret(companyA, "pat-1");
+    const secret2 = await seedSecret(companyA, "pat-2");
+    const pluginId = randomUUID();
+    const svc = secretService(db);
+
+    await svc.syncPluginSecretBindings({
+      pluginId,
+      instanceConfigSchema: SCHEMA,
+      previousConfig: null,
+      nextConfig: { githubPatSecretId: secret1 },
+    });
+    const repointed = await svc.syncPluginSecretBindings({
+      pluginId,
+      instanceConfigSchema: SCHEMA,
+      previousConfig: { githubPatSecretId: secret1 },
+      nextConfig: { githubPatSecretId: secret2 },
+    });
+
     expect(repointed).toEqual({ bound: 1, revoked: 1 });
     const rows = await bindingsFor(pluginId);
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ companyId: companyB, secretId: secretB });
+    expect(rows[0]).toMatchObject({ companyId: companyA, secretId: secret2 });
   });
 
   it("binds nested secret-ref paths with the manifest dot-path", async () => {

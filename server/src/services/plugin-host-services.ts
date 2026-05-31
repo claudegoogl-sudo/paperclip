@@ -1117,13 +1117,29 @@ export function buildHostServices(
     return { resourceType, resourceId, companyId, policy: null, updatedAt: company.updatedAt };
   };
 
-  return {
-    config: {
-      async get() {
-        const configRow = await registry.getConfig(pluginId);
-        return configRow?.configJson ?? {};
-      },
+  // PLA-677: The runtime config service exposes `getForCompany` for per-tenant
+  // effective config. The SDK's `HostServices.config` interface adds this as an
+  // optional method; the cast keeps this file compiling against SDK versions
+  // that pre-date the extension (the gated handler duck-types `getForCompany`
+  // via `if (services.config.getForCompany)` so the absence is safe).
+  const configService = {
+    async get(): Promise<Record<string, unknown>> {
+      const configRow = await registry.getConfig(pluginId);
+      return (configRow?.configJson as Record<string, unknown> | undefined) ?? {};
     },
+    async getForCompany(companyId: string): Promise<Record<string, unknown>> {
+      const [configRow, override] = await Promise.all([
+        registry.getConfig(pluginId),
+        registry.getCompanyConfigOverride(pluginId, companyId),
+      ]);
+      const base = (configRow?.configJson as Record<string, unknown> | undefined) ?? {};
+      if (!override) return { ...base };
+      return { ...base, ...override };
+    },
+  };
+
+  return {
+    config: configService as unknown as HostServices["config"],
 
     localFolders: {
       async declarations() {

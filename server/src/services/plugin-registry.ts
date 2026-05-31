@@ -482,6 +482,155 @@ export function pluginRegistryService(db: Db) {
       return row;
     },
 
+    /**
+     * PLA-677: Per-tenant plugin config overrides.
+     *
+     * Reads the `configOverrides` sub-tree of a tenant's
+     * `plugin_company_settings.settingsJson`. The keys directly match the
+     * plugin's `instanceConfigSchema` so secret-ref paths line up with the
+     * binding-sync schema walker.
+     */
+    getCompanyConfigOverride: async (
+      pluginId: string,
+      companyId: string,
+    ): Promise<Record<string, unknown> | null> => {
+      const settings = await db
+        .select()
+        .from(pluginCompanySettings)
+        .where(and(
+          eq(pluginCompanySettings.pluginId, pluginId),
+          eq(pluginCompanySettings.companyId, companyId),
+        ))
+        .then((rows) => rows[0] ?? null);
+      const overrides = (settings?.settingsJson as Record<string, unknown> | undefined)
+        ?.configOverrides;
+      return overrides && typeof overrides === "object" && !Array.isArray(overrides)
+        ? (overrides as Record<string, unknown>)
+        : null;
+    },
+
+    /**
+     * PLA-677: Replace the per-tenant plugin config override.
+     *
+     * Preserves other top-level keys of `settingsJson` (e.g. local-folders).
+     * Reconciles `company_secret_bindings` for THIS tenant only — cross-tenant
+     * binding rows are untouched. Empty `configJson` clears all per-tenant
+     * bindings for this plugin/tenant (revoke-only sync).
+     */
+    upsertCompanyConfigOverride: async (
+      pluginId: string,
+      companyId: string,
+      configJson: Record<string, unknown>,
+    ): Promise<PluginCompanySettings> => {
+      const plugin = await getById(pluginId);
+      if (!plugin) throw notFound("Plugin not found");
+
+      const existing = await db
+        .select()
+        .from(pluginCompanySettings)
+        .where(and(
+          eq(pluginCompanySettings.pluginId, pluginId),
+          eq(pluginCompanySettings.companyId, companyId),
+        ))
+        .then((rows) => rows[0] ?? null);
+
+      const existingSettings = (existing?.settingsJson as Record<string, unknown> | undefined) ?? {};
+      const existingOverride = existingSettings.configOverrides;
+      const previousOverride =
+        existingOverride && typeof existingOverride === "object" && !Array.isArray(existingOverride)
+          ? (existingOverride as Record<string, unknown>)
+          : null;
+      const nextSettings = { ...existingSettings, configOverrides: configJson };
+
+      const row = (existing
+        ? await db
+            .update(pluginCompanySettings)
+            .set({
+              settingsJson: nextSettings,
+              updatedAt: new Date(),
+            })
+            .where(eq(pluginCompanySettings.id, existing.id))
+            .returning()
+            .then((rows) => rows[0])
+        : await db
+            .insert(pluginCompanySettings)
+            .values({
+              pluginId,
+              companyId,
+              enabled: true,
+              settingsJson: nextSettings,
+            })
+            .returning()
+            .then((rows) => rows[0])) as PluginCompanySettings;
+
+      // Reconcile bindings on the configOverrides sub-tree (where the
+      // manifest's secret-ref paths actually live), scoped to this tenant.
+      await secretService(db).syncPluginSecretBindings({
+        pluginId,
+        instanceConfigSchema: instanceConfigSchemaOf(plugin),
+        previousConfig: previousOverride,
+        nextConfig: configJson,
+        companyId,
+      });
+
+      return row;
+    },
+
+    /**
+     * PLA-677: Clear a tenant's per-tenant plugin config override.
+     *
+     * Equivalent to upsertCompanyConfigOverride(…, {}) but explicitly removes
+     * the `configOverrides` key from settingsJson rather than storing an empty
+     * object. Revokes all of this tenant's plugin bindings for paths that were
+     * previously in the override.
+     */
+    deleteCompanyConfigOverride: async (
+      pluginId: string,
+      companyId: string,
+    ): Promise<PluginCompanySettings | null> => {
+      const plugin = await getById(pluginId);
+      if (!plugin) throw notFound("Plugin not found");
+
+      const existing = await db
+        .select()
+        .from(pluginCompanySettings)
+        .where(and(
+          eq(pluginCompanySettings.pluginId, pluginId),
+          eq(pluginCompanySettings.companyId, companyId),
+        ))
+        .then((rows) => rows[0] ?? null);
+      if (!existing) return null;
+
+      const existingSettings = (existing.settingsJson as Record<string, unknown> | undefined) ?? {};
+      const existingOverride = existingSettings.configOverrides;
+      const previousOverride =
+        existingOverride && typeof existingOverride === "object" && !Array.isArray(existingOverride)
+          ? (existingOverride as Record<string, unknown>)
+          : null;
+      const { configOverrides: _drop, ...rest } = existingSettings as { configOverrides?: unknown } & Record<string, unknown>;
+      void _drop;
+
+      const row = await db
+        .update(pluginCompanySettings)
+        .set({
+          settingsJson: rest,
+          updatedAt: new Date(),
+        })
+        .where(eq(pluginCompanySettings.id, existing.id))
+        .returning()
+        .then((rows) => rows[0]) as PluginCompanySettings;
+
+      await secretService(db).syncPluginSecretBindings({
+        pluginId,
+        instanceConfigSchema: instanceConfigSchemaOf(plugin),
+        previousConfig: previousOverride,
+        nextConfig: null,
+        companyId,
+      });
+
+      return row;
+    },
+
     // ----- Entities -------------------------------------------------------
 
     /**
