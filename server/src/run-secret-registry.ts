@@ -60,6 +60,14 @@ export function registerRunSecretValue(runId: string, value: string): void {
   if (typeof value !== "string" || value.length === 0) {
     throw new Error("registerRunSecretValue: a non-empty value is required");
   }
+  // Values shorter than this threshold are too low-entropy for value-exact
+  // matching: they would cause over-redaction across unrelated concurrent runs.
+  // Vault-resolved secrets are always high-entropy; short values indicate a
+  // misconfiguration or non-secret field — skip registration rather than corrupt logs.
+  const MIN_VALUE_LENGTH = 8;
+  if (value.length < MIN_VALUE_LENGTH) {
+    return;
+  }
   const now = Date.now();
   pruneExpired(now);
   const existing = registry.get(runId);
