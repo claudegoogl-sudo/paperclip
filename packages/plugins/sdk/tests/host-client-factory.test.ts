@@ -370,3 +370,107 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
     });
   });
 });
+
+describe("createHostClientHandlers — singleInFlightScope cannot widen company scope (PLA-722)", () => {
+  // PLA-719 added `context.singleInFlightScope` for the legacy runId back-fill
+  // ONLY. `requireInvocationCompanyScope` governs tenant scope solely via
+  // `invalidInvocationScope` + `invocationScope.companyId`; it must never read
+  // `singleInFlightScope`. These tests pin that invariant directly so a future
+  // refactor that starts consulting the field for company scope fails loudly.
+  const SECRET_REF = "22222222-2222-2222-2222-222222222222";
+
+  it("denies a different-company call even when singleInFlightScope names another company", async () => {
+    const resolve = vi.fn(async () => "resolved-value");
+    const services = { secrets: { resolve } } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services,
+    });
+
+    const context = {
+      invalidInvocationScope: true,
+      singleInFlightScope: {
+        companyId: "company-a",
+        runId: "run-x",
+        agentId: "agent-a",
+      },
+    };
+
+    await expect(
+      handlers["secrets.resolve"](
+        { secretRef: SECRET_REF, companyId: "company-b" } as never,
+        context,
+      ),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    await expect(
+      handlers["secrets.resolve"](
+        { secretRef: SECRET_REF, companyId: "company-b" } as never,
+        context,
+      ),
+    ).rejects.toMatchObject({
+      code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED,
+    });
+    // Resolved against neither company-a (singleInFlightScope) nor company-b (params).
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
+  it("still back-fills runId from singleInFlightScope for the legacy no-companyId shape", async () => {
+    const resolve = vi.fn(async () => "resolved-value");
+    const services = { secrets: { resolve } } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services,
+    });
+
+    // Same context as above, but the legacy `{ secretRef }` shape requests no
+    // company, so the scope check is a no-op and the field serves its intended
+    // purpose: back-filling the dispatch runId.
+    await handlers["secrets.resolve"](
+      { secretRef: SECRET_REF } as never,
+      {
+        invalidInvocationScope: true,
+        singleInFlightScope: {
+          companyId: "company-a",
+          runId: "run-x",
+          agentId: "agent-a",
+        },
+      },
+    );
+
+    expect(resolve).toHaveBeenCalledWith({
+      secretRef: SECRET_REF,
+      runId: "run-x",
+    });
+  });
+
+  it("denies a company-scoped call that MATCHES singleInFlightScope when no invocationScope resolved", async () => {
+    const resolve = vi.fn(async () => "resolved-value");
+    const services = { secrets: { resolve } } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services,
+    });
+
+    // Only singleInFlightScope is present — not flagged invalid, no invocationScope.
+    // If requireInvocationCompanyScope ever fell back to singleInFlightScope for
+    // the allowed company, this would resolve against company-a. It must fail
+    // closed instead: this is the assertion that flips throw→resolve under a
+    // widening refactor.
+    await expect(
+      handlers["secrets.resolve"](
+        { secretRef: SECRET_REF, companyId: "company-a" } as never,
+        {
+          singleInFlightScope: {
+            companyId: "company-a",
+            runId: "run-x",
+            agentId: "agent-a",
+          },
+        },
+      ),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    expect(resolve).not.toHaveBeenCalled();
+  });
+});
