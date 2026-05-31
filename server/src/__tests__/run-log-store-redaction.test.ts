@@ -2,7 +2,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { REDACTED_EVENT_VALUE, REDACTED_VAULT_VALUE } from "../redaction.js";
+import { REDACTED_EVENT_VALUE, REDACTED_VAULT_VALUE, redactSensitiveText } from "../redaction.js";
 import { clearRunSecretValues, registerRunSecretValue } from "../run-secret-registry.js";
 
 let tmpDir: string;
@@ -131,6 +131,68 @@ describe("RunLogStore.append() value-exact vault redaction (PLA-697)", () => {
     const parsed = JSON.parse(persisted.trim());
     // After clearing, the value is no longer registered, so the heuristic
     // redactor leaves this hint-free value untouched.
+    expect(parsed).toEqual({ ts, stream: "stdout", chunk });
+  });
+});
+
+// ── Finding A regression (PLA-704) ───────────────────────────────────────────
+// event.message must be routed through redactSensitiveText so value-exact and
+// pattern redactors both see it (not just redactCurrentUserText).
+describe("redactSensitiveText covers event.message field (Finding A, PLA-704)", () => {
+  const HIGH_ENTROPY = "Zx7Qm2Lp9Rt4Wv6Yb1Nc3Df5Gh8Jk0MnABC";
+  const RUN_ID = "run-704-finding-a";
+
+  afterEach(() => {
+    clearRunSecretValues(RUN_ID);
+  });
+
+  it("redacts a registered vault value that appears in a message string", () => {
+    registerRunSecretValue(RUN_ID, HIGH_ENTROPY);
+    const message = `tool returned: ${HIGH_ENTROPY} end`;
+    const result = redactSensitiveText(message);
+    expect(result).not.toContain(HIGH_ENTROPY);
+    expect(result).toContain(REDACTED_VAULT_VALUE);
+  });
+});
+
+// ── Finding B regression (PLA-704) ───────────────────────────────────────────
+// Short (< 8 char) values must be silently skipped by registerRunSecretValue so
+// they can never cause over-redaction in sibling runs' logs.
+describe("registerRunSecretValue short-value guard (Finding B, PLA-704)", () => {
+  const SHORT_VALUE = "abc";
+  const RUN_A = "run-704-finding-b-a";
+  const RUN_B = "run-704-finding-b-b";
+
+  afterEach(() => {
+    clearRunSecretValues(RUN_A);
+    clearRunSecretValues(RUN_B);
+  });
+
+  it("does not register a value shorter than the minimum length floor", () => {
+    // Must not throw, and the short value must not be redacted from any string.
+    expect(() => registerRunSecretValue(RUN_A, SHORT_VALUE)).not.toThrow();
+    const input = `status: ${SHORT_VALUE} ok`;
+    const result = redactSensitiveText(input);
+    expect(result).toBe(input);
+  });
+
+  it("short value registered by run A does not corrupt run B log content", async () => {
+    registerRunSecretValue(RUN_A, SHORT_VALUE);
+    const store = getRunLogStore();
+    const handle = await store.begin({
+      companyId: "company-redaction",
+      agentId: "agent-redaction",
+      runId: RUN_B,
+    });
+
+    const ts = "2026-05-31T00:00:00.000Z";
+    // RUN_B's log contains the same short token but should NOT be redacted.
+    const chunk = `sibling log contains the value ${SHORT_VALUE} inline`;
+    await store.append(handle, { stream: "stdout", ts, chunk });
+
+    const absPath = path.resolve(tmpDir, handle.logRef);
+    const persisted = await fs.readFile(absPath, "utf8");
+    const parsed = JSON.parse(persisted.trim());
     expect(parsed).toEqual({ ts, stream: "stdout", chunk });
   });
 });

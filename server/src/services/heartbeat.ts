@@ -4363,7 +4363,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   ) {
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
     const sanitizedMessage = event.message
-      ? redactCurrentUserText(event.message, currentUserRedactionOptions)
+      ? redactSensitiveText(redactCurrentUserText(event.message, currentUserRedactionOptions))
       : event.message;
     const boundedPayload = event.payload
       ? boundHeartbeatRunEventPayloadForStorage(event.payload)
