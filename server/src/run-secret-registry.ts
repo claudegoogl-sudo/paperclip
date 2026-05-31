@@ -34,6 +34,17 @@ const registry = new Map<string, RegistryEntry>();
  */
 const ENTRY_TTL_MS = 60 * 60 * 1_000;
 
+/**
+ * Minimum length (in characters) for a value to be registered for value-exact
+ * scrub. Values shorter than this floor are too short to uniquely identify a
+ * secret and would cause pathological over-redaction across concurrent runs
+ * (PLA-704 Finding B). Fail-open for short values is acceptable because
+ * high-entropy secrets resolved by platform.vault are always well above this
+ * floor; the heuristic/pattern redactors in redactSensitiveText handle
+ * structured short-field leaks (JWT, env vars, etc.) independently.
+ */
+export const MIN_REDACTABLE_VALUE_LENGTH = 8;
+
 function pruneExpired(now: number): void {
   for (const [runId, entry] of registry) {
     if (now - entry.touchedAt > ENTRY_TTL_MS) registry.delete(runId);
@@ -60,6 +71,9 @@ export function registerRunSecretValue(runId: string, value: string): void {
   if (typeof value !== "string" || value.length === 0) {
     throw new Error("registerRunSecretValue: a non-empty value is required");
   }
+  // Values below the entropy floor are skipped: they are too short to uniquely
+  // identify a secret and would cause host-wide cross-run over-redaction (PLA-704 B).
+  if (value.length < MIN_REDACTABLE_VALUE_LENGTH) return;
   const now = Date.now();
   pruneExpired(now);
   const existing = registry.get(runId);

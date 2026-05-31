@@ -153,7 +153,7 @@ import {
   redactCurrentUserValue,
   type CurrentUserRedactionOptions,
 } from "../log-redaction.js";
-import { redactEventPayload, redactSensitiveText } from "../redaction.js";
+import { redactEventPayload, redactSensitiveText, sanitizeRunEventMessage } from "../redaction.js";
 import { clearRunSecretValues } from "../run-secret-registry.js";
 import {
   hasSessionCompactionThresholds,
@@ -4363,7 +4363,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   ) {
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
     const sanitizedMessage = event.message
-      ? redactCurrentUserText(event.message, currentUserRedactionOptions)
+      ? sanitizeRunEventMessage(event.message, currentUserRedactionOptions)
       : event.message;
     const boundedPayload = event.payload
       ? boundHeartbeatRunEventPayloadForStorage(event.payload)
