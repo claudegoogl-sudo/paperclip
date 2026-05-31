@@ -18,12 +18,23 @@ const ACTIVITY_ACTION_TO_PLUGIN_EVENT: Readonly<Record<string, PluginEventType>>
   issue_document_updated: "issue.document.updated",
   issue_document_deleted: "issue.document.deleted",
   issue_blockers_updated: "issue.relations.updated",
+  issue_thread_interaction_created: "issue.interaction.created",
+  issue_thread_interaction_accepted: "issue.interaction.responded",
+  issue_thread_interaction_rejected: "issue.interaction.responded",
+  issue_thread_interaction_answered: "issue.interaction.responded",
   approval_approved: "approval.decided",
   approval_rejected: "approval.decided",
   approval_revision_requested: "approval.decided",
   budget_soft_threshold_crossed: "budget.incident.opened",
   budget_hard_threshold_crossed: "budget.incident.opened",
   budget_incident_resolved: "budget.incident.resolved",
+};
+
+const INTERACTION_OUTCOME_FROM_ACTION: Readonly<Record<string, string>> = {
+  issue_thread_interaction_created: "created",
+  issue_thread_interaction_accepted: "accepted",
+  issue_thread_interaction_rejected: "rejected",
+  issue_thread_interaction_answered: "answered",
 };
 
 let _pluginEventBus: PluginEventBus | null = null;
@@ -36,9 +47,14 @@ export function setPluginEventBus(bus: PluginEventBus): void {
   _pluginEventBus = bus;
 }
 
-function eventTypeForActivityAction(action: string): PluginEventType | null {
+export function eventTypeForActivityAction(action: string): PluginEventType | null {
   if (PLUGIN_EVENT_SET.has(action)) return action as PluginEventType;
   return ACTIVITY_ACTION_TO_PLUGIN_EVENT[action.replaceAll(".", "_")] ?? null;
+}
+
+export function pluginPayloadExtrasForActivityAction(action: string): Record<string, unknown> {
+  const outcome = INTERACTION_OUTCOME_FROM_ACTION[action.replaceAll(".", "_")];
+  return outcome ? { outcome } : {};
 }
 
 export function publishPluginDomainEvent(event: PluginEvent): void {
@@ -112,6 +128,7 @@ export async function logActivity(db: Db, input: LogActivityInput) {
         ...redactedDetails,
         agentId: input.agentId ?? null,
         runId: input.runId ?? null,
+        ...pluginPayloadExtrasForActivityAction(input.action),
       },
     };
     publishPluginDomainEvent(event);
