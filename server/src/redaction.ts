@@ -1,4 +1,5 @@
 import { redactCommandText } from "@paperclipai/adapter-utils";
+import { type CurrentUserRedactionOptions, redactCurrentUserText } from "./log-redaction.js";
 import { redactRegisteredSecretValues } from "./run-secret-registry.js";
 
 const SECRET_FIELD_NAME_PATTERN =
@@ -145,4 +146,16 @@ export function redactSensitiveText(input: string): string {
       .replace(ESCAPED_JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`),
     REDACTED_EVENT_VALUE,
   );
+}
+
+/**
+ * Single source of truth for sanitizing a heartbeat run-event `message` before
+ * persistence. Composes the current-user/PII censor with the value-exact +
+ * pattern redactor so a host-registered secret (e.g. a `vault.read` plaintext)
+ * appearing in an event message is scrubbed, not only username/PII text
+ * (PLA-704 Finding A). `appendRunEvent` delegates here; the regression test
+ * drives this helper so reverting the value-exact composition fails CI.
+ */
+export function sanitizeRunEventMessage(message: string, opts?: CurrentUserRedactionOptions): string {
+  return redactSensitiveText(redactCurrentUserText(message, opts));
 }

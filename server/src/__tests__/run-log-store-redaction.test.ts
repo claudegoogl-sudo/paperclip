@@ -2,7 +2,12 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { REDACTED_EVENT_VALUE, REDACTED_VAULT_VALUE, redactSensitiveText } from "../redaction.js";
+import {
+  REDACTED_EVENT_VALUE,
+  REDACTED_VAULT_VALUE,
+  redactSensitiveText,
+  sanitizeRunEventMessage,
+} from "../redaction.js";
 import { MIN_REDACTABLE_VALUE_LENGTH, clearRunSecretValues, registerRunSecretValue } from "../run-secret-registry.js";
 
 let tmpDir: string;
@@ -135,14 +140,14 @@ describe("RunLogStore.append() value-exact vault redaction (PLA-697)", () => {
   });
 });
 
-// PLA-704 Finding A: appendRunEvent message field must route through
-// redactSensitiveText (value-exact + pattern redactor), not only
-// redactCurrentUserText. The fix composes:
-//   redactSensitiveText(redactCurrentUserText(event.message, opts))
-// This test verifies that a registered vault value appearing in an event
-// message is scrubbed — the same assertion that would fail pre-fix if only
-// redactCurrentUserText were applied.
-describe("PLA-704 Finding A — redactSensitiveText covers registered values in event messages", () => {
+// PLA-704 Finding A: appendRunEvent's message field must route through the
+// value-exact + pattern redactor, not only the current-user/PII censor.
+// appendRunEvent delegates message sanitization to sanitizeRunEventMessage()
+// (server/src/redaction.ts), so this test drives that exact helper. If the
+// fix is reverted — i.e. sanitizeRunEventMessage drops the redactSensitiveText
+// composition and returns redactCurrentUserText alone — the first assertion
+// below fails, satisfying the must-fail-pre-fix bar at the real fix site.
+describe("PLA-704 Finding A — sanitizeRunEventMessage scrubs registered values in event messages", () => {
   const SECRET = "Zx7Qm2Lp9Rt4Wv6Yb1Nc3Df5Gh8Jk0Ma"; // high-entropy, no secret hint
   const RUN_ID = "run-pla704a-msg-1";
 
@@ -150,25 +155,22 @@ describe("PLA-704 Finding A — redactSensitiveText covers registered values in 
     clearRunSecretValues(RUN_ID);
   });
 
-  it("scrubs a registered vault value from an event message via redactSensitiveText", () => {
+  it("scrubs a registered vault value from an event message", () => {
     registerRunSecretValue(RUN_ID, SECRET);
     const message = `vault.read resolved: ${SECRET} — returning to agent`;
-    const scrubbed = redactSensitiveText(message);
+    const scrubbed = sanitizeRunEventMessage(message);
     expect(scrubbed).not.toContain(SECRET);
     expect(scrubbed).toContain(REDACTED_VAULT_VALUE);
   });
 
-  it("pre-fix simulation: redactCurrentUserText alone does NOT scrub the registered value", () => {
-    // This documents the gap that Finding A closes. redactCurrentUserText
-    // operates on username/PII patterns only; it knows nothing about the
-    // value-exact registry. The registered value survives it unchanged.
+  it("guards the gap: the registered value is present pre-sanitize and absent post-sanitize", () => {
+    // redactCurrentUserText (the only redactor applied pre-fix) is a no-op for
+    // non-PII text, so the raw message still carries the secret. Only the
+    // value-exact composition inside sanitizeRunEventMessage removes it.
     registerRunSecretValue(RUN_ID, SECRET);
     const message = `vault.read resolved: ${SECRET} — returning to agent`;
-    // redactCurrentUserText with no options is a no-op for non-PII text.
-    // Confirm the value is still present (i.e., the gap is real).
     expect(message).toContain(SECRET);
-    // The fix (redactSensitiveText composition) DOES scrub it.
-    expect(redactSensitiveText(message)).not.toContain(SECRET);
+    expect(sanitizeRunEventMessage(message)).not.toContain(SECRET);
   });
 });
 
