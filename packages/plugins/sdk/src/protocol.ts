@@ -295,6 +295,20 @@ export interface PluginInvocationContext {
 export interface WorkerHostCallContext {
   invocationScope?: PluginInvocationScope | null;
   invalidInvocationScope?: boolean;
+  /**
+   * PLA-719: the host-validated scope of the SINGLE host→worker dispatch that
+   * is in-flight when a worker→host call arrives without echoing a
+   * `paperclipInvocationId`. Plugins bundled against a pre-PLA-657 SDK (e.g.
+   * platform.cad ≤0.1.7) never echo the id, so `invocationScope` cannot be
+   * resolved for their callbacks. When — and only when — exactly one dispatch
+   * is in-flight, that dispatch is unambiguously the one the worker is
+   * servicing, so the host surfaces its scope here for the legacy runId
+   * back-fill (secrets.resolve / artifacts.fetch). It is intentionally NOT used
+   * for company-scope enforcement: `invalidInvocationScope` still governs that,
+   * so a worker can never name an arbitrary target company off this field.
+   * Absent whenever 0 or 2+ dispatches are in-flight (fail closed).
+   */
+  singleInFlightScope?: PluginInvocationScope | null;
 }
 
 // ---------------------------------------------------------------------------

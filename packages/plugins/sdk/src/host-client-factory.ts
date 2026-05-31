@@ -588,10 +588,19 @@ export function createHostClientHandlers(
    * from the worker — so the security invariants of PLA-657/PLA-574 are
    * preserved.
    *
-   * Only writes when (a) the worker omitted `runId` AND (b) the invocation
-   * scope has a runId AND (c) the scope was validated by the host (the
-   * `invalidInvocationScope` branch is rejected upstream in
-   * `requireInvocationCompanyScope`).
+   * Only writes when (a) the worker omitted `runId` AND (b) a host-validated
+   * scope carries a runId.
+   *
+   * The scope is sourced, in order, from:
+   *   1. `context.invocationScope` — the worker echoed a `paperclipInvocationId`
+   *      the host resolved to an active dispatch (post-PLA-657 SDKs).
+   *   2. `context.singleInFlightScope` — PLA-719: the worker echoed no id (a
+   *      pre-PLA-657 SDK such as platform.cad ≤0.1.7), but exactly one
+   *      host→worker dispatch is in-flight, so the host attributes the callback
+   *      to it. Both come from the host's own runContext, never from the worker,
+   *      so the PLA-657/PLA-574 isolation model holds: a forged worker→host call
+   *      outside any dispatch surfaces no scope here and still fails closed at
+   *      the server's secrets handler (`runcontext_invalid`).
    */
   function backfillDispatchRunId<P>(
     params: P,
@@ -599,7 +608,9 @@ export function createHostClientHandlers(
   ): P {
     if (!isRecord(params)) return params;
     if (readNonEmptyString((params as Record<string, unknown>).runId)) return params;
-    const scopedRunId = readNonEmptyString(context?.invocationScope?.runId);
+    const scopedRunId =
+      readNonEmptyString(context?.invocationScope?.runId) ??
+      readNonEmptyString(context?.singleInFlightScope?.runId);
     if (!scopedRunId) return params;
     return { ...params, runId: scopedRunId } as P;
   }
