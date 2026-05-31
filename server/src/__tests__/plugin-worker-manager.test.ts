@@ -25,6 +25,10 @@ const LEGACY_SECRETS_WORKER_ENTRYPOINT = path.join(
   FIXTURES_DIR,
   "plugin-worker-legacy-secrets.cjs",
 );
+const NOID_SECRETS_WORKER_ENTRYPOINT = path.join(
+  FIXTURES_DIR,
+  "plugin-worker-noid-secrets.cjs",
+);
 const TERMINATED_WORKER_ENTRYPOINT = path.join(FIXTURES_DIR, "plugin-worker-terminated.cjs");
 const STREAM_SCOPE_WORKER_ENTRYPOINT = path.join(
   FIXTURES_DIR,
@@ -578,6 +582,134 @@ describe("PLA-673 — back-fill runId for pre-PLA-657 SDK secrets.resolve", () =
 
     expect(secretsResolve).toHaveBeenCalledWith({
       secretRef: "11111111-1111-1111-1111-111111111111",
+    });
+  });
+});
+
+describe("PLA-719 — back-fill runId when the worker echoes no invocation id", () => {
+  // The deployed platform.cad worker (cad ≤0.1.7) sends `secrets.resolve`
+  // with neither `runId` NOR `paperclipInvocationId` (verified: its bundled
+  // worker.js has zero `paperclipInvocation` references). PLA-673's back-fill
+  // therefore had nothing to resolve a scope from and the call failed closed
+  // at the server's secrets handler. PLA-719 attributes such an id-less
+  // callback to the SINGLE in-flight host→worker dispatch and surfaces its
+  // host-validated scope via `singleInFlightScope`, so the runId back-fill
+  // succeeds — without trusting any worker-supplied field.
+
+  it("back-fills runId from the single in-flight dispatch when the worker omits the invocation id", async () => {
+    const secretsResolve = vi.fn(async (params: { secretRef: string; runId?: string }) => {
+      return `value-for-${params.secretRef}-via-${params.runId ?? "<missing>"}`;
+    });
+    const handlers = createHostClientHandlers({
+      pluginId: "test.plugin",
+      capabilities: ["secrets.read-ref"],
+      services: {
+        secrets: { resolve: secretsResolve },
+      } as unknown as HostServices,
+    });
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: NOID_SECRETS_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: handlers,
+    });
+
+    try {
+      await handle.start();
+
+      await expect(
+        handle.call("executeTool", {
+          toolName: "cad.export",
+          parameters: {
+            secretRef: "11111111-1111-1111-1111-111111111111",
+          },
+          runContext: {
+            agentId: "agent-1",
+            runId: "run-pla719",
+            companyId: "company-a",
+            projectId: "project-1",
+          },
+        } as unknown as HostToWorkerMethods["executeTool"][0]),
+      ).resolves.toMatchObject({
+        data: {
+          resolvedTo: "value-for-11111111-1111-1111-1111-111111111111-via-run-pla719",
+        },
+      });
+
+      expect(secretsResolve).toHaveBeenCalledTimes(1);
+      // No runId AND no invocation id arrived on the wire; the host resolved
+      // the single in-flight executeTool dispatch and the gated wrapper
+      // back-filled runId from its host-validated scope.
+      expect(secretsResolve.mock.calls[0]?.[0]).toEqual({
+        secretRef: "11111111-1111-1111-1111-111111111111",
+        runId: "run-pla719",
+      });
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("does not back-fill (fails closed) when no scope is surfaced — neither invocationScope nor singleInFlightScope", async () => {
+    const secretsResolve = vi.fn(async () => "should-not-be-resolved");
+    const handlers = createHostClientHandlers({
+      pluginId: "test.plugin",
+      capabilities: ["secrets.read-ref"],
+      services: {
+        secrets: { resolve: secretsResolve },
+      } as unknown as HostServices,
+    });
+
+    // Context with invalidInvocationScope but NO singleInFlightScope models the
+    // ambiguous case (0 or 2+ dispatches in-flight). The wrapper must forward
+    // params unchanged so the server-side secrets handler still throws
+    // `runcontext_invalid`.
+    await expect(
+      handlers["secrets.resolve"](
+        { secretRef: "11111111-1111-1111-1111-111111111111" } as never,
+        { invalidInvocationScope: true },
+      ),
+    ).resolves.toEqual("should-not-be-resolved");
+
+    expect(secretsResolve).toHaveBeenCalledWith({
+      secretRef: "11111111-1111-1111-1111-111111111111",
+    });
+  });
+
+  it("back-fills runId from singleInFlightScope while leaving company-scope enforcement to invalidInvocationScope", async () => {
+    const secretsResolve = vi.fn(
+      async (params: { secretRef: string; runId?: string }) => params.runId ?? "<missing>",
+    );
+    const handlers = createHostClientHandlers({
+      pluginId: "test.plugin",
+      capabilities: ["secrets.read-ref"],
+      services: {
+        secrets: { resolve: secretsResolve },
+      } as unknown as HostServices,
+    });
+
+    // secrets.resolve is not company-scoped at the wrapper layer, so
+    // invalidInvocationScope does not block it; singleInFlightScope feeds the
+    // runId back-fill. The runId originates from the host scope, never the
+    // worker params.
+    await expect(
+      handlers["secrets.resolve"](
+        { secretRef: "11111111-1111-1111-1111-111111111111" } as never,
+        {
+          invalidInvocationScope: true,
+          singleInFlightScope: {
+            companyId: "company-a",
+            runId: "run-pla719",
+            agentId: "agent-1",
+          },
+        },
+      ),
+    ).resolves.toEqual("run-pla719");
+
+    expect(secretsResolve).toHaveBeenCalledWith({
+      secretRef: "11111111-1111-1111-1111-111111111111",
+      runId: "run-pla719",
     });
   });
 });

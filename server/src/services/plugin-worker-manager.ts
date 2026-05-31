@@ -582,9 +582,33 @@ export function createPluginWorkerHandle(
       (message as { paperclipInvocationId?: unknown }).paperclipInvocationId,
     );
     if (!invocationId) {
-      const hasActiveInvocation = activeInvocations.size > 0 ||
-        Array.from(pendingRequests.values()).some((pending) => pending.invocationId);
-      return hasActiveInvocation ? { invalidInvocationScope: true } : {};
+      // PLA-719: a pre-PLA-657 worker SDK (e.g. platform.cad ≤0.1.7) does not
+      // echo `paperclipInvocationId` on its worker→host callbacks, so we cannot
+      // bind this call to an invocation by id. When EXACTLY ONE host→worker
+      // dispatch is in-flight, that dispatch is unambiguously the one the worker
+      // is servicing, so we surface its host-validated scope as
+      // `singleInFlightScope` for the legacy runId back-fill ONLY (the runId
+      // comes from the host's own runContext, never the worker). We deliberately
+      // STILL return `invalidInvocationScope` so company-scope enforcement stays
+      // strict — a worker can never name an arbitrary target company off this.
+      // With 0 or 2+ dispatches in-flight we cannot attribute the call and fall
+      // through to the fail-closed behaviour (no scope surfaced).
+      const inFlightInvocationIds = new Set<string>();
+      for (const pending of pendingRequests.values()) {
+        if (pending.invocationId) inFlightInvocationIds.add(pending.invocationId);
+      }
+      const hasActiveInvocation =
+        activeInvocations.size > 0 || inFlightInvocationIds.size > 0;
+      if (!hasActiveInvocation) return {};
+      let singleInFlightScope: PluginInvocationScope | undefined;
+      if (inFlightInvocationIds.size === 1) {
+        const [onlyId] = inFlightInvocationIds;
+        const entry = onlyId ? activeInvocations.get(onlyId) : undefined;
+        if (entry) singleInFlightScope = entry.scope;
+      }
+      return singleInFlightScope
+        ? { invalidInvocationScope: true, singleInFlightScope }
+        : { invalidInvocationScope: true };
     }
     const entry = activeInvocations.get(invocationId);
     if (!entry) return { invalidInvocationScope: true };
