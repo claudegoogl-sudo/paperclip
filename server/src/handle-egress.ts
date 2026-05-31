@@ -378,6 +378,17 @@ function parseEntry(entry: string): AllowlistMatcher | null {
 }
 
 /**
+ * True if `entry` is a well-formed operator allowlist entry — i.e. the egress
+ * matcher can parse it into a real origin rule. Used by the operator-set path
+ * (PLA-731) to reject malformed entries up front rather than silently storing a
+ * dead rule that {@link matchesAllowlist} would skip (an entry that never
+ * matches is a footgun once the binding is flipped to enforce).
+ */
+export function isValidAllowlistEntry(entry: string): boolean {
+  return parseEntry(entry) !== null;
+}
+
+/**
  * True if `origin` is permitted by `allowlist`. Match is exact origin
  * (scheme + host + port, post-normalization). No implicit subdomain wildcard:
  * `*.host` matches a strict subdomain only; a bare `host` never matches a

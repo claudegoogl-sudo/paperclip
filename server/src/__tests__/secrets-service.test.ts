@@ -15,6 +15,13 @@ import {
   secretAccessEvents,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import {
+  clearHostMediatedTools,
+  decideEgress,
+  registerHostMediatedTool,
+  type HandleEgressCapture,
+} from "../handle-egress.js";
+import { clearRunHandles, getHandleRecord, mintHandle } from "../handle-vault.js";
 import { awsSecretsManagerProvider } from "../secrets/aws-secrets-manager-provider.js";
 import { localEncryptedProvider } from "../secrets/local-encrypted-provider.js";
 import { SecretProviderClientError } from "../secrets/types.js";
@@ -1912,5 +1919,171 @@ describeEmbeddedPostgres("secretService", () => {
     await expect(svc.resolveSecretValue(companyId, secret.id, "latest")).rejects.toThrow(
       /not active/i,
     );
+  });
+
+  // PLA-731 (EG4 ruling 2): migration 0092 left every pre-existing binding
+  // log-only. These cover the operator-driven flip-to-enforce path that closes
+  // that time-box one binding at a time.
+  describe("egress allowlist enforce-flip (PLA-731)", () => {
+    const FETCH_TOOL = "platform.http:fetch";
+    const RUN_ID = "run-pla731";
+    const SECRET_VALUE = "Zx7Qm2Lp9Rt4Wv6Yb1Nc3Df5Gh8Jk0Mn2Pq4Su6Xa";
+
+    beforeAll(() => {
+      registerHostMediatedTool(FETCH_TOOL, { destinationParam: "url", kind: "url" });
+    });
+    afterAll(() => {
+      clearHostMediatedTools();
+    });
+    afterEach(() => {
+      clearRunHandles(RUN_ID);
+    });
+
+    // A migrated row as 0092 left it: enforcement off, empty allowlist.
+    async function seedMigratedBinding() {
+      const companyId = await seedCompany();
+      const svc = secretService(db);
+      const secret = await svc.create(companyId, {
+        name: `eg-${randomUUID()}`,
+        provider: "local_encrypted",
+        value: SECRET_VALUE,
+      });
+      const binding = await svc.createBinding({
+        companyId,
+        secretId: secret.id,
+        targetType: "agent",
+        targetId: "agent-eg",
+        configPath: "env.API_KEY",
+      });
+      // Replicate migration 0092: pre-existing rows flipped to log-only.
+      await db
+        .update(companySecretBindings)
+        .set({ egressAllowlistEnforced: false })
+        .where(eq(companySecretBindings.id, binding.id));
+      return { companyId, svc, bindingId: binding.id };
+    }
+
+    async function reloadBinding(bindingId: string) {
+      return db
+        .select()
+        .from(companySecretBindings)
+        .where(eq(companySecretBindings.id, bindingId))
+        .then((rows) => rows[0]);
+    }
+
+    // Decide egress for a destination as if a handle minted under `binding`'s
+    // current posture carried it — the realistic mint-time-capture path.
+    function decideForBinding(
+      binding: { allowedEgress: string[]; egressAllowlistEnforced: boolean; id: string },
+      url: string,
+    ) {
+      const capture: HandleEgressCapture = {
+        handle: "vault-handle://x/y",
+        allowedEgress: binding.allowedEgress,
+        enforced: binding.egressAllowlistEnforced,
+        bindingId: binding.id,
+      };
+      return decideEgress({
+        namespacedName: FETCH_TOOL,
+        descriptor: { destinationParam: "url", kind: "url" },
+        rawParameters: { url },
+        handles: [capture],
+      });
+    }
+
+    it("a migrated binding denies a non-allowlisted destination once flipped", async () => {
+      const { companyId, svc, bindingId } = await seedMigratedBinding();
+
+      // Pre-flip (log-only): the call is recorded as would-deny but NOT blocked.
+      const migrated = await reloadBinding(bindingId);
+      const before = decideForBinding(migrated, "https://evil.example.com/exfil");
+      expect(before.allow).toBe(true);
+      expect(before.wouldDeny).toHaveLength(1);
+
+      // Operator seeds the reviewed allowlist, then signs off the flip.
+      await svc.setBindingEgressAllowlist({
+        companyId,
+        bindingId,
+        allowedEgress: ["https://api.github.com"],
+      });
+      const flip = await svc.enforceBindingEgress({ companyId, bindingId });
+      expect(flip.binding.egressAllowlistEnforced).toBe(true);
+
+      const enforced = await reloadBinding(bindingId);
+      // Non-allowlisted destination is now hard-denied (fail-closed).
+      const denied = decideForBinding(enforced, "https://evil.example.com/exfil");
+      expect(denied.allow).toBe(false);
+      // The reviewed destination still flows.
+      const allowed = decideForBinding(enforced, "https://api.github.com/repos");
+      expect(allowed.allow).toBe(true);
+    });
+
+    it("purges in-flight handles minted under the binding on flip (EG3)", async () => {
+      const { companyId, svc, bindingId } = await seedMigratedBinding();
+      await svc.setBindingEgressAllowlist({
+        companyId,
+        bindingId,
+        allowedEgress: ["https://api.github.com"],
+      });
+
+      // A handle minted under the pre-flip (log-only) posture.
+      const handle = mintHandle(RUN_ID, SECRET_VALUE, {
+        allowedEgress: [],
+        enforced: false,
+        bindingId,
+      });
+      expect(getHandleRecord(RUN_ID, handle)).toBeDefined();
+
+      const flip = await svc.enforceBindingEgress({ companyId, bindingId });
+      expect(flip.handlesPurged).toBe(1);
+      // The stale log-only handle is gone; the next mint re-captures enforce=true.
+      expect(getHandleRecord(RUN_ID, handle)).toBeUndefined();
+    });
+
+    it("refuses to enforce a binding with an empty allowlist (no breakage cliff)", async () => {
+      const { companyId, svc, bindingId } = await seedMigratedBinding();
+      await expect(svc.enforceBindingEgress({ companyId, bindingId })).rejects.toThrow(
+        /empty allowlist/i,
+      );
+      // The deliberate deny-all override is allowed.
+      const flip = await svc.enforceBindingEgress({ companyId, bindingId, allowEmpty: true });
+      expect(flip.binding.egressAllowlistEnforced).toBe(true);
+    });
+
+    it("re-flipping an already-enforcing binding is idempotent", async () => {
+      const { companyId, svc, bindingId } = await seedMigratedBinding();
+      await svc.setBindingEgressAllowlist({
+        companyId,
+        bindingId,
+        allowedEgress: ["https://api.github.com"],
+      });
+      await svc.enforceBindingEgress({ companyId, bindingId });
+      const again = await svc.enforceBindingEgress({ companyId, bindingId });
+      expect(again.binding.egressAllowlistEnforced).toBe(true);
+      const row = await reloadBinding(bindingId);
+      expect(row.egressAllowlistEnforced).toBe(true);
+    });
+
+    it("validates and de-duplicates operator allowlist entries", async () => {
+      const { companyId, svc, bindingId } = await seedMigratedBinding();
+      await expect(
+        svc.setBindingEgressAllowlist({ companyId, bindingId, allowedEgress: ["not a url with spaces"] }),
+      ).rejects.toThrow(/invalid egress allowlist entry/i);
+
+      const res = await svc.setBindingEgressAllowlist({
+        companyId,
+        bindingId,
+        allowedEgress: ["https://api.github.com", " https://api.github.com ", "*.internal.example"],
+      });
+      expect(res.binding.allowedEgress).toEqual(["https://api.github.com", "*.internal.example"]);
+    });
+
+    it("scopes the flip to the owning company", async () => {
+      const { svc, bindingId } = await seedMigratedBinding();
+      const otherCompany = await seedCompany("Other");
+      await expect(
+        svc.enforceBindingEgress({ companyId: otherCompany, bindingId }),
+      ).rejects.toThrow(/not found/i);
+    });
   });
 });
