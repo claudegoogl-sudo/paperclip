@@ -1,4 +1,5 @@
 import { redactCommandText } from "@paperclipai/adapter-utils";
+import { redactRegisteredSecretValues } from "./run-secret-registry.js";
 
 const SECRET_FIELD_NAME_PATTERN =
   String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)[A-Za-z0-9_-]*`;
@@ -38,6 +39,12 @@ const SECRET_TEXT_HINTS = [
   "ghr_",
 ] as const;
 export const REDACTED_EVENT_VALUE = "***REDACTED***";
+/**
+ * Marker for value-exact redaction of a host-registered secret (e.g. a
+ * `vault.read` plaintext). Distinct from {@link REDACTED_EVENT_VALUE} so a
+ * value-exact hit is attributable in a persisted record (PLA-697).
+ */
+export const REDACTED_VAULT_VALUE = "***REDACTED:vault***";
 
 function maybeContainsSecretText(input: string) {
   const lower = input.toLowerCase();
@@ -55,6 +62,9 @@ function sanitizeValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sanitizeValue);
   if (isSecretRefBinding(value)) return value;
   if (isPlainBinding(value)) return { type: "plain", value: sanitizeValue(value.value) };
+  // String leaves (e.g. a tool result's `data.value`) get value-exact scrubbing
+  // for any host-registered secret before being returned unchanged otherwise.
+  if (typeof value === "string") return redactRegisteredSecretValues(value, REDACTED_VAULT_VALUE);
   if (!isPlainObject(value)) return value;
   return sanitizeRecord(value);
 }
@@ -124,9 +134,13 @@ export function redactEventPayload(payload: Record<string, unknown> | null): Rec
 }
 
 export function redactSensitiveText(input: string): string {
-  if (!maybeContainsSecretText(input)) return input;
+  // Value-exact scrub runs FIRST and unconditionally: a high-entropy registered
+  // secret may carry no secret-ish hint, so it would survive the
+  // maybeContainsSecretText short-circuit below (PLA-697 / PLA-695 Control 1).
+  const valueScrubbed = redactRegisteredSecretValues(input, REDACTED_VAULT_VALUE);
+  if (!maybeContainsSecretText(valueScrubbed)) return valueScrubbed;
   return redactCommandText(
-    input
+    valueScrubbed
       .replace(JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`)
       .replace(ESCAPED_JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`),
     REDACTED_EVENT_VALUE,

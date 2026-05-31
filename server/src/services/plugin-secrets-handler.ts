@@ -62,6 +62,7 @@ import {
 import { logActivity } from "./activity-log.js";
 import { logger } from "../middleware/logger.js";
 import { secretService } from "./secrets.js";
+import { registerRunSecretValue } from "../run-secret-registry.js";
 import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js";
 
 /**
@@ -510,7 +511,37 @@ export function createPluginSecretsHandler(
         throw new SecretsError("not_found", "secret not found");
       }
 
-      // ---------- Gate 5: audit success + return ----------
+      // ---------- Gate 5: register for value-exact redaction (fail-closed) ----------
+      // The host has just mediated a vault.read resolution and holds plaintext.
+      // Register the exact bytes (keyed by the server-validated runId) so any
+      // PERSISTED tool-result/transcript/run-log record is value-exact redacted
+      // by the shared redaction pipeline — the pattern/field-name heuristics
+      // cannot reliably catch a high-entropy value embedded in free-form
+      // `content` (PLA-697 / PLA-695 Control 1). The live value still flows back
+      // to the worker (agent working context) unchanged below; only persisted
+      // records are scrubbed. Fail-closed: if registration throws, persistence
+      // could later leak the plaintext into the transcript, so we refuse the
+      // resolution (collapse to the opaque not_found) rather than leak it.
+      try {
+        registerRunSecretValue(ctx.runId, value);
+      } catch (err) {
+        log.warn(
+          { err, secretId: trimmedRef, companyId: ctx.companyId },
+          "value-exact redaction registration failed; refusing resolution (fail-closed)",
+        );
+        await audit({
+          outcome: "denied",
+          deniedReason: "not_found",
+          dispatchingAgentId: ctx.agentId,
+          dispatchingCompanyId: ctx.companyId,
+          secretId: trimmedRef,
+          runId: ctx.runId,
+          toolName: ctx.toolName,
+        });
+        throw new SecretsError("not_found", "secret not found");
+      }
+
+      // ---------- Gate 6: audit success + return ----------
       await audit({
         outcome: "allowed",
         dispatchingAgentId: ctx.agentId,
