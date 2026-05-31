@@ -777,6 +777,27 @@ export interface PluginSecretsClient {
    * @returns The resolved secret value.
    */
   resolve(secretRef: string, runId: string): Promise<string>;
+
+  /**
+   * Exchange a resolved secret plaintext for an opaque **borrowed handle**
+   * (`vault-handle://<runId>/<128-bit-id>`) — PLA-702 / PLA-695 Control 2.
+   *
+   * Return the handle to the agent INSTEAD of the plaintext. The host keeps the
+   * real value in a per-run vault and substitutes it back in only at the
+   * worker-dispatch edge of a downstream tool call, so the transcript and the
+   * persisted call record only ever contain the handle, never the secret. The
+   * value is also registered with the Control-1 value-exact redactor.
+   *
+   * Fail-closed: on any error, do NOT fall back to returning plaintext.
+   *
+   * Throws the same typed errors as {@link resolve} (`runcontext_invalid`,
+   * `rate_limited`, …) when minting is refused.
+   *
+   * @param value - The resolved secret plaintext to borrow.
+   * @param runId - The `runCtx.runId` of the active tool dispatch.
+   * @returns The opaque borrowed handle string.
+   */
+  mintHandle(value: string, runId: string): Promise<string>;
 }
 
 /**

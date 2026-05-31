@@ -114,6 +114,7 @@ const OPERATION_CAPABILITIES: Record<string, readonly PluginCapability[]> = {
   "webhooks.receive": ["webhooks.receive"],
   "http.request": ["http.outbound"],
   "secrets.resolve": ["secrets.read-ref"],
+  "secrets.mintHandle": ["secrets.read-ref"],
 
   // Agent tools
   "agent.tools.register": ["agent.tools.register"],
