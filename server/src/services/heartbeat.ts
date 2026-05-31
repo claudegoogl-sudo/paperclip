@@ -154,6 +154,7 @@ import {
   type CurrentUserRedactionOptions,
 } from "../log-redaction.js";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
+import { clearRunSecretValues } from "../run-secret-registry.js";
 import {
   hasSessionCompactionThresholds,
   resolveSessionCompactionPolicy,
@@ -8209,6 +8210,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             failureReason: latestRun?.error ?? undefined,
           });
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+          // Drop any value-exact secret values registered during this run so a
+          // rotated secret's stale plaintext is never retained across runs
+          // (PLA-697 / PLA-695 Control 1).
+          clearRunSecretValues(run.id);
           activeRunExecutions.delete(run.id);
           await startNextQueuedRunForAgent(run.agentId);
         }
