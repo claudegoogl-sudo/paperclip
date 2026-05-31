@@ -2,8 +2,13 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { REDACTED_EVENT_VALUE, REDACTED_VAULT_VALUE } from "../redaction.js";
-import { clearRunSecretValues, registerRunSecretValue } from "../run-secret-registry.js";
+import {
+  REDACTED_EVENT_VALUE,
+  REDACTED_VAULT_VALUE,
+  redactSensitiveText,
+  sanitizeRunEventMessage,
+} from "../redaction.js";
+import { MIN_REDACTABLE_VALUE_LENGTH, clearRunSecretValues, registerRunSecretValue } from "../run-secret-registry.js";
 
 let tmpDir: string;
 let getRunLogStore: typeof import("../services/run-log-store.js").getRunLogStore;
@@ -132,5 +137,74 @@ describe("RunLogStore.append() value-exact vault redaction (PLA-697)", () => {
     // After clearing, the value is no longer registered, so the heuristic
     // redactor leaves this hint-free value untouched.
     expect(parsed).toEqual({ ts, stream: "stdout", chunk });
+  });
+});
+
+// PLA-704 Finding A: appendRunEvent's message field must route through the
+// value-exact + pattern redactor, not only the current-user/PII censor.
+// appendRunEvent delegates message sanitization to sanitizeRunEventMessage()
+// (server/src/redaction.ts), so this test drives that exact helper. If the
+// fix is reverted — i.e. sanitizeRunEventMessage drops the redactSensitiveText
+// composition and returns redactCurrentUserText alone — the first assertion
+// below fails, satisfying the must-fail-pre-fix bar at the real fix site.
+describe("PLA-704 Finding A — sanitizeRunEventMessage scrubs registered values in event messages", () => {
+  const SECRET = "Zx7Qm2Lp9Rt4Wv6Yb1Nc3Df5Gh8Jk0Ma"; // high-entropy, no secret hint
+  const RUN_ID = "run-pla704a-msg-1";
+
+  afterEach(() => {
+    clearRunSecretValues(RUN_ID);
+  });
+
+  it("scrubs a registered vault value from an event message", () => {
+    registerRunSecretValue(RUN_ID, SECRET);
+    const message = `vault.read resolved: ${SECRET} — returning to agent`;
+    const scrubbed = sanitizeRunEventMessage(message);
+    expect(scrubbed).not.toContain(SECRET);
+    expect(scrubbed).toContain(REDACTED_VAULT_VALUE);
+  });
+
+  it("guards the gap: the registered value is present pre-sanitize and absent post-sanitize", () => {
+    // redactCurrentUserText (the only redactor applied pre-fix) is a no-op for
+    // non-PII text, so the raw message still carries the secret. Only the
+    // value-exact composition inside sanitizeRunEventMessage removes it.
+    registerRunSecretValue(RUN_ID, SECRET);
+    const message = `vault.read resolved: ${SECRET} — returning to agent`;
+    expect(message).toContain(SECRET);
+    expect(sanitizeRunEventMessage(message)).not.toContain(SECRET);
+  });
+});
+
+// PLA-704 Finding B: registerRunSecretValue must skip values below the
+// minimum-length floor. A short/low-entropy value (PIN, 3–4 char token) must
+// NOT be registered into the host-wide cross-run registry, so it cannot
+// corrupt unrelated concurrent run logs.
+describe("PLA-704 Finding B — min-length guard prevents short-value over-redaction", () => {
+  const SHORT_VALUE = "abc"; // well below MIN_REDACTABLE_VALUE_LENGTH
+  const SIBLING_RUN_ID = "run-pla704b-sibling";
+  const REGISTERING_RUN_ID = "run-pla704b-registering";
+
+  afterEach(() => {
+    clearRunSecretValues(REGISTERING_RUN_ID);
+    clearRunSecretValues(SIBLING_RUN_ID);
+  });
+
+  it("does not register values shorter than MIN_REDACTABLE_VALUE_LENGTH", () => {
+    expect(SHORT_VALUE.length).toBeLessThan(MIN_REDACTABLE_VALUE_LENGTH);
+    // registerRunSecretValue must NOT throw; it silently skips the short value.
+    expect(() => registerRunSecretValue(REGISTERING_RUN_ID, SHORT_VALUE)).not.toThrow();
+    // The short value must not appear in sibling run output.
+    const siblingText = `word with abc in it`;
+    const scrubbed = redactSensitiveText(siblingText);
+    // "abc" is NOT registered so sibling text is untouched.
+    expect(scrubbed).toBe(siblingText);
+  });
+
+  it("still registers values at or above the length floor", async () => {
+    const atFloor = "A".repeat(MIN_REDACTABLE_VALUE_LENGTH);
+    const RUN_ID2 = "run-pla704b-floor";
+    registerRunSecretValue(RUN_ID2, atFloor);
+    const text = `secret=${atFloor}`;
+    expect(redactSensitiveText(text)).not.toContain(atFloor);
+    clearRunSecretValues(RUN_ID2);
   });
 });
