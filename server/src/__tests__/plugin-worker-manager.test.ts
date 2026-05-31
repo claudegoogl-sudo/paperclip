@@ -712,4 +712,39 @@ describe("PLA-719 — back-fill runId when the worker echoes no invocation id", 
       runId: "run-pla719",
     });
   });
+
+  it("cannot widen company scope: a worker naming company-b is denied even when singleInFlightScope is company-a", async () => {
+    // SEC invariant (PLA-721): the new `singleInFlightScope` feeds the runId
+    // back-fill ONLY. `requireInvocationCompanyScope` runs first, never reads
+    // `singleInFlightScope`, and the no-id branch always sets
+    // `invalidInvocationScope` — so a worker that names a *different* company in
+    // params is still denied. This pins that the field can't widen tenant scope.
+    const companiesGet = vi.fn(async (params: { companyId: string }) => ({ id: params.companyId }));
+    const handlers = createHostClientHandlers({
+      pluginId: "test.plugin",
+      capabilities: ["companies.read"],
+      services: {
+        companies: { get: companiesGet },
+      } as unknown as HostServices,
+    });
+
+    await expect(
+      handlers["companies.get"](
+        { companyId: "company-b" } as never,
+        {
+          invalidInvocationScope: true,
+          singleInFlightScope: {
+            companyId: "company-a",
+            runId: "run-pla719",
+            agentId: "agent-1",
+          },
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED,
+      message: expect.stringContaining("unknown invocation scope"),
+    });
+
+    expect(companiesGet).not.toHaveBeenCalled();
+  });
 });
