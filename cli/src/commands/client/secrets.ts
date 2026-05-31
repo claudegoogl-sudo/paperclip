@@ -59,6 +59,59 @@ interface SecretMigrateInlineEnvOptions extends BaseClientOptions {
   apply?: boolean;
 }
 
+interface EgressReviewOptions extends BaseClientOptions {
+  companyId?: string;
+}
+
+interface EgressSetAllowlistOptions extends BaseClientOptions {
+  companyId?: string;
+  bindingId?: string;
+  allow?: string[];
+}
+
+interface EgressEnforceOptions extends BaseClientOptions {
+  companyId?: string;
+  bindingId?: string;
+  allowEmpty?: boolean;
+}
+
+export interface EgressSuggestion {
+  origin: string;
+  count: number;
+  firstSeen: string;
+  lastSeen: string;
+  selected: false;
+}
+
+export interface EgressReviewBinding {
+  id: string;
+  secretId: string;
+  targetType: string;
+  targetId: string;
+  configPath: string;
+  label: string | null;
+  allowedEgress: string[];
+  egressAllowlistEnforced: boolean;
+  suggestions: EgressSuggestion[];
+}
+
+/**
+ * PLA-735 — the operator review console is a high-privilege surface, and the
+ * `origin` strings rendered here are harvested from attacker-influenceable
+ * egress destinations (an agent can drive a borrowed handle at an arbitrary
+ * URL). Even though the server only persists a normalized scheme+host+port, we
+ * still treat these as untrusted when writing them to a terminal: strip ANSI
+ * escapes and other C0/C1 control characters so a crafted origin cannot move
+ * the cursor, recolor the line, or smuggle a terminal escape sequence into the
+ * operator's console (contextual output encoding for the TTY sink).
+ */
+// eslint-disable-next-line no-control-regex
+const TERMINAL_UNSAFE_RE = /[\u0000-\u001f\u007f-\u009f]/g;
+
+export function sanitizeForTerminal(value: string): string {
+  return value.replace(TERMINAL_UNSAFE_RE, "�");
+}
+
 interface SecretProviderHealth {
   provider: SecretProvider;
   status: "ok" | "warn" | "error";
@@ -250,6 +303,39 @@ function printProviderHealth(rows: SecretProviderHealth[], json: boolean): void 
     }
     for (const guidance of row.backupGuidance ?? []) {
       console.log(pc.dim(`backup=${guidance}`));
+    }
+  }
+}
+
+function printEgressReview(bindings: EgressReviewBinding[]): void {
+  if (bindings.length === 0) {
+    console.log(pc.dim("No borrowed-handle egress bindings in this company."));
+    return;
+  }
+  for (const binding of bindings) {
+    const posture = binding.egressAllowlistEnforced ? pc.green("enforced") : pc.yellow("log-only");
+    console.log(
+      formatInlineRecord({
+        binding: binding.id,
+        target: `${binding.targetType}:${binding.targetId}`,
+        configPath: binding.configPath,
+        posture,
+      }),
+    );
+    const allow = binding.allowedEgress.length > 0
+      ? binding.allowedEgress.map((e) => sanitizeForTerminal(e)).join(", ")
+      : pc.dim("(empty)");
+    console.log(`  allowlist: ${allow}`);
+    if (binding.suggestions.length === 0) {
+      console.log(pc.dim("  suggestions: (none harvested)"));
+    } else {
+      console.log(pc.dim(`  suggestions (UNCHECKED — select to add, nothing auto-applied):`));
+      for (const s of binding.suggestions) {
+        // "[ ]" makes it explicit each harvested origin is unselected.
+        console.log(
+          `    ${pc.dim("[ ]")} ${sanitizeForTerminal(s.origin)} ${pc.dim(`(count=${s.count}, lastSeen=${s.lastSeen})`)}`,
+        );
+      }
     }
   }
 }
@@ -493,6 +579,84 @@ export function registerSecretCommands(program: Command): void {
       .action(async (opts: SecretMigrateInlineEnvOptions) => {
         try {
           await migrateInlineEnv(opts);
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  // PLA-735 — operator-only egress review + per-binding enforce-flip. These call
+  // the board-authenticated /secret-egress-bindings routes; there is no
+  // agent-invokable path. Per-binding by construction (no bulk enforce).
+  const egress = secrets
+    .command("egress")
+    .description("Operator review + per-binding enforce-flip for borrowed-handle egress allowlists");
+
+  addCommonClientOptions(
+    egress
+      .command("review")
+      .description("List bindings with their allowlist, posture, and harvested would-deny suggestions (unchecked)")
+      .requiredOption("-C, --company-id <id>", "Company ID")
+      .action(async (opts: EgressReviewOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts, { requireCompany: true });
+          const res = await ctx.api.get<{ bindings: EgressReviewBinding[] }>(
+            `/api/companies/${ctx.companyId}/secret-egress-bindings`,
+          );
+          const bindings = res?.bindings ?? [];
+          if (ctx.json) {
+            printOutput({ bindings }, { json: true });
+          } else {
+            printEgressReview(bindings);
+          }
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    egress
+      .command("set-allowlist")
+      .description("Replace one binding's egress allowlist from your affirmative selection")
+      .requiredOption("-C, --company-id <id>", "Company ID")
+      .requiredOption("--binding-id <id>", "Secret binding ID")
+      .option(
+        "--allow <entry>",
+        "Allowlist entry (repeatable). Omit entirely to clear the allowlist.",
+        (value: string, prev: string[] = []) => [...prev, value],
+        [] as string[],
+      )
+      .action(async (opts: EgressSetAllowlistOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts, { requireCompany: true });
+          const allowedEgress = opts.allow ?? [];
+          const result = await ctx.api.post(
+            `/api/companies/${ctx.companyId}/secret-egress-bindings/${opts.bindingId}/allowlist`,
+            { allowedEgress },
+          );
+          printOutput(result, { json: ctx.json });
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  addCommonClientOptions(
+    egress
+      .command("enforce")
+      .description("Flip ONE binding to enforcing (per-binding; no bulk enforce-all)")
+      .requiredOption("-C, --company-id <id>", "Company ID")
+      .requiredOption("--binding-id <id>", "Secret binding ID")
+      .option("--allow-empty", "Enforce even with an empty allowlist (deny ALL egress for this secret)", false)
+      .action(async (opts: EgressEnforceOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts, { requireCompany: true });
+          const result = await ctx.api.post(
+            `/api/companies/${ctx.companyId}/secret-egress-bindings/${opts.bindingId}/enforce`,
+            { allowEmpty: opts.allowEmpty === true },
+          );
+          printOutput(result, { json: ctx.json });
         } catch (err) {
           handleCommandError(err);
         }

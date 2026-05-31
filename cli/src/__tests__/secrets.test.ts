@@ -7,6 +7,7 @@ import {
   buildMigratedAgentEnv,
   collectInlineSecretMigrationCandidates,
   parseSecretsInclude,
+  sanitizeForTerminal,
   toPlainEnvValue,
 } from "../commands/client/secrets.js";
 
@@ -253,5 +254,24 @@ describe("secrets CLI helpers", () => {
     expect(result.status).toBe("pass");
     expect(result.message).toContain("prod-us-1");
     expect(result.message).toContain("AWS_PROFILE/shared config");
+  });
+});
+
+describe("PLA-735 sanitizeForTerminal (operator console output encoding)", () => {
+  it("passes a clean origin through unchanged", () => {
+    expect(sanitizeForTerminal("https://api.example.com:443")).toBe("https://api.example.com:443");
+  });
+
+  it("strips an ANSI/escape sequence smuggled in a harvested origin", () => {
+    // ESC[31m ... ESC[0m would recolor the operator's terminal if rendered raw.
+    const malicious = "https://evil.test\u001b[31mPWNED\u001b[0m";
+    const cleaned = sanitizeForTerminal(malicious);
+    expect(cleaned).not.toContain("\u001b");
+    expect(cleaned).toContain("https://evil.test");
+    expect(cleaned).toContain("PWNED");
+  });
+
+  it("strips C0 controls and DEL", () => {
+    expect(sanitizeForTerminal("a\u0000b\u001bc\u007fd")).toBe("a\uFFFDb\uFFFDc\uFFFDd");
   });
 });
