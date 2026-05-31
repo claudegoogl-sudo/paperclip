@@ -637,13 +637,15 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           // company scope. Pass `runCtx.runId` from inside a tool handler.
           return callHost("secrets.resolve", { secretRef, runId });
         },
-        async mintHandle(value: string, runId: string): Promise<string> {
+        async mintHandle(value: string, runId: string, secretRef?: string): Promise<string> {
           // Exchange resolved plaintext for an opaque borrowed handle
           // (PLA-702 Control 2). Return the handle to the agent instead of the
           // plaintext; the host substitutes the real value back in only at a
           // downstream tool's dispatch edge. `runId` is the active dispatch's
-          // runCtx.runId, same contract as `resolve`.
-          const { handle } = await callHost("secrets.mintHandle", { value, runId });
+          // runCtx.runId, same contract as `resolve`. `secretRef` lets the host
+          // capture the binding's operator egress allowlist onto the handle
+          // (PLA-723); the worker never asserts the allowlist itself.
+          const { handle } = await callHost("secrets.mintHandle", { value, runId, secretRef });
           return handle;
         },
       },

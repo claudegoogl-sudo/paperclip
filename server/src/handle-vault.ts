@@ -59,8 +59,52 @@ const HANDLE_ID_BYTES = 16;
  */
 const ENTRY_TTL_MS = 60 * 60 * 1_000;
 
+/**
+ * Operator-set egress posture captured into a handle at mint time (PLA-723).
+ *
+ * Mint-time capture is deliberate (PLA-720 EG3): the handle carries an
+ * immutable allowlist for its lifetime so the egress-time check never re-reads
+ * config (no TOCTOU / re-read attack surface). The trade-off — a tightened
+ * allowlist not taking effect until TTL — is closed by {@link purgeHandlesByBinding}.
+ */
+export interface HandleCapture {
+  /** Operator-set destination allowlist for this binding (empty = nothing allowed). */
+  allowedEgress: readonly string[];
+  /**
+   * Enforce (deny on no-match) vs log-only "would-deny" migration mode (EG4).
+   * New bindings are born enforcing; pre-existing bindings migrate via log-only.
+   */
+  enforced: boolean;
+  /** Binding this handle was minted under — audit + EG3 purge correlation. */
+  bindingId: string | null;
+  /**
+   * Tool names the operator explicitly opted in for this binding despite the
+   * host being unable to enforce their destination (EG1 escape hatch).
+   */
+  unmediatedOptInTools?: readonly string[];
+}
+
+/** A stored handle: the borrowed plaintext plus its captured egress posture. */
+export interface HandleRecord extends HandleCapture {
+  value: string;
+}
+
+/**
+ * Default capture for a handle minted without an explicit posture (legacy /
+ * test callers, and the pre-PLA-723 mint path). Log-only + empty allowlist =
+ * the migration-safe posture: substitution proceeds but a would-deny audit
+ * fires. The PRODUCTION mint path derives capture from the binding row, where
+ * NEW bindings are born `enforced: true` (EG4) — the secure default lives there,
+ * not here.
+ */
+const DEFAULT_CAPTURE: HandleCapture = {
+  allowedEgress: [],
+  enforced: false,
+  bindingId: null,
+};
+
 interface VaultEntry {
-  handles: Map<string, string>;
+  handles: Map<string, HandleRecord>;
   touchedAt: number;
 }
 
@@ -104,7 +148,7 @@ export function isHandleShaped(token: string): boolean {
  *   legitimately empty, so this is purely defensive; callers treat a throw as
  *   fail-closed (mint failed → do not return a handle).
  */
-export function mintHandle(runId: string, value: string): string {
+export function mintHandle(runId: string, value: string, capture?: HandleCapture): string {
   if (typeof runId !== "string" || runId.length === 0) {
     throw new Error("mintHandle: runId is required");
   }
@@ -115,12 +159,20 @@ export function mintHandle(runId: string, value: string): string {
   pruneExpired(now);
   const id = randomBytes(HANDLE_ID_BYTES).toString("hex");
   const handle = `${HANDLE_SCHEME}${runId}/${id}`;
+  const c = capture ?? DEFAULT_CAPTURE;
+  const record: HandleRecord = {
+    value,
+    allowedEgress: c.allowedEgress,
+    enforced: c.enforced,
+    bindingId: c.bindingId,
+    unmediatedOptInTools: c.unmediatedOptInTools,
+  };
   const existing = vault.get(runId);
   if (existing) {
-    existing.handles.set(handle, value);
+    existing.handles.set(handle, record);
     existing.touchedAt = now;
   } else {
-    vault.set(runId, { handles: new Map([[handle, value]]), touchedAt: now });
+    vault.set(runId, { handles: new Map([[handle, record]]), touchedAt: now });
   }
   return handle;
 }
@@ -134,9 +186,72 @@ export function mintHandle(runId: string, value: string): string {
  * select another run's vault.
  */
 export function resolveHandle(runId: string, handle: string): string | undefined {
+  return getHandleRecord(runId, handle)?.value;
+}
+
+/**
+ * Resolve a single handle to its full record (plaintext + captured egress
+ * posture) within `runId`, or `undefined` if this run's vault holds no such
+ * handle. Used by the egress chokepoint to make the destination decision from
+ * each handle's OWN captured allowlist (PLA-723 EG5) before any substitution.
+ */
+export function getHandleRecord(runId: string, handle: string): HandleRecord | undefined {
   const entry = vault.get(runId);
   if (!entry) return undefined;
   return entry.handles.get(handle);
+}
+
+/**
+ * Collect every distinct borrowed-handle token present in the string leaves of
+ * `input` (deep walk). Used at the chokepoint to enumerate the handles a call
+ * carries WITHOUT resolving them to plaintext (PLA-723 EG5: decide before
+ * substitute).
+ */
+export function collectHandleTokens(input: unknown): string[] {
+  const found = new Set<string>();
+  collectWalk(input, found);
+  return [...found];
+}
+
+function collectWalk(value: unknown, found: Set<string>): void {
+  if (typeof value === "string") {
+    if (value.includes(HANDLE_SCHEME)) {
+      HANDLE_TOKEN_RE.lastIndex = 0;
+      for (const m of value.matchAll(HANDLE_TOKEN_RE)) found.add(m[0]);
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const v of value) collectWalk(v, found);
+    return;
+  }
+  if (value !== null && typeof value === "object") {
+    for (const v of Object.values(value as Record<string, unknown>)) collectWalk(v, found);
+  }
+}
+
+/**
+ * Purge every live handle minted under `bindingId`, across all runs (PLA-723
+ * EG3). When an operator tightens or revokes a binding's `allowedEgress`, the
+ * mint-time-captured allowlist on in-flight handles would otherwise keep
+ * authorizing egress to a now-removed destination for up to the handle TTL.
+ * Calling this on a binding change makes revocation effective immediately.
+ *
+ * Returns the number of handles purged. Idempotent and safe to re-run.
+ */
+export function purgeHandlesByBinding(bindingId: string): number {
+  if (typeof bindingId !== "string" || bindingId.length === 0) return 0;
+  let purged = 0;
+  for (const [runId, entry] of vault) {
+    for (const [handle, record] of entry.handles) {
+      if (record.bindingId === bindingId) {
+        entry.handles.delete(handle);
+        purged++;
+      }
+    }
+    if (entry.handles.size === 0) vault.delete(runId);
+  }
+  return purged;
 }
 
 /**

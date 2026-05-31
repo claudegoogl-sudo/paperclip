@@ -66,7 +66,7 @@ function buildHandler(resolveValue: string) {
     pluginKey: PLUGIN_KEY,
     runContextRegistry: registry,
     bindings: {
-      findBinding: async () => ({ secretId: SECRET_ID, configPath: "tokenSecretId", versionSelector: "latest" }),
+      findBinding: async () => ({ id: "binding-1", secretId: SECRET_ID, configPath: "tokenSecretId", versionSelector: "latest", allowedEgress: [], egressAllowlistEnforced: false }),
     },
     resolver: { resolve: async () => resolveValue },
   });

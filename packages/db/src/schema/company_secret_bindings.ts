@@ -13,6 +13,13 @@ export const companySecretBindings = pgTable(
     configPath: text("config_path").notNull(),
     versionSelector: text("version_selector").notNull().default("latest"),
     required: boolean("required").notNull().default(true),
+    // PLA-723: operator-set egress destination allowlist for handles minted
+    // under this binding. `allowedEgress` is operator-only — there is no
+    // agent/worker-passable path that can set or extend it (EG1-provenance).
+    // NEW bindings are born enforcing (EG4 secure-by-default); pre-existing
+    // rows were migrated to log-only by 0092.
+    allowedEgress: text("allowed_egress").array().notNull().default([]),
+    egressAllowlistEnforced: boolean("egress_allowlist_enforced").notNull().default(true),
     label: text("label"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

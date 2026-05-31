@@ -872,8 +872,16 @@ export interface WorkerToHostMethods {
   // tool dispatch (same contract as `secrets.resolve`); the host keys the
   // borrowed value off the server-validated runContext, never the worker.
   // Minting also registers the value with the Control-1 value-exact redactor.
+  //
+  // `secretRef` (PLA-723) is the UUID of the secret the handle borrows. The
+  // host uses it to look up the per-company `company_secret_bindings` row and
+  // capture that binding's operator-set egress allowlist onto the handle at
+  // mint time. The worker only names WHICH secret it minted; it can never
+  // assert the allowlist itself (EG1-provenance — allowedEgress is
+  // operator-only). Omitted by legacy/own-backend mints, which then get the
+  // migration-safe log-only posture.
   "secrets.mintHandle": [
-    params: { value: string; runId: string },
+    params: { value: string; runId: string; secretRef?: string },
     result: { handle: string },
   ];
 
