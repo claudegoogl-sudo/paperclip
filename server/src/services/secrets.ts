@@ -42,6 +42,7 @@ import { badRequest, conflict, HttpError, notFound, unprocessable } from "../err
 import { logger } from "../middleware/logger.js";
 import { isValidAllowlistEntry } from "../handle-egress.js";
 import { purgeHandlesByBinding } from "../handle-vault.js";
+import { listEgressWouldDeny, type EgressWouldDenyObservationRow } from "./egress-harvest.js";
 import {
   collectSecretRefPaths,
   isUuidSecretRef,
@@ -2044,6 +2045,67 @@ export function secretService(db: Db) {
         })
         .returning()
         .then((rows) => rows[0]);
+    },
+
+    /**
+     * Operator-only: company-scoped review surface for the egress enforce-flip
+     * (PLA-735). Returns every borrowed-handle binding in the company alongside
+     * its CURRENT persisted allowlist + enforcement posture and the harvested
+     * would-deny origins (PLA-734) as SEPARATE suggestion rows.
+     *
+     * Deliberate shape decisions, all load-bearing for the SE acceptance
+     * criteria:
+     *  - `suggestions` is a distinct field, never merged into `allowedEgress`.
+     *    The read path NEVER pre-selects or auto-applies a harvested origin
+     *    (allowlist-poisoning guard): the operator must affirmatively choose
+     *    which suggestions to seed via setBindingEgressAllowlist.
+     *  - Company-scoped (BOLA): bindings are filtered by `companyId` and the
+     *    harvest read is the company-scoped {@link listEgressWouldDeny}; a
+     *    binding in another company is never returned here.
+     *  - Origins are returned as opaque strings for the caller to contextually
+     *    encode at its sink (JSON here; the operator console must not innerHTML
+     *    them — Stored-XSS guard).
+     */
+    listEgressReview: async (companyId: string) => {
+      const bindings = await db
+        .select({
+          id: companySecretBindings.id,
+          secretId: companySecretBindings.secretId,
+          targetType: companySecretBindings.targetType,
+          targetId: companySecretBindings.targetId,
+          configPath: companySecretBindings.configPath,
+          label: companySecretBindings.label,
+          allowedEgress: companySecretBindings.allowedEgress,
+          egressAllowlistEnforced: companySecretBindings.egressAllowlistEnforced,
+          updatedAt: companySecretBindings.updatedAt,
+        })
+        .from(companySecretBindings)
+        .where(eq(companySecretBindings.companyId, companyId))
+        .orderBy(companySecretBindings.targetType, companySecretBindings.targetId, companySecretBindings.configPath);
+
+      const observations = await listEgressWouldDeny(db, { companyId });
+      const byBinding = new Map<string, EgressWouldDenyObservationRow[]>();
+      for (const obs of observations) {
+        const list = byBinding.get(obs.bindingId) ?? [];
+        list.push(obs);
+        byBinding.set(obs.bindingId, list);
+      }
+
+      return bindings.map((binding) => ({
+        ...binding,
+        // Harvested would-deny origins as UNCHECKED suggestions. `selected` is
+        // hard-coded false: the surface presents them un-applied and the
+        // operator opts each one in. Never derived from `allowedEgress` — a
+        // suggestion already on the allowlist is still surfaced as a suggestion,
+        // not silently auto-selected.
+        suggestions: (byBinding.get(binding.id) ?? []).map((obs) => ({
+          origin: obs.origin,
+          count: obs.count,
+          firstSeen: obs.firstSeen,
+          lastSeen: obs.lastSeen,
+          selected: false as const,
+        })),
+      }));
     },
 
     /**

@@ -302,3 +302,29 @@ export const remoteSecretImportSchema = z.object({
 
 export type RemoteSecretImportSelection = z.infer<typeof remoteSecretImportSelectionSchema>;
 export type RemoteSecretImport = z.infer<typeof remoteSecretImportSchema>;
+
+// PLA-735 — operator-only egress review+flip surface for borrowed-handle
+// bindings. The request body only bounds shape/size here; per-entry semantic
+// validation (the egress matcher) and the empty-allowlist enforce guard stay
+// server-side in secretService so the rule lives in one place. The body carries
+// NO binding/company id (those come from the operator-authenticated path
+// params) and NO agent-passable fields (EG1-provenance).
+export const setBindingEgressAllowlistSchema = z.object({
+  // The full desired allowlist for the binding (replace semantics, matching
+  // setBindingEgressAllowlist). Operator-curated: the review surface presents
+  // harvested origins as UNCHECKED suggestions and the operator affirmatively
+  // selects which to include — nothing is auto-applied (allowlist-poisoning
+  // guard). Empty array is allowed (clears the allowlist); enforce-flip then
+  // refuses unless allowEmpty.
+  allowedEgress: z.array(z.string().trim().min(1).max(2048)).max(200),
+});
+
+export const enforceBindingEgressSchema = z.object({
+  // Deliberate deny-all opt-in: flip a binding whose allowlist is empty (denies
+  // ALL egress for that secret). Defaults to false so the common path refuses
+  // an accidental empty-allowlist enforce.
+  allowEmpty: z.boolean().optional(),
+});
+
+export type SetBindingEgressAllowlistInput = z.infer<typeof setBindingEgressAllowlistSchema>;
+export type EnforceBindingEgressInput = z.infer<typeof enforceBindingEgressSchema>;

@@ -7,6 +7,8 @@ import {
   remoteSecretImportSchema,
   rotateSecretSchema,
   secretProviderConfigDiscoveryPreviewSchema,
+  setBindingEgressAllowlistSchema,
+  enforceBindingEgressSchema,
   updateSecretProviderConfigSchema,
   updateSecretSchema,
 } from "@paperclipai/shared";
@@ -509,6 +511,97 @@ export function secretRoutes(db: Db) {
 
     res.json({ ok: true });
   });
+
+  // ---------------------------------------------------------------------------
+  // PLA-735 — operator-only egress review + per-binding enforce-flip surface.
+  //
+  // `assertBoard` is the EG1-provenance gate: it requires `req.actor.type ===
+  // "board"` and throws 403 for an agent/worker JWT, so there is NO
+  // agent-invokable path to read suggestions, seed an allowlist, or flip a
+  // binding. `assertCompanyAccess` then enforces BOLA (a board user may only
+  // touch companies they belong to), and the service `loadOwnedBinding` re-checks
+  // company ownership on every write so a binding id from another company 404s.
+  // ---------------------------------------------------------------------------
+
+  // Review surface: current allowlist + posture per binding, plus harvested
+  // would-deny origins as UNCHECKED suggestions (never auto-applied). Read-only.
+  router.get("/companies/:companyId/secret-egress-bindings", async (req, res) => {
+    assertBoard(req);
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const bindings = await svc.listEgressReview(companyId);
+    res.json({ bindings });
+  });
+
+  // Seed/replace one binding's allowlist from the operator's affirmative
+  // selection. The body carries only the chosen entries — no binding/company id
+  // (those are path-scoped) and no agent-passable provenance field.
+  router.post(
+    "/companies/:companyId/secret-egress-bindings/:bindingId/allowlist",
+    validate(setBindingEgressAllowlistSchema),
+    async (req, res) => {
+      assertBoard(req);
+      const companyId = req.params.companyId as string;
+      const bindingId = req.params.bindingId as string;
+      assertCompanyAccess(req, companyId);
+
+      const result = await svc.setBindingEgressAllowlist({
+        companyId,
+        bindingId,
+        allowedEgress: req.body.allowedEgress,
+      });
+
+      await logActivity(db, {
+        companyId,
+        actorType: "user",
+        actorId: req.actor.userId ?? "board",
+        action: "secret.egress_allowlist_set",
+        entityType: "secret_binding",
+        entityId: bindingId,
+        details: {
+          allowlistSize: result.binding.allowedEgress.length,
+          handlesPurged: result.handlesPurged,
+        },
+      });
+
+      res.json(result);
+    },
+  );
+
+  // Flip ONE binding to enforcing. Per-binding by construction — there is no
+  // bulk/enforce-all route, so a misjudged allowlist breaks a single binding,
+  // not every migrated secret (no breakage cliff).
+  router.post(
+    "/companies/:companyId/secret-egress-bindings/:bindingId/enforce",
+    validate(enforceBindingEgressSchema),
+    async (req, res) => {
+      assertBoard(req);
+      const companyId = req.params.companyId as string;
+      const bindingId = req.params.bindingId as string;
+      assertCompanyAccess(req, companyId);
+
+      const result = await svc.enforceBindingEgress({
+        companyId,
+        bindingId,
+        allowEmpty: req.body.allowEmpty,
+      });
+
+      await logActivity(db, {
+        companyId,
+        actorType: "user",
+        actorId: req.actor.userId ?? "board",
+        action: "secret.egress_allowlist_enforced",
+        entityType: "secret_binding",
+        entityId: bindingId,
+        details: {
+          allowlistSize: result.binding.allowedEgress.length,
+          handlesPurged: result.handlesPurged,
+        },
+      });
+
+      res.json(result);
+    },
+  );
 
   return router;
 }

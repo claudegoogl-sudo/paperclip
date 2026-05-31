@@ -306,6 +306,8 @@ export {
   rotateSecretSchema,
   secretBindingTargetSchema,
   updateSecretSchema,
+  setBindingEgressAllowlistSchema,
+  enforceBindingEgressSchema,
   type CreateSecretBinding,
   type CreateSecret,
   type CreateSecretProviderConfig,
@@ -316,6 +318,8 @@ export {
   type RemoteSecretImportSelection,
   type RotateSecret,
   type UpdateSecret,
+  type SetBindingEgressAllowlistInput,
+  type EnforceBindingEgressInput,
 } from "./secret.js";
 
 export {
