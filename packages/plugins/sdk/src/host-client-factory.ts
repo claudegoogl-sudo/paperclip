@@ -100,7 +100,25 @@ export class InvocationScopeDeniedError extends Error {
 export interface HostServices {
   /** Provides `config.get`. */
   config: {
+    /**
+     * Return the instance-wide plugin configuration. Always available.
+     *
+     * For multi-tenant deployments, hosts SHOULD also implement
+     * {@link HostServices.config.getForCompany} to deliver per-tenant
+     * overrides; the gated wrapper for `config.get` consults
+     * `getForCompany` first when the invocation carries a company scope.
+     */
     get(): Promise<Record<string, unknown>>;
+    /**
+     * PLA-677: Return the effective plugin configuration for `companyId`,
+     * i.e. the instance-wide config merged with this tenant's
+     * `plugin_company_settings.settingsJson.configOverrides`.
+     *
+     * Optional — when omitted the gated wrapper falls back to {@link get},
+     * preserving single-tenant behaviour for hosts that haven't adopted
+     * per-tenant config delivery yet.
+     */
+    getForCompany?(companyId: string): Promise<Record<string, unknown>>;
   };
 
   /** Provides trusted company-scoped local folder helpers. */
@@ -651,7 +669,14 @@ export function createHostClientHandlers(
 
   return {
     // Config
-    "config.get": gated("config.get", async () => {
+    "config.get": gated("config.get", async (_params, context) => {
+      // PLA-677: When the invocation carries a company scope and the host
+      // implements per-tenant config delivery, return the company-scoped
+      // effective config; otherwise fall back to the instance-wide config.
+      const companyId = readNonEmptyString(context?.invocationScope?.companyId);
+      if (companyId && services.config.getForCompany) {
+        return services.config.getForCompany(companyId);
+      }
       return services.config.get();
     }),
 

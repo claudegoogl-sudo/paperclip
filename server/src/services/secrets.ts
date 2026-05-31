@@ -2191,6 +2191,23 @@ export function secretService(db: Db) {
           if (newRefs.get(dotPath) === oldValue) continue; // unchanged
           const oldOwner = input.companyId ?? (await ownerCompanyFor(oldValue, tx));
           if (!oldOwner) continue; // cannot locate the row to revoke (harmless)
+          // PLA-677: Multi-tenant safety for the instance-wide save path. When
+          // the global plugin_config is repointed from one tenant's secret to
+          // a different tenant's, the operator's intent is "default ref for
+          // the plugin is now <new>" — NOT a per-tenant revoke. Each tenant's
+          // binding row is independent (the resolver is keyed by dispatching
+          // company), so silently deleting the prior tenant's row would break
+          // them with no audit trail. Cross-tenant repoint → leave the prior
+          // tenant's row in place; the per-tenant route
+          // PUT /api/plugins/:id/companies/:cid/config-overrides is the
+          // authoritative path for revoking a specific tenant's binding.
+          if (!input.companyId) {
+            const newValue = newRefs.get(dotPath);
+            if (newValue && newValue !== oldValue) {
+              const newOwner = await ownerCompanyFor(newValue, tx);
+              if (newOwner && newOwner !== oldOwner) continue;
+            }
+          }
           const deleted = await tx
             .delete(companySecretBindings)
             .where(

@@ -8,6 +8,13 @@ const mockRegistry = vi.hoisted(() => ({
   upsertConfig: vi.fn(),
   getCompanySettings: vi.fn(),
   upsertCompanySettings: vi.fn(),
+  getCompanyConfigOverride: vi.fn(),
+  upsertCompanyConfigOverride: vi.fn(),
+  deleteCompanyConfigOverride: vi.fn(),
+}));
+
+const mockSecretService = vi.hoisted(() => ({
+  getById: vi.fn(),
 }));
 
 const mockLifecycle = vi.hoisted(() => ({
@@ -20,6 +27,10 @@ const mockLifecycle = vi.hoisted(() => ({
 
 vi.mock("../services/plugin-registry.js", () => ({
   pluginRegistryService: () => mockRegistry,
+}));
+
+vi.mock("../services/secrets.js", () => ({
+  secretService: () => mockSecretService,
 }));
 
 vi.mock("../services/plugin-lifecycle.js", () => ({
@@ -412,6 +423,126 @@ describe.sequential("scoped plugin API routes", () => {
       }),
     );
   }, 20_000);
+});
+
+describe.sequential("plugin per-tenant config override routes (PLA-677)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockRegistry.getCompanyConfigOverride.mockResolvedValue(null);
+    mockRegistry.upsertCompanyConfigOverride.mockReset();
+    mockRegistry.deleteCompanyConfigOverride.mockResolvedValue(null);
+    mockSecretService.getById.mockReset();
+  });
+
+  function readyOverridePlugin() {
+    mockRegistry.getById.mockResolvedValue({
+      id: pluginId,
+      pluginKey: "platform.cad",
+      version: "1.0.0",
+      status: "ready",
+      manifestJson: {
+        id: "platform.cad",
+        capabilities: ["secrets.read-ref"],
+        instanceConfigSchema: {
+          type: "object",
+          properties: {
+            githubPatSecretId: { type: "string", format: "secret-ref" },
+            label: { type: "string" },
+          },
+        },
+      },
+    });
+  }
+
+  const dprSecretId = "77777777-7777-4777-8777-777777777777";
+  const otherTenantSecretId = "88888888-8888-4888-8888-888888888888";
+
+  it("rejects non-board actors", async () => {
+    readyOverridePlugin();
+    const { app } = await createApp(agentActor());
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson: { label: "ok" } });
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(mockRegistry.upsertCompanyConfigOverride).not.toHaveBeenCalled();
+  });
+
+  it("rejects board actors without companyA access", async () => {
+    readyOverridePlugin();
+    const { app } = await createApp(boardActor({ companyIds: [companyB] }));
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson: { label: "ok" } });
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(mockRegistry.upsertCompanyConfigOverride).not.toHaveBeenCalled();
+  });
+
+  it("returns 422 when a secret-ref UUID belongs to a different company", async () => {
+    readyOverridePlugin();
+    mockSecretService.getById.mockResolvedValue({
+      id: otherTenantSecretId,
+      companyId: companyB,
+      status: "active",
+    });
+    const { app } = await createApp(boardActor());
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson: { githubPatSecretId: otherTenantSecretId } });
+    expect(res.status).toBe(422);
+    expect(res.body.error).toContain("Referenced secret must belong to the target company");
+    expect(mockRegistry.upsertCompanyConfigOverride).not.toHaveBeenCalled();
+  });
+
+  it("returns 422 when a referenced secret cannot be found", async () => {
+    readyOverridePlugin();
+    mockSecretService.getById.mockResolvedValue(null);
+    const { app } = await createApp(boardActor());
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson: { githubPatSecretId: dprSecretId } });
+    expect(res.status).toBe(422);
+    expect(res.body.error).toContain("Referenced secret not found");
+    expect(mockRegistry.upsertCompanyConfigOverride).not.toHaveBeenCalled();
+  });
+
+  it("accepts an own-company secret-ref and forwards to upsertCompanyConfigOverride", async () => {
+    readyOverridePlugin();
+    mockSecretService.getById.mockResolvedValue({
+      id: dprSecretId,
+      companyId: companyA,
+      status: "active",
+    });
+    mockRegistry.upsertCompanyConfigOverride.mockResolvedValue({
+      id: "row-1",
+      pluginId,
+      companyId: companyA,
+      settingsJson: { configOverrides: { githubPatSecretId: dprSecretId } },
+    });
+    const { app } = await createApp(boardActor());
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson: { githubPatSecretId: dprSecretId } });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      pluginId,
+      companyId: companyA,
+      configJson: { githubPatSecretId: dprSecretId },
+    });
+    expect(mockRegistry.upsertCompanyConfigOverride).toHaveBeenCalledWith(
+      pluginId,
+      companyA,
+      { githubPatSecretId: dprSecretId },
+    );
+  });
+
+  it("clears the override via DELETE", async () => {
+    readyOverridePlugin();
+    const { app } = await createApp(boardActor());
+    const res = await request(app)
+      .delete(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`);
+    expect(res.status).toBe(200);
+    expect(mockRegistry.deleteCompanyConfigOverride).toHaveBeenCalledWith(pluginId, companyA);
+  });
 });
 
 describe.sequential("plugin local folder routes", () => {
