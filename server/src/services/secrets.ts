@@ -38,8 +38,10 @@ import {
   secretProviderConfigDiscoveryPreviewSchema,
   updateSecretProviderConfigSchema,
 } from "@paperclipai/shared";
-import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import { badRequest, conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+import { isValidAllowlistEntry } from "../handle-egress.js";
+import { purgeHandlesByBinding } from "../handle-vault.js";
 import {
   collectSecretRefPaths,
   isUuidSecretRef,
@@ -356,6 +358,21 @@ export function secretService(db: Db) {
         ),
       )
       .then((rows) => rows[0] ?? null);
+  }
+
+  async function loadOwnedBinding(companyId: string, bindingId: string) {
+    const binding = await db
+      .select()
+      .from(companySecretBindings)
+      .where(
+        and(
+          eq(companySecretBindings.id, bindingId),
+          eq(companySecretBindings.companyId, companyId),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (!binding) throw notFound(`Secret binding ${bindingId} not found in this company`);
+    return binding;
   }
 
   async function assertBindingContext(
@@ -2027,6 +2044,92 @@ export function secretService(db: Db) {
         })
         .returning()
         .then((rows) => rows[0]);
+    },
+
+    /**
+     * Operator-only: set/replace a binding's egress allowlist (PLA-731 step 2-3).
+     *
+     * This is the only path that writes `allowedEgress`; there is no
+     * agent/worker-passable route, preserving EG1-provenance. Entries are
+     * trimmed, de-duplicated, and validated against the egress matcher so a
+     * malformed rule is rejected up front rather than stored as a dead entry
+     * that silently never matches once the binding enforces.
+     *
+     * Calling this purges in-flight handles minted under the binding (EG3) so
+     * the new allowlist takes effect immediately rather than at handle TTL.
+     * Idempotent: re-setting the same list converges (the row + purge are both
+     * safe to re-run).
+     */
+    setBindingEgressAllowlist: async (input: {
+      companyId: string;
+      bindingId: string;
+      allowedEgress: string[];
+    }) => {
+      const binding = await loadOwnedBinding(input.companyId, input.bindingId);
+      const cleaned = [
+        ...new Set(input.allowedEgress.map((e) => (typeof e === "string" ? e.trim() : "")).filter((e) => e.length > 0)),
+      ];
+      for (const entry of cleaned) {
+        if (!isValidAllowlistEntry(entry)) {
+          throw badRequest(`Invalid egress allowlist entry: ${entry}`);
+        }
+      }
+      const updated = await db
+        .update(companySecretBindings)
+        .set({ allowedEgress: cleaned, updatedAt: new Date() })
+        .where(eq(companySecretBindings.id, binding.id))
+        .returning()
+        .then((rows) => rows[0]);
+      const handlesPurged = purgeHandlesByBinding(binding.id);
+      return { binding: updated, handlesPurged };
+    },
+
+    /**
+     * Operator-only: flip ONE migrated binding to enforcing (PLA-731 step 3-4).
+     *
+     * Deliberately per-binding, never a blanket UPDATE: operators sign off one
+     * binding at a time as they review its harvested allowlist, so a misjudged
+     * allowlist breaks a single binding rather than every migrated secret at
+     * once (no breakage cliff).
+     *
+     * Refuses to enforce a binding whose `allowedEgress` is empty (that would
+     * deny ALL egress) unless `allowEmpty` is set for a deliberate deny-all.
+     *
+     * On flip, purges in-flight handles minted under this binding (EG3) so the
+     * next mint captures `enforced: true` immediately instead of at handle TTL.
+     * Idempotent: re-flipping an already-enforcing binding is a no-op flip plus
+     * an idempotent purge.
+     */
+    enforceBindingEgress: async (input: {
+      companyId: string;
+      bindingId: string;
+      allowEmpty?: boolean;
+    }) => {
+      const binding = await loadOwnedBinding(input.companyId, input.bindingId);
+      if (binding.allowedEgress.length === 0 && input.allowEmpty !== true) {
+        throw conflict(
+          `Refusing to enforce egress on binding ${binding.id} with an empty allowlist ` +
+            `(would deny all egress for this secret). Seed allowedEgress first, or pass ` +
+            `allowEmpty to intentionally deny all egress.`,
+        );
+      }
+      const updated = await db
+        .update(companySecretBindings)
+        .set({ egressAllowlistEnforced: true, updatedAt: new Date() })
+        .where(eq(companySecretBindings.id, binding.id))
+        .returning()
+        .then((rows) => rows[0]);
+      const handlesPurged = purgeHandlesByBinding(binding.id);
+      logger.info(
+        {
+          companyId: input.companyId,
+          bindingId: binding.id,
+          handlesPurged,
+          action: "secret.egress_allowlist_enforced",
+        },
+        "flipped secret binding egress allowlist to enforcing (PLA-731)",
+      );
+      return { binding: updated, handlesPurged };
     },
 
     syncSecretRefsForTarget: async (
