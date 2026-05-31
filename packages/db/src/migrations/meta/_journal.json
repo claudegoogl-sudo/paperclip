@@ -652,6 +652,13 @@
       "when": 1780531200000,
       "tag": "0092_secret_binding_egress_allowlist",
       "breakpoints": true
+    },
+    {
+      "idx": 93,
+      "version": "7",
+      "when": 1780617600000,
+      "tag": "0093_egress_would_deny_observations",
+      "breakpoints": true
     }
   ]
 }

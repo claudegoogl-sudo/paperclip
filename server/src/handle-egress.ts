@@ -315,6 +315,22 @@ export function normalizeDestination(kind: EgressKind, raw: unknown): Normalized
   }
 }
 
+/**
+ * Render a normalized origin to a canonical, persistable, allowlist-shaped
+ * string: `scheme://host:port` (scheme omitted for bare-`host` destinations,
+ * port omitted when it is the scheme default / unset). This is the ONLY form of
+ * a destination that may be stored (PLA-734): it is derived purely from parser
+ * output (scheme+host+port), so it can never carry a path, query, fragment, or
+ * userinfo — the components that leak tokens/PII. Returns `null` for a
+ * fail-closed / non-`ok` origin so callers drop unparseable destinations rather
+ * than persist a placeholder.
+ */
+export function formatOrigin(origin: NormalizedOrigin | null): string | null {
+  if (!origin || !origin.ok) return null;
+  const authority = origin.port === null ? origin.host : `${origin.host}:${origin.port}`;
+  return origin.scheme === null ? authority : `${origin.scheme}://${authority}`;
+}
+
 // ---------------------------------------------------------------------------
 // Allowlist matching (EG2) — exact origin, explicit wildcard only.
 // ---------------------------------------------------------------------------
@@ -425,6 +441,14 @@ export interface EgressDecision {
   reason: string;
   /** The extracted destination string (attacker-influenced; escape on render — EG6). */
   destination: string | null;
+  /**
+   * The destination AFTER egress-parser normalization (scheme+host+port only —
+   * NO path/query/fragment). This is the only destination representation safe to
+   * persist (PLA-734 harvest): the raw `destination` above can carry tokens/PII
+   * in its path/query. `null` when the call is not host-mediated or the
+   * destination is undeterminable; `{ ok: false }` when it failed to parse.
+   */
+  origin: NormalizedOrigin | null;
   /** Handles that would be denied under enforcement but are in log-only mode (EG4 audit). */
   wouldDeny: HandleEgressCapture[];
 }
@@ -457,7 +481,7 @@ function extractDestination(rawParameters: unknown, key: string): unknown {
 export function decideEgress(input: EgressDecisionInput): EgressDecision {
   const { namespacedName, descriptor, rawParameters, handles } = input;
   if (handles.length === 0) {
-    return { allow: true, reason: "no_handles", destination: null, wouldDeny: [] };
+    return { allow: true, reason: "no_handles", destination: null, origin: null, wouldDeny: [] };
   }
 
   // Compute the destination once (host-mediated path only).
@@ -489,11 +513,12 @@ export function decideEgress(input: EgressDecisionInput): EgressDecision {
               ? `undeterminable_destination:${origin.reason}`
               : "destination_not_allowlisted",
           destination,
+          origin,
           wouldDeny,
         };
       }
       wouldDeny.push(h); // log-only migration binding — record, do not block (EG4)
     }
   }
-  return { allow: true, reason: "allowed", destination, wouldDeny };
+  return { allow: true, reason: "allowed", destination, origin, wouldDeny };
 }
