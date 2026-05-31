@@ -63,7 +63,7 @@ import { logActivity } from "./activity-log.js";
 import { logger } from "../middleware/logger.js";
 import { secretService } from "./secrets.js";
 import { registerRunSecretValue } from "../run-secret-registry.js";
-import { mintHandle as mintBorrowedHandle } from "../handle-vault.js";
+import { mintHandle as mintBorrowedHandle, type HandleCapture } from "../handle-vault.js";
 import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js";
 
 /**
@@ -190,6 +190,14 @@ export interface PluginSecretsMintHandleParams {
   value: string;
   /** The runId of the currently-executing tool dispatch. */
   runId: string;
+  /**
+   * The UUID of the secret being borrowed (PLA-723). The host uses it ONLY to
+   * look up the per-company binding row and capture that binding's
+   * operator-set egress allowlist onto the handle — the worker can never
+   * supply the allowlist itself (EG1-provenance). Absent / no-binding mints
+   * get the migration-safe log-only posture.
+   */
+  secretRef?: string;
 }
 
 /**
@@ -197,9 +205,15 @@ export interface PluginSecretsMintHandleParams {
  * handler needs. Implemented by a query against `company_secret_bindings`.
  */
 export interface PluginSecretBindingRow {
+  /** Binding row id — the EG3 purge correlation key captured onto the handle. */
+  id: string;
   secretId: string;
   configPath: string;
   versionSelector: string | null;
+  /** Operator-set egress destination allowlist (PLA-723, EG1-provenance). */
+  allowedEgress: string[];
+  /** EG4: NEW bindings enforce; pre-existing migrate via log-only. */
+  egressAllowlistEnforced: boolean;
 }
 
 export interface PluginSecretBindingLookup {
@@ -344,9 +358,12 @@ export function createPluginSecretsHandler(
       async findBinding(input) {
         const row = await db
           .select({
+            id: companySecretBindings.id,
             secretId: companySecretBindings.secretId,
             configPath: companySecretBindings.configPath,
             versionSelector: companySecretBindings.versionSelector,
+            allowedEgress: companySecretBindings.allowedEgress,
+            egressAllowlistEnforced: companySecretBindings.egressAllowlistEnforced,
           })
           .from(companySecretBindings)
           .where(
@@ -591,7 +608,7 @@ export function createPluginSecretsHandler(
       if (!params || typeof params !== "object") {
         throw new SecretsError("invalid_ref", "invalid mint request");
       }
-      const { value, runId } = params;
+      const { value, runId, secretRef } = params;
       if (typeof value !== "string" || value.length === 0) {
         throw new SecretsError("invalid_ref", "invalid mint request");
       }
@@ -635,8 +652,31 @@ export function createPluginSecretsHandler(
         throw new SecretsError("not_found", "mint failed");
       }
 
-      // ---------- Gate 4: mint + store + audit ----------
-      const handle = mintBorrowedHandle(ctx.runId, value);
+      // ---------- Gate 4: capture the binding's operator egress posture ----------
+      // EG1-provenance: the allowlist is ALWAYS derived host-side from the
+      // binding row keyed by (dispatching company, plugin, secretRef). The
+      // worker only names WHICH secret it borrowed — it can never pass or
+      // extend the allowlist. A mint with no `secretRef`, an invalid ref, or no
+      // matching binding falls back to the migration-safe log-only posture
+      // (the legacy default) rather than failing the mint.
+      let capture: HandleCapture | undefined;
+      if (typeof secretRef === "string" && isUuidSecretRef(secretRef.trim())) {
+        const binding = await bindings.findBinding({
+          companyId: ctx.companyId,
+          pluginTargetId: pluginDbId,
+          secretId: secretRef.trim(),
+        });
+        if (binding) {
+          capture = {
+            allowedEgress: binding.allowedEgress ?? [],
+            enforced: binding.egressAllowlistEnforced,
+            bindingId: binding.id,
+          };
+        }
+      }
+
+      // ---------- Gate 5: mint + store + audit ----------
+      const handle = mintBorrowedHandle(ctx.runId, value, capture);
       await auditMint({ outcome: "allowed", ctx });
 
       // Only the opaque handle leaves this method; the value is never logged.

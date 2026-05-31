@@ -79,7 +79,14 @@ function buildHandler(opts: BuildOpts = {}) {
   }) => {
     const set = bindingsByCompany[input.companyId];
     if (set && set.has(input.secretId)) {
-      return { secretId: input.secretId, configPath: "githubPatSecretId", versionSelector: "latest" };
+      return {
+        id: `binding-${input.secretId}`,
+        secretId: input.secretId,
+        configPath: "githubPatSecretId",
+        versionSelector: "latest",
+        allowedEgress: [],
+        egressAllowlistEnforced: false,
+      };
     }
     return null;
   });

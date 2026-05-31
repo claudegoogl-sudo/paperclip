@@ -795,9 +795,14 @@ export interface PluginSecretsClient {
    *
    * @param value - The resolved secret plaintext to borrow.
    * @param runId - The `runCtx.runId` of the active tool dispatch.
+   * @param secretRef - Optional UUID of the secret being borrowed (PLA-723).
+   *   When given, the host captures the secret's per-company binding egress
+   *   allowlist onto the handle at mint time so downstream egress is gated to
+   *   operator-approved destinations. The allowlist is always derived host-side
+   *   from the binding row — naming the ref never lets the worker set it.
    * @returns The opaque borrowed handle string.
    */
-  mintHandle(value: string, runId: string): Promise<string>;
+  mintHandle(value: string, runId: string, secretRef?: string): Promise<string>;
 }
 
 /**
