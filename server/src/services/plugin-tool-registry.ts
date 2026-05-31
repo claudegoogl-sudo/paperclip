@@ -27,7 +27,18 @@ import type { ToolRunContext, ToolResult, ExecuteToolParams } from "@paperclipai
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js";
 import { logger } from "../middleware/logger.js";
-import { substituteHandles, UnresolvedHandleError } from "../handle-vault.js";
+import {
+  collectHandleTokens,
+  getHandleRecord,
+  substituteHandles,
+  UnresolvedHandleError,
+} from "../handle-vault.js";
+import {
+  decideEgress,
+  EgressNotAllowedError,
+  getHostMediatedEgress,
+  type HandleEgressCapture,
+} from "../handle-egress.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -435,10 +446,83 @@ export function createPluginToolRegistry(
       // mutated. A handle-shaped token that does not resolve in this run's
       // vault (foreign / expired / forged) aborts the call fail-closed (RC5);
       // a literal `vault-handle://` must never leave the host outbound.
+      //
+      // PLA-723 Control-2 residual — per-binding egress allowlist. The
+      // destination decision runs BEFORE any plaintext substitution (EG5): we
+      // enumerate the borrowed handles present in the RAW parameters and check
+      // each handle's OWN captured allowlist against the call's declared,
+      // host-mediated destination. A non-host-mediated tool (EG1), an
+      // undeterminable destination, or any enforced handle whose allowlist
+      // excludes the destination aborts the whole call fail-closed — the
+      // handle is never resolved to plaintext and the worker is never invoked.
       let dispatchParameters: unknown;
       try {
+        const handleTokens = collectHandleTokens(parameters);
+        if (handleTokens.length > 0) {
+          // Resolve each handle's metadata (NOT its plaintext) for the decision.
+          // A token unresolvable in this run (foreign/expired/forged) fails
+          // closed exactly as before (RC5).
+          const captures: HandleEgressCapture[] = handleTokens.map((handle) => {
+            const record = getHandleRecord(runContext.runId, handle);
+            if (!record) throw new UnresolvedHandleError(handle);
+            return {
+              handle,
+              allowedEgress: record.allowedEgress,
+              enforced: record.enforced,
+              bindingId: record.bindingId,
+              unmediatedOptInTools: record.unmediatedOptInTools,
+            };
+          });
+
+          const decision = decideEgress({
+            namespacedName,
+            descriptor: getHostMediatedEgress(namespacedName),
+            rawParameters: parameters,
+            handles: captures,
+          });
+
+          if (!decision.allow) {
+            throw new EgressNotAllowedError(decision.reason, decision.destination);
+          }
+          // Log-only migration bindings (EG4): record would-deny, do not block.
+          if (decision.wouldDeny.length > 0) {
+            log.warn(
+              {
+                pluginId,
+                toolName,
+                namespacedName,
+                runId: runContext.runId,
+                // attacker-influenced — logged as data only, never eval'd (EG6).
+                destination: decision.destination,
+                wouldDenyBindings: decision.wouldDeny.map((h) => h.bindingId),
+                action: "secret.egress_would_deny",
+              },
+              "egress would be denied under enforcement; binding is in log-only mode",
+            );
+          }
+        }
         dispatchParameters = substituteHandles(runContext.runId, parameters);
       } catch (err) {
+        if (err instanceof EgressNotAllowedError) {
+          log.warn(
+            {
+              pluginId,
+              toolName,
+              namespacedName,
+              runId: runContext.runId,
+              reason: err.reason,
+              // attacker-influenced — logged as data only, never eval'd (EG6).
+              destination: err.destination,
+              action: "secret.egress_denied",
+            },
+            "aborting tool dispatch: borrowed handle not allowed to egress to this destination (fail-closed)",
+          );
+          throw new Error(
+            `Cannot execute tool "${namespacedName}" — a borrowed secret handle in its ` +
+            `parameters is not permitted to egress to the call's destination. The call ` +
+            `was aborted before the handle was resolved to plaintext.`,
+          );
+        }
         if (err instanceof UnresolvedHandleError) {
           log.warn(
             { pluginId, toolName, namespacedName, runId: runContext.runId, handle: err.handle },
