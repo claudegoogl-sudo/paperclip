@@ -63,6 +63,7 @@ import { logActivity } from "./activity-log.js";
 import { logger } from "../middleware/logger.js";
 import { secretService } from "./secrets.js";
 import { registerRunSecretValue } from "../run-secret-registry.js";
+import { mintHandle as mintBorrowedHandle } from "../handle-vault.js";
 import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js";
 
 /**
@@ -177,6 +178,21 @@ export interface PluginSecretsResolveParams {
 }
 
 /**
+ * Input shape for the `secrets.mintHandle` handler (PLA-702 Control 2). The
+ * worker supplies the resolved plaintext plus the opaque dispatch `runId`; the
+ * dispatching company/agent is re-derived server-side from the run-context
+ * registry (the worker is never trusted for scope).
+ *
+ * Matches `WorkerToHostMethods["secrets.mintHandle"][0]` from the SDK protocol.
+ */
+export interface PluginSecretsMintHandleParams {
+  /** The resolved secret plaintext to borrow behind an opaque handle. */
+  value: string;
+  /** The runId of the currently-executing tool dispatch. */
+  runId: string;
+}
+
+/**
  * A per-company plugin secret-ref binding row, narrowed to the fields this
  * handler needs. Implemented by a query against `company_secret_bindings`.
  */
@@ -246,6 +262,17 @@ export interface PluginSecretsService {
    * @throws {SecretsError} typed code only — never leaks ref/value.
    */
   resolve(params: PluginSecretsResolveParams): Promise<string>;
+
+  /**
+   * Mint an opaque borrowed handle for a resolved secret plaintext within the
+   * server-validated dispatch run (PLA-702 Control 2). Registers the value with
+   * the Control-1 value-exact redactor (fail-closed) before minting, so the
+   * consuming tool's own output is also scrubbed from the transcript.
+   *
+   * @throws {SecretsError} typed code only — never leaks the value. The value
+   *   is never logged.
+   */
+  mintHandle(params: PluginSecretsMintHandleParams): Promise<{ handle: string }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -554,5 +581,103 @@ export function createPluginSecretsHandler(
       // The resolved value only ever appears in this return — never in logs.
       return value;
     },
+
+    async mintHandle(
+      params: PluginSecretsMintHandleParams,
+    ): Promise<{ handle: string }> {
+      // ---------- Gate 0: shape validation ----------
+      // The `value` is the plaintext secret — it is NEVER echoed in errors or
+      // logs (PLA-190/PLA-193, PLA-697 discipline).
+      if (!params || typeof params !== "object") {
+        throw new SecretsError("invalid_ref", "invalid mint request");
+      }
+      const { value, runId } = params;
+      if (typeof value !== "string" || value.length === 0) {
+        throw new SecretsError("invalid_ref", "invalid mint request");
+      }
+      if (typeof runId !== "string" || runId.trim().length === 0) {
+        throw new SecretsError("runcontext_invalid", "no active dispatch for this runId");
+      }
+
+      // ---------- Gate 1: server-validated runContext lookup (RC3) ----------
+      // The borrowed value is keyed off the host-validated runContext, never a
+      // worker-asserted run. A run-A handle can never resolve under run B.
+      const ctx = runContextRegistry?.get(pluginDbId, runId.trim()) ?? null;
+      if (!ctx) {
+        throw new SecretsError("runcontext_invalid", "no active dispatch for this runId");
+      }
+
+      // ---------- Gate 2: rate limit (shared with resolve) ----------
+      if (!globalLimiter.check(`agent:${ctx.agentId}`)) {
+        await auditMint({ outcome: "denied", deniedReason: "rate_limited", ctx });
+        throw new SecretsError("rate_limited", "global per-agent rate limit exceeded");
+      }
+      if (!perCompanyLimiter.check(`agent:${ctx.agentId}|company:${ctx.companyId}`)) {
+        await auditMint({ outcome: "denied", deniedReason: "rate_limited", ctx });
+        throw new SecretsError("rate_limited", "per-company rate limit exceeded");
+      }
+
+      // ---------- Gate 3: Control-1 registration (RC2, fail-closed) ----------
+      // Register the plaintext with the value-exact redactor so the CONSUMING
+      // tool's own output (curl -v echo, error text, shell stdout) is scrubbed
+      // from the persisted transcript. A registration throw FAILS the mint — we
+      // never hand back a handle for a value we could not register, because the
+      // substituted plaintext would otherwise reach a tool whose output is not
+      // value-exact redacted.
+      try {
+        registerRunSecretValue(ctx.runId, value);
+      } catch (err) {
+        log.warn(
+          { err, companyId: ctx.companyId, toolName: ctx.toolName },
+          "value-exact redaction registration failed; refusing mint (fail-closed)",
+        );
+        await auditMint({ outcome: "denied", deniedReason: "not_found", ctx });
+        throw new SecretsError("not_found", "mint failed");
+      }
+
+      // ---------- Gate 4: mint + store + audit ----------
+      const handle = mintBorrowedHandle(ctx.runId, value);
+      await auditMint({ outcome: "allowed", ctx });
+
+      // Only the opaque handle leaves this method; the value is never logged.
+      return { handle };
+    },
   };
+
+  /**
+   * Value-free audit for a borrowed-handle mint. Mirrors the resolve audit
+   * discipline: the secret value is NEVER included; only the opaque
+   * agent/company/tool dimensions are recorded. Failures never change the
+   * decision returned to the worker.
+   */
+  async function auditMint(input: {
+    outcome: "allowed" | "denied";
+    deniedReason?: SecretsErrorCode;
+    ctx: { agentId: string; companyId: string; runId: string; toolName: string };
+  }) {
+    try {
+      await logActivity(db, {
+        companyId: input.ctx.companyId,
+        actorType: "plugin",
+        actorId: pluginDbId,
+        action: "secret.handle_minted",
+        entityType: "plugin",
+        entityId: pluginDbId,
+        agentId: input.ctx.agentId,
+        runId: input.ctx.runId,
+        details: {
+          pluginKey,
+          pluginDbId,
+          outcome: input.outcome,
+          deniedReason: input.deniedReason ?? null,
+          dispatchingAgentId: input.ctx.agentId,
+          dispatchingCompanyId: input.ctx.companyId,
+          toolName: input.ctx.toolName,
+        },
+      });
+    } catch (err) {
+      // No value, no secretId — nothing sensitive to leak in this warning.
+      log.warn({ err, toolName: input.ctx.toolName }, "mint audit log write failed");
+    }
+  }
 }

@@ -846,6 +846,23 @@ export interface WorkerToHostMethods {
     result: string,
   ];
 
+  // Secrets — borrowed-handle minting (PLA-702 / PLA-695 Control 2).
+  //
+  // After a plugin resolves a secret's plaintext (via `secrets.resolve` or its
+  // own backend), it calls `secrets.mintHandle` to exchange the plaintext for
+  // an opaque borrowed handle (`vault-handle://<runId>/<128-bit-id>`). The
+  // plugin returns the HANDLE to the agent instead of the plaintext; the host
+  // substitutes the real value back in only at the worker-dispatch edge of a
+  // downstream tool call, so the transcript and persisted call records never
+  // contain the secret. `runId` MUST be the runId of the currently-executing
+  // tool dispatch (same contract as `secrets.resolve`); the host keys the
+  // borrowed value off the server-validated runContext, never the worker.
+  // Minting also registers the value with the Control-1 value-exact redactor.
+  "secrets.mintHandle": [
+    params: { value: string; runId: string },
+    result: { handle: string },
+  ];
+
   // Artifacts (attachment bytes)
   //
   // `runId` MUST be the runId of the currently-executing tool dispatch.

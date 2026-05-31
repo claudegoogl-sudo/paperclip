@@ -27,6 +27,7 @@ import type { ToolRunContext, ToolResult, ExecuteToolParams } from "@paperclipai
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js";
 import { logger } from "../middleware/logger.js";
+import { substituteHandles, UnresolvedHandleError } from "../handle-vault.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -418,9 +419,43 @@ export function createPluginToolRegistry(
         "executing tool via plugin worker",
       );
 
+      // PLA-702 Control 2 — borrowed-handle egress substitution chokepoint.
+      //
+      // This is the STRUCTURAL chokepoint (RC5 placement): every plugin tool
+      // dispatch routes through here, including the `getRegistry()` escape
+      // hatch that bypasses the higher-level dispatcher. Before handing the
+      // parameters to the worker we replace any borrowed-handle substrings with
+      // the plaintext borrowed for THIS run (keyed by the host's own
+      // `runContext.runId`, never a handle-embedded run id — RC3), so the
+      // executing tool sees the real secret while the transcript / persisted
+      // call record keeps the opaque handle.
+      //
+      // The substitution is on a throwaway deep copy (RC4): `parameters` — the
+      // handle-bearing object the caller persists and audits — is never
+      // mutated. A handle-shaped token that does not resolve in this run's
+      // vault (foreign / expired / forged) aborts the call fail-closed (RC5);
+      // a literal `vault-handle://` must never leave the host outbound.
+      let dispatchParameters: unknown;
+      try {
+        dispatchParameters = substituteHandles(runContext.runId, parameters);
+      } catch (err) {
+        if (err instanceof UnresolvedHandleError) {
+          log.warn(
+            { pluginId, toolName, namespacedName, runId: runContext.runId, handle: err.handle },
+            "aborting tool dispatch: unresolvable borrowed handle in parameters (fail-closed)",
+          );
+          throw new Error(
+            `Cannot execute tool "${namespacedName}" — a borrowed secret handle in ` +
+            `its parameters does not belong to this run. The call was aborted so the ` +
+            `opaque handle is never sent downstream.`,
+          );
+        }
+        throw err;
+      }
+
       const rpcParams: ExecuteToolParams = {
         toolName,
-        parameters,
+        parameters: dispatchParameters,
         runContext,
       };
 

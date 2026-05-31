@@ -853,6 +853,13 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         requireCapability(manifest, capabilitySet, "secrets.read-ref");
         return `resolved:${secretRef}`;
       },
+      async mintHandle(value, runId) {
+        requireCapability(manifest, capabilitySet, "secrets.read-ref");
+        // Deterministic stand-in handle for unit tests; the real host mints a
+        // 128-bit random id. The value is intentionally not echoed.
+        void value;
+        return `vault-handle://${runId}/00000000000000000000000000000000`;
+      },
     },
     activity: {
       async log(entry) {

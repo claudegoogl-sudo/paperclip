@@ -1314,6 +1314,9 @@ export function buildHostServices(
       async resolve(params) {
         return secretsHandler.resolve(params);
       },
+      async mintHandle(params) {
+        return secretsHandler.mintHandle(params);
+      },
     },
 
     artifacts: {

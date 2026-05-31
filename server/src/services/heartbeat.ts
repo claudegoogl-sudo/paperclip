@@ -155,6 +155,7 @@ import {
 } from "../log-redaction.js";
 import { redactEventPayload, redactSensitiveText } from "../redaction.js";
 import { clearRunSecretValues } from "../run-secret-registry.js";
+import { clearRunHandles } from "../handle-vault.js";
 import {
   hasSessionCompactionThresholds,
   resolveSessionCompactionPolicy,
@@ -8214,6 +8215,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // rotated secret's stale plaintext is never retained across runs
           // (PLA-697 / PLA-695 Control 1).
           clearRunSecretValues(run.id);
+          // Drop any borrowed-handle plaintext minted during this run so a
+          // run-A handle can never resolve under a later run and rotated
+          // secrets are not retained (PLA-702 / PLA-695 Control 2).
+          clearRunHandles(run.id);
           activeRunExecutions.delete(run.id);
           await startNextQueuedRunForAgent(run.agentId);
         }

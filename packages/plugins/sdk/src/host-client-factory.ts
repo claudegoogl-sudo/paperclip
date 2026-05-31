@@ -163,9 +163,12 @@ export interface HostServices {
     fetch(params: WorkerToHostMethods["http.fetch"][0]): Promise<WorkerToHostMethods["http.fetch"][1]>;
   };
 
-  /** Provides `secrets.resolve`. */
+  /** Provides `secrets.resolve` and `secrets.mintHandle`. */
   secrets: {
     resolve(params: WorkerToHostMethods["secrets.resolve"][0]): Promise<string>;
+    mintHandle(
+      params: WorkerToHostMethods["secrets.mintHandle"][0],
+    ): Promise<WorkerToHostMethods["secrets.mintHandle"][1]>;
   };
 
   /**
@@ -424,6 +427,9 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
 
   // Secrets
   "secrets.resolve": "secrets.read-ref",
+  // Minting a borrowed handle is part of resolving a secret-ref, so it shares
+  // the same capability gate (PLA-702 Control 2).
+  "secrets.mintHandle": "secrets.read-ref",
 
   // Artifacts — no capability gate: tool-dispatch implies attachment-read
   // (host enforces dispatching-agent authz via runContext lookup). See PLA-574.
@@ -795,6 +801,14 @@ export function createHostClientHandlers(
       // `runcontext_invalid`.
       const enriched = backfillDispatchRunId(params, context);
       return services.secrets.resolve(enriched);
+    }),
+
+    // Secrets — borrowed-handle minting (PLA-702 Control 2). Same dispatch
+    // run-id back-fill as `secrets.resolve`; the host keys the borrowed value
+    // off the server-validated runContext and fail-closes outside a dispatch.
+    "secrets.mintHandle": gated("secrets.mintHandle", async (params, context) => {
+      const enriched = backfillDispatchRunId(params, context);
+      return services.secrets.mintHandle(enriched);
     }),
 
     // Artifacts (PLA-574) — host enforces dispatching-agent authz via runContext
