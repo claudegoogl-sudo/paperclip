@@ -49,6 +49,7 @@ vi.mock("../services/index.js", () => ({
       agent: { id: raw },
     })),
   }),
+  documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
   documentService: () => ({}),
   executionWorkspaceService: () => ({}),
   feedbackService: () => ({
@@ -117,6 +118,7 @@ function registerModuleMocks() {
         agent: { id: raw },
       })),
     }),
+    documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
     documentService: () => ({}),
     executionWorkspaceService: () => ({}),
     feedbackService: () => ({

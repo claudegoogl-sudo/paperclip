@@ -89,6 +89,7 @@ function registerModuleMocks() {
   }));
 
   vi.doMock("../services/documents.js", () => ({
+    documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
     documentService: () => mockDocumentsService,
   }));
 
@@ -114,6 +115,7 @@ function registerModuleMocks() {
     }),
     accessService: () => mockAccessService,
     agentService: () => mockAgentService,
+    documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
     documentService: () => mockDocumentsService,
     executionWorkspaceService: () => ({}),
     feedbackService: () => ({}),
