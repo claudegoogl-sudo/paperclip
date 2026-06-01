@@ -370,3 +370,103 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
     });
   });
 });
+
+describe("createHostClientHandlers config.get per-company scope selection (PLA-761)", () => {
+  // id-less legacy workers (e.g. platform.cad ≤0.1.x) never echo a
+  // `paperclipInvocationId`, so `invocationScope` is null. PLA-719 gave the host
+  // a `singleInFlightScope` (the sole in-flight dispatch's company, host-derived)
+  // and wired secrets.resolve/artifacts.fetch to consult it — but config.get was
+  // left reading only `invocationScope`, so it fell through to the instance-wide
+  // config and handed DPR Platform's secret ref. These tests pin the fix.
+
+  function makeConfigHandlers() {
+    const getForCompany = vi.fn(async (companyId: string) => ({
+      githubPatSecretId: `secret-for-${companyId}`,
+    }));
+    const get = vi.fn(async () => ({ githubPatSecretId: "instance-wide-secret" }));
+    const services = {
+      config: { get, getForCompany },
+    } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: [],
+      services,
+    });
+    return { handlers, get, getForCompany };
+  }
+
+  it("delegates to getForCompany using singleInFlightScope when the worker echoed no invocation id", async () => {
+    const { handlers, get, getForCompany } = makeConfigHandlers();
+
+    await expect(
+      handlers["config.get"](undefined as never, {
+        invocationScope: null,
+        singleInFlightScope: { companyId: "company-dpr" },
+      }),
+    ).resolves.toEqual({ githubPatSecretId: "secret-for-company-dpr" });
+
+    expect(getForCompany).toHaveBeenCalledWith("company-dpr");
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it("prefers invocationScope over singleInFlightScope when both are present", async () => {
+    const { handlers, getForCompany } = makeConfigHandlers();
+
+    await handlers["config.get"](undefined as never, {
+      invocationScope: { companyId: "company-a" },
+      singleInFlightScope: { companyId: "company-b" },
+    });
+
+    expect(getForCompany).toHaveBeenCalledWith("company-a");
+    expect(getForCompany).not.toHaveBeenCalledWith("company-b");
+  });
+
+  it("falls back to instance-wide get() with no scope (0 or 2+ in-flight dispatches → no singleInFlightScope)", async () => {
+    const { handlers, get, getForCompany } = makeConfigHandlers();
+
+    await expect(
+      handlers["config.get"](undefined as never, {}),
+    ).resolves.toEqual({ githubPatSecretId: "instance-wide-secret" });
+
+    expect(get).toHaveBeenCalledTimes(1);
+    expect(getForCompany).not.toHaveBeenCalled();
+  });
+
+  it("a worker cannot name an arbitrary tenant via a forged companyId param — fails closed", async () => {
+    const { handlers, get, getForCompany } = makeConfigHandlers();
+
+    // config.get carries no companyId in its real contract. If a worker forges
+    // one, the gated `requireInvocationCompanyScope` enforcement treats it as a
+    // requested company scope; with no matching `invocationScope` it is denied
+    // before the handler body runs. The forged company's config is never read —
+    // the scope selection in the handler only ever uses host-derived scopes.
+    await expect(
+      handlers["config.get"](
+        { companyId: "company-attacker" } as never,
+        { singleInFlightScope: { companyId: "company-dpr" } },
+      ),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+
+    expect(getForCompany).not.toHaveBeenCalled();
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it("falls back to get() when the host implements no per-company delivery", async () => {
+    const get = vi.fn(async () => ({ githubPatSecretId: "instance-wide-secret" }));
+    const services = {
+      config: { get },
+    } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: [],
+      services,
+    });
+
+    await expect(
+      handlers["config.get"](undefined as never, {
+        singleInFlightScope: { companyId: "company-dpr" },
+      }),
+    ).resolves.toEqual({ githubPatSecretId: "instance-wide-secret" });
+    expect(get).toHaveBeenCalledTimes(1);
+  });
+});
