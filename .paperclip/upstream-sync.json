@@ -1,10 +1,10 @@
 {
-  "lastSyncedTag": "v2026.525.0",
-  "lastSyncedSha": "2c4f9ed4d29ba1047f52a29d0ab6d73abe3e7a50",
-  "lastSyncedAt": "2026-05-29T05:28:59Z",
-  "etag": "W/\"7ddf56f0a51b2400604feb7ad43f7064160fc53717d7d70a133da167930220b1\"",
-  "lastCheckedAt": "2026-05-29T05:28:59Z",
+  "lastSyncedTag": "v2026.529.0",
+  "lastSyncedSha": "43dfde763ceae7481e7a96d4fe8183aaaeec8eaa",
+  "lastSyncedAt": "2026-06-01T05:57:06Z",
+  "etag": "W/\"fd6a229e9c96aec3a00412dcd00c8c599d589fee4ebaadf065d453900b53efae\"",
+  "lastCheckedAt": "2026-06-01T05:58:28Z",
   "pendingPrUrl": null,
-  "lastConflictBuckets": { "clean": 1, "reviewable": 0, "escalation": 0 },
-  "_syncNote": "v2026.525.0 upstream sync landed on fork master via PR #35 (merge commit 2c4f9ed4, lineage preserved); lastSyncedSha is that merge commit. ETag still reflects upstream releases/latest at v2026.525.0, so the next scheduled tick gets a 304 and exits no-op until upstream cuts a newer release. Supersedes the PLA-603 bootstrap note (was pinned at v2026.428.0)."
+  "lastConflictBuckets": { "clean": 0, "reviewable": 1, "escalation": 0 },
+  "_syncNote": "v2026.529.0 upstream sync landed on fork master via PR #60 (merge commit 43dfde763ceae7481e7a96d4fe8183aaaeec8eaa; lineage preserved: 43dfde7 = merge of 16de9da/2334632, upstream tag 911a1e8b is an ancestor). 5 conflicts resolved per CTO decision PLA-751 (bucket: reviewable=1); SecurityEngineer review PLA-758 PASS (both egress migrations 0096/0097 byte-identical post-renumber). State advanced by CTO-driven re-run after the conflict was addressed and the PR merged (skill 3+4). ETag reflects upstream releases/latest at v2026.529.0, so the next scheduled tick gets a 304 and exits no-op until upstream cuts a newer release. Supersedes the PLA-752 staged note (was pinned at v2026.525.0)."
 }
