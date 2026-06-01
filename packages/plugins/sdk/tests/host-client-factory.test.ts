@@ -342,6 +342,61 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
     });
   });
 
+  it("back-fills runId on secrets.resolve from the service scope (PLA-768)", async () => {
+    // A setup()-started loop (e.g. messenger getUpdates) or a background
+    // dispatch resolves with NO dispatch in flight, so neither invocation nor
+    // single-in-flight scope exists — only the host-minted service scope.
+    const resolve = vi.fn(async () => "resolved-value");
+    const services = {
+      secrets: { resolve },
+    } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services,
+    });
+
+    await handlers["secrets.resolve"](
+      { secretRef: "11111111-1111-1111-1111-111111111111" } as never,
+      { serviceScope: { runId: "service-run-1" } },
+    );
+
+    expect(resolve).toHaveBeenCalledWith({
+      secretRef: "11111111-1111-1111-1111-111111111111",
+      runId: "service-run-1",
+    });
+  });
+
+  it("prefers an active dispatch runId over the service scope (PLA-768)", async () => {
+    // When both are present (a tool dispatch happens to run inside a worker that
+    // also has a service scope), the active dispatch must win so the resolve is
+    // attributed to the dispatching agent, not the system actor.
+    const resolve = vi.fn(async () => "resolved-value");
+    const services = {
+      secrets: { resolve },
+    } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services,
+    });
+
+    await handlers["secrets.resolve"](
+      { secretRef: "11111111-1111-1111-1111-111111111111" } as never,
+      {
+        invocationScope: { companyId: "company-a", runId: "dispatch-run" },
+        serviceScope: { runId: "service-run-1" },
+      },
+    );
+
+    expect(resolve).toHaveBeenCalledWith({
+      secretRef: "11111111-1111-1111-1111-111111111111",
+      runId: "dispatch-run",
+    });
+  });
+
   it("back-fills runId on artifacts.fetch symmetrically", async () => {
     const fetch = vi.fn(async () => ({
       filename: "a.txt",

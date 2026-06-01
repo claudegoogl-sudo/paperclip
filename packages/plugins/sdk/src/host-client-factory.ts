@@ -601,6 +601,15 @@ export function createHostClientHandlers(
    *      so the PLA-657/PLA-574 isolation model holds: a forged worker→host call
    *      outside any dispatch surfaces no scope here and still fails closed at
    *      the server's secrets handler (`runcontext_invalid`).
+   *   3. `context.serviceScope` — PLA-768: the host-minted, worker-lifetime
+   *      service run-context, surfaced on EVERY worker→host call. It is the
+   *      fallback for a background dispatch (`onEvent`/`onWebhook`/`runJob`) or
+   *      a loop started in `setup()` (e.g. a `getUpdates` long-poll) that calls
+   *      `secrets.resolve` with NO dispatch in flight, so neither scope above
+   *      exists. Checked last so an active dispatch's runId always wins. The
+   *      service runId is host-minted (never worker-supplied) and resolves to a
+   *      system actor at the server with the company derived from the secret
+   *      binding — it grants no company scope here.
    */
   function backfillDispatchRunId<P>(
     params: P,
@@ -610,7 +619,8 @@ export function createHostClientHandlers(
     if (readNonEmptyString((params as Record<string, unknown>).runId)) return params;
     const scopedRunId =
       readNonEmptyString(context?.invocationScope?.runId) ??
-      readNonEmptyString(context?.singleInFlightScope?.runId);
+      readNonEmptyString(context?.singleInFlightScope?.runId) ??
+      readNonEmptyString(context?.serviceScope?.runId);
     if (!scopedRunId) return params;
     return { ...params, runId: scopedRunId } as P;
   }

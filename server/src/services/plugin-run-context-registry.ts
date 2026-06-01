@@ -16,7 +16,13 @@
  * runIds, not slow tools.
  */
 
-export interface RegisteredRunContext {
+/**
+ * A run-context backing a tool/action dispatch. The dispatching agent's
+ * identity is server-validated and used to authorize worker→host callbacks.
+ */
+export interface RegisteredDispatchRunContext {
+  /** Discriminator. Absent is treated as `"dispatch"` for back-compat. */
+  kind?: "dispatch";
   /** UUID of the dispatching agent (server-validated). */
   agentId: string;
   /** UUID of the dispatching agent's company (server-validated). */
@@ -31,8 +37,36 @@ export interface RegisteredRunContext {
   registeredAt: number;
 }
 
+/**
+ * PLA-768: a worker-lifetime **service** run-context. It backs background
+ * plugin dispatches (`onEvent`/`onWebhook`/`runJob`) and loops started in
+ * `setup()` that call `ctx.secrets.resolve` outside any dispatch. There is NO
+ * dispatching agent or company: it is a system actor (`actorType: "plugin"`).
+ * The secrets handler derives the dispatching company from the operator-created
+ * secret binding — never from this entry — so a service context grants no
+ * broader access than the plugin's own bindings. Unlike dispatch entries it is
+ * exempt from the TTL sweep (a poll loop may run for hours) and is removed
+ * explicitly when the worker stops/exits.
+ */
+export interface RegisteredServiceRunContext {
+  kind: "service";
+  /** Host-minted, worker-lifetime run UUID (never worker-supplied). */
+  runId: string;
+  /** Wall-clock when the entry was added. */
+  registeredAt: number;
+}
+
+export type RegisteredRunContext =
+  | RegisteredDispatchRunContext
+  | RegisteredServiceRunContext;
+
 export interface PluginRunContextRegistry {
-  register(pluginDbId: string, ctx: RegisteredRunContext): void;
+  register(pluginDbId: string, ctx: RegisteredDispatchRunContext): void;
+  /**
+   * PLA-768: register a worker-lifetime service run-context (system actor).
+   * Idempotent for a given `(pluginDbId, runId)`.
+   */
+  registerService(pluginDbId: string, runId: string): void;
   get(pluginDbId: string, runId: string): RegisteredRunContext | null;
   deregister(pluginDbId: string, runId: string): void;
   /** Test/diagnostic. Returns the number of live entries. */
@@ -67,6 +101,9 @@ export function createPluginRunContextRegistry(
   const sweep = () => {
     const cutoff = now() - ttlMs;
     for (const [key, value] of entries) {
+      // PLA-768: service entries are worker-lifetime (a poll loop may run for
+      // hours) and removed explicitly on worker stop — never TTL-swept.
+      if (value.kind === "service") continue;
       if (value.registeredAt < cutoff) {
         entries.delete(key);
       }
@@ -83,11 +120,19 @@ export function createPluginRunContextRegistry(
     register(pluginDbId, ctx) {
       entries.set(compositeKey(pluginDbId, ctx.runId), ctx);
     },
+    registerService(pluginDbId, runId) {
+      entries.set(compositeKey(pluginDbId, runId), {
+        kind: "service",
+        runId,
+        registeredAt: now(),
+      });
+    },
     get(pluginDbId, runId) {
       const entry = entries.get(compositeKey(pluginDbId, runId));
       if (!entry) return null;
-      // Guard against orphaned entries that survived past TTL between sweeps.
-      if (entry.registeredAt < now() - ttlMs) {
+      // Guard against orphaned dispatch entries that survived past TTL between
+      // sweeps. Service entries are worker-lifetime — never TTL-expired here.
+      if (entry.kind !== "service" && entry.registeredAt < now() - ttlMs) {
         entries.delete(compositeKey(pluginDbId, runId));
         return null;
       }

@@ -309,6 +309,24 @@ export interface WorkerHostCallContext {
    * Absent whenever 0 or 2+ dispatches are in-flight (fail closed).
    */
   singleInFlightScope?: PluginInvocationScope | null;
+  /**
+   * PLA-768: the worker-lifetime **service run-context**. Unlike
+   * `invocationScope`/`singleInFlightScope` — which only exist while a
+   * host→worker dispatch is in-flight — this is minted once per worker process
+   * and surfaced on EVERY worker→host call, so a background dispatch
+   * (`onEvent`/`onWebhook`/`runJob`) or a loop started in `setup()` (e.g. a
+   * `getUpdates` long-poll) that calls `ctx.secrets.resolve` outside any
+   * dispatch still carries a host-validated `runId`.
+   *
+   * The `runId` is host-minted (never worker-supplied) and registered in the
+   * run-context registry as a system actor (`actorType: "plugin"`). It grants
+   * NO company scope by itself: the secrets handler derives the dispatching
+   * company from the operator-created secret binding, and company-scoped
+   * worker→host calls (issues, state, etc.) still require an `invocationScope`.
+   * So this field is consumed ONLY by the runId back-fill for `secrets.resolve`
+   * — it is never used for company-scope enforcement.
+   */
+  serviceScope?: { runId: string } | null;
 }
 
 // ---------------------------------------------------------------------------

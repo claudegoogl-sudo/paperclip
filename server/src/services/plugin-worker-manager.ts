@@ -53,6 +53,7 @@ import type {
   InitializeParams,
 } from "@paperclipai/plugin-sdk";
 import { logger } from "../middleware/logger.js";
+import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -228,6 +229,16 @@ export interface PluginWorkerHandle {
   /** The plugin ID this worker serves. */
   readonly pluginId: string;
 
+  /**
+   * PLA-768: host-minted, worker-lifetime service run UUID. Surfaced as
+   * `context.serviceScope.runId` on every worker→host call so a background
+   * dispatch or a `setup()`-started loop can resolve secrets outside any
+   * dispatch. Stable across crash/auto-restart of this handle; never
+   * worker-supplied. The manager registers it in the run-context registry as a
+   * system actor for the handle's lifetime.
+   */
+  readonly serviceRunId: string;
+
   /** Current worker status. */
   readonly status: WorkerStatus;
 
@@ -392,6 +403,10 @@ export function createPluginWorkerHandle(
   const pendingRequests = new Map<string | number, PendingRequest>();
   let nextRequestId = 1;
   const activeInvocations = new Map<string, ActiveInvocation>();
+  // PLA-768: stable, host-minted service run-context for this worker's
+  // lifetime. Surfaced on every worker→host call so background dispatches /
+  // setup() loops can resolve secrets outside any dispatch.
+  const serviceRunId = randomUUID();
 
   // Optional methods reported by the worker during initialization
   let supportedMethods: string[] = [];
@@ -578,6 +593,19 @@ export function createPluginWorkerHandle(
   }
 
   function contextForWorkerMessage(message: JsonRpcRequest | JsonRpcNotification): WorkerHostCallContext {
+    // PLA-768: ALWAYS attach the worker-lifetime service run-context, on top of
+    // whatever dispatch scope (if any) the message resolves to. The service
+    // scope is consumed only by the runId back-fill for `secrets.resolve`; it
+    // grants no company scope, so merging it never widens `invocationScope`
+    // enforcement (a worker→host call with `invalidInvocationScope` stays
+    // invalid for company-scoped methods).
+    return {
+      ...baseContextForWorkerMessage(message),
+      serviceScope: { runId: serviceRunId },
+    };
+  }
+
+  function baseContextForWorkerMessage(message: JsonRpcRequest | JsonRpcNotification): WorkerHostCallContext {
     const invocationId = readNonEmptyString(
       (message as { paperclipInvocationId?: unknown }).paperclipInvocationId,
     );
@@ -1277,6 +1305,10 @@ export function createPluginWorkerHandle(
       return pluginId;
     },
 
+    get serviceRunId() {
+      return serviceRunId;
+    },
+
     get status() {
       return status;
     },
@@ -1384,6 +1416,13 @@ export interface PluginWorkerManagerOptions {
     signal?: string | null;
     willRestart?: boolean;
   }) => void;
+  /**
+   * PLA-768: shared run-context registry. When provided, the manager registers
+   * each worker's host-minted service run-context (`handle.serviceRunId`) as a
+   * system actor for the worker's lifetime, so background dispatches and
+   * `setup()`-started loops can resolve secrets. Deregistered on stop.
+   */
+  runContextRegistry?: PluginRunContextRegistry;
 }
 
 /**
@@ -1442,6 +1481,16 @@ export function createPluginWorkerManager(
       const handle = createPluginWorkerHandle(pluginId, options);
       workers.set(pluginId, handle);
 
+      // PLA-768: register the worker-lifetime service run-context so background
+      // dispatches / setup() loops can resolve secrets (system actor). Stable
+      // across crash/auto-restart of this handle; removed on stop. The runId is
+      // host-minted — it grants no company scope (company is derived from the
+      // operator-created secret binding at resolve time).
+      managerOptions?.runContextRegistry?.registerService(
+        pluginId,
+        handle.serviceRunId,
+      );
+
       // Subscribe to crash/ready events for live event forwarding
       if (managerOptions?.onWorkerEvent) {
         const notify = managerOptions.onWorkerEvent;
@@ -1486,6 +1535,7 @@ export function createPluginWorkerManager(
 
       log.info({ pluginId }, "stopping plugin worker");
       await handle.stop();
+      managerOptions?.runContextRegistry?.deregister(pluginId, handle.serviceRunId);
       workers.delete(pluginId);
     },
 
@@ -1503,6 +1553,7 @@ export function createPluginWorkerManager(
       const promises = Array.from(workers.values()).map(async (handle) => {
         try {
           await handle.stop();
+          managerOptions?.runContextRegistry?.deregister(handle.pluginId, handle.serviceRunId);
         } catch (err) {
           log.error(
             {

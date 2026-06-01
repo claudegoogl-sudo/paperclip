@@ -246,6 +246,9 @@ describe("plugin-worker-manager stderr failure context", () => {
       // `secrets.resolve({secretRef})`) can be back-filled by host-client-
       // factory. The values come from the host's `actorContext` and were
       // already on the wire — they're just exposed via scope now too.
+      // PLA-768: the host-minted worker-lifetime service scope is also surfaced
+      // on every worker→host call (the fallback runId for background/setup-loop
+      // secrets.resolve). It never overrides an active dispatch scope.
       expect(companiesGet).toHaveBeenCalledWith(
         { companyId: "company-a" },
         {
@@ -254,6 +257,7 @@ describe("plugin-worker-manager stderr failure context", () => {
             runId: "run-1",
             agentId: "agent-1",
           },
+          serviceScope: { runId: expect.any(String) },
         },
       );
     } finally {
@@ -289,9 +293,13 @@ describe("plugin-worker-manager stderr failure context", () => {
         },
       } as HostToWorkerMethods["getData"][0])).resolves.toEqual({ id: "company-1" });
 
+      // PLA-768: service scope is always present alongside the echoed scope.
       expect(companiesGet).toHaveBeenCalledWith(
         { companyId: "company-1" },
-        { invocationScope: { companyId: "company-1" } },
+        {
+          invocationScope: { companyId: "company-1" },
+          serviceScope: { runId: expect.any(String) },
+        },
       );
     } finally {
       await handle.stop().catch(() => undefined);

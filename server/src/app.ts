@@ -194,7 +194,16 @@ export async function createApp(
   app.use(llmRoutes(db));
 
   const hostServicesDisposers = new Map<string, () => void>();
-  const workerManager = opts.pluginWorkerManager ?? createPluginWorkerManager();
+  // PLA-574: shared run-context registry tying the dispatching agent's
+  // identity to (pluginDbId, runId) for the duration of each tool call, so the
+  // worker's `artifacts.fetch`/`secrets.resolve` callbacks can be authorized
+  // server-side. PLA-768: also holds each worker's worker-lifetime service
+  // run-context (system actor) for background secret resolution — created
+  // before the worker manager so the manager can register on worker start.
+  const pluginRunContextRegistry = createPluginRunContextRegistry();
+  const workerManager =
+    opts.pluginWorkerManager ??
+    createPluginWorkerManager({ runContextRegistry: pluginRunContextRegistry });
 
   // Mount API routes
   const api = Router();
@@ -246,10 +255,6 @@ export async function createApp(
     jobStore,
     workerManager,
   });
-  // PLA-574: shared run-context registry tying the dispatching agent's
-  // identity to (pluginDbId, runId) for the duration of each tool call,
-  // so the worker's `artifacts.fetch` callback can be authorized server-side.
-  const pluginRunContextRegistry = createPluginRunContextRegistry();
   const toolDispatcher = createPluginToolDispatcher({
     workerManager,
     lifecycleManager: lifecycle,
