@@ -283,11 +283,12 @@ export function createPluginArtifactsHandler(
           "no active dispatch for this runId",
         );
       }
-      // PLA-768: a worker-lifetime service context has no dispatching agent or
-      // company, so it cannot authorize an attachment fetch (which is scoped to
-      // the dispatching agent's access). Reject it like an unknown runId rather
-      // than attribute the fetch to a non-existent agent/company.
-      if (ctx.kind === "service") {
+      // PLA-768/PLA-773: a worker-lifetime service context (no agent/company) and
+      // a per-dispatch background context (company but no agent) cannot authorize
+      // an attachment fetch, which is scoped to the dispatching agent's access.
+      // Reject both like an unknown runId rather than attribute the fetch to a
+      // non-existent agent.
+      if (ctx.kind === "service" || ctx.kind === "background") {
         throw new ArtifactsError(
           "runcontext_invalid",
           "no active dispatch for this runId",

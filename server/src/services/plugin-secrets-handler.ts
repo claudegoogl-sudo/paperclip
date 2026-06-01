@@ -379,10 +379,19 @@ export function createPluginSecretsHandler(
     perCompanyCfg.windowMs,
     now,
   );
-  // PLA-768: a service context has no dispatching agent, so it cannot share the
-  // per-agent buckets. It gets its own bucket keyed on the plugin install, with
-  // the same window/limit, so a runaway poll loop is still capped.
+  // PLA-768: a service/background context has no dispatching agent, so it cannot
+  // share the per-agent buckets. It gets its own limiter with the same
+  // window/limit so a runaway poll loop is still capped.
+  //
+  // PLA-773 (item 3): the limiter is keyed per `(plugin, company)` whenever the
+  // company is known — a background dispatch carries its triggering company, so
+  // one tenant's runaway loop can no longer exhaust the bucket every other
+  // tenant's background resolves share. The genuinely company-less `setup()`
+  // path falls back to the per-plugin key as a pre-lookup enumeration guard
+  // (no company is known until after the binding lookup).
   const serviceLimiter = createRateLimiter(globalCfg.maxAttempts, globalCfg.windowMs, now);
+  const serviceRateKey = (companyId?: string) =>
+    companyId ? `service:${pluginDbId}|company:${companyId}` : `service:${pluginDbId}`;
   const log = logger.child({ service: "plugin-secrets-handler", pluginId: pluginKey });
 
   const bindings: PluginSecretBindingLookup =
@@ -538,7 +547,7 @@ export function createPluginSecretsHandler(
     // ---------- Gate 2: rate limit (per-plugin service bucket) ----------
     // Checked BEFORE any DB lookup so a forged/looping worker cannot enumerate.
     // No company is known yet, so no audit is possible on this deny.
-    if (!serviceLimiter.check(`service:${pluginDbId}`)) {
+    if (!serviceLimiter.check(serviceRateKey())) {
       throw new SecretsError("rate_limited", "service rate limit exceeded");
     }
 
@@ -623,6 +632,123 @@ export function createPluginSecretsHandler(
     return value;
   }
 
+  /**
+   * PLA-773 (item 1): resolve a secret for a per-dispatch **background** context
+   * — a background dispatch (`onEvent`/`onWebhook`) that carries a known
+   * TRIGGERING company. Unlike {@link resolveForServiceContext}, the company is
+   * NOT derived from the binding: it is the host-validated triggering company,
+   * and the binding lookup is **scoped to it** (the same company-scoped
+   * `findBinding` the agent-dispatch path uses). So a global plugin worker
+   * handling company A's event can resolve ONLY the secrets company A bound to
+   * this plugin — a ref bound by company B collapses to the opaque `not_found`,
+   * exactly as it would for an agent dispatch in company A.
+   *
+   * The triggering company comes from the run-context registry (host-derived
+   * from the event), never from the worker. Rate-limiting uses the per-(plugin,
+   * company) bucket (item 3). Gates 4-6 are identical to the other paths.
+   */
+  async function resolveForBackgroundContext(
+    trimmedRef: string,
+    backgroundRunId: string,
+    companyId: string,
+  ): Promise<string> {
+    const sentinelTool = "background:dispatch";
+
+    // ---------- Gate 2: rate limit (per-(plugin, company) bucket) ----------
+    if (!serviceLimiter.check(serviceRateKey(companyId))) {
+      await audit({
+        outcome: "denied",
+        deniedReason: "rate_limited",
+        dispatchingAgentId: null,
+        dispatchingCompanyId: companyId,
+        secretId: trimmedRef,
+        runId: backgroundRunId,
+        toolName: sentinelTool,
+      });
+      throw new SecretsError("rate_limited", "background rate limit exceeded");
+    }
+
+    // ---------- Gate 3: company-scoped allow-list (binding) ----------
+    // The ref is resolvable only if the TRIGGERING company has bound it to this
+    // plugin. A cross-tenant ref is not bound here and collapses to not_found.
+    const binding = await bindings.findBinding({
+      companyId,
+      pluginTargetId: pluginDbId,
+      secretId: trimmedRef,
+    });
+    if (!binding) {
+      await audit({
+        outcome: "denied",
+        deniedReason: "not_found",
+        dispatchingAgentId: null,
+        dispatchingCompanyId: companyId,
+        secretId: trimmedRef,
+        runId: backgroundRunId,
+        toolName: sentinelTool,
+      });
+      throw new SecretsError("not_found", "secret not found");
+    }
+
+    // ---------- Gate 4: company-scoped resolve (defence in depth) ----------
+    let value: string;
+    try {
+      value = await resolver.resolve({
+        companyId,
+        secretId: trimmedRef,
+        version: parseVersionSelector(binding.versionSelector),
+        pluginDbId,
+        configPath: binding.configPath,
+      });
+    } catch (err) {
+      log.warn(
+        { err, secretId: trimmedRef, companyId },
+        "background-context secret resolution failed; collapsing to not_found",
+      );
+      await audit({
+        outcome: "denied",
+        deniedReason: "not_found",
+        dispatchingAgentId: null,
+        dispatchingCompanyId: companyId,
+        secretId: trimmedRef,
+        runId: backgroundRunId,
+        toolName: sentinelTool,
+      });
+      throw new SecretsError("not_found", "secret not found");
+    }
+
+    // ---------- Gate 5: value-exact redaction (fail-closed) ----------
+    try {
+      registerRunSecretValue(backgroundRunId, value);
+    } catch (err) {
+      log.warn(
+        { err, secretId: trimmedRef, companyId },
+        "value-exact redaction registration failed; refusing background resolution (fail-closed)",
+      );
+      await audit({
+        outcome: "denied",
+        deniedReason: "not_found",
+        dispatchingAgentId: null,
+        dispatchingCompanyId: companyId,
+        secretId: trimmedRef,
+        runId: backgroundRunId,
+        toolName: sentinelTool,
+      });
+      throw new SecretsError("not_found", "secret not found");
+    }
+
+    // ---------- Gate 6: audit success + return ----------
+    await audit({
+      outcome: "allowed",
+      dispatchingAgentId: null,
+      dispatchingCompanyId: companyId,
+      secretId: trimmedRef,
+      runId: backgroundRunId,
+      toolName: sentinelTool,
+    });
+
+    return value;
+  }
+
   return {
     async resolve(params: PluginSecretsResolveParams): Promise<string> {
       // ---------- Gate 0: shape validation ----------
@@ -659,6 +785,15 @@ export function createPluginSecretsHandler(
       // path below is left byte-for-byte unchanged.
       if (ctx.kind === "service") {
         return resolveForServiceContext(trimmedRef, ctx.runId);
+      }
+
+      // ---------- PLA-773: per-dispatch background context branch ----------
+      // A background dispatch (onEvent/onWebhook) with a known TRIGGERING
+      // company. The owning company is NOT derived from the binding — it is the
+      // host-validated triggering company, and the binding lookup is scoped to
+      // it. So company A's event can never resolve company B's bound secret.
+      if (ctx.kind === "background") {
+        return resolveForBackgroundContext(trimmedRef, ctx.runId, ctx.companyId);
       }
 
       // ---------- Gate 2: rate limit (global, then per-company) ----------
@@ -814,11 +949,12 @@ export function createPluginSecretsHandler(
       if (!ctx) {
         throw new SecretsError("runcontext_invalid", "no active dispatch for this runId");
       }
-      // PLA-768: borrowed handles are an agent-dispatch primitive (they scope a
-      // plaintext to a single tool call's working context). A worker-lifetime
-      // service context has no such dispatch, so minting is rejected rather than
-      // attributed to a non-existent agent.
-      if (ctx.kind === "service") {
+      // PLA-768/PLA-773: borrowed handles are an agent-dispatch primitive (they
+      // scope a plaintext to a single tool call's working context). Neither a
+      // worker-lifetime service context nor a per-dispatch background context
+      // has such a dispatch, so minting is rejected rather than attributed to a
+      // non-existent agent.
+      if (ctx.kind === "service" || ctx.kind === "background") {
         throw new SecretsError("runcontext_invalid", "no active dispatch for this runId");
       }
 

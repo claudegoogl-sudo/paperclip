@@ -56,9 +56,34 @@ export interface RegisteredServiceRunContext {
   registeredAt: number;
 }
 
+/**
+ * PLA-773: a per-dispatch **background** run-context. It backs a single
+ * background dispatch (`onEvent`/`onWebhook`) that carries a known TRIGGERING
+ * company — unlike the company-less {@link RegisteredServiceRunContext}, which
+ * is reserved for `setup()`-started loops and instance-wide `runJob`s.
+ *
+ * The secrets handler resolves a background context **scoped to this company**
+ * (the company-scoped `findBinding` path), so a global plugin worker handling
+ * company A's event can only resolve secrets company A bound to it — never
+ * another tenant's. There is still NO dispatching agent (system actor,
+ * `actorType: "plugin"`). Like dispatch entries (and unlike service entries) it
+ * is TTL-swept: each background dispatch is bounded, and it is removed
+ * explicitly when the dispatch's host-owned invocation clears.
+ */
+export interface RegisteredBackgroundRunContext {
+  kind: "background";
+  /** Host-minted, per-dispatch run UUID (never worker-supplied). */
+  runId: string;
+  /** The triggering tenant's company UUID (server-derived from the event). */
+  companyId: string;
+  /** Wall-clock when the entry was added (for TTL sweep). */
+  registeredAt: number;
+}
+
 export type RegisteredRunContext =
   | RegisteredDispatchRunContext
-  | RegisteredServiceRunContext;
+  | RegisteredServiceRunContext
+  | RegisteredBackgroundRunContext;
 
 export interface PluginRunContextRegistry {
   register(pluginDbId: string, ctx: RegisteredDispatchRunContext): void;
@@ -67,6 +92,11 @@ export interface PluginRunContextRegistry {
    * Idempotent for a given `(pluginDbId, runId)`.
    */
   registerService(pluginDbId: string, runId: string): void;
+  /**
+   * PLA-773: register a per-dispatch background run-context carrying the
+   * triggering company. Idempotent for a given `(pluginDbId, runId)`.
+   */
+  registerBackground(pluginDbId: string, runId: string, companyId: string): void;
   get(pluginDbId: string, runId: string): RegisteredRunContext | null;
   deregister(pluginDbId: string, runId: string): void;
   /** Test/diagnostic. Returns the number of live entries. */
@@ -124,6 +154,14 @@ export function createPluginRunContextRegistry(
       entries.set(compositeKey(pluginDbId, runId), {
         kind: "service",
         runId,
+        registeredAt: now(),
+      });
+    },
+    registerBackground(pluginDbId, runId, companyId) {
+      entries.set(compositeKey(pluginDbId, runId), {
+        kind: "background",
+        runId,
+        companyId,
         registeredAt: now(),
       });
     },
