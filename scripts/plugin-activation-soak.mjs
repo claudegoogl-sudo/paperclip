@@ -335,6 +335,29 @@ function stagePluginTarball(spec, stagingRoot, tmpDir) {
       mkdirSync(dest, { recursive: true });
       execFileSync("cp", ["-a", `${extractedPackage}/.`, dest], { stdio: "pipe" });
     }
+
+    // Install runtime deps the same way the real deployment does. `plugin install
+    // -l <dir>` does NOT install deps, so a plugin that declares a runtime
+    // dependency (e.g. CAD's @paperclipai/plugin-sdk — unlike klipper, which
+    // bundles its SDK into dist) would have no node_modules and its worker would
+    // exit with ERR_MODULE_NOT_FOUND. Stage like prod: extract → npm install
+    // --omit=dev → install -l.
+    const runtimeDeps = Object.keys(pkgJson.dependencies ?? {});
+    if (runtimeDeps.length > 0) {
+      execFileSync("npm", ["install", "--omit=dev"], { cwd: dest, stdio: "pipe" });
+      // Positive check: every declared runtime dep must now resolve under the
+      // staged node_modules, so a future silent regression (missing/renamed SDK)
+      // fails the soak loudly instead of only surfacing at worker boot.
+      for (const dep of runtimeDeps) {
+        const depDir = path.join(dest, "node_modules", ...dep.split("/"));
+        if (!existsSync(depDir)) {
+          throw new Error(
+            `staged package for "${spec.name}" is missing runtime dependency "${dep}" ` +
+              `under ${path.join(dest, "node_modules")} after \`npm install --omit=dev\``,
+          );
+        }
+      }
+    }
     return { ...spec, packageName, version, packageRoot: dest };
   } finally {
     rmSync(scratch, { recursive: true, force: true });
