@@ -729,7 +729,20 @@ export function createHostClientHandlers(
       // PLA-677: When the invocation carries a company scope and the host
       // implements per-tenant config delivery, return the company-scoped
       // effective config; otherwise fall back to the instance-wide config.
-      const companyId = readNonEmptyString(context?.invocationScope?.companyId);
+      //
+      // PLA-761: id-less legacy workers (e.g. platform.cad ≤0.1.x) echo no
+      // `paperclipInvocationId`, so `invocationScope` is null. Consult the same
+      // host-validated `singleInFlightScope` the runId backfill uses
+      // (`backfillDispatchRunId`) so their per-tenant config — and the secret
+      // refs it carries — resolves to the in-flight dispatch's company rather
+      // than falling through to the instance-wide config. The companyId is
+      // host-derived, never worker-supplied: `config.get` takes no companyId
+      // param, so this is a scope *selection* read, not an enforcement bypass.
+      // With 0 or 2+ in-flight dispatches the host pins no `singleInFlightScope`,
+      // so behavior is unchanged (instance-wide config).
+      const companyId =
+        readNonEmptyString(context?.invocationScope?.companyId) ??
+        readNonEmptyString(context?.singleInFlightScope?.companyId);
       if (companyId && services.config.getForCompany) {
         return services.config.getForCompany(companyId);
       }
