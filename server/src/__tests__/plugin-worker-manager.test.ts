@@ -12,8 +12,15 @@ import {
 import {
   appendStderrExcerpt,
   createPluginWorkerHandle,
+  createPluginWorkerManager,
   formatWorkerFailureMessage,
 } from "../services/plugin-worker-manager.js";
+import { createPluginRunContextRegistry } from "../services/plugin-run-context-registry.js";
+import {
+  clearRunSecretValues,
+  registerRunSecretValue,
+  registeredRunCount,
+} from "../run-secret-registry.js";
 
 const FIXTURES_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 const DELAYED_WORKER_ENTRYPOINT = path.join(FIXTURES_DIR, "plugin-worker-delayed.cjs");
@@ -33,6 +40,10 @@ const TERMINATED_WORKER_ENTRYPOINT = path.join(FIXTURES_DIR, "plugin-worker-term
 const STREAM_SCOPE_WORKER_ENTRYPOINT = path.join(
   FIXTURES_DIR,
   "plugin-worker-stream-scope.cjs",
+);
+const ONEVENT_WORKER_ENTRYPOINT = path.join(
+  FIXTURES_DIR,
+  "plugin-worker-onevent.cjs",
 );
 
 const TEST_MANIFEST: PaperclipPluginManifestV1 = {
@@ -754,5 +765,100 @@ describe("PLA-719 — back-fill runId when the worker echoes no invocation id", 
     });
 
     expect(companiesGet).not.toHaveBeenCalled();
+  });
+});
+
+describe("PLA-773 — background dispatch run-context (item 1) + redaction cleanup (item 2)", () => {
+  const SECRET_REF = "11111111-1111-4111-8111-111111111111";
+
+  it("mints a company-scoped background run-context for an onEvent dispatch and threads its runId to the worker's secrets.resolve", async () => {
+    const registry = createPluginRunContextRegistry({ sweepIntervalMs: 60_000 });
+    const registerBackground = vi.spyOn(registry, "registerBackground");
+
+    const secretsResolve = vi.fn(
+      async (params: { secretRef: string; runId?: string }) =>
+        `value-via-${params.runId ?? "<missing>"}`,
+    );
+    const handlers = createHostClientHandlers({
+      pluginId: "test.plugin",
+      capabilities: ["secrets.read-ref"],
+      services: {
+        secrets: { resolve: secretsResolve },
+      } as unknown as HostServices,
+    });
+
+    const handle = createPluginWorkerHandle(
+      "test.plugin",
+      {
+        entrypointPath: ONEVENT_WORKER_ENTRYPOINT,
+        manifest: TEST_MANIFEST,
+        config: {},
+        instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+        apiVersion: 1,
+        hostHandlers: handlers,
+      },
+      { runContextRegistry: registry },
+    );
+
+    try {
+      await handle.start();
+
+      await handle.call("onEvent", {
+        event: { companyId: "company-a", secretRef: SECRET_REF },
+      } as unknown as HostToWorkerMethods["onEvent"][0]);
+
+      // A per-dispatch background ctx was minted for the TRIGGERING company.
+      expect(registerBackground).toHaveBeenCalledTimes(1);
+      const [, mintedRunId, companyId] = registerBackground.mock.calls[0]!;
+      expect(companyId).toBe("company-a");
+
+      // The worker's id-less secrets.resolve callback was back-filled with the
+      // minted background runId — NOT the worker-lifetime service runId.
+      expect(secretsResolve).toHaveBeenCalledTimes(1);
+      expect(secretsResolve.mock.calls[0]?.[0]).toEqual({
+        secretRef: SECRET_REF,
+        runId: mintedRunId,
+      });
+      expect(mintedRunId).not.toBe(handle.serviceRunId);
+
+      // The per-dispatch ctx is cleared once the dispatch settles.
+      expect(registry.get("test.plugin", mintedRunId)).toBeNull();
+    } finally {
+      await handle.stop().catch(() => undefined);
+      registry.dispose();
+    }
+  });
+
+  it("clears the worker's service-runId redaction values on manager stopWorker (item 2)", async () => {
+    const registry = createPluginRunContextRegistry({ sweepIntervalMs: 60_000 });
+    const manager = createPluginWorkerManager({ runContextRegistry: registry });
+
+    const handle = await manager.startWorker("test.plugin", {
+      entrypointPath: ONEVENT_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: {},
+    });
+
+    const serviceRunId = handle.serviceRunId;
+    clearRunSecretValues(serviceRunId);
+
+    try {
+      // Simulate a background/setup-loop secrets.resolve registering plaintext
+      // under the service runId (TTL-exempt — lingers without explicit clear).
+      registerRunSecretValue(serviceRunId, "Zx7Qm2Lp9Rt4Wv6Yb1Nc");
+      expect(registeredRunCount()).toBeGreaterThan(0);
+
+      await manager.stopWorker("test.plugin");
+
+      // The service runId's plaintext is gone after stop.
+      expect(registeredRunCount()).toBe(0);
+    } finally {
+      clearRunSecretValues(serviceRunId);
+      await manager.stopAll().catch(() => undefined);
+      registry.dispose();
+    }
   });
 });

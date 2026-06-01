@@ -54,6 +54,7 @@ import type {
 } from "@paperclipai/plugin-sdk";
 import { logger } from "../middleware/logger.js";
 import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js";
+import { clearRunSecretValues } from "../run-secret-registry.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -212,7 +213,29 @@ interface PendingRequest {
 interface ActiveInvocation {
   scope: PluginInvocationScope;
   timer?: ReturnType<typeof setTimeout>;
+  /**
+   * PLA-773: when this invocation is a company-scoped background dispatch
+   * (`onEvent`), the host-minted per-dispatch run UUID registered in the
+   * run-context registry. Deregistered when the invocation clears so the
+   * registry stays bounded.
+   */
+  backgroundRunId?: string;
 }
+
+/**
+ * PLA-773 (item 1): host→worker dispatches that carry a TRIGGERING company but
+ * no dispatching agent. For these, the host mints a per-dispatch
+ * **company-scoped** run-context (rather than letting the worker→host
+ * `secrets.resolve` fall through to the company-agnostic worker-lifetime
+ * service path), so a global plugin worker handling company A's event can only
+ * resolve secrets company A bound to it. `runJob` is deliberately absent: jobs
+ * are instance-wide and carry no triggering company, so they keep using the
+ * company-less service path.
+ */
+const BACKGROUND_DISPATCH_METHODS: ReadonlySet<string> = new Set([
+  "onEvent",
+  "onWebhook",
+]);
 
 // ---------------------------------------------------------------------------
 // PluginWorkerHandle — manages a single worker process
@@ -375,6 +398,21 @@ export interface PluginWorkerManager {
 // ---------------------------------------------------------------------------
 
 /**
+ * Internal dependencies injected by the manager (not part of the caller-facing
+ * {@link WorkerStartOptions}).
+ */
+export interface PluginWorkerHandleDeps {
+  /**
+   * PLA-773: the shared run-context registry. When provided, a background
+   * dispatch carrying a triggering company (`onEvent`) mints a per-dispatch
+   * company-scoped run-context here so its worker→host `secrets.resolve` is
+   * scoped to that company rather than falling through to the company-agnostic
+   * worker-lifetime service path.
+   */
+  runContextRegistry?: PluginRunContextRegistry;
+}
+
+/**
  * Create a handle for a single plugin worker process.
  *
  * @internal Exported for testing; consumers should use `createPluginWorkerManager`.
@@ -382,8 +420,10 @@ export interface PluginWorkerManager {
 export function createPluginWorkerHandle(
   pluginId: string,
   options: WorkerStartOptions,
+  deps: PluginWorkerHandleDeps = {},
 ): PluginWorkerHandle {
   const log = logger.child({ service: "plugin-worker", pluginId });
+  const runContextRegistry = deps.runContextRegistry;
   const emitter = new EventEmitter();
   /**
    * Higher than default (10) to accommodate multiple subscribers to
@@ -569,15 +609,40 @@ export function createPluginWorkerHandle(
     return null;
   }
 
-  function registerInvocation(scope: PluginInvocationScope, ttlMs?: number): PluginInvocationContext {
+  function registerInvocation(
+    scope: PluginInvocationScope,
+    ttlMs?: number,
+    method?: HostToWorkerMethodName | string,
+  ): PluginInvocationContext {
+    // PLA-773: for a background dispatch carrying a triggering company (and no
+    // dispatching agent runId of its own), mint a per-dispatch company-scoped
+    // run-context and surface its runId on the scope. The worker echoes it on
+    // its `secrets.resolve` callback (or the host back-fills it from this
+    // scope), so the resolve is company-scoped instead of falling through to
+    // the company-agnostic worker-lifetime service path.
+    let effectiveScope = scope;
+    let backgroundRunId: string | undefined;
+    if (
+      method !== undefined &&
+      BACKGROUND_DISPATCH_METHODS.has(method) &&
+      scope.companyId &&
+      !scope.runId &&
+      runContextRegistry
+    ) {
+      backgroundRunId = randomUUID();
+      effectiveScope = { ...scope, runId: backgroundRunId };
+      runContextRegistry.registerBackground(pluginId, backgroundRunId, scope.companyId);
+    }
+
     const invocation: PluginInvocationContext = {
       id: randomUUID(),
-      scope,
+      scope: effectiveScope,
     };
-    const entry: ActiveInvocation = { scope };
+    const entry: ActiveInvocation = { scope: effectiveScope, backgroundRunId };
     if (ttlMs !== undefined) {
       entry.timer = setTimeout(() => {
         activeInvocations.delete(invocation.id);
+        if (backgroundRunId) runContextRegistry?.deregister(pluginId, backgroundRunId);
       }, ttlMs);
       if (entry.timer.unref) entry.timer.unref();
     }
@@ -589,6 +654,9 @@ export function createPluginWorkerHandle(
     if (!invocation) return;
     const entry = activeInvocations.get(invocation.id);
     if (entry?.timer) clearTimeout(entry.timer);
+    if (entry?.backgroundRunId) {
+      runContextRegistry?.deregister(pluginId, entry.backgroundRunId);
+    }
     activeInvocations.delete(invocation.id);
   }
 
@@ -1221,7 +1289,7 @@ export function createPluginWorkerHandle(
       const id = nextRequestId++;
       const timeout = Math.min(timeoutMs ?? rpcTimeoutMs, MAX_RPC_TIMEOUT_MS);
       const invocationScope = deriveInvocationScope(method, params);
-      const invocation = invocationScope ? registerInvocation(invocationScope) : null;
+      const invocation = invocationScope ? registerInvocation(invocationScope, undefined, method) : null;
 
       // Guard against double-settlement. When a process exits all pending
       // requests are rejected via rejectAllPending(), but the timeout timer
@@ -1348,7 +1416,7 @@ export function createPluginWorkerHandle(
     notify(method: string, params: unknown) {
       if (status !== "running") return;
       const invocationScope = deriveInvocationScope(method, params);
-      const invocation = invocationScope ? registerInvocation(invocationScope, MAX_RPC_TIMEOUT_MS) : null;
+      const invocation = invocationScope ? registerInvocation(invocationScope, MAX_RPC_TIMEOUT_MS, method) : null;
       try {
         sendMessage({
           jsonrpc: JSONRPC_VERSION,
@@ -1478,7 +1546,9 @@ export function createPluginWorkerManager(
         );
       }
 
-      const handle = createPluginWorkerHandle(pluginId, options);
+      const handle = createPluginWorkerHandle(pluginId, options, {
+        runContextRegistry: managerOptions?.runContextRegistry,
+      });
       workers.set(pluginId, handle);
 
       // PLA-768: register the worker-lifetime service run-context so background
@@ -1536,6 +1606,10 @@ export function createPluginWorkerManager(
       log.info({ pluginId }, "stopping plugin worker");
       await handle.stop();
       managerOptions?.runContextRegistry?.deregister(pluginId, handle.serviceRunId);
+      // PLA-773 (item 2): the service runId is TTL-exempt in the redaction map,
+      // so without this its resolved plaintext would linger for the process
+      // lifetime (lazy prune only). Clear it on stop.
+      clearRunSecretValues(handle.serviceRunId);
       workers.delete(pluginId);
     },
 
@@ -1554,6 +1628,7 @@ export function createPluginWorkerManager(
         try {
           await handle.stop();
           managerOptions?.runContextRegistry?.deregister(handle.pluginId, handle.serviceRunId);
+          clearRunSecretValues(handle.serviceRunId);
         } catch (err) {
           log.error(
             {
