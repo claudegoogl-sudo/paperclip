@@ -265,8 +265,18 @@ function toRelativePath(absolutePath: string) {
   return path.relative(repoRoot, absolutePath).split(path.sep).join("/");
 }
 
+function isMissingPathError(error: unknown) {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
 function readSignature(absolutePath: string) {
-  const stats = statSync(absolutePath);
+  let stats: ReturnType<typeof statSync>;
+  try {
+    stats = statSync(absolutePath);
+  } catch (error) {
+    if (isMissingPathError(error)) return null;
+    throw error;
+  }
   return `${Math.trunc(stats.mtimeMs)}:${stats.size}`;
 }
 
@@ -274,13 +284,23 @@ function addFileToSnapshot(snapshot: Map<string, string>, absolutePath: string) 
   const relativePath = toRelativePath(absolutePath);
   if (ignoredRelativePaths.has(relativePath)) return;
   if (!shouldTrackDevServerPath(relativePath)) return;
-  snapshot.set(relativePath, readSignature(absolutePath));
+  const signature = readSignature(absolutePath);
+  if (signature === null) return;
+  snapshot.set(relativePath, signature);
 }
 
 function walkDirectory(snapshot: Map<string, string>, absoluteDirectory: string) {
   if (!existsSync(absoluteDirectory)) return;
 
-  for (const entry of readdirSync(absoluteDirectory, { withFileTypes: true })) {
+  let entries: ReturnType<typeof readdirSync>;
+  try {
+    entries = readdirSync(absoluteDirectory, { withFileTypes: true });
+  } catch (error) {
+    if (isMissingPathError(error)) return;
+    throw error;
+  }
+
+  for (const entry of entries) {
     if (ignoredDirectoryNames.has(entry.name)) continue;
 
     const absolutePath = path.join(absoluteDirectory, entry.name);
