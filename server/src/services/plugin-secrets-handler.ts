@@ -216,12 +216,40 @@ export interface PluginSecretBindingRow {
   egressAllowlistEnforced: boolean;
 }
 
+/**
+ * PLA-768: a binding row resolved for a worker-lifetime **service** context,
+ * where there is no dispatching company. The owning company is derived from the
+ * binding itself: a `secretRef` has exactly one owning company, so a
+ * `(plugin install, secretId)` binding uniquely determines the company that may
+ * resolve it. The derived `companyId` is then re-checked by `resolveSecretValue`
+ * (Gate 4), so this lookup grants no broader access than the plugin's own
+ * operator-created bindings.
+ */
+export interface PluginServiceSecretBindingRow extends PluginSecretBindingRow {
+  /** The company that owns this binding (and the secret) — derived, not asserted. */
+  companyId: string;
+}
+
 export interface PluginSecretBindingLookup {
   findBinding(input: {
     companyId: string;
     pluginTargetId: string;
     secretId: string;
   }): Promise<PluginSecretBindingRow | null>;
+  /**
+   * PLA-768: find the single binding for `(plugin install, secretId)` WITHOUT a
+   * dispatching company, returning the owning company. Fails closed (returns
+   * null) if zero rows OR if more than one distinct company has bound the ref to
+   * this plugin — an ambiguous derivation must never silently pick a tenant.
+   *
+   * Optional so existing dispatch-only injected lookups remain valid; when a
+   * service-context resolve is attempted and this is absent, the handler fails
+   * closed (opaque `not_found`).
+   */
+  findServiceBinding?(input: {
+    pluginTargetId: string;
+    secretId: string;
+  }): Promise<PluginServiceSecretBindingRow | null>;
 }
 
 /**
@@ -351,6 +379,10 @@ export function createPluginSecretsHandler(
     perCompanyCfg.windowMs,
     now,
   );
+  // PLA-768: a service context has no dispatching agent, so it cannot share the
+  // per-agent buckets. It gets its own bucket keyed on the plugin install, with
+  // the same window/limit, so a runaway poll loop is still capped.
+  const serviceLimiter = createRateLimiter(globalCfg.maxAttempts, globalCfg.windowMs, now);
   const log = logger.child({ service: "plugin-secrets-handler", pluginId: pluginKey });
 
   const bindings: PluginSecretBindingLookup =
@@ -376,6 +408,36 @@ export function createPluginSecretsHandler(
           )
           .then((rows) => rows[0] ?? null);
         return row;
+      },
+      async findServiceBinding(input) {
+        // PLA-768: no dispatching company is supplied — derive it from the
+        // binding. We select ALL rows for (plugin install, secretId) so we can
+        // fail closed on ambiguity rather than picking an arbitrary tenant.
+        const rows = await db
+          .select({
+            companyId: companySecretBindings.companyId,
+            id: companySecretBindings.id,
+            secretId: companySecretBindings.secretId,
+            configPath: companySecretBindings.configPath,
+            versionSelector: companySecretBindings.versionSelector,
+            allowedEgress: companySecretBindings.allowedEgress,
+            egressAllowlistEnforced: companySecretBindings.egressAllowlistEnforced,
+          })
+          .from(companySecretBindings)
+          .where(
+            and(
+              eq(companySecretBindings.targetType, PLUGIN_SECRET_BINDING_TARGET_TYPE),
+              eq(companySecretBindings.targetId, input.pluginTargetId),
+              eq(companySecretBindings.secretId, input.secretId),
+            ),
+          );
+        if (rows.length === 0) return null;
+        const distinctCompanies = new Set(rows.map((r) => r.companyId));
+        // Ambiguous: more than one company bound this ref to this plugin. A
+        // secret has one owning company, so this should not happen, but if it
+        // does we refuse rather than leak a cross-tenant resolution.
+        if (distinctCompanies.size > 1) return null;
+        return rows[0];
       },
     };
 
@@ -407,7 +469,12 @@ export function createPluginSecretsHandler(
   async function audit(input: {
     outcome: "allowed" | "denied";
     deniedReason?: SecretsErrorCode;
-    dispatchingAgentId: string;
+    /**
+     * PLA-768: null for a worker-lifetime **service** context (background
+     * dispatch / setup-loop) — there is no dispatching agent. The audit row is
+     * still attributed to the plugin system actor (`actorType: "plugin"`).
+     */
+    dispatchingAgentId: string | null;
     dispatchingCompanyId: string;
     secretId: string;
     runId: string;
@@ -443,6 +510,119 @@ export function createPluginSecretsHandler(
     }
   }
 
+  /**
+   * PLA-768: resolve a secret for a worker-lifetime **service** context. Used
+   * by background dispatches (onEvent/onWebhook/runJob) and setup()-started
+   * loops that resolve secrets outside any agent RPC dispatch.
+   *
+   * Differences from the dispatch path:
+   *  - There is NO dispatching agent or company. The owning company is DERIVED
+   *    from the operator-created binding (`findServiceBinding`), which fails
+   *    closed on zero/ambiguous rows. A secretRef has exactly one owning
+   *    company, so this grants no broader access than the plugin's own bindings.
+   *  - Rate-limiting uses a dedicated per-plugin service bucket (no agent key).
+   *  - The audit row carries `actorType: "plugin"`, `agentId: null`, the derived
+   *    company, the host-minted service runId, and a `service:background`
+   *    sentinel toolName.
+   *
+   * Every later gate (resolve company re-check, value-exact redaction, opaque
+   * `not_found` collapse) is identical to the dispatch path. The `secretRef` is
+   * already shape/UUID-validated by the caller (Gate 0).
+   */
+  async function resolveForServiceContext(
+    trimmedRef: string,
+    serviceRunId: string,
+  ): Promise<string> {
+    const sentinelTool = "service:background";
+
+    // ---------- Gate 2: rate limit (per-plugin service bucket) ----------
+    // Checked BEFORE any DB lookup so a forged/looping worker cannot enumerate.
+    // No company is known yet, so no audit is possible on this deny.
+    if (!serviceLimiter.check(`service:${pluginDbId}`)) {
+      throw new SecretsError("rate_limited", "service rate limit exceeded");
+    }
+
+    // ---------- Gate 3: derive company + binding (fail closed) ----------
+    // No dispatching company is asserted; the binding determines it. Not-bound
+    // (or ambiguous) collapses to not_found with no company to attribute. An
+    // injected lookup without service support also fails closed here.
+    if (!bindings.findServiceBinding) {
+      throw new SecretsError("not_found", "secret not found");
+    }
+    const binding = await bindings.findServiceBinding({
+      pluginTargetId: pluginDbId,
+      secretId: trimmedRef,
+    });
+    if (!binding) {
+      throw new SecretsError("not_found", "secret not found");
+    }
+    const companyId = binding.companyId;
+
+    // ---------- Gate 4: company-scoped resolve (defence in depth) ----------
+    // resolveSecretValue re-checks secret.companyId === companyId; every failure
+    // shape flattens to opaque not_found. The value is never cached.
+    let value: string;
+    try {
+      value = await resolver.resolve({
+        companyId,
+        secretId: trimmedRef,
+        version: parseVersionSelector(binding.versionSelector),
+        pluginDbId,
+        configPath: binding.configPath,
+      });
+    } catch (err) {
+      log.warn(
+        { err, secretId: trimmedRef, companyId },
+        "service-context secret resolution failed; collapsing to not_found",
+      );
+      await audit({
+        outcome: "denied",
+        deniedReason: "not_found",
+        dispatchingAgentId: null,
+        dispatchingCompanyId: companyId,
+        secretId: trimmedRef,
+        runId: serviceRunId,
+        toolName: sentinelTool,
+      });
+      throw new SecretsError("not_found", "secret not found");
+    }
+
+    // ---------- Gate 5: value-exact redaction (fail-closed) ----------
+    // Keyed by the host-minted service runId so any persisted record carrying
+    // these bytes is scrubbed. Fail-closed: a registration throw refuses the
+    // resolution rather than risk leaking plaintext into a transcript.
+    try {
+      registerRunSecretValue(serviceRunId, value);
+    } catch (err) {
+      log.warn(
+        { err, secretId: trimmedRef, companyId },
+        "value-exact redaction registration failed; refusing service resolution (fail-closed)",
+      );
+      await audit({
+        outcome: "denied",
+        deniedReason: "not_found",
+        dispatchingAgentId: null,
+        dispatchingCompanyId: companyId,
+        secretId: trimmedRef,
+        runId: serviceRunId,
+        toolName: sentinelTool,
+      });
+      throw new SecretsError("not_found", "secret not found");
+    }
+
+    // ---------- Gate 6: audit success + return ----------
+    await audit({
+      outcome: "allowed",
+      dispatchingAgentId: null,
+      dispatchingCompanyId: companyId,
+      secretId: trimmedRef,
+      runId: serviceRunId,
+      toolName: sentinelTool,
+    });
+
+    return value;
+  }
+
   return {
     async resolve(params: PluginSecretsResolveParams): Promise<string> {
       // ---------- Gate 0: shape validation ----------
@@ -468,6 +648,17 @@ export function createPluginSecretsHandler(
       if (!ctx) {
         // No audit — we have no tenant/agent to attribute the call to.
         throw new SecretsError("runcontext_invalid", "no active dispatch for this runId");
+      }
+
+      // ---------- PLA-768: worker-lifetime service context branch ----------
+      // A background dispatch (onEvent/onWebhook/runJob) or a setup()-started
+      // loop resolves from its OWN tick, outside any agent RPC dispatch. There
+      // is no dispatching agent/company; the owning company is derived from the
+      // operator-created binding (a secretRef has exactly one owning company),
+      // and the resolve is attributed to the plugin system actor. The dispatch
+      // path below is left byte-for-byte unchanged.
+      if (ctx.kind === "service") {
+        return resolveForServiceContext(trimmedRef, ctx.runId);
       }
 
       // ---------- Gate 2: rate limit (global, then per-company) ----------
@@ -621,6 +812,13 @@ export function createPluginSecretsHandler(
       // worker-asserted run. A run-A handle can never resolve under run B.
       const ctx = runContextRegistry?.get(pluginDbId, runId.trim()) ?? null;
       if (!ctx) {
+        throw new SecretsError("runcontext_invalid", "no active dispatch for this runId");
+      }
+      // PLA-768: borrowed handles are an agent-dispatch primitive (they scope a
+      // plaintext to a single tool call's working context). A worker-lifetime
+      // service context has no such dispatch, so minting is rejected rather than
+      // attributed to a non-existent agent.
+      if (ctx.kind === "service") {
         throw new SecretsError("runcontext_invalid", "no active dispatch for this runId");
       }
 
