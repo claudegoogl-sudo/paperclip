@@ -95,6 +95,7 @@ vi.mock("../services/index.js", () => ({
     expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
   }),
   documentService: () => ({}),
+  documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
   routineService: () => ({}),
   workProductService: () => ({}),
 }));

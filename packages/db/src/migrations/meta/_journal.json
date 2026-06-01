@@ -635,29 +635,57 @@
     {
       "idx": 90,
       "version": "7",
-      "when": 1780036363953,
-      "tag": "0090_activity_log_run_id_set_null",
+      "when": 1779573019125,
+      "tag": "0090_resource_memberships",
       "breakpoints": true
     },
     {
       "idx": 91,
       "version": "7",
-      "when": 1780099200000,
-      "tag": "0091_backfill_plugin_secret_bindings",
+      "when": 1778810394522,
+      "tag": "0091_old_swarm",
       "breakpoints": true
     },
     {
       "idx": 92,
       "version": "7",
-      "when": 1780531200000,
-      "tag": "0092_secret_binding_egress_allowlist",
+      "when": 1779999768200,
+      "tag": "0092_mighty_puma",
       "breakpoints": true
     },
     {
       "idx": 93,
       "version": "7",
+      "when": 1780040470886,
+      "tag": "0093_giant_green_goblin",
+      "breakpoints": true
+    },
+    {
+      "idx": 94,
+      "version": "7",
+      "when": 1780041000000,
+      "tag": "0094_activity_log_run_id_set_null",
+      "breakpoints": true
+    },
+    {
+      "idx": 95,
+      "version": "7",
+      "when": 1780099200000,
+      "tag": "0095_backfill_plugin_secret_bindings",
+      "breakpoints": true
+    },
+    {
+      "idx": 96,
+      "version": "7",
+      "when": 1780531200000,
+      "tag": "0096_secret_binding_egress_allowlist",
+      "breakpoints": true
+    },
+    {
+      "idx": 97,
+      "version": "7",
       "when": 1780617600000,
-      "tag": "0093_egress_would_deny_observations",
+      "tag": "0097_egress_would_deny_observations",
       "breakpoints": true
     }
   ]

@@ -51,6 +51,12 @@ jobs:
       - name: Validate Dockerfile deps stage
         run: node ./scripts/check-docker-deps-stage.mjs
 
+      - name: Reject git push in adapter/runtime code
+        run: node ./scripts/check-no-git-push.mjs
+
+      - name: Test no-git-push check
+        run: node --test ./scripts/check-no-git-push.test.mjs
+
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
 
@@ -298,29 +304,11 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # PLA-597: split `playwright install --with-deps chromium` into a cached
-      # browser download and an apt `install-deps` step. Combined, a hung
-      # apt-get/dpkg silently consumed the full 30-minute job budget after the
-      # 167 MiB Chrome zip had already finished downloading. The cache also
-      # turns the browser download into a no-op on cache hit, removing the
-      # network dependency on cdn.playwright.dev entirely for the common path.
-      - name: Cache Playwright browser
-        id: playwright-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: ms-playwright-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
-          restore-keys: |
-            ms-playwright-${{ runner.os }}-
-
-      - name: Download Playwright browser (chromium)
-        if: steps.playwright-cache.outputs.cache-hit != 'true'
-        timeout-minutes: 5
-        run: npx playwright install chromium
-
-      - name: Install Playwright system deps (chromium)
-        timeout-minutes: 10
-        run: sudo npx playwright install-deps chromium
+      - name: Verify runner Chrome
+        # GitHub's Ubuntu runner image already ships Google Chrome, so use that
+        # directly for the headless e2e lane instead of downloading Playwright
+        # browser bundles inside the 30 minute job budget.
+        run: google-chrome --version
 
       - name: Generate Paperclip config
         run: |
@@ -340,6 +328,7 @@ jobs:
       - name: Run e2e tests
         env:
           PAPERCLIP_E2E_SKIP_LLM: "true"
+          PAPERCLIP_PLAYWRIGHT_CHANNEL: "chrome"
         run: pnpm run test:e2e
 
       - name: Upload Playwright report
