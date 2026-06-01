@@ -25,6 +25,7 @@ sibling task and lives outside this skill.
 | Sync-tick entrypoint | `scripts/upstream-sync.mjs` |
 | Trivial conflict resolver | `scripts/resolve-trivial-sync-conflicts.mjs` |
 | PR body formatter | `scripts/format-sync-pr-body.mjs` |
+| Plugin-activation soak | `scripts/plugin-activation-soak.mjs` |
 | Routine state (lastSyncedTag, ETag) | `.paperclip/upstream-sync.json` |
 | CI gate | `.github/workflows/pr.yml` (must be green before approval) |
 
@@ -120,6 +121,38 @@ addressed) should advance `.paperclip/upstream-sync.json`.
 | `reviewable` bucket from the routine | Same parent (PLA-589), labelled for the calling agent to handle inline |
 | PR CI failure on `pr.yml` | Treated as P0 per `public_pr_ci_clean_gate`; fix or close before requesting approval |
 | Upstream API 5xx | Routine exits non-zero with the body; retry on next tick is fine |
+
+## 5b. Plugin-activation soak gate (PLA-640)
+
+After a clean merge, **before** advancing state or pushing, the tick runs a
+plugin-activation soak (`scripts/plugin-activation-soak.mjs` via
+`runActivationSoakGate`). Root cause: PLA-639 — CAD went `error` on the v525
+cut (`Package root not found for plugin "platform.cad"`) because it had been
+installed from a `/tmp` source dir that the host recorded as `packagePath`
+without copying; systemd-tmpfiles swept the dir and the next restart could not
+re-resolve the package root. klipper has the same latent defect.
+
+The soak boots an **isolated** host (`local_trusted`, loopback, embedded
+PostgreSQL in a throwaway `--data-dir` — never `~/.paperclip`), installs CAD
+and klipper from their release tarballs (extracted to a **persistent** staging
+dir, never `/tmp`), and asserts each reaches `status: "ready"` with a
+non-ephemeral `packagePath`. Any non-ready plugin, or a `packagePath` under a
+swept location, fails the tick (no PR opened).
+
+```bash
+# stand-alone (what the gate shells out to):
+SOAK_CAD_TARBALL=/path/to/platform-paperclip-plugin-cad-<v>.tgz \
+SOAK_KLIPPER_TARBALL=/path/to/platform-paperclip-klipper-<v>.tgz \
+  node scripts/plugin-activation-soak.mjs --json
+
+# skip for a tick that runs the soak elsewhere (loud, never silent):
+PAPERCLIP_SYNC_SKIP_SOAK=1 node scripts/upstream-sync.mjs
+```
+
+The soak prerequisites (a built `server/dist/index.js` and the release
+tarballs) come from the surrounding build/release step. If they are missing the
+soak exits non-zero and the gate aborts the tick — a missing soak is treated as
+a failure, never a silent pass.
 
 ## 6. Board-gated landing
 
