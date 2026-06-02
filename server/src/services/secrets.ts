@@ -2349,6 +2349,11 @@ export function secretService(db: Db) {
 
       let bound = 0;
       let revoked = 0;
+      // PLA-797: secret-ref paths whose value points at a secret that could not
+      // be bound (orphan UUID, or cross-company in per-company scope). These are
+      // exactly the refs that would later fail closed at `ctx.secrets.resolve()`
+      // as "secret not found", so we surface them loudly at config time below.
+      const unboundPaths: string[] = [];
 
       await db.transaction(async (tx) => {
         // 1) Revoke bindings for paths that were cleared or repointed.
@@ -2390,7 +2395,10 @@ export function secretService(db: Db) {
         // 2) Upsert bindings for the current refs.
         for (const [dotPath, value] of newRefs) {
           const owner = await ownerCompanyFor(value, tx);
-          if (!owner) continue; // orphan or cross-company → no binding
+          if (!owner) {
+            unboundPaths.push(dotPath); // orphan or cross-company → no binding
+            continue;
+          }
           const upserted = await tx
             .insert(companySecretBindings)
             .values({
@@ -2417,12 +2425,29 @@ export function secretService(db: Db) {
         }
       });
 
-      logger
-        .child({ service: "plugin-secret-bindings", pluginId: input.pluginId })
-        .debug(
-          { companyScope: input.companyId ?? "instance", bound, revoked },
-          "synced plugin secret-ref bindings",
+      const bindingsLogger = logger.child({
+        service: "plugin-secret-bindings",
+        pluginId: input.pluginId,
+      });
+      bindingsLogger.debug(
+        { companyScope: input.companyId ?? "instance", bound, revoked },
+        "synced plugin secret-ref bindings",
+      );
+      // PLA-797: a secret ref persisted to config but left unbound resolves as
+      // "secret not found" at call time (the messenger poll-loop failure). Warn
+      // at config time, naming the paths, so it fails loudly instead of silently.
+      if (unboundPaths.length > 0) {
+        bindingsLogger.warn(
+          {
+            companyScope: input.companyId ?? "instance",
+            unboundConfigPaths: unboundPaths,
+            reason: input.companyId
+              ? "secret missing or owned by a different company"
+              : "secret not found for any company",
+          },
+          "plugin config has secret-ref paths with no resolvable binding — ctx.secrets.resolve() will fail closed for these paths",
         );
+      }
       return { bound, revoked };
     },
 

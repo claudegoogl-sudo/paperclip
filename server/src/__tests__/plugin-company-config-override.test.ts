@@ -223,6 +223,38 @@ describeEmbeddedPostgres("pluginRegistryService.upsertCompanyConfigOverride (PLA
     });
   });
 
+  it("PLA-797: instance-wide upsertConfig binds a secret ref to the secret's owning company", async () => {
+    // Regression guard for the gap behind the messenger poll-loop failure: a
+    // secret ref set through the instance-wide route (POST /plugins/:id/config →
+    // registry.upsertConfig) must reconcile company_secret_bindings so
+    // ctx.secrets.resolve() can find the row. Without the sync call this row is
+    // absent and resolution fails closed as "secret not found".
+    const companyA = await seedCompany("A");
+    const secretA = await seedSecret(companyA, "messenger-bot-token");
+    const pluginId = await seedPlugin();
+    const registry = pluginRegistryService(db);
+
+    await registry.upsertConfig(pluginId, {
+      configJson: { githubPatSecretId: secretA, label: "ignore-me" },
+    });
+
+    const rows = await bindingsFor(pluginId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      companyId: companyA,
+      secretId: secretA,
+      configPath: "githubPatSecretId",
+      versionSelector: "latest",
+      required: true,
+    });
+
+    // Re-running the same save is idempotent (no duplicate/zombie rows).
+    await registry.upsertConfig(pluginId, {
+      configJson: { githubPatSecretId: secretA, label: "ignore-me" },
+    });
+    expect(await bindingsFor(pluginId)).toHaveLength(1);
+  });
+
   it("effective per-tenant config = global plugin_config merged with override", async () => {
     // The host-services `config.getForCompany` shape (mirrored here at the
     // registry layer): start from `plugin_config.configJson` and shallow-merge

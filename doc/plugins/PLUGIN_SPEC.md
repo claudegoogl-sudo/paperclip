@@ -1462,6 +1462,43 @@ Rules:
    - webhook delivery rows
    - error messages
 
+### 22.1 Secret-ref binding model
+
+A secret ref in config is only a pointer. Before a worker can resolve it,
+the host must reconcile a `company_secret_bindings` row for the ref —
+resolution is authorized at call time against the **dispatching company's**
+bindings, so a bare ref in config never grants cross-company access.
+
+Both config-write paths reconcile bindings automatically. Operators do not
+manage `company_secret_bindings` directly:
+
+- **Instance-wide config** — `POST /api/plugins/:pluginId/config`. Each
+  secret ref binds to the secret's **own** company (single-tenant ownership
+  is derived from the secret itself). Repointing the global ref from one
+  tenant's secret to another's leaves the prior tenant's binding in place;
+  the per-company route below is the authoritative path for revoking a
+  specific tenant.
+- **Per-company override** — `PUT /api/plugins/:pluginId/companies/:companyId/config-overrides`.
+  Each ref must belong to `:companyId`; a cross-company ref is rejected with
+  `422` rather than silently skipped.
+
+A secret ref that points at a missing secret (orphan), or — on the
+per-company path — at another company's secret, is persisted to config but
+produces **no** binding. The host logs a `warn` at config time
+(`service: "plugin-secret-bindings"`, `unboundConfigPaths: [...]`) naming the
+affected config paths, because `ctx.secrets.resolve()` will fail closed as
+`secret not found` for those paths at call time. Treat that log line as the
+config-time signal that a ref was set through a path that cannot resolve.
+
+**Happy path (instance-wide):**
+
+1. Create the secret for the owning company (Company Settings → Secrets).
+2. Save the plugin's instance config with the secret ref at its
+   `"format": "secret-ref"` field via `POST /api/plugins/:pluginId/config`.
+3. The host writes a `company_secret_bindings` row owned by the secret's
+   company. `ctx.secrets.resolve(ref)` now succeeds for that company's
+   dispatched work.
+
 ## 23. Auditing
 
 All plugin-originated mutating actions must be auditable.
