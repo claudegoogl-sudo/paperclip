@@ -745,12 +745,27 @@ export function createPluginWorkerHandle(
       });
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
-      log.error({ method, err: errorMessage }, "host handler error");
+      const errorCode = errorCodeForWorkerHostError(err);
+      // PLA-814: surface the JSON-RPC error code and typed error name alongside
+      // the message so a denied/failed in-process host call (e.g. an
+      // InvocationScopeDeniedError from a background loop) is diagnosable from
+      // logs alone, without correlating to source. `errorMessage` already
+      // carries the human reason; `errorCode`/`errorName` make the failure class
+      // queryable.
+      log.error(
+        {
+          method,
+          err: errorMessage,
+          errorCode,
+          errorName: err instanceof Error ? err.name : undefined,
+        },
+        "host handler error",
+      );
       try {
         sendMessage(
           createErrorResponse(
             request.id,
-            errorCodeForWorkerHostError(err),
+            errorCode,
             errorMessage,
           ),
         );
