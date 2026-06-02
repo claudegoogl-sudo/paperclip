@@ -666,6 +666,27 @@ export function createHostClientHandlers(
 
     const allowedCompanyId = readNonEmptyString(context?.invocationScope?.companyId);
     if (!allowedCompanyId) {
+      // PLA-810: a company-filtered `events.subscribe` requests a STRICT SUBSET
+      // of what an unfiltered subscribe delivers. An unfiltered subscribe has
+      // companyScope "none" (see `requestedCompanyScope`) and is allowed
+      // unconditionally above, and the host event bus only ever *removes*
+      // events that fail the filter (`passesFilter`) — so a per-company filter
+      // can only NARROW a worker's event visibility, never widen it. When the
+      // call carries the host-minted, worker-lifetime `serviceScope` (PLA-768)
+      // — i.e. a background dispatch or a loop started in `setup()` with no
+      // active dispatch to pin a company — authorize the narrower filtered
+      // subscribe instead of forcing the worker onto the broader unfiltered
+      // form. Restricted to `events.subscribe`: other company-scoped methods
+      // are not subsets of an already-allowed call, so they keep failing closed
+      // below. `invalidInvocationScope` was already rejected above, so this only
+      // legitimizes a genuinely scope-less call.
+      if (
+        method === "events.subscribe" &&
+        requested.kind === "single" &&
+        readNonEmptyString(context?.serviceScope?.runId)
+      ) {
+        return;
+      }
       // Fail closed (Complete Mediation / Fail Securely): a company-scoped
       // worker→host call arrived with no resolvable invocation scope — e.g. an
       // idle-window call between dispatches where the host pinned no tenant.

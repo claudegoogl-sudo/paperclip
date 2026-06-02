@@ -525,3 +525,127 @@ describe("createHostClientHandlers config.get per-company scope selection (PLA-7
     expect(get).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("createHostClientHandlers events.subscribe serviceScope (PLA-810)", () => {
+  // A single-company plugin sets its `topicMap`, so its `setup()` loop
+  // subscribes with a per-company `filter` instead of unfiltered. There is no
+  // active dispatch at `setup()`, so the only host-validated context is the
+  // worker-lifetime `serviceScope` (PLA-768). The gate must authorize this
+  // narrower filtered subscribe — denying it (the pre-PLA-810 bug) regressed the
+  // messenger's subscriptions 5 → 0 and is a least-privilege inversion: the
+  // broader unfiltered subscribe was allowed while the narrower one was denied.
+  function makeEventsHandlers() {
+    const subscribe = vi.fn(async () => undefined);
+    const services = {
+      events: { subscribe },
+    } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.messenger",
+      capabilities: ["events.subscribe"],
+      services,
+    });
+    return { handlers, subscribe };
+  }
+
+  it("allows a company-filtered subscribe at setup() under serviceScope (no active dispatch)", async () => {
+    const { handlers, subscribe } = makeEventsHandlers();
+    const params = {
+      eventPattern: "issue.created",
+      filter: { companyId: "company-a" },
+    };
+
+    await expect(
+      handlers["events.subscribe"](params as never, {
+        serviceScope: { runId: "service-run-1" },
+      }),
+    ).resolves.toBeUndefined();
+    expect(subscribe).toHaveBeenCalledTimes(1);
+    expect(subscribe).toHaveBeenCalledWith(params);
+  });
+
+  it("still allows an unfiltered subscribe under serviceScope (companyScope 'none')", async () => {
+    const { handlers, subscribe } = makeEventsHandlers();
+    const params = { eventPattern: "issue.created" };
+
+    await expect(
+      handlers["events.subscribe"](params as never, {
+        serviceScope: { runId: "service-run-1" },
+      }),
+    ).resolves.toBeUndefined();
+    expect(subscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed for a company-filtered subscribe with NO scope at all (no serviceScope)", async () => {
+    const { handlers, subscribe } = makeEventsHandlers();
+    const params = {
+      eventPattern: "issue.created",
+      filter: { companyId: "company-a" },
+    };
+
+    await expect(
+      handlers["events.subscribe"](params as never, {}),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    await expect(
+      handlers["events.subscribe"](params as never),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    expect(subscribe).not.toHaveBeenCalled();
+  });
+
+  it("fails closed for a company-filtered subscribe when the scope is invalid (forged/stale invocation id)", async () => {
+    const { handlers, subscribe } = makeEventsHandlers();
+    const params = {
+      eventPattern: "issue.created",
+      filter: { companyId: "company-a" },
+    };
+
+    // serviceScope present but the worker also referenced an unknown invocation
+    // — the invalid-scope rejection wins; serviceScope cannot launder it.
+    await expect(
+      handlers["events.subscribe"](params as never, {
+        invalidInvocationScope: true,
+        serviceScope: { runId: "service-run-1" },
+      }),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    expect(subscribe).not.toHaveBeenCalled();
+  });
+
+  it("does NOT extend the serviceScope allowance to other company-scoped methods", async () => {
+    // The subset argument is specific to events.subscribe (filtered ⊆ allowed
+    // unfiltered). A different company-scoped method under serviceScope alone is
+    // not a subset of any allowed call, so it must keep failing closed.
+    const projectsList = vi.fn(async () => []);
+    const services = {
+      projects: { list: projectsList },
+    } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.messenger",
+      capabilities: ["projects.read"],
+      services,
+    });
+
+    await expect(
+      handlers["projects.list"](
+        { companyId: "company-a" },
+        { serviceScope: { runId: "service-run-1" } },
+      ),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    expect(projectsList).not.toHaveBeenCalled();
+  });
+
+  it("keeps strict enforcement when an active dispatch pins a different company", async () => {
+    // When an active invocation pins a company, the serviceScope relaxation does
+    // not apply: a filter naming a different company is still denied.
+    const { handlers, subscribe } = makeEventsHandlers();
+
+    await expect(
+      handlers["events.subscribe"](
+        { eventPattern: "issue.created", filter: { companyId: "company-b" } } as never,
+        {
+          invocationScope: { companyId: "company-a" },
+          serviceScope: { runId: "service-run-1" },
+        },
+      ),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    expect(subscribe).not.toHaveBeenCalled();
+  });
+});
