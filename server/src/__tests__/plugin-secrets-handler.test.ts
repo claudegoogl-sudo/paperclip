@@ -264,12 +264,19 @@ describe("createPluginSecretsHandler — company-scoped resolution", () => {
       action: string;
       actorType: string;
       companyId: string;
+      runId: string | null;
       details: Record<string, unknown>;
     };
     expect(lastInput.action).toBe("secret.resolved");
     expect(lastInput.actorType).toBe("plugin");
     expect(lastInput.companyId).toBe(COMPANY_A);
     expect(lastInput.details.outcome).toBe("allowed");
+    // PLA-806 (AC3): a foreground agent dispatch carries a REAL heartbeat run,
+    // so run_id is populated with the dispatch runId — never nulled — and the
+    // synthetic-run markers used by the background/service paths are absent.
+    expect(lastInput.runId).toBe(runId);
+    expect(lastInput.details.backgroundRunId).toBeUndefined();
+    expect(lastInput.details.runContextKind).toBeUndefined();
   });
 });
 

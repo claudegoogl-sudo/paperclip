@@ -151,7 +151,7 @@ describe("background-context secrets.resolve (PLA-773 item 1)", () => {
     expect(findServiceBinding).not.toHaveBeenCalled();
   });
 
-  it("audits as a plugin system actor scoped to the triggering company", async () => {
+  it("audits as a plugin system actor scoped to the triggering company, with a durable null run_id (PLA-806)", async () => {
     const { handler, registry } = buildHandler();
     registry.registerBackground(PLUGIN_DB_ID, BG_RUN_A, COMPANY_A);
 
@@ -165,13 +165,18 @@ describe("background-context secrets.resolve (PLA-773 item 1)", () => {
       action: "secret.resolved",
       companyId: COMPANY_A,
       agentId: null,
-      runId: BG_RUN_A,
+      // PLA-806: the background runId is host-minted/synthetic — NOT a
+      // heartbeat_runs row. Writing it into run_id would 23503 and drop the
+      // audit row, so it goes to run_id=NULL with the synthetic id in details.
+      runId: null,
     });
     expect(entry.details).toMatchObject({
       outcome: "allowed",
       dispatchingAgentId: null,
       dispatchingCompanyId: COMPANY_A,
       toolName: "background:dispatch",
+      backgroundRunId: BG_RUN_A,
+      runContextKind: "background",
     });
   });
 
