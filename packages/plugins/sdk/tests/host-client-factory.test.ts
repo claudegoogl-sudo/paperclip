@@ -610,9 +610,10 @@ describe("createHostClientHandlers events.subscribe serviceScope (PLA-810)", () 
   });
 
   it("does NOT extend the serviceScope allowance to other company-scoped methods", async () => {
-    // The subset argument is specific to events.subscribe (filtered ⊆ allowed
-    // unfiltered). A different company-scoped method under serviceScope alone is
-    // not a subset of any allowed call, so it must keep failing closed.
+    // The serviceScope allowance is an explicit allowlist
+    // (SERVICE_SCOPE_COMPANY_METHODS). A company-scoped method outside it —
+    // here projects.list, which trusts companyId as the sole authority with no
+    // entity cross-check — must keep failing closed under serviceScope alone.
     const projectsList = vi.fn(async () => []);
     const services = {
       projects: { list: projectsList },
@@ -647,5 +648,136 @@ describe("createHostClientHandlers events.subscribe serviceScope (PLA-810)", () 
       ),
     ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
     expect(subscribe).not.toHaveBeenCalled();
+  });
+});
+
+describe("createHostClientHandlers serviceScope company writes/state (PLA-814)", () => {
+  // Inbound sibling of PLA-810: the messenger `getUpdates` poll loop is started
+  // in `setup()` and runs with no active dispatch, so an operator reply it
+  // routes calls `issues.createComment` (and reads company-scoped state) under
+  // the bare worker-lifetime `serviceScope` (PLA-768). The gate must authorize
+  // the narrow allowlist of company-scoped methods that cannot widen reach
+  // beyond a host-pinned dispatch — createComment is entity-cross-checked
+  // server-side (requireInCompany); company state is the plugin's own data.
+  function makeHandlers() {
+    const createComment = vi.fn(async () => ({ id: "comment-1" }));
+    const stateGet = vi.fn(async () => null);
+    const stateSet = vi.fn(async () => undefined);
+    const stateDelete = vi.fn(async () => undefined);
+    const issuesList = vi.fn(async () => []);
+    const services = {
+      issues: { createComment, list: issuesList },
+      state: { get: stateGet, set: stateSet, delete: stateDelete },
+    } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.messenger",
+      capabilities: [
+        "issue.comments.create",
+        "issues.read",
+        "plugin.state.read",
+        "plugin.state.write",
+      ],
+      services,
+    });
+    return { handlers, createComment, stateGet, stateSet, stateDelete, issuesList };
+  }
+
+  it("allows issues.createComment under serviceScope (poll loop, no active dispatch)", async () => {
+    const { handlers, createComment } = makeHandlers();
+    const params = { issueId: "issue-1", body: "operator reply", companyId: "company-a" };
+
+    await expect(
+      handlers["issues.createComment"](params as never, {
+        serviceScope: { runId: "service-run-1" },
+      }),
+    ).resolves.toEqual({ id: "comment-1" });
+    expect(createComment).toHaveBeenCalledWith(params);
+  });
+
+  it("allows company-scoped state get/set/delete under serviceScope (plugin's own data)", async () => {
+    const { handlers, stateGet, stateSet, stateDelete } = makeHandlers();
+    const ctx = { serviceScope: { runId: "service-run-1" } };
+
+    await expect(
+      handlers["state.get"](
+        { scopeKind: "company", scopeId: "company-a", stateKey: "open" } as never,
+        ctx,
+      ),
+    ).resolves.toBeNull();
+    await expect(
+      handlers["state.set"](
+        { scopeKind: "company", scopeId: "company-a", stateKey: "open", value: { x: 1 } } as never,
+        ctx,
+      ),
+    ).resolves.toBeUndefined();
+    await expect(
+      handlers["state.delete"](
+        { scopeKind: "company", scopeId: "company-a", stateKey: "open" } as never,
+        ctx,
+      ),
+    ).resolves.toBeUndefined();
+    expect(stateGet).toHaveBeenCalledTimes(1);
+    expect(stateSet).toHaveBeenCalledTimes(1);
+    expect(stateDelete).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed for issues.createComment with NO scope at all", async () => {
+    const { handlers, createComment } = makeHandlers();
+    const params = { issueId: "issue-1", body: "x", companyId: "company-a" };
+
+    await expect(
+      handlers["issues.createComment"](params as never, {}),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    await expect(
+      handlers["issues.createComment"](params as never),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    expect(createComment).not.toHaveBeenCalled();
+  });
+
+  it("fails closed for issues.createComment when the invocation scope is invalid (cannot be laundered by serviceScope)", async () => {
+    const { handlers, createComment } = makeHandlers();
+    const params = { issueId: "issue-1", body: "x", companyId: "company-a" };
+
+    await expect(
+      handlers["issues.createComment"](params as never, {
+        invalidInvocationScope: true,
+        serviceScope: { runId: "service-run-1" },
+      }),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    expect(createComment).not.toHaveBeenCalled();
+  });
+
+  it("keeps strict company enforcement when an active dispatch pins a different company", async () => {
+    // serviceScope never relaxes a *pinned* dispatch: createComment for
+    // company-b while company-a is pinned is still denied. The relaxation only
+    // applies when there is no pinned company at all.
+    const { handlers, createComment } = makeHandlers();
+
+    await expect(
+      handlers["issues.createComment"](
+        { issueId: "issue-1", body: "x", companyId: "company-b" } as never,
+        {
+          invocationScope: { companyId: "company-a" },
+          serviceScope: { runId: "service-run-1" },
+        },
+      ),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    expect(createComment).not.toHaveBeenCalled();
+  });
+
+  it("does NOT extend the allowance to entity-listing reads that trust companyId alone (issues.list)", async () => {
+    // issues.list filters by companyId with no caller-supplied entity to
+    // cross-check, so a worker-forged companyId would enumerate an arbitrary
+    // tenant's issues. It is deliberately excluded from the allowlist and must
+    // fail closed under serviceScope.
+    const { handlers, issuesList } = makeHandlers();
+
+    await expect(
+      handlers["issues.list"](
+        { companyId: "company-a" } as never,
+        { serviceScope: { runId: "service-run-1" } },
+      ),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    expect(issuesList).not.toHaveBeenCalled();
   });
 });

@@ -535,6 +535,47 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   "authorization.audit.search": "authorization.audit.read",
 };
 
+/**
+ * Company-scoped worker→host methods that are safe to run under the bare,
+ * host-minted `serviceScope` (PLA-768) — i.e. from a background dispatch or a
+ * `setup()`-started loop (e.g. the messenger `getUpdates` poll loop) with NO
+ * active dispatch to pin a tenant. Every other company-scoped method keeps
+ * failing closed in that state.
+ *
+ * The bar for membership is that the call cannot widen which companies/entities
+ * the plugin can reach beyond what a host-pinned dispatch already allows — the
+ * `serviceScope` only relaxes *timing* (act while idle), never reach. Three
+ * distinct safety arguments, one per entry:
+ *
+ *  - `events.subscribe` (PLA-810): a company filter requests a STRICT SUBSET of
+ *    the unconditionally-allowed unfiltered subscribe; the host event bus only
+ *    ever *removes* events that fail the filter, so a filter can only NARROW
+ *    visibility, never widen it.
+ *  - `state.get` / `state.set` / `state.delete`: company-scoped plugin state is
+ *    the plugin's OWN data, partitioned by `(pluginId, company)`. Reading or
+ *    writing its company-B partition leaks nothing cross-tenant and is reachable
+ *    during any company-B dispatch anyway.
+ *  - `issues.createComment`: the host service independently verifies the target
+ *    issue belongs to the claimed company (`requireInCompany`), so a
+ *    worker-forged `companyId` cannot reach a foreign issue. The reachable set
+ *    equals the plugin's dispatch-lifetime reach (a plugin subscribed to
+ *    `issue.*` already comments on every company's issues, one dispatch at a
+ *    time); serviceScope only removes the "must be mid-dispatch" timing
+ *    constraint.
+ *
+ * Deliberately excluded: any method that trusts `companyId` as the SOLE
+ * authority with no entity cross-check (e.g. `issues.list`, `companies.get`).
+ * Those must not run with a worker-chosen company outside a host-pinned
+ * dispatch, or a background loop could enumerate arbitrary tenants.
+ */
+const SERVICE_SCOPE_COMPANY_METHODS: ReadonlySet<WorkerToHostMethodName> = new Set([
+  "events.subscribe",
+  "state.get",
+  "state.set",
+  "state.delete",
+  "issues.createComment",
+]);
+
 // ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
@@ -666,24 +707,22 @@ export function createHostClientHandlers(
 
     const allowedCompanyId = readNonEmptyString(context?.invocationScope?.companyId);
     if (!allowedCompanyId) {
-      // PLA-810: a company-filtered `events.subscribe` requests a STRICT SUBSET
-      // of what an unfiltered subscribe delivers. An unfiltered subscribe has
-      // companyScope "none" (see `requestedCompanyScope`) and is allowed
-      // unconditionally above, and the host event bus only ever *removes*
-      // events that fail the filter (`passesFilter`) — so a per-company filter
-      // can only NARROW a worker's event visibility, never widen it. When the
-      // call carries the host-minted, worker-lifetime `serviceScope` (PLA-768)
-      // — i.e. a background dispatch or a loop started in `setup()` with no
-      // active dispatch to pin a company — authorize the narrower filtered
-      // subscribe instead of forcing the worker onto the broader unfiltered
-      // form. Restricted to `events.subscribe`: other company-scoped methods
-      // are not subsets of an already-allowed call, so they keep failing closed
-      // below. `invalidInvocationScope` was already rejected above, so this only
-      // legitimizes a genuinely scope-less call.
+      // PLA-810 / PLA-814: when the only scope present is the host-minted,
+      // worker-lifetime `serviceScope` (PLA-768) — i.e. a background dispatch or
+      // a loop started in `setup()` (e.g. the messenger `getUpdates` poll loop)
+      // with no active dispatch to pin a company — authorize the narrow
+      // allowlist of company-scoped methods that cannot widen the plugin's reach
+      // beyond what a host-pinned dispatch already grants (see
+      // `SERVICE_SCOPE_COMPANY_METHODS` for the per-method safety argument).
+      // `requested.kind === "single"` ensures a concrete target company: a
+      // company-scoped call with no specific company (`kind: "all"`) still fails
+      // closed below. `invalidInvocationScope` was already rejected above, so
+      // this only legitimizes a genuinely scope-less call carrying the service
+      // run-context.
       if (
-        method === "events.subscribe" &&
         requested.kind === "single" &&
-        readNonEmptyString(context?.serviceScope?.runId)
+        readNonEmptyString(context?.serviceScope?.runId) &&
+        SERVICE_SCOPE_COMPANY_METHODS.has(method)
       ) {
         return;
       }
