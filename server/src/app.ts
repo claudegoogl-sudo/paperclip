@@ -50,7 +50,10 @@ import { createPluginWorkerManager, type PluginWorkerManager } from "./services/
 import { createPluginJobScheduler } from "./services/plugin-job-scheduler.js";
 import { pluginJobStore } from "./services/plugin-job-store.js";
 import { createPluginToolDispatcher } from "./services/plugin-tool-dispatcher.js";
-import { createPluginRunContextRegistry } from "./services/plugin-run-context-registry.js";
+import {
+  createPluginRunContextRegistry,
+  type PluginRunContextRegistry,
+} from "./services/plugin-run-context-registry.js";
 import { pluginLifecycleManager } from "./services/plugin-lifecycle.js";
 import { createPluginJobCoordinator } from "./services/plugin-job-coordinator.js";
 import { buildHostServices, flushPluginLogBuffer } from "./services/plugin-host-services.js";
@@ -148,6 +151,11 @@ export async function createApp(
     localPluginDir?: string;
     pluginMigrationDb?: Db;
     pluginWorkerManager?: PluginWorkerManager;
+    // PLA-781: the run-context registry the injected pluginWorkerManager was
+    // built with. MUST be the same instance, so a worker's host-minted service
+    // run-context (registered by the manager on worker start) is visible to the
+    // secrets host-handler's Gate 1 lookup. When omitted, app creates its own.
+    pluginRunContextRegistry?: PluginRunContextRegistry;
     betterAuthHandler?: express.RequestHandler;
     resolveSession?: (req: ExpressRequest) => Promise<BetterAuthSessionResult | null>;
   },
@@ -200,7 +208,14 @@ export async function createApp(
   // server-side. PLA-768: also holds each worker's worker-lifetime service
   // run-context (system actor) for background secret resolution — created
   // before the worker manager so the manager can register on worker start.
-  const pluginRunContextRegistry = createPluginRunContextRegistry();
+  // PLA-781: when the caller injects a pre-built pluginWorkerManager (index.ts
+  // does, so it can also drive heartbeat/routine services), it MUST inject the
+  // registry that manager was built with. Otherwise app would create a second,
+  // disjoint registry: the manager's registerService would write to its own
+  // registry while the secrets host-handler reads this one, so service/setup()
+  // run-contexts would never be found (Gate 1 → runcontext_invalid).
+  const pluginRunContextRegistry =
+    opts.pluginRunContextRegistry ?? createPluginRunContextRegistry();
   const workerManager =
     opts.pluginWorkerManager ??
     createPluginWorkerManager({ runContextRegistry: pluginRunContextRegistry });
