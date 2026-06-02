@@ -41,6 +41,7 @@ import {
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
+import { createPluginRunContextRegistry } from "./services/plugin-run-context-registry.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -635,7 +636,17 @@ export async function startServer(): Promise<StartedServer> {
       databaseBackupInFlight = false;
     }
   };
-  const pluginWorkerManager = createPluginWorkerManager();
+  // PLA-781: the worker manager and the secrets host-handler MUST share one
+  // run-context registry. The manager registers each worker's host-minted
+  // service run-context on start (so setup()-loop / background secret resolves
+  // can be authorized server-side); the secrets handler reads it on resolve.
+  // Build the registry here and thread the SAME instance into both the manager
+  // and createApp — passing the manager without its registry would leave the
+  // handler reading a disjoint, empty registry (Gate 1 → runcontext_invalid).
+  const pluginRunContextRegistry = createPluginRunContextRegistry();
+  const pluginWorkerManager = createPluginWorkerManager({
+    runContextRegistry: pluginRunContextRegistry,
+  });
   const app = await createApp(db as any, {
     uiMode,
     serverPort: listenPort,
@@ -660,6 +671,7 @@ export async function startServer(): Promise<StartedServer> {
     betterAuthHandler,
     resolveSession,
     pluginWorkerManager,
+    pluginRunContextRegistry,
   });
   const server = createServer(app as unknown as Parameters<typeof createServer>[0]);
 

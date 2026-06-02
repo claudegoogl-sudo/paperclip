@@ -1556,10 +1556,23 @@ export function createPluginWorkerManager(
       // across crash/auto-restart of this handle; removed on stop. The runId is
       // host-minted — it grants no company scope (company is derived from the
       // operator-created secret binding at resolve time).
-      managerOptions?.runContextRegistry?.registerService(
-        pluginId,
-        handle.serviceRunId,
-      );
+      // PLA-781: observability — make the registration (and any missing-registry
+      // misconfiguration) visible. A `registryWired: false` line here means the
+      // manager was built without a registry, so service run-contexts will not
+      // be resolvable by the secrets handler (the PLA-781 wiring bug).
+      const registry = managerOptions?.runContextRegistry;
+      if (registry) {
+        registry.registerService(pluginId, handle.serviceRunId);
+        log.info(
+          { pluginId, serviceRunId: handle.serviceRunId, registryWired: true },
+          "registered worker-lifetime service run-context",
+        );
+      } else {
+        log.warn(
+          { pluginId, serviceRunId: handle.serviceRunId, registryWired: false },
+          "no run-context registry wired into worker manager; service/setup() secret resolves will fail",
+        );
+      }
 
       // Subscribe to crash/ready events for live event forwarding
       if (managerOptions?.onWorkerEvent) {
