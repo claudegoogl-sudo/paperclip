@@ -43,6 +43,12 @@ const { clearRunSecretValues, registeredRunCount } = await import(
 const PLUGIN_DB_ID = "plugin-db-messenger";
 const PLUGIN_KEY = "platform.messenger";
 
+// PLA-806: a non-messenger plugin, used to prove the durable-audit fix is
+// plugin-agnostic — any `service:background` resolve is affected, not just the
+// messenger (CTO note on PLA-806 folding in PLA-805 forensics).
+const PLUGIN_KLIPPER_ID = "plugin-db-klipper";
+const PLUGIN_KLIPPER_KEY = "platform.klipper";
+
 const SECRET_A = "11111111-1111-4111-8111-111111111111"; // bound by company A
 const SECRET_B = "22222222-2222-4222-8222-222222222222"; // bound by company B
 const COMPANY_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -53,9 +59,15 @@ const BG_RUN_B = "00000000-0000-4000-8000-00000000000b";
 interface BuildOpts {
   resolveValue?: string;
   globalRateLimit?: { maxAttempts: number; windowMs: number };
+  // PLA-806: override the plugin identity to prove the audit-durability fix is
+  // not messenger-specific. Defaults to the messenger plugin.
+  pluginDbId?: string;
+  pluginKey?: string;
 }
 
 function buildHandler(opts: BuildOpts = {}) {
+  const pluginDbId = opts.pluginDbId ?? PLUGIN_DB_ID;
+  const pluginKey = opts.pluginKey ?? PLUGIN_KEY;
   const registry = createPluginRunContextRegistry({
     ttlMs: 60_000,
     sweepIntervalMs: 60_000,
@@ -93,8 +105,8 @@ function buildHandler(opts: BuildOpts = {}) {
 
   const handler = createPluginSecretsHandler({
     db: {} as never,
-    pluginDbId: PLUGIN_DB_ID,
-    pluginKey: PLUGIN_KEY,
+    pluginDbId,
+    pluginKey,
     runContextRegistry: registry,
     bindings: { findBinding, findServiceBinding },
     resolver: { resolve: resolverFn },
@@ -172,6 +184,44 @@ describe("background-context secrets.resolve (PLA-773 item 1)", () => {
     });
     expect(entry.details).toMatchObject({
       outcome: "allowed",
+      dispatchingAgentId: null,
+      dispatchingCompanyId: COMPANY_A,
+      toolName: "background:dispatch",
+      backgroundRunId: BG_RUN_A,
+      runContextKind: "background",
+    });
+  });
+
+  it("PLA-806: a non-messenger (klipper) background resolve is equally durable — run_id null, attribution + plugin actor preserved", async () => {
+    // Plugin-agnostic guard: the FK violation that drops the audit row hits ANY
+    // `service:background` resolve, not just the messenger (CTO note folding in
+    // PLA-805 forensics — 151 violations across plugins). Build the handler with
+    // the klipper plugin identity and prove the same durable null-run shape.
+    const { handler, registry } = buildHandler({
+      pluginDbId: PLUGIN_KLIPPER_ID,
+      pluginKey: PLUGIN_KLIPPER_KEY,
+    });
+    registry.registerBackground(PLUGIN_KLIPPER_ID, BG_RUN_A, COMPANY_A);
+
+    await handler.resolve({ secretRef: SECRET_A, runId: BG_RUN_A });
+
+    expect(logActivity).toHaveBeenCalledTimes(1);
+    const [, entry] = (logActivity as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(entry).toMatchObject({
+      actorType: "plugin",
+      // Attribution follows the resolving plugin — not hard-coded to messenger.
+      actorId: PLUGIN_KLIPPER_ID,
+      action: "secret.resolved",
+      companyId: COMPANY_A,
+      agentId: null,
+      // Same durability contract: synthetic background runId is not a
+      // heartbeat_runs row, so run_id is NULL rather than dropped on the FK.
+      runId: null,
+    });
+    expect(entry.details).toMatchObject({
+      outcome: "allowed",
+      pluginKey: PLUGIN_KLIPPER_KEY,
+      pluginDbId: PLUGIN_KLIPPER_ID,
       dispatchingAgentId: null,
       dispatchingCompanyId: COMPANY_A,
       toolName: "background:dispatch",
