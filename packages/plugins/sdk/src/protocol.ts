@@ -1210,7 +1210,16 @@ export interface WorkerToHostMethods {
     result: IssueComment[],
   ];
   "issues.createComment": [
-    params: { issueId: string; body: string; companyId: string; authorAgentId?: string },
+    params: {
+      issueId: string;
+      body: string;
+      companyId: string;
+      authorAgentId?: string;
+      authorUserId?: string;
+      identifier?: string;
+      wakeAssignee?: boolean;
+      refuseClosed?: boolean;
+    },
     result: IssueComment,
   ];
   "issues.createInteraction": [

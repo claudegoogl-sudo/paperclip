@@ -1621,18 +1621,25 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       },
       async createComment(issueId, body, companyId, options) {
         requireCapability(manifest, capabilitySet, "issue.comments.create");
-        const parentIssue = issues.get(issueId);
+        let parentIssue = issues.get(issueId);
+        if (!parentIssue && options?.identifier) {
+          parentIssue = [...issues.values()].find((candidate) => candidate.identifier === options.identifier);
+          if (parentIssue) issueId = parentIssue.id;
+        }
         if (!isInCompany(parentIssue, companyId)) {
-          throw new Error(`Issue not found: ${issueId}`);
+          throw new Error(`Issue not found: ${options?.identifier ?? issueId}`);
+        }
+        if (options?.refuseClosed && (parentIssue.status === "done" || parentIssue.status === "cancelled")) {
+          throw new Error("Issue is closed");
         }
         const now = new Date();
         const comment: IssueComment = {
           id: randomUUID(),
           companyId: parentIssue.companyId,
           issueId,
-          authorType: options?.authorAgentId ? "agent" : "system",
+          authorType: options?.authorAgentId ? "agent" : options?.authorUserId ? "user" : "system",
           authorAgentId: options?.authorAgentId ?? null,
-          authorUserId: null,
+          authorUserId: options?.authorUserId ?? null,
           body,
           presentation: null,
           metadata: null,

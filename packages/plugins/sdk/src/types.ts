@@ -1574,7 +1574,17 @@ export interface PluginIssuesClient {
     issueId: string,
     body: string,
     companyId: string,
-    options?: { authorAgentId?: string },
+    options?: {
+      authorAgentId?: string;
+      /** Attribute the comment to a board user (e.g. an operator relay). */
+      authorUserId?: string;
+      /** Resolve the target issue by identifier (e.g. `PLA-822`) instead of `issueId`. */
+      identifier?: string;
+      /** Wake the issue assignee + any @-mentioned agents, mirroring the HTTP comment route. */
+      wakeAssignee?: boolean;
+      /** Throw instead of inserting when the target issue is done/cancelled. */
+      refuseClosed?: boolean;
+    },
   ): Promise<IssueComment>;
   createInteraction(
     issueId: string,
