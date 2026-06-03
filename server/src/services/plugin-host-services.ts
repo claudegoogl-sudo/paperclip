@@ -1307,6 +1307,23 @@ export function buildHostServices(
         } else {
           scopedBus.subscribe(params.eventPattern as any, handler);
         }
+        // PLA-854 observability: a plugin worker re-runs setup() (and therefore
+        // re-issues every events.subscribe RPC) on each (re)start — e.g. a
+        // dev-watcher hot reload or crash auto-restart. If the host-side
+        // subscription ever fails to re-attach, board events silently stop
+        // reaching the worker with no error. Logging the running per-plugin
+        // subscription count on every (re)subscribe makes a detached relay
+        // observable: a healthy worker logs a rising count right after restart;
+        // a detached one logs nothing (count stuck at 0).
+        logger.info(
+          {
+            pluginId,
+            pluginKey,
+            eventPattern: params.eventPattern,
+            subscriptionCount: eventBus.subscriptionCount(pluginKey),
+          },
+          "plugin event subscription registered",
+        );
       },
     },
 
