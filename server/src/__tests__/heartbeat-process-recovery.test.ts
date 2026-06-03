@@ -3458,6 +3458,69 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(recoveryIssues).toHaveLength(0);
   });
 
+  it("skips an in_progress assigned standby wake target instead of escalating it (PLA-838)", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+    });
+
+    await db
+      .update(issues)
+      .set({ executionPolicy: { mode: "normal", commentRequired: true, stages: [], standbyWakeTarget: true } })
+      .where(eq(issues.id, issueId));
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(0);
+    expect(result.dispatchRequeued).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.successfulRunHandoffEscalated).toBe(0);
+    expect(result.issueIds).not.toContain(issueId);
+
+    const parked = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(parked?.status).toBe("in_progress");
+
+    const recoveryIssues = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
+    expect(recoveryIssues).toHaveLength(0);
+
+    const recoveryWakes = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.agentId, agentId),
+          inArray(agentWakeupRequests.reason, ["issue_continuation_needed", "source_scoped_recovery_action"]),
+        ),
+      );
+    expect(recoveryWakes).toHaveLength(0);
+
+    const auditRows = await db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.recovery_skipped"),
+        ),
+      );
+    expect(auditRows).toHaveLength(1);
+    expect(auditRows[0]?.details).toMatchObject({
+      source: "recovery.reconcile_stranded_assigned_issue_skipped",
+      reason: "standby_wake_target",
+    });
+  });
+
   it("skips an in_progress assigned issue parked on a pending board approval requested by the assignee (PLA-407)", async () => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",

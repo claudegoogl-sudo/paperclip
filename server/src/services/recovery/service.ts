@@ -42,6 +42,7 @@ import {
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
   buildSuccessfulRunHandoffExhaustedNotice,
+  isStandbyWakeTargetIssue,
   noticeMetadataReferencesRecoveryAction,
   type SuccessfulRunHandoffNotice,
 } from "./successful-run-handoff.js";
@@ -2560,6 +2561,31 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       // `hasExplicitWaitingPath` logic already used by the `in_review` branch
       // via `classifyIssueGraphLiveness`.
       if (issue.status === "in_progress") {
+        // PLA-838: A standby wake target (a perpetually-open catch-all issue
+        // such as a plugin inbox) parked between externally-driven wakes is not
+        // stranded. Skip without escalating to `blocked` or enqueueing a
+        // source_scoped_recovery_action wake; it resumes when an external event
+        // posts a comment and wakes the assignee normally.
+        if (isStandbyWakeTargetIssue(issue)) {
+          await logActivity(db, {
+            companyId: issue.companyId,
+            actorType: "system",
+            actorId: "system",
+            agentId: null,
+            runId: null,
+            action: "issue.recovery_skipped",
+            entityType: "issue",
+            entityId: issue.id,
+            details: {
+              identifier: issue.identifier,
+              source: "recovery.reconcile_stranded_assigned_issue_skipped",
+              reason: "standby_wake_target",
+            },
+          });
+          result.skipped += 1;
+          continue;
+        }
+
         const pendingApproval = await findPendingAssigneeBoardApproval(
           issue.companyId,
           issue.id,

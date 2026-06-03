@@ -23,6 +23,7 @@ interface IssueExecutionPolicy {
   mode: "normal" | "auto";
   commentRequired: boolean;       // always true, enforced by runtime
   stages: IssueExecutionStage[];  // ordered list of review/approval stages
+  standbyWakeTarget?: boolean | null; // marks a perpetually-open catch-all issue parked between external events (see "Standby Wake Targets")
 }
 
 interface IssueExecutionStage {
@@ -167,6 +168,48 @@ This prevents silent completions where an agent finishes work but leaves no trac
 | `issueCommentStatus` | `satisfied`, `retry_queued`, or `retry_exhausted` |
 | `issueCommentSatisfiedByCommentId` | Links to the comment that fulfilled the requirement |
 | `issueCommentRetryQueuedAt` | Timestamp when the retry wake was scheduled |
+
+## Standby Wake Targets (Catch-All Issues)
+
+Some issues are **never meant to be completed**. A catch-all wake target — for example a Telegram/messenger inbox issue that external plugin events route into — must stay open forever so it keeps receiving events. (Plugin event delivery uses `refuseClosed`: a `done`/`cancelled` issue silently drops inbound events.) The issue is intentionally *parked* in `in_progress`, assigned to the catch-all owner, waiting for the next external event to wake it.
+
+### The problem this solves
+
+The recovery engine treats a long-lived `in_progress` issue that has no live heartbeat run and no next step as **stranded work** and tries to rescue it. For a standby issue this is a false positive: each sweep fires a `source_scoped_recovery_action` (the "missing disposition / `clear_next_step`" productivity review), which wakes the assignee, posts no progress, and re-parks — an alternating `blocked`/`in_progress` churn loop that burns budget every sweep (~30s cadence in the PLA-834 incident).
+
+Closing the issue is **not** an option (it would break event delivery via `refuseClosed`), and relying on the assignee's heartbeat instructions to self-park in `blocked` is fragile — a single missed instruction restarts the loop.
+
+### The marker
+
+Set `standbyWakeTarget: true` on the issue's `executionPolicy`. This is a runtime-enforced, agent-behavior-independent opt-out: the recovery engine skips the issue instead of escalating it.
+
+```bash
+PATCH /api/issues/{issueId}
+{
+  "executionPolicy": { "mode": "normal", "commentRequired": true, "stages": [], "standbyWakeTarget": true }
+}
+```
+
+A policy whose only content is `standbyWakeTarget: true` (no stages, no monitor) is preserved rather than normalized to `null`. The marker also survives monitor-stripping, so attaching/clearing a monitor does not silently un-park the issue.
+
+### What the runtime does
+
+Both recovery paths consult `isStandbyWakeTargetIssue(issue)` and skip when it is true:
+
+- **`decideSuccessfulRunHandoff`** returns `{ kind: "skip", reason: "issue is a standby wake target parked between external events" }` instead of enqueuing a `finish_successful_run_handoff` / missing-state recovery action.
+- **`reconcileStrandedAssignedIssues`** skips the `in_progress` issue, increments `result.skipped`, and logs an activity row (`action: "issue.recovery_skipped"`, `details.reason: "standby_wake_target"`) so the skip is observable in logs.
+
+The issue stays visibly `in_progress` and assigned, so the normal event-driven wake path (plugin event → wake assignee) is untouched. No productivity-review spam, no blocked/in_progress churn.
+
+### When to use this vs. other states
+
+| Situation | Use |
+|---|---|
+| Perpetual catch-all that must keep receiving events and never close | `standbyWakeTarget: true`, leave `in_progress` |
+| Work genuinely waiting on a one-off external signal (a job, a webhook, a board approval) | `blocked` with an owner/action, or an execution `monitor` |
+| Work that can sit idle and be picked up later with no event routing | `backlog` (already exempt from recovery sweeps) |
+
+Reserve `standbyWakeTarget` for issues that *structurally* cannot be closed. It is a recovery opt-out, not a substitute for `blocked` on ordinary parked work.
 
 ## Access Control
 
