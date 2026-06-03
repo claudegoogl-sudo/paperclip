@@ -5,6 +5,8 @@ import {
   firstSecretMatch,
   redactSecrets,
   redactSecretsDeep,
+  redactSecretsForLog,
+  redactSecretsDeepForLog,
   secretMarker,
 } from "../secret-patterns.js";
 
@@ -98,6 +100,17 @@ describe("secret-patterns shared module", () => {
   it("leaves Paperclip run JWTs intact during redaction", () => {
     const paperclip = makeJwt({ iss: "paperclip" });
     expect(redactSecrets(`x ${paperclip} y`)).toBe(`x ${paperclip} y`);
+  });
+
+  // PLA-842 Finding 1: the log-surface variant bypasses the Option A issuer
+  // allowlist so a live iss=paperclip run JWT is never persisted to logs.
+  it("redacts Paperclip run JWTs on the LOG surface (ignores Option A)", () => {
+    const paperclip = makeJwt({ iss: "paperclip" });
+    expect(redactSecretsForLog(`x ${paperclip} y`)).toBe(`x ${secretMarker("jwt")} y`);
+    expect(redactSecretsForLog(`x ${paperclip} y`)).not.toContain(paperclip);
+
+    const deep = redactSecretsDeepForLog({ note: `run ${paperclip}` });
+    expect(deep.note).toBe(`run ${secretMarker("jwt")}`);
   });
 
   it("redacts every string leaf of a nested structure", () => {

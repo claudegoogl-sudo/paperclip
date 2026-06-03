@@ -99,6 +99,21 @@ export function secretMarker(label: string): string {
   return `<redacted ${label}>`;
 }
 
+export interface RedactOptions {
+  /**
+   * When true, the per-pattern `isSecret` gate is bypassed so EVERY shape match
+   * is redacted — including Paperclip's own `iss=paperclip` run JWTs. This is
+   * the correct posture for the LOG surface (PLA-842 Finding 1): a run/API JWT
+   * is a live bearer credential and must never be persisted to `server.log`,
+   * even though the write-block denylist (Option A) legitimately allows it in
+   * free-text bodies (an agent pasting `gh auth status`-style debug output).
+   *
+   * The pattern SET stays shared either way, so the two surfaces still cannot
+   * drift; only the issuer-allowlist decision differs per surface.
+   */
+  ignoreIssuerAllowlist?: boolean;
+}
+
 function globalCopy(regex: RegExp): RegExp {
   const flags = regex.flags.includes("g") ? regex.flags : `${regex.flags}g`;
   return new RegExp(regex.source, flags);
@@ -139,16 +154,18 @@ export function firstSecretMatch(text: unknown): SecretMatch | null {
 
 /**
  * Replace every secret substring in `text` with its class marker. Each
- * pattern is applied in set order; the `isSecret` gate is honoured so
- * Paperclip's own run JWTs are left intact (Option A).
+ * pattern is applied in set order. By default the `isSecret` gate is honoured
+ * so Paperclip's own run JWTs are left intact (Option A — for the write-block
+ * surface). Pass `{ ignoreIssuerAllowlist: true }` on the LOG surface so every
+ * credential shape is scrubbed regardless of issuer (PLA-842 Finding 1).
  */
-export function redactSecrets(text: string): string {
+export function redactSecrets(text: string, opts: RedactOptions = {}): string {
   if (typeof text !== "string" || text.length === 0) return text;
   let out = text;
   for (const pattern of SECRET_PATTERNS) {
     const scanner = globalCopy(pattern.regex);
     out = out.replace(scanner, (match) => {
-      if (pattern.isSecret && !pattern.isSecret(match)) return match;
+      if (!opts.ignoreIssuerAllowlist && pattern.isSecret && !pattern.isSecret(match)) return match;
       return secretMarker(pattern.label);
     });
   }
@@ -159,11 +176,12 @@ export function redactSecrets(text: string): string {
  * Recursively redact secret substrings from every string leaf of an arbitrary
  * value (objects, arrays, nested). Object keys are preserved; only string
  * values are scrubbed. Used by the HTTP logger to cover `reqBody.*` (every
- * leaf), serialized request fields, and any other logged structure.
+ * leaf), serialized request fields, and any other logged structure. `opts` is
+ * threaded through to every leaf.
  */
-export function redactSecretsDeep<T>(value: T): T {
-  if (typeof value === "string") return redactSecrets(value) as unknown as T;
-  if (Array.isArray(value)) return value.map((v) => redactSecretsDeep(v)) as unknown as T;
+export function redactSecretsDeep<T>(value: T, opts: RedactOptions = {}): T {
+  if (typeof value === "string") return redactSecrets(value, opts) as unknown as T;
+  if (Array.isArray(value)) return value.map((v) => redactSecretsDeep(v, opts)) as unknown as T;
   if (value && typeof value === "object") {
     if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) {
       // Non-plain objects (Buffers, Dates, class instances) are left as-is;
@@ -172,9 +190,25 @@ export function redactSecretsDeep<T>(value: T): T {
     }
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      out[k] = redactSecretsDeep(v);
+      out[k] = redactSecretsDeep(v, opts);
     }
     return out as unknown as T;
   }
   return value;
+}
+
+/**
+ * Log-surface variants. The HTTP logger and any direct `logger.*` call that
+ * embeds a request URL / body / error message MUST use these so that a live
+ * `iss=paperclip` run JWT appearing outside the force-redacted `authorization`
+ * header (e.g. in a `?token=` query, a body leaf, or an error string) is still
+ * scrubbed from `server.log`. The write-block surface keeps the gated variants
+ * above (Option A). Same shared pattern set → no drift (PLA-842 Finding 1).
+ */
+export function redactSecretsForLog(text: string): string {
+  return redactSecrets(text, { ignoreIssuerAllowlist: true });
+}
+
+export function redactSecretsDeepForLog<T>(value: T): T {
+  return redactSecretsDeep(value, { ignoreIssuerAllowlist: true });
 }

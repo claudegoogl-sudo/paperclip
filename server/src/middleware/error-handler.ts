@@ -4,6 +4,7 @@ import { HttpError } from "../errors.js";
 import { trackErrorHandlerCrash } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { logger } from "./logger.js";
+import { redactSecretsForLog } from "../secret-patterns.js";
 import { COMPANY_IMPORT_API_PATH } from "../routes/company-import-paths.js";
 
 export interface ErrorContext {
@@ -93,7 +94,11 @@ export function errorHandler(
     if (numericStatus === 413) {
       logger.warn(
         {
-          route: req.originalUrl,
+          // Direct logger.* call: NOT covered by pino-http `redact.paths`
+          // (those only cover req.url/req.query/req.headers), so scrub the URL
+          // here — a `?token=<secret>` on an oversized request would otherwise
+          // land in server.log cleartext (PLA-842 Finding 2).
+          route: redactSecretsForLog(req.originalUrl),
           method: req.method,
           contentLength: Number.isFinite(contentLength) ? contentLength : null,
           limit: typeof errLike.limit === "number" ? errLike.limit : null,

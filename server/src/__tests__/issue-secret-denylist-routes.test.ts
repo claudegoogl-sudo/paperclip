@@ -244,6 +244,21 @@ describe.sequential("issue write-block secret denylist routes", () => {
     expect(mockIssueService.create).not.toHaveBeenCalled();
   });
 
+  // PLA-842 Finding 3 regression: create-issue `title` is a stored, rendered
+  // free-text field and must be guarded symmetrically with PATCH `title`. Fails
+  // on pre-fix code, where the create guard only covered `description`.
+  it("blocks a github_pat in a new issue title and never persists", async () => {
+    const res = await request(await installActor(createApp()))
+      .post("/api/companies/company-1/issues")
+      .send({ title: `deploy with ${GITHUB_PAT}`, description: "clean" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.blockedPattern).toBe("github_pat");
+    expect(res.body.surface).toBe("title");
+    expect(JSON.stringify(res.body)).not.toContain(GITHUB_PAT);
+    expect(mockIssueService.create).not.toHaveBeenCalled();
+  });
+
   it("blocks a github_pat in a PATCH description", async () => {
     const res = await request(await installActor(createApp()))
       .patch(`/api/issues/${ISSUE_ID}`)

@@ -3556,6 +3556,7 @@ export function issueRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     if (!assertNoSecretPatternInWritePayload(req, res, [
+      { name: "title", value: req.body.title },
       { name: "description", value: req.body.description },
     ], { companyId })) return;
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
