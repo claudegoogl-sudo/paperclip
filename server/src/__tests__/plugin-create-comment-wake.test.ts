@@ -216,6 +216,53 @@ describeEmbeddedPostgres("plugin issues.createComment wake + identifier resoluti
     expect(wakeups.length).toBe(0);
   });
 
+  it("consults the wake rate limiter per relay and suppresses the wake when it blocks (PLA-829)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const identifier = `${issuePrefix(companyId)}-10b`;
+    const issueId = await seedIssue({ companyId, identifier, status: "in_progress", assigneeAgentId: agentId });
+
+    const relayCount = 8;
+    // Block-all spy limiter: this asserts the host createComment path consults
+    // the limiter once per relay and that a blocked verdict skips the wake.
+    // It deliberately enqueues no heartbeats, so the test never spawns an async
+    // run (whose activity_log / company_skills writes would race teardown). The
+    // cap arithmetic itself — N rapid wakes within the window yield <= cap — is
+    // proven deterministically in plugin-wake-rate-limit.test.ts.
+    let consumeCalls = 0;
+    const wakeRateLimiter = {
+      consume(actor: { pluginId: string; companyId: string; agentId: string }) {
+        consumeCalls += 1;
+        return { allowed: false, limit: 0, remaining: 0, retryAfterSeconds: 1, actor };
+      },
+    };
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.messenger", createEventBusStub(), undefined, {
+      wakeRateLimiter,
+    });
+
+    for (let i = 0; i < relayCount; i++) {
+      const comment = await services.issues.createComment({
+        issueId,
+        body: `relay burst ${i}`,
+        companyId,
+        wakeAssignee: true,
+      } as any);
+      // Every relay comment must still land — only the wake is throttled.
+      expect(comment.id).toBeTruthy();
+    }
+
+    // The limiter is consulted exactly once per relay (assignee set, not self).
+    expect(consumeCalls).toBe(relayCount);
+
+    // Comments all landed; not a single wake was enqueued while the limiter blocked.
+    const landed = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(landed.length).toBe(relayCount);
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId)));
+    expect(wakeups.length).toBe(0);
+  });
+
   it("does NOT wake a body-@mentioned agent — assignee-only wake (PLA-823 Finding 2)", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent("Assignee");
     const mentionedAgentId = randomUUID();

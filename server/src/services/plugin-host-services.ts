@@ -63,6 +63,10 @@ import {
 } from "./plugin-local-folders.js";
 import { createPluginSecretsHandler } from "./plugin-secrets-handler.js";
 import { createPluginArtifactsHandler } from "./plugin-artifacts-handler.js";
+import {
+  defaultPluginWakeRateLimiter,
+  type PluginWakeRateLimiter,
+} from "./plugin-wake-rate-limit.js";
 import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js";
 import type { StorageService } from "../storage/types.js";
 import { logActivity } from "./activity-log.js";
@@ -517,8 +521,10 @@ export function buildHostServices(
     storageService?: StorageService;
     runContextRegistry?: PluginRunContextRegistry;
     manifest?: import("@paperclipai/shared").PaperclipPluginManifestV1;
+    wakeRateLimiter?: PluginWakeRateLimiter;
   } = {},
 ): HostServices & { dispose(): void } {
+  const wakeRateLimiter = options.wakeRateLimiter ?? defaultPluginWakeRateLimiter;
   const registry = pluginRegistryService(db);
   const stateStore = pluginStateStore(db);
   const pluginDb = pluginDatabaseService(db);
@@ -2144,7 +2150,21 @@ export function buildHostServices(
           const authorAgentId = params.authorAgentId ?? null;
           const assigneeId = issue.assigneeAgentId;
           const selfComment = Boolean(authorAgentId && authorAgentId === assigneeId);
-          if (assigneeId && !selfComment) {
+          // Throttle wakes per (plugin, company, assignee). A relay storm still
+          // lands every comment, but only the first `maxWakes`/window enqueue a
+          // heartbeat — the rest are dropped so untrusted inbound volume cannot
+          // spam the assignee's runs or burn budget. (PLA-829.)
+          const wakeAllowed =
+            assigneeId && !selfComment
+              ? wakeRateLimiter.consume({ pluginId, companyId, agentId: assigneeId }).allowed
+              : true;
+          if (assigneeId && !selfComment && !wakeAllowed) {
+            logger.warn(
+              { issueId: issue.id, agentId: assigneeId, companyId, pluginId, pluginKey },
+              "plugin createComment: assignee wake rate-limited; comment landed but wakeup skipped",
+            );
+          }
+          if (assigneeId && !selfComment && wakeAllowed) {
             await heartbeat
               .wakeup(assigneeId, {
                 source: "automation",
