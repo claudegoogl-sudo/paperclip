@@ -61,6 +61,7 @@ import { createPluginEventBus } from "./services/plugin-event-bus.js";
 import { setPluginEventBus } from "./services/activity-log.js";
 import { createPluginDevWatcher } from "./services/plugin-dev-watcher.js";
 import { createPluginHostServiceCleanup } from "./services/plugin-host-service-cleanup.js";
+import { createEventRelayProbe } from "./services/plugin-event-relay-probe.js";
 import { pluginRegistryService } from "./services/plugin-registry.js";
 import { createHostClientHandlers } from "@paperclipai/plugin-sdk";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
@@ -202,6 +203,10 @@ export async function createApp(
   app.use(llmRoutes(db));
 
   const hostServicesDisposers = new Map<string, () => void>();
+  // PLA-854: pluginId -> pluginKey, populated as each plugin's host handlers are
+  // built. Lets the event-relay probe resolve the bus key (which is the plugin
+  // key) for the running workers reported by the worker manager.
+  const pluginKeyById = new Map<string, string>();
   // PLA-574: shared run-context registry tying the dispatching agent's
   // identity to (pluginDbId, runId) for the duration of each tool call, so the
   // worker's `artifacts.fetch`/`secrets.resolve` callbacks can be authorized
@@ -264,7 +269,7 @@ export async function createApp(
   const eventBus = createPluginEventBus();
   setPluginEventBus(eventBus);
   const jobStore = pluginJobStore(db);
-  const lifecycle = pluginLifecycleManager(db, { workerManager });
+  const lifecycle = pluginLifecycleManager(db, { workerManager, eventBus });
   const scheduler = createPluginJobScheduler({
     db,
     jobStore,
@@ -315,6 +320,7 @@ export async function createApp(
           manifest,
         });
         hostServicesDisposers.set(pluginId, () => services.dispose());
+        pluginKeyById.set(pluginId, manifest.id);
         return createHostClientHandlers({
           pluginId,
           capabilities: manifest.capabilities,
@@ -502,11 +508,30 @@ export async function createApp(
   }).catch((err) => {
     logger.error({ err }, "Failed to load ready plugins on startup");
   });
+
+  // PLA-854: liveness probe that warns if a running plugin's board-event relay
+  // detaches (worker up, zero event-bus subscriptions). Belt-and-suspenders to
+  // the per-restart subscription-count log in plugin-lifecycle.
+  const eventRelayProbe = createEventRelayProbe({
+    listRunningPlugins: () =>
+      workerManager
+        .diagnostics()
+        .filter((d) => d.status === "running")
+        .map((d) => ({ pluginId: d.pluginId, pluginKey: pluginKeyById.get(d.pluginId) }))
+        .filter((p): p is { pluginId: string; pluginKey: string } => Boolean(p.pluginKey)),
+    subscriptionCount: (pluginKey) => eventBus.subscriptionCount(pluginKey),
+    log: {
+      warn: (obj, msg) => logger.warn({ service: "plugin-event-relay-probe", ...obj }, msg),
+      info: (obj, msg) => logger.info({ service: "plugin-event-relay-probe", ...obj }, msg),
+    },
+  });
+  eventRelayProbe.start();
   let appServicesShutdown = false;
   const shutdownAppServices = () => {
     if (appServicesShutdown) return;
     appServicesShutdown = true;
     disableFeedbackExportFlushes();
+    eventRelayProbe.stop();
     devWatcher?.close();
     viteHtmlRenderer?.dispose();
     hostServiceCleanup.disposeAll();

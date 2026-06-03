@@ -44,6 +44,7 @@ import type {
 } from "@paperclipai/shared";
 import { pluginRegistryService } from "./plugin-registry.js";
 import { pluginLoader, type PluginLoader } from "./plugin-loader.js";
+import type { PluginEventBus } from "./plugin-event-bus.js";
 import type { PluginWorkerManager, WorkerStartOptions } from "./plugin-worker-manager.js";
 import { badRequest, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -278,6 +279,17 @@ export interface PluginLifecycleManagerOptions {
    * caller is responsible for managing worker processes externally.
    */
   workerManager?: PluginWorkerManager;
+
+  /**
+   * In-process plugin event bus. When provided, a bare worker restart (the
+   * fallback path taken when no runtime-activation services are wired in)
+   * clears the plugin's stale event-bus subscriptions before bouncing the
+   * worker, so the restarted worker's `setup()` re-subscription is the
+   * authoritative final state rather than an accumulation on top of dead
+   * subscriptions. Also used to log the re-established subscription count so a
+   * detached relay is observable. See PLA-854.
+   */
+  eventBus?: PluginEventBus;
 }
 
 /**
@@ -309,6 +321,7 @@ export function pluginLifecycleManager(
   // as well as the new options object form.
   let loaderArg: PluginLoader | undefined;
   let workerManager: PluginWorkerManager | undefined;
+  let eventBus: PluginEventBus | undefined;
 
   if (options && typeof options === "object" && "discoverAll" in options) {
     // Legacy: second arg is a PluginLoader directly
@@ -317,6 +330,7 @@ export function pluginLifecycleManager(
     const opts = options as PluginLifecycleManagerOptions;
     loaderArg = opts.loader;
     workerManager = opts.workerManager;
+    eventBus = opts.eventBus;
   }
 
   const registry = pluginRegistryService(db);
@@ -803,15 +817,49 @@ export function pluginLifecycleManager(
         await deactivatePluginRuntime(pluginId, plugin.pluginKey);
         await activateReadyPlugin(pluginId);
       } else {
-        // No runtime activation services wired in (e.g. state-only test harness)
-        // — fall back to a bare worker subprocess bounce.
+        // No runtime activation services wired in (e.g. state-only test harness,
+        // or a host whose lifecycle manager was not given the runtime-services
+        // loader) — fall back to a bare worker subprocess bounce.
         log.info(
           { pluginId, pluginKey: plugin.pluginKey },
           "plugin lifecycle: restarting worker (runtime services unavailable; skipping migration re-apply)",
         );
+
+        // PLA-854: clear the plugin's existing event-bus subscriptions BEFORE
+        // bouncing the worker. The restarted worker re-declares its
+        // subscriptions during setup() (`ctx.events.on` -> `events.subscribe`),
+        // so this clear makes that re-subscription the authoritative final
+        // state instead of accumulating a fresh set on top of the now-dead
+        // ones (which would fan out every relayed event N times after N
+        // restarts).
+        //
+        // Crucially we do NOT emit `plugin.worker_stopped` here. That event is
+        // wired to the host-service cleanup controller, whose disposer calls
+        // `services.dispose()` -> `scopedBus.clear()`. Because a bare bounce
+        // reuses the SAME host-services object (handlers are not rebuilt the
+        // way the loader path rebuilds them), emitting it AFTER the restart
+        // tore down the subscriptions the new worker had just re-established —
+        // detaching the relay — and set the `disposed` flag, which would then
+        // reject the worker's later host calls (e.g. sendMessage). Host
+        // services must outlive a worker process bounce.
+        eventBus?.clearPlugin(plugin.pluginKey);
         await handle.restart();
-        emitDomain("plugin.worker_stopped", { pluginId, pluginKey: plugin.pluginKey });
         emitDomain("plugin.worker_started", { pluginId, pluginKey: plugin.pluginKey });
+
+        if (eventBus) {
+          const eventSubscriptions = eventBus.subscriptionCount(plugin.pluginKey);
+          if (eventSubscriptions === 0) {
+            log.warn(
+              { pluginId, pluginKey: plugin.pluginKey, eventSubscriptions },
+              "plugin lifecycle: worker restarted but no event subscriptions were re-established — board-event relay is detached",
+            );
+          } else {
+            log.info(
+              { pluginId, pluginKey: plugin.pluginKey, eventSubscriptions },
+              "plugin lifecycle: worker restarted, event subscriptions re-established",
+            );
+          }
+        }
       }
 
       log.info(

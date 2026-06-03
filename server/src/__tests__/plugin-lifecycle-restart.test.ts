@@ -121,9 +121,65 @@ describe("pluginLifecycleManager.restartWorker", () => {
     expect(loader.unloadSingle).not.toHaveBeenCalled();
     expect(loader.loadSingle).not.toHaveBeenCalled();
     expect(handle.restart).toHaveBeenCalledTimes(1);
-    expect(stopped).toHaveBeenCalledTimes(1);
-    expect(stopped).toHaveBeenCalledWith({ pluginId: "plugin-1", pluginKey: "example.plugin" });
     expect(started).toHaveBeenCalledTimes(1);
     expect(started).toHaveBeenCalledWith({ pluginId: "plugin-1", pluginKey: "example.plugin" });
+    // PLA-854: the bare branch must NOT emit `plugin.worker_stopped`. That event
+    // drives the host-service cleanup disposer (services.dispose() ->
+    // scopedBus.clear()), which — because a bare bounce reuses the same
+    // host-services object — would tear down the subscriptions the restarted
+    // worker just re-established, detaching the relay.
+    expect(stopped).not.toHaveBeenCalled();
+  });
+
+  it("clears stale event subscriptions before the bounce so the restarted worker's re-subscription survives (PLA-854)", async () => {
+    mockRegistry.getById.mockResolvedValue(pluginRecord);
+    mockRegistry.updateStatus.mockResolvedValue(pluginRecord);
+
+    const { handle, workerManager } = makeWorkerManagerStub();
+
+    // Model the in-process bus: it starts with stale subscriptions from the
+    // worker that is about to be bounced.
+    const counts = new Map<string, number>([["example.plugin", 6]]);
+    const eventBus = {
+      clearPlugin: vi.fn((key: string) => counts.set(key, 0)),
+      subscriptionCount: vi.fn((key?: string) =>
+        key === undefined
+          ? Array.from(counts.values()).reduce((a, b) => a + b, 0)
+          : counts.get(key) ?? 0,
+      ),
+      emit: vi.fn(),
+      forPlugin: vi.fn(),
+    };
+
+    // The restarted worker re-declares all six relay subscriptions during
+    // setup() (comment / approval.created / approval.decided / issue.* /
+    // interaction). Model that as the bus regaining 6 subs during restart().
+    handle.restart.mockImplementation(async () => {
+      counts.set("example.plugin", 6);
+    });
+
+    const loader: Partial<PluginLoader> = {
+      hasRuntimeServices: vi.fn().mockReturnValue(false) as PluginLoader["hasRuntimeServices"],
+    };
+
+    const lifecycle = pluginLifecycleManager(
+      {} as never,
+      { loader: loader as PluginLoader, workerManager, eventBus: eventBus as never },
+    );
+    const stopped = vi.fn();
+    lifecycle.on("plugin.worker_stopped", stopped);
+
+    await lifecycle.restartWorker("plugin-1");
+
+    // Stale subs were cleared, and the clear happened BEFORE the bounce so the
+    // restart's re-subscription is the authoritative final state.
+    expect(eventBus.clearPlugin).toHaveBeenCalledWith("example.plugin");
+    expect(eventBus.clearPlugin.mock.invocationCallOrder[0]).toBeLessThan(
+      handle.restart.mock.invocationCallOrder[0],
+    );
+    // Relay survives: subscriptions are present after the restart, and the
+    // clobbering worker_stopped emit is gone.
+    expect(counts.get("example.plugin")).toBe(6);
+    expect(stopped).not.toHaveBeenCalled();
   });
 });
