@@ -591,22 +591,28 @@ describe("createHostClientHandlers events.subscribe serviceScope (PLA-810)", () 
     expect(subscribe).not.toHaveBeenCalled();
   });
 
-  it("fails closed for a company-filtered subscribe when the scope is invalid (forged/stale invocation id)", async () => {
+  it("allows a company-filtered subscribe under serviceScope even when base context reports invalidInvocationScope (PLA-818)", async () => {
     const { handlers, subscribe } = makeEventsHandlers();
     const params = {
       eventPattern: "issue.created",
       filter: { companyId: "company-a" },
     };
 
-    // serviceScope present but the worker also referenced an unknown invocation
-    // — the invalid-scope rejection wins; serviceScope cannot launder it.
+    // PLA-818: the inbound relay path (onWebhook / getUpdates callback with no
+    // resolvable dispatch id) resolves to `invalidInvocationScope` in the host's
+    // base context. For an allowlisted, reach-checked method carrying a valid
+    // serviceScope this must be authorized — the allowlist bypass is an
+    // exception to the invalid-scope rejection. It grants no reach beyond the
+    // scope-less `{}` case already allowed (events.subscribe is company-filtered
+    // and the filter is reach-checked server-side).
     await expect(
       handlers["events.subscribe"](params as never, {
         invalidInvocationScope: true,
         serviceScope: { runId: "service-run-1" },
       }),
-    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
-    expect(subscribe).not.toHaveBeenCalled();
+    ).resolves.toBeUndefined();
+    expect(subscribe).toHaveBeenCalledTimes(1);
+    expect(subscribe).toHaveBeenCalledWith(params);
   });
 
   it("does NOT extend the serviceScope allowance to other company-scoped methods", async () => {
@@ -734,17 +740,45 @@ describe("createHostClientHandlers serviceScope company writes/state (PLA-814)",
     expect(createComment).not.toHaveBeenCalled();
   });
 
-  it("fails closed for issues.createComment when the invocation scope is invalid (cannot be laundered by serviceScope)", async () => {
+  it("allows issues.createComment under serviceScope even when base context reports invalidInvocationScope (PLA-818 inbound relay)", async () => {
+    // PLA-818: the live inbound path — an operator reply routed through
+    // onWebhook/getUpdates — produces a worker→host createComment whose base
+    // context is `invalidInvocationScope` (no resolvable dispatch id). The
+    // PLA-814 allowlist bypass must reach this call: placing the invalid-scope
+    // throw first (the fork.16 bug) made the bypass dead code for the only path
+    // it exists to serve. The grant is reach-bounded (server-side
+    // requireInCompany) and identical to the scope-less `{}` case already
+    // authorized above.
     const { handlers, createComment } = makeHandlers();
-    const params = { issueId: "issue-1", body: "x", companyId: "company-a" };
+    const params = { issueId: "issue-1", body: "operator reply", companyId: "company-a" };
 
     await expect(
       handlers["issues.createComment"](params as never, {
         invalidInvocationScope: true,
         serviceScope: { runId: "service-run-1" },
       }),
+    ).resolves.toEqual({ id: "comment-1" });
+    expect(createComment).toHaveBeenCalledWith(params);
+  });
+
+  it("still fails closed for a NON-allowlisted company-scoped method under invalidInvocationScope + serviceScope (issues.list)", async () => {
+    // PLA-818 must NOT widen the bypass beyond SERVICE_SCOPE_COMPANY_METHODS.
+    // issues.list trusts companyId as the sole authority (no entity
+    // cross-check), so the invalid-scope rejection retains full force for it
+    // even with a valid serviceScope present — this is where the throw's
+    // protective value lives.
+    const { handlers, issuesList } = makeHandlers();
+
+    await expect(
+      handlers["issues.list"](
+        { companyId: "company-a" } as never,
+        {
+          invalidInvocationScope: true,
+          serviceScope: { runId: "service-run-1" },
+        },
+      ),
     ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
-    expect(createComment).not.toHaveBeenCalled();
+    expect(issuesList).not.toHaveBeenCalled();
   });
 
   it("keeps strict company enforcement when an active dispatch pins a different company", async () => {

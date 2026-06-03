@@ -45,6 +45,10 @@ const ONEVENT_WORKER_ENTRYPOINT = path.join(
   FIXTURES_DIR,
   "plugin-worker-onevent.cjs",
 );
+const INBOUND_COMMENT_WORKER_ENTRYPOINT = path.join(
+  FIXTURES_DIR,
+  "plugin-worker-inbound-comment.cjs",
+);
 
 const TEST_MANIFEST: PaperclipPluginManifestV1 = {
   id: "test.plugin",
@@ -765,6 +769,74 @@ describe("PLA-719 — back-fill runId when the worker echoes no invocation id", 
     });
 
     expect(companiesGet).not.toHaveBeenCalled();
+  });
+});
+
+describe("PLA-818 — inbound relay createComment authorized end-to-end under invalidInvocationScope", () => {
+  // The live fork.16 bug: an operator reply routed through the messenger's
+  // onWebhook/getUpdates path calls `ctx.issues.createComment` WITHOUT echoing a
+  // resolvable invocation id while a host→worker dispatch is in flight. The host
+  // base context surfaces `invalidInvocationScope: true` and attaches the
+  // worker-lifetime `serviceScope`. Pre-fix the SDK gate threw on
+  // `invalidInvocationScope` before reaching the PLA-814 allowlist bypass, so the
+  // comment was denied and never landed. This proves the FULL chain
+  // (contextForWorkerMessage → SDK gate) now authorizes the reach-checked,
+  // allowlisted createComment — guarding against a context-shape regression
+  // silently re-breaking the relay.
+
+  it("authorizes an id-less issues.createComment emitted during an in-flight dispatch (real worker)", async () => {
+    const createComment = vi.fn(async (params: { issueId: string; body: string; companyId: string }) => ({
+      id: `comment-for-${params.issueId}`,
+    }));
+    const handlers = createHostClientHandlers({
+      pluginId: "test.plugin",
+      capabilities: ["issue.comments.create"],
+      services: {
+        issues: { createComment },
+      } as unknown as HostServices,
+    });
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INBOUND_COMMENT_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: handlers,
+    });
+
+    try {
+      await handle.start();
+
+      await expect(
+        handle.call("executeTool", {
+          toolName: "messenger.route",
+          parameters: {
+            issueId: "issue-1",
+            body: "operator reply",
+            companyId: "company-a",
+          },
+          runContext: {
+            agentId: "agent-1",
+            runId: "run-pla818",
+            companyId: "company-a",
+            projectId: "project-1",
+          },
+        } as unknown as HostToWorkerMethods["executeTool"][0]),
+      ).resolves.toMatchObject({
+        data: { commentedVia: { id: "comment-for-issue-1" } },
+      });
+
+      // The nested createComment carried no invocation id (→ invalidInvocationScope
+      // in base context) yet was authorized via the serviceScope allowlist bypass.
+      expect(createComment).toHaveBeenCalledTimes(1);
+      expect(createComment).toHaveBeenCalledWith({
+        issueId: "issue-1",
+        body: "operator reply",
+        companyId: "company-a",
+      });
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
   });
 });
 

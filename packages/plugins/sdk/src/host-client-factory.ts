@@ -697,34 +697,49 @@ export function createHostClientHandlers(
     const requested = requestedCompanyScope(method, params);
     if (requested.kind === "none") return;
 
-    if (context?.invalidInvocationScope) {
-      throw new InvocationScopeDeniedError(
-        pluginId,
-        method,
-        "the worker referenced a missing, expired, or unknown invocation scope",
-      );
-    }
-
     const allowedCompanyId = readNonEmptyString(context?.invocationScope?.companyId);
     if (!allowedCompanyId) {
-      // PLA-810 / PLA-814: when the only scope present is the host-minted,
+      // PLA-810 / PLA-814 / PLA-818: when no dispatch pins a company, authorize
+      // the narrow allowlist of company-scoped methods carrying the host-minted,
       // worker-lifetime `serviceScope` (PLA-768) — i.e. a background dispatch or
-      // a loop started in `setup()` (e.g. the messenger `getUpdates` poll loop)
-      // with no active dispatch to pin a company — authorize the narrow
-      // allowlist of company-scoped methods that cannot widen the plugin's reach
-      // beyond what a host-pinned dispatch already grants (see
+      // a loop started in `setup()` (e.g. the messenger `getUpdates` poll loop /
+      // inbound `onWebhook` route) that cannot widen the plugin's reach beyond
+      // what a host-pinned dispatch already grants (see
       // `SERVICE_SCOPE_COMPANY_METHODS` for the per-method safety argument).
-      // `requested.kind === "single"` ensures a concrete target company: a
-      // company-scoped call with no specific company (`kind: "all"`) still fails
-      // closed below. `invalidInvocationScope` was already rejected above, so
-      // this only legitimizes a genuinely scope-less call carrying the service
-      // run-context.
+      //
+      // PLA-818 (guard-ordering fix): this bypass is evaluated BEFORE the
+      // `invalidInvocationScope` rejection below. The inbound relay path resolves
+      // to `invalidInvocationScope` in the host's base context (the worker→host
+      // callback carries no resolvable dispatch id — see `contextForWorkerMessage`
+      // / `baseContextForWorkerMessage` in plugin-worker-manager), so placing the
+      // throw first made this bypass dead code for the only path it exists to
+      // serve. Reaching the bypass here grants NO reach beyond the scope-less
+      // (`{}`) case already allowed below: these exact allowlist methods are
+      // server-side `requireInCompany` reach-checked, so a worker-forged
+      // `companyId` cannot reach a foreign tenant regardless of whether the
+      // worker echoed a bad id or no id. `requested.kind === "single"` ensures a
+      // concrete target company (`kind: "all"` still fails closed below), and a
+      // present `serviceScope.runId` is required. The `invalidInvocationScope`
+      // throw below retains full force for every NON-allowlisted company-scoped
+      // method, which is where its protective value actually lives.
       if (
         requested.kind === "single" &&
         readNonEmptyString(context?.serviceScope?.runId) &&
         SERVICE_SCOPE_COMPANY_METHODS.has(method)
       ) {
         return;
+      }
+      // The worker referenced a scope the host could not resolve to an active
+      // dispatch (missing/expired/unknown id, or a background call the host could
+      // not attribute). For non-allowlisted company-scoped methods this still
+      // fails closed — serviceScope cannot launder it into reach the method's own
+      // entity cross-check does not already grant.
+      if (context?.invalidInvocationScope) {
+        throw new InvocationScopeDeniedError(
+          pluginId,
+          method,
+          "the worker referenced a missing, expired, or unknown invocation scope",
+        );
       }
       // Fail closed (Complete Mediation / Fail Securely): a company-scoped
       // worker→host call arrived with no resolvable invocation scope — e.g. an
