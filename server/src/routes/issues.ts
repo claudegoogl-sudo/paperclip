@@ -82,6 +82,7 @@ import {
   workProductService,
 } from "../services/index.js";
 import { logger } from "../middleware/logger.js";
+import { firstSecretMatch } from "../secret-patterns.js";
 import { retryOnTransientPgError } from "../services/pg-retry.js";
 import { conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
@@ -1546,6 +1547,54 @@ export function issueRoutes(
       },
     });
     return false;
+  }
+
+  /**
+   * Pre-submit secret-pattern denylist (PLA-177 / locked spec PLA-302). Scans
+   * the named write-side fields against the shared pattern set
+   * (../secret-patterns.js — the same module the HTTP logger redactor uses, so
+   * the two cannot drift). On a hit it BLOCKS the write with a structured 422
+   * naming the matched pattern class and the offending field — it does NOT
+   * silently strip, and it never echoes the matched value back. An
+   * operator-facing log line is emitted carrying only the class label + actor
+   * + issue id (no token bytes). JWT/`PAPERCLIP_API_KEY` overlap is handled
+   * inside the shared matcher via Option A (allow `iss=paperclip`).
+   */
+  function assertNoSecretPatternInWritePayload(
+    req: Request,
+    res: Response,
+    fields: Array<{ name: string; value: unknown }>,
+    context: { issueId?: string | null; companyId?: string | null },
+  ): boolean {
+    for (const field of fields) {
+      const match = firstSecretMatch(field.value);
+      if (!match) continue;
+      const actor = getActorInfo(req);
+      logger.warn(
+        {
+          event: "secret_pattern_blocked",
+          blockedPattern: match.label,
+          surface: field.name,
+          actorType: actor.actorType,
+          agentId: actor.agentId,
+          issueId: context.issueId ?? null,
+          companyId: context.companyId ?? null,
+        },
+        `Blocked write containing secret pattern (${match.label}) in field "${field.name}"`,
+      );
+      res.status(422).json({
+        error:
+          `Request field "${field.name}" matches a blocked secret pattern (${match.label}). ` +
+          `Remove or redact the secret and resubmit — the value was not stored.`,
+        blockedPattern: match.label,
+        surface: field.name,
+        details: {
+          securityPrinciples: ["Secure Defaults", "Fail Closed"],
+        },
+      });
+      return false;
+    }
+    return true;
   }
 
   async function assertExplicitResumeIntentAllowed(
@@ -3506,6 +3555,9 @@ export function issueRoutes(
   router.post("/companies/:companyId/issues", applyCreateIssueStatusDefault, validate(createIssueSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    if (!assertNoSecretPatternInWritePayload(req, res, [
+      { name: "description", value: req.body.description },
+    ], { companyId })) return;
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, { companyId }, req.body))) return;
     if (req.body.assigneeAgentId || req.body.assigneeUserId) {
@@ -3913,6 +3965,11 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, existing.companyId);
+    if (!assertNoSecretPatternInWritePayload(req, res, [
+      { name: "description", value: req.body.description },
+      { name: "comment", value: req.body.comment },
+      { name: "title", value: req.body.title },
+    ], { issueId: existing.id, companyId: existing.companyId })) return;
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
@@ -5637,6 +5694,9 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
+    if (!assertNoSecretPatternInWritePayload(req, res, [
+      { name: "body", value: req.body.body },
+    ], { issueId: issue.id, companyId: issue.companyId })) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (!assertStructuredCommentFieldsAllowed(req, res, {
       presentation: req.body.presentation,
