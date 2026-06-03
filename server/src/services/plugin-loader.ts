@@ -1929,16 +1929,25 @@ export function pluginLoader(
       // are registered by the host handler layer when the worker calls
       // events.subscribe via RPC.
       //
-      // The bus.forPlugin() call creates the scoped handle if needed;
-      // any previous subscriptions for this plugin are preserved if the
-      // worker is restarting.
+      // The bus.forPlugin() call creates the scoped handle if needed.
+      //
+      // PLA-854: on a restart (dev-watcher hot reload / crash auto-restart)
+      // unloadSingle() has already called eventBus.clearPlugin(), so this
+      // plugin starts with ZERO subscriptions; the new worker process must
+      // re-issue every events.subscribe RPC from its setup() for the relay to
+      // re-attach. That happens asynchronously AFTER startWorker() resolves,
+      // so the count read here is a point-in-time snapshot (typically 0 right
+      // after (re)activation) — the authoritative per-subscribe count is logged
+      // by the host events.subscribe handler as each subscription lands. A relay
+      // that stays at 0 (worker alive but no "plugin event subscription
+      // registered" lines) is the PLA-854 detached-subscription signature.
       // ------------------------------------------------------------------
       const _scopedBus = eventBus.forPlugin(pluginKey);
       registered.eventSubscriptions = eventBus.subscriptionCount(pluginKey);
 
       log.debug(
-        { pluginId, pluginKey },
-        "plugin-loader: event bus scoped handle ready",
+        { pluginId, pluginKey, subscriptionsAtActivation: registered.eventSubscriptions },
+        "plugin-loader: event bus scoped handle ready (worker re-subscribes asynchronously)",
       );
 
       // ------------------------------------------------------------------
