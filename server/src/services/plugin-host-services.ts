@@ -2093,24 +2093,106 @@ export function buildHostServices(
       async createComment(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
-        const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
+        // Resolve target by identifier (e.g. PLA-822) when no issueId is supplied.
+        // requireInCompany keeps the tenant reach-check: an identifier that resolves
+        // to a foreign company throws "Issue not found".
+        const issue = params.identifier && !params.issueId
+          ? requireInCompany("Issue", await issues.getByIdentifier(params.identifier), companyId)
+          : requireInCompany("Issue", await issues.getById(params.issueId), companyId);
+        const isClosed = issue.status === "done" || issue.status === "cancelled";
+        if (params.refuseClosed && isClosed) {
+          // Never land an operator relay silently on a closed issue.
+          throw new Error(`Issue is closed (status: ${issue.status})`);
+        }
+        // Attribute to the operator user when provided (authorType derives "user"),
+        // else to an agent, else system. Prefer user attribution if both are set.
+        const actor: { agentId?: string; userId?: string } = params.authorUserId
+          ? { userId: params.authorUserId }
+          : { agentId: params.authorAgentId };
         const comment = (await issues.addComment(
-          params.issueId,
+          issue.id,
           params.body,
-          { agentId: params.authorAgentId },
+          actor,
         )) as IssueComment;
         await logPluginActivity({
           companyId,
           action: "issue.comment.created",
           entityType: "issue",
           entityId: issue.id,
-          actor: { actorAgentId: params.authorAgentId ?? null },
+          actor: { actorAgentId: params.authorAgentId ?? null, actorUserId: params.authorUserId ?? null },
           details: {
             identifier: issue.identifier,
             commentId: comment.id,
             bodySnippet: comment.body.slice(0, 120),
+            resolvedByIdentifier: Boolean(params.identifier && !params.issueId),
+            wakeAssignee: params.wakeAssignee === true,
           },
         });
+
+        if (params.wakeAssignee) {
+          // Mirror the HTTP comment route's merged wake block: one enqueue per agent,
+          // covering the assignee plus any @-mentioned agents in the body. Wakes are
+          // constrained to the resolved issue's own company.
+          const authorAgentId = params.authorUserId ? null : (params.authorAgentId ?? null);
+          const wakeups = new Map<string, Parameters<typeof heartbeat.wakeup>[1]>();
+          const assigneeId = issue.assigneeAgentId;
+          const selfComment = Boolean(authorAgentId && authorAgentId === assigneeId);
+          if (assigneeId && !selfComment && !isClosed) {
+            wakeups.set(assigneeId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_commented",
+              payload: { issueId: issue.id, commentId: comment.id, mutation: "comment", pluginId, pluginKey },
+              requestedByActorType: "system",
+              requestedByActorId: pluginId,
+              contextSnapshot: {
+                issueId: issue.id,
+                taskId: issue.id,
+                commentId: comment.id,
+                wakeCommentId: comment.id,
+                source: "plugin.issue.comment",
+                wakeReason: "issue_commented",
+                pluginId,
+                pluginKey,
+              },
+            });
+          }
+
+          let mentionedIds: string[] = [];
+          try {
+            mentionedIds = await issues.findMentionedAgents(companyId, params.body);
+          } catch (err) {
+            logger.warn({ err, issueId: issue.id }, "plugin createComment: failed to resolve @-mentions");
+          }
+          for (const mentionedId of mentionedIds) {
+            if (wakeups.has(mentionedId)) continue;
+            if (authorAgentId && authorAgentId === mentionedId) continue;
+            wakeups.set(mentionedId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_comment_mentioned",
+              payload: { issueId: issue.id, commentId: comment.id, pluginId, pluginKey },
+              requestedByActorType: "system",
+              requestedByActorId: pluginId,
+              contextSnapshot: {
+                issueId: issue.id,
+                taskId: issue.id,
+                commentId: comment.id,
+                wakeCommentId: comment.id,
+                wakeReason: "issue_comment_mentioned",
+                source: "plugin.comment.mention",
+                pluginId,
+                pluginKey,
+              },
+            });
+          }
+
+          for (const [agentId, wakeup] of wakeups.entries()) {
+            await heartbeat
+              .wakeup(agentId, wakeup)
+              .catch((err) => logger.warn({ err, issueId: issue.id, agentId }, "plugin createComment: failed to wake agent"));
+          }
+        }
         return comment;
       },
       async createInteraction(params) {

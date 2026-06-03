@@ -930,8 +930,28 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           return callHost("issues.listComments", { issueId, companyId });
         },
 
-        async createComment(issueId: string, body: string, companyId: string, options?: { authorAgentId?: string }) {
-          return callHost("issues.createComment", { issueId, body, companyId, authorAgentId: options?.authorAgentId });
+        async createComment(
+          issueId: string,
+          body: string,
+          companyId: string,
+          options?: {
+            authorAgentId?: string;
+            authorUserId?: string;
+            identifier?: string;
+            wakeAssignee?: boolean;
+            refuseClosed?: boolean;
+          },
+        ) {
+          return callHost("issues.createComment", {
+            issueId,
+            body,
+            companyId,
+            authorAgentId: options?.authorAgentId,
+            authorUserId: options?.authorUserId,
+            identifier: options?.identifier,
+            wakeAssignee: options?.wakeAssignee,
+            refuseClosed: options?.refuseClosed,
+          });
         },
 
         async createInteraction(issueId: string, interaction, companyId: string, options?: { authorAgentId?: string }) {
