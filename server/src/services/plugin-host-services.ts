@@ -2093,9 +2093,27 @@ export function buildHostServices(
       async createComment(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
-        const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
+        // Resolve target by identifier (e.g. PLA-822) when no issueId is supplied.
+        // requireInCompany keeps the tenant reach-check: an identifier that resolves
+        // to a foreign company throws "Issue not found".
+        const issue = params.identifier && !params.issueId
+          ? requireInCompany("Issue", await issues.getByIdentifier(params.identifier), companyId)
+          : requireInCompany("Issue", await issues.getById(params.issueId), companyId);
+        const isClosed = issue.status === "done" || issue.status === "cancelled";
+        // Secure default: on the relay/wake path, never land silently on a closed
+        // issue unless the caller explicitly opts out (refuseClosed === false).
+        const refuseClosed = params.refuseClosed ?? params.wakeAssignee === true;
+        if (refuseClosed && isClosed) {
+          throw new Error(`Issue is closed (status: ${issue.status})`);
+        }
+        // The host must not let a plugin mint *user* authorship. A worker-supplied
+        // user id is untrusted: it would write authorType "user", indistinguishable
+        // from a real board comment, and governance leans on comment authorship
+        // (send-it-back-to-me, approvals, audit). Relays are attributed to the
+        // plugin's own agent identity; operator identity, if any, belongs in the
+        // comment body/metadata, not in host-minted authorship. (PLA-823 Finding 1.)
         const comment = (await issues.addComment(
-          params.issueId,
+          issue.id,
           params.body,
           { agentId: params.authorAgentId },
         )) as IssueComment;
@@ -2104,13 +2122,53 @@ export function buildHostServices(
           action: "issue.comment.created",
           entityType: "issue",
           entityId: issue.id,
+          // Record the true principal only: the plugin's agent identity. Never a
+          // worker-claimed user (would make the audit trail itself spoofable).
           actor: { actorAgentId: params.authorAgentId ?? null },
           details: {
             identifier: issue.identifier,
             commentId: comment.id,
             bodySnippet: comment.body.slice(0, 120),
+            resolvedByIdentifier: Boolean(params.identifier && !params.issueId),
+            wakeAssignee: params.wakeAssignee === true,
           },
         });
+
+        if (params.wakeAssignee && !isClosed) {
+          // Assignee-only wake. Body @-mentions are deliberately NOT honored as a
+          // wake primitive here: createComment bodies on the relay path are
+          // untrusted operator/Telegram text, and mention-driven wake would let
+          // inbound content fan out heartbeat runs to arbitrary same-company agents
+          // (indirect prompt-injection / DoS). Capped, rate-limited mention-wake is
+          // tracked as a follow-up. (PLA-823 Finding 2.)
+          const authorAgentId = params.authorAgentId ?? null;
+          const assigneeId = issue.assigneeAgentId;
+          const selfComment = Boolean(authorAgentId && authorAgentId === assigneeId);
+          if (assigneeId && !selfComment) {
+            await heartbeat
+              .wakeup(assigneeId, {
+                source: "automation",
+                triggerDetail: "system",
+                reason: "issue_commented",
+                payload: { issueId: issue.id, commentId: comment.id, mutation: "comment", pluginId, pluginKey },
+                requestedByActorType: "system",
+                requestedByActorId: pluginId,
+                contextSnapshot: {
+                  issueId: issue.id,
+                  taskId: issue.id,
+                  commentId: comment.id,
+                  wakeCommentId: comment.id,
+                  source: "plugin.issue.comment",
+                  wakeReason: "issue_commented",
+                  pluginId,
+                  pluginKey,
+                },
+              })
+              .catch((err) =>
+                logger.warn({ err, issueId: issue.id, agentId: assigneeId }, "plugin createComment: failed to wake assignee"),
+              );
+          }
+        }
         return comment;
       },
       async createInteraction(params) {

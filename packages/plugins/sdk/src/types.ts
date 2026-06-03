@@ -1574,7 +1574,22 @@ export interface PluginIssuesClient {
     issueId: string,
     body: string,
     companyId: string,
-    options?: { authorAgentId?: string },
+    options?: {
+      authorAgentId?: string;
+      /** Resolve the target issue by identifier (e.g. `PLA-822`) instead of `issueId`. */
+      identifier?: string;
+      /**
+       * Wake the resolved issue's assignee. Body @-mentions are NOT honored as a
+       * wake primitive: relay bodies are untrusted, so mention-wake is omitted to
+       * avoid inbound content fanning out heartbeats (see PLA-823 Finding 2).
+       */
+      wakeAssignee?: boolean;
+      /**
+       * Throw instead of inserting when the target issue is done/cancelled.
+       * Defaults to `true` when `wakeAssignee` is set; pass `false` to opt out.
+       */
+      refuseClosed?: boolean;
+    },
   ): Promise<IssueComment>;
   createInteraction(
     issueId: string,
