@@ -936,7 +936,6 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           companyId: string,
           options?: {
             authorAgentId?: string;
-            authorUserId?: string;
             identifier?: string;
             wakeAssignee?: boolean;
             refuseClosed?: boolean;
@@ -947,7 +946,6 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             body,
             companyId,
             authorAgentId: options?.authorAgentId,
-            authorUserId: options?.authorUserId,
             identifier: options?.identifier,
             wakeAssignee: options?.wakeAssignee,
             refuseClosed: options?.refuseClosed,

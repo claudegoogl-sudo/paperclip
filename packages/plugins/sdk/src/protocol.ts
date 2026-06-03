@@ -1215,7 +1215,6 @@ export interface WorkerToHostMethods {
       body: string;
       companyId: string;
       authorAgentId?: string;
-      authorUserId?: string;
       identifier?: string;
       wakeAssignee?: boolean;
       refuseClosed?: boolean;
