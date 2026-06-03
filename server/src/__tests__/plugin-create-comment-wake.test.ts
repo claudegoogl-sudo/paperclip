@@ -54,15 +54,18 @@ describeEmbeddedPostgres("plugin issues.createComment wake + identifier resoluti
 
   afterEach(async () => {
     await db.delete(activityLog);
-    await db.delete(agentTaskSessions);
-    await db.delete(agentRuntimeState);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
     await db.delete(issueComments);
     await db.delete(issueRelations);
     await db.delete(issues);
     await db.delete(projects);
     await db.delete(plugins);
+    // Delete agent-referencing tables last: wakeAssignee spawns a heartbeat run
+    // that can insert agent_runtime_state asynchronously, so clear these
+    // immediately before `agents` to avoid an FK race on teardown.
+    await db.delete(agentTaskSessions);
+    await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
+    await db.delete(agentRuntimeState);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -132,24 +135,46 @@ describeEmbeddedPostgres("plugin issues.createComment wake + identifier resoluti
     expect(stored?.body).toBe("relayed from operator");
   });
 
-  it("attributes the comment to a board user via authorUserId", async () => {
-    const { companyId } = await seedCompanyAndAgent();
+  it("never mints user authorship from a worker-supplied authorUserId (PLA-823 Finding 1)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
     const identifier = `${issuePrefix(companyId)}-8`;
     const issueId = await seedIssue({ companyId, identifier });
-    const operatorUserId = randomUUID();
+    const spoofedUserId = randomUUID();
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.messenger", createEventBusStub());
+    // A compromised/buggy worker smuggles a board user id alongside its own agent
+    // id. The host must ignore the user id entirely — no "user"-attributed comment.
+    const comment = await services.issues.createComment({
+      issueId,
+      body: "relayed from operator",
+      companyId,
+      authorAgentId: agentId,
+      authorUserId: spoofedUserId,
+    } as any);
+
+    const [stored] = await db.select().from(issueComments).where(eq(issueComments.id, comment.id));
+    expect(stored?.authorType).toBe("agent");
+    expect(stored?.authorAgentId).toBe(agentId);
+    expect(stored?.authorUserId).toBeNull();
+  });
+
+  it("ignores a bare worker-supplied authorUserId (attributes to system, never user)", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const identifier = `${issuePrefix(companyId)}-8b`;
+    const issueId = await seedIssue({ companyId, identifier });
+    const spoofedUserId = randomUUID();
 
     const services = buildHostServices(db, "plugin-record-id", "paperclip.messenger", createEventBusStub());
     const comment = await services.issues.createComment({
       issueId,
-      body: "operator says hi",
+      body: "no agent, just a smuggled user id",
       companyId,
-      authorUserId: operatorUserId,
+      authorUserId: spoofedUserId,
     } as any);
 
     const [stored] = await db.select().from(issueComments).where(eq(issueComments.id, comment.id));
-    expect(stored?.authorType).toBe("user");
-    expect(stored?.authorUserId).toBe(operatorUserId);
-    expect(stored?.authorAgentId).toBeNull();
+    expect(stored?.authorType).not.toBe("user");
+    expect(stored?.authorUserId).toBeNull();
   });
 
   it("wakes the assignee on an open issue when wakeAssignee is set", async () => {
@@ -191,7 +216,7 @@ describeEmbeddedPostgres("plugin issues.createComment wake + identifier resoluti
     expect(wakeups.length).toBe(0);
   });
 
-  it("wakes a mentioned agent in addition to the assignee", async () => {
+  it("does NOT wake a body-@mentioned agent — assignee-only wake (PLA-823 Finding 2)", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent("Assignee");
     const mentionedAgentId = randomUUID();
     await db.insert(agents).values({
@@ -211,6 +236,7 @@ describeEmbeddedPostgres("plugin issues.createComment wake + identifier resoluti
     const services = buildHostServices(db, "plugin-record-id", "paperclip.messenger", createEventBusStub());
     await services.issues.createComment({
       issueId,
+      // Untrusted relay text trying to fan out a wake to an arbitrary agent.
       body: "ping @Reviewer please review",
       companyId,
       wakeAssignee: true,
@@ -221,8 +247,32 @@ describeEmbeddedPostgres("plugin issues.createComment wake + identifier resoluti
         (row) => row.agentId,
       ),
     );
+    // Only the assignee is woken; the mention must never be honored from relay text.
     expect(wokenAgentIds.has(agentId)).toBe(true);
-    expect(wokenAgentIds.has(mentionedAgentId)).toBe(true);
+    expect(wokenAgentIds.has(mentionedAgentId)).toBe(false);
+    expect(wokenAgentIds.size).toBe(1);
+  });
+
+  it("defaults refuseClosed on when wakeAssignee is set (PLA-823 Finding 3)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const identifier = `${issuePrefix(companyId)}-11b`;
+    const issueId = await seedIssue({ companyId, identifier, status: "cancelled", assigneeAgentId: agentId });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.messenger", createEventBusStub());
+    // No explicit refuseClosed — the wake path must refuse a closed issue by default.
+    await expect(
+      services.issues.createComment({
+        issueId,
+        body: "operator relay to a cancelled issue",
+        companyId,
+        wakeAssignee: true,
+      } as any),
+    ).rejects.toThrow(/closed/i);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.length).toBe(0);
+    const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+    expect(wakeups.length).toBe(0);
   });
 
   it("refuses to land a comment on a closed issue when refuseClosed is set", async () => {
