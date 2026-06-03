@@ -663,10 +663,20 @@ export function createPluginWorkerHandle(
   function contextForWorkerMessage(message: JsonRpcRequest | JsonRpcNotification): WorkerHostCallContext {
     // PLA-768: ALWAYS attach the worker-lifetime service run-context, on top of
     // whatever dispatch scope (if any) the message resolves to. The service
-    // scope is consumed only by the runId back-fill for `secrets.resolve`; it
-    // grants no company scope, so merging it never widens `invocationScope`
-    // enforcement (a worker→host call with `invalidInvocationScope` stays
-    // invalid for company-scoped methods).
+    // scope grants no company scope by itself; merging it never widens
+    // `invocationScope` enforcement for a method that trusts `companyId` as its
+    // sole authority.
+    //
+    // PLA-810 / PLA-814 / PLA-818: a NARROW allowlist of company-scoped methods
+    // (`SERVICE_SCOPE_COMPANY_METHODS` in the SDK gate) that are server-side
+    // `requireInCompany` reach-checked IS authorized under this serviceScope when
+    // no dispatch pins a company — including when base context reports
+    // `invalidInvocationScope` for the scope-less inbound relay path (the
+    // `onWebhook` / `getUpdates` callback carries no resolvable dispatch id). The
+    // SDK gate evaluates that allowlist bypass before its `invalidInvocationScope`
+    // rejection (PLA-818 guard-ordering fix). This does not widen reach: the
+    // bypass is reach-checked, and the rejection retains full force for every
+    // non-allowlisted company-scoped method.
     return {
       ...baseContextForWorkerMessage(message),
       serviceScope: { runId: serviceRunId },
