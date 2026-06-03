@@ -9,6 +9,7 @@ import {
   buildSuccessfulRunHandoffRequiredNotice,
   decideSuccessfulRunHandoff,
   isIdempotentFinishSuccessfulRunHandoffWakeStatus,
+  isStandbyWakeTargetIssue,
   isSuccessfulRunHandoffRequiredNoticeBody,
   noticeMetadataReferencesRecoveryAction,
 } from "./successful-run-handoff.js";
@@ -98,6 +99,24 @@ describe("successful run handoff decision", () => {
       kind: "skip",
       reason: "issue status done is a valid disposition",
     });
+  });
+
+  it("does not queue for a standby wake target parked between external events", () => {
+    expect(
+      decide({
+        issue: { ...issue, executionPolicy: { standbyWakeTarget: true } } as any,
+      }),
+    ).toEqual({
+      kind: "skip",
+      reason: "issue is a standby wake target parked between external events",
+    });
+  });
+
+  it("still queues when standbyWakeTarget is not set on the execution policy", () => {
+    const decision = decide({
+      issue: { ...issue, executionPolicy: { mode: "normal", standbyWakeTarget: false } } as any,
+    });
+    expect(decision.kind).toBe("enqueue");
   });
 
   it("does not queue when a successful run records an accepted next-action path", () => {
@@ -303,5 +322,18 @@ describe("successful run handoff decision", () => {
     expect(isSuccessfulRunHandoffRequiredNoticeBody("## Successful run missing issue disposition\n\nold body")).toBe(true);
     expect(isSuccessfulRunHandoffRequiredNoticeBody("## This issue still needs a next step\n\nold body")).toBe(true);
     expect(isSuccessfulRunHandoffRequiredNoticeBody("Unrelated comment")).toBe(false);
+  });
+});
+
+describe("isStandbyWakeTargetIssue", () => {
+  it("is true only when the execution policy marks standbyWakeTarget", () => {
+    expect(isStandbyWakeTargetIssue({ executionPolicy: { standbyWakeTarget: true } } as any)).toBe(true);
+  });
+
+  it("is false for null, missing, or non-true markers", () => {
+    expect(isStandbyWakeTargetIssue({ executionPolicy: null } as any)).toBe(false);
+    expect(isStandbyWakeTargetIssue({ executionPolicy: {} } as any)).toBe(false);
+    expect(isStandbyWakeTargetIssue({ executionPolicy: { standbyWakeTarget: false } } as any)).toBe(false);
+    expect(isStandbyWakeTargetIssue({ executionPolicy: { standbyWakeTarget: "true" } } as any)).toBe(false);
   });
 });

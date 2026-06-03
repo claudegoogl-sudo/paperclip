@@ -441,6 +441,16 @@ export interface IssueExecutionPolicy {
   commentRequired: boolean;
   stages: IssueExecutionStage[];
   monitor?: IssueExecutionMonitorPolicy | null;
+  /**
+   * Marks a perpetually-open catch-all issue (e.g. a plugin inbox wake target)
+   * that is intentionally parked between externally-driven wakes. When true,
+   * automatic stranded/missing-disposition recovery treats a resting
+   * `in_progress` issue as a valid disposition instead of churn, so it is not
+   * escalated to `blocked` or re-woken via finish_successful_run_handoff /
+   * source_scoped_recovery_action. The issue still wakes normally when an
+   * external event posts a comment.
+   */
+  standbyWakeTarget?: boolean | null;
 }
 
 export interface IssueExecutionMonitorState {
