@@ -54,6 +54,10 @@ import { pluginLifecycleManager } from "./services/plugin-lifecycle.js";
 import { createPluginJobCoordinator } from "./services/plugin-job-coordinator.js";
 import { buildHostServices, flushPluginLogBuffer } from "./services/plugin-host-services.js";
 import { createPluginEventBus } from "./services/plugin-event-bus.js";
+import {
+  createPluginEventSubscriptionProbe,
+  DEFAULT_EVENT_PROBE_INTERVAL_MS,
+} from "./services/plugin-event-subscription-probe.js";
 import { setPluginEventBus } from "./services/activity-log.js";
 import { createPluginDevWatcher } from "./services/plugin-dev-watcher.js";
 import { createPluginHostServiceCleanup } from "./services/plugin-host-service-cleanup.js";
@@ -237,6 +241,14 @@ export async function createApp(
   const pluginRegistry = pluginRegistryService(db);
   const eventBus = createPluginEventBus();
   setPluginEventBus(eventBus);
+  // PLA-854: periodically log the per-plugin subscription snapshot so a
+  // detached board-event relay (worker alive, zero subscriptions) is greppable
+  // from logs without driving a real event.
+  const eventSubscriptionProbe = createPluginEventSubscriptionProbe({
+    eventBus,
+    logger,
+    intervalMs: DEFAULT_EVENT_PROBE_INTERVAL_MS,
+  });
   const jobStore = pluginJobStore(db);
   const lifecycle = pluginLifecycleManager(db, { workerManager });
   const scheduler = createPluginJobScheduler({
@@ -431,6 +443,7 @@ export async function createApp(
 
   jobCoordinator.start();
   scheduler.start();
+  eventSubscriptionProbe.start();
   let feedbackExportShuttingDown = false;
   let feedbackExportTimer: ReturnType<typeof setInterval> | null = null;
   const disableFeedbackExportFlushes = () => {
@@ -485,6 +498,7 @@ export async function createApp(
     if (appServicesShutdown) return;
     appServicesShutdown = true;
     disableFeedbackExportFlushes();
+    eventSubscriptionProbe.stop();
     devWatcher?.close();
     viteHtmlRenderer?.dispose();
     hostServiceCleanup.disposeAll();

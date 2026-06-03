@@ -209,6 +209,12 @@ export function createPluginEventBus(): PluginEventBus {
    * plugin's own subscription list and enforces the plugin namespace on `emit`.
    */
   function forPlugin(pluginId: string): ScopedPluginEventBus {
+    // Subscriptions registered through THIS scoped handle, tracked by identity.
+    // A scoped handle corresponds to a single worker generation's host-services
+    // instance (one `buildHostServices` call). `clear()` removes only these, so
+    // a stale generation's late `dispose()` cannot wipe a newer generation's
+    // live subscription — see clear() below (PLA-854).
+    const ownSubs: Subscription[] = [];
     return {
       /**
        * Subscribe to a core domain event or a plugin-namespaced event.
@@ -235,7 +241,9 @@ export function createPluginEventBus(): PluginEventBus {
           handler = maybeFn;
         }
 
-        subsFor(pluginId).push({ eventPattern, filter, handler });
+        const sub: Subscription = { eventPattern, filter, handler };
+        subsFor(pluginId).push(sub);
+        ownSubs.push(sub);
       },
 
       /**
@@ -278,9 +286,32 @@ export function createPluginEventBus(): PluginEventBus {
         return emit(event);
       },
 
-      /** Remove all subscriptions registered by this plugin. */
+      /**
+       * Remove the subscriptions registered through THIS scoped handle only.
+       *
+       * PLA-854: this is called from host-services `dispose()`, which fires on
+       * async lifecycle/crash events (`plugin.worker_stopped`,
+       * `plugin.worker.crashed`) keyed by pluginId. On a worker restart the
+       * loader builds a NEW host-services instance (new scoped handle) and the
+       * restarted worker re-subscribes through it BEFORE the old generation's
+       * dispose() necessarily runs. Clearing the whole pluginKey bucket here
+       * (the previous `clearPlugin(pluginId)` behaviour) let that late, stale
+       * dispose() delete the new generation's freshly-registered subscription,
+       * silently killing the relay until the next restart. Removing only
+       * `ownSubs` (by identity) makes the teardown generation-safe. The loader's
+       * explicit `clearPlugin()` in `unloadSingle()` still fully drains a bucket
+       * for a real unload, and runs sequentially before any re-subscribe.
+       */
       clear(): void {
-        clearPlugin(pluginId);
+        const bucket = registry.get(pluginId);
+        if (bucket && ownSubs.length > 0) {
+          for (const sub of ownSubs) {
+            const idx = bucket.indexOf(sub);
+            if (idx !== -1) bucket.splice(idx, 1);
+          }
+          if (bucket.length === 0) registry.delete(pluginId);
+        }
+        ownSubs.length = 0;
       },
     };
   }
@@ -297,6 +328,19 @@ export function createPluginEventBus(): PluginEventBus {
       let total = 0;
       for (const subs of registry.values()) total += subs.length;
       return total;
+    },
+    /**
+     * Point-in-time snapshot of per-plugin subscription counts. Used by the
+     * periodic "events alive" probe (PLA-854) so a detached relay surfaces in
+     * logs/metrics — a plugin that should be observing board events but holds
+     * zero subscriptions is the detached-subscription signature.
+     */
+    subscriptionSnapshot(): Array<{ pluginKey: string; subscriptionCount: number }> {
+      const out: Array<{ pluginKey: string; subscriptionCount: number }> = [];
+      for (const [pluginKey, subs] of registry) {
+        out.push({ pluginKey, subscriptionCount: subs.length });
+      }
+      return out;
     },
   };
 }
@@ -347,6 +391,12 @@ export interface PluginEventBus {
    * specific plugin if `pluginId` is provided.
    */
   subscriptionCount(pluginId?: string): number;
+
+  /**
+   * Point-in-time per-plugin subscription counts, for the periodic
+   * "events alive" observability probe (PLA-854).
+   */
+  subscriptionSnapshot(): Array<{ pluginKey: string; subscriptionCount: number }>;
 }
 
 /**

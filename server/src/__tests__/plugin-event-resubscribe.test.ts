@@ -36,10 +36,10 @@ import type { PluginEvent } from "@paperclipai/plugin-sdk";
 
 const PLUGIN_KEY = "paperclip.messenger";
 
-function boardEvent(): PluginEvent {
+function boardEvent(eventType = "issue.created"): PluginEvent {
   return {
     eventId: "evt-1",
-    eventType: "issue.created",
+    eventType,
     companyId: "company-1",
     occurredAt: new Date().toISOString(),
     entityId: "issue-1",
@@ -90,6 +90,81 @@ describe("PLA-854: plugin event subscription survives worker restart", () => {
     await eventBus.emit(boardEvent());
     expect(gen2.delivered).toHaveLength(1);
     expect(gen1.delivered).toHaveLength(0);
+  });
+
+  it("a stale generation's late dispose() must NOT wipe the restarted worker's live subscription", async () => {
+    // This is the actual PLA-854 relay-death race. host-services dispose()
+    // fires on async lifecycle/crash events (plugin.worker_stopped /
+    // plugin.worker.crashed) keyed by pluginId. On a restart the new worker
+    // re-subscribes through a NEW host-services instance BEFORE the old
+    // generation's dispose() necessarily runs. If dispose() blunt-clears the
+    // whole pluginKey bucket, that late call deletes the new generation's
+    // freshly-registered subscription and the relay goes silently dead.
+    const eventBus = createPluginEventBus();
+
+    // Generation 1 attaches, then the restart path drains its bucket
+    // (loader unloadSingle → eventBus.clearPlugin), exactly as in production.
+    const gen1 = spawnWorkerGeneration(eventBus);
+    await gen1.services.events.subscribe({ eventPattern: "issue.created" });
+    eventBus.clearPlugin(PLUGIN_KEY);
+
+    // Generation 2 (restarted worker) re-subscribes and is verified live.
+    const gen2 = spawnWorkerGeneration(eventBus);
+    await gen2.services.events.subscribe({ eventPattern: "issue.created" });
+    await eventBus.emit(boardEvent());
+    expect(gen2.delivered).toHaveLength(1);
+
+    // Now the OLD generation's cleanup finally runs (late, out of order).
+    // It must only tear down its own (already-drained) subscriptions.
+    gen1.services.dispose();
+
+    gen2.delivered.length = 0;
+    await eventBus.emit(boardEvent());
+    expect(eventBus.subscriptionCount(PLUGIN_KEY)).toBe(1);
+    expect(gen2.delivered).toHaveLength(1);
+  });
+
+  it("scoped clear() removes only this generation's subscriptions, leaving siblings intact", async () => {
+    const eventBus = createPluginEventBus();
+    const genA = spawnWorkerGeneration(eventBus);
+    const genB = spawnWorkerGeneration(eventBus);
+
+    await genA.services.events.subscribe({ eventPattern: "issue.created" });
+    await genB.services.events.subscribe({ eventPattern: "issue.created" });
+    expect(eventBus.subscriptionCount(PLUGIN_KEY)).toBe(2);
+
+    genA.services.dispose();
+
+    expect(eventBus.subscriptionCount(PLUGIN_KEY)).toBe(1);
+    await eventBus.emit(boardEvent());
+    expect(genB.delivered).toHaveLength(1);
+    expect(genA.delivered).toHaveLength(0);
+  });
+
+  it("relays all three kinds (comment/approval/interaction) after a restart (AC#2, kind-agnostic)", async () => {
+    // The three relay kinds ride distinct board event types through the same
+    // ctx.events.on(...) subscription path; the survival fix is event-kind
+    // independent. Prove each routes to the restarted worker generation.
+    // (End-to-end Telegram delivery for approval/interaction is covered by the
+    //  PLA-848 QA harness; this pins the host-bus contract underneath it.)
+    const kinds = [
+      "issue.comment_added",
+      "issue.thread_interaction_created",
+      "issue.created",
+    ];
+    const eventBus = createPluginEventBus();
+
+    const gen1 = spawnWorkerGeneration(eventBus);
+    for (const k of kinds) await gen1.services.events.subscribe({ eventPattern: k });
+
+    // Restart: drain + re-subscribe on a fresh generation.
+    eventBus.clearPlugin(PLUGIN_KEY);
+    const gen2 = spawnWorkerGeneration(eventBus);
+    for (const k of kinds) await gen2.services.events.subscribe({ eventPattern: k });
+    expect(eventBus.subscriptionCount(PLUGIN_KEY)).toBe(kinds.length);
+
+    for (const k of kinds) await eventBus.emit(boardEvent(k));
+    expect(gen2.delivered.map((e) => e.eventType).sort()).toEqual([...kinds].sort());
   });
 
   it("logs the running subscription count on every (re)subscribe (Ask #2 observability)", async () => {
