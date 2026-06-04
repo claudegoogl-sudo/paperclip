@@ -66,6 +66,34 @@ export function isRetryablePgError(err: unknown): boolean {
   return findRetryablePgErrorCode(err) !== null;
 }
 
+/**
+ * Returns the first SQLSTATE string `code` found anywhere in the error's
+ * `.cause` chain (the thrown error itself counts as depth 0), or `null` if
+ * none is present. Unlike {@link findRetryablePgErrorCode} this is not limited
+ * to the retryable set, so callers can match any SQLSTATE (e.g. 22P02
+ * invalid_text_representation) despite drizzle-orm rewrapping the driver error
+ * as a `DrizzleQueryError` without a top-level `code` (see MAX_CAUSE_DEPTH note
+ * above).
+ */
+export function findPgErrorCode(err: unknown): string | null {
+  let current: unknown = err;
+  const seen = new Set<unknown>();
+  for (
+    let depth = 0;
+    depth < MAX_CAUSE_DEPTH && current && typeof current === "object";
+    depth += 1
+  ) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === "string") {
+      return code;
+    }
+    current = (current as { cause?: unknown }).cause;
+  }
+  return null;
+}
+
 export async function retryOnTransientPgError<T>(
   fn: () => Promise<T>,
   opts: RetryOnTransientPgErrorOptions = {},
