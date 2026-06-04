@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  findPgErrorCode,
   findRetryablePgErrorCode,
   isRetryablePgError,
   retryOnTransientPgError,
@@ -89,6 +90,42 @@ describe("findRetryablePgErrorCode", () => {
 
   it("returns null when nothing in the chain is retryable", () => {
     expect(findRetryablePgErrorCode(new Error("boom"))).toBe(null);
+  });
+});
+
+describe("findPgErrorCode", () => {
+  it("returns a top-level SQLSTATE code", () => {
+    expect(findPgErrorCode(makePgError("22P02", "invalid input"))).toBe("22P02");
+  });
+
+  // PLA-873 regression: invalid-uuid lookups arrive drizzle-wrapped, so the
+  // plugin-ui-static route's top-level-`code`-only check missed 22P02 and
+  // surfaced every plugin-key UI request as a 500. The code lives on `.cause`.
+  it("resolves a non-retryable SQLSTATE (22P02) through the DrizzleQueryError wrapper", () => {
+    const wrapped = wrapAsDrizzleQueryError(
+      makePgError("22P02", 'invalid input syntax for type uuid: "paperclip-messenger"'),
+    );
+    expect((wrapped as { code?: unknown }).code).toBeUndefined();
+    expect(findPgErrorCode(wrapped)).toBe("22P02");
+  });
+
+  it("returns the first code found, walking outermost-first", () => {
+    const wrapped = wrapAsDrizzleQueryError(makePgError("23505"));
+    expect(findPgErrorCode(wrapped)).toBe("23505");
+  });
+
+  it("returns null when no code is present in the chain", () => {
+    expect(findPgErrorCode(new Error("boom"))).toBe(null);
+    expect(findPgErrorCode(null)).toBe(null);
+    expect(findPgErrorCode(undefined)).toBe(null);
+  });
+
+  it("does not infinite-loop on a cyclic cause chain", () => {
+    const a = new Error("a") as Error & { cause?: unknown };
+    const b = new Error("b") as Error & { cause?: unknown };
+    a.cause = b;
+    b.cause = a;
+    expect(findPgErrorCode(a)).toBe(null);
   });
 });
 

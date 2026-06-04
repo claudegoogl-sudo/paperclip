@@ -33,6 +33,7 @@ import fs from "node:fs";
 import crypto from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import { pluginRegistryService } from "../services/plugin-registry.js";
+import { findPgErrorCode } from "../services/pg-retry.js";
 import { logger } from "../middleware/logger.js";
 
 // ---------------------------------------------------------------------------
@@ -246,11 +247,12 @@ export function pluginUiStaticRoutes(db: Db, options: PluginUiStaticRouteOptions
     try {
       plugin = await registry.getById(pluginId);
     } catch (error) {
-      const maybeCode =
-        typeof error === "object" && error !== null && "code" in error
-          ? (error as { code?: unknown }).code
-          : undefined;
-      if (maybeCode !== "22P02") {
+      // drizzle-orm rewraps the driver error as a `DrizzleQueryError` with no
+      // top-level `code`; the postgres.js SQLSTATE lives on `.cause` (PLA-638).
+      // 22P02 (invalid_text_representation) means `pluginId` is not a UUID, so
+      // fall through to the by-key lookup. A top-level `code` check missed this
+      // and surfaced every plugin-key UI request as a 500 (PLA-873).
+      if (findPgErrorCode(error) !== "22P02") {
         throw error;
       }
     }
