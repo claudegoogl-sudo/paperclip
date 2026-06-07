@@ -682,6 +682,75 @@ Typed errors surfaced to the worker:
 
 See PLA-574 for the threat model and seven-point security checklist.
 
+### 13.12 `artifacts.create` (worker → host)
+
+The inverse of `artifacts.fetch`: a worker→host RPC that stores inbound bytes as
+a real Paperclip attachment so a plugin can relay external content (e.g. an
+inbound Telegram photo/voice note) onto a company inbox issue. Called from a
+tool handler — or from a service/background worker on the relay path — via
+`runCtx.artifacts.create({ companyId, filename, mimeType, bytes })`.
+
+Wire payload: `{ companyId, filename, mimeType, contentBase64, runId }`. The SDK
+base64-encodes the caller's `Uint8Array` and refuses to send an empty body.
+
+Success result: `{ attachmentId }` — the id of the newly created standalone
+**asset**. The asset is not yet bound to any issue; surface it on a comment by
+passing it to `issues.createComment({ ..., attachmentIds: [attachmentId] })`,
+which mints the `issue_attachments` row that `artifacts.fetch` reads.
+
+Capability: **`issue.attachments.create`** — default-deny, must be declared in
+the plugin manifest. (Unlike `artifacts.fetch`, which is gated only by per-call
+authorization, the write path is an explicit capability.)
+
+Authorization semantics:
+
+- From a **dispatch** or **background** context the registered `companyId` must
+  equal the `companyId` in params — a worker cannot write into a foreign tenant.
+  Mismatches are rejected with `forbidden` (the caller names its own company, so
+  there is no existence-enumeration concern that would warrant collapsing to
+  `not_found`).
+- From a **service** context (worker-lifetime, company-less — the inbound relay
+  path) the host trusts the params `companyId`, because there is no dispatching
+  agent to key off. Storage abuse from this path is bounded by the write rate
+  limit below.
+
+Validation gates (in order): run-context lookup → company authz → write rate
+limit → MIME allowlist → size ceiling → idempotency dedup → store.
+
+- **MIME allowlist** — a single named constant
+  `PLUGIN_ARTIFACT_ALLOWED_MIME_TYPES` (images, common documents, and
+  audio/voice types). Disallowed types are rejected with `forbidden`.
+- **Size ceiling** — `min(company.attachmentMaxBytes, 10 MiB)`, mirroring the
+  human attachment-upload route exactly (`normalizeIssueAttachmentMaxBytes`).
+  Oversize or empty bodies are rejected with `too_large`.
+- **Idempotency** — a retried create with identical bytes for the same company
+  converges onto the existing **unattached** asset (matched on the host-computed
+  `sha256`) instead of storing duplicate bytes. Already-attached assets are
+  excluded from reuse because `issue_attachments.asset_id` is UNIQUE.
+- **Storage** — reuses the existing internal storage path (`storage.putFile`,
+  namespace `plugin-artifacts`); no second storage backend is introduced.
+
+Rate limit enforced server-side:
+
+- 30 creates / minute per company (bounds storage-DoS on the relay path where
+  there is no dispatching agent to key off).
+
+Every call — success or denial — emits an `artifact.created` audit log entry in
+the target tenant carrying: outcome, denied reason (if any), companyId, context
+kind, dispatchingAgentId (if any), plugin identity, mimeType, byteSize, and a
+`deduped` flag. Bytes themselves are never written to logs.
+
+Typed errors surfaced to the worker:
+
+| code                  | meaning                                                                                  |
+| --------------------- | ---------------------------------------------------------------------------------------- |
+| `runcontext_invalid`  | No active run-context registered for this `(pluginDbId, runId)`, or malformed params     |
+| `forbidden`           | Cross-tenant `companyId`, or a MIME type outside the allowlist                           |
+| `rate_limited`        | Per-company write ceiling tripped                                                        |
+| `too_large`           | Body empty, invalid base64, or larger than `min(company cap, 10 MiB)`                    |
+
+See PLA-888 for the threat model and gate-by-gate rationale.
+
 ## 14. SDK Surface
 
 Plugins do not talk to the DB directly.
@@ -865,6 +934,7 @@ The host enforces capabilities in the SDK layer and refuses calls outside the gr
 - `telemetry.track`
 - `assets.read`
 - `assets.write`
+- `issue.attachments.create`
 - `database.namespace.migrate`
 - `database.namespace.write`
 - `goals.create`

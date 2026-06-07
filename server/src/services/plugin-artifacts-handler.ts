@@ -29,9 +29,11 @@
  * @see PLA-574 — host-mediated cross-tenant artifact fetch
  */
 
+import { createHash } from "node:crypto";
 import type { Readable } from "node:stream";
 import type { Db } from "@paperclipai/db";
 import type { StorageService } from "../storage/types.js";
+import { isAllowedPluginArtifactMimeType, normalizeContentType } from "../attachment-types.js";
 import { logActivity } from "./activity-log.js";
 import { logger } from "../middleware/logger.js";
 import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js";
@@ -54,9 +56,28 @@ export interface PluginArtifactsFetchResult {
   contentBase64: string;
 }
 
+/**
+ * PLA-888: request shape for `artifacts.create`. The worker supplies the target
+ * company plus the bytes (base64); `runId` is the dispatch/service/background
+ * run id the host validates against the registry.
+ */
+export interface PluginArtifactsCreateParams {
+  companyId: string;
+  filename: string;
+  mimeType: string;
+  contentBase64: string;
+  runId: string;
+}
+
+/** PLA-888: response shape — the created (or deduped) asset id. */
+export interface PluginArtifactsCreateResult {
+  attachmentId: string;
+}
+
 /** Service shape consumed by `HostServices.artifacts`. */
 export interface PluginArtifactsService {
   fetch(params: PluginArtifactsFetchParams): Promise<PluginArtifactsFetchResult>;
+  create(params: PluginArtifactsCreateParams): Promise<PluginArtifactsCreateResult>;
 }
 
 /**
@@ -77,6 +98,25 @@ export interface AttachmentLookup {
   getAttachmentById(id: string): Promise<AttachmentLookupRow | null>;
 }
 
+/**
+ * PLA-888: the asset-write surface `artifacts.create` needs. Implemented by
+ * `issueService(db)` (`createStandaloneAsset` / `findReusableUnattachedAsset`).
+ * Kept separate from {@link AttachmentLookup} so the read path stays minimal.
+ */
+export interface AssetWriter {
+  findReusableUnattachedAsset(companyId: string, sha256: string): Promise<{ id: string } | null>;
+  createStandaloneAsset(input: {
+    companyId: string;
+    provider: string;
+    objectKey: string;
+    contentType: string;
+    byteSize: number;
+    sha256: string;
+    originalFilename?: string | null;
+    createdByAgentId?: string | null;
+  }): Promise<{ id: string }>;
+}
+
 export interface CreateArtifactsHandlerOptions {
   db: Db;
   /** The plugin DB UUID (used as registry key + audit field). */
@@ -85,11 +125,20 @@ export interface CreateArtifactsHandlerOptions {
   pluginKey: string;
   storage: StorageService;
   attachments: AttachmentLookup;
+  /** PLA-888: asset-write surface for `artifacts.create`. */
+  assetWriter: AssetWriter;
+  /**
+   * PLA-888: resolve the per-company attachment byte ceiling — MUST mirror the
+   * human upload route (`normalizeIssueAttachmentMaxBytes(company.attachmentMaxBytes)`).
+   */
+  resolveCompanyMaxBytes(companyId: string): Promise<number>;
   runContextRegistry: PluginRunContextRegistry;
   /** Override the per-agent global rate limit (default 60/min). */
   globalRateLimit?: { maxAttempts: number; windowMs: number };
   /** Override the per-(agent, company) sub-bucket limit (default 30/min). */
   perCompanyRateLimit?: { maxAttempts: number; windowMs: number };
+  /** PLA-888: override the per-company write rate limit (default 30/min). */
+  writeRateLimit?: { maxAttempts: number; windowMs: number };
   /** Hard ceiling on attachment size streamed through this path. */
   maxByteSize?: number;
   /** Inject a clock for tests. */
@@ -174,6 +223,9 @@ async function readStreamToBuffer(stream: Readable, maxBytes: number): Promise<B
 
 const DEFAULT_GLOBAL = { maxAttempts: 60, windowMs: 60_000 };
 const DEFAULT_PER_COMPANY = { maxAttempts: 30, windowMs: 60_000 };
+/** PLA-888: per-company write ceiling — bounds storage-DoS from the relay path
+ *  where there is no dispatching agent to key off. */
+const DEFAULT_WRITE = { maxAttempts: 30, windowMs: 60_000 };
 /** 10 MiB — large enough for screenshots / small docs, small enough to fit
  *  comfortably inside one JSON-RPC base64 payload. */
 const DEFAULT_MAX_BYTES = 10 * 1024 * 1024;
@@ -191,11 +243,14 @@ export function createPluginArtifactsHandler(
     pluginKey,
     storage,
     attachments,
+    assetWriter,
+    resolveCompanyMaxBytes,
     runContextRegistry,
   } = opts;
   const now = opts.now ?? (() => Date.now());
   const globalCfg = opts.globalRateLimit ?? DEFAULT_GLOBAL;
   const perCompanyCfg = opts.perCompanyRateLimit ?? DEFAULT_PER_COMPANY;
+  const writeCfg = opts.writeRateLimit ?? DEFAULT_WRITE;
   const maxByteSize = opts.maxByteSize ?? DEFAULT_MAX_BYTES;
 
   const globalLimiter = createRateLimiter(
@@ -206,6 +261,11 @@ export function createPluginArtifactsHandler(
   const perCompanyLimiter = createRateLimiter(
     perCompanyCfg.maxAttempts,
     perCompanyCfg.windowMs,
+    now,
+  );
+  const writeLimiter = createRateLimiter(
+    writeCfg.maxAttempts,
+    writeCfg.windowMs,
     now,
   );
   const log = logger.child({ service: "plugin-artifacts-handler", pluginId: pluginKey });
@@ -255,6 +315,57 @@ export function createPluginArtifactsHandler(
       });
     } catch (err) {
       log.warn({ err, attachmentId: input.attachmentId }, "audit log write failed");
+    }
+  }
+
+  /**
+   * PLA-888: audit the write path. Six fields mirror the fetch audit but the
+   * action is `artifact.created` and the actor may be a system context (service
+   * /background dispatch) with no dispatching agent. Bytes are NEVER recorded —
+   * only the sha256 digest + size. Best-effort like {@link audit}.
+   */
+  async function auditCreate(input: {
+    outcome: "allowed" | "denied";
+    deniedReason?: ArtifactsErrorCode;
+    companyId: string;
+    contextKind: "dispatch" | "service" | "background";
+    dispatchingAgentId: string | null;
+    runId: string;
+    toolName: string | null;
+    assetId?: string | null;
+    sha256?: string | null;
+    byteSize?: number | null;
+    mimeType?: string | null;
+    deduped?: boolean;
+  }) {
+    try {
+      await logActivity(db, {
+        companyId: input.companyId,
+        actorType: "plugin",
+        actorId: pluginDbId,
+        action: "artifact.created",
+        entityType: "asset",
+        entityId: input.assetId ?? input.companyId,
+        agentId: input.dispatchingAgentId ?? undefined,
+        runId: input.runId,
+        details: {
+          pluginKey,
+          pluginDbId,
+          outcome: input.outcome,
+          deniedReason: input.deniedReason ?? null,
+          contextKind: input.contextKind,
+          dispatchingAgentId: input.dispatchingAgentId,
+          companyId: input.companyId,
+          assetId: input.assetId ?? null,
+          sha256: input.sha256 ?? null,
+          byteSize: input.byteSize ?? null,
+          mimeType: input.mimeType ?? null,
+          deduped: input.deduped ?? false,
+          toolName: input.toolName,
+        },
+      });
+    } catch (err) {
+      log.warn({ err, companyId: input.companyId }, "create audit log write failed");
     }
   }
 
@@ -414,6 +525,182 @@ export function createPluginArtifactsHandler(
         // Bytes only ever appear in the response payload — never logs/details.
         contentBase64: buf.toString("base64"),
       };
+    },
+
+    async create(params: PluginArtifactsCreateParams): Promise<PluginArtifactsCreateResult> {
+      // ---------- Gate 0: shape validation ----------
+      if (!params || typeof params !== "object") {
+        throw new ArtifactsError("runcontext_invalid", "invalid request");
+      }
+      const { companyId, filename, mimeType, contentBase64, runId } = params;
+      if (typeof runId !== "string" || runId.length === 0) {
+        throw new ArtifactsError("runcontext_invalid", "invalid runId");
+      }
+      if (typeof companyId !== "string" || companyId.length === 0) {
+        throw new ArtifactsError("forbidden", "invalid companyId");
+      }
+      if (typeof contentBase64 !== "string" || contentBase64.length === 0) {
+        throw new ArtifactsError("too_large", "missing artifact bytes");
+      }
+
+      // ---------- Gate 1: server-validated runContext lookup ----------
+      const ctx = runContextRegistry.get(pluginDbId, runId);
+      if (!ctx) {
+        throw new ArtifactsError("runcontext_invalid", "no active run for this runId");
+      }
+      const contextKind: "dispatch" | "service" | "background" =
+        ctx.kind === "service" ? "service" : ctx.kind === "background" ? "background" : "dispatch";
+      const dispatchingAgentId = ctx.kind === "service" || ctx.kind === "background" ? null : ctx.agentId;
+      const toolName = ctx.kind === "service" || ctx.kind === "background" ? null : ctx.toolName;
+
+      // ---------- Gate 2: per-tenant authorization ----------
+      // dispatch / background contexts carry a server-validated company — the
+      // claimed `companyId` MUST match it (no cross-tenant write). A service
+      // context (PLA-768, e.g. the messenger inbound relay) carries NO company,
+      // so the claimed `companyId` is trusted as the write target: the asset is
+      // stored under that company's namespace ONLY and is unattached until
+      // `issues.createComment` binds it (which independently re-checks the issue's
+      // company). The reachable set equals the plugin's dispatch-lifetime reach;
+      // storage cost is bounded by the per-company write rate limit below. This
+      // deviates from `artifacts.fetch` (which rejects service/background) — a
+      // read is scoped to the dispatching agent's access, but an inbound write
+      // legitimately has no agent. See PLA-888 security notes.
+      // A dispatch context's `kind` is optional (absent === "dispatch"), so test
+      // for the company-less service kind rather than enumerating the others —
+      // otherwise a back-compat dispatch entry (no `kind`) would be misread as
+      // service and skip the cross-tenant check.
+      const scopedCompanyId = ctx.kind === "service" ? null : ctx.companyId;
+      if (scopedCompanyId !== null && scopedCompanyId !== companyId) {
+        await auditCreate({
+          outcome: "denied",
+          deniedReason: "forbidden",
+          companyId,
+          contextKind,
+          dispatchingAgentId,
+          runId,
+          toolName,
+        });
+        // `forbidden` (not `not_found`): the caller named its OWN company
+        // explicitly, so there is no cross-tenant enumeration concern that the
+        // fetch path's `not_found` collapse exists to prevent.
+        throw new ArtifactsError("forbidden", "companyId does not match the dispatching scope");
+      }
+
+      // ---------- Gate 3: per-company write rate limit ----------
+      if (!writeLimiter.check(`company:${companyId}`)) {
+        await auditCreate({
+          outcome: "denied",
+          deniedReason: "rate_limited",
+          companyId,
+          contextKind,
+          dispatchingAgentId,
+          runId,
+          toolName,
+        });
+        throw new ArtifactsError("rate_limited", "per-company write rate limit exceeded");
+      }
+
+      // ---------- Gate 4: MIME allowlist ----------
+      const contentType = normalizeContentType(mimeType);
+      if (!isAllowedPluginArtifactMimeType(contentType)) {
+        await auditCreate({
+          outcome: "denied",
+          deniedReason: "forbidden",
+          companyId,
+          contextKind,
+          dispatchingAgentId,
+          runId,
+          toolName,
+          mimeType: contentType,
+        });
+        throw new ArtifactsError("forbidden", `disallowed mime type: ${contentType}`);
+      }
+
+      // ---------- Gate 5: decode + size ceiling (per-company, mirrors human route) ----------
+      let body: Buffer;
+      try {
+        body = Buffer.from(contentBase64, "base64");
+      } catch {
+        throw new ArtifactsError("too_large", "invalid base64 body");
+      }
+      if (body.length <= 0) {
+        throw new ArtifactsError("too_large", "artifact is empty");
+      }
+      const companyMaxBytes = await resolveCompanyMaxBytes(companyId);
+      const ceiling = Math.min(companyMaxBytes, maxByteSize);
+      if (body.length > ceiling) {
+        await auditCreate({
+          outcome: "denied",
+          deniedReason: "too_large",
+          companyId,
+          contextKind,
+          dispatchingAgentId,
+          runId,
+          toolName,
+          byteSize: body.length,
+          mimeType: contentType,
+        });
+        throw new ArtifactsError("too_large", `artifact exceeds maximum size of ${ceiling} bytes`);
+      }
+
+      // ---------- Gate 6: idempotency — reuse an unattached same-content asset ----------
+      const sha256 = createHash("sha256").update(body).digest("hex");
+      const reusable = await assetWriter.findReusableUnattachedAsset(companyId, sha256);
+      if (reusable) {
+        await auditCreate({
+          outcome: "allowed",
+          companyId,
+          contextKind,
+          dispatchingAgentId,
+          runId,
+          toolName,
+          assetId: reusable.id,
+          sha256,
+          byteSize: body.length,
+          mimeType: contentType,
+          deduped: true,
+        });
+        return { attachmentId: reusable.id };
+      }
+
+      // ---------- Gate 7: store via the existing internal storage path ----------
+      const stored = await storage.putFile({
+        companyId,
+        namespace: "plugin-artifacts",
+        originalFilename: typeof filename === "string" && filename.length > 0 ? filename : null,
+        contentType,
+        body,
+      });
+      const asset = await assetWriter.createStandaloneAsset({
+        companyId,
+        provider: stored.provider,
+        objectKey: stored.objectKey,
+        contentType: stored.contentType,
+        byteSize: stored.byteSize,
+        // Persist the sha256 we deduped on (Gate 6) rather than whatever the
+        // storage backend returns. Idempotency requires the stored key to equal
+        // the lookup key; coupling it to the backend's hashing would silently
+        // break convergence if the backend hashed differently (or not at all).
+        sha256,
+        originalFilename: stored.originalFilename,
+        createdByAgentId: dispatchingAgentId,
+      });
+
+      await auditCreate({
+        outcome: "allowed",
+        companyId,
+        contextKind,
+        dispatchingAgentId,
+        runId,
+        toolName,
+        assetId: asset.id,
+        sha256,
+        byteSize: stored.byteSize,
+        mimeType: contentType,
+        deduped: false,
+      });
+
+      return { attachmentId: asset.id };
     },
   };
 }

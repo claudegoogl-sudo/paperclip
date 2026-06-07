@@ -33,6 +33,40 @@ export const DEFAULT_ALLOWED_TYPES: readonly string[] = [
   "text/html",
 ];
 
+/**
+ * PLA-888: MIME allowlist for plugin-created attachments (`artifacts.create`).
+ *
+ * The human upload route trusts whatever MIME multer reports (it only
+ * normalises, it does not allowlist). The plugin write path is more hostile —
+ * a worker fully controls the declared `mimeType` — so it enforces this
+ * explicit, single-source-of-truth allowlist: the curated human-facing set
+ * ({@link DEFAULT_ALLOWED_TYPES}) plus the audio/voice types an inbound
+ * messenger relay needs (Telegram voice notes are `audio/ogg`; other channels
+ * use mp3/m4a/webm/wav). Anything outside this list is rejected before any
+ * bytes are stored. Wildcards are intentionally avoided here: the list is exact
+ * so the reachable type surface is auditable.
+ */
+export const PLUGIN_ARTIFACT_ALLOWED_MIME_TYPES: readonly string[] = [
+  ...DEFAULT_ALLOWED_TYPES,
+  "audio/ogg",
+  "audio/mpeg",
+  "audio/mp4",
+  "audio/aac",
+  "audio/webm",
+  "audio/wav",
+  "audio/x-wav",
+  "audio/flac",
+];
+
+/**
+ * PLA-888: whether `contentType` is permitted for a plugin-created attachment.
+ * Exact, case-insensitive match against {@link PLUGIN_ARTIFACT_ALLOWED_MIME_TYPES}.
+ */
+export function isAllowedPluginArtifactMimeType(contentType: string): boolean {
+  const ct = normalizeContentType(contentType);
+  return PLUGIN_ARTIFACT_ALLOWED_MIME_TYPES.includes(ct);
+}
+
 export const DEFAULT_ATTACHMENT_CONTENT_TYPE = "application/octet-stream";
 export const SVG_CONTENT_TYPE = "image/svg+xml";
 export const INLINE_ATTACHMENT_TYPES: readonly string[] = [

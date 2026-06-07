@@ -939,6 +939,9 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             identifier?: string;
             wakeAssignee?: boolean;
             refuseClosed?: boolean;
+            // PLA-888: asset ids from ctx.artifacts.create to surface on this
+            // comment. Each must belong to the comment's company.
+            attachmentIds?: string[];
           },
         ) {
           return callHost("issues.createComment", {
@@ -949,6 +952,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             identifier: options?.identifier,
             wakeAssignee: options?.wakeAssignee,
             refuseClosed: options?.refuseClosed,
+            attachmentIds: options?.attachmentIds,
           });
         },
 
@@ -1692,6 +1696,35 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             contentType: result.contentType,
             byteSize: result.byteSize,
           };
+        },
+        // PLA-888: inverse of fetch — store inbound bytes as a company-scoped
+        // asset. Bytes are base64-encoded for the JSON-RPC payload; the host
+        // gates on capability, company scope, size, and MIME before storing.
+        async create(input) {
+          if (!input || typeof input !== "object") {
+            throw new Error("ctx.artifacts.create: input must be an object");
+          }
+          const { companyId, filename, mimeType, bytes } = input;
+          if (typeof companyId !== "string" || companyId.length === 0) {
+            throw new Error("ctx.artifacts.create: companyId must be a non-empty string");
+          }
+          if (typeof filename !== "string" || filename.length === 0) {
+            throw new Error("ctx.artifacts.create: filename must be a non-empty string");
+          }
+          if (typeof mimeType !== "string" || mimeType.length === 0) {
+            throw new Error("ctx.artifacts.create: mimeType must be a non-empty string");
+          }
+          if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) {
+            throw new Error("ctx.artifacts.create: bytes must be a non-empty Uint8Array");
+          }
+          const result = await callHost("artifacts.create", {
+            companyId,
+            filename,
+            mimeType,
+            contentBase64: Buffer.from(bytes).toString("base64"),
+            runId,
+          });
+          return { attachmentId: result.attachmentId };
         },
       },
     };

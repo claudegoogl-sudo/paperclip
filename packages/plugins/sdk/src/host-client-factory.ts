@@ -189,6 +189,18 @@ export interface HostServices {
    */
   artifacts: {
     fetch(params: WorkerToHostMethods["artifacts.fetch"][0]): Promise<WorkerToHostMethods["artifacts.fetch"][1]>;
+    /**
+     * Provides `artifacts.create` (PLA-888) — host-mediated inbound attachment
+     * store. Inverse of `artifacts.fetch`. The service implementation must:
+     * 1. Resolve the runContext keyed on `(pluginId, runId)`.
+     * 2. Authorize `params.companyId` against the dispatching/service company
+     *    scope (same resolution `fetch` uses); reject cross-tenant writes.
+     * 3. Enforce the human-upload size ceiling and the plugin-artifact MIME
+     *    allowlist.
+     * 4. Dedupe on (companyId, sha256) so retries converge (idempotent).
+     * 5. Audit-log without ever recording the bytes.
+     */
+    create(params: WorkerToHostMethods["artifacts.create"][0]): Promise<WorkerToHostMethods["artifacts.create"][1]>;
   };
 
   /** Provides `activity.log`. */
@@ -434,6 +446,9 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   // Artifacts — no capability gate: tool-dispatch implies attachment-read
   // (host enforces dispatching-agent authz via runContext lookup). See PLA-574.
   "artifacts.fetch": null,
+  // Writing an attachment is a privileged mutation (unlike read), so it IS
+  // gated behind a dedicated default-deny capability. See PLA-888.
+  "artifacts.create": "issue.attachments.create",
 
   // Activity
   "activity.log": "activity.log.write",
@@ -562,6 +577,14 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
  *    `issue.*` already comments on every company's issues, one dispatch at a
  *    time); serviceScope only removes the "must be mid-dispatch" timing
  *    constraint.
+ *  - `artifacts.create` (PLA-888): the host service stores the asset under the
+ *    claimed `companyId`'s own storage namespace only and binds it to that
+ *    company's issues; a worker-forged `companyId` cannot reach a foreign
+ *    tenant's data, and the human-upload size ceiling + per-company rate limit
+ *    bound storage cost. As with `issues.createComment`, the reachable set
+ *    equals the plugin's dispatch-lifetime reach; serviceScope only relaxes the
+ *    timing constraint so an inbound relay (e.g. Telegram webhook) can store
+ *    while idle.
  *
  * Deliberately excluded: any method that trusts `companyId` as the SOLE
  * authority with no entity cross-check (e.g. `issues.list`, `companies.get`).
@@ -574,6 +597,7 @@ const SERVICE_SCOPE_COMPANY_METHODS: ReadonlySet<WorkerToHostMethodName> = new S
   "state.set",
   "state.delete",
   "issues.createComment",
+  "artifacts.create",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -927,6 +951,14 @@ export function createHostClientHandlers(
       // that bundled an older SDK.
       const enriched = backfillDispatchRunId(params, context);
       return services.artifacts.fetch(enriched);
+    }),
+
+    // Artifacts write (PLA-888) — gated behind issue.attachments.create.
+    // Same runId back-fill as fetch; the host re-validates company scope and
+    // enforces size/mime/idempotency before storing.
+    "artifacts.create": gated("artifacts.create", async (params, context) => {
+      const enriched = backfillDispatchRunId(params, context);
+      return services.artifacts.create(enriched);
     }),
 
     // Activity

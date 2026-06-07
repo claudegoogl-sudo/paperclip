@@ -2404,6 +2404,13 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
               "ctx.artifacts.fetch is not stubbed in this test — pass `runCtx.artifacts` to inject a mock",
             );
           },
+          // PLA-888: default create stub throws so tests that exercise the write
+          // path inject their own client (mirrors the fetch default).
+          create: async () => {
+            throw new Error(
+              "ctx.artifacts.create is not stubbed in this test — pass `runCtx.artifacts` to inject a mock",
+            );
+          },
         },
       };
       return await handler(params, ctxToPass) as T;

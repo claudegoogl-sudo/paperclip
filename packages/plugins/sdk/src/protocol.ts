@@ -921,6 +921,34 @@ export interface WorkerToHostMethods {
     },
   ];
 
+  // Artifacts (attachment bytes) — INBOUND write path (PLA-888)
+  //
+  // The inverse of `artifacts.fetch`. Stores `contentBase64` bytes as a
+  // company-scoped Paperclip asset via the same storage backend the human
+  // upload route uses, returning `{ attachmentId }` (the asset id). The
+  // returned id can be passed to `issues.createComment`'s `attachmentIds` to
+  // surface the stored bytes on a comment.
+  //
+  // `runId` MUST be the runId of the currently-executing tool dispatch OR the
+  // host-minted service/background run id of an inbound relay loop (e.g. the
+  // messenger `getUpdates`/`onWebhook` path). The host looks up the active
+  // runContext keyed on (pluginDbId, runId): a dispatch/background context's
+  // company MUST equal `companyId` (cross-tenant writes are rejected); a
+  // service context relies on the `serviceScope` company-scope allowlist gate.
+  // Bytes travel as base64 over JSON-RPC; the worker SDK encodes the caller's
+  // Uint8Array before sending. Gated behind the `issue.attachments.create`
+  // capability (default-deny).
+  "artifacts.create": [
+    params: {
+      companyId: string;
+      filename: string;
+      mimeType: string;
+      contentBase64: string;
+      runId: string;
+    },
+    result: { attachmentId: string },
+  ];
+
   // Activity
   "activity.log": [
     params: {
@@ -1218,6 +1246,12 @@ export interface WorkerToHostMethods {
       identifier?: string;
       wakeAssignee?: boolean;
       refuseClosed?: boolean;
+      /**
+       * PLA-888: asset ids returned by `artifacts.create` to surface on this
+       * comment. Each must belong to the comment's company or the call is
+       * rejected. Omitted/empty keeps the existing text-only behaviour.
+       */
+      attachmentIds?: string[];
     },
     result: IssueComment,
   ];
