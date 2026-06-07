@@ -3,23 +3,26 @@
  * the dispatching agent, enforcing all seven security gates locked in by
  * SecurityEngineer for PLA-574.
  *
- * The worker calls `ctx.artifacts.fetch(attachmentId)` from inside a tool
- * handler. The SDK serializes that into a JSON-RPC `artifacts.fetch` request
- * carrying ONLY `{ attachmentId, runId }`. This handler:
+ * The worker calls `ctx.artifacts.fetch(attachmentId)` from a tool handler OR
+ * (PLA-897) a background dispatch (`onEvent`/`onWebhook`). The SDK serializes
+ * that into a JSON-RPC `artifacts.fetch` request carrying ONLY
+ * `{ attachmentId, runId }`. This handler:
  *
  *  1. Validates `(pluginDbId, runId)` against the in-memory run-context
  *     registry. If absent → `runcontext_invalid`. The worker is never trusted
- *     to assert agent identity.
+ *     to assert agent identity. A company-less **service** context is rejected
+ *     (`runcontext_invalid`): no company means no authorization basis.
  *  2. Loads the attachment by ID.
- *  3. Authorizes against the **dispatching agent's** companyId (from the
- *     registered runContext), NOT the worker's tenant. Mismatch + missing
- *     attachment are collapsed into a single `not_found` shape to deny
- *     existence/no-access enumeration.
- *  4. Applies a sliding-window rate limit per dispatching agent (60/min
- *     global) AND per (dispatching-agent, attachment-company) sub-bucket
- *     (30/min). Either ceiling triggers `rate_limited`.
- *  5. Emits a six-field audit log entry (success OR deny) via `logActivity`.
- *     Audit fields: dispatchingAgentId, dispatchingCompanyId,
+ *  3. Authorizes against the run-context's companyId — the **dispatching
+ *     agent's** company for a dispatch fetch, or the host-validated
+ *     **triggering** company for a background fetch (PLA-897) — NOT the
+ *     worker's tenant. Mismatch + missing attachment are collapsed into a
+ *     single `not_found` shape to deny existence/no-access enumeration.
+ *  4. Applies a sliding-window rate limit keyed by dispatching agent when
+ *     present, else by company (background), AND a per (principal,
+ *     attachment-company) sub-bucket. Either ceiling triggers `rate_limited`.
+ *  5. Emits an audit log entry (success OR deny) via `logActivity`. Fields:
+ *     contextKind, dispatchingAgentId (null for background), dispatchingCompanyId,
  *     attachmentCompanyId, attachmentId, pluginId, outcome.
  *  6. Streams the storage object into a buffer (single-resource only;
  *     enforces a max byte cap to avoid OOM via JSON-RPC base64 inflation).
@@ -27,6 +30,7 @@
  *     are NEVER logged.
  *
  * @see PLA-574 — host-mediated cross-tenant artifact fetch
+ * @see PLA-897 — background run-context fetch, scoped to the triggering company
  */
 
 import { createHash } from "node:crypto";
@@ -278,12 +282,15 @@ export function createPluginArtifactsHandler(
   async function audit(input: {
     outcome: "allowed" | "denied";
     deniedReason?: ArtifactsErrorCode;
-    dispatchingAgentId: string;
+    // PLA-897: a background fetch has no dispatching agent — mirror the create
+    // audit and allow null (system actor).
+    contextKind: "dispatch" | "background";
+    dispatchingAgentId: string | null;
     dispatchingCompanyId: string;
     attachmentCompanyId: string | null;
     attachmentId: string;
     runId: string;
-    toolName: string;
+    toolName: string | null;
     byteSize?: number;
   }) {
     try {
@@ -298,13 +305,14 @@ export function createPluginArtifactsHandler(
         action: "artifact.fetched",
         entityType: "issue_attachment",
         entityId: input.attachmentId,
-        agentId: input.dispatchingAgentId,
+        agentId: input.dispatchingAgentId ?? undefined,
         runId: input.runId,
         details: {
           pluginKey,
           pluginDbId,
           outcome: input.outcome,
           deniedReason: input.deniedReason ?? null,
+          contextKind: input.contextKind,
           dispatchingAgentId: input.dispatchingAgentId,
           dispatchingCompanyId: input.dispatchingCompanyId,
           attachmentCompanyId: input.attachmentCompanyId,
@@ -394,34 +402,49 @@ export function createPluginArtifactsHandler(
           "no active dispatch for this runId",
         );
       }
-      // PLA-768/PLA-773: a worker-lifetime service context (no agent/company) and
-      // a per-dispatch background context (company but no agent) cannot authorize
-      // an attachment fetch, which is scoped to the dispatching agent's access.
-      // Reject both like an unknown runId rather than attribute the fetch to a
-      // non-existent agent.
-      if (ctx.kind === "service" || ctx.kind === "background") {
+      // PLA-768: a worker-lifetime service context carries NO company, so an
+      // attachment fetch has no authorization basis — reject it like an unknown
+      // runId. PLA-897: a per-dispatch background context DOES carry the
+      // host-validated triggering company, which is the same scope a dispatch
+      // fetch authorizes against (company-level), so it is allowed below with no
+      // dispatching agent. A back-compat dispatch entry has `kind` absent, so
+      // test for the company-less service kind explicitly.
+      if (ctx.kind === "service") {
         throw new ArtifactsError(
           "runcontext_invalid",
           "no active dispatch for this runId",
         );
       }
 
+      // PLA-897: derive the authorizing principal once. Background has a company
+      // but no agent (system actor); dispatch has both. Rate-limit/audit keys
+      // fall back to the company when there is no agent.
+      const authCompanyId = ctx.companyId;
+      const principalAgentId = ctx.kind === "background" ? null : ctx.agentId;
+      const contextKind: "dispatch" | "background" =
+        ctx.kind === "background" ? "background" : "dispatch";
+      const toolName = ctx.kind === "background" ? null : ctx.toolName;
+      const rateKey = principalAgentId
+        ? `agent:${principalAgentId}`
+        : `company:${authCompanyId}`;
+
       // ---------- Gate 2: rate limit (global first, then per-company) ----------
       // Global check happens before lookups to make brute-force enumeration
       // strictly bounded. We don't know attachmentCompanyId yet for the
       // per-company bucket; that's a second check after the lookup succeeds.
-      if (!globalLimiter.check(`agent:${ctx.agentId}`)) {
+      if (!globalLimiter.check(rateKey)) {
         await audit({
           outcome: "denied",
           deniedReason: "rate_limited",
-          dispatchingAgentId: ctx.agentId,
-          dispatchingCompanyId: ctx.companyId,
+          contextKind,
+          dispatchingAgentId: principalAgentId,
+          dispatchingCompanyId: authCompanyId,
           attachmentCompanyId: null,
           attachmentId,
           runId,
-          toolName: ctx.toolName,
+          toolName,
         });
-        throw new ArtifactsError("rate_limited", "global per-agent rate limit exceeded");
+        throw new ArtifactsError("rate_limited", "global rate limit exceeded");
       }
 
       // ---------- Gate 3: attachment lookup ----------
@@ -431,49 +454,58 @@ export function createPluginArtifactsHandler(
         await audit({
           outcome: "denied",
           deniedReason: "not_found",
-          dispatchingAgentId: ctx.agentId,
-          dispatchingCompanyId: ctx.companyId,
+          contextKind,
+          dispatchingAgentId: principalAgentId,
+          dispatchingCompanyId: authCompanyId,
           attachmentCompanyId: null,
           attachmentId,
           runId,
-          toolName: ctx.toolName,
+          toolName,
         });
         throw new ArtifactsError("not_found", "attachment not found");
       }
 
-      // ---------- Gate 4: dispatching-agent authorization ----------
-      // Agents are scoped to a single company per the JWT actor model
-      // (see routes/authz.ts:assertCompanyAccess). For an agent to read an
-      // attachment, the dispatching agent's company MUST match the
-      // attachment's company. We DO NOT use the worker's tenant for authz.
-      if (ctx.companyId !== attachment.companyId) {
+      // ---------- Gate 4: authorization ----------
+      // For a dispatch fetch, agents are scoped to a single company per the JWT
+      // actor model (routes/authz.ts:assertCompanyAccess): the dispatching
+      // agent's company MUST match the attachment's company. PLA-897: a
+      // background fetch authorizes against the host-validated TRIGGERING company
+      // (`authCompanyId`) — same company-level check, correct result. We DO NOT
+      // use the worker's tenant for authz in either case.
+      if (authCompanyId !== attachment.companyId) {
         await audit({
           outcome: "denied",
           deniedReason: "not_found",
-          dispatchingAgentId: ctx.agentId,
-          dispatchingCompanyId: ctx.companyId,
+          contextKind,
+          dispatchingAgentId: principalAgentId,
+          dispatchingCompanyId: authCompanyId,
           attachmentCompanyId: attachment.companyId,
           attachmentId,
           runId,
-          toolName: ctx.toolName,
+          toolName,
         });
-        // Collapse to not_found to prevent existence enumeration by a
-        // dispatching agent guessing IDs in other tenants.
+        // Collapse to not_found to prevent existence enumeration by a caller
+        // guessing IDs in other tenants.
         throw new ArtifactsError("not_found", "attachment not found");
       }
 
-      // ---------- Gate 5: per-(agent, attachment-company) sub-bucket ----------
-      const subKey = `agent:${ctx.agentId}|company:${attachment.companyId}`;
+      // ---------- Gate 5: per-(principal, attachment-company) sub-bucket ----------
+      // Keyed by agent when present, otherwise by company so a background fetch
+      // is bounded per triggering company.
+      const subKey = principalAgentId
+        ? `agent:${principalAgentId}|company:${attachment.companyId}`
+        : `company:${attachment.companyId}`;
       if (!perCompanyLimiter.check(subKey)) {
         await audit({
           outcome: "denied",
           deniedReason: "rate_limited",
-          dispatchingAgentId: ctx.agentId,
-          dispatchingCompanyId: ctx.companyId,
+          contextKind,
+          dispatchingAgentId: principalAgentId,
+          dispatchingCompanyId: authCompanyId,
           attachmentCompanyId: attachment.companyId,
           attachmentId,
           runId,
-          toolName: ctx.toolName,
+          toolName,
         });
         throw new ArtifactsError(
           "rate_limited",
@@ -495,12 +527,13 @@ export function createPluginArtifactsHandler(
           await audit({
             outcome: "denied",
             deniedReason: "too_large",
-            dispatchingAgentId: ctx.agentId,
-            dispatchingCompanyId: ctx.companyId,
+            contextKind,
+            dispatchingAgentId: principalAgentId,
+            dispatchingCompanyId: authCompanyId,
             attachmentCompanyId: attachment.companyId,
             attachmentId,
             runId,
-            toolName: ctx.toolName,
+            toolName,
           });
         }
         throw err;
@@ -509,12 +542,13 @@ export function createPluginArtifactsHandler(
       // ---------- Gate 7: audit success + return ----------
       await audit({
         outcome: "allowed",
-        dispatchingAgentId: ctx.agentId,
-        dispatchingCompanyId: ctx.companyId,
+        contextKind,
+        dispatchingAgentId: principalAgentId,
+        dispatchingCompanyId: authCompanyId,
         attachmentCompanyId: attachment.companyId,
         attachmentId,
         runId,
-        toolName: ctx.toolName,
+        toolName,
         byteSize: buf.length,
       });
 

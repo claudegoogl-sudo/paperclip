@@ -346,6 +346,111 @@ describe("plugin-artifacts-handler — PLA-574", () => {
   });
 });
 
+describe("plugin-artifacts-handler.fetch — PLA-897 (background run-context)", () => {
+  beforeEach(() => {
+    vi.mocked(logActivity).mockClear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("background ctx fetches an attachment in the triggering company (agent=null, contextKind=background)", async () => {
+    const { handler, registry, bytes } = buildHandler();
+    // attachment default companyId is "dpr-company".
+    registry.registerBackground("plugin-db-1", "bg-run", "dpr-company");
+    const result = await handler.fetch({ attachmentId: "att-1", runId: "bg-run" });
+    expect(result).toEqual({
+      filename: "screenshot.png",
+      contentType: "image/png",
+      byteSize: bytes.length,
+      contentBase64: bytes.toString("base64"),
+    });
+    expect(logActivity).toHaveBeenCalledTimes(1);
+    const call = vi.mocked(logActivity).mock.calls[0]![1];
+    // System actor: no agentId attributed.
+    expect(call.agentId).toBeUndefined();
+    expect(call.companyId).toBe("dpr-company");
+    expect(call.runId).toBe("bg-run");
+    expect(JSON.stringify(call.details)).not.toContain(bytes.toString("base64"));
+    expect(call.details).toMatchObject({
+      outcome: "allowed",
+      contextKind: "background",
+      dispatchingAgentId: null,
+      dispatchingCompanyId: "dpr-company",
+      attachmentCompanyId: "dpr-company",
+      attachmentId: "att-1",
+      toolName: null,
+    });
+  });
+
+  it("background ctx fetching another company's attachment collapses to not_found", async () => {
+    const { handler, registry } = buildHandler();
+    // Triggering company B; attachment is in A ("dpr-company").
+    registry.registerBackground("plugin-db-1", "bg-run", "other-company");
+    await expect(
+      handler.fetch({ attachmentId: "att-1", runId: "bg-run" }),
+    ).rejects.toMatchObject({ code: "not_found" });
+    const call = vi.mocked(logActivity).mock.calls[0]![1];
+    expect(call.details).toMatchObject({
+      outcome: "denied",
+      deniedReason: "not_found",
+      contextKind: "background",
+      dispatchingAgentId: null,
+      dispatchingCompanyId: "other-company",
+      attachmentCompanyId: "dpr-company",
+    });
+  });
+
+  it("service ctx fetch stays denied with runcontext_invalid (no company to authorize against)", async () => {
+    const { handler, registry } = buildHandler();
+    registry.registerService("plugin-db-1", "svc-run");
+    await expect(
+      handler.fetch({ attachmentId: "att-1", runId: "svc-run" }),
+    ).rejects.toMatchObject({ code: "runcontext_invalid" });
+    // No audit: no company/agent to attribute it to.
+    expect(logActivity).not.toHaveBeenCalled();
+  });
+
+  it("background ctx is rate-limited by company sub-bucket", async () => {
+    const { handler, registry } = buildHandler({
+      globalRateLimit: { maxAttempts: 100, windowMs: 60_000 },
+      perCompanyRateLimit: { maxAttempts: 2, windowMs: 60_000 },
+    });
+    registry.registerBackground("plugin-db-1", "bg-run", "dpr-company");
+    await handler.fetch({ attachmentId: "att-1", runId: "bg-run" });
+    await handler.fetch({ attachmentId: "att-1", runId: "bg-run" });
+    await expect(
+      handler.fetch({ attachmentId: "att-1", runId: "bg-run" }),
+    ).rejects.toMatchObject({ code: "rate_limited" });
+    const last = vi.mocked(logActivity).mock.calls.at(-1)![1];
+    expect(last.details).toMatchObject({
+      outcome: "denied",
+      deniedReason: "rate_limited",
+      contextKind: "background",
+      dispatchingAgentId: null,
+      dispatchingCompanyId: "dpr-company",
+    });
+  });
+
+  it("regression guard: dispatch ctx fetch is unchanged (authorizes on agent company, audit carries agentId)", async () => {
+    const { handler, registry, bytes } = buildHandler();
+    registerCtx(registry);
+    const result = await handler.fetch({ attachmentId: "att-1", runId: "run-1" });
+    expect(result.contentBase64).toBe(bytes.toString("base64"));
+    const call = vi.mocked(logActivity).mock.calls[0]![1];
+    expect(call.agentId).toBe("agent-dpr-1");
+    expect(call.details).toMatchObject({
+      outcome: "allowed",
+      contextKind: "dispatch",
+      dispatchingAgentId: "agent-dpr-1",
+      dispatchingCompanyId: "dpr-company",
+      attachmentCompanyId: "dpr-company",
+      toolName: "lookup-screenshot",
+    });
+  });
+});
+
 describe("plugin-artifacts-handler.create — PLA-888", () => {
   beforeEach(() => {
     vi.mocked(logActivity).mockClear();
