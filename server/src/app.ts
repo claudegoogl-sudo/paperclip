@@ -63,6 +63,11 @@ import { createPluginDevWatcher } from "./services/plugin-dev-watcher.js";
 import { createPluginHostServiceCleanup } from "./services/plugin-host-service-cleanup.js";
 import { createEventRelayProbe } from "./services/plugin-event-relay-probe.js";
 import { pluginRegistryService } from "./services/plugin-registry.js";
+import { approvalService } from "./services/approvals.js";
+import {
+  createApprovalsCapabilityEscalationGateway,
+  registerCapabilityEscalationResolver,
+} from "./services/plugin-capability-escalation.js";
 import { createHostClientHandlers } from "@paperclipai/plugin-sdk";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
 import { createCachedViteHtmlRenderer } from "./vite-html-renderer.js";
@@ -151,6 +156,15 @@ export async function createApp(
     hostVersion?: string;
     localPluginDir?: string;
     pluginMigrationDb?: Db;
+    /**
+     * Company the host files plugin capability-escalation board approvals
+     * against (PLA-910). A plugin capability escalation is instance-wide but
+     * approvals are company-scoped, so the host files against this single
+     * configured "platform" company. When omitted, no escalation gateway is
+     * wired and the loader keeps failing closed on a cap-escalating upgrade —
+     * preserving the pre-PLA-908 production default.
+     */
+    escalationApprovalCompanyId?: string;
     pluginWorkerManager?: PluginWorkerManager;
     // PLA-781: the run-context registry the injected pluginWorkerManager was
     // built with. MUST be the same instance, so a worker's host-minted service
@@ -289,11 +303,21 @@ export async function createApp(
   });
   const hostServiceCleanup = createPluginHostServiceCleanup(lifecycle, hostServicesDisposers);
   let viteHtmlRenderer: ReturnType<typeof createCachedViteHtmlRenderer> | null = null;
+  // PLA-910: wire the capability-escalation gateway when a platform company is
+  // configured. Absent it, the loader receives no gateway and keeps failing
+  // closed on cap-escalating upgrades (pre-PLA-908 production default).
+  const escalationGateway = opts.escalationApprovalCompanyId
+    ? createApprovalsCapabilityEscalationGateway({
+        approvals: approvalService(db),
+        companyId: opts.escalationApprovalCompanyId,
+      })
+    : undefined;
   const loader = pluginLoader(
     db,
     {
       localPluginDir: opts.localPluginDir ?? DEFAULT_LOCAL_PLUGIN_DIR,
       migrationDb: opts.pluginMigrationDb,
+      escalationGateway,
     },
     {
       workerManager,
@@ -329,6 +353,19 @@ export async function createApp(
       },
     },
   );
+  // PLA-910: a lifecycle bound to the runtime-services + gateway loader, used
+  // only to apply board decisions to parked upgrades (complete/revert + worker
+  // re-activation). The approvals service dispatches resolved escalation
+  // approvals to this resolver via the module-level registry, breaking the
+  // approvals -> loader import cycle.
+  const upgradeLifecycle = pluginLifecycleManager(db, { loader, workerManager });
+  registerCapabilityEscalationResolver(async ({ payload, outcome }) => {
+    if (outcome === "approved") {
+      await upgradeLifecycle.completeUpgradeApproved(payload.pluginId);
+    } else {
+      await upgradeLifecycle.revertUpgradeRejected(payload.pluginId);
+    }
+  });
   api.use(
     pluginRoutes(
       db,

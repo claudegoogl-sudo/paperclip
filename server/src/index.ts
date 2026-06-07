@@ -668,6 +668,10 @@ export async function startServer(): Promise<StartedServer> {
     authReady,
     companyDeletionEnabled: config.companyDeletionEnabled,
     pluginMigrationDb: pluginMigrationDb as any,
+    // PLA-910: company the host files plugin capability-escalation board
+    // approvals against. Unset → no gateway wired → loader fails closed.
+    escalationApprovalCompanyId:
+      process.env.PAPERCLIP_PLUGIN_ESCALATION_COMPANY_ID?.trim() || undefined,
     betterAuthHandler,
     resolveSession,
     pluginWorkerManager,
