@@ -48,7 +48,7 @@ function createGatewayStub() {
   // treated as approved, which is what `completeUpgrade` verifies against.
   const approvedByPlugin = new Map<
     string,
-    { approvalId: string; toVersion: string; addedCapabilities: string[]; digest: string }
+    { approvalId: string; toVersion: string; addedCapabilities: string[]; digest?: string }
   >();
   let counter = 0;
   const gateway: CapabilityEscalationGateway = {
@@ -97,10 +97,14 @@ describeEmbeddedPostgres("plugin-loader upgrade_pending (PLA-908)", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let packageRoots: string[] = [];
+  // Host-managed dir the loader snapshots verified upgrades into (PLA-913).
+  // Kept off the real ~/.paperclip/plugins so tests don't pollute the host.
+  let localPluginDir!: string;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-plugin-upgrade-pending-");
     db = createDb(tempDb.connectionString);
+    localPluginDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-upgrade-localdir-"));
   }, 20_000);
 
   afterEach(async () => {
@@ -112,9 +116,11 @@ describeEmbeddedPostgres("plugin-loader upgrade_pending (PLA-908)", () => {
     await db.delete(companies);
     await Promise.all(packageRoots.map((root) => rm(root, { recursive: true, force: true })));
     packageRoots = [];
+    await rm(path.join(localPluginDir, ".upgrade-snapshots"), { recursive: true, force: true });
   });
 
   afterAll(async () => {
+    await rm(localPluginDir, { recursive: true, force: true });
     await tempDb?.cleanup();
   });
 
@@ -166,6 +172,7 @@ describeEmbeddedPostgres("plugin-loader upgrade_pending (PLA-908)", () => {
       enableLocalFilesystem: false,
       enableNpmDiscovery: false,
       escalationGateway: gateway,
+      localPluginDir,
     });
   }
 
@@ -362,11 +369,18 @@ describeEmbeddedPostgres("plugin-loader upgrade_pending (PLA-908)", () => {
     const approvedPkg = await writePackage(approvedManifest);
     const pluginId = await seedPlugin(oldManifest, oldPkg);
 
-    const { gateway } = createGatewayStub();
+    const { approvedByPlugin, gateway } = createGatewayStub();
     const loader = makeLoader(gateway);
 
     // Park + file the approval naming addedCapabilities = ["issues.create"].
     await loader.upgradePlugin(pluginId, { localPath: approvedPkg });
+
+    // Simulate a legacy (pre-PLA-913) approval with no content snapshot/digest
+    // so completeUpgrade falls back to re-reading the caller-supplied package —
+    // the path the PLA-911 version/caps binding still guards. With a snapshot
+    // present, PLA-913 ignores the swapped package entirely (covered in
+    // plugin-loader-upgrade-snapshot.test.ts).
+    approvedByPlugin.get(pluginId)!.digest = undefined;
 
     // A swapped package at the SAME approved version but declaring an extra,
     // valid-but-unapproved capability (issues.update). completeUpgrade must
@@ -393,10 +407,15 @@ describeEmbeddedPostgres("plugin-loader upgrade_pending (PLA-908)", () => {
     const approvedPkg = await writePackage(approvedManifest);
     const pluginId = await seedPlugin(oldManifest, oldPkg);
 
-    const { gateway } = createGatewayStub();
+    const { approvedByPlugin, gateway } = createGatewayStub();
     const loader = makeLoader(gateway);
 
     await loader.upgradePlugin(pluginId, { localPath: approvedPkg });
+
+    // Legacy (pre-PLA-913) approval with no snapshot/digest → completeUpgrade
+    // re-reads the caller-supplied package, where the PLA-911 version binding
+    // applies. (A snapshot would make PLA-913 ignore the swapped package.)
+    approvedByPlugin.get(pluginId)!.digest = undefined;
 
     // A package whose caps stay within the approved set but at a different,
     // un-approved version (0.3.0). completeUpgrade must reject it.
@@ -413,7 +432,7 @@ describeEmbeddedPostgres("plugin-loader upgrade_pending (PLA-908)", () => {
     expect(row?.manifestJson.capabilities).toEqual(["issues.read"]);
   });
 
-  it("refuses to complete an upgrade whose package contents differ from the approved package at the same version + caps (PLA-912)", async () => {
+  it("refuses to complete an upgrade when the immutable snapshot is tampered after park (PLA-912 digest anchor over PLA-913 snapshot)", async () => {
     const oldManifest = manifest("0.1.0", ["issues.read"]);
     const oldPkg = await writePackage(oldManifest);
     // The package the board reviewed and approved: 0.2.0 adding issues.create.
@@ -424,22 +443,22 @@ describeEmbeddedPostgres("plugin-loader upgrade_pending (PLA-908)", () => {
     const { approvedByPlugin, gateway } = createGatewayStub();
     const loader = makeLoader(gateway);
 
-    // Park + file the approval, anchoring digest D1 over approvedPkg's contents.
+    // Park: anchors digest D1 over approvedPkg and snapshots it (PLA-913).
     await loader.upgradePlugin(pluginId, { localPath: approvedPkg });
     const d1 = approvedByPlugin.get(pluginId)?.digest;
     expect(d1).toMatch(/^sha256:[0-9a-f]{64}$/);
 
-    // A swapped package at the SAME approved version and SAME caps, but with
-    // different code (digest D2 ≠ D1) — passes the version + caps checks yet
-    // must be rejected by the content-digest anchor.
-    const swappedPkg = await writePackage(approvedManifest);
+    // Now tamper the immutable snapshot itself (the bytes completeUpgrade loads
+    // from). The PLA-912 digest check recomputes over the snapshot and must
+    // reject when it no longer matches the approved digest.
+    const snapshotDir = path.join(localPluginDir, ".upgrade-snapshots", d1!.slice("sha256:".length));
     await writeFile(
-      path.join(swappedPkg, "dist", "worker.js"),
+      path.join(snapshotDir, "dist", "worker.js"),
       "export const tampered = true;\n",
       "utf8",
     );
 
-    await expect(loader.completeUpgrade(pluginId, { localPath: swappedPkg })).rejects.toThrow(
+    await expect(loader.completeUpgrade(pluginId, { localPath: approvedPkg })).rejects.toThrow(
       /content digest|contents changed/i,
     );
 

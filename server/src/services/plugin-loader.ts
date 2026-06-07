@@ -24,9 +24,9 @@
  * @see PLUGIN_SPEC.md §10 — Package Contract
  * @see PLUGIN_SPEC.md §12 — Process Model
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readdir, readFile, rm, stat } from "node:fs/promises";
+import { cp, mkdir, readdir, readFile, rename, rm, stat } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -809,6 +809,25 @@ async function computePackageContentDigest(packageRoot: string): Promise<string>
   return `sha256:${hash.digest("hex")}`;
 }
 
+// ---------------------------------------------------------------------------
+// Verified-upgrade snapshotting to immutable storage (PLA-913)
+// ---------------------------------------------------------------------------
+
+/**
+ * Subdirectory of the local plugin dir holding content-addressed snapshots of
+ * verified upgrade packages (PLA-913). Each parked cap-escalating upgrade from a
+ * local-path source is copied here, keyed by the content digest captured at
+ * park, so `completeUpgrade` and the worker load the board-approved bytes from a
+ * host-controlled copy instead of re-reading the mutable `localPath` source.
+ */
+const UPGRADE_SNAPSHOT_DIRNAME = ".upgrade-snapshots";
+
+/** Absolute path of the snapshot for a given `sha256:<hex>` digest. */
+function upgradeSnapshotPathFor(localPluginDir: string, digest: string): string {
+  const hex = digest.startsWith("sha256:") ? digest.slice("sha256:".length) : digest;
+  return path.join(localPluginDir, UPGRADE_SNAPSHOT_DIRNAME, hex);
+}
+
 /**
  * Resolve the manifest entrypoint from a package.json and package root.
  *
@@ -1197,6 +1216,63 @@ export function pluginLoader(
       manifest,
       digest,
     };
+  }
+
+  /**
+   * Snapshot a verified local-path package into content-addressed immutable
+   * storage (PLA-913) and return the snapshot path. Copies the *entire resolved
+   * tree* — including `node_modules` and dereferencing symlinks, which
+   * {@link computePackageContentDigest} deliberately excludes — so the bytes
+   * that will be required at load time are a host-controlled copy, not the
+   * mutable (board-approved but attacker-writable) source dir.
+   *
+   * Closes the two residuals the digest-only anchor (PLA-912) left open:
+   * - **Verify-then-load TOCTOU**: `completeUpgrade` and the worker load this
+   *   snapshot, so a swap of the source *after* approval can no longer reach the
+   *   loader — the check-time and use-time bytes are the same immutable copy.
+   * - **Unhashed deps/symlinks (OWASP A08)**: the loaded artifact is the
+   *   snapshot, whose `node_modules`/symlinked code cannot be swapped after the
+   *   copy, making the digest's `node_modules`/symlink exclusion moot for what
+   *   actually runs.
+   *
+   * Content-addressed and idempotent: a re-park at the same digest reuses an
+   * existing, still-matching snapshot; a corrupt/mismatched one is rebuilt. The
+   * tree is built under a temp name and atomically `rename`d into place, so a
+   * crash mid-copy never publishes a partial snapshot and a concurrent park to
+   * the same digest converges on byte-equivalent content.
+   */
+  async function ensureUpgradeSnapshot(packageRoot: string, digest: string): Promise<string> {
+    const dest = upgradeSnapshotPathFor(localPluginDir, digest);
+    if (existsSync(dest)) {
+      try {
+        if ((await computePackageContentDigest(dest)) === digest) return dest;
+      } catch {
+        // fall through and rebuild from the source
+      }
+      log.warn(
+        { dest, digest },
+        "plugin-loader: existing upgrade snapshot failed its digest re-check — rebuilding",
+      );
+      await rm(dest, { recursive: true, force: true });
+    }
+
+    await mkdir(path.dirname(dest), { recursive: true });
+    const tmp = `${dest}.tmp-${randomUUID()}`;
+    await rm(tmp, { recursive: true, force: true });
+    // dereference: capture the symlink *targets'* contents so a symlinked
+    // entrypoint or pnpm-style node_modules is materialized into the snapshot
+    // rather than left as a dangling link into the mutable source.
+    await cp(packageRoot, tmp, { recursive: true, dereference: true });
+    try {
+      await rename(tmp, dest);
+    } catch (err) {
+      // A concurrent park may have published the same content first. Snapshots
+      // are content-addressed, so an existing dest is byte-equivalent — drop
+      // ours and converge on theirs.
+      await rm(tmp, { recursive: true, force: true });
+      if (!existsSync(dest)) throw err;
+    }
+    return dest;
   }
 
   /**
@@ -1706,6 +1782,16 @@ export function pluginLoader(
           );
         }
 
+        // Snapshot the verified bytes to immutable storage BEFORE filing, so the
+        // approval the board sees is backed by a stored, content-addressed copy
+        // and a later swap of the source can reach neither `completeUpgrade` nor
+        // the worker (PLA-913). Only local-path sources load in place; npm
+        // packages resolve hoisted deps from the shared `node_modules` and must
+        // not be copied in isolation, so they keep the digest-only anchor.
+        if (discovered.source === "local-filesystem") {
+          await ensureUpgradeSnapshot(discovered.packagePath, discovered.digest!);
+        }
+
         // Idempotency: if we are already parked for this exact target version,
         // converge — do NOT file a second approval (criterion 5).
         const existingApprovalId = await escalationGateway.findPending({
@@ -1816,6 +1902,12 @@ export function pluginLoader(
      * carrying different code (a mutable `localPath` swapped after approval) is
      * rejected. This closes the code-integrity residual the version + caps
      * checks alone leave open (OWASP A08).
+     *
+     * For local-path sources the bytes are loaded from the immutable snapshot
+     * taken at park (PLA-913) rather than re-read from the mutable source, which
+     * fully closes the verify-then-load TOCTOU and covers the `node_modules`/
+     * symlinked code the digest excludes. The completed row's `packagePath` is
+     * repointed at that snapshot so the worker requires the approved bytes.
      */
     async completeUpgrade(
       pluginId: string,
@@ -1854,11 +1946,28 @@ export function pluginLoader(
         localPath = plugin.packagePath ?? undefined,
       } = upgradeOptions;
 
+      // Prefer the immutable snapshot captured at park (PLA-913) over the
+      // mutable source. Loading the approved bytes from host-controlled storage
+      // closes the verify-then-load TOCTOU and covers the `node_modules`/
+      // symlinked code the digest excludes: a swap of the source after approval
+      // can no longer reach the loader. Falls back to the source only for legacy
+      // approvals with no snapshot (pre-PLA-913, or npm-sourced), preserving the
+      // prior digest-only behavior and never widening it.
+      let loadFromLocalPath = localPath;
+      let snapshotPath: string | null = null;
+      if (approved.digest) {
+        const candidate = upgradeSnapshotPathFor(localPluginDir, approved.digest);
+        if (existsSync(candidate)) {
+          snapshotPath = candidate;
+          loadFromLocalPath = candidate;
+        }
+      }
+
       // Pin the fetched version to the approved target — ignore any divergent
       // caller-supplied `version`.
       const discovered = await fetchAndValidate({
         packageName,
-        localPath,
+        localPath: loadFromLocalPath,
         version: approved.toVersion,
         installDir: localPluginDir,
       });
@@ -1929,6 +2038,10 @@ export function pluginLoader(
         packageName: discovered.packageName,
         version: discovered.version,
         manifest: newManifest,
+        // Repoint at the immutable snapshot so the worker requires the approved
+        // bytes, not the mutable source (PLA-913). Left unset for legacy/npm
+        // paths, which keep their existing packagePath.
+        ...(snapshotPath ? { packagePath: snapshotPath } : {}),
       });
       const updated = await registry.updateStatus(pluginId, { status: "ready" });
 
