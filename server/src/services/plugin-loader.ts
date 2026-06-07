@@ -24,6 +24,7 @@
  * @see PLUGIN_SPEC.md §10 — Package Contract
  * @see PLUGIN_SPEC.md §12 — Process Model
  */
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readdir, readFile, rm, stat } from "node:fs/promises";
 import { execFile } from "node:child_process";
@@ -166,6 +167,17 @@ export interface DiscoveredPlugin {
   source: PluginSource;
   /** The parsed and validated manifest if available, null if discovery-only. */
   manifest: PaperclipPluginManifestV1 | null;
+  /**
+   * Content digest (`sha256:<hex>`) over the resolved package's own files, the
+   * integrity anchor for a parked capability-escalating upgrade (PLA-912). A
+   * version string alone is forgeable for a mutable source (a `localPath` dir
+   * swapped after approval, or a re-published version/tag), so `completeUpgrade`
+   * pins the applied package to the digest captured at park.
+   *
+   * Populated by {@link fetchAndValidate} (the install/upgrade path). Left
+   * undefined by discovery scans, which do not hash every candidate package.
+   */
+  digest?: string;
 }
 
 /**
@@ -277,6 +289,13 @@ export interface CapabilityEscalationRequest {
   toCapabilities: string[];
   /** Capabilities present in the new manifest but not the old one. */
   addedCapabilities: string[];
+  /**
+   * Content digest (`sha256:<hex>`) of the exact package the board is approving,
+   * captured at park. Persisted on the approval so `completeUpgrade` can pin the
+   * applied package to the approved contents and reject a swapped/re-published
+   * package that declares the same version (PLA-912).
+   */
+  digest: string;
 }
 
 /**
@@ -324,6 +343,14 @@ export interface ApprovedUpgrade {
   toVersion: string;
   /** The capabilities the board approved adding (the upgrade must not exceed these). */
   addedCapabilities: string[];
+  /**
+   * Content digest (`sha256:<hex>`) of the package the board approved, captured
+   * at park (PLA-912). When present, `completeUpgrade` rejects any fetched
+   * package whose digest differs — closing the mutable-source TOCTOU residual
+   * that the version + caps checks alone leave open. Optional so approvals filed
+   * before this anchor existed still resolve (version + caps still enforced).
+   */
+  digest?: string | null;
 }
 
 /**
@@ -736,6 +763,53 @@ async function readPackageJson(
 }
 
 /**
+ * Compute a deterministic content digest (`sha256:<hex>`) over a resolved
+ * plugin package's own files — the integrity anchor for a parked
+ * capability-escalating upgrade (PLA-912).
+ *
+ * The digest covers every regular file under `packageRoot`, keyed by its
+ * POSIX-normalized relative path and length so a rename, truncation, or content
+ * swap all change it. Files are hashed in sorted path order so the result is
+ * independent of filesystem enumeration order.
+ *
+ * `node_modules` and `.git` are skipped: dependency trees and VCS metadata vary
+ * by install/platform and would make the digest non-deterministic, while the
+ * threat this closes is a swap of the plugin's *own* code under an unchanged
+ * version. Symlinks are not followed (neither `isFile` nor `isDirectory`),
+ * keeping the walk inside the package tree.
+ */
+async function computePackageContentDigest(packageRoot: string): Promise<string> {
+  const files: string[] = [];
+  async function walk(dir: string): Promise<void> {
+    const entries = await readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        if (entry.name === "node_modules" || entry.name === ".git") continue;
+        await walk(path.join(dir, entry.name));
+      } else if (entry.isFile()) {
+        files.push(path.join(dir, entry.name));
+      }
+    }
+  }
+  await walk(packageRoot);
+
+  const rels = files
+    .map((abs) => ({ abs, rel: path.relative(packageRoot, abs).split(path.sep).join("/") }))
+    .sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+
+  const hash = createHash("sha256");
+  for (const { abs, rel } of rels) {
+    const bytes = await readFile(abs);
+    hash.update(rel, "utf8");
+    hash.update("\0");
+    hash.update(String(bytes.length));
+    hash.update("\0");
+    hash.update(bytes);
+  }
+  return `sha256:${hash.digest("hex")}`;
+}
+
+/**
  * Resolve the manifest entrypoint from a package.json and package root.
  *
  * The spec defines a "paperclipPlugin" key in package.json with a "manifest"
@@ -1111,12 +1185,17 @@ export function pluginLoader(
     // Use the version declared in the manifest (required field per the spec)
     const resolvedVersion = manifest.version;
 
+    // Content digest of the resolved package — the integrity anchor a parked
+    // upgrade is pinned to at completion (PLA-912).
+    const digest = await computePackageContentDigest(resolvedPackagePath);
+
     return {
       packagePath: resolvedPackagePath,
       packageName: resolvedPackageName,
       version: resolvedVersion,
       source: localPath ? "local-filesystem" : "npm",
       manifest,
+      digest,
     };
   }
 
@@ -1672,6 +1751,8 @@ export function pluginLoader(
             fromCapabilities: [...oldCaps],
             toCapabilities: [...newCaps],
             addedCapabilities,
+            // Anchor the approval to the exact package contents (PLA-912).
+            digest: discovered.digest!,
           }));
 
         // Park WITHOUT touching version/manifest/caps. Because nothing else is
@@ -1729,6 +1810,12 @@ export function pluginLoader(
      * `addedCapabilities`. This is enforced loader-side rather than trusting the
      * caller's `upgradeOptions`, so a swapped/re-published package cannot
      * silently escalate capabilities the board never saw.
+     *
+     * The applied package is additionally pinned to the content digest captured
+     * at park (PLA-912): a package declaring the approved version and caps but
+     * carrying different code (a mutable `localPath` swapped after approval) is
+     * rejected. This closes the code-integrity residual the version + caps
+     * checks alone leave open (OWASP A08).
      */
     async completeUpgrade(
       pluginId: string,
@@ -1809,6 +1896,32 @@ export function pluginLoader(
         throw new Error(
           `Cannot complete parked upgrade for "${pluginId}": fetched manifest adds capabilities that were not approved: ` +
             `${unapprovedCaps.join(", ")}. The board approved [${approved.addedCapabilities.join(", ")}].`,
+        );
+      }
+
+      // Content-integrity check (PLA-912). The version + caps checks above pass a
+      // package that declares the approved version and caps but carries
+      // *different code* (a mutable `localPath` swapped after approval, or a
+      // re-published version/tag). Pin to the digest captured at park: fail
+      // closed (no mutation, row stays parked) on any mismatch. When the
+      // approval predates this anchor (no stored digest) we cannot compare, so
+      // fall through on version + caps — never widening, only adding a check.
+      if (approved.digest) {
+        if (discovered.digest !== approved.digest) {
+          log.warn(
+            { pluginId, discoveredDigest: discovered.digest, approvedDigest: approved.digest },
+            "plugin-loader: completeUpgrade fetched package contents differ from the approved package — refusing",
+          );
+          throw new Error(
+            `Cannot complete parked upgrade for "${pluginId}": fetched package content digest ` +
+              `"${discovered.digest}" does not match the board-approved digest "${approved.digest}". ` +
+              `The package contents changed after approval (same version, different code).`,
+          );
+        }
+      } else {
+        log.warn(
+          { pluginId, approvalId: approved.approvalId },
+          "plugin-loader: completeUpgrade has no approved content digest to verify against (approval predates PLA-912) — applying on version + capability checks only",
         );
       }
 

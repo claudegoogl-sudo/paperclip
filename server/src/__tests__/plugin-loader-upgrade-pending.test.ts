@@ -48,7 +48,7 @@ function createGatewayStub() {
   // treated as approved, which is what `completeUpgrade` verifies against.
   const approvedByPlugin = new Map<
     string,
-    { approvalId: string; toVersion: string; addedCapabilities: string[] }
+    { approvalId: string; toVersion: string; addedCapabilities: string[]; digest: string }
   >();
   let counter = 0;
   const gateway: CapabilityEscalationGateway = {
@@ -63,6 +63,9 @@ function createGatewayStub() {
         approvalId,
         toVersion: input.toVersion,
         addedCapabilities: input.addedCapabilities,
+        // Anchor the approved contract to the exact package contents (PLA-912),
+        // mirroring what the real approvals-backed gateway persists at park.
+        digest: input.digest,
       });
       return approvalId;
     },
@@ -408,6 +411,67 @@ describeEmbeddedPostgres("plugin-loader upgrade_pending (PLA-908)", () => {
     expect(row?.status).toBe("upgrade_pending");
     expect(row?.version).toBe("0.1.0");
     expect(row?.manifestJson.capabilities).toEqual(["issues.read"]);
+  });
+
+  it("refuses to complete an upgrade whose package contents differ from the approved package at the same version + caps (PLA-912)", async () => {
+    const oldManifest = manifest("0.1.0", ["issues.read"]);
+    const oldPkg = await writePackage(oldManifest);
+    // The package the board reviewed and approved: 0.2.0 adding issues.create.
+    const approvedManifest = manifest("0.2.0", ["issues.read", "issues.create"]);
+    const approvedPkg = await writePackage(approvedManifest);
+    const pluginId = await seedPlugin(oldManifest, oldPkg);
+
+    const { approvedByPlugin, gateway } = createGatewayStub();
+    const loader = makeLoader(gateway);
+
+    // Park + file the approval, anchoring digest D1 over approvedPkg's contents.
+    await loader.upgradePlugin(pluginId, { localPath: approvedPkg });
+    const d1 = approvedByPlugin.get(pluginId)?.digest;
+    expect(d1).toMatch(/^sha256:[0-9a-f]{64}$/);
+
+    // A swapped package at the SAME approved version and SAME caps, but with
+    // different code (digest D2 ≠ D1) — passes the version + caps checks yet
+    // must be rejected by the content-digest anchor.
+    const swappedPkg = await writePackage(approvedManifest);
+    await writeFile(
+      path.join(swappedPkg, "dist", "worker.js"),
+      "export const tampered = true;\n",
+      "utf8",
+    );
+
+    await expect(loader.completeUpgrade(pluginId, { localPath: swappedPkg })).rejects.toThrow(
+      /content digest|contents changed/i,
+    );
+
+    // Fail closed: no mutation, row stays parked at the old version/caps.
+    const [row] = await db.select().from(plugins).where(eq(plugins.id, pluginId));
+    expect(row?.status).toBe("upgrade_pending");
+    expect(row?.version).toBe("0.1.0");
+    expect(row?.manifestJson.capabilities).toEqual(["issues.read"]);
+  });
+
+  it("completes an upgrade whose package contents match the approved digest (PLA-912 positive control)", async () => {
+    const oldManifest = manifest("0.1.0", ["issues.read"]);
+    const oldPkg = await writePackage(oldManifest);
+    const approvedManifest = manifest("0.2.0", ["issues.read", "issues.create"]);
+    const approvedPkg = await writePackage(approvedManifest);
+    const pluginId = await seedPlugin(oldManifest, oldPkg);
+
+    const { gateway } = createGatewayStub();
+    const loader = makeLoader(gateway);
+
+    await loader.upgradePlugin(pluginId, { localPath: approvedPkg });
+
+    // A distinct directory with byte-identical contents hashes to the same
+    // digest, so completion succeeds — the anchor binds to contents, not path.
+    const sameContentsPkg = await writePackage(approvedManifest);
+    const completed = await loader.completeUpgrade(pluginId, { localPath: sameContentsPkg });
+
+    expect(completed.status).toBe("ready");
+    expect(completed.version).toBe("0.2.0");
+    const [row] = await db.select().from(plugins).where(eq(plugins.id, pluginId));
+    expect(row?.version).toBe("0.2.0");
+    expect(row?.manifestJson.capabilities).toEqual(["issues.read", "issues.create"]);
   });
 
   it("refuses to park a disabled plugin for a cap-escalating upgrade (PLA-911 Finding 2)", async () => {
