@@ -46,10 +46,20 @@ import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js"
 // Public types
 // ---------------------------------------------------------------------------
 
-/** Request shape over the wire. The worker only supplies `runId`. */
+/**
+ * Request shape over the wire. PLA-895 made `runId` optional on the SDK wire
+ * protocol — the worker client omits it and the SDK host-client factory
+ * backfills it from the host-validated invocation scope before this handler
+ * runs (`backfillDispatchRunId`). Gate 0 below still rejects a genuinely absent
+ * runId with `runcontext_invalid`, so the host contract is unchanged.
+ */
 export interface PluginArtifactsFetchParams {
   attachmentId: string;
-  runId: string;
+  // PLA-895 made the SDK wire-protocol `runId` optional (the host backfills it
+  // from the invocation/singleInFlight/service scope via backfillDispatchRunId).
+  // Gate 0 in `fetch` still rejects a missing/empty runId with
+  // `runcontext_invalid`, so behavior is preserved.
+  runId?: string;
 }
 
 /** Response shape returned to the worker. Bytes are base64-encoded. */
@@ -70,7 +80,11 @@ export interface PluginArtifactsCreateParams {
   filename: string;
   mimeType: string;
   contentBase64: string;
-  runId: string;
+  // PLA-895 made the SDK wire-protocol `runId` optional (the host backfills it
+  // from the invocation/singleInFlight/service scope via backfillDispatchRunId).
+  // Gate 0 in `create` still rejects a missing/empty runId with
+  // `runcontext_invalid`, so behavior is preserved.
+  runId?: string;
 }
 
 /** PLA-888: response shape — the created (or deduped) asset id. */
