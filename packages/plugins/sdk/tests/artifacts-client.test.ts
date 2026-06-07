@@ -12,6 +12,7 @@ import { describe, expect, it } from "vitest";
 
 import { definePlugin } from "../src/define-plugin.js";
 import {
+  createErrorResponse,
   createRequest,
   createSuccessResponse,
   isJsonRpcRequest,
@@ -568,5 +569,168 @@ describe("ctx.artifacts.fetch — PLA-574 worker→host wire", () => {
       hostToWorker.destroy();
       workerToHost.destroy();
     }
+  });
+});
+
+/**
+ * PLA-895 — `ctx.artifacts` on the worker `PluginContext`, reachable from a
+ * NON-tool-dispatch (service/background) context. Here we exercise it from a
+ * `runJob` handler, which the host drives with a `paperclipInvocation`. The
+ * worker must:
+ *  - send NO `runId` on the wire (the worker ctx has none),
+ *  - echo the host's `paperclipInvocationId` so the host can backfill the
+ *    active service/background run-context (the same path `secrets.resolve`
+ *    uses from a `setup()` poll loop),
+ *  - and surface the host's `runcontext_invalid` error verbatim on `fetch`
+ *    from a service context (documents the PLA-894-B boundary — this issue
+ *    must NOT widen service/background reads).
+ */
+describe("ctx.artifacts (worker PluginContext) — PLA-895 service/background", () => {
+  interface JobHarness {
+    captured?: Record<string, unknown>;
+    invocationId?: unknown;
+    returned?: { attachmentId: string };
+    fetchError?: Error;
+  }
+
+  async function runJobArtifacts(opts: {
+    create?: { companyId: string; filename: string; mimeType: string; bytes: Uint8Array };
+    fetchAttachmentId?: string;
+    createResponse?: { attachmentId: string };
+    fetchError?: { code: number; message: string };
+  }): Promise<JobHarness> {
+    const harness: JobHarness = {};
+
+    const plugin = definePlugin({
+      async setup(ctx) {
+        ctx.jobs.register("relay-tick", async () => {
+          if (opts.create) {
+            harness.returned = await ctx.artifacts.create(opts.create);
+          }
+          if (opts.fetchAttachmentId !== undefined) {
+            try {
+              await ctx.artifacts.fetch(opts.fetchAttachmentId);
+            } catch (err) {
+              harness.fetchError = err as Error;
+            }
+          }
+        });
+      },
+    });
+
+    const hostToWorker = new PassThrough();
+    const workerToHost = new PassThrough();
+    const hostReadline = createInterface({ input: workerToHost });
+    const pending = new Map<string | number, (response: JsonRpcResponse) => void>();
+    let nextRequestId = 1;
+
+    function callWorker(method: string, params: unknown, extra?: Record<string, unknown>): Promise<unknown> {
+      const id = `host-${nextRequestId++}`;
+      const p = new Promise<unknown>((resolve, reject) => {
+        pending.set(id, (response) => {
+          if ("error" in response && response.error) reject(new Error(response.error.message));
+          else resolve((response as { result?: unknown }).result);
+        });
+      });
+      const req = { ...createRequest(method, params, id), ...(extra ?? {}) };
+      hostToWorker.write(serializeMessage(req));
+      return p;
+    }
+
+    hostReadline.on("line", (line) => {
+      let message: unknown;
+      try {
+        message = parseMessage(line);
+      } catch {
+        return;
+      }
+      if (isJsonRpcResponse(message)) {
+        const id = (message as JsonRpcResponse).id as string | number | null;
+        if (id != null) {
+          const cb = pending.get(id);
+          if (cb) {
+            pending.delete(id);
+            cb(message as JsonRpcResponse);
+          }
+        }
+        return;
+      }
+      if (isJsonRpcRequest(message)) {
+        const req = message as JsonRpcRequest & { paperclipInvocationId?: unknown };
+        if (req.method === "artifacts.create") {
+          harness.captured = (req.params ?? {}) as Record<string, unknown>;
+          harness.invocationId = req.paperclipInvocationId;
+          hostToWorker.write(
+            serializeMessage(
+              createSuccessResponse(req.id, opts.createResponse ?? { attachmentId: "asset-svc-1" }),
+            ),
+          );
+        } else if (req.method === "artifacts.fetch") {
+          const e = opts.fetchError ?? { code: -32099, message: "runcontext_invalid" };
+          hostToWorker.write(serializeMessage(createErrorResponse(req.id, e.code, e.message)));
+        } else {
+          hostToWorker.write(serializeMessage(createSuccessResponse(req.id, null)));
+        }
+      }
+    });
+
+    const worker = startWorkerRpcHost({ plugin, stdin: hostToWorker, stdout: workerToHost });
+    try {
+      await callWorker("initialize", {
+        manifest: {
+          id: "paperclip.test-artifacts-worker-ctx",
+          apiVersion: 1,
+          version: "1.0.0",
+          displayName: "x",
+          description: "x",
+          author: "x",
+          categories: ["automation"],
+          capabilities: ["issue.attachments.create"],
+          entrypoints: {},
+        },
+        config: {},
+        databaseNamespace: null,
+      });
+      // Drive the background job WITH a host-issued invocation context — this
+      // is what lets the worker echo `paperclipInvocationId` for host backfill.
+      await callWorker(
+        "runJob",
+        { job: { jobKey: "relay-tick", runId: "job-run-1", trigger: "schedule", scheduledAt: "2026-06-07T00:00:00Z" } },
+        { paperclipInvocation: { id: "inv-svc-1", scope: { companyId: "platform-company" } } },
+      );
+    } finally {
+      worker.stop();
+      hostReadline.close();
+      hostToWorker.destroy();
+      workerToHost.destroy();
+    }
+    return harness;
+  }
+
+  it("create succeeds from a runJob (background) ctx: no runId on the wire, invocation id echoed", async () => {
+    const raw = new Uint8Array([0x00, 0xff, 0x21, 0x7f]);
+    const h = await runJobArtifacts({
+      create: { companyId: "platform-company", filename: "photo.jpg", mimeType: "image/jpeg", bytes: raw },
+      createResponse: { attachmentId: "asset-svc-42" },
+    });
+
+    expect(h.returned).toEqual({ attachmentId: "asset-svc-42" });
+    expect(h.captured).toBeDefined();
+    const { companyId, filename, mimeType, contentBase64, runId, ...extra } = h.captured!;
+    expect(companyId).toBe("platform-company");
+    expect(filename).toBe("photo.jpg");
+    expect(mimeType).toBe("image/jpeg");
+    expect(Array.from(Buffer.from(contentBase64 as string, "base64"))).toEqual(Array.from(raw));
+    // Worker ctx has no tool dispatch → no runId is asserted by the worker.
+    expect(runId).toBeUndefined();
+    expect(extra).toEqual({});
+    // Host backfill hook: the worker echoed the host-issued invocation id.
+    expect(h.invocationId).toBe("inv-svc-1");
+  });
+
+  it("fetch from a service/background ctx surfaces runcontext_invalid (PLA-894-B boundary not widened)", async () => {
+    const h = await runJobArtifacts({ fetchAttachmentId: "att-svc-1" });
+    expect(h.fetchError).toBeDefined();
+    expect(h.fetchError!.message).toContain("runcontext_invalid");
   });
 });

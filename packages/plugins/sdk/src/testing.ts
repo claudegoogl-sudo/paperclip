@@ -861,6 +861,24 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         return `vault-handle://${runId}/00000000000000000000000000000000`;
       },
     },
+    artifacts: {
+      // PLA-895: worker-ctx artifacts client. `create` is gated on
+      // `issue.attachments.create` and returns a deterministic id; `fetch`
+      // returns deterministic bytes so service/background tests have a default.
+      async create(input) {
+        requireCapability(manifest, capabilitySet, "issue.attachments.create");
+        return { attachmentId: `asset:${input.companyId}:${input.filename}` };
+      },
+      async fetch(attachmentId) {
+        const bytes = new Uint8Array(0);
+        return {
+          bytes,
+          filename: attachmentId,
+          contentType: "application/octet-stream",
+          byteSize: bytes.byteLength,
+        };
+      },
+    },
     activity: {
       async log(entry) {
         requireCapability(manifest, capabilitySet, "activity.log.write");

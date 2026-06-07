@@ -353,6 +353,48 @@ export interface ToolRunContextArtifactCreateInput {
 }
 
 /**
+ * `ctx.artifacts` — worker-level attachment client available on the full
+ * {@link PluginContext}, not only inside a tool handler.
+ *
+ * Same method shape as {@link ToolRunContextArtifactsClient}, but reachable
+ * from **service/background** code — a `setup()`-started loop (e.g. a
+ * `getUpdates` long-poll), `onWebhook`, `onEvent`, or `runJob` — as well as
+ * from tool dispatch. It takes no `runId`: the host backfills the active
+ * run-context from the worker→host `paperclipInvocationId`
+ * (PLA-768 `serviceScope` / PLA-719 `singleInFlightScope`), exactly as
+ * {@link PluginSecretsClient.resolve} already does from these contexts.
+ *
+ * @see PLA-895 — worker-ctx artifacts surface
+ * @see PLA-893 — messenger inbound media relay (the unblocked consumer)
+ */
+export interface PluginArtifactsClient {
+  /**
+   * Store inbound bytes as a company-scoped Paperclip asset, returning
+   * `{ attachmentId }` for use in {@link PluginIssuesClient.createComment}'s
+   * `attachmentIds`. Requires the `issue.attachments.create` capability
+   * (default-deny). Host gates match {@link ToolRunContextArtifactsClient.create}:
+   * company scope (cross-tenant writes throw `forbidden`), MIME allowlist, size
+   * ceiling, and `(companyId, sha256)` dedupe (idempotent). Authorized from
+   * `service`/`background` contexts (PLA-888 Gate 2) as well as tool dispatch.
+   *
+   * Typed error codes via JsonRpcCallError: `runcontext_invalid`, `forbidden`,
+   * `too_large`, `rate_limited`.
+   */
+  create(input: ToolRunContextArtifactCreateInput): Promise<{ attachmentId: string }>;
+
+  /**
+   * Fetch attachment bytes by ID on behalf of the dispatching run-context.
+   *
+   * Works today from a **tool-dispatch** context. From a `service`/`background`
+   * context the host currently rejects reads with `runcontext_invalid` — reads
+   * are scoped to the dispatching agent; widening this is the separately
+   * security-reviewed host change PLA-894-B. This SDK surface is already correct
+   * for both: no further SDK change is needed once 894-B lands.
+   */
+  fetch(attachmentId: string): Promise<ToolRunContextArtifact>;
+}
+
+/**
  * Result returned from a plugin tool handler.
  *
  * @see PLUGIN_SPEC.md §13.10 — `executeTool`
@@ -2064,6 +2106,13 @@ export interface PluginContext {
 
   /** Resolve secret references. Requires `secrets.read-ref`. */
   secrets: PluginSecretsClient;
+
+  /**
+   * Create and fetch attachment bytes from service/background or tool-dispatch
+   * code. `create` requires `issue.attachments.create` (default-deny). Takes no
+   * `runId` — the host backfills the active run-context (PLA-895).
+   */
+  artifacts: PluginArtifactsClient;
 
   /** Write activity log entries. Requires `activity.log.write`. */
   activity: PluginActivityClient;
