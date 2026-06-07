@@ -617,17 +617,31 @@ export function createPluginArtifactsHandler(
       }
 
       // ---------- Gate 5: decode + size ceiling (per-company, mirrors human route) ----------
-      let body: Buffer;
-      try {
-        body = Buffer.from(contentBase64, "base64");
-      } catch {
-        throw new ArtifactsError("too_large", "invalid base64 body");
+      const companyMaxBytes = await resolveCompanyMaxBytes(companyId);
+      const ceiling = Math.min(companyMaxBytes, maxByteSize);
+      // PLA-888 review F1: bound the encoded string BEFORE decoding so a hostile
+      // worker cannot force a large transient allocation (the worker→host
+      // transport has no frame cap). base64 inflates ~4/3×; reject anything that
+      // could not possibly fit under the ceiling once decoded.
+      if (contentBase64.length > ceiling * 1.4 + 8) {
+        await auditCreate({
+          outcome: "denied",
+          deniedReason: "too_large",
+          companyId,
+          contextKind,
+          dispatchingAgentId,
+          runId,
+          toolName,
+          mimeType: contentType,
+        });
+        throw new ArtifactsError("too_large", `artifact exceeds maximum size of ${ceiling} bytes`);
       }
+      // Node's base64 decoder never throws — it silently drops invalid chars —
+      // so no try/catch is needed here.
+      const body = Buffer.from(contentBase64, "base64");
       if (body.length <= 0) {
         throw new ArtifactsError("too_large", "artifact is empty");
       }
-      const companyMaxBytes = await resolveCompanyMaxBytes(companyId);
-      const ceiling = Math.min(companyMaxBytes, maxByteSize);
       if (body.length > ceiling) {
         await auditCreate({
           outcome: "denied",

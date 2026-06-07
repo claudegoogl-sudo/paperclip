@@ -45,9 +45,16 @@ export const DEFAULT_ALLOWED_TYPES: readonly string[] = [
  * use mp3/m4a/webm/wav). Anything outside this list is rejected before any
  * bytes are stored. Wildcards are intentionally avoided here: the list is exact
  * so the reachable type surface is auditable.
+ *
+ * `text/html` and `text/csv` are excluded from the plugin set even though the
+ * human route allows them (PLA-888 security review F2): an inbound external
+ * relay has no need for active/markup document types, and dropping the classic
+ * stored-XSS / formula-injection inputs minimises the hostile-input surface.
  */
+const PLUGIN_ARTIFACT_EXCLUDED_DEFAULT_TYPES: readonly string[] = ["text/html", "text/csv"];
+
 export const PLUGIN_ARTIFACT_ALLOWED_MIME_TYPES: readonly string[] = [
-  ...DEFAULT_ALLOWED_TYPES,
+  ...DEFAULT_ALLOWED_TYPES.filter((t) => !PLUGIN_ARTIFACT_EXCLUDED_DEFAULT_TYPES.includes(t)),
   "audio/ogg",
   "audio/mpeg",
   "audio/mp4",

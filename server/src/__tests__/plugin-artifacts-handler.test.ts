@@ -480,6 +480,31 @@ describe("plugin-artifacts-handler.create — PLA-888", () => {
     const last = vi.mocked(logActivity).mock.calls.at(-1)![1];
     expect(last.details).toMatchObject({ outcome: "denied", deniedReason: "rate_limited" });
   });
+
+  it("review F1: rejects an over-ceiling encoded string BEFORE decoding (no decode, no putFile)", async () => {
+    // companyMaxBytes 64 → pre-decode bound 64*1.4+8 ≈ 97 chars. A 400-char
+    // base64 string trips the bound before Buffer.from runs.
+    const { handler, registry, putFileCalls } = buildHandler({ companyMaxBytes: 64 });
+    registerCtx(registry);
+    const oversizeEncoded = "A".repeat(400);
+    await expect(
+      handler.create(createParams({ contentBase64: oversizeEncoded })),
+    ).rejects.toMatchObject({ code: "too_large" });
+    expect(putFileCalls).toHaveLength(0);
+    const call = vi.mocked(logActivity).mock.calls[0]![1];
+    expect(call.details).toMatchObject({ outcome: "denied", deniedReason: "too_large" });
+  });
+
+  it("review F2: text/html and text/csv are rejected for plugin artifacts (forbidden)", async () => {
+    for (const mimeType of ["text/html", "text/csv"]) {
+      const { handler, registry, putFileCalls } = buildHandler();
+      registerCtx(registry);
+      await expect(
+        handler.create(createParams({ mimeType, contentBase64: makeBytes("x").toString("base64") })),
+      ).rejects.toMatchObject({ code: "forbidden" });
+      expect(putFileCalls).toHaveLength(0);
+    }
+  });
 });
 
 describe("plugin-run-context-registry — PLA-574", () => {
