@@ -8,6 +8,7 @@ import {
   agentWakeupRequests,
   agents,
   companies,
+  companySkills,
   createDb,
   heartbeatRuns,
   issueComments,
@@ -67,6 +68,9 @@ describeEmbeddedPostgres("plugin issues.createComment wake + identifier resoluti
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
     await db.delete(agents);
+    // The spawned heartbeat run also syncs bundled skills into company_skills,
+    // so clear it immediately before `companies` for the same FK-race reason.
+    await db.delete(companySkills);
     await db.delete(companies);
   });
 
