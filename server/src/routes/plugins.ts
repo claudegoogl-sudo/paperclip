@@ -50,6 +50,11 @@ import { getPluginUiContributionMetadata, pluginLoader } from "../services/plugi
 import { extractSecretRefPathsFromConfig } from "../services/plugin-secrets-handler.js";
 import { secretService } from "../services/secrets.js";
 import { logActivity } from "../services/activity-log.js";
+import {
+  createToolDispatchRateLimiter,
+  guardAndAuditToolDispatch,
+  RateLimitExceededError,
+} from "../services/plugin-tool-dispatch-guard.js";
 import { publishGlobalLiveEvent } from "../services/live-events.js";
 import { issueService } from "../services/issues.js";
 import type { PluginJobScheduler } from "../services/plugin-job-scheduler.js";
@@ -479,6 +484,10 @@ export function pluginRoutes(
 ) {
   const router = Router();
   const registry = pluginRegistryService(db);
+  // PLA-903: process-local sliding-window limiter for agent.tools.register
+  // dispatches. Shared across requests for this server instance; resets on
+  // restart (intentional — see plugin-tool-dispatch-guard.ts).
+  const toolDispatchRateLimiter = createToolDispatchRateLimiter();
   const lifecycle = pluginLifecycleManager(db, {
     loader,
     workerManager: bridgeDeps?.workerManager ?? webhookDeps?.workerManager,
@@ -1001,6 +1010,25 @@ export function pluginRoutes(
     if (!registeredTool) {
       res.status(404).json({ error: `Tool "${tool}" not found` });
       return;
+    }
+
+    // PLA-903 (A+B): enforce the host-side per-dispatcher rate limit and write
+    // exactly one audit row for this authorized dispatch BEFORE handing the
+    // call to the plugin worker. A breach fails closed with a 429.
+    try {
+      await guardAndAuditToolDispatch({
+        db,
+        namespacedTool: tool,
+        runContext,
+        parameters,
+        rateLimiter: toolDispatchRateLimiter,
+      });
+    } catch (err) {
+      if (err instanceof RateLimitExceededError) {
+        res.status(429).json({ error: err.message, code: err.code });
+        return;
+      }
+      throw err;
     }
 
     try {
