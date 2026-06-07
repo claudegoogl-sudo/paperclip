@@ -297,6 +297,33 @@ export interface CapabilityEscalationGateway {
 
   /** File a new pending capability-escalation approval; returns its id. */
   file(input: CapabilityEscalationRequest): Promise<string>;
+
+  /**
+   * Return the *granted* (board-approved) capability-escalation contract for
+   * this plugin, or `null` if none is approved. `completeUpgrade` uses this as
+   * the integrity anchor: the package it applies must match the version and
+   * stay within the capabilities the board actually saw and approved. The
+   * loader self-enforces against this rather than trusting the caller's
+   * upgrade options.
+   *
+   * @see PLA-911 Finding 1 (approve-time TOCTOU)
+   */
+  findApproved(input: { pluginId: string }): Promise<ApprovedUpgrade | null>;
+}
+
+/**
+ * The capability-escalation contract the board approved for a parked upgrade —
+ * the integrity anchor `completeUpgrade` verifies the applied package against.
+ *
+ * @see PLA-911 Finding 1
+ */
+export interface ApprovedUpgrade {
+  /** The approval record id. */
+  approvalId: string;
+  /** The exact version the board approved moving to. */
+  toVersion: string;
+  /** The capabilities the board approved adding (the upgrade must not exceed these). */
+  addedCapabilities: string[];
 }
 
 /**
@@ -1621,6 +1648,20 @@ export function pluginLoader(
           };
         }
 
+        // Lifecycle guard (PLA-911 Finding 2): parking is the `→ upgrade_pending`
+        // transition, which `VALID_TRANSITIONS` permits ONLY from `ready`. Refuse
+        // to park a plugin an operator has deliberately disabled or that is
+        // error-quarantined, so a (later rejected) upgrade cannot silently flip
+        // it back to `ready` via `revertPendingUpgrade`. The idempotent converge
+        // path above is the one legitimate non-`ready` entry and is handled first.
+        if (plugin.status !== "ready") {
+          throw new Error(
+            `Cannot park plugin "${pluginId}" for capability-escalation approval from status "${plugin.status}": ` +
+              `only a "ready" plugin may enter "upgrade_pending". ` +
+              `A disabled or error-quarantined plugin must be re-enabled by an operator before it can be upgraded.`,
+          );
+        }
+
         const approvalId =
           existingApprovalId ??
           (await escalationGateway.file({
@@ -1680,6 +1721,14 @@ export function pluginLoader(
      * therefore the new capabilities), and returns the plugin to `ready`.
      * Plugin-scoped data (`plugin_config`, `plugin_state`, secret-ref bindings)
      * lives in separate tables and is left untouched. Idempotent.
+     *
+     * The applied package is bound to the board-approved contract (PLA-911
+     * Finding 1): the loader fetches the approval from the escalation gateway
+     * and refuses to apply a package whose version differs from the approved
+     * `toVersion` or whose capability delta exceeds the approved
+     * `addedCapabilities`. This is enforced loader-side rather than trusting the
+     * caller's `upgradeOptions`, so a swapped/re-published package cannot
+     * silently escalate capabilities the board never saw.
      */
     async completeUpgrade(
       pluginId: string,
@@ -1697,17 +1746,33 @@ export function pluginLoader(
         return plugin;
       }
 
+      // Bind to the board-approved contract. Without a gateway we cannot verify
+      // what was approved, so fail closed rather than apply an unbound package.
+      if (!escalationGateway) {
+        throw new Error(
+          `Cannot complete parked upgrade for "${pluginId}": no escalation gateway is configured to verify the board-approved contract.`,
+        );
+      }
+      const approved = await escalationGateway.findApproved({ pluginId });
+      if (!approved) {
+        throw new Error(
+          `Cannot complete parked upgrade for "${pluginId}": no approved capability-escalation contract was found. ` +
+            `The upgrade must be approved by the board before it can be applied.`,
+        );
+      }
+
       const oldManifest = plugin.manifestJson as PaperclipPluginManifestV1;
       const {
         packageName = plugin.packageName,
         localPath = plugin.packagePath ?? undefined,
-        version,
       } = upgradeOptions;
 
+      // Pin the fetched version to the approved target — ignore any divergent
+      // caller-supplied `version`.
       const discovered = await fetchAndValidate({
         packageName,
         localPath,
-        version,
+        version: approved.toVersion,
         installDir: localPluginDir,
       });
       const newManifest = discovered.manifest!;
@@ -1715,6 +1780,35 @@ export function pluginLoader(
       if (newManifest.id !== oldManifest.id) {
         throw new Error(
           `Upgrade completion failed: new manifest ID '${newManifest.id}' does not match existing plugin ID '${oldManifest.id}'`,
+        );
+      }
+
+      // Approval-binding checks (PLA-911 Finding 1). A version string is not an
+      // integrity anchor for a mutable source, so verify BOTH the version and
+      // the capability delta against the approved contract; fail closed (no
+      // mutation, row stays parked) on any mismatch.
+      if (discovered.version !== approved.toVersion) {
+        log.warn(
+          { pluginId, discoveredVersion: discovered.version, approvedVersion: approved.toVersion },
+          "plugin-loader: completeUpgrade fetched a version that differs from the approved target — refusing",
+        );
+        throw new Error(
+          `Cannot complete parked upgrade for "${pluginId}": fetched version "${discovered.version}" ` +
+            `does not match the board-approved version "${approved.toVersion}".`,
+        );
+      }
+      const oldCaps = new Set(oldManifest.capabilities ?? []);
+      const fetchedAddedCaps = (newManifest.capabilities ?? []).filter((c) => !oldCaps.has(c));
+      const approvedAddedCaps = new Set(approved.addedCapabilities);
+      const unapprovedCaps = fetchedAddedCaps.filter((c) => !approvedAddedCaps.has(c));
+      if (unapprovedCaps.length > 0) {
+        log.warn(
+          { pluginId, unapprovedCaps, approvedAddedCapabilities: approved.addedCapabilities },
+          "plugin-loader: completeUpgrade fetched a manifest declaring capabilities the board never approved — refusing",
+        );
+        throw new Error(
+          `Cannot complete parked upgrade for "${pluginId}": fetched manifest adds capabilities that were not approved: ` +
+            `${unapprovedCaps.join(", ")}. The board approved [${approved.addedCapabilities.join(", ")}].`,
         );
       }
 

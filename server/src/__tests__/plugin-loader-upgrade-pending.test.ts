@@ -44,6 +44,12 @@ if (!embeddedPostgresSupport.supported) {
 function createGatewayStub() {
   const filed: CapabilityEscalationRequest[] = [];
   const pendingByKey = new Map<string, string>();
+  // The board-approved contract per plugin. In this stub a filed approval is
+  // treated as approved, which is what `completeUpgrade` verifies against.
+  const approvedByPlugin = new Map<
+    string,
+    { approvalId: string; toVersion: string; addedCapabilities: string[] }
+  >();
   let counter = 0;
   const gateway: CapabilityEscalationGateway = {
     async findPending({ pluginId, toVersion }) {
@@ -53,10 +59,18 @@ function createGatewayStub() {
       filed.push(input);
       const approvalId = `approval-${++counter}`;
       pendingByKey.set(`${input.pluginId}:${input.toVersion}`, approvalId);
+      approvedByPlugin.set(input.pluginId, {
+        approvalId,
+        toVersion: input.toVersion,
+        addedCapabilities: input.addedCapabilities,
+      });
       return approvalId;
     },
+    async findApproved({ pluginId }) {
+      return approvedByPlugin.get(pluginId) ?? null;
+    },
   };
-  return { filed, pendingByKey, gateway };
+  return { filed, pendingByKey, approvedByPlugin, gateway };
 }
 
 function manifest(
@@ -335,5 +349,90 @@ describeEmbeddedPostgres("plugin-loader upgrade_pending (PLA-908)", () => {
     const [row] = await db.select().from(plugins).where(eq(plugins.id, pluginId));
     expect(row?.status).toBe("upgrade_pending");
     expect(row?.version).toBe("0.1.0");
+  });
+
+  it("refuses to complete an upgrade whose fetched manifest exceeds the approved capabilities (PLA-911 Finding 1)", async () => {
+    const oldManifest = manifest("0.1.0", ["issues.read"]);
+    const oldPkg = await writePackage(oldManifest);
+    // The package the board reviewed: adds only issues.create.
+    const approvedManifest = manifest("0.2.0", ["issues.read", "issues.create"]);
+    const approvedPkg = await writePackage(approvedManifest);
+    const pluginId = await seedPlugin(oldManifest, oldPkg);
+
+    const { gateway } = createGatewayStub();
+    const loader = makeLoader(gateway);
+
+    // Park + file the approval naming addedCapabilities = ["issues.create"].
+    await loader.upgradePlugin(pluginId, { localPath: approvedPkg });
+
+    // A swapped package at the SAME approved version but declaring an extra,
+    // valid-but-unapproved capability (issues.update). completeUpgrade must
+    // reject it (issues.update is a real capability, so this exercises the
+    // approval-binding check rather than manifest schema validation).
+    const tamperedManifest = manifest("0.2.0", ["issues.read", "issues.create", "issues.update"]);
+    const tamperedPkg = await writePackage(tamperedManifest);
+
+    await expect(loader.completeUpgrade(pluginId, { localPath: tamperedPkg })).rejects.toThrow(
+      /not approved|issues\.update/i,
+    );
+
+    // Fail closed: no mutation, row stays parked at the old version/caps.
+    const [row] = await db.select().from(plugins).where(eq(plugins.id, pluginId));
+    expect(row?.status).toBe("upgrade_pending");
+    expect(row?.version).toBe("0.1.0");
+    expect(row?.manifestJson.capabilities).toEqual(["issues.read"]);
+  });
+
+  it("refuses to complete an upgrade whose fetched version differs from the approved target (PLA-911 Finding 1)", async () => {
+    const oldManifest = manifest("0.1.0", ["issues.read"]);
+    const oldPkg = await writePackage(oldManifest);
+    const approvedManifest = manifest("0.2.0", ["issues.read", "issues.create"]);
+    const approvedPkg = await writePackage(approvedManifest);
+    const pluginId = await seedPlugin(oldManifest, oldPkg);
+
+    const { gateway } = createGatewayStub();
+    const loader = makeLoader(gateway);
+
+    await loader.upgradePlugin(pluginId, { localPath: approvedPkg });
+
+    // A package whose caps stay within the approved set but at a different,
+    // un-approved version (0.3.0). completeUpgrade must reject it.
+    const wrongVersionManifest = manifest("0.3.0", ["issues.read", "issues.create"]);
+    const wrongVersionPkg = await writePackage(wrongVersionManifest);
+
+    await expect(loader.completeUpgrade(pluginId, { localPath: wrongVersionPkg })).rejects.toThrow(
+      /version/i,
+    );
+
+    const [row] = await db.select().from(plugins).where(eq(plugins.id, pluginId));
+    expect(row?.status).toBe("upgrade_pending");
+    expect(row?.version).toBe("0.1.0");
+    expect(row?.manifestJson.capabilities).toEqual(["issues.read"]);
+  });
+
+  it("refuses to park a disabled plugin for a cap-escalating upgrade (PLA-911 Finding 2)", async () => {
+    const oldManifest = manifest("0.1.0", ["issues.read"]);
+    const oldPkg = await writePackage(oldManifest);
+    const newManifest = manifest("0.2.0", ["issues.read", "issues.create"]);
+    const newPkg = await writePackage(newManifest);
+    const pluginId = await seedPlugin(oldManifest, oldPkg);
+
+    // Operator deliberately disabled the plugin (a kill switch).
+    await db.update(plugins).set({ status: "disabled" }).where(eq(plugins.id, pluginId));
+
+    const { filed, gateway } = createGatewayStub();
+    const loader = makeLoader(gateway);
+
+    await expect(loader.upgradePlugin(pluginId, { localPath: newPkg })).rejects.toThrow(
+      /only a "ready" plugin|disabled/i,
+    );
+
+    // No approval filed, and the operator-disabled state is untouched — a later
+    // revert cannot silently re-enable it because it was never parked.
+    expect(filed).toHaveLength(0);
+    const [row] = await db.select().from(plugins).where(eq(plugins.id, pluginId));
+    expect(row?.status).toBe("disabled");
+    expect(row?.version).toBe("0.1.0");
+    expect(row?.manifestJson.capabilities).toEqual(["issues.read"]);
   });
 });
