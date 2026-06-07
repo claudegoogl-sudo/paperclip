@@ -26,7 +26,7 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { cp, mkdir, readdir, readFile, rename, rm, stat } from "node:fs/promises";
+import { copyFile, lstat, mkdir, readdir, readFile, realpath, rename, rm, stat } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -60,6 +60,9 @@ export const BUNDLED_LOCAL_PLUGIN_ROOT = path.join(REPO_ROOT, "packages", "plugi
 export const STANDALONE_BUNDLED_PLUGIN_ROOT = path.join(BUNDLED_LOCAL_PLUGIN_ROOT, "sandbox-providers");
 export const LOCAL_PLUGIN_AUTOBUILD_TIMEOUT_MS = 120_000;
 const STANDALONE_BUNDLED_PLUGIN_SDK_PACKAGE = "@paperclipai/plugin-sdk";
+
+/** Logger for module-level helpers that run outside the loader closure. */
+const moduleLog = logger.child({ service: "plugin-loader" });
 
 // ---------------------------------------------------------------------------
 // Manifest dynamic-import cache-bust
@@ -1188,6 +1191,142 @@ function upgradeSnapshotPathFor(localPluginDir: string, digest: string): string 
 }
 
 /**
+ * Hard caps on a single snapshot copy. They defend the copy-time DoS
+ * angle the snapshot fix introduced: with a blanket `dereference: true`, a
+ * symlink to a huge file or an unbounded device (`/dev/zero`) could exhaust host
+ * disk or hang `park`. The walk aborts — and the caller discards the partial
+ * temp tree — once either bound is crossed. Sized generously enough for real
+ * plugin trees (incl. vendored `node_modules`) while still bounding the blast.
+ */
+const MAX_SNAPSHOT_BYTES = 1_073_741_824; // 1 GiB
+const MAX_SNAPSHOT_FILES = 200_000;
+
+/** Thrown when a snapshot copy violates a trust/size constraint. */
+class SnapshotCopyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SnapshotCopyError";
+  }
+}
+
+/**
+ * Recursively copy a verified local-path package into the snapshot tree under
+ * strict trust-boundary constraints, replacing a blanket
+ * `cp(packageRoot, dest, { recursive: true, dereference: true })`:
+ *
+ * - **Symlinks are dereferenced only when their resolved real path stays inside
+ *   `srcRoot`.** A legit in-tree vendored / pnpm-style `node_modules` link is
+ *   materialized into the snapshot (preserving the OWASP-A08 snapshot fix), while
+ *   a link whose target escapes the tree — `./vendor/leak -> ~/.paperclip/
+ *   secrets/x`, `-> /etc/passwd`, or another tenant's data — is **skipped**, so
+ *   the host file's bytes never land in the worker-readable snapshot. The
+ *   content digest excludes symlinks, so such smuggled bytes would otherwise
+ *   pass the digest re-check unchanged.
+ * - **Only regular files and directories are copied.** Devices, FIFOs, and
+ *   sockets — whether a direct entry or a symlink target — are refused, killing
+ *   the hang / `/dev/zero` DoS angle.
+ * - **Total bytes and file count are bounded** (see {@link MAX_SNAPSHOT_BYTES} /
+ *   {@link MAX_SNAPSHOT_FILES}).
+ *
+ * Symlink cycles are bounded by both caps and a visited-realpath set on
+ * directories, so an in-tree `a -> .` loop terminates instead of recursing
+ * forever.
+ */
+async function copyVerifiedPackageTree(srcRoot: string, destRoot: string): Promise<void> {
+  const rootReal = await realpath(srcRoot);
+  let totalBytes = 0;
+  let fileCount = 0;
+
+  // A real path counts as in-tree iff it is the root itself or strictly within.
+  const isInsideRoot = (real: string): boolean =>
+    real === rootReal || real.startsWith(rootReal + path.sep);
+
+  async function copyRegularFile(srcPath: string, destPath: string, size: number): Promise<void> {
+    if (fileCount + 1 > MAX_SNAPSHOT_FILES) {
+      throw new SnapshotCopyError(
+        `upgrade snapshot exceeds file-count cap (${MAX_SNAPSHOT_FILES}) — refusing copy`,
+      );
+    }
+    if (totalBytes + size > MAX_SNAPSHOT_BYTES) {
+      throw new SnapshotCopyError(
+        `upgrade snapshot exceeds size cap (${MAX_SNAPSHOT_BYTES} bytes) — refusing copy`,
+      );
+    }
+    fileCount += 1;
+    totalBytes += size;
+    await copyFile(srcPath, destPath);
+  }
+
+  // `ancestors` holds the real paths on the current recursion branch. A real dir
+  // that reappears on its own branch is a symlink cycle (e.g. `a -> .`) and is
+  // cut; a dir shared across *different* branches (the common pnpm case) is
+  // still copied to each destination — only the byte/file caps bound that.
+  async function walk(srcDir: string, destDir: string, ancestors: Set<string>): Promise<void> {
+    const realSrcDir = await realpath(srcDir);
+    if (ancestors.has(realSrcDir)) {
+      moduleLog.warn({ srcDir, realSrcDir }, "plugin-loader: snapshot cut a symlink directory cycle");
+      return;
+    }
+    const nextAncestors = new Set(ancestors);
+    nextAncestors.add(realSrcDir);
+
+    await mkdir(destDir, { recursive: true });
+    const entries = await readdir(srcDir, { withFileTypes: true });
+    for (const entry of entries) {
+      const srcPath = path.join(srcDir, entry.name);
+      const destPath = path.join(destDir, entry.name);
+
+      // Classify WITHOUT following the link first.
+      const lst = await lstat(srcPath);
+
+      if (lst.isSymbolicLink()) {
+        let real: string;
+        try {
+          real = await realpath(srcPath);
+        } catch {
+          // Dangling link — nothing safe to materialize; skip it.
+          moduleLog.warn({ srcPath }, "plugin-loader: snapshot skipped dangling symlink");
+          continue;
+        }
+        if (!isInsideRoot(real)) {
+          // Out-of-tree target: never copy its bytes into the snapshot.
+          moduleLog.warn(
+            { srcPath, real },
+            "plugin-loader: snapshot skipped symlink whose target escapes the package root",
+          );
+          continue;
+        }
+        // In-tree target — resolve its type via the followed stat.
+        const tst = await stat(srcPath);
+        if (tst.isDirectory()) {
+          await walk(real, destPath, nextAncestors);
+        } else if (tst.isFile()) {
+          await copyRegularFile(real, destPath, tst.size);
+        } else {
+          throw new SnapshotCopyError(
+            `upgrade snapshot refuses non-regular symlink target (device/FIFO/socket) at ${srcPath}`,
+          );
+        }
+        continue;
+      }
+
+      if (lst.isDirectory()) {
+        await walk(srcPath, destPath, nextAncestors);
+      } else if (lst.isFile()) {
+        await copyRegularFile(srcPath, destPath, lst.size);
+      } else {
+        // Direct device/FIFO/socket entry in the source tree.
+        throw new SnapshotCopyError(
+          `upgrade snapshot refuses non-regular file (device/FIFO/socket) at ${srcPath}`,
+        );
+      }
+    }
+  }
+
+  await walk(srcRoot, destRoot, new Set());
+}
+
+/**
  * Resolve the manifest entrypoint from a package.json and package root.
  *
  * The spec defines a "paperclipPlugin" key in package.json with a "manifest"
@@ -1585,12 +1724,19 @@ export function pluginLoader(
   }
 
   /**
-   * SECURITY-CRITICAL: snapshot a verified local-path package into
-   * content-addressed immutable storage and return the snapshot path. Copies
-   * the *entire resolved tree* — including `node_modules` and dereferencing
-   * symlinks, which {@link computePackageContentDigest} deliberately excludes —
-   * so the bytes that will be required at load time are a host-controlled
-   * copy, not the mutable (board-approved but attacker-writable) source dir.
+   * Snapshot a verified local-path package into content-addressed immutable
+   * storage and return the snapshot path. Copies the *entire resolved
+   * tree* — including `node_modules` and dereferencing in-tree symlinks, which
+   * {@link computePackageContentDigest} deliberately excludes — so the bytes
+   * that will be required at load time are a host-controlled copy, not the
+   * mutable (board-approved but attacker-writable) source dir.
+   *
+   * The copy is performed by {@link copyVerifiedPackageTree}, NOT a blanket
+   * `cp(..., { dereference: true })`: out-of-tree symlink targets, devices,
+   * FIFOs, and sockets are refused/skipped and the total size/file count is
+   * bounded, so the snapshot cannot become a vehicle for smuggling
+   * arbitrary host-file bytes into the worker-readable tree or for a copy-time
+   * disk/hang DoS.
    *
    * Closes the two residuals the digest-only anchor left open:
    * - **Verify-then-load TOCTOU**: `completeUpgrade` and the worker load this
@@ -1625,10 +1771,16 @@ export function pluginLoader(
     await mkdir(path.dirname(dest), { recursive: true });
     const tmp = `${dest}.tmp-${randomUUID()}`;
     await rm(tmp, { recursive: true, force: true });
-    // dereference: capture the symlink *targets'* contents so a symlinked
-    // entrypoint or pnpm-style node_modules is materialized into the snapshot
-    // rather than left as a dangling link into the mutable source.
-    await cp(packageRoot, tmp, { recursive: true, dereference: true });
+    // Materialize in-tree symlink targets (a symlinked entrypoint or pnpm-style
+    // node_modules) while refusing out-of-tree targets, devices/FIFOs/sockets,
+    // and oversized trees. On any violation, discard the partial temp
+    // tree so a rejected/over-budget copy never publishes a snapshot.
+    try {
+      await copyVerifiedPackageTree(packageRoot, tmp);
+    } catch (err) {
+      await rm(tmp, { recursive: true, force: true });
+      throw err;
+    }
     try {
       await rename(tmp, dest);
     } catch (err) {
@@ -1639,6 +1791,45 @@ export function pluginLoader(
       if (!existsSync(dest)) throw err;
     }
     return dest;
+  }
+
+  /**
+   * Prune upgrade snapshots no longer referenced by any installed plugin's
+   * `packagePath`. Snapshots are content-addressed and accumulate one
+   * dir per distinct digest; nothing else removes them, so without this they
+   * grow unbounded on disk. Called after a successful completion, a revert, and
+   * an uninstall — the points at which a snapshot can become unreferenced.
+   *
+   * Best-effort and idempotent: it never throws into its caller (a GC failure
+   * must not fail an upgrade/uninstall), skips in-flight `*.tmp-*` builds, and
+   * keeps every snapshot still pointed at by a live plugin row.
+   */
+  async function pruneUnreferencedSnapshots(): Promise<void> {
+    const snapRoot = path.join(localPluginDir, UPGRADE_SNAPSHOT_DIRNAME);
+    if (!existsSync(snapRoot)) return;
+    try {
+      const installed = (await registry.listInstalled()) as PluginRecord[];
+      const referenced = new Set(
+        installed
+          .map((p) => p.packagePath)
+          .filter((p): p is string => !!p)
+          .map((p) => path.resolve(p)),
+      );
+      const entries = await readdir(snapRoot);
+      for (const entry of entries) {
+        // Leave partially-built temp trees to their own copy path.
+        if (entry.includes(".tmp-")) continue;
+        const abs = path.join(snapRoot, entry);
+        if (referenced.has(path.resolve(abs))) continue;
+        await rm(abs, { recursive: true, force: true });
+        log.info({ snapshot: abs }, "plugin-loader: pruned unreferenced upgrade snapshot");
+      }
+    } catch (err) {
+      log.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        "plugin-loader: upgrade-snapshot GC failed (non-fatal)",
+      );
+    }
   }
 
   /**
@@ -1842,6 +2033,13 @@ export function pluginLoader(
       }
 
       for (const entry of entries) {
+        // Skip dot-directories: these are host-managed internals (e.g. the
+        // `.upgrade-snapshots` content-addressed store), not plugin
+        // packages. Without this the non-recursive sweep calls
+        // `buildDiscoveredPlugin` on them every pass and logs a spurious
+        // "no manifest" error entry on every pass (discovery noise).
+        if (entry.startsWith(".")) continue;
+
         const entryPath = path.join(scanDir, entry);
 
         // Check if entry is a directory
@@ -2415,6 +2613,9 @@ export function pluginLoader(
         "plugin-loader: parked upgrade approved and completed",
       );
 
+      // The prior packagePath (or any superseded snapshot) is now unreferenced.
+      await pruneUnreferencedSnapshots();
+
       return (updated as PluginRecord | null) ?? ((await registry.getById(pluginId)) as PluginRecord);
     },
 
@@ -2441,6 +2642,9 @@ export function pluginLoader(
         { pluginId, version: plugin.version },
         "plugin-loader: parked upgrade rejected and reverted to ready",
       );
+
+      // The rejected upgrade's snapshot (if any) is no longer referenced.
+      await pruneUnreferencedSnapshots();
 
       return (updated as PluginRecord | null) ?? ((await registry.getById(pluginId)) as PluginRecord);
     },
@@ -2495,6 +2699,10 @@ export function pluginLoader(
         if (!existsSync(target)) continue;
         await rm(target, { recursive: true, force: true });
       }
+
+      // The uninstalled plugin's snapshot (if its packagePath pointed at one) is
+      // now unreferenced; reclaim it.
+      await pruneUnreferencedSnapshots();
     },
 
     // -----------------------------------------------------------------------
