@@ -56,6 +56,23 @@ describe("escapeAuditName", () => {
     expect(escaped).toContain("\\\\"); // the backslash itself
   });
 
+  it("escapes bidi/zero-width format chars so they cannot reorder or hide audited text (F1)", () => {
+    // U+202E RIGHT-TO-LEFT OVERRIDE, U+200E LRM, U+2066 LRI, U+200B ZWSP,
+    // U+FEFF BOM — none of these were escaped before the F1 fix.
+    const spoof = "a‮b‎⁦c​﻿d";
+    const escaped = escapeAuditName(spoof);
+    expect(escaped).toContain("\\u202e");
+    expect(escaped).toContain("\\u200e");
+    expect(escaped).toContain("\\u2066");
+    expect(escaped).toContain("\\u200b");
+    expect(escaped).toContain("\\ufeff");
+    // No raw bidi/zero-width format char survives in the stored copy.
+    const RAW_BIDI_FORMAT_RE = new RegExp(
+      "[\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2064\\u2066-\\u206f\\ufeff\\ufff9-\\ufffb]",
+    );
+    expect(RAW_BIDI_FORMAT_RE.test(escaped)).toBe(false);
+  });
+
   it("truncates to the configured maximum without splitting surrogate pairs", () => {
     const emoji = "😀"; // astral codepoint = surrogate pair
     const raw = emoji.repeat(MAX_AUDIT_NAME_LENGTH + 10);

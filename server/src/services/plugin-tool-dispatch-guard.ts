@@ -39,6 +39,10 @@ export const MAX_AUDIT_NAME_LENGTH = 128;
  * `maxPerWindow`/`windowMs` define the sliding-window budget (layer B).
  * `auditNameParam` names the single untrusted string argument to capture in
  * the audit detail (layer A) — e.g. `messenger.create_topic`'s `name`.
+ *
+ * SECURITY: `auditNameParam` must NEVER reference a secret/credential/PII
+ * field. Its value is persisted into the activity log; point it only at a
+ * benign human-facing label (a topic name, not a token or email).
  */
 export interface ToolDispatchPolicy {
   maxPerWindow: number;
@@ -112,13 +116,37 @@ export function dispatchRateKey(runContext: ToolRunContext, namespacedTool: stri
   return `${runContext.companyId}|${runContext.agentId}|${namespacedTool}`;
 }
 
-// Control/format chars (C0, DEL+C1, LINE/PARAGRAPH SEPARATOR), backslash, and
-// the markdown-significant set. Built from a string so no literal control
-// bytes live in this source file.
+// Control/format chars (C0, DEL+C1, LINE/PARAGRAPH SEPARATOR), the Unicode
+// bidi/zero-width format set (Cf: bidi overrides/embeddings/isolates,
+// zero-width joiners/spaces, word joiner, BOM, interlinear annotation),
+// backslash, and the markdown-significant set. Built from a string so no
+// literal control bytes live in this source file.
 const AUDIT_NAME_ESCAPE_RE = new RegExp(
-  "[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029\\\\`*_~|<>\\[\\]#]",
+  "[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029" +
+    "\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2064\\u2066-\\u206f\\ufeff\\ufff9-\\ufffb" +
+    "\\\\`*_~|<>\\[\\]#]",
   "g",
 );
+
+/**
+ * True for code points that are invisible/format/control and therefore must be
+ * emitted as `\uXXXX` — a bare backslash prefix would not neutralise an
+ * invisible or bidi-altering character.
+ */
+function isControlOrFormat(code: number): boolean {
+  return (
+    code <= 0x1f ||
+    (code >= 0x7f && code <= 0x9f) ||
+    code === 0x2028 ||
+    code === 0x2029 ||
+    (code >= 0x200b && code <= 0x200f) ||
+    (code >= 0x202a && code <= 0x202e) ||
+    (code >= 0x2060 && code <= 0x2064) ||
+    (code >= 0x2066 && code <= 0x206f) ||
+    code === 0xfeff ||
+    (code >= 0xfff9 && code <= 0xfffb)
+  );
+}
 
 /**
  * Charset-escape an untrusted name for safe inclusion in an audit log.
@@ -132,9 +160,7 @@ export function escapeAuditName(raw: string): string {
   const truncated = Array.from(raw).slice(0, MAX_AUDIT_NAME_LENGTH).join("");
   return truncated.replace(AUDIT_NAME_ESCAPE_RE, (ch) => {
     const code = ch.codePointAt(0) ?? 0;
-    const isControl =
-      code <= 0x1f || (code >= 0x7f && code <= 0x9f) || code === 0x2028 || code === 0x2029;
-    return isControl ? `\\u${code.toString(16).padStart(4, "0")}` : `\\${ch}`;
+    return isControlOrFormat(code) ? `\\u${code.toString(16).padStart(4, "0")}` : `\\${ch}`;
   });
 }
 
