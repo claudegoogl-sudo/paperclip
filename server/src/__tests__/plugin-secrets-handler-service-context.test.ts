@@ -139,7 +139,7 @@ describe("service-context secrets.resolve (PLA-768)", () => {
     );
   });
 
-  it("audits as a plugin system actor with a null agent and the service runId", async () => {
+  it("audits as a plugin system actor with a null run_id and the synthetic runId preserved in details (PLA-806)", async () => {
     const { handler, registry } = buildHandler();
     registry.registerService(PLUGIN_DB_ID, SERVICE_RUN_ID);
 
@@ -153,13 +153,18 @@ describe("service-context secrets.resolve (PLA-768)", () => {
       action: "secret.resolved",
       companyId: COMPANY_OWNER,
       agentId: null,
-      runId: SERVICE_RUN_ID,
+      // PLA-806: the service runId is host-minted/synthetic — NOT a heartbeat_runs
+      // row. It must be written as run_id=NULL so the FK does not silently drop
+      // the row; the synthetic id is preserved in details instead.
+      runId: null,
     });
     expect(entry.details).toMatchObject({
       outcome: "allowed",
       dispatchingAgentId: null,
       dispatchingCompanyId: COMPANY_OWNER,
       toolName: "service:background",
+      backgroundRunId: SERVICE_RUN_ID,
+      runContextKind: "service",
     });
   });
 
