@@ -239,6 +239,83 @@ export interface PluginLoaderOptions {
    * Registry support is not yet implemented; this field is reserved.
    */
   registryUrl?: string;
+
+  /**
+   * Governance hook used when an upgrade introduces new capabilities.
+   *
+   * When provided, a cap-escalating `upgradePlugin` parks the plugin in
+   * `upgrade_pending` and files a capability-escalation approval via this
+   * gateway instead of throwing. When omitted, the loader fails closed and
+   * throws on any escalation — preserving the "no silent cap escalation"
+   * default. Injected (rather than constructed here) so the loader stays free
+   * of company/board governance policy; the host wiring decides which company
+   * the approval is filed against.
+   *
+   * @see PLA-908
+   */
+  escalationGateway?: CapabilityEscalationGateway;
+}
+
+// ---------------------------------------------------------------------------
+// Capability-escalation governance (PLA-908)
+// ---------------------------------------------------------------------------
+
+/**
+ * Details of a capability-escalating upgrade, handed to the escalation gateway
+ * so the board approval names exactly what is being requested.
+ */
+export interface CapabilityEscalationRequest {
+  pluginId: string;
+  pluginKey: string;
+  /** Currently-installed version (unchanged while parked). */
+  fromVersion: string;
+  /** Version the upgrade would move to once approved. */
+  toVersion: string;
+  /** Capabilities declared by the installed (old) manifest. */
+  fromCapabilities: string[];
+  /** Capabilities declared by the requested (new) manifest. */
+  toCapabilities: string[];
+  /** Capabilities present in the new manifest but not the old one. */
+  addedCapabilities: string[];
+}
+
+/**
+ * Gateway the loader uses to file and look up capability-escalation approvals.
+ *
+ * Kept as an injected interface so the loader does not embed governance policy
+ * (which company/board owns the approval). The production implementation is
+ * wired by the host; tests can supply a stub.
+ */
+export interface CapabilityEscalationGateway {
+  /**
+   * Return the id of an existing *pending* capability-escalation approval for
+   * this plugin + target version, or `null` if none exists. Used for
+   * idempotency so a repeat upgrade call while already parked does not
+   * double-file the approval.
+   */
+  findPending(input: { pluginId: string; toVersion: string }): Promise<string | null>;
+
+  /** File a new pending capability-escalation approval; returns its id. */
+  file(input: CapabilityEscalationRequest): Promise<string>;
+}
+
+/**
+ * Result of `upgradePlugin`.
+ *
+ * - `status: "ready"` — a non-escalating upgrade was applied in place.
+ * - `status: "upgrade_pending"` — the upgrade adds capabilities and was parked
+ *   pending board approval; `approvalId` names the filed (or pre-existing)
+ *   capability-escalation approval and `addedCapabilities` the new caps.
+ */
+export interface UpgradePluginResult {
+  oldManifest: PaperclipPluginManifestV1;
+  newManifest: PaperclipPluginManifestV1;
+  discovered: DiscoveredPlugin;
+  /** Capabilities present in the new manifest but not the old one (may be empty). */
+  addedCapabilities: string[];
+  status: "ready" | "upgrade_pending";
+  /** Set only when parked; the capability-escalation approval id. */
+  approvalId: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -464,11 +541,34 @@ export interface PluginLoader {
    *
    * @see PLUGIN_SPEC.md §25.3 — Upgrade Lifecycle
    */
-  upgradePlugin(pluginId: string, options: Omit<PluginInstallOptions, "installDir">): Promise<{
-    oldManifest: PaperclipPluginManifestV1;
-    newManifest: PaperclipPluginManifestV1;
-    discovered: DiscoveredPlugin;
-  }>;
+  upgradePlugin(pluginId: string, options: Omit<PluginInstallOptions, "installDir">): Promise<UpgradePluginResult>;
+
+  /**
+   * Complete a previously parked (`upgrade_pending`) capability-escalating
+   * upgrade after its board approval was granted. Re-fetches the target
+   * package, applies the new version + manifest (and therefore the new
+   * capabilities) and returns the plugin to `ready`.
+   *
+   * Plugin-scoped data lives in separate tables (`plugin_config`,
+   * `plugin_state`, secret-ref bindings) and is left untouched. Idempotent: a
+   * call against a plugin that is not `upgrade_pending` is a no-op that returns
+   * the current row.
+   *
+   * @see PLA-908
+   */
+  completeUpgrade(
+    pluginId: string,
+    options?: Omit<PluginInstallOptions, "installDir">,
+  ): Promise<PluginRecord>;
+
+  /**
+   * Revert a parked (`upgrade_pending`) upgrade after its board approval was
+   * rejected. Because parking never mutates the version/manifest/capabilities,
+   * this only restores the lifecycle status to `ready`. Idempotent.
+   *
+   * @see PLA-908
+   */
+  revertPendingUpgrade(pluginId: string): Promise<PluginRecord>;
 
   /**
    * Check whether a plugin API version is supported by this host.
@@ -813,6 +913,7 @@ export function pluginLoader(
     migrationDb = db,
     enableLocalFilesystem = true,
     enableNpmDiscovery = true,
+    escalationGateway,
   } = options;
 
   const registry = pluginRegistryService(db);
@@ -1426,27 +1527,26 @@ export function pluginLoader(
      * This method:
      * 1. Fetches and validates the new plugin package using `fetchAndValidate`.
      * 2. Ensures the new manifest ID matches the existing plugin ID for safety.
-     * 3. Updates the plugin record in the registry with the new version and manifest.
+     * 3. Detects capability escalation (caps in the new manifest but not the old).
+     *    - No new caps → updates the record in place and returns `status: "ready"`.
+     *    - New caps + an escalation gateway → parks the row in `upgrade_pending`
+     *      and files a capability-escalation approval WITHOUT mutating the
+     *      version/manifest/caps, returning `status: "upgrade_pending"`.
+     *    - New caps + no gateway → throws (fail-closed default).
      *
      * @param pluginId - The UUID of the plugin to upgrade.
      * @param upgradeOptions - Options for the upgrade (packageName, localPath, version).
-     * @returns The old and new manifests, along with the discovery metadata.
-     * @throws {Error} If the plugin is not found or if the new manifest ID differs.
+     * @returns Old/new manifests, discovery metadata, the added caps, and whether
+     *   the upgrade was applied (`ready`) or parked for approval (`upgrade_pending`).
+     * @throws {Error} If the plugin is not found, the new manifest ID differs, or
+     *   the upgrade escalates capabilities and no escalation gateway is configured.
+     * @see PLA-908
      */
     async upgradePlugin(
       pluginId: string,
       upgradeOptions: Omit<PluginInstallOptions, "installDir">,
-    ): Promise<{
-      oldManifest: PaperclipPluginManifestV1;
-      newManifest: PaperclipPluginManifestV1;
-      discovered: DiscoveredPlugin;
-    }> {
-      const plugin = (await registry.getById(pluginId)) as {
-        id: string;
-        packageName: string;
-        packagePath: string | null;
-        manifestJson: PaperclipPluginManifestV1;
-      } | null;
+    ): Promise<UpgradePluginResult> {
+      const plugin = (await registry.getById(pluginId)) as PluginRecord | null;
       if (!plugin) throw new Error(`Plugin not found: ${pluginId}`);
 
       const oldManifest = plugin.manifestJson;
@@ -1484,21 +1584,76 @@ export function pluginLoader(
       // 3. Detect capability escalation — new capabilities not in the old manifest
       const oldCaps = new Set(oldManifest.capabilities ?? []);
       const newCaps = newManifest.capabilities ?? [];
-      const escalated = newCaps.filter((c) => !oldCaps.has(c));
+      const addedCapabilities = newCaps.filter((c) => !oldCaps.has(c));
 
-      if (escalated.length > 0) {
+      if (addedCapabilities.length > 0) {
+        // Fail closed when no governance path is wired: never silently escalate.
+        if (!escalationGateway) {
+          log.warn(
+            { pluginId, addedCapabilities, oldVersion: oldManifest.version, newVersion: newManifest.version },
+            "plugin-loader: upgrade introduces new capabilities and no escalation gateway is configured — refusing",
+          );
+          throw new Error(
+            `Upgrade for "${pluginId}" introduces new capabilities that require approval: ${addedCapabilities.join(", ")}. ` +
+              `The previous version declared [${[...oldCaps].join(", ")}]. ` +
+              `Please review and approve the capability escalation before upgrading.`,
+          );
+        }
+
+        // Idempotency: if we are already parked for this exact target version,
+        // converge — do NOT file a second approval (criterion 5).
+        const existingApprovalId = await escalationGateway.findPending({
+          pluginId,
+          toVersion: newManifest.version,
+        });
+        if (existingApprovalId && plugin.status === "upgrade_pending") {
+          log.info(
+            { pluginId, approvalId: existingApprovalId, toVersion: newManifest.version },
+            "plugin-loader: upgrade already parked for this target — converging without re-filing",
+          );
+          return {
+            oldManifest,
+            newManifest,
+            discovered,
+            addedCapabilities,
+            status: "upgrade_pending",
+            approvalId: existingApprovalId,
+          };
+        }
+
+        const approvalId =
+          existingApprovalId ??
+          (await escalationGateway.file({
+            pluginId,
+            pluginKey: plugin.pluginKey,
+            fromVersion: oldManifest.version,
+            toVersion: newManifest.version,
+            fromCapabilities: [...oldCaps],
+            toCapabilities: [...newCaps],
+            addedCapabilities,
+          }));
+
+        // Park WITHOUT touching version/manifest/caps. Because nothing else is
+        // mutated, a rejection is a pure status restore and capabilities can
+        // only ever grow through `completeUpgrade` (criteria 3 & 6).
+        await registry.updateStatus(pluginId, { status: "upgrade_pending" });
+
         log.warn(
-          { pluginId, escalated, oldVersion: oldManifest.version, newVersion: newManifest.version },
-          "plugin-loader: upgrade introduces new capabilities — requires admin approval",
+          { pluginId, approvalId, addedCapabilities, oldVersion: oldManifest.version, newVersion: newManifest.version },
+          "plugin-loader: upgrade introduces new capabilities — parked in upgrade_pending pending board approval",
         );
-        throw new Error(
-          `Upgrade for "${pluginId}" introduces new capabilities that require approval: ${escalated.join(", ")}. ` +
-            `The previous version declared [${[...oldCaps].join(", ")}]. ` +
-            `Please review and approve the capability escalation before upgrading.`,
-        );
+
+        return {
+          oldManifest,
+          newManifest,
+          discovered,
+          addedCapabilities,
+          status: "upgrade_pending",
+          approvalId,
+        };
       }
 
-      // 4. Update the existing record
+      // 4. Non-escalating upgrade — apply in place (criterion 4).
       await registry.update(pluginId, {
         packageName: discovered.packageName,
         version: discovered.version,
@@ -1509,7 +1664,100 @@ export function pluginLoader(
         oldManifest,
         newManifest,
         discovered,
+        addedCapabilities: [],
+        status: "ready",
+        approvalId: null,
       };
+    },
+
+    // -----------------------------------------------------------------------
+    // completeUpgrade / revertPendingUpgrade (PLA-908)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Complete a parked (`upgrade_pending`) upgrade after board approval.
+     * Re-fetches the target package, applies the new version + manifest (and
+     * therefore the new capabilities), and returns the plugin to `ready`.
+     * Plugin-scoped data (`plugin_config`, `plugin_state`, secret-ref bindings)
+     * lives in separate tables and is left untouched. Idempotent.
+     */
+    async completeUpgrade(
+      pluginId: string,
+      upgradeOptions: Omit<PluginInstallOptions, "installDir"> = {},
+    ): Promise<PluginRecord> {
+      const plugin = (await registry.getById(pluginId)) as PluginRecord | null;
+      if (!plugin) throw new Error(`Plugin not found: ${pluginId}`);
+
+      // Idempotency: nothing parked → no-op (converge).
+      if (plugin.status !== "upgrade_pending") {
+        log.info(
+          { pluginId, status: plugin.status },
+          "plugin-loader: completeUpgrade called on a plugin that is not upgrade_pending — no-op",
+        );
+        return plugin;
+      }
+
+      const oldManifest = plugin.manifestJson as PaperclipPluginManifestV1;
+      const {
+        packageName = plugin.packageName,
+        localPath = plugin.packagePath ?? undefined,
+        version,
+      } = upgradeOptions;
+
+      const discovered = await fetchAndValidate({
+        packageName,
+        localPath,
+        version,
+        installDir: localPluginDir,
+      });
+      const newManifest = discovered.manifest!;
+
+      if (newManifest.id !== oldManifest.id) {
+        throw new Error(
+          `Upgrade completion failed: new manifest ID '${newManifest.id}' does not match existing plugin ID '${oldManifest.id}'`,
+        );
+      }
+
+      await registry.update(pluginId, {
+        packageName: discovered.packageName,
+        version: discovered.version,
+        manifest: newManifest,
+      });
+      const updated = await registry.updateStatus(pluginId, { status: "ready" });
+
+      log.info(
+        { pluginId, fromVersion: oldManifest.version, toVersion: newManifest.version },
+        "plugin-loader: parked upgrade approved and completed",
+      );
+
+      return (updated as PluginRecord | null) ?? ((await registry.getById(pluginId)) as PluginRecord);
+    },
+
+    /**
+     * Revert a parked (`upgrade_pending`) upgrade after board rejection.
+     * Parking never mutated the version/manifest/caps, so this only restores
+     * the lifecycle status to `ready`. Idempotent.
+     */
+    async revertPendingUpgrade(pluginId: string): Promise<PluginRecord> {
+      const plugin = (await registry.getById(pluginId)) as PluginRecord | null;
+      if (!plugin) throw new Error(`Plugin not found: ${pluginId}`);
+
+      if (plugin.status !== "upgrade_pending") {
+        log.info(
+          { pluginId, status: plugin.status },
+          "plugin-loader: revertPendingUpgrade called on a plugin that is not upgrade_pending — no-op",
+        );
+        return plugin;
+      }
+
+      const updated = await registry.updateStatus(pluginId, { status: "ready" });
+
+      log.info(
+        { pluginId, version: plugin.version },
+        "plugin-loader: parked upgrade rejected and reverted to ready",
+      );
+
+      return (updated as PluginRecord | null) ?? ((await registry.getById(pluginId)) as PluginRecord);
     },
 
     // -----------------------------------------------------------------------
