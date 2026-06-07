@@ -1,20 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
-  activityLog,
-  agentRuntimeState,
-  agentTaskSessions,
   agentWakeupRequests,
   agents,
   companies,
   createDb,
-  heartbeatRuns,
   issueComments,
-  issueRelations,
   issues,
-  plugins,
-  projects,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -53,21 +46,23 @@ describeEmbeddedPostgres("plugin issues.createComment wake + identifier resoluti
   }, 20_000);
 
   afterEach(async () => {
-    await db.delete(activityLog);
-    await db.delete(issueComments);
-    await db.delete(issueRelations);
-    await db.delete(issues);
-    await db.delete(projects);
-    await db.delete(plugins);
-    // Delete agent-referencing tables last: wakeAssignee spawns a heartbeat run
-    // that can insert agent_runtime_state asynchronously, so clear these
-    // immediately before `agents` to avoid an FK race on teardown.
-    await db.delete(agentTaskSessions);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(agents);
-    await db.delete(companies);
+    // `wakeAssignee` spawns a real background heartbeat run whose startup
+    // asynchronously seeds company-scoped rows (bundled skills -> company_skills,
+    // plus wiki / distillation / lease tables) that can outlive the test body.
+    // Ordered DELETEs race those lagging inserts and intermittently trip a
+    // foreign-key constraint on `delete companies`. TRUNCATE ... CASCADE clears
+    // the company and every FK-dependent row atomically, and retrying lets the
+    // statement win once the (fast `true`-command) run releases its locks —
+    // covering both the FK race and a transient deadlock with the live run.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await db.execute(sql`TRUNCATE TABLE companies RESTART IDENTITY CASCADE`);
+        break;
+      } catch (err) {
+        if (attempt >= 40) throw err;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
   });
 
   afterAll(async () => {

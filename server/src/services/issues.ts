@@ -5920,6 +5920,119 @@ export function issueService(db: Db) {
       });
     },
 
+    /**
+     * PLA-888: create a standalone `assets` row with NO `issue_attachments`
+     * binding yet. Returned by `artifacts.create`; the asset is bound to an
+     * issue+comment later via {@link attachAssetsToComment} (called from
+     * `issues.createComment` with `attachmentIds`). The split exists because
+     * `artifacts.create` has no `issueId` in its signature — the worker stores
+     * bytes first, then surfaces them on a comment.
+     */
+    createStandaloneAsset: async (input: {
+      companyId: string;
+      provider: string;
+      objectKey: string;
+      contentType: string;
+      byteSize: number;
+      sha256: string;
+      originalFilename?: string | null;
+      createdByAgentId?: string | null;
+    }): Promise<{ id: string }> => {
+      const [asset] = await db
+        .insert(assets)
+        .values({
+          companyId: input.companyId,
+          provider: input.provider,
+          objectKey: input.objectKey,
+          contentType: input.contentType,
+          byteSize: input.byteSize,
+          sha256: input.sha256,
+          originalFilename: input.originalFilename ?? null,
+          createdByAgentId: input.createdByAgentId ?? null,
+          createdByUserId: null,
+        })
+        .returning({ id: assets.id });
+      return { id: asset.id };
+    },
+
+    /**
+     * PLA-888 idempotency: find an existing asset for `(companyId, sha256)` that
+     * is NOT yet bound to any `issue_attachments` row. A retried
+     * `artifacts.create` (same bytes, same company) converges onto this asset
+     * instead of storing duplicate bytes. Attached assets are excluded because
+     * `issue_attachments.asset_id` is UNIQUE — reusing an already-attached asset
+     * would make the later bind fail, so only unattached ones are reusable.
+     */
+    findReusableUnattachedAsset: async (
+      companyId: string,
+      sha256: string,
+    ): Promise<{ id: string } | null> => {
+      const attachedAssetIds = db
+        .select({ assetId: issueAttachments.assetId })
+        .from(issueAttachments);
+      const rows = await db
+        .select({ id: assets.id })
+        .from(assets)
+        .where(
+          and(
+            eq(assets.companyId, companyId),
+            eq(assets.sha256, sha256),
+            notInArray(assets.id, attachedAssetIds),
+          ),
+        )
+        .orderBy(asc(assets.createdAt))
+        .limit(1);
+      return rows[0] ?? null;
+    },
+
+    /**
+     * PLA-888: bind previously-created standalone assets (by id) to an issue +
+     * comment. Each asset must belong to the issue's company or the call is
+     * rejected (`unprocessable`) — a worker cannot surface a foreign tenant's
+     * asset onto its own issue. The insert is idempotent via
+     * `onConflictDoNothing` on the UNIQUE `asset_id` index, so a retried
+     * `createComment` does not duplicate or error on already-bound assets.
+     */
+    attachAssetsToComment: async (input: {
+      issueId: string;
+      issueCommentId: string;
+      assetIds: string[];
+    }): Promise<void> => {
+      if (input.assetIds.length === 0) return;
+      const issue = await db
+        .select({ id: issues.id, companyId: issues.companyId })
+        .from(issues)
+        .where(eq(issues.id, input.issueId))
+        .then((rows) => rows[0] ?? null);
+      if (!issue) throw notFound("Issue not found");
+
+      const uniqueAssetIds = [...new Set(input.assetIds)];
+      const assetRows = await db
+        .select({ id: assets.id, companyId: assets.companyId })
+        .from(assets)
+        .where(inArray(assets.id, uniqueAssetIds));
+      const byId = new Map(assetRows.map((row) => [row.id, row]));
+      for (const assetId of uniqueAssetIds) {
+        const asset = byId.get(assetId);
+        if (!asset) throw notFound("Attachment asset not found");
+        if (asset.companyId !== issue.companyId) {
+          throw unprocessable("Attachment asset must belong to same company as issue");
+        }
+      }
+
+      await db
+        .insert(issueAttachments)
+        .values(
+          uniqueAssetIds.map((assetId) => ({
+            companyId: issue.companyId,
+            issueId: issue.id,
+            assetId,
+            issueCommentId: input.issueCommentId,
+          })),
+        )
+        .onConflictDoNothing({ target: issueAttachments.assetId });
+    },
+
     listAttachments: async (issueId: string) =>
       db
         .select({

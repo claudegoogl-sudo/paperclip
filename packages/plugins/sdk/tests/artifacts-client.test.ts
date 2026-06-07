@@ -249,6 +249,216 @@ describe("ctx.artifacts.fetch — PLA-574 worker→host wire", () => {
     });
   });
 
+  it("PLA-888 create: base64-encodes bytes and sends companyId/filename/mimeType/runId only", async () => {
+    const raw = new Uint8Array([0x00, 0xff, 0x10, 0x7f, 0x80]);
+    let captured: Record<string, unknown> | undefined;
+    let returned: { attachmentId: string } | undefined;
+
+    const plugin = definePlugin({
+      async setup(ctx) {
+        ctx.tools.register(
+          "create-artifact",
+          { displayName: "x", description: "x", parametersSchema: { type: "object" } },
+          async (_p, runCtx) => {
+            returned = await runCtx.artifacts.create({
+              companyId: "dpr-company",
+              filename: "voice.ogg",
+              mimeType: "audio/ogg",
+              bytes: raw,
+            });
+            return { content: "ok" };
+          },
+        );
+      },
+    });
+
+    const hostToWorker = new PassThrough();
+    const workerToHost = new PassThrough();
+    const hostReadline = createInterface({ input: workerToHost });
+    const pending = new Map<string | number, (response: JsonRpcResponse) => void>();
+    let nextRequestId = 1;
+
+    function callWorker(method: string, params: unknown): Promise<unknown> {
+      const id = `host-${nextRequestId++}`;
+      const p = new Promise<unknown>((resolve, reject) => {
+        pending.set(id, (response) => {
+          if ("error" in response && response.error) reject(new Error(response.error.message));
+          else resolve((response as { result?: unknown }).result);
+        });
+      });
+      hostToWorker.write(serializeMessage(createRequest(method, params, id)));
+      return p;
+    }
+
+    hostReadline.on("line", (line) => {
+      let message: unknown;
+      try {
+        message = parseMessage(line);
+      } catch {
+        return;
+      }
+      if (isJsonRpcResponse(message)) {
+        const id = (message as JsonRpcResponse).id as string | number | null;
+        if (id != null) {
+          const cb = pending.get(id);
+          if (cb) {
+            pending.delete(id);
+            cb(message as JsonRpcResponse);
+          }
+        }
+        return;
+      }
+      if (isJsonRpcRequest(message)) {
+        const req = message as JsonRpcRequest;
+        if (req.method === "artifacts.create") {
+          captured = (req.params ?? {}) as Record<string, unknown>;
+          hostToWorker.write(serializeMessage(createSuccessResponse(req.id, { attachmentId: "asset-99" })));
+        } else {
+          hostToWorker.write(serializeMessage(createSuccessResponse(req.id, null)));
+        }
+      }
+    });
+
+    const worker = startWorkerRpcHost({ plugin, stdin: hostToWorker, stdout: workerToHost });
+    try {
+      await callWorker("initialize", {
+        manifest: {
+          id: "paperclip.test-artifacts-create",
+          apiVersion: 1,
+          version: "1.0.0",
+          displayName: "x",
+          description: "x",
+          author: "x",
+          categories: ["automation"],
+          capabilities: ["issue.attachments.create"],
+          entrypoints: {},
+        },
+        config: {},
+        databaseNamespace: null,
+      });
+      await callWorker("executeTool", {
+        toolName: "create-artifact",
+        parameters: {},
+        runContext: { agentId: "a", runId: "run-XYZ", companyId: "dpr-company", projectId: "p" } as ToolRunContext,
+      });
+      expect(returned).toEqual({ attachmentId: "asset-99" });
+      expect(captured).toBeDefined();
+      const { companyId, filename, mimeType, contentBase64, runId, ...extra } = captured!;
+      expect(companyId).toBe("dpr-company");
+      expect(filename).toBe("voice.ogg");
+      expect(mimeType).toBe("audio/ogg");
+      expect(runId).toBe("run-XYZ");
+      // Bytes travel as base64 and round-trip exactly.
+      expect(Array.from(Buffer.from(contentBase64 as string, "base64"))).toEqual(Array.from(raw));
+      // No bytes field or stray identity fields leak onto the wire.
+      expect(extra).toEqual({});
+    } finally {
+      worker.stop();
+      hostReadline.close();
+      hostToWorker.destroy();
+      workerToHost.destroy();
+    }
+  });
+
+  it("PLA-888 create: rejects empty bytes at the SDK boundary (no RPC sent)", async () => {
+    const captured: { errorMessage?: string } = {};
+    const calls: unknown[] = [];
+    const plugin = definePlugin({
+      async setup(ctx) {
+        ctx.tools.register(
+          "create-bad",
+          { displayName: "x", description: "x", parametersSchema: { type: "object" } },
+          async (_p, runCtx) => {
+            try {
+              await runCtx.artifacts.create({
+                companyId: "c",
+                filename: "f",
+                mimeType: "image/png",
+                bytes: new Uint8Array(0),
+              });
+              return { content: "should not reach" };
+            } catch (err) {
+              captured.errorMessage = (err as Error).message;
+              return { content: "rejected" };
+            }
+          },
+        );
+      },
+    });
+
+    const hostToWorker = new PassThrough();
+    const workerToHost = new PassThrough();
+    const hostReadline = createInterface({ input: workerToHost });
+    const pending = new Map<string | number, (response: JsonRpcResponse) => void>();
+    let nextRequestId = 1;
+    function callWorker(method: string, params: unknown): Promise<unknown> {
+      const id = `host-${nextRequestId++}`;
+      const p = new Promise<unknown>((resolve, reject) => {
+        pending.set(id, (response) => {
+          if ("error" in response && response.error) reject(new Error(response.error.message));
+          else resolve((response as { result?: unknown }).result);
+        });
+      });
+      hostToWorker.write(serializeMessage(createRequest(method, params, id)));
+      return p;
+    }
+    hostReadline.on("line", (line) => {
+      let message: unknown;
+      try {
+        message = parseMessage(line);
+      } catch {
+        return;
+      }
+      if (isJsonRpcResponse(message)) {
+        const id = (message as JsonRpcResponse).id as string | number | null;
+        if (id != null) {
+          const cb = pending.get(id);
+          if (cb) {
+            pending.delete(id);
+            cb(message as JsonRpcResponse);
+          }
+        }
+        return;
+      }
+      if (isJsonRpcRequest(message)) {
+        const req = message as JsonRpcRequest;
+        if (req.method === "artifacts.create") calls.push(req.params);
+        hostToWorker.write(serializeMessage(createSuccessResponse(req.id, null)));
+      }
+    });
+    const worker = startWorkerRpcHost({ plugin, stdin: hostToWorker, stdout: workerToHost });
+    try {
+      await callWorker("initialize", {
+        manifest: {
+          id: "paperclip.test-artifacts-create-bad",
+          apiVersion: 1,
+          version: "1.0.0",
+          displayName: "x",
+          description: "x",
+          author: "x",
+          categories: ["automation"],
+          capabilities: ["issue.attachments.create"],
+          entrypoints: {},
+        },
+        config: {},
+        databaseNamespace: null,
+      });
+      const result = (await callWorker("executeTool", {
+        toolName: "create-bad",
+        parameters: {},
+        runContext: { agentId: "a", runId: "r", companyId: "c", projectId: "p" } as ToolRunContext,
+      })) as ToolResult;
+      expect(result.content).toBe("rejected");
+      expect(calls).toHaveLength(0);
+      expect(captured.errorMessage).toContain("bytes");
+    } finally {
+      worker.stop();
+      hostReadline.close();
+      hostToWorker.destroy();
+      workerToHost.destroy();
+    }
+  });
+
   it("rejects empty attachmentId at the SDK boundary (no RPC sent)", async () => {
     // Build an invocation with empty id — the SDK should throw before any
     // wire activity, so the host never sees the call.

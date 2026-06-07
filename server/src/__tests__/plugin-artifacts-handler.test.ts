@@ -10,6 +10,7 @@
  *  7. No bytes in audit log details
  */
 
+import { createHash, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -49,7 +50,16 @@ interface BuildOptions {
   maxByteSize?: number;
   globalRateLimit?: { maxAttempts: number; windowMs: number };
   perCompanyRateLimit?: { maxAttempts: number; windowMs: number };
+  writeRateLimit?: { maxAttempts: number; windowMs: number };
+  companyMaxBytes?: number;
 }
+
+type StoredAsset = {
+  id: string;
+  companyId: string;
+  sha256: string;
+  attached: boolean;
+};
 
 function buildHandler(opts: BuildOptions = {}) {
   const attachment =
@@ -65,15 +75,29 @@ function buildHandler(opts: BuildOptions = {}) {
       : opts.attachment;
   const bytes = opts.bytes ?? makeBytes("hello world");
   const registry = createPluginRunContextRegistry({ ttlMs: 60_000, sweepIntervalMs: 60_000 });
+  const sha256Of = (buf: Buffer) => createHash("sha256").update(buf).digest("hex");
+
+  // In-memory asset store backing the create() idempotency + write path.
+  const assetStore: StoredAsset[] = [];
+  const putFileCalls: Array<{ companyId: string; namespace: string; byteSize: number }> = [];
+  let assetSeq = 0;
+
   const handler = createPluginArtifactsHandler({
     db: {} as never,
     pluginDbId: "plugin-db-1",
     pluginKey: "acme.support",
     storage: {
       provider: "local",
-      // Only getObject is used by the handler.
-      async putFile() {
-        throw new Error("not used in test");
+      async putFile(input: { companyId: string; namespace: string; originalFilename: string | null; contentType: string; body: Buffer }) {
+        putFileCalls.push({ companyId: input.companyId, namespace: input.namespace, byteSize: input.body.length });
+        return {
+          provider: "local",
+          objectKey: `${input.companyId}/${input.namespace}/${randomUUID()}-${input.originalFilename ?? "file"}`,
+          contentType: input.contentType,
+          byteSize: input.body.length,
+          sha256: sha256Of(input.body),
+          originalFilename: input.originalFilename,
+        };
       },
       async getObject(_companyId: string, _key: string) {
         return {
@@ -94,12 +118,29 @@ function buildHandler(opts: BuildOptions = {}) {
         return attachment && attachment.id === id ? attachment : null;
       },
     },
+    assetWriter: {
+      async findReusableUnattachedAsset(companyId: string, sha256: string) {
+        const found = assetStore.find(
+          (a) => a.companyId === companyId && a.sha256 === sha256 && !a.attached,
+        );
+        return found ? { id: found.id } : null;
+      },
+      async createStandaloneAsset(input: { companyId: string; sha256: string }) {
+        const id = `asset-${++assetSeq}`;
+        assetStore.push({ id, companyId: input.companyId, sha256: input.sha256, attached: false });
+        return { id };
+      },
+    },
+    async resolveCompanyMaxBytes() {
+      return opts.companyMaxBytes ?? 10 * 1024 * 1024;
+    },
     runContextRegistry: registry,
     maxByteSize: opts.maxByteSize,
     globalRateLimit: opts.globalRateLimit,
     perCompanyRateLimit: opts.perCompanyRateLimit,
+    writeRateLimit: opts.writeRateLimit,
   });
-  return { handler, registry, bytes };
+  return { handler, registry, bytes, assetStore, putFileCalls, sha256Of };
 }
 
 function registerCtx(
@@ -302,6 +343,167 @@ describe("plugin-artifacts-handler — PLA-574", () => {
     await expect(
       handler.fetch({ attachmentId: "att-1", runId: "run-1" }),
     ).rejects.toMatchObject({ code: "runcontext_invalid" });
+  });
+});
+
+describe("plugin-artifacts-handler.create — PLA-888", () => {
+  beforeEach(() => {
+    vi.mocked(logActivity).mockClear();
+  });
+
+  const PNG = "image/png";
+  function createParams(overrides: Partial<{ companyId: string; filename: string; mimeType: string; contentBase64: string; runId: string }> = {}) {
+    return {
+      companyId: overrides.companyId ?? "dpr-company",
+      filename: overrides.filename ?? "inbound.png",
+      mimeType: overrides.mimeType ?? PNG,
+      contentBase64: overrides.contentBase64 ?? makeBytes("hello world").toString("base64"),
+      runId: overrides.runId ?? "run-1",
+    };
+  }
+
+  it("Gate 1: throws runcontext_invalid when no registry entry matches the runId", async () => {
+    const { handler } = buildHandler();
+    await expect(handler.create(createParams({ runId: "missing" }))).rejects.toMatchObject({
+      code: "runcontext_invalid",
+    });
+    expect(logActivity).not.toHaveBeenCalled();
+  });
+
+  it("happy path (dispatch ctx): stores bytes, returns assetId, audits artifact.created without bytes", async () => {
+    const { handler, registry, putFileCalls } = buildHandler();
+    registerCtx(registry);
+    const bytesB64 = makeBytes("hello world").toString("base64");
+    const result = await handler.create(createParams({ contentBase64: bytesB64 }));
+    expect(result.attachmentId).toBe("asset-1");
+    expect(putFileCalls).toHaveLength(1);
+    expect(putFileCalls[0]!.namespace).toBe("plugin-artifacts");
+    expect(logActivity).toHaveBeenCalledTimes(1);
+    const call = vi.mocked(logActivity).mock.calls[0]![1];
+    expect(call.action).toBe("artifact.created");
+    expect(call.companyId).toBe("dpr-company");
+    expect(JSON.stringify(call.details)).not.toContain(bytesB64);
+    expect(call.details).toMatchObject({ outcome: "allowed", deduped: false, assetId: "asset-1" });
+  });
+
+  it("AC3 cross-tenant: dispatch ctx in another company is rejected with forbidden (no store)", async () => {
+    const { handler, registry, putFileCalls } = buildHandler();
+    registerCtx(registry, { companyId: "platform-company", agentId: "agent-plat-1" });
+    await expect(handler.create(createParams({ companyId: "dpr-company" }))).rejects.toMatchObject({
+      code: "forbidden",
+    });
+    expect(putFileCalls).toHaveLength(0);
+    const call = vi.mocked(logActivity).mock.calls[0]![1];
+    expect(call.details).toMatchObject({ outcome: "denied", deniedReason: "forbidden" });
+  });
+
+  it("AC3 service ctx (relay path): no dispatching company → claimed companyId is the write target", async () => {
+    const { handler, registry } = buildHandler();
+    registry.registerService("plugin-db-1", "svc-run");
+    const result = await handler.create(createParams({ companyId: "dpr-company", runId: "svc-run" }));
+    expect(result.attachmentId).toBe("asset-1");
+    const call = vi.mocked(logActivity).mock.calls[0]![1];
+    expect(call.details).toMatchObject({ outcome: "allowed", contextKind: "service" });
+  });
+
+  it("AC3 background ctx: triggering company must equal claimed companyId", async () => {
+    const { handler, registry } = buildHandler();
+    registry.registerBackground("plugin-db-1", "bg-run", "dpr-company");
+    await expect(
+      handler.create(createParams({ companyId: "other-company", runId: "bg-run" })),
+    ).rejects.toMatchObject({ code: "forbidden" });
+  });
+
+  it("AC5 mime allowlist: a disallowed type is rejected with forbidden before storing", async () => {
+    const { handler, registry, putFileCalls } = buildHandler();
+    registerCtx(registry);
+    await expect(
+      handler.create(createParams({ mimeType: "application/x-msdownload" })),
+    ).rejects.toMatchObject({ code: "forbidden" });
+    expect(putFileCalls).toHaveLength(0);
+    const call = vi.mocked(logActivity).mock.calls[0]![1];
+    expect(call.details).toMatchObject({ outcome: "denied", deniedReason: "forbidden", mimeType: "application/x-msdownload" });
+  });
+
+  it("AC5 mime allowlist: audio/voice (audio/ogg) is allowed for relay voice notes", async () => {
+    const { handler, registry } = buildHandler();
+    registerCtx(registry);
+    const result = await handler.create(
+      createParams({ mimeType: "audio/ogg", contentBase64: makeBytes("voice").toString("base64") }),
+    );
+    expect(result.attachmentId).toBe("asset-1");
+  });
+
+  it("AC4 size ceiling: rejects payloads over the per-company ceiling with too_large", async () => {
+    const big = Buffer.alloc(2048, 0x41);
+    const { handler, registry, putFileCalls } = buildHandler({ companyMaxBytes: 1024 });
+    registerCtx(registry);
+    await expect(
+      handler.create(createParams({ contentBase64: big.toString("base64") })),
+    ).rejects.toMatchObject({ code: "too_large" });
+    expect(putFileCalls).toHaveLength(0);
+    const call = vi.mocked(logActivity).mock.calls[0]![1];
+    expect(call.details).toMatchObject({ outcome: "denied", deniedReason: "too_large" });
+  });
+
+  it("AC6 idempotency: a retried store (same bytes/company) dedupes to the same asset, no second putFile", async () => {
+    const { handler, registry, putFileCalls } = buildHandler();
+    registerCtx(registry);
+    const params = createParams({ contentBase64: makeBytes("same-bytes").toString("base64") });
+    const first = await handler.create(params);
+    const second = await handler.create(params);
+    expect(second.attachmentId).toBe(first.attachmentId);
+    expect(putFileCalls).toHaveLength(1);
+    const last = vi.mocked(logActivity).mock.calls.at(-1)![1];
+    expect(last.details).toMatchObject({ outcome: "allowed", deduped: true });
+  });
+
+  it("AC6 idempotency: an already-attached asset is NOT reused (would violate the unique bind)", async () => {
+    const { handler, registry, assetStore, putFileCalls } = buildHandler();
+    registerCtx(registry);
+    const params = createParams({ contentBase64: makeBytes("twice").toString("base64") });
+    const first = await handler.create(params);
+    // Simulate the asset getting bound to a comment.
+    assetStore.find((a) => a.id === first.attachmentId)!.attached = true;
+    const second = await handler.create(params);
+    expect(second.attachmentId).not.toBe(first.attachmentId);
+    expect(putFileCalls).toHaveLength(2);
+  });
+
+  it("write rate limit: per-company ceiling triggers rate_limited and audits", async () => {
+    const { handler, registry } = buildHandler({ writeRateLimit: { maxAttempts: 1, windowMs: 60_000 } });
+    registerCtx(registry);
+    await handler.create(createParams({ contentBase64: makeBytes("a").toString("base64") }));
+    await expect(
+      handler.create(createParams({ contentBase64: makeBytes("b").toString("base64") })),
+    ).rejects.toMatchObject({ code: "rate_limited" });
+    const last = vi.mocked(logActivity).mock.calls.at(-1)![1];
+    expect(last.details).toMatchObject({ outcome: "denied", deniedReason: "rate_limited" });
+  });
+
+  it("review F1: rejects an over-ceiling encoded string BEFORE decoding (no decode, no putFile)", async () => {
+    // companyMaxBytes 64 → pre-decode bound 64*1.4+8 ≈ 97 chars. A 400-char
+    // base64 string trips the bound before Buffer.from runs.
+    const { handler, registry, putFileCalls } = buildHandler({ companyMaxBytes: 64 });
+    registerCtx(registry);
+    const oversizeEncoded = "A".repeat(400);
+    await expect(
+      handler.create(createParams({ contentBase64: oversizeEncoded })),
+    ).rejects.toMatchObject({ code: "too_large" });
+    expect(putFileCalls).toHaveLength(0);
+    const call = vi.mocked(logActivity).mock.calls[0]![1];
+    expect(call.details).toMatchObject({ outcome: "denied", deniedReason: "too_large" });
+  });
+
+  it("review F2: text/html and text/csv are rejected for plugin artifacts (forbidden)", async () => {
+    for (const mimeType of ["text/html", "text/csv"]) {
+      const { handler, registry, putFileCalls } = buildHandler();
+      registerCtx(registry);
+      await expect(
+        handler.create(createParams({ mimeType, contentBase64: makeBytes("x").toString("base64") })),
+      ).rejects.toMatchObject({ code: "forbidden" });
+      expect(putFileCalls).toHaveLength(0);
+    }
   });
 });
 

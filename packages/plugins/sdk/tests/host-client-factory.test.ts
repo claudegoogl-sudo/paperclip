@@ -424,6 +424,76 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
       runId: "run-xyz",
     });
   });
+
+  it("back-fills runId on artifacts.create symmetrically", async () => {
+    const create = vi.fn(async () => ({ attachmentId: "att-new" }));
+    const services = {
+      artifacts: { create },
+    } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["issue.attachments.create"],
+      services,
+    });
+
+    await handlers["artifacts.create"](
+      {
+        companyId: "company-a",
+        filename: "a.png",
+        mimeType: "image/png",
+        contentBase64: "AAAA",
+      } as never,
+      { invocationScope: { companyId: "company-a", runId: "run-xyz" } },
+    );
+
+    expect(create).toHaveBeenCalledWith({
+      companyId: "company-a",
+      filename: "a.png",
+      mimeType: "image/png",
+      contentBase64: "AAAA",
+      runId: "run-xyz",
+    });
+  });
+});
+
+describe("createHostClientHandlers artifacts.create capability gate (PLA-888)", () => {
+  it("denies artifacts.create when the plugin lacks issue.attachments.create", async () => {
+    const create = vi.fn(async () => ({ attachmentId: "att-new" }));
+    const services = {
+      artifacts: { create },
+    } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: [],
+      services,
+    });
+
+    const params = {
+      companyId: "company-a",
+      filename: "a.png",
+      mimeType: "image/png",
+      contentBase64: "AAAA",
+    };
+
+    await expect(
+      handlers["artifacts.create"](
+        params as never,
+        { invocationScope: { companyId: "company-a", runId: "run-xyz" } },
+      ),
+    ).rejects.toMatchObject({
+      name: "CapabilityDeniedError",
+      message: expect.stringContaining("issue.attachments.create"),
+    });
+    await expect(
+      handlers["artifacts.create"](
+        params as never,
+        { invocationScope: { companyId: "company-a", runId: "run-xyz" } },
+      ),
+    ).rejects.toBeInstanceOf(CapabilityDeniedError);
+    expect(create).not.toHaveBeenCalled();
+  });
 });
 
 describe("createHostClientHandlers config.get per-company scope selection (PLA-761)", () => {

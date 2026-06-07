@@ -314,6 +314,42 @@ export interface ToolRunContextArtifactsClient {
    * @returns Attachment bytes + metadata.
    */
   fetch(attachmentId: string): Promise<ToolRunContextArtifact>;
+
+  /**
+   * PLA-888: store inbound bytes as a company-scoped Paperclip asset (the
+   * inverse of {@link fetch}). Returns `{ attachmentId }` — the asset id, which
+   * you pass to `issues.createComment`'s `attachmentIds` to surface the bytes
+   * on a comment.
+   *
+   * Requires the `issue.attachments.create` capability (default-deny; declare
+   * it in the manifest). The host:
+   * - authorizes `companyId` against the dispatching/service scope (rejects
+   *   cross-tenant writes with `forbidden`),
+   * - enforces the human-upload size ceiling and a MIME allowlist (images,
+   *   common documents, audio/voice); disallowed types throw `forbidden`,
+   * - dedupes on `(companyId, sha256)` so retries converge (idempotent).
+   *
+   * Typed error codes via JsonRpcCallError: `runcontext_invalid`, `forbidden`,
+   * `too_large`, `rate_limited`.
+   *
+   * @param input - target company, filename, MIME type, and raw bytes.
+   * @returns `{ attachmentId }` — the created (or deduped) asset id.
+   */
+  create(input: ToolRunContextArtifactCreateInput): Promise<{ attachmentId: string }>;
+}
+
+/**
+ * PLA-888: input to {@link ToolRunContextArtifactsClient.create}.
+ */
+export interface ToolRunContextArtifactCreateInput {
+  /** Target company UUID. Must match the dispatching/service scope. */
+  companyId: string;
+  /** Original filename (used for the stored asset's display name). */
+  filename: string;
+  /** MIME type; must be in the host's plugin-artifact allowlist. */
+  mimeType: string;
+  /** Raw bytes to store. */
+  bytes: Uint8Array;
 }
 
 /**
@@ -1589,6 +1625,12 @@ export interface PluginIssuesClient {
        * Defaults to `true` when `wakeAssignee` is set; pass `false` to opt out.
        */
       refuseClosed?: boolean;
+      /**
+       * PLA-888: asset ids returned by `ctx.artifacts.create` to surface on this
+       * comment. Each must belong to the comment's company. Omit/empty keeps the
+       * existing text-only behaviour.
+       */
+      attachmentIds?: string[];
     },
   ): Promise<IssueComment>;
   createInteraction(

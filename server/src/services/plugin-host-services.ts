@@ -63,6 +63,7 @@ import {
 } from "./plugin-local-folders.js";
 import { createPluginSecretsHandler } from "./plugin-secrets-handler.js";
 import { createPluginArtifactsHandler } from "./plugin-artifacts-handler.js";
+import { normalizeIssueAttachmentMaxBytes } from "../attachment-types.js";
 import {
   defaultPluginWakeRateLimiter,
   type PluginWakeRateLimiter,
@@ -603,6 +604,17 @@ export function buildHostServices(
                 originalFilename: row.originalFilename ?? null,
               };
             },
+          },
+          // PLA-888: asset-write surface + per-company size ceiling for
+          // artifacts.create (mirrors the human upload route's ceiling).
+          assetWriter: {
+            findReusableUnattachedAsset: (companyId, sha256) =>
+              issues.findReusableUnattachedAsset(companyId, sha256),
+            createStandaloneAsset: (input) => issues.createStandaloneAsset(input),
+          },
+          async resolveCompanyMaxBytes(companyId: string) {
+            const company = await companies.getById(companyId);
+            return normalizeIssueAttachmentMaxBytes(company?.attachmentMaxBytes);
           },
           runContextRegistry: options.runContextRegistry,
         })
@@ -1333,6 +1345,14 @@ export function buildHostServices(
           );
         }
         return artifactsHandler.fetch(params);
+      },
+      async create(params) {
+        if (!artifactsHandler) {
+          throw new Error(
+            "artifacts.create is not available — host was built without a storage service or run-context registry",
+          );
+        }
+        return artifactsHandler.create(params);
       },
     },
 
@@ -2123,6 +2143,21 @@ export function buildHostServices(
           params.body,
           { agentId: params.authorAgentId },
         )) as IssueComment;
+        // PLA-888: bind any standalone assets created via artifacts.create onto
+        // this comment. attachAssetsToComment re-checks each asset's company
+        // against the (already tenant-validated) issue's company, so a worker
+        // cannot surface a foreign tenant's asset. Idempotent on the UNIQUE
+        // asset_id index, so a retried createComment does not duplicate.
+        const attachmentIds = Array.isArray(params.attachmentIds)
+          ? params.attachmentIds.filter((id): id is string => typeof id === "string" && id.length > 0)
+          : [];
+        if (attachmentIds.length > 0) {
+          await issues.attachAssetsToComment({
+            issueId: issue.id,
+            issueCommentId: comment.id,
+            assetIds: attachmentIds,
+          });
+        }
         await logPluginActivity({
           companyId,
           action: "issue.comment.created",
@@ -2137,6 +2172,7 @@ export function buildHostServices(
             bodySnippet: comment.body.slice(0, 120),
             resolvedByIdentifier: Boolean(params.identifier && !params.issueId),
             wakeAssignee: params.wakeAssignee === true,
+            attachmentCount: attachmentIds.length,
           },
         });
 
