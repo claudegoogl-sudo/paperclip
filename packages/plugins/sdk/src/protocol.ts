@@ -905,12 +905,18 @@ export interface WorkerToHostMethods {
 
   // Artifacts (attachment bytes)
   //
-  // `runId` MUST be the runId of the currently-executing tool dispatch.
-  // The host looks up the active runContext keyed on (pluginDbId, runId)
-  // and uses the DISPATCHING agent (not the worker JWT) for authorization
-  // against the attachment's owning company. Bytes travel as base64 over
-  // JSON-RPC; the worker SDK decodes them to Uint8Array before returning
-  // to the plugin caller.
+  // `runId` is the runId of the currently-executing tool dispatch; the
+  // tool-dispatch `runCtx.artifacts` client always sends it. The worker-level
+  // `ctx.artifacts` client (PLA-895) omits it on the wire and the host
+  // backfills the active run-context from the worker→host
+  // `paperclipInvocationId` (serviceScope/singleInFlightScope), exactly as
+  // `secrets.resolve` does from service/background contexts — so the wire type
+  // keeps `runId` required (the host's `backfillDispatchRunId` populates it
+  // before the artifacts handler runs; matching the `secrets.resolve` shape).
+  // Either way the host looks up the active runContext and uses the DISPATCHING
+  // agent (not the worker JWT) for authorization against the attachment's
+  // owning company. Bytes travel as base64 over JSON-RPC; the worker SDK
+  // decodes them to Uint8Array before returning to the plugin caller.
   "artifacts.fetch": [
     params: { attachmentId: string; runId: string },
     result: {
@@ -929,15 +935,19 @@ export interface WorkerToHostMethods {
   // returned id can be passed to `issues.createComment`'s `attachmentIds` to
   // surface the stored bytes on a comment.
   //
-  // `runId` MUST be the runId of the currently-executing tool dispatch OR the
-  // host-minted service/background run id of an inbound relay loop (e.g. the
-  // messenger `getUpdates`/`onWebhook` path). The host looks up the active
-  // runContext keyed on (pluginDbId, runId): a dispatch/background context's
-  // company MUST equal `companyId` (cross-tenant writes are rejected); a
-  // service context relies on the `serviceScope` company-scope allowlist gate.
-  // Bytes travel as base64 over JSON-RPC; the worker SDK encodes the caller's
-  // Uint8Array before sending. Gated behind the `issue.attachments.create`
-  // capability (default-deny).
+  // `runId` is the runId of the currently-executing tool dispatch (sent by the
+  // tool-dispatch `runCtx.artifacts` client). The worker-level `ctx.artifacts`
+  // client (PLA-895) omits it on the wire for inbound relay loops (e.g. the
+  // messenger `getUpdates`/`onWebhook`/`runJob` path) and the host backfills the
+  // host-minted service/background run id from the worker→host
+  // `paperclipInvocationId` (`backfillDispatchRunId`) before this handler runs —
+  // so the wire type keeps `runId` required, matching `secrets.resolve`. The
+  // host looks up the active runContext: a dispatch/background context's company
+  // MUST equal `companyId` (cross-tenant writes are rejected); a service context
+  // relies on the `serviceScope` company-scope allowlist gate. Bytes travel as
+  // base64 over JSON-RPC; the worker SDK encodes the caller's Uint8Array before
+  // sending. Gated behind the `issue.attachments.create` capability
+  // (default-deny).
   "artifacts.create": [
     params: {
       companyId: string;

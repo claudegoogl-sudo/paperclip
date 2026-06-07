@@ -650,6 +650,67 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
         },
       },
 
+      // PLA-895: worker-level artifacts client (mirror of the tool-dispatch
+      // runCtx client, minus runId). It sends NO runId — callHost attaches the
+      // worker→host `paperclipInvocationId` and the host backfills the active
+      // service/background/dispatch run-context from it, exactly like
+      // `secrets.resolve`. `create` is host-gated on `issue.attachments.create`
+      // + company scope (PLA-888); `fetch` works from a tool-dispatch context
+      // today and from service/background once PLA-894-B lands (until then the
+      // host returns `runcontext_invalid` for service/background reads).
+      artifacts: {
+        async fetch(attachmentId: string) {
+          if (typeof attachmentId !== "string" || attachmentId.length === 0) {
+            throw new Error(
+              "ctx.artifacts.fetch: attachmentId must be a non-empty string",
+            );
+          }
+          // The wire type requires `runId`, but the worker client omits it: the
+          // host's `backfillDispatchRunId` populates it from the worker→host
+          // `paperclipInvocationId` before the artifacts handler runs (same path
+          // `secrets.resolve` uses). Localized cast keeps the type-lie contained.
+          const result = await callHost(
+            "artifacts.fetch",
+            { attachmentId } as WorkerToHostMethods["artifacts.fetch"][0],
+          );
+          return {
+            bytes: new Uint8Array(Buffer.from(result.contentBase64, "base64")),
+            filename: result.filename,
+            contentType: result.contentType,
+            byteSize: result.byteSize,
+          };
+        },
+        async create(input) {
+          if (!input || typeof input !== "object") {
+            throw new Error("ctx.artifacts.create: input must be an object");
+          }
+          const { companyId, filename, mimeType, bytes } = input;
+          if (typeof companyId !== "string" || companyId.length === 0) {
+            throw new Error("ctx.artifacts.create: companyId must be a non-empty string");
+          }
+          if (typeof filename !== "string" || filename.length === 0) {
+            throw new Error("ctx.artifacts.create: filename must be a non-empty string");
+          }
+          if (typeof mimeType !== "string" || mimeType.length === 0) {
+            throw new Error("ctx.artifacts.create: mimeType must be a non-empty string");
+          }
+          if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) {
+            throw new Error("ctx.artifacts.create: bytes must be a non-empty Uint8Array");
+          }
+          // `runId` is omitted on the wire — the host backfills it from the
+          // worker→host `paperclipInvocationId` (`backfillDispatchRunId`), the
+          // same path `secrets.resolve` relies on. Localized cast keeps the
+          // type-lie contained to this call.
+          const result = await callHost("artifacts.create", {
+            companyId,
+            filename,
+            mimeType,
+            contentBase64: Buffer.from(bytes).toString("base64"),
+          } as WorkerToHostMethods["artifacts.create"][0]);
+          return { attachmentId: result.attachmentId };
+        },
+      },
+
       activity: {
         async log(entry): Promise<void> {
           await callHost("activity.log", {
