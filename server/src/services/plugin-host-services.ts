@@ -419,6 +419,14 @@ const MAX_LOG_MESSAGE_LENGTH = 10_000;
 /** Max serialised JSON size for plugin log meta objects. */
 const MAX_LOG_META_JSON_LENGTH = 50_000;
 
+/**
+ * Defensive upper bound on rows returned by the PLA-923 reconcile reads
+ * (`approvals.list` / `interactions.list`). A normal pending set is far smaller,
+ * so this is a no-op in practice; it only prevents a pathological pending count
+ * from ballooning a single response. When the cap is hit we emit one warn line.
+ */
+const RECONCILE_LIST_LIMIT = 500;
+
 /** Max length for a metric name. */
 const MAX_METRIC_NAME_LENGTH = 500;
 
@@ -2404,12 +2412,25 @@ export function buildHostServices(
     // `requirePluginEnabledForCompany` gate before any query (Complete
     // Mediation) and return a field-minimized projection (no requester/decider
     // user ids, no decision notes, no result blobs). Default to pending when no
-    // status is supplied — the digest only cares about live blockers.
+    // status is supplied — the digest only cares about live blockers. A defensive
+    // `RECONCILE_LIST_LIMIT` bounds each response so a pathological pending count
+    // can't balloon a single read; a normal pending set is far below the cap, so
+    // this is a no-op in practice.
     approvals: {
       async list(params) {
         const companyId = ensureCompanyId(params.companyId);
         await requirePluginEnabledForCompany(companyId);
-        const rows = await boardApprovals.list(companyId, params.status ?? "pending");
+        const rows = await boardApprovals.list(
+          companyId,
+          params.status ?? "pending",
+          RECONCILE_LIST_LIMIT,
+        );
+        if (rows.length >= RECONCILE_LIST_LIMIT) {
+          logger.warn(
+            { companyId, limit: RECONCILE_LIST_LIMIT, status: params.status ?? "pending" },
+            "plugin approvals.list reconcile read hit the defensive row cap; response truncated",
+          );
+        }
         return rows.map((row) => ({
           id: row.id,
           type: row.type,
@@ -2431,7 +2452,13 @@ export function buildHostServices(
         if (status !== "pending") {
           throw new Error(`interactions.list only supports status="pending" (got "${status}")`);
         }
-        const rows = await interactions.listPendingByCompany(companyId);
+        const rows = await interactions.listPendingByCompany(companyId, RECONCILE_LIST_LIMIT);
+        if (rows.length >= RECONCILE_LIST_LIMIT) {
+          logger.warn(
+            { companyId, limit: RECONCILE_LIST_LIMIT },
+            "plugin interactions.list reconcile read hit the defensive row cap; response truncated",
+          );
+        }
         return rows.map((row) => ({
           id: row.id,
           issueId: row.issueId,
