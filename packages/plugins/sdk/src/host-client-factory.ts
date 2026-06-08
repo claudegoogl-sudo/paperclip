@@ -297,6 +297,16 @@ export interface HostServices {
     delete(params: WorkerToHostMethods["issues.documents.delete"][0]): Promise<WorkerToHostMethods["issues.documents.delete"][1]>;
   };
 
+  /** Provides `approvals.list` — reconcile read of pending board approvals (PLA-923). */
+  approvals: {
+    list(params: WorkerToHostMethods["approvals.list"][0]): Promise<WorkerToHostMethods["approvals.list"][1]>;
+  };
+
+  /** Provides `interactions.list` — reconcile read of pending issue interactions (PLA-923). */
+  interactions: {
+    list(params: WorkerToHostMethods["interactions.list"][0]): Promise<WorkerToHostMethods["interactions.list"][1]>;
+  };
+
   /** Provides `agents.list`, `agents.get`, `agents.pause`, `agents.resume`, `agents.invoke`. */
   agents: {
     list(params: WorkerToHostMethods["agents.list"][0]): Promise<WorkerToHostMethods["agents.list"][1]>;
@@ -505,6 +515,10 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   "issues.createInteraction": "issue.interactions.create",
   "issues.resolveInteraction": "issue.interactions.resolve",
 
+  // Reconcile reads (PLA-923)
+  "approvals.list": "board.approvals.read",
+  "interactions.list": "issue.interactions.read",
+
   // Issue Documents
   "issues.documents.list": "issue.documents.read",
   "issues.documents.get": "issue.documents.read",
@@ -596,6 +610,18 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
  *    no accept side-effects and no continuation wake. The reachable set equals
  *    the plugin's dispatch-lifetime reach; serviceScope only lets the inbound
  *    Telegram relay retire the pending confirmation it just answered while idle.
+ *  - `approvals.list` / `interactions.list` (PLA-923): these reconcile reads run
+ *    a real, method-scoped plugin↔company availability gate
+ *    (`ensurePluginAvailableForCompany` in plugin-host-services) BEFORE any
+ *    query and fail closed if the plugin is not installed+enabled for the
+ *    claimed company. That gate is the entity cross-check that the excluded
+ *    `issues.list` lacks: a worker-forged `companyId` can only reach a company
+ *    the plugin is genuinely provisioned for, so the reachable set equals the
+ *    plugin's install reach (== its instance-wide event-stream reach, the very
+ *    set the digest already accumulates). serviceScope only relaxes the timing
+ *    constraint so the digest can reconcile on worker startup / poll with no
+ *    active dispatch. Both reject `kind:"all"` and missing/empty `companyId`, so
+ *    no single call can enumerate across tenants.
  *
  * Deliberately excluded: any method that trusts `companyId` as the SOLE
  * authority with no entity cross-check (e.g. `issues.list`, `companies.get`).
@@ -610,6 +636,8 @@ const SERVICE_SCOPE_COMPANY_METHODS: ReadonlySet<WorkerToHostMethodName> = new S
   "issues.createComment",
   "issues.resolveInteraction",
   "artifacts.create",
+  "approvals.list",
+  "interactions.list",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -1114,6 +1142,37 @@ export function createHostClientHandlers(
     }),
     "issues.resolveInteraction": gated("issues.resolveInteraction", async (params) => {
       return services.issues.resolveInteraction(params);
+    }),
+
+    // Reconcile reads (PLA-923) — pending-blocker snapshot for the messenger
+    // digest. Beyond the capability + serviceScope gates, each handler hard-
+    // rejects a missing/empty `companyId` here. `requestedCompanyScope` maps a
+    // missing companyId to `kind:"none"`, which makes `requireInvocationCompanyScope`
+    // return early WITHOUT enforcement — so a company-less call would otherwise
+    // slip the scope check entirely and let the server gate decide alone. These
+    // are cross-tenant-sensitive enumerations, so we fail closed at the bridge:
+    // no single call may run without a concrete target company (Complete
+    // Mediation / Defense in Depth; the server `ensurePluginAvailableForCompany`
+    // gate is the second, authoritative layer).
+    "approvals.list": gated("approvals.list", async (params) => {
+      if (!readNonEmptyString(params.companyId)) {
+        throw new InvocationScopeDeniedError(
+          pluginId,
+          "approvals.list",
+          "a concrete companyId is required; cross-tenant enumeration is not permitted",
+        );
+      }
+      return services.approvals.list(params);
+    }),
+    "interactions.list": gated("interactions.list", async (params) => {
+      if (!readNonEmptyString(params.companyId)) {
+        throw new InvocationScopeDeniedError(
+          pluginId,
+          "interactions.list",
+          "a concrete companyId is required; cross-tenant enumeration is not permitted",
+        );
+      }
+      return services.interactions.list(params);
     }),
 
     // Issue Documents
