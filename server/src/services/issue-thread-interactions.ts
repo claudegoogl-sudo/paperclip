@@ -761,8 +761,8 @@ export function issueThreadInteractionService(db: Db) {
     // we skip hydration (which would parse the payload and could throw on a
     // malformed row). Scoped by companyId + status="pending"; backed by
     // issue_thread_interactions_company_issue_status_idx.
-    listPendingByCompany: async (companyId: string) => {
-      return db
+    listPendingByCompany: async (companyId: string, limit?: number) => {
+      const query = db
         .select({
           id: issueThreadInteractions.id,
           issueId: issueThreadInteractions.issueId,
@@ -778,6 +778,9 @@ export function issueThreadInteractionService(db: Db) {
           eq(issueThreadInteractions.status, "pending"),
         ))
         .orderBy(asc(issueThreadInteractions.createdAt), asc(issueThreadInteractions.id));
+      // Optional defensive bound for the PLA-923 reconcile read; omitted (and
+      // therefore unbounded) for any non-reconcile caller.
+      return limit === undefined ? query : query.limit(limit);
     },
 
     create: async (
