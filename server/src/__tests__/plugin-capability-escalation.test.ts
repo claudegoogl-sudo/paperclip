@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   approvals,
   companies,
@@ -67,6 +67,10 @@ describeEmbeddedPostgres("plugin capability-escalation wiring (PLA-910)", () => 
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-cap-escalation-");
     db = createDb(tempDb.connectionString);
   }, 20_000);
+
+  beforeEach(async () => {
+    companyId = await seedCompany();
+  });
 
   afterEach(async () => {
     __resetCapabilityEscalationResolverForTests();
@@ -149,15 +153,6 @@ describeEmbeddedPostgres("plugin capability-escalation wiring (PLA-910)", () => 
     });
     return { gateway, loader };
   }
-
-  beforeAll(async () => {
-    companyId = await seedCompany();
-  });
-
-  // Reseed company per test (afterEach wipes it).
-  afterEach(async () => {
-    companyId = await seedCompany();
-  });
 
   it("gateway.file() creates a pending board approval carrying the escalation payload", async () => {
     const { gateway } = makeLoaderWithGateway(companyId);
