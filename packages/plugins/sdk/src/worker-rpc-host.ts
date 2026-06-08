@@ -1149,6 +1149,18 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
         },
       },
 
+      approvals: {
+        async list(companyId: string, status?: string) {
+          return callHost("approvals.list", { companyId, status });
+        },
+      },
+
+      interactions: {
+        async list(companyId: string, status?: string) {
+          return callHost("interactions.list", { companyId, status });
+        },
+      },
+
       agents: {
         async list(input) {
           return callHost("agents.list", {

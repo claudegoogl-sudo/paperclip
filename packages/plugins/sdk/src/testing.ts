@@ -1864,6 +1864,20 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         },
       },
     },
+    approvals: {
+      async list(companyId) {
+        requireCapability(manifest, capabilitySet, "board.approvals.read");
+        requireCompanyId(companyId);
+        return [];
+      },
+    },
+    interactions: {
+      async list(companyId) {
+        requireCapability(manifest, capabilitySet, "issue.interactions.read");
+        requireCompanyId(companyId);
+        return [];
+      },
+    },
     agents: {
       async list(input) {
         requireCapability(manifest, capabilitySet, "agents.read");
