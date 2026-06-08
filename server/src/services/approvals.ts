@@ -79,10 +79,13 @@ export function approvalService(db: Db) {
   }
 
   return {
-    list: (companyId: string, status?: string) => {
+    list: (companyId: string, status?: string, limit?: number) => {
       const conditions = [eq(approvals.companyId, companyId)];
       if (status) conditions.push(eq(approvals.status, status));
-      return db.select().from(approvals).where(and(...conditions));
+      const query = db.select().from(approvals).where(and(...conditions));
+      // Optional defensive bound for the PLA-923 reconcile read; omitted (and
+      // therefore unbounded) for all existing board-route callers.
+      return limit === undefined ? query : query.limit(limit);
     },
 
     getById: (id: string) =>
