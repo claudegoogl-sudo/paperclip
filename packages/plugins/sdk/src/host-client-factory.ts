@@ -612,7 +612,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
  *    Telegram relay retire the pending confirmation it just answered while idle.
  *  - `approvals.list` / `interactions.list` (PLA-923): these reconcile reads run
  *    a real, method-scoped plugin↔company availability gate
- *    (`ensurePluginAvailableForCompany` in plugin-host-services) BEFORE any
+ *    (`requirePluginEnabledForCompany` in plugin-host-services) BEFORE any
  *    query and fail closed if the plugin is not installed+enabled for the
  *    claimed company. That gate is the entity cross-check that the excluded
  *    `issues.list` lacks: a worker-forged `companyId` can only reach a company
@@ -1152,7 +1152,7 @@ export function createHostClientHandlers(
     // slip the scope check entirely and let the server gate decide alone. These
     // are cross-tenant-sensitive enumerations, so we fail closed at the bridge:
     // no single call may run without a concrete target company (Complete
-    // Mediation / Defense in Depth; the server `ensurePluginAvailableForCompany`
+    // Mediation / Defense in Depth; the server `requirePluginEnabledForCompany`
     // gate is the second, authoritative layer).
     "approvals.list": gated("approvals.list", async (params) => {
       if (!readNonEmptyString(params.companyId)) {
