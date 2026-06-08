@@ -23,6 +23,7 @@ import { approvalService } from "../services/approvals.js";
 import {
   CAPABILITY_ESCALATION_APPROVAL_TYPE,
   CAPABILITY_ESCALATION_PAYLOAD_KIND,
+  type CapabilityEscalationPayload,
   createApprovalsCapabilityEscalationGateway,
   isCapabilityEscalationPayload,
   registerCapabilityEscalationResolver,
@@ -234,7 +235,7 @@ describeEmbeddedPostgres("plugin capability-escalation wiring (PLA-910)", () => 
       configJson: { apiBase: "https://example.test" },
     });
 
-    const { loader } = makeLoaderWithGateway(companyId);
+    const { gateway, loader } = makeLoaderWithGateway(companyId);
     const lifecycle = pluginLifecycleManager(db, { loader });
     registerCapabilityEscalationResolver(async ({ payload, outcome }) => {
       if (outcome === "approved") await lifecycle.completeUpgradeApproved(payload.pluginId);
@@ -250,6 +251,13 @@ describeEmbeddedPostgres("plugin capability-escalation wiring (PLA-910)", () => 
     const [approval] = await approvalService(db).list(companyId, "pending");
     expect(approval).toBeTruthy();
 
+    // The production gateway must persist the park-time content digest (PLA-912):
+    // without it completeUpgrade can never pin the applied bytes to what the board
+    // approved and silently falls back to version+caps only.
+    expect(isCapabilityEscalationPayload(approval!.payload)).toBe(true);
+    const parkDigest = (approval!.payload as CapabilityEscalationPayload).digest;
+    expect(parkDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
+
     const { applied } = await approvalService(db).approve(approval!.id, "board-user");
     expect(applied).toBe(true);
 
@@ -257,6 +265,20 @@ describeEmbeddedPostgres("plugin capability-escalation wiring (PLA-910)", () => 
     expect(row?.status).toBe("ready");
     expect(row?.version).toBe("0.2.0");
     expect(row?.manifestJson.capabilities).toEqual(["issues.read", "issues.create"]);
+
+    // The digest round-trips back out of the gateway as the board-approved
+    // contract, so completeUpgrade pins against it (the anchor is live through
+    // production wiring, not just the loader interface).
+    const approvedContract = await gateway.findApproved({ pluginId });
+    expect(approvedContract?.digest).toBe(parkDigest);
+
+    // Completion applies the immutable park-time snapshot (PLA-913), so the row's
+    // packagePath is repointed at the content-addressed snapshot — proving the
+    // approved bytes were applied, not whatever the mutable source held at approve
+    // time. A swap of newPkg after approval can no longer reach the loader.
+    const parkHex = parkDigest!.slice("sha256:".length);
+    expect(row?.packagePath).toContain(parkHex);
+    expect(row?.packagePath).not.toBe(newPkg);
 
     // Config bindings untouched.
     const [cfg] = await db.select().from(pluginConfig).where(eq(pluginConfig.pluginId, pluginId));

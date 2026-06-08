@@ -38,11 +38,14 @@ The approval reuses the standard `request_board_approval` type. Capability-escal
   "toVersion": "0.2.0",
   "fromCapabilities": ["issues.read"],
   "toCapabilities": ["issues.read", "issues.create"],
-  "addedCapabilities": ["issues.create"]
+  "addedCapabilities": ["issues.create"],
+  "digest": "sha256:…"
 }
 ```
 
 Review `addedCapabilities` — that is the exact set of new powers the upgrade is asking for. Approve or reject from the Approvals page like any other approval; resolution is wired straight back into the plugin lifecycle.
+
+The `digest` is a content hash (`sha256:<hex>`) of the exact package captured when the upgrade was parked. On approval the loader pins the applied package to this digest: a package that declares the approved version and capabilities but carries different code (a source swapped after approval) is rejected. Approvals filed before this anchor existed have no `digest` and fall back to version + capability checks only.
 
 ## Configuration
 
