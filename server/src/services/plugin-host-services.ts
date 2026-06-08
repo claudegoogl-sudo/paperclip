@@ -39,6 +39,8 @@ import { documentService } from "./documents.js";
 import { heartbeatService } from "./heartbeat.js";
 import { budgetService } from "./budgets.js";
 import { issueApprovalService } from "./issue-approvals.js";
+import { approvalService } from "./approvals.js";
+import { redactEventPayload } from "../redaction.js";
 import { subscribeCompanyLiveEvents } from "./live-events.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import path from "node:path";
@@ -588,6 +590,8 @@ export function buildHostServices(
   const authorization = authorizationService(db);
   const budgets = budgetService(db);
   const issueApprovals = issueApprovalService(db);
+  const boardApprovals = approvalService(db);
+  const interactions = issueThreadInteractionService(db);
   const scopedBus = eventBus.forPlugin(pluginKey);
 
   // PLA-574: artifacts.fetch handler — only available when storage + a
@@ -675,6 +679,48 @@ export function buildHostServices(
    * availability gate to enforce here.
    */
   const ensurePluginAvailableForCompany = async (_companyId: string) => {};
+
+  /**
+   * PLA-923: real, method-scoped availability gate for the reconcile reads
+   * (`approvals.list` / `interactions.list`). Unlike the instance-wide no-op
+   * stub above, this fail-closes so a cross-tenant-sensitive enumeration can
+   * never run for a company the plugin is not genuinely provisioned for. It is
+   * deliberately NOT wired into the existing handlers (whose per-entity
+   * `requireInCompany` already supplies the cross-check) — only the new reads
+   * call it.
+   *
+   * Denial order (each step throws rather than returning an empty list — a
+   * silent empty would mask a misconfig and reopen the very downtime gap this
+   * RPC closes):
+   *   (a) companyId must be a non-empty string;
+   *   (b) the company must exist;
+   *   (c) the plugin install record must exist and be in an operational state
+   *       (not `uninstalled` / `disabled`);
+   *   (d) the company must not have explicitly disabled the plugin
+   *       (`enabled !== false`; absent settings row ⇒ default-ON, matching the
+   *       instance-wide install model accepted for PLA-923 3.b).
+   */
+  const requirePluginEnabledForCompany = async (companyId: string): Promise<void> => {
+    // (a)
+    if (typeof companyId !== "string" || companyId.trim().length === 0) {
+      throw new Error("companyId is required for this operation");
+    }
+    // (b)
+    const company = await companies.getById(companyId);
+    if (!company) {
+      throw new Error("Company not found");
+    }
+    // (c)
+    const plugin = await registry.getById(pluginId);
+    if (!plugin || plugin.status === "uninstalled" || plugin.status === "disabled") {
+      throw new Error("Plugin is not available for this company");
+    }
+    // (d)
+    const settings = await registry.getCompanySettings(pluginId, companyId);
+    if (settings && settings.enabled === false) {
+      throw new Error("Plugin is disabled for this company");
+    }
+  };
 
   const getLocalFolderDeclaration = (folderKey: string) =>
     requireLocalFolderDeclaration(options.manifest?.localFolders, folderKey);
@@ -2277,6 +2323,50 @@ export function buildHostServices(
           },
         });
         return interaction as any;
+      },
+    },
+
+    // PLA-923: reconcile reads. Both run the real, fail-closed
+    // `requirePluginEnabledForCompany` gate before any query (Complete
+    // Mediation) and return a field-minimized projection (no requester/decider
+    // user ids, no decision notes, no result blobs). Default to pending when no
+    // status is supplied — the digest only cares about live blockers.
+    approvals: {
+      async list(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await requirePluginEnabledForCompany(companyId);
+        const rows = await boardApprovals.list(companyId, params.status ?? "pending");
+        return rows.map((row) => ({
+          id: row.id,
+          type: row.type,
+          status: row.status,
+          payload: redactEventPayload(row.payload) ?? {},
+          createdAt: row.createdAt.toISOString(),
+        }));
+      },
+    },
+
+    interactions: {
+      async list(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await requirePluginEnabledForCompany(companyId);
+        // This reconcile read is pending-only by design (the digest tracks live
+        // blockers). Reject any other status rather than returning a silent
+        // empty list, which would mask a caller misconfig.
+        const status = params.status ?? "pending";
+        if (status !== "pending") {
+          throw new Error(`interactions.list only supports status="pending" (got "${status}")`);
+        }
+        const rows = await interactions.listPendingByCompany(companyId);
+        return rows.map((row) => ({
+          id: row.id,
+          issueId: row.issueId,
+          kind: row.kind,
+          status: row.status,
+          title: row.title ?? null,
+          summary: row.summary ?? null,
+          createdAt: row.createdAt.toISOString(),
+        }));
       },
     },
 
