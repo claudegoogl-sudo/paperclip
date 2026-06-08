@@ -57,6 +57,11 @@ export interface CapabilityEscalationPayload extends Record<string, unknown> {
   addedCapabilities: string[];
   fromCapabilities: string[];
   toCapabilities: string[];
+  // Content digest (`sha256:<hex>`) of the package captured at park (PLA-912).
+  // Persisted so completeUpgrade can pin the applied package to the approved
+  // contents. Optional because approvals filed before this anchor existed have
+  // no stored digest — the loader's version + caps checks still apply to those.
+  digest?: string;
 }
 
 /** Outcome the board reached on an escalation approval. */
@@ -182,6 +187,11 @@ export function createApprovalsCapabilityEscalationGateway(input: {
       approvalId: chosen.id,
       toVersion: payload.toVersion,
       addedCapabilities: payload.addedCapabilities,
+      // Surface the park-time digest so completeUpgrade can pin the applied
+      // package to the approved contents (PLA-912). `null` for legacy approvals
+      // filed before the digest anchor — the loader then falls back to version +
+      // caps checks rather than failing closed on a digest it never captured.
+      digest: payload.digest ?? null,
     };
   }
 
@@ -195,6 +205,7 @@ export function createApprovalsCapabilityEscalationGateway(input: {
       addedCapabilities: request.addedCapabilities,
       fromCapabilities: request.fromCapabilities,
       toCapabilities: request.toCapabilities,
+      digest: request.digest,
     };
     const created = await approvals.create(companyId, {
       type: CAPABILITY_ESCALATION_APPROVAL_TYPE,
@@ -215,6 +226,7 @@ export function createApprovalsCapabilityEscalationGateway(input: {
         pluginId: request.pluginId,
         toVersion: request.toVersion,
         addedCapabilities: request.addedCapabilities,
+        digest: request.digest,
       },
       "capability-escalation: filed board approval for plugin capability escalation",
     );
