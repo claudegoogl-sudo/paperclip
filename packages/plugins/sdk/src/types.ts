@@ -1445,6 +1445,61 @@ export interface PluginIssueApprovalSummary {
   createdAt: string;
 }
 
+/**
+ * Field-minimized view of a pending board approval, returned by the
+ * `approvals.list` reconcile read (PLA-923). Excludes the requester/decider
+ * user-id and decision-note PII carried by {@link PluginIssueApprovalSummary};
+ * the digest only needs to identify and relay the pending blocker.
+ */
+export interface PluginPendingApproval {
+  id: string;
+  type: string;
+  status: string;
+  payload: Record<string, unknown>;
+  createdAt: string;
+}
+
+/**
+ * Field-minimized view of a pending issue thread interaction, returned by the
+ * `interactions.list` reconcile read (PLA-923). Excludes creator/resolver
+ * user-id PII and the free-form payload/result blobs.
+ */
+export interface PluginPendingInteraction {
+  id: string;
+  issueId: string;
+  kind: string;
+  status: string;
+  title: string | null;
+  summary: string | null;
+  createdAt: string;
+}
+
+/**
+ * `ctx.approvals` — reconcile read of pending board approvals (PLA-923).
+ * Requires `board.approvals.read`. Company-scoped and read-only; intended for a
+ * digest plugin to seed/reconcile its in-memory blocker set on worker startup.
+ */
+export interface PluginApprovalsClient {
+  /**
+   * List board approvals for a company. Defaults to `status:"pending"` when
+   * `status` is omitted. The host rejects a missing/empty `companyId`.
+   */
+  list(companyId: string, status?: string): Promise<PluginPendingApproval[]>;
+}
+
+/**
+ * `ctx.interactions` — reconcile read of pending issue thread interactions
+ * (PLA-923). Requires `issue.interactions.read`. Company-scoped, read-only.
+ */
+export interface PluginInteractionsClient {
+  /**
+   * List issue thread interactions for a company. Defaults to
+   * `status:"pending"` when `status` is omitted. The host rejects a
+   * missing/empty `companyId`.
+   */
+  list(companyId: string, status?: string): Promise<PluginPendingInteraction[]>;
+}
+
 export interface PluginIssueCostSummary {
   costCents: number;
   inputTokens: number;
@@ -2140,6 +2195,12 @@ export interface PluginContext {
 
   /** Read and write issues, comments, and documents. Requires issue capabilities. */
   issues: PluginIssuesClient;
+
+  /** Reconcile read of pending board approvals. Requires `board.approvals.read`. */
+  approvals: PluginApprovalsClient;
+
+  /** Reconcile read of pending issue thread interactions. Requires `issue.interactions.read`. */
+  interactions: PluginInteractionsClient;
 
   /** Read and manage agents. Requires `agents.read` for reads; `agents.pause` / `agents.resume` / `agents.invoke` for write ops. */
   agents: PluginAgentsClient;

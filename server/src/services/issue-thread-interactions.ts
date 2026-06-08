@@ -663,6 +663,31 @@ export function issueThreadInteractionService(db: Db) {
       return row ? hydrateInteraction(row) : null;
     },
 
+    // PLA-923: company-wide pending snapshot for the messenger digest reconcile.
+    // Returns a field-minimized projection (no payload/result/PII) directly from
+    // SQL — the digest only needs to identify and relay the pending blocker, so
+    // we skip hydration (which would parse the payload and could throw on a
+    // malformed row). Scoped by companyId + status="pending"; backed by
+    // issue_thread_interactions_company_issue_status_idx.
+    listPendingByCompany: async (companyId: string) => {
+      return db
+        .select({
+          id: issueThreadInteractions.id,
+          issueId: issueThreadInteractions.issueId,
+          kind: issueThreadInteractions.kind,
+          status: issueThreadInteractions.status,
+          title: issueThreadInteractions.title,
+          summary: issueThreadInteractions.summary,
+          createdAt: issueThreadInteractions.createdAt,
+        })
+        .from(issueThreadInteractions)
+        .where(and(
+          eq(issueThreadInteractions.companyId, companyId),
+          eq(issueThreadInteractions.status, "pending"),
+        ))
+        .orderBy(asc(issueThreadInteractions.createdAt), asc(issueThreadInteractions.id));
+    },
+
     create: async (
       issue: { id: string; companyId: string },
       input: CreateIssueThreadInteraction,

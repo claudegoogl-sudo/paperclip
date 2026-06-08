@@ -65,6 +65,8 @@ import type {
   PluginAuthorizationDecisionResult,
   PluginAuthorizationPolicyRecord,
   PluginAuthorizationPolicySummary,
+  PluginPendingApproval,
+  PluginPendingInteraction,
 } from "./types.js";
 import type {
   PluginHealthDiagnostics,
@@ -1299,6 +1301,18 @@ export interface WorkerToHostMethods {
   "issues.documents.delete": [
     params: { issueId: string; key: string; companyId: string },
     result: void,
+  ];
+
+  // Reconcile reads (PLA-923) — authoritative pending-blocker snapshot for the
+  // messenger digest to seed/reconcile on worker startup. Company-scoped,
+  // read-only; the host rejects kind:"all" / missing companyId.
+  "approvals.list": [
+    params: { companyId: string; status?: string },
+    result: PluginPendingApproval[],
+  ];
+  "interactions.list": [
+    params: { companyId: string; status?: string },
+    result: PluginPendingInteraction[],
   ];
 
   // Agents (read)

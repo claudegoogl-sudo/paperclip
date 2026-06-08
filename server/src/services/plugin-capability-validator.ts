@@ -73,6 +73,8 @@ const OPERATION_CAPABILITIES: Record<string, readonly PluginCapability[]> = {
   "costs.list": ["costs.read"],
   "costs.get": ["costs.read"],
   "issues.summaries.getOrchestration": ["issues.orchestration.read"],
+  "approvals.list": ["board.approvals.read"],
+  "interactions.list": ["issue.interactions.read"],
   "db.namespace": ["database.namespace.read"],
   "db.query": ["database.namespace.read"],
   "localFolders.declarations": [],
