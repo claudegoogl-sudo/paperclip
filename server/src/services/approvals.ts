@@ -7,6 +7,7 @@ import { agentService } from "./agents.js";
 import { budgetService } from "./budgets.js";
 import { notifyHireApproved } from "./hire-hook.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { dispatchCapabilityEscalationResolution } from "./plugin-capability-escalation.js";
 
 export function approvalService(db: Db) {
   const agentsSvc = agentService(db);
@@ -165,6 +166,16 @@ export function approvalService(db: Db) {
         }
       }
 
+      if (applied) {
+        // PLA-910: apply a board-approved plugin capability escalation to the
+        // parked (`upgrade_pending`) plugin. No-op for non-escalation payloads.
+        await dispatchCapabilityEscalationResolution({
+          payload: updated.payload,
+          outcome: "approved",
+          approvalId: updated.id,
+        });
+      }
+
       return { approval: updated, applied };
     },
 
@@ -182,6 +193,16 @@ export function approvalService(db: Db) {
         if (payloadAgentId) {
           await agentsSvc.terminate(payloadAgentId);
         }
+      }
+
+      if (applied) {
+        // PLA-910: restore the parked (`upgrade_pending`) plugin to ready on a
+        // board rejection. No-op for non-escalation payloads.
+        await dispatchCapabilityEscalationResolution({
+          payload: updated.payload,
+          outcome: "rejected",
+          approvalId: updated.id,
+        });
       }
 
       return { approval: updated, applied };

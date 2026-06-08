@@ -189,6 +189,25 @@ export interface PluginLifecycleManager {
   upgrade(pluginId: string, version?: string): Promise<PluginRecord>;
 
   /**
+   * Apply a board-approved capability escalation to a parked
+   * (`upgrade_pending`) plugin: complete the upgrade in the loader (apply the
+   * new version + capabilities, return to `ready`) and re-activate the worker.
+   * Idempotent — a no-op if the plugin is not `upgrade_pending`.
+   *
+   * @see PLA-910
+   */
+  completeUpgradeApproved(pluginId: string): Promise<PluginRecord>;
+
+  /**
+   * Restore a parked (`upgrade_pending`) plugin to `ready` after the board
+   * rejected its capability escalation, then re-activate the worker at the
+   * still-installed (pre-upgrade) version. Idempotent.
+   *
+   * @see PLA-910
+   */
+  revertUpgradeRejected(pluginId: string): Promise<PluginRecord>;
+
+  /**
    * Start the worker process for a plugin that is already in `ready` state.
    *
    * This is used by the server startup orchestration to start workers for
@@ -668,58 +687,118 @@ export function pluginLifecycleManager(
 
       await deactivatePluginRuntime(pluginId, plugin.pluginKey);
 
-      // 1. Download and validate new package via loader
-      const { oldManifest, newManifest, discovered } =
-        await pluginLoaderInstance.upgradePlugin(pluginId, { version });
+      // 1. Delegate to the loader, which owns the capability-escalation gate
+      //    (PLA-908): a cap-escalating upgrade is *parked* in `upgrade_pending`
+      //    (filing a board approval via the injected gateway, or throwing when
+      //    no gateway is wired — fail closed); a non-escalating upgrade is
+      //    applied in place and the row is left `ready` with the new
+      //    version/manifest. We consume that result rather than re-deciding the
+      //    escalation here, so there is a single source of truth (PLA-910).
+      const result = await pluginLoaderInstance.upgradePlugin(pluginId, { version });
 
       log.info(
         {
           pluginId,
           pluginKey: plugin.pluginKey,
-          oldVersion: oldManifest.version,
-          newVersion: newManifest.version,
+          oldVersion: result.oldManifest.version,
+          newVersion: result.newManifest.version,
+          status: result.status,
+          addedCapabilities: result.addedCapabilities,
+          approvalId: result.approvalId,
         },
-        "plugin lifecycle: package upgraded on disk",
+        "plugin lifecycle: loader upgrade resolved",
       );
 
-      // 2. Compare capabilities
-      const addedCaps = newManifest.capabilities.filter(
-        (cap) => !oldManifest.capabilities.includes(cap),
-      );
-
-      // 3. Transition state
-      if (addedCaps.length > 0) {
-        // New capabilities require operator approval — worker stays stopped
-        log.info(
-          { pluginId, pluginKey: plugin.pluginKey, addedCaps },
-          "plugin lifecycle: new capabilities detected, transitioning to upgrade_pending",
-        );
-        // Skip the inner stopWorkerIfRunning since we already stopped above
-        const result = await transition(pluginId, "upgrade_pending", null, plugin);
+      if (result.status === "upgrade_pending") {
+        // Loader already parked the row + filed the approval; worker stays
+        // stopped pending the board decision. Surface the domain event.
+        const parked = await requirePlugin(pluginId);
         emitDomain("plugin.upgrade_pending", {
           pluginId,
-          pluginKey: result.pluginKey,
+          pluginKey: parked.pluginKey,
         });
-        return result;
-      } else {
-        const result = await transition(pluginId, "ready", null, {
-          ...plugin,
-          version: discovered.version,
-          manifestJson: newManifest,
-        } as PluginRecord);
-        await activateReadyPlugin(pluginId);
-
-        emitDomain("plugin.loaded", {
-          pluginId,
-          pluginKey: result.pluginKey,
-        });
-        emitDomain("plugin.enabled", {
-          pluginId,
-          pluginKey: result.pluginKey,
-        });
-
-        return result;
+        return parked;
       }
+
+      // Non-escalating upgrade applied in place — bring the worker back online.
+      const updated = await requirePlugin(pluginId);
+      await activateReadyPlugin(pluginId);
+      emitDomain("plugin.loaded", { pluginId, pluginKey: updated.pluginKey });
+      emitDomain("plugin.enabled", { pluginId, pluginKey: updated.pluginKey });
+      return updated;
+    },
+
+    // -- completeUpgradeApproved ------------------------------------------
+    async completeUpgradeApproved(pluginId: string): Promise<PluginRecord> {
+      const before = await requirePlugin(pluginId);
+      if (before.status !== "upgrade_pending") {
+        log.info(
+          { pluginId, pluginKey: before.pluginKey, status: before.status },
+          "plugin lifecycle: completeUpgradeApproved called on a plugin that is not upgrade_pending — no-op",
+        );
+        return before;
+      }
+
+      // Loader applies the new version + capabilities and returns to `ready`.
+      const upgraded = (await pluginLoaderInstance.completeUpgrade(pluginId)) as PluginRecord;
+
+      log.info(
+        {
+          pluginId,
+          pluginKey: upgraded.pluginKey,
+          version: upgraded.version,
+        },
+        "plugin lifecycle: parked upgrade approved — applied and returning to ready",
+      );
+
+      // Best-effort worker re-activation: the DB state transition is the source
+      // of truth, so an activation failure must not unwind the approved upgrade.
+      try {
+        await activateReadyPlugin(pluginId);
+        emitDomain("plugin.loaded", { pluginId, pluginKey: upgraded.pluginKey });
+        emitDomain("plugin.enabled", { pluginId, pluginKey: upgraded.pluginKey });
+      } catch (err) {
+        log.warn(
+          { pluginId, pluginKey: upgraded.pluginKey, err: String(err) },
+          "plugin lifecycle: upgrade applied but worker re-activation failed — plugin is ready but stopped",
+        );
+      }
+
+      return upgraded;
+    },
+
+    // -- revertUpgradeRejected -------------------------------------------
+    async revertUpgradeRejected(pluginId: string): Promise<PluginRecord> {
+      const before = await requirePlugin(pluginId);
+      if (before.status !== "upgrade_pending") {
+        log.info(
+          { pluginId, pluginKey: before.pluginKey, status: before.status },
+          "plugin lifecycle: revertUpgradeRejected called on a plugin that is not upgrade_pending — no-op",
+        );
+        return before;
+      }
+
+      // Parking never mutated version/manifest/caps, so this only restores the
+      // lifecycle status to `ready` at the still-installed version.
+      const reverted = (await pluginLoaderInstance.revertPendingUpgrade(pluginId)) as PluginRecord;
+
+      log.info(
+        { pluginId, pluginKey: reverted.pluginKey, version: reverted.version },
+        "plugin lifecycle: parked upgrade rejected — restored to ready",
+      );
+
+      try {
+        await activateReadyPlugin(pluginId);
+        emitDomain("plugin.loaded", { pluginId, pluginKey: reverted.pluginKey });
+        emitDomain("plugin.enabled", { pluginId, pluginKey: reverted.pluginKey });
+      } catch (err) {
+        log.warn(
+          { pluginId, pluginKey: reverted.pluginKey, err: String(err) },
+          "plugin lifecycle: upgrade reverted but worker re-activation failed — plugin is ready but stopped",
+        );
+      }
+
+      return reverted;
     },
 
     // -- startWorker ------------------------------------------------------
