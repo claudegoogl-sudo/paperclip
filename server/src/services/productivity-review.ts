@@ -19,6 +19,7 @@ import {
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
+import { isStandbyWakeTargetIssue } from "./recovery/successful-run-handoff.js";
 
 export const PRODUCTIVITY_REVIEW_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.issueProductivityReview;
 export const DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS = 10;
@@ -386,6 +387,12 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     thresholds: ProductivityReviewThresholds,
     now: Date,
   ): Promise<ProductivityReviewEvidence | null> {
+    // PLA-986: standby wake targets (executionPolicy.standbyWakeTarget=true)
+    // are designed to sit `in_progress` indefinitely between externally-driven
+    // wakes, so long-active / no-comment evidence is meaningless for them.
+    // Skip the issue entirely, mirroring the recovery reconciler (PLA-838).
+    if (isStandbyWakeTargetIssue(sourceIssue)) return null;
+
     const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
     const sixHoursAgo = new Date(now.getTime() - 6 * 60 * 60 * 1000);
 
