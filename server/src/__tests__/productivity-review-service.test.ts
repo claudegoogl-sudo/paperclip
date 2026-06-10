@@ -55,6 +55,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     startedAt?: Date;
     parentId?: string | null;
     originKind?: string;
+    executionPolicy?: Record<string, unknown>;
   }) {
     const companyId = randomUUID();
     const managerId = randomUUID();
@@ -103,6 +104,7 @@ describeEmbeddedPostgres("productivity review service", () => {
       assigneeAgentId: coderId,
       parentId: opts?.parentId ?? null,
       originKind: opts?.originKind ?? "manual",
+      executionPolicy: opts?.executionPolicy ?? null,
       issueNumber: 1,
       identifier: `${issuePrefix}-1`,
       startedAt: opts?.startedAt ?? createdAt,
@@ -358,6 +360,67 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
     expect(review?.priority).toBe("medium");
     expect(hold.held).toBe(false);
+  });
+
+  // PLA-986: standby wake targets (executionPolicy.standbyWakeTarget=true) sit
+  // in_progress indefinitely by design, so long-active + no-comment evidence
+  // must never page a reviewer for them.
+  it("skips standby wake-target issues entirely despite long-active and no-comment evidence", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      executionPolicy: { standbyWakeTarget: true },
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+    const hold = await service.isProductivityReviewContinuationHoldActive({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      agentId: seeded.coderId,
+      now,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+    expect(hold.held).toBe(false);
+  });
+
+  // PLA-986 positive control: the gate is the flag value, not the mere presence
+  // of an executionPolicy — identical evidence on a non-standby issue still files.
+  it("still reviews a non-standby issue with identical long-active and no-comment evidence", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      executionPolicy: { standbyWakeTarget: false },
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
   });
 
   // PLA-141: suppress long_active when the orphan checkoutRunId points at a
