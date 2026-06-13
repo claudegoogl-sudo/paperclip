@@ -496,6 +496,66 @@ describe("createHostClientHandlers artifacts.create capability gate (PLA-888)", 
   });
 });
 
+describe("createHostClientHandlers issues.listAttachments capability gate (PLA-1050)", () => {
+  const params = { issueId: "issue-1", companyId: "company-a" };
+  const scope = { invocationScope: { companyId: "company-a", runId: "run-xyz" } };
+
+  it("denies issues.listAttachments when the plugin lacks issue.attachments.read", async () => {
+    const listAttachments = vi.fn(async () => []);
+    const services = {
+      issues: { listAttachments },
+    } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: [],
+      services,
+    });
+
+    await expect(
+      handlers["issues.listAttachments"](params as never, scope),
+    ).rejects.toMatchObject({
+      name: "CapabilityDeniedError",
+      message: expect.stringContaining("issue.attachments.read"),
+    });
+    await expect(
+      handlers["issues.listAttachments"](params as never, scope),
+    ).rejects.toBeInstanceOf(CapabilityDeniedError);
+    expect(listAttachments).not.toHaveBeenCalled();
+  });
+
+  it("allows issues.listAttachments and passes through when the capability is granted", async () => {
+    const rows = [
+      {
+        id: "att-1",
+        companyId: "company-a",
+        issueId: "issue-1",
+        issueCommentId: "comment-1",
+        assetId: "asset-1",
+        contentType: "image/png",
+        byteSize: 1234,
+        originalFilename: "shot.png",
+        createdAt: new Date("2026-06-13T00:00:00.000Z"),
+      },
+    ];
+    const listAttachments = vi.fn(async () => rows);
+    const services = {
+      issues: { listAttachments },
+    } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["issue.attachments.read"],
+      services,
+    });
+
+    await expect(
+      handlers["issues.listAttachments"](params as never, scope),
+    ).resolves.toEqual(rows);
+    expect(listAttachments).toHaveBeenCalledWith(params);
+  });
+});
+
 describe("createHostClientHandlers config.get per-company scope selection (PLA-761)", () => {
   // id-less legacy workers (e.g. platform.cad ≤0.1.x) never echo a
   // `paperclipInvocationId`, so `invocationScope` is null. PLA-719 gave the host

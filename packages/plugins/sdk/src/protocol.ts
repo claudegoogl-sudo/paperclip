@@ -45,6 +45,7 @@ export type { PluginLauncherRenderContextSnapshot } from "@paperclipai/shared";
 
 import type {
   PluginEvent,
+  PluginIssueAttachment,
   PluginIssueCheckoutOwnership,
   PluginIssueOrchestrationSummary,
   PluginIssueRelationSummary,
@@ -1267,6 +1268,10 @@ export interface WorkerToHostMethods {
   "issues.listComments": [
     params: { issueId: string; companyId: string },
     result: IssueComment[],
+  ];
+  "issues.listAttachments": [
+    params: { issueId: string; companyId: string },
+    result: PluginIssueAttachment[],
   ];
   "issues.createComment": [
     params: {
