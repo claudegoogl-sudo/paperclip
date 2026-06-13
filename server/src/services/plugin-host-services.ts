@@ -23,6 +23,7 @@ import type {
   PluginWorkspace,
   IssueComment,
   PluginIssueAssigneeSummary,
+  PluginIssueAttachment,
   PluginIssueOrchestrationSummary,
   PluginExecutionWorkspaceMetadata,
 } from "@paperclipai/plugin-sdk";
@@ -2186,6 +2187,31 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         if (!inCompany(await issues.getById(params.issueId), companyId)) return [];
         return (await issues.listComments(params.issueId)) as IssueComment[];
+      },
+      async listAttachments(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        // Tenant reach-check on the issue (mirrors listComments): never enumerate
+        // attachments for an issue outside the caller's company. (PLA-1050 AC3.)
+        if (!inCompany(await issues.getById(params.issueId), companyId)) return [];
+        const rows = await issues.listAttachments(params.issueId);
+        // Curated projection: expose only the metadata a worker needs to map a
+        // comment-created event onto its asset ids and feed artifacts.fetch.
+        // Storage internals (provider/objectKey/sha256) are withheld. The
+        // per-row companyId filter is defense-in-depth on top of the issue gate.
+        return rows
+          .filter((row) => row.companyId === companyId)
+          .map((row): PluginIssueAttachment => ({
+            id: row.id,
+            companyId: row.companyId,
+            issueId: row.issueId,
+            issueCommentId: row.issueCommentId,
+            assetId: row.assetId,
+            contentType: row.contentType,
+            byteSize: row.byteSize,
+            originalFilename: row.originalFilename,
+            createdAt: row.createdAt,
+          }));
       },
       async createComment(params) {
         const companyId = ensureCompanyId(params.companyId);

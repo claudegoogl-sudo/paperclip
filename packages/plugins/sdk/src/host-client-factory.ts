@@ -284,6 +284,7 @@ export interface HostServices {
     requestWakeups(params: WorkerToHostMethods["issues.requestWakeups"][0]): Promise<WorkerToHostMethods["issues.requestWakeups"][1]>;
     getOrchestrationSummary(params: WorkerToHostMethods["issues.summaries.getOrchestration"][0]): Promise<WorkerToHostMethods["issues.summaries.getOrchestration"][1]>;
     listComments(params: WorkerToHostMethods["issues.listComments"][0]): Promise<WorkerToHostMethods["issues.listComments"][1]>;
+    listAttachments(params: WorkerToHostMethods["issues.listAttachments"][0]): Promise<WorkerToHostMethods["issues.listAttachments"][1]>;
     createComment(params: WorkerToHostMethods["issues.createComment"][0]): Promise<WorkerToHostMethods["issues.createComment"][1]>;
     createInteraction(params: WorkerToHostMethods["issues.createInteraction"][0]): Promise<WorkerToHostMethods["issues.createInteraction"][1]>;
   };
@@ -510,6 +511,10 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   "issues.requestWakeups": "issues.wakeup",
   "issues.summaries.getOrchestration": "issues.orchestration.read",
   "issues.listComments": "issue.comments.read",
+  // Reading attachment metadata is a default-deny read, gated separately from
+  // comment text so a plugin must opt in before it can enumerate asset ids
+  // (PLA-1050). The asset bytes still go through artifacts.fetch.
+  "issues.listAttachments": "issue.attachments.read",
   "issues.createComment": "issue.comments.create",
   "issues.createInteraction": "issue.interactions.create",
 
@@ -1121,6 +1126,9 @@ export function createHostClientHandlers(
     }),
     "issues.listComments": gated("issues.listComments", async (params) => {
       return services.issues.listComments(params);
+    }),
+    "issues.listAttachments": gated("issues.listAttachments", async (params) => {
+      return services.issues.listAttachments(params);
     }),
     "issues.createComment": gated("issues.createComment", async (params) => {
       return services.issues.createComment(params);

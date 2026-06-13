@@ -751,6 +751,35 @@ Typed errors surfaced to the worker:
 
 See PLA-888 for the threat model and gate-by-gate rationale.
 
+### Reading attachment ids — `ctx.issues.listAttachments`
+
+`artifacts.fetch(assetId)` resolves bytes **by asset id**, but the
+`issue.comment.created` event payload does not carry attachment/asset ids — so a
+worker on the relay path has no way to discover what an agent attached to a
+comment. `ctx.issues.listAttachments(issueId, companyId)` closes that gap: it
+returns the attachments bound to an issue and its comments, so a worker can map a
+comment-created event onto its asset ids (filter rows by `issueCommentId`) and
+then fetch each via `artifacts.fetch(assetId)`.
+
+Wire payload: `{ issueId, companyId }`. Result: an array of curated rows —
+
+```ts
+{ id, companyId, issueId, issueCommentId, assetId, contentType, byteSize, originalFilename, createdAt }
+```
+
+Storage internals (`provider`, `objectKey`, `sha256`) are deliberately withheld.
+`issueCommentId` is `null` for issue-level attachments not bound to a comment.
+
+Capability: **`issue.attachments.read`** — default-deny, must be declared in the
+plugin manifest. This is a distinct, read-only capability from the
+`issue.attachments.create` write gate, so a plugin can enumerate attachment
+metadata without being granted the privilege to mint new attachments.
+
+Authorization: company-scoped. The call applies a tenant reach-check on the
+target issue (returns `[]` for an issue outside `companyId`, mirroring
+`listComments`) plus a defense-in-depth per-row `companyId` filter, so a worker
+can never enumerate a foreign tenant's attachments. See PLA-1050.
+
 ## 14. SDK Surface
 
 Plugins do not talk to the DB directly.
@@ -909,6 +938,7 @@ The host enforces capabilities in the SDK layer and refuses calls outside the gr
 - `project.workspaces.read`
 - `issues.read`
 - `issue.comments.read`
+- `issue.attachments.read`
 - `issue.documents.read`
 - `issue.relations.read`
 - `issue.subtree.read`

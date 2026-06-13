@@ -1575,6 +1575,27 @@ export interface PluginIssueSubtree {
   assignees?: Record<string, PluginIssueAssigneeSummary>;
 }
 
+/**
+ * A single issue-comment attachment surfaced to a plugin worker (PLA-1050).
+ *
+ * Curated projection of the internal `issue_attachments` ⨝ `assets` join: it
+ * exposes only the metadata a worker needs to map a `issue.comment.created`
+ * event onto its assets and feed them to `ctx.artifacts.fetch(assetId)`. The
+ * raw storage details (provider, objectKey, sha256) are deliberately withheld.
+ * `issueCommentId` is null for issue-level attachments not bound to a comment.
+ */
+export interface PluginIssueAttachment {
+  id: string;
+  companyId: string;
+  issueId: string;
+  issueCommentId: string | null;
+  assetId: string;
+  contentType: string | null;
+  byteSize: number | null;
+  originalFilename: string | null;
+  createdAt: Date | string;
+}
+
 export interface PluginIssueSummariesClient {
   /**
    * Read the compact orchestration inputs a workflow plugin needs for an
@@ -1599,6 +1620,7 @@ export interface PluginIssueSummariesClient {
  * - `issues.wakeup` for assignment wakeup requests
  * - `issues.orchestration.read` for orchestration summaries
  * - `issue.comments.read` for `listComments`
+ * - `issue.attachments.read` for `listAttachments`
  * - `issue.comments.create` for `createComment`
  * - `issue.interactions.create` for `createInteraction`, `suggestTasks`, `askUserQuestions`, and `requestConfirmation`
  * - `issue.documents.read` for `documents.list` and `documents.get`
@@ -1703,6 +1725,14 @@ export interface PluginIssuesClient {
     } & PluginIssueMutationActor,
   ): Promise<PluginIssueWakeupBatchResult[]>;
   listComments(issueId: string, companyId: string): Promise<IssueComment[]>;
+  /**
+   * List the attachments bound to an issue and its comments (PLA-1050). Lets a
+   * worker map a `issue.comment.created` event onto the asset ids attached to
+   * that comment (filter the returned rows by `issueCommentId`), then fetch each
+   * via `ctx.artifacts.fetch(assetId)`. Company-scoped: returns `[]` for an
+   * issue outside `companyId`. Requires `issue.attachments.read` (default-deny).
+   */
+  listAttachments(issueId: string, companyId: string): Promise<PluginIssueAttachment[]>;
   createComment(
     issueId: string,
     body: string,
