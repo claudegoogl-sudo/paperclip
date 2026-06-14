@@ -151,7 +151,7 @@ function isPrivateIP(ip: string): boolean {
  * @returns Request-routing metadata used to connect directly to the resolved IP
  *          while preserving the original hostname for HTTP Host and TLS SNI.
  */
-interface ValidatedFetchTarget {
+export interface ValidatedFetchTarget {
   parsedUrl: URL;
   resolvedAddress: string;
   hostHeader: string;
@@ -292,11 +292,20 @@ function buildPinnedRequestOptions(
   };
 }
 
-async function executePinnedHttpRequest(
+// Exported for unit tests (PLA-1063 binary-safety round-trip). Callers in this
+// module reach it through buildHostServices(); tests drive it directly against a
+// loopback server to assert byte-exact base64 response encoding.
+export async function executePinnedHttpRequest(
   target: ValidatedFetchTarget,
   init: PluginFetchInit | undefined,
   signal: AbortSignal,
-): Promise<{ status: number; statusText: string; headers: Record<string, string>; body: string }> {
+): Promise<{
+  status: number;
+  statusText: string;
+  headers: Record<string, string>;
+  body: string;
+  bodyEncoding: "base64";
+}> {
   const { options, body } = buildPinnedRequestOptions(target, init);
 
   const response = await new Promise<IncomingMessage>((resolve, reject) => {
@@ -338,11 +347,16 @@ async function executePinnedHttpRequest(
     }
   }
 
+  // Always base64-encode the response body. The request-body path is already
+  // base64+bodyEncoding symmetric (decodeFetchBody); mirroring that here keeps
+  // binary responses (images/docs/multipart) byte-exact instead of corrupting
+  // them through a UTF-8 round-trip. No content-type sniffing edge cases. (PLA-1063)
   return {
     status: response.statusCode ?? 500,
     statusText: response.statusMessage ?? "",
     headers,
-    body: Buffer.concat(chunks).toString("utf8"),
+    body: Buffer.concat(chunks).toString("base64"),
+    bodyEncoding: "base64",
   };
 }
 

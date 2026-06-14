@@ -622,8 +622,15 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             init: Object.keys(serializedInit).length > 0 ? serializedInit : undefined,
           });
 
-          // Reconstruct a Response-like object from the serialized result
-          return new Response(result.body, {
+          // Reconstruct a Response from the serialized result. When the host
+          // marks the body base64 (binary-safe path, PLA-1063), decode to bytes
+          // so images/docs round-trip exactly; a missing bodyEncoding means an
+          // old host that returned a utf8 string — use it as-is (back-compat).
+          const responseBody =
+            result.bodyEncoding === "base64"
+              ? new Uint8Array(Buffer.from(result.body, "base64"))
+              : result.body;
+          return new Response(responseBody, {
             status: result.status,
             statusText: result.statusText,
             headers: result.headers,
