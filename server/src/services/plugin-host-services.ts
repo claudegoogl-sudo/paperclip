@@ -299,12 +299,16 @@ export async function executePinnedHttpRequest(
   target: ValidatedFetchTarget,
   init: PluginFetchInit | undefined,
   signal: AbortSignal,
+  // PLA-1063 opt-in. Only when the worker requests "base64" do we base64-encode
+  // the response body (binary-safe). Old SDKs never send it, so they keep the
+  // legacy utf8 string and are byte-for-byte unaffected by this host upgrade.
+  acceptResponseBodyEncoding?: "base64",
 ): Promise<{
   status: number;
   statusText: string;
   headers: Record<string, string>;
   body: string;
-  bodyEncoding: "base64";
+  bodyEncoding?: "utf8" | "base64";
 }> {
   const { options, body } = buildPinnedRequestOptions(target, init);
 
@@ -347,16 +351,30 @@ export async function executePinnedHttpRequest(
     }
   }
 
-  // Always base64-encode the response body. The request-body path is already
-  // base64+bodyEncoding symmetric (decodeFetchBody); mirroring that here keeps
-  // binary responses (images/docs/multipart) byte-exact instead of corrupting
-  // them through a UTF-8 round-trip. No content-type sniffing edge cases. (PLA-1063)
+  const rawBody = Buffer.concat(chunks);
+
+  // Base64-encode the response body ONLY when the worker opted in via
+  // acceptResponseBodyEncoding (PLA-1063). Base64 is symmetric with the
+  // request-body path (decodeFetchBody) and keeps binary payloads
+  // (images/docs/multipart) byte-exact instead of corrupting them through a
+  // UTF-8 round-trip. Legacy workers that don't send the flag stay on the old
+  // utf8 string encoding, so this host change is non-breaking for not-yet-
+  // rebuilt plugins (klipper/vault) — no lockstep host+plugins deploy required.
+  if (acceptResponseBodyEncoding === "base64") {
+    return {
+      status: response.statusCode ?? 500,
+      statusText: response.statusMessage ?? "",
+      headers,
+      body: rawBody.toString("base64"),
+      bodyEncoding: "base64",
+    };
+  }
+
   return {
     status: response.statusCode ?? 500,
     statusText: response.statusMessage ?? "",
     headers,
-    body: Buffer.concat(chunks).toString("base64"),
-    bodyEncoding: "base64",
+    body: rawBody.toString("utf8"),
   };
 }
 
@@ -1416,7 +1434,12 @@ export function buildHostServices(
 
         try {
           const init = params.init as PluginFetchInit | undefined;
-          return await executePinnedHttpRequest(target, init, controller.signal);
+          return await executePinnedHttpRequest(
+            target,
+            init,
+            controller.signal,
+            params.acceptResponseBodyEncoding,
+          );
         } finally {
           clearTimeout(timeout);
         }

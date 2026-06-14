@@ -51,6 +51,9 @@ interface DownloadResult {
   sha256: string;
   byteLength: number;
   text: string;
+  // The params the worker sent on its `http.fetch` RPC. Lets tests assert the
+  // SDK opts in to base64 responses (PLA-1064 acceptResponseBodyEncoding).
+  requestParams: Record<string, unknown>;
 }
 
 const sha256 = (buf: Buffer): string => createHash("sha256").update(buf).digest("hex");
@@ -67,8 +70,9 @@ async function fetchThroughWorker(hostResponse: HostResponse): Promise<DownloadR
   const pending = new Map<string | number, (response: JsonRpcResponse) => void>();
   let nextRequestId = 1;
 
-  let download: DownloadResult | null = null;
+  let download: Omit<DownloadResult, "requestParams"> | null = null;
   let setupError: unknown = null;
+  let capturedRequestParams: Record<string, unknown> = {};
 
   const plugin = definePlugin({
     async setup(ctx) {
@@ -124,6 +128,7 @@ async function fetchThroughWorker(hostResponse: HostResponse): Promise<DownloadR
     if (isJsonRpcRequest(message)) {
       const req = message as JsonRpcRequest;
       if (req.method === "http.fetch") {
+        capturedRequestParams = (req.params ?? {}) as Record<string, unknown>;
         hostToWorker.write(
           serializeMessage(
             createSuccessResponse(req.id, {
@@ -167,7 +172,7 @@ async function fetchThroughWorker(hostResponse: HostResponse): Promise<DownloadR
 
   if (setupError) throw setupError;
   if (!download) throw new Error("plugin setup did not complete the fetch");
-  return download;
+  return { ...download, requestParams: capturedRequestParams };
 }
 
 // A fake-but-realistic JPEG: SOI/EOI markers wrapping bytes that are NOT valid
@@ -236,5 +241,13 @@ describe("ctx.http.fetch response body decoding (PLA-1063)", () => {
     const result = await fetchThroughWorker({ body: json });
     expect(result.text).toBe(json);
     expect(JSON.parse(result.text)).toEqual({ legacy: true });
+  });
+
+  // PLA-1064: the new SDK MUST opt in to base64 responses on every fetch so the
+  // host can binary-encode. (Old hosts ignore the flag; old SDKs never send it,
+  // which is what keeps the host change non-breaking.)
+  it("sends acceptResponseBodyEncoding:'base64' on the http.fetch request", async () => {
+    const result = await fetchThroughWorker({ body: '{"ok":true}', bodyEncoding: "utf8" });
+    expect(result.requestParams.acceptResponseBodyEncoding).toBe("base64");
   });
 });

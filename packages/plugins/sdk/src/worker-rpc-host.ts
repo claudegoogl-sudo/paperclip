@@ -620,6 +620,12 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           const result = await callHost("http.fetch", {
             url,
             init: Object.keys(serializedInit).length > 0 ? serializedInit : undefined,
+            // Opt in to base64 response bodies (PLA-1063 binary safety). This
+            // SDK decodes bodyEncoding below, so it is always safe to request.
+            // Old hosts ignore the flag and return utf8 (handled by the default
+            // branch); old SDKs never send it, so a new host leaves them on the
+            // legacy utf8 path — no lockstep deploy required.
+            acceptResponseBodyEncoding: "base64",
           });
 
           // Reconstruct a Response from the serialized result. When the host
