@@ -865,6 +865,12 @@ export interface WorkerToHostMethods {
         body?: string;
         bodyEncoding?: "utf8" | "base64";
       };
+      // Opt-in (PLA-1063): when "base64", the host base64-encodes the response
+      // body and tags it `bodyEncoding:"base64"` so binary payloads round-trip
+      // byte-exact. Absent → host keeps the legacy utf8 string encoding. This
+      // makes the host fix non-breaking: old SDKs never send it and stay on the
+      // utf8 path, so a new host does not corrupt their (text) responses.
+      acceptResponseBodyEncoding?: "base64";
     },
     // `body` is always a string on the wire (JSON-RPC). `bodyEncoding` tells the
     // worker how to reconstruct the Response body: "base64" → decode to bytes,

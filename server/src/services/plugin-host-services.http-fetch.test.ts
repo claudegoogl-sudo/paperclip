@@ -63,7 +63,7 @@ function fakeJpeg(): Buffer {
 }
 
 describe("host http.fetch response serialization (PLA-1063)", () => {
-  it("returns binary bodies as byte-exact base64", async () => {
+  it("returns binary bodies as byte-exact base64 when the worker opts in", async () => {
     const jpeg = fakeJpeg();
     const port = await startServer(() => ({ contentType: "image/jpeg", body: jpeg }));
     const controller = new AbortController();
@@ -72,6 +72,7 @@ describe("host http.fetch response serialization (PLA-1063)", () => {
       loopbackTarget(port, "/image.jpg"),
       undefined,
       controller.signal,
+      "base64",
     );
 
     expect(result.status).toBe(200);
@@ -81,7 +82,7 @@ describe("host http.fetch response serialization (PLA-1063)", () => {
     expect(sha256(decoded)).toBe(sha256(jpeg));
   });
 
-  it("round-trips a JSON body through base64 without text corruption", async () => {
+  it("round-trips a JSON body through base64 without text corruption (opt-in)", async () => {
     const json = Buffer.from('{"hello":"world","emoji":"éü"}', "utf8");
     const port = await startServer(() => ({ contentType: "application/json", body: json }));
     const controller = new AbortController();
@@ -90,11 +91,33 @@ describe("host http.fetch response serialization (PLA-1063)", () => {
       loopbackTarget(port, "/data.json"),
       undefined,
       controller.signal,
+      "base64",
     );
 
     expect(result.bodyEncoding).toBe("base64");
     const decoded = Buffer.from(result.body, "base64");
     expect(decoded.toString("utf8")).toBe(json.toString("utf8"));
     expect(sha256(decoded)).toBe(sha256(json));
+  });
+
+  // Old-worker / new-host case (PLA-1064 review): a legacy SDK never sends
+  // acceptResponseBodyEncoding. The host MUST keep returning a utf8 string with
+  // no bodyEncoding so not-yet-rebuilt plugins (klipper/vault, JSON-only) are
+  // byte-for-byte unaffected by the host upgrade — no lockstep deploy required.
+  it("returns a legacy utf8 string with no bodyEncoding when the worker does NOT opt in", async () => {
+    const json = Buffer.from('{"legacy":true,"emoji":"éü"}', "utf8");
+    const port = await startServer(() => ({ contentType: "application/json", body: json }));
+    const controller = new AbortController();
+
+    const result = await executePinnedHttpRequest(
+      loopbackTarget(port, "/legacy.json"),
+      undefined,
+      controller.signal,
+      // no acceptResponseBodyEncoding — simulates an old SDK
+    );
+
+    expect(result.bodyEncoding).toBeUndefined();
+    expect(result.body).toBe(json.toString("utf8"));
+    expect(JSON.parse(result.body)).toEqual({ legacy: true, emoji: "éü" });
   });
 });
