@@ -863,7 +863,16 @@ export interface WorkerToHostMethods {
         bodyEncoding?: "utf8" | "base64";
       };
     },
-    result: { status: number; statusText: string; headers: Record<string, string>; body: string },
+    // `body` is always a string on the wire (JSON-RPC). `bodyEncoding` tells the
+    // worker how to reconstruct the Response body: "base64" → decode to bytes,
+    // "utf8"/absent → use the string as-is (absent for back-compat with old hosts).
+    result: {
+      status: number;
+      statusText: string;
+      headers: Record<string, string>;
+      body: string;
+      bodyEncoding?: "utf8" | "base64";
+    },
   ];
 
   // Secrets
