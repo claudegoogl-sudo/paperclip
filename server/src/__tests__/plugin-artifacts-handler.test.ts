@@ -26,6 +26,9 @@ const {
   createPluginArtifactsHandler,
   ArtifactsError,
 } = await import("../services/plugin-artifacts-handler.js");
+const { normalizeIssueAttachmentMaxBytes, MAX_ATTACHMENT_BYTES } = await import(
+  "../attachment-types.js"
+);
 
 type AttachmentRow = {
   id: string;
@@ -609,6 +612,65 @@ describe("plugin-artifacts-handler.create — PLA-888", () => {
       ).rejects.toMatchObject({ code: "forbidden" });
       expect(putFileCalls).toHaveLength(0);
     }
+  });
+});
+
+describe("plugin-artifacts-handler.create — PLA-1147 (raised >10 MiB size ceiling)", () => {
+  beforeEach(() => {
+    vi.mocked(logActivity).mockClear();
+  });
+
+  const MIB = 1024 * 1024;
+  // The plugin path stores STL/CAD geometry; model/stl is on the PLA-1140 allowlist.
+  const STL = "model/stl";
+
+  function createParams(contentBase64: string, overrides: Partial<{ companyId: string; runId: string }> = {}) {
+    return {
+      companyId: overrides.companyId ?? "dpr-company",
+      filename: "model.stl",
+      mimeType: STL,
+      contentBase64,
+      runId: overrides.runId ?? "run-1",
+    };
+  }
+
+  it("regression guard: the fresh-install (unset) company ceiling clears 20 MiB so the plugin path isn't silently re-capped to 10 MiB", () => {
+    // PLA-1147 spec point 2: even with NO env tuning and NO per-company override,
+    // the Math.min(companyMaxBytes, ...) chain must not pin the plugin path back
+    // to the old 10 MiB. If a future change drops DEFAULT_COMPANY_ATTACHMENT_MAX_BYTES
+    // or MAX_ATTACHMENT_BYTES below 20 MiB, this fails first with a clear message.
+    expect(normalizeIssueAttachmentMaxBytes(undefined)).toBeGreaterThanOrEqual(20 * MIB);
+    expect(MAX_ATTACHMENT_BYTES).toBeGreaterThanOrEqual(20 * MIB);
+  });
+
+  it("accepts a >10 MiB (15 MiB) artifact through create() with default ceilings", async () => {
+    // companyMaxBytes = the fresh-install per-company value; maxByteSize defaults
+    // to DEFAULT_MAX_BYTES (25 MiB) since the harness leaves it undefined.
+    const { handler, registry, putFileCalls } = buildHandler({
+      companyMaxBytes: normalizeIssueAttachmentMaxBytes(undefined),
+    });
+    registerCtx(registry);
+    const fifteenMiB = Buffer.alloc(15 * MIB, 0x42);
+    const result = await handler.create(createParams(fifteenMiB.toString("base64")));
+    expect(result.attachmentId).toBe("asset-1");
+    expect(putFileCalls).toHaveLength(1);
+    expect(putFileCalls[0]!.byteSize).toBe(15 * MIB);
+    const call = vi.mocked(logActivity).mock.calls.at(-1)![1];
+    expect(call.details).toMatchObject({ outcome: "allowed", deduped: false, byteSize: 15 * MIB });
+  });
+
+  it("still rejects an artifact above the new 25 MiB ceiling with too_large (no store)", async () => {
+    const { handler, registry, putFileCalls } = buildHandler({
+      companyMaxBytes: normalizeIssueAttachmentMaxBytes(undefined),
+    });
+    registerCtx(registry);
+    const overCeiling = Buffer.alloc(26 * MIB, 0x43);
+    await expect(
+      handler.create(createParams(overCeiling.toString("base64"))),
+    ).rejects.toMatchObject({ code: "too_large" });
+    expect(putFileCalls).toHaveLength(0);
+    const call = vi.mocked(logActivity).mock.calls.at(-1)![1];
+    expect(call.details).toMatchObject({ outcome: "denied", deniedReason: "too_large" });
   });
 });
 
