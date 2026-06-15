@@ -1,6 +1,6 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import {
   createHostClientHandlers,
@@ -11,9 +11,11 @@ import {
 } from "@paperclipai/plugin-sdk";
 import {
   appendStderrExcerpt,
+  createBoundedFrameReader,
   createPluginWorkerHandle,
   createPluginWorkerManager,
   formatWorkerFailureMessage,
+  resolveMaxIpcFrameBytes,
 } from "../services/plugin-worker-manager.js";
 import { createPluginRunContextRegistry } from "../services/plugin-run-context-registry.js";
 import {
@@ -48,6 +50,10 @@ const ONEVENT_WORKER_ENTRYPOINT = path.join(
 const INBOUND_COMMENT_WORKER_ENTRYPOINT = path.join(
   FIXTURES_DIR,
   "plugin-worker-inbound-comment.cjs",
+);
+const OVERSIZE_FRAME_WORKER_ENTRYPOINT = path.join(
+  FIXTURES_DIR,
+  "plugin-worker-oversize-frame.cjs",
 );
 
 const TEST_MANIFEST: PaperclipPluginManifestV1 = {
@@ -931,6 +937,152 @@ describe("PLA-773 — background dispatch run-context (item 1) + redaction clean
       clearRunSecretValues(serviceRunId);
       await manager.stopAll().catch(() => undefined);
       registry.dispose();
+    }
+  });
+});
+
+// PLA-1149: bounded worker→host IPC frame reader (OOM hardening).
+describe("resolveMaxIpcFrameBytes", () => {
+  const ENV_KEY = "PAPERCLIP_PLUGIN_MAX_IPC_FRAME_BYTES";
+  const original = process.env[ENV_KEY];
+
+  afterEach(() => {
+    if (original === undefined) delete process.env[ENV_KEY];
+    else process.env[ENV_KEY] = original;
+  });
+
+  it("prefers a valid explicit override", () => {
+    process.env[ENV_KEY] = "100";
+    expect(resolveMaxIpcFrameBytes(4096)).toBe(4096);
+  });
+
+  it("falls back to the env var when no override is given", () => {
+    process.env[ENV_KEY] = "12345";
+    expect(resolveMaxIpcFrameBytes()).toBe(12345);
+  });
+
+  it("ignores non-positive / non-finite values and uses the default", () => {
+    delete process.env[ENV_KEY];
+    const def = resolveMaxIpcFrameBytes();
+    expect(def).toBe(64 * 1024 * 1024);
+    expect(resolveMaxIpcFrameBytes(0)).toBe(def);
+    expect(resolveMaxIpcFrameBytes(-5)).toBe(def);
+    expect(resolveMaxIpcFrameBytes(Number.NaN)).toBe(def);
+    process.env[ENV_KEY] = "not-a-number";
+    expect(resolveMaxIpcFrameBytes()).toBe(def);
+  });
+});
+
+describe("createBoundedFrameReader", () => {
+  it("emits complete newline-delimited frames, including several in one chunk", () => {
+    const frames: string[] = [];
+    const reader = createBoundedFrameReader({
+      maxFrameBytes: 1024,
+      onFrame: (line) => frames.push(line),
+      onOversize: () => {
+        throw new Error("unexpected oversize");
+      },
+    });
+    reader.push(Buffer.from("a\nbb\nccc\n"));
+    expect(frames).toEqual(["a", "bb", "ccc"]);
+  });
+
+  it("reassembles a frame split across multiple chunks", () => {
+    const frames: string[] = [];
+    const reader = createBoundedFrameReader({
+      maxFrameBytes: 1024,
+      onFrame: (line) => frames.push(line),
+      onOversize: () => {
+        throw new Error("unexpected oversize");
+      },
+    });
+    reader.push(Buffer.from("hel"));
+    reader.push(Buffer.from("lo wor"));
+    reader.push(Buffer.from("ld\nnext\n"));
+    expect(frames).toEqual(["hello world", "next"]);
+  });
+
+  it("allows a frame exactly at the cap but trips one byte over", () => {
+    const atCap: string[] = [];
+    const atCapReader = createBoundedFrameReader({
+      maxFrameBytes: 8,
+      onFrame: (line) => atCap.push(line),
+      onOversize: () => {
+        throw new Error("should not trip at exactly the cap");
+      },
+    });
+    atCapReader.push(Buffer.from("12345678\n"));
+    expect(atCap).toEqual(["12345678"]);
+
+    const overFrames: string[] = [];
+    const trips: Array<{ bytesSeen: number; limit: number }> = [];
+    const overReader = createBoundedFrameReader({
+      maxFrameBytes: 8,
+      onFrame: (line) => overFrames.push(line),
+      onOversize: (info) => trips.push(info),
+    });
+    overReader.push(Buffer.from("123456789\n"));
+    expect(overFrames).toEqual([]);
+    expect(trips).toHaveLength(1);
+    expect(trips[0]!.limit).toBe(8);
+  });
+
+  it("trips before the full payload is buffered and resynchronizes on the next frame", () => {
+    const frames: string[] = [];
+    const trips: Array<{ bytesSeen: number; limit: number }> = [];
+    const reader = createBoundedFrameReader({
+      maxFrameBytes: 16,
+      onFrame: (line) => frames.push(line),
+      onOversize: (info) => trips.push(info),
+    });
+
+    // Stream a giant newline-less frame in small chunks, then a valid frame.
+    for (let i = 0; i < 1000; i++) {
+      reader.push(Buffer.from("x".repeat(64)));
+    }
+    // Trips exactly once; never accumulates the whole 64 KiB.
+    expect(trips).toHaveLength(1);
+    // bytesSeen is bounded near the cap + one chunk, not the 64 KiB total.
+    expect(trips[0]!.bytesSeen).toBeLessThanOrEqual(16 + 64);
+
+    // The next newline resynchronizes; subsequent valid frames parse again.
+    reader.push(Buffer.from("\nrecovered\n"));
+    expect(frames).toEqual(["recovered"]);
+    expect(trips).toHaveLength(1);
+  });
+});
+
+describe("plugin worker IPC frame cap (PLA-1149 end-to-end)", () => {
+  it("terminates a worker that emits an over-limit IPC frame", async () => {
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: OVERSIZE_FRAME_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: {},
+      autoRestart: false,
+      maxIpcFrameBytes: 4096,
+    });
+
+    const crashed = new Promise<void>((resolve) => {
+      handle.on("crash", () => resolve());
+    });
+
+    try {
+      await handle.start();
+
+      // Ask the worker to emit a single ~5 MiB newline-less frame, far above the
+      // 4 KiB cap. The host must drop + terminate rather than buffer it.
+      const call = handle.call(
+        "environmentExecute",
+        { oversizeBytes: 5 * 1024 * 1024 } as HostToWorkerMethods["environmentExecute"][0],
+      );
+      await expect(call).rejects.toThrow();
+      await crashed;
+      expect(handle.status).not.toBe("running");
+    } finally {
+      await handle.stop().catch(() => undefined);
     }
   });
 });
