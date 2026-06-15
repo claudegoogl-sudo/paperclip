@@ -21,7 +21,6 @@
 import { fork, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { createInterface, type Interface as ReadlineInterface } from "node:readline";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import {
   JSONRPC_VERSION,
@@ -92,6 +91,134 @@ const CRASH_WINDOW_MS = 10 * 60 * 1_000;
 
 /** Maximum number of stderr characters retained for worker failure context. */
 const MAX_STDERR_EXCERPT_CHARS = 8_000;
+
+/**
+ * PLA-1149: hard cap on a single worker→host IPC frame (one NDJSON line) in
+ * bytes. The transport is node `fork` stdio and the worker controls how many
+ * bytes it writes before a newline. Without a cap the host buffers an entire
+ * line into memory *before* any application-level size gate runs (e.g. the
+ * artifacts `create` byte ceiling in plugin-artifacts-handler.ts), so a
+ * compromised or buggy worker can OOM the host with one oversized frame. Plugin
+ * workers are global/shared across tenants, so one bad frame is a host-wide
+ * transient. This default sits well above the largest legitimate frame — a
+ * base64 artifact `create` at the 25 MiB ceiling is ≈35 MiB plus a small JSON
+ * envelope — while bounding catastrophic allocation. Override per deployment via
+ * `PAPERCLIP_PLUGIN_MAX_IPC_FRAME_BYTES`.
+ */
+const DEFAULT_MAX_IPC_FRAME_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Resolve the per-frame IPC byte cap, preferring an explicit override (used by
+ * tests and per-deployment tuning), then the env var, then the safe default.
+ */
+export function resolveMaxIpcFrameBytes(override?: number): number {
+  if (typeof override === "number" && Number.isFinite(override) && override > 0) {
+    return Math.floor(override);
+  }
+  const fromEnv = Number(process.env.PAPERCLIP_PLUGIN_MAX_IPC_FRAME_BYTES);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return Math.floor(fromEnv);
+  return DEFAULT_MAX_IPC_FRAME_BYTES;
+}
+
+/**
+ * Options for {@link createBoundedFrameReader}.
+ */
+export interface BoundedFrameReaderOptions {
+  /** Hard cap on a single newline-delimited frame, in bytes (inclusive). */
+  maxFrameBytes: number;
+  /** Invoked with each complete frame (newline stripped, decoded as UTF-8). */
+  onFrame: (line: string) => void;
+  /**
+   * Invoked once per oversized frame, as soon as the accumulated bytes for the
+   * current (still newline-less) frame would exceed `maxFrameBytes` — i.e.
+   * BEFORE the whole payload is buffered. `bytesSeen` is how many bytes of the
+   * offending frame had been observed at the trip point (≤ maxFrameBytes plus
+   * one transport chunk); the host never allocates the full payload. After this
+   * fires the reader discards bytes up to the next newline to resynchronize, so
+   * subsequent valid frames still parse. The caller decides whether to also
+   * terminate the worker.
+   */
+  onOversize: (info: { bytesSeen: number; limit: number }) => void;
+}
+
+/**
+ * A pushed-bytes line reader. Unlike node `readline`, it enforces a hard byte
+ * ceiling on a single newline-delimited frame and never buffers more than
+ * `maxFrameBytes` of an in-flight frame. Feed it raw stdout/stderr chunks via
+ * {@link BoundedFrameReader.push}.
+ */
+export interface BoundedFrameReader {
+  /** Feed the next chunk of bytes read from the worker stream. */
+  push(chunk: Buffer): void;
+}
+
+export function createBoundedFrameReader(
+  options: BoundedFrameReaderOptions,
+): BoundedFrameReader {
+  const { maxFrameBytes, onFrame, onOversize } = options;
+  const NEWLINE = 0x0a;
+
+  let pending: Buffer[] = [];
+  let pendingBytes = 0;
+  // After an oversize frame we drop bytes until the next newline to realign on
+  // a frame boundary rather than misparsing the tail of the giant frame.
+  let resyncing = false;
+
+  function trip(extraBytes: number): void {
+    const bytesSeen = pendingBytes + extraBytes;
+    pending = [];
+    pendingBytes = 0;
+    onOversize({ bytesSeen, limit: maxFrameBytes });
+  }
+
+  return {
+    push(chunk: Buffer): void {
+      let offset = 0;
+      while (offset < chunk.length) {
+        if (resyncing) {
+          const nl = chunk.indexOf(NEWLINE, offset);
+          if (nl === -1) return; // whole remainder is still the oversized frame
+          resyncing = false;
+          offset = nl + 1;
+          continue;
+        }
+
+        const nl = chunk.indexOf(NEWLINE, offset);
+        if (nl === -1) {
+          const tail = chunk.subarray(offset);
+          if (pendingBytes + tail.length > maxFrameBytes) {
+            resyncing = true;
+            trip(tail.length);
+            return;
+          }
+          pending.push(tail);
+          pendingBytes += tail.length;
+          return;
+        }
+
+        const frameLen = nl - offset;
+        if (pendingBytes + frameLen > maxFrameBytes) {
+          // Newline is in this chunk, so we can resync immediately past it.
+          trip(frameLen);
+          offset = nl + 1;
+          continue;
+        }
+
+        let frame: Buffer;
+        if (pending.length === 0) {
+          frame = chunk.subarray(offset, nl);
+        } else {
+          pending.push(chunk.subarray(offset, nl));
+          frame = Buffer.concat(pending);
+          pending = [];
+          pendingBytes = 0;
+        }
+        onFrame(frame.toString("utf8"));
+        offset = nl + 1;
+      }
+    },
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -179,6 +306,12 @@ export interface WorkerStartOptions {
   hostHandlers: WorkerToHostHandlers;
   /** Default timeout for RPC calls (ms). Defaults to 30s. */
   rpcTimeoutMs?: number;
+  /**
+   * PLA-1149: hard byte cap on a single worker→host IPC frame. Defaults to
+   * `PAPERCLIP_PLUGIN_MAX_IPC_FRAME_BYTES` or {@link DEFAULT_MAX_IPC_FRAME_BYTES}.
+   * Mainly an injection point for tests; production should use the env var.
+   */
+  maxIpcFrameBytes?: number;
   /** Whether to auto-restart on crash. Defaults to true. */
   autoRestart?: boolean;
   /** Node.js execArgv passed to the child process. */
@@ -433,8 +566,6 @@ export function createPluginWorkerHandle(
 
   // Worker process state
   let childProcess: ChildProcess | null = null;
-  let readline: ReadlineInterface | null = null;
-  let stderrReadline: ReadlineInterface | null = null;
   let status: WorkerStatus = "stopped";
   let startedAt: number | null = null;
   let stderrExcerpt = "";
@@ -467,6 +598,7 @@ export function createPluginWorkerHandle(
 
   const rpcTimeoutMs = options.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
   const autoRestart = options.autoRestart ?? true;
+  const maxIpcFrameBytes = resolveMaxIpcFrameBytes(options.maxIpcFrameBytes);
 
   // -----------------------------------------------------------------------
   // Status management
@@ -919,19 +1051,53 @@ export function createPluginWorkerHandle(
   }
 
   function attachStdioHandlers(child: ChildProcess): void {
-    // Read NDJSON from stdout
+    // Read NDJSON from stdout through a byte-bounded frame reader (PLA-1149).
+    // The reader never buffers more than `maxIpcFrameBytes` of an in-flight
+    // frame; an oversized frame is dropped before the host allocates the full
+    // payload, audited, and the worker is terminated (fail closed).
     if (child.stdout) {
-      readline = createInterface({ input: child.stdout });
-      readline.on("line", handleLine);
+      const stdoutReader = createBoundedFrameReader({
+        maxFrameBytes: maxIpcFrameBytes,
+        onFrame: handleLine,
+        onOversize: ({ bytesSeen, limit }) => {
+          log.error(
+            {
+              audit: "plugin.worker.ipc.oversize_frame",
+              stream: "stdout",
+              bytesSeen,
+              limit,
+            },
+            "worker IPC frame exceeded hard size cap; dropping frame and terminating worker",
+          );
+          terminateForOversizeFrame();
+        },
+      });
+      child.stdout.on("data", (chunk: Buffer) => stdoutReader.push(chunk));
     }
 
-    // Capture stderr for logging
+    // Capture stderr for logging, also byte-bounded so a worker cannot OOM the
+    // host with a giant newline-less stderr line. Oversized stderr is truncated
+    // rather than fatal — it is a logging channel, not the IPC transport.
     if (child.stderr) {
-      stderrReadline = createInterface({ input: child.stderr });
-      stderrReadline.on("line", (line: string) => {
-        stderrExcerpt = appendStderrExcerpt(stderrExcerpt, line);
-        log.warn({ stream: "stderr" }, `[plugin stderr] ${line}`);
+      const stderrReader = createBoundedFrameReader({
+        maxFrameBytes: maxIpcFrameBytes,
+        onFrame: (line: string) => {
+          stderrExcerpt = appendStderrExcerpt(stderrExcerpt, line);
+          log.warn({ stream: "stderr" }, `[plugin stderr] ${line}`);
+        },
+        onOversize: ({ bytesSeen, limit }) => {
+          log.warn(
+            {
+              audit: "plugin.worker.ipc.oversize_frame",
+              stream: "stderr",
+              bytesSeen,
+              limit,
+            },
+            "worker stderr line exceeded hard size cap; truncating",
+          );
+        },
       });
+      child.stderr.on("data", (chunk: Buffer) => stderrReader.push(chunk));
     }
 
     // Handle process exit
@@ -963,15 +1129,9 @@ export function createPluginWorkerHandle(
   ): void {
     const wasIntentional = intentionalStop;
 
-    // Clean up readline interfaces
-    if (readline) {
-      readline.close();
-      readline = null;
-    }
-    if (stderrReadline) {
-      stderrReadline.close();
-      stderrReadline = null;
-    }
+    // The stdout/stderr readers are plain `data` listeners on the child's
+    // streams, which are destroyed when the process exits — no explicit
+    // teardown needed.
     childProcess = null;
     startedAt = null;
 
@@ -1266,6 +1426,22 @@ export function createPluginWorkerHandle(
         resolve();
       }
     });
+  }
+
+  /**
+   * PLA-1149: SIGKILL a worker that sent an oversized IPC frame. Deliberately
+   * does NOT set `intentionalStop`, so {@link handleProcessExit} treats the
+   * death as a crash and the normal exponential-backoff / consecutive-crash
+   * ceiling applies — a worker that keeps emitting oversized frames is
+   * eventually abandoned rather than restarted forever.
+   */
+  function terminateForOversizeFrame(): void {
+    if (!childProcess) return;
+    try {
+      childProcess.kill("SIGKILL");
+    } catch {
+      // Process may already be dead.
+    }
   }
 
   async function killProcess(): Promise<void> {
