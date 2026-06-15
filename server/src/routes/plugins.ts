@@ -11,8 +11,9 @@
  * - Retrieving UI slot contributions for frontend rendering
  * - Discovering and executing plugin-contributed agent tools
  *
- * All routes require board-level authentication, and sensitive instance-wide
+ * Most routes require board-level authentication, and sensitive instance-wide
  * mutations such as install/upgrade require instance-admin privileges.
+ * Plugin tool discovery and execution routes allow both board and agent access.
  *
  * @module server/routes/plugins
  * @see doc/plugins/PLUGIN_SPEC.md for the full plugin specification

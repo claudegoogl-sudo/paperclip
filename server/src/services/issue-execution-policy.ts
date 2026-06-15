@@ -393,8 +393,10 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
     : null;
 
   const standbyWakeTarget = parsed.data.standbyWakeTarget === true;
+  const reviewPreset = parsed.data.reviewPreset;
+  const authorizationPolicy = parsed.data.authorizationPolicy;
 
-  if (stages.length === 0 && !monitor && !standbyWakeTarget) return null;
+  if (stages.length === 0 && !monitor && !standbyWakeTarget && !reviewPreset && !authorizationPolicy) return null;
 
   return {
     mode: parsed.data.mode ?? "normal",
@@ -402,6 +404,8 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
     stages,
     ...(monitor ? { monitor } : {}),
     ...(standbyWakeTarget ? { standbyWakeTarget: true } : {}),
+    ...(reviewPreset ? { reviewPreset } : {}),
+    ...(authorizationPolicy ? { authorizationPolicy } : {}),
   };
 }
 

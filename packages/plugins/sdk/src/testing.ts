@@ -1036,6 +1036,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
             leadAgentId: null,
             targetDate: null,
             color: declaration.color ?? null,
+            icon: null,
             env: null,
             pauseReason: null,
             pausedAt: null,
@@ -1635,7 +1636,9 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       async listComments(issueId, companyId) {
         requireCapability(manifest, capabilitySet, "issue.comments.read");
         if (!isInCompany(issues.get(issueId), companyId)) return [];
-        return issueComments.get(issueId) ?? [];
+        return (issueComments.get(issueId) ?? []).map((comment) =>
+          comment.deletedAt ? { ...comment, body: "", presentation: null, metadata: null } : comment
+        );
       },
       async createComment(issueId, body, companyId, options) {
         requireCapability(manifest, capabilitySet, "issue.comments.create");
@@ -1712,6 +1715,9 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       },
       async requestConfirmation(issueId, interaction, companyId, options) {
         return this.createInteraction(issueId, { ...interaction, kind: "request_confirmation" }, companyId, options) as Promise<any>;
+      },
+      async requestCheckboxConfirmation(issueId, interaction, companyId, options) {
+        return this.createInteraction(issueId, { ...interaction, kind: "request_checkbox_confirmation" }, companyId, options) as Promise<any>;
       },
       documents: {
         async list(issueId, companyId) {

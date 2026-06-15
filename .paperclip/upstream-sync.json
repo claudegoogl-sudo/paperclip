@@ -1,10 +1,10 @@
 {
-  "lastSyncedTag": "v2026.529.0",
-  "lastSyncedSha": "43dfde763ceae7481e7a96d4fe8183aaaeec8eaa",
-  "lastSyncedAt": "2026-06-01T05:57:06Z",
-  "etag": "W/\"fd6a229e9c96aec3a00412dcd00c8c599d589fee4ebaadf065d453900b53efae\"",
-  "lastCheckedAt": "2026-06-01T05:58:28Z",
+  "lastSyncedTag": "v2026.609.0",
+  "lastSyncedSha": "a0f7d3dabaf5308ade45cae0c64ebd133948dca2",
+  "lastSyncedAt": "2026-06-15T05:45:00Z",
+  "etag": "W/\"d7d12378987a2a124733aa991b927e38e0dcf928f9e6b6eabd262b445f93d93e\"",
+  "lastCheckedAt": "2026-06-15T05:45:00Z",
   "pendingPrUrl": null,
-  "lastConflictBuckets": { "clean": 0, "reviewable": 1, "escalation": 0 },
-  "_syncNote": "v2026.529.0 upstream sync landed on fork master via PR #60 (merge commit 43dfde763ceae7481e7a96d4fe8183aaaeec8eaa; lineage preserved: 43dfde7 = merge of 16de9da/2334632, upstream tag 911a1e8b is an ancestor). 5 conflicts resolved per CTO decision PLA-751 (bucket: reviewable=1); SecurityEngineer review PLA-758 PASS (both egress migrations 0096/0097 byte-identical post-renumber). State advanced by CTO-driven re-run after the conflict was addressed and the PR merged (skill 3+4). ETag reflects upstream releases/latest at v2026.529.0, so the next scheduled tick gets a 304 and exits no-op until upstream cuts a newer release. Supersedes the PLA-752 staged note (was pinned at v2026.525.0)."
+  "lastConflictBuckets": { "clean": 0, "reviewable": 8, "escalation": 7 },
+  "_syncNote": "v2026.609.0 upstream sync (PLA-1078). 15 conflicted files resolved manually on branch sync/upstream-v2026.609.0 off fork master 600c7c030, merging upstream tag commit a0f7d3dabaf5308ade45cae0c64ebd133948dca2. Buckets: take-upstream/union (e2e.yml, pr.yml, CONTRIBUTING.md, package.json) + reviewable (shared/types/issue.ts, validators/issue.ts, validators/plugin.test.ts) + dispatcher contract = reviewable; 7 security-sensitive files (cli secrets.ts/secrets.test.ts, server routes/issues.ts, routes/plugins.ts, issue-execution-policy.ts, plugin-loader.ts, plugin-tool-dispatcher.ts) gated on SecurityEngineer (agent 7e888032) review child. Fork hardening preserved: egress allowlist + secret-pattern denylist + per-actor plugin-tool scoping + v1 slot floor. 4 fork migrations renumbered 0094-0097 -> 0099-0102 above upstream 0098, fork relative order (egress dep chain) preserved; from-empty apply verified (db migration tests 10/10). pnpm-lock.yaml regenerated as authored-by-sync-branch. lastSyncedSha currently pins the UPSTREAM tag commit; the fork-master merge-commit SHA + final pendingPrUrl are finalized by CTO/board when the DRAFT PR merges (FULL UPSTREAM-PR FREEZE PLA-585: DRAFT-only against claudegoogl-sudo/paperclip:master, board-gated, no upstream PR, no auto-merge). etag reflects upstream releases/latest at v2026.609.0 so the next scheduled tick 304s no-op until a newer release. Supersedes v2026.529.0 (PR #60)."
 }

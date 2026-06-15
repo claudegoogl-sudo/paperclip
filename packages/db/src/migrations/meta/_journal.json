@@ -663,29 +663,64 @@
     {
       "idx": 94,
       "version": "7",
-      "when": 1780041000000,
-      "tag": "0094_activity_log_run_id_set_null",
+      "when": 1780533900000,
+      "tag": "0094_backfill_archived_company_agent_pauses",
       "breakpoints": true
     },
     {
       "idx": 95,
       "version": "7",
-      "when": 1780099200000,
-      "tag": "0095_backfill_plugin_secret_bindings",
+      "when": 1780507597454,
+      "tag": "0095_issue_comment_tombstones",
       "breakpoints": true
     },
     {
       "idx": 96,
       "version": "7",
-      "when": 1780531200000,
-      "tag": "0096_secret_binding_egress_allowlist",
+      "when": 1780507597455,
+      "tag": "0096_document_annotation_issue_comment_links",
       "breakpoints": true
     },
     {
       "idx": 97,
       "version": "7",
-      "when": 1780617600000,
-      "tag": "0097_egress_would_deny_observations",
+      "when": 1780534000000,
+      "tag": "0097_low_trust_source_trust",
+      "breakpoints": true
+    },
+    {
+      "idx": 98,
+      "version": "7",
+      "when": 1780534200000,
+      "tag": "0098_project_icon",
+      "breakpoints": true
+    },
+    {
+      "idx": 99,
+      "version": "7",
+      "when": 1780534300000,
+      "tag": "0099_activity_log_run_id_set_null",
+      "breakpoints": true
+    },
+    {
+      "idx": 100,
+      "version": "7",
+      "when": 1780534400000,
+      "tag": "0100_backfill_plugin_secret_bindings",
+      "breakpoints": true
+    },
+    {
+      "idx": 101,
+      "version": "7",
+      "when": 1780534500000,
+      "tag": "0101_secret_binding_egress_allowlist",
+      "breakpoints": true
+    },
+    {
+      "idx": 102,
+      "version": "7",
+      "when": 1780534600000,
+      "tag": "0102_egress_would_deny_observations",
       "breakpoints": true
     }
   ]

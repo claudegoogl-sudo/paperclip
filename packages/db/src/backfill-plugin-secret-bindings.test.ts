@@ -7,8 +7,8 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./test-embedded-postgres.js";
 
-// Exercises migration 0095_backfill_plugin_secret_bindings against representative
-// pre-state data. The embedded-pg helper boots an already-migrated DB (so 0095 has
+// Exercises migration 0100_backfill_plugin_secret_bindings against representative
+// pre-state data. The embedded-pg helper boots an already-migrated DB (so 0100 has
 // run once over empty data); each case seeds plugin/secret/config rows and then
 // replays the shipped backfill SQL on a fresh connection — mirroring how
 // applyPendingMigrationsManually executes it (one connection so the pg_temp helper
@@ -24,7 +24,7 @@ if (!embeddedPostgresSupport.supported) {
 }
 
 const BACKFILL_SQL = fs.readFileSync(
-  new URL("./migrations/0095_backfill_plugin_secret_bindings.sql", import.meta.url),
+  new URL("./migrations/0100_backfill_plugin_secret_bindings.sql", import.meta.url),
   "utf8",
 );
 
@@ -49,7 +49,7 @@ async function runBackfill(connectionString: string): Promise<void> {
   }
 }
 
-describeEmbeddedPostgres("0095 backfill company_secret_bindings", () => {
+describeEmbeddedPostgres("0100 backfill company_secret_bindings", () => {
   let connectionString: string;
   let cleanup: () => Promise<void>;
   let sql: ReturnType<typeof postgres>;
