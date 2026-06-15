@@ -55,6 +55,13 @@ export const DEFAULT_ALLOWED_TYPES: readonly string[] = [
  * human route allows them (PLA-888 security review F2): an inbound external
  * relay has no need for active/markup document types, and dropping the classic
  * stored-XSS / formula-injection inputs minimises the hostile-input surface.
+ *
+ * PLA-1139: also includes inert 3D-geometry types (STL/3MF/OBJ/STEP/glTF) so an
+ * operator can relay a CAD model through the inbound messenger path. These are
+ * static geometry descriptions — non-executable data, no active/markup surface —
+ * so they extend the auditable type set without widening the hostile-input risk.
+ * All entries are lowercase: {@link isAllowedPluginArtifactMimeType} lowercases
+ * its input before matching, so case variants would be dead duplicates.
  */
 const PLUGIN_ARTIFACT_EXCLUDED_DEFAULT_TYPES: readonly string[] = ["text/html", "text/csv"];
 
@@ -68,6 +75,19 @@ export const PLUGIN_ARTIFACT_ALLOWED_MIME_TYPES: readonly string[] = [
   "audio/wav",
   "audio/x-wav",
   "audio/flac",
+  // PLA-1139: inert 3D-geometry types (static, non-executable).
+  "model/stl",
+  "application/vnd.ms-pki.stl",
+  "application/sla",
+  "model/x.stl-binary",
+  "model/x.stl-ascii",
+  "model/3mf",
+  "application/vnd.ms-package.3dmanufacturing-3dmodel+xml",
+  "model/obj",
+  "model/step",
+  "application/step",
+  "model/gltf-binary",
+  "model/gltf+json",
 ];
 
 /**
