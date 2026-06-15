@@ -1,7 +1,13 @@
 export const COMPANY_STATUSES = ["active", "paused", "archived"] as const;
 export type CompanyStatus = (typeof COMPANY_STATUSES)[number];
 
-export const DEFAULT_COMPANY_ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
+// 25 MiB. Raised from 10 MiB (PLA-1147) so the plugin-artifact write path —
+// whose effective ceiling is Math.min(companyMaxBytes, pluginMaxBytes) — is not
+// silently pinned back to 10 MiB by an unset per-company limit. 25 MiB covers
+// everything Telegram's Bot API getFile can deliver (hard 20 MB inbound cap)
+// with margin for base64/metadata, so an inbound messenger relay can store a CAD
+// model / STL. Per-company overrides may still set anything up to the 1 GiB cap.
+export const DEFAULT_COMPANY_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
 export const MAX_COMPANY_ATTACHMENT_MAX_BYTES = 1024 * 1024 * 1024;
 
 export const DEPLOYMENT_MODES = ["local_trusted", "authenticated"] as const;

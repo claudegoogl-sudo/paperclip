@@ -183,8 +183,15 @@ export function isAllowedContentType(contentType: string): boolean {
   return matchesContentType(contentType, allowedPatterns);
 }
 
+// Default raised 10 MiB → 25 MiB (PLA-1147). This is the shared upper bound for
+// BOTH the human upload route (routes/assets.ts multer limit) and the per-company
+// `normalizeIssueAttachmentMaxBytes` ceiling that the plugin-artifact write path
+// inherits. Raising it is intentional: it is required so a fresh install with no
+// env tuning accepts a ~15-20 MiB STL via the plugin/messenger relay path, and it
+// lifts the human upload default to match. `PAPERCLIP_ATTACHMENT_MAX_BYTES` still
+// overrides it for operators who want a different shared cap.
 export const MAX_ATTACHMENT_BYTES =
-  Number(process.env.PAPERCLIP_ATTACHMENT_MAX_BYTES) || 10 * 1024 * 1024;
+  Number(process.env.PAPERCLIP_ATTACHMENT_MAX_BYTES) || 25 * 1024 * 1024;
 
 export function normalizeIssueAttachmentMaxBytes(value: number | null | undefined): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
