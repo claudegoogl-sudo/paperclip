@@ -230,9 +230,26 @@ const DEFAULT_PER_COMPANY = { maxAttempts: 30, windowMs: 60_000 };
 /** PLA-888: per-company write ceiling — bounds storage-DoS from the relay path
  *  where there is no dispatching agent to key off. */
 const DEFAULT_WRITE = { maxAttempts: 30, windowMs: 60_000 };
-/** 10 MiB — large enough for screenshots / small docs, small enough to fit
- *  comfortably inside one JSON-RPC base64 payload. */
-const DEFAULT_MAX_BYTES = 10 * 1024 * 1024;
+/**
+ * Default plugin-artifact byte ceiling: 25 MiB (PLA-1147, raised from 10 MiB).
+ *
+ * Sized to cover everything Telegram's Bot API `getFile` can deliver (hard 20 MB
+ * inbound cap) plus margin for base64/metadata, so an operator can relay a CAD
+ * model / STL through the inbound messenger path. The worker↔host transport is
+ * node `fork` IPC over stdio (NOT express), so the 10 MiB JSON body limit
+ * (DEFAULT_JSON_BODY_LIMIT) does not gate this path — a ~25 MiB binary inflates
+ * to a ~33 MiB base64 string over IPC, which is feasible.
+ *
+ * Env-tunable, mirroring the human upload route's `PAPERCLIP_ATTACHMENT_MAX_BYTES`:
+ * `PAPERCLIP_PLUGIN_ARTIFACT_MAX_BYTES` wins, then the shared
+ * `PAPERCLIP_ATTACHMENT_MAX_BYTES`, then this 25 MiB default. NOTE: the effective
+ * ceiling is still `Math.min(companyMaxBytes, maxByteSize)` (see the `create`
+ * size gate) — the per-company attachment limit can lower it below this value.
+ */
+const DEFAULT_MAX_BYTES =
+  Number(process.env.PAPERCLIP_PLUGIN_ARTIFACT_MAX_BYTES) ||
+  Number(process.env.PAPERCLIP_ATTACHMENT_MAX_BYTES) ||
+  25 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Factory
