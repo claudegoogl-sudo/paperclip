@@ -18,7 +18,7 @@
  * @see PLUGIN_SPEC.md §13 — Host-Worker Protocol
  */
 
-import { fork, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
@@ -94,7 +94,7 @@ const MAX_STDERR_EXCERPT_CHARS = 8_000;
 
 /**
  * PLA-1149: hard cap on a single worker→host IPC frame (one NDJSON line) in
- * bytes. The transport is node `fork` stdio and the worker controls how many
+ * bytes. The transport is node child-process stdio and the worker controls how many
  * bytes it writes before a newline. Without a cap the host buffers an entire
  * line into memory *before* any application-level size gate runs (e.g. the
  * artifacts `create` byte ceiling in plugin-artifacts-handler.ts), so a
@@ -1039,13 +1039,44 @@ export function createPluginWorkerHandle(
       TZ: process.env.TZ ?? "UTC",
     };
 
-    const child = fork(options.entrypointPath, [], {
-      stdio: ["pipe", "pipe", "pipe", "ipc"],
-      execArgv: options.execArgv ?? [],
-      env: workerEnv,
-      // Don't let the child keep the parent alive
-      detached: false,
-    });
+    // PLA-1154: use `spawn` with a 3-fd stdio instead of `fork`. The host↔worker
+    // protocol runs entirely over stdin (host→worker requests) and stdout
+    // (worker→host NDJSON, byte-capped by PLA-1149). It NEVER uses the node IPC
+    // channel: there is no `child.send(...)`/`child.on("message", ...)` anywhere
+    // in the host, and the worker SDK transports over `process.stdin`/`stdout`.
+    // `fork()` always provisions an IPC channel (fd 3) whose parent-side reader
+    // calls `readStart()` and buffers incoming bytes with no application-level
+    // cap — a worker→host OOM vector the PLA-1149 stdout cap does not cover (a
+    // compromised worker could `process.send({huge})` or `fs.writeSync(3, ...)`).
+    // `spawn` with `["pipe","pipe","pipe"]` provisions no IPC channel, removing
+    // the surface entirely (Minimize Attack Surface / Least Common Mechanism).
+    // `fork`'s node args are `execArgv` before the module path; replicate that.
+    const child = spawn(
+      process.execPath,
+      [...(options.execArgv ?? []), options.entrypointPath],
+      {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: workerEnv,
+        // Don't let the child keep the parent alive
+        detached: false,
+      },
+    );
+
+    // Defense-in-depth: assert no IPC channel exists. `spawn` with a 3-fd stdio
+    // never creates one, but if a future change reintroduces it, sever the
+    // channel and audit rather than silently leaving the uncapped fd-3 bypass
+    // open.
+    if (child.channel != null) {
+      log.error(
+        { audit: "plugin.worker.ipc.unexpected_channel", pid: child.pid },
+        "worker spawned with an unexpected node IPC channel; disconnecting to close the uncapped fd-3 OOM vector",
+      );
+      try {
+        child.disconnect();
+      } catch {
+        // Channel may already be torn down.
+      }
+    }
 
     return child;
   }

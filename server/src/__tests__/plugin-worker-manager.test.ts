@@ -55,6 +55,10 @@ const OVERSIZE_FRAME_WORKER_ENTRYPOINT = path.join(
   FIXTURES_DIR,
   "plugin-worker-oversize-frame.cjs",
 );
+const IPC_CHANNEL_WORKER_ENTRYPOINT = path.join(
+  FIXTURES_DIR,
+  "plugin-worker-ipc-channel.cjs",
+);
 
 const TEST_MANIFEST: PaperclipPluginManifestV1 = {
   id: "test.plugin",
@@ -1081,6 +1085,42 @@ describe("plugin worker IPC frame cap (PLA-1149 end-to-end)", () => {
       await expect(call).rejects.toThrow();
       await crashed;
       expect(handle.status).not.toBe("running");
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+});
+
+describe("plugin worker node IPC channel removal (PLA-1154)", () => {
+  it("spawns the worker with no live node IPC channel (fd 3 gone)", async () => {
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: IPC_CHANNEL_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: {},
+      autoRestart: false,
+    });
+
+    try {
+      await handle.start();
+
+      const probe = (await handle.call(
+        "environmentExecute",
+        {} as HostToWorkerMethods["environmentExecute"][0],
+      )) as {
+        hasProcessSend: boolean;
+        hasChannel: boolean;
+        fd3Write: { threw: boolean; code?: string };
+      };
+
+      // The worker has no IPC channel: no `process.send`, no `process.channel`.
+      expect(probe.hasProcessSend).toBe(false);
+      expect(probe.hasChannel).toBe(false);
+      // The OOM bypass vector — a raw newline-less write to fd 3 — fails because
+      // the fd is not provisioned, so the host never buffers the payload.
+      expect(probe.fd3Write.threw).toBe(true);
     } finally {
       await handle.stop().catch(() => undefined);
     }
