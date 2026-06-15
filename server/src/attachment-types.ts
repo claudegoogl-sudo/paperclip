@@ -56,10 +56,19 @@ export const DEFAULT_ALLOWED_TYPES: readonly string[] = [
  * relay has no need for active/markup document types, and dropping the classic
  * stored-XSS / formula-injection inputs minimises the hostile-input surface.
  *
- * PLA-1139: also includes inert 3D-geometry types (STL/3MF/OBJ/STEP/glTF) so an
- * operator can relay a CAD model through the inbound messenger path. These are
- * static geometry descriptions — non-executable data, no active/markup surface —
- * so they extend the auditable type set without widening the hostile-input risk.
+ * PLA-1139/PLA-1140: also includes a broadened set of inert common-file types so
+ * an operator can relay everyday documents, CAD models, photos and video through
+ * the inbound messenger path: 3D geometry (STL/3MF/OBJ/STEP/glTF/PLY), office
+ * documents (Word/Excel/PowerPoint/OpenDocument/RTF), extra image formats
+ * (TIFF/BMP/HEIC/HEIF) and common video containers (MP4/WebM/QuickTime). These
+ * are all static, non-executable payloads with no active/markup/scripting
+ * surface, so they extend the auditable type set without widening the
+ * hostile-input risk that F2 (text/html, text/csv) guards against.
+ *
+ * Deliberately NOT included pending SecurityEngineer ruling (PLA-1141):
+ * `image/svg+xml` (active-content/XSS) and archive containers
+ * (zip/gzip/7z/tar — zip-bomb / smuggling). Executables are never added.
+ *
  * All entries are lowercase: {@link isAllowedPluginArtifactMimeType} lowercases
  * its input before matching, so case variants would be dead duplicates.
  */
@@ -75,7 +84,7 @@ export const PLUGIN_ARTIFACT_ALLOWED_MIME_TYPES: readonly string[] = [
   "audio/wav",
   "audio/x-wav",
   "audio/flac",
-  // PLA-1139: inert 3D-geometry types (static, non-executable).
+  // PLA-1139/PLA-1140: inert 3D / CAD geometry (static, non-executable).
   "model/stl",
   "application/vnd.ms-pki.stl",
   "application/sla",
@@ -88,6 +97,25 @@ export const PLUGIN_ARTIFACT_ALLOWED_MIME_TYPES: readonly string[] = [
   "application/step",
   "model/gltf-binary",
   "model/gltf+json",
+  "model/ply",
+  // PLA-1140: inert office documents.
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "application/vnd.oasis.opendocument.text",
+  "application/vnd.oasis.opendocument.spreadsheet",
+  "application/vnd.oasis.opendocument.presentation",
+  "application/rtf",
+  // PLA-1140: extra inert image formats (png/jpeg/webp/gif already in DEFAULT_ALLOWED_TYPES).
+  "image/tiff",
+  "image/bmp",
+  "image/heic",
+  "image/heif",
+  // PLA-1140: inert video containers.
+  "video/mp4",
+  "video/webm",
+  "video/quicktime",
 ];
 
 /**
