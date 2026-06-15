@@ -126,6 +126,9 @@ import {
   secretProviderConfigDiscoveryPreviewSchema,
   remoteSecretImportPreviewSchema,
   remoteSecretImportSchema,
+  // PLA-735 (fork) — secret egress operator surface
+  setBindingEgressAllowlistSchema,
+  enforceBindingEgressSchema,
 } from "@paperclipai/shared";
 
 type JsonSchema = Record<string, unknown>;
@@ -4200,6 +4203,32 @@ registerCurrentRoute({
   body: remoteSecretImportSchema,
 });
 
+// PLA-735 (fork) — operator-only secret egress review + per-binding allowlist /
+// enforce-flip surface. These routes are mounted in routes/secrets.ts; document
+// them here so the openapi spec stays an exact match for the fork's hardening.
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/secret-egress-bindings",
+  tags: ["secrets"],
+  summary: "List secret egress bindings for operator review",
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/secret-egress-bindings/{bindingId}/allowlist",
+  tags: ["secrets"],
+  summary: "Set the egress allowlist for a secret binding",
+  body: setBindingEgressAllowlistSchema,
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/secret-egress-bindings/{bindingId}/enforce",
+  tags: ["secrets"],
+  summary: "Toggle egress enforcement for a secret binding",
+  body: enforceBindingEgressSchema,
+});
+
 for (const route of [
   ["get", "/api/skills/catalog", "List catalog skills"],
   ["get", "/api/skills/catalog/{catalogId}", "Get a catalog skill"],
@@ -4370,6 +4399,22 @@ for (const route of [
     tags: ["plugins"],
     summary: route[2],
     ...(route[0] === "post" || route[0] === "put" ? { body: pluginLocalFolderRequestSchema } : {}),
+  });
+}
+
+// PLA-662 (fork) — per-tenant plugin config overrides + secret-binding lifecycle.
+// Mounted in routes/plugins.ts; the PUT body is validated inline against the
+// plugin's instanceConfigSchema, so these are registered path-only.
+for (const route of [
+  ["get", "/api/plugins/{pluginId}/companies/{companyId}/config-overrides", "Get a plugin per-tenant config override"],
+  ["put", "/api/plugins/{pluginId}/companies/{companyId}/config-overrides", "Replace a plugin per-tenant config override"],
+  ["delete", "/api/plugins/{pluginId}/companies/{companyId}/config-overrides", "Clear a plugin per-tenant config override"],
+] as const) {
+  registerCurrentRoute({
+    method: route[0],
+    path: route[1],
+    tags: ["plugins"],
+    summary: route[2],
   });
 }
 
