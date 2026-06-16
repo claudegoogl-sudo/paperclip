@@ -122,6 +122,22 @@ describe("HTTP logger redaction (real log file)", () => {
     expect(content).not.toContain(GITHUB_PAT);
   });
 
+  // PLA-1175 regression: an off-length fine-grained PAT (90-char body, not the
+  // historical 82) must still be scrubbed from the real log file. Fails against
+  // the old exact `{82}` regex, passes against `{36,}`. Synthetic filler only.
+  it("redacts an off-length (90-char body) github_pat in the body and URL query", async () => {
+    const offLenPat = `github_pat_${"B".repeat(90)}`;
+    const app = buildApp();
+    await request(app)
+      .post(`/echo/99?q=${offLenPat}`)
+      .send({ description: `off-length ${offLenPat}`, nested: { token: offLenPat } });
+
+    const content = await readLogWhen((c) => c.includes("POST /echo/99"));
+    expect(content).toContain("<redacted github_pat>");
+    expect(content).not.toContain(offLenPat);
+    expect(content).not.toMatch(/B{20,}/);
+  });
+
   // PLA-842 Finding 1 regression: Option A allows an iss=paperclip run JWT in a
   // write-block body, but the LOG surface must still scrub it. A paperclip JWT
   // outside the (force-redacted) authorization header — body leaf + URL query —
