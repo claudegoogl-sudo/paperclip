@@ -132,4 +132,39 @@ describe("secret-patterns shared module", () => {
     expect(labels[labels.length - 1]).toBe("jwt");
     expect(labels.indexOf("github_pat")).toBeLessThan(labels.indexOf("jwt"));
   });
+
+  // PLA-1175 regression: the github_pat body length is not contractually fixed,
+  // so the matcher must be min-length, not exact. The 80- and 90-char cases
+  // below FAIL against the old `{82}` regex and PASS against `{36,}`. The
+  // 82-char case (the historical PLA-190/194 leak shape) must keep matching.
+  // Fixtures are synthetic, shape-valid filler — never a real token.
+  describe("github_pat off-length variants (min-length, not exact)", () => {
+    for (const len of [80, 82, 90]) {
+      const pat = `github_pat_${"A".repeat(len)}`;
+
+      it(`flags a ${len}-char body via firstSecretMatch (write-block denylist)`, () => {
+        expect(firstSecretMatch(`prefix ${pat} suffix`)?.label).toBe("github_pat");
+      });
+
+      it(`redacts a ${len}-char body with the class marker (write-block surface)`, () => {
+        const redacted = redactSecrets(`token=${pat} done`);
+        expect(redacted).toBe(`token=${secretMarker("github_pat")} done`);
+        expect(redacted).not.toContain(pat);
+        expect(redacted).not.toMatch(/A{10,}/);
+      });
+
+      it(`redacts a ${len}-char body on the LOG surface (deep)`, () => {
+        const out = redactSecretsDeepForLog({ note: `run ${pat}`, nested: { token: pat } });
+        expect(out.note).toBe(`run ${secretMarker("github_pat")}`);
+        expect(out.nested.token).toBe(secretMarker("github_pat"));
+        expect(JSON.stringify(out)).not.toContain(pat);
+      });
+    }
+
+    it("does not match a too-short github_pat_ fragment (below the 36-char floor)", () => {
+      // A bare prefix with a short fragment is not a token shape; stay below the
+      // floor so ordinary `github_pat_` mentions are not over-flagged.
+      expect(firstSecretMatch(`github_pat_${"A".repeat(20)}`)).toBeNull();
+    });
+  });
 });

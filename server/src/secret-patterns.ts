@@ -71,7 +71,12 @@ function isThirdPartyJwt(match: string): boolean {
  * redaction (serves PLA-317 §2 / PLA-319 §4 — no partial value left behind).
  */
 export const SECRET_PATTERNS: readonly SecretPatternDef[] = [
-  { label: "github_pat", regex: /github_pat_[A-Za-z0-9_]{82}/ },
+  // Fine-grained PAT body length is NOT contractually fixed; an exact `{82}`
+  // silently misses off-length variants (81/83-body, future format changes, a
+  // truncated copy). Match a min length instead so the class — not one instance
+  // length — is redacted/blocked (PLA-1175). The classic `gh[poust]_` classes
+  // below stay exact because GitHub documents them at a stable 40-total length.
+  { label: "github_pat", regex: /github_pat_[A-Za-z0-9_]{36,}/ },
   { label: "github_classic_pat", regex: /ghp_[A-Za-z0-9]{36}/ },
   { label: "github_oauth", regex: /gho_[A-Za-z0-9]{36}/ },
   { label: "github_user_to_server", regex: /ghu_[A-Za-z0-9]{36}/ },
