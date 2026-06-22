@@ -24,6 +24,11 @@ jobs:
           ref: master
 
       - name: Dependency Review
+        # Dependency graph (a prerequisite of this action) is only enabled on
+        # the upstream repo. On forks the action errors in ~8s with no signal
+        # and reds the whole job, skipping the quality/security gates below.
+        # Gate the step to upstream so forks stay green and still run the gates.
+        if: github.repository == 'paperclipai/paperclip'
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           base-ref: ${{ github.event.pull_request.base.sha }}
