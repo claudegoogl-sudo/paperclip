@@ -105,9 +105,13 @@ const mockBudgetService = vi.hoisted(() => ({
   upsertPolicy: vi.fn(),
   resolveIncident: vi.fn(),
 }));
+const mockAccessService = vi.hoisted(() => ({
+  decide: vi.fn(),
+}));
 
 function registerModuleMocks() {
   vi.doMock("../services/index.js", () => ({
+    accessService: () => mockAccessService,
     budgetService: () => mockBudgetService,
     costService: () => mockCostService,
     financeService: () => mockFinanceService,
@@ -168,6 +172,13 @@ beforeEach(() => {
   vi.doUnmock("../middleware/index.js");
   registerModuleMocks();
   vi.clearAllMocks();
+  mockAccessService.decide.mockReset();
+  mockAccessService.decide.mockResolvedValue({
+    allowed: true,
+    action: "company_scope:read",
+    reason: "allow_test",
+    explanation: "Allowed by test mock.",
+  });
   mockCompanyService.update.mockResolvedValue({
     id: "company-1",
     name: "Paperclip",

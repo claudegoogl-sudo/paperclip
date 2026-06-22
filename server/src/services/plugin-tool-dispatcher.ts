@@ -160,16 +160,18 @@ export interface PluginToolDispatcher {
    * This is called automatically when a plugin transitions to `ready`.
    * Can also be called manually for testing or recovery scenarios.
    *
-   * @param pluginId - The plugin's unique identifier (the plugin key, e.g. `platform.cad`)
-   * @param manifest - The plugin manifest containing tool declarations
-   * @param pluginDbId - The plugin row's DB UUID. When provided, it is stamped onto each
-   *   registered tool so dispatch can correlate to the worker manager (which is keyed by
-   *   DB UUID, not plugin key). Optional for backward compatibility / test scenarios.
+   * @param pluginKey - The plugin's namespaced key (e.g. `acme.linear`).
+   *   Used as the lookup key for tool registration.
+   * @param manifest - The plugin manifest containing tool declarations.
+   * @param pluginDbId - The plugin's database UUID. Required (PLA-323):
+   *   `workerManager` keys running workers by DB UUID, not by pluginKey, so
+   *   without this `workerManager.isRunning(...)` always returns false and
+   *   every tool dispatch fails with `worker for plugin X is not running`.
    */
   registerPluginTools(
-    pluginId: string,
+    pluginKey: string,
     manifest: PaperclipPluginManifestV1,
-    pluginDbId?: string,
+    pluginDbId: string,
   ): void;
 
   /**
@@ -458,11 +460,11 @@ export function createPluginToolDispatcher(
     },
 
     registerPluginTools(
-      pluginId: string,
+      pluginKey: string,
       manifest: PaperclipPluginManifestV1,
-      pluginDbId?: string,
+      pluginDbId: string,
     ): void {
-      registry.registerPlugin(pluginId, manifest, pluginDbId);
+      registry.registerPlugin(pluginKey, manifest, pluginDbId);
     },
 
     unregisterPluginTools(pluginId: string): void {

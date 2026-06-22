@@ -55,16 +55,10 @@ describe("PluginToolDispatcher.registerPluginTools — pluginDbId threading (PLA
     expect(tool!.pluginDbId).not.toBe(pluginKey);
   });
 
-  it("falls back to pluginId when pluginDbId is omitted (backwards-compat)", () => {
-    const dispatcher = createPluginToolDispatcher();
-    const pluginKey = "platform.cad";
-
-    dispatcher.registerPluginTools(pluginKey, makeManifest(pluginKey));
-
-    const tool = dispatcher.getTool(`${pluginKey}:run_script`);
-    expect(tool).not.toBeNull();
-    // Without a UUID, the registry stamps pluginId itself onto pluginDbId so
-    // pre-PLA-323 callers continue to work (used in tests where id === key).
-    expect(tool!.pluginDbId).toBe(pluginKey);
-  });
+  // The former "falls back to pluginId when pluginDbId is omitted" test was
+  // removed in the v2026.609.0 sync: upstream made pluginDbId a required
+  // contract with a fail-closed boundary guard (registry throws on a missing
+  // UUID), superseding the fork's silent backwards-compat fallback. The
+  // required-contract behavior is covered by
+  // __tests__/plugin-tool-dispatcher-pluginDbId.test.ts.
 });

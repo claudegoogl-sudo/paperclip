@@ -34,6 +34,7 @@ import {
 } from "@paperclipai/db";
 import type {
   AcceptedPlanDecomposition,
+  IssueComment,
   IssueCommentAuthorType,
   IssueCommentMetadata,
   IssueCommentPresentation,
@@ -43,6 +44,7 @@ import type {
   IssueProductivityReview,
   IssueProductivityReviewTrigger,
   IssueRelationIssueSummary,
+  LowTrustBoundary,
   SuccessfulRunHandoffState,
 } from "@paperclipai/shared";
 import {
@@ -74,6 +76,7 @@ import { redactSensitiveText } from "../redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
 import { getRunLogStore } from "./run-log-store.js";
 import { getDefaultCompanyGoal } from "./goals.js";
+import { assertAssignableAgent } from "./agent-assignability.js";
 import {
   isVerifiedIssueTreeControlInteractionWake,
   issueTreeControlService,
@@ -97,6 +100,7 @@ const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_LOG_BYTES = 2_000_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_CHUNK_BYTES = 256_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_END_SLACK_MS = 60_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_PARALLEL_READS = 8;
+const DELETED_ISSUE_COMMENT_BODY = "";
 function assertTransition(from: string, to: string) {
   if (from === to) return;
   if (!ALL_ISSUE_STATUSES.includes(to)) {
@@ -242,6 +246,8 @@ export interface IssueFilters {
   includePluginOperations?: boolean;
   includeBlockedBy?: boolean;
   includeBlockedInboxAttention?: boolean;
+  hasPlanDocument?: boolean;
+  lowTrustBoundary?: LowTrustBoundary & { companyId: string };
   q?: string;
   limit?: number;
   offset?: number;
@@ -1179,6 +1185,39 @@ const PRODUCTIVITY_REVIEW_TRIGGERS: readonly IssueProductivityReviewTrigger[] = 
   "long_active_duration",
   "high_churn",
 ];
+
+function lowTrustBoundaryIssueCondition(
+  companyId: string,
+  boundary: (LowTrustBoundary & { companyId: string }) | null | undefined,
+) {
+  if (!boundary || boundary.companyId !== companyId) return null;
+  const clauses: SQL[] = [];
+  const issueIds = [...new Set(boundary.issueIds ?? [])];
+  const projectIds = [...new Set(boundary.projectIds ?? [])];
+  if (issueIds.length > 0) clauses.push(inArray(issues.id, issueIds));
+  if (projectIds.length > 0) clauses.push(inArray(issues.projectId, projectIds));
+  if (boundary.rootIssueId) {
+    clauses.push(sql<boolean>`
+      ${issues.id} IN (
+        WITH RECURSIVE descendants(id) AS (
+          SELECT ${issues.id}
+          FROM ${issues}
+          WHERE ${issues.companyId} = ${companyId}
+            AND ${issues.id} = ${boundary.rootIssueId}
+          UNION
+          SELECT ${issues.id}
+          FROM ${issues}
+          JOIN descendants ON ${issues.parentId} = descendants.id
+          WHERE ${issues.companyId} = ${companyId}
+        )
+        SELECT id FROM descendants
+      )
+    `);
+  }
+  if (clauses.length === 0) return sql<boolean>`false`;
+  return or(...clauses);
+}
+
 const BLOCKER_ATTENTION_OPEN_RECOVERY_TERMINAL_STATUSES = ["done", "cancelled"];
 const BLOCKER_ATTENTION_MAX_DEPTH = 8;
 const BLOCKER_ATTENTION_MAX_NODES = 2000;
@@ -1932,6 +1971,7 @@ const issueListSelect = {
   executionWorkspaceId: issues.executionWorkspaceId,
   executionWorkspacePreference: issues.executionWorkspacePreference,
   executionWorkspaceSettings: sql<null>`null`,
+  sourceTrust: issues.sourceTrust,
   startedAt: issues.startedAt,
   completedAt: issues.completedAt,
   cancelledAt: issues.cancelledAt,
@@ -2168,6 +2208,19 @@ function issueRef(row: Pick<IssueRow, "id" | "identifier" | "title" | "status" |
     assigneeAgentId: row.assigneeAgentId,
     assigneeUserId: row.assigneeUserId,
   };
+}
+
+function hasPlanDocumentCondition(companyId: string, hasPlanDocument: boolean): SQL {
+  const existsPlanDocument = sql<boolean>`
+    EXISTS (
+      SELECT 1
+      FROM ${issueDocuments}
+      WHERE ${issueDocuments.companyId} = ${companyId}
+        AND ${issueDocuments.issueId} = ${issues.id}
+        AND ${issueDocuments.key} = 'plan'
+    )
+  `;
+  return hasPlanDocument ? existsPlanDocument : sql<boolean>`NOT ${existsPlanDocument}`;
 }
 
 function isoDate(value: Date | string | null | undefined): string | null {
@@ -2858,6 +2911,8 @@ async function blockedInboxIssueConditions(
       )
     `);
   }
+  const lowTrustCondition = lowTrustBoundaryIssueCondition(companyId, filters?.lowTrustBoundary);
+  if (lowTrustCondition) conditions.push(lowTrustCondition);
   if (filters?.status) {
     const statuses = filters.status.split(",").map((status) => status.trim()).filter(Boolean);
     if (statuses.length > 0) {
@@ -2882,6 +2937,9 @@ async function blockedInboxIssueConditions(
   if (filters?.originKind) conditions.push(eq(issues.originKind, filters.originKind));
   if (filters?.originKindPrefix) conditions.push(like(issues.originKind, `${filters.originKindPrefix}%`));
   if (filters?.originId) conditions.push(eq(issues.originId, filters.originId));
+  if (filters?.hasPlanDocument !== undefined) {
+    conditions.push(hasPlanDocumentCondition(companyId, filters.hasPlanDocument));
+  }
   if (!shouldIncludePluginOperationIssues(filters)) conditions.push(nonPluginOperationIssueCondition());
   if (filters?.labelId) {
     const labeledIssueIds = await dbOrTx
@@ -2958,6 +3016,7 @@ async function listBlockedInboxIssues(
         .where(and(
           eq(issueComments.companyId, companyId),
           inArray(issueComments.issueId, issueIdChunk),
+          isNull(issueComments.deletedAt),
           sql<boolean>`${issueComments.body} ILIKE ${containsPattern} ESCAPE '\\'`,
         ));
       for (const row of rows as Array<{ issueId: string }>) commentSearchMatchIssueIds.add(row.issueId);
@@ -3033,6 +3092,7 @@ async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?:
         .where(and(
           eq(issueComments.companyId, companyId),
           inArray(issueComments.issueId, issueIdChunk),
+          isNull(issueComments.deletedAt),
           sql<boolean>`${issueComments.body} ILIKE ${containsPattern} ESCAPE '\\'`,
         ));
       for (const row of commentRows as Array<{ issueId: string }>) commentSearchMatchIssueIds.add(row.issueId);
@@ -3134,7 +3194,19 @@ export function issueService(db: Db) {
     }
   }
 
-  function redactIssueComment<T extends { body: string; authorType?: string | null; authorAgentId?: string | null; authorUserId?: string | null; presentation?: unknown; metadata?: unknown }>(
+  function redactIssueComment<T extends {
+    body: string;
+    authorType?: string | null;
+    authorAgentId?: string | null;
+    authorUserId?: string | null;
+    presentation?: unknown;
+    metadata?: unknown;
+    deletedAt?: Date | string | null;
+    deletedByType?: "agent" | "user" | null;
+    deletedByAgentId?: string | null;
+    deletedByUserId?: string | null;
+    deletedByRunId?: string | null;
+  }>(
     comment: T,
     censorUsernameInLogs: boolean,
   ): T & {
@@ -3142,6 +3214,22 @@ export function issueService(db: Db) {
     presentation: IssueCommentPresentation | null;
     metadata: IssueCommentMetadata | null;
   } {
+    const deletedAt = comment.deletedAt ?? null;
+    if (deletedAt) {
+      return {
+        ...comment,
+        authorType: deriveIssueCommentAuthorType(comment),
+        body: "",
+        presentation: null,
+        metadata: null,
+        deletedAt,
+        deletedByType: comment.deletedByType ?? null,
+        deletedByAgentId: comment.deletedByAgentId ?? null,
+        deletedByUserId: comment.deletedByUserId ?? null,
+        deletedByRunId: comment.deletedByRunId ?? null,
+      };
+    }
+
     return {
       ...comment,
       authorType: deriveIssueCommentAuthorType(comment),
@@ -3286,29 +3374,6 @@ export function issueService(db: Db) {
     });
   }
 
-  async function assertAssignableAgent(companyId: string, agentId: string) {
-    const assignee = await db
-      .select({
-        id: agents.id,
-        companyId: agents.companyId,
-        status: agents.status,
-      })
-      .from(agents)
-      .where(eq(agents.id, agentId))
-      .then((rows) => rows[0] ?? null);
-
-    if (!assignee) throw notFound("Assignee agent not found");
-    if (assignee.companyId !== companyId) {
-      throw unprocessable("Assignee must belong to same company");
-    }
-    if (assignee.status === "pending_approval") {
-      throw conflict("Cannot assign work to pending approval agents");
-    }
-    if (assignee.status === "terminated") {
-      throw conflict("Cannot assign work to terminated agents");
-    }
-  }
-
   async function isTreeHoldInteractionCheckoutAllowed(
     companyId: string,
     checkoutRunId: string | null,
@@ -3375,6 +3440,7 @@ export function issueService(db: Db) {
     if (projectId && workspace.projectId !== projectId) {
       throw unprocessable("Project workspace must belong to the selected project");
     }
+    return workspace;
   }
 
   async function assertValidExecutionWorkspace(
@@ -3397,6 +3463,7 @@ export function issueService(db: Db) {
     if (projectId && workspace.projectId !== projectId) {
       throw unprocessable("Execution workspace must belong to the selected project");
     }
+    return workspace;
   }
 
   async function assertValidLabelIds(companyId: string, labelIds: string[], dbOrTx: any = db) {
@@ -3878,6 +3945,7 @@ export function issueService(db: Db) {
           FROM ${issueComments}
           WHERE ${issueComments.issueId} = ${issues.id}
             AND ${issueComments.companyId} = ${companyId}
+            AND ${issueComments.deletedAt} IS NULL
             AND ${issueComments.body} ILIKE ${containsPattern} ESCAPE '\\'
         )
       `;
@@ -3899,6 +3967,8 @@ export function issueService(db: Db) {
           )
         `);
       }
+      const lowTrustCondition = lowTrustBoundaryIssueCondition(companyId, filters?.lowTrustBoundary);
+      if (lowTrustCondition) conditions.push(lowTrustCondition);
       if (filters?.status) {
         const statuses = filters.status.split(",").map((s) => s.trim());
         conditions.push(statuses.length === 1 ? eq(issues.status, statuses[0]) : inArray(issues.status, statuses));
@@ -3935,6 +4005,9 @@ export function issueService(db: Db) {
       if (filters?.originKind) conditions.push(eq(issues.originKind, filters.originKind));
       if (filters?.originKindPrefix) conditions.push(like(issues.originKind, `${filters.originKindPrefix}%`));
       if (filters?.originId) conditions.push(eq(issues.originId, filters.originId));
+      if (filters?.hasPlanDocument !== undefined) {
+        conditions.push(hasPlanDocumentCondition(companyId, filters.hasPlanDocument));
+      }
       if (!shouldIncludePluginOperationIssues(filters)) {
         conditions.push(nonPluginOperationIssueCondition());
       }
@@ -4098,6 +4171,9 @@ export function issueService(db: Db) {
       if (filters?.originKind) conditions.push(eq(issues.originKind, filters.originKind));
       if (filters?.originKindPrefix) conditions.push(like(issues.originKind, `${filters.originKindPrefix}%`));
       if (filters?.originId) conditions.push(eq(issues.originId, filters.originId));
+      if (filters?.hasPlanDocument !== undefined) {
+        conditions.push(hasPlanDocumentCondition(companyId, filters.hasPlanDocument));
+      }
       if (!shouldIncludePluginOperationIssues(filters)) conditions.push(nonPluginOperationIssueCondition());
       const [row] = await db
         .select({ count: sql<number>`count(*)` })
@@ -4366,7 +4442,11 @@ export function issueService(db: Db) {
               createdAt: issueComments.createdAt,
             })
             .from(issueComments)
-            .where(and(eq(issueComments.companyId, parent.companyId), inArray(issueComments.issueId, childIdsForSummaries)))
+            .where(and(
+              eq(issueComments.companyId, parent.companyId),
+              inArray(issueComments.issueId, childIdsForSummaries),
+              isNull(issueComments.deletedAt),
+            ))
             .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
         : [];
       const latestCommentByIssueId = new Map<string, string>();
@@ -4740,7 +4820,7 @@ export function issueService(db: Db) {
         throw unprocessable("Issue can only have one assignee");
       }
       if (data.assigneeAgentId) {
-        await assertAssignableAgent(companyId, data.assigneeAgentId);
+        await assertAssignableAgent(db, companyId, data.assigneeAgentId, { kind: "work" });
       }
       if (data.assigneeUserId) {
         await assertAssignableUser(companyId, data.assigneeUserId);
@@ -4750,7 +4830,6 @@ export function issueService(db: Db) {
       }
       return db.transaction(async (tx) => {
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, companyId);
-        const projectGoalId = await getProjectDefaultGoalId(tx, companyId, issueData.projectId);
         let projectWorkspaceId = issueData.projectWorkspaceId ?? null;
         let executionWorkspaceId = issueData.executionWorkspaceId ?? null;
         let executionWorkspacePreference = issueData.executionWorkspacePreference ?? null;
@@ -4763,6 +4842,9 @@ export function issueService(db: Db) {
           issueData.executionWorkspaceSettings !== undefined;
         if (workspaceInheritanceIssueId) {
           const workspaceSource = await getWorkspaceInheritanceIssue(tx, companyId, workspaceInheritanceIssueId);
+          if (issueData.projectId == null && workspaceSource.projectId) {
+            issueData.projectId = workspaceSource.projectId;
+          }
           if (projectWorkspaceId == null && workspaceSource.projectWorkspaceId) {
             projectWorkspaceId = workspaceSource.projectWorkspaceId;
           }
@@ -4789,6 +4871,15 @@ export function issueService(db: Db) {
             }
           }
         }
+        if (issueData.projectId == null && projectWorkspaceId) {
+          const workspace = await assertValidProjectWorkspace(companyId, null, projectWorkspaceId, tx);
+          issueData.projectId = workspace.projectId;
+        }
+        if (issueData.projectId == null && executionWorkspaceId) {
+          const workspace = await assertValidExecutionWorkspace(companyId, null, executionWorkspaceId, tx);
+          issueData.projectId = workspace.projectId;
+        }
+        const projectGoalId = await getProjectDefaultGoalId(tx, companyId, issueData.projectId);
         // Cache the project policy lookup for this insert. Both the
         // default-settings block and the assignee-environment-promotion block
         // need the same row; without caching they'd issue two round-trips.
@@ -5017,13 +5108,16 @@ export function issueService(db: Db) {
           throw unprocessable("Issue is blocked by unresolved blockers", { unresolvedBlockerIssueIds });
         }
       }
-      if (issueData.assigneeAgentId) {
-        await assertAssignableAgent(existing.companyId, issueData.assigneeAgentId);
+      const shouldValidateNextAssignee =
+        Boolean(nextAssigneeAgentId) &&
+        (issueData.assigneeAgentId !== undefined || patch.status === "in_progress");
+      if (shouldValidateNextAssignee) {
+        await assertAssignableAgent(dbOrTx as Db, existing.companyId, nextAssigneeAgentId, { kind: "work" });
       }
       if (issueData.assigneeUserId) {
         await assertAssignableUser(existing.companyId, issueData.assigneeUserId);
       }
-      const nextProjectId = issueData.projectId !== undefined ? issueData.projectId : existing.projectId;
+      let nextProjectId = issueData.projectId !== undefined ? issueData.projectId : existing.projectId;
       const nextProjectWorkspaceId =
         issueData.projectWorkspaceId !== undefined ? issueData.projectWorkspaceId : existing.projectWorkspaceId;
       const nextExecutionWorkspaceId =
@@ -5036,11 +5130,29 @@ export function issueService(db: Db) {
         issueData.executionWorkspaceSettings !== undefined
           ? parseIssueExecutionWorkspaceSettings(issueData.executionWorkspaceSettings)
           : parseIssueExecutionWorkspaceSettings(existing.executionWorkspaceSettings);
+      let validatedProjectWorkspace: { projectId: string } | null = null;
+      let validatedExecutionWorkspace: { projectId: string } | null = null;
+      if (!nextProjectId && nextProjectWorkspaceId) {
+        const workspace = await assertValidProjectWorkspace(existing.companyId, null, nextProjectWorkspaceId);
+        validatedProjectWorkspace = workspace;
+        nextProjectId = workspace.projectId;
+        patch.projectId = workspace.projectId;
+      }
+      if (!nextProjectId && nextExecutionWorkspaceId) {
+        const workspace = await assertValidExecutionWorkspace(existing.companyId, null, nextExecutionWorkspaceId);
+        validatedExecutionWorkspace = workspace;
+        nextProjectId = workspace.projectId;
+        patch.projectId = workspace.projectId;
+      }
       if (nextProjectWorkspaceId) {
-        await assertValidProjectWorkspace(existing.companyId, nextProjectId, nextProjectWorkspaceId);
+        if (!validatedProjectWorkspace) {
+          await assertValidProjectWorkspace(existing.companyId, nextProjectId, nextProjectWorkspaceId);
+        }
       }
       if (nextExecutionWorkspaceId) {
-        await assertValidExecutionWorkspace(existing.companyId, nextProjectId, nextExecutionWorkspaceId);
+        if (!validatedExecutionWorkspace) {
+          await assertValidExecutionWorkspace(existing.companyId, nextProjectId, nextExecutionWorkspaceId);
+        }
       }
 
       applyStatusSideEffects(issueData.status, patch);
@@ -5325,7 +5437,7 @@ export function issueService(db: Db) {
         .where(eq(issues.id, id))
         .then((rows) => rows[0] ?? null);
       if (!issueCompany) throw notFound("Issue not found");
-      await assertAssignableAgent(issueCompany.companyId, agentId);
+      await assertAssignableAgent(db, issueCompany.companyId, agentId, { kind: "work" });
 
       const now = new Date();
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(issueCompany.companyId, id);
@@ -5698,15 +5810,25 @@ export function issueService(db: Db) {
           .then((rows) => rows[0] ?? null);
 
         if (!anchor) return [];
+        const anchorCreatedAt =
+          anchor.createdAt instanceof Date
+            ? anchor.createdAt
+            : new Date(String(anchor.createdAt));
         conditions.push(
           order === "asc"
             ? or(
-                gt(issueComments.createdAt, anchor.createdAt),
-                and(eq(issueComments.createdAt, anchor.createdAt), gt(issueComments.id, anchor.id)),
+                gt(issueComments.createdAt, anchorCreatedAt),
+                and(
+                  eq(issueComments.createdAt, anchorCreatedAt),
+                  gt(issueComments.id, anchor.id),
+                ),
               )!
             : or(
-                lt(issueComments.createdAt, anchor.createdAt),
-                and(eq(issueComments.createdAt, anchor.createdAt), lt(issueComments.id, anchor.id)),
+                lt(issueComments.createdAt, anchorCreatedAt),
+                and(
+                  eq(issueComments.createdAt, anchorCreatedAt),
+                  lt(issueComments.id, anchor.id),
+                ),
               )!,
         );
       }
@@ -5788,6 +5910,54 @@ export function issueService(db: Db) {
       });
     },
 
+    tombstoneComment: async (
+      commentId: string,
+      actor: {
+        actorType: "agent" | "user";
+        agentId?: string | null;
+        userId?: string | null;
+        runId?: string | null;
+      },
+      options?: {
+        afterTombstone?: (comment: IssueComment, tx: any) => Promise<void>;
+      },
+    ) => {
+      const currentUserRedactionOptions = {
+        enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
+      };
+
+      return db.transaction(async (tx) => {
+        const now = new Date();
+        const [comment] = await tx
+          .update(issueComments)
+          .set({
+            body: DELETED_ISSUE_COMMENT_BODY,
+            presentation: null,
+            metadata: null,
+            deletedAt: now,
+            deletedByType: actor.actorType,
+            deletedByAgentId: actor.actorType === "agent" ? actor.agentId ?? null : null,
+            deletedByUserId: actor.actorType === "user" ? actor.userId ?? null : null,
+            deletedByRunId: actor.runId ?? null,
+            updatedAt: now,
+          })
+          .where(and(eq(issueComments.id, commentId), isNull(issueComments.deletedAt)))
+          .returning();
+
+        if (!comment) return null;
+
+        await tx
+          .update(issues)
+          .set({ updatedAt: now })
+          .where(eq(issues.id, comment.issueId));
+
+        const redacted = redactIssueComment(comment, currentUserRedactionOptions.enabled);
+        await options?.afterTombstone?.(redacted, tx);
+
+        return redacted;
+      });
+    },
+
     addComment: async (
       issueId: string,
       body: string,
@@ -5796,6 +5966,7 @@ export function issueService(db: Db) {
         authorType?: IssueCommentAuthorType | null;
         presentation?: IssueCommentPresentation | null;
         metadata?: IssueCommentMetadata | null;
+        sourceTrust?: typeof issueComments.$inferInsert.sourceTrust;
         createdAt?: Date | string | null;
       },
     ) => {
@@ -5830,6 +6001,7 @@ export function issueService(db: Db) {
           body: redactedBody,
           presentation,
           metadata,
+          sourceTrust: options?.sourceTrust ?? null,
           ...(createdAt && !Number.isNaN(createdAt.getTime()) ? { createdAt } : {}),
         })
         .returning();
@@ -6160,7 +6332,7 @@ export function issueService(db: Db) {
         const comments = await db
           .select({ body: issueComments.body })
           .from(issueComments)
-          .where(eq(issueComments.issueId, issueId));
+          .where(and(eq(issueComments.issueId, issueId), isNull(issueComments.deletedAt)));
 
         for (const comment of comments) {
           for (const projectId of extractProjectMentionIds(comment.body)) {

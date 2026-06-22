@@ -42,7 +42,7 @@
     "smoke:openclaw-docker-ui": "./scripts/smoke/openclaw-docker-ui.sh",
     "smoke:openclaw-sse-standalone": "./scripts/smoke/openclaw-sse-standalone.sh",
     "smoke:terminal-bench-loop-skill": "node scripts/smoke/terminal-bench-loop-skill-smoke.mjs",
-    "test:release-registry": "node --test scripts/verify-release-registry-state.test.mjs scripts/release-package-map.test.mjs scripts/check-release-package-bootstrap.test.mjs scripts/check-no-git-push.test.mjs",
+    "test:release-registry": "node --test scripts/verify-release-registry-state.test.mjs scripts/release-package-map.test.mjs scripts/check-release-package-bootstrap.test.mjs scripts/check-no-git-push.test.mjs scripts/release-lib.test.mjs",
     "test:upstream-sync": "node --test scripts/upstream-sync.test.mjs scripts/plugin-activation-soak.test.mjs",
     "test:plugin-activation-soak": "node --test scripts/plugin-activation-soak.test.mjs",
     "test:scaffold-create-paperclip-plugin": "node --test scripts/smoke-create-paperclip-plugin.test.mjs",
@@ -58,9 +58,9 @@
   "devDependencies": {
     "@playwright/test": "^1.58.2",
     "cross-env": "^10.1.0",
-    "esbuild": "^0.27.3",
+    "esbuild": "^0.28.0",
     "typescript": "^5.7.3",
-    "vitest": "^3.0.5"
+    "vitest": "^4.1.8"
   },
   "engines": {
     "node": ">=20"

@@ -16,15 +16,16 @@ jobs:
       PAPERCLIP_E2E_SKIP_LLM: ${{ inputs.skip_llm && 'true' || 'false' }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # PLA-597: do not specify `version:` here. package.json declares
-      # `packageManager: pnpm@9.15.4`; pnpm/action-setup@v4 errors with
+      # `packageManager: pnpm@9.15.4`; pnpm/action-setup errors with
       # ERR_PNPM_BAD_PM_VERSION when both are present. Matches pr.yml which
-      # also lets the packageManager field win.
-      - uses: pnpm/action-setup@v4
+      # also lets the packageManager field win. (Upstream v6 action bump
+      # taken; fork-only no-version gate re-applied.)
+      - uses: pnpm/action-setup@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 20
           cache: pnpm
@@ -38,7 +39,7 @@ jobs:
           PAPERCLIP_PLAYWRIGHT_CHANNEL: "chrome"
         run: pnpm run test:e2e
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: playwright-report
