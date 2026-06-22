@@ -15,6 +15,15 @@ permissions:
 
 jobs:
   review:
+    # This entire job is upstream-only infrastructure and cannot run on forks:
+    #  - Dependency Review needs Dependency graph (disabled on forks).
+    #  - The commitperclip token + quality/security gates need the
+    #    COMMITPERCLIP_KEY secret and the commitperclip GitHub App, which only
+    #    exist on paperclipai/paperclip.
+    # On a fork no step can succeed, so the job only reds the PR with zero
+    # signal. Gate the whole job to upstream; on forks it is skipped (the
+    # `review` check reports as not-run, which satisfies our clean-CI gate).
+    if: github.repository == 'paperclipai/paperclip'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -24,11 +33,6 @@ jobs:
           ref: master
 
       - name: Dependency Review
-        # Dependency graph (a prerequisite of this action) is only enabled on
-        # the upstream repo. On forks the action errors in ~8s with no signal
-        # and reds the whole job, skipping the quality/security gates below.
-        # Gate the step to upstream so forks stay green and still run the gates.
-        if: github.repository == 'paperclipai/paperclip'
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           base-ref: ${{ github.event.pull_request.base.sha }}
