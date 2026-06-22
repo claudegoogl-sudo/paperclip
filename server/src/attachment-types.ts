@@ -72,7 +72,10 @@ export const DEFAULT_ALLOWED_TYPES: readonly string[] = [
  * All entries are lowercase: {@link isAllowedPluginArtifactMimeType} lowercases
  * its input before matching, so case variants would be dead duplicates.
  */
-const PLUGIN_ARTIFACT_EXCLUDED_DEFAULT_TYPES: readonly string[] = ["text/html", "text/csv"];
+// `application/zip` lives in DEFAULT_ALLOWED_TYPES for the human-facing route but
+// is excluded here: archives stay gated for plugin artifacts pending the PLA-1141
+// SecurityEngineer ruling (zip-bomb / smuggling), matching the doc note above.
+const PLUGIN_ARTIFACT_EXCLUDED_DEFAULT_TYPES: readonly string[] = ["text/html", "text/csv", "application/zip"];
 
 export const PLUGIN_ARTIFACT_ALLOWED_MIME_TYPES: readonly string[] = [
   ...DEFAULT_ALLOWED_TYPES.filter((t) => !PLUGIN_ARTIFACT_EXCLUDED_DEFAULT_TYPES.includes(t)),
