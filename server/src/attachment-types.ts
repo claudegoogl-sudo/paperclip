@@ -75,7 +75,16 @@ export const DEFAULT_ALLOWED_TYPES: readonly string[] = [
 // `application/zip` lives in DEFAULT_ALLOWED_TYPES for the human-facing route but
 // is excluded here: archives stay gated for plugin artifacts pending the PLA-1141
 // SecurityEngineer ruling (zip-bomb / smuggling), matching the doc note above.
-const PLUGIN_ARTIFACT_EXCLUDED_DEFAULT_TYPES: readonly string[] = ["text/html", "text/csv", "application/zip"];
+// `video/x-m4v` (added to DEFAULT_ALLOWED_TYPES by upstream 618) is likewise
+// excluded (PLA-1282): the plugin video set stays exactly {mp4, webm, quicktime}
+// per the PLA-1140 explicit block below, so x-m4v cannot silently leak in via the
+// DEFAULT_ALLOWED_TYPES filter and bypass the auditable-explicit-list invariant.
+const PLUGIN_ARTIFACT_EXCLUDED_DEFAULT_TYPES: readonly string[] = [
+  "text/html",
+  "text/csv",
+  "application/zip",
+  "video/x-m4v",
+];
 
 export const PLUGIN_ARTIFACT_ALLOWED_MIME_TYPES: readonly string[] = [
   ...DEFAULT_ALLOWED_TYPES.filter((t) => !PLUGIN_ARTIFACT_EXCLUDED_DEFAULT_TYPES.includes(t)),

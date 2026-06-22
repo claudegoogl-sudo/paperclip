@@ -174,6 +174,13 @@ describe("isAllowedPluginArtifactMimeType", () => {
     }
   });
 
+  it("gates video/x-m4v out of the plugin set even though the human route allows it (PLA-1282)", () => {
+    // Upstream 618 added video/x-m4v to DEFAULT_ALLOWED_TYPES; it must not leak
+    // into the plugin-artifact allowlist via the filter. The plugin video set
+    // stays exactly {mp4, webm, quicktime}.
+    expect(isAllowedPluginArtifactMimeType("video/x-m4v")).toBe(false);
+  });
+
   it("leaves SVG and archive types gated (PLA-1141) until SecurityEngineer rules", () => {
     for (const ct of [
       "image/svg+xml",
