@@ -496,6 +496,66 @@ describe("createHostClientHandlers artifacts.create capability gate (PLA-888)", 
   });
 });
 
+describe("createHostClientHandlers issues.listAttachments capability gate (PLA-1050)", () => {
+  const params = { issueId: "issue-1", companyId: "company-a" };
+  const scope = { invocationScope: { companyId: "company-a", runId: "run-xyz" } };
+
+  it("denies issues.listAttachments when the plugin lacks issue.attachments.read", async () => {
+    const listAttachments = vi.fn(async () => []);
+    const services = {
+      issues: { listAttachments },
+    } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: [],
+      services,
+    });
+
+    await expect(
+      handlers["issues.listAttachments"](params as never, scope),
+    ).rejects.toMatchObject({
+      name: "CapabilityDeniedError",
+      message: expect.stringContaining("issue.attachments.read"),
+    });
+    await expect(
+      handlers["issues.listAttachments"](params as never, scope),
+    ).rejects.toBeInstanceOf(CapabilityDeniedError);
+    expect(listAttachments).not.toHaveBeenCalled();
+  });
+
+  it("allows issues.listAttachments and passes through when the capability is granted", async () => {
+    const rows = [
+      {
+        id: "att-1",
+        companyId: "company-a",
+        issueId: "issue-1",
+        issueCommentId: "comment-1",
+        assetId: "asset-1",
+        contentType: "image/png",
+        byteSize: 1234,
+        originalFilename: "shot.png",
+        createdAt: new Date("2026-06-13T00:00:00.000Z"),
+      },
+    ];
+    const listAttachments = vi.fn(async () => rows);
+    const services = {
+      issues: { listAttachments },
+    } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["issue.attachments.read"],
+      services,
+    });
+
+    await expect(
+      handlers["issues.listAttachments"](params as never, scope),
+    ).resolves.toEqual(rows);
+    expect(listAttachments).toHaveBeenCalledWith(params);
+  });
+});
+
 describe("createHostClientHandlers config.get per-company scope selection (PLA-761)", () => {
   // id-less legacy workers (e.g. platform.cad ≤0.1.x) never echo a
   // `paperclipInvocationId`, so `invocationScope` is null. PLA-719 gave the host
@@ -883,5 +943,95 @@ describe("createHostClientHandlers serviceScope company writes/state (PLA-814)",
       ),
     ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
     expect(issuesList).not.toHaveBeenCalled();
+  });
+});
+
+describe("createHostClientHandlers reconcile reads (PLA-923)", () => {
+  // The messenger digest seeds/reconciles its pending-blocker set on worker
+  // startup by reading the authoritative live set. These reads run from a
+  // setup()-started context with no active dispatch, so they must be authorized
+  // under the bare serviceScope (SERVICE_SCOPE_COMPANY_METHODS) — but, unlike a
+  // host-pinned dispatch, the worker chooses the companyId, so the bridge hard-
+  // rejects a missing/empty companyId (the server gate is the second layer).
+  function makeHandlers(capabilities: string[] = ["board.approvals.read", "issue.interactions.read"]) {
+    const approvalsList = vi.fn(async () => []);
+    const interactionsList = vi.fn(async () => []);
+    const services = {
+      approvals: { list: approvalsList },
+      interactions: { list: interactionsList },
+    } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.messenger",
+      capabilities: capabilities as never,
+      services,
+    });
+    return { handlers, approvalsList, interactionsList };
+  }
+
+  it("rejects approvals.list when the plugin lacks board.approvals.read", async () => {
+    const { handlers, approvalsList } = makeHandlers([]);
+    await expect(
+      handlers["approvals.list"](
+        { companyId: "company-a" },
+        { invocationScope: { companyId: "company-a" } },
+      ),
+    ).rejects.toBeInstanceOf(CapabilityDeniedError);
+    expect(approvalsList).not.toHaveBeenCalled();
+  });
+
+  it("rejects interactions.list when the plugin lacks issue.interactions.read", async () => {
+    const { handlers, interactionsList } = makeHandlers([]);
+    await expect(
+      handlers["interactions.list"](
+        { companyId: "company-a" },
+        { invocationScope: { companyId: "company-a" } },
+      ),
+    ).rejects.toBeInstanceOf(CapabilityDeniedError);
+    expect(interactionsList).not.toHaveBeenCalled();
+  });
+
+  it("allows both reconcile reads under serviceScope (worker-startup reconcile, no active dispatch)", async () => {
+    const { handlers, approvalsList, interactionsList } = makeHandlers();
+    const ctx = { serviceScope: { runId: "service-run-1" } };
+
+    await expect(
+      handlers["approvals.list"]({ companyId: "company-a" }, ctx),
+    ).resolves.toEqual([]);
+    await expect(
+      handlers["interactions.list"]({ companyId: "company-a" }, ctx),
+    ).resolves.toEqual([]);
+    expect(approvalsList).toHaveBeenCalledWith({ companyId: "company-a" });
+    expect(interactionsList).toHaveBeenCalledWith({ companyId: "company-a" });
+  });
+
+  it("hard-rejects a missing/empty companyId at the bridge even under serviceScope", async () => {
+    const { handlers, approvalsList, interactionsList } = makeHandlers();
+    const ctx = { serviceScope: { runId: "service-run-1" } };
+
+    // Missing companyId maps to scope kind "none", which would otherwise slip
+    // the invocation-scope check entirely — the handler's own guard must catch
+    // it so no single call can run without a concrete target company.
+    await expect(
+      handlers["approvals.list"]({} as never, ctx),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    await expect(
+      handlers["approvals.list"]({ companyId: "  " } as never, ctx),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    await expect(
+      handlers["interactions.list"]({} as never, ctx),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    expect(approvalsList).not.toHaveBeenCalled();
+    expect(interactionsList).not.toHaveBeenCalled();
+  });
+
+  it("keeps strict company enforcement when an active dispatch pins a different company", async () => {
+    const { handlers, approvalsList } = makeHandlers();
+    await expect(
+      handlers["approvals.list"](
+        { companyId: "company-b" },
+        { invocationScope: { companyId: "company-a" } },
+      ),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    expect(approvalsList).not.toHaveBeenCalled();
   });
 });

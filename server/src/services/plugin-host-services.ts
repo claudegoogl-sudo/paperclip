@@ -23,6 +23,7 @@ import type {
   PluginWorkspace,
   IssueComment,
   PluginIssueAssigneeSummary,
+  PluginIssueAttachment,
   PluginIssueOrchestrationSummary,
   PluginExecutionWorkspaceMetadata,
 } from "@paperclipai/plugin-sdk";
@@ -39,6 +40,8 @@ import { documentService } from "./documents.js";
 import { heartbeatService } from "./heartbeat.js";
 import { budgetService } from "./budgets.js";
 import { issueApprovalService } from "./issue-approvals.js";
+import { approvalService } from "./approvals.js";
+import { redactEventPayload } from "../redaction.js";
 import { subscribeCompanyLiveEvents } from "./live-events.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import path from "node:path";
@@ -148,7 +151,7 @@ function isPrivateIP(ip: string): boolean {
  * @returns Request-routing metadata used to connect directly to the resolved IP
  *          while preserving the original hostname for HTTP Host and TLS SNI.
  */
-interface ValidatedFetchTarget {
+export interface ValidatedFetchTarget {
   parsedUrl: URL;
   resolvedAddress: string;
   hostHeader: string;
@@ -289,11 +292,24 @@ function buildPinnedRequestOptions(
   };
 }
 
-async function executePinnedHttpRequest(
+// Exported for unit tests (PLA-1063 binary-safety round-trip). Callers in this
+// module reach it through buildHostServices(); tests drive it directly against a
+// loopback server to assert byte-exact base64 response encoding.
+export async function executePinnedHttpRequest(
   target: ValidatedFetchTarget,
   init: PluginFetchInit | undefined,
   signal: AbortSignal,
-): Promise<{ status: number; statusText: string; headers: Record<string, string>; body: string }> {
+  // PLA-1063 opt-in. Only when the worker requests "base64" do we base64-encode
+  // the response body (binary-safe). Old SDKs never send it, so they keep the
+  // legacy utf8 string and are byte-for-byte unaffected by this host upgrade.
+  acceptResponseBodyEncoding?: "base64",
+): Promise<{
+  status: number;
+  statusText: string;
+  headers: Record<string, string>;
+  body: string;
+  bodyEncoding?: "utf8" | "base64";
+}> {
   const { options, body } = buildPinnedRequestOptions(target, init);
 
   const response = await new Promise<IncomingMessage>((resolve, reject) => {
@@ -335,11 +351,30 @@ async function executePinnedHttpRequest(
     }
   }
 
+  const rawBody = Buffer.concat(chunks);
+
+  // Base64-encode the response body ONLY when the worker opted in via
+  // acceptResponseBodyEncoding (PLA-1063). Base64 is symmetric with the
+  // request-body path (decodeFetchBody) and keeps binary payloads
+  // (images/docs/multipart) byte-exact instead of corrupting them through a
+  // UTF-8 round-trip. Legacy workers that don't send the flag stay on the old
+  // utf8 string encoding, so this host change is non-breaking for not-yet-
+  // rebuilt plugins (klipper/vault) — no lockstep host+plugins deploy required.
+  if (acceptResponseBodyEncoding === "base64") {
+    return {
+      status: response.statusCode ?? 500,
+      statusText: response.statusMessage ?? "",
+      headers,
+      body: rawBody.toString("base64"),
+      bodyEncoding: "base64",
+    };
+  }
+
   return {
     status: response.statusCode ?? 500,
     statusText: response.statusMessage ?? "",
     headers,
-    body: Buffer.concat(chunks).toString("utf8"),
+    body: rawBody.toString("utf8"),
   };
 }
 
@@ -391,6 +426,14 @@ const MAX_LOG_MESSAGE_LENGTH = 10_000;
 
 /** Max serialised JSON size for plugin log meta objects. */
 const MAX_LOG_META_JSON_LENGTH = 50_000;
+
+/**
+ * Defensive upper bound on rows returned by the PLA-923 reconcile reads
+ * (`approvals.list` / `interactions.list`). A normal pending set is far smaller,
+ * so this is a no-op in practice; it only prevents a pathological pending count
+ * from ballooning a single response. When the cap is hit we emit one warn line.
+ */
+const RECONCILE_LIST_LIMIT = 500;
 
 /** Max length for a metric name. */
 const MAX_METRIC_NAME_LENGTH = 500;
@@ -588,6 +631,8 @@ export function buildHostServices(
   const authorization = authorizationService(db);
   const budgets = budgetService(db);
   const issueApprovals = issueApprovalService(db);
+  const boardApprovals = approvalService(db);
+  const interactions = issueThreadInteractionService(db);
   const scopedBus = eventBus.forPlugin(pluginKey);
 
   // PLA-574: artifacts.fetch handler — only available when storage + a
@@ -675,6 +720,48 @@ export function buildHostServices(
    * availability gate to enforce here.
    */
   const ensurePluginAvailableForCompany = async (_companyId: string) => {};
+
+  /**
+   * PLA-923: real, method-scoped availability gate for the reconcile reads
+   * (`approvals.list` / `interactions.list`). Unlike the instance-wide no-op
+   * stub above, this fail-closes so a cross-tenant-sensitive enumeration can
+   * never run for a company the plugin is not genuinely provisioned for. It is
+   * deliberately NOT wired into the existing handlers (whose per-entity
+   * `requireInCompany` already supplies the cross-check) — only the new reads
+   * call it.
+   *
+   * Denial order (each step throws rather than returning an empty list — a
+   * silent empty would mask a misconfig and reopen the very downtime gap this
+   * RPC closes):
+   *   (a) companyId must be a non-empty string;
+   *   (b) the company must exist;
+   *   (c) the plugin install record must exist and be in an operational state
+   *       (not `uninstalled` / `disabled`);
+   *   (d) the company must not have explicitly disabled the plugin
+   *       (`enabled !== false`; absent settings row ⇒ default-ON, matching the
+   *       instance-wide install model accepted for PLA-923 3.b).
+   */
+  const requirePluginEnabledForCompany = async (companyId: string): Promise<void> => {
+    // (a)
+    if (typeof companyId !== "string" || companyId.trim().length === 0) {
+      throw new Error("companyId is required for this operation");
+    }
+    // (b)
+    const company = await companies.getById(companyId);
+    if (!company) {
+      throw new Error("Company not found");
+    }
+    // (c)
+    const plugin = await registry.getById(pluginId);
+    if (!plugin || plugin.status === "uninstalled" || plugin.status === "disabled") {
+      throw new Error("Plugin is not available for this company");
+    }
+    // (d)
+    const settings = await registry.getCompanySettings(pluginId, companyId);
+    if (settings && settings.enabled === false) {
+      throw new Error("Plugin is disabled for this company");
+    }
+  };
 
   const getLocalFolderDeclaration = (folderKey: string) =>
     requireLocalFolderDeclaration(options.manifest?.localFolders, folderKey);
@@ -1347,7 +1434,12 @@ export function buildHostServices(
 
         try {
           const init = params.init as PluginFetchInit | undefined;
-          return await executePinnedHttpRequest(target, init, controller.signal);
+          return await executePinnedHttpRequest(
+            target,
+            init,
+            controller.signal,
+            params.acceptResponseBodyEncoding,
+          );
         } finally {
           clearTimeout(timeout);
         }
@@ -2144,6 +2236,31 @@ export function buildHostServices(
         if (!inCompany(await issues.getById(params.issueId), companyId)) return [];
         return (await issues.listComments(params.issueId)) as IssueComment[];
       },
+      async listAttachments(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        // Tenant reach-check on the issue (mirrors listComments): never enumerate
+        // attachments for an issue outside the caller's company. (PLA-1050 AC3.)
+        if (!inCompany(await issues.getById(params.issueId), companyId)) return [];
+        const rows = await issues.listAttachments(params.issueId);
+        // Curated projection: expose only the metadata a worker needs to map a
+        // comment-created event onto its asset ids and feed artifacts.fetch.
+        // Storage internals (provider/objectKey/sha256) are withheld. The
+        // per-row companyId filter is defense-in-depth on top of the issue gate.
+        return rows
+          .filter((row) => row.companyId === companyId)
+          .map((row): PluginIssueAttachment => ({
+            id: row.id,
+            companyId: row.companyId,
+            issueId: row.issueId,
+            issueCommentId: row.issueCommentId,
+            assetId: row.assetId,
+            contentType: row.contentType,
+            byteSize: row.byteSize,
+            originalFilename: row.originalFilename,
+            createdAt: row.createdAt,
+          }));
+      },
       async createComment(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
@@ -2277,6 +2394,69 @@ export function buildHostServices(
           },
         });
         return interaction as any;
+      },
+    },
+
+    // PLA-923: reconcile reads. Both run the real, fail-closed
+    // `requirePluginEnabledForCompany` gate before any query (Complete
+    // Mediation) and return a field-minimized projection (no requester/decider
+    // user ids, no decision notes, no result blobs). Default to pending when no
+    // status is supplied — the digest only cares about live blockers. A defensive
+    // `RECONCILE_LIST_LIMIT` bounds each response so a pathological pending count
+    // can't balloon a single read; a normal pending set is far below the cap, so
+    // this is a no-op in practice.
+    approvals: {
+      async list(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await requirePluginEnabledForCompany(companyId);
+        const rows = await boardApprovals.list(
+          companyId,
+          params.status ?? "pending",
+          RECONCILE_LIST_LIMIT,
+        );
+        if (rows.length >= RECONCILE_LIST_LIMIT) {
+          logger.warn(
+            { companyId, limit: RECONCILE_LIST_LIMIT, status: params.status ?? "pending" },
+            "plugin approvals.list reconcile read hit the defensive row cap; response truncated",
+          );
+        }
+        return rows.map((row) => ({
+          id: row.id,
+          type: row.type,
+          status: row.status,
+          payload: redactEventPayload(row.payload) ?? {},
+          createdAt: row.createdAt.toISOString(),
+        }));
+      },
+    },
+
+    interactions: {
+      async list(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await requirePluginEnabledForCompany(companyId);
+        // This reconcile read is pending-only by design (the digest tracks live
+        // blockers). Reject any other status rather than returning a silent
+        // empty list, which would mask a caller misconfig.
+        const status = params.status ?? "pending";
+        if (status !== "pending") {
+          throw new Error(`interactions.list only supports status="pending" (got "${status}")`);
+        }
+        const rows = await interactions.listPendingByCompany(companyId, RECONCILE_LIST_LIMIT);
+        if (rows.length >= RECONCILE_LIST_LIMIT) {
+          logger.warn(
+            { companyId, limit: RECONCILE_LIST_LIMIT },
+            "plugin interactions.list reconcile read hit the defensive row cap; response truncated",
+          );
+        }
+        return rows.map((row) => ({
+          id: row.id,
+          issueId: row.issueId,
+          kind: row.kind,
+          status: row.status,
+          title: row.title ?? null,
+          summary: row.summary ?? null,
+          createdAt: row.createdAt.toISOString(),
+        }));
       },
     },
 

@@ -45,6 +45,7 @@ export type { PluginLauncherRenderContextSnapshot } from "@paperclipai/shared";
 
 import type {
   PluginEvent,
+  PluginIssueAttachment,
   PluginIssueCheckoutOwnership,
   PluginIssueOrchestrationSummary,
   PluginIssueRelationSummary,
@@ -65,6 +66,8 @@ import type {
   PluginAuthorizationDecisionResult,
   PluginAuthorizationPolicyRecord,
   PluginAuthorizationPolicySummary,
+  PluginPendingApproval,
+  PluginPendingInteraction,
 } from "./types.js";
 import type {
   PluginHealthDiagnostics,
@@ -869,8 +872,23 @@ export interface WorkerToHostMethods {
         body?: string;
         bodyEncoding?: "utf8" | "base64";
       };
+      // Opt-in (PLA-1063): when "base64", the host base64-encodes the response
+      // body and tags it `bodyEncoding:"base64"` so binary payloads round-trip
+      // byte-exact. Absent → host keeps the legacy utf8 string encoding. This
+      // makes the host fix non-breaking: old SDKs never send it and stay on the
+      // utf8 path, so a new host does not corrupt their (text) responses.
+      acceptResponseBodyEncoding?: "base64";
     },
-    result: { status: number; statusText: string; headers: Record<string, string>; body: string },
+    // `body` is always a string on the wire (JSON-RPC). `bodyEncoding` tells the
+    // worker how to reconstruct the Response body: "base64" → decode to bytes,
+    // "utf8"/absent → use the string as-is (absent for back-compat with old hosts).
+    result: {
+      status: number;
+      statusText: string;
+      headers: Record<string, string>;
+      body: string;
+      bodyEncoding?: "utf8" | "base64";
+    },
   ];
 
   // Secrets
@@ -1266,6 +1284,10 @@ export interface WorkerToHostMethods {
     params: { issueId: string; companyId: string },
     result: IssueComment[],
   ];
+  "issues.listAttachments": [
+    params: { issueId: string; companyId: string },
+    result: PluginIssueAttachment[],
+  ];
   "issues.createComment": [
     params: {
       issueId: string;
@@ -1318,6 +1340,18 @@ export interface WorkerToHostMethods {
   "issues.documents.delete": [
     params: { issueId: string; key: string; companyId: string },
     result: void,
+  ];
+
+  // Reconcile reads (PLA-923) — authoritative pending-blocker snapshot for the
+  // messenger digest to seed/reconcile on worker startup. Company-scoped,
+  // read-only; the host rejects kind:"all" / missing companyId.
+  "approvals.list": [
+    params: { companyId: string; status?: string },
+    result: PluginPendingApproval[],
+  ];
+  "interactions.list": [
+    params: { companyId: string; status?: string },
+    result: PluginPendingInteraction[],
   ];
 
   // Agents (read)

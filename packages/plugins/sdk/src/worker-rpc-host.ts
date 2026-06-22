@@ -620,10 +620,23 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           const result = await callHost("http.fetch", {
             url,
             init: Object.keys(serializedInit).length > 0 ? serializedInit : undefined,
+            // Opt in to base64 response bodies (PLA-1063 binary safety). This
+            // SDK decodes bodyEncoding below, so it is always safe to request.
+            // Old hosts ignore the flag and return utf8 (handled by the default
+            // branch); old SDKs never send it, so a new host leaves them on the
+            // legacy utf8 path — no lockstep deploy required.
+            acceptResponseBodyEncoding: "base64",
           });
 
-          // Reconstruct a Response-like object from the serialized result
-          return new Response(result.body, {
+          // Reconstruct a Response from the serialized result. When the host
+          // marks the body base64 (binary-safe path, PLA-1063), decode to bytes
+          // so images/docs round-trip exactly; a missing bodyEncoding means an
+          // old host that returned a utf8 string — use it as-is (back-compat).
+          const responseBody =
+            result.bodyEncoding === "base64"
+              ? new Uint8Array(Buffer.from(result.body, "base64"))
+              : result.body;
+          return new Response(responseBody, {
             status: result.status,
             statusText: result.statusText,
             headers: result.headers,
@@ -992,6 +1005,10 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           return callHost("issues.listComments", { issueId, companyId });
         },
 
+        async listAttachments(issueId: string, companyId: string) {
+          return callHost("issues.listAttachments", { issueId, companyId });
+        },
+
         async createComment(
           issueId: string,
           body: string,
@@ -1164,6 +1181,18 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           async getOrchestration(input) {
             return callHost("issues.summaries.getOrchestration", input);
           },
+        },
+      },
+
+      approvals: {
+        async list(companyId: string, status?: string) {
+          return callHost("approvals.list", { companyId, status });
+        },
+      },
+
+      interactions: {
+        async list(companyId: string, status?: string) {
+          return callHost("interactions.list", { companyId, status });
         },
       },
 
