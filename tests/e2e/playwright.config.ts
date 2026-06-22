@@ -18,12 +18,17 @@ export default defineConfig({
   testIgnore: ["multi-user.spec.ts", "multi-user-authenticated.spec.ts"],
   timeout: 60_000,
   retries: 0,
-  // PLA-597: pin CI to a single worker so spec files run strictly sequentially
-  // against the shared webServer. Cross-file parallelism is the only path that
-  // surfaces the heartbeat_runs / issues deadlock pair (PATCH /issues:done in
-  // one spec contends with a heartbeat-run lifecycle update in another). On a
-  // developer's machine we keep the default so the suite stays fast.
-  workers: process.env.CI ? 1 : undefined,
+  // Pin to a single worker so spec files run strictly sequentially against the
+  // shared webServer. Two independent reasons require this:
+  //  - PLA-597: cross-file parallelism is the only path that surfaces the
+  //    heartbeat_runs / issues deadlock pair (PATCH /issues:done in one spec
+  //    contends with a heartbeat-run lifecycle update in another).
+  //  - upstream v2026.618.0: several specs toggle instance-level state (the
+  //    `enableConferenceRoomChat` experimental flag) that changes which UI
+  //    variant renders, so a flag flip in one spec must not race another.
+  // The second reason applies on developer machines too, so this is always 1
+  // (not just under CI).
+  workers: 1,
   use: {
     baseURL: BASE_URL,
     headless: true,

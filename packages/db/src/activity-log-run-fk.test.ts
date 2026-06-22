@@ -44,7 +44,7 @@ describeEmbeddedPostgres("activity_log.run_id ON DELETE SET NULL", () => {
 
       const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
       try {
-        // The FK must be declared with ON DELETE SET NULL after migration 0099.
+        // The FK must be declared with ON DELETE SET NULL after migration 0103.
         const [fk] = await sql.unsafe<{ delete_rule: string }[]>(
           `SELECT rc.delete_rule
              FROM information_schema.referential_constraints rc
@@ -91,13 +91,13 @@ describeEmbeddedPostgres("activity_log.run_id ON DELETE SET NULL", () => {
   );
 
   it(
-    "migration 0099 is re-runnable (DROP CONSTRAINT IF EXISTS + ADD converges)",
+    "migration 0103 is re-runnable (DROP CONSTRAINT IF EXISTS + ADD converges)",
     async () => {
       const connectionString = await createTempDatabase();
       await applyPendingMigrations(connectionString);
 
       const migrationSql = await readFile(
-        new URL("./migrations/0099_activity_log_run_id_set_null.sql", import.meta.url),
+        new URL("./migrations/0103_activity_log_run_id_set_null.sql", import.meta.url),
         "utf8",
       );
 

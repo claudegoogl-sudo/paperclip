@@ -6,6 +6,7 @@ import { readConfigFile } from "../config-file.js";
 import { resolveDefaultLogsDir, resolveHomeAwarePath } from "../home-paths.js";
 import { shouldSilenceHttpSuccessLog } from "./http-log-policy.js";
 import { redactSecretsForLog, redactSecretsDeepForLog } from "../secret-patterns.js";
+import { redactSensitive } from "./redact-sensitive.js";
 
 /**
  * Censor used by pino `redact` to scrub secret patterns from the serialised
@@ -118,27 +119,33 @@ export const httpLogger = pinoHttp({
   },
 });
 
+// Two redaction layers apply to the request fields below (defense in depth):
+//  1. `redactSensitive` here scrubs values by *key name* (password, *_token,
+//     api_key, …) so a credential whose value doesn't match a known secret
+//     pattern still never lands on disk (upstream v2026.618.0).
+//  2. the outer `redactSecretsDeepForLog` in `customProps` then scrubs by
+//     *value pattern* (live JWTs, provider keys) anywhere in the tree (PLA-842).
 function buildHttpLogProps(req: any, res: any): Record<string, unknown> {
   if (res.statusCode >= 400) {
     const ctx = (res as any).__errorContext;
     if (ctx) {
       return {
         errorContext: ctx.error,
-        reqBody: ctx.reqBody,
-        reqParams: ctx.reqParams,
-        reqQuery: ctx.reqQuery,
+        reqBody: redactSensitive(ctx.reqBody),
+        reqParams: redactSensitive(ctx.reqParams),
+        reqQuery: redactSensitive(ctx.reqQuery),
       };
     }
     const props: Record<string, unknown> = {};
     const { body, params, query } = req as any;
     if (body && typeof body === "object" && Object.keys(body).length > 0) {
-      props.reqBody = body;
+      props.reqBody = redactSensitive(body);
     }
     if (params && typeof params === "object" && Object.keys(params).length > 0) {
-      props.reqParams = params;
+      props.reqParams = redactSensitive(params);
     }
     if (query && typeof query === "object" && Object.keys(query).length > 0) {
-      props.reqQuery = query;
+      props.reqQuery = redactSensitive(query);
     }
     if ((req as any).route?.path) {
       props.routePath = (req as any).route.path;

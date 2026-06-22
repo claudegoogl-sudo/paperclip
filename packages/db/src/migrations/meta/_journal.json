@@ -698,29 +698,57 @@
     {
       "idx": 99,
       "version": "7",
-      "when": 1780534300000,
-      "tag": "0099_activity_log_run_id_set_null",
+      "when": 1781130000000,
+      "tag": "0099_skills_store_foundation",
       "breakpoints": true
     },
     {
       "idx": 100,
       "version": "7",
-      "when": 1780534400000,
-      "tag": "0100_backfill_plugin_secret_bindings",
+      "when": 1781480000000,
+      "tag": "0100_skill_install_count_backfill",
       "breakpoints": true
     },
     {
       "idx": 101,
       "version": "7",
-      "when": 1780534500000,
-      "tag": "0101_secret_binding_egress_allowlist",
+      "when": 1781490000000,
+      "tag": "0101_plugin_company_id_tenant_isolation",
       "breakpoints": true
     },
     {
       "idx": 102,
       "version": "7",
-      "when": 1780534600000,
-      "tag": "0102_egress_would_deny_observations",
+      "when": 1781490100000,
+      "tag": "0102_managed_sandbox_dedup_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 103,
+      "version": "7",
+      "when": 1781490200000,
+      "tag": "0103_activity_log_run_id_set_null",
+      "breakpoints": true
+    },
+    {
+      "idx": 104,
+      "version": "7",
+      "when": 1781490300000,
+      "tag": "0104_backfill_plugin_secret_bindings",
+      "breakpoints": true
+    },
+    {
+      "idx": 105,
+      "version": "7",
+      "when": 1781490400000,
+      "tag": "0105_secret_binding_egress_allowlist",
+      "breakpoints": true
+    },
+    {
+      "idx": 106,
+      "version": "7",
+      "when": 1781490500000,
+      "tag": "0106_egress_would_deny_observations",
       "breakpoints": true
     }
   ]
