@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
-import { and, desc, eq, inArray, notInArray } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, notInArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -16,6 +16,10 @@ import {
   issueRelations,
   issues as issueRows,
   issueWorkProducts,
+  pipelineCaseIssueLinks,
+  pipelineCases,
+  pipelineStages,
+  pipelines,
   projectWorkspaces,
 } from "@paperclipai/db";
 import {
@@ -40,9 +44,12 @@ import {
   feedbackTraceStatusSchema,
   feedbackVoteValueSchema,
   upsertIssueFeedbackVoteSchema,
+  upsertIssueWatchdogSchema,
   linkIssueApprovalSchema,
   issueDocumentKeySchema,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
+  ISSUE_WATCHDOG_DISCOVERY_KINDS,
+  TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND,
   rejectIssueThreadInteractionSchema,
   restoreIssueDocumentRevisionSchema,
   respondIssueThreadInteractionSchema,
@@ -58,6 +65,7 @@ import {
   type CompanySearchResponse,
   type ExecutionWorkspace,
   type IssueRelationIssueSummary,
+  type IssueWatchdogDiscoveryKind,
   type SourceTrustMetadata,
   type SuccessfulRunHandoffState,
 } from "@paperclipai/shared";
@@ -89,6 +97,12 @@ import {
   routineService,
   workProductService,
 } from "../services/index.js";
+import {
+  TASK_WATCHDOG_ORIGIN_KIND,
+  resolveTaskWatchdogMutationScope,
+  taskWatchdogScopeAllowsIssueMutation,
+} from "../services/task-watchdog-scope.js";
+import type { TaskWatchdogServiceDeps, taskWatchdogService } from "../services/task-watchdogs.js";
 import { logger } from "../middleware/logger.js";
 import { firstSecretMatch } from "../secret-patterns.js";
 import { retryOnTransientPgError } from "../services/pg-retry.js";
@@ -101,7 +115,6 @@ import {
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 import {
   isInlineAttachmentContentType,
-  isAllowedContentType,
   normalizeIssueAttachmentMaxBytes,
   normalizeContentType,
   SVG_CONTENT_TYPE,
@@ -113,6 +126,7 @@ import { feedbackService } from "../services/feedback.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { readAcceptedPlanConfirmationTarget } from "../services/issues.js";
 import { environmentService } from "../services/environments.js";
+import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { redactSensitiveText } from "../redaction.js";
 import {
   createCompanySearchRateLimiter,
@@ -139,11 +153,18 @@ import {
   resolveCoreTrustPreset,
   type TrustPresetResolution,
 } from "../services/trust-preset-resolver.js";
+import { externalObjectService } from "../services/external-objects.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
+const refreshExternalObjectsSchema = z.object({
+  objectIds: z.array(z.string().uuid()).max(50).optional(),
+}).strict();
+const externalObjectSummariesSchema = z.object({
+  issueIds: z.array(z.string().uuid()).max(1000),
+}).strict();
 
 const promoteLowTrustOutputSchema = z.object({
   sourceArtifactKind: z.enum(["comment", "document", "work_product", "issue"]),
@@ -151,6 +172,44 @@ const promoteLowTrustOutputSchema = z.object({
   title: z.string().trim().min(1).max(200),
   summary: z.string().trim().min(1).max(8_000),
 });
+
+async function listIssueLinkedCases(db: Db, companyId: string, issueId: string) {
+  const rows = await db
+    .select({
+      link: pipelineCaseIssueLinks,
+      case: pipelineCases,
+      pipeline: pipelines,
+      stage: pipelineStages,
+    })
+    .from(pipelineCaseIssueLinks)
+    .innerJoin(pipelineCases, eq(pipelineCaseIssueLinks.caseId, pipelineCases.id))
+    .innerJoin(pipelines, eq(pipelineCases.pipelineId, pipelines.id))
+    .innerJoin(pipelineStages, eq(pipelineCases.stageId, pipelineStages.id))
+    .where(and(
+      eq(pipelineCaseIssueLinks.companyId, companyId),
+      eq(pipelineCaseIssueLinks.issueId, issueId),
+      eq(pipelineCases.companyId, companyId),
+      eq(pipelines.companyId, companyId),
+    ));
+  return rows.map((row) => ({
+    id: row.case.id,
+    caseKey: row.case.caseKey,
+    title: row.case.title,
+    status: row.case.terminalKind ?? "open",
+    role: row.link.role,
+    pipeline: {
+      id: row.pipeline.id,
+      key: row.pipeline.key,
+      name: row.pipeline.name,
+    },
+    stage: {
+      id: row.stage.id,
+      key: row.stage.key,
+      name: row.stage.name,
+      kind: row.stage.kind,
+    },
+  }));
+}
 
 type ParsedExecutionState = NonNullable<ReturnType<typeof parseIssueExecutionState>>;
 type NormalizedExecutionPolicy = NonNullable<ReturnType<typeof normalizeIssueExecutionPolicy>>;
@@ -191,6 +250,8 @@ type SuccessfulRunHandoffActivityRow = {
   details: Record<string, unknown> | null;
   createdAt: Date;
 };
+type TaskWatchdogService = ReturnType<typeof taskWatchdogService>;
+type TaskWatchdogServiceFactory = typeof taskWatchdogService;
 
 function applyCreateIssueStatusDefault(req: Request, res: Response, next: () => void) {
   if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
@@ -207,6 +268,43 @@ function applyCreateIssueStatusDefault(req: Request, res: Response, next: () => 
     };
   }
   next();
+}
+
+function noopTaskWatchdogService(): TaskWatchdogService {
+  return {
+    getActiveForIssue: async () => null,
+    listActiveSummariesForIssues: async () => new Map(),
+    upsertForIssue: async () => {
+      throw unprocessable("Task watchdog service is unavailable");
+    },
+    disableForIssue: async () => null,
+    reconcileTaskWatchdogs: async () => ({
+      checked: 0,
+      triggered: 0,
+      live: 0,
+      pendingFirstRun: 0,
+      alreadyReviewed: 0,
+      skipped: 0,
+      watchdogIssueIds: [],
+    }),
+    reconcileForIssueAndAncestors: async () => ({
+      checked: 0,
+      triggered: 0,
+      pendingFirstRun: 0,
+      skipped: 0,
+      watchdogIssueIds: [],
+    }),
+    revalidateMutationScope: async () => ({
+      allowed: true,
+      classification: {
+        state: "stopped",
+        reason: "Task watchdog service unavailable in this route context.",
+        includedIssueIds: [],
+        stopFingerprint: "task_watchdog_stop:unavailable",
+        stoppedLeaves: [],
+      },
+    }),
+  };
 }
 
 function buildAttachmentContentPath(attachmentId: string): string {
@@ -1017,6 +1115,7 @@ export function issueRoutes(
     searchService?: CompanySearchService;
     searchRateLimiter?: CompanySearchRateLimiter;
     pluginWorkerManager?: PluginWorkerManager;
+    taskWatchdogEnqueueWakeup?: TaskWatchdogServiceDeps["enqueueWakeup"] | null;
   } = {},
 ) {
   const router = Router();
@@ -1045,7 +1144,25 @@ export function issueRoutes(
   const documentAnnotationsSvc = documentAnnotationService(db);
   const issueReferencesSvc = issueReferenceService(db);
   const issueThreadInteractionsSvc = issueThreadInteractionService(db);
+  const taskWatchdogFactory: TaskWatchdogServiceFactory | undefined = Object.prototype.hasOwnProperty.call(
+    serviceIndex,
+    "taskWatchdogService",
+  )
+    ? serviceIndex.taskWatchdogService
+    : undefined;
+  const taskWatchdogsSvc = taskWatchdogFactory?.(db, {
+    enqueueWakeup: opts.taskWatchdogEnqueueWakeup === undefined
+      ? heartbeat.wakeup
+      : opts.taskWatchdogEnqueueWakeup ?? undefined,
+  }) ?? noopTaskWatchdogService();
+  const externalObjectsSvc = externalObjectService(db, {
+    pluginWorkerManager: opts.pluginWorkerManager,
+    enabled: async () => (await instanceSettings.getExperimental()).enableExternalObjects === true,
+  });
   const routinesSvc = routineService(db, {
+    pluginWorkerManager: opts.pluginWorkerManager,
+  });
+  const environmentRuntime = environmentRuntimeService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
   });
   const issueTreeControlFactory = Object.prototype.hasOwnProperty.call(
@@ -1059,6 +1176,14 @@ export function issueRoutes(
   };
   const feedbackExportService = opts?.feedbackExportService;
   const environmentsSvc = environmentService(db);
+
+  async function queueTaskWatchdogEvaluation(issue: { id: string; companyId: string }, runId?: string | null) {
+    await taskWatchdogsSvc
+      .reconcileForIssueAndAncestors(issue.companyId, issue.id, { runId: runId ?? null })
+      .catch((err) => {
+        logger.warn({ err, issueId: issue.id }, "task watchdog evaluation hook failed");
+      });
+  }
 
   async function sourceTrustForActorWrite(
     issue: { id: string; companyId: string; projectId?: string | null; executionPolicy?: unknown },
@@ -1766,6 +1891,25 @@ export function issueRoutes(
     throw forbidden(decision.explanation);
   }
 
+  function isTaskBridgeKeyActor(req: Request) {
+    return req.actor.type === "agent" && req.actor.source === "agent_key" && req.actor.keyScope?.kind === "task_bridge";
+  }
+
+  function taskBridgeOriginForActor(req: Request) {
+    return isTaskBridgeKeyActor(req) && req.actor.keyId
+      ? { originKind: "task_bridge", originId: req.actor.keyId }
+      : null;
+  }
+
+  async function assertTaskBridgeCreateAllowed(
+    req: Request,
+    companyId: string,
+    assignmentScope: TaskAssignmentAuthorizationScope,
+  ) {
+    if (!isTaskBridgeKeyActor(req)) return;
+    await assertCanAssignTasks(req, companyId, assignmentScope);
+  }
+
   async function decideIssueAccess(
     req: Request,
     issue: {
@@ -1777,7 +1921,7 @@ export function issueRoutes(
       assigneeUserId: string | null;
       status: string;
     },
-    action: "issue:read" | "issue:mutate",
+    action: "issue:comment" | "issue:read" | "issue:mutate",
   ) {
     return access.decide({
       actor: req.actor,
@@ -1807,6 +1951,52 @@ export function issueRoutes(
     if (decision.allowed) return true;
     res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
     return false;
+  }
+
+  async function assertAgentIssueCommentAllowed(
+    req: Request,
+    res: Response,
+    issue: {
+      id: string;
+      companyId: string;
+      projectId: string | null;
+      parentId: string | null;
+      status: string;
+      assigneeAgentId: string | null;
+      assigneeUserId: string | null;
+    },
+  ) {
+    if (req.actor.type !== "agent") return true;
+    const actorAgentId = req.actor.agentId;
+    if (!actorAgentId) {
+      res.status(403).json({ error: "Agent authentication required" });
+      return false;
+    }
+    const watchdogScope = await resolveTaskWatchdogMutationScope(db, req.actor);
+    if (watchdogScope.kind !== "none") {
+      const scopeResult = await taskWatchdogScopeAllowsIssueMutation(db, watchdogScope, issue);
+      if (scopeResult.kind === "invalid") {
+        res.status(403).json({
+          error: scopeResult.detail,
+          details: {
+            issueId: issue.id,
+            securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+          },
+        });
+        return false;
+      }
+      return assertFreshTaskWatchdogSourceMutation(res, watchdogScope, issue);
+    }
+    const boundaryDecision = await decideIssueAccess(req, issue, "issue:comment");
+    if (!boundaryDecision.allowed) {
+      res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
+      return false;
+    }
+    return boundaryDecision;
+  }
+
+  function isIssueMentionGrantDecision(decision: true | Awaited<ReturnType<typeof decideIssueAccess>>) {
+    return decision !== true && decision.reason === "allow_issue_mention_grant";
   }
 
   async function filterIssuesForActor<T extends Parameters<typeof decideIssueAccess>[1]>(req: Request, rows: T[]) {
@@ -1862,6 +2052,29 @@ export function issueRoutes(
     if (!actorAgentId) {
       res.status(403).json({ error: "Agent authentication required" });
       return false;
+    }
+    // Task-watchdog runs receive a scoped *grant* to mutate issues inside the
+    // watched subtree. This must be evaluated before the base assignee-ownership
+    // boundary below: that boundary denies an agent mutating an issue owned by a
+    // different agent, which is exactly the watchdog's primary job
+    // (SPEC-implementation §9.9 — comment, transition, reassign within the
+    // watched subtree). The watchdog scope can only widen access to the watched
+    // subtree; downstream status-transition, assignment, recovery, and budget
+    // guards in the route handlers still apply.
+    const watchdogScope = await resolveTaskWatchdogMutationScope(db, req.actor);
+    if (watchdogScope.kind !== "none") {
+      const scopeResult = await taskWatchdogScopeAllowsIssueMutation(db, watchdogScope, issue);
+      if (scopeResult.kind === "invalid") {
+        res.status(403).json({
+          error: scopeResult.detail,
+          details: {
+            issueId: issue.id,
+            securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+          },
+        });
+        return false;
+      }
+      return assertFreshTaskWatchdogSourceMutation(res, watchdogScope, issue);
     }
     const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
     if (!boundaryDecision.allowed) {
@@ -1923,6 +2136,320 @@ export function issueRoutes(
       });
     }
     return true;
+  }
+
+  async function assertFreshTaskWatchdogSourceMutation(
+    res: Response,
+    scope: Awaited<ReturnType<typeof resolveTaskWatchdogMutationScope>>,
+    issue: { id: string },
+  ) {
+    if (scope.kind !== "watchdog") return true;
+    if (scope.watchdogIssueId && issue.id === scope.watchdogIssueId) return true;
+
+    const revalidated = await taskWatchdogsSvc.revalidateMutationScope(scope);
+    if (revalidated.allowed) return true;
+    res.status(409).json({
+      error: revalidated.reason,
+      details: {
+        watchedIssueId: scope.watchedIssueId,
+        watchdogId: scope.watchdogId,
+        runStopFingerprint: scope.stopFingerprint,
+        currentState: revalidated.classification?.state ?? null,
+        currentStopFingerprint: revalidated.classification && "stopFingerprint" in revalidated.classification
+          ? revalidated.classification.stopFingerprint
+          : null,
+      },
+    });
+    return false;
+  }
+
+  async function rejectTaskWatchdogConfigMutation(req: Request, res: Response) {
+    if (req.actor.type !== "agent") return false;
+    const scope = await resolveTaskWatchdogMutationScope(db, req.actor);
+    if (scope.kind !== "watchdog") return false;
+    res.status(403).json({
+      error: "Task-watchdog runs cannot change watchdog configuration.",
+      details: {
+        watchedIssueId: scope.watchedIssueId,
+        watchdogId: scope.watchdogId,
+        securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+      },
+    });
+    return true;
+  }
+
+  async function assertTaskWatchdogIssueMutationAllowed(
+    req: Request,
+    res: Response,
+    issue: {
+      id: string;
+      companyId: string;
+      parentId?: string | null;
+    },
+    opts: { allowWatchdogIssue?: boolean } = {},
+  ) {
+    if (req.actor.type !== "agent") return true;
+    const scope = await resolveTaskWatchdogMutationScope(db, req.actor);
+    if (scope.kind === "none") return true;
+    const result = await taskWatchdogScopeAllowsIssueMutation(db, scope, issue, opts);
+    if (result.kind !== "invalid") return assertFreshTaskWatchdogSourceMutation(res, scope, issue);
+    res.status(403).json({
+      error: result.detail,
+      details: {
+        issueId: issue.id,
+        securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+      },
+    });
+    return false;
+  }
+
+  async function rejectAgentIssueThreadInteractionResolution(
+    req: Request,
+    res: Response,
+    issue: {
+      id: string;
+      companyId: string;
+      parentId?: string | null;
+    },
+  ) {
+    if (req.actor.type !== "agent") return false;
+    if (
+      req.actor.runId &&
+      !(await assertTaskWatchdogIssueMutationAllowed(req, res, issue, { allowWatchdogIssue: false }))
+    ) {
+      return true;
+    }
+    res.status(403).json({ error: "Agent actors cannot resolve issue-thread interactions through this board-only route" });
+    return true;
+  }
+
+  async function assertTaskWatchdogCreateIssueAllowed(
+    req: Request,
+    res: Response,
+    companyId: string,
+    parent: {
+      id: string;
+      companyId: string;
+      parentId?: string | null;
+    } | null,
+  ) {
+    if (req.actor.type !== "agent") return true;
+    const scope = await resolveTaskWatchdogMutationScope(db, req.actor);
+    if (scope.kind === "none") return true;
+    if (scope.kind === "invalid") {
+      res.status(403).json({
+        error: scope.detail,
+        details: {
+          securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+        },
+      });
+      return false;
+    }
+    if (!parent) {
+      res.status(403).json({
+        error: "Task-watchdog runs must create issues inside the watched issue subtree.",
+        details: {
+          companyId,
+          watchedIssueId: scope.watchedIssueId,
+          securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+        },
+      });
+      return false;
+    }
+    const result = await taskWatchdogScopeAllowsIssueMutation(db, scope, parent, { allowWatchdogIssue: false });
+    if (result.kind !== "invalid") return assertFreshTaskWatchdogSourceMutation(res, scope, parent);
+    res.status(403).json({
+      error: result.detail,
+      details: {
+        parentIssueId: parent.id,
+        securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+      },
+    });
+    return false;
+  }
+
+  async function resolveWatchdogFollowUpSerializationContext(
+    req: Request,
+    parent: {
+      id: string;
+      companyId: string;
+      status?: string | null;
+      originKind?: string | null;
+    },
+  ) {
+    if (parent.originKind === TASK_WATCHDOG_ORIGIN_KIND) {
+      return {
+        enabled: true as const,
+        watchdogParentIssueId: parent.id,
+      };
+    }
+    if (req.actor.type !== "agent") return null;
+    const scope = await resolveTaskWatchdogMutationScope(db, req.actor);
+    if (scope.kind !== "watchdog") return null;
+    return {
+      enabled: true as const,
+      watchdogParentIssueId: scope.watchdogIssueId,
+    };
+  }
+
+  function mergeIssueBlockerIds(
+    existing: unknown,
+    blockerIssueId: string | null | undefined,
+  ) {
+    const current = Array.isArray(existing)
+      ? existing.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+      : [];
+    return blockerIssueId ? [...new Set([...current, blockerIssueId])] : [...new Set(current)];
+  }
+
+  async function findCurrentSerializedWatchdogChild(parent: { id: string; companyId: string }) {
+    const children = await db
+      .select({
+        id: issueRows.id,
+        status: issueRows.status,
+      })
+      .from(issueRows)
+      .where(and(
+        eq(issueRows.companyId, parent.companyId),
+        eq(issueRows.parentId, parent.id),
+        inArray(issueRows.status, ["todo", "in_progress", "in_review", "blocked"]),
+        isNull(issueRows.hiddenAt),
+      ))
+      .orderBy(asc(issueRows.issueNumber), asc(issueRows.createdAt), asc(issueRows.id));
+    return children[0] ?? null;
+  }
+
+  async function blockWatchdogParentOnCurrentChild(input: {
+    actor: ReturnType<typeof getActorInfo>;
+    watchdogParentIssueId: string | null | undefined;
+    currentChildIssueId: string | null | undefined;
+  }) {
+    if (!input.watchdogParentIssueId || !input.currentChildIssueId) return;
+    const watchdogParent = await svc.getById(input.watchdogParentIssueId);
+    if (!watchdogParent || watchdogParent.originKind !== TASK_WATCHDOG_ORIGIN_KIND) return;
+    if (watchdogParent.status !== "in_progress" && watchdogParent.status !== "blocked") return;
+
+    const relations = await svc.getRelationSummaries(watchdogParent.id);
+    const nextBlockedByIssueIds = mergeIssueBlockerIds(
+      relations.blockedBy?.map((relation) => relation.id) ?? [],
+      input.currentChildIssueId,
+    );
+    await svc.update(watchdogParent.id, {
+      status: "blocked",
+      blockedByIssueIds: nextBlockedByIssueIds,
+      actorAgentId: input.actor.agentId,
+      actorUserId: input.actor.actorType === "user" ? input.actor.actorId : null,
+    });
+    await logActivity(db, {
+      companyId: watchdogParent.companyId,
+      actorType: input.actor.actorType,
+      actorId: input.actor.actorId,
+      agentId: input.actor.agentId,
+      runId: input.actor.runId,
+      action: "issue.task_watchdog_followups_serialized",
+      entityType: "issue",
+      entityId: watchdogParent.id,
+      details: {
+        watchdogParentIssueId: watchdogParent.id,
+        currentChildIssueId: input.currentChildIssueId,
+        blockedByIssueIds: nextBlockedByIssueIds,
+      },
+    });
+  }
+
+  function normalizeWatchdogDiscovery(input: unknown): {
+    kind: IssueWatchdogDiscoveryKind;
+    evidenceMarkdown: string | null;
+  } | null {
+    if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+    const record = input as Record<string, unknown>;
+    const kind = typeof record.kind === "string" &&
+      (ISSUE_WATCHDOG_DISCOVERY_KINDS as readonly string[]).includes(record.kind)
+      ? record.kind as IssueWatchdogDiscoveryKind
+      : null;
+    if (!kind) return null;
+    const evidenceMarkdown =
+      typeof record.evidenceMarkdown === "string" && record.evidenceMarkdown.trim().length > 0
+        ? record.evidenceMarkdown.trim()
+        : null;
+    return { kind, evidenceMarkdown };
+  }
+
+  function issueMarkdownLink(issue: { id: string; identifier?: string | null }) {
+    const identifier = issue.identifier?.trim();
+    if (!identifier) return `\`${issue.id}\``;
+    const prefix = identifier.split("-")[0] || "PAP";
+    return `[${identifier}](/${prefix}/issues/${identifier})`;
+  }
+
+  function appendWatchdogDiscoveryContext(input: {
+    description: string | null | undefined;
+    discovery: { kind: IssueWatchdogDiscoveryKind; evidenceMarkdown: string | null };
+    sourceIssue: { id: string; identifier?: string | null };
+    watchdogIssue: { id: string; identifier?: string | null } | null;
+    stopFingerprint: string | null;
+    runId: string | null;
+  }) {
+    const contextLines = [
+      "## Watchdog Discovery",
+      "",
+      `Kind: \`${input.discovery.kind}\``,
+      `Watched source issue: ${issueMarkdownLink(input.sourceIssue)}`,
+      input.watchdogIssue ? `Watchdog issue: ${issueMarkdownLink(input.watchdogIssue)}` : null,
+      input.stopFingerprint ? `Stopped fingerprint: \`${input.stopFingerprint}\`` : null,
+      input.runId ? `Watchdog run: \`${input.runId}\`` : null,
+      input.discovery.evidenceMarkdown ? "" : null,
+      input.discovery.evidenceMarkdown ? "Evidence:" : null,
+      input.discovery.evidenceMarkdown ?? null,
+    ].filter((line): line is string => line != null);
+    const existing = input.description?.trim();
+    return existing ? `${existing}\n\n${contextLines.join("\n")}` : contextLines.join("\n");
+  }
+
+  async function resolveTaskWatchdogProductBugFollowUp(
+    req: Request,
+    res: Response,
+    companyId: string,
+    discovery: { kind: IssueWatchdogDiscoveryKind; evidenceMarkdown: string | null } | null,
+  ) {
+    if (!discovery) return null;
+    if (req.actor.type !== "agent") {
+      res.status(403).json({
+        error: "Only task-watchdog agent runs can create watchdog-discovered product bug follow-ups",
+      });
+      return false;
+    }
+    const scope = await resolveTaskWatchdogMutationScope(db, req.actor);
+    if (scope.kind === "none") {
+      res.status(403).json({ error: "Only task-watchdog runs can create watchdog-discovered product bug follow-ups" });
+      return false;
+    }
+    if (scope.kind === "invalid") {
+      res.status(403).json({
+        error: scope.detail,
+        details: {
+          securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+        },
+      });
+      return false;
+    }
+    if (scope.companyId !== companyId) {
+      res.status(403).json({ error: "Task-watchdog product bug follow-up target is outside the watchdog company" });
+      return false;
+    }
+
+    const sourceIssue = await svc.getById(scope.watchedIssueId);
+    if (!sourceIssue || sourceIssue.companyId !== companyId) {
+      res.status(404).json({ error: "Watched source issue not found" });
+      return false;
+    }
+    const watchdogIssue = scope.watchdogIssueId ? await svc.getById(scope.watchdogIssueId) : null;
+    if (watchdogIssue && watchdogIssue.companyId !== companyId) {
+      res.status(403).json({ error: "Task-watchdog product bug evidence issue is outside the watchdog company" });
+      return false;
+    }
+
+    return { scope, discovery, sourceIssue, watchdogIssue };
   }
 
   function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
@@ -1995,6 +2522,28 @@ export function issueRoutes(
 
     res.status(403).json({
       error: "Cheap status-only recovery runs cannot update issue documents, plans, or deliverable artifacts",
+      details: {
+        issueId: issue.id,
+        runId: run.id,
+        modelProfile: "cheap",
+        recoveryIntent: "status_only",
+        resumeRequiresNormalModel: true,
+      },
+    });
+    return false;
+  }
+
+  async function assertApprovalMutationAllowedByRunContext(
+    req: Request,
+    res: Response,
+    issue: { id: string; companyId: string },
+  ) {
+    const run = await loadActorRunContext(req, issue.companyId);
+    if (!run) return true;
+    if (!isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return true;
+
+    res.status(403).json({
+      error: "Cheap status-only recovery runs cannot create or modify approvals",
       details: {
         issueId: issue.id,
         runId: run.id,
@@ -2369,6 +2918,27 @@ export function issueRoutes(
     });
   }
 
+  async function destroyReusableSandboxLeasesForTerminalIssue(issue: {
+    id: string;
+    companyId: string;
+    status: string;
+    executionWorkspaceId?: string | null;
+  }) {
+    try {
+      await environmentRuntime.destroyReusableSandboxLeases({
+        companyId: issue.companyId,
+        issueId: issue.id,
+        executionWorkspaceId: issue.executionWorkspaceId ?? null,
+        failureReason: `issue_terminal_${issue.status}`,
+      });
+    } catch (err) {
+      logger.warn(
+        { err, issueId: issue.id, executionWorkspaceId: issue.executionWorkspaceId ?? null },
+        "failed to destroy reusable sandbox leases for terminal issue",
+      );
+    }
+  }
+
   async function resolveIssueRouteId(rawId: string): Promise<string> {
     const identifier = normalizeIssueReferenceIdentifier(rawId);
     if (identifier) {
@@ -2465,6 +3035,10 @@ export function issueRoutes(
   router.get("/companies/:companyId/issues", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    if (isTaskBridgeKeyActor(req)) {
+      res.status(403).json({ error: "Task bridge keys cannot use company-wide issue list APIs" });
+      return;
+    }
     const assigneeUserFilterRaw = req.query.assigneeUserId as string | undefined;
     const touchedByUserFilterRaw = req.query.touchedByUserId as string | undefined;
     const inboxArchivedByUserFilterRaw = req.query.inboxArchivedByUserId as string | undefined;
@@ -2625,6 +3199,10 @@ export function issueRoutes(
   router.get("/companies/:companyId/issues/count", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    if (isTaskBridgeKeyActor(req)) {
+      res.status(403).json({ error: "Task bridge keys cannot use company-wide issue count APIs" });
+      return;
+    }
     const attention = req.query.attention as string | undefined;
     const hasPlanDocument = parseOptionalBooleanQuery(req.query.hasPlanDocument);
     if (attention !== "blocked") {
@@ -2927,6 +3505,7 @@ export function issueRoutes(
       successfulRunHandoffStates,
       scheduledRetry,
       activeRecoveryAction,
+      linkedCases,
     ] = await Promise.all([
       resolveIssueProjectAndGoal(issue),
       svc.getAncestors(issue.id),
@@ -2939,6 +3518,7 @@ export function issueRoutes(
       listSuccessfulRunHandoffStates(db, issue.companyId, [issue.id]),
       svc.getCurrentScheduledRetry(issue.id),
       recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id),
+      listIssueLinkedCases(db, issue.companyId, issue.id),
     ]);
     const recoveryActionsByRelationIssue = await relationRecoveryActionMap(
       recoveryActionsSvc,
@@ -2981,7 +3561,104 @@ export function issueRoutes(
       mentionedProjects,
       currentExecutionWorkspace,
       workProducts,
+      linkedCases,
     });
+  });
+
+  router.get("/issues/:id/watchdog", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    res.json(await taskWatchdogsSvc.getActiveForIssue(issue.companyId, issue.id));
+  });
+
+  router.put("/issues/:id/watchdog", validate(upsertIssueWatchdogSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+    if (await rejectTaskWatchdogConfigMutation(req, res)) return;
+    if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
+
+    const actor = getActorInfo(req);
+    const existingWatchdog = await taskWatchdogsSvc.getActiveForIssue(issue.companyId, issue.id);
+    const { watchdog, created } = await taskWatchdogsSvc.upsertForIssue(issue.companyId, issue.id, {
+      agentId: req.body.agentId,
+      instructions: req.body.instructions,
+      actor: {
+        agentId: actor.agentId,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+        runId: actor.runId,
+      },
+    });
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: created ? "issue.watchdog_created" : "issue.watchdog_updated",
+      entityType: "issue",
+      entityId: issue.id,
+      details: {
+        identifier: issue.identifier,
+        watchdogId: watchdog.id,
+        watchdogAgentId: watchdog.watchdogAgentId,
+        instructionsChanged: (existingWatchdog?.instructions ?? null) !== (watchdog.instructions ?? null),
+      },
+    });
+    await queueTaskWatchdogEvaluation(issue, actor.runId);
+    res.json(watchdog);
+  });
+
+  router.delete("/issues/:id/watchdog", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+    if (await rejectTaskWatchdogConfigMutation(req, res)) return;
+    if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
+
+    const actor = getActorInfo(req);
+    const disabled = await taskWatchdogsSvc.disableForIssue(issue.companyId, issue.id, {
+      agentId: actor.agentId,
+      userId: actor.actorType === "user" ? actor.actorId : null,
+      runId: actor.runId,
+    });
+    if (disabled) {
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.watchdog_removed",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          identifier: issue.identifier,
+          watchdogId: disabled.id,
+          watchdogAgentId: disabled.watchdogAgentId,
+        },
+      });
+    }
+    await queueTaskWatchdogEvaluation(issue, actor.runId);
+    res.json({ ok: true });
   });
 
   router.get("/issues/:id/recovery-actions", async (req, res) => {
@@ -3185,6 +3862,69 @@ export function issueRoutes(
     res.json(workProducts);
   });
 
+  router.get("/issues/:id/external-objects", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+    const objects = await externalObjectsSvc.listForIssue(issue.id);
+    res.json(objects);
+  });
+
+  router.get("/issues/:id/external-object-summary", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+    const summary = await externalObjectsSvc.getIssueSummary(issue.id);
+    res.json(summary);
+  });
+
+  router.post("/companies/:companyId/issues/external-object-summaries", validate(externalObjectSummariesSchema), async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const summaries = await externalObjectsSvc.getIssueSummaries(companyId, req.body.issueIds);
+    res.json({ summaries: Object.fromEntries(summaries) });
+  });
+
+  router.post("/issues/:id/external-objects/refresh", validate(refreshExternalObjectsSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+    const actor = getActorInfo(req);
+    const results = await externalObjectsSvc.refreshIssueObjects(issue.id, {
+      companyId: issue.companyId,
+      objectIds: req.body.objectIds,
+      actor,
+    });
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "external_object.refresh_requested",
+      entityType: "issue",
+      entityId: issue.id,
+      details: {
+        issueId: issue.id,
+        objectIds: results.map((result) => result.object.id),
+      },
+    });
+    res.json({ refreshed: results });
+  });
+
   router.get("/issues/:id/documents", async (req, res) => {
     const id = req.params.id as string;
     const issue = await svc.getById(id);
@@ -3287,6 +4027,7 @@ export function issueRoutes(
         entityType: "issue",
         entityId: issue.id,
         details: {
+          key: thread.documentKey,
           documentKey: thread.documentKey,
           documentId: thread.documentId,
           threadId: thread.id,
@@ -3371,6 +4112,7 @@ export function issueRoutes(
         entityType: "issue",
         entityId: issue.id,
         details: {
+          key: keyParsed.data,
           documentKey: keyParsed.data,
           threadId: comment.threadId,
           commentId: comment.id,
@@ -3424,6 +4166,7 @@ export function issueRoutes(
         entityType: "issue",
         entityId: issue.id,
         details: {
+          key: thread.documentKey,
           documentKey: thread.documentKey,
           documentId: thread.documentId,
           threadId: thread.id,
@@ -3471,6 +4214,7 @@ export function issueRoutes(
     const redirectedFromLockedDocument =
       "redirectedFromLockedDocument" in result ? result.redirectedFromLockedDocument : null;
     await issueReferencesSvc.syncDocument(doc.id);
+    await externalObjectsSvc.syncDocumentSafely(doc.id);
     const referenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
     const referenceDiff = issueReferencesSvc.diffIssueReferenceSummary(referenceSummaryBefore, referenceSummaryAfter);
     const remappedAnnotations = result.created
@@ -3700,6 +4444,7 @@ export function issueRoutes(
       });
       await issueReferencesSvc.syncDocument(result.document.id);
       const referenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
+      await externalObjectsSvc.syncDocumentSafely(result.document.id);
       const referenceDiff = issueReferencesSvc.diffIssueReferenceSummary(referenceSummaryBefore, referenceSummaryAfter);
       const remappedAnnotations = await documentAnnotationsSvc.remapOpenThreadsForDocument({
         issueId: issue.id,
@@ -3813,6 +4558,7 @@ export function issueRoutes(
     }
     await issueReferencesSvc.deleteDocumentSource(removed.id);
     const referenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
+    if (removed) await externalObjectsSvc.syncDocumentSafely(removed.id);
     const referenceDiff = issueReferencesSvc.diffIssueReferenceSummary(referenceSummaryBefore, referenceSummaryAfter);
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -4309,6 +5055,7 @@ export function issueRoutes(
     }
     assertCompanyAccess(req, issue.companyId);
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+    if (!(await assertApprovalMutationAllowedByRunContext(req, res, issue))) return;
     if (!(await assertCanManageIssueApprovalLinks(req, res, issue.companyId))) return;
 
     const actor = getActorInfo(req);
@@ -4343,6 +5090,7 @@ export function issueRoutes(
     }
     assertCompanyAccess(req, issue.companyId);
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+    if (!(await assertApprovalMutationAllowedByRunContext(req, res, issue))) return;
     if (!(await assertCanManageIssueApprovalLinks(req, res, issue.companyId))) return;
 
     await issueApprovalsSvc.unlink(id, approvalId);
@@ -4372,7 +5120,18 @@ export function issueRoutes(
     ], { companyId })) return;
     if (await assertLowTrustControlPlaneDenied(req, res, companyId, null)) return;
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
-    if (req.actor.type === "agent" && !req.body.parentId) {
+    const { watchdogDiscovery: rawWatchdogDiscovery, ...rawCreateBody } = req.body;
+    const watchdogDiscovery = normalizeWatchdogDiscovery(rawWatchdogDiscovery);
+    const watchdogProductBugFollowUp = await resolveTaskWatchdogProductBugFollowUp(
+      req,
+      res,
+      companyId,
+      watchdogDiscovery,
+    );
+    if (watchdogProductBugFollowUp === false) return;
+    const effectiveParentId = watchdogProductBugFollowUp ? null : rawCreateBody.parentId;
+    let createParent: Awaited<ReturnType<typeof svc.getById>> | null = null;
+    if (req.actor.type === "agent" && !effectiveParentId && !watchdogProductBugFollowUp && !isTaskBridgeKeyActor(req)) {
       const companyScopeDecision = await access.decide({
         actor: req.actor,
         action: "company_scope:read",
@@ -4383,41 +5142,71 @@ export function issueRoutes(
         return;
       }
     }
-    if (req.actor.type === "agent" && req.body.parentId) {
-      const parent = await svc.getById(req.body.parentId);
-      if (!parent || parent.companyId !== companyId) {
+    if (req.actor.type === "agent" && effectiveParentId) {
+      createParent = await svc.getById(effectiveParentId);
+      if (!createParent || createParent.companyId !== companyId) {
         res.status(404).json({ error: "Parent issue not found" });
         return;
       }
-      if (!(await assertIssueReadAllowed(req, res, parent))) return;
+      if (!isTaskBridgeKeyActor(req) && !(await assertIssueReadAllowed(req, res, createParent))) return;
     }
+    if (
+      !watchdogProductBugFollowUp &&
+      !(await assertTaskWatchdogCreateIssueAllowed(req, res, companyId, createParent))
+    ) return;
     const normalizedAssigneeAgentId = await normalizeIssueAssigneeAgentReference(
       companyId,
-      req.body.assigneeAgentId as string | null | undefined,
+      rawCreateBody.assigneeAgentId as string | null | undefined,
     );
     const actor = getActorInfo(req);
-    const runWorkspaceInheritanceSourceIssueId = hasExplicitIssueWorkspaceCreateSelection(req.body)
+    const runWorkspaceInheritanceSourceIssueId = hasExplicitIssueWorkspaceCreateSelection(rawCreateBody)
       ? null
       : await resolveRunIssueWorkspaceInheritanceSource(companyId, actor);
     const createBody = {
-      ...req.body,
+      ...rawCreateBody,
+      parentId: effectiveParentId,
       ...(normalizedAssigneeAgentId !== undefined ? { assigneeAgentId: normalizedAssigneeAgentId } : {}),
       ...(runWorkspaceInheritanceSourceIssueId
         ? { inheritExecutionWorkspaceFromIssueId: runWorkspaceInheritanceSourceIssueId }
         : {}),
+      ...(watchdogProductBugFollowUp
+        ? {
+          description: appendWatchdogDiscoveryContext({
+            description: rawCreateBody.description,
+            discovery: watchdogProductBugFollowUp.discovery,
+            sourceIssue: watchdogProductBugFollowUp.sourceIssue,
+            watchdogIssue: watchdogProductBugFollowUp.watchdogIssue,
+            stopFingerprint: watchdogProductBugFollowUp.scope.stopFingerprint,
+            runId: actor.runId,
+          }),
+          projectId: rawCreateBody.projectId ?? watchdogProductBugFollowUp.sourceIssue.projectId,
+          goalId: rawCreateBody.goalId ?? watchdogProductBugFollowUp.sourceIssue.goalId,
+          billingCode: rawCreateBody.billingCode ?? watchdogProductBugFollowUp.sourceIssue.billingCode,
+          originKind: TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND,
+          originId: watchdogProductBugFollowUp.sourceIssue.id,
+          originRunId: actor.runId,
+          originFingerprint: [
+            TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND,
+            watchdogProductBugFollowUp.sourceIssue.id,
+            actor.runId ?? randomUUID(),
+          ].join(":"),
+        }
+        : {}),
     };
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, { companyId }, createBody))) return;
-    if (req.body.assigneeAgentId || req.body.assigneeUserId) {
-      await assertCanAssignTasks(req, companyId, {
-        projectId: await resolveAssignmentProjectId({
-          companyId,
-          projectId: req.body.projectId,
-          parentIssueId: req.body.parentId,
-        }),
-        parentIssueId: req.body.parentId ?? null,
-        assigneeAgentId: createBody.assigneeAgentId ?? null,
-        assigneeUserId: req.body.assigneeUserId ?? null,
-      });
+    const createAssignmentScope = {
+      projectId: await resolveAssignmentProjectId({
+        companyId,
+        projectId: createBody.projectId,
+        parentIssueId: createBody.parentId,
+      }),
+      parentIssueId: createBody.parentId ?? null,
+      assigneeAgentId: createBody.assigneeAgentId ?? null,
+      assigneeUserId: rawCreateBody.assigneeUserId ?? null,
+    };
+    await assertTaskBridgeCreateAllowed(req, companyId, createAssignmentScope);
+    if (rawCreateBody.assigneeAgentId || rawCreateBody.assigneeUserId) {
+      await assertCanAssignTasks(req, companyId, createAssignmentScope);
     }
     await assertIssueEnvironmentSelection(companyId, createBody.executionWorkspaceSettings?.environmentId);
 
@@ -4435,13 +5224,16 @@ export function issueRoutes(
     }, actor);
     const issue = await svc.create(companyId, {
       ...createBody,
+      ...(taskBridgeOriginForActor(req) ?? {}),
       id: issueId,
       executionPolicy,
       ...(sourceTrust ? { sourceTrust } : {}),
       createdByAgentId: actor.agentId,
       createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+      watchdogActorRunId: actor.runId,
     });
     await issueReferencesSvc.syncIssue(issue.id);
+    await externalObjectsSvc.syncIssueSafely(issue.id);
     const referenceSummary = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
     const referenceDiff = issueReferencesSvc.diffIssueReferenceSummary(
       issueReferencesSvc.emptySummary(),
@@ -4460,6 +5252,18 @@ export function issueRoutes(
       details: {
         title: issue.title,
         identifier: issue.identifier,
+        ...(watchdogProductBugFollowUp
+          ? {
+            watchdogDiscovery: {
+              kind: watchdogProductBugFollowUp.discovery.kind,
+              sourceIssueId: watchdogProductBugFollowUp.sourceIssue.id,
+              sourceIssueIdentifier: watchdogProductBugFollowUp.sourceIssue.identifier,
+              watchdogIssueId: watchdogProductBugFollowUp.watchdogIssue?.id ?? null,
+              watchdogIssueIdentifier: watchdogProductBugFollowUp.watchdogIssue?.identifier ?? null,
+              stopFingerprint: watchdogProductBugFollowUp.scope.stopFingerprint,
+            },
+          }
+          : {}),
         ...buildCreateIssueActivityStatusDetails(issue, res),
         ...(Array.isArray(req.body.blockedByIssueIds) ? { blockedByIssueIds: req.body.blockedByIssueIds } : {}),
         ...summarizeIssueReferenceActivityDetails({
@@ -4493,6 +5297,25 @@ export function issueRoutes(
       });
     }
 
+    if (issue.watchdog) {
+      await logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.watchdog_created",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          identifier: issue.identifier,
+          watchdogId: issue.watchdog.id,
+          watchdogAgentId: issue.watchdog.watchdogAgentId,
+          source: "issue.create",
+        },
+      });
+    }
+
     void queueIssueAssignmentWakeup({
       heartbeat,
       issue,
@@ -4502,6 +5325,7 @@ export function issueRoutes(
       requestedByActorType: actor.actorType,
       requestedByActorId: actor.actorId,
     });
+    await queueTaskWatchdogEvaluation(issue, actor.runId);
 
     res.status(201).json({
       ...issue,
@@ -4518,7 +5342,8 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, parent.companyId);
-    if (!(await assertIssueReadAllowed(req, res, parent))) return;
+    if (!isTaskBridgeKeyActor(req) && !(await assertIssueReadAllowed(req, res, parent))) return;
+    if (!(await assertTaskWatchdogCreateIssueAllowed(req, res, parent.companyId, parent))) return;
     if (await assertLowTrustControlPlaneDenied(req, res, parent.companyId, parent)) return;
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
     const normalizedAssigneeAgentId = await normalizeIssueAssigneeAgentReference(
@@ -4530,17 +5355,23 @@ export function issueRoutes(
       ...(normalizedAssigneeAgentId !== undefined ? { assigneeAgentId: normalizedAssigneeAgentId } : {}),
     };
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, parent, createBody))) return;
+    const childAssignmentScope = {
+      projectId: createBody.projectId ?? parent.projectId ?? null,
+      parentIssueId: parent.id,
+      assigneeAgentId: createBody.assigneeAgentId ?? null,
+      assigneeUserId: createBody.assigneeUserId ?? null,
+    };
+    await assertTaskBridgeCreateAllowed(req, parent.companyId, childAssignmentScope);
     if (req.body.assigneeAgentId || req.body.assigneeUserId) {
-      await assertCanAssignTasks(req, parent.companyId, {
-        projectId: createBody.projectId ?? parent.projectId ?? null,
-        parentIssueId: parent.id,
-        assigneeAgentId: createBody.assigneeAgentId ?? null,
-        assigneeUserId: createBody.assigneeUserId ?? null,
-      });
+      await assertCanAssignTasks(req, parent.companyId, childAssignmentScope);
     }
     await assertIssueEnvironmentSelection(parent.companyId, createBody.executionWorkspaceSettings?.environmentId);
 
     const actor = getActorInfo(req);
+    const serializationContext = await resolveWatchdogFollowUpSerializationContext(req, parent);
+    const currentSerializedChild = serializationContext
+      ? await findCurrentSerializedWatchdogChild(parent)
+      : null;
     const executionPolicy = applyActorMonitorScheduledBy(
       normalizeIssueExecutionPolicy(createBody.executionPolicy),
       actor.actorType,
@@ -4555,14 +5386,23 @@ export function issueRoutes(
     }, actor);
     const { issue, parentBlockerAdded } = await svc.createChild(parent.id, {
       ...createBody,
+      ...(taskBridgeOriginForActor(req) ?? {}),
       id: issueId,
       executionPolicy,
+      ...(currentSerializedChild
+        ? {
+          status: "blocked",
+          blockedByIssueIds: mergeIssueBlockerIds(createBody.blockedByIssueIds, currentSerializedChild.id),
+        }
+        : {}),
       ...(sourceTrust ? { sourceTrust } : {}),
       createdByAgentId: actor.agentId,
       createdByUserId: actor.actorType === "user" ? actor.actorId : null,
       actorAgentId: actor.agentId,
       actorUserId: actor.actorType === "user" ? actor.actorId : null,
+      watchdogActorRunId: actor.runId,
     });
+    await externalObjectsSvc.syncIssueSafely(issue.id);
 
     await logActivity(db, {
       companyId: parent.companyId,
@@ -4581,6 +5421,12 @@ export function issueRoutes(
         inheritedExecutionWorkspaceFromIssueId: parent.id,
         ...(Array.isArray(req.body.blockedByIssueIds) ? { blockedByIssueIds: req.body.blockedByIssueIds } : {}),
         ...(parentBlockerAdded ? { parentBlockerAdded: true } : {}),
+        ...(serializationContext
+          ? {
+            watchdogFollowUpsSerialized: true,
+            serializedBehindIssueId: currentSerializedChild?.id ?? null,
+          }
+          : {}),
       },
     });
 
@@ -4608,15 +5454,43 @@ export function issueRoutes(
       });
     }
 
-    void queueIssueAssignmentWakeup({
-      heartbeat,
-      issue,
-      reason: "issue_assigned",
-      mutation: "create",
-      contextSource: "issue.child_create",
-      requestedByActorType: actor.actorType,
-      requestedByActorId: actor.actorId,
+    if (issue.watchdog) {
+      await logActivity(db, {
+        companyId: parent.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.watchdog_created",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          identifier: issue.identifier,
+          watchdogId: issue.watchdog.id,
+          watchdogAgentId: issue.watchdog.watchdogAgentId,
+          source: "issue.child_create",
+          parentId: parent.id,
+        },
+      });
+    }
+
+    if (!serializationContext || !currentSerializedChild) {
+      void queueIssueAssignmentWakeup({
+        heartbeat,
+        issue,
+        reason: "issue_assigned",
+        mutation: "create",
+        contextSource: "issue.child_create",
+        requestedByActorType: actor.actorType,
+        requestedByActorId: actor.actorId,
+      });
+    }
+    await blockWatchdogParentOnCurrentChild({
+      actor,
+      watchdogParentIssueId: serializationContext?.watchdogParentIssueId,
+      currentChildIssueId: currentSerializedChild?.id ?? issue.id,
     });
+    await queueTaskWatchdogEvaluation(issue, actor.runId);
 
     res.status(201).json(issue);
   });
@@ -4693,6 +5567,25 @@ export function issueRoutes(
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
       });
     }
+    const serializationContext = await resolveWatchdogFollowUpSerializationContext(req, sourceIssue);
+    const existingSerializedChild = serializationContext
+      ? await findCurrentSerializedWatchdogChild(sourceIssue)
+      : null;
+    const serializedBlockedChildIds = new Set<string>();
+    if (serializationContext) {
+      for (let index = 0; index < normalizedChildren.length; index += 1) {
+        const blockerIssueId: string | null = index === 0
+          ? existingSerializedChild?.id ?? null
+          : normalizedChildren[index - 1]?.id ?? null;
+        if (!blockerIssueId) continue;
+        normalizedChildren[index] = {
+          ...normalizedChildren[index],
+          status: "blocked",
+          blockedByIssueIds: mergeIssueBlockerIds(normalizedChildren[index].blockedByIssueIds, blockerIssueId),
+        };
+        serializedBlockedChildIds.add(normalizedChildren[index].id);
+      }
+    }
 
     const result = await svc.decomposeAcceptedPlan(sourceIssue.id, {
       acceptedPlanRevisionId: req.body.acceptedPlanRevisionId,
@@ -4719,6 +5612,13 @@ export function issueRoutes(
         requestedChildCount: req.body.children.length,
         childIssueIds: result.childIssueIds,
         newlyCreatedChildIssueIds: result.newlyCreatedIssues.map((issue) => issue.id),
+        ...(serializationContext
+          ? {
+            watchdogFollowUpsSerialized: true,
+            currentSerializedChildIssueId: existingSerializedChild?.id ?? result.newlyCreatedIssues[0]?.id ?? null,
+            serializedBlockedChildIssueIds: [...serializedBlockedChildIds],
+          }
+          : {}),
       },
     });
 
@@ -4739,6 +5639,12 @@ export function issueRoutes(
           inheritedExecutionWorkspaceFromIssueId: sourceIssue.id,
           acceptedPlanRevisionId: req.body.acceptedPlanRevisionId,
           ...buildCreateIssueActivityStatusDetails(issue, res),
+          ...(serializationContext
+            ? {
+              watchdogFollowUpsSerialized: true,
+              serializedBlocked: serializedBlockedChildIds.has(issue.id),
+            }
+            : {}),
         },
       });
 
@@ -4768,16 +5674,24 @@ export function issueRoutes(
         });
       }
 
-      void queueIssueAssignmentWakeup({
-        heartbeat,
-        issue,
-        reason: "issue_assigned",
-        mutation: "accepted_plan_decomposition",
-        contextSource: "issue.accepted_plan_decomposition",
-        requestedByActorType: actor.actorType,
-        requestedByActorId: actor.actorId,
-      });
+      if (!serializedBlockedChildIds.has(issue.id)) {
+        void queueIssueAssignmentWakeup({
+          heartbeat,
+          issue,
+          reason: "issue_assigned",
+          mutation: "accepted_plan_decomposition",
+          contextSource: "issue.accepted_plan_decomposition",
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+        });
+      }
+      await queueTaskWatchdogEvaluation(issue, actor.runId);
     }
+    await blockWatchdogParentOnCurrentChild({
+      actor,
+      watchdogParentIssueId: serializationContext?.watchdogParentIssueId,
+      currentChildIssueId: existingSerializedChild?.id ?? result.newlyCreatedIssues[0]?.id,
+    });
 
     res.json({
       decomposition: result.decomposition,
@@ -5276,6 +6190,7 @@ export function issueRoutes(
 
     if (titleOrDescriptionChanged) {
       await issueReferencesSvc.syncIssue(issue.id);
+      await externalObjectsSvc.syncIssueSafely(issue.id);
     }
     const updateReferenceSummaryAfter = titleOrDescriptionChanged
       ? await issueReferencesSvc.listIssueReferenceSummary(issue.id)
@@ -5581,6 +6496,7 @@ export function issueRoutes(
         sourceTrust: await sourceTrustForActorWrite(issue, actor),
       });
       await issueReferencesSvc.syncComment(comment.id);
+      await externalObjectsSvc.syncCommentSafely(comment.id);
       const commentReferenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
       const commentReferenceDiff = issueReferencesSvc.diffIssueReferenceSummary(
         commentReferenceSummaryBefore,
@@ -5835,6 +6751,9 @@ export function issueRoutes(
 
       const becameTerminal =
         !["done", "cancelled"].includes(existing.status) && ["done", "cancelled"].includes(issue.status);
+      if (becameTerminal) {
+        await destroyReusableSandboxLeasesForTerminalIssue(issue);
+      }
       if (becameTerminal && issue.parentId) {
         const parent = await svc.getWakeableParentAfterChildCompletion(issue.parentId);
         if (parent) {
@@ -5872,6 +6791,7 @@ export function issueRoutes(
       }
     })();
 
+    await queueTaskWatchdogEvaluation(issue, actor.runId);
     res.json({ ...issueResponse, comment });
   });
 
@@ -5912,6 +6832,7 @@ export function issueRoutes(
       entityId: issue.id,
     });
 
+    await queueTaskWatchdogEvaluation(existing, actor.runId);
     res.json(issue);
   });
 
@@ -6094,6 +7015,7 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
     const afterCommentId =
       typeof req.query.after === "string" && req.query.after.trim().length > 0
         ? req.query.after.trim()
@@ -6128,6 +7050,7 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
     const actor = getActorInfo(req);
     const interactionSvc = issueThreadInteractionService(db);
     const expiredInteractions = await interactionSvc.expireRequestConfirmationsSupersededByHistoricalComments(issue);
@@ -6201,6 +7124,7 @@ export function issueRoutes(
         return;
       }
       assertCompanyAccess(req, issue.companyId);
+      if (await rejectAgentIssueThreadInteractionResolution(req, res, issue)) return;
       assertBoard(req);
 
       const actor = getActorInfo(req);
@@ -6308,6 +7232,7 @@ export function issueRoutes(
         return;
       }
       assertCompanyAccess(req, issue.companyId);
+      if (await rejectAgentIssueThreadInteractionResolution(req, res, issue)) return;
       assertBoard(req);
 
       const actor = getActorInfo(req);
@@ -6364,6 +7289,7 @@ export function issueRoutes(
         return;
       }
       assertCompanyAccess(req, issue.companyId);
+      if (await rejectAgentIssueThreadInteractionResolution(req, res, issue)) return;
       assertBoard(req);
 
       const actor = getActorInfo(req);
@@ -6416,6 +7342,7 @@ export function issueRoutes(
         return;
       }
       assertCompanyAccess(req, issue.companyId);
+      if (await rejectAgentIssueThreadInteractionResolution(req, res, issue)) return;
       assertBoard(req);
 
       const actor = getActorInfo(req);
@@ -6465,6 +7392,7 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
     const comment = await svc.getComment(commentId);
     if (!comment || comment.issueId !== id) {
       res.status(404).json({ error: "Comment not found" });
@@ -6566,6 +7494,7 @@ export function issueRoutes(
       {
         afterTombstone: async (deletedComment, tx) => {
           await issueReferencesSvc.syncComment(deletedComment.id, tx);
+          await externalObjectsSvc.syncCommentSafely(deletedComment.id, tx);
           annotationCleanup = await documentAnnotationsSvc.cleanupForIssueCommentDeletion(issue.id, deletedComment.id, {
             actorType: actor.actorType,
             actorId: actor.actorId,
@@ -6575,7 +7504,10 @@ export function issueRoutes(
           }, tx);
           await Promise.all(
             annotationCleanup.deletedCommentIds.map((annotationCommentId) =>
-              issueReferencesSvc.deleteCommentSource(annotationCommentId, tx)
+              Promise.all([
+                issueReferencesSvc.deleteCommentSource(annotationCommentId, tx),
+                externalObjectsSvc.syncCommentSafely(annotationCommentId, tx),
+              ])
             ),
           );
         },
@@ -6706,7 +7638,8 @@ export function issueRoutes(
     if (!assertNoSecretPatternInWritePayload(req, res, [
       { name: "body", value: req.body.body },
     ], { issueId: issue.id, companyId: issue.companyId })) return;
-    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+    const commentAccessDecision = await assertAgentIssueCommentAllowed(req, res, issue);
+    if (!commentAccessDecision) return;
     if (!assertStructuredCommentFieldsAllowed(req, res, {
       presentation: req.body.presentation,
       metadata: req.body.metadata,
@@ -6721,13 +7654,32 @@ export function issueRoutes(
     const reopenRequested = req.body.reopen === true;
     const resumeRequested = req.body.resume === true;
     const interruptRequested = req.body.interrupt === true;
-    if (resumeRequested === true && !(await assertExplicitResumeIntentAllowed(req, res, issue))) return;
-    if (resumeRequested !== true && reopenRequested === true && req.actor.type === "agent") {
-      if (!(await assertExplicitResumeIntentAllowed(req, res, issue))) return;
-    }
     const isClosed = isClosedIssueStatus(issue.status);
     const isBlocked = issue.status === "blocked";
-    const explicitMoveToTodoRequested = reopenRequested || resumeRequested === true;
+    const mentionGrantedPeerAgentCommentOnly =
+      isClosed &&
+      req.actor.type === "agent" &&
+      issue.assigneeAgentId !== null &&
+      issue.assigneeAgentId !== req.actor.agentId &&
+      !reopenRequested &&
+      !resumeRequested &&
+      isIssueMentionGrantDecision(commentAccessDecision);
+    const effectiveReopenRequested = mentionGrantedPeerAgentCommentOnly ? false : reopenRequested;
+    const effectiveResumeRequested = mentionGrantedPeerAgentCommentOnly ? false : resumeRequested;
+    if (
+      isClosed &&
+      req.actor.type === "agent" &&
+      issue.assigneeAgentId !== null &&
+      issue.assigneeAgentId !== req.actor.agentId &&
+      !mentionGrantedPeerAgentCommentOnly
+    ) {
+      if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+    }
+    if (effectiveResumeRequested === true && !(await assertExplicitResumeIntentAllowed(req, res, issue))) return;
+    if (effectiveResumeRequested !== true && effectiveReopenRequested === true && req.actor.type === "agent") {
+      if (!(await assertExplicitResumeIntentAllowed(req, res, issue))) return;
+    }
+    const explicitMoveToTodoRequested = effectiveReopenRequested || effectiveResumeRequested === true;
     const scheduledRetryForHumanComment =
       shouldHumanCommentResumeInProgressScheduledRetry({
         hasComment: true,
@@ -7000,6 +7952,7 @@ export function issueRoutes(
     }
 
     await issueReferencesSvc.syncComment(comment.id);
+    await externalObjectsSvc.syncCommentSafely(comment.id);
     const commentReferenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(currentIssue.id);
     const commentReferenceDiff = issueReferencesSvc.diffIssueReferenceSummary(
       commentReferenceSummaryBefore,
@@ -7206,6 +8159,9 @@ export function issueRoutes(
       const becameTerminal =
         !["done", "cancelled"].includes(issueBeforeCommentDecision.status) &&
         ["done", "cancelled"].includes(currentIssue.status);
+      if (becameTerminal) {
+        await destroyReusableSandboxLeasesForTerminalIssue(currentIssue);
+      }
       if (becameTerminal && currentIssue.parentId) {
         const parent = await svc.getWakeableParentAfterChildCompletion(currentIssue.parentId);
         if (parent) {
@@ -7243,6 +8199,7 @@ export function issueRoutes(
       }
     })();
 
+    await queueTaskWatchdogEvaluation(currentIssue, actor.runId);
     res.status(201).json(comment);
   });
 
@@ -7398,10 +8355,6 @@ export function issueRoutes(
     const contentType = normalizeContentType(file.mimetype);
     if (file.buffer.length <= 0) {
       res.status(422).json({ error: "Attachment is empty" });
-      return;
-    }
-    if (!isAllowedContentType(contentType)) {
-      res.status(422).json({ error: `Unsupported attachment content type: ${contentType}` });
       return;
     }
 

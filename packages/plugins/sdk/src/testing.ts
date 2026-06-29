@@ -1991,7 +1991,10 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
             spentMonthlyCents: 0,
             pauseReason: null,
             pausedAt: null,
-            permissions: { canCreateAgents: Boolean(declaration.permissions?.canCreateAgents) },
+            permissions: {
+              canCreateAgents: Boolean(declaration.permissions?.canCreateAgents),
+              canCreateSkills: declaration.permissions?.canCreateSkills !== false,
+            },
             lastHeartbeatAt: null,
             metadata: managedAgentMetadata(agentKey),
             createdAt: now,
@@ -2029,7 +2032,10 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
               spentMonthlyCents: 0,
               pauseReason: null,
               pausedAt: null,
-              permissions: { canCreateAgents: Boolean(declaration.permissions?.canCreateAgents) },
+              permissions: {
+                canCreateAgents: Boolean(declaration.permissions?.canCreateAgents),
+                canCreateSkills: declaration.permissions?.canCreateSkills !== false,
+              },
               lastHeartbeatAt: null,
               metadata: managedAgentMetadata(agentKey),
               createdAt: now,
@@ -2050,7 +2056,10 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
             adapterConfig: declaration.adapterConfig ?? {},
             runtimeConfig: declaration.runtimeConfig ?? {},
             budgetMonthlyCents: declaration.budgetMonthlyCents ?? 0,
-            permissions: { canCreateAgents: Boolean(declaration.permissions?.canCreateAgents) },
+            permissions: {
+              canCreateAgents: Boolean(declaration.permissions?.canCreateAgents),
+              canCreateSkills: declaration.permissions?.canCreateSkills !== false,
+            },
             metadata: managedAgentMetadata(agentKey, resolved.agent.metadata),
             updatedAt: new Date(),
           };
