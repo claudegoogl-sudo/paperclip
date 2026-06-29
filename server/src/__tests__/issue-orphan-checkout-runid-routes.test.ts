@@ -206,10 +206,19 @@ describeEmbeddedPostgres("orphan checkoutRunId mutation tolerance (PLA-141)", ()
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
-    // After back-fill the assignee's currentRunId owns both locks again.
+    // PLA-141's guarantee is that a terminal-run orphan lock never wedges the
+    // assignee's comment — and it doesn't: the request succeeds (201 above) and
+    // `clearOrphanCheckoutLocksIfTerminal` (route prelude) nulls both terminal
+    // locks. As of upstream v2026.626.0 the comments route authorizes via
+    // `assertAgentIssueCommentAllowed` (action `issue:comment`), which — unlike
+    // the mutation guard the PATCH route still uses — does NOT take checkout
+    // ownership (a comment is not a checkout, and this is what lets mention-grant
+    // peer agents comment). So the orphan is cleared rather than re-adopted to
+    // the commenter's run; the assignee owns the lock again only after an actual
+    // checkout/PATCH. Tolerance preserved; back-fill is now PATCH-only.
     expect(row).toEqual({
-      checkoutRunId: currentRunId,
-      executionRunId: currentRunId,
+      checkoutRunId: null,
+      executionRunId: null,
     });
   });
 
