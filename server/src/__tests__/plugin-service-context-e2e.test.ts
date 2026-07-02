@@ -109,14 +109,23 @@ describe("PLA-768 service-context e2e (messenger getUpdates + onEvent)", () => {
     expect(value).toBe(TEST_TOKEN);
 
     // Attributed to the plugin system actor — not a spoofed agent/user run.
+    // PLA-806: the synthetic service runId is not a heartbeat_runs row, so the
+    // durable audit row writes run_id = NULL and preserves the synthetic id
+    // under details.backgroundRunId + details.runContextKind (avoids the 23503
+    // FK drop that previously swallowed the whole audit insert).
     const entry = (logActivity as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1];
     expect(entry).toMatchObject({
       actorType: "plugin",
       agentId: null,
-      runId: SERVICE_RUN_ID,
+      runId: null,
       companyId: OWNER_COMPANY,
     });
-    expect(entry.details).toMatchObject({ outcome: "allowed", dispatchingAgentId: null });
+    expect(entry.details).toMatchObject({
+      outcome: "allowed",
+      dispatchingAgentId: null,
+      backgroundRunId: SERVICE_RUN_ID,
+      runContextKind: "service",
+    });
   });
 
   it("resolves the same token from the onEvent (approval.created) background relay", async () => {
