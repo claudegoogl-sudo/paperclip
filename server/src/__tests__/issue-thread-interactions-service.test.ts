@@ -1033,6 +1033,65 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     });
   });
 
+  it("supersedes a single pending request_confirmation to expired and rejects a second attempt", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Self-service supersede");
+    const authorAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: authorAgentId,
+      companyId,
+      name: "AuthorAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      payload: {
+        version: 1,
+        prompt: "Approve the earlier plan?",
+      },
+    }, {
+      agentId: authorAgentId,
+    });
+    expect(created.status).toBe("pending");
+
+    const superseded = await interactionsSvc.supersedeInteractionById(
+      { id: issueId, companyId },
+      created.id,
+      { reason: "superseded by a newer confirmation" },
+      { agentId: authorAgentId },
+    );
+
+    expect(superseded).toMatchObject({
+      id: created.id,
+      status: "expired",
+      result: {
+        version: 1,
+        outcome: "superseded_by_comment",
+        commentId: null,
+        reason: "superseded by a newer confirmation",
+      },
+      resolvedByAgentId: authorAgentId,
+    });
+
+    // Idempotency guard: a second supersede on the now-resolved interaction 409s.
+    await expect(
+      interactionsSvc.supersedeInteractionById(
+        { id: issueId, companyId },
+        created.id,
+        {},
+        { agentId: authorAgentId },
+      ),
+    ).rejects.toMatchObject({ status: 409 });
+  });
+
   it("keeps request confirmations pending when user-comment supersede is explicitly disabled", async () => {
     const { companyId, issueId } = await seedConfirmationIssue("Comment supersede opt-out");
 

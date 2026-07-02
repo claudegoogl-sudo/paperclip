@@ -12,6 +12,7 @@ const mockIssueService = vi.hoisted(() => ({
 
 const mockInteractionService = vi.hoisted(() => ({
   listForIssue: vi.fn(),
+  getById: vi.fn(),
   create: vi.fn(),
   acceptInteraction: vi.fn(),
   acceptSuggestedTasks: vi.fn(),
@@ -20,6 +21,7 @@ const mockInteractionService = vi.hoisted(() => ({
   expireRequestConfirmationsSupersededByHistoricalComments: vi.fn(),
   answerQuestions: vi.fn(),
   cancelQuestions: vi.fn(),
+  supersedeInteractionById: vi.fn(),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
@@ -312,6 +314,39 @@ describe.sequential("issue thread interaction routes", () => {
       updatedAt: "2026-04-20T12:05:00.000Z",
       resolvedAt: "2026-04-20T12:05:00.000Z",
     });
+    mockInteractionService.getById.mockResolvedValue({
+      id: "interaction-3",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee_on_accept",
+      idempotencyKey: null,
+      sourceCommentId: null,
+      sourceRunId: null,
+      createdByAgentId: CREATED_AGENT_ID,
+      payload: { version: 1, prompt: "Approve?" },
+      result: null,
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:00:00.000Z",
+    });
+    mockInteractionService.supersedeInteractionById.mockResolvedValue({
+      id: "interaction-3",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_confirmation",
+      status: "expired",
+      continuationPolicy: "wake_assignee_on_accept",
+      idempotencyKey: null,
+      sourceCommentId: null,
+      sourceRunId: null,
+      createdByAgentId: CREATED_AGENT_ID,
+      payload: { version: 1, prompt: "Approve?" },
+      result: { version: 1, outcome: "superseded_by_comment", commentId: null },
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:07:00.000Z",
+      resolvedAt: "2026-04-20T12:07:00.000Z",
+    });
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
     mockDbSelectWhere.mockImplementation(() => ({
@@ -499,6 +534,69 @@ describe.sequential("issue thread interaction routes", () => {
         action: "issue.thread_interaction_cancelled",
       }),
     );
+  });
+
+  it("lets a board actor supersede an interaction and records it as expired without a continuation wake", async () => {
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-3/supersede")
+      .send({ reason: "superseded by newer request" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("expired");
+    expect(mockInteractionService.supersedeInteractionById).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
+      "interaction-3",
+      { reason: "superseded by newer request" },
+      expect.objectContaining({ userId: "local-board" }),
+    );
+    // "expired" terminal status must not fire a continuation wake.
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: "issue.thread_interaction_superseded" }),
+    );
+  });
+
+  it("lets the authoring agent supersede its OWN interaction", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: CREATED_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-9",
+      source: "agent_jwt",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-3/supersede")
+      .send({});
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("expired");
+    expect(mockInteractionService.supersedeInteractionById).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
+      "interaction-3",
+      { reason: null },
+      expect.objectContaining({ agentId: CREATED_AGENT_ID }),
+    );
+  });
+
+  it("rejects a non-author agent superseding another agent's interaction with 403", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: ASSIGNEE_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-9",
+      source: "agent_jwt",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-3/supersede")
+      .send({});
+
+    expect(res.status).toBe(403);
+    expect(mockInteractionService.supersedeInteractionById).not.toHaveBeenCalled();
   });
 
   it("accepts request confirmations and wakes the current assignee when configured for accept-only wakeups", async () => {
