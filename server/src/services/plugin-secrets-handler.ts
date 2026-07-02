@@ -64,7 +64,10 @@ import { logger } from "../middleware/logger.js";
 import { secretService } from "./secrets.js";
 import { registerRunSecretValue } from "../run-secret-registry.js";
 import { mintHandle as mintBorrowedHandle, type HandleCapture } from "../handle-vault.js";
-import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js";
+import type {
+  PluginRunContextRegistry,
+  RegisteredRunContext,
+} from "./plugin-run-context-registry.js";
 
 /**
  * The binding target type used for plugin secret-ref bindings. A binding row
@@ -488,7 +491,18 @@ export function createPluginSecretsHandler(
     secretId: string;
     runId: string;
     toolName: string;
+    /**
+     * PLA-806: which run-context backs this resolve. A "dispatch" context
+     * carries a real `heartbeat_runs` row in `runId`; "service"/"background"
+     * contexts carry a host-minted SYNTHETIC runId that is NOT a `heartbeat_runs`
+     * row. Writing that synthetic id into `activity_log.run_id` violates the FK
+     * (SQLSTATE 23503) and silently drops the audit row, so for those contexts we
+     * null `run_id` and preserve the synthetic id under `details.backgroundRunId`
+     * + `details.runContextKind`.
+     */
+    runContextKind: RegisteredRunContext["kind"];
   }) {
+    const isSyntheticRun = input.runContextKind !== "dispatch";
     try {
       await logActivity(db, {
         companyId: input.dispatchingCompanyId,
@@ -498,7 +512,9 @@ export function createPluginSecretsHandler(
         entityType: "company_secret",
         entityId: input.secretId,
         agentId: input.dispatchingAgentId,
-        runId: input.runId,
+        // PLA-806: a synthetic background/service runId is not a heartbeat_runs
+        // row; storing it in run_id would 23503 and drop the audit row.
+        runId: isSyntheticRun ? null : input.runId,
         details: {
           pluginKey,
           pluginDbId,
@@ -511,6 +527,11 @@ export function createPluginSecretsHandler(
           // cannot (and must not) attribute the ref to another tenant.
           secretCompanyId: input.outcome === "allowed" ? input.dispatchingCompanyId : null,
           toolName: input.toolName,
+          // PLA-806: preserve attribution for synthetic-run resolves that can't
+          // populate run_id. Foreground dispatches keep run_id and omit these.
+          ...(isSyntheticRun
+            ? { backgroundRunId: input.runId, runContextKind: input.runContextKind }
+            : {}),
         },
       });
     } catch (err) {
@@ -592,6 +613,7 @@ export function createPluginSecretsHandler(
         secretId: trimmedRef,
         runId: serviceRunId,
         toolName: sentinelTool,
+        runContextKind: "service",
       });
       throw new SecretsError("not_found", "secret not found");
     }
@@ -615,6 +637,7 @@ export function createPluginSecretsHandler(
         secretId: trimmedRef,
         runId: serviceRunId,
         toolName: sentinelTool,
+        runContextKind: "service",
       });
       throw new SecretsError("not_found", "secret not found");
     }
@@ -627,6 +650,7 @@ export function createPluginSecretsHandler(
       secretId: trimmedRef,
       runId: serviceRunId,
       toolName: sentinelTool,
+      runContextKind: "service",
     });
 
     return value;
@@ -664,6 +688,7 @@ export function createPluginSecretsHandler(
         secretId: trimmedRef,
         runId: backgroundRunId,
         toolName: sentinelTool,
+        runContextKind: "background",
       });
       throw new SecretsError("rate_limited", "background rate limit exceeded");
     }
@@ -685,6 +710,7 @@ export function createPluginSecretsHandler(
         secretId: trimmedRef,
         runId: backgroundRunId,
         toolName: sentinelTool,
+        runContextKind: "background",
       });
       throw new SecretsError("not_found", "secret not found");
     }
@@ -712,6 +738,7 @@ export function createPluginSecretsHandler(
         secretId: trimmedRef,
         runId: backgroundRunId,
         toolName: sentinelTool,
+        runContextKind: "background",
       });
       throw new SecretsError("not_found", "secret not found");
     }
@@ -732,6 +759,7 @@ export function createPluginSecretsHandler(
         secretId: trimmedRef,
         runId: backgroundRunId,
         toolName: sentinelTool,
+        runContextKind: "background",
       });
       throw new SecretsError("not_found", "secret not found");
     }
@@ -744,6 +772,7 @@ export function createPluginSecretsHandler(
       secretId: trimmedRef,
       runId: backgroundRunId,
       toolName: sentinelTool,
+      runContextKind: "background",
     });
 
     return value;
@@ -809,6 +838,7 @@ export function createPluginSecretsHandler(
           secretId: trimmedRef,
           runId: ctx.runId,
           toolName: ctx.toolName,
+          runContextKind: "dispatch",
         });
         throw new SecretsError("rate_limited", "global per-agent rate limit exceeded");
       }
@@ -821,6 +851,7 @@ export function createPluginSecretsHandler(
           secretId: trimmedRef,
           runId: ctx.runId,
           toolName: ctx.toolName,
+          runContextKind: "dispatch",
         });
         throw new SecretsError("rate_limited", "per-company rate limit exceeded");
       }
@@ -842,6 +873,7 @@ export function createPluginSecretsHandler(
           secretId: trimmedRef,
           runId: ctx.runId,
           toolName: ctx.toolName,
+          runContextKind: "dispatch",
         });
         throw new SecretsError("not_found", "secret not found");
       }
@@ -877,6 +909,7 @@ export function createPluginSecretsHandler(
           secretId: trimmedRef,
           runId: ctx.runId,
           toolName: ctx.toolName,
+          runContextKind: "dispatch",
         });
         throw new SecretsError("not_found", "secret not found");
       }
@@ -907,6 +940,7 @@ export function createPluginSecretsHandler(
           secretId: trimmedRef,
           runId: ctx.runId,
           toolName: ctx.toolName,
+          runContextKind: "dispatch",
         });
         throw new SecretsError("not_found", "secret not found");
       }
@@ -919,6 +953,7 @@ export function createPluginSecretsHandler(
         secretId: trimmedRef,
         runId: ctx.runId,
         toolName: ctx.toolName,
+        runContextKind: "dispatch",
       });
 
       // The resolved value only ever appears in this return — never in logs.
@@ -1023,6 +1058,13 @@ export function createPluginSecretsHandler(
    * discipline: the secret value is NEVER included; only the opaque
    * agent/company/tool dimensions are recorded. Failures never change the
    * decision returned to the worker.
+   *
+   * PLA-806: `ctx` here is always an agent-DISPATCH context — minting rejects
+   * service/background contexts at the gate above — so `ctx.runId` is a real
+   * `heartbeat_runs` row and is safe to store in `run_id` (no synthetic-id FK
+   * drop). If borrowed handles are ever extended to a background/service
+   * context, replicate the synthetic-run handling from {@link audit} (null
+   * `run_id`, stash `backgroundRunId`/`runContextKind` in `details`).
    */
   async function auditMint(input: {
     outcome: "allowed" | "denied";
