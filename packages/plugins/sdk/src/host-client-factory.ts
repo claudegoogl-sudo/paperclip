@@ -286,6 +286,7 @@ export interface HostServices {
     listComments(params: WorkerToHostMethods["issues.listComments"][0]): Promise<WorkerToHostMethods["issues.listComments"][1]>;
     createComment(params: WorkerToHostMethods["issues.createComment"][0]): Promise<WorkerToHostMethods["issues.createComment"][1]>;
     createInteraction(params: WorkerToHostMethods["issues.createInteraction"][0]): Promise<WorkerToHostMethods["issues.createInteraction"][1]>;
+    resolveInteraction(params: WorkerToHostMethods["issues.resolveInteraction"][0]): Promise<WorkerToHostMethods["issues.resolveInteraction"][1]>;
   };
 
   /** Provides `issues.documents.list`, `issues.documents.get`, `issues.documents.upsert`, `issues.documents.delete`. */
@@ -502,6 +503,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   "issues.listComments": "issue.comments.read",
   "issues.createComment": "issue.comments.create",
   "issues.createInteraction": "issue.interactions.create",
+  "issues.resolveInteraction": "issue.interactions.resolve",
 
   // Issue Documents
   "issues.documents.list": "issue.documents.read",
@@ -585,6 +587,15 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
  *    equals the plugin's dispatch-lifetime reach; serviceScope only relaxes the
  *    timing constraint so an inbound relay (e.g. Telegram webhook) can store
  *    while idle.
+ *  - `issues.resolveInteraction` (PLA-1438): identical reach argument to
+ *    `issues.createComment`. The host service independently verifies the target
+ *    interaction belongs to the claimed company AND issue (`requireInCompany` +
+ *    interaction company/issue cross-check), so a worker-forged `companyId`
+ *    cannot reach a foreign tenant's interaction. It can only transition a
+ *    *pending* interaction to terminal `expired` (never `accepted`), so it fires
+ *    no accept side-effects and no continuation wake. The reachable set equals
+ *    the plugin's dispatch-lifetime reach; serviceScope only lets the inbound
+ *    Telegram relay retire the pending confirmation it just answered while idle.
  *
  * Deliberately excluded: any method that trusts `companyId` as the SOLE
  * authority with no entity cross-check (e.g. `issues.list`, `companies.get`).
@@ -597,6 +608,7 @@ const SERVICE_SCOPE_COMPANY_METHODS: ReadonlySet<WorkerToHostMethodName> = new S
   "state.set",
   "state.delete",
   "issues.createComment",
+  "issues.resolveInteraction",
   "artifacts.create",
 ]);
 
@@ -1099,6 +1111,9 @@ export function createHostClientHandlers(
     }),
     "issues.createInteraction": gated("issues.createInteraction", async (params) => {
       return services.issues.createInteraction(params);
+    }),
+    "issues.resolveInteraction": gated("issues.resolveInteraction", async (params) => {
+      return services.issues.resolveInteraction(params);
     }),
 
     // Issue Documents

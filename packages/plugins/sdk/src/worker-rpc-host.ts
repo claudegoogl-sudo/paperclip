@@ -1030,6 +1030,21 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           });
         },
 
+        async resolveInteraction(
+          issueId: string,
+          interactionId: string,
+          companyId: string,
+          options?: { supersedingCommentId?: string | null; reason?: string | null },
+        ) {
+          return callHost("issues.resolveInteraction", {
+            issueId,
+            companyId,
+            interactionId,
+            supersedingCommentId: options?.supersedingCommentId ?? null,
+            reason: options?.reason ?? null,
+          });
+        },
+
         async suggestTasks(
           issueId: string,
           interaction,

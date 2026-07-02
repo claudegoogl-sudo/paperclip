@@ -2278,6 +2278,44 @@ export function buildHostServices(
         });
         return interaction as any;
       },
+      // PLA-1438 Part A: retire (expire) a single pending interaction the plugin
+      // is relaying an operator reply to. Least-privilege authorization:
+      //  - gated by the default-deny `issue.interactions.resolve` capability
+      //    (granted only to the messenger manifest),
+      //  - `requireInCompany` binds the target issue to the plugin's own company,
+      //    and the shared service re-checks the interaction belongs to that issue
+      //    (cross-tenant interactionId -> notFound), and
+      //  - actor `userId` is ALWAYS null: the messenger acts on the operator's
+      //    behalf via free text but must NOT mint operator user authorship in the
+      //    audit trail (PLA-823 Finding-1). Terminal status is always "expired",
+      //    never "accepted", so no accept side-effect or continuation wake fires.
+      async resolveInteraction(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
+        const interaction = await issueThreadInteractionService(db).supersedeInteractionById(
+          issue,
+          params.interactionId,
+          { commentId: params.supersedingCommentId ?? null, reason: params.reason ?? null },
+          { agentId: null, userId: null },
+        );
+        await logPluginActivity({
+          companyId,
+          action: "issue.thread_interaction_superseded",
+          entityType: "issue",
+          entityId: issue.id,
+          actor: { actorAgentId: null },
+          details: {
+            identifier: issue.identifier,
+            interactionId: interaction.id,
+            interactionKind: interaction.kind,
+            interactionStatus: interaction.status,
+            supersededByActorType: "plugin",
+            supersedingCommentId: params.supersedingCommentId ?? null,
+          },
+        });
+        return interaction as any;
+      },
     },
 
     issueDocuments: {

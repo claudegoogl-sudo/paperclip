@@ -1685,6 +1685,22 @@ export interface PluginIssuesClient {
     companyId: string,
     options?: { authorAgentId?: string },
   ): Promise<IssueThreadInteraction>;
+  /**
+   * PLA-1438 Part A: retire (expire) a single pending interaction the plugin is
+   * relaying an operator reply to — e.g. the messenger converting a free-text
+   * Telegram reply into a comment and resolving the `request_confirmation` it
+   * answered so nothing stays `pending`. Terminal status is always `expired`
+   * (never `accepted`), so this cannot trigger accept side-effects. Requires the
+   * default-deny `issue.interactions.resolve` capability. When `supersedingCommentId`
+   * is given the outcome is `superseded_by_comment` + that comment; otherwise the
+   * outcome is the dedicated `superseded`.
+   */
+  resolveInteraction(
+    issueId: string,
+    interactionId: string,
+    companyId: string,
+    options?: { supersedingCommentId?: string | null; reason?: string | null },
+  ): Promise<IssueThreadInteraction>;
   suggestTasks(
     issueId: string,
     interaction: Omit<Extract<CreateIssueThreadInteraction, { kind: "suggest_tasks" }>, "kind">,

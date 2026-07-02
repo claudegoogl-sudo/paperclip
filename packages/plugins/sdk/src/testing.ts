@@ -1735,6 +1735,37 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         issueInteractions.set(issueId, current);
         return created;
       },
+      async resolveInteraction(issueId, interactionId, companyId, options) {
+        requireCapability(manifest, capabilitySet, "issue.interactions.resolve");
+        const parentIssue = issues.get(issueId);
+        if (!isInCompany(parentIssue, companyId)) {
+          throw new Error(`Issue not found: ${issueId}`);
+        }
+        const current = issueInteractions.get(issueId) ?? [];
+        const target = current.find((entry) => entry.id === interactionId);
+        if (!target || target.companyId !== parentIssue.companyId) {
+          throw new Error(`Interaction not found: ${interactionId}`);
+        }
+        if (target.status !== "pending") {
+          throw new Error("Interaction has already been resolved");
+        }
+        const commentId = options?.supersedingCommentId ?? null;
+        const reason = options?.reason?.trim() || null;
+        const now = new Date();
+        target.status = "expired";
+        target.result = {
+          version: 1,
+          outcome: commentId ? "superseded_by_comment" : "superseded",
+          commentId,
+          ...(reason ? { reason } : {}),
+        } as IssueThreadInteraction["result"];
+        // The messenger plugin actor never mints operator user authorship.
+        target.resolvedByUserId = null;
+        target.resolvedByAgentId = null;
+        target.resolvedAt = now;
+        target.updatedAt = now;
+        return target;
+      },
       async suggestTasks(issueId, interaction, companyId, options) {
         return this.createInteraction(issueId, { ...interaction, kind: "suggest_tasks" }, companyId, options) as Promise<any>;
       },
