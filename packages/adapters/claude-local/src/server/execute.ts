@@ -64,9 +64,34 @@ import { resolveClaudeDesiredSkillNames } from "./skills.js";
 import { isBedrockModelId } from "./models.js";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
 import { buildClaudeExecutionPermissionArgs } from "./permissions.js";
-import { SANDBOX_INSTALL_COMMAND } from "../index.js";
+import { SANDBOX_INSTALL_COMMAND, models as ADAPTER_MODELS } from "../index.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
+
+// Models that must NEVER be used as an automatic fallback target, regardless
+// of per-agent config. claude-mythos-5 is a safeguards-lifted model; routing
+// refused work to it would silently escalate to an unsafe model. Hard-reject
+// by exact id and by any id containing "mythos" as defense in depth (covers
+// future variants / Bedrock-qualified ids). SECURITY-CRITICAL — see PLA-1421.
+const SAFEGUARDS_LIFTED_FALLBACK_DENYLIST = new Set(["claude-mythos-5"]);
+
+export function isSafeguardsLiftedModel(model: string): boolean {
+  const id = model.trim().toLowerCase();
+  if (!id) return false;
+  return SAFEGUARDS_LIFTED_FALLBACK_DENYLIST.has(id) || id.includes("mythos");
+}
+
+/**
+ * A fallback target is only allowed when it is a known adapter model AND is not
+ * a safeguards-lifted model. Unknown ids and denylisted ids are rejected so the
+ * refusal is surfaced as-is instead of silently retried on an untrusted model.
+ */
+export function isAllowedFallbackModel(model: string): boolean {
+  const id = model.trim();
+  if (!id) return false;
+  if (isSafeguardsLiftedModel(id)) return false;
+  return ADAPTER_MODELS.some((entry) => entry.id === id);
+}
 
 interface ClaudeExecutionInput {
   runId: string;
@@ -377,6 +402,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   );
   const model = asString(config.model, "");
+  const fallbackModel = asString(config.fallbackModel, "").trim();
   const effort = asString(config.effort, "");
   const chrome = asBoolean(config.chrome, false);
   const maxTurns = asNumber(config.maxTurnsPerRun, 0);
@@ -710,7 +736,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const buildClaudeArgs = (
     resumeSessionId: string | null,
     attemptInstructionsFilePath: string | undefined,
+    modelOverride?: string,
   ) => {
+    const effectiveModel = modelOverride ?? model;
     const args = ["--print", "-", "--output-format", "stream-json", "--verbose"];
     if (resumeSessionId) args.push("--resume", resumeSessionId);
     args.push(...buildClaudeExecutionPermissionArgs({
@@ -721,8 +749,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // For Bedrock: only pass --model when the ID is a Bedrock-native identifier
     // (e.g. "us.anthropic.*" or ARN). Anthropic-style IDs like "claude-opus-4-6" are invalid
     // on Bedrock, so skip them and let the CLI use its own configured model.
-    if (model && (!isBedrockAuth(effectiveEnv) || isBedrockModelId(model))) {
-      args.push("--model", model);
+    if (effectiveModel && (!isBedrockAuth(effectiveEnv) || isBedrockModelId(effectiveModel))) {
+      args.push("--model", effectiveModel);
     }
     if (effectiveEffort) args.push("--effort", effectiveEffort);
     if (maxTurns > 0) args.push("--max-turns", String(maxTurns));
@@ -753,9 +781,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : `Claude exited with code ${proc.exitCode ?? -1}`;
   };
 
-  const runAttempt = async (resumeSessionId: string | null) => {
+  const runAttempt = async (resumeSessionId: string | null, modelOverride?: string) => {
     const attemptInstructionsFilePath = resumeSessionId ? undefined : effectiveInstructionsFilePath;
-    const args = buildClaudeArgs(resumeSessionId, attemptInstructionsFilePath);
+    const args = buildClaudeArgs(resumeSessionId, attemptInstructionsFilePath, modelOverride);
     const commandNotes: string[] = [];
     if (!resumeSessionId) {
       commandNotes.push(`Using stable Claude prompt bundle ${promptBundle.bundleKey}.`);
@@ -1057,6 +1085,48 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
       const retry = await runAttempt(null);
       return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
+    }
+
+    // Fallback-on-refusal: a policy refusal exits cleanly (exitCode=0,
+    // is_error=false), so it is never a session error and lands here. When a
+    // distinct, allowed fallbackModel is configured, retry EXACTLY ONCE on a
+    // fresh session with that model and return its result instead of the
+    // refusal. One-shot only — the fallback attempt's own result (refusal,
+    // error, or success) is surfaced as-is, so there is no retry loop.
+    if (
+      fallbackModel &&
+      fallbackModel !== model &&
+      isClaudeRefusalResult(initial.parsed)
+    ) {
+      if (!isAllowedFallbackModel(fallbackModel)) {
+        // SECURITY-CRITICAL: never route refused work to an unknown or
+        // safeguards-lifted model (e.g. claude-mythos-5). Log and surface the
+        // original refusal unchanged.
+        await onLog(
+          "stdout",
+          `[paperclip] ${model || "primary model"} refused but fallbackModel "${fallbackModel}" is not an allowed fallback target; surfacing refusal.\n`,
+        );
+      } else {
+        await onLog(
+          "stdout",
+          `[paperclip] ${model || "primary model"} refused; falling back to ${fallbackModel}.\n`,
+        );
+        const fallbackAttempt = await runAttempt(null, fallbackModel);
+        const fallbackResult = toAdapterResult(fallbackAttempt, {
+          fallbackSessionId: null,
+          clearSessionOnMissingSession: true,
+        });
+        // Telemetry: refusal + fallback means two billed calls. Surface flags so
+        // cost/monitoring can attribute the extra call and see fallback fired.
+        fallbackResult.resultJson = {
+          ...(fallbackResult.resultJson ?? {}),
+          fallbackModelUsed: true,
+          primaryRefused: true,
+          primaryModel: model || null,
+          fallbackModel,
+        };
+        return fallbackResult;
+      }
     }
 
     return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });

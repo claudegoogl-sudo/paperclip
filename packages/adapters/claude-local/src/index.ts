@@ -38,6 +38,7 @@ Core fields:
 - cwd (string, optional): default absolute working directory fallback for the agent process (created if missing when possible)
 - instructionsFilePath (string, optional): absolute path to a markdown instructions file injected at runtime
 - model (string, optional): Claude model id
+- fallbackModel (string, optional): Claude model id used for a single automatic retry when the primary model returns a policy refusal. Must be a known adapter model and is never a safeguards-lifted model (claude-mythos-5 is hard-rejected). On a refusal the run retries exactly once on a fresh session with this model and returns that result; without it, refusals surface as today. resultJson carries fallbackModelUsed/primaryRefused telemetry when it fires.
 - effort (string, optional): reasoning effort passed via --effort (low|medium|high)
 - chrome (boolean, optional): pass --chrome when running Claude
 - promptTemplate (string, optional): run prompt template
