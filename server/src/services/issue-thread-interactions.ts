@@ -1486,10 +1486,14 @@ export function issueThreadInteractionService(db: Db) {
       const commentId = options.commentId ?? null;
       let result: IssueThreadInteractionRow["result"];
       if (isRequestConfirmationLikeKind(current.kind)) {
-        // outcome "superseded_by_comment" with commentId null covers the
-        // author-self-cancel (no comment) case. Whether to add a dedicated
-        // "superseded" outcome is an open review question on PLA-1439.
-        result = { version: 1, outcome: "superseded_by_comment", commentId, ...(reason ? { reason } : {}) };
+        // When a comment superseded the interaction (messenger relayed an
+        // operator Telegram reply), record the comment linkage with
+        // "superseded_by_comment". When no comment is involved (an authoring
+        // agent retracting its OWN ask), use the dedicated "superseded" outcome
+        // so the audit trail never falsely claims a comment superseded it
+        // (PLA-1439 F5 / PLA-823 truthful-audit-trail class).
+        const outcome = commentId ? "superseded_by_comment" : "superseded";
+        result = { version: 1, outcome, commentId, ...(reason ? { reason } : {}) };
       } else if (current.kind === "ask_user_questions") {
         result = { version: 1, answers: [], cancelled: true, cancellationReason: reason, summaryMarkdown: null };
       } else {
