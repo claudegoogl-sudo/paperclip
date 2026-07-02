@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import type { AdapterExecutionContext, AdapterExecutionResult, AdapterModel } from "@paperclipai/adapter-utils";
 import type { RunProcessResult } from "@paperclipai/adapter-utils/server-utils";
 import {
   adapterExecutionTargetIsRemote,
@@ -68,29 +68,43 @@ import { SANDBOX_INSTALL_COMMAND, models as ADAPTER_MODELS } from "../index.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
-// Models that must NEVER be used as an automatic fallback target, regardless
-// of per-agent config. claude-mythos-5 is a safeguards-lifted model; routing
-// refused work to it would silently escalate to an unsafe model. Hard-reject
-// by exact id and by any id containing "mythos" as defense in depth (covers
-// future variants / Bedrock-qualified ids). SECURITY-CRITICAL — see PLA-1421.
+// Models that must NEVER be used as an automatic fallback target, regardless of
+// per-agent config. The authoritative classification is the structured
+// `safeguardsLifted` flag on each registry entry (src/index.ts): adding a new
+// model forces an explicit safe/unsafe decision instead of defaulting to
+// allowed (fail-secure-on-omission). The name-based denylist and "mythos"
+// substring below are retained as defense in depth for ids that never reach a
+// registry entry (unknown / Bedrock-qualified) or a flag that was omitted.
+// SECURITY-CRITICAL — see PLA-1421 / PLA-1423.
 const SAFEGUARDS_LIFTED_FALLBACK_DENYLIST = new Set(["claude-mythos-5"]);
 
-export function isSafeguardsLiftedModel(model: string): boolean {
+export function isSafeguardsLiftedModel(
+  model: string,
+  registry: readonly AdapterModel[] = ADAPTER_MODELS,
+): boolean {
   const id = model.trim().toLowerCase();
   if (!id) return false;
+  // Primary: structured registry flag lives with the model definition.
+  const entry = registry.find((m) => m.id.toLowerCase() === id);
+  if (entry?.safeguardsLifted === true) return true;
+  // Defense in depth: legacy name-based denylist + "mythos" substring.
   return SAFEGUARDS_LIFTED_FALLBACK_DENYLIST.has(id) || id.includes("mythos");
 }
 
 /**
  * A fallback target is only allowed when it is a known adapter model AND is not
- * a safeguards-lifted model. Unknown ids and denylisted ids are rejected so the
- * refusal is surfaced as-is instead of silently retried on an untrusted model.
+ * a safeguards-lifted model. Unknown ids and safeguards-lifted ids are rejected
+ * so the refusal is surfaced as-is instead of silently retried on an untrusted
+ * model.
  */
-export function isAllowedFallbackModel(model: string): boolean {
+export function isAllowedFallbackModel(
+  model: string,
+  registry: readonly AdapterModel[] = ADAPTER_MODELS,
+): boolean {
   const id = model.trim();
   if (!id) return false;
-  if (isSafeguardsLiftedModel(id)) return false;
-  return ADAPTER_MODELS.some((entry) => entry.id === id);
+  if (isSafeguardsLiftedModel(id, registry)) return false;
+  return registry.some((entry) => entry.id === id);
 }
 
 interface ClaudeExecutionInput {

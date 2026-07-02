@@ -129,6 +129,26 @@ describe("claude_local fallback-on-refusal", () => {
     expect(isSafeguardsLiftedModel("claude-opus-4-8")).toBe(false);
   });
 
+  it("structured safeguardsLifted flag rejects a fallback target even when its id has no known keyword", () => {
+    // A future safeguards-lifted model whose id contains neither "mythos" nor
+    // any denylist entry. The name-based checks alone would allowlist it; the
+    // structured registry flag must reject it (fail-secure-on-omission).
+    const registry = [
+      { id: "claude-opus-4-8", label: "Claude Opus 4.8" },
+      { id: "claude-nextgen-x", label: "Claude NextGen X", safeguardsLifted: true },
+    ];
+
+    expect(isSafeguardsLiftedModel("claude-nextgen-x", registry)).toBe(true);
+    expect(isAllowedFallbackModel("claude-nextgen-x", registry)).toBe(false);
+    // A non-flagged known model in the same registry stays allowed.
+    expect(isAllowedFallbackModel("claude-opus-4-8", registry)).toBe(true);
+    // Sanity: without the flag, that id would have been allowed.
+    expect(isAllowedFallbackModel("claude-nextgen-x", [{ id: "claude-nextgen-x", label: "X" }])).toBe(true);
+    // Real registry: claude-mythos-5 is flagged in src/index.ts, still rejected.
+    expect(isSafeguardsLiftedModel("claude-mythos-5")).toBe(true);
+    expect(isAllowedFallbackModel("claude-mythos-5")).toBe(false);
+  });
+
   it("refusal + fallbackModel set → exactly one fallback attempt on the fallback model, returns its result", async () => {
     runChildProcess
       .mockResolvedValueOnce(refusalProc())

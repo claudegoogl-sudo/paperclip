@@ -1,14 +1,15 @@
-import type { AdapterModelProfileDefinition } from "@paperclipai/adapter-utils";
+import type { AdapterModel, AdapterModelProfileDefinition } from "@paperclipai/adapter-utils";
 
 export const type = "claude_local";
 export const label = "Claude Code (local)";
 
 export const SANDBOX_INSTALL_COMMAND = "npm install -g @anthropic-ai/claude-code";
 
-export const models = [
+export const models: AdapterModel[] = [
   { id: "claude-opus-4-8", label: "Claude Opus 4.8" },
   { id: "claude-fable-5", label: "Claude Fable 5" },
-  { id: "claude-mythos-5", label: "Claude Mythos 5" },
+  // Safeguards-lifted — must never be an automatic fallback target. See PLA-1423.
+  { id: "claude-mythos-5", label: "Claude Mythos 5", safeguardsLifted: true },
   { id: "claude-opus-4-7", label: "Claude Opus 4.7" },
   { id: "claude-opus-4-6", label: "Claude Opus 4.6" },
   { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
