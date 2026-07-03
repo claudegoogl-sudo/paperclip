@@ -1033,6 +1033,145 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     });
   });
 
+  it("supersedes a single pending request_confirmation to expired and rejects a second attempt", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Self-service supersede");
+    const authorAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: authorAgentId,
+      companyId,
+      name: "AuthorAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      payload: {
+        version: 1,
+        prompt: "Approve the earlier plan?",
+      },
+    }, {
+      agentId: authorAgentId,
+    });
+    expect(created.status).toBe("pending");
+
+    const superseded = await interactionsSvc.supersedeInteractionById(
+      { id: issueId, companyId },
+      created.id,
+      { reason: "superseded by a newer confirmation" },
+      { agentId: authorAgentId },
+    );
+
+    // PLA-1439 F5: no comment involved (author self-cancel) records the dedicated
+    // "superseded" outcome, NOT "superseded_by_comment", so the audit trail never
+    // falsely claims a comment superseded it.
+    expect(superseded).toMatchObject({
+      id: created.id,
+      status: "expired",
+      result: {
+        version: 1,
+        outcome: "superseded",
+        commentId: null,
+        reason: "superseded by a newer confirmation",
+      },
+      resolvedByAgentId: authorAgentId,
+    });
+
+    // Idempotency guard: a second supersede on the now-resolved interaction 409s.
+    await expect(
+      interactionsSvc.supersedeInteractionById(
+        { id: issueId, companyId },
+        created.id,
+        {},
+        { agentId: authorAgentId },
+      ),
+    ).rejects.toMatchObject({ status: 409 });
+  });
+
+  it("records superseded_by_comment (with the comment id) when a comment supersedes the interaction", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Comment supersede outcome");
+    const supersedingCommentId = randomUUID();
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      payload: {
+        version: 1,
+        prompt: "Approve the earlier plan?",
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    // PLA-1438 Part A path: the messenger relays an operator reply as a comment and
+    // resolves the interaction it answered, passing the superseding comment id and
+    // NEVER a userId (must not mint operator user authorship — PLA-823 Finding-1).
+    const superseded = await interactionsSvc.supersedeInteractionById(
+      { id: issueId, companyId },
+      created.id,
+      { commentId: supersedingCommentId },
+      { agentId: null, userId: null },
+    );
+
+    expect(superseded).toMatchObject({
+      id: created.id,
+      status: "expired",
+      result: {
+        version: 1,
+        outcome: "superseded_by_comment",
+        commentId: supersedingCommentId,
+      },
+    });
+    expect(superseded.resolvedByUserId).toBeNull();
+    expect(superseded.resolvedByAgentId).toBeNull();
+  });
+
+  it("rejects a superseding interactionId that belongs to a different issue (cross-tenant guard)", async () => {
+    const first = await seedConfirmationIssue("Cross-tenant guard A");
+    const second = await seedConfirmationIssue("Cross-tenant guard B");
+
+    const created = await interactionsSvc.create({
+      id: first.issueId,
+      companyId: first.companyId,
+    }, {
+      kind: "request_confirmation",
+      payload: {
+        version: 1,
+        prompt: "Approve?",
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    // Passing the interaction under a foreign company/issue must 404 (notFound),
+    // not resolve it — this is the service-layer defense-in-depth the plugin
+    // resolve host method relies on.
+    await expect(
+      interactionsSvc.supersedeInteractionById(
+        { id: second.issueId, companyId: second.companyId },
+        created.id,
+        {},
+        { agentId: null, userId: null },
+      ),
+    ).rejects.toMatchObject({ status: 404 });
+
+    const row = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, created.id))
+      .then((rows) => rows[0]);
+    expect(row?.status).toBe("pending");
+  });
+
   it("keeps request confirmations pending when user-comment supersede is explicitly disabled", async () => {
     const { companyId, issueId } = await seedConfirmationIssue("Comment supersede opt-out");
 

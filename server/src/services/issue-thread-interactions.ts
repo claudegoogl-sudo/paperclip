@@ -1453,5 +1453,76 @@ export function issueThreadInteractionService(db: Db) {
       await touchIssue(db, issue.id);
       return hydrateInteraction(updated);
     },
+
+    // Self-service supersede of a single pending interaction, shared by:
+    //  - the agent self-cancel route (author retires its OWN interaction), and
+    //  - the messenger plugin resolve primitive (operator answered on Telegram).
+    // Authorization is enforced by the CALLER (route author-check / plugin
+    // capability + company reach); this method is a pure pending->terminal
+    // transition. Terminal status is always "expired" so
+    // queueResolvedInteractionContinuationWakeup() early-returns and no spurious
+    // continuation wake fires (the wakeup guard skips "expired").
+    supersedeInteractionById: async (
+      issue: { id: string; companyId: string },
+      interactionId: string,
+      options: { commentId?: string | null; reason?: string | null },
+      actor: InteractionActor,
+    ) => {
+      const current = await db
+        .select()
+        .from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, interactionId))
+        .then((rows) => rows[0] ?? null);
+
+      if (!current) throw notFound("Interaction not found");
+      if (current.companyId !== issue.companyId || current.issueId !== issue.id) {
+        throw notFound("Interaction not found");
+      }
+      if (current.status !== "pending") {
+        throw conflict("Interaction has already been resolved");
+      }
+
+      const reason = options.reason?.trim() || null;
+      const commentId = options.commentId ?? null;
+      let result: IssueThreadInteractionRow["result"];
+      if (isRequestConfirmationLikeKind(current.kind)) {
+        // When a comment superseded the interaction (messenger relayed an
+        // operator Telegram reply), record the comment linkage with
+        // "superseded_by_comment". When no comment is involved (an authoring
+        // agent retracting its OWN ask), use the dedicated "superseded" outcome
+        // so the audit trail never falsely claims a comment superseded it
+        // (PLA-1439 F5 / PLA-823 truthful-audit-trail class).
+        const outcome = commentId ? "superseded_by_comment" : "superseded";
+        result = { version: 1, outcome, commentId, ...(reason ? { reason } : {}) };
+      } else if (current.kind === "ask_user_questions") {
+        result = { version: 1, answers: [], cancelled: true, cancellationReason: reason, summaryMarkdown: null };
+      } else {
+        throw unprocessable("Only request_confirmation and ask_user_questions interactions can be superseded");
+      }
+
+      const now = new Date();
+      const [updated] = await db
+        .update(issueThreadInteractions)
+        .set({
+          status: "expired",
+          result,
+          resolvedByAgentId: actor.agentId ?? null,
+          resolvedByUserId: actor.userId ?? null,
+          resolvedAt: now,
+          updatedAt: now,
+        })
+        .where(and(
+          eq(issueThreadInteractions.id, interactionId),
+          eq(issueThreadInteractions.status, "pending"),
+        ))
+        .returning();
+
+      if (!updated) {
+        throw conflict("Interaction has already been resolved");
+      }
+
+      await touchIssue(db, issue.id);
+      return hydrateInteraction(updated);
+    },
   };
 }

@@ -1422,6 +1422,23 @@ export interface WorkerToHostMethods {
     },
     result: IssueThreadInteraction,
   ];
+  // PLA-1438 Part A: resolve (expire) a single pending interaction the plugin is
+  // relaying an operator reply to. Terminal status is always "expired"; never
+  // "accepted", so this can never fire accept side-effects. Scoped to the
+  // plugin's own company via host-side requireInCompany. Gated by the
+  // default-deny `issue.interactions.resolve` capability (messenger-only).
+  "issues.resolveInteraction": [
+    params: {
+      issueId: string;
+      companyId: string;
+      interactionId: string;
+      /** When set, records `superseded_by_comment` + this comment id; when
+       * omitted the interaction is recorded with the `superseded` outcome. */
+      supersedingCommentId?: string | null;
+      reason?: string | null;
+    },
+    result: IssueThreadInteraction,
+  ];
 
   // Issue Documents
   "issues.documents.list": [

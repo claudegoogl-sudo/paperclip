@@ -887,6 +887,7 @@ export const PLUGIN_CAPABILITIES = [
   "issues.wakeup",
   "issue.comments.create",
   "issue.interactions.create",
+  "issue.interactions.resolve",
   "issue.documents.write",
   "issue.attachments.create",
   "projects.managed",

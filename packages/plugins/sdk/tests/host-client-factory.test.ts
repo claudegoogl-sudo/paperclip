@@ -885,3 +885,89 @@ describe("createHostClientHandlers serviceScope company writes/state (PLA-814)",
     expect(issuesList).not.toHaveBeenCalled();
   });
 });
+
+describe("createHostClientHandlers issues.resolveInteraction capability + serviceScope (PLA-1438 Part A)", () => {
+  // The messenger auto-resolves the interaction an operator answered by free
+  // text, from its inbound relay path (no active dispatch → bare serviceScope).
+  // The resolve is default-deny (issue.interactions.resolve, messenger-only) and
+  // shares createComment's entity-cross-checked reach argument, so it is on the
+  // SERVICE_SCOPE_COMPANY_METHODS allowlist.
+  function makeHandlers(capabilities: string[]) {
+    const resolveInteraction = vi.fn(async () => ({ id: "interaction-1", status: "expired" }));
+    const services = {
+      issues: { resolveInteraction },
+    } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.messenger",
+      capabilities: capabilities as never,
+      services,
+    });
+    return { handlers, resolveInteraction };
+  }
+
+  const params = {
+    issueId: "issue-1",
+    companyId: "company-a",
+    interactionId: "interaction-1",
+    supersedingCommentId: "comment-1",
+  };
+
+  it("denies resolveInteraction when the plugin lacks issue.interactions.resolve (default-deny)", async () => {
+    const { handlers, resolveInteraction } = makeHandlers([]);
+
+    await expect(
+      handlers["issues.resolveInteraction"](
+        params as never,
+        { invocationScope: { companyId: "company-a" } },
+      ),
+    ).rejects.toMatchObject({
+      name: "CapabilityDeniedError",
+      message: expect.stringContaining("issue.interactions.resolve"),
+    });
+    await expect(
+      handlers["issues.resolveInteraction"](
+        params as never,
+        { invocationScope: { companyId: "company-a" } },
+      ),
+    ).rejects.toBeInstanceOf(CapabilityDeniedError);
+    expect(resolveInteraction).not.toHaveBeenCalled();
+  });
+
+  it("allows the granted plugin to resolveInteraction under an active dispatch", async () => {
+    const { handlers, resolveInteraction } = makeHandlers(["issue.interactions.resolve"]);
+
+    await expect(
+      handlers["issues.resolveInteraction"](
+        params as never,
+        { invocationScope: { companyId: "company-a" } },
+      ),
+    ).resolves.toEqual({ id: "interaction-1", status: "expired" });
+    expect(resolveInteraction).toHaveBeenCalledWith(params);
+  });
+
+  it("allows resolveInteraction under serviceScope (inbound relay, no active dispatch)", async () => {
+    const { handlers, resolveInteraction } = makeHandlers(["issue.interactions.resolve"]);
+
+    await expect(
+      handlers["issues.resolveInteraction"](params as never, {
+        serviceScope: { runId: "service-run-1" },
+      }),
+    ).resolves.toEqual({ id: "interaction-1", status: "expired" });
+    expect(resolveInteraction).toHaveBeenCalledWith(params);
+  });
+
+  it("keeps strict company enforcement when an active dispatch pins a different company", async () => {
+    const { handlers, resolveInteraction } = makeHandlers(["issue.interactions.resolve"]);
+
+    await expect(
+      handlers["issues.resolveInteraction"](
+        { ...params, companyId: "company-b" } as never,
+        {
+          invocationScope: { companyId: "company-a" },
+          serviceScope: { runId: "service-run-1" },
+        },
+      ),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    expect(resolveInteraction).not.toHaveBeenCalled();
+  });
+});

@@ -94,6 +94,7 @@ const OPERATION_CAPABILITIES: Record<string, readonly PluginCapability[]> = {
   "issues.requestWakeups": ["issues.wakeup"],
   "issue.comments.create": ["issue.comments.create"],
   "issue.interactions.create": ["issue.interactions.create"],
+  "issues.resolveInteraction": ["issue.interactions.resolve"],
   "activity.log": ["activity.log.write"],
   "metrics.write": ["metrics.write"],
   "telemetry.track": ["telemetry.track"],

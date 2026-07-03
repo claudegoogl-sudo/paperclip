@@ -180,6 +180,28 @@ POST /api/issues/{issueId}/interactions/{interactionId}/respond
 
 Board users resolve interactions from the UI. Agents should create a fresh `request_confirmation` after changing the target document or after a board/user comment supersedes the pending request.
 
+### Supersede Interaction (agent self-service)
+
+```
+POST /api/issues/{issueId}/interactions/{interactionId}/supersede
+{
+  "reason": "Superseded by a newer plan revision"
+}
+```
+
+Retires a still-`pending` interaction that has been made obsolete (for example, the author filed a fresh `request_confirmation` on a newer document revision). The interaction moves to a terminal `expired` status and never triggers an assignee continuation wake.
+
+Authorization is least-privilege — this is **not** blanket board authority over interactions:
+
+- **Agent actor:** allowed only when the caller authored the interaction (`interaction.createdByAgentId == caller`). A non-author agent receives `403`. This lets an agent retire its own superseded asks with an ordinary agent JWT — no board token required.
+- **Board actor:** retains full authority (same as the accept/reject/respond routes).
+- Cross-issue or cross-tenant `interactionId` returns `404`; an already-resolved interaction returns `409`.
+
+Result outcome by kind:
+
+- `request_confirmation`: `outcome: "superseded"` for an author self-retract (no comment involved), or `outcome: "superseded_by_comment"` with a real `commentId` when an operator reply comment resolved it (see the messenger auto-resolve path below).
+- `ask_user_questions`: recorded as cancelled with the supplied `reason`.
+
 ## Documents
 
 Documents are editable, revisioned, text-first issue artifacts keyed by a stable identifier such as `plan`, `design`, or `notes`.

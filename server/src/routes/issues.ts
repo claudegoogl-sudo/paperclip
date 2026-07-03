@@ -7383,6 +7383,77 @@ export function issueRoutes(
     },
   );
 
+  // PLA-1438: agent self-service supersede of an interaction it AUTHORED.
+  // Unlike the board-only accept/reject/cancel routes above, an agent may retire
+  // a pending interaction here IFF createdByAgentId === caller (least-privilege:
+  // author-only, never blanket resolution authority). Board actors keep full
+  // authority. Terminal state is "expired" (no continuation wake).
+  router.post(
+    "/issues/:id/interactions/:interactionId/supersede",
+    validate(cancelIssueThreadInteractionSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const interactionId = req.params.interactionId as string;
+      const issue = await svc.getById(id);
+      if (!issue) {
+        res.status(404).json({ error: "Issue not found" });
+        return;
+      }
+      assertCompanyAccess(req, issue.companyId);
+
+      const interactionSvc = issueThreadInteractionService(db);
+      if (req.actor.type === "agent") {
+        if (
+          req.actor.runId
+          && !(await assertTaskWatchdogIssueMutationAllowed(req, res, issue, { allowWatchdogIssue: false }))
+        ) {
+          return;
+        }
+        const existing = await interactionSvc.getById(interactionId);
+        if (!existing || existing.companyId !== issue.companyId || existing.issueId !== issue.id) {
+          res.status(404).json({ error: "Interaction not found" });
+          return;
+        }
+        if (existing.createdByAgentId !== req.actor.agentId) {
+          res.status(403).json({ error: "Agents can only supersede interactions they authored" });
+          return;
+        }
+      } else {
+        assertBoard(req);
+      }
+
+      const actor = getActorInfo(req);
+      const interaction = await interactionSvc.supersedeInteractionById(
+        issue,
+        interactionId,
+        { reason: req.body?.reason ?? null },
+        {
+          agentId: actor.agentId,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        },
+      );
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.thread_interaction_superseded",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          interactionId: interaction.id,
+          interactionKind: interaction.kind,
+          interactionStatus: interaction.status,
+          supersededByActorType: actor.actorType,
+        },
+      });
+
+      res.json(interaction);
+    },
+  );
+
   router.get("/issues/:id/comments/:commentId", async (req, res) => {
     const id = req.params.id as string;
     const commentId = req.params.commentId as string;
