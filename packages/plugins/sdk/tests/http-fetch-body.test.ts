@@ -36,6 +36,15 @@ interface HostFetchCapture {
     body?: string;
     bodyEncoding?: "utf8" | "base64";
   };
+  acceptResponseBodyEncoding?: "utf8" | "base64";
+}
+
+interface HostFetchResponse {
+  status?: number;
+  statusText?: string;
+  headers?: Record<string, string>;
+  body: string;
+  bodyEncoding?: "utf8" | "base64";
 }
 
 interface BridgeResult {
@@ -50,6 +59,7 @@ interface BridgeResult {
  */
 async function runWorkerCapturingFetch(
   setupFn: (ctx: import("../src/types.js").PluginContext) => Promise<void> | void,
+  fetchResponder?: (capture: HostFetchCapture) => HostFetchResponse,
 ): Promise<BridgeResult> {
   const hostToWorker = new PassThrough();
   const workerToHost = new PassThrough();
@@ -115,15 +125,20 @@ async function runWorkerCapturingFetch(
     if (isJsonRpcRequest(message)) {
       const req = message as JsonRpcRequest;
       if (req.method === "http.fetch") {
-        fetchCalls.push(req.params as HostFetchCapture);
-        // Respond with a benign 200 so the worker's fetch promise resolves.
+        const capture = req.params as HostFetchCapture;
+        fetchCalls.push(capture);
+        // Default: a benign 200 with an empty body so the worker's fetch
+        // promise resolves. Tests that exercise the response path supply a
+        // `fetchResponder` that mimics the host's base64/utf8 result contract.
+        const responded = fetchResponder?.(capture) ?? { body: "" };
         hostToWorker.write(
           serializeMessage(
             createSuccessResponse(req.id, {
-              status: 200,
-              statusText: "OK",
-              headers: {},
-              body: "",
+              status: responded.status ?? 200,
+              statusText: responded.statusText ?? "OK",
+              headers: responded.headers ?? {},
+              body: responded.body,
+              ...(responded.bodyEncoding ? { bodyEncoding: responded.bodyEncoding } : {}),
             }),
           ),
         );
@@ -279,5 +294,73 @@ describe("ctx.http.fetch body serialization", () => {
     expect(init.headers?.["Content-Type"]).toBe("application/x-caller-supplied");
     // Body still encoded as bytes — caller takes responsibility for the boundary.
     expect(init.bodyEncoding).toBe("base64");
+  });
+});
+
+describe("ctx.http.fetch response body decoding (PLA-1459)", () => {
+  // JPEG SOI + APP0: high bytes that a lossy utf8 decode destroys.
+  const JPEG_BYTES = new Uint8Array([
+    0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46,
+  ]);
+
+  it("opts in with acceptResponseBodyEncoding: base64 on every request", async () => {
+    const { fetchCalls, pluginSetupError } = await runWorkerCapturingFetch(async (ctx) => {
+      await ctx.http.fetch("https://example.com/thing");
+    });
+    expect(pluginSetupError).toBeNull();
+    expect(fetchCalls[0]!.acceptResponseBodyEncoding).toBe("base64");
+  });
+
+  it("round-trips a binary response byte-exact via res.arrayBuffer()", async () => {
+    let roundTripped: Uint8Array | null = null;
+    const { pluginSetupError } = await runWorkerCapturingFetch(
+      async (ctx) => {
+        const res = await ctx.http.fetch("https://example.com/photo.jpg");
+        roundTripped = new Uint8Array(await res.arrayBuffer());
+      },
+      // Host honors the opt-in: base64 of the exact bytes + bodyEncoding.
+      () => ({
+        body: Buffer.from(JPEG_BYTES).toString("base64"),
+        bodyEncoding: "base64",
+      }),
+    );
+
+    expect(pluginSetupError).toBeNull();
+    expect(roundTripped).not.toBeNull();
+    expect(Array.from(roundTripped!)).toEqual(Array.from(JPEG_BYTES));
+  });
+
+  it("decodes a base64 text response correctly via res.text()", async () => {
+    const text = "hello, wörld — ünïcode ✓";
+    let decoded: string | null = null;
+    const { pluginSetupError } = await runWorkerCapturingFetch(
+      async (ctx) => {
+        const res = await ctx.http.fetch("https://example.com/hello.txt");
+        decoded = await res.text();
+      },
+      () => ({
+        body: Buffer.from(text, "utf8").toString("base64"),
+        bodyEncoding: "base64",
+      }),
+    );
+
+    expect(pluginSetupError).toBeNull();
+    expect(decoded).toBe(text);
+  });
+
+  it("passes a legacy-host utf8 string body through unchanged (no bodyEncoding)", async () => {
+    const text = "plain legacy body";
+    let decoded: string | null = null;
+    const { pluginSetupError } = await runWorkerCapturingFetch(
+      async (ctx) => {
+        const res = await ctx.http.fetch("https://example.com/legacy");
+        decoded = await res.text();
+      },
+      // Old host: utf8 string, no bodyEncoding field.
+      () => ({ body: text }),
+    );
+
+    expect(pluginSetupError).toBeNull();
+    expect(decoded).toBe(text);
   });
 });

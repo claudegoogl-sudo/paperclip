@@ -623,10 +623,24 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           const result = await callHost("http.fetch", {
             url,
             init: Object.keys(serializedInit).length > 0 ? serializedInit : undefined,
+            // Opt in to base64 response bodies. This SDK decodes `bodyEncoding`
+            // below, so it is always safe to request byte-exact bytes. Old hosts
+            // ignore the flag and return utf8 (handled by the default branch);
+            // old SDKs never send it, so a new host leaves them on the legacy
+            // utf8 path — no lockstep deploy required.
+            acceptResponseBodyEncoding: "base64",
           });
 
-          // Reconstruct a Response-like object from the serialized result
-          return new Response(result.body, {
+          // Reconstruct a Response from the serialized result. When the host
+          // honored our opt-in it returns base64 of the exact response bytes;
+          // decode to a Buffer so binary bodies (images, etc.) survive
+          // `res.arrayBuffer()` byte-exact. A legacy host omits `bodyEncoding`
+          // and returns a utf8 string, which we pass through unchanged.
+          const responseBody =
+            result.bodyEncoding === "base64"
+              ? new Uint8Array(Buffer.from(result.body, "base64"))
+              : result.body;
+          return new Response(responseBody, {
             status: result.status,
             statusText: result.statusText,
             headers: result.headers,
