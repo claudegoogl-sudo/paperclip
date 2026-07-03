@@ -148,7 +148,7 @@ function isPrivateIP(ip: string): boolean {
  * @returns Request-routing metadata used to connect directly to the resolved IP
  *          while preserving the original hostname for HTTP Host and TLS SNI.
  */
-interface ValidatedFetchTarget {
+export interface ValidatedFetchTarget {
   parsedUrl: URL;
   resolvedAddress: string;
   hostHeader: string;
@@ -289,11 +289,18 @@ function buildPinnedRequestOptions(
   };
 }
 
-async function executePinnedHttpRequest(
+export async function executePinnedHttpRequest(
   target: ValidatedFetchTarget,
   init: PluginFetchInit | undefined,
   signal: AbortSignal,
-): Promise<{ status: number; statusText: string; headers: Record<string, string>; body: string }> {
+  responseBase64: boolean,
+): Promise<{
+  status: number;
+  statusText: string;
+  headers: Record<string, string>;
+  body: string;
+  bodyEncoding?: "utf8" | "base64";
+}> {
   const { options, body } = buildPinnedRequestOptions(target, init);
 
   const response = await new Promise<IncomingMessage>((resolve, reject) => {
@@ -335,11 +342,29 @@ async function executePinnedHttpRequest(
     }
   }
 
+  const raw = Buffer.concat(chunks);
+
+  // Opt-in callers (new SDK, which announces `acceptResponseBodyEncoding:
+  // "base64"` and decodes `result.bodyEncoding` on its end) get byte-exact
+  // base64 for text AND binary. Legacy callers keep the lossy utf8 decode
+  // (bytes >=0x80 collapse to U+FFFD) with NO `bodyEncoding` field — changing
+  // it would break old-SDK plugins that read `result.body` as a plain utf8
+  // string and ignore `bodyEncoding`.
+  if (responseBase64) {
+    return {
+      status: response.statusCode ?? 500,
+      statusText: response.statusMessage ?? "",
+      headers,
+      body: raw.toString("base64"),
+      bodyEncoding: "base64",
+    };
+  }
+
   return {
     status: response.statusCode ?? 500,
     statusText: response.statusMessage ?? "",
     headers,
-    body: Buffer.concat(chunks).toString("utf8"),
+    body: raw.toString("utf8"),
   };
 }
 
@@ -1347,7 +1372,18 @@ export function buildHostServices(
 
         try {
           const init = params.init as PluginFetchInit | undefined;
-          return await executePinnedHttpRequest(target, init, controller.signal);
+          // The SDK worker opts in by sending `acceptResponseBodyEncoding:
+          // "base64"` as a top-level param (sibling of `url`/`init`). Old SDKs
+          // never send it, so they stay on the legacy utf8 path.
+          const responseBase64 =
+            (params as { acceptResponseBodyEncoding?: "utf8" | "base64" })
+              .acceptResponseBodyEncoding === "base64";
+          return await executePinnedHttpRequest(
+            target,
+            init,
+            controller.signal,
+            responseBase64,
+          );
         } finally {
           clearTimeout(timeout);
         }

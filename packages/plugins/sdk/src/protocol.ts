@@ -984,11 +984,19 @@ export interface WorkerToHostMethods {
   // HTTP
   //
   // `init.body` travels as a string over JSON-RPC. `bodyEncoding` tells the
-  // host how to decode it:
+  // host how to decode the REQUEST body before writing it on the wire:
   //   - "utf8"   (default if absent) — body is plain text, written as-is.
   //   - "base64" — body is base64-encoded bytes, decoded to a Buffer before
   //                being written on the wire. Used by the SDK for FormData,
   //                Uint8Array, ArrayBuffer, and Buffer payloads.
+  //
+  // The RESPONSE body has the symmetric problem. `acceptResponseBodyEncoding`
+  // is a worker capability flag: when set to "base64", the worker guarantees it
+  // decodes the result per `result.bodyEncoding`, so the host base64-encodes the
+  // raw response bytes (byte-exact for text AND binary). When absent the host
+  // keeps the legacy lossy `toString("utf8")` behavior — required so plugins
+  // bundling an old SDK (which expect a plain utf8 `result.body` string and
+  // ignore `bodyEncoding`) do not regress. New SDKs always send "base64".
   "http.fetch": [
     params: {
       url: string;
@@ -998,8 +1006,18 @@ export interface WorkerToHostMethods {
         body?: string;
         bodyEncoding?: "utf8" | "base64";
       };
+      acceptResponseBodyEncoding?: "utf8" | "base64";
     },
-    result: { status: number; statusText: string; headers: Record<string, string>; body: string },
+    result: {
+      status: number;
+      statusText: string;
+      headers: Record<string, string>;
+      body: string;
+      // How `body` is encoded. Absent/"utf8" → legacy lossy text decode.
+      // "base64" → `body` is base64 of the exact response bytes; decode with
+      // `Buffer.from(body, "base64")` for a byte-exact reconstruction.
+      bodyEncoding?: "utf8" | "base64";
+    },
   ];
 
   // Secrets
