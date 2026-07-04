@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   DEFAULT_ALLOWED_TYPES,
   INLINE_ATTACHMENT_TYPES,
+  isAllowedPluginArtifactMimeType,
   isInlineAttachmentContentType,
   matchesContentType,
   normalizeContentType,
@@ -107,6 +108,90 @@ describe("normalizeContentType", () => {
   it("falls back to octet-stream when the type is missing", () => {
     expect(normalizeContentType(undefined)).toBe("application/octet-stream");
     expect(normalizeContentType("")).toBe("application/octet-stream");
+  });
+});
+
+describe("isAllowedPluginArtifactMimeType", () => {
+  // PLA-1139/PLA-1140: full broadened set of inert common-file types that must pass.
+  const inertAllowed = [
+    // 3D / CAD
+    "model/stl",
+    "application/vnd.ms-pki.stl",
+    "application/sla",
+    "model/x.stl-binary",
+    "model/x.stl-ascii",
+    "model/3mf",
+    "application/vnd.ms-package.3dmanufacturing-3dmodel+xml",
+    "model/obj",
+    "model/step",
+    "application/step",
+    "model/gltf-binary",
+    "model/gltf+json",
+    "model/ply",
+    // office documents
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.oasis.opendocument.text",
+    "application/vnd.oasis.opendocument.spreadsheet",
+    "application/vnd.oasis.opendocument.presentation",
+    "application/rtf",
+    // extra images
+    "image/tiff",
+    "image/bmp",
+    "image/heic",
+    "image/heif",
+    // video containers (supplied via DEFAULT_ALLOWED_TYPES on this lineage)
+    "video/mp4",
+    "video/webm",
+    "video/quicktime",
+  ];
+
+  it("allows every broadened inert type", () => {
+    for (const ct of inertAllowed) {
+      expect(isAllowedPluginArtifactMimeType(ct)).toBe(true);
+    }
+  });
+
+  it("retains the PLA-888 base image/pdf/audio types", () => {
+    for (const ct of ["image/png", "image/jpeg", "application/pdf", "audio/ogg"]) {
+      expect(isAllowedPluginArtifactMimeType(ct)).toBe(true);
+    }
+  });
+
+  it("matches case-insensitively", () => {
+    expect(isAllowedPluginArtifactMimeType("Application/STEP")).toBe(true);
+    expect(isAllowedPluginArtifactMimeType("MODEL/STL")).toBe(true);
+    expect(isAllowedPluginArtifactMimeType("Application/VND.MS-PKI.STL")).toBe(true);
+  });
+
+  it("keeps the F2 exclusions (text/html, text/csv) rejected", () => {
+    expect(isAllowedPluginArtifactMimeType("text/html")).toBe(false);
+    expect(isAllowedPluginArtifactMimeType("text/csv")).toBe(false);
+  });
+
+  it("never allows executables", () => {
+    for (const ct of [
+      "application/x-msdownload",
+      "application/x-sh",
+      "application/x-msdos-program",
+      "application/x-executable",
+    ]) {
+      expect(isAllowedPluginArtifactMimeType(ct)).toBe(false);
+    }
+  });
+
+  it("leaves SVG and archive types gated (PLA-1141) until SecurityEngineer rules", () => {
+    for (const ct of [
+      "image/svg+xml",
+      "application/zip",
+      "application/gzip",
+      "application/x-7z-compressed",
+      "application/x-tar",
+    ]) {
+      expect(isAllowedPluginArtifactMimeType(ct)).toBe(false);
+    }
   });
 });
 

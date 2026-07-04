@@ -51,12 +51,36 @@ export const DEFAULT_ALLOWED_TYPES: readonly string[] = [
  * bytes are stored. Wildcards are intentionally avoided here: the list is exact
  * so the reachable type surface is auditable.
  *
- * `text/html` and `text/csv` are excluded from the plugin set even though the
- * human route allows them (PLA-888 security review F2): an inbound external
- * relay has no need for active/markup document types, and dropping the classic
- * stored-XSS / formula-injection inputs minimises the hostile-input surface.
+ * `text/html`, `text/csv` and `application/zip` are excluded from the plugin set
+ * even though the human route (`DEFAULT_ALLOWED_TYPES`) allows them: an inbound
+ * external relay has no need for active/markup document types (PLA-888 F2 —
+ * stored-XSS / formula-injection surface) nor archive containers (PLA-1141 —
+ * zip-bomb / smuggling surface), so dropping them minimises the hostile-input
+ * surface. `application/zip` entered `DEFAULT_ALLOWED_TYPES` upstream after the
+ * original review, so it is excluded here to preserve the SE-approved posture.
+ *
+ * PLA-1139/PLA-1140: also includes a broadened set of inert common-file types so
+ * an operator can relay everyday documents, CAD models, photos and video through
+ * the inbound messenger path: 3D geometry (STL/3MF/OBJ/STEP/glTF/PLY), office
+ * documents (Word/Excel/PowerPoint/OpenDocument/RTF) and extra image formats
+ * (TIFF/BMP/HEIC/HEIF). These are all static, non-executable payloads with no
+ * active/markup/scripting surface, so they extend the auditable type set without
+ * widening the hostile-input risk that F2 (text/html, text/csv) guards against.
+ * Common video containers (MP4/WebM/QuickTime) are already covered via
+ * {@link DEFAULT_ALLOWED_TYPES} on this host lineage, so they are not re-listed.
+ *
+ * Deliberately NOT included pending SecurityEngineer ruling (PLA-1141):
+ * `image/svg+xml` (active-content/XSS) and archive containers
+ * (zip/gzip/7z/tar — zip-bomb / smuggling). Executables are never added.
+ *
+ * All entries are lowercase: {@link isAllowedPluginArtifactMimeType} lowercases
+ * its input before matching, so case variants would be dead duplicates.
  */
-const PLUGIN_ARTIFACT_EXCLUDED_DEFAULT_TYPES: readonly string[] = ["text/html", "text/csv"];
+const PLUGIN_ARTIFACT_EXCLUDED_DEFAULT_TYPES: readonly string[] = [
+  "text/html",
+  "text/csv",
+  "application/zip",
+];
 
 export const PLUGIN_ARTIFACT_ALLOWED_MIME_TYPES: readonly string[] = [
   ...DEFAULT_ALLOWED_TYPES.filter((t) => !PLUGIN_ARTIFACT_EXCLUDED_DEFAULT_TYPES.includes(t)),
@@ -68,6 +92,36 @@ export const PLUGIN_ARTIFACT_ALLOWED_MIME_TYPES: readonly string[] = [
   "audio/wav",
   "audio/x-wav",
   "audio/flac",
+  // PLA-1139/PLA-1140: inert 3D / CAD geometry (static, non-executable).
+  "model/stl",
+  "application/vnd.ms-pki.stl",
+  "application/sla",
+  "model/x.stl-binary",
+  "model/x.stl-ascii",
+  "model/3mf",
+  "application/vnd.ms-package.3dmanufacturing-3dmodel+xml",
+  "model/obj",
+  "model/step",
+  "application/step",
+  "model/gltf-binary",
+  "model/gltf+json",
+  "model/ply",
+  // PLA-1140: inert office documents.
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "application/vnd.oasis.opendocument.text",
+  "application/vnd.oasis.opendocument.spreadsheet",
+  "application/vnd.oasis.opendocument.presentation",
+  "application/rtf",
+  // PLA-1140: extra inert image formats (png/jpeg/webp/gif already in DEFAULT_ALLOWED_TYPES).
+  "image/tiff",
+  "image/bmp",
+  "image/heic",
+  "image/heif",
+  // PLA-1140: video containers (mp4/webm/quicktime) are supplied by DEFAULT_ALLOWED_TYPES
+  // on this fork.626 lineage, so they are intentionally not re-listed here (dedup).
 ];
 
 /**
