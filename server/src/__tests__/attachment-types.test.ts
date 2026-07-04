@@ -118,6 +118,8 @@ describe("isAllowedPluginArtifactMimeType", () => {
     "model/stl",
     "application/vnd.ms-pki.stl",
     "application/sla",
+    "model/x.stl-binary",
+    "model/x.stl-ascii",
     "model/3mf",
     "application/vnd.ms-package.3dmanufacturing-3dmodel+xml",
     "model/obj",

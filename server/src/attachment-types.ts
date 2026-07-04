@@ -96,6 +96,8 @@ export const PLUGIN_ARTIFACT_ALLOWED_MIME_TYPES: readonly string[] = [
   "model/stl",
   "application/vnd.ms-pki.stl",
   "application/sla",
+  "model/x.stl-binary",
+  "model/x.stl-ascii",
   "model/3mf",
   "application/vnd.ms-package.3dmanufacturing-3dmodel+xml",
   "model/obj",
