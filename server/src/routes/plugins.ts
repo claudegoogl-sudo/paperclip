@@ -47,6 +47,7 @@ import {
 } from "@paperclipai/shared";
 import { pluginRegistryService } from "../services/plugin-registry.js";
 import { pluginLifecycleManager } from "../services/plugin-lifecycle.js";
+import type { PluginWatchReconciler } from "../services/plugin-dev-watcher.js";
 import {
   getPluginUiContributionMetadata,
   listMissingDeclaredPluginEntrypoints,
@@ -424,6 +425,22 @@ export interface PluginRouteBridgeDeps {
   streamBus?: PluginStreamBus;
 }
 
+/**
+ * Optional dependencies for keeping local plugin file watchers in sync with the
+ * DB packagePath as lifecycle mutations happen at runtime.
+ *
+ * The dev-watcher subscribes to lifecycle domain events on the app-level
+ * lifecycle instance, but the install/enable/disable/uninstall routes run
+ * against a route-local lifecycle instance whose events never reach it. Calling
+ * `reconciler.reconcile(pluginId)` after each mutation arms/disarms the watcher
+ * against the current DB packagePath regardless of which emitter fired. See
+ * PLA-1537.
+ */
+export interface PluginRouteWatchDeps {
+  /** Dev-watcher reconciler; a no-op path is taken when absent. */
+  reconciler: PluginWatchReconciler;
+}
+
 interface PluginScopedApiRequest {
   routeKey: string;
   method: string;
@@ -500,6 +517,8 @@ interface PluginToolExecuteRequest {
  * @param webhookDeps - Optional webhook ingestion dependencies
  * @param toolDeps - Optional tool dispatcher dependencies
  * @param bridgeDeps - Optional bridge proxy dependencies for getData/performAction
+ * @param watchDeps - Optional dev-watcher reconciler to re-arm/disarm local
+ *   plugin file watchers when a mutation changes the DB packagePath (PLA-1537)
  * @returns Express router with plugin routes mounted
  */
 export function pluginRoutes(
@@ -509,6 +528,7 @@ export function pluginRoutes(
   webhookDeps?: PluginRouteWebhookDeps,
   toolDeps?: PluginRouteToolDeps,
   bridgeDeps?: PluginRouteBridgeDeps,
+  watchDeps?: PluginRouteWatchDeps,
 ) {
   const router = Router();
   const registry = pluginRegistryService(db);
@@ -521,6 +541,14 @@ export function pluginRoutes(
     workerManager: bridgeDeps?.workerManager ?? webhookDeps?.workerManager,
   });
   const issuesSvc = issueService(db);
+
+  // PLA-1537: re-arm/disarm the local-plugin file watcher after a lifecycle
+  // mutation. Fire-and-forget: reconcile reads the current DB packagePath and
+  // is fully self-contained (its own try/catch), so it never blocks or fails
+  // the HTTP response.
+  const reconcileWatch = (pluginId: string): void => {
+    void watchDeps?.reconciler.reconcile(pluginId);
+  };
 
   function matchScopedApiRoute(route: PluginApiRouteDeclaration, method: string, requestPath: string) {
     if (route.method !== method) return null;
@@ -1152,6 +1180,7 @@ export function pluginRoutes(
       const existingPlugin = await registry.getByKey(discovered.manifest.id);
       if (existingPlugin) {
         await lifecycle.load(existingPlugin.id);
+        reconcileWatch(existingPlugin.id);
         const updated = await registry.getById(existingPlugin.id);
         await logPluginMutationActivity(req, "plugin.installed", existingPlugin.id, {
           pluginId: existingPlugin.id,
@@ -1929,6 +1958,7 @@ export function pluginRoutes(
 
     try {
       const result = await lifecycle.unload(plugin.id, purge);
+      reconcileWatch(plugin.id);
       await logPluginMutationActivity(req, "plugin.uninstalled", plugin.id, {
         pluginId: plugin.id,
         pluginKey: plugin.pluginKey,
@@ -1964,6 +1994,7 @@ export function pluginRoutes(
 
     try {
       const result = await lifecycle.enable(plugin.id);
+      reconcileWatch(plugin.id);
       await logPluginMutationActivity(req, "plugin.enabled", plugin.id, {
         pluginId: plugin.id,
         pluginKey: plugin.pluginKey,
@@ -2004,6 +2035,7 @@ export function pluginRoutes(
 
     try {
       const result = await lifecycle.disable(plugin.id, reason);
+      reconcileWatch(plugin.id);
       await logPluginMutationActivity(req, "plugin.disabled", plugin.id, {
         pluginId: plugin.id,
         pluginKey: plugin.pluginKey,
