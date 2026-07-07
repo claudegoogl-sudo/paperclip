@@ -383,6 +383,22 @@ export async function createApp(
       await upgradeLifecycle.revertUpgradeRejected(payload.pluginId);
     }
   });
+  // PLA-1537: create the dev-watcher before the plugin routes so the routes can
+  // reconcile the local-plugin file watcher after each lifecycle mutation. The
+  // routes run against a route-local lifecycle instance whose domain events
+  // never reach this watcher's app-level subscription, so an explicit reconcile
+  // is the reliable re-arm/disarm path on install/enable/disable/uninstall.
+  // Resolve the watch target for a plugin: its local packagePath, but only
+  // while the plugin is active ('ready'). Gating on status means reconcile()
+  // disarms the watcher on disable/uninstall (status leaves 'ready') even
+  // though disable keeps packagePath in the DB. See PLA-1537.
+  const devWatcher = createPluginDevWatcher(
+    lifecycle,
+    async (pluginId) => {
+      const plugin = await pluginRegistry.getById(pluginId);
+      return plugin?.status === "ready" ? plugin.packagePath ?? null : null;
+    },
+  );
   api.use(
     pluginRoutes(
       db,
@@ -391,6 +407,7 @@ export async function createApp(
       { workerManager },
       { toolDispatcher },
       { workerManager },
+      { reconciler: devWatcher },
     ),
   );
   api.use(adapterRoutes());
@@ -548,10 +565,6 @@ export async function createApp(
   void toolDispatcher.initialize().catch((err) => {
     logger.error({ err }, "Failed to initialize plugin tool dispatcher");
   });
-  const devWatcher = createPluginDevWatcher(
-    lifecycle,
-    async (pluginId) => (await pluginRegistry.getById(pluginId))?.packagePath ?? null,
-  );
   // Auto-install the bundled kubernetes sandbox-provider plugin so the
   // "kubernetes" sandbox provider is registered for agent runs. The plugin is
   // excluded from the pnpm workspace and built standalone into the image (see

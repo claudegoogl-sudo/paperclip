@@ -29,9 +29,21 @@ export interface PluginDevWatcher {
   watch(pluginId: string, packagePath: string): void;
   /** Stop watching a specific plugin. */
   unwatch(pluginId: string): void;
+  /**
+   * Reconcile the watch state for a plugin against the current DB packagePath.
+   * Arms the watcher on the resolved path (re-arming if the path changed),
+   * or disarms it when the plugin is no longer a local-path install. Called by
+   * the lifecycle mutation routes so runtime install/enable/disable/uninstall
+   * moves the watch even though those operations emit on a different lifecycle
+   * emitter than the one this watcher subscribes to. See PLA-1537.
+   */
+  reconcile(pluginId: string): Promise<void>;
   /** Stop all watchers and clean up. */
   close(): void;
 }
+
+/** Subset of {@link PluginDevWatcher} used to reconcile watch state at runtime. */
+export type PluginWatchReconciler = Pick<PluginDevWatcher, "reconcile">;
 
 export type ResolvePluginPackagePath = (
   pluginId: string,
@@ -162,6 +174,10 @@ export function createPluginDevWatcher(
   fsDeps?: PluginDevWatcherFsDeps,
 ): PluginDevWatcher {
   const watchers = new Map<string, FSWatcher>();
+  // Absolute package path each active watcher is bound to, so a runtime
+  // repoint (soft-uninstall + local reinstall from a new dir) can be detected
+  // and the stale watch torn down rather than silently kept. See PLA-1537.
+  const watchedPaths = new Map<string, string>();
   const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const fileExists = fsDeps?.existsSync ?? existsSync;
   log.info(
@@ -170,10 +186,22 @@ export function createPluginDevWatcher(
   );
 
   function watchPlugin(pluginId: string, packagePath: string): void {
-    // Don't double-watch
-    if (watchers.has(pluginId)) return;
-
     const absPath = path.resolve(packagePath);
+
+    // Re-arm on path change: if we already watch this plugin but the resolved
+    // package path is unchanged, keep the existing watcher (no churn). If the
+    // path changed, tear down the stale watch before rewatching the new path
+    // so touches to the old directory stop firing. See PLA-1537.
+    if (watchers.has(pluginId)) {
+      const currentPath = watchedPaths.get(pluginId);
+      if (currentPath === absPath) return;
+      log.info(
+        { pluginId, previousPath: currentPath, packagePath: absPath },
+        "plugin-dev-watcher: package path changed, re-arming watch",
+      );
+      unwatchPlugin(pluginId);
+    }
+
     if (!fileExists(absPath)) {
       log.warn(
         { pluginId, packagePath: absPath },
@@ -249,6 +277,7 @@ export function createPluginDevWatcher(
       });
 
       watchers.set(pluginId, watcher);
+      watchedPaths.set(pluginId, absPath);
       log.info(
         {
           pluginId,
@@ -275,8 +304,14 @@ export function createPluginDevWatcher(
   function unwatchPlugin(pluginId: string): void {
     const pluginWatcher = watchers.get(pluginId);
     if (pluginWatcher) {
+      const packagePath = watchedPaths.get(pluginId);
       void pluginWatcher.close();
       watchers.delete(pluginId);
+      watchedPaths.delete(pluginId);
+      log.info(
+        { pluginId, packagePath },
+        "plugin-dev-watcher: unwatched local plugin",
+      );
     }
     const timer = debounceTimers.get(pluginId);
     if (timer) {
@@ -326,6 +361,40 @@ export function createPluginDevWatcher(
     }
   }
 
+  async function reconcilePlugin(pluginId: string): Promise<void> {
+    if (!resolvePluginPackagePath) {
+      log.debug(
+        { pluginId },
+        "plugin-dev-watcher: no package path resolver configured, skipping reconcile",
+      );
+      return;
+    }
+
+    let packagePath: string | null | undefined;
+    try {
+      packagePath = await resolvePluginPackagePath(pluginId);
+    } catch (err) {
+      log.warn(
+        {
+          pluginId,
+          err: err instanceof Error ? err.message : String(err),
+        },
+        "plugin-dev-watcher: failed to resolve plugin package path during reconcile",
+      );
+      return;
+    }
+
+    if (!packagePath) {
+      // Plugin is no longer a local-path install (uninstalled, disabled+purged,
+      // or repointed to an npm package): disarm any stale watcher.
+      unwatchPlugin(pluginId);
+      return;
+    }
+
+    // Arms the watcher, or re-arms it when the path changed.
+    watchPlugin(pluginId, packagePath);
+  }
+
   function handlePluginLoaded(payload: { pluginId: string }): void {
     void watchLocalPluginById(payload.pluginId);
   }
@@ -350,6 +419,7 @@ export function createPluginDevWatcher(
   return {
     watch: watchPlugin,
     unwatch: unwatchPlugin,
+    reconcile: reconcilePlugin,
     close,
   };
 }
