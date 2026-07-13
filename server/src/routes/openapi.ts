@@ -52,6 +52,11 @@ import {
   createSecretSchema,
   updateSecretSchema,
   rotateSecretSchema,
+  rotateUserSecretValueSchema,
+  createUserSecretDefinitionSchema,
+  updateUserSecretDefinitionSchema,
+  createUserSecretValueSchema,
+  updateUserSecretValueSchema,
   // Approval
   createApprovalSchema,
   resolveApprovalSchema,
@@ -72,8 +77,15 @@ import {
   workspaceRuntimeControlTargetSchema,
   // Environments
   createEnvironmentSchema,
+  cancelEnvironmentCustomImageSetupSessionSchema,
+  createEnvironmentCustomImageTerminalSessionTokenSchema,
+  environmentCustomImageSetupSessionSchema,
+  environmentCustomImageTerminalSessionTokenSchema,
+  environmentCustomImageTemplateSchema,
+  finishEnvironmentCustomImageSetupSessionSchema,
   updateEnvironmentSchema,
   probeEnvironmentConfigSchema,
+  startEnvironmentCustomImageSetupSessionSchema,
   // Company skills
   companySkillCreateSchema,
   companySkillFileUpdateSchema,
@@ -459,6 +471,93 @@ const refreshExternalObjectsBodySchema = z.object({
   objectIds: z.array(z.string().uuid()).max(50).optional(),
 }).strict();
 
+const environmentCustomImageCompanyQuerySchema = z.object({
+  companyId: z.string().optional(),
+}).strict();
+
+const disableEnvironmentCustomImageTemplateQuerySchema =
+  environmentCustomImageCompanyQuerySchema.extend({
+    deleteProviderTemplate: z.enum(["true", "false"]).optional(),
+  });
+
+const environmentCustomImageOverviewSchema = z.object({
+  activeTemplate: environmentCustomImageTemplateSchema.nullable(),
+  activeSession: environmentCustomImageSetupSessionSchema.nullable(),
+  latestSession: environmentCustomImageSetupSessionSchema.nullable(),
+}).strict();
+
+const environmentCustomImageSetupSessionResultSchema = z.object({
+  session: environmentCustomImageSetupSessionSchema,
+  connectionPayload: z.record(z.string(), z.unknown()).nullable(),
+}).strict();
+
+const environmentCustomImageSetupSessionFinishResultSchema =
+  environmentCustomImageSetupSessionResultSchema.extend({
+    template: environmentCustomImageTemplateSchema,
+  });
+
+const environmentCustomImageTemplateRollbackResultSchema = z.object({
+  activeTemplate: environmentCustomImageTemplateSchema,
+  supersededTemplate: environmentCustomImageTemplateSchema,
+}).strict();
+
+const workTimelineQuerySchema = z.object({
+  from: z.string().optional(),
+  to: z.string().optional(),
+  userId: z.string().optional(),
+  goalId: z.string().uuid().optional(),
+  projectId: z.string().uuid().optional(),
+  issueId: z.string().uuid().optional(),
+  limit: z.string().optional(),
+  offset: z.string().optional(),
+}).strict();
+
+const workTimelineResponseSchema = z.object({
+  actors: z.array(z.object({
+    id: z.string(),
+    type: z.enum(["agent", "user", "system", "plugin"]),
+    name: z.string(),
+    avatar: z.string().nullable().optional(),
+  }).strict()),
+  spans: z.array(z.object({
+    actorId: z.string(),
+    laneHint: z.string().nullable(),
+    runId: z.string(),
+    issueId: z.string(),
+    issueIdentifier: z.string().nullable(),
+    start: z.string(),
+    end: z.string().nullable(),
+    status: z.string(),
+    retryOfRunId: z.string().nullable().optional(),
+    continuationAttempt: z.number().optional(),
+    invocationSource: z.string().nullable().optional(),
+  }).strict()),
+  events: z.array(z.object({
+    actorId: z.string(),
+    kind: z.enum(["created", "commented", "approved", "delegated", "assigned"]),
+    issueId: z.string(),
+    at: z.string(),
+  }).strict()),
+  edges: z.array(z.object({
+    fromActorId: z.string(),
+    toActorId: z.string(),
+    issueId: z.string(),
+    at: z.string(),
+    kind: z.enum(["delegation", "assignment", "mention"]),
+  }).strict()),
+  pagination: z.object({
+    limit: z.number().int().positive(),
+    offset: z.number().int().nonnegative(),
+    totalIssues: z.number().int().nonnegative(),
+    hasMore: z.boolean(),
+  }).strict(),
+  window: z.object({
+    from: z.string(),
+    to: z.string(),
+    capped: z.boolean(),
+  }).strict(),
+}).strict();
+
 function paramsSchemaFromPath(routePath: string): z.ZodObject<z.ZodRawShape> | undefined {
   const names = [...routePath.matchAll(/\{([A-Za-z0-9_]+)\}/g)].map((match) => match[1]);
   if (names.length === 0) return undefined;
@@ -581,6 +680,16 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "DELETE /api/secret-provider-configs/{id}",
   "POST /api/secret-provider-configs/{id}/default",
   "POST /api/secret-provider-configs/{id}/health",
+  "GET /api/companies/{companyId}/user-secret-definitions",
+  "POST /api/companies/{companyId}/user-secret-definitions",
+  "PATCH /api/companies/{companyId}/user-secret-definitions/{definitionId}",
+  "DELETE /api/companies/{companyId}/user-secret-definitions/{definitionId}",
+  "GET /api/companies/{companyId}/user-secret-definitions/{definitionId}/coverage",
+  "GET /api/companies/{companyId}/me/user-secrets",
+  "POST /api/companies/{companyId}/me/user-secrets",
+  "PATCH /api/companies/{companyId}/me/user-secrets/{secretId}",
+  "POST /api/companies/{companyId}/me/user-secrets/{secretId}/rotate",
+  "DELETE /api/companies/{companyId}/me/user-secrets/{secretId}",
   "POST /api/companies/{companyId}/secrets/remote-import",
   "POST /api/companies/{companyId}/secrets/remote-import/preview",
   "GET /api/secrets/{id}/usage",
@@ -621,6 +730,7 @@ const CREATED_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/finance-events",
   "POST /api/companies/{companyId}/secret-provider-configs",
   "POST /api/companies/{companyId}/environments",
+  "POST /api/environments/{environmentId}/custom-image-setup-sessions",
   "POST /api/companies/{companyId}/goals",
   "POST /api/companies/{companyId}/labels",
   "POST /api/issues/{id}/documents/{key}/annotations",
@@ -640,6 +750,8 @@ const CREATED_OPERATIONS = new Set([
   "POST /api/companies/{companyId}/routines",
   "POST /api/routines/{id}/triggers",
   "POST /api/companies/{companyId}/secrets",
+  "POST /api/companies/{companyId}/user-secret-definitions",
+  "POST /api/companies/{companyId}/me/user-secrets",
   "POST /api/companies/{companyId}/skills",
   "POST /api/companies/{companyId}/skills/import",
   "POST /api/join-requests/{requestId}/claim-api-key",
@@ -771,6 +883,37 @@ registry.registerPath({
       deploymentMode: z.string().optional(),
       bootstrapStatus: z.enum(["ready", "bootstrap_pending"]).optional(),
       bootstrapInviteActive: z.boolean().optional(),
+      databaseBackup: z.object({
+        enabled: z.boolean(),
+        status: z.enum(["ok", "warning"]),
+        backupDir: z.string().optional(),
+        maxAgeHours: z.number().optional(),
+        latestBackup: z.object({
+          name: z.string(),
+          path: z.string(),
+          mtime: z.string().datetime(),
+          ageHours: z.number(),
+          sizeBytes: z.number(),
+        }).nullable().optional(),
+        lastFailure: z.object({
+          path: z.string(),
+          mtime: z.string().datetime(),
+          message: z.string(),
+        }).nullable().optional(),
+        warnings: z.array(z.object({
+          code: z.enum([
+            "database_backup_check_failed",
+            "database_backup_last_failure",
+            "database_backup_missing",
+            "database_backup_stale",
+          ]),
+          message: z.string(),
+        })),
+      }).optional(),
+      warnings: z.array(z.object({
+        code: z.string(),
+        message: z.string(),
+      })).optional(),
       serverInfo: z.object({
         processStartedAt: z.string().datetime(),
         git: z.union([
@@ -780,6 +923,19 @@ registry.registerPath({
             shortSha: z.string(),
             subject: z.string(),
             committedAt: z.string().datetime().nullable(),
+            localChanges: z.union([
+              z.object({
+                available: z.literal(true),
+                hasLocalChanges: z.boolean(),
+                stagedFileCount: z.number().int().nonnegative(),
+                unstagedFileCount: z.number().int().nonnegative(),
+                untrackedFileCount: z.number().int().nonnegative(),
+              }).strict(),
+              z.object({
+                available: z.literal(false),
+                unavailableReason: z.enum(["git_status_unavailable"]),
+              }).strict(),
+            ]),
           }).strict(),
           z.object({
             available: z.literal(false),
@@ -855,6 +1011,23 @@ registry.registerPath({
       },
     },
     401: r.unauthorized,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/timeline",
+  tags: ["companies"],
+  summary: "Get company work timeline",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: workTimelineQuerySchema,
+  },
+  responses: {
+    200: r.ok(workTimelineResponseSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
   },
 });
 
@@ -2132,6 +2305,111 @@ registry.registerPath({
   summary: "Delete a secret",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/user-secret-definitions",
+  tags: ["secrets"],
+  summary: "List user secret definitions",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/user-secret-definitions",
+  tags: ["secrets"],
+  summary: "Create a user secret definition",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(createUserSecretDefinitionSchema),
+  },
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "patch",
+  path: "/api/companies/{companyId}/user-secret-definitions/{definitionId}",
+  tags: ["secrets"],
+  summary: "Update a user secret definition",
+  request: {
+    params: z.object({ companyId: z.string(), definitionId: z.string() }),
+    body: jsonBody(updateUserSecretDefinitionSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/companies/{companyId}/user-secret-definitions/{definitionId}",
+  tags: ["secrets"],
+  summary: "Delete a user secret definition",
+  request: { params: z.object({ companyId: z.string(), definitionId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/user-secret-definitions/{definitionId}/coverage",
+  tags: ["secrets"],
+  summary: "Get user secret definition coverage",
+  request: { params: z.object({ companyId: z.string(), definitionId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/me/user-secrets",
+  tags: ["secrets"],
+  summary: "List my user secret values",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/me/user-secrets",
+  tags: ["secrets"],
+  summary: "Create my user secret value",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(createUserSecretValueSchema),
+  },
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "patch",
+  path: "/api/companies/{companyId}/me/user-secrets/{secretId}",
+  tags: ["secrets"],
+  summary: "Update my user secret value",
+  request: {
+    params: z.object({ companyId: z.string(), secretId: z.string() }),
+    body: jsonBody(updateUserSecretValueSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/me/user-secrets/{secretId}/rotate",
+  tags: ["secrets"],
+  summary: "Rotate my user secret value",
+  request: {
+    params: z.object({ companyId: z.string(), secretId: z.string() }),
+    body: jsonBody(rotateUserSecretValueSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/companies/{companyId}/me/user-secrets/{secretId}",
+  tags: ["secrets"],
+  summary: "Delete my user secret value",
+  request: { params: z.object({ companyId: z.string(), secretId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
 });
 
 // ─── Approvals ───────────────────────────────────────────────────────────────
@@ -3474,6 +3752,142 @@ registry.registerPath({
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
+registry.registerPath({
+  method: "get",
+  path: "/api/environments/{environmentId}/custom-image-template",
+  tags: ["environments"],
+  summary: "Get the active customImage template and setup status for an environment",
+  request: {
+    params: z.object({ environmentId: z.string() }),
+    query: environmentCustomImageCompanyQuerySchema,
+  },
+  responses: { 200: r.ok(environmentCustomImageOverviewSchema), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/environments/{environmentId}/custom-image-setup-sessions",
+  tags: ["environments"],
+  summary: "Start an interactive environment customImage setup session",
+  request: {
+    params: z.object({ environmentId: z.string() }),
+    query: environmentCustomImageCompanyQuerySchema,
+    body: jsonBody(startEnvironmentCustomImageSetupSessionSchema),
+  },
+  responses: {
+    201: r.ok(environmentCustomImageSetupSessionResultSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/environment-custom-image-setup-sessions/{sessionId}",
+  tags: ["environments"],
+  summary: "Get and refresh an environment customImage setup session",
+  request: { params: z.object({ sessionId: z.string() }) },
+  responses: {
+    200: r.ok(environmentCustomImageSetupSessionResultSchema),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/environment-custom-image-setup-sessions/{sessionId}/terminal-session-token",
+  tags: ["environments"],
+  summary: "Mint a short-lived terminal websocket token for a customImage SSH setup session",
+  request: {
+    params: z.object({ sessionId: z.string() }),
+    body: jsonBody(createEnvironmentCustomImageTerminalSessionTokenSchema),
+  },
+  responses: {
+    201: r.ok(environmentCustomImageTerminalSessionTokenSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/environment-custom-image-setup-sessions/{sessionId}/finish",
+  tags: ["environments"],
+  summary: "Capture and promote an environment customImage setup session",
+  request: {
+    params: z.object({ sessionId: z.string() }),
+    body: jsonBody(finishEnvironmentCustomImageSetupSessionSchema),
+  },
+  responses: {
+    200: r.ok(environmentCustomImageSetupSessionFinishResultSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/environment-custom-image-setup-sessions/{sessionId}/cancel",
+  tags: ["environments"],
+  summary: "Cancel an environment customImage setup session",
+  request: {
+    params: z.object({ sessionId: z.string() }),
+    body: jsonBody(cancelEnvironmentCustomImageSetupSessionSchema),
+  },
+  responses: {
+    200: r.ok(environmentCustomImageSetupSessionSchema),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/environments/{environmentId}/custom-image-template/rollback",
+  tags: ["environments"],
+  summary: "Roll back an environment customImage template to the previous captured template",
+  request: {
+    params: z.object({ environmentId: z.string() }),
+    query: environmentCustomImageCompanyQuerySchema,
+  },
+  responses: {
+    200: r.ok(environmentCustomImageTemplateRollbackResultSchema),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/environments/{environmentId}/custom-image-template",
+  tags: ["environments"],
+  summary: "Disable the active environment customImage template",
+  request: {
+    params: z.object({ environmentId: z.string() }),
+    query: disableEnvironmentCustomImageTemplateQuerySchema,
+  },
+  responses: {
+    200: r.ok(environmentCustomImageTemplateSchema),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
+});
+
 // ─── Adapters (full) ──────────────────────────────────────────────────────────
 
 registry.registerPath({
@@ -4600,6 +5014,27 @@ registerCurrentRoute({
   tags: ["routines"],
   summary: "Update a routine description annotation thread",
   body: updateDocumentAnnotationThreadSchema,
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/issues/{id}/diagnostics/blockers",
+  tags: ["issues"],
+  summary: "Get blocker diagnostics for an issue",
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/issues/{id}/diagnostics/wakes",
+  tags: ["issues"],
+  summary: "Get wake diagnostics for an issue",
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/issues/{id}/diagnostics/subtree",
+  tags: ["issues"],
+  summary: "Get bounded subtree wake and blocker diagnostics for an issue",
 });
 
 registerCurrentRoute({

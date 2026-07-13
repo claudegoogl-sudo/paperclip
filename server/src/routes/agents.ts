@@ -7,6 +7,7 @@ import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
 import {
   agentSkillSyncSchema,
   agentMineInboxQuerySchema,
+  ADAPTER_AGNOSTIC_KEYS,
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
   createAgentKeySchema,
   createAgentHireSchema,
@@ -68,6 +69,7 @@ import type {
 } from "@paperclipai/adapter-utils";
 import { skillVersionSelectionMap } from "../services/runtime-skill-selections.js";
 import { secretService } from "../services/secrets.js";
+import { authorizationDeniedDetails } from "../services/authorization.js";
 import {
   detectAdapterModel,
   findActiveServerAdapter,
@@ -169,6 +171,7 @@ export function agentRoutes(
     "instructionsFilePath",
     "agentsMdPath",
   ] as const;
+  const KNOWN_INSTRUCTIONS_BUNDLE_KEY_SET: ReadonlySet<string> = new Set(KNOWN_INSTRUCTIONS_BUNDLE_KEYS);
 
   const router = Router();
   const svc = agentService(db);
@@ -362,6 +365,11 @@ export function agentRoutes(
         issueId: null,
         heartbeatRunId: null,
         persistedExecutionWorkspace: null,
+        // Apply the active custom-image template so the Test boots with the
+        // operator's captured sandbox customizations and prepared image state,
+        // matching what real agent runs use. Without this the test would
+        // silently fall back to the base image.
+        applyCustomImageTemplate: true,
       });
     } catch (err) {
       return {
@@ -661,7 +669,7 @@ export function agentRoutes(
       resource: { type: "company", companyId },
     });
     if (!decision.allowed) {
-      throw forbidden(decision.explanation);
+      throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
     }
     if (req.actor.type !== "agent") return null;
     const actorAgent = req.actor.agentId ? await svc.getById(req.actor.agentId) : null;
@@ -680,7 +688,7 @@ export function agentRoutes(
       resource: { type: "company", companyId },
     });
     if (decision.allowed) return;
-    throw forbidden(decision.explanation);
+    throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
   }
 
   async function assertCanReadConfigurations(req: Request, companyId: string) {
@@ -828,7 +836,7 @@ export function agentRoutes(
       resource: { type: "agent", companyId: targetAgent.companyId, agentId: targetAgent.id },
     });
     if (decision.allowed) return;
-    throw forbidden(decision.explanation);
+    throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
   }
 
   async function assertCanReadAgent(req: Request, targetAgent: { companyId: string }) {
@@ -2865,11 +2873,8 @@ export function agentRoutes(
         // Preserve adapter-agnostic keys (env, cwd, etc.) from the existing config
         // when the adapter type changes. Without this, a PATCH that includes
         // adapterConfig but omits these keys would silently drop them.
-        const ADAPTER_AGNOSTIC_KEYS = [
-          "env", "cwd", "timeoutSec", "graceSec",
-          "promptTemplate", "bootstrapPromptTemplate",
-        ] as const;
         for (const key of ADAPTER_AGNOSTIC_KEYS) {
+          if (KNOWN_INSTRUCTIONS_BUNDLE_KEY_SET.has(key)) continue;
           if (rawEffectiveAdapterConfig[key] === undefined && existingAdapterConfig[key] !== undefined) {
             rawEffectiveAdapterConfig = { ...rawEffectiveAdapterConfig, [key]: existingAdapterConfig[key] };
           }
@@ -3200,7 +3205,9 @@ export function agentRoutes(
     if (!agent) {
       return;
     }
-    const key = await svc.createApiKey(id, req.body.name, req.body.scope);
+    const key = await svc.createApiKey(id, req.body.name, req.body.scope, {
+      responsibleUserId: req.actor.userId ?? null,
+    });
 
     await logActivity(db, {
       companyId: agent.companyId,
@@ -3209,7 +3216,12 @@ export function agentRoutes(
       action: "agent.key_created",
       entityType: "agent",
       entityId: agent.id,
-      details: { keyId: key.id, name: key.name, scope: key.scope },
+      details: {
+        keyId: key.id,
+        name: key.name,
+        scope: key.scope,
+        responsibleUserId: key.responsibleUserId,
+      },
     });
 
     res.status(201).json(key);
