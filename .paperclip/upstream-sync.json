@@ -1,10 +1,10 @@
 {
-  "lastSyncedTag": "v2026.626.0",
-  "lastSyncedSha": "4c6c0c6ad048838dda4a67e1aca43aa37a6fcf0d",
-  "lastSyncedAt": "2026-07-06T00:00:00Z",
-  "etag": "\"3268e2333bcdac12b54b05ff89a75a7eab50abe7cde40e6921ae4055169b38cd\"",
-  "lastCheckedAt": "2026-07-06T00:00:00Z",
+  "lastSyncedTag": "v2026.707.0",
+  "lastSyncedSha": "390627b46eb333309d357004384b220ecf8a65af",
+  "lastSyncedAt": "2026-07-13T00:00:00Z",
+  "etag": "W/\"385a9c2e30ab8fe833bae7f43069f404728bf0c011d3b0ba40ab327e43b2d960\"",
+  "lastCheckedAt": "2026-07-13T00:00:00Z",
   "pendingPrUrl": null,
-  "lastConflictBuckets": { "clean": 0, "reviewable": 0, "escalation": 0 },
-  "_syncNote": "v2026.626.0 cursor reconcile (PLA-1515). Upstream release v2026.626.0 (tag commit 4c6c0c6ad048838dda4a67e1aca43aa37a6fcf0d) was ALREADY merged into fork master out-of-band via PLA-1370 (merge commit 3a5f68d4c 'merge upstream/v2026.626.0 into sync/upstream-v2026.626.0'; branch head 1d024a1d, both are ancestors of origin/master). The weekly sync routine's state cursor was never advanced from v2026.618.0, so `node scripts/upstream-sync.mjs` no-oped every tick via the remoteBranchExists guard ('remote branch sync/upstream-v2026.626.0 exists but no open PR; leaving as-is for manual review'). This commit reconciles the durable cursor to reality so future ticks 304/no-op instead of re-flagging an already-landed sync. No content merge here — purely bookkeeping (mirrors 9f3a7799f/281dbdd37/c4f695194 post-merge cursor advances). Host release for v2026.626.0 already cut (fork.1..fork.7 line, PLA-1373 et al.), so the downstream host-release obligation is satisfied. lastSyncedSha pins the UPSTREAM tag commit per the established marker convention; the fork-master merge is 3a5f68d4c. etag captured from paperclipai/paperclip releases/latest at 2026-07-06 (strong validator). Supersedes v2026.618.0 (_syncNote from PLA-1270/PR #89)."
+  "lastConflictBuckets": { "clean": 0, "reviewable": 5, "escalation": 2 },
+  "_syncNote": "v2026.707.0 cursor advance (PLA-1615). Upstream release v2026.707.0 (tag commit 390627b46eb333309d357004384b220ecf8a65af, published 2026-07-07) was merged into fork master via PR #102 (sync/upstream-v2026.707.0 -> master; fork-master merge commit d532a15c5, containing the --no-ff upstream sync commit 81160bd24160fa955231d3bffc3251231c58d2c7). Conflict resolution (PLA-1616, Coder): 7 files, 5 reviewable keep-both (CONTRIBUTING.md, packages/db schema index, error-handler.ts+test, server-startup-feedback-export test) + 2 escalation (migration-index collision renumbered fork 0125-0128 -> 0136-0139 above upstream's 0135; recovery/service.ts SEMANTIC merge combining descendant-subtree membership AND optional agentId scope). Review gates cleared: PLA-1617 SecurityEngineer APPROVE (error-handler redaction/denial path), PLA-1618 QA PASS (recovery re-wake soak). CI 15/15 green on PR #102. This commit advances the durable cursor so future ticks 304/no-op instead of re-flagging the already-landed sync (mirrors 710786a10/9f3a7799f/281dbdd37 post-merge cursor advances). lastSyncedSha pins the UPSTREAM tag commit per the established marker convention (fork-master merge is d532a15c5). etag captured from paperclipai/paperclip releases/latest at 2026-07-13 (weak validator). Host release for v2026.707.0 is a SEPARATE downstream obligation (PLA-1614 standing operator policy) tracked via the host-release-cut child of PLA-1615; live host still at 2026.626.0-fork.8 until that lands. Supersedes v2026.626.0 (_syncNote from PLA-1515)."
 }
