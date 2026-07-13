@@ -12,8 +12,14 @@ const loggerMock = vi.hoisted(() => ({
   }),
 }));
 
+const recordResponsibleUserDenialOnActiveRunMock = vi.hoisted(() => vi.fn());
+
 vi.mock("../middleware/logger.js", () => ({
   logger: loggerMock,
+}));
+
+vi.mock("../services/responsible-user-denial-run-outcomes.js", () => ({
+  recordResponsibleUserDenialOnActiveRun: recordResponsibleUserDenialOnActiveRunMock,
 }));
 
 const { errorHandler } = await import("../middleware/error-handler.js");
@@ -45,6 +51,8 @@ describe("errorHandler", () => {
     loggerMock.info.mockClear();
     loggerMock.error.mockClear();
     loggerMock.debug.mockClear();
+    recordResponsibleUserDenialOnActiveRunMock.mockReset();
+    recordResponsibleUserDenialOnActiveRunMock.mockResolvedValue(null);
   });
 
   it("attaches the original Error to res.err for 500s", () => {
@@ -178,5 +186,40 @@ describe("errorHandler", () => {
     expect(res.json).toHaveBeenCalledWith({ error: "Internal server error" });
     expect(res.err).toBe(err);
     expect(res.__errorContext?.error?.message).toBe("upstream blew up");
+  });
+
+  it("records responsible-user denial codes on the active agent run", () => {
+    const db = { marker: "db" };
+    const req = {
+      ...makeReq(),
+      app: { locals: { paperclipDb: db } },
+      actor: {
+        type: "agent",
+        agentId: "agent-1",
+        companyId: "company-1",
+        runId: "run-1",
+        source: "agent_jwt",
+      },
+    } as unknown as Request;
+    const res = makeRes();
+    const next = vi.fn() as unknown as NextFunction;
+    const err = new HttpError(403, "Responsible user is not authorized", {
+      code: "RESPONSIBLE_USER_UNAUTHORIZED",
+    });
+
+    errorHandler(err, req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(res.json).toHaveBeenCalledWith({
+      error: "Responsible user is not authorized",
+      code: "RESPONSIBLE_USER_UNAUTHORIZED",
+      details: { code: "RESPONSIBLE_USER_UNAUTHORIZED" },
+    });
+    expect(recordResponsibleUserDenialOnActiveRunMock).toHaveBeenCalledWith(db, {
+      runId: "run-1",
+      agentId: "agent-1",
+      companyId: "company-1",
+      code: "RESPONSIBLE_USER_UNAUTHORIZED",
+    });
   });
 });

@@ -97,7 +97,7 @@ describeEmbeddedPostgres("activity_log.run_id ON DELETE SET NULL", () => {
       await applyPendingMigrations(connectionString);
 
       const migrationSql = await readFile(
-        new URL("./migrations/0125_activity_log_run_id_set_null.sql", import.meta.url),
+        new URL("./migrations/0136_activity_log_run_id_set_null.sql", import.meta.url),
         "utf8",
       );
 

@@ -110,6 +110,10 @@ CI is required to be green, but the `e2e` job in particular can occasionally fai
 2. **If the same step fails twice in a row, treat it as a real failure** — investigate before merging, even if the logs look "infra-shaped". File a follow-up issue rather than retrying a third time.
 3. **Never disable a check to land a PR.** If a check is genuinely useless, remove it in its own PR with justification.
 
+### Telemetry Changes
+
+If your change adds, removes, or modifies emitted telemetry events, update the [Telemetry Data Contract](packages/shared/src/telemetry/README.md) in the same PR. Keep clients emitting raw dimension values and avoid documenting or relying on private delivery details.
+
 ### Paperclip Gates Must Pass
 
 All Paperclip CI gates (lint, typecheck, tests, build, and any other required checks) must be satisfied before a PR can be merged. Don't ask for a merge while gates are red — fix them first.

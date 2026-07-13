@@ -33,16 +33,19 @@ import detectPort from "detect-port";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
+import { setupEnvironmentCustomImageTerminalWebSocketServer } from "./realtime/environment-custom-image-terminal-ws.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
 import {
   feedbackService,
   backfillPrincipalAccessCompatibility,
   bootstrapExecutionPolicyFromEnv,
+  environmentCustomImageService,
   heartbeatService,
   instanceSettingsService,
   reconcileCloudUpstreamRunsOnStartup,
   reconcileCodexLocalManagedHomesOnStartup,
   reconcilePersistedRuntimeServicesOnStartup,
+  resolveHeartbeatSchedulingSuppression,
   routineService,
 } from "./services/index.js";
 import {
@@ -116,25 +119,25 @@ export async function startServer(): Promise<StartedServer> {
   if (process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE === undefined) {
     process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = config.secretsMasterKeyFilePath;
   }
-  
+
   type MigrationSummary =
     | "skipped"
     | "already applied"
     | "applied (empty database)"
     | "applied (pending migrations)";
-  
+
   function formatPendingMigrationSummary(migrations: string[]): string {
     if (migrations.length === 0) return "none";
     return migrations.length > 3
       ? `${migrations.slice(0, 3).join(", ")} (+${migrations.length - 3} more)`
       : migrations.join(", ");
   }
-  
+
   async function promptApplyMigrations(migrations: string[]): Promise<boolean> {
     if (process.env.PAPERCLIP_MIGRATION_AUTO_APPLY === "true") return true;
     if (process.env.PAPERCLIP_MIGRATION_PROMPT === "never") return false;
     if (!stdin.isTTY || !stdout.isTTY) return true;
-  
+
     const prompt = createInterface({ input: stdin, output: stdout });
     try {
       const answer = (await prompt.question(
@@ -145,11 +148,11 @@ export async function startServer(): Promise<StartedServer> {
       prompt.close();
     }
   }
-  
+
   type EnsureMigrationsOptions = {
     autoApply?: boolean;
   };
-  
+
   async function ensureMigrations(
     connectionString: string,
     label: string,
@@ -181,12 +184,12 @@ export async function startServer(): Promise<StartedServer> {
             "Refusing to start against a stale schema. Run pnpm db:migrate or set PAPERCLIP_MIGRATION_AUTO_APPLY=true.",
         );
       }
-  
+
       logger.info({ pendingMigrations: state.pendingMigrations }, `Applying ${state.pendingMigrations.length} pending migrations for ${label}`);
       await applyPendingMigrations(connectionString);
       return "applied (pending migrations)";
     }
-  
+
     const apply = autoApply ? true : await promptApplyMigrations(state.pendingMigrations);
     if (!apply) {
       throw new Error(
@@ -194,12 +197,12 @@ export async function startServer(): Promise<StartedServer> {
           "Refusing to start against a stale schema. Run pnpm db:migrate or set PAPERCLIP_MIGRATION_AUTO_APPLY=true.",
       );
     }
-  
+
     logger.info({ pendingMigrations: state.pendingMigrations }, `Applying ${state.pendingMigrations.length} pending migrations for ${label}`);
     await applyPendingMigrations(connectionString);
     return "applied (pending migrations)";
   }
-  
+
   function isLoopbackHost(host: string): boolean {
     const normalized = host.trim().toLowerCase();
     return normalized === "127.0.0.1" || normalized === "localhost" || normalized === "::1";
@@ -251,11 +254,11 @@ export async function startServer(): Promise<StartedServer> {
       return rawUrl;
     }
   }
-  
+
   const LOCAL_BOARD_USER_ID = "local-board";
   const LOCAL_BOARD_USER_EMAIL = "local@paperclip.local";
   const LOCAL_BOARD_USER_NAME = "Board";
-  
+
   async function ensureLocalTrustedBoardPrincipal(db: any): Promise<void> {
     const now = new Date();
     const existingUser = await db
@@ -263,7 +266,7 @@ export async function startServer(): Promise<StartedServer> {
       .from(authUsers)
       .where(eq(authUsers.id, LOCAL_BOARD_USER_ID))
       .then((rows: Array<{ id: string }>) => rows[0] ?? null);
-  
+
     if (!existingUser) {
       await db.insert(authUsers).values({
         id: LOCAL_BOARD_USER_ID,
@@ -275,7 +278,7 @@ export async function startServer(): Promise<StartedServer> {
         updatedAt: now,
       });
     }
-  
+
     const role = await db
       .select({ id: instanceUserRoles.id })
       .from(instanceUserRoles)
@@ -287,7 +290,7 @@ export async function startServer(): Promise<StartedServer> {
         role: "instance_admin",
       });
     }
-  
+
     const companyRows = await db.select({ id: companies.id }).from(companies);
     for (const company of companyRows) {
       const membership = await db
@@ -311,7 +314,7 @@ export async function startServer(): Promise<StartedServer> {
       });
     }
   }
-  
+
   let db;
   let pluginMigrationDb;
   let embeddedPostgres: EmbeddedPostgresInstance | null = null;
@@ -326,7 +329,7 @@ export async function startServer(): Promise<StartedServer> {
   if (config.databaseUrl) {
     const migrationUrl = config.databaseMigrationUrl ?? config.databaseUrl;
     migrationSummary = await ensureMigrations(migrationUrl, "PostgreSQL");
-  
+
     db = createDb(config.databaseUrl);
     pluginMigrationDb = config.databaseMigrationUrl ? createDb(config.databaseMigrationUrl) : db;
     logger.info("Using external PostgreSQL via DATABASE_URL/config");
@@ -344,7 +347,7 @@ export async function startServer(): Promise<StartedServer> {
       );
     }
     await prepareEmbeddedPostgresNativeRuntime();
-  
+
     const dataDir = resolve(config.embeddedPostgresDataDir);
     const configuredPort = config.embeddedPostgresPort;
     let port = configuredPort;
@@ -379,11 +382,11 @@ export async function startServer(): Promise<StartedServer> {
         );
       }
     };
-  
+
     if (config.databaseMode === "postgres") {
       logger.warn("Database mode is postgres but no connection string was set; falling back to embedded PostgreSQL");
     }
-  
+
     const clusterVersionFile = resolve(dataDir, "PG_VERSION");
     const clusterAlreadyInitialized = existsSync(clusterVersionFile);
     const postmasterPidFile = resolve(dataDir, "postmaster.pid");
@@ -395,7 +398,7 @@ export async function startServer(): Promise<StartedServer> {
         return false;
       }
     };
-  
+
     const getRunningPid = (): number | null => {
       if (!existsSync(postmasterPidFile)) return null;
       try {
@@ -408,7 +411,7 @@ export async function startServer(): Promise<StartedServer> {
         return null;
       }
     };
-  
+
     const runningPid = getRunningPid();
     if (runningPid) {
       logger.warn(`Embedded PostgreSQL already running; reusing existing process (pid=${runningPid}, port=${port})`);
@@ -474,13 +477,13 @@ export async function startServer(): Promise<StartedServer> {
         embeddedPostgresStartedByThisProcess = true;
       }
     }
-  
+
     const embeddedAdminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/postgres`;
     const dbStatus = await ensurePostgresDatabase(embeddedAdminConnectionString, "paperclip");
     if (dbStatus === "created") {
       logger.info("Created embedded PostgreSQL database: paperclip");
     }
-  
+
     const embeddedConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`;
     const shouldAutoApplyFirstRunMigrations = !clusterAlreadyInitialized || dbStatus === "created";
     if (shouldAutoApplyFirstRunMigrations) {
@@ -489,7 +492,7 @@ export async function startServer(): Promise<StartedServer> {
     migrationSummary = await ensureMigrations(embeddedConnectionString, "Embedded PostgreSQL", {
       autoApply: shouldAutoApplyFirstRunMigrations,
     });
-  
+
     db = createDb(embeddedConnectionString);
     pluginMigrationDb = db;
     logger.info("Embedded PostgreSQL ready");
@@ -497,18 +500,18 @@ export async function startServer(): Promise<StartedServer> {
     resolvedEmbeddedPostgresPort = port;
     startupDbInfo = { mode: "embedded-postgres", dataDir, port };
   }
-  
+
   if (config.deploymentMode === "local_trusted" && !isLoopbackHost(config.host)) {
     throw new Error(
       `local_trusted mode requires loopback host binding (received: ${config.host}). ` +
         "Use authenticated mode for non-loopback deployments.",
     );
   }
-  
+
   if (config.deploymentMode === "local_trusted" && config.deploymentExposure !== "private") {
     throw new Error("local_trusted mode only supports private exposure");
   }
-  
+
   if (config.deploymentMode === "authenticated") {
     if (config.authBaseUrlMode === "explicit" && !config.authPublicBaseUrl) {
       throw new Error("auth.baseUrlMode=explicit requires auth.publicBaseUrl");
@@ -528,7 +531,7 @@ export async function startServer(): Promise<StartedServer> {
   if (config.authBaseUrlMode === "explicit" && config.authPublicBaseUrl) {
     config.authPublicBaseUrl = rewriteLocalUrlPort(config.authPublicBaseUrl, listenPort);
   }
-  
+
   let authReady = config.deploymentMode === "local_trusted";
   let betterAuthHandler: RequestHandler | undefined;
   let resolveSession:
@@ -591,6 +594,19 @@ export async function startServer(): Promise<StartedServer> {
     shareClient: createFeedbackTraceShareClientFromConfig(config),
   });
   const backupSettingsSvc = instanceSettingsService(db);
+  const databaseBackupMaxAgeHours = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_DB_BACKUP_MAX_AGE_HOURS) ||
+      Math.max(26, Math.ceil((config.databaseBackupIntervalMinutes / 60) * 2)),
+  );
+  const databaseBackupAlertFile =
+    process.env.PAPERCLIP_DB_BACKUP_ALERT_FILE ||
+    resolve(config.databaseBackupDir, "..", "health", "db-backup-to-s3.failure");
+  const databaseBackupAlertFiles = [
+    databaseBackupAlertFile,
+    resolve(config.databaseBackupDir, "db-backup-to-s3.failure"),
+    resolve(config.databaseBackupDir, "..", "db-backup-to-s3.failure"),
+  ];
   let databaseBackupInFlight = false;
   const runServerDatabaseBackup = async (
     trigger: InstanceDatabaseBackupTrigger,
@@ -675,6 +691,15 @@ export async function startServer(): Promise<StartedServer> {
         return result;
       },
     },
+    databaseBackupHealth: config.databaseBackupEnabled
+      ? {
+          enabled: config.databaseBackupEnabled,
+          backupDir: config.databaseBackupDir,
+          maxAgeHours: databaseBackupMaxAgeHours,
+          alertFile: databaseBackupAlertFile,
+          alertFiles: databaseBackupAlertFiles,
+        }
+      : undefined,
     deploymentMode: config.deploymentMode,
     deploymentExposure: config.deploymentExposure,
     allowedHostnames: config.allowedHostnames,
@@ -698,11 +723,11 @@ export async function startServer(): Promise<StartedServer> {
   // This prevents intermittent 502/ECONNRESET errors caused by Node's 5s default.
   server.keepAliveTimeout = 185000;
   server.headersTimeout = 186000;
-  
+
   if (listenPort !== requestedListenPort) {
     logger.warn(`Requested port is busy; using next free port (requestedPort=${requestedListenPort}, selectedPort=${listenPort})`);
   }
-  
+
   const runtimeListenHost = config.host;
   const runtimeApiUrl = choosePrimaryRuntimeApiUrl({
     authPublicBaseUrl: config.authPublicBaseUrl ?? null,
@@ -723,7 +748,10 @@ export async function startServer(): Promise<StartedServer> {
   process.env.PAPERCLIP_RUNTIME_API_URL = runtimeApiUrl;
   process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON = JSON.stringify(runtimeApiCandidates);
   process.env.PAPERCLIP_API_URL = configuredApiUrl;
-  
+
+  setupEnvironmentCustomImageTerminalWebSocketServer(server, db as any, {
+    pluginWorkerManager,
+  });
   setupLiveEventsWebSocketServer(server, db as any, {
     deploymentMode: config.deploymentMode,
     resolveSessionFromHeaders,
@@ -800,81 +828,95 @@ export async function startServer(): Promise<StartedServer> {
 
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
+    const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
     const routines = routineService(db as any, { pluginWorkerManager });
+    const heartbeatSchedulingSuppression = resolveHeartbeatSchedulingSuppression();
 
     // Reap orphaned runs before timer ticks start so wakeups cannot coalesce
     // into a dead "running" row during startup recovery.
-    await (async () => {
-      for (let attempt = 1; attempt <= 2; attempt++) {
-        try {
-          const result = await heartbeat.reapOrphanedRuns();
-          logger.info(
-            { reaped: result.reaped, runIds: result.runIds },
-            "startup reap of orphaned heartbeat runs complete",
-          );
-          break;
-        } catch (err) {
-          if (attempt < 2) {
-            logger.warn({ err, attempt }, "startup reap failed, retrying");
-          } else {
-            logger.error(
-              { err },
-              "startup reap of orphaned heartbeat runs failed after retry — periodic reaper will serve as degraded backstop",
+    if (heartbeatSchedulingSuppression.suppressed) {
+      logger.warn(
+        { reason: heartbeatSchedulingSuppression.reason },
+        "heartbeat scheduling suppressed for this runtime instance",
+      );
+    } else {
+      await (async () => {
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          try {
+            const result = await heartbeat.reapOrphanedRuns();
+            logger.info(
+              { reaped: result.reaped, runIds: result.runIds },
+              "startup reap of orphaned heartbeat runs complete",
             );
+            break;
+          } catch (err) {
+            if (attempt < 2) {
+              logger.warn({ err, attempt }, "startup reap failed, retrying");
+            } else {
+              logger.error(
+                { err },
+                "startup reap of orphaned heartbeat runs failed after retry — periodic reaper will serve as degraded backstop",
+              );
+            }
           }
         }
-      }
 
-      const promotion = await heartbeat.promoteDueScheduledRetries();
-      await heartbeat.resumeQueuedRuns();
-      const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
-      if (
-        promotion.promoted > 0 ||
-        reconciled.assignmentDispatched > 0 ||
-        reconciled.dispatchRequeued > 0 ||
-        reconciled.continuationRequeued > 0 ||
-        reconciled.successfulRunHandoffEscalated > 0 ||
-        reconciled.escalated > 0
-      ) {
-        logger.warn(
-          { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
-          "startup heartbeat recovery changed assigned issue state",
-        );
-      }
+        const promotion = await heartbeat.promoteDueScheduledRetries();
+        await heartbeat.resumeQueuedRuns();
+        const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
+        if (
+          promotion.promoted > 0 ||
+          reconciled.assignmentDispatched > 0 ||
+          reconciled.dispatchRequeued > 0 ||
+          reconciled.continuationRequeued > 0 ||
+          reconciled.successfulRunHandoffEscalated > 0 ||
+          reconciled.escalated > 0
+        ) {
+          logger.warn(
+            { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
+            "startup heartbeat recovery changed assigned issue state",
+          );
+        }
 
-      const issueGraphReconciled = await heartbeat.reconcileIssueGraphLiveness();
-      if (issueGraphReconciled.escalationsCreated > 0) {
-        logger.warn(
-          { ...issueGraphReconciled },
-          "startup issue-graph liveness reconciliation created escalations",
-        );
-      }
+        const issueGraphReconciled = await heartbeat.reconcileIssueGraphLiveness();
+        if (issueGraphReconciled.escalationsCreated > 0 || issueGraphReconciled.dependencyWakesHealed > 0) {
+          logger.warn(
+            { ...issueGraphReconciled },
+            "startup issue-graph liveness reconciliation changed issue graph state",
+          );
+        }
 
-      const taskWatchdogsReconciled = await heartbeat.reconcileTaskWatchdogs();
-      if (taskWatchdogsReconciled.triggered > 0) {
-        logger.warn(
-          { ...taskWatchdogsReconciled },
-          "startup task-watchdog reconciliation triggered watchdog work",
-        );
-      }
+        const taskWatchdogsReconciled = await heartbeat.reconcileTaskWatchdogs();
+        if (taskWatchdogsReconciled.triggered > 0) {
+          logger.warn(
+            { ...taskWatchdogsReconciled },
+            "startup task-watchdog reconciliation triggered watchdog work",
+          );
+        }
 
-      const scanned = await heartbeat.scanSilentActiveRuns();
-      if (scanned.created > 0 || scanned.escalated > 0) {
-        logger.warn({ ...scanned }, "startup active-run output watchdog created review work");
-      }
+        const scanned = await heartbeat.scanSilentActiveRuns();
+        if (scanned.created > 0 || scanned.escalated > 0) {
+          logger.warn({ ...scanned }, "startup active-run output watchdog created review work");
+        }
 
-      const swept = await heartbeat.sweepStaleIssueLocks();
-      if (swept.cleared > 0) {
-        logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
-      }
+        const swept = await heartbeat.sweepStaleIssueLocks();
+        if (swept.cleared > 0) {
+          logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
+        }
 
-      const reviewed = await heartbeat.reconcileProductivityReviews();
-      if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
-        logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
-      }
-    })().catch((err) => {
-      logger.error({ err }, "startup heartbeat recovery failed");
-    });
+        const reviewed = await heartbeat.reconcileProductivityReviews();
+        if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
+          logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
+        }
+      })().catch((err) => {
+        logger.error({ err }, "startup heartbeat recovery failed");
+      });
+    }
+
+    const setupCleanup = await environmentCustomImages.cleanupExpiredSetupSessions();
+    if (setupCleanup.timedOut > 0 || setupCleanup.failed > 0) {
+      logger.warn({ ...setupCleanup }, "startup environment customImage setup cleanup changed sessions");
+    }
 
     setInterval(() => {
       const sweptRuntimeStatuses = heartbeat.sweepExpiredRuntimeStatuses();
@@ -885,16 +927,18 @@ export async function startServer(): Promise<StartedServer> {
         );
       }
 
-      void heartbeat
-        .tickTimers(new Date())
-        .then((result) => {
-          if (result.enqueued > 0) {
-            logger.info({ ...result }, "heartbeat timer tick enqueued runs");
-          }
-        })
-        .catch((err) => {
-          logger.error({ err }, "heartbeat timer tick failed");
-        });
+      if (!resolveHeartbeatSchedulingSuppression().suppressed) {
+        void heartbeat
+          .tickTimers(new Date())
+          .then((result) => {
+            if (result.enqueued > 0) {
+              logger.info({ ...result }, "heartbeat timer tick enqueued runs");
+            }
+          })
+          .catch((err) => {
+            logger.error({ err }, "heartbeat timer tick failed");
+          });
+      }
 
       void routines
         .tickScheduledTriggers(new Date())
@@ -906,65 +950,78 @@ export async function startServer(): Promise<StartedServer> {
         .catch((err) => {
           logger.error({ err }, "routine scheduler tick failed");
         });
-  
-      // Periodically reap orphaned runs (5-min staleness threshold) and make sure
-      // persisted queued work is still being driven forward.
-      void heartbeat
-        .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
-        .then(() => heartbeat.promoteDueScheduledRetries())
-        .then(async (promotion) => {
-          await heartbeat.resumeQueuedRuns();
-          const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
-          if (
-            promotion.promoted > 0 ||
-            reconciled.assignmentDispatched > 0 ||
-            reconciled.dispatchRequeued > 0 ||
-            reconciled.continuationRequeued > 0 ||
-            reconciled.successfulRunHandoffEscalated > 0 ||
-            reconciled.escalated > 0
-          ) {
-            logger.warn(
-              { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
-              "periodic heartbeat recovery changed assigned issue state",
-            );
-          }
-        })
-        .then(async () => {
-          const reconciled = await heartbeat.reconcileIssueGraphLiveness();
-          if (reconciled.escalationsCreated > 0) {
-            logger.warn({ ...reconciled }, "periodic issue-graph liveness reconciliation created escalations");
-          }
-        })
-        .then(async () => {
-          const reconciled = await heartbeat.reconcileTaskWatchdogs();
-          if (reconciled.triggered > 0) {
-            logger.warn({ ...reconciled }, "periodic task-watchdog reconciliation triggered watchdog work");
-          }
-        })
-        .then(async () => {
-          const scanned = await heartbeat.scanSilentActiveRuns();
-          if (scanned.created > 0 || scanned.escalated > 0) {
-            logger.warn({ ...scanned }, "periodic active-run output watchdog created review work");
-          }
-        })
-        .then(async () => {
-          const swept = await heartbeat.sweepStaleIssueLocks();
-          if (swept.cleared > 0) {
-            logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
-          }
-        })
-        .then(async () => {
-          const reviewed = await heartbeat.reconcileProductivityReviews();
-          if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
-            logger.warn({ ...reviewed }, "periodic productivity reconciliation created or updated review work");
+
+      void environmentCustomImages
+        .cleanupExpiredSetupSessions()
+        .then((result) => {
+          if (result.timedOut > 0 || result.failed > 0) {
+            logger.warn({ ...result }, "environment customImage setup cleanup changed sessions");
           }
         })
         .catch((err) => {
-          logger.error({ err }, "periodic heartbeat recovery failed");
+          logger.error({ err }, "environment customImage setup cleanup failed");
         });
+
+      if (!resolveHeartbeatSchedulingSuppression().suppressed) {
+        // Periodically reap orphaned runs (5-min staleness threshold) and make sure
+        // persisted queued work is still being driven forward.
+        void heartbeat
+          .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
+          .then(() => heartbeat.promoteDueScheduledRetries())
+          .then(async (promotion) => {
+            await heartbeat.resumeQueuedRuns();
+            const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
+            if (
+              promotion.promoted > 0 ||
+              reconciled.assignmentDispatched > 0 ||
+              reconciled.dispatchRequeued > 0 ||
+              reconciled.continuationRequeued > 0 ||
+              reconciled.successfulRunHandoffEscalated > 0 ||
+              reconciled.escalated > 0
+            ) {
+              logger.warn(
+                { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
+                "periodic heartbeat recovery changed assigned issue state",
+              );
+            }
+          })
+          .then(async () => {
+            const reconciled = await heartbeat.reconcileIssueGraphLiveness();
+            if (reconciled.escalationsCreated > 0 || reconciled.dependencyWakesHealed > 0) {
+              logger.warn({ ...reconciled }, "periodic issue-graph liveness reconciliation changed issue graph state");
+            }
+          })
+          .then(async () => {
+            const reconciled = await heartbeat.reconcileTaskWatchdogs();
+            if (reconciled.triggered > 0) {
+              logger.warn({ ...reconciled }, "periodic task-watchdog reconciliation triggered watchdog work");
+            }
+          })
+          .then(async () => {
+            const scanned = await heartbeat.scanSilentActiveRuns();
+            if (scanned.created > 0 || scanned.escalated > 0) {
+              logger.warn({ ...scanned }, "periodic active-run output watchdog created review work");
+            }
+          })
+          .then(async () => {
+            const swept = await heartbeat.sweepStaleIssueLocks();
+            if (swept.cleared > 0) {
+              logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
+            }
+          })
+          .then(async () => {
+            const reviewed = await heartbeat.reconcileProductivityReviews();
+            if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
+              logger.warn({ ...reviewed }, "periodic productivity reconciliation created or updated review work");
+            }
+          })
+          .catch((err) => {
+            logger.error({ err }, "periodic heartbeat recovery failed");
+          });
+      }
     }, config.heartbeatSchedulerIntervalMs);
   }
-  
+
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
 
@@ -982,7 +1039,7 @@ export async function startServer(): Promise<StartedServer> {
       });
     }, backupIntervalMs);
   }
-  
+
   // Wait for external adapters to finish loading before accepting requests.
   // Without this, adapter type validation (assertKnownAdapterType) would
   // reject valid external adapter types during the startup loading window.
@@ -1061,7 +1118,7 @@ export async function startServer(): Promise<StartedServer> {
       resolveListen();
     });
   });
-  
+
   {
     const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
       const telemetryClient = getTelemetryClient();

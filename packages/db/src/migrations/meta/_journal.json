@@ -881,28 +881,91 @@
       "idx": 125,
       "version": "7",
       "when": 1782440100000,
-      "tag": "0125_activity_log_run_id_set_null",
-      "breakpoints": true
-    },
-    {
-      "idx": 126,
-      "version": "7",
-      "when": 1782440200000,
-      "tag": "0126_backfill_plugin_secret_bindings",
+      "tag": "0125_environment_custom_image_templates",
       "breakpoints": true
     },
     {
       "idx": 127,
       "version": "7",
-      "when": 1782440300000,
-      "tag": "0127_secret_binding_egress_allowlist",
+      "when": 1782526500000,
+      "tag": "0127_environment_custom_images_instance_scoped",
       "breakpoints": true
     },
     {
       "idx": 128,
       "version": "7",
-      "when": 1782440400000,
-      "tag": "0128_egress_would_deny_observations",
+      "when": 1782923938661,
+      "tag": "0128_user_specific_secrets",
+      "breakpoints": true
+    },
+    {
+      "idx": 129,
+      "version": "7",
+      "when": 1783025124120,
+      "tag": "0129_agent_api_key_responsible_user",
+      "breakpoints": true
+    },
+    {
+      "idx": 131,
+      "version": "7",
+      "when": 1783025324120,
+      "tag": "0131_repair_run_responsible_user_context_refs",
+      "breakpoints": true
+    },
+    {
+      "idx": 132,
+      "version": "7",
+      "when": 1783025424120,
+      "tag": "0132_issue_comment_derived_attribution_fast",
+      "breakpoints": true
+    },
+    {
+      "idx": 133,
+      "version": "7",
+      "when": 1783034521000,
+      "tag": "0133_resource_membership_stars",
+      "breakpoints": true
+    },
+    {
+      "idx": 134,
+      "version": "7",
+      "when": 1783025624120,
+      "tag": "0134_run_responsible_user_invariant",
+      "breakpoints": true
+    },
+    {
+      "idx": 135,
+      "version": "7",
+      "when": 1783025724120,
+      "tag": "0135_repair_run_responsible_user_updated_at_sweep",
+      "breakpoints": true
+    },
+    {
+      "idx": 136,
+      "version": "7",
+      "when": 1783100000000,
+      "tag": "0136_activity_log_run_id_set_null",
+      "breakpoints": true
+    },
+    {
+      "idx": 137,
+      "version": "7",
+      "when": 1783100100000,
+      "tag": "0137_backfill_plugin_secret_bindings",
+      "breakpoints": true
+    },
+    {
+      "idx": 138,
+      "version": "7",
+      "when": 1783100200000,
+      "tag": "0138_secret_binding_egress_allowlist",
+      "breakpoints": true
+    },
+    {
+      "idx": 139,
+      "version": "7",
+      "when": 1783100300000,
+      "tag": "0139_egress_would_deny_observations",
       "breakpoints": true
     }
   ]

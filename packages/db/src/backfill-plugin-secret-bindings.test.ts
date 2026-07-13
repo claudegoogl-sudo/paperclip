@@ -24,7 +24,7 @@ if (!embeddedPostgresSupport.supported) {
 }
 
 const BACKFILL_SQL = fs.readFileSync(
-  new URL("./migrations/0126_backfill_plugin_secret_bindings.sql", import.meta.url),
+  new URL("./migrations/0137_backfill_plugin_secret_bindings.sql", import.meta.url),
   "utf8",
 );
 

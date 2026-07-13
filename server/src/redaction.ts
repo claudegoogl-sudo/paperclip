@@ -61,6 +61,7 @@ function sanitizeValue(value: unknown): unknown {
   if (value === null || value === undefined) return value;
   if (Array.isArray(value)) return value.map(sanitizeValue);
   if (isSecretRefBinding(value)) return value;
+  if (isUserSecretRefBinding(value)) return value;
   if (isPlainBinding(value)) return { type: "plain", value: sanitizeValue(value.value) };
   // String leaves (e.g. a tool result's `data.value`) get value-exact scrubbing
   // for any host-registered secret before being returned unchanged otherwise.
@@ -72,6 +73,11 @@ function sanitizeValue(value: unknown): unknown {
 function isSecretRefBinding(value: unknown): value is { type: "secret_ref"; secretId: string; version?: unknown } {
   if (!isPlainObject(value)) return false;
   return value.type === "secret_ref" && typeof value.secretId === "string";
+}
+
+function isUserSecretRefBinding(value: unknown): value is { type: "user_secret_ref"; key: string; version?: unknown } {
+  if (!isPlainObject(value)) return false;
+  return value.type === "user_secret_ref" && typeof value.key === "string";
 }
 
 function isPlainBinding(value: unknown): value is { type: "plain"; value: unknown } {
@@ -108,6 +114,10 @@ export function sanitizeRecord(record: Record<string, unknown>): Record<string, 
     }
     if (SECRET_PAYLOAD_KEY_RE.test(key)) {
       if (isSecretRefBinding(value)) {
+        redacted[key] = sanitizeValue(value);
+        continue;
+      }
+      if (isUserSecretRefBinding(value)) {
         redacted[key] = sanitizeValue(value);
         continue;
       }

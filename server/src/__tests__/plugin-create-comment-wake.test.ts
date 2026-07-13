@@ -76,6 +76,10 @@ describeEmbeddedPostgres("plugin issues.createComment wake + identifier resoluti
       id: companyId,
       name: "Paperclip",
       issuePrefix: issuePrefix(companyId),
+      // A queued heartbeat run must resolve a responsible user or its seed aborts
+      // (422) and rolls back the wakeup row — so wakeAssignee would silently
+      // enqueue nothing. Real companies always carry a default; seed one here.
+      defaultResponsibleUserId: `owner-${randomUUID()}`,
       requireBoardApprovalForNewAgents: false,
     });
     await db.insert(agents).values({
