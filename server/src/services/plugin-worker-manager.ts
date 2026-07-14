@@ -54,6 +54,7 @@ import type {
 import { logger } from "../middleware/logger.js";
 import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js";
 import { clearRunSecretValues } from "../run-secret-registry.js";
+import { redactSensitiveText } from "../redaction.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -281,6 +282,21 @@ export function formatWorkerFailureMessage(message: string, stderrExcerpt: strin
   if (!excerpt) return message;
   if (message.includes(excerpt)) return message;
   return `${message}\n\nWorker stderr:\n${excerpt}`;
+}
+
+/**
+ * Defense-in-depth redaction for host-handler error messages before they
+ * reach `log.error` (server logs) and the JSON-RPC `error.message` returned
+ * to the worker. Even though the secrets handler redacts rejected refs at the
+ * source (PLA-190), this chokepoint catches future host handlers that
+ * interpolate caller input into `Error.message`.
+ *
+ * Exported so the redaction wrap can be exercised by unit tests without
+ * spawning a real worker (PLA-197).
+ */
+export function redactHostHandlerErrorMessage(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  return redactSensitiveText(raw);
 }
 
 /**
@@ -886,7 +902,9 @@ export function createPluginWorkerHandle(
         result: result ?? null,
       });
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : String(err);
+      // PLA-190/PLA-197: defense-in-depth — route the message through
+      // redactSensitiveText before it reaches logs or the JSON-RPC error.
+      const errorMessage = redactHostHandlerErrorMessage(err);
       const errorCode = errorCodeForWorkerHostError(err);
       // PLA-814: surface the JSON-RPC error code and typed error name alongside
       // the message so a denied/failed in-process host call (e.g. an
