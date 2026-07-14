@@ -156,6 +156,46 @@ describeEmbeddedPostgres("plugin issues.listAttachments host services", () => {
     expect(foreign).toEqual([]);
   });
 
+  it("excludes a divergent-company_id attachment row on an in-company issue (invariant break)", async () => {
+    // Simulate a broken write path: an attachment on company A's issue whose own
+    // company_id has drifted to company B (the invariant
+    // issue_attachments.company_id == parent issue company_id is violated). The
+    // DB-layer tenant scope (PLA-1643) must drop the row so its foreign companyId
+    // string never surfaces in metadata, even though the issue guard passes.
+    const companyA = await createCompany("ATTA");
+    const companyB = await createCompany("ATTB");
+    const plugin = await installPlugin();
+    const issue = await createIssue(companyA.id, "Company A issue");
+
+    // Asset lives under company A (a legitimate in-company asset), but the
+    // attachment row is corrupted to carry company B's id.
+    const asset = await db
+      .insert(assets)
+      .values({
+        companyId: companyA.id,
+        provider: "local_disk",
+        objectKey: `issues/${issue.id}/${randomUUID()}`,
+        contentType: "application/zip",
+        byteSize: 2048,
+        sha256: "sha256-sample-secret",
+        originalFilename: "leaky.zip",
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+    await db
+      .insert(issueAttachments)
+      .values({ companyId: companyB.id, issueId: issue.id, assetId: asset.id })
+      .returning();
+
+    const services = buildHostServices(db, plugin.id, PLUGIN_KEY, createEventBusStub());
+    // Called as the issue's real owner (company A); the issue guard passes.
+    const result = await services.issues.listAttachments({ issueId: issue.id, companyId: companyA.id });
+    services.dispose();
+
+    expect(result).toEqual([]);
+    expect(JSON.stringify(result)).not.toContain(companyB.id);
+  });
+
   it("fails closed on a missing/empty companyId", async () => {
     const plugin = await installPlugin();
     const services = buildHostServices(db, plugin.id, PLUGIN_KEY, createEventBusStub());
