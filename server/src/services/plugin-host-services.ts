@@ -2245,7 +2245,7 @@ export function buildHostServices(
         // raw storage addressing (provider, objectKey, sha256) and creator identity
         // are deliberately withheld so a worker cannot reach the blob store directly
         // or infer authorship — asset bytes go through artifacts.fetch(assetId).
-        const rows = await issues.listAttachments(params.issueId);
+        const rows = await issues.listAttachments(params.issueId, companyId);
         return rows.map((row) => ({
           id: row.id,
           companyId: row.companyId,

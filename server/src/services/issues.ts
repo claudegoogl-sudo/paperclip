@@ -7414,7 +7414,13 @@ export function issueService(db: Db) {
         .onConflictDoNothing({ target: issueAttachments.assetId });
     },
 
-    listAttachments: async (issueId: string) =>
+    // Tenant-scoped at the data layer: callers must pass the validated (issue)
+    // companyId. Filtering on issue_attachments.company_id here — not just via
+    // the caller's issue guard — is defense in depth: if any write path ever
+    // breaks the invariant that an attachment's company_id equals its parent
+    // issue's company_id, a foreign row can never surface (not even its
+    // companyId string in metadata). See PLA-1643 (R1 from PLA-1642 review).
+    listAttachments: async (issueId: string, companyId: string) =>
       db
         .select({
           id: issueAttachments.id,
@@ -7435,7 +7441,12 @@ export function issueService(db: Db) {
         })
         .from(issueAttachments)
         .innerJoin(assets, eq(issueAttachments.assetId, assets.id))
-        .where(eq(issueAttachments.issueId, issueId))
+        .where(
+          and(
+            eq(issueAttachments.issueId, issueId),
+            eq(issueAttachments.companyId, companyId),
+          ),
+        )
         .orderBy(desc(issueAttachments.createdAt)),
 
     getAttachmentById: async (id: string) =>
