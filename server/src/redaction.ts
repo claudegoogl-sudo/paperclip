@@ -1,5 +1,6 @@
 import { redactCommandText } from "@paperclipai/adapter-utils";
 import { redactRegisteredSecretValues } from "./run-secret-registry.js";
+import { redactSecretsForLog } from "./secret-patterns.js";
 
 const SECRET_FIELD_NAME_PATTERN =
   String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)[A-Za-z0-9_-]*`;
@@ -148,11 +149,24 @@ export function redactSensitiveText(input: string): string {
   // secret may carry no secret-ish hint, so it would survive the
   // maybeContainsSecretText short-circuit below (PLA-697 / PLA-695 Control 1).
   const valueScrubbed = redactRegisteredSecretValues(input, REDACTED_VAULT_VALUE);
-  if (!maybeContainsSecretText(valueScrubbed)) return valueScrubbed;
-  return redactCommandText(
-    valueScrubbed
-      .replace(JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`)
-      .replace(ESCAPED_JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`),
-    REDACTED_EVENT_VALUE,
-  );
+  const commandScrubbed = maybeContainsSecretText(valueScrubbed)
+    ? redactCommandText(
+        valueScrubbed
+          .replace(JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`)
+          .replace(ESCAPED_JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`),
+        REDACTED_EVENT_VALUE,
+      )
+    : valueScrubbed;
+  // Canonical secret-shape scrub runs LAST and UNCONDITIONALLY, sourced from the
+  // single shared pattern set (secret-patterns.ts). This closes the gap where a
+  // free-form string carrying ONLY a fine-grained `github_pat_*` — which no
+  // command hint matches, so the maybeContainsSecretText gate above short-circuits
+  // — reached the host-error/log boundary unredacted (PLA-1636). Running it after
+  // the command path leaves existing markers (classic `gh[pousr]_*`, `sk-*`,
+  // JWTs, CLI/env secret shapes already turned into REDACTED_EVENT_VALUE) intact,
+  // so it only adds coverage for shapes the command redactor misses. The ...ForLog
+  // variant force-scrubs even Paperclip's own `iss=paperclip` run JWTs, matching
+  // the log-surface posture (PLA-842 F1): this text feeds server.log, persisted
+  // run-log/event payloads, and the JSON-RPC error returned to the worker.
+  return redactSecretsForLog(commandScrubbed);
 }

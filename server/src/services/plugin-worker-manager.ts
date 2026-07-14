@@ -894,10 +894,10 @@ export function createPluginWorkerHandle(
       // source), but this catch-all boundary sees errors from every host method.
       // Any future handler that interpolates worker-supplied input would leak it
       // to server.log (log.error) and back to the worker over JSON-RPC unless we
-      // scrub here. redactSensitiveText covers gh[pousr]_* classic PATs, sk-*
-      // keys, 3-segment JWTs, Authorization: Bearer headers, env-var-shape
-      // *TOKEN/KEY/SECRET*=* and CLI secret flags. (Fine-grained github_pat_*
-      // is not yet covered by the shared redactor — tracked as a follow-up.)
+      // scrub here. redactSensitiveText covers gh[pousr]_* classic PATs,
+      // fine-grained github_pat_* (via the shared secret-patterns set, PLA-1636),
+      // sk-* keys, 3-segment JWTs, Authorization: Bearer headers, env-var-shape
+      // *TOKEN/KEY/SECRET*=* and CLI secret flags.
       const safeErrorMessage = redactSensitiveText(errorMessage);
       // PLA-814: surface the JSON-RPC error code and typed error name alongside
       // the message so a denied/failed in-process host call (e.g. an

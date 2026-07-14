@@ -114,14 +114,17 @@ describe("worker-manager host-error boundary redaction (PLA-190/PLA-193 AC2-B)",
     expect(redactSensitiveText(bearerLine)).not.toContain(JWT_PROBE);
   });
 
-  // Known gap tracked as a follow-up: the shared adapter-utils GitHub token
-  // regex is `gh[pousr]_` and misses the fine-grained `github_pat_` shape, and
-  // `github_pat_` is not a SECRET_TEXT_HINT — so the boundary redactor alone
-  // does NOT scrub it. The secrets.resolve source path is unaffected (it echoes
-  // no input at all — asserted above), so this is defense-in-depth only.
-  it("documents the github_pat_ boundary gap (source path already safe)", () => {
+  // PLA-1636: the fine-grained `github_pat_*` shape is now scrubbed at the
+  // boundary too. redactSensitiveText runs the shared secret-patterns set
+  // (single source of truth) as an unconditional final pass, so a free-form
+  // string carrying only a `github_pat_*` — which no command hint matches, so
+  // the command redactor's gate short-circuits — no longer survives. The
+  // secrets.resolve source path echoes no input at all (asserted above); this
+  // remains defense-in-depth.
+  it("scrubs a fine-grained github_pat_* shape at the boundary (PLA-1636)", () => {
     const line = `host handler failed: rejected input ${FINE_GRAINED_PROBE} at gate`;
-    // Asserting the CURRENT behavior so a future fix flips this test loudly.
-    expect(redactSensitiveText(line)).toContain(FINE_GRAINED_PROBE);
+    const redacted = redactSensitiveText(line);
+    expect(redacted).not.toContain(FINE_GRAINED_PROBE);
+    expect(redacted).not.toContain("github_pat_");
   });
 });

@@ -89,6 +89,23 @@ describe("redaction", () => {
     expect(result).not.toContain(jwt);
   });
 
+  it("redacts a bare fine-grained github_pat_* with no surrounding hint (PLA-1636)", () => {
+    // Regression: a free-form string carrying ONLY a fine-grained PAT matches no
+    // command hint, so the command-redactor gate short-circuits. Pre-fix this
+    // returned the PAT unchanged; the shared secret-patterns final pass now
+    // scrubs it. `{82}` body reproduces the historical PLA-190/194 leak shape.
+    const finePat = `github_pat_11${"B".repeat(80)}`;
+    const line = `host handler failed: rejected input ${finePat} at gate`;
+
+    const result = redactSensitiveText(line);
+
+    expect(result).not.toContain(finePat);
+    expect(result).not.toContain("github_pat_");
+    // Non-secret framing text is preserved — no over-redaction.
+    expect(result).toContain("host handler failed:");
+    expect(result).toContain("at gate");
+  });
+
   it("redacts inline secrets from command metadata without hiding safe command text", () => {
     const input = {
       command: "custom-acp --token ghp_example_secret env OPENAI_API_KEY=sk-live-example custom-acp",
