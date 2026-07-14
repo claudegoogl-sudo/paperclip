@@ -9330,6 +9330,23 @@ export function issueRoutes(
       });
     }
 
+    // PLA-1657: bind pre-uploaded standalone assets to this comment before any
+    // downstream `comment.created` fan-out, so a media relay reading attachments
+    // at comment-created time sees them (no attach-after-post race). Idempotent
+    // and tenant-checked in attachAssetsToComment; mirrors the host bridge path.
+    const commentAttachmentIds = Array.isArray(req.body.attachmentIds)
+      ? req.body.attachmentIds.filter(
+          (assetId: unknown): assetId is string => typeof assetId === "string" && assetId.length > 0,
+        )
+      : [];
+    if (commentAttachmentIds.length > 0) {
+      await svc.attachAssetsToComment({
+        issueId: currentIssue.id,
+        issueCommentId: comment.id,
+        assetIds: commentAttachmentIds,
+      });
+    }
+
     await issueReferencesSvc.syncComment(comment.id);
     await externalObjectsSvc.syncCommentSafely(comment.id);
     const commentReferenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(currentIssue.id);
@@ -9357,6 +9374,7 @@ export function issueRoutes(
         bodySnippet: comment.body.slice(0, 120),
         identifier: currentIssue.identifier,
         issueTitle: currentIssue.title,
+        ...(commentAttachmentIds.length > 0 ? { attachmentCount: commentAttachmentIds.length } : {}),
         ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
         ...(reopened ? { reopened: true, reopenedFrom: reopenFromStatus, source: "comment" } : {}),
         ...(scheduledRetrySupersededByComment
