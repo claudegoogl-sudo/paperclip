@@ -285,6 +285,27 @@ export function formatWorkerFailureMessage(message: string, stderrExcerpt: strin
 }
 
 /**
+ * Defense-in-depth redaction for host-handler errors (PLA-190/PLA-193/PLA-197).
+ *
+ * The host-handler dispatch catch-all in {@link createPluginWorkerHandle} sees
+ * errors from every host method and forwards the message to both `log.error`
+ * and the JSON-RPC `error.message` returned to the worker. Host handlers must
+ * never echo raw caller input into an error message — the secrets handler is
+ * already fixed at source — but any future handler that interpolates
+ * worker-supplied input would leak it on both egress channels unless we scrub
+ * here. `redactSensitiveText` covers gh[pousr]_* classic PATs, fine-grained
+ * github_pat_* (PLA-1638), sk-* keys, 3-segment JWTs, `Authorization: Bearer`
+ * headers, env-var-shape *TOKEN/KEY/SECRET*=* and CLI secret flags.
+ *
+ * Exported so the redaction wrap can be exercised by unit tests without
+ * spawning a real worker (PLA-197).
+ */
+export function redactHostHandlerErrorMessage(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  return redactSensitiveText(raw);
+}
+
+/**
  * Options for starting a worker process.
  */
 export interface WorkerStartOptions {
@@ -887,24 +908,16 @@ export function createPluginWorkerHandle(
         result: result ?? null,
       });
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : String(err);
+      // PLA-190/PLA-193/PLA-197: defense-in-depth redaction happens in the
+      // exported redactHostHandlerErrorMessage helper (see its doc comment).
+      const safeErrorMessage = redactHostHandlerErrorMessage(err);
       const errorCode = errorCodeForWorkerHostError(err);
-      // PLA-190/PLA-193: defense-in-depth. Host handlers must never echo raw
-      // input into an error message (the secrets handler is already fixed at
-      // source), but this catch-all boundary sees errors from every host method.
-      // Any future handler that interpolates worker-supplied input would leak it
-      // to server.log (log.error) and back to the worker over JSON-RPC unless we
-      // scrub here. redactSensitiveText covers gh[pousr]_* classic PATs, sk-*
-      // keys, 3-segment JWTs, Authorization: Bearer headers, env-var-shape
-      // *TOKEN/KEY/SECRET*=* and CLI secret flags. (Fine-grained github_pat_*
-      // is not yet covered by the shared redactor — tracked as a follow-up.)
-      const safeErrorMessage = redactSensitiveText(errorMessage);
       // PLA-814: surface the JSON-RPC error code and typed error name alongside
       // the message so a denied/failed in-process host call (e.g. an
       // InvocationScopeDeniedError from a background loop) is diagnosable from
-      // logs alone, without correlating to source. `errorMessage` already
-      // carries the human reason; `errorCode`/`errorName` make the failure class
-      // queryable.
+      // logs alone, without correlating to source. `safeErrorMessage` already
+      // carries the (redacted) human reason; `errorCode`/`errorName` make the
+      // failure class queryable.
       log.error(
         {
           method,
