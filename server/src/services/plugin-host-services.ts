@@ -23,6 +23,7 @@ import type {
   PluginWorkspace,
   IssueComment,
   PluginIssueAssigneeSummary,
+  PluginIssueAttachment,
   PluginIssueOrchestrationSummary,
   PluginExecutionWorkspaceMetadata,
 } from "@paperclipai/plugin-sdk";
@@ -2235,6 +2236,27 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         if (!inCompany(await issues.getById(params.issueId), companyId)) return [];
         return (await issues.listComments(params.issueId)) as IssueComment[];
+      },
+      async listAttachments(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        if (!inCompany(await issues.getById(params.issueId), companyId)) return [];
+        // Narrow the host row to the plugin-facing projection:
+        // raw storage addressing (provider, objectKey, sha256) and creator identity
+        // are deliberately withheld so a worker cannot reach the blob store directly
+        // or infer authorship — asset bytes go through artifacts.fetch(assetId).
+        const rows = await issues.listAttachments(params.issueId);
+        return rows.map((row) => ({
+          id: row.id,
+          companyId: row.companyId,
+          issueId: row.issueId,
+          issueCommentId: row.issueCommentId,
+          assetId: row.assetId,
+          contentType: row.contentType,
+          byteSize: row.byteSize,
+          originalFilename: row.originalFilename,
+          createdAt: row.createdAt,
+        })) as PluginIssueAttachment[];
       },
       async createComment(params) {
         const companyId = ensureCompanyId(params.companyId);

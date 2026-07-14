@@ -933,6 +933,11 @@ export const PLUGIN_CAPABILITIES = [
   "issue.relations.read",
   "issue.subtree.read",
   "issue.comments.read",
+  // Reading attachment metadata (asset ids on a comment) is a default-deny read,
+  // gated separately from comment text so a plugin must opt in before it can
+  // enumerate asset ids. Restored after a prior SDK reset dropped it. Asset
+  // bytes still go through artifacts.fetch.
+  "issue.attachments.read",
   "issue.documents.read",
   "agents.read",
   "goals.read",
