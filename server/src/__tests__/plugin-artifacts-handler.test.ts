@@ -229,6 +229,57 @@ describe("plugin-artifacts-handler — PLA-574", () => {
     });
   });
 
+  // PLA-1658: a background-context fetch carries the wire/background-dispatch
+  // runId, which has NO heartbeat_runs row. The old code passed it straight to
+  // activity_log.run_id (a nullable FK to heartbeat_runs) → SQLSTATE 23503 →
+  // best-effort catch → audit row silently dropped (OWASP A09 logging gap). The
+  // fix writes run_id = NULL and preserves the dispatch id under
+  // details.backgroundRunId. These assertions FAIL on the old code (which set
+  // call.runId to the phantom id and omitted backgroundRunId).
+  it("PLA-1658: background allowed fetch audits with run_id=NULL + details.backgroundRunId", async () => {
+    const { handler, registry, bytes } = buildHandler();
+    // A per-dispatch background context: triggering company, no agent, and a
+    // host-minted runId with no heartbeat_runs row.
+    registry.registerBackground("plugin-db-1", "bg-run-1", "dpr-company");
+    const result = await handler.fetch({ attachmentId: "att-1", runId: "bg-run-1" });
+    expect(result.byteSize).toBe(bytes.length);
+    expect(logActivity).toHaveBeenCalledTimes(1);
+    const call = vi.mocked(logActivity).mock.calls[0]![1];
+    expect(call.action).toBe("artifact.fetched");
+    // The phantom runId must NOT reach the heartbeat_runs FK column.
+    expect(call.runId).toBeNull();
+    // A background dispatch has no attributable agent (system actor).
+    expect(call.agentId ?? null).toBeNull();
+    expect(call.details).toMatchObject({
+      outcome: "allowed",
+      contextKind: "background",
+      dispatchingAgentId: null,
+      dispatchingCompanyId: "dpr-company",
+      attachmentCompanyId: "dpr-company",
+      // The dispatch id is preserved for the audit trail, off the FK column.
+      backgroundRunId: "bg-run-1",
+    });
+  });
+
+  it("PLA-1658: background denied fetch is still logged (run_id=NULL + backgroundRunId)", async () => {
+    // No attachment → Gate 3 deny path. The deny audit must survive too.
+    const { handler, registry } = buildHandler({ attachment: null });
+    registry.registerBackground("plugin-db-1", "bg-run-2", "dpr-company");
+    await expect(
+      handler.fetch({ attachmentId: "att-1", runId: "bg-run-2" }),
+    ).rejects.toMatchObject({ code: "not_found" });
+    expect(logActivity).toHaveBeenCalledTimes(1);
+    const call = vi.mocked(logActivity).mock.calls[0]![1];
+    expect(call.runId).toBeNull();
+    expect(call.details).toMatchObject({
+      outcome: "denied",
+      deniedReason: "not_found",
+      contextKind: "background",
+      dispatchingAgentId: null,
+      backgroundRunId: "bg-run-2",
+    });
+  });
+
   it("Gate 4: collapses cross-company access denial into not_found (no existence oracle)", async () => {
     const { handler, registry } = buildHandler();
     // Dispatching agent is in a DIFFERENT company than the attachment.
@@ -374,7 +425,9 @@ describe("plugin-artifacts-handler.fetch — PLA-897 (background run-context)", 
     // System actor: no agentId attributed.
     expect(call.agentId).toBeUndefined();
     expect(call.companyId).toBe("dpr-company");
-    expect(call.runId).toBe("bg-run");
+    // PLA-1658: the background dispatch runId has no heartbeat_runs row, so it
+    // must NOT populate the run_id FK; it is preserved under details instead.
+    expect(call.runId).toBeNull();
     expect(JSON.stringify(call.details)).not.toContain(bytes.toString("base64"));
     expect(call.details).toMatchObject({
       outcome: "allowed",
@@ -384,6 +437,7 @@ describe("plugin-artifacts-handler.fetch — PLA-897 (background run-context)", 
       attachmentCompanyId: "dpr-company",
       attachmentId: "att-1",
       toolName: null,
+      backgroundRunId: "bg-run",
     });
   });
 
