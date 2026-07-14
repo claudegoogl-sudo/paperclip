@@ -310,6 +310,14 @@ export function createPluginArtifactsHandler(
     toolName: string | null;
     byteSize?: number;
   }) {
+    // PLA-1658: a background fetch's runId is the wire/background-dispatch id,
+    // which has NO heartbeat_runs row (background relays fire on a board event,
+    // not a heartbeat run). Storing it in activity_log.run_id violates the
+    // nullable FK (SQLSTATE 23503) and the best-effort catch below silently
+    // drops the audit row. Mirror the PLA-806 secret-resolve fix: write
+    // run_id = NULL and preserve the dispatch id under details.backgroundRunId.
+    // Dispatch fetches carry a real heartbeat run and are unchanged.
+    const isBackground = input.contextKind === "background";
     try {
       // We audit against the DISPATCHING agent's company so the activity log
       // shows up in their tenant's audit trail (where the data was actually
@@ -323,7 +331,7 @@ export function createPluginArtifactsHandler(
         entityType: "issue_attachment",
         entityId: input.attachmentId,
         agentId: input.dispatchingAgentId ?? undefined,
-        runId: input.runId,
+        runId: isBackground ? null : input.runId,
         details: {
           pluginKey,
           pluginDbId,
@@ -336,6 +344,9 @@ export function createPluginArtifactsHandler(
           attachmentId: input.attachmentId,
           toolName: input.toolName,
           byteSize: input.byteSize ?? null,
+          // PLA-1658: preserve dispatch attribution for background fetches that
+          // can't populate run_id. Dispatch fetches keep run_id and omit this.
+          ...(isBackground ? { backgroundRunId: input.runId } : {}),
         },
       });
     } catch (err) {
