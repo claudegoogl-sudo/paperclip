@@ -54,6 +54,7 @@ import type {
 import { logger } from "../middleware/logger.js";
 import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js";
 import { clearRunSecretValues } from "../run-secret-registry.js";
+import { redactSensitiveText } from "../redaction.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -888,6 +889,16 @@ export function createPluginWorkerHandle(
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       const errorCode = errorCodeForWorkerHostError(err);
+      // PLA-190/PLA-193: defense-in-depth. Host handlers must never echo raw
+      // input into an error message (the secrets handler is already fixed at
+      // source), but this catch-all boundary sees errors from every host method.
+      // Any future handler that interpolates worker-supplied input would leak it
+      // to server.log (log.error) and back to the worker over JSON-RPC unless we
+      // scrub here. redactSensitiveText covers gh[pousr]_* classic PATs, sk-*
+      // keys, 3-segment JWTs, Authorization: Bearer headers, env-var-shape
+      // *TOKEN/KEY/SECRET*=* and CLI secret flags. (Fine-grained github_pat_*
+      // is not yet covered by the shared redactor — tracked as a follow-up.)
+      const safeErrorMessage = redactSensitiveText(errorMessage);
       // PLA-814: surface the JSON-RPC error code and typed error name alongside
       // the message so a denied/failed in-process host call (e.g. an
       // InvocationScopeDeniedError from a background loop) is diagnosable from
@@ -897,7 +908,7 @@ export function createPluginWorkerHandle(
       log.error(
         {
           method,
-          err: errorMessage,
+          err: safeErrorMessage,
           errorCode,
           errorName: err instanceof Error ? err.name : undefined,
         },
@@ -908,7 +919,7 @@ export function createPluginWorkerHandle(
           createErrorResponse(
             request.id,
             errorCode,
-            errorMessage,
+            safeErrorMessage,
           ),
         );
       } catch {
