@@ -8,6 +8,7 @@ const mockIssueService = vi.hoisted(() => ({
   assertCheckoutOwner: vi.fn(),
   update: vi.fn(),
   addComment: vi.fn(),
+  attachAssetsToComment: vi.fn(async () => undefined),
   getDependencyReadiness: vi.fn(),
   getCurrentScheduledRetry: vi.fn(),
   findMentionedAgents: vi.fn(),
@@ -238,6 +239,8 @@ describe.sequential("issue comment reopen routes", () => {
     mockIssueService.assertCheckoutOwner.mockReset();
     mockIssueService.update.mockReset();
     mockIssueService.addComment.mockReset();
+    mockIssueService.attachAssetsToComment.mockReset();
+    mockIssueService.attachAssetsToComment.mockResolvedValue(undefined);
     mockIssueService.getDependencyReadiness.mockReset();
     mockIssueService.getCurrentScheduledRetry.mockReset();
     mockIssueService.findMentionedAgents.mockReset();
@@ -1053,6 +1056,81 @@ describe.sequential("issue comment reopen routes", () => {
 
     expect(res.status).toBe(400);
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
+  // PLA-1657: attachmentIds on the comment POST body must be bound to the created
+  // comment so a `comment.created` subscriber (media relay) sees them with no race.
+  it("links attachmentIds on POST comments to the created comment", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      body: "here is the bundle",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      authorAgentId: null,
+      authorUserId: "local-board",
+    });
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({
+        body: "here is the bundle",
+        attachmentIds: [
+          "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        ],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueService.attachAssetsToComment).toHaveBeenCalledWith({
+      issueId: "11111111-1111-4111-8111-111111111111",
+      issueCommentId: "comment-1",
+      assetIds: [
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      ],
+    });
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.comment_added",
+        details: expect.objectContaining({ attachmentCount: 2 }),
+      }),
+    );
+  });
+
+  // No-regression: the upload-time issueCommentId path stays untouched when the
+  // comment POST omits attachmentIds — no attach call, no attachmentCount.
+  it("does not link attachments when attachmentIds is omitted on POST comments", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "no attachments here" });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.attachAssetsToComment).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        details: expect.objectContaining({ attachmentCount: expect.anything() }),
+      }),
+    );
+  });
+
+  // Invalid (non-uuid) attachmentIds must be rejected by the schema before any write.
+  it("rejects non-uuid attachmentIds on POST comments", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "bad id", attachmentIds: ["not-a-uuid"] });
+
+    expect(res.status).toBe(400);
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockIssueService.attachAssetsToComment).not.toHaveBeenCalled();
   });
 
   it("does not move dependency-blocked issues to todo via POST comments", async () => {
