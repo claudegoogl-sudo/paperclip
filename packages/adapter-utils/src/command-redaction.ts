@@ -14,6 +14,10 @@ const COMMAND_ENV_SECRET_ASSIGNMENT_RE = new RegExp(
 const COMMAND_AUTHORIZATION_BEARER_RE = /(\bAuthorization\s*:\s*Bearer\s+)[^\s"'`]+/gi;
 const COMMAND_OPENAI_KEY_RE = /\bsk-[A-Za-z0-9_-]{12,}\b/g;
 const COMMAND_GITHUB_TOKEN_RE = /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g;
+// Fine-grained PATs use the `github_pat_` prefix, which the classic
+// `gh[pousr]_` shape above does not match. Keep in sync with
+// server/src/secret-patterns.ts GITHUB_FINE_GRAINED_PAT_RE.
+const COMMAND_GITHUB_FINE_GRAINED_TOKEN_RE = /\bgithub_pat_[A-Za-z0-9_]{36,}\b/g;
 const COMMAND_JWT_RE =
   /\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,})?\b/g;
 const COMMAND_SECRET_HINTS = [
@@ -35,6 +39,7 @@ const COMMAND_SECRET_HINTS = [
   "ghu_",
   "ghs_",
   "ghr_",
+  "github_pat_",
 ] as const;
 
 function maybeContainsSecretText(command: string) {
@@ -54,5 +59,6 @@ export function redactCommandText(command: string, redactedValue = REDACTED_COMM
     )
     .replace(COMMAND_OPENAI_KEY_RE, redactedValue)
     .replace(COMMAND_GITHUB_TOKEN_RE, redactedValue)
+    .replace(COMMAND_GITHUB_FINE_GRAINED_TOKEN_RE, redactedValue)
     .replace(COMMAND_JWT_RE, redactedValue);
 }
