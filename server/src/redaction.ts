@@ -1,5 +1,6 @@
 import { redactCommandText } from "@paperclipai/adapter-utils";
 import { redactRegisteredSecretValues } from "./run-secret-registry.js";
+import { GITHUB_FINE_GRAINED_PAT_RE } from "./secret-patterns.js";
 
 const SECRET_FIELD_NAME_PATTERN =
   String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)[A-Za-z0-9_-]*`;
@@ -37,8 +38,18 @@ const SECRET_TEXT_HINTS = [
   "ghu_",
   "ghs_",
   "ghr_",
+  // Fine-grained PAT prefix. The classic `gh[pousr]_` covered above does not
+  // subsume it, so without this hint a lone `github_pat_…` short-circuits the
+  // gate below unredacted (PLA-1637).
+  "github_pat_",
 ] as const;
 export const REDACTED_EVENT_VALUE = "***REDACTED***";
+
+// Global copy of the shared fine-grained PAT matcher (secret-patterns.ts is the
+// single source of truth). The shared patterns are authored without `g`; the
+// free-form text path replaces every occurrence, so a global copy is needed
+// here (PLA-1637).
+const GITHUB_FINE_GRAINED_PAT_TEXT_RE = new RegExp(GITHUB_FINE_GRAINED_PAT_RE.source, "g");
 /**
  * Marker for value-exact redaction of a host-registered secret (e.g. a
  * `vault.read` plaintext). Distinct from {@link REDACTED_EVENT_VALUE} so a
@@ -149,10 +160,13 @@ export function redactSensitiveText(input: string): string {
   // maybeContainsSecretText short-circuit below (PLA-697 / PLA-695 Control 1).
   const valueScrubbed = redactRegisteredSecretValues(input, REDACTED_VAULT_VALUE);
   if (!maybeContainsSecretText(valueScrubbed)) return valueScrubbed;
+  // The shared adapter-utils GitHub matcher is `\bgh[pousr]_…` and does not
+  // cover the fine-grained `github_pat_` shape, so scrub it here with the
+  // canonical secret-patterns matcher after the command-text pass (PLA-1637).
   return redactCommandText(
     valueScrubbed
       .replace(JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`)
       .replace(ESCAPED_JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`),
     REDACTED_EVENT_VALUE,
-  );
+  ).replace(GITHUB_FINE_GRAINED_PAT_TEXT_RE, REDACTED_EVENT_VALUE);
 }

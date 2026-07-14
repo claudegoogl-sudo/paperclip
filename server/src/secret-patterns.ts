@@ -63,6 +63,21 @@ function isThirdPartyJwt(match: string): boolean {
 }
 
 /**
+ * Fine-grained PAT matcher. Body length is NOT contractually fixed; an exact
+ * `{82}` silently misses off-length variants (81/83-body, future format
+ * changes, a truncated copy). Match a min length instead so the class — not one
+ * instance length — is redacted/blocked (PLA-1175). The classic `gh[poust]_`
+ * classes in the set below stay exact because GitHub documents them at a stable
+ * 40-total length.
+ *
+ * Exported so the free-form host-error redactor (`redactSensitiveText`) reuses
+ * this exact shape instead of re-deriving it — the two paths cannot drift
+ * (PLA-1637). Authored WITHOUT the global flag like every pattern here; callers
+ * add `g` via `globalCopy`.
+ */
+export const GITHUB_FINE_GRAINED_PAT_RE = /github_pat_[A-Za-z0-9_]{36,}/;
+
+/**
  * Ordered pattern set. Order is load-bearing: specific literal-prefixed
  * classes come before the generic JWT shape so a literal class is never
  * preempted by the broader matcher (PLA-319 §6). The text of each pattern
@@ -71,12 +86,7 @@ function isThirdPartyJwt(match: string): boolean {
  * redaction (serves PLA-317 §2 / PLA-319 §4 — no partial value left behind).
  */
 export const SECRET_PATTERNS: readonly SecretPatternDef[] = [
-  // Fine-grained PAT body length is NOT contractually fixed; an exact `{82}`
-  // silently misses off-length variants (81/83-body, future format changes, a
-  // truncated copy). Match a min length instead so the class — not one instance
-  // length — is redacted/blocked (PLA-1175). The classic `gh[poust]_` classes
-  // below stay exact because GitHub documents them at a stable 40-total length.
-  { label: "github_pat", regex: /github_pat_[A-Za-z0-9_]{36,}/ },
+  { label: "github_pat", regex: GITHUB_FINE_GRAINED_PAT_RE },
   { label: "github_classic_pat", regex: /ghp_[A-Za-z0-9]{36}/ },
   { label: "github_oauth", regex: /gho_[A-Za-z0-9]{36}/ },
   { label: "github_user_to_server", regex: /ghu_[A-Za-z0-9]{36}/ },

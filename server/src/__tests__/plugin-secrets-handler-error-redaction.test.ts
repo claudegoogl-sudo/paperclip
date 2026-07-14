@@ -114,14 +114,19 @@ describe("worker-manager host-error boundary redaction (PLA-190/PLA-193 AC2-B)",
     expect(redactSensitiveText(bearerLine)).not.toContain(JWT_PROBE);
   });
 
-  // Known gap tracked as a follow-up: the shared adapter-utils GitHub token
-  // regex is `gh[pousr]_` and misses the fine-grained `github_pat_` shape, and
-  // `github_pat_` is not a SECRET_TEXT_HINT — so the boundary redactor alone
-  // does NOT scrub it. The secrets.resolve source path is unaffected (it echoes
-  // no input at all — asserted above), so this is defense-in-depth only.
-  it("documents the github_pat_ boundary gap (source path already safe)", () => {
+  // PLA-1637: the boundary redactor now scrubs the fine-grained `github_pat_`
+  // shape too. `redactSensitiveText` gates on a `github_pat_` hint and reuses the
+  // canonical secret-patterns matcher, closing the gap this test formerly pinned
+  // open. The secrets.resolve source path was already safe (echoes no input);
+  // this remains defense-in-depth for any future leaky host handler.
+  it("scrubs the fine-grained github_pat_ shape at the boundary (PLA-1637)", () => {
     const line = `host handler failed: rejected input ${FINE_GRAINED_PROBE} at gate`;
-    // Asserting the CURRENT behavior so a future fix flips this test loudly.
-    expect(redactSensitiveText(line)).toContain(FINE_GRAINED_PROBE);
+    expect(redactSensitiveText(line)).not.toContain(FINE_GRAINED_PROBE);
+  });
+
+  // A lone fine-grained PAT with no other secret-ish hint must not short-circuit
+  // the SECRET_TEXT_HINTS gate unredacted (the exact class the pin above tracked).
+  it("scrubs a lone github_pat_ that carries no other secret hint (PLA-1637)", () => {
+    expect(redactSensitiveText(FINE_GRAINED_PROBE)).not.toContain(FINE_GRAINED_PROBE);
   });
 });

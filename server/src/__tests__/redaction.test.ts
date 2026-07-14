@@ -89,6 +89,20 @@ describe("redaction", () => {
     expect(result).not.toContain(jwt);
   });
 
+  it("redacts a lone fine-grained github_pat_ with no other secret hint (PLA-1637)", () => {
+    // Synthetic, shape-valid probe — never a real credential.
+    const finePat = `github_pat_11${"B".repeat(80)}`;
+    const result = redactSensitiveText(`rejected input ${finePat} at gate`);
+
+    expect(result).not.toContain(finePat);
+    expect(result).toContain(REDACTED_EVENT_VALUE);
+  });
+
+  it("does not over-redact a benign github_pat_ mention below the length floor", () => {
+    const benign = "see github_pat_docs for setup";
+    expect(redactSensitiveText(benign)).toBe(benign);
+  });
+
   it("redacts inline secrets from command metadata without hiding safe command text", () => {
     const input = {
       command: "custom-acp --token ghp_example_secret env OPENAI_API_KEY=sk-live-example custom-acp",
