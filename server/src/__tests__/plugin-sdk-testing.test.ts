@@ -160,4 +160,65 @@ describe("plugin SDK test harness", () => {
     expect(JSON.stringify(comments)).not.toContain("secret plugin-visible body");
     expect(JSON.stringify(comments)).not.toContain("secret plugin metadata");
   });
+
+  it("lists issue attachments only with the issue.attachments.read capability (host-gate regression)", async () => {
+    // Guard rail against the kind of SDK reset that silently dropped
+    // issues.listAttachments (host bridge + SDK). If a future reset drops the
+    // capability wiring again, this default-deny gate assertion fails loudly
+    // instead of the method quietly becoming undefined.
+    const manifest: PaperclipPluginManifestV1 = {
+      id: "paperclip.test-issue-attachments",
+      apiVersion: 1,
+      version: "0.1.0",
+      displayName: "Issue Attachments",
+      description: "Test plugin",
+      author: "Paperclip",
+      categories: ["automation"],
+      capabilities: ["issue.attachments.read"],
+      entrypoints: { worker: "./dist/worker.js" },
+    };
+    const harness = createTestHarness({ manifest });
+    harness.seed({
+      issues: [{
+        id: "issue-1",
+        companyId: "company-1",
+        title: "Attachment relay",
+        status: "todo",
+        priority: "medium",
+      }],
+      issueAttachments: [{
+        id: "att-1",
+        companyId: "company-1",
+        issueId: "issue-1",
+        issueCommentId: "comment-1",
+        assetId: "asset-1",
+        contentType: "application/zip",
+        byteSize: 2048,
+        originalFilename: "gerber-bom-cpl.zip",
+        createdAt: new Date("2026-07-14T10:00:00.000Z"),
+      }],
+    });
+
+    const attachments = await harness.ctx.issues.listAttachments("issue-1", "company-1");
+    expect(attachments).toHaveLength(1);
+    expect(attachments[0]).toMatchObject({
+      assetId: "asset-1",
+      issueCommentId: "comment-1",
+      contentType: "application/zip",
+      originalFilename: "gerber-bom-cpl.zip",
+    });
+
+    // Company-scoped: a foreign company sees nothing.
+    expect(await harness.ctx.issues.listAttachments("issue-1", "other-company")).toEqual([]);
+
+    // Default-deny: a manifest without issue.attachments.read is rejected.
+    const ungatedManifest: PaperclipPluginManifestV1 = { ...manifest, id: "paperclip.test-issue-attachments-ungated", capabilities: [] };
+    const ungated = createTestHarness({ manifest: ungatedManifest });
+    ungated.seed({
+      issues: [{ id: "issue-1", companyId: "company-1", title: "x", status: "todo", priority: "medium" }],
+    });
+    await expect(ungated.ctx.issues.listAttachments("issue-1", "company-1")).rejects.toThrow(
+      /issue\.attachments\.read/,
+    );
+  });
 });

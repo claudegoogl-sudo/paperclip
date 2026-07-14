@@ -251,6 +251,7 @@ export type {
   PluginIssueOrchestrationSummary,
   PluginIssueSubtreeOptions,
   PluginIssueAssigneeSummary,
+  PluginIssueAttachment,
   PluginIssueSubtree,
   PluginIssueSummariesClient,
   PluginAgentsClient,
