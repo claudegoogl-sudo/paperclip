@@ -1302,6 +1302,11 @@ export function routineService(
   // Deliberately narrow: a `running` (or merely queued, or not-yet-due) run is real work in
   // flight and must keep its pin. Stalled `running` runs are already handled by the heartbeat
   // liveness/recovery path, so this guard does not duplicate that.
+  //
+  // The rows are locked FOR UPDATE because promoteDueScheduledRetry flips `scheduled_retry` to
+  // `queued` outside this transaction. Without the lock, READ COMMITTED lets us decide "dead" on
+  // a snapshot that a concurrent promotion has already invalidated, and then cancel a run that
+  // is about to start.
   async function findDeadExecutionPinRuns(
     issue: typeof issues.$inferSelect,
     executor: Db,
@@ -1325,13 +1330,17 @@ export function routineService(
             sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = cast(${issue.id} as text)`,
           ),
         ),
-      );
+      )
+      .for("update");
 
     if (pinningRuns.length === 0) return null;
 
     const deadlineMs = now.getTime() - STALE_EXECUTION_PIN_GRACE_MS;
+    // `status` must be asserted explicitly: promotion to `queued` leaves scheduledRetryAt and
+    // startedAt untouched, so a just-promoted run is otherwise indistinguishable from a dead one.
     const allDead = pinningRuns.every((run) =>
-      run.startedAt === null
+      run.status === "scheduled_retry"
+      && run.startedAt === null
       && run.lastOutputAt === null
       && run.scheduledRetryAt !== null
       && new Date(run.scheduledRetryAt).getTime() <= deadlineMs
@@ -1342,6 +1351,10 @@ export function routineService(
 
   // Cancels the dead pin and terminalises its execution issue so the tick that follows creates
   // exactly one new execution issue rather than racing a second one against the stale pin.
+  //
+  // Returns null — abandoning the whole reap — if any pinning run no longer matches the shape we
+  // decided on. Losing a tick to a needless skip is cheap; cancelling a run that has just started
+  // is not, so the cancel is all-or-nothing and mismatch falls through to the normal skip.
   async function releaseDeadExecutionPin(input: {
     routine: typeof routines.$inferSelect;
     issue: typeof issues.$inferSelect;
@@ -1356,18 +1369,46 @@ export function routineService(
       .reduce((max, value) => Math.max(max, value), 0);
     const overdueMinutes = Math.round(overdueBy / 60_000);
 
-    if (runIds.length > 0) {
-      await input.executor
-        .update(heartbeatRuns)
-        .set({
-          status: "cancelled",
-          finishedAt: input.now,
-          error: "Scheduled retry never started and is past due; cancelled by the routine staleness guard",
-          errorCode: STALE_EXECUTION_PIN_ERROR_CODE,
-          scheduledRetryAt: null,
-          updatedAt: input.now,
-        })
-        .where(inArray(heartbeatRuns.id, runIds));
+    // Subquery guard, not just a per-row predicate: a per-row `WHERE status = 'scheduled_retry'`
+    // would cancel the subset that still matches and leave the rest pinning the issue. Counting
+    // first makes the statement match all rows or none.
+    const stillDead = input.executor
+      .select({ value: sql<number>`count(*)` })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          inArray(heartbeatRuns.id, runIds),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          isNull(heartbeatRuns.startedAt),
+        ),
+      );
+
+    const cancelledRuns = await input.executor
+      .update(heartbeatRuns)
+      .set({
+        status: "cancelled",
+        finishedAt: input.now,
+        error: "Scheduled retry never started and is past due; cancelled by the routine staleness guard",
+        errorCode: STALE_EXECUTION_PIN_ERROR_CODE,
+        scheduledRetryAt: null,
+        updatedAt: input.now,
+      })
+      .where(
+        and(
+          inArray(heartbeatRuns.id, runIds),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          isNull(heartbeatRuns.startedAt),
+          sql`(${stillDead}) = ${runIds.length}`,
+        ),
+      )
+      .returning({ id: heartbeatRuns.id });
+
+    if (cancelledRuns.length !== runIds.length) {
+      logger.info(
+        { issueId: input.issue.id, routineId: input.routine.id, runIds, cancelled: cancelledRuns.length },
+        "abandoned stale routine execution pin release: a pinning run changed under the guard",
+      );
+      return null;
     }
 
     const comment = [
@@ -1691,17 +1732,17 @@ export function routineService(
         if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
           const deadRuns = await findDeadExecutionPinRuns(activeIssue, txDb, triggeredAt);
           if (deadRuns) {
-            stalePinRelease.value = {
-              issueId: activeIssue.id,
-              ...(await releaseDeadExecutionPin({
-                routine: input.routine,
-                issue: activeIssue,
-                deadRuns,
-                now: triggeredAt,
-                executor: txDb,
-              })),
-            };
-            activeIssue = null;
+            const released = await releaseDeadExecutionPin({
+              routine: input.routine,
+              issue: activeIssue,
+              deadRuns,
+              now: triggeredAt,
+              executor: txDb,
+            });
+            if (released) {
+              stalePinRelease.value = { issueId: activeIssue.id, ...released };
+              activeIssue = null;
+            }
           }
         }
         if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
