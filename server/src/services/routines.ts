@@ -71,6 +71,13 @@ import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
+// How long past its due time a never-started scheduled retry must sit before the routine
+// staleness guard treats it as dead. Generous enough that a briefly backed-up retry promoter
+// is never mistaken for a permanent stall.
+const STALE_EXECUTION_PIN_GRACE_MS = 30 * 60 * 1000;
+const STALE_EXECUTION_PIN_ERROR_CODE = "stale_execution_pin";
+
+type StalePinRelease = { issueId: string; runIds: string[]; overdueMinutes: number };
 const MAX_CATCH_UP_RUNS = 25;
 const MAX_ROUTINE_REVISIONS = 100;
 const WEEKDAY_INDEX: Record<string, number> = {
@@ -226,6 +233,9 @@ export function nextCronTickInTimeZone(expression: string, timeZone: string, aft
 }
 
 function nextResultText(status: string, issueId?: string | null) {
+  if (status === "issue_created_after_stale_pin_release" && issueId) {
+    return `Released a stale execution issue pin, then created execution issue ${issueId}`;
+  }
   if (status === "issue_created" && issueId) return `Created execution issue ${issueId}`;
   if (status === "coalesced") return "Coalesced into an existing live execution issue";
   if (status === "skipped_paused") return "Skipped because the project is paused";
@@ -1285,6 +1295,104 @@ export function routineService(
       .then((rows) => rows[0]?.issues ?? null);
   }
 
+  // Returns the runs pinning `issue` only when EVERY one of them is demonstrably dead, i.e. a
+  // scheduled retry that was never started and whose due time has long passed — the promoter
+  // will never pick it up, so `skip_if_active` would otherwise skip on it forever.
+  //
+  // Deliberately narrow: a `running` (or merely queued, or not-yet-due) run is real work in
+  // flight and must keep its pin. Stalled `running` runs are already handled by the heartbeat
+  // liveness/recovery path, so this guard does not duplicate that.
+  async function findDeadExecutionPinRuns(
+    issue: typeof issues.$inferSelect,
+    executor: Db,
+    now: Date,
+  ) {
+    const pinningRuns = await executor
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        startedAt: heartbeatRuns.startedAt,
+        lastOutputAt: heartbeatRuns.lastOutputAt,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, issue.companyId),
+          inArray(heartbeatRuns.status, LIVE_HEARTBEAT_RUN_STATUSES),
+          or(
+            issue.executionRunId ? eq(heartbeatRuns.id, issue.executionRunId) : undefined,
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = cast(${issue.id} as text)`,
+          ),
+        ),
+      );
+
+    if (pinningRuns.length === 0) return null;
+
+    const deadlineMs = now.getTime() - STALE_EXECUTION_PIN_GRACE_MS;
+    const allDead = pinningRuns.every((run) =>
+      run.startedAt === null
+      && run.lastOutputAt === null
+      && run.scheduledRetryAt !== null
+      && new Date(run.scheduledRetryAt).getTime() <= deadlineMs
+    );
+
+    return allDead ? pinningRuns : null;
+  }
+
+  // Cancels the dead pin and terminalises its execution issue so the tick that follows creates
+  // exactly one new execution issue rather than racing a second one against the stale pin.
+  async function releaseDeadExecutionPin(input: {
+    routine: typeof routines.$inferSelect;
+    issue: typeof issues.$inferSelect;
+    deadRuns: NonNullable<Awaited<ReturnType<typeof findDeadExecutionPinRuns>>>;
+    now: Date;
+    executor: Db;
+  }) {
+    const { deadRuns } = input;
+    const runIds = deadRuns.map((run) => run.id);
+    const overdueBy = deadRuns
+      .map((run) => (run.scheduledRetryAt ? input.now.getTime() - new Date(run.scheduledRetryAt).getTime() : 0))
+      .reduce((max, value) => Math.max(max, value), 0);
+    const overdueMinutes = Math.round(overdueBy / 60_000);
+
+    if (runIds.length > 0) {
+      await input.executor
+        .update(heartbeatRuns)
+        .set({
+          status: "cancelled",
+          finishedAt: input.now,
+          error: "Scheduled retry never started and is past due; cancelled by the routine staleness guard",
+          errorCode: STALE_EXECUTION_PIN_ERROR_CODE,
+          scheduledRetryAt: null,
+          updatedAt: input.now,
+        })
+        .where(inArray(heartbeatRuns.id, runIds));
+    }
+
+    const comment = [
+      "This routine execution issue was pinned by a scheduled retry that never started, so the routine could not run.",
+      "",
+      `- Stale run(s): ${runIds.length > 0 ? runIds.map((id) => `\`${id}\``).join(", ") : "_none_"}`,
+      `- Retry was due ${overdueMinutes} minute(s) ago and was never promoted`,
+      "",
+      "The stale run has been cancelled and this issue closed so the routine can schedule a fresh execution.",
+    ].join("\n");
+
+    try {
+      await issueSvc.addComment(input.issue.id, comment, {}, undefined, input.executor);
+    } catch (err) {
+      logger.warn(
+        { err, issueId: input.issue.id, routineId: input.routine.id },
+        "failed to comment on stale routine execution issue",
+      );
+    }
+
+    await issueSvc.update(input.issue.id, { status: "cancelled" }, input.executor);
+
+    return { runIds, overdueMinutes };
+  }
+
   async function finalizeRun(runId: string, patch: Partial<typeof routineRuns.$inferInsert>, executor: Db = db) {
     return executor
       .update(routineRuns)
@@ -1502,6 +1610,8 @@ export function routineService(
       title,
       description,
     });
+    // Boxed so the assignment inside the transaction callback survives control-flow narrowing.
+    const stalePinRelease: { value: StalePinRelease | null } = { value: null };
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await tx.execute(
@@ -1572,10 +1682,28 @@ export function routineService(
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
       try {
-        const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
-          kind: issueOriginKind,
-          id: issueOriginId,
-        });
+        let activeIssue: typeof issues.$inferSelect | null = await findLiveExecutionIssue(
+          input.routine,
+          txDb,
+          dispatchFingerprint,
+          { kind: issueOriginKind, id: issueOriginId },
+        );
+        if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
+          const deadRuns = await findDeadExecutionPinRuns(activeIssue, txDb, triggeredAt);
+          if (deadRuns) {
+            stalePinRelease.value = {
+              issueId: activeIssue.id,
+              ...(await releaseDeadExecutionPin({
+                routine: input.routine,
+                issue: activeIssue,
+                deadRuns,
+                now: triggeredAt,
+                executor: txDb,
+              })),
+            };
+            activeIssue = null;
+          }
+        }
         if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
           const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
           if (manualRunnerUserId) {
@@ -1688,7 +1816,9 @@ export function routineService(
           routineId: input.routine.id,
           triggerId: input.trigger?.id ?? null,
           triggeredAt,
-          status: "issue_created",
+          // Distinct result text so a routine that had to break a stale pin stops reporting as
+          // plainly healthy on the triggers list.
+          status: stalePinRelease.value ? "issue_created_after_stale_pin_release" : "issue_created",
           issueId: createdIssue.id,
           nextRunAt,
         }, txDb);
@@ -1713,6 +1843,32 @@ export function routineService(
         return failed ?? createdRun;
       }
     });
+
+    const releasedStalePin = stalePinRelease.value;
+    if (releasedStalePin) {
+      try {
+        await logActivity(db, {
+          companyId: input.routine.companyId,
+          actorType: "system",
+          actorId: "routine-scheduler",
+          action: "routine.stale_execution_pin_released",
+          entityType: "issue",
+          entityId: releasedStalePin.issueId,
+          details: {
+            routineId: input.routine.id,
+            triggerId: input.trigger?.id ?? null,
+            runId: run.id,
+            staleRunIds: releasedStalePin.runIds,
+            overdueMinutes: releasedStalePin.overdueMinutes,
+          },
+        });
+      } catch (err) {
+        logger.warn(
+          { err, routineId: input.routine.id, issueId: releasedStalePin.issueId },
+          "failed to log stale routine execution pin release",
+        );
+      }
+    }
 
     if (input.source === "schedule" || input.source === "webhook") {
       const actorId = input.source === "schedule" ? "routine-scheduler" : "routine-webhook";
