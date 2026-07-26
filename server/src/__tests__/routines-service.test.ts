@@ -1490,6 +1490,84 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     ).resolves.toHaveLength(0);
   });
 
+  // A skip that only says "a live execution issue already exists" cannot tell an operator whether
+  // the work is merely late or wedged forever. These lock the detail onto both surfaces that
+  // report a skip: the run row and the trigger's last result.
+  it("records the pinning retry's id, attempt, cause and due time on a skipped run", async () => {
+    const { pinningRunId, previousIssue, routine, svc } = await seedStaleExecutionPin({
+      heartbeatRunStatus: "scheduled_retry",
+      startedAt: null,
+      lastOutputAt: null,
+      scheduledRetryAt: new Date(Date.now() + 5 * 60 * 1000),
+    });
+
+    // Due before the next tick, so this is the "late, but real work is still coming" case and
+    // neither reap arm may fire — exactly the case the old message could not distinguish.
+    const run = await fireDueScheduleTrigger({
+      svc,
+      routineId: routine.id,
+      pinningRunId,
+      retryOffsetMs: -60 * 1000,
+    });
+
+    expect(run.status).toBe("skipped");
+    expect(run.failureReason).toContain(previousIssue.id);
+    expect(run.failureReason).toContain(pinningRunId);
+    expect(run.failureReason).toContain("scheduled retry");
+    expect(run.failureReason).toContain("attempt 4");
+    expect(run.failureReason).toContain("transient_failure");
+    // The due time is what makes "late" actionable, and it reads as pending rather than overdue.
+    expect(run.failureReason).toContain("due in");
+
+    const trigger = await db
+      .select({ lastResult: routineTriggers.lastResult })
+      .from(routineTriggers)
+      .where(eq(routineTriggers.routineId, routine.id))
+      .then((rows) => rows[0]!);
+    expect(trigger.lastResult).toContain("Skipped because a live execution issue already exists");
+    expect(trigger.lastResult).toContain(pinningRunId);
+  });
+
+  // The other side of the same question: a pin that is running carries no due time at all, so the
+  // description must report the run's state instead of inventing a schedule for it.
+  it("describes a running pin by its state rather than a retry due time", async () => {
+    const { pinningRunId, routine, svc } = await seedStaleExecutionPin({
+      heartbeatRunStatus: "running",
+      startedAt: new Date(Date.now() - 5 * 60 * 1000),
+      lastOutputAt: new Date(Date.now() - 30 * 1000),
+      scheduledRetryAt: null,
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("skipped");
+    expect(run.failureReason).toContain(`run ${pinningRunId} is running`);
+    expect(run.failureReason).not.toContain("due");
+  });
+
+  // A tick that had to break a pin before it could run must say so on its own row, or run history
+  // shows an ordinary success and the reap is only discoverable in the activity log.
+  it("names the reap arm on the run row of the tick that broke the pin", async () => {
+    const { routine, strandedIssueId, svc } = await seedRunlessExecutionIssue();
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("issue_created");
+    expect(run.failureReason).toContain(strandedIssueId);
+    expect(run.failureReason).toContain("runless_issue");
+  });
+
+  // Guards AC9: adding the description must not change *when* a tick fires. An ordinary
+  // unobstructed dispatch keeps a null reason rather than picking up a stray "released" note.
+  it("leaves the reason null on an ordinary unobstructed dispatch", async () => {
+    const { routine, svc } = await seedFixture();
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("issue_created");
+    expect(run.failureReason).toBeNull();
+  });
+
   it("respects a genuinely running pin with recent output", async () => {
     const { pinningRunId, previousIssue, routine, svc } = await seedStaleExecutionPin({
       heartbeatRunStatus: "running",
