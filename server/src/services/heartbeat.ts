@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -273,6 +273,15 @@ const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retr
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "failed", "cancelled", "timed_out"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
+// Mirrors OPEN_ISSUE_STATUSES in services/routines.ts — the statuses that still pin a routine
+// via findLiveExecutionIssue, and therefore the ones a retry give-up must clear.
+const ROUTINE_EXECUTION_RELEASABLE_ISSUE_STATUSES = [
+  "backlog",
+  "todo",
+  "in_progress",
+  "in_review",
+  "blocked",
+] as const;
 export {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
@@ -8127,6 +8136,120 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { outcome: "promoted", run: promoted };
   }
 
+  // A routine execution issue is only reachable through its run: it has no human owner and no
+  // independent waker. Once the bounded retry ladder gives up, nothing will ever touch the issue
+  // again, yet it stays open and keeps pinning the routine via findLiveExecutionIssue. Terminalise
+  // it here — with a visible comment — so the next tick can start a fresh run.
+  async function releaseRoutineExecutionIssueAfterRetryGiveUp(
+    run: typeof heartbeatRuns.$inferSelect,
+    details: {
+      retryReason: string;
+      attempt: number;
+      maxAttempts: number;
+      giveUpReason: string;
+    },
+  ) {
+    const contextSnapshot = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(contextSnapshot.issueId);
+    if (!issueId) return { released: false as const, reason: "no_issue" as const };
+
+    const issue = await db
+      .select({
+        id: issues.id,
+        status: issues.status,
+        originKind: issues.originKind,
+      })
+      .from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!issue) return { released: false as const, reason: "issue_not_found" as const };
+    if (issue.originKind !== "routine_execution") {
+      return { released: false as const, reason: "not_routine_execution" as const };
+    }
+    if (!ROUTINE_EXECUTION_RELEASABLE_ISSUE_STATUSES.includes(issue.status as never)) {
+      return { released: false as const, reason: "issue_already_terminal" as const };
+    }
+
+    // Never release an issue another live run is still driving; that run is the waker.
+    const otherLiveRun = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, run.companyId),
+          ne(heartbeatRuns.id, run.id),
+          inArray(heartbeatRuns.status, EXECUTION_PATH_HEARTBEAT_RUN_STATUSES),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (otherLiveRun) return { released: false as const, reason: "another_live_run" as const };
+
+    const lastError = readNonEmptyString(run.error);
+    const lastErrorCode = readNonEmptyString(run.errorCode);
+    const comment = [
+      "Automatic retries for this routine execution have been exhausted, so the control plane is closing this issue.",
+      "",
+      `- Retry ladder: \`${details.retryReason}\`, ${details.maxAttempts} scheduled attempt(s); attempt ${details.attempt} was not queued`,
+      `- Give-up reason: ${details.giveUpReason}`,
+      `- Last error code: ${lastErrorCode ? `\`${lastErrorCode}\`` : "_none recorded_"}`,
+      `- Last error: ${lastError ? lastError.slice(0, 500) : "_none recorded_"}`,
+      `- Last run: \`${run.id}\``,
+      "",
+      "No further automatic wake will be queued for this issue. The routine's next scheduled tick will create a fresh execution issue.",
+    ].join("\n");
+
+    try {
+      await issuesSvc.addComment(issueId, comment, { agentId: run.agentId, runId: run.id });
+    } catch (err) {
+      logger.warn(
+        { err, issueId, runId: run.id },
+        "failed to post retry-exhaustion comment on routine execution issue",
+      );
+    }
+
+    await issuesSvc.update(issueId, { status: "cancelled", actorAgentId: run.agentId });
+
+    await appendRunEvent(run, await nextRunEventSeq(run.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: "Released routine execution issue after bounded retry give-up",
+      payload: {
+        issueId,
+        retryReason: details.retryReason,
+        attempt: details.attempt,
+        maxAttempts: details.maxAttempts,
+        giveUpReason: details.giveUpReason,
+        errorCode: lastErrorCode,
+      },
+    });
+
+    try {
+      await logActivity(db, {
+        companyId: run.companyId,
+        actorType: "system",
+        actorId: "heartbeat-retry",
+        action: "routine.execution_issue_released",
+        entityType: "issue",
+        entityId: issueId,
+        details: {
+          runId: run.id,
+          retryReason: details.retryReason,
+          attempt: details.attempt,
+          maxAttempts: details.maxAttempts,
+          giveUpReason: details.giveUpReason,
+          errorCode: lastErrorCode,
+        },
+      });
+    } catch (err) {
+      logger.warn({ err, issueId, runId: run.id }, "failed to log routine execution issue release");
+    }
+
+    return { released: true as const, issueId };
+  }
+
   async function scheduleBoundedRetryForRun(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -8179,6 +8302,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           maxAttempts,
         },
       });
+      await releaseRoutineExecutionIssueAfterRetryGiveUp(run, {
+        retryReason,
+        attempt: nextAttempt,
+        maxAttempts,
+        giveUpReason: `Bounded retry exhausted after ${run.scheduledRetryAttempt ?? 0} scheduled attempts`,
+      });
       return {
         outcome: "retry_exhausted" as const,
         attempt: nextAttempt,
@@ -8204,6 +8333,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             invalidOrgChain: invokability.invalidOrgChain,
             ...invokability.details,
           },
+        });
+        // Same stranding hazard as exhaustion: no retry is queued and nothing else will wake
+        // the execution issue. The transaction-level `not_scheduled` codes below are excluded
+        // because they already mean the issue is terminal or owned by a different run.
+        await releaseRoutineExecutionIssueAfterRetryGiveUp(run, {
+          retryReason,
+          attempt: nextAttempt,
+          maxAttempts,
+          giveUpReason: "Scheduled retry suppressed because the agent is not invokable",
         });
         return {
           outcome: "not_scheduled" as const,
