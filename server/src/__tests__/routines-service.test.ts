@@ -1038,7 +1038,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
   // PLA-1789: a `scheduled_retry` heartbeat run counts as live, so a retry that is never
   // promoted pins the execution issue and `skip_if_active` skips every subsequent tick forever.
   async function seedStaleExecutionPin(input: {
-    heartbeatRunStatus: "scheduled_retry" | "queued" | "running";
+    heartbeatRunStatus: "scheduled_retry" | "queued" | "running" | "failed";
     startedAt?: Date | null;
     lastOutputAt?: Date | null;
     scheduledRetryAt?: Date | null;
@@ -1236,6 +1236,257 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     ).resolves.toEqual([{ status: "in_progress" }]);
     await expect(
       db.select().from(issueComments).where(eq(issueComments.issueId, previousIssue.id)),
+    ).resolves.toHaveLength(0);
+  });
+
+  // The "demonstrably redundant" arm only has a meaning relative to a schedule, so these fire the
+  // routine through tickScheduledTriggers rather than runRoutine — runRoutine without a trigger
+  // has no nextRunAt and leaves the arm inert by construction.
+  // `retryOffsetMs` is measured from the trigger's own next cron tick rather than from wall clock,
+  // so "retry lands before/after the next tick" holds no matter what time of day CI runs at.
+  async function fireDueScheduleTrigger(input: {
+    svc: ReturnType<typeof routineService>;
+    routineId: string;
+    pinningRunId: string;
+    retryOffsetMs: number;
+  }) {
+    const { trigger } = await input.svc.createTrigger(
+      input.routineId,
+      { kind: "schedule", label: "pin-test", cronExpression: "0 * * * *", timezone: "UTC" },
+      {},
+    );
+    await db
+      .update(heartbeatRuns)
+      .set({ scheduledRetryAt: new Date(trigger.nextRunAt!.getTime() + input.retryOffsetMs) })
+      .where(eq(heartbeatRuns.id, input.pinningRunId));
+    await db
+      .update(routineTriggers)
+      .set({ nextRunAt: new Date("2020-01-01T00:00:00.000Z") })
+      .where(eq(routineTriggers.id, trigger.id));
+    await input.svc.tickScheduledTriggers(new Date());
+    return db
+      .select()
+      .from(routineRuns)
+      .where(eq(routineRuns.routineId, input.routineId))
+      .orderBy(drizzleSql`${routineRuns.triggeredAt} desc`)
+      .limit(1)
+      .then((rows) => rows[0]!);
+  }
+
+  // A never-started retry due at or after the next tick cannot produce work any sooner than
+  // letting this tick through, so holding the pin for it only burns ticks. The retry is set an
+  // hour PAST the next tick, and stays in the future, so the overdue arm cannot be what fires
+  // here.
+  it("reaps a pin whose retry is not due until after the next scheduled tick", async () => {
+    const { companyId, pinningRunId, previousIssue, routine, svc } = await seedStaleExecutionPin({
+      heartbeatRunStatus: "scheduled_retry",
+      startedAt: null,
+      lastOutputAt: null,
+      scheduledRetryAt: new Date(Date.now() + 3 * 60 * 60 * 1000),
+    });
+
+    const run = await fireDueScheduleTrigger({
+      svc,
+      routineId: routine.id,
+      pinningRunId,
+      retryOffsetMs: 60 * 60 * 1000,
+    });
+
+    expect(run.status).toBe("issue_created");
+    expect(run.linkedIssueId).not.toBe(previousIssue.id);
+
+    await expect(
+      db
+        .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, pinningRunId)),
+    ).resolves.toEqual([{ status: "cancelled", errorCode: "stale_execution_pin" }]);
+    await expect(
+      db.select({ status: issues.status }).from(issues).where(eq(issues.id, previousIssue.id)),
+    ).resolves.toEqual([{ status: "cancelled" }]);
+
+    // AC6: the reap names itself on the issue and in the activity log.
+    const comments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, previousIssue.id));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("redundant_retry");
+
+    const released = await db
+      .select({ action: activityLog.action, details: activityLog.details })
+      .from(activityLog)
+      .where(eq(activityLog.companyId, companyId))
+      .then((rows) => rows.filter((row) => row.action === "routine.stale_execution_pin_released"));
+    expect(released).toHaveLength(1);
+    expect((released[0]?.details as { reason?: string })?.reason).toBe("redundant_retry");
+  });
+
+  // The mirror image. A retry due a minute BEFORE the next tick is strictly sooner than waiting
+  // for the tick, so it is real work worth holding the pin for — and it is nowhere near the
+  // overdue grace either. Neither arm may fire.
+  it("does not reap a pin whose retry is due before the next scheduled tick", async () => {
+    const { pinningRunId, previousIssue, routine, svc } = await seedStaleExecutionPin({
+      heartbeatRunStatus: "scheduled_retry",
+      startedAt: null,
+      lastOutputAt: null,
+      scheduledRetryAt: new Date(Date.now() + 5 * 60 * 1000),
+    });
+
+    const run = await fireDueScheduleTrigger({
+      svc,
+      routineId: routine.id,
+      pinningRunId,
+      retryOffsetMs: -60 * 1000,
+    });
+
+    expect(run.status).toBe("skipped");
+    expect(run.linkedIssueId).toBe(previousIssue.id);
+    await expect(
+      db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, pinningRunId)),
+    ).resolves.toEqual([{ status: "scheduled_retry" }]);
+    await expect(
+      db.select({ status: issues.status }).from(issues).where(eq(issues.id, previousIssue.id)),
+    ).resolves.toEqual([{ status: "in_progress" }]);
+    await expect(
+      db.select().from(issueComments).where(eq(issueComments.issueId, previousIssue.id)),
+    ).resolves.toHaveLength(0);
+  });
+
+  // The runless shape cannot be seeded by hand: the unique index keys on
+  // originFingerprint, and a hand-made issue gets the legacy "default" fingerprint, which
+  // collides with nothing. So dispatch for real once to mint an issue with the true dispatch
+  // fingerprint, then strip it of live runs — that is exactly how a killed agent leaves things.
+  async function seedRunlessExecutionIssue() {
+    const fixture = await seedFixture();
+    const { agentId, companyId, routine, svc } = fixture;
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "skip_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const firstRun = await svc.runRoutine(routine.id, { source: "schedule" });
+    expect(firstRun.status).toBe("issue_created");
+    const strandedIssueId = firstRun.linkedIssueId!;
+
+    // Dispatch queues an assignment wakeup run, which is live. Kill it the way a session-limit
+    // 429 or an OOM would, leaving the issue open with nothing left to advance it.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "failed", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.companyId, companyId));
+
+    // A terminal heartbeat run: enough to satisfy the index's `execution_run_id is not null`,
+    // but nothing findLiveExecutionIssue will ever count as live.
+    const deadRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: deadRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      status: "failed",
+      contextSnapshot: { issueId: strandedIssueId, wakeReason: "issue_assigned" },
+      startedAt: new Date(Date.now() - 60 * 60 * 1000),
+    });
+    await db
+      .update(issues)
+      .set({ executionRunId: deadRunId, status: "in_progress" })
+      .where(eq(issues.id, strandedIssueId));
+
+    return { ...fixture, strandedIssueId, deadRunId };
+  }
+
+  it("reaps a runless open execution issue that collides on the unique index", async () => {
+    const { companyId, deadRunId, routine, strandedIssueId, svc } = await seedRunlessExecutionIssue();
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    // The whole point: this used to rethrow the 23505 and roll the dispatch back, so there was no
+    // routine_runs row at all and the routine looked idle rather than stuck.
+    expect(run.status).toBe("issue_created");
+    expect(run.linkedIssueId).not.toBe(strandedIssueId);
+
+    await expect(
+      db.select({ status: issues.status }).from(issues).where(eq(issues.id, strandedIssueId)),
+    ).resolves.toEqual([{ status: "cancelled" }]);
+    // The reap only terminalises the issue; a run that already failed is left exactly as it was.
+    await expect(
+      db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, deadRunId)),
+    ).resolves.toEqual([{ status: "failed" }]);
+
+    const comments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, strandedIssueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("runless_issue");
+
+    const released = await db
+      .select({ action: activityLog.action, details: activityLog.details })
+      .from(activityLog)
+      .where(eq(activityLog.companyId, companyId))
+      .then((rows) => rows.filter((row) => row.action === "routine.stale_execution_pin_released"));
+    expect(released).toHaveLength(1);
+    expect((released[0]?.details as { reason?: string })?.reason).toBe("runless_issue");
+  });
+
+  // `in_review` is open with no live run too, but it means an agent deliberately parked
+  // the issue waiting on an operator — cancelling that would throw away a pending interaction.
+  // Only `in_progress` is unambiguously a run that died mid-work.
+  it("does not reap an execution issue parked in in_review", async () => {
+    const { routine, strandedIssueId, svc } = await seedRunlessExecutionIssue();
+    await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, strandedIssueId));
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    await expect(
+      db.select({ status: issues.status }).from(issues).where(eq(issues.id, strandedIssueId)),
+    ).resolves.toEqual([{ status: "in_review" }]);
+    await expect(
+      db.select().from(issueComments).where(eq(issueComments.issueId, strandedIssueId)),
+    ).resolves.toHaveLength(0);
+    expect(run.linkedIssueId).not.toBe(strandedIssueId);
+  });
+
+  // Every reap arm is scoped to originKind = 'routine_execution'; an issue that
+  // merely looks stale must be invisible to all of them.
+  it("never reaps a non-routine issue, however stale it looks", async () => {
+    const { agentId, companyId, issueSvc, routine, strandedIssueId, svc } = await seedRunlessExecutionIssue();
+
+    // Same company and same originId as the routine, but a different originKind — so it is stale
+    // and runless in exactly the way the guard looks for, and still must not be touched.
+    const bystander = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      title: "hand-made issue that must survive",
+      status: "in_progress",
+      assigneeAgentId: routine.assigneeAgentId,
+      originKind: "manual",
+      originId: routine.id,
+    });
+    const bystanderRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: bystanderRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      status: "failed",
+      contextSnapshot: { issueId: bystander.id, wakeReason: "issue_assigned" },
+      startedAt: new Date(Date.now() - 6 * 60 * 60 * 1000),
+    });
+    await db.update(issues).set({ executionRunId: bystanderRunId }).where(eq(issues.id, bystander.id));
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    // The routine's own stranded issue is reaped; the bystander is untouched.
+    expect(run.status).toBe("issue_created");
+    await expect(
+      db.select({ status: issues.status }).from(issues).where(eq(issues.id, strandedIssueId)),
+    ).resolves.toEqual([{ status: "cancelled" }]);
+    await expect(
+      db.select({ status: issues.status }).from(issues).where(eq(issues.id, bystander.id)),
+    ).resolves.toEqual([{ status: "in_progress" }]);
+    await expect(
+      db.select().from(issueComments).where(eq(issueComments.issueId, bystander.id)),
     ).resolves.toHaveLength(0);
   });
 
