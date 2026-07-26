@@ -143,6 +143,24 @@ The database mode is controlled by `DATABASE_URL`:
 
 Your Drizzle schema (`packages/db/src/schema/`) stays the same regardless of mode.
 
+## Connection pool behavior
+
+The application pool is sized by `PAPERCLIP_DB_POOL_MAX` and every statement runs under `PAPERCLIP_DB_STATEMENT_TIMEOUT_MS` (see [environment variables](../docs/deploy/environment-variables.md)). Both are backstops. The pool is a fixed resource, so the thing that turns a slow query into an outage is a query holding a connection longer than anyone needs its result.
+
+That is what happens when an HTTP client gives up: the driver runs a query to completion whether or not the request is still there. Paperclip closes that gap with a request-scoped cancellation scope:
+
+- `server/src/middleware/request-query-cancellation.ts` opens a scope per request and aborts it when the socket closes before the response started.
+- `packages/db/src/query-cancellation.ts` tracks the queries issued inside that scope and cancels them on abort, which returns their connections to the pool immediately instead of at `statement_timeout`.
+- A cancelled query fails with SQLSTATE `57014`, and the middleware logs one `warn` per abandoned request with the route and a `cancelledQueries` count — the signal to watch if pool pressure returns.
+
+Three deliberate exclusions:
+
+- **`GET`/`HEAD` only.** Cancelling a mutation partway through would leave the database in a state nobody asked for, so an abandoned write is allowed to finish.
+- **Nothing is cancelled once the response has started.** A streaming response (SSE) sends headers first and keeps querying afterwards; its own close handling owns that teardown.
+- **Transactions are not covered.** `sql.begin` runs on its own reserved connection, and cancelling one statement mid-transaction would abort work the caller may still be committing.
+
+One caveat when writing handlers: a Drizzle query builder does not touch the database until it is awaited, so only queries **awaited** inside the request scope are cancellable. Returning a builder from a request handler and awaiting it elsewhere silently opts that query out.
+
 ## Migration authoring checklist
 
 The 0126 issue comment attribution backfill showed the failure mode this checklist is meant to prevent: each batch looked for the next rows with an unindexed predicate, so PostgreSQL repeatedly scanned the same table and the migration became O(n²) as the table grew.
