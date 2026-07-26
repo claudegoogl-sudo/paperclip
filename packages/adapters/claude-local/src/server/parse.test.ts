@@ -7,7 +7,19 @@ import {
   isClaudeRefusalResult,
   isClaudeUnknownSessionError,
   isClaudeImageProcessingError,
+  isClaudePreTurnRateLimitResult,
 } from "./parse.js";
+
+const SESSION_LIMIT_RESULT = {
+  type: "result",
+  subtype: "error_during_execution",
+  is_error: true,
+  num_turns: 1,
+  duration_api_ms: 0,
+  total_cost_usd: 0,
+  api_error_status: 429,
+  result: "You've hit your session limit · resets 1:50pm (UTC)",
+} satisfies Record<string, unknown>;
 
 describe("detectClaudeLoginRequired", () => {
   it("classifies Claude's invalid API key login prompt as auth required", () => {
@@ -96,6 +108,10 @@ describe("isClaudeTransientUpstreamError", () => {
         stderr: "Please log in. Run `claude login` first.",
       }),
     ).toBe(false);
+  });
+
+  it("classifies the session-limit failure as transient", () => {
+    expect(isClaudeTransientUpstreamError({ parsed: SESSION_LIMIT_RESULT })).toBe(true);
   });
 
   it("does not classify max-turns or unknown-session as transient", () => {
@@ -326,5 +342,63 @@ describe("extractClaudeRetryNotBefore", () => {
     expect(
       extractClaudeRetryNotBefore({ errorMessage: "Overloaded. Try again later." }, new Date()),
     ).toBeNull();
+  });
+
+  it("parses the session-limit reset time later the same day", () => {
+    const now = new Date("2026-07-26T12:30:00.000Z");
+    expect(
+      extractClaudeRetryNotBefore({ parsed: SESSION_LIMIT_RESULT }, now)?.toISOString(),
+    ).toBe("2026-07-26T13:50:00.000Z");
+  });
+
+  it("rolls the session-limit reset time to tomorrow when it has already passed today", () => {
+    const now = new Date("2026-07-26T14:30:00.000Z");
+    expect(
+      extractClaudeRetryNotBefore({ parsed: SESSION_LIMIT_RESULT }, now)?.toISOString(),
+    ).toBe("2026-07-27T13:50:00.000Z");
+  });
+
+  it("resolves a session-limit reset time in a non-UTC zone", () => {
+    const now = new Date("2026-07-26T12:30:00.000Z");
+    expect(
+      extractClaudeRetryNotBefore(
+        { errorMessage: "You've hit your session limit · resets 1:50pm (America/New_York)" },
+        now,
+      )?.toISOString(),
+    ).toBe("2026-07-26T17:50:00.000Z");
+  });
+
+  it("returns null for a session limit whose reset time is unparseable", () => {
+    expect(
+      extractClaudeRetryNotBefore(
+        { errorMessage: "You've hit your session limit · resets soon" },
+        new Date("2026-07-26T12:30:00.000Z"),
+      ),
+    ).toBeNull();
+  });
+});
+
+describe("isClaudePreTurnRateLimitResult", () => {
+  it("classifies a session-limit 429 that never reached the model", () => {
+    expect(isClaudePreTurnRateLimitResult(SESSION_LIMIT_RESULT)).toBe(true);
+  });
+
+  it("does not classify a 429 that billed model turns", () => {
+    expect(
+      isClaudePreTurnRateLimitResult({
+        ...SESSION_LIMIT_RESULT,
+        duration_api_ms: 4_210,
+        total_cost_usd: 0.12,
+      }),
+    ).toBe(false);
+  });
+
+  it("does not classify non-429 failures", () => {
+    expect(
+      isClaudePreTurnRateLimitResult({ ...SESSION_LIMIT_RESULT, api_error_status: 500 }),
+    ).toBe(false);
+    expect(isClaudePreTurnRateLimitResult({ ...SESSION_LIMIT_RESULT, api_error_status: undefined }))
+      .toBe(false);
+    expect(isClaudePreTurnRateLimitResult(null)).toBe(false);
   });
 });

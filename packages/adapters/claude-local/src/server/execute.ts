@@ -55,6 +55,7 @@ import {
   isClaudeUnknownSessionError,
   isClaudePoisonedPreviousMessageIdError,
   isClaudeImageProcessingError,
+  isClaudePreTurnRateLimitResult,
 } from "./parse.js";
 import {
   materializeRemoteClaudeConfig,
@@ -996,6 +997,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage,
         })
       : null;
+    const preTurnRateLimit = transientUpstream && isClaudePreTurnRateLimitResult(parsed);
     const resolvedErrorCode = loginMeta.requiresLogin
       ? "claude_auth_required"
       : failed && clearSessionForMaxTurns
@@ -1015,6 +1017,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
       ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
+      ...(preTurnRateLimit ? { noOpDispatch: true, noOpDispatchReason: "pre_turn_rate_limit" } : {}),
     };
 
     return {

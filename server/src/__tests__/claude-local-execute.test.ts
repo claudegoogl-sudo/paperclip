@@ -1337,6 +1337,69 @@ describe("claude execute", () => {
     }
   });
 
+  it("marks a session-limit 429 that never reached the model as a no-op dispatch", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-session-limit-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "claude");
+    await fs.mkdir(workspace, { recursive: true });
+    await writeFailingClaudeCommand(commandPath, {
+      resultEvent: {
+        type: "result",
+        subtype: "error_during_execution",
+        session_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        is_error: true,
+        num_turns: 1,
+        duration_api_ms: 0,
+        total_cost_usd: 0,
+        api_error_status: 429,
+        result: "You've hit your session limit · resets 1:50pm (UTC)",
+      },
+    });
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-26T12:30:00.000Z"));
+
+    try {
+      const result = await execute({
+        runId: "run-claude-session-limit",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      expect(result.errorCode).toBe("claude_transient_upstream");
+      expect(result.errorFamily).toBe("transient_upstream");
+      expect(result.retryNotBefore).toBe("2026-07-26T13:50:00.000Z");
+      expect(result.resultJson?.noOpDispatch).toBe(true);
+      expect(result.resultJson?.noOpDispatchReason).toBe("pre_turn_rate_limit");
+    } finally {
+      vi.useRealTimers();
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("classifies rate-limit / overloaded failures without reset metadata as transient", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-rate-limit-"));
     const workspace = path.join(root, "workspace");
