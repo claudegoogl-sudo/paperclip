@@ -14,6 +14,7 @@ import {
   executionWorkspaces,
   heartbeatRuns,
   instanceSettings,
+  issueComments,
   issueInboxArchives,
   issueReadStates,
   issues,
@@ -61,6 +62,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       process.env.PAPERCLIP_SECRETS_PROVIDER = originalSecretsProviderEnv;
     }
     await db.delete(activityLog);
+    await db.delete(issueComments);
     await db.delete(issueInboxArchives);
     await db.delete(issueReadStates);
     await db.delete(secretAccessEvents);
@@ -1016,6 +1018,175 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       includeRoutineExecutions: true,
     });
     expect(inboxIssues.map((issue) => issue.id)).toContain(previousIssue.id);
+  });
+
+  // PLA-1789: a `scheduled_retry` heartbeat run counts as live, so a retry that is never
+  // promoted pins the execution issue and `skip_if_active` skips every subsequent tick forever.
+  async function seedStaleExecutionPin(input: {
+    heartbeatRunStatus: "scheduled_retry" | "running";
+    startedAt?: Date | null;
+    lastOutputAt?: Date | null;
+    scheduledRetryAt?: Date | null;
+  }) {
+    const fixture = await seedFixture();
+    const { agentId, companyId, issueSvc, routine } = fixture;
+    const previousRunId = randomUUID();
+    const pinningRunId = randomUUID();
+
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "skip_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const previousIssue = await issueSvc.create(companyId, {
+      projectId: routine.projectId,
+      title: routine.title,
+      description: routine.description,
+      status: "in_progress",
+      priority: routine.priority,
+      assigneeAgentId: routine.assigneeAgentId,
+      originKind: "routine_execution",
+      originId: routine.id,
+      originRunId: previousRunId,
+    });
+
+    await db.insert(routineRuns).values({
+      id: previousRunId,
+      companyId,
+      routineId: routine.id,
+      triggerId: null,
+      source: "schedule",
+      status: "issue_created",
+      triggeredAt: new Date("2026-03-20T12:00:00.000Z"),
+      linkedIssueId: previousIssue.id,
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: pinningRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      status: input.heartbeatRunStatus,
+      contextSnapshot: { issueId: previousIssue.id, wakeReason: "transient_failure_retry" },
+      startedAt: input.startedAt ?? null,
+      lastOutputAt: input.lastOutputAt ?? null,
+      scheduledRetryAt: input.scheduledRetryAt ?? null,
+      scheduledRetryAttempt: input.heartbeatRunStatus === "scheduled_retry" ? 4 : 0,
+      scheduledRetryReason: input.heartbeatRunStatus === "scheduled_retry" ? "transient_failure" : null,
+    });
+
+    await db
+      .update(issues)
+      .set({ executionRunId: pinningRunId, executionLockedAt: new Date("2026-03-20T12:01:00.000Z") })
+      .where(eq(issues.id, previousIssue.id));
+
+    return { ...fixture, pinningRunId, previousIssue };
+  }
+
+  it("releases a dead scheduled-retry pin so skip_if_active cannot skip forever", async () => {
+    const { companyId, pinningRunId, previousIssue, routine, svc } = await seedStaleExecutionPin({
+      heartbeatRunStatus: "scheduled_retry",
+      startedAt: null,
+      lastOutputAt: null,
+      // Due well over the staleness grace period ago and never promoted.
+      scheduledRetryAt: new Date(Date.now() - 4 * 60 * 60 * 1000),
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("issue_created");
+    expect(run.linkedIssueId).not.toBe(previousIssue.id);
+
+    const stalePin = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, pinningRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(stalePin).toEqual({ status: "cancelled", errorCode: "stale_execution_pin" });
+
+    const staleIssue = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, previousIssue.id))
+      .then((rows) => rows[0] ?? null);
+    expect(staleIssue?.status).toBe("cancelled");
+
+    const comments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, previousIssue.id));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("pinned by a scheduled retry that never started");
+
+    // Exactly one live execution issue for this routine afterwards.
+    const openIssues = await db
+      .select({ id: issues.id, status: issues.status })
+      .from(issues)
+      .where(eq(issues.originId, routine.id));
+    expect(openIssues.filter((issue) => !["done", "cancelled"].includes(issue.status))).toEqual([
+      expect.objectContaining({ id: run.linkedIssueId }),
+    ]);
+
+    const detail = await svc.getDetail(routine.id);
+    expect(detail?.activeIssue?.id).toBe(run.linkedIssueId);
+
+    const audit = await db
+      .select({ action: activityLog.action, entityId: activityLog.entityId })
+      .from(activityLog)
+      .where(eq(activityLog.companyId, companyId));
+    expect(audit.map((entry) => entry.action)).toContain("routine.stale_execution_pin_released");
+    expect(
+      audit.find((entry) => entry.action === "routine.stale_execution_pin_released")?.entityId,
+    ).toBe(previousIssue.id);
+  });
+
+  it("keeps skipping while a scheduled retry is still within its grace period", async () => {
+    const { pinningRunId, previousIssue, routine, svc } = await seedStaleExecutionPin({
+      heartbeatRunStatus: "scheduled_retry",
+      startedAt: null,
+      lastOutputAt: null,
+      // Due in the future — a legitimately pending retry.
+      scheduledRetryAt: new Date(Date.now() + 60 * 60 * 1000),
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("skipped");
+    expect(run.linkedIssueId).toBe(previousIssue.id);
+    await expect(
+      db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, pinningRunId)),
+    ).resolves.toEqual([{ status: "scheduled_retry" }]);
+  });
+
+  it("respects a genuinely running pin with recent output", async () => {
+    const { pinningRunId, previousIssue, routine, svc } = await seedStaleExecutionPin({
+      heartbeatRunStatus: "running",
+      startedAt: new Date(Date.now() - 5 * 60 * 1000),
+      lastOutputAt: new Date(Date.now() - 30 * 1000),
+      scheduledRetryAt: null,
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("skipped");
+    expect(run.linkedIssueId).toBe(previousIssue.id);
+
+    const pin = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, pinningRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(pin?.status).toBe("running");
+
+    const staleIssue = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, previousIssue.id))
+      .then((rows) => rows[0] ?? null);
+    expect(staleIssue?.status).toBe("in_progress");
+    await expect(
+      db.select().from(issueComments).where(eq(issueComments.issueId, previousIssue.id)),
+    ).resolves.toHaveLength(0);
   });
 
   it("does not coalesce live routine runs with different resolved variables", async () => {
