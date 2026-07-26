@@ -4672,6 +4672,24 @@ export function issueService(db: Db) {
             AND ${issueComments.body} ILIKE ${containsPattern} ESCAPE '\\'
         )
       `;
+      // Scan each searchable column as its own branch so the planner can serve it
+      // from that column's trigram index. OR-ing the branches into one predicate
+      // collapses to a company-wide scan that detoasts every issue description.
+      const searchMatchIssueIds = sql`
+        SELECT ${issues.id} FROM ${issues}
+          WHERE ${issues.companyId} = ${companyId} AND ${titleContainsMatch}
+        UNION ALL
+        SELECT ${issues.id} FROM ${issues}
+          WHERE ${issues.companyId} = ${companyId} AND ${identifierContainsMatch}
+        UNION ALL
+        SELECT ${issues.id} FROM ${issues}
+          WHERE ${issues.companyId} = ${companyId} AND ${descriptionContainsMatch}
+        UNION ALL
+        SELECT ${issueComments.issueId} FROM ${issueComments}
+          WHERE ${issueComments.companyId} = ${companyId}
+            AND ${issueComments.deletedAt} IS NULL
+            AND ${issueComments.body} ILIKE ${containsPattern} ESCAPE '\\'
+      `;
       if (filters?.descendantOf) {
         conditions.push(sql<boolean>`
           ${issues.id} IN (
@@ -4747,14 +4765,7 @@ export function issueService(db: Db) {
         conditions.push(inArray(issues.id, labeledIssueIds.map((row) => row.issueId)));
       }
       if (hasSearch) {
-        conditions.push(
-          or(
-            titleContainsMatch,
-            identifierContainsMatch,
-            descriptionContainsMatch,
-            commentContainsMatch,
-          )!,
-        );
+        conditions.push(sql<boolean>`${issues.id} IN (${searchMatchIssueIds})`);
       }
       if (filters?.excludeRoutineExecutions && !filters?.originKind && !filters?.originId) {
         conditions.push(ne(issues.originKind, "routine_execution"));
