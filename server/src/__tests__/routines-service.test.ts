@@ -1,5 +1,5 @@
 import { createHmac, randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql as drizzleSql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -1020,10 +1020,25 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(inboxIssues.map((issue) => issue.id)).toContain(previousIssue.id);
   });
 
+  // Polls until some backend is parked on a row lock, so the concurrency test synchronises on the
+  // real block instead of a sleep.
+  async function waitForBlockedBackend(timeoutMs = 10_000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const blocked = await db.execute(
+        drizzleSql`select count(*)::int as blocked from pg_stat_activity
+                   where wait_event_type = 'Lock' and state = 'active'`,
+      );
+      if (Number((blocked as unknown as Array<{ blocked: number }>)[0]?.blocked ?? 0) > 0) return;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    throw new Error("timed out waiting for a backend to block on a row lock");
+  }
+
   // PLA-1789: a `scheduled_retry` heartbeat run counts as live, so a retry that is never
   // promoted pins the execution issue and `skip_if_active` skips every subsequent tick forever.
   async function seedStaleExecutionPin(input: {
-    heartbeatRunStatus: "scheduled_retry" | "running";
+    heartbeatRunStatus: "scheduled_retry" | "queued" | "running";
     startedAt?: Date | null;
     lastOutputAt?: Date | null;
     scheduledRetryAt?: Date | null;
@@ -1156,6 +1171,72 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     await expect(
       db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, pinningRunId)),
     ).resolves.toEqual([{ status: "scheduled_retry" }]);
+  });
+
+  // Promotion sets `status = 'queued'` and leaves scheduledRetryAt/startedAt alone, so a
+  // run that has just been promoted looks byte-for-byte like a dead one on every field except
+  // status. Reaping it cancels work that is about to start.
+  it("never reaps a pin that has already been promoted to queued", async () => {
+    const { pinningRunId, previousIssue, routine, svc } = await seedStaleExecutionPin({
+      heartbeatRunStatus: "queued",
+      startedAt: null,
+      lastOutputAt: null,
+      scheduledRetryAt: new Date(Date.now() - 4 * 60 * 60 * 1000),
+    });
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("skipped");
+    expect(run.linkedIssueId).toBe(previousIssue.id);
+    await expect(
+      db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, pinningRunId)),
+    ).resolves.toEqual([{ status: "queued" }]);
+    await expect(
+      db.select({ status: issues.status }).from(issues).where(eq(issues.id, previousIssue.id)),
+    ).resolves.toEqual([{ status: "in_progress" }]);
+  });
+
+  // The promoter runs outside the dispatch transaction. Under READ COMMITTED the reap
+  // could decide "dead" on a pre-promotion snapshot and then cancel the promoted run anyway.
+  it("abandons the reap when the pin is promoted concurrently with dispatch", async () => {
+    const { pinningRunId, previousIssue, routine, svc } = await seedStaleExecutionPin({
+      heartbeatRunStatus: "scheduled_retry",
+      startedAt: null,
+      lastOutputAt: null,
+      scheduledRetryAt: new Date(Date.now() - 4 * 60 * 60 * 1000),
+    });
+
+    let releasePromoter!: () => void;
+    const promoterHeld = new Promise<void>((resolve) => {
+      releasePromoter = resolve;
+    });
+    const promoterTx = db.transaction(async (tx) => {
+      await tx
+        .update(heartbeatRuns)
+        .set({ status: "queued", updatedAt: new Date() })
+        .where(eq(heartbeatRuns.id, pinningRunId));
+      await promoterHeld;
+    });
+
+    const dispatch = svc.runRoutine(routine.id, { source: "schedule" });
+    // Let dispatch reach the pinning row and block on the promoter's uncommitted row lock; without
+    // that lock it would read the stale snapshot and the assertions below would be vacuous.
+    await waitForBlockedBackend();
+    releasePromoter();
+    await promoterTx;
+    const run = await dispatch;
+
+    expect(run.status).toBe("skipped");
+    expect(run.linkedIssueId).toBe(previousIssue.id);
+    await expect(
+      db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, pinningRunId)),
+    ).resolves.toEqual([{ status: "queued" }]);
+    await expect(
+      db.select({ status: issues.status }).from(issues).where(eq(issues.id, previousIssue.id)),
+    ).resolves.toEqual([{ status: "in_progress" }]);
+    await expect(
+      db.select().from(issueComments).where(eq(issueComments.issueId, previousIssue.id)),
+    ).resolves.toHaveLength(0);
   });
 
   it("respects a genuinely running pin with recent output", async () => {
