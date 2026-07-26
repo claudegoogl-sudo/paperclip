@@ -8,4 +8,6 @@
 --
 -- This composite index makes the same lookup a single index-only seek (measured
 -- >60s -> 79ms at production scale). Idempotent: re-running creates nothing new.
+--
+-- paperclip:migration-safety-ignore large-create-index-not-concurrently: CONCURRENTLY is not applicable in this runner. applyPendingMigrations wraps every migration in an explicit BEGIN/COMMIT so the file and its history row commit atomically, and CREATE INDEX CONCURRENTLY cannot run inside a transaction block -- it fails with SQLSTATE 25001, verified against PostgreSQL using the runner's exact execution shape. Accepting the plain build instead: it takes a SHARE lock that blocks writes to activity_log (reads are unaffected) for the duration, measured at 1827ms on 1.08M rows. Migrations run at startup before the server serves traffic, so that window does not overlap live writes.
 CREATE INDEX IF NOT EXISTS "activity_log_company_entity_created_idx" ON "activity_log" ("company_id","entity_type","entity_id","created_at");
