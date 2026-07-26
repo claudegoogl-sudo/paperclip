@@ -299,6 +299,15 @@ const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0.25;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
+// A dispatch the adapter reports as never having reached the model (session-limit 429)
+// gets its own budget: it must not eat the bounded ladder, but it also must not loop
+// forever, so it is capped and then falls through to the ordinary exhaustion path.
+export const NO_OP_DISPATCH_RETRY_MAX_ATTEMPTS = 8;
+const NO_OP_DISPATCH_RETRY_FALLBACK_DELAY_MS = 10 * 60 * 1000;
+const NO_OP_DISPATCH_RETRY_MIN_DELAY_MS = 60 * 1000;
+const NO_OP_DISPATCH_RETRY_MAX_DELAY_MS = 5 * 60 * 60 * 1000;
+// The advertised reset time is a lossy wall clock; wake just past it, not exactly on it.
+const NO_OP_DISPATCH_RETRY_SAFETY_MARGIN_MS = 60 * 1000;
 const WORKSPACE_VALIDATION_FAILURE_CODE = "workspace_validation_failed";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
 const CONFIGURATION_INCOMPLETE_FAILURE_CODE = "configuration_incomplete";
@@ -414,6 +423,56 @@ function readTransientRecoveryContractFromRun(
         retryNotBefore: readTransientRetryNotBeforeFromRun(run),
       }
     : null;
+}
+
+function isNoOpDispatchRun(run: Pick<typeof heartbeatRuns.$inferSelect, "resultJson">) {
+  return parseObject(run.resultJson).noOpDispatch === true;
+}
+
+function readNoOpDispatchRetryAttempt(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "contextSnapshot">,
+) {
+  const value = parseObject(run.contextSnapshot).noOpDispatchRetryAttempt;
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : 0;
+}
+
+function resolveNoOpDispatchRetry(input: {
+  run: Pick<typeof heartbeatRuns.$inferSelect, "resultJson" | "contextSnapshot">;
+  retryReason: string;
+}) {
+  const isNoOp =
+    input.retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON && isNoOpDispatchRun(input.run);
+  // Reset on any dispatch that did reach the model, so a stale count never leaks forward.
+  const attempt = isNoOp ? readNoOpDispatchRetryAttempt(input.run) + 1 : 0;
+  const exhausted = isNoOp && attempt > NO_OP_DISPATCH_RETRY_MAX_ATTEMPTS;
+  return {
+    attempt,
+    exhausted,
+    active: isNoOp && !exhausted,
+    maxAttempts: NO_OP_DISPATCH_RETRY_MAX_ATTEMPTS,
+  };
+}
+
+function buildNoOpDispatchRetrySchedule(input: {
+  now: Date;
+  attempt: number;
+  maxAttempts: number;
+  retryNotBefore: Date | null;
+}) {
+  const target = input.retryNotBefore
+    ? input.retryNotBefore.getTime() + NO_OP_DISPATCH_RETRY_SAFETY_MARGIN_MS
+    : input.now.getTime() + NO_OP_DISPATCH_RETRY_FALLBACK_DELAY_MS;
+  const delayMs = Math.min(
+    NO_OP_DISPATCH_RETRY_MAX_DELAY_MS,
+    Math.max(NO_OP_DISPATCH_RETRY_MIN_DELAY_MS, target - input.now.getTime()),
+  );
+  return {
+    attempt: input.attempt,
+    baseDelayMs: delayMs,
+    delayMs,
+    dueAt: new Date(input.now.getTime() + delayMs),
+    maxAttempts: input.maxAttempts,
+  };
 }
 
 function mergeAdapterRecoveryMetadata(input: {
@@ -8266,9 +8325,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const retryReason = opts?.retryReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON;
     const wakeReason = opts?.wakeReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON;
     const maxAttempts = Math.max(0, Math.floor(opts?.maxAttempts ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS));
-    const nextAttempt = (run.scheduledRetryAttempt ?? 0) + 1;
-    const baseSchedule = opts?.delayMs != null
-      ? nextAttempt <= maxAttempts
+    const noOpDispatchRetry = resolveNoOpDispatchRetry({ run, retryReason });
+    // A dispatch that never reached the model did not happen, so it must not advance the ladder.
+    const nextAttempt = (run.scheduledRetryAttempt ?? 0) + (noOpDispatchRetry.active ? 0 : 1);
+    const ladderAttempt = Math.max(1, nextAttempt);
+    const transientRecovery =
+      retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON
+        ? readTransientRecoveryContractFromRun(run)
+        : null;
+    const codexTransientFallbackMode =
+      agent.adapterType === "codex_local" && transientRecovery
+        ? resolveCodexTransientFallbackMode(ladderAttempt)
+        : null;
+    const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
+    const ladderSchedule = opts?.delayMs != null
+      ? ladderAttempt <= maxAttempts
         ? {
             attempt: nextAttempt,
             baseDelayMs: Math.max(0, Math.floor(opts.delayMs)),
@@ -8277,36 +8348,46 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             maxAttempts,
           }
         : null
-      : nextAttempt <= maxAttempts
-        ? computeBoundedTransientHeartbeatRetrySchedule(nextAttempt, now, opts?.random)
+      : ladderAttempt <= maxAttempts
+        ? computeBoundedTransientHeartbeatRetrySchedule(ladderAttempt, now, opts?.random)
         : null;
-    const transientRecovery =
-      retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON
-        ? readTransientRecoveryContractFromRun(run)
-        : null;
-    const codexTransientFallbackMode =
-      agent.adapterType === "codex_local" && transientRecovery
-        ? resolveCodexTransientFallbackMode(nextAttempt)
-        : null;
-    const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
+    const baseSchedule = noOpDispatchRetry.exhausted
+      ? null
+      : noOpDispatchRetry.active
+        ? buildNoOpDispatchRetrySchedule({
+            now,
+            attempt: nextAttempt,
+            maxAttempts,
+            retryNotBefore: transientRetryNotBefore,
+          })
+        : ladderSchedule;
 
     if (!baseSchedule) {
+      const giveUpReason = noOpDispatchRetry.exhausted
+        ? `No-op dispatch retries exhausted after ${noOpDispatchRetry.maxAttempts} attempts that never reached the model`
+        : `Bounded retry exhausted after ${run.scheduledRetryAttempt ?? 0} scheduled attempts`;
       await appendRunEvent(run, await nextRunEventSeq(run.id), {
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
-        message: `Bounded retry exhausted after ${run.scheduledRetryAttempt ?? 0} scheduled attempts; no further automatic retry will be queued`,
+        message: `${giveUpReason}; no further automatic retry will be queued`,
         payload: {
           retryReason,
           scheduledRetryAttempt: run.scheduledRetryAttempt ?? 0,
           maxAttempts,
+          ...(noOpDispatchRetry.exhausted
+            ? {
+                noOpDispatchRetryAttempt: noOpDispatchRetry.attempt,
+                noOpDispatchMaxAttempts: noOpDispatchRetry.maxAttempts,
+              }
+            : {}),
         },
       });
       await releaseRoutineExecutionIssueAfterRetryGiveUp(run, {
         retryReason,
         attempt: nextAttempt,
         maxAttempts,
-        giveUpReason: `Bounded retry exhausted after ${run.scheduledRetryAttempt ?? 0} scheduled attempts`,
+        giveUpReason,
       });
       return {
         outcome: "retry_exhausted" as const,
@@ -8353,7 +8434,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const schedule =
-      transientRetryNotBefore && transientRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
+      !noOpDispatchRetry.active &&
+      transientRetryNotBefore &&
+      transientRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
         ? {
             ...baseSchedule,
             dueAt: transientRetryNotBefore,
@@ -8398,6 +8481,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       scheduledRetryAt: schedule.dueAt.toISOString(),
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
+      noOpDispatchRetryAttempt: noOpDispatchRetry.attempt,
+      ...(noOpDispatchRetry.active ? { noOpDispatchRetry: true } : {}),
     }, "normal_model");
     const responsibleUserId = await resolveResponsibleUserIdForRunContext(run, retryContextSnapshot);
     const maxTurnContinuationIdempotencyKey = retryReason === MAX_TURN_CONTINUATION_RETRY_REASON
@@ -8569,6 +8654,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             scheduledRetryAt: schedule.dueAt.toISOString(),
             ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
             ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
+            ...(noOpDispatchRetry.active
+              ? { noOpDispatchRetry: true, noOpDispatchRetryAttempt: noOpDispatchRetry.attempt }
+              : {}),
           }, "normal_model"),
           status: "queued",
           requestedByActorType: "system",
@@ -8681,7 +8769,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       eventType: "lifecycle",
       stream: "system",
       level: "warn",
-      message: `Scheduled bounded retry ${schedule.attempt}/${schedule.maxAttempts} for ${schedule.dueAt.toISOString()}`,
+      message: noOpDispatchRetry.active
+        ? `Scheduled no-op dispatch retry ${noOpDispatchRetry.attempt}/${noOpDispatchRetry.maxAttempts} for ${schedule.dueAt.toISOString()} without consuming bounded retry attempt ${schedule.attempt}`
+        : `Scheduled bounded retry ${schedule.attempt}/${schedule.maxAttempts} for ${schedule.dueAt.toISOString()}`,
       payload: {
         retryRunId: retryRun.id,
         retryReason,
@@ -8692,6 +8782,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         delayMs: schedule.delayMs,
         ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
         ...(codexTransientFallbackMode ? { codexTransientFallbackMode } : {}),
+        ...(noOpDispatchRetry.active
+          ? {
+              noOpDispatchRetry: true,
+              noOpDispatchRetryAttempt: noOpDispatchRetry.attempt,
+              noOpDispatchMaxAttempts: noOpDispatchRetry.maxAttempts,
+            }
+          : {}),
       },
     });
 
