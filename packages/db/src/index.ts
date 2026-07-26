@@ -12,6 +12,10 @@ export {
   type Db,
 } from "./client.js";
 export {
+  createQueryCancellationScope,
+  type QueryCancellationScope,
+} from "./query-cancellation.js";
+export {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
   type EmbeddedPostgresTestDatabase,

@@ -4,6 +4,7 @@ import { migrate as migratePg } from "drizzle-orm/postgres-js/migrator";
 import { readFile, readdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import postgres from "postgres";
+import { enableQueryCancellation } from "./query-cancellation.js";
 import * as schema from "./schema/index.js";
 
 const MIGRATIONS_FOLDER = fileURLToPath(new URL("./migrations", import.meta.url));
@@ -74,7 +75,10 @@ export function createDb(url: string) {
     max,
     connection: { statement_timeout: statementTimeoutMs },
   });
-  return drizzlePg(sql, { schema });
+  // Queries issued inside a cancellation scope (see query-cancellation.ts) are
+  // cancelled when that scope aborts, so an abandoned request stops holding its
+  // pool connection instead of squatting it until statement_timeout.
+  return drizzlePg(enableQueryCancellation(sql), { schema });
 }
 
 export async function getPostgresDataDirectory(url: string): Promise<string | null> {
