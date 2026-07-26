@@ -23,5 +23,10 @@ export const activityLog = pgTable(
     companyCreatedIdx: index("activity_log_company_created_idx").on(table.companyId, table.createdAt),
     runIdIdx: index("activity_log_run_id_idx").on(table.runId),
     entityIdx: index("activity_log_entity_type_id_idx").on(table.entityType, table.entityId),
+    // Serves the per-issue MAX(created_at) lookup behind issue-list ordering as a single
+    // index seek. Without the trailing created_at the planner instead scans
+    // activity_log_company_created_idx backwards across the whole company per row.
+    companyEntityCreatedIdx: index("activity_log_company_entity_created_idx")
+      .on(table.companyId, table.entityType, table.entityId, table.createdAt),
   }),
 );

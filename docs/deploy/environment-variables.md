@@ -15,6 +15,8 @@ All environment variables that Paperclip uses for server configuration.
 | `HOST` | `127.0.0.1` | Legacy host override; prefer `PAPERCLIP_BIND` for new setups |
 | `DATABASE_URL` | (embedded) | PostgreSQL connection string |
 | `PAPERCLIP_ALLOW_EMBEDDED_POSTGRES_PUBLIC` | `true` | When `false`, an `authenticated` + `public` deployment with no `DATABASE_URL` refuses to boot instead of falling back to embedded PostgreSQL. Default (`true`, or unset) warns and continues on embedded PostgreSQL. Set `false` to require an external managed Postgres in production. |
+| `PAPERCLIP_DB_POOL_MAX` | `20` | Maximum connections in the application's PostgreSQL pool. Raise it for busier instances, but keep the total across all processes under the server's `max_connections` (commonly `100`). Values below `1` or non-integers fall back to the default. |
+| `PAPERCLIP_DB_STATEMENT_TIMEOUT_MS` | `60000` | Per-query `statement_timeout` for the application pool, in milliseconds. A query exceeding it is cancelled and its pool connection released, so one slow query cannot starve the pool. Set `0` to disable (not recommended). Non-integers and negative values fall back to the default. Database migrations run on a separate connection and are not affected. |
 | `PAPERCLIP_HOME` | `~/.paperclip` | Base directory for all Paperclip data |
 | `PAPERCLIP_INSTANCE_ID` | `default` | Instance identifier (for multiple local instances) |
 | `PAPERCLIP_DEPLOYMENT_MODE` | `local_trusted` | Runtime mode override |

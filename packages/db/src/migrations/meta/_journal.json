@@ -967,6 +967,13 @@
       "when": 1783100300000,
       "tag": "0139_egress_would_deny_observations",
       "breakpoints": true
+    },
+    {
+      "idx": 140,
+      "version": "7",
+      "when": 1783100400000,
+      "tag": "0140_activity_log_company_entity_created_idx",
+      "breakpoints": true
     }
   ]
 }

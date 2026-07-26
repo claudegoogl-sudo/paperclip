@@ -3,8 +3,11 @@ import fs from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
 import {
+  DEFAULT_DB_POOL_MAX,
+  DEFAULT_DB_STATEMENT_TIMEOUT_MS,
   applyPendingMigrations,
   inspectMigrations,
+  resolveDbPoolOptions,
 } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -1272,4 +1275,49 @@ describeEmbeddedPostgres("applyPendingMigrations", () => {
     },
     20_000,
   );
+});
+
+describe("resolveDbPoolOptions", () => {
+  const envKeys = ["PAPERCLIP_DB_POOL_MAX", "PAPERCLIP_DB_STATEMENT_TIMEOUT_MS"] as const;
+  const originalEnv = new Map(envKeys.map((key) => [key, process.env[key]]));
+
+  afterEach(() => {
+    for (const key of envKeys) {
+      const original = originalEnv.get(key);
+      if (original === undefined) delete process.env[key];
+      else process.env[key] = original;
+    }
+  });
+
+  it("defaults to a bounded pool and statement timeout", () => {
+    for (const key of envKeys) delete process.env[key];
+    expect(resolveDbPoolOptions()).toEqual({
+      max: DEFAULT_DB_POOL_MAX,
+      statementTimeoutMs: DEFAULT_DB_STATEMENT_TIMEOUT_MS,
+    });
+  });
+
+  it("honours valid overrides", () => {
+    process.env.PAPERCLIP_DB_POOL_MAX = "42";
+    process.env.PAPERCLIP_DB_STATEMENT_TIMEOUT_MS = "15000";
+    expect(resolveDbPoolOptions()).toEqual({ max: 42, statementTimeoutMs: 15000 });
+  });
+
+  it("treats a zero statement timeout as an explicit opt-out but keeps the pool bounded", () => {
+    process.env.PAPERCLIP_DB_POOL_MAX = "0";
+    process.env.PAPERCLIP_DB_STATEMENT_TIMEOUT_MS = "0";
+    expect(resolveDbPoolOptions()).toEqual({
+      max: DEFAULT_DB_POOL_MAX,
+      statementTimeoutMs: 0,
+    });
+  });
+
+  it("falls back to defaults for unparseable values", () => {
+    process.env.PAPERCLIP_DB_POOL_MAX = "lots";
+    process.env.PAPERCLIP_DB_STATEMENT_TIMEOUT_MS = "-1";
+    expect(resolveDbPoolOptions()).toEqual({
+      max: DEFAULT_DB_POOL_MAX,
+      statementTimeoutMs: DEFAULT_DB_STATEMENT_TIMEOUT_MS,
+    });
+  });
 });

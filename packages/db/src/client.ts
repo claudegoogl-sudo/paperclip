@@ -45,8 +45,35 @@ export type MigrationState =
       reason: "no-migration-journal-empty-db" | "no-migration-journal-non-empty-db" | "pending-migrations";
     };
 
+export const DEFAULT_DB_POOL_MAX = 20;
+export const DEFAULT_DB_STATEMENT_TIMEOUT_MS = 60_000;
+
+function readIntEnv(name: string, fallback: number, { min }: { min: number }): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = Number(raw.trim());
+  if (!Number.isInteger(parsed) || parsed < min) return fallback;
+  return parsed;
+}
+
+export function resolveDbPoolOptions(): { max: number; statementTimeoutMs: number } {
+  return {
+    max: readIntEnv("PAPERCLIP_DB_POOL_MAX", DEFAULT_DB_POOL_MAX, { min: 1 }),
+    // 0 disables the timeout, matching Postgres' own statement_timeout semantics.
+    statementTimeoutMs: readIntEnv(
+      "PAPERCLIP_DB_STATEMENT_TIMEOUT_MS",
+      DEFAULT_DB_STATEMENT_TIMEOUT_MS,
+      { min: 0 },
+    ),
+  };
+}
+
 export function createDb(url: string) {
-  const sql = postgres(url);
+  const { max, statementTimeoutMs } = resolveDbPoolOptions();
+  const sql = postgres(url, {
+    max,
+    connection: { statement_timeout: statementTimeoutMs },
+  });
   return drizzlePg(sql, { schema });
 }
 
