@@ -92,6 +92,40 @@ type StalePinReason =
   | "runless_issue";
 
 type StalePinRelease = { issueId: string; runIds: string[]; overdueMinutes: number; reason: StalePinReason };
+
+// The live heartbeat runs holding an execution issue open. Both the reap classifier and the skip
+// description read these, so they are loaded once per dispatch and shared.
+type PinningRun = {
+  id: string;
+  status: string;
+  startedAt: Date | null;
+  lastOutputAt: Date | null;
+  scheduledRetryAt: Date | null;
+  scheduledRetryAttempt: number | null;
+  scheduledRetryReason: string | null;
+};
+
+// Turns the pinning runs into one line a human can act on. `Skipped because a live execution issue
+// already exists` is true of both "the retry is late, it is due at 15:04Z" and "nothing is ever
+// coming", and telling those apart used to mean querying heartbeat_runs by hand.
+function describePinningRuns(pinningRuns: PinningRun[], now: Date) {
+  if (pinningRuns.length === 0) return "a live execution issue (no pinning run rows found)";
+
+  const parts = pinningRuns.map((run) => {
+    const attempt = run.scheduledRetryAttempt ? ` attempt ${run.scheduledRetryAttempt}` : "";
+    const cause = run.scheduledRetryReason ? ` (${run.scheduledRetryReason})` : "";
+    if (run.status !== "scheduled_retry" || !run.scheduledRetryAt) {
+      return `run ${run.id} is ${run.status}${attempt}${cause}`;
+    }
+    const dueAt = new Date(run.scheduledRetryAt);
+    const lateBy = Math.round((now.getTime() - dueAt.getTime()) / 60000);
+    const timing = lateBy > 0 ? `${lateBy} minute(s) overdue` : `due in ${Math.abs(lateBy)} minute(s)`;
+    return `run ${run.id} is a scheduled retry${attempt}${cause} due ${dueAt.toISOString()} (${timing})`;
+  });
+
+  return parts.join("; ");
+}
+
 const MAX_CATCH_UP_RUNS = 25;
 const MAX_ROUTINE_REVISIONS = 100;
 const WEEKDAY_INDEX: Record<string, number> = {
@@ -1155,6 +1189,10 @@ export function routineService(
     status: string;
     issueId?: string | null;
     nextRunAt?: Date | null;
+    // Appended to the trigger's lastResult. This is the surface an operator reads first, and
+    // bare "Skipped because a live execution issue already exists" cannot distinguish a retry
+    // that is merely late from one that is never coming.
+    resultDetail?: string | null;
   }, executor: Db = db) {
     await executor
       .update(routines)
@@ -1170,7 +1208,9 @@ export function routineService(
         .update(routineTriggers)
         .set({
           lastFiredAt: input.triggeredAt,
-          lastResult: nextResultText(input.status, input.issueId),
+          lastResult: input.resultDetail
+            ? `${nextResultText(input.status, input.issueId)} — ${input.resultDetail}`
+            : nextResultText(input.status, input.issueId),
           nextRunAt: input.nextRunAt === undefined ? undefined : input.nextRunAt,
           updatedAt: new Date(),
         })
@@ -1359,31 +1399,24 @@ export function routineService(
       .then((rows) => rows[0] ?? null);
   }
 
-  // Returns the runs pinning `issue` only when EVERY one of them is demonstrably dead, i.e. a
-  // scheduled retry that was never started and whose due time has long passed — the promoter
-  // will never pick it up, so `skip_if_active` would otherwise skip on it forever.
-  //
-  // Deliberately narrow: a `running` (or merely queued, or not-yet-due) run is real work in
-  // flight and must keep its pin. Stalled `running` runs are already handled by the heartbeat
-  // liveness/recovery path, so this guard does not duplicate that.
+  // The live heartbeat runs holding `issue` open. Loaded once per dispatch and shared, so the
+  // skip description reports the very rows the reap decision was taken on rather than re-querying
+  // and possibly disagreeing with itself.
   //
   // The rows are locked FOR UPDATE because promoteDueScheduledRetry flips `scheduled_retry` to
   // `queued` outside this transaction. Without the lock, READ COMMITTED lets us decide "dead" on
   // a snapshot that a concurrent promotion has already invalidated, and then cancel a run that
   // is about to start.
-  async function findDeadExecutionPinRuns(
-    issue: typeof issues.$inferSelect,
-    executor: Db,
-    now: Date,
-    nextRunAt?: Date | null,
-  ) {
-    const pinningRuns = await executor
+  async function loadPinningRuns(issue: typeof issues.$inferSelect, executor: Db) {
+    return executor
       .select({
         id: heartbeatRuns.id,
         status: heartbeatRuns.status,
         startedAt: heartbeatRuns.startedAt,
         lastOutputAt: heartbeatRuns.lastOutputAt,
         scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+        scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+        scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
       })
       .from(heartbeatRuns)
       .where(
@@ -1397,7 +1430,18 @@ export function routineService(
         ),
       )
       .for("update");
+  }
 
+  // Classifies the pinning runs, returning them only when EVERY one is demonstrably reapable.
+  //
+  // Deliberately narrow: a `running` (or merely queued, or not-yet-due) run is real work in
+  // flight and must keep its pin. Stalled `running` runs are already handled by the heartbeat
+  // liveness/recovery path, so this guard does not duplicate that.
+  function findDeadExecutionPinRuns(
+    pinningRuns: PinningRun[],
+    now: Date,
+    nextRunAt?: Date | null,
+  ) {
     if (pinningRuns.length === 0) return null;
 
     // Shared by both arms. `status` must be asserted explicitly: promotion to `queued` leaves
@@ -1867,8 +1911,10 @@ export function routineService(
           dispatchFingerprint,
           { kind: issueOriginKind, id: issueOriginId },
         );
+        let pinningRuns: PinningRun[] = [];
         if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
-          const deadRuns = await findDeadExecutionPinRuns(activeIssue, txDb, triggeredAt, nextRunAt);
+          pinningRuns = await loadPinningRuns(activeIssue, txDb);
+          const deadRuns = findDeadExecutionPinRuns(pinningRuns, triggeredAt, nextRunAt);
           if (deadRuns) {
             const released = await releaseDeadExecutionPin({
               routine: input.routine,
@@ -1893,10 +1939,12 @@ export function routineService(
               touchedAt: triggeredAt,
             });
           }
+          const pinDescription = describePinningRuns(pinningRuns, triggeredAt);
           const updated = await finalizeRun(createdRun.id, {
             status,
             linkedIssueId: activeIssue.id,
             coalescedIntoRunId: activeIssue.originRunId,
+            failureReason: `Pinned by issue ${activeIssue.id}: ${pinDescription}`,
             completedAt: triggeredAt,
           }, txDb);
           await updateRoutineTouchedState({
@@ -1906,6 +1954,7 @@ export function routineService(
             status,
             issueId: activeIssue.id,
             nextRunAt,
+            resultDetail: pinDescription,
           }, txDb);
           return updated ?? createdRun;
         }
@@ -1984,10 +2033,12 @@ export function routineService(
                 touchedAt: triggeredAt,
               });
             }
+            const pinDescription = describePinningRuns(await loadPinningRuns(existingIssue, txDb), triggeredAt);
             const updated = await finalizeRun(createdRun.id, {
               status,
               linkedIssueId: existingIssue.id,
               coalescedIntoRunId: existingIssue.originRunId,
+              failureReason: `Pinned by issue ${existingIssue.id}: ${pinDescription}`,
               completedAt: triggeredAt,
             }, txDb);
             await updateRoutineTouchedState({
@@ -1997,6 +2048,7 @@ export function routineService(
               status,
               issueId: existingIssue.id,
               nextRunAt,
+              resultDetail: pinDescription,
             }, txDb);
             return updated ?? createdRun;
           }
@@ -2017,6 +2069,11 @@ export function routineService(
         const updated = await finalizeRun(createdRun.id, {
           status: "issue_created",
           linkedIssueId: createdIssue.id,
+          // Names the reap arm on the run row so "this tick had to break a pin first" is legible
+          // from run history alone, without correlating against the activity log.
+          failureReason: stalePinRelease.value
+            ? `Released stale execution pin on issue ${stalePinRelease.value.issueId} (${stalePinRelease.value.reason})`
+            : null,
         }, txDb);
         await updateRoutineTouchedState({
           routineId: input.routine.id,
