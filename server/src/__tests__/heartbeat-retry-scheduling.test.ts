@@ -24,6 +24,7 @@ import {
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS,
   MAX_TURN_CONTINUATION_RETRY_REASON,
   MAX_TURN_CONTINUATION_WAKE_REASON,
+  NO_OP_DISPATCH_RETRY_MAX_ATTEMPTS,
   heartbeatService,
 } from "../services/heartbeat.ts";
 
@@ -76,6 +77,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     retryNotBefore?: string | null;
     scheduledRetryAttempt?: number;
     resultJson?: Record<string, unknown> | null;
+    contextSnapshotExtra?: Record<string, unknown>;
     adapterType?: "codex_local" | "claude_local";
     agentName?: string;
   }) {
@@ -129,6 +131,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       contextSnapshot: {
         issueId: randomUUID(),
         wakeReason: "issue_assigned",
+        ...(input.contextSnapshotExtra ?? {}),
       },
       updatedAt: input.now,
       createdAt: input.now,
@@ -1616,5 +1619,134 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect((wakeupRequest?.payload as Record<string, unknown> | null)?.transientRetryNotBefore).toBe(
       retryNotBefore.toISOString(),
     );
+  });
+
+  it("retries a pre-turn 429 at the advertised reset time without consuming a bounded attempt", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-07-26T13:16:00.000Z");
+    const retryNotBefore = new Date("2026-07-26T13:50:00.000Z");
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "claude_transient_upstream",
+      adapterType: "claude_local",
+      scheduledRetryAttempt: 2,
+      resultJson: {
+        errorFamily: "transient_upstream",
+        retryNotBefore: retryNotBefore.toISOString(),
+        transientRetryNotBefore: retryNotBefore.toISOString(),
+        noOpDispatch: true,
+        noOpDispatchReason: "pre_turn_rate_limit",
+      },
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+    expect(scheduled.attempt).toBe(2);
+    expect(scheduled.dueAt.getTime()).toBeGreaterThanOrEqual(retryNotBefore.getTime());
+
+    const retryRun = await db
+      .select({
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+        scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+
+    expect(retryRun?.scheduledRetryAttempt).toBe(2);
+    expect(retryRun?.scheduledRetryAt?.getTime()).toBeGreaterThanOrEqual(retryNotBefore.getTime());
+    expect((retryRun?.contextSnapshot as Record<string, unknown> | null)?.noOpDispatchRetryAttempt).toBe(1);
+  });
+
+  it("stops retrying pre-turn 429s once the no-op cap is reached", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-07-26T13:16:00.000Z");
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "claude_transient_upstream",
+      adapterType: "claude_local",
+      scheduledRetryAttempt: 1,
+      resultJson: {
+        errorFamily: "transient_upstream",
+        noOpDispatch: true,
+        noOpDispatchReason: "pre_turn_rate_limit",
+      },
+      contextSnapshotExtra: { noOpDispatchRetryAttempt: NO_OP_DISPATCH_RETRY_MAX_ATTEMPTS },
+    });
+
+    const exhausted = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+
+    expect(exhausted.outcome).toBe("retry_exhausted");
+
+    const runCount = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(heartbeatRuns)
+      .then((rows) => rows[0]?.count ?? 0);
+    expect(runCount).toBe(1);
+
+    const exhaustionEvent = await db
+      .select({ message: heartbeatRunEvents.message, payload: heartbeatRunEvents.payload })
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, runId))
+      .orderBy(sql`${heartbeatRunEvents.seq} desc`)
+      .then((rows) => rows.find((row) => row.message.includes("No-op dispatch retries exhausted")) ?? null);
+    expect(exhaustionEvent?.payload).toMatchObject({
+      noOpDispatchRetryAttempt: NO_OP_DISPATCH_RETRY_MAX_ATTEMPTS + 1,
+      noOpDispatchMaxAttempts: NO_OP_DISPATCH_RETRY_MAX_ATTEMPTS,
+    });
+  });
+
+  it("still consumes a bounded attempt for a 429 that took model turns", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date("2026-07-26T13:16:00.000Z");
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "claude_transient_upstream",
+      adapterType: "claude_local",
+      scheduledRetryAttempt: 2,
+      errorFamily: "transient_upstream",
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+    expect(scheduled.attempt).toBe(3);
+    expect(scheduled.dueAt.getTime()).toBe(
+      now.getTime() + BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS[2],
+    );
+
+    const retryRun = await db
+      .select({
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+
+    expect(retryRun?.scheduledRetryAttempt).toBe(3);
+    expect((retryRun?.contextSnapshot as Record<string, unknown> | null)?.noOpDispatchRetryAttempt).toBe(0);
   });
 });
