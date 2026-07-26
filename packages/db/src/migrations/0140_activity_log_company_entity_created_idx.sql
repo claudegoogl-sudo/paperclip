@@ -1,0 +1,11 @@
+-- Issue-list ordering resolves each row's last-activity timestamp with a
+-- correlated `SELECT MAX(created_at) FROM activity_log WHERE company_id = ? AND
+-- entity_type = 'issue' AND entity_id = ?`. Neither existing index covers that
+-- predicate together with created_at, so the planner rewrites MAX into a backwards
+-- scan of "activity_log_company_created_idx" and walks the company's entire activity
+-- history once per candidate row. On a 1.1M-row activity_log that is >60s for a
+-- company-wide search, which is what exhausted the connection pool.
+--
+-- This composite index makes the same lookup a single index-only seek (measured
+-- >60s -> 79ms at production scale). Idempotent: re-running creates nothing new.
+CREATE INDEX IF NOT EXISTS "activity_log_company_entity_created_idx" ON "activity_log" ("company_id","entity_type","entity_id","created_at");
