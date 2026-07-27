@@ -97,6 +97,23 @@ async function deleteHeartbeatRunsAndWakeupsAfterActivityLogDrains(db: Db) {
   }
 }
 
+async function deleteAgentsAfterActivityLogDrains(db: Db) {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    await db.delete(activityLog);
+    try {
+      await db.delete(agents);
+      return;
+    } catch (error) {
+      const message = error instanceof Error ? `${error.message} ${String(error.cause ?? "")}` : String(error);
+      if (!message.includes("activity_log_agent_id_agents_id_fk")) throw error;
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  throw lastError;
+}
+
 async function deleteCompanySkillsAfterLateHeartbeatWritesDrain(db: Db) {
   let lastError: unknown = null;
   for (let attempt = 0; attempt < 10; attempt += 1) {
@@ -673,7 +690,7 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
     await db.delete(agentRuntimeState);
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
-    await db.delete(agents);
+    await deleteAgentsAfterActivityLogDrains(db);
     await db.delete(projects);
     await deleteCompanySkillsAfterLateHeartbeatWritesDrain(db);
   });

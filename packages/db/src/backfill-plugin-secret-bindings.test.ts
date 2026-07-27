@@ -106,9 +106,16 @@ describeEmbeddedPostgres("0100 backfill company_secret_bindings", () => {
     return id;
   }
 
-  async function setInstanceConfig(pluginId: string, config: unknown): Promise<void> {
-    await sql`INSERT INTO plugin_config (plugin_id, config_json)
-      VALUES (${pluginId}, ${sql.json(config as Json)})`;
+  // Upstream migration 0164 scoped plugin_config by company (company_id NOT NULL),
+  // so there is no longer an instance-global config row. Every caller here refers
+  // to a companyA-owned secret, so companyA keeps each case's assertion intact.
+  async function setInstanceConfig(
+    pluginId: string,
+    config: unknown,
+    companyId: string = companyA,
+  ): Promise<void> {
+    await sql`INSERT INTO plugin_config (plugin_id, company_id, config_json)
+      VALUES (${pluginId}, ${companyId}, ${sql.json(config as Json)})`;
   }
 
   async function setCompanySettings(

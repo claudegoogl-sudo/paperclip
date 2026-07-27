@@ -9520,12 +9520,8 @@ export function issueRoutes(
     async (req, res) => {
       const id = req.params.id as string;
       const interactionId = req.params.interactionId as string;
-      const issue = await svc.getById(id);
-      if (!issue) {
-        res.status(404).json({ error: "Issue not found" });
-        return;
-      }
-      assertCompanyAccess(req, issue.companyId);
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
 
       const interactionSvc = issueThreadInteractionService(db);
       if (req.actor.type === "agent") {
