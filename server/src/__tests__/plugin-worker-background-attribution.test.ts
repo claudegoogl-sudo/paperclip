@@ -51,6 +51,21 @@ describe("PLA-1824 — a background call that owns no dispatch must not inherit 
       } as unknown as HostServices,
     });
 
+    // PLA-1819 (be872d0a4) made `config.get` fail closed, so "the loop is still
+    // ticking" can no longer be read off a service spy — a denied call reaches
+    // no service at all. Count the denials instead, which doubles as the
+    // liveness proof for the background loop.
+    let deniedConfigGets = 0;
+    const rawConfigGet = handlers["config.get"];
+    handlers["config.get"] = (async (params: unknown, context: unknown) => {
+      try {
+        return await (rawConfigGet as (p: unknown, c: unknown) => Promise<unknown>)(params, context);
+      } catch (err) {
+        deniedConfigGets += 1;
+        throw err;
+      }
+    }) as typeof rawConfigGet;
+
     const handle = createPluginWorkerHandle("test.plugin", {
       entrypointPath: BACKGROUND_CONFIG_POLL_WORKER_ENTRYPOINT,
       manifest: TEST_MANIFEST,
@@ -63,11 +78,11 @@ describe("PLA-1824 — a background call that owns no dispatch must not inherit 
         : {}),
     });
 
-    return { getForCompany, instanceWideGet, handle };
+    return { getForCompany, instanceWideGet, handle, denials: () => deniedConfigGets };
   }
 
   it("does not resolve a setup()-loop config.get to the unrelated tenant whose dispatch is in flight", async () => {
-    const { getForCompany, instanceWideGet, handle } = buildHarness(true);
+    const { getForCompany, instanceWideGet, handle, denials } = buildHarness(true);
 
     try {
       await handle.start();
@@ -75,7 +90,8 @@ describe("PLA-1824 — a background call that owns no dispatch must not inherit 
       // Let the background loop tick with NO dispatch in flight first. This
       // proves the loop is independent of any dispatch: it already exists.
       await new Promise((resolve) => setTimeout(resolve, 60));
-      expect(instanceWideGet.mock.calls.length).toBeGreaterThan(0);
+      const denialsBefore = denials();
+      expect(denialsBefore).toBeGreaterThan(0);
       expect(getForCompany).not.toHaveBeenCalled();
 
       // Now company-a dispatches an event. The fixture holds it open, so it is
@@ -88,11 +104,12 @@ describe("PLA-1824 — a background call that owns no dispatch must not inherit 
       } as unknown as HostToWorkerMethods["onEvent"][0]);
 
       // The background loop owns no dispatch. It must never be handed
-      // company-a's effective config.
+      // company-a's effective config. Pre-fix this is `getForCompany("company-a")`.
       expect(getForCompany).not.toHaveBeenCalled();
-      // It still gets a working, tenant-free answer — the loop is not broken,
-      // it is just no longer pointed at a stranger's tenant.
-      expect(instanceWideGet.mock.calls.length).toBeGreaterThan(1);
+      // Post-PLA-1819 there is no tenant-free config to fall back to, so the
+      // loop keeps being denied rather than silently reading a stranger's tenant.
+      expect(instanceWideGet).not.toHaveBeenCalled();
+      expect(denials()).toBeGreaterThan(denialsBefore);
     } finally {
       await handle.stop().catch(() => undefined);
     }
