@@ -604,8 +604,8 @@ export function createPluginWorkerHandle(
   // Optional methods reported by the worker during initialization
   let supportedMethods: string[] = [];
   // PLA-1824: whether the worker declared at `initialize` that it echoes
-  // `paperclipInvocationId` on dispatch-servicing calls. Reset on every start
-  // so a crash-restarted worker must re-declare.
+  // `paperclipInvocationId` on dispatch-servicing calls. Reassigned from each
+  // successful handshake, so a crash-restarted worker re-declares.
   let echoesInvocationId = false;
 
   // Crash tracking for exponential backoff
