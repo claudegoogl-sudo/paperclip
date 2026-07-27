@@ -774,11 +774,38 @@ export const HEARTBEAT_RUN_STATUSES = [
   "scheduled_retry",
   "running",
   "succeeded",
+  // The adapter emitted a clean completion result but the process still exited
+  // non-zero (dirty teardown). The work landed, so this is a success for every
+  // purpose except teardown diagnostics — never treat it as a failure.
+  "succeeded_dirty",
   "failed",
   "cancelled",
   "timed_out",
 ] as const;
 export type HeartbeatRunStatus = (typeof HEARTBEAT_RUN_STATUSES)[number];
+
+/** Terminal statuses where the run actually did its work. */
+export const SUCCESSFUL_HEARTBEAT_RUN_STATUSES = ["succeeded", "succeeded_dirty"] as const;
+
+/** Terminal statuses where the run did not complete its work. */
+export const UNSUCCESSFUL_HEARTBEAT_RUN_STATUSES = ["failed", "cancelled", "timed_out"] as const;
+
+export const TERMINAL_HEARTBEAT_RUN_STATUSES = [
+  ...SUCCESSFUL_HEARTBEAT_RUN_STATUSES,
+  ...UNSUCCESSFUL_HEARTBEAT_RUN_STATUSES,
+] as const;
+
+export function isSuccessfulHeartbeatRunStatus(status: string | null | undefined): boolean {
+  return SUCCESSFUL_HEARTBEAT_RUN_STATUSES.includes(
+    status as (typeof SUCCESSFUL_HEARTBEAT_RUN_STATUSES)[number],
+  );
+}
+
+export function isTerminalHeartbeatRunStatus(status: string | null | undefined): boolean {
+  return TERMINAL_HEARTBEAT_RUN_STATUSES.includes(
+    status as (typeof TERMINAL_HEARTBEAT_RUN_STATUSES)[number],
+  );
+}
 
 export const RUN_LIVENESS_STATES = [
   "completed",
