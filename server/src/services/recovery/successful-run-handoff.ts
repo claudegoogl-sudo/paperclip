@@ -1,6 +1,7 @@
 import { and, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests, agents, heartbeatRuns, issues } from "@paperclipai/db";
+import { isSuccessfulHeartbeatRunStatus } from "@paperclipai/shared";
 import type { IssueCommentMetadata, IssueCommentPresentation, RunLivenessState } from "@paperclipai/shared";
 import { withRecoveryModelProfileHint } from "./model-profile-hint.js";
 
@@ -360,7 +361,7 @@ export function decideSuccessfulRunHandoff(input: {
 }): SuccessfulRunHandoffDecision {
   const { run, issue, agent } = input;
 
-  if (run.status !== "succeeded") return { kind: "skip", reason: "source run did not succeed" };
+  if (!isSuccessfulHeartbeatRunStatus(run.status)) return { kind: "skip", reason: "source run did not succeed" };
   if (isCorrectiveHandoffRun(run)) return { kind: "skip", reason: "source run is already a corrective handoff run" };
   if (isIssueMonitorMaintenanceRun(run)) return { kind: "skip", reason: "issue monitor run owns its own recovery path" };
   if (isCommentDrivenWake(run)) return { kind: "skip", reason: "comment-driven wake already owns the next action" };

@@ -1337,6 +1337,155 @@ describe("claude execute", () => {
     }
   });
 
+  // The CLI can exit non-zero during teardown after it already emitted a clean
+  // result. Those runs must not read as failures, and the guards below must
+  // keep real failures failing.
+  describe("dirty teardown after a successful result", () => {
+    async function executeWithCommand(commandPath: string, workspace: string, root: string) {
+      const previousHome = process.env.HOME;
+      process.env.HOME = root;
+      try {
+        return await execute({
+          runId: "run-claude-dirty-exit",
+          agent: {
+            id: "agent-1",
+            companyId: "company-1",
+            name: "Claude Coder",
+            adapterType: "claude_local",
+            adapterConfig: {},
+          },
+          runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+          config: {
+            command: commandPath,
+            cwd: workspace,
+            promptTemplate: "Follow the paperclip heartbeat.",
+          },
+          context: {},
+          authToken: "run-jwt-token",
+          onLog: async () => {},
+        });
+      } finally {
+        if (previousHome === undefined) delete process.env.HOME;
+        else process.env.HOME = previousHome;
+      }
+    }
+
+    async function runCase(resultEvent: Record<string, unknown>, exitCode: number) {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-dirty-"));
+      const workspace = path.join(root, "workspace");
+      const commandPath = path.join(root, "claude");
+      await fs.mkdir(workspace, { recursive: true });
+      await writeFailingClaudeCommand(commandPath, { resultEvent, exitCode });
+      try {
+        return await executeWithCommand(commandPath, workspace, root);
+      } finally {
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    }
+
+    const successResultEvent = {
+      type: "result",
+      subtype: "success",
+      session_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      is_error: false,
+      num_turns: 42,
+      total_cost_usd: 2.375,
+      result: "**Closed the ticket `done`.** The answer to the review question...",
+    } as const;
+
+    it("reports completedDirty instead of a failure when is_error is false", async () => {
+      const result = await runCase({ ...successResultEvent }, 1);
+
+      expect(result.exitCode).toBe(1);
+      expect(result.completedDirty).toBe(true);
+      expect(result.errorCode).toBe("dirty_exit");
+      // The old behaviour concatenated the agent's own success summary onto a
+      // failure verdict ("Claude run failed: subtype=success: ...").
+      expect(result.errorMessage ?? "").not.toContain("Claude run failed");
+      expect(result.errorMessage ?? "").toContain("exited with code 1");
+      // Must not feed the transient-retry machinery — the work is already done.
+      expect(result.errorFamily ?? null).toBeNull();
+      expect(result.retryNotBefore ?? null).toBeNull();
+      expect(result.resultJson?.dirtyExit).toMatchObject({ exitCode: 1 });
+      expect(result.summary ?? "").toContain("Closed the ticket");
+    });
+
+    it("still records the teardown cause for the follow-up investigation", async () => {
+      const result = await runCase(
+        {
+          ...successResultEvent,
+          errors: [{ type: "rate_limit_error", message: "You're out of extra usage" }],
+        },
+        1,
+      );
+
+      expect(result.completedDirty).toBe(true);
+      expect(result.resultJson?.dirtyExit).toMatchObject({
+        teardownErrorCode: "claude_transient_upstream",
+      });
+      // Recorded as diagnostics only; the retry contract stays unset.
+      expect(result.errorFamily ?? null).toBeNull();
+    });
+
+    it("still fails a run whose result reports is_error: true", async () => {
+      const result = await runCase(
+        {
+          type: "result",
+          subtype: "error",
+          session_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+          is_error: true,
+          result: "Something went wrong",
+        },
+        1,
+      );
+
+      expect(result.completedDirty ?? false).toBe(false);
+      expect(result.errorCode).not.toBe("dirty_exit");
+      expect(result.errorMessage ?? "").toContain("Claude run failed");
+      expect(result.resultJson?.dirtyExit).toBeUndefined();
+    });
+
+    it("still fails a non-zero exit whose result is not an explicit success", async () => {
+      // `subtype` absent: an unknown outcome must never be read as success.
+      const result = await runCase(
+        {
+          type: "result",
+          session_id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+          is_error: false,
+          result: "partial output",
+        },
+        1,
+      );
+
+      expect(result.completedDirty ?? false).toBe(false);
+      expect(result.errorMessage ?? "").toContain("Claude run failed");
+    });
+
+    it("still fails a non-zero exit that emitted no result at all", async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-noresult-"));
+      const workspace = path.join(root, "workspace");
+      const commandPath = path.join(root, "claude");
+      await fs.mkdir(workspace, { recursive: true });
+      await writeTextFailingClaudeCommand(commandPath, { stderr: "boom\n", exitCode: 1 });
+      try {
+        const result = await executeWithCommand(commandPath, workspace, root);
+        expect(result.completedDirty ?? false).toBe(false);
+        expect(result.errorMessage ?? "").not.toBe("");
+      } finally {
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    });
+
+    it("keeps a clean exit-0 success unchanged", async () => {
+      const result = await runCase({ ...successResultEvent }, 0);
+
+      expect(result.exitCode).toBe(0);
+      expect(result.completedDirty ?? false).toBe(false);
+      expect(result.errorMessage ?? null).toBeNull();
+      expect(result.errorCode ?? null).toBeNull();
+    });
+  });
+
   it("marks a session-limit 429 that never reached the model as a no-op dispatch", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-session-limit-"));
     const workspace = path.join(root, "workspace");

@@ -28,7 +28,11 @@ import type {
   PluginExecutionWorkspaceMetadata,
 } from "@paperclipai/plugin-sdk";
 import type { CreateIssueThreadInteraction, InviteJoinType, IssueDocumentSummary, PermissionKey, PrincipalType } from "@paperclipai/shared";
-import { pluginOperationIssueOriginKind } from "@paperclipai/shared";
+import {
+  pluginOperationIssueOriginKind,
+  TERMINAL_HEARTBEAT_RUN_STATUSES,
+  isSuccessfulHeartbeatRunStatus,
+} from "@paperclipai/shared";
 import { companyService } from "./companies.js";
 import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
@@ -3084,7 +3088,7 @@ export function buildHostServices(
         // Track the subscription so it can be cleaned up on dispose() if the run
         // never reaches a terminal status (hang, crash, network partition).
         if (notifyWorker) {
-          const TERMINAL_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
+          const TERMINAL_STATUSES = new Set<string>(TERMINAL_HEARTBEAT_RUN_STATUSES);
 
           const cleanup = () => {
             unsubscribe();
@@ -3113,9 +3117,9 @@ export function buildHostServices(
                   sessionId: params.sessionId,
                   runId: run.id,
                   seq: 0,
-                  eventType: status === "succeeded" ? "done" : "error",
+                  eventType: isSuccessfulHeartbeatRunStatus(status) ? "done" : "error",
                   stream: "system",
-                  message: status === "succeeded" ? "Run completed" : `Run ${status}`,
+                  message: isSuccessfulHeartbeatRunStatus(status) ? "Run completed" : `Run ${status}`,
                   payload: payload,
                 });
                 cleanup();

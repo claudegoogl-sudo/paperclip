@@ -16,6 +16,9 @@ import {
   type ExecutionWorkspace,
   type ExecutionWorkspaceConfig,
   type HeartbeatRunStatusPhase,
+  TERMINAL_HEARTBEAT_RUN_STATUSES,
+  UNSUCCESSFUL_HEARTBEAT_RUN_STATUSES,
+  isSuccessfulHeartbeatRunStatus,
   type IssueExecutionMonitorClearReason,
   type IssueExecutionMonitorPolicy,
   type IssueExecutionMonitorRecoveryPolicy,
@@ -89,6 +92,7 @@ import {
   buildHeartbeatRunStopMetadata,
   mergeHeartbeatRunStopMetadata,
   normalizeMaxTurnStopReason,
+  resolveAgentStatusAfterRun,
 } from "./heartbeat-stop-metadata.js";
 import {
   classifyRunLiveness,
@@ -270,8 +274,8 @@ const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
 const execFile = promisify(execFileCallback);
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
-const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "failed", "cancelled", "timed_out"] as const;
-const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
+const HEARTBEAT_RUN_TERMINAL_STATUSES = TERMINAL_HEARTBEAT_RUN_STATUSES;
+const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = UNSUCCESSFUL_HEARTBEAT_RUN_STATUSES;
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
 // Mirrors OPEN_ISSUE_STATUSES in services/routines.ts — the statuses that still pin a routine
 // via findLiveExecutionIssue, and therefore the ones a retry give-up must clear.
@@ -4789,7 +4793,7 @@ export function normalizeSessionParams(params: Record<string, unknown> | null | 
   return Object.keys(params).length > 0 ? params : null;
 }
 
-type RunSessionOutcome = "succeeded" | "failed" | "cancelled" | "timed_out";
+type RunSessionOutcome = "succeeded" | "succeeded_dirty" | "failed" | "cancelled" | "timed_out";
 
 const HERMES_ADAPTER_TYPE = "hermes_local";
 const HERMES_SESSION_ID_REGEX = /^(?:\d{8}_\d{6}_[A-Za-z0-9_-]{4,}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$/;
@@ -4901,7 +4905,7 @@ export function resolveNextSessionState(input: {
     };
   };
 
-  if (input.outcome !== "succeeded") {
+  if (input.outcome !== "succeeded" && input.outcome !== "succeeded_dirty") {
     return previousState();
   }
 
@@ -6762,7 +6766,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const eventType =
       run.status === "running"
         ? "agent.run.started"
-        : run.status === "succeeded"
+        : isSuccessfulHeartbeatRunStatus(run.status)
           ? "agent.run.finished"
           : run.status === "failed" || run.status === "timed_out"
             ? "agent.run.failed"
@@ -7018,7 +7022,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function handleSuccessfulRunHandoff(run: typeof heartbeatRuns.$inferSelect, agent: typeof agents.$inferSelect) {
-    if (run.status !== "succeeded") return;
+    if (!isSuccessfulHeartbeatRunStatus(run.status)) return;
     const context = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
     if (!issueId) return;
@@ -9656,7 +9660,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function finalizeAgentStatus(
     agentId: string,
-    outcome: "succeeded" | "failed" | "cancelled" | "timed_out",
+    outcome: RunSessionOutcome,
     failureReason?: string | null,
   ) {
     const existing = await getAgent(agentId);
@@ -9669,12 +9673,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const isFirstHeartbeat = !existing.lastHeartbeatAt;
 
     const runningCount = await countRunningRunsForAgent(agentId);
-    const nextStatus =
-      runningCount > 0
-        ? "running"
-        : outcome === "succeeded" || outcome === "cancelled"
-          ? "idle"
-          : "error";
+    const nextStatus = resolveAgentStatusAfterRun({ outcome, runningRunCount: runningCount });
 
     const updated = await db
       .update(agents)
@@ -9714,7 +9713,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   function mergeRunStopMetadataForAgent(
     agent: Pick<typeof agents.$inferSelect, "adapterType" | "adapterConfig">,
-    outcome: "succeeded" | "failed" | "cancelled" | "timed_out",
+    outcome: RunSessionOutcome,
     options?: {
       resultJson?: Record<string, unknown> | null;
       errorCode?: string | null;
@@ -12045,9 +12044,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         outcome = "timed_out";
       } else if ((adapterResult.exitCode ?? 0) === 0 && !adapterResult.errorMessage) {
         outcome = "succeeded";
+      } else if (adapterResult.completedDirty) {
+        // The agent emitted a clean completion result and only teardown exited
+        // non-zero. Recording this as `failed` used to park the agent in `error`
+        // on the back of a run that had done its work.
+        outcome = "succeeded_dirty";
       } else {
         outcome = "failed";
       }
+      const outcomeSucceeded = outcome === "succeeded" || outcome === "succeeded_dirty";
 
       const nextSessionState = resolveNextSessionState({
         adapterType: agent.adapterType,
@@ -12084,7 +12089,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ? (latestRun?.errorCode ?? "cancelled")
             : outcome === "failed"
               ? (adapterResult.errorCode ?? recordedResponsibleUserDenialCode ?? "adapter_failed")
-              : null;
+              : outcome === "succeeded_dirty"
+                ? (adapterResult.errorCode ?? "dirty_exit")
+                : null;
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
       if (handle) {
@@ -12099,11 +12106,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const status =
         outcome === "succeeded"
           ? "succeeded"
-          : outcome === "cancelled"
-            ? "cancelled"
-            : outcome === "timed_out"
-              ? "timed_out"
-              : "failed";
+          : outcome === "succeeded_dirty"
+            ? "succeeded_dirty"
+            : outcome === "cancelled"
+              ? "cancelled"
+              : outcome === "timed_out"
+                ? "timed_out"
+                : "failed";
 
       const usageJson =
         normalizedUsage || adapterResult.costUsd != null
@@ -12183,7 +12192,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         persistedRun = await classifyAndPersistRunLiveness(persistedRun, persistedResultJson) ?? persistedRun;
       }
 
-      await setWakeupStatus(run.wakeupRequestId, outcome === "succeeded" ? "completed" : status, {
+      await setWakeupStatus(run.wakeupRequestId, outcomeSucceeded ? "completed" : status, {
         finishedAt: new Date(),
         error: runErrorMessage,
       });
@@ -12193,7 +12202,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await appendRunEvent(finalizedRun, seq++, {
           eventType: "lifecycle",
           stream: "system",
-          level: outcome === "succeeded" ? "info" : "error",
+          level: outcomeSucceeded ? "info" : "error",
           message: `run ${outcome}`,
           payload: {
             status,
@@ -12203,7 +12212,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const livenessRun = finalizedRun;
         await refreshContinuationSummaryForRun(livenessRun, agent);
         const skipRunIssueComment = parseObject(livenessRun.contextSnapshot).skipIssueComment === true;
-        if (issueId && outcome === "succeeded" && !skipRunIssueComment) {
+        if (issueId && outcomeSucceeded && !skipRunIssueComment) {
           try {
             const existingRunComment = await findRunIssueComment(livenessRun.id, livenessRun.companyId, issueId);
             if (!existingRunComment) {
@@ -12361,7 +12370,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ),
               sessionDisplayId: nextSessionState.displayId,
               lastRunId: finalizedRun.id,
-              lastError: outcome === "succeeded" ? null : (adapterResult.errorMessage ?? "run_failed"),
+              lastError: outcomeSucceeded ? null : (adapterResult.errorMessage ?? "run_failed"),
             });
           }
         }
@@ -12369,7 +12378,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await finalizeAgentStatus(
         agent.id,
         outcome,
-        outcome === "succeeded" ? null : (adapterResult.errorMessage ?? null),
+        outcomeSucceeded ? null : (adapterResult.errorMessage ?? null),
       );
     } catch (err) {
       const message = redactCurrentUserText(

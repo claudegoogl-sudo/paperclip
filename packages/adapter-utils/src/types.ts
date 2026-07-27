@@ -74,6 +74,12 @@ export interface AdapterExecutionResult {
   errorMessage?: string | null;
   errorCode?: string | null;
   errorFamily?: AdapterExecutionErrorFamily | null;
+  /**
+   * The agent emitted a clean completion result but the process still exited
+   * non-zero. The work landed; only teardown went wrong, so the run must not be
+   * recorded as failed. `errorCode`/`errorMessage` describe the teardown fault.
+   */
+  completedDirty?: boolean;
   retryNotBefore?: string | null;
   errorMeta?: Record<string, unknown>;
   usage?: UsageSummary;

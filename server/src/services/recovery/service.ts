@@ -4,6 +4,8 @@ import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
+  UNSUCCESSFUL_HEARTBEAT_RUN_STATUSES,
+  isSuccessfulHeartbeatRunStatus,
   type IssueGraphLivenessAutoRecoveryPreview,
   type IssueGraphLivenessAutoRecoveryPreviewItem,
 } from "@paperclipai/shared";
@@ -71,7 +73,7 @@ import {
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
-const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
+const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = UNSUCCESSFUL_HEARTBEAT_RUN_STATUSES;
 export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
@@ -125,7 +127,7 @@ type LatestIssueRun = Pick<
 > & {
   resultJson?: unknown;
 } | null;
-type SuccessfulLatestIssueRun = NonNullable<LatestIssueRun> & { status: "succeeded" };
+type SuccessfulLatestIssueRun = NonNullable<LatestIssueRun> & { status: "succeeded" | "succeeded_dirty" };
 
 type StrandedRecoveryCause =
   | "stranded_assigned_issue"
@@ -411,11 +413,11 @@ function isUnsuccessfulTerminalIssueRun(latestRun: LatestIssueRun) {
 }
 
 function isSuccessfulInProgressContinuationRun(latestRun: LatestIssueRun): latestRun is SuccessfulLatestIssueRun {
-  return latestRun?.status === "succeeded";
+  return isSuccessfulHeartbeatRunStatus(latestRun?.status);
 }
 
 function isProductiveContinuationRun(latestRun: LatestIssueRun) {
-  return latestRun?.status === "succeeded" &&
+  return isSuccessfulInProgressContinuationRun(latestRun) &&
     (latestRun.livenessState === "advanced" ||
       latestRun.livenessState === "completed" ||
       latestRun.livenessState === "blocked" ||
@@ -3230,7 +3232,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
-        if (latestRun.status === "succeeded") {
+        if (isSuccessfulHeartbeatRunStatus(latestRun.status)) {
           result.skipped += 1;
           continue;
         }

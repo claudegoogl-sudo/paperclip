@@ -1,3 +1,4 @@
+import { isSuccessfulHeartbeatRunStatus } from "@paperclipai/shared";
 import type { HeartbeatRunStatus, IssueStatus, RunLivenessState } from "@paperclipai/shared";
 
 export type RunLivenessActionability =
@@ -309,7 +310,7 @@ export function classifyRunLiveness(input: RunLivenessClassificationInput): RunL
     actionability,
   });
 
-  if (input.runStatus !== "succeeded") {
+  if (!isSuccessfulHeartbeatRunStatus(input.runStatus)) {
     return output("failed", input.errorCode ? `Run ended with ${input.runStatus} (${input.errorCode})` : `Run ended with ${input.runStatus}`);
   }
 
