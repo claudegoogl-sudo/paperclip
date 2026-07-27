@@ -557,6 +557,45 @@ if (_logFlushInterval.unref) _logFlushInterval.unref();
 /** Maximum time (ms) to keep a session event subscription alive before forcing cleanup. */
 const SESSION_EVENT_SUBSCRIPTION_TIMEOUT_MS = 30 * 60 * 1_000; // 30 minutes
 
+/**
+ * PLA-1819: the `secrets.resolve` host-service wrapper, extracted so tests can
+ * drive the REAL layer instead of stubbing `services: { secrets: handler }`.
+ * That stub is why 143 green tests missed a branch on which every secret
+ * resolution threw: it bypassed this wrapper, where v722's new requirement
+ * lives. An upstream sync is exactly the scenario where a stubbed seam lies to
+ * you — upstream changes both halves of a contract and the stub pins only one.
+ *
+ * Upstream v722 hard-requires `params.companyId` here. That holds for every
+ * dispatch/background resolve, where the SDK injects the host-derived pin. It
+ * cannot hold for the fork-only PLA-768 service context (a setup()-started loop
+ * such as the messenger getUpdates poll): `RegisteredServiceRunContext` carries
+ * no company at all, so no pin exists to inject and none can be derived here —
+ * the owning company is only known after the binding-row lookup inside
+ * `secretsHandler.resolve`.
+ *
+ * An absent `companyId` is NOT a widening. The handler treats `companyId` as a
+ * non-authoritative HINT on every path and re-derives the tenant from the
+ * run-context registry keyed on (pluginDbId, runId), fail-closing with
+ * `runcontext_invalid` when there is no live host-minted context.
+ */
+export function buildSecretsResolveService(
+  secretsHandler: ReturnType<typeof createPluginSecretsHandler>,
+  ensurePluginAvailableForCompany: (companyId: string) => Promise<void>,
+) {
+  return async function resolve(
+    params: Parameters<ReturnType<typeof createPluginSecretsHandler>["resolve"]>[0],
+  ) {
+    if (params.companyId === undefined) {
+      return secretsHandler.resolve(params);
+    }
+    if (!params.companyId) {
+      throw new Error("companyId is required for this operation");
+    }
+    await ensurePluginAvailableForCompany(params.companyId);
+    return secretsHandler.resolve(params);
+  };
+}
+
 export function buildHostServices(
   db: Db,
   pluginId: string,
@@ -1487,11 +1526,7 @@ export function buildHostServices(
     },
 
     secrets: {
-      async resolve(params) {
-        const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
-        return secretsHandler.resolve({ ...params, companyId });
-      },
+      resolve: buildSecretsResolveService(secretsHandler, ensurePluginAvailableForCompany),
       async mintHandle(params) {
         return secretsHandler.mintHandle(params);
       },

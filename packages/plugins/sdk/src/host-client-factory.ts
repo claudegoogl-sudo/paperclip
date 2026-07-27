@@ -1057,26 +1057,36 @@ export function createHostClientHandlers(
       // forged worker→host call outside a tool dispatch keeps getting
       // `runcontext_invalid`.
       //
-      // PLA-1819: adopt upstream v722's fail-closed company guard. Called for
-      // its rejection side effect only — deliberately NOT injecting `companyId`
-      // into params the way upstream does, because our server handler treats a
-      // params `companyId` as a non-authoritative HINT and re-derives the
-      // dispatching company from the run-context registry keyed on
-      // (pluginDbId, runId). The runId back-fill is the authoritative binding.
+      // PLA-1819: adopt upstream v722's fail-closed company guard AND its
+      // matched `companyId` injection. Both halves are required: v722's server
+      // wrapper (`plugin-host-services.ts` `buildHostServices.secrets.resolve`)
+      // hard-requires `params.companyId` via `ensureCompanyId`. Taking the
+      // guard without the injection makes every resolve throw, in-dispatch
+      // included.
       //
       // PLA-768 is passed as the alternate host binding: a setup()-started loop
       // (e.g. the messenger getUpdates poll) resolves with no dispatch in
       // flight, so no company pin exists — only the host-minted
       // `serviceScope.runId`, which the server maps to a company itself. A
       // worker-named `companyId` is still denied outright without a pin.
-      resolveRequiredCompanyId(
+      const companyId = resolveRequiredCompanyId(
         "secrets.resolve",
         params,
         context,
         context?.serviceScope?.runId,
       );
       const enriched = backfillDispatchRunId(params, context);
-      return services.secrets.resolve(enriched, context);
+      // Only ever forward the HOST-derived id, spread last so a worker-echoed
+      // `params.companyId` can never survive. The server still treats it as a
+      // non-authoritative HINT and re-derives the dispatching company from the
+      // run-context registry keyed on (pluginDbId, runId) — injecting it buys
+      // the wrapper's `ensurePluginAvailableForCompany` check, not authority.
+      // `null` is the PLA-768 service path: no pin exists to forward, and the
+      // server derives the owning company from the operator-created binding.
+      return services.secrets.resolve(
+        companyId ? { ...enriched, companyId } : enriched,
+        context,
+      );
     }),
 
     // Secrets — borrowed-handle minting (PLA-702 Control 2). Same dispatch

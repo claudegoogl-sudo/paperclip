@@ -580,9 +580,12 @@ describe("PLA-673 — back-fill runId for pre-PLA-657 SDK secrets.resolve", () =
       // The wire payload arrived from the worker without runId; the gated
       // wrapper back-filled it from the active invocation scope (which the
       // host populated from the outer dispatcher's runContext).
+      // PLA-1819: the wrapper also injects the host-derived companyId, which
+      // v722's `buildHostServices.secrets.resolve` requires.
       expect(secretsResolve.mock.calls[0]?.[0]).toEqual({
         secretRef: "11111111-1111-1111-1111-111111111111",
         runId: "run-pla673",
+        companyId: "company-a",
       });
     } finally {
       await handle.stop().catch(() => undefined);
@@ -677,9 +680,12 @@ describe("PLA-719 — back-fill runId when the worker echoes no invocation id", 
       // No runId AND no invocation id arrived on the wire; the host resolved
       // the single in-flight executeTool dispatch and the gated wrapper
       // back-filled runId from its host-validated scope.
+      // PLA-1819: companyId comes from the same host-derived singleInFlight pin
+      // the runId came from — never from the worker.
       expect(secretsResolve.mock.calls[0]?.[0]).toEqual({
         secretRef: "11111111-1111-1111-1111-111111111111",
         runId: "run-pla719",
+        companyId: "company-a",
       });
     } finally {
       await handle.stop().catch(() => undefined);
@@ -755,6 +761,7 @@ describe("PLA-719 — back-fill runId when the worker echoes no invocation id", 
       {
         secretRef: "11111111-1111-1111-1111-111111111111",
         runId: "run-pla719",
+        companyId: "company-a",
       },
       expect.anything(),
     );
@@ -916,9 +923,12 @@ describe("PLA-773 — background dispatch run-context (item 1) + redaction clean
       // The worker's id-less secrets.resolve callback was back-filled with the
       // minted background runId — NOT the worker-lifetime service runId.
       expect(secretsResolve).toHaveBeenCalledTimes(1);
+      // PLA-1819: a background dispatch carries a TRIGGERING company, so the
+      // pin exists and is injected — unlike the company-less service context.
       expect(secretsResolve.mock.calls[0]?.[0]).toEqual({
         secretRef: SECRET_REF,
         runId: mintedRunId,
+        companyId: "company-a",
       });
       expect(mintedRunId).not.toBe(handle.serviceRunId);
 

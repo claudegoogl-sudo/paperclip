@@ -424,9 +424,14 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
     expect(resolve).toHaveBeenCalledWith(
       // v722 plumbs the host-validated call context to HostServices as an
       // explicit second argument; the back-filled params stay the first.
+      //
+      // PLA-1819: `companyId` is injected from the host-derived pin. The
+      // server's `buildHostServices.secrets.resolve` hard-requires it via
+      // `ensureCompanyId`, so omitting it throws on every dispatch resolve.
       {
         secretRef: "11111111-1111-1111-1111-111111111111",
         runId: "run-xyz",
+        companyId: "company-a",
       },
       { invocationScope: { companyId: "company-a", runId: "run-xyz" } },
     );
@@ -456,6 +461,7 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
       {
         secretRef: "11111111-1111-1111-1111-111111111111",
         runId: "worker-supplied-run",
+        companyId: "company-a",
       },
       { invocationScope: { companyId: "company-a", runId: "run-xyz" } },
     );
@@ -478,11 +484,15 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
       { invocationScope: { companyId: "company-a" } },
     );
 
-    // No runId on scope → we pass through unchanged. The server-side handler
-    // will still throw `runcontext_invalid`, which is the desired fail-closed
-    // behaviour for an out-of-dispatch caller.
+    // No runId on scope → no runId back-fill. The server-side handler will
+    // still throw `runcontext_invalid`, which is the desired fail-closed
+    // behaviour for an out-of-dispatch caller. `companyId` is still injected
+    // (PLA-1819) because the scope pins a company even without a runId.
     expect(resolve).toHaveBeenCalledWith(
-      { secretRef: "11111111-1111-1111-1111-111111111111" },
+      {
+        secretRef: "11111111-1111-1111-1111-111111111111",
+        companyId: "company-a",
+      },
       { invocationScope: { companyId: "company-a" } },
     );
   });
@@ -514,6 +524,93 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
       },
       { serviceScope: { runId: "service-run-1" } },
     );
+  });
+
+  it("PLA-1819: injects the host-derived companyId so the v722 server wrapper accepts the call", async () => {
+    // Regression for the defect that shipped in be872d0a4: the branch took
+    // v722's fail-closed guard but declined to inject `companyId`, while v722's
+    // `buildHostServices.secrets.resolve` began hard-requiring it via
+    // `ensureCompanyId`. Half of a matched pair => every dispatch resolve threw
+    // "companyId is required for this operation", the operator's messenger bot
+    // token included. Assert the id actually reaches the service boundary.
+    const resolve = vi.fn(async () => "resolved-value");
+    const services = { secrets: { resolve } } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services,
+    });
+
+    await handlers["secrets.resolve"](
+      { secretRef: "11111111-1111-1111-1111-111111111111" } as never,
+      { invocationScope: { companyId: "company-a", runId: "run-xyz" } },
+    );
+
+    const [params] = resolve.mock.calls[0] as [Record<string, unknown>];
+    expect(params.companyId).toBe("company-a");
+  });
+
+  it("PLA-1819: forwards the HOST pin, never the worker-echoed companyId", async () => {
+    // A worker that echoes the *correct* company clears the guard's equality
+    // check. The value forwarded downstream must still be the host-derived pin
+    // — spread last — so params can never become an authority channel even
+    // when the two happen to agree today.
+    const resolve = vi.fn(async () => "resolved-value");
+    const services = { secrets: { resolve } } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services,
+    });
+
+    await handlers["secrets.resolve"](
+      {
+        secretRef: "11111111-1111-1111-1111-111111111111",
+        companyId: "company-a",
+      } as never,
+      { invocationScope: { companyId: "company-a", runId: "run-xyz" } },
+    );
+
+    const [params] = resolve.mock.calls[0] as [Record<string, unknown>];
+    expect(params.companyId).toBe("company-a");
+
+    // And a worker naming a DIFFERENT company is still denied outright.
+    await expect(
+      handlers["secrets.resolve"](
+        {
+          secretRef: "11111111-1111-1111-1111-111111111111",
+          companyId: "company-b",
+        } as never,
+        { invocationScope: { companyId: "company-a", runId: "run-xyz" } },
+      ),
+    ).rejects.toThrow(/company/i);
+    expect(resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it("PLA-1819: omits companyId entirely on the PLA-768 service path", async () => {
+    // The service context carries NO company (`RegisteredServiceRunContext` has
+    // only `runId`), so there is nothing to inject. The absence is what selects
+    // the server wrapper's pass-through branch, where the secrets handler
+    // derives the owning company from the operator-created binding. Injecting a
+    // guessed or defaulted id here would be a tenancy bug.
+    const resolve = vi.fn(async () => "resolved-value");
+    const services = { secrets: { resolve } } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services,
+    });
+
+    await handlers["secrets.resolve"](
+      { secretRef: "11111111-1111-1111-1111-111111111111" } as never,
+      { serviceScope: { runId: "service-run-1" } },
+    );
+
+    const [params] = resolve.mock.calls[0] as [Record<string, unknown>];
+    expect(params).not.toHaveProperty("companyId");
   });
 
   it("PLA-1819: serviceScope does not let a worker NAME a company on secrets.resolve", async () => {
@@ -598,6 +695,10 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
       {
         secretRef: "11111111-1111-1111-1111-111111111111",
         runId: "dispatch-run",
+        // PLA-1819: the dispatch pin also supplies the injected companyId, so
+        // the resolve is attributed to the dispatching company, not the
+        // service context's binding-derived owner.
+        companyId: "company-a",
       },
       {
         invocationScope: { companyId: "company-a", runId: "dispatch-run" },
