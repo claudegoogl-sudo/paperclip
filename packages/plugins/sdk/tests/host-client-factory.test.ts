@@ -9,6 +9,65 @@ import {
 import { PLUGIN_RPC_ERROR_CODES } from "../src/protocol.js";
 
 describe("createHostClientHandlers invocation company scope", () => {
+  it("rejects worker-selected config and secret company ids without a host invocation scope", async () => {
+    const configGet = vi.fn(async () => ({ apiKeyRef: "unreachable" }));
+    const secretsResolve = vi.fn(async () => "unreachable");
+    const services = {
+      config: { get: configGet },
+      secrets: { resolve: secretsResolve },
+    } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services,
+    });
+
+    await expect(
+      handlers["config.get"]({ companyId: "company-a" }),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    await expect(
+      handlers["secrets.resolve"]({
+        companyId: "company-a",
+        secretRef: { type: "secret_ref", secretId: "secret-a" },
+      }),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    expect(configGet).not.toHaveBeenCalled();
+    expect(secretsResolve).not.toHaveBeenCalled();
+  });
+
+  it("allows explicit config and secret company ids only when they match the host invocation scope", async () => {
+    const configGet = vi.fn(async () => ({ apiKeyRef: "ref" }));
+    const secretsResolve = vi.fn(async () => "resolved");
+    const services = {
+      config: { get: configGet },
+      secrets: { resolve: secretsResolve },
+    } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services,
+    });
+    const context = { invocationScope: { companyId: "company-a" } };
+
+    await expect(
+      handlers["config.get"]({ companyId: "company-a" }, context),
+    ).resolves.toEqual({ apiKeyRef: "ref" });
+    await expect(
+      handlers["secrets.resolve"]({
+        companyId: "company-a",
+        secretRef: { type: "secret_ref", secretId: "secret-a" },
+      }, context),
+    ).resolves.toBe("resolved");
+
+    expect(configGet).toHaveBeenCalledWith({ companyId: "company-a" }, context);
+    expect(secretsResolve).toHaveBeenCalledWith({
+      companyId: "company-a",
+      secretRef: { type: "secret_ref", secretId: "secret-a" },
+    }, context);
+  });
+
   it("rejects company-scoped host calls outside the current invocation company", async () => {
     const projectsList = vi.fn(async () => []);
     const services = {
@@ -173,6 +232,80 @@ describe("createHostClientHandlers invocation company scope", () => {
     expect(searchAudit).not.toHaveBeenCalled();
   });
 
+  it("rejects a human-attributed createComment call when only issue.comments.create is granted", async () => {
+    const createComment = vi.fn(async () => ({ id: "comment-1" }));
+    const services = {
+      issues: { createComment },
+    } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["issue.comments.create"],
+      services,
+    });
+    const context = { invocationScope: { companyId: "company-a" } };
+
+    await expect(
+      handlers["issues.createComment"]({
+        issueId: "issue-a",
+        body: "hello",
+        companyId: "company-a",
+        actorUserId: "user-a",
+      }, context),
+    ).rejects.toBeInstanceOf(CapabilityDeniedError);
+    expect(createComment).not.toHaveBeenCalled();
+  });
+
+  it("allows a human-attributed createComment call once issue.comments.create_human_attributed is also granted", async () => {
+    const createComment = vi.fn(async () => ({ id: "comment-1" }));
+    const services = {
+      issues: { createComment },
+    } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["issue.comments.create", "issue.comments.create_human_attributed"],
+      services,
+    });
+    const context = { invocationScope: { companyId: "company-a" } };
+
+    await expect(
+      handlers["issues.createComment"]({
+        issueId: "issue-a",
+        body: "hello",
+        companyId: "company-a",
+        actorUserId: "user-a",
+      }, context),
+    ).resolves.toEqual({ id: "comment-1" });
+    expect(createComment).toHaveBeenCalledWith({
+      issueId: "issue-a",
+      body: "hello",
+      companyId: "company-a",
+      actorUserId: "user-a",
+    });
+  });
+
+  it("still allows a plain agent-attributed createComment call without the human-attribution capability", async () => {
+    const createComment = vi.fn(async () => ({ id: "comment-2" }));
+    const services = {
+      issues: { createComment },
+    } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["issue.comments.create"],
+      services,
+    });
+    const context = { invocationScope: { companyId: "company-a" } };
+
+    await expect(
+      handlers["issues.createComment"]({
+        issueId: "issue-a",
+        body: "hello",
+        companyId: "company-a",
+        authorAgentId: "agent-a",
+      }, context),
+    ).resolves.toEqual({ id: "comment-2" });
+    expect(createComment).toHaveBeenCalled();
+  });
+
   it("fails closed for a company-scoped call with no resolvable invocation scope", async () => {
     const configure = vi.fn(async () => ({ ok: true }));
     const services = {
@@ -285,10 +418,15 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
       { invocationScope: { companyId: "company-a", runId: "run-xyz" } },
     );
 
-    expect(resolve).toHaveBeenCalledWith({
-      secretRef: "11111111-1111-1111-1111-111111111111",
-      runId: "run-xyz",
-    });
+    expect(resolve).toHaveBeenCalledWith(
+      // v722 plumbs the host-validated call context to HostServices as an
+      // explicit second argument; the back-filled params stay the first.
+      {
+        secretRef: "11111111-1111-1111-1111-111111111111",
+        runId: "run-xyz",
+      },
+      { invocationScope: { companyId: "company-a", runId: "run-xyz" } },
+    );
   });
 
   it("does NOT overwrite a runId the worker already provided", async () => {
@@ -311,10 +449,13 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
       { invocationScope: { companyId: "company-a", runId: "run-xyz" } },
     );
 
-    expect(resolve).toHaveBeenCalledWith({
-      secretRef: "11111111-1111-1111-1111-111111111111",
-      runId: "worker-supplied-run",
-    });
+    expect(resolve).toHaveBeenCalledWith(
+      {
+        secretRef: "11111111-1111-1111-1111-111111111111",
+        runId: "worker-supplied-run",
+      },
+      { invocationScope: { companyId: "company-a", runId: "run-xyz" } },
+    );
   });
 
   it("forwards untouched when no active invocation carries a runId", async () => {
@@ -337,9 +478,10 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
     // No runId on scope → we pass through unchanged. The server-side handler
     // will still throw `runcontext_invalid`, which is the desired fail-closed
     // behaviour for an out-of-dispatch caller.
-    expect(resolve).toHaveBeenCalledWith({
-      secretRef: "11111111-1111-1111-1111-111111111111",
-    });
+    expect(resolve).toHaveBeenCalledWith(
+      { secretRef: "11111111-1111-1111-1111-111111111111" },
+      { invocationScope: { companyId: "company-a" } },
+    );
   });
 
   it("back-fills runId on secrets.resolve from the service scope (PLA-768)", async () => {
@@ -362,10 +504,13 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
       { serviceScope: { runId: "service-run-1" } },
     );
 
-    expect(resolve).toHaveBeenCalledWith({
-      secretRef: "11111111-1111-1111-1111-111111111111",
-      runId: "service-run-1",
-    });
+    expect(resolve).toHaveBeenCalledWith(
+      {
+        secretRef: "11111111-1111-1111-1111-111111111111",
+        runId: "service-run-1",
+      },
+      { serviceScope: { runId: "service-run-1" } },
+    );
   });
 
   it("prefers an active dispatch runId over the service scope (PLA-768)", async () => {
@@ -391,10 +536,16 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
       },
     );
 
-    expect(resolve).toHaveBeenCalledWith({
-      secretRef: "11111111-1111-1111-1111-111111111111",
-      runId: "dispatch-run",
-    });
+    expect(resolve).toHaveBeenCalledWith(
+      {
+        secretRef: "11111111-1111-1111-1111-111111111111",
+        runId: "dispatch-run",
+      },
+      {
+        invocationScope: { companyId: "company-a", runId: "dispatch-run" },
+        serviceScope: { runId: "service-run-1" },
+      },
+    );
   });
 
   it("back-fills runId on artifacts.fetch symmetrically", async () => {

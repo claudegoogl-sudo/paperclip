@@ -101,14 +101,17 @@ export interface HostServices {
   /** Provides `config.get`. */
   config: {
     /**
-     * Return the instance-wide plugin configuration. Always available.
+     * Return the plugin configuration for this call. Always available.
      *
      * For multi-tenant deployments, hosts SHOULD also implement
      * {@link HostServices.config.getForCompany} to deliver per-tenant
      * overrides; the gated wrapper for `config.get` consults
      * `getForCompany` first when the invocation carries a company scope.
      */
-    get(): Promise<Record<string, unknown>>;
+    get(
+      params: WorkerToHostMethods["config.get"][0],
+      context?: WorkerHostCallContext,
+    ): Promise<Record<string, unknown>>;
     /**
      * PLA-677: Return the effective plugin configuration for `companyId`,
      * i.e. the instance-wide config merged with this tenant's
@@ -165,7 +168,10 @@ export interface HostServices {
 
   /** Provides `secrets.resolve` and `secrets.mintHandle`. */
   secrets: {
-    resolve(params: WorkerToHostMethods["secrets.resolve"][0]): Promise<string>;
+    resolve(
+      params: WorkerToHostMethods["secrets.resolve"][0],
+      context?: WorkerHostCallContext,
+    ): Promise<string>;
     mintHandle(
       params: WorkerToHostMethods["secrets.mintHandle"][0],
     ): Promise<WorkerToHostMethods["secrets.mintHandle"][1]>;
@@ -827,11 +833,18 @@ export function createHostClientHandlers(
 
     if (requested.kind === "all") {
       if (method === "companies.list") return;
+      if (!allowedCompanyId) {
+        throw new InvocationScopeDeniedError(pluginId, method, "company context is required");
+      }
       throw new InvocationScopeDeniedError(
         pluginId,
         method,
         `the current invocation is scoped to company "${allowedCompanyId}"`,
       );
+    }
+
+    if (!allowedCompanyId) {
+      throw new InvocationScopeDeniedError(pluginId, method, "company context is required");
     }
 
     if (requested.companyId !== allowedCompanyId) {
@@ -880,7 +893,7 @@ export function createHostClientHandlers(
 
   return {
     // Config
-    "config.get": gated("config.get", async (_params, context) => {
+    "config.get": gated("config.get", async (params, context) => {
       // PLA-677: When the invocation carries a company scope and the host
       // implements per-tenant config delivery, return the company-scoped
       // effective config; otherwise fall back to the instance-wide config.
@@ -901,7 +914,13 @@ export function createHostClientHandlers(
       if (companyId && services.config.getForCompany) {
         return services.config.getForCompany(companyId);
       }
-      return services.config.get();
+      // v722 plumbs the resolved company through the params object. Only ever
+      // forward the HOST-derived id — never the worker-echoed `params.companyId`
+      // — so this stays a scope *selection* read, not an enforcement bypass.
+      // Unlike upstream we do NOT hard-fail when no company is pinned: the fork
+      // keeps the single-tenant/instance-wide fallback that `setup()` and
+      // background reads depend on.
+      return services.config.get(companyId ? { ...params, companyId } : params, context);
     }),
 
     "localFolders.declarations": gated("localFolders.declarations", async (params) => {
@@ -979,7 +998,7 @@ export function createHostClientHandlers(
       // forged worker→host call outside a tool dispatch keeps getting
       // `runcontext_invalid`.
       const enriched = backfillDispatchRunId(params, context);
-      return services.secrets.resolve(enriched);
+      return services.secrets.resolve(enriched, context);
     }),
 
     // Secrets — borrowed-handle minting (PLA-702 Control 2). Same dispatch
@@ -1144,6 +1163,13 @@ export function createHostClientHandlers(
       return services.issues.listAttachments(params);
     }),
     "issues.createComment": gated("issues.createComment", async (params) => {
+      if (params.actorUserId && !capabilitySet.has("issue.comments.create_human_attributed")) {
+        throw new CapabilityDeniedError(
+          pluginId,
+          "issues.createComment",
+          "issue.comments.create_human_attributed",
+        );
+      }
       return services.issues.createComment(params);
     }),
     "issues.createInteraction": gated("issues.createInteraction", async (params) => {

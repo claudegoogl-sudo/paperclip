@@ -4,6 +4,7 @@ import {
   agentTaskSessions as agentTaskSessionsTable,
   agents as agentsTable,
   budgetIncidents,
+  companyMemberships,
   costEvents,
   heartbeatRuns,
   invites,
@@ -818,6 +819,30 @@ export function buildHostServices(
     return record;
   };
 
+  /**
+   * Verify `userId` is an active human member of `companyId` before letting a
+   * plugin attribute a mutation to them. Mirrors the authorization bar the
+   * web app's own board routes apply — a plugin can only ever attribute an
+   * action to an identity that could have taken it in the web app itself.
+   * Used by any plugin capability that accepts an `actorUserId` (currently
+   * `createComment`'s human-attributed path).
+   */
+  const requireActiveHumanMember = async (companyId: string, userId: string): Promise<void> => {
+    const [membership] = await db
+      .select({ id: companyMemberships.id })
+      .from(companyMemberships)
+      .where(and(
+        eq(companyMemberships.companyId, companyId),
+        eq(companyMemberships.principalType, "user"),
+        eq(companyMemberships.principalId, userId),
+        eq(companyMemberships.status, "active"),
+      ))
+      .limit(1);
+    if (!membership) {
+      throw new Error(`actorUserId "${userId}" is not an active human member of this company`);
+    }
+  };
+
   const pluginActivityDetails = (
     details: Record<string, unknown> | null | undefined,
     actor?: { actorAgentId?: string | null; actorUserId?: string | null; actorRunId?: string | null },
@@ -1029,19 +1054,16 @@ export function buildHostServices(
   };
 
   const INVITE_TOKEN_PREFIX = "pcp_invite_";
-  const INVITE_TOKEN_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
-  const INVITE_TOKEN_SUFFIX_LENGTH = 8;
+  // 256 bits of entropy, base64url-encoded. Keep in sync with createInviteToken
+  // in routes/access.ts. The token is public, so it must not be brute-forceable.
+  const INVITE_TOKEN_ENTROPY_BYTES = 32;
   const INVITE_TOKEN_MAX_RETRIES = 5;
   const COMPANY_INVITE_TTL_MS = 72 * 60 * 60 * 1000;
 
   const hashToken = (token: string) => createHash("sha256").update(token).digest("hex");
 
   const createInviteToken = () => {
-    const bytes = randomBytes(INVITE_TOKEN_SUFFIX_LENGTH);
-    let suffix = "";
-    for (let idx = 0; idx < INVITE_TOKEN_SUFFIX_LENGTH; idx += 1) {
-      suffix += INVITE_TOKEN_ALPHABET[bytes[idx]! % INVITE_TOKEN_ALPHABET.length];
-    }
+    const suffix = randomBytes(INVITE_TOKEN_ENTROPY_BYTES).toString("base64url");
     return `${INVITE_TOKEN_PREFIX}${suffix}`;
   };
 
@@ -1229,14 +1251,33 @@ export function buildHostServices(
   // optional method; the cast keeps this file compiling against SDK versions
   // that pre-date the extension (the gated handler duck-types `getForCompany`
   // via `if (services.config.getForCompany)` so the absence is safe).
+  //
+  // v722 made `plugin_config` company-scoped, so `registry.getConfig` now needs a
+  // company. `getForCompany` layers the operator-set
+  // `plugin_company_settings.settingsJson.configOverrides` on top of that row.
   const configService = {
-    async get(): Promise<Record<string, unknown>> {
-      const configRow = await registry.getConfig(pluginId);
+    async get(params?: { companyId?: string }): Promise<Record<string, unknown>> {
+      const companyId = params?.companyId;
+      if (!companyId) {
+        // The SDK's gated `config.get` wrapper falls through to here when no
+        // dispatch pins a tenant (e.g. a `setup()`-time read). There is no
+        // instance-wide config row to return post-v722, so degrade to empty
+        // rather than throwing — but log it, because a plugin silently seeing
+        // `{}` is otherwise invisible.
+        logger.warn(
+          { pluginId, pluginKey },
+          "plugin config.get with no company scope; returning empty config (plugin_config is company-scoped since v2026.722.0)",
+        );
+        return {};
+      }
+      await ensurePluginAvailableForCompany(companyId);
+      const configRow = await registry.getConfig(pluginId, companyId);
       return (configRow?.configJson as Record<string, unknown> | undefined) ?? {};
     },
     async getForCompany(companyId: string): Promise<Record<string, unknown>> {
+      await ensurePluginAvailableForCompany(companyId);
       const [configRow, override] = await Promise.all([
-        registry.getConfig(pluginId),
+        registry.getConfig(pluginId, companyId),
         registry.getCompanyConfigOverride(pluginId, companyId),
       ]);
       const base = (configRow?.configJson as Record<string, unknown> | undefined) ?? {};
@@ -1447,7 +1488,9 @@ export function buildHostServices(
 
     secrets: {
       async resolve(params) {
-        return secretsHandler.resolve(params);
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        return secretsHandler.resolve({ ...params, companyId });
       },
       async mintHandle(params) {
         return secretsHandler.mintHandle(params);
@@ -2280,10 +2323,21 @@ export function buildHostServices(
         // (send-it-back-to-me, approvals, audit). Relays are attributed to the
         // plugin's own agent identity; operator identity, if any, belongs in the
         // comment body/metadata, not in host-minted authorship. (PLA-823 Finding 1.)
+        //
+        // v722 reopens human attribution behind a SEPARATE default-deny
+        // capability (`issue.comments.create_human_attributed`, enforced in the
+        // SDK capability map) PLUS a host-side check that the id is an active
+        // human member of this issue's company. That closes PLA-823 Finding 1's
+        // actual gap — an unprivileged worker still cannot mint user authorship,
+        // and a privileged one can only name identities that could have posted
+        // the comment in the web app.
+        if (params.actorUserId) {
+          await requireActiveHumanMember(companyId, params.actorUserId);
+        }
         const comment = (await issues.addComment(
           issue.id,
           params.body,
-          { agentId: params.authorAgentId },
+          { agentId: params.actorUserId ? undefined : params.authorAgentId, userId: params.actorUserId },
         )) as IssueComment;
         // PLA-888: bind any standalone assets created via artifacts.create onto
         // this comment. attachAssetsToComment re-checks each asset's company
@@ -2305,9 +2359,13 @@ export function buildHostServices(
           action: "issue.comment.created",
           entityType: "issue",
           entityId: issue.id,
-          // Record the true principal only: the plugin's agent identity. Never a
-          // worker-claimed user (would make the audit trail itself spoofable).
-          actor: { actorAgentId: params.authorAgentId ?? null },
+          // Record the true principal. A worker-claimed user id is only ever
+          // recorded after `requireActiveHumanMember` has verified it against
+          // this company's active human members (PLA-823 Finding 1 + v722).
+          actor: {
+            actorAgentId: params.actorUserId ? null : params.authorAgentId ?? null,
+            actorUserId: params.actorUserId ?? null,
+          },
           details: {
             identifier: issue.identifier,
             commentId: comment.id,
@@ -2367,6 +2425,47 @@ export function buildHostServices(
               );
           }
         }
+
+        // Human-attributed comments participate in the same "wake the
+        // assignee" behavior a board user's comment gets in the web app
+        // (routes/issues.ts's addComment route) — a plugin's own
+        // agent-attributed comments never do this. Deliberately narrower
+        // than the HTTP route: no reopen/resume/interrupt/scheduled-retry
+        // handling here, just the core wake. An assignee-less or
+        // closed-status issue is a silent no-op, matching the route's own
+        // guard.
+        if (
+          params.actorUserId
+          && issue.assigneeAgentId
+          && issue.status !== "done"
+          && issue.status !== "cancelled"
+        ) {
+          await heartbeat.wakeup(issue.assigneeAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "issue_commented",
+            payload: {
+              issueId: issue.id,
+              commentId: comment.id,
+              mutation: "comment",
+            },
+            requestedByActorType: "user",
+            requestedByActorId: params.actorUserId,
+            contextSnapshot: {
+              issueId: issue.id,
+              taskId: issue.id,
+              sourceCommentId: comment.id,
+              wakeReason: "issue_commented",
+              source: `plugin:${pluginKey}`,
+            },
+          }).catch((err) => logger.warn({
+            err,
+            issueId: issue.id,
+            commentId: comment.id,
+            agentId: issue.assigneeAgentId,
+          }, "failed to wake assignee on plugin-relayed human comment"));
+        }
+
         return comment;
       },
       async createInteraction(params) {
@@ -3084,7 +3183,7 @@ export function buildHostServices(
         // Track the subscription so it can be cleaned up on dispose() if the run
         // never reaches a terminal status (hang, crash, network partition).
         if (notifyWorker) {
-          const TERMINAL_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
+          const TERMINAL_STATUSES = new Set(["succeeded", "interrupted", "failed", "cancelled", "timed_out"]);
 
           const cleanup = () => {
             unsubscribe();

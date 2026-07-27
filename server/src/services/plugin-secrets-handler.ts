@@ -3,7 +3,8 @@
  * Paperclip secret provider system with enforced cross-company isolation.
  *
  * When a plugin worker calls `ctx.secrets.resolve(secretRef, runId)`, the
- * JSON-RPC request arrives at the host carrying ONLY `{ secretRef, runId }`.
+ * JSON-RPC request arrives at the host carrying `{ secretRef, runId }` (plus
+ * optional v722 `companyId`/`configPath` HINTS, which are never authoritative).
  * This module provides the concrete `HostServices.secrets` adapter that:
  *
  *  1. Validates `(pluginDbId, runId)` against the in-memory run-context
@@ -31,7 +32,10 @@
  * ## Secret Reference Format
  *
  * A `secretRef` is a **secret UUID** — the primary key (`id`) of a row in the
- * `company_secrets` table. Operators reference these UUIDs from plugin config;
+ * `company_secrets` table — or, since upstream v2026.722.0, the shared
+ * `{ type: "secret_ref", secretId, version? }` binding object, which this
+ * handler normalizes down to its `secretId` before Gate 1.
+ * Operators reference these UUIDs from plugin config;
  * a per-company `company_secret_bindings` row authorizes which company may
  * resolve which ref through which plugin.
  *
@@ -54,11 +58,14 @@
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { companySecretBindings } from "@paperclipai/db";
+import type { EnvSecretRefBinding, SecretProjectionClass, SecretVersionSelector } from "@paperclipai/shared";
+import { envBindingSecretRefSchema } from "@paperclipai/shared";
 import {
   collectSecretRefPaths,
   isUuidSecretRef,
   readConfigValueAtPath,
 } from "./json-schema-secret-refs.js";
+import { unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
 import { logger } from "../middleware/logger.js";
 import { secretService } from "./secrets.js";
@@ -101,64 +108,121 @@ export class SecretsError extends Error {
   }
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseSecretRefBinding(value: unknown): EnvSecretRefBinding | null {
+  const parsed = envBindingSecretRefSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
+
+function assertSecretRefBinding(
+  value: unknown,
+  path: string,
+  allowLegacyUuid = false,
+): EnvSecretRefBinding | null {
+  // Fork delta vs upstream v2026.722.0, which hard-rejects the bare UUID here.
+  // Rejecting it wedges config saves outright: every shipped manifest declares
+  // its secret field as `{ type: "string", format: "secret-ref" }`, so the
+  // object form fails `instanceConfigSchema` validation (400) while the UUID
+  // form would fail this check (422) — no writable shape would be left. The
+  // fork's own binding maintainer (`syncPluginSecretBindings`, PLA-660 model C)
+  // also still keys off the UUID string. Both shapes normalize to the same
+  // binding and go through the same per-company authorization, so accepting
+  // both is shape back-compat, not an authorization widening.
+  if (allowLegacyUuid && typeof value === "string" && isUuidSecretRef(value)) {
+    return { type: "secret_ref", secretId: value.toLowerCase() };
+  }
+  if (!isPlainRecord(value) || value.type !== "secret_ref") return null;
+  const parsed = parseSecretRefBinding(value);
+  if (!parsed) {
+    throw unprocessable(`Invalid secret_ref binding at ${path}`);
+  }
+  return parsed;
+}
+
+export interface PluginConfigSecretRefBinding {
+  secretId: string;
+  configPath: string;
+  versionSelector?: SecretVersionSelector;
+  required?: boolean;
+  label?: string | null;
+  projectionClass?: SecretProjectionClass;
+  projectionAllowlistKey?: string | null;
+}
+
 // ---------------------------------------------------------------------------
 // Secret-ref extraction helpers (schema-scoped; retained for the documented
 // per-company config-delivery follow-up referenced in the SEC sign-off).
 // ---------------------------------------------------------------------------
 
-/**
- * Extract secret reference UUIDs from a plugin's configJson, scoped to only
- * the fields annotated with `format: "secret-ref"` in the schema.
- *
- * When no schema is provided, falls back to collecting all UUID-shaped strings
- * (backwards-compatible for plugins without a declared instanceConfigSchema).
- */
+/** Extract shared object-shaped secret refs from plugin config. */
+export function extractSecretRefBindingsFromConfig(
+  configJson: unknown,
+  schema?: Record<string, unknown> | null,
+): PluginConfigSecretRefBinding[] {
+  if (configJson == null || typeof configJson !== "object") return [];
+
+  const refsByPath = new Map<string, PluginConfigSecretRefBinding>();
+  const addRef = (binding: EnvSecretRefBinding, configPath: string) => {
+    refsByPath.set(configPath, {
+      secretId: binding.secretId,
+      configPath,
+      versionSelector: binding.version ?? "latest",
+      required: true,
+      label: configPath,
+      projectionClass: binding.projectionClass,
+      projectionAllowlistKey: binding.projectionAllowlistKey ?? null,
+    });
+  };
+
+  const secretPaths = collectSecretRefPaths(schema);
+  for (const dotPath of secretPaths) {
+    const current = readConfigValueAtPath(configJson as Record<string, unknown>, dotPath);
+    const binding = assertSecretRefBinding(current, dotPath, true);
+    if (binding) addRef(binding, dotPath);
+  }
+
+  function walk(value: unknown, path: string): void {
+    const binding = assertSecretRefBinding(value, path || "$");
+    if (binding) {
+      addRef(binding, path || "$");
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => walk(item, path ? `${path}.${index}` : String(index)));
+      return;
+    }
+    if (!isPlainRecord(value)) return;
+    for (const [key, child] of Object.entries(value)) {
+      walk(child, path ? `${path}.${key}` : key);
+    }
+  }
+
+  walk(configJson, "");
+  return [...refsByPath.values()];
+}
+
+/** Backward-compatible helper returning only secret IDs. */
 export function extractSecretRefsFromConfig(
   configJson: unknown,
   schema?: Record<string, unknown> | null,
 ): Set<string> {
-  return new Set(extractSecretRefPathsFromConfig(configJson, schema).keys());
+  return new Set(extractSecretRefBindingsFromConfig(configJson, schema).map((ref) => ref.secretId));
 }
 
+/** Backward-compatible helper returning secret IDs grouped by config path. */
 export function extractSecretRefPathsFromConfig(
   configJson: unknown,
   schema?: Record<string, unknown> | null,
 ): Map<string, Set<string>> {
   const refs = new Map<string, Set<string>>();
-  const addRef = (secretRef: string, path: string) => {
-    const existing = refs.get(secretRef) ?? new Set<string>();
-    existing.add(path);
-    refs.set(secretRef, existing);
-  };
-  if (configJson == null || typeof configJson !== "object") return new Map();
-
-  const secretPaths = collectSecretRefPaths(schema);
-
-  // If schema declares secret-ref paths, extract only those values.
-  if (secretPaths.size > 0) {
-    for (const dotPath of secretPaths) {
-      const current = readConfigValueAtPath(configJson as Record<string, unknown>, dotPath);
-      if (typeof current === "string" && isUuidSecretRef(current)) {
-        addRef(current, dotPath);
-      }
-    }
-    return refs;
+  for (const ref of extractSecretRefBindingsFromConfig(configJson, schema)) {
+    const paths = refs.get(ref.secretId) ?? new Set<string>();
+    paths.add(ref.configPath);
+    refs.set(ref.secretId, paths);
   }
-
-  // Fallback: no schema or no secret-ref annotations — collect all UUIDs.
-  // This preserves backwards compatibility for plugins that omit
-  // instanceConfigSchema.
-  function walkAll(value: unknown): void {
-    if (typeof value === "string") {
-      if (isUuidSecretRef(value)) addRef(value, "$");
-    } else if (Array.isArray(value)) {
-      for (const item of value) walkAll(item);
-    } else if (value !== null && typeof value === "object") {
-      for (const v of Object.values(value as Record<string, unknown>)) walkAll(v);
-    }
-  }
-
-  walkAll(configJson);
   return refs;
 }
 
@@ -167,17 +231,29 @@ export function extractSecretRefPathsFromConfig(
 // ---------------------------------------------------------------------------
 
 /**
- * Input shape for the `secrets.resolve` handler. The worker supplies only the
- * ref and the opaque dispatch `runId`; the dispatching company is re-derived
- * server-side from the run-context registry.
+ * Input shape for the `secrets.resolve` handler. The worker supplies the ref and
+ * the opaque dispatch `runId`; the dispatching company is re-derived
+ * server-side from the run-context registry and is NEVER taken from the worker.
  *
  * Matches `WorkerToHostMethods["secrets.resolve"][0]` from the SDK protocol.
  */
 export interface PluginSecretsResolveParams {
-  /** The secret reference string (a secret UUID). */
-  secretRef: string;
+  /**
+   * The secret reference: a bare secret UUID, or (upstream v2026.722.0) the
+   * shared `{ type: "secret_ref", secretId, version? }` binding object. The
+   * object form is normalized to its `secretId` before authorization.
+   */
+  secretRef: string | EnvSecretRefBinding;
   /** The runId of the currently-executing tool dispatch. */
   runId: string;
+  /**
+   * v722 hint only. The authoritative dispatching company always comes from the
+   * run-context registry keyed on `(pluginDbId, runId)`; a worker-supplied
+   * `companyId` can never widen or redirect resolution (PLA-655/PLA-657).
+   */
+  companyId?: string;
+  /** v722 hint: the config path the ref came from. Narrows the binding lookup. */
+  configPath?: string;
 }
 
 /**
@@ -296,9 +372,6 @@ export interface PluginSecretsHandlerOptions {
   now?: () => number;
 }
 
-/**
- * The `HostServices.secrets` adapter for the plugin host-client factory.
- */
 export interface PluginSecretsService {
   /**
    * Resolve a secret reference to its current plaintext value, scoped to the
@@ -456,17 +529,23 @@ export function createPluginSecretsHandler(
   const resolver: PluginSecretResolver =
     options.resolver ?? {
       async resolve(input) {
+        const context = {
+          consumerId: input.pluginDbId,
+          configPath: input.configPath,
+          actorType: "plugin" as const,
+          actorId: input.pluginDbId,
+          pluginId: input.pluginDbId,
+        };
         return secretService(db).resolveSecretValue(
           input.companyId,
           input.secretId,
           input.version,
           {
-            consumerType: PLUGIN_SECRET_BINDING_TARGET_TYPE,
-            consumerId: input.pluginDbId,
-            configPath: input.configPath,
-            actorType: "plugin",
-            actorId: input.pluginDbId,
-            pluginId: input.pluginDbId,
+            // The binding row is keyed on the target type, so the lookup must use
+            // it; the access event records the narrower v722 `plugin_worker` label
+            // so a worker resolution is distinguishable from a config-time bind.
+            bindingContext: { ...context, consumerType: PLUGIN_SECRET_BINDING_TARGET_TYPE },
+            accessContext: { ...context, consumerType: "plugin_worker" },
           },
         );
       },
@@ -778,6 +857,31 @@ export function createPluginSecretsHandler(
     return value;
   }
 
+  async function lookupBinding(input: {
+    companyId: string;
+    secretId: string;
+    versionSelector: SecretVersionSelector;
+    configPath?: string;
+  }) {
+    const conditions = [
+      eq(companySecretBindings.companyId, input.companyId),
+      eq(companySecretBindings.targetType, "plugin"),
+      eq(companySecretBindings.targetId, pluginDbId),
+      eq(companySecretBindings.secretId, input.secretId),
+    ];
+    if (input.configPath) {
+      conditions.push(eq(companySecretBindings.configPath, input.configPath));
+    }
+    const rows = await db
+      .select()
+      .from(companySecretBindings)
+      .where(and(...conditions));
+    const matchingVersion = rows.filter(
+      (row) => row.versionSelector === String(input.versionSelector),
+    );
+    return matchingVersion;
+  }
+
   return {
     async resolve(params: PluginSecretsResolveParams): Promise<string> {
       // ---------- Gate 0: shape validation ----------
@@ -785,10 +889,20 @@ export function createPluginSecretsHandler(
         throw new SecretsError("invalid_ref", "invalid secret reference");
       }
       const { secretRef, runId } = params;
-      if (typeof secretRef !== "string" || secretRef.trim().length === 0) {
+      // v722 widened the wire ref to `string | EnvSecretRefBinding`. Normalize
+      // the object form down to its `secretId` here so every gate below keeps
+      // operating on a single validated UUID. Nothing inside the binding object
+      // is trusted for authorization — the company still comes from the
+      // run-context registry, and the version still comes from the host-side
+      // binding row, not from the worker-supplied `version`.
+      const rawRef =
+        typeof secretRef === "string"
+          ? secretRef
+          : (parseSecretRefBinding(secretRef)?.secretId ?? "");
+      if (typeof rawRef !== "string" || rawRef.trim().length === 0) {
         throw new SecretsError("invalid_ref", "invalid secret reference");
       }
-      const trimmedRef = secretRef.trim();
+      const trimmedRef = rawRef.trim();
       if (!isUuidSecretRef(trimmedRef)) {
         // Generic message — the ref is NEVER echoed (PLA-190/PLA-193, R2).
         throw new SecretsError("invalid_ref", "invalid secret reference");

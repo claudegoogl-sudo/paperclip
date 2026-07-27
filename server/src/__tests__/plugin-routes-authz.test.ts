@@ -13,16 +13,17 @@ const mockRegistry = vi.hoisted(() => ({
   deleteCompanyConfigOverride: vi.fn(),
 }));
 
-const mockSecretService = vi.hoisted(() => ({
-  getById: vi.fn(),
-}));
-
 const mockLifecycle = vi.hoisted(() => ({
   load: vi.fn(),
   upgrade: vi.fn(),
   unload: vi.fn(),
   enable: vi.fn(),
   disable: vi.fn(),
+}));
+
+const mockSecretService = vi.hoisted(() => ({
+  getById: vi.fn(),
+  syncSecretRefsForTarget: vi.fn(),
 }));
 
 vi.mock("../services/plugin-registry.js", () => ({
@@ -113,6 +114,7 @@ const agentA = "44444444-4444-4444-8444-444444444444";
 const runA = "55555555-5555-4555-8555-555555555555";
 const projectA = "66666666-6666-4666-8666-666666666666";
 const pluginId = "11111111-1111-4111-8111-111111111111";
+const secretId = "77777777-7777-4777-8777-777777777777";
 
 function boardActor(overrides: Record<string, unknown> = {}) {
   return {
@@ -319,12 +321,45 @@ describe.sequential("plugin install and upgrade authz", () => {
     expect(mockLifecycle.unload).toHaveBeenCalledWith(pluginId, true);
   }, 20_000);
 
-  it("permits plugin config saves that contain secret refs (resolution is company-binding-gated; PLA-657)", async () => {
+  it("allows instance admins to save company-scoped secret refs and sync plugin bindings", async () => {
     readyPlugin();
-    mockRegistry.upsertConfig.mockResolvedValue({
-      pluginId,
-      configJson: { apiKeyRef: "77777777-7777-4777-8777-777777777777" },
+    const configJson = {
+      apiKeyRef: { type: "secret_ref", secretId, version: "latest" },
+    };
+    mockSecretService.getById.mockResolvedValue({ id: secretId, companyId: companyA, status: "active" });
+    mockSecretService.syncSecretRefsForTarget.mockResolvedValue([]);
+    mockRegistry.upsertConfig.mockResolvedValue({ id: "config-1", pluginId, companyId: companyA, configJson });
+
+    const { app } = await createApp({
+      type: "board",
+      userId: "admin-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [companyA],
     });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/config`)
+      .send({ companyId: companyA, configJson });
+
+    expect(res.status).toBe(200);
+    expect(mockSecretService.getById).toHaveBeenCalledWith(secretId);
+    expect(mockSecretService.syncSecretRefsForTarget).toHaveBeenCalledWith(
+      companyA,
+      { targetType: "plugin", targetId: pluginId },
+      [expect.objectContaining({ secretId, configPath: "apiKeyRef", versionSelector: "latest" })],
+      { replaceAll: true },
+    );
+    expect(mockRegistry.upsertConfig).toHaveBeenCalledWith(pluginId, companyA, {
+      companyId: companyA,
+      configJson,
+    });
+  }, 20_000);
+
+  it("rejects plugin config saves that reference another company's secret before syncing bindings", async () => {
+    readyPlugin();
+    mockSecretService.getById.mockResolvedValue({ id: secretId, companyId: companyB, status: "active" });
+    mockSecretService.syncSecretRefsForTarget.mockResolvedValue([]);
 
     const { app } = await createApp({
       type: "board",
@@ -337,19 +372,16 @@ describe.sequential("plugin install and upgrade authz", () => {
     const res = await request(app)
       .post(`/api/plugins/${pluginId}/config`)
       .send({
+        companyId: companyA,
         configJson: {
-          apiKeyRef: "77777777-7777-4777-8777-777777777777",
+          apiKeyRef: { type: "secret_ref", secretId, version: "latest" },
         },
       });
 
-    // The kill-switch's config-save half is lifted: a secret-ref in config is
-    // only a pointer. Resolution is authorized at call time against the
-    // dispatching company's company_secret_bindings (plugin-secrets-handler),
-    // so storing the ref grants no cross-company access.
-    expect(res.status).toBe(200);
-    expect(mockRegistry.upsertConfig).toHaveBeenCalledWith(pluginId, {
-      configJson: { apiKeyRef: "77777777-7777-4777-8777-777777777777" },
-    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/outside the selected company/i);
+    expect(mockSecretService.syncSecretRefsForTarget).not.toHaveBeenCalled();
+    expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
   }, 20_000);
 
   it("allows instance admins to upgrade plugins", async () => {
@@ -468,7 +500,7 @@ describe.sequential("plugin per-tenant config override routes (PLA-677)", () => 
         instanceConfigSchema: {
           type: "object",
           properties: {
-            githubPatSecretId: { type: "string", format: "secret-ref" },
+            githubPatSecretId: { format: "secret-ref" },
             label: { type: "string" },
           },
         },
@@ -509,7 +541,7 @@ describe.sequential("plugin per-tenant config override routes (PLA-677)", () => 
     const { app } = await createApp(boardActor());
     const res = await request(app)
       .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
-      .send({ configJson: { githubPatSecretId: otherTenantSecretId } });
+      .send({ configJson: { githubPatSecretId: { type: "secret_ref", secretId: otherTenantSecretId } } });
     expect(res.status).toBe(422);
     expect(res.body.error).toContain("Referenced secret must belong to the target company");
     expect(mockRegistry.upsertCompanyConfigOverride).not.toHaveBeenCalled();
@@ -521,7 +553,7 @@ describe.sequential("plugin per-tenant config override routes (PLA-677)", () => 
     const { app } = await createApp(boardActor());
     const res = await request(app)
       .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
-      .send({ configJson: { githubPatSecretId: dprSecretId } });
+      .send({ configJson: { githubPatSecretId: { type: "secret_ref", secretId: dprSecretId } } });
     expect(res.status).toBe(422);
     expect(res.body.error).toContain("Referenced secret not found");
     expect(mockRegistry.upsertCompanyConfigOverride).not.toHaveBeenCalled();
@@ -534,27 +566,49 @@ describe.sequential("plugin per-tenant config override routes (PLA-677)", () => 
       companyId: companyA,
       status: "active",
     });
+    const secretRef = { type: "secret_ref", secretId: dprSecretId };
     mockRegistry.upsertCompanyConfigOverride.mockResolvedValue({
       id: "row-1",
       pluginId,
       companyId: companyA,
-      settingsJson: { configOverrides: { githubPatSecretId: dprSecretId } },
+      settingsJson: { configOverrides: { githubPatSecretId: secretRef } },
     });
     const { app } = await createApp(boardActor());
     const res = await request(app)
       .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
-      .send({ configJson: { githubPatSecretId: dprSecretId } });
+      .send({ configJson: { githubPatSecretId: secretRef } });
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({
       pluginId,
       companyId: companyA,
-      configJson: { githubPatSecretId: dprSecretId },
+      configJson: { githubPatSecretId: secretRef },
     });
     expect(mockRegistry.upsertCompanyConfigOverride).toHaveBeenCalledWith(
       pluginId,
       companyA,
-      { githubPatSecretId: dprSecretId },
+      { githubPatSecretId: secretRef },
     );
+  });
+
+  it("still per-company-validates a legacy bare-UUID secret ref", async () => {
+    // Upstream v722 hard-rejects the bare UUID at a secret-ref field. The fork
+    // keeps accepting it (shipped manifests declare `type: "string"`, so the
+    // object form cannot pass schema validation) — the point of this test is
+    // that the legacy shape still goes through cross-company authorization
+    // rather than slipping past extraction unnoticed.
+    readyOverridePlugin();
+    mockSecretService.getById.mockResolvedValue({
+      id: otherTenantSecretId,
+      companyId: companyB,
+      status: "active",
+    });
+    const { app } = await createApp(boardActor());
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson: { githubPatSecretId: otherTenantSecretId } });
+    expect(res.status).toBe(422);
+    expect(res.body.error).toContain("Referenced secret must belong to the target company");
+    expect(mockRegistry.upsertCompanyConfigOverride).not.toHaveBeenCalled();
   });
 
   it("clears the override via DELETE", async () => {

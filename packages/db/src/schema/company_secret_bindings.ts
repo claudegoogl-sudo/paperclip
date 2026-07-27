@@ -21,6 +21,8 @@ export const companySecretBindings = pgTable(
     allowedEgress: text("allowed_egress").array().notNull().default([]),
     egressAllowlistEnforced: boolean("egress_allowlist_enforced").notNull().default(true),
     label: text("label"),
+    projectionClass: text("projection_class").notNull().default("unclassified"),
+    projectionAllowlistKey: text("projection_allowlist_key"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

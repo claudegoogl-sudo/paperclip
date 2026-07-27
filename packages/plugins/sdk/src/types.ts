@@ -46,6 +46,7 @@ import type {
   PermissionKey,
   PrincipalPermissionGrant,
   PrincipalType,
+  EnvSecretRefBinding,
 } from "@paperclipai/shared";
 import type { PluginPerformActionContext } from "./protocol.js";
 
@@ -138,6 +139,7 @@ export type {
   PermissionKey,
   PrincipalPermissionGrant,
   PrincipalType,
+  EnvSecretRefBinding,
 } from "@paperclipai/shared";
 
 // ---------------------------------------------------------------------------
@@ -569,11 +571,11 @@ export interface PluginExecutionWorkspaceMetadata {
  */
 export interface PluginConfigClient {
   /**
-   * Returns the resolved operator configuration for this plugin instance.
-   * Values are validated against the plugin's `instanceConfigSchema` by the
-   * host before being passed to the worker.
+   * Returns the resolved operator configuration for this plugin in a company.
+   * When called during a host-scoped invocation, the host may derive the
+   * companyId; otherwise callers must pass it explicitly.
    */
-  get(): Promise<Record<string, unknown>>;
+  get(companyId?: string): Promise<Record<string, unknown>>;
 }
 
 export interface PluginLocalFolderProblem {
@@ -821,9 +823,11 @@ export interface PluginHttpClient {
  *
  * Requires `secrets.read-ref` capability.
  *
- * Plugins store secret *references* in their config (e.g. a secret UUID).
- * This client resolves the reference through the Paperclip secret provider
- * system and returns the resolved value at execution time.
+ * Plugins store secret *references* in their config — either a bare secret
+ * UUID or the shared `{ type: "secret_ref", secretId, version? }` binding shape
+ * in company-scoped config. This client resolves the reference through the
+ * Paperclip secret provider system and returns the resolved value at execution
+ * time.
  *
  * Resolution is scoped to the **dispatching company** of the active tool call:
  * the host re-derives the company from the `runId` you pass (never from the
@@ -839,9 +843,10 @@ export interface PluginSecretsClient {
    * Resolve a secret reference to its current value, scoped to the dispatching
    * company of the active tool call.
    *
-   * The reference is a secret UUID from the plugin's config. Pass the
-   * `runCtx.runId` of the currently-executing tool dispatch so the host can
-   * authorize resolution against the dispatching company.
+   * The reference is a secret UUID from the plugin's config, or the shared
+   * `secret_ref` object shape. Pass the `runCtx.runId` of the
+   * currently-executing tool dispatch so the host can authorize resolution
+   * against the dispatching company.
    *
    * Secret values are resolved at call time and must never be cached or
    * written to logs, config, or other persistent storage.
@@ -855,11 +860,19 @@ export interface PluginSecretsClient {
    *   cross-company existence enumeration).
    * - `rate_limited` — too many resolutions from this dispatching agent.
    *
-   * @param secretRef - The secret reference (UUID) from plugin config.
+   * @param secretRef - The secret reference from plugin config: a bare UUID or
+   *   the shared `secret_ref` binding object.
    * @param runId - The `runCtx.runId` of the active tool dispatch.
+   * @param options - Optional company/config-path hints for shared bindings.
+   *   `companyId` is only ever a hint — the host re-derives the authoritative
+   *   dispatching company from `runId`.
    * @returns The resolved secret value.
    */
-  resolve(secretRef: string, runId: string): Promise<string>;
+  resolve(
+    secretRef: string | EnvSecretRefBinding,
+    runId: string,
+    options?: { companyId?: string; configPath?: string },
+  ): Promise<string>;
 
   /**
    * Exchange a resolved secret plaintext for an opaque **borrowed handle**
@@ -1625,6 +1638,7 @@ export interface PluginIssueSummariesClient {
  * - `issue.comments.read` for `listComments`
  * - `issue.attachments.read` for `listAttachments`
  * - `issue.comments.create` for `createComment`
+ * - `issue.comments.create_human_attributed` for `createComment` calls that pass `actorUserId`
  * - `issue.interactions.create` for `createInteraction`, `suggestTasks`, `askUserQuestions`, `requestConfirmation`, and `requestCheckboxConfirmation`
  * - `issue.documents.read` for `documents.list` and `documents.get`
  * - `issue.documents.write` for `documents.upsert` and `documents.delete`
@@ -1736,12 +1750,35 @@ export interface PluginIssuesClient {
    * issue outside `companyId`. Requires `issue.attachments.read` (default-deny).
    */
   listAttachments(issueId: string, companyId: string): Promise<PluginIssueAttachment[]>;
+  /**
+   * Post a comment on an issue.
+   *
+   * Pass `authorAgentId` to attribute the comment to the plugin's own agent
+   * identity (requires `issue.comments.create`, the default).
+   *
+   * Pass `actorUserId` to attribute the comment to a real human instead —
+   * for example, relaying a paired chat user's reply back into the issue
+   * thread. Requires the additional `issue.comments.create_human_attributed`
+   * capability. The host independently verifies that `actorUserId` is an
+   * active human member of the issue's company before applying the
+   * attribution — a plugin can only ever attribute comments to identities
+   * that could have posted them in the web app. A human-attributed comment
+   * also participates in the normal wake-the-assignee behavior a board
+   * user's comment gets in the web app (subject to the same closed-issue /
+   * no-assignee exclusions) — unlike a plugin's own agent-attributed
+   * comments, which never wake anyone.
+   */
   createComment(
     issueId: string,
     body: string,
     companyId: string,
     options?: {
       authorAgentId?: string;
+      /**
+       * Active human company member the comment is attributed to. Requires the
+       * additional `issue.comments.create_human_attributed` capability.
+       */
+      actorUserId?: string;
       /** Resolve the target issue by identifier (e.g. `PLA-822`) instead of `issueId`. */
       identifier?: string;
       /**

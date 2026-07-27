@@ -16,11 +16,22 @@ export const activityLog = pgTable(
     agentId: uuid("agent_id").references(() => agents.id),
     // fork-only divergence (migration 0090); re-submit upstream after PLA-585 thaw (tracking: PLA-644)
     runId: uuid("run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
+    responsibleUserId: text("responsible_user_id"),
     details: jsonb("details").$type<Record<string, unknown>>(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
     companyCreatedIdx: index("activity_log_company_created_idx").on(table.companyId, table.createdAt),
+    companyAgentCreatedIdx: index("activity_log_company_agent_created_idx").on(
+      table.companyId,
+      table.agentId,
+      table.createdAt,
+    ),
+    companyResponsibleUserCreatedIdx: index("activity_log_company_responsible_user_created_idx").on(
+      table.companyId,
+      table.responsibleUserId,
+      table.createdAt,
+    ),
     runIdIdx: index("activity_log_run_id_idx").on(table.runId),
     entityIdx: index("activity_log_entity_type_id_idx").on(table.entityType, table.entityId),
     // Serves the per-issue MAX(created_at) lookup behind issue-list ordering as a single
