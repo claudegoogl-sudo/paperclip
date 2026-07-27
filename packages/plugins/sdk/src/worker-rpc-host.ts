@@ -1685,7 +1685,11 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     if (plugin.definition.onEnvironmentCancelInteractiveSetup) supportedMethods.push("environmentCancelInteractiveSetup");
     if (plugin.definition.onEnvironmentDeleteTemplate) supportedMethods.push("environmentDeleteTemplate");
 
-    return { ok: true, supportedMethods };
+    // PLA-1824: this SDK threads `paperclipInvocationId` through
+    // AsyncLocalStorage on every worker→host call made inside a dispatch, so an
+    // id-less call from this worker is definitionally a no-dispatch background
+    // call and must not inherit an unrelated tenant's in-flight scope.
+    return { ok: true, supportedMethods, echoesInvocationId: true };
   }
 
   async function handleHealth(): Promise<PluginHealthDiagnostics> {
