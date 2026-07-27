@@ -607,6 +607,15 @@ export function createPluginWorkerHandle(
   // `paperclipInvocationId` on dispatch-servicing calls. Reassigned from each
   // successful handshake, so a crash-restarted worker re-declares.
   let echoesInvocationId = false;
+  // PLA-1838: host-observed counterpart to `echoesInvocationId`. Method names
+  // this worker has been seen calling id-less while NO dispatch was in flight
+  // — direct proof that it issues that call outside any dispatch, so
+  // "exactly one dispatch is in flight" no longer implies the call belongs to
+  // it. Unlike the worker's declaration this needs no plugin rebuild, which is
+  // what makes it reach the installed base (PLA-1830). Deliberately NOT reset
+  // on restart: it describes the plugin's code, not the process, and it can
+  // only ever narrow what the worker is granted.
+  const idlessCallsSeenWithNoDispatch = new Set<string>();
 
   // Crash tracking for exponential backoff
   let consecutiveCrashes = 0;
@@ -866,7 +875,17 @@ export function createPluginWorkerHandle(
       }
       const hasActiveInvocation =
         activeInvocations.size > 0 || inFlightInvocationIds.size > 0;
-      if (!hasActiveInvocation) return {};
+      const method = readNonEmptyString((message as { method?: unknown }).method);
+      if (!hasActiveInvocation) {
+        // PLA-1838: an id-less call with nothing in flight is unambiguous —
+        // this worker makes this call outside any dispatch. Record it so the
+        // attribution below is withdrawn for this method from now on. A worker
+        // servicing its own dispatch always has that dispatch in flight, so a
+        // dispatch-only legacy worker (platform.cad ≤0.1.7, klipper) can never
+        // trip this and keeps PLA-719 intact.
+        if (method) idlessCallsSeenWithNoDispatch.add(method);
+        return {};
+      }
       // PLA-1824: plugin workers are GLOBAL — one worker process serves every
       // tenant — so "the single in-flight dispatch" is only the caller's own
       // dispatch for a worker that CANNOT echo the id. A worker that declared
@@ -876,8 +895,18 @@ export function createPluginWorkerHandle(
       // tenant's effective config — and the secret-refs it carries — to a caller
       // with no claim to it. Such callers use `serviceScope` (PLA-768), which
       // `contextForWorkerMessage` attaches unconditionally.
+      //
+      // PLA-1838: `echoesInvocationId` is worker-declared, and plugins bundle
+      // their own SDK copy in `dist/worker.js`, so it stays false for the whole
+      // installed base until each plugin is rebuilt (PLA-1830). The second
+      // clause is the host's own observation of the same fact and needs no
+      // rebuild: once this worker has issued THIS method id-less with nothing
+      // in flight, a later id-less call cannot be assumed to own the single
+      // dispatch that happens to be open. Per-method rather than per-worker so
+      // an unrelated startup `log` cannot withdraw `secrets.resolve`'s binding.
       let singleInFlightScope: PluginInvocationScope | undefined;
-      if (!echoesInvocationId && inFlightInvocationIds.size === 1) {
+      const ownsNoDispatch = method !== null && idlessCallsSeenWithNoDispatch.has(method);
+      if (!echoesInvocationId && !ownsNoDispatch && inFlightInvocationIds.size === 1) {
         const [onlyId] = inFlightInvocationIds;
         const entry = onlyId ? activeInvocations.get(onlyId) : undefined;
         if (entry) singleInFlightScope = entry.scope;
