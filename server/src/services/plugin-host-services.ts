@@ -1391,11 +1391,9 @@ export function buildHostServices(
             notifyWorker("onEvent", { event });
           }
         };
-        if (params.filter) {
-          scopedBus.subscribe(params.eventPattern as any, params.filter as any, handler);
-        } else {
-          scopedBus.subscribe(params.eventPattern as any, handler);
-        }
+        const { replaced } = params.filter
+          ? scopedBus.subscribe(params.eventPattern as any, params.filter as any, handler)
+          : scopedBus.subscribe(params.eventPattern as any, handler);
         // PLA-854 observability: a plugin worker re-runs setup() (and therefore
         // re-issues every events.subscribe RPC) on each (re)start — e.g. a
         // dev-watcher hot reload or crash auto-restart. If the host-side
@@ -1404,12 +1402,17 @@ export function buildHostServices(
         // subscription count on every (re)subscribe makes a detached relay
         // observable: a healthy worker logs a rising count right after restart;
         // a detached one logs nothing (count stuck at 0).
+        //
+        // `replaced` distinguishes a first bind from a re-bind that
+        // adopted the current notify channel, which is why `subscriptionCount`
+        // now stays flat across re-binds instead of climbing.
         logger.info(
           {
             pluginId,
             pluginKey,
             eventPattern: params.eventPattern,
             subscriptionCount: eventBus.subscriptionCount(pluginKey),
+            replaced,
           },
           "plugin event subscription registered",
         );
