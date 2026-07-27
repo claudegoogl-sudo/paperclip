@@ -21,6 +21,7 @@ import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import {
+  activityLog,
   agents,
   companies,
   companySecretBindings,
@@ -154,6 +155,9 @@ describeEmbeddedPostgres("createPluginSecretsHandler shared vault integration", 
   });
 
   afterEach(async () => {
+    // `secretService.resolve` awaits `logActivity`, so the audit row is durable by the
+    // time a test returns and must be cleared before the `agents` row it references.
+    await db.delete(activityLog);
     await db.delete(secretAccessEvents);
     await db.delete(companySecretBindings);
     await db.delete(companySecretVersions);
