@@ -599,23 +599,25 @@ describe("PLA-673 — back-fill runId for pre-PLA-657 SDK secrets.resolve", () =
       } as unknown as HostServices,
     });
     // No active invocation: a forged worker→host call with no
-    // paperclipInvocationId arrives. requireInvocationCompanyScope guards the
-    // company-scoped methods, but `secrets.resolve` is not company-scoped at
-    // the wrapper layer — its fail-closed gate lives in the server-side
-    // secrets handler. To make this independently testable, we invoke the
-    // gated wrapper directly with no invocation scope and assert the params
-    // are forwarded *unchanged* (no runId), so the real handler still throws
-    // `runcontext_invalid`.
+    // paperclipInvocationId arrives.
+    //
+    // PLA-1819: the denial now happens at the WRAPPER, not downstream in the
+    // server-side secrets handler. `resolveRequiredCompanyId` finds no
+    // host-derived tenant (no invocationScope, no singleInFlightScope, and no
+    // serviceScope.runId to defer resolution to) and throws before host
+    // services are entered. The server-side `runcontext_invalid` gate is
+    // untouched and remains the second layer.
     await expect(
       handlers["secrets.resolve"](
         { secretRef: "11111111-1111-1111-1111-111111111111" } as never,
         {},
       ),
-    ).resolves.toEqual("should-not-be-called");
-
-    expect(secretsResolve).toHaveBeenCalledWith({
-      secretRef: "11111111-1111-1111-1111-111111111111",
+    ).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("company context is required"),
     });
+
+    expect(secretsResolve).not.toHaveBeenCalled();
   });
 });
 
@@ -695,19 +697,23 @@ describe("PLA-719 — back-fill runId when the worker echoes no invocation id", 
     });
 
     // Context with invalidInvocationScope but NO singleInFlightScope models the
-    // ambiguous case (0 or 2+ dispatches in-flight). The wrapper must forward
-    // params unchanged so the server-side secrets handler still throws
-    // `runcontext_invalid`.
+    // ambiguous case (0 or 2+ dispatches in-flight).
+    //
+    // PLA-1819: the wrapper now denies outright instead of forwarding unchanged
+    // and letting the server-side secrets handler throw `runcontext_invalid`.
+    // Same fail-closed outcome, one layer earlier — host services are never
+    // entered.
     await expect(
       handlers["secrets.resolve"](
         { secretRef: "11111111-1111-1111-1111-111111111111" } as never,
         { invalidInvocationScope: true },
       ),
-    ).resolves.toEqual("should-not-be-resolved");
-
-    expect(secretsResolve).toHaveBeenCalledWith({
-      secretRef: "11111111-1111-1111-1111-111111111111",
+    ).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("company context is required"),
     });
+
+    expect(secretsResolve).not.toHaveBeenCalled();
   });
 
   it("back-fills runId from singleInFlightScope while leaving company-scope enforcement to invalidInvocationScope", async () => {
@@ -722,10 +728,13 @@ describe("PLA-719 — back-fill runId when the worker echoes no invocation id", 
       } as unknown as HostServices,
     });
 
-    // secrets.resolve is not company-scoped at the wrapper layer, so
-    // invalidInvocationScope does not block it; singleInFlightScope feeds the
-    // runId back-fill. The runId originates from the host scope, never the
-    // worker params.
+    // singleInFlightScope feeds the runId back-fill. The runId originates from
+    // the host scope, never the worker params.
+    //
+    // PLA-1819: `secrets.resolve` IS now company-guarded at the wrapper, but
+    // `singleInFlightScope.companyId` satisfies the guard (it is host-derived),
+    // so `invalidInvocationScope` still does not block this call — resolution
+    // runs ahead of that rejection, per the PLA-818 ordering precedent.
     await expect(
       handlers["secrets.resolve"](
         { secretRef: "11111111-1111-1111-1111-111111111111" } as never,
@@ -740,18 +749,28 @@ describe("PLA-719 — back-fill runId when the worker echoes no invocation id", 
       ),
     ).resolves.toEqual("run-pla719");
 
-    expect(secretsResolve).toHaveBeenCalledWith({
-      secretRef: "11111111-1111-1111-1111-111111111111",
-      runId: "run-pla719",
-    });
+    // v722 plumbs the host-validated call context to HostServices as an
+    // explicit second argument; the back-filled params stay the first.
+    expect(secretsResolve).toHaveBeenCalledWith(
+      {
+        secretRef: "11111111-1111-1111-1111-111111111111",
+        runId: "run-pla719",
+      },
+      expect.anything(),
+    );
   });
 
   it("cannot widen company scope: a worker naming company-b is denied even when singleInFlightScope is company-a", async () => {
-    // SEC invariant (PLA-721): the new `singleInFlightScope` feeds the runId
-    // back-fill ONLY. `requireInvocationCompanyScope` runs first, never reads
-    // `singleInFlightScope`, and the no-id branch always sets
-    // `invalidInvocationScope` — so a worker that names a *different* company in
-    // params is still denied. This pins that the field can't widen tenant scope.
+    // SEC invariant (PLA-721, narrowed by PLA-1819): a worker that names a
+    // *different* company in params is denied. `requireInvocationCompanyScope`
+    // runs first and never reads `singleInFlightScope`, and the no-id branch
+    // always sets `invalidInvocationScope`.
+    //
+    // PLA-1819 narrows PLA-721's original wording — `singleInFlightScope` no
+    // longer feeds the runId back-fill *only*; for `config.get` and
+    // `secrets.resolve` it is also an accepted tenant source in
+    // `resolveRequiredCompanyId`. It still cannot WIDEN scope: a worker-named
+    // company must equal the host-derived pin or it throws. This test pins that.
     const companiesGet = vi.fn(async (params: { companyId: string }) => ({ id: params.companyId }));
     const handlers = createHostClientHandlers({
       pluginId: "test.plugin",

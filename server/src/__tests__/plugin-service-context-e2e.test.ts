@@ -141,13 +141,19 @@ describe("PLA-768 service-context e2e (messenger getUpdates + onEvent)", () => {
     expect(value).toBe(TEST_TOKEN);
   });
 
-  it("still fails closed (runcontext_invalid) with neither dispatch nor service scope", async () => {
+  it("still fails closed with neither dispatch nor service scope", async () => {
     const { handlers } = buildWorld();
 
     // A forged worker→host call outside any dispatch and without a service
-    // scope surfaces no runId, so the server handler fails closed.
+    // scope surfaces no tenant binding at all.
+    //
+    // PLA-1819: the denial moved one layer earlier. It used to reach the server
+    // handler and fail there as `runcontext_invalid`; now the gated wrapper's
+    // `resolveRequiredCompanyId` denies first (no invocationScope, no
+    // singleInFlightScope, no serviceScope.runId) and host services are never
+    // entered. The server-side gate is untouched and remains the second layer.
     await expect(
       handlers["secrets.resolve"]({ secretRef: BOT_TOKEN_SECRET_REF } as never, {}),
-    ).rejects.toMatchObject({ code: "runcontext_invalid" });
+    ).rejects.toMatchObject({ name: "InvocationScopeDeniedError" });
   });
 });

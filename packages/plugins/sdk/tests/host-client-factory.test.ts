@@ -370,10 +370,10 @@ describe("createHostClientHandlers invocation company scope", () => {
       { id: "company-a", name: "Company A" },
       { id: "company-b", name: "Company B" },
     ]);
-    const configGet = vi.fn(async () => ({ value: 1 }));
+    const declarations = vi.fn(async () => ({ value: 1 }));
     const services = {
       companies: { list: companiesList },
-      config: { get: configGet },
+      localFolders: { declarations },
     } as unknown as HostServices;
 
     const handlers = createHostClientHandlers({
@@ -388,8 +388,11 @@ describe("createHostClientHandlers invocation company scope", () => {
       { id: "company-b", name: "Company B" },
     ]);
     // A genuinely no-companyId method (kind "none") still passes with no scope.
+    // PLA-1819: `config.get` is no longer an example of this — it now carries
+    // its own fail-closed company guard inside the handler body, so a
+    // scope-less read is denied. Use a method with no tenant semantics at all.
     await expect(
-      handlers["config.get"](undefined as never, {}),
+      handlers["localFolders.declarations"](undefined as never, {}),
     ).resolves.toEqual({ value: 1 });
   });
 });
@@ -511,6 +514,61 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
       },
       { serviceScope: { runId: "service-run-1" } },
     );
+  });
+
+  it("PLA-1819: serviceScope does not let a worker NAME a company on secrets.resolve", async () => {
+    // The PLA-768 carve-out above lets a scope-less `secrets.resolve` through
+    // because `serviceScope.runId` is host-minted and the server re-derives the
+    // company from (pluginDbId, runId). That must not become a way for the
+    // worker to *choose* the tenant: a worker-supplied `companyId` still has no
+    // host pin to be checked against, so it is denied outright.
+    const resolve = vi.fn(async () => "unreachable");
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services: { secrets: { resolve } } as unknown as HostServices,
+    });
+
+    await expect(
+      handlers["secrets.resolve"](
+        {
+          companyId: "company-attacker",
+          secretRef: "11111111-1111-1111-1111-111111111111",
+        } as never,
+        { serviceScope: { runId: "service-run-1" } },
+      ),
+    ).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("company context is required"),
+    });
+
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
+  it("PLA-1819: serviceScope is NOT an accepted tenant source for config.get", async () => {
+    // `serviceScope` carries only a runId. `secrets.resolve` can accept it
+    // because the server maps that runId to a company; `config.get` has no such
+    // downstream derivation — it needs a concrete companyId to select a row —
+    // so a serviceScope-only read fails closed.
+    const get = vi.fn(async () => ({ apiKey: "unreachable" }));
+    const getForCompany = vi.fn(async () => ({ apiKey: "unreachable" }));
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: [],
+      services: { config: { get, getForCompany } } as unknown as HostServices,
+    });
+
+    await expect(
+      handlers["config.get"](undefined as never, {
+        serviceScope: { runId: "service-run-1" },
+      }),
+    ).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("company context is required"),
+    });
+
+    expect(get).not.toHaveBeenCalled();
+    expect(getForCompany).not.toHaveBeenCalled();
   });
 
   it("prefers an active dispatch runId over the service scope (PLA-768)", async () => {
@@ -697,14 +755,23 @@ describe("createHostClientHandlers config.get per-company scope selection (PLA-7
     expect(getForCompany).not.toHaveBeenCalledWith("company-b");
   });
 
-  it("falls back to instance-wide get() with no scope (0 or 2+ in-flight dispatches → no singleInFlightScope)", async () => {
+  it("fails closed with no scope (0 or 2+ in-flight dispatches → no singleInFlightScope)", async () => {
     const { handlers, get, getForCompany } = makeConfigHandlers();
 
+    // PLA-1819: this used to fall through to the instance-wide `get()`. Since
+    // v2026.722.0 `plugin_config.company_id` is NOT NULL — there is no
+    // instance-wide row, and the host's own handler returns `{}` here. Handing
+    // a plugin `{}` makes it read `config.apiKey` as `undefined` and proceed
+    // unauthenticated, converting a host-side denial into a plugin-side
+    // fail-open. Deny instead (upstream v722's control).
     await expect(
       handlers["config.get"](undefined as never, {}),
-    ).resolves.toEqual({ githubPatSecretId: "instance-wide-secret" });
+    ).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("company context is required"),
+    });
 
-    expect(get).toHaveBeenCalledTimes(1);
+    expect(get).not.toHaveBeenCalled();
     expect(getForCompany).not.toHaveBeenCalled();
   });
 
