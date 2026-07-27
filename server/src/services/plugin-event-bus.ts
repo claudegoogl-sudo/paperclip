@@ -37,6 +37,8 @@ interface Subscription {
   filter: EventFilter | null;
   /** Async handler to invoke when a matching event passes the filter. */
   handler: (event: PluginEvent) => Promise<void>;
+  /** Identity of `(eventPattern, filter)` used to collapse duplicate binds. */
+  dedupeKey: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -66,8 +68,24 @@ function matchesPattern(eventType: string, pattern: string): boolean {
 }
 
 /**
+ * The filter fields the host actually evaluates in {@link passesFilter}.
+ *
+ * `EventFilter` also permits arbitrary extra fields. The host ignores those —
+ * the worker re-applies the full filter locally, per registration, when the
+ * event arrives — so they have no effect on host-side delivery.
+ *
+ * {@link subscriptionKey} keys subscriptions on exactly these fields, which is
+ * what makes collapsing duplicates lossless. **Keep the two in sync:** a field
+ * honoured by `passesFilter` but missing here would let two subscriptions with
+ * different match sets collapse onto one key and silently drop a binding.
+ */
+const HOST_FILTER_FIELDS = ["projectId", "companyId", "agentId"] as const;
+
+/**
  * Returns true if the event passes all fields of the filter.
  * A `null` or empty filter object passes all events.
+ *
+ * Only the fields in {@link HOST_FILTER_FIELDS} are evaluated here.
  *
  * **Resolution strategy per field:**
  *
@@ -110,6 +128,37 @@ function passesFilter(event: PluginEvent, filter: EventFilter | null): boolean {
   }
 
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Subscription identity
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the identity of a subscription. Two `subscribe` calls with the same key
+ * request the same host-side delivery, so the second replaces the first rather
+ * than stacking on top of it.
+ *
+ * The key covers the event pattern plus the {@link HOST_FILTER_FIELDS} values,
+ * read in a fixed order so that `{projectId, companyId}` and
+ * `{companyId, projectId}` produce the same key.
+ *
+ * Fields outside `HOST_FILTER_FIELDS` are deliberately excluded: `passesFilter`
+ * ignores them, so two filters differing only in an extra field select exactly
+ * the same events. Hashing them would let a plugin that varies an inert field
+ * across re-binds (a nonce, a cursor, a config version) defeat deduplication
+ * entirely and keep leaking subscriptions.
+ *
+ * A filter with no effective fields matches everything, exactly like an absent
+ * filter, so both produce the same key.
+ */
+function subscriptionKey(eventPattern: string, filter: EventFilter | null): string {
+  const parts: string[] = [];
+  for (const field of HOST_FILTER_FIELDS) {
+    const value = filter?.[field];
+    if (value !== undefined) parts.push(`${field}=${JSON.stringify(value)}`);
+  }
+  return `${JSON.stringify(eventPattern)}\n${parts.join(",")}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -218,12 +267,16 @@ export function createPluginEventBus(): PluginEventBus {
        *
        * Requires the `events.subscribe` capability (capability enforcement is
        * done by the host layer before calling this method).
+       *
+       * Subscriptions are keyed on `(eventPattern, filter)`. Re-subscribing an
+       * existing key replaces that subscription's handler in place instead of
+       * appending a second one.
        */
       subscribe(
         eventPattern: PluginEventType | `plugin.${string}`,
         fnOrFilter: EventFilter | ((event: PluginEvent) => Promise<void>),
         maybeFn?: (event: PluginEvent) => Promise<void>,
-      ): void {
+      ): PluginEventSubscribeResult {
         let filter: EventFilter | null = null;
         let handler: (event: PluginEvent) => Promise<void>;
 
@@ -235,7 +288,19 @@ export function createPluginEventBus(): PluginEventBus {
           handler = maybeFn;
         }
 
-        subsFor(pluginId).push({ eventPattern, filter, handler });
+        const dedupeKey = subscriptionKey(eventPattern, filter);
+        const subs = subsFor(pluginId);
+        const existing = subs.find((sub) => sub.dedupeKey === dedupeKey);
+        if (existing) {
+          // Replace, never skip: the handler closes over the *current* worker
+          // notify channel, so a re-bind must adopt it. Skipping would strand
+          // the plugin on a dead channel with no error surfaced.
+          existing.handler = handler;
+          return { replaced: true };
+        }
+
+        subs.push({ eventPattern, filter, handler, dedupeKey });
+        return { replaced: false };
       },
 
       /**
@@ -316,6 +381,23 @@ export interface PluginEventBusEmitResult {
 }
 
 /**
+ * Outcome of a `subscribe` call.
+ *
+ * A plugin worker re-issues every `events.subscribe` RPC whenever it re-runs
+ * `setup()`. Without deduplication each re-bind appended another host
+ * subscription that fanned into the same worker channel, so a worker that
+ * self-healed N times delivered every event N+1 times and never released the
+ * stale entries until the plugin was unloaded.
+ */
+export interface PluginEventSubscribeResult {
+  /**
+   * `true` when an existing subscription for the same `(eventPattern, filter)`
+   * had its handler swapped for this one; `false` for a first bind.
+   */
+  replaced: boolean;
+}
+
+/**
  * The full event bus — held by the host process.
  *
  * Call `forPlugin(id)` to obtain a `ScopedPluginEventBus` for each plugin worker.
@@ -379,16 +461,25 @@ export interface ScopedPluginEventBus {
    *
    * An optional `EventFilter` can be passed as the second argument to perform
    * server-side pre-filtering; filtered-out events are never delivered to the handler.
+   *
+   * **Idempotent on `(eventPattern, filter)`.** Subscribing a key that is
+   * already registered replaces that subscription's handler in place and
+   * returns `{ replaced: true }`; the plugin's subscription list does not grow.
+   * Use `clear()` to drop everything.
+   *
+   * Two filters count as the same key when they select the same events: filter
+   * key ordering is not significant, filter fields the host does not evaluate
+   * are ignored, and an empty filter is equivalent to no filter.
    */
   subscribe(
     eventPattern: PluginEventType | `plugin.${string}`,
     fn: (event: PluginEvent) => Promise<void>,
-  ): void;
+  ): PluginEventSubscribeResult;
   subscribe(
     eventPattern: PluginEventType | `plugin.${string}`,
     filter: EventFilter,
     fn: (event: PluginEvent) => Promise<void>,
-  ): void;
+  ): PluginEventSubscribeResult;
 
   /**
    * Emit a plugin-namespaced event. The bus automatically prepends
