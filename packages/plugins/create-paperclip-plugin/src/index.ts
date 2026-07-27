@@ -162,6 +162,12 @@ export function scaffoldPluginProject(options: ScaffoldPluginOptions): string {
     type: "module",
     private: true,
     description,
+    // Keep `.map` files out of any tarball packed from this repo, so sourcemap
+    // `sourcesContent` cannot ship the plugin's original TypeScript. Kept in
+    // sync with the SDK's `RECOMMENDED_PLUGIN_PACKAGE_FILES` by entrypoints.test.ts
+    // — inlined rather than imported so this module stays loadable from source
+    // (via tsx in `onboard`) before the SDK's `dist/` is built.
+    files: ["dist/", "!dist/**/*.map", "README.md"],
     scripts: {
       build: "node ./esbuild.config.mjs",
       "build:rollup": "rollup -c",

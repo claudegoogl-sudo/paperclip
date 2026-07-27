@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { RECOMMENDED_PLUGIN_PACKAGE_FILES } from "@paperclipai/plugin-sdk/bundlers";
 
 const tempDirs: string[] = [];
 
@@ -62,7 +63,8 @@ describe("create-paperclip-plugin entrypoints", () => {
 
     expect(result).toBe(outputDir);
     expect(stdout).toEqual([`Created plugin scaffold at ${outputDir}`]);
-    expect(JSON.parse(fs.readFileSync(path.join(outputDir, "package.json"), "utf8"))).toMatchObject({
+    const scaffoldedPackageJson = JSON.parse(fs.readFileSync(path.join(outputDir, "package.json"), "utf8"));
+    expect(scaffoldedPackageJson).toMatchObject({
       name: "demo-plugin",
       paperclipPlugin: {
         manifest: "./dist/manifest.js",
@@ -70,5 +72,7 @@ describe("create-paperclip-plugin entrypoints", () => {
         ui: "./dist/ui/",
       },
     });
+    expect(scaffoldedPackageJson.files).toEqual([...RECOMMENDED_PLUGIN_PACKAGE_FILES]);
+    expect(scaffoldedPackageJson.files).toContain("!dist/**/*.map");
   });
 });
