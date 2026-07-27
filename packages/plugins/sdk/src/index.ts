@@ -51,7 +51,12 @@
 
 export { definePlugin } from "./define-plugin.js";
 export { createTestHarness, createEnvironmentTestHarness, createFakeEnvironmentDriver, filterEnvironmentEvents, assertEnvironmentEventOrder, assertLeaseLifecycle, assertWorkspaceRealizationLifecycle, assertExecutionLifecycle, assertEnvironmentError } from "./testing.js";
-export { createPluginBundlerPresets } from "./bundlers.js";
+export {
+  createPluginBundlerPresets,
+  DEFAULT_PLUGIN_SOURCEMAP,
+  PLUGIN_SOURCEMAP_FILES_NEGATION,
+  RECOMMENDED_PLUGIN_PACKAGE_FILES,
+} from "./bundlers.js";
 export { startPluginDevServer, getUiBuildSnapshot } from "./dev-server.js";
 export { startWorkerRpcHost, runWorker } from "./worker-rpc-host.js";
 export {
@@ -111,6 +116,9 @@ export type {
 export type {
   PluginBundlerPresetInput,
   PluginBundlerPresets,
+  PluginSourcemapMode,
+  EsbuildSourcemap,
+  RollupSourcemap,
   EsbuildLikeOptions,
   RollupLikeConfig,
 } from "./bundlers.js";

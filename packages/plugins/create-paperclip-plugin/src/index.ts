@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { RECOMMENDED_PLUGIN_PACKAGE_FILES } from "@paperclipai/plugin-sdk/bundlers";
 
 const VALID_TEMPLATES = ["default", "connector", "workspace", "environment"] as const;
 type PluginTemplate = (typeof VALID_TEMPLATES)[number];
@@ -162,6 +163,9 @@ export function scaffoldPluginProject(options: ScaffoldPluginOptions): string {
     type: "module",
     private: true,
     description,
+    // Keep `.map` files out of any tarball packed from this repo, so sourcemap
+    // `sourcesContent` cannot ship the plugin's original TypeScript.
+    files: [...RECOMMENDED_PLUGIN_PACKAGE_FILES],
     scripts: {
       build: "node ./esbuild.config.mjs",
       "build:rollup": "rollup -c",
