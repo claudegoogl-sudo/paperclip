@@ -18,8 +18,8 @@
 -- it applied to the whole instance, so fan-out is the faithful conversion and
 -- the only rule that preserves current behaviour for every tenant.
 --
--- Run `node scripts/plugin-config-company-scope-report.mjs <db-url>` before
--- upgrading for the exact row-by-row plan.
+-- Run `pnpm db:plugin-config-report [db-url]` before upgrading for the exact
+-- row-by-row plan.
 
 ALTER TABLE "plugin_config"
   ADD COLUMN IF NOT EXISTS "company_id" uuid;--> statement-breakpoint
