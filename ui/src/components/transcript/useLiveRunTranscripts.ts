@@ -1,6 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import type { LiveEvent } from "@paperclipai/shared";
+import {
+  isSuccessfulHeartbeatRunStatus,
+  isTerminalHeartbeatRunStatus,
+  type LiveEvent,
+} from "@paperclipai/shared";
 import { ApiError } from "../../api/client";
 import { instanceSettingsApi } from "../../api/instanceSettings";
 import { heartbeatsApi } from "../../api/heartbeats";
@@ -34,9 +38,6 @@ function readString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
-function isTerminalStatus(status: string): boolean {
-  return status === "failed" || status === "timed_out" || status === "cancelled" || status === "succeeded";
-}
 
 function runKnownLogBytes(run: RunTranscriptSource): number | null {
   const bytes = run.status === "queued"
@@ -133,7 +134,7 @@ export function useLiveRunTranscripts({
 
   const runById = useMemo(() => new Map(normalizedRuns.map((run) => [run.id, run])), [normalizedRuns]);
   const activeRunIds = useMemo(
-    () => new Set(normalizedRuns.filter((run) => !isTerminalStatus(run.status)).map((run) => run.id)),
+    () => new Set(normalizedRuns.filter((run) => !isTerminalHeartbeatRunStatus(run.status)).map((run) => run.id)),
     [normalizedRuns],
   );
   const runIdsKey = useMemo(
@@ -232,7 +233,7 @@ export function useLiveRunTranscripts({
           logOffsetByRunRef.current.set(run.id, offset + result.content.length);
         }
       } catch (error) {
-        if (error instanceof ApiError && error.status === 404 && isTerminalStatus(run.status)) {
+        if (error instanceof ApiError && error.status === 404 && isTerminalHeartbeatRunStatus(run.status)) {
           missingTerminalLogRunIdsRef.current.add(run.id);
         }
       } finally {
@@ -252,7 +253,7 @@ export function useLiveRunTranscripts({
     };
 
     void readAll();
-    const activeRuns = normalizedRuns.filter((run) => !isTerminalStatus(run.status));
+    const activeRuns = normalizedRuns.filter((run) => !isTerminalHeartbeatRunStatus(run.status));
     const interval = activeRuns.length > 0 && logPollIntervalMs > 0
       ? window.setInterval(() => {
           void Promise.all(activeRuns.map((run) => readRunLog(run)));
@@ -338,7 +339,7 @@ export function useLiveRunTranscripts({
           const status = readString(payload["status"]) ?? "updated";
           appendChunks(runId, [{
             ts: event.createdAt,
-            stream: isTerminalStatus(status) && status !== "succeeded" ? "stderr" : "system",
+            stream: isTerminalHeartbeatRunStatus(status) && !isSuccessfulHeartbeatRunStatus(status) ? "stderr" : "system",
             chunk: `run ${status}`,
             dedupeKey: `socket:status:${runId}:${status}:${readString(payload["finishedAt"]) ?? ""}`,
           }]);
