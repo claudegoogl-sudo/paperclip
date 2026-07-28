@@ -14,6 +14,10 @@ const BACKGROUND_CONFIG_POLL_WORKER_ENTRYPOINT = path.join(
   FIXTURES_DIR,
   "plugin-worker-background-config-poll.cjs",
 );
+const DISPATCH_CONFIG_GET_WORKER_ENTRYPOINT = path.join(
+  FIXTURES_DIR,
+  "plugin-worker-dispatch-config-get.cjs",
+);
 
 const TEST_MANIFEST: PaperclipPluginManifestV1 = {
   id: "test.plugin",
@@ -36,7 +40,10 @@ describe("PLA-1824 — a background call that owns no dispatch must not inherit 
   // means reading a tenant's effective config (and the secret-refs it carries)
   // that the background caller has no claim to.
 
-  function buildHarness(echoesInvocationId: boolean) {
+  function buildHarness(
+    echoesInvocationId: boolean,
+    entrypointPath: string = BACKGROUND_CONFIG_POLL_WORKER_ENTRYPOINT,
+  ) {
     const getForCompany = vi.fn(async (companyId: string) => ({
       tenant: companyId,
       telegramBotTokenSecretId: `secret-ref-of-${companyId}`,
@@ -52,7 +59,7 @@ describe("PLA-1824 — a background call that owns no dispatch must not inherit 
     });
 
     const handle = createPluginWorkerHandle("test.plugin", {
-      entrypointPath: BACKGROUND_CONFIG_POLL_WORKER_ENTRYPOINT,
+      entrypointPath,
       manifest: TEST_MANIFEST,
       config: {},
       instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
@@ -103,11 +110,19 @@ describe("PLA-1824 — a background call that owns no dispatch must not inherit 
     // `paperclipInvocationId` even while servicing its own dispatch, so the
     // attribution remains the only way to scope it. Narrowing PLA-1824 must not
     // take that away.
-    const { getForCompany, handle } = buildHarness(false);
+    //
+    // PLA-1838: this must use a DISPATCH-ONLY fixture. Originally it reused the
+    // background-poll worker, so what it actually asserted was that a
+    // background loop's id-less `config.get` resolves to the unrelated tenant
+    // whose dispatch is open — the PLA-1838 vulnerability itself, one method
+    // over from `secrets.resolve`, not the PLA-719 affordance it names.
+    const { getForCompany, handle } = buildHarness(
+      false,
+      DISPATCH_CONFIG_GET_WORKER_ENTRYPOINT,
+    );
 
     try {
       await handle.start();
-      await new Promise((resolve) => setTimeout(resolve, 60));
 
       await handle.call("onEvent", {
         event: { companyId: "company-a", type: "issue.created" },
