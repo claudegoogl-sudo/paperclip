@@ -46,7 +46,7 @@ function migrationStatements(migrationSql: string): string[] {
 }
 
 // One connection per migration, matching applyPendingMigrationsManually: the
-// pg_temp helpers a migration declares live and die with that session.
+// pg_temp helpers both migrations declare live and die with that session.
 async function runMigrationSql(connectionString: string, migrationSql: string): Promise<void> {
   const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
   try {
@@ -128,12 +128,16 @@ describeEmbeddedPostgres("0164 plugin_config company scope", () => {
   }
 
   // Mirrors the shape every shipped manifest uses: a string field tagged
-  // `format: "secret-ref"`, which is what 0185 walks the manifest for.
+  // `format: "secret-ref"`, here both at the top level and one level down.
   const SECRET_REF_SCHEMA = {
     type: "object",
     properties: {
       telegramBotTokenSecretId: { type: "string", format: "secret-ref" },
       supergroupId: { type: "number" },
+      auth: {
+        type: "object",
+        properties: { tokenSecretId: { type: "string", format: "secret-ref" } },
+      },
     },
   } as const;
 
@@ -142,6 +146,13 @@ describeEmbeddedPostgres("0164 plugin_config company scope", () => {
     await sql`INSERT INTO company_secrets (id, company_id, key, name)
       VALUES (${secretId}, ${companyId}, ${`k-${secretId.slice(0, 8)}`}, 'test secret')`;
     return secretId;
+  }
+
+  async function configByCompany(pluginId: string): Promise<Map<string, Record<string, unknown>>> {
+    const rows = (await sql`
+      SELECT company_id, config_json FROM plugin_config WHERE plugin_id = ${pluginId}
+    `) as unknown as { company_id: string; config_json: Record<string, unknown> }[];
+    return new Map(rows.map((row) => [row.company_id, row.config_json]));
   }
 
   async function pluginBindings(): Promise<
@@ -256,6 +267,101 @@ describeEmbeddedPostgres("0164 plugin_config company scope", () => {
       WHERE tablename = 'plugin_config' AND indexname = 'plugin_config_plugin_company_idx'
     `) as unknown as { indexname: string }[];
     expect(indexes).toHaveLength(1);
+  });
+
+  it("drops a foreign secret-ref from the copies and keeps it for the owning company", async () => {
+    // paperclip-messenger on the live instance: telegramBotTokenSecretId names a
+    // Platform-owned secret, but the topicMap covers all 8 tenants.
+    const pluginId = await insertPlugin("paperclip-messenger", SECRET_REF_SCHEMA);
+    const owner = companyIds[3];
+    const secretId = await insertSecret(owner);
+    const topicMap = Object.fromEntries(companyIds.map((id, index) => [id, 100 + index]));
+    await insertLegacyConfig(pluginId, {
+      telegramBotTokenSecretId: secretId,
+      supergroupId: -1001,
+      topicMap,
+    });
+
+    await runMigration(connectionString);
+
+    const configs = await configByCompany(pluginId);
+    expect([...configs.keys()].sort()).toEqual(companyIds);
+    expect(configs.get(owner)).toEqual({
+      telegramBotTokenSecretId: secretId,
+      supergroupId: -1001,
+      topicMap,
+    });
+    for (const companyId of companyIds.filter((id) => id !== owner)) {
+      // Only the foreign ref goes; the map a global worker routes on stays whole.
+      expect(configs.get(companyId)).toEqual({ supergroupId: -1001, topicMap });
+    }
+  });
+
+  it("drops a nested foreign secret-ref without disturbing its siblings", async () => {
+    const pluginId = await insertPlugin("platform.vault", SECRET_REF_SCHEMA);
+    const owner = companyIds[6];
+    const secretId = await insertSecret(owner);
+    await insertLegacyConfig(pluginId, {
+      auth: { tokenSecretId: secretId, mode: "token" },
+      vaultUrl: "https://vault.local",
+    });
+
+    await runMigration(connectionString);
+
+    const configs = await configByCompany(pluginId);
+    expect(configs.get(owner)).toEqual({
+      auth: { tokenSecretId: secretId, mode: "token" },
+      vaultUrl: "https://vault.local",
+    });
+    for (const companyId of companyIds.filter((id) => id !== owner)) {
+      expect(configs.get(companyId)).toEqual({
+        auth: { mode: "token" },
+        vaultUrl: "https://vault.local",
+      });
+    }
+  });
+
+  it("leaves values that are not resolvable secret refs alone on every row", async () => {
+    // A UUID with no company_secrets row is a dangling pointer the fan-out
+    // neither created nor can repair, and an unannotated UUID is not a ref at
+    // all. Dropping either would be the migration editorialising.
+    const pluginId = await insertPlugin("platform.cad", SECRET_REF_SCHEMA);
+    const config = {
+      telegramBotTokenSecretId: randomUUID(),
+      githubPatSecretId: randomUUID(),
+      supergroupId: 7,
+    };
+    await insertLegacyConfig(pluginId, config);
+
+    await runMigration(connectionString);
+
+    const configs = await configByCompany(pluginId);
+    expect(configs.size).toBe(companyIds.length);
+    for (const companyId of companyIds) {
+      expect(configs.get(companyId)).toEqual(config);
+    }
+  });
+
+  // The invariant the PLA-1841 security sign-off rests on: fan-out must not
+  // change which companies end up holding a secret binding. This exercises the
+  // natural post-scrub shape (ref present only on the owner's row).
+  it("derives exactly the owner-keyed bindings when 0185 backfills after the fan-out", async () => {
+    const pluginId = await insertPlugin("paperclip-messenger", SECRET_REF_SCHEMA);
+    const owner = companyIds[2];
+    const secretId = await insertSecret(owner);
+    await insertLegacyConfig(pluginId, { telegramBotTokenSecretId: secretId, supergroupId: -1 });
+
+    await runMigration(connectionString);
+    await runBackfill(connectionString);
+
+    expect(await pluginBindings()).toEqual([
+      {
+        company_id: owner,
+        secret_id: secretId,
+        target_id: pluginId,
+        config_path: "telegramBotTokenSecretId",
+      },
+    ]);
   });
 
   // The invariant the PLA-1841 security sign-off rests on: fan-out copies a

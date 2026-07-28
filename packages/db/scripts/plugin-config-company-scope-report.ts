@@ -70,6 +70,48 @@ function describeConfig(configJson: unknown): string {
   return `${keys.length} key(s): ${keys.sort().join(", ")}`;
 }
 
+// Same rule as 0164's pg_temp.pla1843_collect_secret_ref_paths and the server's
+// collectSecretRefPaths: only a property the manifest tags `format: "secret-ref"`.
+function collectSecretRefPaths(schema: unknown, prefix = ""): string[] {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return [];
+  const node = schema as Record<string, unknown>;
+  const paths: string[] = [];
+
+  for (const keyword of ["allOf", "anyOf", "oneOf"] as const) {
+    const branches = node[keyword];
+    if (!Array.isArray(branches)) continue;
+    for (const branch of branches) paths.push(...collectSecretRefPaths(branch, prefix));
+  }
+
+  const properties = node.properties;
+  if (properties && typeof properties === "object" && !Array.isArray(properties)) {
+    for (const [key, propertySchema] of Object.entries(properties as Record<string, unknown>)) {
+      if (!propertySchema || typeof propertySchema !== "object" || Array.isArray(propertySchema)) {
+        continue;
+      }
+      const path = prefix ? `${prefix}.${key}` : key;
+      if ((propertySchema as Record<string, unknown>).format === "secret-ref") paths.push(path);
+      paths.push(...collectSecretRefPaths(propertySchema, path));
+    }
+  }
+
+  return paths;
+}
+
+function readSecretRefAtPath(configJson: unknown, dotPath: string): string | null {
+  let current: unknown = configJson;
+  for (const key of dotPath.split(".")) {
+    if (!current || typeof current !== "object" || Array.isArray(current)) return null;
+    current = (current as Record<string, unknown>)[key];
+  }
+  if (typeof current === "string") return current;
+  if (current && typeof current === "object" && !Array.isArray(current)) {
+    const record = current as Record<string, unknown>;
+    if (record.type === "secret_ref" && typeof record.secretId === "string") return record.secretId;
+  }
+  return null;
+}
+
 async function main(): Promise<number> {
   const { connectionString, source } = resolveConnectionString();
   console.log("Migration 0164 plugin_config fan-out plan");
@@ -104,11 +146,17 @@ async function main(): Promise<number> {
       SELECT id, name FROM companies ORDER BY id::text
     `;
     const legacyRows = await sql<
-      { plugin_key: string | null; config_json: unknown; binding_companies: number }[]
+      {
+        plugin_key: string | null;
+        config_json: unknown;
+        manifest_json: unknown;
+        binding_companies: number;
+      }[]
     >`
       SELECT
         p.plugin_key,
         pc.config_json,
+        p.manifest_json,
         (
           SELECT count(DISTINCT csb.company_id)::int
           FROM company_secret_bindings csb
@@ -118,6 +166,13 @@ async function main(): Promise<number> {
       LEFT JOIN plugins p ON p.id = pc.plugin_id
       ORDER BY p.plugin_key
     `;
+    const secretOwners = new Map(
+      (
+        await sql<{ id: string; company_id: string }[]>`
+          SELECT id, company_id FROM company_secrets
+        `
+      ).map((secret) => [secret.id.toLowerCase(), secret.company_id]),
+    );
 
     const primaryCompanyId = companies[0]?.id;
     console.log(`\nCompanies: ${companies.length}`);
@@ -126,12 +181,29 @@ async function main(): Promise<number> {
       console.log(`  ${company.id}  ${company.name}${marker}`);
     }
 
+    const companyNamesById = new Map(companies.map((company) => [company.id, company.name]));
+
     console.log(`\nLegacy instance-global plugin_config rows: ${legacyRows.length}`);
     for (const row of legacyRows) {
       console.log(`  ${row.plugin_key ?? "<orphan plugin>"}`);
       console.log(`    secret bindings in ${row.binding_companies} company/companies`);
       console.log(`    config_json: ${describeConfig(row.config_json)}`);
       console.log(`    -> will exist for all ${companies.length} company/companies after 0164`);
+
+      const schema = (row.manifest_json as Record<string, unknown> | null)?.instanceConfigSchema;
+      for (const path of collectSecretRefPaths(schema)) {
+        const ref = readSecretRefAtPath(row.config_json, path)?.toLowerCase();
+        if (!ref) continue;
+        const ownerId = secretOwners.get(ref);
+        if (!ownerId) {
+          console.log(`    ${path}: references no known secret; left as-is on every row`);
+          continue;
+        }
+        const ownerName = companyNamesById.get(ownerId) ?? ownerId;
+        console.log(
+          `    ${path}: kept for ${ownerName}, dropped from the other ${companies.length - 1} row(s)`,
+        );
+      }
     }
 
     const before = legacyRows.length;
@@ -145,6 +217,11 @@ async function main(): Promise<number> {
       return 1;
     }
     console.log("\nOK: every legacy row has a company to fan out to; 0164 will apply.");
+    console.log(
+      "Note: the fan-out only covers the companies that exist when 0164 runs. A company\n" +
+        "created afterwards gets no plugin_config row and reads as unconfigured ({}), so it\n" +
+        "needs an explicit POST /api/plugins/:pluginId/config to start using a plugin.",
+    );
     return 0;
   } finally {
     await sql.end();
