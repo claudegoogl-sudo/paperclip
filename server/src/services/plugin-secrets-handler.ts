@@ -284,6 +284,23 @@ export interface PluginSecretsHandlerOptions {
    * `runcontext_invalid`.
    */
   runContextRegistry?: PluginRunContextRegistry;
+  /**
+   * PLA-1845: per-tenant plugin-enablement gate, invoked with the AUTHORITATIVE
+   * owning company once it is known — binding-derived on the service path,
+   * host-validated on the background path. Must throw when the plugin is
+   * disabled for that company.
+   *
+   * This lives here rather than in the host-services wrapper because on the
+   * service path there is no caller-supplied company by construction: the
+   * company only becomes known inside `resolveForServiceContext`, after the
+   * binding row is read. A wrapper can therefore only check a company the
+   * caller already supplied, which on that path is nothing.
+   *
+   * Optional so existing dispatch-only injected hosts stay valid; when a
+   * service- or background-context resolve is attempted and this is absent the
+   * handler fails closed (opaque `not_found`), matching `findServiceBinding`.
+   */
+  ensurePluginEnabledForCompany?: (companyId: string) => Promise<void>;
   /** Override the per-agent global rate limit (default 30/min). */
   globalRateLimit?: { maxAttempts: number; windowMs: number };
   /** Override the per-(agent, company) sub-bucket limit (default 30/min). */
@@ -371,7 +388,8 @@ function parseVersionSelector(selector: string | null | undefined): number | "la
 export function createPluginSecretsHandler(
   options: PluginSecretsHandlerOptions,
 ): PluginSecretsService {
-  const { db, pluginDbId, pluginKey, runContextRegistry } = options;
+  const { db, pluginDbId, pluginKey, runContextRegistry, ensurePluginEnabledForCompany } =
+    options;
   const now = options.now ?? (() => Date.now());
   const globalCfg = options.globalRateLimit ?? DEFAULT_GLOBAL;
   const perCompanyCfg = options.perCompanyRateLimit ?? DEFAULT_PER_COMPANY;
@@ -541,6 +559,58 @@ export function createPluginSecretsHandler(
   }
 
   /**
+   * PLA-1845 Gate 3b: per-tenant plugin-enablement, checked with the
+   * authoritative company — binding-derived (service) or host-validated
+   * (background). An operator who disables a plugin for company X expects X's
+   * secrets to stop resolving for it, including from the plugin's own
+   * background/service contexts.
+   *
+   * Every denial (gate absent, or the injected gate throwing) collapses to the
+   * SAME opaque `not_found` as the not-bound case at Gate 3, so a worker cannot
+   * use the response to probe whether a plugin is enabled for a tenant. The
+   * audit row is written as `denied`/`not_found` — never `allowed`.
+   */
+  async function assertPluginEnabledForCompany(input: {
+    companyId: string;
+    secretId: string;
+    runId: string;
+    toolName: string;
+    runContextKind: "service" | "background";
+  }): Promise<void> {
+    const deny = async (reason: string, err?: unknown) => {
+      log.warn(
+        { err, secretId: input.secretId, companyId: input.companyId },
+        `${reason}; collapsing to not_found`,
+      );
+      await audit({
+        outcome: "denied",
+        deniedReason: "not_found",
+        dispatchingAgentId: null,
+        dispatchingCompanyId: input.companyId,
+        secretId: input.secretId,
+        runId: input.runId,
+        toolName: input.toolName,
+        runContextKind: input.runContextKind,
+      });
+      throw new SecretsError("not_found", "secret not found");
+    };
+
+    const gate = ensurePluginEnabledForCompany;
+    if (!gate) {
+      // Fail closed: a host built without the gate must not resolve on the
+      // paths whose owning company the wrapper never sees.
+      await deny("plugin-enablement gate not configured for this host");
+      return;
+    }
+
+    try {
+      await gate(input.companyId);
+    } catch (err) {
+      await deny("plugin is not enabled for the owning company", err);
+    }
+  }
+
+  /**
    * PLA-768: resolve a secret for a worker-lifetime **service** context. Used
    * by background dispatches (onEvent/onWebhook/runJob) and setup()-started
    * loops that resolve secrets outside any agent RPC dispatch.
@@ -587,6 +657,19 @@ export function createPluginSecretsHandler(
       throw new SecretsError("not_found", "secret not found");
     }
     const companyId = binding.companyId;
+
+    // ---------- Gate 3b: per-tenant enablement (PLA-1845) ----------
+    // Only now is the owning company known, so this is the earliest point the
+    // check can run. Moving it earlier would reintroduce the circularity that
+    // makes the wrapper check unimplementable here (a service run-context
+    // carries no companyId).
+    await assertPluginEnabledForCompany({
+      companyId,
+      secretId: trimmedRef,
+      runId: serviceRunId,
+      toolName: sentinelTool,
+      runContextKind: "service",
+    });
 
     // ---------- Gate 4: company-scoped resolve (defence in depth) ----------
     // resolveSecretValue re-checks secret.companyId === companyId; every failure
@@ -714,6 +797,16 @@ export function createPluginSecretsHandler(
       });
       throw new SecretsError("not_found", "secret not found");
     }
+
+    // ---------- Gate 3b: per-tenant enablement (PLA-1845) ----------
+    // Uses the host-validated TRIGGERING company, not a binding-derived one.
+    await assertPluginEnabledForCompany({
+      companyId,
+      secretId: trimmedRef,
+      runId: backgroundRunId,
+      toolName: sentinelTool,
+      runContextKind: "background",
+    });
 
     // ---------- Gate 4: company-scoped resolve (defence in depth) ----------
     let value: string;

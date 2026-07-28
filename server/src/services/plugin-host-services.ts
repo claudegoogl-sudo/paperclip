@@ -583,6 +583,11 @@ export function buildHostServices(
     pluginDbId: pluginId,
     pluginKey,
     runContextRegistry: options.runContextRegistry,
+    // PLA-1845: the service/background resolve paths learn their owning company
+    // only inside the handler, so the enablement gate has to be injected rather
+    // than applied out here. Wrapped in an arrow because
+    // `requirePluginEnabledForCompany` is declared below this construction.
+    ensurePluginEnabledForCompany: (companyId) => requirePluginEnabledForCompany(companyId),
   });
   const companies = companyService(db);
   const agents = agentService(db);
@@ -724,8 +729,11 @@ export function buildHostServices(
    * stub above, this fail-closes so a cross-tenant-sensitive enumeration can
    * never run for a company the plugin is not genuinely provisioned for. It is
    * deliberately NOT wired into the existing handlers (whose per-entity
-   * `requireInCompany` already supplies the cross-check) — only the new reads
-   * call it.
+   * `requireInCompany` already supplies the cross-check) — only the reconcile
+   * reads and, since PLA-1845, the secrets handler's service/background resolve
+   * paths call it. Those two paths have no per-entity company to cross-check
+   * against: the owning company is derived from the binding, so this is the
+   * only gate that can enforce the operator's per-tenant disablement there.
    *
    * Denial order (each step throws rather than returning an empty list — a
    * silent empty would mask a misconfig and reopen the very downtime gap this

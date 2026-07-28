@@ -111,6 +111,10 @@ function buildHandler(opts: BuildOpts = {}) {
     bindings: { findBinding, findServiceBinding },
     resolver: { resolve: resolverFn },
     globalRateLimit: opts.globalRateLimit,
+    // PLA-1845: the background path fails closed without an enablement gate.
+    // This suite covers PLA-773/806 scoping, so keep the plugin enabled; the
+    // gate itself is covered by plugin-secrets-handler-availability-gate.test.ts.
+    ensurePluginEnabledForCompany: async () => {},
   });
   return { handler, registry, resolverFn, findBinding, findServiceBinding };
 }

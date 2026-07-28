@@ -102,6 +102,11 @@ function buildHandler(opts: BuildOpts = {}) {
     bindings,
     resolver: { resolve: resolverFn },
     globalRateLimit: opts.globalRateLimit,
+    // PLA-1845: the service path fails closed without an enablement gate. This
+    // suite covers PLA-768 scoping, so the plugin is enabled for every company
+    // here; the gate's own behaviour lives in
+    // plugin-secrets-handler-availability-gate.test.ts.
+    ensurePluginEnabledForCompany: async () => {},
   });
   return { handler, registry, resolverFn, findServiceBinding };
 }
