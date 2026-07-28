@@ -9662,6 +9662,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agentId: string,
     outcome: RunSessionOutcome,
     failureReason?: string | null,
+    errorFamily?: string | null,
   ) {
     const existing = await getAgent(agentId);
     if (!existing) return;
@@ -9673,7 +9674,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const isFirstHeartbeat = !existing.lastHeartbeatAt;
 
     const runningCount = await countRunningRunsForAgent(agentId);
-    const nextStatus = resolveAgentStatusAfterRun({ outcome, runningRunCount: runningCount });
+    const nextStatus = resolveAgentStatusAfterRun({
+      outcome,
+      runningRunCount: runningCount,
+      errorFamily,
+    });
 
     const updated = await db
       .update(agents)
@@ -12379,6 +12384,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         agent.id,
         outcome,
         outcomeSucceeded ? null : (adapterResult.errorMessage ?? null),
+        adapterResult.errorFamily ?? null,
       );
     } catch (err) {
       const message = redactCurrentUserText(
