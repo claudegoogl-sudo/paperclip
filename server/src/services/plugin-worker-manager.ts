@@ -613,8 +613,12 @@ export function createPluginWorkerHandle(
   // "exactly one dispatch is in flight" no longer implies the call belongs to
   // it. Unlike the worker's declaration this needs no plugin rebuild, which is
   // what makes it reach the installed base (PLA-1830). Deliberately NOT reset
-  // on restart: it describes the plugin's code, not the process, and it can
-  // only ever narrow what the worker is granted.
+  // on worker crash-restart: `spawnProcess()` respawns inside this same
+  // closure, and the signal describes the plugin's code rather than the
+  // process, so it should outlive the child. It does NOT survive a new handle
+  // (host restart, or plugin disable→enable), which reopens the learning
+  // window until the worker is next observed calling id-less with no dispatch
+  // in flight. It can only ever narrow what the worker is granted.
   const idlessCallsSeenWithNoDispatch = new Set<string>();
 
   // Crash tracking for exponential backoff
