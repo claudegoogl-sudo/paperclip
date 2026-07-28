@@ -721,6 +721,20 @@ export function createHostClientHandlers(
    *      service runId is host-minted (never worker-supplied) and resolves to a
    *      system actor at the server with the company derived from the secret
    *      binding — it grants no company scope here.
+   *
+   * PLA-1838: `serviceScope` being host-minted is NOT on its own a tenant-
+   * isolation argument for `secrets.resolve`. `contextForWorkerMessage`
+   * attaches `serviceScope` unconditionally, so whenever the host attributes a
+   * call to a single in-flight dispatch BOTH keys are present and (2) shadows
+   * (3). The runId written here IS the tenant binding — the server's secrets
+   * handler re-derives the company from `(pluginDbId, runId)` — so a
+   * no-dispatch caller reaching this with someone else's `singleInFlightScope`
+   * resolves that tenant's secret. What keeps (2) off a no-dispatch caller is
+   * the host, not this precedence chain: see `baseContextForWorkerMessage` in
+   * plugin-worker-manager (PLA-1824's worker-declared `echoesInvocationId` plus
+   * PLA-1838's host-observed per-method signal). Reordering the chain here is
+   * NOT the fix — for a legacy id-less worker servicing its own dispatch, (2)
+   * is the correct binding and (3) is not.
    */
   function backfillDispatchRunId<P>(
     params: P,

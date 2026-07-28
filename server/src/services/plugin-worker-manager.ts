@@ -603,6 +603,23 @@ export function createPluginWorkerHandle(
 
   // Optional methods reported by the worker during initialization
   let supportedMethods: string[] = [];
+  // PLA-1824: whether the worker declared at `initialize` that it echoes
+  // `paperclipInvocationId` on dispatch-servicing calls. Reassigned from each
+  // successful handshake, so a crash-restarted worker re-declares.
+  let echoesInvocationId = false;
+  // PLA-1838: host-observed counterpart to `echoesInvocationId`. Method names
+  // this worker has been seen calling id-less while NO dispatch was in flight
+  // — direct proof that it issues that call outside any dispatch, so
+  // "exactly one dispatch is in flight" no longer implies the call belongs to
+  // it. Unlike the worker's declaration this needs no plugin rebuild, which is
+  // what makes it reach the installed base (PLA-1830). Deliberately NOT reset
+  // on worker crash-restart: `spawnProcess()` respawns inside this same
+  // closure, and the signal describes the plugin's code rather than the
+  // process, so it should outlive the child. It does NOT survive a new handle
+  // (host restart, or plugin disable→enable), which reopens the learning
+  // window until the worker is next observed calling id-less with no dispatch
+  // in flight. It can only ever narrow what the worker is granted.
+  const idlessCallsSeenWithNoDispatch = new Set<string>();
 
   // Crash tracking for exponential backoff
   let consecutiveCrashes = 0;
@@ -847,8 +864,11 @@ export function createPluginWorkerHandle(
       // bind this call to an invocation by id. When EXACTLY ONE host→worker
       // dispatch is in-flight, that dispatch is unambiguously the one the worker
       // is servicing, so we surface its host-validated scope as
-      // `singleInFlightScope` for the legacy runId back-fill ONLY (the runId
-      // comes from the host's own runContext, never the worker). We deliberately
+      // `singleInFlightScope`. PLA-721 recorded this as feeding the runId
+      // back-fill ONLY; that stopped being true once PLA-761 made `config.get`
+      // select a tenant from it, which is why PLA-1824 gates the whole branch on
+      // the worker being unable to echo an id in the first place. The runId
+      // comes from the host's own runContext, never the worker. We deliberately
       // STILL return `invalidInvocationScope` so company-scope enforcement stays
       // strict — a worker can never name an arbitrary target company off this.
       // With 0 or 2+ dispatches in-flight we cannot attribute the call and fall
@@ -859,9 +879,38 @@ export function createPluginWorkerHandle(
       }
       const hasActiveInvocation =
         activeInvocations.size > 0 || inFlightInvocationIds.size > 0;
-      if (!hasActiveInvocation) return {};
+      const method = readNonEmptyString((message as { method?: unknown }).method);
+      if (!hasActiveInvocation) {
+        // PLA-1838: an id-less call with nothing in flight is unambiguous —
+        // this worker makes this call outside any dispatch. Record it so the
+        // attribution below is withdrawn for this method from now on. A worker
+        // servicing its own dispatch always has that dispatch in flight, so a
+        // dispatch-only legacy worker (platform.cad ≤0.1.7, klipper) can never
+        // trip this and keeps PLA-719 intact.
+        if (method) idlessCallsSeenWithNoDispatch.add(method);
+        return {};
+      }
+      // PLA-1824: plugin workers are GLOBAL — one worker process serves every
+      // tenant — so "the single in-flight dispatch" is only the caller's own
+      // dispatch for a worker that CANNOT echo the id. A worker that declared
+      // `echoesInvocationId` at initialize and still sent none is servicing no
+      // dispatch at all (a `setup()`-started poll loop, a `runJob`, a timer).
+      // Attributing it to whichever tenant happens to be mid-dispatch hands that
+      // tenant's effective config — and the secret-refs it carries — to a caller
+      // with no claim to it. Such callers use `serviceScope` (PLA-768), which
+      // `contextForWorkerMessage` attaches unconditionally.
+      //
+      // PLA-1838: `echoesInvocationId` is worker-declared, and plugins bundle
+      // their own SDK copy in `dist/worker.js`, so it stays false for the whole
+      // installed base until each plugin is rebuilt (PLA-1830). The second
+      // clause is the host's own observation of the same fact and needs no
+      // rebuild: once this worker has issued THIS method id-less with nothing
+      // in flight, a later id-less call cannot be assumed to own the single
+      // dispatch that happens to be open. Per-method rather than per-worker so
+      // an unrelated startup `log` cannot withdraw `secrets.resolve`'s binding.
       let singleInFlightScope: PluginInvocationScope | undefined;
-      if (inFlightInvocationIds.size === 1) {
+      const ownsNoDispatch = method !== null && idlessCallsSeenWithNoDispatch.has(method);
+      if (!echoesInvocationId && !ownsNoDispatch && inFlightInvocationIds.size === 1) {
         const [onlyId] = inFlightInvocationIds;
         const entry = onlyId ? activeInvocations.get(onlyId) : undefined;
         if (entry) singleInFlightScope = entry.scope;
@@ -1348,11 +1397,14 @@ export function createPluginWorkerHandle(
         "initialize",
         initParams,
         INITIALIZE_TIMEOUT_MS,
-      ) as { ok?: boolean; supportedMethods?: string[] } | undefined;
+      ) as
+        | { ok?: boolean; supportedMethods?: string[]; echoesInvocationId?: boolean }
+        | undefined;
       if (!result || !result.ok) {
         throw new Error("Worker initialize returned ok=false");
       }
       supportedMethods = result.supportedMethods ?? [];
+      echoesInvocationId = result.echoesInvocationId === true;
     } catch (err) {
       // Initialize failed — kill the process and propagate
       const msg = err instanceof Error ? err.message : String(err);
