@@ -372,6 +372,20 @@ export interface InitializeResult {
   ok: boolean;
   /** Optional methods the worker has implemented (e.g. "validateConfig", "onEvent"). */
   supportedMethods?: string[];
+  /**
+   * PLA-1824: the worker echoes `paperclipInvocationId` on every worker→host
+   * call it makes while servicing a dispatch. Declared by every SDK from
+   * PLA-657 onward; absent from the pre-PLA-657 workers (platform.cad ≤0.1.7,
+   * klipper) that PLA-719/PLA-761's `singleInFlightScope` attribution exists
+   * for.
+   *
+   * When this is `true` an id-less worker→host call is, by construction, a call
+   * that owns NO dispatch (a `setup()`-started loop, a `runJob`, a timer), so
+   * the host must not attribute it to whichever tenant's dispatch happens to be
+   * in flight. Declaring it can only NARROW what the worker is granted, so the
+   * host may honour a worker-supplied value without trusting the worker.
+   */
+  echoesInvocationId?: boolean;
 }
 
 /**

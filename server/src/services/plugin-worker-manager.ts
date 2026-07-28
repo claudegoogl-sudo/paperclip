@@ -603,6 +603,10 @@ export function createPluginWorkerHandle(
 
   // Optional methods reported by the worker during initialization
   let supportedMethods: string[] = [];
+  // PLA-1824: whether the worker declared at `initialize` that it echoes
+  // `paperclipInvocationId` on dispatch-servicing calls. Reset on every start
+  // so a crash-restarted worker must re-declare.
+  let echoesInvocationId = false;
 
   // Crash tracking for exponential backoff
   let consecutiveCrashes = 0;
@@ -847,8 +851,11 @@ export function createPluginWorkerHandle(
       // bind this call to an invocation by id. When EXACTLY ONE host→worker
       // dispatch is in-flight, that dispatch is unambiguously the one the worker
       // is servicing, so we surface its host-validated scope as
-      // `singleInFlightScope` for the legacy runId back-fill ONLY (the runId
-      // comes from the host's own runContext, never the worker). We deliberately
+      // `singleInFlightScope`. PLA-721 recorded this as feeding the runId
+      // back-fill ONLY; that stopped being true once PLA-761 made `config.get`
+      // select a tenant from it, which is why PLA-1824 gates the whole branch on
+      // the worker being unable to echo an id in the first place. The runId
+      // comes from the host's own runContext, never the worker. We deliberately
       // STILL return `invalidInvocationScope` so company-scope enforcement stays
       // strict — a worker can never name an arbitrary target company off this.
       // With 0 or 2+ dispatches in-flight we cannot attribute the call and fall
@@ -860,8 +867,17 @@ export function createPluginWorkerHandle(
       const hasActiveInvocation =
         activeInvocations.size > 0 || inFlightInvocationIds.size > 0;
       if (!hasActiveInvocation) return {};
+      // PLA-1824: plugin workers are GLOBAL — one worker process serves every
+      // tenant — so "the single in-flight dispatch" is only the caller's own
+      // dispatch for a worker that CANNOT echo the id. A worker that declared
+      // `echoesInvocationId` at initialize and still sent none is servicing no
+      // dispatch at all (a `setup()`-started poll loop, a `runJob`, a timer).
+      // Attributing it to whichever tenant happens to be mid-dispatch hands that
+      // tenant's effective config — and the secret-refs it carries — to a caller
+      // with no claim to it. Such callers use `serviceScope` (PLA-768), which
+      // `contextForWorkerMessage` attaches unconditionally.
       let singleInFlightScope: PluginInvocationScope | undefined;
-      if (inFlightInvocationIds.size === 1) {
+      if (!echoesInvocationId && inFlightInvocationIds.size === 1) {
         const [onlyId] = inFlightInvocationIds;
         const entry = onlyId ? activeInvocations.get(onlyId) : undefined;
         if (entry) singleInFlightScope = entry.scope;
@@ -1348,11 +1364,14 @@ export function createPluginWorkerHandle(
         "initialize",
         initParams,
         INITIALIZE_TIMEOUT_MS,
-      ) as { ok?: boolean; supportedMethods?: string[] } | undefined;
+      ) as
+        | { ok?: boolean; supportedMethods?: string[]; echoesInvocationId?: boolean }
+        | undefined;
       if (!result || !result.ok) {
         throw new Error("Worker initialize returned ok=false");
       }
       supportedMethods = result.supportedMethods ?? [];
+      echoesInvocationId = result.echoesInvocationId === true;
     } catch (err) {
       // Initialize failed — kill the process and propagate
       const msg = err instanceof Error ? err.message : String(err);
