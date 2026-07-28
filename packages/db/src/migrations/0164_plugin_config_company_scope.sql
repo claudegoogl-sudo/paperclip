@@ -18,6 +18,12 @@
 -- it applied to the whole instance, so fan-out is the faithful conversion and
 -- the only rule that preserves current behaviour for every tenant.
 --
+-- The fan-out only covers the companies that exist when this runs. A company
+-- created afterwards gets no plugin_config row, so configService.getForCompany()
+-- reads {} for it and the plugin has to be configured explicitly for that
+-- tenant. That degrades to "unconfigured", not "unauthenticated" -- config.get
+-- denies rather than fails open (PLA-1819) -- but new tenants need provisioning.
+--
 -- Run `pnpm db:plugin-config-report [db-url]` before upgrading for the exact
 -- row-by-row plan.
 
