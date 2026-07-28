@@ -50,10 +50,17 @@ function defaultTimeoutSecForAdapter(adapterType: string) {
 /**
  * A run that completed with a dirty teardown did its work, so it must leave the
  * agent idle. Only genuine failures park an agent in `error`.
+ *
+ * A quota/upstream-transient failure is not the agent's fault, so it stays
+ * `failed` as a run — the work really did not happen — but leaves the agent
+ * `idle` so it wakes again once `retryNotBefore` elapses. Parking it in `error`
+ * takes the agent out of service for the entire limit window, which is how a
+ * weekly limit removed a company's escalation path for days.
  */
 export function resolveAgentStatusAfterRun(input: {
   outcome: HeartbeatRunOutcome;
   runningRunCount: number;
+  errorFamily?: string | null;
 }): "running" | "idle" | "error" {
   if (input.runningRunCount > 0) return "running";
   if (
@@ -61,6 +68,9 @@ export function resolveAgentStatusAfterRun(input: {
     input.outcome === "succeeded_dirty" ||
     input.outcome === "cancelled"
   ) {
+    return "idle";
+  }
+  if (input.outcome === "failed" && input.errorFamily === "transient_upstream") {
     return "idle";
   }
   return "error";
