@@ -101,6 +101,9 @@ function buildSecretsHandler(registry: ReturnType<typeof createPluginRunContextR
     runContextRegistry: registry,
     bindings: { findBinding: vi.fn(async () => null), findServiceBinding },
     resolver: { resolve: resolverFn },
+    // PLA-1845: the service path fails closed without an enablement gate; this
+    // suite is about manager↔handler run-id wiring, so keep the plugin enabled.
+    ensurePluginEnabledForCompany: async () => {},
   });
   return { handler, resolverFn, findServiceBinding };
 }
