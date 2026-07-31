@@ -606,6 +606,26 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
   return checkoutRunId == null;
 }
 
+// PLA-1932: a not-yet-started `scheduled_retry` run reserves the issue's
+// executionRunId for its own agent until the retry becomes due (see the
+// handover in heartbeat.ts's scheduleTransientHeartbeatRetry). Nothing
+// previously let that reservation yield, so the same agent's own live run
+// got wedged with a 409 until the backoff timer fired. This predicate is the
+// one safe exception: cross-agent holders (or a holder that has already
+// started) are never yieldable, so the reservation still blocks everyone
+// else exactly as before.
+function isYieldableExecutionLockHolder(
+  holderRun: { status: string; agentId: string; startedAt: Date | null } | null | undefined,
+  actorAgentId: string,
+  assigneeAgentId: string | null,
+): boolean {
+  if (!holderRun) return false;
+  if (holderRun.status !== "scheduled_retry") return false;
+  if (holderRun.startedAt != null) return false;
+  if (holderRun.agentId !== actorAgentId) return false;
+  return assigneeAgentId === actorAgentId;
+}
+
 export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set<string>(SHARED_TERMINAL_HEARTBEAT_RUN_STATUSES);
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
@@ -4363,6 +4383,27 @@ export function issueService(db: Db) {
     actorRunId: string;
   }) {
     return db.transaction(async (tx) => {
+      const lockedIssue = await tx
+        .select({
+          id: issues.id,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, input.issueId))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (
+        !lockedIssue ||
+        lockedIssue.status !== "in_progress" ||
+        lockedIssue.assigneeAgentId !== input.actorAgentId ||
+        lockedIssue.checkoutRunId != null
+      ) {
+        return null;
+      }
+
       await tx.execute(
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.actorRunId} for update`,
       );
@@ -4372,6 +4413,28 @@ export function issueService(db: Db) {
         .where(eq(heartbeatRuns.id, input.actorRunId))
         .then((rows) => rows[0] ?? null);
       if (!actorRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status)) return null;
+
+      // PLA-1932: the issue's executionRunId can be held unexpired by a
+      // not-yet-started scheduled_retry run reserved for this same agent
+      // (see the handover in heartbeat.ts's scheduleTransientHeartbeatRetry).
+      // Re-read + lock that holder row inside this transaction — never trust
+      // a pre-transaction read — because the retry can become due
+      // concurrently between the caller's lookup and this adoption.
+      let yieldedRun: typeof heartbeatRuns.$inferSelect | null = null;
+      if (lockedIssue.executionRunId != null && lockedIssue.executionRunId !== input.actorRunId) {
+        await tx.execute(
+          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${lockedIssue.executionRunId} for update`,
+        );
+        const holderRun = await tx
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, lockedIssue.executionRunId))
+          .then((rows) => rows[0] ?? null);
+        if (!isYieldableExecutionLockHolder(holderRun, input.actorAgentId, lockedIssue.assigneeAgentId)) {
+          return null;
+        }
+        yieldedRun = holderRun;
+      }
 
       const now = new Date();
       const adopted = await tx
@@ -4388,7 +4451,9 @@ export function issueService(db: Db) {
             eq(issues.status, "in_progress"),
             eq(issues.assigneeAgentId, input.actorAgentId),
             isNull(issues.checkoutRunId),
-            or(isNull(issues.executionRunId), eq(issues.executionRunId, input.actorRunId)),
+            lockedIssue.executionRunId == null
+              ? isNull(issues.executionRunId)
+              : eq(issues.executionRunId, lockedIssue.executionRunId),
           ),
         )
         .returning({
@@ -4399,6 +4464,38 @@ export function issueService(db: Db) {
           executionRunId: issues.executionRunId,
         })
         .then((rows) => rows[0] ?? null);
+
+      if (!adopted) return null;
+
+      if (yieldedRun) {
+        // Cancel the superseded scheduled_retry run (and its wakeup request)
+        // in this same transaction so it can never later start and re-steal
+        // the issue back from the live run that just adopted the lock —
+        // mirrors cancelStaleScheduledRetry's cancel-in-transaction shape.
+        const reason = "Cancelled: yielded the issue's execution lock to the same agent's live run (PLA-1932)";
+        await tx
+          .update(heartbeatRuns)
+          .set({
+            status: "cancelled",
+            finishedAt: now,
+            error: reason,
+            errorCode: "issue_execution_lock_yielded",
+            updatedAt: now,
+          })
+          .where(and(eq(heartbeatRuns.id, yieldedRun.id), eq(heartbeatRuns.status, "scheduled_retry")));
+
+        if (yieldedRun.wakeupRequestId) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "cancelled",
+              finishedAt: now,
+              error: reason,
+              updatedAt: now,
+            })
+            .where(eq(agentWakeupRequests.id, yieldedRun.wakeupRequestId));
+        }
+      }
 
       return adopted;
     });
@@ -6769,18 +6866,32 @@ export function issueService(db: Db) {
         return null;
       };
 
-      const canAdoptUnownedCheckout = (candidate: {
+      const canAdoptUnownedCheckout = async (candidate: {
         status: string;
         assigneeAgentId: string | null;
         checkoutRunId: string | null;
         executionRunId: string | null;
-      }) => (
-        actorRunId
-        && candidate.status === "in_progress"
-        && candidate.assigneeAgentId === actorAgentId
-        && candidate.checkoutRunId == null
-        && (candidate.executionRunId == null || candidate.executionRunId === actorRunId)
-      );
+      }) => {
+        if (
+          !actorRunId
+          || candidate.status !== "in_progress"
+          || candidate.assigneeAgentId !== actorAgentId
+          || candidate.checkoutRunId != null
+        ) {
+          return false;
+        }
+        if (candidate.executionRunId == null || candidate.executionRunId === actorRunId) return true;
+
+        // Fast pre-check only — not authoritative. adoptUnownedCheckoutRun
+        // re-reads and locks the holder run inside its transaction before
+        // committing to the adoption (PLA-1932).
+        const holderRun = await db
+          .select({ status: heartbeatRuns.status, agentId: heartbeatRuns.agentId, startedAt: heartbeatRuns.startedAt })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, candidate.executionRunId))
+          .then((rows) => rows[0] ?? null);
+        return isYieldableExecutionLockHolder(holderRun, actorAgentId, candidate.assigneeAgentId);
+      };
 
       const resolveOwnership = async (
         candidate: {
@@ -6794,7 +6905,7 @@ export function issueService(db: Db) {
         const sameRunOwnership = resolveSameRunOwnership(candidate);
         if (sameRunOwnership) return { ownership: sameRunOwnership, latest: null };
 
-        if (canAdoptUnownedCheckout(candidate)) {
+        if (await canAdoptUnownedCheckout(candidate)) {
           const adopted = await adoptUnownedCheckoutRun({
             issueId: id,
             actorAgentId,

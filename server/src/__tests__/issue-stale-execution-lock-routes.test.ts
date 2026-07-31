@@ -5,6 +5,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   companies,
   createDb,
@@ -46,6 +47,7 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     await db.delete(activityLog);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -288,6 +290,228 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(409);
     expect(res.body?.error).toBe("Issue run ownership conflict");
+  });
+
+  // PLA-1932: a bounded transient retry hands executionRunId to a
+  // not-yet-started scheduled_retry run reserved for the same agent
+  // (heartbeat.ts's scheduleTransientHeartbeatRetry). That reservation must
+  // yield to the same agent's own live run instead of wedging it out with a
+  // 409 for the whole backoff window.
+  describe("yieldable scheduled_retry execution lock (PLA-1932)", () => {
+    async function seedScheduledRetryHolder(opts: {
+      companyId: string;
+      agentId: string;
+      holderAgentId?: string;
+      holderStatus?: string;
+      holderStartedAt?: Date | null;
+    }) {
+      const holderRunId = randomUUID();
+      const wakeupRequestId = randomUUID();
+      await db.insert(agentWakeupRequests).values({
+        id: wakeupRequestId,
+        companyId: opts.companyId,
+        agentId: opts.holderAgentId ?? opts.agentId,
+        source: "heartbeat",
+        status: "queued",
+        runId: holderRunId,
+      });
+      await db.insert(heartbeatRuns).values({
+        id: holderRunId,
+        companyId: opts.companyId,
+        agentId: opts.holderAgentId ?? opts.agentId,
+        status: opts.holderStatus ?? "scheduled_retry",
+        invocationSource: "automation",
+        wakeupRequestId,
+        startedAt: opts.holderStartedAt ?? null,
+      });
+      return { holderRunId, wakeupRequestId };
+    }
+
+    it("yields to the same agent's live run on PATCH and cancels the superseded retry", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const { holderRunId, wakeupRequestId } = await seedScheduledRetryHolder({ companyId, agentId });
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Yieldable scheduled_retry lock",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: null,
+        executionRunId: holderRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+      });
+
+      const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .patch(`/api/issues/${issueId}`)
+        .send({ title: "Recovered from scheduled_retry hold" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+      const row = await db
+        .select({
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({ checkoutRunId: currentRunId, executionRunId: currentRunId });
+
+      const holderRun = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, holderRunId))
+        .then((rows) => rows[0]);
+      expect(holderRun?.status).toBe("cancelled");
+
+      const wakeupRequest = await db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeupRequestId))
+        .then((rows) => rows[0]);
+      expect(wakeupRequest?.status).toBe("cancelled");
+    });
+
+    it("still returns 409 when a different agent holds the scheduled_retry lock", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const otherAgentId = randomUUID();
+      await db.insert(agents).values({
+        id: otherAgentId,
+        companyId,
+        name: "OtherAgent",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      const { holderRunId } = await seedScheduledRetryHolder({
+        companyId,
+        agentId,
+        holderAgentId: otherAgentId,
+      });
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Cross-agent scheduled_retry lock",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: null,
+        executionRunId: holderRunId,
+        executionAgentNameKey: "otheragent",
+        executionLockedAt: new Date(),
+      });
+
+      const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .patch(`/api/issues/${issueId}`)
+        .send({ title: "Should fail" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body?.error).toBe("Issue run ownership conflict");
+
+      const holderRun = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, holderRunId))
+        .then((rows) => rows[0]);
+      expect(holderRun?.status).toBe("scheduled_retry");
+    });
+
+    it("still returns 409 when the scheduled_retry holder has already started", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const { holderRunId } = await seedScheduledRetryHolder({
+        companyId,
+        agentId,
+        holderStartedAt: new Date(),
+      });
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Started scheduled_retry lock",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: null,
+        executionRunId: holderRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+      });
+
+      const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .patch(`/api/issues/${issueId}`)
+        .send({ title: "Should fail" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body?.error).toBe("Issue run ownership conflict");
+    });
+
+    it("still returns 409 when the holder run is running rather than scheduled_retry", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const { holderRunId } = await seedScheduledRetryHolder({
+        companyId,
+        agentId,
+        holderStatus: "running",
+      });
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Running holder, unowned checkout",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: null,
+        executionRunId: holderRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+      });
+
+      const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .patch(`/api/issues/${issueId}`)
+        .send({ title: "Should fail" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body?.error).toBe("Issue run ownership conflict");
+    });
+
+    it("still returns 409 when the actor's own run is terminal", async () => {
+      const { companyId, agentId, failedRunId } = await seedCompanyAgentAndRuns();
+      const { holderRunId } = await seedScheduledRetryHolder({ companyId, agentId });
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Terminal actor run",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: null,
+        executionRunId: holderRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+      });
+
+      const res = await request(createApp(agentActor(companyId, agentId, failedRunId)))
+        .patch(`/api/issues/${issueId}`)
+        .send({ title: "Should fail" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body?.error).toBe("Issue run ownership conflict");
+
+      const holderRun = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, holderRunId))
+        .then((rows) => rows[0]);
+      expect(holderRun?.status).toBe("scheduled_retry");
+    });
   });
 
   it("preserves live checkout ownership on checkout conflicts without retry side effects", async () => {
