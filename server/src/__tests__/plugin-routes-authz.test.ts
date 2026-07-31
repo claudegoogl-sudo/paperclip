@@ -351,7 +351,7 @@ describe.sequential("plugin install and upgrade authz", () => {
       companyA,
       { targetType: "plugin", targetId: pluginId },
       [expect.objectContaining({ secretId, configPath: "apiKeyRef", versionSelector: "latest" })],
-      { replaceAll: true },
+      { replaceAll: true, exactPathDelete: true },
     );
     expect(mockRegistry.upsertConfig).toHaveBeenCalledWith(pluginId, companyA, {
       companyId: companyA,
