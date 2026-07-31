@@ -69,6 +69,12 @@ jobs:
       - name: Test no-git-push check
         run: node --test ./scripts/check-no-git-push.test.mjs
 
+      - name: Check plugin-config write agreement guard is still wired up
+        run: node ./scripts/check-plugin-config-agreement-guard-presence.mjs
+
+      - name: Test plugin-config write agreement guard presence check
+        run: node --test ./scripts/check-plugin-config-agreement-guard-presence.test.mjs
+
       - name: Test general-server shard partition
         run: node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs
 
