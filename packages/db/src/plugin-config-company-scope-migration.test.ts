@@ -133,6 +133,7 @@ describeEmbeddedPostgres("0164 plugin_config company scope", () => {
     type: "object",
     properties: {
       telegramBotTokenSecretId: { type: "string", format: "secret-ref" },
+      githubPatSecretId: { type: "string", format: "secret-ref" },
       supergroupId: { type: "number" },
       auth: {
         type: "object",
@@ -330,6 +331,33 @@ describeEmbeddedPostgres("0164 plugin_config company scope", () => {
       telegramBotTokenSecretId: randomUUID(),
       githubPatSecretId: randomUUID(),
       supergroupId: 7,
+    };
+    await insertLegacyConfig(pluginId, config);
+
+    await runMigration(connectionString);
+
+    const configs = await configByCompany(pluginId);
+    expect(configs.size).toBe(companyIds.length);
+    for (const companyId of companyIds) {
+      expect(configs.get(companyId)).toEqual(config);
+    }
+  });
+
+  // PLA-1963 AC3 — the three ways a declared secret-ref path can fail to name
+  // a real, foreign secret, pinned together in one row so a regression in any
+  // one CONTINUE WHEN branch of pla1843_drop_foreign_secret_refs shows up here:
+  // a non-UUID value, a declared path that is simply absent from the config,
+  // and a UUID that parses but has no company_secrets row. None of the three
+  // is a "foreign secret" the scrub is entitled to touch, so every one of the
+  // 8 fanned-out rows must come out byte-identical to what was inserted.
+  it("leaves a non-UUID value, an absent path, and a dangling UUID untouched on every row", async () => {
+    const pluginId = await insertPlugin("platform.cad", SECRET_REF_SCHEMA);
+    const config = {
+      telegramBotTokenSecretId: "not-a-uuid",
+      githubPatSecretId: randomUUID(), // dangling: parses as a UUID, no company_secrets row
+      supergroupId: 9,
+      // auth.tokenSecretId is declared in SECRET_REF_SCHEMA but omitted here entirely.
+      auth: { mode: "token" },
     };
     await insertLegacyConfig(pluginId, config);
 

@@ -60,10 +60,14 @@ describeEmbeddedPostgres("plugin config.get agreement gate (PLA-1944)", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
+  // Same rationale as the global hookTimeout in vitest.config.ts: under a
+  // loaded shard the embedded-postgres cold boot can cross the 20s most
+  // suites use. Bumped in isolation here rather than lowering the shared
+  // default for every other file.
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-plugin-config-agreement-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 90_000);
 
   afterEach(async () => {
     await db.delete(plugins);
@@ -270,6 +274,45 @@ describeEmbeddedPostgres("plugin config.get agreement gate (PLA-1944)", () => {
 
     expect(result).toEqual({ defaultBranch: "main" });
     refreshed = await registry.getById(plugin.id);
+    expect(refreshed?.lastError).toBeNull();
+  });
+
+  // PLA-1963 AC5 — the exact row shape produced by the 0164 migration's
+  // pla1843_drop_foreign_secret_refs scrub: the owner row keeps its
+  // secret-ref value, every non-owner row has the path deleted entirely
+  // (jsonb `#-`, i.e. ABSENT — not null), and every row's non-secret key
+  // (defaultBranch here, standing in for topicMap/catchAllIssueMap/
+  // companyPolicies) is byte-identical. getAgreedOrDeny must still resolve
+  // this shape and union the owner's secret-ref value back in.
+  it("PLA-1963 AC5: resolves the post-scrub shape (ref on the owner row, path absent on every other row)", async () => {
+    const plugin = await installPlugin();
+    const registry = pluginRegistryService(db);
+    const owner = await createCompany("SCRO");
+    const nonOwners = await Promise.all(
+      ["SCR1", "SCR2", "SCR3", "SCR4", "SCR5", "SCR6", "SCR7"].map((prefix) =>
+        createCompany(prefix),
+      ),
+    );
+    const secretId = "33333333-3333-3333-3333-333333333333";
+
+    await registry.upsertConfig(plugin.id, owner.id, {
+      configJson: { defaultBranch: "main", apiKeySecretId: secretId },
+    });
+    for (const company of nonOwners) {
+      // Path deleted entirely by the scrub, not set to null.
+      await registry.upsertConfig(plugin.id, company.id, {
+        configJson: { defaultBranch: "main" },
+      });
+    }
+
+    const services = buildServices(plugin.id);
+    const result = await services.config.getAgreedOrDeny!();
+    services.dispose();
+
+    expect(result).toEqual({ defaultBranch: "main", apiKeySecretId: secretId });
+    expect(logger.error).not.toHaveBeenCalled();
+
+    const refreshed = await registry.getById(plugin.id);
     expect(refreshed?.lastError).toBeNull();
   });
 });
