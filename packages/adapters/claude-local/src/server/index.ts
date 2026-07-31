@@ -12,6 +12,7 @@ export {
   isClaudeMaxTurnsResult,
   isClaudeRefusalResult,
   isClaudeUnknownSessionError,
+  extractClaudeRetryNotBefore,
 } from "./parse.js";
 export {
   getQuotaWindows,

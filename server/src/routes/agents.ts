@@ -1897,6 +1897,15 @@ export function agentRoutes(
     res.json(items);
   });
 
+  // PLA-1930: instance-wide usage-limit park state — lets the dashboard/recovery
+  // sweep tell "parked on purpose until the account-wide quota resets" apart from
+  // a stall, without inferring it from an absence of active runs.
+  router.get("/instance/usage-limit-park", async (req, res) => {
+    assertInstanceAdmin(req);
+    const state = await heartbeat.getUsageLimitParkState();
+    res.json(state);
+  });
+
   router.get("/companies/:companyId/org", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
