@@ -161,8 +161,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The server suite is pinned to maxWorkers=1 (server/vitest.config.ts),
-          # so it can only be parallelized across runners. Shard it to keep this
+          # server/vitest.config.ts runs this lane with a bounded in-process
+          # worker pool (default 2, PAPERCLIP_SERVER_TEST_MAX_WORKERS-
+          # overridable); shard across runners on top of that to keep this
           # lane off the PR critical path.
           - group: general-server
             group_label: server (1/3)
