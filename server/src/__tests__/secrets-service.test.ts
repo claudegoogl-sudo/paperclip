@@ -432,6 +432,98 @@ describeEmbeddedPostgres("secretService", () => {
     });
   });
 
+  // `exactPathDelete` scopes the pre-insert delete to the exact
+  // configPath values passed, instead of their shared top-level prefix. This
+  // exercises `syncSecretRefsForTarget` directly (no `plugin-registry.ts`
+  // `upsertConfig` call afterward) precisely because `upsertConfig` runs its
+  // own unconditional `syncPluginSecretBindings` pass over the row's FULL
+  // final config immediately after — which re-derives and re-upserts every
+  // secret-ref path still present, silently re-healing the very
+  // over-delete this flag exists to prevent. A test that writes through the
+  // full plugin-config-write.ts path can never observe a regression here for
+  // that reason (see the in-file note on the equivalent scenario in
+  // plugin-config-write-agreement-guard.test.ts); asserting directly on
+  // `syncSecretRefsForTarget`'s own persisted state is what makes this
+  // load-bearing.
+  it("exactPathDelete scopes a changed-subset resync to only the changed paths, leaving an unchanged sibling under the same prefix intact", async () => {
+    const companyId = await seedCompany();
+    const svc = secretService(db);
+    const token = await svc.create(companyId, {
+      name: `nested-token-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "token-v1",
+    });
+    const refresh = await svc.create(companyId, {
+      name: `nested-refresh-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "refresh-v1",
+    });
+    const rotatedToken = await svc.create(companyId, {
+      name: `nested-token-rotated-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "token-v2",
+    });
+    const target = { targetType: "plugin" as const, targetId: `plugin-${randomUUID()}` };
+
+    // Establish both sibling bindings under the shared `auth` prefix.
+    await svc.syncSecretRefsForTarget(
+      companyId,
+      target,
+      [
+        { secretId: token.id, configPath: "auth.tokenSecretId" },
+        { secretId: refresh.id, configPath: "auth.refreshSecretId" },
+      ],
+      { replaceAll: true },
+    );
+
+    // Resync only the CHANGED subset (auth.tokenSecretId), as
+    // `applyToAllCompanies`'s fan-out does, with exactPathDelete: true.
+    await svc.syncSecretRefsForTarget(
+      companyId,
+      target,
+      [{ secretId: rotatedToken.id, configPath: "auth.tokenSecretId" }],
+      { replaceAll: false, exactPathDelete: true },
+    );
+
+    const withExact = await db
+      .select()
+      .from(companySecretBindings)
+      .where(eq(companySecretBindings.targetId, target.targetId));
+    const withExactByPath = new Map(withExact.map((row) => [row.configPath, row.secretId]));
+    expect(withExactByPath.get("auth.tokenSecretId")).toBe(rotatedToken.id);
+    // The regression this flag guards: the untouched sibling under the same
+    // top-level prefix must survive a changed-subset resync.
+    expect(withExactByPath.get("auth.refreshSecretId")).toBe(refresh.id);
+
+    // Negative control on a second, independent target: the exact same
+    // sequence WITHOUT exactPathDelete (the prior prefix-scoped
+    // delete) orphans the sibling — proving this test would actually catch
+    // a reversion of the flag, unlike the route-level equivalent.
+    const target2 = { targetType: "plugin" as const, targetId: `plugin-${randomUUID()}` };
+    await svc.syncSecretRefsForTarget(
+      companyId,
+      target2,
+      [
+        { secretId: token.id, configPath: "auth.tokenSecretId" },
+        { secretId: refresh.id, configPath: "auth.refreshSecretId" },
+      ],
+      { replaceAll: true },
+    );
+    await svc.syncSecretRefsForTarget(
+      companyId,
+      target2,
+      [{ secretId: rotatedToken.id, configPath: "auth.tokenSecretId" }],
+      { replaceAll: false },
+    );
+    const withoutExact = await db
+      .select()
+      .from(companySecretBindings)
+      .where(eq(companySecretBindings.targetId, target2.targetId));
+    const withoutExactByPath = new Map(withoutExact.map((row) => [row.configPath, row.secretId]));
+    expect(withoutExactByPath.get("auth.tokenSecretId")).toBe(rotatedToken.id);
+    expect(withoutExactByPath.has("auth.refreshSecretId")).toBe(false);
+  });
+
   it("reports reference counts and resolves binding target labels", async () => {
     const companyId = await seedCompany();
     const svc = secretService(db);

@@ -57,8 +57,12 @@ import {
 import {
   extractSecretRefBindingsFromConfig,
   extractSecretRefPathsFromConfig,
+  validatePluginSecretRefsForCompany,
 } from "../services/plugin-secrets-handler.js";
-import { collectSecretRefPaths } from "../services/json-schema-secret-refs.js";
+import {
+  writePluginConfigWithAgreement,
+  ConfigAgreementGuardError,
+} from "../services/plugin-config-write.js";
 import { secretService } from "../services/secrets.js";
 import { logActivity } from "../services/activity-log.js";
 import {
@@ -763,26 +767,6 @@ export function pluginRoutes(
     const scopedCompanyId = companyId.trim();
     assertCompanyAccess(req, scopedCompanyId);
     return scopedCompanyId;
-  }
-
-  async function validatePluginSecretRefsForCompany(
-    companyId: string,
-    refs: ReturnType<typeof extractSecretRefBindingsFromConfig>,
-  ): Promise<void> {
-    if (refs.length === 0) return;
-    const secretsSvc = secretService(db);
-    const checked = new Set<string>();
-    for (const ref of refs) {
-      if (checked.has(ref.secretId)) continue;
-      checked.add(ref.secretId);
-      const secret = await secretsSvc.getById(ref.secretId);
-      if (!secret || secret.companyId !== companyId) {
-        throw unprocessable("Plugin config references a secret outside the selected company");
-      }
-      if (secret.status === "deleted") {
-        throw unprocessable("Plugin config references a deleted secret");
-      }
-    }
   }
 
   function performActionActorContext(req: Request, companyId: string | undefined): PluginPerformActionActorContext {
@@ -2337,16 +2321,27 @@ export function pluginRoutes(
    * Save (create or replace) the company-scoped configuration for a plugin.
    *
    * The caller provides the full `configJson` object. The server persists it
-   * via `registry.upsertConfig()`.
+   * via `writePluginConfigWithAgreement()` (`plugin-config-write.ts`), which
+   * wraps `registry.upsertConfig()` with the config-write agreement guard/fan-out.
    *
    * Request body:
    * - `companyId`: Company that owns this plugin config row
    * - `configJson`: Configuration values matching the plugin's `instanceConfigSchema`
+   * - `applyToAllCompanies` (optional): fan the non-secret-ref portion of this
+   *   write out to every other owning company's row, atomically, preserving
+   *   each row's own secret-ref values. Mutually exclusive with `allowDivergence`.
+   * - `allowDivergence` (optional): write only this company's row with no
+   *   agreement guard — today's behaviour, for plugins that intentionally
+   *   run divergent per-company config.
    *
-   * Response: `PluginConfig`
+   * Response: `PluginConfig` (the written row for `companyId`)
    * Errors:
-   * - 400 if request validation fails
+   * - 400 if request validation fails, or both `applyToAllCompanies` and
+   *   `allowDivergence` are set
    * - 404 if plugin not found
+   * - 409 if the write would break an agreement across owning companies that
+   *   currently holds (see `plugin-config-write.ts`); body names the
+   *   diverging top-level keys and the two ways forward
    */
   router.post("/plugins/:pluginId/config", async (req, res) => {
     assertInstanceAdmin(req);
@@ -2358,10 +2353,26 @@ export function pluginRoutes(
       return;
     }
 
-    const body = req.body as { companyId?: unknown; configJson?: Record<string, unknown> } | undefined;
+    const body = req.body as
+      | {
+          companyId?: unknown;
+          configJson?: Record<string, unknown>;
+          applyToAllCompanies?: unknown;
+          allowDivergence?: unknown;
+        }
+      | undefined;
     const companyId = requirePluginConfigCompanyId(req, body?.companyId);
     if (!body?.configJson || typeof body.configJson !== "object" || Array.isArray(body.configJson)) {
       res.status(400).json({ error: '"configJson" is required and must be an object' });
+      return;
+    }
+
+    const applyToAllCompanies = body.applyToAllCompanies === true;
+    const allowDivergence = body.allowDivergence === true;
+    if (applyToAllCompanies && allowDivergence) {
+      res.status(400).json({
+        error: '"applyToAllCompanies" and "allowDivergence" are mutually exclusive',
+      });
       return;
     }
 
@@ -2395,40 +2406,25 @@ export function pluginRoutes(
       // plugin-secrets-handler re-authorizes at call time against the
       // *dispatching* company (PLA-655/PLA-657). A ref in config therefore
       // never grants cross-company access on its own.
-      const secretRefs = extractSecretRefBindingsFromConfig(body.configJson, schema);
-      await validatePluginSecretRefsForCompany(companyId, secretRefs);
-      await secretService(db).syncSecretRefsForTarget(
-        companyId,
-        { targetType: "plugin", targetId: plugin.id },
-        secretRefs,
-        { replaceAll: true },
-      );
-
-      const result = await registry.upsertConfig(plugin.id, companyId, {
+      const result = await writePluginConfigWithAgreement(db, {
+        pluginId: plugin.id,
         companyId,
         configJson: body.configJson,
+        schema,
+        options: { applyToAllCompanies, allowDivergence },
       });
+
       await logPluginMutationActivity(req, "plugin.config.updated", plugin.id, {
         pluginId: plugin.id,
         pluginKey: plugin.pluginKey,
         companyId,
-        secretRefCount: secretRefs.length,
+        secretRefCount: extractSecretRefBindingsFromConfig(body.configJson, schema).length,
         configKeyCount: Object.keys(body.configJson).length,
+        applyToAllCompanies: result.fannedOut,
+        // Fan-out silently changes up to N companies' rows — the admin who
+        // edited one company must be able to see everyone it also touched.
+        companiesWritten: result.companiesWritten,
       });
-
-      // PLA-1937 Condition 1: the read-side agreement gate (`getAgreedOrDeny`)
-      // depends on every owning row agreeing on non-secret-ref fields. Without
-      // this broadcast, the row just written above diverges from every
-      // sibling row on this ordinary edit and the gate denies `config.get` for
-      // every other company sharing the plugin — reusing the same
-      // `collectSecretRefPaths` helper as the write-validation above so the
-      // excluded-path set is identical on both sides of the invariant.
-      const broadcastCompanyIds = await registry.broadcastNonSecretConfig(
-        plugin.id,
-        companyId,
-        body.configJson,
-        collectSecretRefPaths(schema),
-      );
 
       // Notify the running worker about the config change (PLUGIN_SPEC §25.4.4).
       // If the worker implements onConfigChanged, send the new config via RPC.
@@ -2439,11 +2435,6 @@ export function pluginRoutes(
           await bridgeDeps.workerManager.call(
             plugin.id,
             "configChanged",
-            // `broadcastCompanyIds` deliberately stays host-side: it is the
-            // list of SIBLING companies whose rows were just fanned out to,
-            // and `handleConfigChanged` never reads it — forwarding it would
-            // leak other tenants' company ids into this plugin's own worker
-            // process for no functional benefit.
             { config: body.configJson, companyId },
           );
         } catch (rpcErr) {
@@ -2463,8 +2454,12 @@ export function pluginRoutes(
         }
       }
 
-      res.json(result);
+      res.json(result.row);
     } catch (err) {
+      if (err instanceof ConfigAgreementGuardError) {
+        res.status(409).json({ error: err.message, divergingKeys: err.divergingKeys });
+        return;
+      }
       const message = err instanceof Error ? err.message : String(err);
       res.status(400).json({ error: message });
     }
@@ -2535,7 +2530,7 @@ export function pluginRoutes(
 
     try {
       const secretRefs = extractSecretRefBindingsFromConfig(body.configJson, schema);
-      await validatePluginSecretRefsForCompany(companyId, secretRefs);
+      await validatePluginSecretRefsForCompany(db, companyId, secretRefs);
 
       const result = await bridgeDeps.workerManager.call(
         plugin.id,

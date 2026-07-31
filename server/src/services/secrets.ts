@@ -4052,7 +4052,21 @@ export function secretService(db: Db) {
         projectionClass?: SecretProjectionClass;
         projectionAllowlistKey?: string | null;
       }>,
-      options?: { replaceAll?: boolean },
+      /**
+       * `exactPathDelete`: when `replaceAll` is false, scope the
+       * pre-insert delete to the EXACT `configPath` values in `refs` instead
+       * of their top-level dot-prefix. The prefix-scoped delete below exists
+       * for callers (e.g. `environments.ts`) that always pass the target's
+       * COMPLETE current ref set, where prefix vs. exact makes no
+       * observable difference. `plugin-config-write.ts`'s `applyToAllCompanies`
+       * fan-out instead passes only the CHANGED subset of refs — if two
+       * secret-ref fields ever shared a top-level parent key and only one
+       * changed, prefix-scoped delete would remove the unrelated sibling's
+       * binding row without reinserting it (not in the filtered set),
+       * silently orphaning it. Opt-in only; default (unset) preserves the
+       * prefix-scoped delete for every existing caller unchanged.
+       */
+      options?: { replaceAll?: boolean; exactPathDelete?: boolean },
     ) => {
       const normalizedRefs: Array<{
         secretId: string;
@@ -4096,6 +4110,20 @@ export function secretService(db: Db) {
                 eq(companySecretBindings.companyId, companyId),
                 eq(companySecretBindings.targetType, target.targetType),
                 eq(companySecretBindings.targetId, target.targetId),
+              ),
+            );
+        } else if (options?.exactPathDelete && normalizedRefs.length > 0) {
+          await tx
+            .delete(companySecretBindings)
+            .where(
+              and(
+                eq(companySecretBindings.companyId, companyId),
+                eq(companySecretBindings.targetType, target.targetType),
+                eq(companySecretBindings.targetId, target.targetId),
+                inArray(
+                  companySecretBindings.configPath,
+                  normalizedRefs.map((ref) => ref.configPath),
+                ),
               ),
             );
         } else if (pathPrefixes.length > 0) {

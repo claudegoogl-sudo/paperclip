@@ -77,3 +77,77 @@ export function writeConfigValueAtPath(
   }
   return result;
 }
+
+// ---------------------------------------------------------------------------
+// Canonical (key-order-independent) structural equality.
+// This is the ONE comparator shared by the no-dispatch `config.get` agreement
+// gate (`plugin-host-services.ts` `getAgreedOrDeny`) and the admin write-path
+// guard that defends the same invariant on write. Do not fork a
+// second comparator — both sides must agree on what "diverge" means or the
+// guard and the gate drift out of sync with each other.
+// ---------------------------------------------------------------------------
+
+export function canonicalizeForComparison(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalizeForComparison);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      out[key] = canonicalizeForComparison((value as Record<string, unknown>)[key]);
+    }
+    return out;
+  }
+  return value;
+}
+
+export function structurallyEqual(a: unknown, b: unknown): boolean {
+  return JSON.stringify(canonicalizeForComparison(a)) === JSON.stringify(canonicalizeForComparison(b));
+}
+
+/** Strip every declared secret-ref path from a config object (delete, not null). */
+export function stripSecretRefPaths(
+  config: Record<string, unknown>,
+  secretRefPaths: Set<string>,
+): Record<string, unknown> {
+  let result = config;
+  for (const path of secretRefPaths) {
+    result = writeConfigValueAtPath(result, path, undefined);
+  }
+  return result;
+}
+
+/**
+ * Layer `sourceConfig`'s values at each declared secret-ref path back onto
+ * `strippedConfig`. Used to preserve a non-target company's own secret-ref
+ * values when fanning out a non-secret config change to its row.
+ */
+export function restoreSecretRefPaths(
+  strippedConfig: Record<string, unknown>,
+  sourceConfig: Record<string, unknown>,
+  secretRefPaths: Set<string>,
+): Record<string, unknown> {
+  let result = strippedConfig;
+  for (const path of secretRefPaths) {
+    const value = readConfigValueAtPath(sourceConfig, path);
+    if (value !== undefined) {
+      result = writeConfigValueAtPath(result, path, value);
+    }
+  }
+  return result;
+}
+
+/** Top-level keys at which the given (already-comparable) configs disagree. */
+export function computeDivergingTopLevelKeys(configs: Record<string, unknown>[]): string[] {
+  const divergingKeys = new Set<string>();
+  const keyUnion = new Set<string>();
+  for (const config of configs) {
+    for (const key of Object.keys(config)) keyUnion.add(key);
+  }
+  for (const key of keyUnion) {
+    const values = configs.map((config) => config[key]);
+    const [firstValue, ...restValues] = values;
+    if (!restValues.every((value) => structurallyEqual(value, firstValue))) {
+      divergingKeys.add(key);
+    }
+  }
+  return [...divergingKeys];
+}

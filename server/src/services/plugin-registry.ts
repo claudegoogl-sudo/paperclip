@@ -289,6 +289,31 @@ export function pluginRegistryService(db: Db) {
 
     // ----- Config ---------------------------------------------------------
 
+    /**
+     * Return EVERY owning `plugin_config` row for a plugin, across all
+     * companies. No LIMIT, no pagination.
+     *
+     * The no-dispatch `config.get` agreement gate
+     * resolves a construction-time read (no dispatch pins a tenant) by
+     * checking whether every owning row agrees. Silent truncation here would
+     * turn "all rows agree" into a false positive that masks real divergence
+     * — the security-relevant invariant the whole gate depends on — so this
+     * accessor is deliberately unpaginated.
+     *
+     * `forUpdate`: row-lock the returned rows for the lifetime
+     * of the caller's transaction. Only pass this from a write path already
+     * inside `db.transaction` — `writePluginConfigWithAgreement` uses it so
+     * two concurrent admin writes to the same plugin serialize on this read
+     * instead of each deciding guard/fan-out off a stale pre-write snapshot.
+     * Never pass it from `getAgreedOrDeny` (the no-dispatch read gate): that
+     * path is READS ONLY by construction, runs outside a write transaction,
+     * and backs a live poll loop — locking it would only add contention.
+     */
+    listConfigRows: (pluginId: string, options?: { forUpdate?: boolean }) => {
+      const query = db.select().from(pluginConfig).where(eq(pluginConfig.pluginId, pluginId));
+      return options?.forUpdate ? query.for("update") : query;
+    },
+
     /** Retrieve a plugin's company-scoped configuration. */
     getConfig: (pluginId: string, companyId: string) =>
       db
@@ -296,17 +321,6 @@ export function pluginRegistryService(db: Db) {
         .from(pluginConfig)
         .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
         .then((rows) => rows[0] ?? null),
-
-    /**
-     * List every owning config row for a plugin, across every company.
-     *
-     * PLA-1937/PLA-1942: this is the security-relevant invariant underneath
-     * the host-minted agreement gate — silent truncation here would turn "all
-     * owning rows agree" into a false positive that masks real divergence.
-     * No LIMIT, no pagination: the whole row set, every time.
-     */
-    listConfigsForPlugin: (pluginId: string) =>
-      db.select().from(pluginConfig).where(eq(pluginConfig.pluginId, pluginId)),
 
     /**
      * Create or fully replace a plugin's company-scoped configuration.
@@ -399,6 +413,32 @@ export function pluginRegistryService(db: Db) {
         touched.push(sibling.companyId);
       }
       return touched;
+    },
+
+    /**
+     * Overwrite an EXISTING owning row's `config_json` verbatim,
+     * with no secret-ref binding sync.
+     *
+     * Only safe to call when the caller has already preserved that row's own
+     * secret-ref field values unchanged (the `applyToAllCompanies` fan-out
+     * does this via `restoreSecretRefPaths` before calling here) — the whole
+     * point is that this row's `company_secret_bindings` rows stay valid
+     * because nothing at a secret-ref path actually changed. Does not
+     * create a row; the fan-out only ever touches rows that already exist.
+     */
+    setConfigJsonForExistingRow: async (
+      pluginId: string,
+      companyId: string,
+      configJson: Record<string, unknown>,
+    ) => {
+      const rows = await db
+        .update(pluginConfig)
+        .set({ configJson, lastError: null, updatedAt: new Date() })
+        .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
+        .returning();
+
+      if (rows.length === 0) throw notFound("Plugin config not found");
+      return rows[0];
     },
 
     /**

@@ -226,6 +226,35 @@ export function extractSecretRefPathsFromConfig(
   return refs;
 }
 
+/**
+ * Confirm every secret-ref extracted from a plugin config write belongs to
+ * the company the row is being written for, and is not soft-deleted. Shared
+ * by the plugin config admin write path (`POST /plugins/:id/config`) and its
+ * `applyToAllCompanies` fan-out — both must apply the exact same
+ * check to the target company's row, so this lives in one place rather than
+ * as a route-local closure.
+ */
+export async function validatePluginSecretRefsForCompany(
+  db: Db,
+  companyId: string,
+  refs: PluginConfigSecretRefBinding[],
+): Promise<void> {
+  if (refs.length === 0) return;
+  const secretsSvc = secretService(db);
+  const checked = new Set<string>();
+  for (const ref of refs) {
+    if (checked.has(ref.secretId)) continue;
+    checked.add(ref.secretId);
+    const secret = await secretsSvc.getById(ref.secretId);
+    if (!secret || secret.companyId !== companyId) {
+      throw unprocessable("Plugin config references a secret outside the selected company");
+    }
+    if (secret.status === "deleted") {
+      throw unprocessable("Plugin config references a deleted secret");
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
