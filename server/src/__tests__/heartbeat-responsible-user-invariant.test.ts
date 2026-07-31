@@ -1,24 +1,19 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  activityLog,
   agents,
-  agentRuntimeState,
-  agentWakeupRequests,
   companies,
   companyMemberships,
-  companySkills,
   createDb,
-  heartbeatRunEvents,
   heartbeatRuns,
-  issueComments,
   issues,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { runningProcesses } from "../adapters/index.ts";
 
@@ -57,26 +52,6 @@ async function waitForRun(db: ReturnType<typeof createDb>, runId: string) {
   return db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0] ?? null);
 }
 
-async function deleteHeartbeatRunsAfterEvents(db: ReturnType<typeof createDb>) {
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    await db.delete(heartbeatRunEvents);
-    try {
-      await db.delete(heartbeatRuns);
-      return;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (
-        attempt < 4 &&
-        message.includes("heartbeat_run_events_run_id_heartbeat_runs_id_fk")
-      ) {
-        await new Promise((resolve) => setTimeout(resolve, 50));
-        continue;
-      }
-      throw error;
-    }
-  }
-}
-
 describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
   let db!: ReturnType<typeof createDb>;
   let heartbeat!: ReturnType<typeof heartbeatService>;
@@ -88,28 +63,15 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
     heartbeat = heartbeatService(db);
   }, 20_000);
 
+  // This suite deliberately lets heartbeatService dispatch real runs, which keep
+  // writing heartbeat_runs/heartbeat_run_events (and friends) in the background
+  // after the test function returns. An ordered per-table DELETE chain races that
+  // write burst; see resetEmbeddedPostgresTestDatabase for why an atomic
+  // TRUNCATE ... CASCADE doesn't have that race.
   afterEach(async () => {
     mockAdapterExecute.mockClear();
     runningProcesses.clear();
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      const activeRuns = await db
-        .select()
-        .from(heartbeatRuns)
-        .where(inArray(heartbeatRuns.status, ["queued", "running"]));
-      if (activeRuns.length === 0) break;
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    await db.delete(issueComments);
-    await db.delete(activityLog);
-    await deleteHeartbeatRunsAfterEvents(db);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(issues);
-    await db.delete(agents);
-    await db.delete(companySkills);
-    await db.delete(companyMemberships);
-    await db.delete(companies);
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {

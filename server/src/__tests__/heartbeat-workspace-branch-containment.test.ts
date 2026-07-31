@@ -8,24 +8,15 @@ import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
-  agentRuntimeState,
   agentWakeupRequests,
   agents,
   companies,
-  companySkills,
   createDb,
-  documentRevisions,
-  documents,
-  environmentLeases,
   environments,
   executionWorkspaces,
-  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
-  issueDocuments,
-  issuePlanDecompositions,
   issueRecoveryActions,
-  issueRelations,
   issues,
   projects,
   projectWorkspaces,
@@ -37,6 +28,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
@@ -168,37 +160,6 @@ async function waitForRunToFinish(heartbeat: Heartbeat, runId: string, timeoutMs
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   return heartbeat.getRun(runId);
-}
-
-async function waitForHeartbeatIdle(db: Db, timeoutMs = 5_000) {
-  const deadline = Date.now() + timeoutMs;
-  let idleSince: number | null = null;
-  while (Date.now() < deadline) {
-    const runs = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns);
-    if (!runs.some((run) => run.status === "queued" || run.status === "running")) {
-      idleSince ??= Date.now();
-      if (Date.now() - idleSince >= 250) return;
-    } else {
-      idleSince = null;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-}
-
-async function deleteHeartbeatRunsForCleanup(db: Db) {
-  let lastError: unknown = null;
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    await db.delete(heartbeatRunEvents);
-    await db.delete(activityLog);
-    try {
-      await db.delete(heartbeatRuns);
-      return;
-    } catch (error) {
-      lastError = error;
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-  }
-  throw lastError;
 }
 
 async function waitForContainmentSideEffects(input: {
@@ -875,7 +836,6 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
   }, 20_000);
 
   afterEach(async () => {
-    await waitForHeartbeatIdle(db);
     adapterExecute.mockReset();
     adapterExecute.mockImplementation(async () => ({
       exitCode: 0,
@@ -889,30 +849,14 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
       const root = tempRoots.pop();
       if (root) await rm(root, { recursive: true, force: true }).catch(() => undefined);
     }
-    await db.delete(issueRecoveryActions);
-    await db.delete(issueRelations);
-    await db.delete(issuePlanDecompositions);
-    await db.delete(issueDocuments);
-    await db.delete(documentRevisions);
-    await db.delete(documents);
-    await db.delete(environmentLeases);
-    await db.delete(activityLog);
-    await db.delete(heartbeatRunEvents);
-    // Heartbeat failure/finalization paths can emit run-linked events and
-    // activity after the first cleanup pass observes all runs as non-active.
-    await deleteHeartbeatRunsForCleanup(db);
-    await db.delete(issueComments);
-    await db.delete(issues);
-    await db.delete(projectWorkspaces);
-    await db.delete(projects);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(agents);
-    await db.delete(workspaceOperations);
-    await db.delete(executionWorkspaces);
+    // Heartbeat failure/finalization paths keep emitting run-linked events and
+    // activity in the background after the test function returns; see
+    // resetEmbeddedPostgresTestDatabase for why an atomic TRUNCATE ... CASCADE
+    // doesn't race that write burst the way an ordered per-table DELETE chain does.
+    await resetEmbeddedPostgresTestDatabase(db);
+    // environments is a global table, not FK-chained to companies, so the
+    // TRUNCATE ... CASCADE above doesn't touch it.
     await db.delete(environments);
-    await db.delete(companySkills);
-    await db.delete(companies);
   });
 
   afterAll(async () => {

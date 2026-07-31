@@ -3,18 +3,12 @@ import { and, desc, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
-  agentRuntimeState,
   agentWakeupRequests,
   agents,
   companies,
-  companySkills,
   createDb,
-  environmentLeases,
   environments,
-  executionWorkspaces,
-  heartbeatRunEvents,
   heartbeatRuns,
-  issueComments,
   issues,
 } from "@paperclipai/db";
 import {
@@ -23,6 +17,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { runningProcesses } from "../adapters/index.ts";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -69,36 +64,14 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
 
   afterEach(async () => {
     runningProcesses.clear();
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      const runs = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns);
-      if (!runs.some((run) => run.status === "queued" || run.status === "running")) break;
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
     // Post-run bookkeeping (run-event records, follow-up wake scheduling) can
-    // still write for a moment after a run reaches a terminal status, so a
-    // single delete sweep can hit a foreign-key violation when a late insert
-    // lands between two deletes. Retry the sweep until it goes through clean.
-    for (let attempt = 0; ; attempt += 1) {
-      try {
-        await db.delete(environmentLeases);
-        await db.delete(issueComments);
-        await db.delete(issues);
-        await db.delete(heartbeatRunEvents);
-        await db.delete(activityLog);
-        await db.delete(heartbeatRuns);
-        await db.delete(agentWakeupRequests);
-        await db.delete(agentRuntimeState);
-        await db.delete(agents);
-        await db.delete(environments);
-        await db.delete(executionWorkspaces);
-        await db.delete(companySkills);
-        await db.delete(companies);
-        break;
-      } catch (error) {
-        if (attempt >= 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      }
-    }
+    // still write for a moment after a run reaches a terminal status; see
+    // resetEmbeddedPostgresTestDatabase for why an atomic TRUNCATE ... CASCADE
+    // doesn't race that write burst the way an ordered per-table DELETE chain does.
+    await resetEmbeddedPostgresTestDatabase(db);
+    // environments is a global table, not FK-chained to companies, so the
+    // TRUNCATE ... CASCADE above doesn't touch it.
+    await db.delete(environments);
   });
 
   afterAll(async () => {

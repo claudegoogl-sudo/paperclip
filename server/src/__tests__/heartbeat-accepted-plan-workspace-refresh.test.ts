@@ -7,32 +7,25 @@ import { promisify } from "node:util";
 import { eq, ne } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  activityLog,
-  agentRuntimeState,
   agentTaskSessions,
-  agentWakeupRequests,
   agents,
   companies,
-  companySkills,
   createDb,
   documentRevisions,
   documents,
   executionWorkspaces,
-  heartbeatRunEvents,
-  heartbeatRuns,
-  issueComments,
   issueDocuments,
   issuePlanDecompositions,
   issueThreadInteractions,
   issues,
   projects,
   projectWorkspaces,
-  workspaceOperations,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import { issueService } from "../services/issues.ts";
@@ -113,52 +106,15 @@ describeEmbeddedPostgres("accepted plan workspace refresh", () => {
 
   afterEach(async () => {
     adapterExecute.mockClear();
-    let idlePolls = 0;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      const runs = await db
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns);
-      const hasActiveRun = runs.some((run) => run.status === "queued" || run.status === "running");
-      if (!hasActiveRun) {
-        idlePolls += 1;
-        if (idlePolls >= 5) break;
-      } else {
-        idlePolls = 0;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
     while (tempRoots.length > 0) {
       const root = tempRoots.pop();
       if (root) await rm(root, { recursive: true, force: true }).catch(() => undefined);
     }
-    await db.delete(issuePlanDecompositions);
-    await db.delete(issueThreadInteractions);
-    await db.delete(issueDocuments);
-    await db.delete(documentRevisions);
-    await db.delete(documents);
-    await db.delete(agentTaskSessions);
-    await db.delete(executionWorkspaces);
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await db.delete(activityLog);
-      await db.delete(heartbeatRunEvents);
-      try {
-        await db.delete(heartbeatRuns);
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-    await db.delete(issueComments);
-    await db.delete(issues);
-    await db.delete(projectWorkspaces);
-    await db.delete(projects);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(agents);
-    await db.delete(workspaceOperations);
-    await db.delete(companySkills);
-    await db.delete(companies);
+    // This suite drives real heartbeat runs, which keep writing heartbeat_runs
+    // (and friends) in the background after the test function returns; see
+    // resetEmbeddedPostgresTestDatabase for why an atomic TRUNCATE ... CASCADE
+    // doesn't race that write burst the way an ordered per-table DELETE chain does.
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {
