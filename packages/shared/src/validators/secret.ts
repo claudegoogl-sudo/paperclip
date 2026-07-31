@@ -451,3 +451,22 @@ export const enforceBindingEgressSchema = z.object({
 
 export type SetBindingEgressAllowlistInput = z.infer<typeof setBindingEgressAllowlistSchema>;
 export type EnforceBindingEgressInput = z.infer<typeof enforceBindingEgressSchema>;
+
+// Sibling operator surface for the plugin config-key egress
+// allowlist (a plugin's own `format:"uri"` instance-config values, e.g.
+// klipper's `moonrakerBaseUrl`). Same body shape and same rationale as the
+// per-binding secret pair above: no plugin/company/config-key id in the body
+// (path params only) and no agent-passable fields.
+export const setPluginConfigEgressAllowlistSchema = z.object({
+  allowedEgress: z.array(z.string().trim().min(1).max(2048)).max(200),
+});
+
+// No body fields: unlike a secret binding's allowlist (which is entirely
+// operator-set), a config key's own declared value is unconditionally part of
+// the effective allowlist (see loadPluginEgressAllowlist in
+// plugin-config-egress.ts) — there is no "empty allowlist denies everything"
+// footgun here to gate behind an allowEmpty opt-in.
+export const enforcePluginConfigEgressAllowlistSchema = z.object({}).strict();
+
+export type SetPluginConfigEgressAllowlistInput = z.infer<typeof setPluginConfigEgressAllowlistSchema>;
+export type EnforcePluginConfigEgressAllowlistInput = z.infer<typeof enforcePluginConfigEgressAllowlistSchema>;

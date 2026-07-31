@@ -429,6 +429,23 @@ export function pluginRegistryService(db: Db) {
         ))
         .then((rows) => rows[0] ?? null) as Promise<PluginCompanySettings | null>,
 
+    /**
+     * Every ENABLED company-settings row for a plugin, across all
+     * companies. Used by the config-key egress allowlist chokepoint to compute
+     * the plugin-wide union of a `format:"uri"` config value (operator amendment
+     * A2 — the runtime deny decision is plugin-scoped, not per-call
+     * company-scoped, because there is no trustworthy per-call company context
+     * on the `ctx.http.fetch` path).
+     */
+    listEnabledCompanySettings: (pluginId: string): Promise<PluginCompanySettings[]> =>
+      db
+        .select()
+        .from(pluginCompanySettings)
+        .where(and(
+          eq(pluginCompanySettings.pluginId, pluginId),
+          eq(pluginCompanySettings.enabled, true),
+        )) as Promise<PluginCompanySettings[]>,
+
     /** Create or replace company-scoped plugin settings. */
     upsertCompanySettings: async (
       pluginId: string,

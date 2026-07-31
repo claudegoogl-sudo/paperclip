@@ -90,6 +90,8 @@ export { companySecretVersions } from "./company_secret_versions.js";
 export { companySecretBindings } from "./company_secret_bindings.js";
 export { companySecretBindingPostureAudit } from "./company_secret_binding_posture_audit.js";
 export { egressWouldDenyObservations } from "./egress_would_deny_observations.js";
+export { pluginConfigEgressAllowlist } from "./plugin_config_egress_allowlist.js";
+export { pluginConfigEgressWouldDenyObservations } from "./plugin_config_egress_would_deny_observations.js";
 export { userSecretDeclarations } from "./user_secret_declarations.js";
 export { secretAccessEvents } from "./secret_access_events.js";
 export { companySkills, companySkillVersions, companySkillStars, companySkillComments } from "./company_skills.js";
