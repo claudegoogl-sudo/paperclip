@@ -11,10 +11,6 @@ on:
   pull_request:
     branches:
       - master
-      # Same base-branch trigger gap as pr.yml (see PLA-1954): without this,
-      # a PR onto a sync/upstream-* branch with the storybook-visual label
-      # gets no run at all, not a skipped check.
-      - 'sync/upstream-**'
     types:
       - opened
       - reopened

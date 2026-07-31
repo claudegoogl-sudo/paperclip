@@ -1,15 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomUUID } from "node:crypto";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
-import { companies, createDb, plugins } from "@paperclipai/db";
-import { buildHostServices } from "../services/plugin-host-services.js";
-import { pluginRegistryService } from "../services/plugin-registry.js";
-import {
-  getEmbeddedPostgresTestSupport,
-  startEmbeddedPostgresTestDatabase,
-} from "./helpers/embedded-postgres.js";
 import {
   createHostClientHandlers,
   JsonRpcCallError,
@@ -66,10 +58,6 @@ const OVERSIZE_FRAME_WORKER_ENTRYPOINT = path.join(
 const IPC_CHANNEL_WORKER_ENTRYPOINT = path.join(
   FIXTURES_DIR,
   "plugin-worker-ipc-channel.cjs",
-);
-const CONFIG_AGREEMENT_WORKER_ENTRYPOINT = path.join(
-  FIXTURES_DIR,
-  "plugin-worker-config-agreement.cjs",
 );
 
 const TEST_MANIFEST: PaperclipPluginManifestV1 = {
@@ -986,185 +974,6 @@ describe("PLA-773 — background dispatch run-context (item 1) + redaction clean
   });
 });
 
-// PLA-1944 — no-dispatch config.get resolved by the host-minted agreement
-// gate, exercised end-to-end: real `createPluginWorkerHandle` dispatch
-// mechanics (per PLA-818/PLA-773 above) AND real DB-backed `buildHostServices`
-// (per plugin-issue-attachments-host-services.test.ts's embedded-postgres
-// pattern) — an SDK-level mock of `services.config.getAgreedOrDeny` alone
-// does not exercise the real `plugin_config` agreement/divergence logic this
-// gate depends on.
-const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
-const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
-
-if (!embeddedPostgresSupport.supported) {
-  console.warn(
-    `Skipping plugin-worker-manager PLA-1944 agreement-gate tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
-  );
-}
-
-describeEmbeddedPostgres("PLA-1944 — no-dispatch config.get agreement gate (real worker + real DB)", () => {
-  const PLUGIN_KEY = "test.config-agreement-worker";
-  let db!: ReturnType<typeof createDb>;
-  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
-
-  beforeAll(async () => {
-    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-plugin-worker-config-agreement-");
-    db = createDb(tempDb.connectionString);
-  }, 20_000);
-
-  afterEach(async () => {
-    await db.delete(plugins);
-    await db.delete(companies);
-  });
-
-  afterAll(async () => {
-    await tempDb?.cleanup();
-  });
-
-  function createEventBusStub() {
-    return {
-      forPlugin() {
-        return { emit: vi.fn(), subscribe: vi.fn(), clear: vi.fn() };
-      },
-    } as any;
-  }
-
-  async function createCompany(prefix: string) {
-    return db
-      .insert(companies)
-      .values({
-        name: `${prefix} ${randomUUID()}`,
-        issuePrefix: `${prefix}${randomUUID().slice(0, 6).toUpperCase()}`,
-      })
-      .returning()
-      .then((rows) => rows[0]!);
-  }
-
-  async function installPlugin() {
-    return db
-      .insert(plugins)
-      .values({
-        pluginKey: PLUGIN_KEY,
-        packageName: "@paperclipai/test-config-agreement-worker",
-        version: "0.0.0",
-        manifestJson: {
-          id: PLUGIN_KEY,
-          version: "0.0.0",
-          displayName: "Config agreement worker test plugin",
-          apiVersion: 1,
-          entrypoints: { worker: "worker.js" },
-        } as any,
-        status: "ready",
-      })
-      .returning()
-      .then((rows) => rows[0]!);
-  }
-
-  it("agrees: a setup()-time config.get with zero active invocations resolves via the agreement gate", async () => {
-    const plugin = await installPlugin();
-    const registry = pluginRegistryService(db);
-    const companyA = await createCompany("WKA");
-    const companyB = await createCompany("WKB");
-    await registry.upsertConfig(plugin.id, companyA.id, { configJson: { defaultBranch: "main" } });
-    await registry.upsertConfig(plugin.id, companyB.id, { configJson: { defaultBranch: "main" } });
-
-    const services = buildHostServices(db, plugin.id, PLUGIN_KEY, createEventBusStub());
-    const handlers = createHostClientHandlers({
-      pluginId: PLUGIN_KEY,
-      capabilities: [],
-      services,
-    });
-    const handle = createPluginWorkerHandle(PLUGIN_KEY, {
-      entrypointPath: CONFIG_AGREEMENT_WORKER_ENTRYPOINT,
-      manifest: TEST_MANIFEST,
-      config: {},
-      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
-      apiVersion: 1,
-      hostHandlers: handlers,
-    });
-
-    try {
-      // The fixture fires its no-dispatch config.get BEFORE responding to
-      // `initialize`, so by the time `start()` resolves the agreement gate has
-      // already run against the real, seeded `plugin_config` rows above.
-      await handle.start();
-
-      const outcome = await handle.call("executeTool", {
-        toolName: "reportConfigGetOutcome",
-        parameters: {},
-        runContext: {
-          agentId: "agent-1",
-          runId: "run-pla1944-agree",
-          companyId: companyA.id,
-          projectId: "project-1",
-        },
-      } as unknown as HostToWorkerMethods["executeTool"][0]);
-
-      expect(outcome).toMatchObject({
-        data: {
-          configGetOutcome: {
-            ok: true,
-            result: { defaultBranch: "main" },
-          },
-        },
-      });
-    } finally {
-      services.dispose();
-      await handle.stop().catch(() => undefined);
-    }
-  });
-
-  it("diverges: a setup()-time config.get denies AND surfaces a health signal via plugins.lastError", async () => {
-    const plugin = await installPlugin();
-    const registry = pluginRegistryService(db);
-    const companyA = await createCompany("WKC");
-    const companyB = await createCompany("WKD");
-    await registry.upsertConfig(plugin.id, companyA.id, { configJson: { defaultBranch: "main" } });
-    await registry.upsertConfig(plugin.id, companyB.id, { configJson: { defaultBranch: "dev" } });
-
-    const services = buildHostServices(db, plugin.id, PLUGIN_KEY, createEventBusStub());
-    const handlers = createHostClientHandlers({
-      pluginId: PLUGIN_KEY,
-      capabilities: [],
-      services,
-    });
-    const handle = createPluginWorkerHandle(PLUGIN_KEY, {
-      entrypointPath: CONFIG_AGREEMENT_WORKER_ENTRYPOINT,
-      manifest: TEST_MANIFEST,
-      config: {},
-      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
-      apiVersion: 1,
-      hostHandlers: handlers,
-    });
-
-    try {
-      await handle.start();
-
-      const outcome = await handle.call("executeTool", {
-        toolName: "reportConfigGetOutcome",
-        parameters: {},
-        runContext: {
-          agentId: "agent-1",
-          runId: "run-pla1944-diverge",
-          companyId: companyA.id,
-          projectId: "project-1",
-        },
-      } as unknown as HostToWorkerMethods["executeTool"][0]);
-
-      expect((outcome as any).data.configGetOutcome.ok).toBe(false);
-
-      // Health signal: plugins.lastError names the divergence, no company ids.
-      const refreshed = await registry.getById(plugin.id);
-      expect(refreshed?.lastError).toBeTruthy();
-      expect(refreshed!.lastError).not.toContain(companyA.id);
-      expect(refreshed!.lastError).not.toContain(companyB.id);
-    } finally {
-      services.dispose();
-      await handle.stop().catch(() => undefined);
-    }
-  });
-});
-
 // PLA-1149: bounded worker→host IPC frame reader (OOM hardening).
 describe("resolveMaxIpcFrameBytes", () => {
   const ENV_KEY = "PAPERCLIP_PLUGIN_MAX_IPC_FRAME_BYTES";
@@ -1361,10 +1170,21 @@ describe("plugin host company context guards", () => {
       } as unknown as HostServices,
     });
 
-    await expect(handlers["config.get"]({})).rejects.toMatchObject({
-      name: "InvocationScopeDeniedError",
-      message: expect.stringContaining("company context is required"),
-    });
+    // PLA-1887/1929/1937/1942: a true no-scope `config.get({})` (no
+    // invocationScope, no singleInFlightScope, no worker-named company) no
+    // longer denies at the SDK layer — it defers to the host's agreement
+    // gate (`getAgreedOrDeny`), which resolves construction-time reads by
+    // checking whether every owning `plugin_config` row already agrees. The
+    // mocked `services.config.get` here stands in for that host gate.
+    await expect(handlers["config.get"]({})).resolves.toEqual({ apiKey: "unreachable" });
+    expect(configGet).toHaveBeenCalledWith({ companyId: undefined }, undefined);
+    configGet.mockClear();
+
+    // A worker-NAMED company is a different case entirely: it is never
+    // authoritative, and still denies outright even though `config.get` now
+    // supplies an `alternateHostBinding` sentinel — `resolveRequiredCompanyId`'s
+    // "single" branch ignores `alternateHostBinding` and requires a matching
+    // host-derived scope, which is absent here.
     await expect(handlers["config.get"]({ companyId: "company-1" })).rejects.toMatchObject({
       name: "InvocationScopeDeniedError",
       message: expect.stringContaining("company context is required"),

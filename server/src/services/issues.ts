@@ -55,6 +55,7 @@ import type {
 } from "@paperclipai/shared";
 import {
   clampIssueRequestDepth,
+  TERMINAL_HEARTBEAT_RUN_STATUSES as SHARED_TERMINAL_HEARTBEAT_RUN_STATUSES,
   extractAgentMentionIds,
   extractProjectMentionIds,
   issueCommentAuthorTypeSchema,
@@ -713,7 +714,7 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
   return checkoutRunId == null;
 }
 
-export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "interrupted", "failed", "cancelled", "timed_out"]);
+export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set<string>(SHARED_TERMINAL_HEARTBEAT_RUN_STATUSES);
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
 

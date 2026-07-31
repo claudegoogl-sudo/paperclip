@@ -1,4 +1,10 @@
-export type HeartbeatRunOutcome = "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out";
+export type HeartbeatRunOutcome =
+  | "succeeded"
+  | "succeeded_dirty"
+  | "interrupted"
+  | "failed"
+  | "cancelled"
+  | "timed_out";
 
 export type HeartbeatRunStopReason =
   | "completed"
@@ -10,6 +16,7 @@ export type HeartbeatRunStopReason =
   | "max_turns_exhausted"
   | "process_lost"
   | "unmanaged_background_task_stopped"
+  | "completed_dirty_exit"
   | "adapter_failed";
 
 export interface HeartbeatRunTimeoutPolicy {
@@ -41,6 +48,38 @@ function hasOwn(record: Record<string, unknown>, key: string) {
 
 function defaultTimeoutSecForAdapter(adapterType: string) {
   return adapterType === "openclaw_gateway" ? 120 : 0;
+}
+
+/**
+ * A run that completed with a dirty teardown did its work, so it must leave the
+ * agent idle. Only genuine failures park an agent in `error`.
+ *
+ * A quota/upstream-transient failure is not the agent's fault, so it stays
+ * `failed` as a run — the work really did not happen — but leaves the agent
+ * `idle` so it wakes again once `retryNotBefore` elapses. Parking it in `error`
+ * takes the agent out of service for the entire limit window, which is how a
+ * weekly limit removed a company's escalation path for days.
+ */
+export function resolveAgentStatusAfterRun(input: {
+  outcome: HeartbeatRunOutcome;
+  runningRunCount: number;
+  keepIdleOnFailure?: boolean;
+  errorFamily?: string | null;
+}): "running" | "idle" | "error" {
+  if (input.runningRunCount > 0) return "running";
+  if (
+    input.outcome === "succeeded" ||
+    input.outcome === "succeeded_dirty" ||
+    input.outcome === "interrupted" ||
+    input.outcome === "cancelled"
+  ) {
+    return "idle";
+  }
+  if (input.outcome === "failed" && input.keepIdleOnFailure) return "idle";
+  if (input.outcome === "failed" && input.errorFamily === "transient_upstream") {
+    return "idle";
+  }
+  return "error";
 }
 
 export function normalizeMaxTurnStopReason(value: unknown): Extract<HeartbeatRunStopReason, "max_turns_exhausted"> | null {
@@ -85,6 +124,8 @@ export function inferHeartbeatRunStopReason(input: {
   errorMessage?: string | null;
 }): HeartbeatRunStopReason {
   if (input.outcome === "succeeded") return "completed";
+  // The work completed; only teardown exited badly.
+  if (input.outcome === "succeeded_dirty") return "completed_dirty_exit";
   if (input.outcome === "interrupted") return "interrupted";
   const maxTurnStopReason = normalizeMaxTurnStopReason(input.errorCode);
   if (maxTurnStopReason) return maxTurnStopReason;

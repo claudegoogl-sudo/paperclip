@@ -29,7 +29,11 @@ import type {
   PluginExecutionWorkspaceMetadata,
 } from "@paperclipai/plugin-sdk";
 import type { CreateIssueThreadInteraction, InviteJoinType, IssueDocumentSummary, PermissionKey, PrincipalType } from "@paperclipai/shared";
-import { pluginOperationIssueOriginKind } from "@paperclipai/shared";
+import {
+  pluginOperationIssueOriginKind,
+  TERMINAL_HEARTBEAT_RUN_STATUSES,
+  isSuccessfulHeartbeatRunStatus,
+} from "@paperclipai/shared";
 import { companyService } from "./companies.js";
 import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
@@ -66,14 +70,10 @@ import {
   writePluginLocalFolderTextAtomic,
 } from "./plugin-local-folders.js";
 import { createPluginSecretsHandler } from "./plugin-secrets-handler.js";
+import { getAgreedOrDeny } from "./plugin-config-agreement.js";
+import { collectSecretRefPaths } from "./json-schema-secret-refs.js";
+import { instanceConfigSchemaOf } from "./plugin-registry.js";
 import { createPluginArtifactsHandler } from "./plugin-artifacts-handler.js";
-import {
-  collectSecretRefPaths,
-  readConfigValueAtPath,
-  writeConfigValueAtPath,
-  canonicalizeForComparison,
-  structurallyEqual,
-} from "./json-schema-secret-refs.js";
 import { normalizeIssueAttachmentMaxBytes } from "../attachment-types.js";
 import {
   defaultPluginWakeRateLimiter,
@@ -1305,16 +1305,56 @@ export function buildHostServices(
     async get(params?: { companyId?: string }): Promise<Record<string, unknown>> {
       const companyId = params?.companyId;
       if (!companyId) {
-        // The SDK's gated `config.get` wrapper falls through to here when no
-        // dispatch pins a tenant (e.g. a `setup()`-time read). There is no
-        // instance-wide config row to return post-v722, so degrade to empty
-        // rather than throwing — but log it, because a plugin silently seeing
-        // `{}` is otherwise invisible.
-        logger.warn(
-          { pluginId, pluginKey },
-          "plugin config.get with no company scope; returning empty config (plugin_config is company-scoped since v2026.722.0)",
+        // PLA-1887/1929/1937/1942: the SDK's gated `config.get` wrapper falls
+        // through to here when no dispatch pins a tenant — a genuine
+        // construction-time read (setup(), a poll loop, ...). Rather than
+        // degrading to `{}` (which a plugin reads as an absent key and
+        // proceeds unauthenticated/unconfigured, silently) resolve via the
+        // host-minted agreement gate: if every owning `plugin_config` row for
+        // this plugin agrees, hand back the agreed config; if they
+        // genuinely diverge, deny loudly and surface it on plugin health.
+        const plugin = await registry.getById(pluginId);
+        const secretRefPaths = collectSecretRefPaths(
+          (instanceConfigSchemaOf(plugin ?? { manifestJson: null }) as Record<string, unknown> | null) ??
+            null,
         );
-        return {};
+        return getAgreedOrDeny({
+          pluginId,
+          pluginKey,
+          listConfigRows: () => registry.listConfigsForPlugin(pluginId),
+          secretRefPaths,
+          logger,
+          onDeny: async ({ disagreeingKeys }) => {
+            // A2 (PLA-1942): tenant-neutral message ONLY — no company ids, no
+            // row counts. `plugins.lastError` is reachable by any board actor
+            // with membership in at least one company (`assertBoardOrgAccess`
+            // gates GET /plugins, /:pluginId, /:pluginId/health,
+            // /:pluginId/dashboard — none of those require instance-admin),
+            // so writing company ids here would hand a single-tenant viewer
+            // the existence and config state of other tenants. Disagreeing
+            // top-level key NAMES are fine: they're manifest-declared and
+            // already readable by every owning tenant. Company ids and full
+            // detail go only to the `logger.error` call above, which no
+            // company-scoped API exposes. Pass the plugin's current `status`
+            // through unchanged so this never clobbers an unrelated
+            // lifecycle transition.
+            const current = await registry.getById(pluginId);
+            if (!current) return;
+            await registry.updateStatus(pluginId, {
+              status: current.status,
+              lastError: `config-agreement: unscoped config.get denied; owning config rows disagree on key(s): ${disagreeingKeys.join(", ")}. See host log for company detail.`,
+            });
+          },
+          onResolve: async () => {
+            // Clear a previously-recorded divergence back to healthy on the
+            // next clean resolve, or a fixed divergence leaves a permanent
+            // false-positive health failure with no path back to green.
+            const current = await registry.getById(pluginId);
+            if (current?.lastError) {
+              await registry.updateStatus(pluginId, { status: current.status, lastError: null });
+            }
+          },
+        });
       }
       await ensurePluginAvailableForCompany(companyId);
       const configRow = await registry.getConfig(pluginId, companyId);
@@ -1329,108 +1369,6 @@ export function buildHostServices(
       const base = (configRow?.configJson as Record<string, unknown> | undefined) ?? {};
       if (!override) return { ...base };
       return { ...base, ...override };
-    },
-    /**
-     * PLA-1944 — Option 3 host-minted agreement gate for a no-dispatch
-     * `config.get` (a `setup()`-time read or a background/poll loop with no
-     * active dispatch to pin a tenant). Resolves by checking EVERY owning
-     * `plugin_config` row: agree → return the agreed value; diverge on a
-     * non-secret-ref key → deny loudly.
-     *
-     * READS ONLY, by construction. The security argument is: every owning
-     * row is read to check agreement, so the value returned is never more
-     * than what each owning company's own row already contains — nothing is
-     * disclosed across a company boundary that that company didn't already
-     * have. That argument is specific to reads and does NOT generalise to a
-     * write: a write would need to pick (or fan out to) an owner, which is
-     * an authorization decision this mechanism has no basis to make. There is
-     * no `config.set` in the worker→host wire protocol, and this gate must
-     * never be extended to add one or to back a future write RPC.
-     */
-    async getAgreedOrDeny(): Promise<Record<string, unknown>> {
-      const rows = await registry.listConfigRows(pluginId);
-      if (rows.length === 0) return {};
-      if (rows.length === 1) {
-        await registry.setPluginLastError(pluginId, null);
-        return (rows[0]!.configJson as Record<string, unknown> | undefined) ?? {};
-      }
-
-      const schema = (options.manifest?.instanceConfigSchema ?? null) as
-        | Record<string, unknown>
-        | null;
-      const secretRefPaths = collectSecretRefPaths(schema);
-
-      // Compare with secret-ref paths stripped: those are unioned in
-      // separately below under the distinct-value rule (C2), never used to
-      // deny the whole config.
-      const comparable = rows.map((row) => {
-        let stripped = (row.configJson as Record<string, unknown> | undefined) ?? {};
-        for (const path of secretRefPaths) {
-          stripped = writeConfigValueAtPath(stripped, path, undefined);
-        }
-        return { companyId: row.companyId, config: stripped };
-      });
-
-      const [first, ...rest] = comparable;
-      const agrees = rest.every((entry) => structurallyEqual(entry.config, first!.config));
-
-      if (!agrees) {
-        const divergingKeys = new Set<string>();
-        const keyUnion = new Set<string>();
-        for (const entry of comparable) {
-          for (const key of Object.keys(entry.config)) keyUnion.add(key);
-        }
-        for (const key of keyUnion) {
-          const values = comparable.map((entry) => entry.config[key]);
-          const [firstValue, ...restValues] = values;
-          if (!restValues.every((value) => structurallyEqual(value, firstValue))) {
-            divergingKeys.add(key);
-          }
-        }
-        const companyIds = rows.map((row) => row.companyId);
-        // Operator-only: company ids and disagreeing top-level keys, never
-        // values, never secret-ref paths (even excluded ones).
-        logger.error(
-          { pluginId, pluginKey, companyIds, divergingKeys: [...divergingKeys] },
-          "plugin config.get agreement gate: owning plugin_config rows disagree; denying no-dispatch read",
-        );
-        // Bounded, no company ids: plugins.lastError is plugin-surfaced.
-        await registry.setPluginLastError(
-          pluginId,
-          `config rows disagree across owning companies; see host log for detail`,
-        );
-        throw new Error(
-          `Plugin "${pluginKey}" configuration could not be resolved: owning companies disagree`,
-        );
-      }
-
-      let result: Record<string, unknown> = structuredClone(first!.config);
-      for (const path of secretRefPaths) {
-        const distinct = new Map<string, unknown>();
-        for (const row of rows) {
-          const value = readConfigValueAtPath(
-            (row.configJson as Record<string, unknown> | undefined) ?? {},
-            path,
-          );
-          if (value === null || value === undefined) continue;
-          distinct.set(JSON.stringify(canonicalizeForComparison(value)), value);
-        }
-        if (distinct.size === 0) continue;
-        if (distinct.size === 1) {
-          const [[, value]] = distinct;
-          result = writeConfigValueAtPath(result, path, value);
-          continue;
-        }
-        // 2+ distinct non-null values: drop ONLY this field, never deny the
-        // whole config over a secret-ref divergence.
-        logger.warn(
-          { pluginId, pluginKey, path },
-          "plugin config.get agreement gate: secret-ref field diverges across owning companies; dropping field",
-        );
-      }
-
-      await registry.setPluginLastError(pluginId, null);
-      return result;
     },
   };
 
@@ -1580,11 +1518,9 @@ export function buildHostServices(
             notifyWorker("onEvent", { event });
           }
         };
-        if (params.filter) {
-          scopedBus.subscribe(params.eventPattern as any, params.filter as any, handler);
-        } else {
-          scopedBus.subscribe(params.eventPattern as any, handler);
-        }
+        const { replaced } = params.filter
+          ? scopedBus.subscribe(params.eventPattern as any, params.filter as any, handler)
+          : scopedBus.subscribe(params.eventPattern as any, handler);
         // PLA-854 observability: a plugin worker re-runs setup() (and therefore
         // re-issues every events.subscribe RPC) on each (re)start — e.g. a
         // dev-watcher hot reload or crash auto-restart. If the host-side
@@ -1593,12 +1529,17 @@ export function buildHostServices(
         // subscription count on every (re)subscribe makes a detached relay
         // observable: a healthy worker logs a rising count right after restart;
         // a detached one logs nothing (count stuck at 0).
+        //
+        // `replaced` distinguishes a first bind from a re-bind that
+        // adopted the current notify channel, which is why `subscriptionCount`
+        // now stays flat across re-binds instead of climbing.
         logger.info(
           {
             pluginId,
             pluginKey,
             eventPattern: params.eventPattern,
             subscriptionCount: eventBus.subscriptionCount(pluginKey),
+            replaced,
           },
           "plugin event subscription registered",
         );
@@ -3327,7 +3268,7 @@ export function buildHostServices(
         // Track the subscription so it can be cleaned up on dispose() if the run
         // never reaches a terminal status (hang, crash, network partition).
         if (notifyWorker) {
-          const TERMINAL_STATUSES = new Set(["succeeded", "interrupted", "failed", "cancelled", "timed_out"]);
+          const TERMINAL_STATUSES = new Set<string>(TERMINAL_HEARTBEAT_RUN_STATUSES);
 
           const cleanup = () => {
             unsubscribe();
@@ -3356,9 +3297,9 @@ export function buildHostServices(
                   sessionId: params.sessionId,
                   runId: run.id,
                   seq: 0,
-                  eventType: status === "succeeded" ? "done" : "error",
+                  eventType: isSuccessfulHeartbeatRunStatus(status) ? "done" : "error",
                   stream: "system",
-                  message: status === "succeeded" ? "Run completed" : `Run ${status}`,
+                  message: isSuccessfulHeartbeatRunStatus(status) ? "Run completed" : `Run ${status}`,
                   payload: payload,
                 });
                 cleanup();
