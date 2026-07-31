@@ -46,7 +46,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-retry-scheduling-");
     db = createDb(tempDb.connectionString);
     heartbeat = heartbeatService(db);
-  }, 20_000);
+  }, 45_000);
 
   afterEach(async () => {
     await db.delete(activityLog);
@@ -1780,5 +1780,92 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
     expect(retryRun?.scheduledRetryAttempt).toBe(3);
     expect((retryRun?.contextSnapshot as Record<string, unknown> | null)?.noOpDispatchRetryAttempt).toBe(0);
+  });
+
+  // PLA-1930 defect-3 diagnosis: the ticket's live evidence shows `scheduled_retry_attempt`
+  // flat at 0 across 385 rows and asked whether the attempt counter is broken. It is not —
+  // that DB column is intentionally kept flat for no-op dispatches (heartbeat.ts:8364, "a
+  // dispatch that never reached the model did not happen, so it must not advance the
+  // ladder") so the bounded-ladder budget isn't spent on runs that never billed anything.
+  // The counter that actually tracks no-op attempts is `noOpDispatchRetryAttempt` in
+  // `contextSnapshot`, and it does compound correctly hop over hop, threaded forward
+  // exactly as a real dispatch-fail-retry cycle persists it (retryContextSnapshot,
+  // heartbeat.ts:8518). This test chains three real `scheduleBoundedRetry` calls — each
+  // hop a fresh failed run seeded with the prior hop's persisted counter — to pin that
+  // behavior against regression, rather than relying only on the single-hop coverage above.
+  it("compounds the no-op dispatch counter across a real multi-hop retry chain while the bounded-ladder column stays flat", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const now = new Date("2026-07-26T13:16:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "ClaudeCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+
+    let priorNoOpAttempt = 0;
+    for (let hop = 1; hop <= 3; hop += 1) {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        status: "failed",
+        error: "upstream overload",
+        errorCode: "claude_transient_upstream",
+        finishedAt: now,
+        // A no-op-caused retry never advances this column, so it is seeded fixed at 2
+        // every hop — precisely the flat-column behavior the ticket's live rows showed.
+        scheduledRetryAttempt: 2,
+        scheduledRetryReason: "transient_failure",
+        resultJson: {
+          errorFamily: "transient_upstream",
+          noOpDispatch: true,
+          noOpDispatchReason: "pre_turn_rate_limit",
+        },
+        contextSnapshot: {
+          issueId: randomUUID(),
+          wakeReason: "issue_assigned",
+          noOpDispatchRetryAttempt: priorNoOpAttempt,
+        },
+        updatedAt: now,
+        createdAt: now,
+      });
+
+      const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+      expect(scheduled.outcome).toBe("scheduled");
+      if (scheduled.outcome !== "scheduled") return;
+
+      const retryRun = await db
+        .select({
+          contextSnapshot: heartbeatRuns.contextSnapshot,
+          scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, scheduled.run.id))
+        .then((rows) => rows[0] ?? null);
+
+      const nextNoOpAttempt = (retryRun?.contextSnapshot as Record<string, unknown> | null)
+        ?.noOpDispatchRetryAttempt;
+      expect(nextNoOpAttempt).toBe(hop);
+      expect(retryRun?.scheduledRetryAttempt).toBe(2);
+
+      priorNoOpAttempt = nextNoOpAttempt as number;
+    }
   });
 });

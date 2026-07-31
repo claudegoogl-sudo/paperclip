@@ -150,6 +150,7 @@ import {
   resolveExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { usageLimitParkService } from "./usage-limit-park.js";
 import {
   evaluateExecutionAllowlist,
   isExecutionForcedToKubernetes,
@@ -311,7 +312,7 @@ const NO_OP_DISPATCH_RETRY_FALLBACK_DELAY_MS = 10 * 60 * 1000;
 const NO_OP_DISPATCH_RETRY_MIN_DELAY_MS = 60 * 1000;
 const NO_OP_DISPATCH_RETRY_MAX_DELAY_MS = 5 * 60 * 60 * 1000;
 // The advertised reset time is a lossy wall clock; wake just past it, not exactly on it.
-const NO_OP_DISPATCH_RETRY_SAFETY_MARGIN_MS = 60 * 1000;
+export const NO_OP_DISPATCH_RETRY_SAFETY_MARGIN_MS = 60 * 1000;
 const WORKSPACE_VALIDATION_FAILURE_CODE = "workspace_validation_failed";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
 const CONFIGURATION_INCOMPLETE_FAILURE_CODE = "configuration_incomplete";
@@ -477,6 +478,44 @@ function buildNoOpDispatchRetrySchedule(input: {
     dueAt: new Date(input.now.getTime() + delayMs),
     maxAttempts: input.maxAttempts,
   };
+}
+
+// PLA-1930: a genuine account-wide usage-limit hit bills nothing and never reaches
+// the model, whatever the adapter's own classification says. Checked independently
+// of `noOpDispatch` (which is Claude/429-specific) so the park gate stays adapter-
+// agnostic and can't be defeated by a result that merely mentions a limit in passing.
+// Exported for direct unit/replay testing (AC2/AC3/AC6) — the actual dispatch this
+// gates lives deep inside `executeRun`'s adapter-execution path, which is not a
+// practical seam to drive end-to-end from a unit test.
+export function isZeroWorkUsageLimitResult(resultJson: Record<string, unknown>): boolean {
+  const cost = readZeroableAmount(resultJson.total_cost_usd);
+  const durationApiMs = readZeroableAmount(resultJson.duration_api_ms);
+  const numTurns = readZeroableAmount(resultJson.num_turns);
+  if (cost === null || durationApiMs === null || numTurns === null) return false;
+  return cost === 0 && durationApiMs === 0 && numTurns <= 1;
+}
+
+function readZeroableAmount(value: unknown): number | null {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+// Mirrors `buildNoOpDispatchRetrySchedule`'s own target calc, including its fallback:
+// a zero-work usage-limit hit with no parseable reset hint (e.g. AC6's replayed live
+// row, produced by the pre-fix adapter, has no `retryNotBefore` key at all) still
+// parks — for a bounded fallback window — rather than silently not parking. Without
+// this fallback the exact storm this ticket exists to stop (a limit result the parser
+// can't extract a reset from) would slip straight through the new gate too.
+// Exported alongside `isZeroWorkUsageLimitResult` for AC6 replay testing.
+export function resolveUsageLimitParkTarget(input: { now: Date; retryNotBefore: Date | null }): Date {
+  const target = input.retryNotBefore
+    ? input.retryNotBefore.getTime() + NO_OP_DISPATCH_RETRY_SAFETY_MARGIN_MS
+    : input.now.getTime() + NO_OP_DISPATCH_RETRY_FALLBACK_DELAY_MS;
+  return new Date(target);
 }
 
 function mergeAdapterRecoveryMetadata(input: {
@@ -4981,6 +5020,7 @@ export function resolveHeartbeatSchedulingSuppression(
 
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
   const instanceSettings = instanceSettingsService(db);
+  const usageLimitPark = usageLimitParkService(db);
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
   });
@@ -10192,6 +10232,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function startNextQueuedRunForAgent(agentId: string) {
     if (getSchedulingSuppression().suppressed) return [];
+    // PLA-1930: single admission choke point for every wake source (issue-comment
+    // wake, sweep, routine trigger, scheduled-retry promotion) — the account-wide
+    // usage-limit quota this guards is instance-wide, so the gate must be too.
+    if (await usageLimitPark.isParked()) return [];
 
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
@@ -10278,6 +10322,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (run.status !== "queued" && run.status !== "running") return;
 
     if (run.status === "queued") {
+      // PLA-1930: defense-in-depth against `startNextQueuedRunForAgent`'s gate —
+      // this function is a second, independently reachable path into a claim, and
+      // an already-running run above must never be stopped mid-flight by a park
+      // that started after it was dispatched.
+      if (await usageLimitPark.isParked()) return;
       const claimed = await claimQueuedRun(run);
       if (!claimed) {
         // claimQueuedRun can also leave the run queued when dependencies are unresolved.
@@ -12058,6 +12107,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         outcome = "failed";
       }
       const outcomeSucceeded = outcome === "succeeded" || outcome === "succeeded_dirty";
+      // PLA-1930: clear early on the first successful dispatch so a stale park set
+      // from an earlier (possibly mis-parsed) reset time can never outlive a quota
+      // that has, in fact, already recovered.
+      if (outcomeSucceeded) {
+        await usageLimitPark.clear({ reason: "run_succeeded" });
+      }
 
       const nextSessionState = resolveNextSessionState({
         adapterType: agent.adapterType,
@@ -12256,6 +12311,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         } else if (outcome === "failed" && readTransientRecoveryContractFromRun(livenessRun)) {
           await scheduleBoundedRetryForRun(livenessRun, agent);
+        }
+        // PLA-1930: a genuinely zero-work usage-limit hit (never billed, never reached
+        // the model) parks every agent in every company until the advertised reset,
+        // instead of relying on this one agent's own retry ladder to eventually stop
+        // hammering a quota the whole account is out of. A mid-flight limit (non-zero
+        // cost/turns) is deliberately excluded — see `isZeroWorkUsageLimitResult`.
+        if (outcome === "failed") {
+          const failedResultJson = parseObject(livenessRun.resultJson);
+          if (isZeroWorkUsageLimitResult(failedResultJson)) {
+            const parkedUntil = resolveUsageLimitParkTarget({
+              now: new Date(),
+              retryNotBefore: readTransientRetryNotBeforeFromRun(livenessRun),
+            });
+            await usageLimitPark.park({
+              parkedUntil,
+              reason: readNonEmptyString(livenessRun.errorCode) ?? "usage_limit_zero_work",
+              rawLimitText: readNonEmptyString(failedResultJson.result),
+              sourceRunId: livenessRun.id,
+            });
+          }
         }
         const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
         await releaseIssueExecutionAndPromote(livenessRun);
@@ -15053,5 +15128,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .limit(1);
       return run ?? null;
     },
+
+    // PLA-1930: observability for the account-wide usage-limit park — lets callers
+    // (API route, recovery sweep) distinguish "parked on purpose" from "stuck", so a
+    // parked fleet isn't misreported as a stall.
+    getUsageLimitParkState: (now?: Date) => usageLimitPark.getState(now),
   };
 }

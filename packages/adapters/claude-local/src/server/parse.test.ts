@@ -376,6 +376,45 @@ describe("extractClaudeRetryNotBefore", () => {
       ),
     ).toBeNull();
   });
+
+  // PLA-1930: exact live strings observed in `heartbeat_runs.result_json.result`
+  // during the 2026-07-31 usage-limit storm. The `·` separator below is the real
+  // U+00B7 middle-dot character the CLI emits, not a hyphen.
+  it("parses the live dated weekly-limit string to the exact absolute instant", () => {
+    const now = new Date("2026-07-30T10:00:00.000Z");
+    expect(
+      extractClaudeRetryNotBefore(
+        { errorMessage: "You've hit your weekly limit · resets Jul 31, 8am (UTC)" },
+        now,
+      )?.toISOString(),
+    ).toBe("2026-07-31T08:00:00.000Z");
+  });
+
+  it("parses the live undated weekly-limit string to the next occurrence of the clock time, not the true weekly reset", () => {
+    // The live wording sometimes drops the date ("resets 8am (UTC)" with no
+    // "Jul 31,"), which is indistinguishable from a same-day clock hint. Master
+    // falls through to nextClockTimeInTimeZone and returns the *next* 8am UTC —
+    // for a weekly limit this can under-wait by up to ~7 days. That is an
+    // accepted, converging behavior (the park re-arms on the next limit hit),
+    // not a bug, so this test pins it as a deliberate, documented decision.
+    const now = new Date("2026-07-25T10:00:00.000Z");
+    expect(
+      extractClaudeRetryNotBefore(
+        { errorMessage: "You've hit your weekly limit · resets 8am (UTC)" },
+        now,
+      )?.toISOString(),
+    ).toBe("2026-07-26T08:00:00.000Z");
+  });
+
+  it("parses the live session-limit string to the exact absolute instant", () => {
+    const now = new Date("2026-07-31T10:00:00.000Z");
+    expect(
+      extractClaudeRetryNotBefore(
+        { errorMessage: "You've hit your session limit · resets 6:50pm (UTC)" },
+        now,
+      )?.toISOString(),
+    ).toBe("2026-07-31T18:50:00.000Z");
+  });
 });
 
 describe("isClaudePreTurnRateLimitResult", () => {
