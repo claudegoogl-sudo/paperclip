@@ -83,7 +83,14 @@ export const CONFIG = {
   // commit -- only uncommitted tracked edits are at risk (excluded below).
   WORKTREE_SCAN_DIRS: [process.env.PLA_JANITOR_WORK_DIR || path.join(HOME, "work")],
   WORKTREE_HOME_GLOB_ROOT: process.env.PLA_JANITOR_HOME_GLOB_ROOT || HOME,
-  WORKTREE_HOME_GLOB_PREFIX: "pla",
+  // Patterns, not a bare prefix: a bare `startsWith("pla")` also captures
+  // `platform-*` (e.g. a stray `platform-*.tgz`, or a future
+  // `~/platform-scratch` directory) and `playwright-*` scratch dirs that
+  // share the "pla" prefix -- exactly the over-match bug class the /tmp
+  // scratch fix above closed. Anchor to `pla` followed by a digit
+  // (ticket-numbered dirs like `pla2008-...`), same shape as
+  // TMP_SCRATCH_PATTERNS.
+  WORKTREE_HOME_GLOB_PATTERNS: [/^pla\d/],
   WORKTREE_MAX_AGE_DAYS: 30,
   // The shared object store all `~/work/*` / `~/pla*` worktrees register
   // against. After deleting eligible worktree directories, `git worktree
@@ -404,11 +411,11 @@ function listSubdirs(dir) {
     .map((e) => path.join(dir, e.name));
 }
 
-/** Lists immediate entries of `dir` whose basename starts with `prefix` and are directories. */
-function listGlobDirs(dir, prefix) {
+/** Lists immediate entries of `dir` that are directories and match any of `patterns`. */
+function listGlobDirs(dir, patterns) {
   if (!existsSync(dir)) return [];
   return readdirSync(dir, { withFileTypes: true })
-    .filter((e) => e.isDirectory() && e.name.startsWith(prefix))
+    .filter((e) => e.isDirectory() && patterns.some((pattern) => pattern.test(e.name)))
     .map((e) => path.join(dir, e.name));
 }
 
@@ -422,7 +429,7 @@ export function scanWorktreeCandidates(config = CONFIG) {
       candidates.push(p);
     }
   }
-  for (const p of listGlobDirs(config.WORKTREE_HOME_GLOB_ROOT, config.WORKTREE_HOME_GLOB_PREFIX)) {
+  for (const p of listGlobDirs(config.WORKTREE_HOME_GLOB_ROOT, config.WORKTREE_HOME_GLOB_PATTERNS)) {
     if (seen.has(p)) continue;
     seen.add(p);
     candidates.push(p);
