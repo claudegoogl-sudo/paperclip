@@ -208,7 +208,7 @@ describeEmbeddedPostgres("plugin config write-path agreement guard (PLA-1957)", 
       }),
     ).rejects.toBeInstanceOf(ConfigAgreementGuardError);
 
-    const rows = await registry.listConfigRows(plugin.id);
+    const rows = await registry.listConfigsForPlugin(plugin.id);
     for (const row of rows) {
       expect(row.configJson).toEqual({ defaultBranch: "main" });
     }
@@ -394,7 +394,7 @@ describeEmbeddedPostgres("plugin config write-path agreement guard (PLA-1957)", 
     });
 
     const services = buildGateServices(plugin.id);
-    const result = await services.config.getAgreedOrDeny!();
+    const result = await services.config.get();
     services.dispose();
 
     expect(result).toEqual({ defaultBranch: "release" });

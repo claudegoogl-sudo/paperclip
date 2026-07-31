@@ -142,7 +142,7 @@ export async function writePluginConfigWithAgreement(
   return db.transaction(async (tx) => {
     const txDb = tx as unknown as Db;
     const registry = pluginRegistryService(txDb);
-    const rows = await registry.listConfigRows(params.pluginId);
+    const rows = await registry.listConfigsForPlugin(params.pluginId);
 
     // applyToAllCompanies is the caller declaring intent to change (or
     // reconcile) the agreed value across every owning row, so the guard —

@@ -29,7 +29,6 @@ import type {
 } from "@paperclipai/shared";
 import { conflict, notFound } from "../errors.js";
 import { secretService } from "./secrets.js";
-import { readConfigValueAtPath, writeConfigValueAtPath } from "./json-schema-secret-refs.js";
 
 /** Read the manifest's `instanceConfigSchema` off a persisted plugins row. */
 export function instanceConfigSchemaOf(plugin: { manifestJson: unknown }): unknown {
@@ -360,45 +359,27 @@ export function pluginRegistryService(db: Db) {
     },
 
     /**
-     * PLA-1937 Condition 1: maintain the read-side agreement invariant on
-     * every write. `POST /api/plugins/:pluginId/config` writes only the
-     * requesting company's row; without this, that row diverges from every
-     * sibling row on its very first ordinary edit and the agreement gate
-     * (`getAgreedOrDeny`) then denies `config.get` for every company sharing
-     * the plugin. Broadcasts the non-secret-ref portion of `configJson`
-     * verbatim into every other owning row, leaving each target row's own
-     * secret-ref fields (per `secretRefPaths`) untouched. Returns the
-     * companyIds of the rows that were updated.
+     * PLA-1957: write `configJson` verbatim into a row that already exists,
+     * without touching that row's own secret-ref field values. Used only by
+     * the `applyToAllCompanies` fan-out (`plugin-config-write.ts`), which has
+     * already computed the sibling-preserving config via
+     * `restoreSecretRefPaths` before calling here — that's what makes it safe
+     * to skip `syncPluginSecretBindings` (nothing at a secret-ref path
+     * actually changed for this row). Does not create a row.
      */
-    broadcastNonSecretConfig: async (
+    setConfigJsonForExistingRow: async (
       pluginId: string,
-      sourceCompanyId: string,
+      companyId: string,
       configJson: Record<string, unknown>,
-      secretRefPaths: Iterable<string>,
-    ): Promise<string[]> => {
-      const paths = [...secretRefPaths];
-      const siblingRows = await db
-        .select()
-        .from(pluginConfig)
-        .where(and(eq(pluginConfig.pluginId, pluginId), ne(pluginConfig.companyId, sourceCompanyId)));
+    ) => {
+      const rows = await db
+        .update(pluginConfig)
+        .set({ configJson, lastError: null, updatedAt: new Date() })
+        .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
+        .returning();
 
-      const touched: string[] = [];
-      for (const sibling of siblingRows) {
-        let nextConfig = configJson;
-        for (const path of paths) {
-          nextConfig = writeConfigValueAtPath(
-            nextConfig,
-            path,
-            readConfigValueAtPath((sibling.configJson as Record<string, unknown>) ?? {}, path),
-          );
-        }
-        await db
-          .update(pluginConfig)
-          .set({ configJson: nextConfig, updatedAt: new Date() })
-          .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, sibling.companyId)));
-        touched.push(sibling.companyId);
-      }
-      return touched;
+      if (rows.length === 0) throw notFound("Plugin config not found");
+      return rows[0];
     },
 
     /**
