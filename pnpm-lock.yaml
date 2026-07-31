@@ -16203,3 +16203,5 @@ snapshots:
       use-sync-external-store: 1.6.0(react@19.2.7)
 
   zwitch@2.0.4: {}
+
+# throwaway hand-edit to trip the lockfile policy check (see #130)
