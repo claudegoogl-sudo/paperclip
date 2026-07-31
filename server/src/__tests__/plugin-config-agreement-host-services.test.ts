@@ -5,10 +5,22 @@ import { companies, createDb, pluginConfig, plugins } from "@paperclipai/db";
 import { buildHostServices } from "../services/plugin-host-services.js";
 import { ConfigAgreementDeniedError } from "../services/plugin-config-agreement.js";
 import { pluginRegistryService } from "../services/plugin-registry.js";
+import { writePluginConfigWithAgreement } from "../services/plugin-config-write.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { logger } from "../middleware/logger.js";
+
+vi.mock("../middleware/logger.js", () => ({
+  logger: {
+    warn: vi.fn(),
+    error: vi.fn(),
+    info: vi.fn(),
+    debug: vi.fn(),
+    child: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }),
+  },
+}));
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -82,6 +94,7 @@ describeEmbeddedPostgres(
       await db.delete(pluginConfig);
       await db.delete(plugins);
       await db.delete(companies);
+      vi.clearAllMocks();
     });
 
     afterAll(async () => {
@@ -136,6 +149,33 @@ describeEmbeddedPostgres(
       services.dispose();
     });
 
+    it("A3.3b: agrees when exactly one of 3+ rows carries a non-null secret-ref value — unions it in", async () => {
+      const plugin = await installPlugin(db, "paperclip.config-agreement-test-b2");
+      const companyA = await createCompany(db, "AGE");
+      const companyB = await createCompany(db, "AGF");
+      const companyC = await createCompany(db, "AGG");
+      const secretRefId = "11111111-1111-4111-8111-111111111111";
+
+      await db.insert(pluginConfig).values([
+        { pluginId: plugin.id, companyId: companyA.id, configJson: { mode: "prod", githubPatSecretId: null } },
+        // githubPatSecretId absent entirely on B — same "no value" outcome as A's explicit null.
+        { pluginId: plugin.id, companyId: companyB.id, configJson: { mode: "prod" } },
+        { pluginId: plugin.id, companyId: companyC.id, configJson: { mode: "prod", githubPatSecretId: secretRefId } },
+      ]);
+
+      const services = buildHostServices(db, plugin.id, plugin.pluginKey, createEventBusStub());
+      const result = await services.config.get();
+      services.dispose();
+
+      // A1: "at most one DISTINCT non-null value" unions it in even though
+      // only one of three rows actually carries it — a row-count check (the
+      // superseded rule) would misread this as a 1-of-3 conflict and drop it.
+      expect(result).toEqual({ mode: "prod", githubPatSecretId: secretRefId });
+      expect(logger.error).not.toHaveBeenCalled();
+      const current = await getPlugin(db, plugin.id);
+      expect(current?.lastError ?? null).toBeNull();
+    });
+
     it("A3.3/A3.4b: diverging owning rows deny config.get and surface a tenant-neutral message on plugins.lastError", async () => {
       const plugin = await installPlugin(db, "paperclip.config-agreement-test-c");
       const companyA = await createCompany(db, "AGC");
@@ -175,7 +215,69 @@ describeEmbeddedPostgres(
       services.dispose();
     });
 
-    it("Condition 1: a write-side broadcast to company X's non-secret config is visible on company Y's own row, and Y's own secret-ref field is untouched", async () => {
+    it("bar#4: rows diverging on a non-secret key deny loudly, with bounded redaction on the host log only", async () => {
+      const plugin = await installPlugin(db, "paperclip.config-agreement-test-bar4");
+      const companyA = await createCompany(db, "AGH");
+      const companyB = await createCompany(db, "AGI");
+      const companyC = await createCompany(db, "AGJ");
+
+      await db.insert(pluginConfig).values([
+        { pluginId: plugin.id, companyId: companyA.id, configJson: { mode: "prod" } },
+        { pluginId: plugin.id, companyId: companyB.id, configJson: { mode: "prod" } },
+        { pluginId: plugin.id, companyId: companyC.id, configJson: { mode: "canary" } },
+      ]);
+
+      const services = buildHostServices(db, plugin.id, plugin.pluginKey, createEventBusStub());
+      await expect(services.config.get()).rejects.toBeInstanceOf(ConfigAgreementDeniedError);
+      services.dispose();
+
+      // bar#4: the host log carries full detail (pluginId/pluginKey/company
+      // ids/which keys disagree)...
+      expect(logger.error).toHaveBeenCalledTimes(1);
+      const [logPayload, logMessage] = (logger.error as any).mock.calls[0];
+      expect(logPayload.pluginId).toBe(plugin.id);
+      expect(logPayload.pluginKey).toBe(plugin.pluginKey);
+      expect(new Set(logPayload.companyIds)).toEqual(new Set([companyA.id, companyB.id, companyC.id]));
+      expect(logPayload.disagreeingKeys).toEqual(["mode"]);
+      // ...but the diverging VALUES themselves never leak into the log
+      // payload or message — only key names and ids are safe to record.
+      expect(JSON.stringify(logPayload)).not.toContain("prod");
+      expect(JSON.stringify(logPayload)).not.toContain("canary");
+      expect(typeof logMessage).toBe("string");
+      expect(logMessage).not.toContain("prod");
+      expect(logMessage).not.toContain("canary");
+    });
+
+    it("PLA-1963 AC5: resolves the post-scrub shape — ref present on the owner row, path absent (not null) on every other row", async () => {
+      const plugin = await installPlugin(db, "paperclip.config-agreement-test-scrub");
+      const owner = await createCompany(db, "AGK");
+      const nonOwners = await Promise.all(
+        Array.from({ length: 7 }, (_, index) => createCompany(db, `AGL${index}`)),
+      );
+      const secretRefId = "44444444-4444-4444-8444-444444444444";
+
+      await db.insert(pluginConfig).values([
+        { pluginId: plugin.id, companyId: owner.id, configJson: { mode: "prod", githubPatSecretId: secretRefId } },
+        ...nonOwners.map((company) => ({
+          pluginId: plugin.id,
+          companyId: company.id,
+          // 0164 scrub shape: the secret-ref path is entirely ABSENT here,
+          // not present-with-null — the union rule must treat both the same.
+          configJson: { mode: "prod" },
+        })),
+      ]);
+
+      const services = buildHostServices(db, plugin.id, plugin.pluginKey, createEventBusStub());
+      const result = await services.config.get();
+      services.dispose();
+
+      expect(result).toEqual({ mode: "prod", githubPatSecretId: secretRefId });
+      expect(logger.error).not.toHaveBeenCalled();
+      const current = await getPlugin(db, plugin.id);
+      expect(current?.lastError ?? null).toBeNull();
+    });
+
+    it("Condition 1 (PLA-1957 applyToAllCompanies): an explicit-consent fan-out write from company X is visible on company Y's own row, and Y's own secret-ref field is untouched", async () => {
       const registry = pluginRegistryService(db);
       const plugin = await installPlugin(db, "paperclip.config-agreement-test-broadcast");
       const companyX = await createCompany(db, "AGX");
@@ -195,21 +297,20 @@ describeEmbeddedPostgres(
         },
       ]);
 
-      // Simulate the POST /api/plugins/:pluginId/config route: company X
-      // writes its own row (mode changes, plus X's own secret-ref), then the
-      // route broadcasts the non-secret-ref portion to every sibling row.
-      const secretRefPaths = new Set(["githubPatSecretId"]);
-      await db
-        .update(pluginConfig)
-        .set({ configJson: { mode: "staging", githubPatSecretId: "x-secret-v2" } })
-        .where(eq(pluginConfig.companyId, companyX.id));
-      const touched = await registry.broadcastNonSecretConfig(
-        plugin.id,
-        companyX.id,
-        { mode: "staging", githubPatSecretId: "x-secret-v2" },
-        secretRefPaths,
-      );
-      expect(touched).toEqual([companyY.id]);
+      // Simulate the POST /api/plugins/:pluginId/config route with explicit
+      // applyToAllCompanies consent: company X writes its own row (mode
+      // changes, plus X's own secret-ref), and the PLA-1957 fan-out applies
+      // the non-secret-ref portion to every sibling row atomically.
+      const schema = plugin.manifestJson?.instanceConfigSchema as Record<string, unknown>;
+      const result = await writePluginConfigWithAgreement(db, {
+        pluginId: plugin.id,
+        companyId: companyX.id,
+        configJson: { mode: "staging", githubPatSecretId: "x-secret-v2" },
+        schema,
+        options: { applyToAllCompanies: true },
+      });
+      expect(result.fannedOut).toBe(true);
+      expect(result.companiesWritten).toEqual([companyX.id, companyY.id]);
 
       // Company Y's own row now carries X's non-secret write...
       const yRow = await registry.getConfig(plugin.id, companyY.id);
@@ -219,7 +320,7 @@ describeEmbeddedPostgres(
 
       // The construction-time agreement gate now sees a genuine secret-ref
       // divergence (X's "x-secret-v2" vs Y's own value) — 2+ distinct values,
-      // so that field alone drops per A1, but the broadcast non-secret field
+      // so that field alone drops per A1, but the fanned-out non-secret field
       // ("mode") is what resolves, proving the write-side invariant repair.
       const services = buildHostServices(db, plugin.id, plugin.pluginKey, createEventBusStub());
       const resolved = await services.config.get();
