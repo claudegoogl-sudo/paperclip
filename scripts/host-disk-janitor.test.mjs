@@ -352,7 +352,7 @@ test("scanWorktreeCandidates covers both ~/work/* and ~/pla*-style roots without
   rmSync(home, { recursive: true, force: true });
 });
 
-test("scanWorktreeCandidates does not over-match 'platform-*' / 'playwright-*' names sharing the 'pla' prefix in $HOME (PLA-2012 regression)", () => {
+test("scanWorktreeCandidates does not over-match 'platform-*' / 'playwright-*' names sharing the 'pla' prefix in $HOME", () => {
   const home = tmpdir("janitor-home-glob-");
   mkdirSync(path.join(home, "pla2012"));
   mkdirSync(path.join(home, "platform-something"));
