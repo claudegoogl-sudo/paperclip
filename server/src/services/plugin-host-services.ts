@@ -71,6 +71,8 @@ import {
   collectSecretRefPaths,
   readConfigValueAtPath,
   writeConfigValueAtPath,
+  canonicalizeForComparison,
+  structurallyEqual,
 } from "./json-schema-secret-refs.js";
 import { normalizeIssueAttachmentMaxBytes } from "../attachment-types.js";
 import {
@@ -599,31 +601,6 @@ export function buildSecretsResolveService(
     await ensurePluginAvailableForCompany(params.companyId);
     return secretsHandler.resolve(params);
   };
-}
-
-// ---------------------------------------------------------------------------
-// PLA-1944: structural (canonical) equality for the no-dispatch `config.get`
-// agreement gate. A naive `JSON.stringify(a) === JSON.stringify(b)` compare
-// is key-order-sensitive — two objects that are semantically identical but
-// were written with keys in a different order would be reported as
-// "diverging" and deny a read that should agree. Sort object keys
-// recursively before stringifying so the comparison is order-independent.
-// ---------------------------------------------------------------------------
-
-function canonicalizeForComparison(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonicalizeForComparison);
-  if (value && typeof value === "object") {
-    const out: Record<string, unknown> = {};
-    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
-      out[key] = canonicalizeForComparison((value as Record<string, unknown>)[key]);
-    }
-    return out;
-  }
-  return value;
-}
-
-function structurallyEqual(a: unknown, b: unknown): boolean {
-  return JSON.stringify(canonicalizeForComparison(a)) === JSON.stringify(canonicalizeForComparison(b));
 }
 
 export function buildHostServices(

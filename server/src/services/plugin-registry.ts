@@ -380,6 +380,32 @@ export function pluginRegistryService(db: Db) {
     },
 
     /**
+     * PLA-1957: overwrite an EXISTING owning row's `config_json` verbatim,
+     * with no secret-ref binding sync.
+     *
+     * Only safe to call when the caller has already preserved that row's own
+     * secret-ref field values unchanged (the `applyToAllCompanies` fan-out
+     * does this via `restoreSecretRefPaths` before calling here) — the whole
+     * point is that this row's `company_secret_bindings` rows stay valid
+     * because nothing at a secret-ref path actually changed. Does not
+     * create a row; the fan-out only ever touches rows that already exist.
+     */
+    setConfigJsonForExistingRow: async (
+      pluginId: string,
+      companyId: string,
+      configJson: Record<string, unknown>,
+    ) => {
+      const rows = await db
+        .update(pluginConfig)
+        .set({ configJson, lastError: null, updatedAt: new Date() })
+        .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
+        .returning();
+
+      if (rows.length === 0) throw notFound("Plugin config not found");
+      return rows[0];
+    },
+
+    /**
      * Partially update a plugin's company-scoped configuration via shallow merge.
      * If no config row exists yet one is created with the supplied values.
      */
