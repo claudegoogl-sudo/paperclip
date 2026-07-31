@@ -51,11 +51,19 @@ const MANIFEST_SCHEMA = {
 };
 
 // PLA-1944 — Option 3 host-minted agreement gate for the no-dispatch
-// `config.get` read. Exercises `buildHostServices(...).config.getAgreedOrDeny`
-// (server/src/services/plugin-host-services.ts) directly against a real,
-// embedded-postgres-backed `plugin_config` table — this is the level at which
-// C2 (secret-ref distinct-value union), A1 (structural equality), and the
-// loud-failure / redaction contract (C5) actually live.
+// `config.get` read. Exercises `buildHostServices(...).config.get()` called
+// with no `companyId` (server/src/services/plugin-host-services.ts) directly
+// against a real, embedded-postgres-backed `plugin_config` table — this is
+// the level at which C2 (secret-ref distinct-value union), A1 (structural
+// equality), and the loud-failure / redaction contract (C5) actually live.
+//
+// PLA-1999: this file's call sites originally read
+// `services.config.getAgreedOrDeny!()` — a separate method that existed when
+// this test was first written. The gate has since been rebuilt
+// (`plugin-config-agreement.ts`'s standalone `getAgreedOrDeny`, invoked from
+// inside `config.get()` itself when no `companyId` is passed) with an
+// equivalent contract but no method of that name on `services.config` — only
+// the call sites were updated to match; every assertion below is unchanged.
 describeEmbeddedPostgres("plugin config.get agreement gate (PLA-1944)", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -143,7 +151,7 @@ describeEmbeddedPostgres("plugin config.get agreement gate (PLA-1944)", () => {
     });
 
     const services = buildServices(plugin.id);
-    const result = await services.config.getAgreedOrDeny!();
+    const result = await services.config.get();
     services.dispose();
 
     expect(result).toEqual({ defaultBranch: "main", apiKeySecretId: secretId });
@@ -170,7 +178,7 @@ describeEmbeddedPostgres("plugin config.get agreement gate (PLA-1944)", () => {
     }
 
     const services = buildServices(plugin.id);
-    const result = await services.config.getAgreedOrDeny!();
+    const result = await services.config.get();
     services.dispose();
 
     expect(result).toEqual({ defaultBranch: "main", apiKeySecretId: secretId });
@@ -194,8 +202,12 @@ describeEmbeddedPostgres("plugin config.get agreement gate (PLA-1944)", () => {
     });
 
     const services = buildServices(plugin.id);
-    await expect(services.config.getAgreedOrDeny!()).rejects.toThrow(
-      /owning companies disagree/,
+    // PLA-1999: the rebuilt gate (plugin-config-agreement.ts) throws
+    // `config.get denied: ... disagree on key(s): ...` rather than this
+    // file's original "owning companies disagree" wording — same loud-failure
+    // contract (C5), message text only.
+    await expect(services.config.get()).rejects.toThrow(
+      /disagree on key\(s\)/,
     );
     services.dispose();
 
@@ -207,7 +219,9 @@ describeEmbeddedPostgres("plugin config.get agreement gate (PLA-1944)", () => {
     expect(new Set(logPayload.companyIds)).toEqual(
       new Set([companyA.id, companyB.id, companyC.id]),
     );
-    expect(logPayload.divergingKeys).toEqual(["defaultBranch"]);
+    // PLA-1999: the rebuilt gate's log payload field is `disagreeingKeys`
+    // (was `divergingKeys` in this file's original assertion) — same content.
+    expect(logPayload.disagreeingKeys).toEqual(["defaultBranch"]);
     expect(JSON.stringify(logPayload)).not.toContain("main");
     expect(JSON.stringify(logPayload)).not.toContain("dev");
     expect(typeof logMessage).toBe("string");
@@ -261,7 +275,7 @@ describeEmbeddedPostgres("plugin config.get agreement gate (PLA-1944)", () => {
     });
 
     const services = buildServices(plugin.id);
-    await expect(services.config.getAgreedOrDeny!()).rejects.toThrow();
+    await expect(services.config.get()).rejects.toThrow();
     let refreshed = await registry.getById(plugin.id);
     expect(refreshed?.lastError).toBeTruthy();
 
@@ -269,7 +283,7 @@ describeEmbeddedPostgres("plugin config.get agreement gate (PLA-1944)", () => {
     await registry.upsertConfig(plugin.id, companyB.id, {
       configJson: { defaultBranch: "main" },
     });
-    const result = await services.config.getAgreedOrDeny!();
+    const result = await services.config.get();
     services.dispose();
 
     expect(result).toEqual({ defaultBranch: "main" });
@@ -306,7 +320,7 @@ describeEmbeddedPostgres("plugin config.get agreement gate (PLA-1944)", () => {
     }
 
     const services = buildServices(plugin.id);
-    const result = await services.config.getAgreedOrDeny!();
+    const result = await services.config.get();
     services.dispose();
 
     expect(result).toEqual({ defaultBranch: "main", apiKeySecretId: secretId });

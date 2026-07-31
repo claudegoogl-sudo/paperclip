@@ -88,7 +88,7 @@ describeEmbeddedPostgres(
       await tempDb?.cleanup();
     });
 
-    it("A3.2: listConfigsForPlugin returns every owning row — no truncation across a large row set", async () => {
+    it("A3.2: listConfigRows returns every owning row — no truncation across a large row set", async () => {
       const plugin = await installPlugin(db, "paperclip.config-agreement-test-a");
       const companyRows = await Promise.all(
         Array.from({ length: 12 }, (_, index) => createCompany(db, `AG${index}`)),

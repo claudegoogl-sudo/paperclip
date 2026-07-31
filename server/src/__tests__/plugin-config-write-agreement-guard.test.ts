@@ -76,9 +76,12 @@ const NESTED_SIBLING_SCHEMA = {
 // PLA-1957 — admin config write path guard/fan-out. Exercises
 // `writePluginConfigWithAgreement` (server/src/services/plugin-config-write.ts)
 // directly against a real, embedded-postgres-backed `plugin_config` table.
-// Never modifies plugin-config-agreement-gate.test.ts or getAgreedOrDeny —
-// this file only adds a *new* combined write+read test (AC5/e2e) that calls
-// both modules, reusing that file's harness pattern rather than its tests.
+// Does not change plugin-config-agreement-gate.test.ts's or getAgreedOrDeny's
+// behavior or assertions — this file only adds a *new* combined write+read
+// test (AC5/e2e) that calls both modules, reusing that file's harness pattern
+// rather than its tests. (Both files' `getAgreedOrDeny` call sites were
+// updated to `config.get()` for the rebuilt gate surface — see the PLA-1999
+// note atop plugin-config-agreement-gate.test.ts.)
 describeEmbeddedPostgres("plugin config write-path agreement guard (PLA-1957)", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -412,7 +415,7 @@ describeEmbeddedPostgres("plugin config write-path agreement guard (PLA-1957)", 
     });
 
     const services = buildGateServices(plugin.id);
-    const result = await services.config.getAgreedOrDeny!();
+    const result = await services.config.get();
     services.dispose();
 
     expect(result).toEqual({ defaultBranch: "release" });
@@ -555,6 +558,24 @@ describeEmbeddedPostgres("plugin config write-path agreement guard (PLA-1957)", 
     expect(result.fannedOut).toBe(true);
   });
 
+  // NB: this test passes with or without `exactPathDelete: true` on the
+  // `syncSecretRefsForTarget` call in plugin-config-write.ts — it is NOT
+  // load-bearing for that flag specifically, and is kept as defense-in-depth
+  // at this (route/write-guard) layer rather than removed. The reason: right
+  // after `syncSecretRefsForTarget` runs for the target company, this same
+  // transaction calls `registry.upsertConfig` for that SAME company, which
+  // unconditionally calls `secretService(db).syncPluginSecretBindings(...)` —
+  // that call re-derives and re-upserts a binding row for EVERY secret-ref
+  // path present in the row's full final `configJson` (including the
+  // untouched `auth.refreshSecretId`), healing any wrongly-scoped delete
+  // before this test ever reads `company_secret_bindings` back. The
+  // `exactPathDelete` regression this test's comment describes IS real for
+  // an intermediate DB state, just not observable through this call chain.
+  // The genuinely load-bearing regression test for `exactPathDelete` itself
+  // lives in secrets-service.test.ts ("PLA-1969: exactPathDelete scopes a
+  // changed-subset resync..."), which asserts directly on
+  // `syncSecretRefsForTarget`'s persisted state with no `upsertConfig` call
+  // afterward to heal it.
   it("PLA-1969: applyToAllCompanies fan-out does not orphan an unchanged sibling secret-ref binding under the same parent key", async () => {
     const plugin = await installPlugin(NESTED_SIBLING_SCHEMA);
     const registry = pluginRegistryService(db);
@@ -650,35 +671,89 @@ describeEmbeddedPostgres("plugin config write-path agreement guard (PLA-1957)", 
     await registry.upsertConfig(plugin.id, companyB.id, { configJson: { defaultBranch: "main" } });
     await registry.upsertConfig(plugin.id, companyC.id, { configJson: { defaultBranch: "old" } });
 
-    // TX1: company A reconciles everyone onto "dev" via applyToAllCompanies
-    // (bypasses the guard by design, fans out unconditionally to A, B, C).
-    // TX2 (concurrent): company B independently proposes "rogue" via a
-    // plain default write. Without the `SELECT ... FOR UPDATE` lock, TX2
-    // could read the pre-fan-out snapshot (A/B="main", C="old" — disagree,
-    // guard skipped) and successfully commit B="rogue" *after* TX1 already
-    // reconciled B to "dev" as part of its fan-out, permanently stranding B
-    // on "rogue" while A and C settle on "dev". With the lock, TX2's read
-    // of the owning rows can only happen strictly before or strictly after
-    // TX1 commits — in both orderings, B ends up back at "dev" (either TX2
-    // is rejected outright by the guard on the post-fan-out agreement, or
-    // TX2's "rogue" commits first and is then overwritten by TX1's
-    // fan-out, which re-reads and re-syncs every owning row including B).
-    await Promise.allSettled([
-      writePluginConfigWithAgreement(db, {
+    // PLA-1999: this test previously raced TX1/TX2 with a bare
+    // `Promise.allSettled` and no control over interleaving — real
+    // scheduling only produced the straddle window it exists to catch on
+    // ~29% of runs (4/14 trials observed with `forUpdate` reverted),
+    // because most runs let TX2's read land either cleanly before TX1
+    // starts or cleanly after TX1 commits, where both orderings are safe
+    // with or without the lock. A test that only sometimes exercises the
+    // regression it names is not a regression test.
+    //
+    // Fixed by injecting a two-step handshake around `listConfigRows` (via
+    // the same `pluginRegistryModule` spy pattern used above) that forces
+    // TX2's underlying `SELECT` to be *issued* while TX1 is still holding
+    // its transaction open, on every run:
+    //   1. TX1's `listConfigRows` call (the fan-out's read) resolves, then
+    //      blocks on `tx1Ready` before returning — holding TX1's
+    //      transaction open (and, with a real `FOR UPDATE`, its row lock)
+    //      for as long as we want.
+    //   2. Only once TX1 has reached that point do we invoke TX2's write.
+    //      TX2's `listConfigRows` call signals `tx2Issued` and THEN calls
+    //      through to the real implementation — so the real `SELECT` is
+    //      guaranteed to be issued before we release TX1.
+    //   3. We await `tx2Issued`, then release `tx1Ready`, letting TX1
+    //      finish (commit) while TX2's real query is in flight.
+    // With `forUpdate: true` genuinely locking the rows, TX2's `SELECT ...
+    // FOR UPDATE` cannot return until TX1's commit releases the lock, so
+    // TX2 always reads the post-fan-out ("dev"-agreeing) snapshot. Without
+    // the lock, TX2's `SELECT` — already in flight against the
+    // pre-commit snapshot — always returns the stale ("main"/"old"
+    // disagreeing) rows instead, reproducing the strand deterministically
+    // on every run rather than occasionally.
+    let listConfigRowsCallCount = 0;
+    let tx1ReadyResolve!: () => void;
+    let tx2IssuedResolve!: () => void;
+    const tx1Ready = new Promise<void>((resolve) => {
+      tx1ReadyResolve = resolve;
+    });
+    const tx2Issued = new Promise<void>((resolve) => {
+      tx2IssuedResolve = resolve;
+    });
+    const realPluginRegistryService = pluginRegistryModule.pluginRegistryService;
+    const spy = vi
+      .spyOn(pluginRegistryModule, "pluginRegistryService")
+      .mockImplementation((txDb) => {
+        const real = realPluginRegistryService(txDb);
+        return {
+          ...real,
+          listConfigRows: async (...args: Parameters<typeof real.listConfigRows>) => {
+            listConfigRowsCallCount += 1;
+            if (listConfigRowsCallCount === 1) {
+              const rows = await real.listConfigRows(...args);
+              await tx1Ready;
+              return rows;
+            }
+            tx2IssuedResolve();
+            return real.listConfigRows(...args);
+          },
+        };
+      });
+
+    try {
+      const tx1 = writePluginConfigWithAgreement(db, {
         pluginId: plugin.id,
         companyId: companyA.id,
         configJson: { defaultBranch: "dev" },
         schema: MANIFEST_SCHEMA,
         options: { applyToAllCompanies: true },
-      }),
-      writePluginConfigWithAgreement(db, {
+      });
+      // Don't start TX2 until TX1's read (call #1) has actually happened,
+      // so the two `listConfigRows` calls are unambiguously ordered.
+      await vi.waitFor(() => expect(listConfigRowsCallCount).toBeGreaterThanOrEqual(1));
+      const tx2 = writePluginConfigWithAgreement(db, {
         pluginId: plugin.id,
         companyId: companyB.id,
         configJson: { defaultBranch: "rogue" },
         schema: MANIFEST_SCHEMA,
         options: {},
-      }),
-    ]);
+      });
+      await tx2Issued;
+      tx1ReadyResolve();
+      await Promise.allSettled([tx1, tx2]);
+    } finally {
+      spy.mockRestore();
+    }
 
     const rowA = await registry.getConfig(plugin.id, companyA.id);
     const rowB = await registry.getConfig(plugin.id, companyB.id);

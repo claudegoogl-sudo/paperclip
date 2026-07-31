@@ -1321,7 +1321,7 @@ export function buildHostServices(
         return getAgreedOrDeny({
           pluginId,
           pluginKey,
-          listConfigRows: () => registry.listConfigsForPlugin(pluginId),
+          listConfigRows: () => registry.listConfigRows(pluginId),
           secretRefPaths,
           logger,
           onDeny: async ({ disagreeingKeys }) => {
