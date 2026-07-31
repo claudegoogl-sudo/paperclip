@@ -2,25 +2,19 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import {
-  activityLog,
   agents,
   agentWakeupRequests,
   agentRuntimeState,
-  companySkills,
   companies,
   createDb,
-  documentRevisions,
-  documents,
-  heartbeatRunEvents,
   heartbeatRuns,
-  issueComments,
-  issueDocuments,
   issues,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import { heartbeatService, resolveHeartbeatSchedulingSuppression } from "../services/heartbeat.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -41,20 +35,15 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
     db = createDb(tempDb.connectionString);
   }, 20_000);
 
+  // The "still creates live-plane assignment runs" case below deliberately lets
+  // heartbeatService dispatch a real run, which keeps writing agent_runtime_state
+  // (and friends) in the background after the test function returns. An ordered
+  // per-table DELETE chain races that write burst and intermittently trips an FK
+  // violation on whichever table gets deleted out from under a still-in-flight
+  // insert (PLA-1975 / PLA-1978) — see resetEmbeddedPostgresTestDatabase for why
+  // an atomic TRUNCATE ... CASCADE doesn't have that race.
   afterEach(async () => {
-    await db.delete(heartbeatRunEvents);
-    await db.delete(activityLog);
-    await db.delete(issueComments);
-    await db.delete(issueDocuments);
-    await db.delete(documentRevisions);
-    await db.delete(documents);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(issues);
-    await db.delete(agentRuntimeState);
-    await db.delete(companySkills);
-    await db.delete(agents);
-    await db.delete(companies);
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {
