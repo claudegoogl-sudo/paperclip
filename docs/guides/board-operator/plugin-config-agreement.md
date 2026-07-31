@@ -33,7 +33,17 @@ The two flags are mutually exclusive (`400` if both are set).
 
 ## Cross-tenant secret-ref handling
 
-See the PLA-1843 findings (tracked in the issue, not yet a merged doc as of this writing) for the history of how a naive fan-out can over-share or reject a company's own unchanged secret-ref value. The `applyToAllCompanies` fan-out here only ever touches the non-secret-ref portion of the config; each row's existing secret-ref values are read back and re-applied verbatim, so a foreign secret-ref is never written to a company that doesn't own it.
+The `0164` migration's fan-out no longer copies a manifest-annotated `secret-ref` value onto a company that does not own the referenced secret, so both the migration path and the `applyToAllCompanies` write path hold the same property. The `applyToAllCompanies` fan-out here only ever touches the non-secret-ref portion of the config; each row's existing secret-ref values are read back and re-applied verbatim, so a foreign secret-ref is never written to a company that doesn't own it.
 
 The executable reference for this flow is
 `server/src/__tests__/plugin-config-write-agreement-guard.test.ts`, which exercises the guard (single-row and already-diverged non-firing, held-agreement denial), the `applyToAllCompanies` fan-out (distinct and identical secret-ref values, atomicity under a forced mid-fan-out failure), `allowDivergence`, and the combined write-then-read (`getAgreedOrDeny`) resolution against an embedded Postgres instance.
+
+## Companies created after the `0164` migration
+
+`0164`'s fan-out only covers companies that existed when the migration ran. Nothing provisions a `plugin_config` row when a company is created afterward: company creation (`server/src/services/companies.ts`) never touches plugin config, and the only two non-migration code paths that insert a `plugin_config` row are `upsertConfig` and `patchConfig` (`server/src/services/plugin-registry.ts`), both reached solely through the `assertInstanceAdmin`-gated `POST /api/plugins/:pluginId/config` route.
+
+For such a company, a company-scoped config read returns `{}` — unconfigured, not unauthenticated.
+
+The no-dispatch read (`getAgreedOrDeny`) is **not** affected by this gap: it compares only the `plugin_config` rows that already exist. A company with no row is simply not in that set, so a newly created company cannot introduce divergence or trip the deny.
+
+The sharp edge is provisioning, not reading: the first `POST /api/plugins/:pluginId/config` for the new company creates its row, and if the submitted config disagrees with the agreement the existing rows already hold, the write-path guard above returns the same `409`. Provision the new company by writing the already-agreed non-secret-ref config, with that company's own secret-ref values — not a hand-written config — and resolve any `409` the same way described in "The write-path guard" above.
