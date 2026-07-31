@@ -2,26 +2,20 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import {
-  activityLog,
   agents,
   agentWakeupRequests,
   agentRuntimeState,
-  companySkills,
   companies,
   createDb,
-  documentRevisions,
-  documents,
-  heartbeatRunEvents,
   heartbeatRuns,
   instanceSettings,
-  issueComments,
-  issueDocuments,
   issues,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import { heartbeatService, resolveHeartbeatSchedulingSuppression } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 
@@ -38,46 +32,24 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
-  function isHeartbeatRunDependentFkError(error: unknown) {
-    const message = error instanceof Error ? `${error.message} ${String(error.cause ?? "")}` : String(error);
-    return (
-      message.includes("heartbeat_run_events_run_id_heartbeat_runs_id_fk") ||
-      message.includes("activity_log_run_id_heartbeat_runs_id_fk")
-    );
-  }
-
-  async function deleteHeartbeatRunsWithDependents() {
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await db.delete(heartbeatRunEvents);
-      await db.delete(activityLog);
-      try {
-        await db.delete(heartbeatRuns);
-        return;
-      } catch (error) {
-        if (!isHeartbeatRunDependentFkError(error) || attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 25));
-      }
-    }
-  }
-
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("heartbeat-worktree-suppression-");
     db = createDb(tempDb.connectionString);
   }, 20_000);
 
+  // The "still creates live-plane assignment runs" case below deliberately lets
+  // heartbeatService dispatch a real run, which keeps writing agent_runtime_state
+  // (and friends) in the background after the test function returns. An ordered
+  // per-table DELETE chain races that write burst and intermittently trips an FK
+  // violation on whichever table gets deleted out from under a still-in-flight
+  // insert — this is the same race reproduced in another suite; see resetEmbeddedPostgresTestDatabase for why
+  // an atomic TRUNCATE ... CASCADE doesn't have that race.
   afterEach(async () => {
-    await db.delete(issueComments);
-    await db.delete(issueDocuments);
-    await db.delete(documentRevisions);
-    await db.delete(documents);
-    await db.delete(activityLog);
-    await deleteHeartbeatRunsWithDependents();
-    await db.delete(agentWakeupRequests);
-    await db.delete(issues);
-    await db.delete(agentRuntimeState);
-    await db.delete(companySkills);
-    await db.delete(agents);
-    await db.delete(companies);
+    await resetEmbeddedPostgresTestDatabase(db);
+    // instance_settings is a global singleton, not FK-chained to companies, so the
+    // TRUNCATE ... CASCADE above doesn't touch it; the worktree-activation tests
+    // below need a clean row each run since activation only latches on a
+    // false->true transition (see applyExperimentalSettingsPatch).
     await db.delete(instanceSettings);
   });
 
