@@ -1491,6 +1491,14 @@ registry.registerPath({
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
+registry.registerPath({
+  method: "get",
+  path: "/api/instance/usage-limit-park",
+  tags: ["agents"],
+  summary: "Get instance-wide usage-limit park state",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
 // ─── Adapters ────────────────────────────────────────────────────────────────
 
 registry.registerPath({
