@@ -4,13 +4,6 @@ on:
   pull_request:
     branches:
       - master
-      # Stacked PRs land on long-lived upstream-sync integration branches
-      # (see .github/workflows/pr.yml's own head_ref exemption below, and the
-      # upstream-sync routine). `branches:` filters on the PR's *base*, so
-      # without this entry those PRs get zero pr.yml runs, not a skipped
-      # check — the largest, riskiest merges (sync conflict resolution)
-      # would ship with no CI signal at all.
-      - 'sync/upstream-**'
 
 concurrency:
   group: pr-${{ github.event.pull_request.number }}

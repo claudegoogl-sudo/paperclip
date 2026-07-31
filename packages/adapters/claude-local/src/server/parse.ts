@@ -215,6 +215,19 @@ export function isClaudeModelNotFoundError(input: {
   return messages.some((message) => CLAUDE_MODEL_NOT_FOUND_RE.test(message));
 }
 
+/**
+ * The CLI reported that it finished its work cleanly. This is deliberately
+ * strict: it requires both the positive `subtype=success` marker and
+ * `is_error=false`, so an absent/unknown subtype never reads as success.
+ */
+export function isClaudeCleanCompletionResult(
+  parsed: Record<string, unknown> | null | undefined,
+): boolean {
+  if (!parsed) return false;
+  if (parsed.is_error !== false) return false;
+  return asString(parsed.subtype, "").trim().toLowerCase() === "success";
+}
+
 export function isClaudeMaxTurnsResult(parsed: Record<string, unknown> | null | undefined): boolean {
   if (!parsed) return false;
 

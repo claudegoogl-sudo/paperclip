@@ -252,24 +252,6 @@ export function pluginRegistryService(db: Db) {
         .then((rows) => rows[0] ?? null);
     },
 
-    /**
-     * Update ONLY the plugin-level `lastError` marker (and `updatedAt`) —
-     * never `status`. `updateStatus` above does a read-modify-write that sets
-     * `status` unconditionally, so using it for a signal that has nothing to
-     * do with lifecycle state (e.g. the PLA-1944 no-dispatch `config.get`
-     * agreement-gate divergence marker) can race a concurrent lifecycle
-     * transition and clobber it. This helper touches only `last_error`, which
-     * removes that race entirely rather than merely narrowing it.
-     */
-    setPluginLastError: async (id: string, lastError: string | null) => {
-      return db
-        .update(plugins)
-        .set({ lastError, updatedAt: new Date() })
-        .where(eq(plugins.id, id))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-    },
-
     // ----- Uninstall / Remove --------------------------------------------
 
     /**
@@ -305,20 +287,6 @@ export function pluginRegistryService(db: Db) {
     },
 
     // ----- Config ---------------------------------------------------------
-
-    /**
-     * Return EVERY owning `plugin_config` row for a plugin, across all
-     * companies. No LIMIT, no pagination.
-     *
-     * PLA-1944: the no-dispatch `config.get` agreement gate resolves a
-     * construction-time read (no dispatch pins a tenant) by checking whether
-     * every owning row agrees. Silent truncation here would turn "all rows
-     * agree" into a false positive that masks real divergence — the
-     * security-relevant invariant the whole gate depends on — so this
-     * accessor is deliberately unpaginated.
-     */
-    listConfigRows: (pluginId: string) =>
-      db.select().from(pluginConfig).where(eq(pluginConfig.pluginId, pluginId)),
 
     /** Retrieve a plugin's company-scoped configuration. */
     getConfig: (pluginId: string, companyId: string) =>
@@ -377,32 +345,6 @@ export function pluginRegistryService(db: Db) {
       });
 
       return row;
-    },
-
-    /**
-     * PLA-1957: overwrite an EXISTING owning row's `config_json` verbatim,
-     * with no secret-ref binding sync.
-     *
-     * Only safe to call when the caller has already preserved that row's own
-     * secret-ref field values unchanged (the `applyToAllCompanies` fan-out
-     * does this via `restoreSecretRefPaths` before calling here) — the whole
-     * point is that this row's `company_secret_bindings` rows stay valid
-     * because nothing at a secret-ref path actually changed. Does not
-     * create a row; the fan-out only ever touches rows that already exist.
-     */
-    setConfigJsonForExistingRow: async (
-      pluginId: string,
-      companyId: string,
-      configJson: Record<string, unknown>,
-    ) => {
-      const rows = await db
-        .update(pluginConfig)
-        .set({ configJson, lastError: null, updatedAt: new Date() })
-        .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
-        .returning();
-
-      if (rows.length === 0) throw notFound("Plugin config not found");
-      return rows[0];
     },
 
     /**

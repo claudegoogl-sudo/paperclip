@@ -38,6 +38,30 @@ describe("run liveness classifier", () => {
     expect(classification.actionability).toBe("unknown");
   });
 
+  // A run that emitted a clean result but exited non-zero at teardown did its
+  // work, so liveness must judge it on its output, not on the exit code.
+  it("judges a succeeded_dirty run on its output rather than failing it outright", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      runStatus: "succeeded_dirty",
+      errorCode: "dirty_exit",
+      issue: { ...baseInput.issue, status: "done" },
+    });
+
+    expect(classification.livenessState).toBe("completed");
+  });
+
+  it("still fails a genuinely failed run", () => {
+    const classification = classifyRunLiveness({
+      ...baseInput,
+      runStatus: "failed",
+      errorCode: "adapter_failed",
+      issue: { ...baseInput.issue, status: "done" },
+    });
+
+    expect(classification.livenessState).toBe("failed");
+  });
+
   it("treats issue comments, documents, products, and actions as progress", () => {
     const latestEvidenceAt = new Date("2026-04-18T12:00:00Z");
     const classification = classifyRunLiveness({

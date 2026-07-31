@@ -1278,6 +1278,60 @@ const presets = createPluginBundlerPresets({ uiEntry: "src/ui/index.tsx" });
 // presets.rollup.worker / presets.rollup.manifest / presets.rollup.ui
 ```
 
+### Sourcemaps default to `external`
+
+`sourcemap` defaults to `"external"` (rollup's equivalent `"hidden"`). The `.map`
+file is still written next to the bundle, but the `//# sourceMappingURL=` footer
+is omitted.
+
+This is a safe-by-omission default. An esbuild sourcemap embeds `sourcesContent`
+— the complete original TypeScript of every module in the bundle — so a plugin
+tarball that ships `dist/**/*.map` publishes its full source. Dropping the footer
+means a published bundle does not advertise a map, and pairing it with the `files`
+negation below means the map never ships at all.
+
+**Debuggability tradeoff:** local debugging is unaffected. The map exists on disk
+after every build, so `node --enable-source-maps` and editor debuggers that load
+maps by convention still resolve original sources. What you lose is automatic
+footer-driven map pickup in tools that only follow `sourceMappingURL`, and stack
+traces from an *installed* plugin will point at bundled output rather than TS.
+
+Opt back in explicitly when you want it — the default is overridable, not enforced:
+
+```ts
+// inline maps for a private build you never publish
+const presets = createPluginBundlerPresets({ uiEntry: "src/ui/index.tsx", sourcemap: "inline" });
+// or the old behaviour
+const presets = createPluginBundlerPresets({ uiEntry: "src/ui/index.tsx", sourcemap: true });
+// or no maps at all
+const presets = createPluginBundlerPresets({ uiEntry: "src/ui/index.tsx", sourcemap: false });
+```
+
+### Keep sourcemaps out of the published tarball
+
+The bundler default is one layer. Add the `files` negation in your plugin's
+`package.json` so `npm pack` cannot pick maps up even if a build writes them:
+
+```jsonc
+{
+  "files": ["dist/", "!dist/**/*.map", "README.md"]
+}
+```
+
+`RECOMMENDED_PLUGIN_PACKAGE_FILES` exports exactly that list, and
+`PLUGIN_SOURCEMAP_FILES_NEGATION` exports the `"!dist/**/*.map"` entry alone, so
+scaffolding and release checks can assert against the SDK rather than re-deriving
+the glob per repo. `create-paperclip-plugin` writes this `files` list into every
+new plugin.
+
+```ts
+import {
+  DEFAULT_PLUGIN_SOURCEMAP,          // "external"
+  PLUGIN_SOURCEMAP_FILES_NEGATION,   // "!dist/**/*.map"
+  RECOMMENDED_PLUGIN_PACKAGE_FILES,  // ["dist/", "!dist/**/*.map", "README.md"]
+} from "@paperclipai/plugin-sdk/bundlers";
+```
+
 ## Local dev server (hot-reload events)
 
 ```bash

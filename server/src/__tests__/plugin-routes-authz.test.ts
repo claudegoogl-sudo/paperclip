@@ -6,8 +6,6 @@ const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
   getByKey: vi.fn(),
   upsertConfig: vi.fn(),
-  listConfigRows: vi.fn(),
-  setConfigJsonForExistingRow: vi.fn(),
   getCompanySettings: vi.fn(),
   upsertCompanySettings: vi.fn(),
   getCompanyConfigOverride: vi.fn(),
@@ -86,7 +84,7 @@ async function createApp(
     next();
   });
   app.use("/api", pluginRoutes(
-    (routeOverrides.db ?? { transaction: (cb: (tx: unknown) => unknown) => cb({}) }) as never,
+    (routeOverrides.db ?? {}) as never,
     loader as never,
     routeOverrides.jobDeps as never,
     undefined,
@@ -330,7 +328,6 @@ describe.sequential("plugin install and upgrade authz", () => {
     };
     mockSecretService.getById.mockResolvedValue({ id: secretId, companyId: companyA, status: "active" });
     mockSecretService.syncSecretRefsForTarget.mockResolvedValue([]);
-    mockRegistry.listConfigRows.mockResolvedValue([]);
     mockRegistry.upsertConfig.mockResolvedValue({ id: "config-1", pluginId, companyId: companyA, configJson });
 
     const { app } = await createApp({
@@ -363,7 +360,6 @@ describe.sequential("plugin install and upgrade authz", () => {
     readyPlugin();
     mockSecretService.getById.mockResolvedValue({ id: secretId, companyId: companyB, status: "active" });
     mockSecretService.syncSecretRefsForTarget.mockResolvedValue([]);
-    mockRegistry.listConfigRows.mockResolvedValue([]);
 
     const { app } = await createApp({
       type: "board",

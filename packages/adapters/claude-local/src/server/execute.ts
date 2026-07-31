@@ -60,6 +60,7 @@ import {
   describeClaudeFailure,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
+  isClaudeCleanCompletionResult,
   isClaudeMaxTurnsResult,
   isClaudeProviderQuotaError,
   isClaudeRefusalResult,
@@ -1104,9 +1105,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // successful run to Paperclip and the heartbeat stalls silently. See RY-604.
     const claudeRefusal = isClaudeRefusalResult(parsed);
     const parsedIsError = asBoolean(parsed.is_error, false);
-    const parsedSubtype = asString(parsed.subtype, "").trim().toLowerCase();
-    const parsedSucceeded = parsedSubtype === "success" && !parsedIsError;
-    const failed = !parsedSucceeded && ((proc.exitCode ?? 0) !== 0 || parsedIsError);
+    // The CLI can exit non-zero during teardown *after* it has already emitted a
+    // clean result (subtype=success, is_error=false). The work landed, so this is
+    // a success with a dirty exit, not a run failure. Every other non-zero exit
+    // — and any is_error=true result — still fails.
+    const completedDirty =
+      !parsedIsError &&
+      (proc.exitCode ?? 0) !== 0 &&
+      isClaudeCleanCompletionResult(parsed) &&
+      !loginMeta.requiresLogin &&
+      !clearSessionForMaxTurns &&
+      !poisonedPreviousMessageId &&
+      !claudeRefusal;
+    const failed = parsedIsError || ((proc.exitCode ?? 0) !== 0 && !completedDirty);
     // Validate-before-persist guard: never persist a sessionId whose transcript
     // is known-poisoned. The Claude CLI keeps an on-disk JSONL keyed by the
     // session id; if the last entry contains a non-`msg_`-prefixed
@@ -1132,7 +1143,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
       } as Record<string, unknown>)
       : null;
-    const errorMessage = failed
+    const errorMessage = completedDirty
+      ? `Claude reported a successful result but the process exited with code ${proc.exitCode ?? -1}${
+          proc.signal ? ` (signal ${proc.signal})` : ""
+        }`
+      : failed
       ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
       : null;
     const providerQuota =
@@ -1146,6 +1161,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         stderr: proc.stderr,
         errorMessage,
       });
+    // Classify *why* teardown went wrong so the follow-up investigation can group
+    // these, but keep it out of `errorFamily`/`retryNotBefore`: the work is done,
+    // so this run must never feed the transient-retry machinery.
+    const dirtyTeardownCode = completedDirty
+      ? isClaudeTransientUpstreamError({
+          parsed,
+          stdout: proc.stdout,
+          stderr: proc.stderr,
+          errorMessage,
+        })
+        ? "claude_transient_upstream"
+        : proc.signal
+        ? `signal_${proc.signal}`
+        : `exit_${proc.exitCode ?? -1}`
+      : null;
     const transientUpstream =
       failed &&
       !loginMeta.requiresLogin &&
@@ -1174,6 +1204,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       (transientUpstream || providerQuota) && isClaudePreTurnRateLimitResult(parsed);
     const resolvedErrorCode = loginMeta.requiresLogin
       ? "claude_auth_required"
+      : completedDirty
+      ? "dirty_exit"
       : failed && isClaudeModelNotFoundError({
         parsed,
         stdout: proc.stdout,
@@ -1201,6 +1233,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : null;
     const mergedResultJson: Record<string, unknown> = {
       ...parsed,
+      ...(completedDirty
+        ? {
+            dirtyExit: {
+              exitCode: proc.exitCode ?? null,
+              signal: proc.signal ?? null,
+              teardownErrorCode: dirtyTeardownCode,
+            },
+          }
+        : {}),
       ...(failed && clearSessionForMaxTurns ? { stopReason: "max_turns_exhausted" } : {}),
       ...(failed && poisonedPreviousMessageId ? { stopReason: "claude_poisoned_previous_message_id" } : {}),
       ...(claudeRefusal ? { stopReason: "refusal", errorFamily: "model_refusal" } : {}),
@@ -1218,6 +1259,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       timedOut: false,
       errorMessage,
       errorCode: resolvedErrorCode,
+      completedDirty,
       errorFamily,
       retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
       errorMeta,

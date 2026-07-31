@@ -1,3 +1,4 @@
+import { isSuccessfulHeartbeatRunStatus } from "@paperclipai/shared";
 import type { HeartbeatRunStatus, IssueStatus, RunLivenessState } from "@paperclipai/shared";
 
 export type RunLivenessActionability =
@@ -326,7 +327,7 @@ export function classifyRunLiveness(input: RunLivenessClassificationInput): RunL
     return output("needs_followup", input.errorCode ? `Run interrupted (${input.errorCode})` : "Run interrupted");
   }
 
-  if (input.runStatus !== "succeeded") {
+  if (!isSuccessfulHeartbeatRunStatus(input.runStatus)) {
     if (hasUnmanagedBackgroundTaskEvidence(input.resultJson)) {
       return output("failed", UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON);
     }

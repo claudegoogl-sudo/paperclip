@@ -67,6 +67,7 @@ function getRunStatusMessage(status: string, agentName: string, elapsed: number)
     case "running":
       return getCyclingMessage(RUNNING_MESSAGES, elapsed, agentName);
     case "succeeded":
+    case "succeeded_dirty":
       return `${agentName} finished`;
     case "failed":
       return `${agentName} encountered an error`;

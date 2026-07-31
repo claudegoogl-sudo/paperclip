@@ -132,4 +132,30 @@ describe("ActivityCharts", () => {
     const dayCell = container.querySelector("[title*='recovered: 4']");
     expect(dayCell).not.toBeNull();
   });
+
+  it("counts a run that completed but exited dirty as succeeded, not other", () => {
+    render(
+      <SuccessRateChart
+        runs={[
+          createRun({ id: "run-clean", status: "succeeded" }),
+          createRun({ id: "run-dirty", status: "succeeded_dirty" }),
+        ]}
+      />,
+    );
+
+    expect(container.querySelector("[title='2026-04-20: 100% (2/2)']")).not.toBeNull();
+  });
+
+  it("keeps a dirty-exit run out of the failed bucket", () => {
+    render(
+      <SuccessRateChart
+        runs={[
+          createRun({ id: "run-dirty", status: "succeeded_dirty" }),
+          createRun({ id: "run-failed", status: "failed" }),
+        ]}
+      />,
+    );
+
+    expect(container.querySelector("[title='2026-04-20: 50% (1/2)']")).not.toBeNull();
+  });
 });

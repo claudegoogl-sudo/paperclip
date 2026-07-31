@@ -226,6 +226,7 @@ function runTimestamp(run: LinkedRunItem) {
 function runStatusClass(status: string) {
   switch (status) {
     case "succeeded":
+    case "succeeded_dirty":
       return "text-green-700 dark:text-green-300";
     case "failed":
     case "error":
