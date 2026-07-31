@@ -4428,7 +4428,7 @@ export function issueRoutes(
         svc.listBlockerAttention(issue.companyId, [issue]).then((map) => map.get(issue.id) ?? null),
         svc.listProductivityReviews(issue.companyId, [issue.id]).then((map) => map.get(issue.id) ?? null),
         svc.getCurrentScheduledRetry(issue.id),
-        svc.listAttachments(issue.id),
+        svc.listAttachments(issue.id, issue.companyId),
         documentsSvc.getIssueDocumentByKey(issue.id, ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY),
         currentExecutionWorkspacePromise,
         recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id),
@@ -8112,7 +8112,7 @@ export function issueRoutes(
     }
     assertCompanyAccess(req, existing.companyId);
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
-    const attachments = await svc.listAttachments(id);
+    const attachments = await svc.listAttachments(id, existing.companyId);
 
     const issue = await svc.remove(id);
     if (!issue) {
@@ -9744,7 +9744,7 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, issue.companyId);
-    const attachments = await svc.listAttachments(issueId);
+    const attachments = await svc.listAttachments(issueId, issue.companyId);
     res.json(attachments.map(withContentPath));
   });
 

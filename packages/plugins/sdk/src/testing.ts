@@ -39,6 +39,7 @@ import type {
   PluginLocalFolderEntry,
   PluginLocalFolderStatus,
   PluginAccessMember,
+  PluginIssueAttachment,
   PrincipalPermissionGrant,
   PermissionKey,
   PrincipalType,
@@ -108,6 +109,7 @@ export interface TestHarness {
     projects?: Project[];
     issues?: Issue[];
     issueComments?: IssueComment[];
+    issueAttachments?: PluginIssueAttachment[];
     agents?: Agent[];
     goals?: Goal[];
     projectWorkspaces?: PluginWorkspace[];
@@ -491,6 +493,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
   const issues = new Map<string, Issue>();
   const blockedByIssueIds = new Map<string, string[]>();
   const issueComments = new Map<string, IssueComment[]>();
+  const issueAttachments = new Map<string, PluginIssueAttachment[]>();
   const issueInteractions = new Map<string, IssueThreadInteraction[]>();
   const issueDocuments = new Map<string, IssueDocument>();
   const agents = new Map<string, Agent>();
@@ -1699,6 +1702,11 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
           comment.deletedAt ? { ...comment, body: "", presentation: null, metadata: null } : comment
         );
       },
+      async listAttachments(issueId, companyId) {
+        requireCapability(manifest, capabilitySet, "issue.attachments.read");
+        if (!isInCompany(issues.get(issueId), companyId)) return [];
+        return issueAttachments.get(issueId) ?? [];
+      },
       async createComment(issueId, body, companyId, options) {
         requireCapability(manifest, capabilitySet, "issue.comments.create");
         let parentIssue = issues.get(issueId);
@@ -2457,6 +2465,11 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         const list = issueComments.get(row.issueId) ?? [];
         list.push(row);
         issueComments.set(row.issueId, list);
+      }
+      for (const row of input.issueAttachments ?? []) {
+        const list = issueAttachments.get(row.issueId) ?? [];
+        list.push(row);
+        issueAttachments.set(row.issueId, list);
       }
       for (const row of input.agents ?? []) agents.set(row.id, row);
       for (const row of input.goals ?? []) goals.set(row.id, row);
