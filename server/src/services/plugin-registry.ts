@@ -316,9 +316,20 @@ export function pluginRegistryService(db: Db) {
      * agree" into a false positive that masks real divergence — the
      * security-relevant invariant the whole gate depends on — so this
      * accessor is deliberately unpaginated.
+     *
+     * `forUpdate` (PLA-1969): row-lock the returned rows for the lifetime
+     * of the caller's transaction. Only pass this from a write path already
+     * inside `db.transaction` — `writePluginConfigWithAgreement` uses it so
+     * two concurrent admin writes to the same plugin serialize on this read
+     * instead of each deciding guard/fan-out off a stale pre-write snapshot.
+     * Never pass it from `getAgreedOrDeny` (the no-dispatch read gate): that
+     * path is READS ONLY by construction, runs outside a write transaction,
+     * and backs a live poll loop — locking it would only add contention.
      */
-    listConfigRows: (pluginId: string) =>
-      db.select().from(pluginConfig).where(eq(pluginConfig.pluginId, pluginId)),
+    listConfigRows: (pluginId: string, options?: { forUpdate?: boolean }) => {
+      const query = db.select().from(pluginConfig).where(eq(pluginConfig.pluginId, pluginId));
+      return options?.forUpdate ? query.for("update") : query;
+    },
 
     /** Retrieve a plugin's company-scoped configuration. */
     getConfig: (pluginId: string, companyId: string) =>

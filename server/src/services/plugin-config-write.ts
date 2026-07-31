@@ -142,7 +142,14 @@ export async function writePluginConfigWithAgreement(
   return db.transaction(async (tx) => {
     const txDb = tx as unknown as Db;
     const registry = pluginRegistryService(txDb);
-    const rows = await registry.listConfigRows(params.pluginId);
+    // PLA-1969: SELECT ... FOR UPDATE — without this, two concurrent admin
+    // writes to the same plugin's config each read at READ COMMITTED with
+    // no lock, so both can decide guard/fan-out off the same stale
+    // "currently agree" snapshot and both proceed, reintroducing the exact
+    // divergence this guard exists to prevent. Locking here serializes
+    // concurrent writers on this read; the second writer's read (and every
+    // decision downstream of it) only happens after the first commits.
+    const rows = await registry.listConfigRows(params.pluginId, { forUpdate: true });
 
     // applyToAllCompanies is the caller declaring intent to change (or
     // reconcile) the agreed value across every owning row, so the guard —
@@ -195,7 +202,11 @@ export async function writePluginConfigWithAgreement(
         params.companyId,
         { targetType: "plugin", targetId: params.pluginId },
         refsToValidateAndSync,
-        { replaceAll: syncReplaceAll },
+        // PLA-1969: exactPathDelete only matters when syncReplaceAll is
+        // false (the applyToAllCompanies fan-out passing a CHANGED-only
+        // ref subset) — see syncSecretRefsForTarget's doc comment. It is a
+        // no-op when syncReplaceAll is true (the replaceAll branch wins).
+        { replaceAll: syncReplaceAll, exactPathDelete: true },
       );
     }
     const targetInput: UpsertPluginConfig = {

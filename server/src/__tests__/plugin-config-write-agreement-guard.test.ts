@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { and, eq } from "drizzle-orm";
 import { companies, companySecretBindings, companySecrets, createDb, plugins } from "@paperclipai/db";
 import { buildHostServices } from "../services/plugin-host-services.js";
 import { pluginRegistryService } from "../services/plugin-registry.js";
@@ -55,6 +56,23 @@ const MANIFEST_SCHEMA = {
   },
 };
 
+// PLA-1969: two secret-ref fields sharing a top-level parent key (`auth`).
+// No shipped first-party manifest declares this shape today, but the
+// sibling-orphaning regression test below needs it to exercise the bug.
+const NESTED_SIBLING_SCHEMA = {
+  type: "object",
+  properties: {
+    defaultBranch: { type: "string" },
+    auth: {
+      type: "object",
+      properties: {
+        tokenSecretId: { type: "string", format: "secret-ref" },
+        refreshSecretId: { type: "string", format: "secret-ref" },
+      },
+    },
+  },
+};
+
 // PLA-1957 — admin config write path guard/fan-out. Exercises
 // `writePluginConfigWithAgreement` (server/src/services/plugin-config-write.ts)
 // directly against a real, embedded-postgres-backed `plugin_config` table.
@@ -99,7 +117,7 @@ describeEmbeddedPostgres("plugin config write-path agreement guard (PLA-1957)", 
     return secretId;
   }
 
-  async function installPlugin() {
+  async function installPlugin(schema: Record<string, unknown> = MANIFEST_SCHEMA) {
     return db
       .insert(plugins)
       .values({
@@ -112,7 +130,7 @@ describeEmbeddedPostgres("plugin config write-path agreement guard (PLA-1957)", 
           displayName: "Config write guard test plugin",
           apiVersion: 1,
           entrypoints: { worker: "worker.js" },
-          instanceConfigSchema: MANIFEST_SCHEMA,
+          instanceConfigSchema: schema,
         } as any,
         status: "ready",
       })
@@ -535,5 +553,142 @@ describeEmbeddedPostgres("plugin config write-path agreement guard (PLA-1957)", 
       new Set([companyA.id, companyB.id, companyC.id]),
     );
     expect(result.fannedOut).toBe(true);
+  });
+
+  it("PLA-1969: applyToAllCompanies fan-out does not orphan an unchanged sibling secret-ref binding under the same parent key", async () => {
+    const plugin = await installPlugin(NESTED_SIBLING_SCHEMA);
+    const registry = pluginRegistryService(db);
+    const companyA = await createCompany("SIBA");
+    const companyB = await createCompany("SIBB");
+    const tokenA = await seedSecret(companyA.id, "token-a");
+    const refreshA = await seedSecret(companyA.id, "refresh-a");
+    const tokenB = await seedSecret(companyB.id, "token-b");
+    const refreshB = await seedSecret(companyB.id, "refresh-b");
+
+    // Seed both rows through the real write path (not a raw upsert) so the
+    // initial `auth.tokenSecretId` / `auth.refreshSecretId` bindings actually
+    // exist in company_secret_bindings for both companies — each write here
+    // sees at most one prior owning row, so the guard never fires.
+    await writePluginConfigWithAgreement(db, {
+      pluginId: plugin.id,
+      companyId: companyA.id,
+      configJson: { defaultBranch: "main", auth: { tokenSecretId: tokenA, refreshSecretId: refreshA } },
+      schema: NESTED_SIBLING_SCHEMA,
+      options: {},
+    });
+    await writePluginConfigWithAgreement(db, {
+      pluginId: plugin.id,
+      companyId: companyB.id,
+      configJson: { defaultBranch: "main", auth: { tokenSecretId: tokenB, refreshSecretId: refreshB } },
+      schema: NESTED_SIBLING_SCHEMA,
+      options: {},
+    });
+
+    const tokenARotated = await seedSecret(companyA.id, "token-a-rotated");
+
+    // Rotate ONLY auth.tokenSecretId for company A via the fan-out path.
+    // auth.refreshSecretId is unchanged in the payload — under the old
+    // prefix-scoped delete this would still delete company A's
+    // `auth.refreshSecretId` binding row (same top-level `auth` prefix as
+    // the changed field) without reinserting it, since only the CHANGED ref
+    // subset gets synced in the applyToAllCompanies branch.
+    await writePluginConfigWithAgreement(db, {
+      pluginId: plugin.id,
+      companyId: companyA.id,
+      configJson: {
+        defaultBranch: "dev",
+        auth: { tokenSecretId: tokenARotated, refreshSecretId: refreshA },
+      },
+      schema: NESTED_SIBLING_SCHEMA,
+      options: { applyToAllCompanies: true },
+    });
+
+    const bindingRows = await db
+      .select()
+      .from(companySecretBindings)
+      .where(
+        and(
+          eq(companySecretBindings.companyId, companyA.id),
+          eq(companySecretBindings.targetType, "plugin"),
+          eq(companySecretBindings.targetId, plugin.id),
+        ),
+      );
+    const byPath = new Map(bindingRows.map((row) => [row.configPath, row.secretId]));
+
+    expect(byPath.get("auth.tokenSecretId")).toBe(tokenARotated);
+    // The regression this test guards: the sibling binding must survive,
+    // still pointing at the ORIGINAL (unchanged) secret.
+    expect(byPath.get("auth.refreshSecretId")).toBe(refreshA);
+
+    const rowA = await registry.getConfig(plugin.id, companyA.id);
+    const rowB = await registry.getConfig(plugin.id, companyB.id);
+    expect(rowA?.configJson).toEqual({
+      defaultBranch: "dev",
+      auth: { tokenSecretId: tokenARotated, refreshSecretId: refreshA },
+    });
+    // Non-secret change fanned out; B's own distinct secret-ref values
+    // (both fields) are completely untouched.
+    expect(rowB?.configJson).toEqual({
+      defaultBranch: "dev",
+      auth: { tokenSecretId: tokenB, refreshSecretId: refreshB },
+    });
+  });
+
+  it("PLA-1969: a concurrent fan-out and a default write on the same plugin never leave a row permanently stuck on an unreconciled value", async () => {
+    const plugin = await installPlugin();
+    const registry = pluginRegistryService(db);
+    const companyA = await createCompany("RACEA");
+    const companyB = await createCompany("RACEB");
+    const companyC = await createCompany("RACEC");
+
+    // A and B already agree; C starts already diverged on purpose, so the
+    // *pre*-fan-out snapshot reads as "rows disagree" (guard inapplicable)
+    // while the *post*-fan-out snapshot reads as "rows agree" (guard
+    // applicable). That transition is what a stale, unlocked read of
+    // company B's concurrent default write could straddle.
+    await registry.upsertConfig(plugin.id, companyA.id, { configJson: { defaultBranch: "main" } });
+    await registry.upsertConfig(plugin.id, companyB.id, { configJson: { defaultBranch: "main" } });
+    await registry.upsertConfig(plugin.id, companyC.id, { configJson: { defaultBranch: "old" } });
+
+    // TX1: company A reconciles everyone onto "dev" via applyToAllCompanies
+    // (bypasses the guard by design, fans out unconditionally to A, B, C).
+    // TX2 (concurrent): company B independently proposes "rogue" via a
+    // plain default write. Without the `SELECT ... FOR UPDATE` lock, TX2
+    // could read the pre-fan-out snapshot (A/B="main", C="old" — disagree,
+    // guard skipped) and successfully commit B="rogue" *after* TX1 already
+    // reconciled B to "dev" as part of its fan-out, permanently stranding B
+    // on "rogue" while A and C settle on "dev". With the lock, TX2's read
+    // of the owning rows can only happen strictly before or strictly after
+    // TX1 commits — in both orderings, B ends up back at "dev" (either TX2
+    // is rejected outright by the guard on the post-fan-out agreement, or
+    // TX2's "rogue" commits first and is then overwritten by TX1's
+    // fan-out, which re-reads and re-syncs every owning row including B).
+    await Promise.allSettled([
+      writePluginConfigWithAgreement(db, {
+        pluginId: plugin.id,
+        companyId: companyA.id,
+        configJson: { defaultBranch: "dev" },
+        schema: MANIFEST_SCHEMA,
+        options: { applyToAllCompanies: true },
+      }),
+      writePluginConfigWithAgreement(db, {
+        pluginId: plugin.id,
+        companyId: companyB.id,
+        configJson: { defaultBranch: "rogue" },
+        schema: MANIFEST_SCHEMA,
+        options: {},
+      }),
+    ]);
+
+    const rowA = await registry.getConfig(plugin.id, companyA.id);
+    const rowB = await registry.getConfig(plugin.id, companyB.id);
+    const rowC = await registry.getConfig(plugin.id, companyC.id);
+
+    // The regression this guards: B must never be left stranded on "rogue"
+    // once A's fan-out has reconciled the group.
+    expect(rowB?.configJson).not.toEqual({ defaultBranch: "rogue" });
+    expect(rowA?.configJson).toEqual({ defaultBranch: "dev" });
+    expect(rowB?.configJson).toEqual({ defaultBranch: "dev" });
+    expect(rowC?.configJson).toEqual({ defaultBranch: "dev" });
   });
 });
