@@ -1359,6 +1359,8 @@ export {
   updateSecretSchema,
   setBindingEgressAllowlistSchema,
   enforceBindingEgressSchema,
+  setPluginConfigEgressAllowlistSchema,
+  enforcePluginConfigEgressAllowlistSchema,
   createRoutineSchema,
   updateRoutineSchema,
   createRoutineTriggerSchema,

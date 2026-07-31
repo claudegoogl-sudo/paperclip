@@ -494,6 +494,8 @@ export {
   updateSecretSchema,
   setBindingEgressAllowlistSchema,
   enforceBindingEgressSchema,
+  setPluginConfigEgressAllowlistSchema,
+  enforcePluginConfigEgressAllowlistSchema,
   type CreateSecretBinding,
   type CreateSecret,
   type CreateUserSecretDefinition,
@@ -511,6 +513,8 @@ export {
   type UpdateSecret,
   type SetBindingEgressAllowlistInput,
   type EnforceBindingEgressInput,
+  type SetPluginConfigEgressAllowlistInput,
+  type EnforcePluginConfigEgressAllowlistInput,
 } from "./secret.js";
 
 export {
