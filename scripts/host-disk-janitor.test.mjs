@@ -25,6 +25,7 @@ import {
   classifyWorktree,
   scanWorktreeCandidates,
   evaluateWorktree,
+  isPathAncestorOf,
   scanTmpCandidates,
   evaluateTmpEntry,
   parseDfUsePercent,
@@ -135,6 +136,27 @@ test("directoryHasFileNewerThan ignores top-level mtime and looks inside the tre
 
   touch(path.join(dir, "nested", "fresh-file.txt"));
   assert.equal(directoryHasFileNewerThan(dir, cutoff), true);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("directoryHasFileNewerThan treats a brand-new empty tree as recent, not vacuously old (blocker 1 regression)", () => {
+  const dir = tmpdir("janitor-empty-fresh-");
+  // Zero leaf files anywhere -- the exact shape of a directory mid `mkdir &&
+  // git worktree add`, or an empty run-log/tmp dir created moments ago. A
+  // realistic 30-day cutoff must NOT read this as "no evidence of recent
+  // activity" -> "old enough to delete".
+  const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  assert.equal(directoryHasFileNewerThan(dir, cutoff), true, "empty dir just created must count as recent");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("directoryHasFileNewerThan lets a genuinely old empty tree age out via ctime fallback", () => {
+  const dir = tmpdir("janitor-empty-old-");
+  // Can't backdate ctime directly (the OS manages it), so simulate the
+  // passage of time by moving the cutoff into the future relative to this
+  // directory's real (just-now) ctime instead.
+  const cutoffInFuture = Date.now() + 5000;
+  assert.equal(directoryHasFileNewerThan(dir, cutoffInFuture), false, "empty dir must still be prunable once its own ctime clears the cutoff");
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -275,6 +297,41 @@ test("evaluateWorktree requires both safety AND age", () => {
   rmSync(remote, { recursive: true, force: true });
 });
 
+test("evaluateWorktree excludes a directory created moments ago even with zero files (blocker 1 regression: mkdir-before-worktree-add race)", () => {
+  const workDir = tmpdir("janitor-race-");
+  const racingDir = path.join(workDir, "plaNNNN");
+  mkdirSync(racingDir); // no .git yet, no files yet -- mid `mkdir && git worktree add`
+  const config = { ...CONFIG, WORKTREE_MAX_AGE_DAYS: 30 };
+  const result = evaluateWorktree(racingDir, Date.now(), config);
+  assert.equal(result.classification, "not-a-repo");
+  assert.equal(result.isOldEnough, false, "an empty dir created just now must not read as 30 days old");
+  assert.equal(result.eligible, false);
+  rmSync(workDir, { recursive: true, force: true });
+});
+
+test("evaluateWorktree hard-excludes the janitor's own resolved directory regardless of age/classification", () => {
+  const remote = makeBareRemote();
+  const dir = makeWorktreeRepo(remote, { dirty: false, pushed: true });
+  const selfPath = path.join(dir, "scripts", "host-disk-janitor.mjs");
+  const config = { ...CONFIG, SELF_SCRIPT_PATH: selfPath };
+  const future = Date.now() + 40 * 24 * 60 * 60 * 1000; // otherwise-eligible by age
+  const result = evaluateWorktree(dir, future, config);
+  assert.equal(result.classification, "safe");
+  assert.equal(result.isOldEnough, true);
+  assert.equal(result.isSelf, true);
+  assert.equal(result.eligible, false, "must never delete the checkout the running script lives under");
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(remote, { recursive: true, force: true });
+});
+
+test("isPathAncestorOf", () => {
+  assert.equal(isPathAncestorOf("/a/b", "/a/b/c.mjs"), true);
+  assert.equal(isPathAncestorOf("/a/b", "/a/b/c/d.mjs"), true);
+  assert.equal(isPathAncestorOf("/a/b", "/a/bc/d.mjs"), false);
+  assert.equal(isPathAncestorOf("/a/b", "/a/b"), false);
+  assert.equal(isPathAncestorOf("/a/b", "/a/other.mjs"), false);
+});
+
 test("scanWorktreeCandidates covers both ~/work/* and ~/pla*-style roots without duplicates", () => {
   const home = tmpdir("janitor-home-");
   const workDir = path.join(home, "work");
@@ -299,14 +356,25 @@ test("scanWorktreeCandidates covers both ~/work/* and ~/pla*-style roots without
 // /tmp scratch
 // ---------------------------------------------------------------------------
 
-test("scanTmpCandidates matches configured prefixes only", () => {
+test("scanTmpCandidates matches configured patterns only", () => {
   const dir = tmpdir("janitor-tmproot-");
   mkdirSync(path.join(dir, "pcvt-abc"));
   mkdirSync(path.join(dir, "pla1999"));
   mkdirSync(path.join(dir, "unrelated"));
-  const config = { ...CONFIG, TMP_DIR: dir, TMP_SCRATCH_PREFIXES: ["pcvt-", "pla"] };
+  const config = { ...CONFIG, TMP_DIR: dir, TMP_SCRATCH_PATTERNS: [/^pcvt-/, /^pla\d/] };
   const candidates = scanTmpCandidates(config).map((p) => path.basename(p)).sort();
   assert.deepEqual(candidates, ["pcvt-abc", "pla1999"]);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("scanTmpCandidates does not over-match playwright scratch dirs sharing the 'pla' prefix (blocker 2 regression)", () => {
+  const dir = tmpdir("janitor-tmproot-");
+  mkdirSync(path.join(dir, "pla2008-runs"));
+  mkdirSync(path.join(dir, "playwright-artifacts-x1y2"));
+  mkdirSync(path.join(dir, "playwright_chromiumdev_profile-z9"));
+  const config = { ...CONFIG, TMP_DIR: dir, TMP_SCRATCH_PATTERNS: CONFIG.TMP_SCRATCH_PATTERNS };
+  const candidates = scanTmpCandidates(config).map((p) => path.basename(p)).sort();
+  assert.deepEqual(candidates, ["pla2008-runs"]);
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -317,6 +385,15 @@ test("evaluateTmpEntry respects the age cutoff", () => {
   assert.equal(evaluateTmpEntry(dir, now, CONFIG).eligible, true);
   touch(path.join(dir, "fresh.txt"));
   assert.equal(evaluateTmpEntry(dir, now, CONFIG).eligible, false);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("evaluateTmpEntry excludes an empty scratch dir created moments ago (blocker 1 regression)", () => {
+  const dir = tmpdir("janitor-tmpentry-empty-");
+  const emptyEntry = path.join(dir, "pla9003");
+  mkdirSync(emptyEntry);
+  const now = Date.now();
+  assert.equal(evaluateTmpEntry(emptyEntry, now, CONFIG).eligible, false);
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -405,10 +482,23 @@ function buildSandbox() {
     WORKTREE_SCAN_DIRS: [workDir],
     WORKTREE_HOME_GLOB_ROOT: home,
     WORKTREE_HOME_GLOB_PREFIX: "__no_match__",
+    // Points at a nonexistent dir so pruneWorktreeRegistrations() is a
+    // no-op here -- these generic tests don't model a shared object store,
+    // and must never touch the real one the janitor targets on the host.
+    WORKTREE_OBJECT_STORE_DIR: path.join(home, "no-such-object-store"),
     TMP_DIR: tmpDir,
-    TMP_SCRATCH_PREFIXES: ["pla"],
+    TMP_SCRATCH_PATTERNS: [/^pla/],
     STATE_DIR: path.join(home, "state"),
     DISK_ALARM_PATH: "/",
+    // Deliberately points at a nonexistent file so readApiCredential() can
+    // never find a real credential. The real host this suite runs on can be
+    // at or above the alarm threshold at any given time (it was at 92% when
+    // this was written) -- without this, an --apply sandbox test would read
+    // the operator's actual ~/.paperclip/auth.json and file a real
+    // production issue purely as a side effect of the disk being full,
+    // which is exactly the kind of blast radius this janitor must not have.
+    PAPERCLIP_AUTH_JSON_PATH: path.join(home, "no-such-auth.json"),
+    SELF_SCRIPT_PATH: path.join(home, "__self_not_under_any_candidate__", "host-disk-janitor.mjs"),
   };
   return { home, remotes: [staleRemote, liveRemote], config };
 }
@@ -472,6 +562,61 @@ test("run() --apply twice in a row is a no-op the second time (AC4 idempotency)"
 
   rmSync(home, { recursive: true, force: true });
   for (const remote of remotes) rmSync(remote, { recursive: true, force: true });
+});
+
+test("run() --apply prunes stale git-worktree registrations after deleting eligible worktree dirs (blocker 3 regression)", async () => {
+  const home = tmpdir("janitor-wtprune-");
+  const mainRepo = path.join(home, "main-repo");
+  mkdirSync(mainRepo);
+  git(["init", "-q", "-b", "main"], mainRepo);
+  git(["config", "user.email", "test@example.com"], mainRepo);
+  git(["config", "user.name", "Test"], mainRepo);
+  writeFileSync(path.join(mainRepo, "f.txt"), "x");
+  git(["add", "."], mainRepo);
+  git(["commit", "-q", "-m", "c"], mainRepo);
+  const remote = makeBareRemote();
+  git(["remote", "add", "origin", remote], mainRepo);
+  git(["push", "-q", "origin", "main"], mainRepo);
+
+  const workDir = path.join(home, "work");
+  mkdirSync(workDir, { recursive: true });
+  const wtPath = path.join(workDir, "stale-worktree");
+  git(["worktree", "add", "-q", "-b", "stale-branch", wtPath], mainRepo);
+  git(["push", "-q", "origin", "stale-branch"], wtPath);
+  const oldTime = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+  utimesSync(path.join(wtPath, "f.txt"), oldTime, oldTime);
+
+  assert.ok(existsSync(path.join(mainRepo, ".git", "worktrees", "stale-worktree")), "sanity: worktree registered");
+
+  const config = {
+    ...CONFIG,
+    BACKUPS_DIR: path.join(home, "backups-unused"),
+    RUN_LOGS_DIR: path.join(home, "run-logs-unused"),
+    WORKTREE_SCAN_DIRS: [workDir],
+    WORKTREE_HOME_GLOB_ROOT: home,
+    WORKTREE_HOME_GLOB_PREFIX: "__no_match__",
+    WORKTREE_OBJECT_STORE_DIR: mainRepo,
+    TMP_DIR: path.join(home, "tmp-unused"),
+    TMP_SCRATCH_PATTERNS: [],
+    STATE_DIR: path.join(home, "state"),
+    PAPERCLIP_AUTH_JSON_PATH: path.join(home, "no-such-auth.json"),
+    SELF_SCRIPT_PATH: path.join(home, "__self_not_under_any_candidate__", "host-disk-janitor.mjs"),
+  };
+
+  assert.equal(evaluateWorktree(wtPath, Date.now(), config).eligible, true, "sanity: stale worktree is eligible");
+
+  const summary = await run({ apply: true, config });
+
+  assert.ok(!existsSync(wtPath), "stale worktree directory must be deleted");
+  assert.ok(
+    !existsSync(path.join(mainRepo, ".git", "worktrees", "stale-worktree")),
+    "git worktree prune must clear the now-dangling registration",
+  );
+  assert.ok(summary.categories.worktrees.registrationPrune, "run() must report the registration-prune outcome");
+  assert.equal(summary.categories.worktrees.registrationPrune.pruned, 1);
+
+  rmSync(home, { recursive: true, force: true });
+  rmSync(remote, { recursive: true, force: true });
 });
 
 test("run() dry-run alarm never makes a network call even when threshold is exceeded", async () => {

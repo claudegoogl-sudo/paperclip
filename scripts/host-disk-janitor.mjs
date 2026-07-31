@@ -85,10 +85,27 @@ export const CONFIG = {
   WORKTREE_HOME_GLOB_ROOT: process.env.PLA_JANITOR_HOME_GLOB_ROOT || HOME,
   WORKTREE_HOME_GLOB_PREFIX: "pla",
   WORKTREE_MAX_AGE_DAYS: 30,
+  // The shared object store all `~/work/*` / `~/pla*` worktrees register
+  // against. After deleting eligible worktree directories, `git worktree
+  // prune` here clears their now-dangling registrations so re-adding a
+  // worktree at the same path later doesn't collide with a stale entry.
+  WORKTREE_OBJECT_STORE_DIR:
+    process.env.PLA_JANITOR_OBJECT_STORE_DIR || path.join(HOME, "upstream-paperclip"),
+  // The cron entry points this very script at a checkout that lives under
+  // one of the roots it scans. Without this, the janitor could delete the
+  // copy of itself that cron invokes, silently disabling both pruning and
+  // the disk alarm from that point on. Never rely on a crontab comment
+  // alone for this -- the guard belongs in code.
+  SELF_SCRIPT_PATH: process.env.PLA_JANITOR_SELF_PATH || fileURLToPath(import.meta.url),
 
   // -- /tmp agent scratch --
+  // Patterns, not bare prefixes: a bare `startsWith("pla")` also captures
+  // `playwright-artifacts-*` / `playwright_chromiumdev_profile-*`, which are
+  // unrelated live browser-test scratch dirs. Anchor the agent-scratch
+  // pattern to `pla` followed by a digit (ticket-numbered dirs like
+  // `pla2008-...`) so it cannot collide with `playwright*`.
   TMP_DIR: process.env.PLA_JANITOR_TMP_DIR || os.tmpdir(),
-  TMP_SCRATCH_PREFIXES: ["pcvt-", "pla"],
+  TMP_SCRATCH_PATTERNS: [/^pcvt-/, /^pla\d/],
   TMP_MAX_AGE_DAYS: 30,
 
   // -- disk alarm --
@@ -207,6 +224,16 @@ export function classifyBackups(entries, config = CONFIG) {
  * Does not follow symlinked directories (pnpm-style circular symlinks are
  * common under node_modules). If `rootPath` is itself a plain file, checks
  * its own mtime.
+ *
+ * A tree with *zero* leaf files anywhere (a brand-new empty directory, e.g.
+ * mid `mkdir && git worktree add`) has no file-age evidence at all. Treating
+ * that absence as "vacuously old" is the bug this function used to have: it
+ * always returned `false` for an empty tree, which every caller inverted
+ * into "old enough to delete" -- so a directory created seconds ago read as
+ * 30+ days old. Absence of evidence must mean keep, not delete, so an empty
+ * tree instead falls back to the root directory's own ctime (inode change
+ * time -- the closest available proxy for "created" on Linux, since
+ * birthtime isn't reliably exposed) compared against the same cutoff.
  */
 export function directoryHasFileNewerThan(rootPath, cutoffMs, skipDirNames = []) {
   let rootStat;
@@ -221,6 +248,7 @@ export function directoryHasFileNewerThan(rootPath, cutoffMs, skipDirNames = [])
 
   const skip = new Set(skipDirNames);
   const stack = [rootPath];
+  let sawLeafFile = false;
   while (stack.length > 0) {
     const dir = stack.pop();
     let children;
@@ -240,12 +268,14 @@ export function directoryHasFileNewerThan(rootPath, cutoffMs, skipDirNames = [])
       }
       if (st.isDirectory()) {
         stack.push(childPath);
-      } else if (st.mtimeMs > cutoffMs) {
-        return true;
+      } else {
+        sawLeafFile = true;
+        if (st.mtimeMs > cutoffMs) return true;
       }
     }
   }
-  return false;
+  if (sawLeafFile) return false;
+  return rootStat.ctimeMs > cutoffMs;
 }
 
 // ---------------------------------------------------------------------------
@@ -400,12 +430,46 @@ export function scanWorktreeCandidates(config = CONFIG) {
   return candidates;
 }
 
+/** True if `targetPath` resolves to a location inside `candidateDir`. */
+export function isPathAncestorOf(candidateDir, targetPath) {
+  const rel = path.relative(path.resolve(candidateDir), path.resolve(targetPath));
+  return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
 export function evaluateWorktree(dirPath, nowMs, config = CONFIG) {
   const classification = classifyWorktree(dirPath);
   const cutoffMs = nowMs - config.WORKTREE_MAX_AGE_DAYS * DAY_MS;
   const isOldEnough = !directoryHasFileNewerThan(dirPath, cutoffMs, [".git"]);
-  const eligible = (classification === "not-a-repo" || classification === "safe") && isOldEnough;
-  return { path: dirPath, classification, isOldEnough, eligible };
+  const isSelf = isPathAncestorOf(dirPath, config.SELF_SCRIPT_PATH);
+  const eligible = (classification === "not-a-repo" || classification === "safe") && isOldEnough && !isSelf;
+  return { path: dirPath, classification, isOldEnough, isSelf, eligible };
+}
+
+/**
+ * Counts `git worktree list` registrations under `storeDir`, or `null` if
+ * `storeDir` isn't a usable git directory (e.g. not present in a sandbox).
+ */
+function countWorktreeRegistrations(storeDir) {
+  const out = runGit(["worktree", "list", "--porcelain"], storeDir);
+  if (out === null) return null;
+  return out.split("\n").filter((line) => line.startsWith("worktree ")).length;
+}
+
+/**
+ * Runs `git worktree prune` against the shared object store so directories
+ * this janitor just deleted don't leave dangling worktree registrations
+ * behind. Best-effort: returns `null` (not an error) if `storeDir` doesn't
+ * exist or isn't a git directory, which is expected in isolated test
+ * sandboxes that don't model the real shared store.
+ */
+function pruneWorktreeRegistrations(storeDir) {
+  if (!existsSync(storeDir)) return null;
+  const before = countWorktreeRegistrations(storeDir);
+  if (before === null) return null;
+  runGit(["worktree", "prune"], storeDir);
+  const after = countWorktreeRegistrations(storeDir);
+  if (after === null) return null;
+  return { before, after, pruned: before - after };
 }
 
 // ---------------------------------------------------------------------------
@@ -415,7 +479,7 @@ export function evaluateWorktree(dirPath, nowMs, config = CONFIG) {
 export function scanTmpCandidates(config = CONFIG) {
   if (!existsSync(config.TMP_DIR)) return [];
   return readdirSync(config.TMP_DIR, { withFileTypes: true })
-    .filter((e) => config.TMP_SCRATCH_PREFIXES.some((prefix) => e.name.startsWith(prefix)))
+    .filter((e) => config.TMP_SCRATCH_PATTERNS.some((pattern) => pattern.test(e.name)))
     .map((e) => path.join(config.TMP_DIR, e.name));
 }
 
@@ -466,14 +530,23 @@ export function readApiCredential(config = CONFIG) {
   return null;
 }
 
+// Statuses that count as "still open" for alarm dedup -- everything except
+// terminal states. Combined with the `q` text search below (title matches
+// rank first per the issues search endpoint), this keeps the dedup lookup
+// on the marker's own issue even once the company has many open issues,
+// instead of depending on it staying on an unfiltered first page.
+const ALARM_OPEN_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
+
 async function fileDiskAlarmIssue({ usePercent, threshold, companyId, credential }) {
   const marker = CONFIG.DISK_ALARM_ISSUE_TITLE_MARKER;
-  const listUrl = `${credential.apiBase}/api/companies/${companyId}/issues`;
+  const createUrl = `${credential.apiBase}/api/companies/${companyId}/issues`;
+  const searchUrl =
+    `${createUrl}?q=${encodeURIComponent(marker)}&status=${encodeURIComponent(ALARM_OPEN_STATUSES.join(","))}`;
   const headers = { Authorization: `Bearer ${credential.token}`, "Content-Type": "application/json" };
 
   let existingOpen = false;
   try {
-    const listResp = await fetch(listUrl, { headers });
+    const listResp = await fetch(searchUrl, { headers });
     if (listResp.ok) {
       const body = await listResp.json();
       const issues = Array.isArray(body) ? body : body.issues || body.data || [];
@@ -501,7 +574,7 @@ async function fileDiskAlarmIssue({ usePercent, threshold, companyId, credential
     `Run the janitor's dry-run to see current reclaim candidates: node scripts/host-disk-janitor.mjs --dry-run`,
   ].join("\n");
 
-  const resp = await fetch(listUrl, {
+  const resp = await fetch(createUrl, {
     method: "POST",
     headers,
     body: JSON.stringify({ title, description, priority: "high" }),
@@ -601,6 +674,11 @@ export async function run({ apply = false, nowMs = Date.now(), config = CONFIG }
     const candidates = scanWorktreeCandidates(config);
     const evaluations = candidates.map((p) => evaluateWorktree(p, nowMs, config));
     const eligible = evaluations.filter((e) => e.eligible);
+    // Size is measured before deletion in both modes -- measuring only in
+    // dry-run (the previous behavior) made every --apply run report
+    // reclaimedBytes: 0, the only observability this job gets.
+    const eligibleSizedBytes = eligible.reduce((sum, e) => sum + dirSizeBytes(e.path), 0);
+    let registrationPrune = null;
     if (apply) {
       for (const e of eligible) {
         try {
@@ -609,13 +687,16 @@ export async function run({ apply = false, nowMs = Date.now(), config = CONFIG }
           // already gone -- idempotent
         }
       }
+      registrationPrune = pruneWorktreeRegistrations(config.WORKTREE_OBJECT_STORE_DIR);
     }
     summary.categories.worktrees = {
       totalScanned: candidates.length,
       eligible: eligible.length,
-      reclaimedBytes: eligible.reduce((sum, e) => sum + (apply ? 0 : dirSizeBytes(e.path)), 0),
+      reclaimedBytes: eligibleSizedBytes,
       eligiblePaths: eligible.map((e) => e.path),
       excludedReview: evaluations.filter((e) => e.classification === "review").map((e) => e.path),
+      excludedSelf: evaluations.filter((e) => e.isSelf).map((e) => e.path),
+      registrationPrune,
     };
   }
 
@@ -624,6 +705,7 @@ export async function run({ apply = false, nowMs = Date.now(), config = CONFIG }
     const candidates = scanTmpCandidates(config);
     const evaluations = candidates.map((p) => evaluateTmpEntry(p, nowMs, config));
     const eligible = evaluations.filter((e) => e.eligible);
+    const eligibleSizedBytes = eligible.reduce((sum, e) => sum + dirSizeBytes(e.path), 0);
     if (apply) {
       for (const e of eligible) {
         try {
@@ -636,7 +718,7 @@ export async function run({ apply = false, nowMs = Date.now(), config = CONFIG }
     summary.categories.tmpScratch = {
       totalScanned: candidates.length,
       eligible: eligible.length,
-      reclaimedBytes: eligible.reduce((sum, e) => sum + (apply ? 0 : dirSizeBytes(e.path)), 0),
+      reclaimedBytes: eligibleSizedBytes,
       eligiblePaths: eligible.map((e) => e.path),
     };
   }
@@ -689,13 +771,17 @@ function printSummary(summary) {
       `${bytesToHuman(c.runLogs.reclaimedBytes)} ${summary.mode === "apply" ? "freed" : "reclaimable"} (kept ${c.runLogs.keptFiles})`,
   );
   console.log(
-    `worktrees:   ${c.worktrees.eligible}/${c.worktrees.totalScanned} dirs ${summary.mode === "apply" ? "deleted" : "would delete"}` +
-      (summary.mode === "apply" ? "" : `, ${bytesToHuman(c.worktrees.reclaimedBytes)} reclaimable`) +
-      ` (excluded as review: ${c.worktrees.excludedReview.length})`,
+    `worktrees:   ${c.worktrees.eligible}/${c.worktrees.totalScanned} dirs ${summary.mode === "apply" ? "deleted" : "would delete"}, ` +
+      `${bytesToHuman(c.worktrees.reclaimedBytes)} ${summary.mode === "apply" ? "freed" : "reclaimable"} ` +
+      `(excluded as review: ${c.worktrees.excludedReview.length}, excluded as self: ${c.worktrees.excludedSelf.length})`,
   );
+  if (c.worktrees.registrationPrune) {
+    const rp = c.worktrees.registrationPrune;
+    console.log(`             git worktree prune: ${rp.pruned} stale registration(s) cleared (${rp.before} -> ${rp.after})`);
+  }
   console.log(
-    `tmp scratch: ${c.tmpScratch.eligible}/${c.tmpScratch.totalScanned} entries ${summary.mode === "apply" ? "deleted" : "would delete"}` +
-      (summary.mode === "apply" ? "" : `, ${bytesToHuman(c.tmpScratch.reclaimedBytes)} reclaimable`),
+    `tmp scratch: ${c.tmpScratch.eligible}/${c.tmpScratch.totalScanned} entries ${summary.mode === "apply" ? "deleted" : "would delete"}, ` +
+      `${bytesToHuman(c.tmpScratch.reclaimedBytes)} ${summary.mode === "apply" ? "freed" : "reclaimable"}`,
   );
   console.log("");
   const d = summary.diskAlarm;
