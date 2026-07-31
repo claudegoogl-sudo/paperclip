@@ -1,10 +1,10 @@
 /**
- * PLA-1957: the admin config write path for `POST /api/plugins/:pluginId/config`.
+ * The admin config write path for `POST /api/plugins/:pluginId/config`.
  *
  * Context this exists to fix: since upstream v2026.722.0 made `plugin_config`
  * company-scoped, a plugin can own more than one row (one per company). The
- * no-dispatch `config.get` agreement gate (PLA-1944,
- * `plugin-host-services.ts` `getAgreedOrDeny`) resolves a construction-time
+ * no-dispatch `config.get` agreement gate
+ * (`plugin-host-services.ts` `getAgreedOrDeny`) resolves a construction-time
  * read only when EVERY owning row agrees on the non-secret-ref portion of
  * `config_json`. The admin write path writes exactly one row at a time, so an
  * ordinary single-company edit silently breaks that agreement for every
@@ -27,8 +27,8 @@
  * Every branch reuses the same comparator (`structurallyEqual`,
  * `json-schema-secret-refs.ts`) the read-side gate uses, and the same
  * secret-ref validator (`validatePluginSecretRefsForCompany`,
- * `plugin-secrets-handler.ts`) the write path already used pre-PLA-1957 —
- * this ticket changes ordering and fan-out, not what "agrees" or "a secret
+ * `plugin-secrets-handler.ts`) the write path already used previously —
+ * this module changes ordering and fan-out, not what "agrees" or "a secret
  * this company may reference" mean.
  */
 import type { Db } from "@paperclipai/db";
@@ -84,7 +84,7 @@ export interface WritePluginConfigResult {
  * rows currently agree on the non-secret-ref portion, and (c) the proposed
  * write disagrees with that agreed value. Never fires to invent an
  * invariant — rows that already disagree are already-lost agreement, and
- * this function passes those straight through (matches PLA-1957 AC2).
+ * this function passes those straight through.
  */
 export function evaluateConfigWriteAgreementGuard(
   rows: Array<{ companyId: string; configJson: unknown }>,
@@ -117,7 +117,7 @@ export function evaluateConfigWriteAgreementGuard(
 }
 
 /**
- * Write `configJson` for `companyId`, applying the PLA-1957 guard/fan-out
+ * Write `configJson` for `companyId`, applying the agreement guard/fan-out
  * behaviour described above. Runs entirely inside one DB transaction: the
  * guard read, the target row write, and (for `applyToAllCompanies`) every
  * other row's write all commit together or not at all.
@@ -142,7 +142,7 @@ export async function writePluginConfigWithAgreement(
   return db.transaction(async (tx) => {
     const txDb = tx as unknown as Db;
     const registry = pluginRegistryService(txDb);
-    // PLA-1969: SELECT ... FOR UPDATE — without this, two concurrent admin
+    // SELECT ... FOR UPDATE — without this, two concurrent admin
     // writes to the same plugin's config each read at READ COMMITTED with
     // no lock, so both can decide guard/fan-out off the same stale
     // "currently agree" snapshot and both proceed, reintroducing the exact
@@ -167,19 +167,19 @@ export async function writePluginConfigWithAgreement(
       }
     }
 
-    // Target row: identical to the pre-PLA-1957 single-row write — validate
+    // Target row: identical to the prior single-row write — validate
     // and sync secret-ref bindings, then upsert. Scoped to `tx` so it rolls
     // back together with the fan-out below on any failure.
     const secretRefs = extractSecretRefBindingsFromConfig(params.configJson, params.schema);
 
     // applyToAllCompanies only: skip validate+sync for a secret-ref value
     // that is UNCHANGED from what this row already had. Without this, an
-    // unrelated non-secret edit on the post-0164/pre-PLA-1843 shape (every
+    // unrelated non-secret edit on the post-migration, pre-scrub shape (every
     // company's row still pointing at one company's secret) would 422 on a
-    // field this write never touched — strictly worse than the problem
-    // PLA-1957 exists to fix. Genuinely new/changed refs are still fully
+    // field this write never touched — strictly worse than the problem this
+    // guard exists to fix. Genuinely new/changed refs are still fully
     // validated below. The default guard path and allowDivergence keep the
-    // pre-PLA-1957 behaviour exactly (AC6): they always validate the full
+    // prior write behaviour exactly (AC6): they always validate the full
     // current ref set, matching today's single-row write.
     let refsToValidateAndSync = secretRefs;
     let syncReplaceAll = true;
@@ -202,7 +202,7 @@ export async function writePluginConfigWithAgreement(
         params.companyId,
         { targetType: "plugin", targetId: params.pluginId },
         refsToValidateAndSync,
-        // PLA-1969: exactPathDelete only matters when syncReplaceAll is
+        // exactPathDelete only matters when syncReplaceAll is
         // false (the applyToAllCompanies fan-out passing a CHANGED-only
         // ref subset) — see syncSecretRefsForTarget's doc comment. It is a
         // no-op when syncReplaceAll is true (the replaceAll branch wins).

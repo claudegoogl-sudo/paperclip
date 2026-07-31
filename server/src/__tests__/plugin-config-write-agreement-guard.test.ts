@@ -46,7 +46,7 @@ function createEventBusStub() {
 const PLUGIN_KEY = "paperclip.test-config-write-guard";
 
 // Mirrors the read-gate test's schema shape: one secret-ref field, one plain
-// field. Reused so the write guard and the PLA-1944 read gate are proven
+// field. Reused so the write guard and the read gate are proven
 // against the exact same non-secret/secret-ref split.
 const MANIFEST_SCHEMA = {
   type: "object",
@@ -56,7 +56,7 @@ const MANIFEST_SCHEMA = {
   },
 };
 
-// PLA-1969: two secret-ref fields sharing a top-level parent key (`auth`).
+// Two secret-ref fields sharing a top-level parent key (`auth`).
 // No shipped first-party manifest declares this shape today, but the
 // sibling-orphaning regression test below needs it to exercise the bug.
 const NESTED_SIBLING_SCHEMA = {
@@ -73,16 +73,16 @@ const NESTED_SIBLING_SCHEMA = {
   },
 };
 
-// PLA-1957 — admin config write path guard/fan-out. Exercises
+// Admin config write path guard/fan-out. Exercises
 // `writePluginConfigWithAgreement` (server/src/services/plugin-config-write.ts)
 // directly against a real, embedded-postgres-backed `plugin_config` table.
 // Does not change plugin-config-agreement-gate.test.ts's or getAgreedOrDeny's
 // behavior or assertions — this file only adds a *new* combined write+read
 // test (AC5/e2e) that calls both modules, reusing that file's harness pattern
 // rather than its tests. (Both files' `getAgreedOrDeny` call sites were
-// updated to `config.get()` for the rebuilt gate surface — see the PLA-1999
+// updated to `config.get()` for the rebuilt gate surface — see the
 // note atop plugin-config-agreement-gate.test.ts.)
-describeEmbeddedPostgres("plugin config write-path agreement guard (PLA-1957)", () => {
+describeEmbeddedPostgres("plugin config write-path agreement guard", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
@@ -352,7 +352,7 @@ describeEmbeddedPostgres("plugin config write-path agreement guard (PLA-1957)", 
     }
   });
 
-  it("AC3: a foreign secret-ref is never written to a company that doesn't own it (PLA-1843 regression guard)", async () => {
+  it("AC3: a foreign secret-ref is never written to a company that doesn't own it (fan-out regression guard)", async () => {
     const plugin = await installPlugin();
     const registry = pluginRegistryService(db);
     const companyA = await createCompany("NFA");
@@ -381,7 +381,7 @@ describeEmbeddedPostgres("plugin config write-path agreement guard (PLA-1957)", 
     expect(rowB?.configJson).toEqual({ defaultBranch: "dev", apiKeySecretId: secretB });
   });
 
-  it("AC4/AC5 (e2e): after applyToAllCompanies, the PLA-1944 no-dispatch read gate resolves cleanly", async () => {
+  it("AC4/AC5 (e2e): after applyToAllCompanies, the no-dispatch read gate resolves cleanly", async () => {
     const plugin = await installPlugin();
     const registry = pluginRegistryService(db);
     const companyA = await createCompany("E2EA");
@@ -572,11 +572,11 @@ describeEmbeddedPostgres("plugin config write-path agreement guard (PLA-1957)", 
   // `exactPathDelete` regression this test's comment describes IS real for
   // an intermediate DB state, just not observable through this call chain.
   // The genuinely load-bearing regression test for `exactPathDelete` itself
-  // lives in secrets-service.test.ts ("PLA-1969: exactPathDelete scopes a
+  // lives in secrets-service.test.ts ("exactPathDelete scopes a
   // changed-subset resync..."), which asserts directly on
   // `syncSecretRefsForTarget`'s persisted state with no `upsertConfig` call
   // afterward to heal it.
-  it("PLA-1969: applyToAllCompanies fan-out does not orphan an unchanged sibling secret-ref binding under the same parent key", async () => {
+  it("applyToAllCompanies fan-out does not orphan an unchanged sibling secret-ref binding under the same parent key", async () => {
     const plugin = await installPlugin(NESTED_SIBLING_SCHEMA);
     const registry = pluginRegistryService(db);
     const companyA = await createCompany("SIBA");
@@ -655,7 +655,7 @@ describeEmbeddedPostgres("plugin config write-path agreement guard (PLA-1957)", 
     });
   });
 
-  it("PLA-1969: a concurrent fan-out and a default write on the same plugin never leave a row permanently stuck on an unreconciled value", async () => {
+  it("a concurrent fan-out and a default write on the same plugin never leave a row permanently stuck on an unreconciled value", async () => {
     const plugin = await installPlugin();
     const registry = pluginRegistryService(db);
     const companyA = await createCompany("RACEA");
@@ -671,7 +671,7 @@ describeEmbeddedPostgres("plugin config write-path agreement guard (PLA-1957)", 
     await registry.upsertConfig(plugin.id, companyB.id, { configJson: { defaultBranch: "main" } });
     await registry.upsertConfig(plugin.id, companyC.id, { configJson: { defaultBranch: "old" } });
 
-    // PLA-1999: this test previously raced TX1/TX2 with a bare
+    // This test previously raced TX1/TX2 with a bare
     // `Promise.allSettled` and no control over interleaving — real
     // scheduling only produced the straddle window it exists to catch on
     // ~29% of runs (4/14 trials observed with `forUpdate` reverted),

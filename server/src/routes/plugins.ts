@@ -2322,7 +2322,7 @@ export function pluginRoutes(
    *
    * The caller provides the full `configJson` object. The server persists it
    * via `writePluginConfigWithAgreement()` (`plugin-config-write.ts`), which
-   * wraps `registry.upsertConfig()` with the PLA-1957 agreement guard/fan-out.
+   * wraps `registry.upsertConfig()` with the config-write agreement guard/fan-out.
    *
    * Request body:
    * - `companyId`: Company that owns this plugin config row

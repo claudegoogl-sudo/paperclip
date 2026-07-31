@@ -432,7 +432,7 @@ describeEmbeddedPostgres("secretService", () => {
     });
   });
 
-  // PLA-1969: `exactPathDelete` scopes the pre-insert delete to the exact
+  // `exactPathDelete` scopes the pre-insert delete to the exact
   // configPath values passed, instead of their shared top-level prefix. This
   // exercises `syncSecretRefsForTarget` directly (no `plugin-registry.ts`
   // `upsertConfig` call afterward) precisely because `upsertConfig` runs its
@@ -445,7 +445,7 @@ describeEmbeddedPostgres("secretService", () => {
   // plugin-config-write-agreement-guard.test.ts); asserting directly on
   // `syncSecretRefsForTarget`'s own persisted state is what makes this
   // load-bearing.
-  it("PLA-1969: exactPathDelete scopes a changed-subset resync to only the changed paths, leaving an unchanged sibling under the same prefix intact", async () => {
+  it("exactPathDelete scopes a changed-subset resync to only the changed paths, leaving an unchanged sibling under the same prefix intact", async () => {
     const companyId = await seedCompany();
     const svc = secretService(db);
     const token = await svc.create(companyId, {
@@ -496,7 +496,7 @@ describeEmbeddedPostgres("secretService", () => {
     expect(withExactByPath.get("auth.refreshSecretId")).toBe(refresh.id);
 
     // Negative control on a second, independent target: the exact same
-    // sequence WITHOUT exactPathDelete (the pre-PLA-1969 prefix-scoped
+    // sequence WITHOUT exactPathDelete (the prior prefix-scoped
     // delete) orphans the sibling — proving this test would actually catch
     // a reversion of the flag, unlike the route-level equivalent.
     const target2 = { targetType: "plugin" as const, targetId: `plugin-${randomUUID()}` };

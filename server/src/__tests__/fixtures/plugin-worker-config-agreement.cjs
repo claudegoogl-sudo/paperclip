@@ -1,4 +1,4 @@
-// PLA-1944 fixture: models a `setup()`-time `config.get` read — a call made
+// Fixture: models a `setup()`-time `config.get` read — a call made
 // with ZERO active invocations, so the host attaches only the worker-lifetime
 // `serviceScope` (no `invocationScope`/`singleInFlightScope` pin exists yet).
 // This is the shape that must resolve via the host-minted agreement gate

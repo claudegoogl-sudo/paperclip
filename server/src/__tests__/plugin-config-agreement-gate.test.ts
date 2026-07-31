@@ -38,10 +38,10 @@ function createEventBusStub() {
 
 const PLUGIN_KEY = "paperclip.test-agreement-gate";
 
-// PLA-1944: instance-config schema declaring a single secret-ref field. Used
+// Instance-config schema declaring a single secret-ref field. Used
 // to prove secret-ref paths are excluded from the agreement comparison and
 // handled by the separate distinct-value union rule (C2), never by row-count
-// (the wrong E1 rule from the superseded PLA-1937 draft).
+// (the wrong E1 rule from a superseded earlier draft).
 const MANIFEST_SCHEMA = {
   type: "object",
   properties: {
@@ -50,21 +50,21 @@ const MANIFEST_SCHEMA = {
   },
 };
 
-// PLA-1944 — Option 3 host-minted agreement gate for the no-dispatch
+// Option 3 host-minted agreement gate for the no-dispatch
 // `config.get` read. Exercises `buildHostServices(...).config.get()` called
 // with no `companyId` (server/src/services/plugin-host-services.ts) directly
 // against a real, embedded-postgres-backed `plugin_config` table — this is
 // the level at which C2 (secret-ref distinct-value union), A1 (structural
 // equality), and the loud-failure / redaction contract (C5) actually live.
 //
-// PLA-1999: this file's call sites originally read
+// This file's call sites originally read
 // `services.config.getAgreedOrDeny!()` — a separate method that existed when
 // this test was first written. The gate has since been rebuilt
 // (`plugin-config-agreement.ts`'s standalone `getAgreedOrDeny`, invoked from
 // inside `config.get()` itself when no `companyId` is passed) with an
 // equivalent contract but no method of that name on `services.config` — only
 // the call sites were updated to match; every assertion below is unchanged.
-describeEmbeddedPostgres("plugin config.get agreement gate (PLA-1944)", () => {
+describeEmbeddedPostgres("plugin config.get agreement gate", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
@@ -161,7 +161,7 @@ describeEmbeddedPostgres("plugin config.get agreement gate (PLA-1944)", () => {
     expect(refreshed?.lastError).toBeNull();
   });
 
-  it("bar#3 (pre-PLA-1843 shape): all rows share the SAME non-null secret-ref value — agrees and unions it in", async () => {
+  it("bar#3 (pre-scrub shape): all rows share the SAME non-null secret-ref value — agrees and unions it in", async () => {
     // Proves C2 (distinct-value rule) subsumes the old fan-out shape rather
     // than requiring "exactly one row non-null" (the wrong E1 rule).
     const plugin = await installPlugin();
@@ -202,7 +202,7 @@ describeEmbeddedPostgres("plugin config.get agreement gate (PLA-1944)", () => {
     });
 
     const services = buildServices(plugin.id);
-    // PLA-1999: the rebuilt gate (plugin-config-agreement.ts) throws
+    // The rebuilt gate (plugin-config-agreement.ts) throws
     // `config.get denied: ... disagree on key(s): ...` rather than this
     // file's original "owning companies disagree" wording — same loud-failure
     // contract (C5), message text only.
@@ -219,7 +219,7 @@ describeEmbeddedPostgres("plugin config.get agreement gate (PLA-1944)", () => {
     expect(new Set(logPayload.companyIds)).toEqual(
       new Set([companyA.id, companyB.id, companyC.id]),
     );
-    // PLA-1999: the rebuilt gate's log payload field is `disagreeingKeys`
+    // The rebuilt gate's log payload field is `disagreeingKeys`
     // (was `divergingKeys` in this file's original assertion) — same content.
     expect(logPayload.disagreeingKeys).toEqual(["defaultBranch"]);
     expect(JSON.stringify(logPayload)).not.toContain("main");
@@ -291,14 +291,14 @@ describeEmbeddedPostgres("plugin config.get agreement gate (PLA-1944)", () => {
     expect(refreshed?.lastError).toBeNull();
   });
 
-  // PLA-1963 AC5 — the exact row shape produced by the 0164 migration's
-  // pla1843_drop_foreign_secret_refs scrub: the owner row keeps its
+  // The exact row shape produced by the 0164_plugin_config_company_scope
+  // migration's foreign-secret-ref scrub: the owner row keeps its
   // secret-ref value, every non-owner row has the path deleted entirely
   // (jsonb `#-`, i.e. ABSENT — not null), and every row's non-secret key
   // (defaultBranch here, standing in for topicMap/catchAllIssueMap/
   // companyPolicies) is byte-identical. getAgreedOrDeny must still resolve
   // this shape and union the owner's secret-ref value back in.
-  it("PLA-1963 AC5: resolves the post-scrub shape (ref on the owner row, path absent on every other row)", async () => {
+  it("resolves the post-scrub shape (ref on the owner row, path absent on every other row)", async () => {
     const plugin = await installPlugin();
     const registry = pluginRegistryService(db);
     const owner = await createCompany("SCRO");

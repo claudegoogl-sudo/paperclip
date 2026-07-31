@@ -79,10 +79,10 @@ export function writeConfigValueAtPath(
 }
 
 // ---------------------------------------------------------------------------
-// PLA-1944 / PLA-1957: canonical (key-order-independent) structural equality.
+// Canonical (key-order-independent) structural equality.
 // This is the ONE comparator shared by the no-dispatch `config.get` agreement
 // gate (`plugin-host-services.ts` `getAgreedOrDeny`) and the admin write-path
-// guard (PLA-1957) that defends the same invariant on write. Do not fork a
+// guard that defends the same invariant on write. Do not fork a
 // second comparator — both sides must agree on what "diverge" means or the
 // guard and the gate drift out of sync with each other.
 // ---------------------------------------------------------------------------

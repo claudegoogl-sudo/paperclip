@@ -293,14 +293,14 @@ export function pluginRegistryService(db: Db) {
      * Return EVERY owning `plugin_config` row for a plugin, across all
      * companies. No LIMIT, no pagination.
      *
-     * PLA-1937/PLA-1942/PLA-1944: the no-dispatch `config.get` agreement gate
+     * The no-dispatch `config.get` agreement gate
      * resolves a construction-time read (no dispatch pins a tenant) by
      * checking whether every owning row agrees. Silent truncation here would
      * turn "all rows agree" into a false positive that masks real divergence
      * — the security-relevant invariant the whole gate depends on — so this
      * accessor is deliberately unpaginated.
      *
-     * `forUpdate` (PLA-1969): row-lock the returned rows for the lifetime
+     * `forUpdate`: row-lock the returned rows for the lifetime
      * of the caller's transaction. Only pass this from a write path already
      * inside `db.transaction` — `writePluginConfigWithAgreement` uses it so
      * two concurrent admin writes to the same plugin serialize on this read
@@ -416,7 +416,7 @@ export function pluginRegistryService(db: Db) {
     },
 
     /**
-     * PLA-1957: overwrite an EXISTING owning row's `config_json` verbatim,
+     * Overwrite an EXISTING owning row's `config_json` verbatim,
      * with no secret-ref binding sync.
      *
      * Only safe to call when the caller has already preserved that row's own

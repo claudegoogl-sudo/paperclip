@@ -351,7 +351,7 @@ describe.sequential("plugin install and upgrade authz", () => {
       companyA,
       { targetType: "plugin", targetId: pluginId },
       [expect.objectContaining({ secretId, configPath: "apiKeyRef", versionSelector: "latest" })],
-      // PLA-1969: writePluginConfigWithAgreement always passes
+      // writePluginConfigWithAgreement always passes
       // exactPathDelete: true to syncSecretRefsForTarget (a no-op here since
       // replaceAll wins, but still present in the call args).
       { replaceAll: true, exactPathDelete: true },

@@ -4053,7 +4053,7 @@ export function secretService(db: Db) {
         projectionAllowlistKey?: string | null;
       }>,
       /**
-       * `exactPathDelete` (PLA-1969): when `replaceAll` is false, scope the
+       * `exactPathDelete`: when `replaceAll` is false, scope the
        * pre-insert delete to the EXACT `configPath` values in `refs` instead
        * of their top-level dot-prefix. The prefix-scoped delete below exists
        * for callers (e.g. `environments.ts`) that always pass the target's

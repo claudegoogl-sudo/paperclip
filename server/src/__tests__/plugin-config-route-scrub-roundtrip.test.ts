@@ -38,7 +38,7 @@ if (!embeddedPostgresSupport.supported) {
 
 const PLUGIN_KEY = "paperclip.test-config-scrub-roundtrip";
 
-// Mirrors the read-gate (PLA-1944) and write-guard (PLA-1957) test schemas:
+// Mirrors the read-gate and write-guard test schemas:
 // one secret-ref field, one plain field.
 const MANIFEST_SCHEMA = {
   type: "object",
@@ -48,7 +48,7 @@ const MANIFEST_SCHEMA = {
   },
 };
 
-// PLA-1963 AC6 — proves the 0164 scrub actually fixes the 422 it was built
+// Proves the 0164 scrub actually fixes the 422 it was built
 // for: a GET -> unmodified POST round trip on a non-owning company's config
 // used to fail with 422 "Plugin config references a secret outside the
 // selected company" (server/src/services/plugin-secrets-handler.ts
@@ -61,7 +61,7 @@ const MANIFEST_SCHEMA = {
 // real-db-real-routes harness rather than the mocked-registry harness in
 // plugin-routes-authz.test.ts, since this needs the write path's actual
 // secret-ownership validation to run.
-describeEmbeddedPostgres("plugin config POST round trip after the 0164 scrub (PLA-1963 AC6)", () => {
+describeEmbeddedPostgres("plugin config POST round trip after the 0164 scrub", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
@@ -155,8 +155,8 @@ describeEmbeddedPostgres("plugin config POST round trip after the 0164 scrub (PL
     const ownerSecretId = await seedSecret(owner.id, "owner-key");
 
     // Owner keeps the ref; non-owner's row has the path entirely absent —
-    // exactly the shape pla1843_drop_foreign_secret_refs produces in
-    // packages/db/src/migrations/0164_plugin_config_company_scope.sql.
+    // exactly the shape the foreign-secret-ref scrub in
+    // packages/db/src/migrations/0164_plugin_config_company_scope.sql produces.
     await registry.upsertConfig(plugin.id, owner.id, {
       configJson: { defaultBranch: "main", apiKeySecretId: ownerSecretId },
     });
