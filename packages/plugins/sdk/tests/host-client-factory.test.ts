@@ -5,6 +5,7 @@ import {
   CapabilityDeniedError,
   createHostClientHandlers,
   InvocationScopeDeniedError,
+  SERVICE_SCOPE_COMPANY_METHODS,
 } from "../src/host-client-factory.js";
 import { PLUGIN_RPC_ERROR_CODES } from "../src/protocol.js";
 
@@ -642,11 +643,44 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
     expect(resolve).not.toHaveBeenCalled();
   });
 
-  it("PLA-1819: serviceScope is NOT an accepted tenant source for config.get", async () => {
-    // `serviceScope` carries only a runId. `secrets.resolve` can accept it
-    // because the server maps that runId to a company; `config.get` has no such
-    // downstream derivation — it needs a concrete companyId to select a row —
-    // so a serviceScope-only read fails closed.
+  it("PLA-1944: serviceScope with no dispatch pin defers config.get to the host-minted agreement gate", async () => {
+    // `serviceScope` carries only a runId, with no company pin — a
+    // `setup()`-time read or a background/poll loop has no active dispatch to
+    // derive a tenant from. Historically (PLA-1819) that failed closed outright,
+    // the same as `secrets.resolve` without a mapped runId. PLA-1944 adds a
+    // narrower, read-only escape hatch: `resolveRequiredCompanyId` is passed
+    // `context.serviceScope.runId` as its `alternateHostBinding` (mirroring
+    // `secrets.resolve`'s PLA-768 pattern above) and returns `null` instead of
+    // throwing, deferring resolution to `services.config.getAgreedOrDeny()` —
+    // the host-minted agreement gate that checks every owning `plugin_config`
+    // row and only ever resolves when they agree (see plugin-host-services.ts).
+    const get = vi.fn(async () => ({ apiKey: "unreachable" }));
+    const getForCompany = vi.fn(async () => ({ apiKey: "unreachable" }));
+    const getAgreedOrDeny = vi.fn(async () => ({ resolvedVia: "agreement" }));
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: [],
+      services: {
+        config: { get, getForCompany, getAgreedOrDeny },
+      } as unknown as HostServices,
+    });
+
+    await expect(
+      handlers["config.get"](undefined as never, {
+        serviceScope: { runId: "service-run-1" },
+      }),
+    ).resolves.toEqual({ resolvedVia: "agreement" });
+
+    expect(getAgreedOrDeny).toHaveBeenCalledTimes(1);
+    expect(getAgreedOrDeny).toHaveBeenCalledWith();
+    expect(get).not.toHaveBeenCalled();
+    expect(getForCompany).not.toHaveBeenCalled();
+  });
+
+  it("PLA-1944: config.get fails closed on serviceScope-only calls when the host doesn't implement the agreement gate", async () => {
+    // A host that hasn't been upgraded to expose `getAgreedOrDeny` must keep
+    // denying a no-dispatch read rather than silently falling through to an
+    // unscoped one.
     const get = vi.fn(async () => ({ apiKey: "unreachable" }));
     const getForCompany = vi.fn(async () => ({ apiKey: "unreachable" }));
     const handlers = createHostClientHandlers({
@@ -661,11 +695,52 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
       }),
     ).rejects.toMatchObject({
       name: "InvocationScopeDeniedError",
-      message: expect.stringContaining("company context is required"),
+      message: expect.stringContaining("does not support the no-dispatch agreement gate"),
     });
 
     expect(get).not.toHaveBeenCalled();
     expect(getForCompany).not.toHaveBeenCalled();
+  });
+
+  it("C3/PLA-1944: config.get is NOT on the SERVICE_SCOPE_COMPANY_METHODS allowlist — a worker-forged companyId with only a serviceScope still denies", async () => {
+    // `SERVICE_SCOPE_COMPANY_METHODS` lets a narrow set of methods accept a
+    // worker-named companyId under a bare serviceScope (no active dispatch)
+    // because each has its own entity-level reach check downstream. config.get
+    // was deliberately left off that list (C3): it has no per-call entity to
+    // cross-check, so a worker-named companyId here has nothing to validate
+    // against. This must keep failing BEFORE the handler body — and therefore
+    // before the PLA-1944 agreement gate — ever runs, regardless of whether the
+    // host implements getAgreedOrDeny.
+    const get = vi.fn(async () => ({ apiKey: "unreachable" }));
+    const getForCompany = vi.fn(async () => ({ apiKey: "unreachable" }));
+    const getAgreedOrDeny = vi.fn(async () => ({ apiKey: "unreachable" }));
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: [],
+      services: {
+        config: { get, getForCompany, getAgreedOrDeny },
+      } as unknown as HostServices,
+    });
+
+    await expect(
+      handlers["config.get"](
+        { companyId: "company-attacker" } as never,
+        { serviceScope: { runId: "service-run-1" } },
+      ),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+
+    expect(get).not.toHaveBeenCalled();
+    expect(getForCompany).not.toHaveBeenCalled();
+    expect(getAgreedOrDeny).not.toHaveBeenCalled();
+  });
+
+  it("C3/PLA-1944: config.get remains absent from SERVICE_SCOPE_COMPANY_METHODS", () => {
+    // Direct guard against a future PR reintroducing config.get here. The
+    // behavioral test above happens to still pass even if this membership
+    // regresses (resolveRequiredCompanyId independently denies a
+    // worker-forged companyId with no host-derived pin), so it alone would
+    // not catch that regression — assert the set membership itself.
+    expect(SERVICE_SCOPE_COMPANY_METHODS.has("config.get")).toBe(false);
   });
 
   it("prefers an active dispatch runId over the service scope (PLA-768)", async () => {

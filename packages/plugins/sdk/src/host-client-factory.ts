@@ -122,6 +122,27 @@ export interface HostServices {
      * per-tenant config delivery yet.
      */
     getForCompany?(companyId: string): Promise<Record<string, unknown>>;
+    /**
+     * PLA-1944 — Option 3 host-minted agreement gate. Resolves a no-dispatch
+     * `config.get` (a `setup()`-time read or a background/poll loop with no
+     * active tool dispatch to pin a tenant) by checking EVERY owning
+     * `plugin_config` row for the plugin: resolve with the agreed value when
+     * every row agrees (structural equality, secret-ref paths excluded from
+     * the comparison and unioned back in only when at most one distinct
+     * non-null value exists across rows), deny loudly when they genuinely
+     * diverge on a non-secret-ref key.
+     *
+     * READS ONLY. The byte-agreement argument that justifies resolving here
+     * ("every owning row is read to check agreement, so nothing beyond what
+     * each company already has is disclosed") does not generalise to a
+     * write — see the implementation's C1 note. This must never be extended
+     * to a future write RPC.
+     *
+     * Optional — when omitted, a no-dispatch `config.get` call (serviceScope
+     * present, no dispatch-pinned company) fails closed rather than falling
+     * through to an unscoped read.
+     */
+    getAgreedOrDeny?(): Promise<Record<string, unknown>>;
   };
 
   /** Provides trusted company-scoped local folder helpers. */
@@ -640,7 +661,12 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
  * Those must not run with a worker-chosen company outside a host-pinned
  * dispatch, or a background loop could enumerate arbitrary tenants.
  */
-const SERVICE_SCOPE_COMPANY_METHODS: ReadonlySet<WorkerToHostMethodName> = new Set([
+// Exported test-only: PLA-1944/C3 needs to assert `config.get` stays absent
+// from this set directly, rather than only through behavioral proxies that
+// happen to still pass via a different, independent guard
+// (`resolveRequiredCompanyId` also denies a worker-named company with no
+// host-derived pin). See host-client-factory.test.ts.
+export const SERVICE_SCOPE_COMPANY_METHODS: ReadonlySet<WorkerToHostMethodName> = new Set([
   "events.subscribe",
   "state.get",
   "state.set",
@@ -873,13 +899,16 @@ export function createHostClientHandlers(
    * no reach.
    *
    * `alternateHostBinding` is a HOST-MINTED tenant binding that the server
-   * re-derives the company from downstream. Only `secrets.resolve` supplies one
-   * — `serviceScope.runId` (PLA-768), which the server's secrets handler maps
-   * to a company via the run-context registry keyed on (pluginDbId, runId).
-   * When it is present and no company pin resolves, this returns `null`
-   * (allowed, tenant resolved downstream) rather than denying. Note the
-   * worker-named-company branch below still denies unconditionally without a
-   * pin, so this cannot be used to reach a tenant the worker names.
+   * re-derives the company from (or, for `config.get`, resolves via
+   * agreement) downstream. Two callers supply one, both `serviceScope.runId`
+   * (PLA-768): `secrets.resolve`, which the server's secrets handler maps to a
+   * company via the run-context registry keyed on (pluginDbId, runId); and,
+   * since PLA-1944, `config.get`, which defers to the host-minted agreement
+   * gate (`getAgreedOrDeny`) instead of a single company mapping. When it is
+   * present and no company pin resolves, this returns `null` (allowed, tenant
+   * resolved downstream) rather than denying. Note the worker-named-company
+   * branch below still denies unconditionally without a pin, so this cannot be
+   * used to reach a tenant the worker names.
    */
   function resolveRequiredCompanyId(
     method: WorkerToHostMethodName,
@@ -970,16 +999,45 @@ export function createHostClientHandlers(
       // "instance-wide fallback" resolved to `{}` — which a plugin reads as an
       // absent key and proceeds unauthenticated. Denying is the only outcome a
       // plugin cannot silently misread as fail-open.
-      // Non-null: only a caller passing `alternateHostBinding` can get null
-      // back, and `config.get` has no downstream company derivation to defer to.
-      const companyId = resolveRequiredCompanyId("config.get", params, context) as string;
-      if (services.config.getForCompany) {
-        return services.config.getForCompany(companyId);
+      //
+      // PLA-1944: pass `context.serviceScope.runId` as the `alternateHostBinding`,
+      // mirroring `secrets.resolve`'s PLA-768 pattern. A `setup()`-time read or a
+      // background/poll loop has no dispatch pinning a tenant, so with no
+      // `alternateHostBinding` this would still deny outright (correct — see the
+      // "fails closed with no scope" regression test). With a host-minted
+      // `serviceScope` present, `resolveRequiredCompanyId` instead returns `null`
+      // and resolution defers to the host-minted agreement gate below
+      // (`getAgreedOrDeny`): every owning `plugin_config` row is checked for
+      // agreement, and only an agreed value is ever returned. This is a READ-ONLY
+      // resolution path — see `getAgreedOrDeny`'s own doc comment (C1): the
+      // byte-agreement argument does not generalise to a write, and this must
+      // never be extended to one.
+      const companyId = resolveRequiredCompanyId(
+        "config.get",
+        params,
+        context,
+        context?.serviceScope?.runId,
+      );
+      if (companyId) {
+        if (services.config.getForCompany) {
+          return services.config.getForCompany(companyId);
+        }
+        // v722 plumbs the resolved company through the params object. Only ever
+        // forward the HOST-derived id — never the worker-echoed `params.companyId`
+        // — so this stays a scope *selection* read, not an enforcement bypass.
+        return services.config.get({ ...params, companyId }, context);
       }
-      // v722 plumbs the resolved company through the params object. Only ever
-      // forward the HOST-derived id — never the worker-echoed `params.companyId`
-      // — so this stays a scope *selection* read, not an enforcement bypass.
-      return services.config.get({ ...params, companyId }, context);
+      // No dispatch-pinned company, but a host-minted serviceScope is present:
+      // defer to the agreement gate. Fail closed if the host doesn't implement
+      // it, rather than falling through to an unscoped read.
+      if (!services.config.getAgreedOrDeny) {
+        throw new InvocationScopeDeniedError(
+          pluginId,
+          "config.get",
+          "no active invocation scope and the host does not support the no-dispatch agreement gate",
+        );
+      }
+      return services.config.getAgreedOrDeny();
     }),
 
     "localFolders.declarations": gated("localFolders.declarations", async (params) => {
