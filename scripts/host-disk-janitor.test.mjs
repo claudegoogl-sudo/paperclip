@@ -345,10 +345,37 @@ test("scanWorktreeCandidates covers both ~/work/* and ~/pla*-style roots without
     ...CONFIG,
     WORKTREE_SCAN_DIRS: [workDir],
     WORKTREE_HOME_GLOB_ROOT: home,
-    WORKTREE_HOME_GLOB_PREFIX: "pla",
+    WORKTREE_HOME_GLOB_PATTERNS: [/^pla\d/],
   };
   const candidates = scanWorktreeCandidates(config).sort();
   assert.deepEqual(candidates, [path.join(home, "pla2004"), path.join(workDir, "fb13-publish")].sort());
+  rmSync(home, { recursive: true, force: true });
+});
+
+test("scanWorktreeCandidates does not over-match 'platform-*' / 'playwright-*' names sharing the 'pla' prefix in $HOME (PLA-2012 regression)", () => {
+  const home = tmpdir("janitor-home-glob-");
+  mkdirSync(path.join(home, "pla2012"));
+  mkdirSync(path.join(home, "platform-something"));
+  mkdirSync(path.join(home, "playwright-cache"));
+
+  const config = {
+    ...CONFIG,
+    WORKTREE_SCAN_DIRS: [path.join(home, "work-does-not-exist")],
+    WORKTREE_HOME_GLOB_ROOT: home,
+    WORKTREE_HOME_GLOB_PATTERNS: CONFIG.WORKTREE_HOME_GLOB_PATTERNS,
+  };
+  const candidates = scanWorktreeCandidates(config).map((p) => path.basename(p)).sort();
+  assert.deepEqual(candidates, ["pla2012"]);
+
+  // Even old and not-a-git-repo, the excluded names must never become
+  // eligible -- they aren't candidates at all, so evaluateWorktree is never
+  // even called on them in the real run() pipeline.
+  const oldTime = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+  utimesSync(path.join(home, "platform-something"), oldTime, oldTime);
+  utimesSync(path.join(home, "playwright-cache"), oldTime, oldTime);
+  const candidatesAfterAging = scanWorktreeCandidates(config).map((p) => path.basename(p)).sort();
+  assert.deepEqual(candidatesAfterAging, ["pla2012"]);
+
   rmSync(home, { recursive: true, force: true });
 });
 
@@ -481,7 +508,7 @@ function buildSandbox() {
     RUN_LOGS_DIR: runLogsDir,
     WORKTREE_SCAN_DIRS: [workDir],
     WORKTREE_HOME_GLOB_ROOT: home,
-    WORKTREE_HOME_GLOB_PREFIX: "__no_match__",
+    WORKTREE_HOME_GLOB_PATTERNS: [],
     // Points at a nonexistent dir so pruneWorktreeRegistrations() is a
     // no-op here -- these generic tests don't model a shared object store,
     // and must never touch the real one the janitor targets on the host.
@@ -594,7 +621,7 @@ test("run() --apply prunes stale git-worktree registrations after deleting eligi
     RUN_LOGS_DIR: path.join(home, "run-logs-unused"),
     WORKTREE_SCAN_DIRS: [workDir],
     WORKTREE_HOME_GLOB_ROOT: home,
-    WORKTREE_HOME_GLOB_PREFIX: "__no_match__",
+    WORKTREE_HOME_GLOB_PATTERNS: [],
     WORKTREE_OBJECT_STORE_DIR: mainRepo,
     TMP_DIR: path.join(home, "tmp-unused"),
     TMP_SCRATCH_PATTERNS: [],
