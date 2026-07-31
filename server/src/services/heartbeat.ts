@@ -480,10 +480,18 @@ function buildNoOpDispatchRetrySchedule(input: {
   };
 }
 
-// PLA-1930: a genuine account-wide usage-limit hit bills nothing and never reaches
-// the model, whatever the adapter's own classification says. Checked independently
-// of `noOpDispatch` (which is Claude/429-specific) so the park gate stays adapter-
-// agnostic and can't be defeated by a result that merely mentions a limit in passing.
+// PLA-1930/PLA-1967: a genuine account-wide usage-limit hit bills nothing and
+// never reaches the model, whatever the adapter's own classification says.
+// Checked independently of `noOpDispatch` (which is Claude/429-specific) so the
+// park gate stays adapter-agnostic. The zero-work conjuncts alone proved too
+// loose in practice — any zero-work failure (an expired OAuth token, a bad
+// model id, a transient 529) matched and parked the whole fleet on a 15-row/
+// 30-day false-positive rate. Requiring a limit-signal string too is what
+// makes the zero-work conjuncts safe: a passing mention of "limit" can't trip
+// this unless the run *also* never reached the model, and a genuine zero-work
+// failure with no limit wording no longer parks. Every live genuine hit
+// carries a signal, so this removes the false positives at zero cost to true
+// positives (see PLA-1967).
 // Exported for direct unit/replay testing (AC2/AC3/AC6) — the actual dispatch this
 // gates lives deep inside `executeRun`'s adapter-execution path, which is not a
 // practical seam to drive end-to-end from a unit test.
@@ -492,7 +500,31 @@ export function isZeroWorkUsageLimitResult(resultJson: Record<string, unknown>):
   const durationApiMs = readZeroableAmount(resultJson.duration_api_ms);
   const numTurns = readZeroableAmount(resultJson.num_turns);
   if (cost === null || durationApiMs === null || numTurns === null) return false;
-  return cost === 0 && durationApiMs === 0 && numTurns <= 1;
+  if (!(cost === 0 && durationApiMs === 0 && numTurns <= 1)) return false;
+  return hasUsageLimitSignal(resultJson.result);
+}
+
+// PLA-1967: minimum signal set from the ticket's live-data audit. "Usage
+// credits are required for this model" is a quota condition (CTO's explicit
+// read on the 3 live rows), so it's included alongside the weekly/session/
+// rate-limit phrasing rather than left to fall through as a false positive.
+const USAGE_LIMIT_SIGNAL_RE = /hit your \S+ limit|usage limit|rate limit|usage credits are required/i;
+
+function hasUsageLimitSignal(result: unknown): boolean {
+  return typeof result === "string" && USAGE_LIMIT_SIGNAL_RE.test(result);
+}
+
+// PLA-1967 AC4: folds the failed-outcome guard into the classifier's call
+// site instead of leaving it to the `if (outcome === "failed")` wrapper alone,
+// so a future refactor that moves the call out from under that wrapper still
+// fails closed. Exported so the guard is unit-testable independent of
+// `executeRun`'s completion path.
+export function shouldParkForUsageLimit(
+  outcome: RunSessionOutcome,
+  resultJson: Record<string, unknown>,
+): boolean {
+  if (outcome !== "failed") return false;
+  return isZeroWorkUsageLimitResult(resultJson);
 }
 
 function readZeroableAmount(value: unknown): number | null {
@@ -12312,14 +12344,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         } else if (outcome === "failed" && readTransientRecoveryContractFromRun(livenessRun)) {
           await scheduleBoundedRetryForRun(livenessRun, agent);
         }
-        // PLA-1930: a genuinely zero-work usage-limit hit (never billed, never reached
-        // the model) parks every agent in every company until the advertised reset,
-        // instead of relying on this one agent's own retry ladder to eventually stop
-        // hammering a quota the whole account is out of. A mid-flight limit (non-zero
-        // cost/turns) is deliberately excluded — see `isZeroWorkUsageLimitResult`.
-        if (outcome === "failed") {
+        // PLA-1930/PLA-1967: a genuinely zero-work usage-limit hit (never billed,
+        // never reached the model, and carrying a limit-signal string) parks every
+        // agent in every company until the advertised reset, instead of relying on
+        // this one agent's own retry ladder to eventually stop hammering a quota the
+        // whole account is out of. A mid-flight limit (non-zero cost/turns) and a
+        // zero-work failure with no limit wording (expired auth, bad model id,
+        // transient upstream error) are both deliberately excluded — see
+        // `shouldParkForUsageLimit` / `isZeroWorkUsageLimitResult`.
+        {
           const failedResultJson = parseObject(livenessRun.resultJson);
-          if (isZeroWorkUsageLimitResult(failedResultJson)) {
+          if (shouldParkForUsageLimit(outcome, failedResultJson)) {
             const parkedUntil = resolveUsageLimitParkTarget({
               now: new Date(),
               retryNotBefore: readTransientRetryNotBeforeFromRun(livenessRun),
