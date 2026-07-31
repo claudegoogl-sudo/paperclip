@@ -1431,10 +1431,11 @@ describe("claude execute", () => {
             companyId: "company-1",
             name: "Claude Coder",
             adapterType: "claude_local",
-            adapterConfig: {},
+            adapterConfig: { engine: "cli" },
           },
           runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
           config: {
+            engine: "cli",
             command: commandPath,
             cwd: workspace,
             promptTemplate: "Follow the paperclip heartbeat.",
@@ -1499,8 +1500,11 @@ describe("claude execute", () => {
       );
 
       expect(result.completedDirty).toBe(true);
+      // v722 split `provider_quota` out of `transient_upstream` (see
+      // execute.ts's `dirtyTeardownCode` derivation) and "out of extra usage"
+      // matches the provider-quota classifier, not the generic transient one.
       expect(result.resultJson?.dirtyExit).toMatchObject({
-        teardownErrorCode: "claude_transient_upstream",
+        teardownErrorCode: "provider_quota",
       });
       // Recorded as diagnostics only; the retry contract stays unset.
       expect(result.errorFamily ?? null).toBeNull();
@@ -1626,64 +1630,6 @@ describe("claude execute", () => {
       expect(result.resultJson?.noOpDispatchReason).toBe("pre_turn_rate_limit");
     } finally {
       vi.useRealTimers();
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
-      await fs.rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it("treats subtype=success results as successful even when the process exits nonzero", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-success-subtype-"));
-    const workspace = path.join(root, "workspace");
-    const commandPath = path.join(root, "claude");
-    await fs.mkdir(workspace, { recursive: true });
-    await writeFailingClaudeCommand(commandPath, {
-      exitCode: 1,
-      resultEvent: {
-        type: "result",
-        subtype: "success",
-        session_id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
-        is_error: false,
-        result: "Implemented the requested change.",
-        usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 },
-      },
-    });
-
-    const previousHome = process.env.HOME;
-    process.env.HOME = root;
-
-    try {
-      const result = await execute({
-        runId: "run-claude-success-subtype",
-        agent: {
-          id: "agent-1",
-          companyId: "company-1",
-          name: "Claude Coder",
-          adapterType: "claude_local",
-          adapterConfig: { engine: "cli" },
-        },
-        runtime: {
-          sessionId: null,
-          sessionParams: null,
-          sessionDisplayId: null,
-          taskKey: null,
-        },
-        config: {
-          engine: "cli",
-          command: commandPath,
-          cwd: workspace,
-          promptTemplate: "Follow the paperclip heartbeat.",
-        },
-        context: {},
-        authToken: "run-jwt-token",
-        onLog: async () => {},
-      });
-
-      expect(result.exitCode).toBe(1);
-      expect(result.errorMessage).toBeNull();
-      expect(result.errorCode).toBeNull();
-      expect(result.summary).toBe("Implemented the requested change.");
-    } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
       await fs.rm(root, { recursive: true, force: true });

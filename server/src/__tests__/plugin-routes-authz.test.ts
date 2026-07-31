@@ -6,6 +6,7 @@ const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
   getByKey: vi.fn(),
   upsertConfig: vi.fn(),
+  broadcastNonSecretConfig: vi.fn().mockResolvedValue([]),
   getCompanySettings: vi.fn(),
   upsertCompanySettings: vi.fn(),
   getCompanyConfigOverride: vi.fn(),

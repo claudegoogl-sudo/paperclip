@@ -58,6 +58,7 @@ import {
   extractSecretRefBindingsFromConfig,
   extractSecretRefPathsFromConfig,
 } from "../services/plugin-secrets-handler.js";
+import { collectSecretRefPaths } from "../services/json-schema-secret-refs.js";
 import { secretService } from "../services/secrets.js";
 import { logActivity } from "../services/activity-log.js";
 import {
@@ -2415,6 +2416,20 @@ export function pluginRoutes(
         configKeyCount: Object.keys(body.configJson).length,
       });
 
+      // PLA-1937 Condition 1: the read-side agreement gate (`getAgreedOrDeny`)
+      // depends on every owning row agreeing on non-secret-ref fields. Without
+      // this broadcast, the row just written above diverges from every
+      // sibling row on this ordinary edit and the gate denies `config.get` for
+      // every other company sharing the plugin — reusing the same
+      // `collectSecretRefPaths` helper as the write-validation above so the
+      // excluded-path set is identical on both sides of the invariant.
+      const broadcastCompanyIds = await registry.broadcastNonSecretConfig(
+        plugin.id,
+        companyId,
+        body.configJson,
+        collectSecretRefPaths(schema),
+      );
+
       // Notify the running worker about the config change (PLUGIN_SPEC §25.4.4).
       // If the worker implements onConfigChanged, send the new config via RPC.
       // If it doesn't (METHOD_NOT_IMPLEMENTED), restart the worker so it picks
@@ -2424,6 +2439,11 @@ export function pluginRoutes(
           await bridgeDeps.workerManager.call(
             plugin.id,
             "configChanged",
+            // `broadcastCompanyIds` deliberately stays host-side: it is the
+            // list of SIBLING companies whose rows were just fanned out to,
+            // and `handleConfigChanged` never reads it — forwarding it would
+            // leak other tenants' company ids into this plugin's own worker
+            // process for no functional benefit.
             { config: body.configJson, companyId },
           );
         } catch (rpcErr) {
