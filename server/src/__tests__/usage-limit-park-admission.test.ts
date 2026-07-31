@@ -67,7 +67,7 @@ describeEmbeddedPostgres("PLA-1930 usage-limit park", () => {
   // environment_leases / agent_runtime_state in the background after the test
   // function returns. An ordered per-table DELETE chain races that write burst
   // and intermittently trips an FK violation on whichever table gets deleted out
-  // from under a still-in-flight insert (PLA-1975). See
+  // from under a still-in-flight insert. See
   // resetEmbeddedPostgresTestDatabase for why an atomic TRUNCATE ... CASCADE
   // doesn't have that race.
   afterEach(async () => {

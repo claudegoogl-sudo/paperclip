@@ -6,7 +6,7 @@ import type { createDb } from "@paperclipai/db";
 // a single atomic statement. This matters when the suite under test exercises a
 // production path that keeps writing in the background after the test function
 // returns (e.g. a fire-and-forget `void executeRun(...)`, or a heartbeat worker
-// loop) — see PLA-1975 / PLA-1978. An ordered per-table `db.delete(...)` chain
+// loop) — reproduced in two separate test suites. An ordered per-table `db.delete(...)` chain
 // races that write burst: deleting a parent table out from under a still-in-flight
 // child insert trips an FK violation (23503) and fails the test's afterEach
 // outright. TRUNCATE CASCADE has no such ordering to race — a write that lands

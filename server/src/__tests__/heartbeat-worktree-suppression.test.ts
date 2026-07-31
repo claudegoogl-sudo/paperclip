@@ -40,7 +40,7 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
   // (and friends) in the background after the test function returns. An ordered
   // per-table DELETE chain races that write burst and intermittently trips an FK
   // violation on whichever table gets deleted out from under a still-in-flight
-  // insert (PLA-1975 / PLA-1978) — see resetEmbeddedPostgresTestDatabase for why
+  // insert — this is the same race reproduced in another suite; see resetEmbeddedPostgresTestDatabase for why
   // an atomic TRUNCATE ... CASCADE doesn't have that race.
   afterEach(async () => {
     await resetEmbeddedPostgresTestDatabase(db);
