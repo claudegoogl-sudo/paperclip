@@ -22,6 +22,7 @@ import {
   heartbeatService,
   isZeroWorkUsageLimitResult,
   resolveUsageLimitParkTarget,
+  shouldParkForUsageLimit,
 } from "../services/heartbeat.ts";
 import { usageLimitParkService } from "../services/usage-limit-park.ts";
 
@@ -43,6 +44,16 @@ if (!embeddedPostgresSupport.supported) {
 //   AC5 - park state (parkedUntil + reason) is observable, with extend-not-shorten
 //         and early-clear-on-success semantics pinned.
 //   AC6 - replay against the ticket's literal live result_json / result string.
+//
+// PLA-1967 (narrowing follow-up to PLA-1930/PR#136) adds:
+//   AC1 - a zero-work failure additionally requires a usage-limit signal string;
+//         the three literal live false-positive strings must not park.
+//   AC2 - "Usage credits are required for this model" is treated as a genuine
+//         limit signal (CTO's explicit read) and still parks.
+//   AC3 - representative genuine live strings (weekly w/ and w/o date, session)
+//         still park.
+//   AC4 - the classifier is unreachable for non-failed outcomes, independent of
+//         the call site, via `shouldParkForUsageLimit`.
 describeEmbeddedPostgres("PLA-1930 usage-limit park", () => {
   let db!: ReturnType<typeof createDb>;
   let heartbeat!: ReturnType<typeof heartbeatService>;
@@ -161,6 +172,100 @@ describeEmbeddedPostgres("PLA-1930 usage-limit park", () => {
     it("fails closed when cost/duration/turns are missing rather than assuming zero-work", () => {
       expect(isZeroWorkUsageLimitResult({})).toBe(false);
       expect(isZeroWorkUsageLimitResult({ total_cost_usd: 0, duration_api_ms: 0 })).toBe(false);
+    });
+
+    // PLA-1967 AC1/AC3: literal live false-positive strings from the ticket's
+    // 30-day audit (CTO, queried against heartbeat_runs) — all zero-work but
+    // carrying no usage-limit signal, so none of these may park the fleet.
+    it.each([
+      ["expired OAuth token", "Failed to authenticate. API Error: 401 OAuth access token has expired."],
+      ["bad model id", "There's an issue with the selected model (Claude Opus 5.0)..."],
+      ["transient 529 overloaded", "API Error: 529 Overloaded..."],
+    ])("PLA-1967: does not park a zero-work failure with no limit signal (%s)", (_label, result) => {
+      expect(
+        isZeroWorkUsageLimitResult({
+          total_cost_usd: 0,
+          duration_api_ms: 0,
+          num_turns: 1,
+          is_error: true,
+          result,
+        }),
+      ).toBe(false);
+    });
+
+    // PLA-1967 AC3: representative genuine live strings must still park.
+    it.each([
+      ["weekly, with date", "You've hit your weekly limit · resets Jul 31, 8am (UTC)"],
+      ["weekly, without date", "You've hit your weekly limit · resets 8am (UTC)"],
+      ["session", "You've hit your session limit · resets 1:50pm (UTC)"],
+    ])("PLA-1967: still parks a genuine zero-work limit hit (%s)", (_label, result) => {
+      expect(
+        isZeroWorkUsageLimitResult({
+          total_cost_usd: 0,
+          duration_api_ms: 0,
+          num_turns: 1,
+          is_error: true,
+          result,
+        }),
+      ).toBe(true);
+    });
+
+    // PLA-1967 AC2: CTO's explicit read — "usage credits are required" is a
+    // quota condition and should park, called out here rather than left
+    // implicit in the regex.
+    it("PLA-1967 AC2: parks on 'usage credits are required for this model'", () => {
+      expect(
+        isZeroWorkUsageLimitResult({
+          total_cost_usd: 0,
+          duration_api_ms: 0,
+          num_turns: 1,
+          is_error: true,
+          result: "Usage credits are required for this model.",
+        }),
+      ).toBe(true);
+    });
+
+    it("PLA-1967: signal match is case-insensitive", () => {
+      expect(
+        isZeroWorkUsageLimitResult({
+          total_cost_usd: 0,
+          duration_api_ms: 0,
+          num_turns: 1,
+          result: "USAGE LIMIT REACHED",
+        }),
+      ).toBe(true);
+    });
+  });
+
+  describe("shouldParkForUsageLimit outcome guard (PLA-1967 AC4)", () => {
+    const zeroWorkLimitResult = {
+      total_cost_usd: 0,
+      duration_api_ms: 0,
+      num_turns: 1,
+      is_error: true,
+      result: "You've hit your weekly limit · resets 8am (UTC)",
+    };
+
+    it.each(["succeeded", "succeeded_dirty", "cancelled", "timed_out"] as const)(
+      "does not park for a %s outcome even when the result would otherwise be park-eligible",
+      (outcome) => {
+        expect(shouldParkForUsageLimit(outcome, zeroWorkLimitResult)).toBe(false);
+      },
+    );
+
+    it("parks for a failed outcome carrying a genuine zero-work limit signal", () => {
+      expect(shouldParkForUsageLimit("failed", zeroWorkLimitResult)).toBe(true);
+    });
+
+    it("does not park for a failed outcome without a limit signal", () => {
+      expect(
+        shouldParkForUsageLimit("failed", {
+          total_cost_usd: 0,
+          duration_api_ms: 0,
+          num_turns: 1,
+          result: "Failed to authenticate. API Error: 401 OAuth access token has expired.",
+        }),
+      ).toBe(false);
     });
   });
 
