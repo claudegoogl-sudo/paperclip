@@ -1,22 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import {
-  agentRuntimeState,
-  agents,
-  agentWakeupRequests,
-  companies,
-  createDb,
-  environmentLeases,
-  heartbeatRunEvents,
-  heartbeatRuns,
-  usageLimitParks,
-} from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
 import { extractClaudeRetryNotBefore } from "@paperclipai/adapter-claude-local/server";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import {
   NO_OP_DISPATCH_RETRY_SAFETY_MARGIN_MS,
   heartbeatService,
@@ -74,32 +65,13 @@ describeEmbeddedPostgres("PLA-1930 usage-limit park", () => {
   // Its errors are already caught and logged internally (never rethrown), so it
   // cannot fail a test directly, but it keeps writing to heartbeat_run_events /
   // environment_leases / agent_runtime_state in the background after the test
-  // function returns. Delete in dependency order with a short bounded retry on
-  // FK-violation (23503) so a still-racing write doesn't fail cleanup — once the
-  // background task's current write burst subsides, the retry succeeds.
-  async function deleteAllTolerantly(table: Parameters<typeof db.delete>[0]) {
-    const deadline = Date.now() + 3_000;
-    for (;;) {
-      try {
-        await db.delete(table);
-        return;
-      } catch (err) {
-        const code = (err as { cause?: { code?: string } } | undefined)?.cause?.code;
-        if (code !== "23503" || Date.now() >= deadline) throw err;
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      }
-    }
-  }
-
+  // function returns. An ordered per-table DELETE chain races that write burst
+  // and intermittently trips an FK violation on whichever table gets deleted out
+  // from under a still-in-flight insert (PLA-1975). See
+  // resetEmbeddedPostgresTestDatabase for why an atomic TRUNCATE ... CASCADE
+  // doesn't have that race.
   afterEach(async () => {
-    await deleteAllTolerantly(heartbeatRunEvents);
-    await deleteAllTolerantly(environmentLeases);
-    await deleteAllTolerantly(heartbeatRuns);
-    await deleteAllTolerantly(agentWakeupRequests);
-    await deleteAllTolerantly(agentRuntimeState);
-    await deleteAllTolerantly(agents);
-    await deleteAllTolerantly(companies);
-    await deleteAllTolerantly(usageLimitParks);
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {
