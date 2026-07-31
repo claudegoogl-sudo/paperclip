@@ -974,6 +974,20 @@
       "when": 1783100400000,
       "tag": "0140_activity_log_company_entity_created_idx",
       "breakpoints": true
+    },
+    {
+      "idx": 141,
+      "version": "7",
+      "when": 1783100500000,
+      "tag": "0141_plugin_config_egress_allowlist",
+      "breakpoints": true
+    },
+    {
+      "idx": 142,
+      "version": "7",
+      "when": 1783100600000,
+      "tag": "0142_plugin_config_egress_would_deny_observations",
+      "breakpoints": true
     }
   ]
 }
