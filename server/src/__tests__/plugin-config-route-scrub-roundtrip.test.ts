@@ -68,7 +68,7 @@ describeEmbeddedPostgres("plugin config POST round trip after the 0164 scrub (PL
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-plugin-config-scrub-roundtrip-");
     db = createDb(tempDb.connectionString);
-  }, 90_000);
+  }, 180_000);
 
   afterEach(async () => {
     await db.delete(plugins);
