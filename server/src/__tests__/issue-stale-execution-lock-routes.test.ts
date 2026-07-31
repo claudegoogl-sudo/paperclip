@@ -134,6 +134,35 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     };
   }
 
+  async function seedScheduledRetryHolder(opts: {
+    companyId: string;
+    agentId: string;
+    holderAgentId?: string;
+    holderStatus?: string;
+    holderStartedAt?: Date | null;
+  }) {
+    const holderRunId = randomUUID();
+    const wakeupRequestId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId,
+      companyId: opts.companyId,
+      agentId: opts.holderAgentId ?? opts.agentId,
+      source: "heartbeat",
+      status: "queued",
+      runId: holderRunId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: holderRunId,
+      companyId: opts.companyId,
+      agentId: opts.holderAgentId ?? opts.agentId,
+      status: opts.holderStatus ?? "scheduled_retry",
+      invocationSource: "automation",
+      wakeupRequestId,
+      startedAt: opts.holderStartedAt ?? null,
+    });
+    return { holderRunId, wakeupRequestId };
+  }
+
   it("allows an assigned agent PATCH to recover a terminal stale executionRunId", async () => {
     const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
     const issueId = randomUUID();
@@ -298,35 +327,6 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
   // yield to the same agent's own live run instead of wedging it out with a
   // 409 for the whole backoff window.
   describe("yieldable scheduled_retry execution lock (PLA-1932)", () => {
-    async function seedScheduledRetryHolder(opts: {
-      companyId: string;
-      agentId: string;
-      holderAgentId?: string;
-      holderStatus?: string;
-      holderStartedAt?: Date | null;
-    }) {
-      const holderRunId = randomUUID();
-      const wakeupRequestId = randomUUID();
-      await db.insert(agentWakeupRequests).values({
-        id: wakeupRequestId,
-        companyId: opts.companyId,
-        agentId: opts.holderAgentId ?? opts.agentId,
-        source: "heartbeat",
-        status: "queued",
-        runId: holderRunId,
-      });
-      await db.insert(heartbeatRuns).values({
-        id: holderRunId,
-        companyId: opts.companyId,
-        agentId: opts.holderAgentId ?? opts.agentId,
-        status: opts.holderStatus ?? "scheduled_retry",
-        invocationSource: "automation",
-        wakeupRequestId,
-        startedAt: opts.holderStartedAt ?? null,
-      });
-      return { holderRunId, wakeupRequestId };
-    }
-
     it("yields to the same agent's live run on PATCH and cancels the superseded retry", async () => {
       const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
       const { holderRunId, wakeupRequestId } = await seedScheduledRetryHolder({ companyId, agentId });
@@ -511,6 +511,215 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         .where(eq(heartbeatRuns.id, holderRunId))
         .then((rows) => rows[0]);
       expect(holderRun?.status).toBe("scheduled_retry");
+    });
+  });
+
+  // PLA-1956: PATCH/release route through assertCheckoutOwner (fixed by
+  // PLA-1932), but POST /issues/:id/checkout calls svc.checkout, a separate
+  // code path with its own unowned-checkout adoption branch that did not
+  // reuse isYieldableExecutionLockHolder. Same predicate, same transactional
+  // adoption helper (adoptUnownedCheckoutRun) — just wired into the other
+  // entry point too.
+  describe("yieldable scheduled_retry execution lock via checkout (PLA-1956)", () => {
+    const expectedStatuses = ["todo", "backlog", "blocked", "in_review"];
+
+    it("yields to the same agent's live run on checkout and cancels the superseded retry", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const { holderRunId, wakeupRequestId } = await seedScheduledRetryHolder({ companyId, agentId });
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Yieldable scheduled_retry lock via checkout",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: null,
+        executionRunId: holderRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+      });
+
+      const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .post(`/api/issues/${issueId}/checkout`)
+        .send({ agentId, expectedStatuses });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+      const row = await db
+        .select({
+          status: issues.status,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({
+        status: "in_progress",
+        checkoutRunId: currentRunId,
+        executionRunId: currentRunId,
+      });
+
+      const holderRun = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, holderRunId))
+        .then((rows) => rows[0]);
+      expect(holderRun?.status).toBe("cancelled");
+
+      const wakeupRequest = await db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeupRequestId))
+        .then((rows) => rows[0]);
+      expect(wakeupRequest?.status).toBe("cancelled");
+    });
+
+    it("still returns 409 Issue checkout conflict when a different agent holds the scheduled_retry lock", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const otherAgentId = randomUUID();
+      await db.insert(agents).values({
+        id: otherAgentId,
+        companyId,
+        name: "OtherAgent",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      const { holderRunId } = await seedScheduledRetryHolder({
+        companyId,
+        agentId,
+        holderAgentId: otherAgentId,
+      });
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Cross-agent scheduled_retry lock via checkout",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: null,
+        executionRunId: holderRunId,
+        executionAgentNameKey: "otheragent",
+        executionLockedAt: new Date(),
+      });
+
+      const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .post(`/api/issues/${issueId}/checkout`)
+        .send({ agentId, expectedStatuses });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body?.error).toBe("Issue checkout conflict");
+
+      const holderRun = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, holderRunId))
+        .then((rows) => rows[0]);
+      expect(holderRun?.status).toBe("scheduled_retry");
+    });
+
+    it("still returns 409 Issue checkout conflict when the scheduled_retry holder has already started", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const { holderRunId } = await seedScheduledRetryHolder({
+        companyId,
+        agentId,
+        holderStartedAt: new Date(),
+      });
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Started scheduled_retry lock via checkout",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: null,
+        executionRunId: holderRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+      });
+
+      const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .post(`/api/issues/${issueId}/checkout`)
+        .send({ agentId, expectedStatuses });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body?.error).toBe("Issue checkout conflict");
+    });
+
+    it("still returns 409 Issue checkout conflict when the holder run is running rather than scheduled_retry", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const { holderRunId } = await seedScheduledRetryHolder({
+        companyId,
+        agentId,
+        holderStatus: "running",
+      });
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Running holder via checkout",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: null,
+        executionRunId: holderRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+      });
+
+      const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .post(`/api/issues/${issueId}/checkout`)
+        .send({ agentId, expectedStatuses });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body?.error).toBe("Issue checkout conflict");
+    });
+
+    it("leaves consistent state so a same-run PATCH still succeeds after a checkout-path yield", async () => {
+      const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+      const { holderRunId } = await seedScheduledRetryHolder({ companyId, agentId });
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Checkout yield then PATCH",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: null,
+        executionRunId: holderRunId,
+        executionAgentNameKey: "codexcoder",
+        executionLockedAt: new Date(),
+      });
+
+      const checkoutRes = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .post(`/api/issues/${issueId}/checkout`)
+        .send({ agentId, expectedStatuses });
+      expect(checkoutRes.status, JSON.stringify(checkoutRes.body)).toBe(200);
+
+      const patchRes = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+        .patch(`/api/issues/${issueId}`)
+        .send({ title: "Patched after checkout-path yield" });
+
+      expect(patchRes.status, JSON.stringify(patchRes.body)).toBe(200);
+      expect(patchRes.body.title).toBe("Patched after checkout-path yield");
+
+      const row = await db
+        .select({
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(row).toEqual({ checkoutRunId: currentRunId, executionRunId: currentRunId });
     });
   });
 

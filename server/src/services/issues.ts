@@ -4501,6 +4501,39 @@ export function issueService(db: Db) {
     });
   }
 
+  // PLA-1956: shared by assertCheckoutOwner (PATCH/release) and checkout
+  // (POST /checkout) so the two entry points can never drift on what counts
+  // as an adoptable "unowned" checkout. This is a fast, non-authoritative
+  // pre-check — adoptUnownedCheckoutRun re-reads and locks the holder row
+  // inside its own transaction before committing to any adoption.
+  async function canAdoptUnownedCheckout(
+    candidate: {
+      status: string;
+      assigneeAgentId: string | null;
+      checkoutRunId: string | null;
+      executionRunId: string | null;
+    },
+    actorAgentId: string,
+    actorRunId: string | null,
+  ): Promise<boolean> {
+    if (
+      !actorRunId
+      || candidate.status !== "in_progress"
+      || candidate.assigneeAgentId !== actorAgentId
+      || candidate.checkoutRunId != null
+    ) {
+      return false;
+    }
+    if (candidate.executionRunId == null || candidate.executionRunId === actorRunId) return true;
+
+    const holderRun = await db
+      .select({ status: heartbeatRuns.status, agentId: heartbeatRuns.agentId, startedAt: heartbeatRuns.startedAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, candidate.executionRunId))
+      .then((rows) => rows[0] ?? null);
+    return isYieldableExecutionLockHolder(holderRun, actorAgentId, candidate.assigneeAgentId);
+  }
+
   async function clearExecutionRunIfTerminal(issueId: string): Promise<boolean> {
     // PLA-597: this helper takes overlapping locks on issues + heartbeat_runs
     // and is called pre-authorization from multiple mutation routes; on its
@@ -6717,31 +6750,34 @@ export function issueService(db: Db) {
       if (!current) throw notFound("Issue not found");
 
       if (
-        current.assigneeAgentId === agentId &&
-        current.status === "in_progress" &&
-        current.checkoutRunId == null &&
-        (current.executionRunId == null || current.executionRunId === checkoutRunId) &&
-        checkoutRunId
+        checkoutRunId &&
+        (await canAdoptUnownedCheckout(
+          {
+            status: current.status,
+            assigneeAgentId: current.assigneeAgentId,
+            checkoutRunId: current.checkoutRunId,
+            executionRunId: current.executionRunId,
+          },
+          agentId,
+          checkoutRunId,
+        ))
       ) {
-        const adopted = await db
-          .update(issues)
-          .set({
-            checkoutRunId,
-            executionRunId: checkoutRunId,
-            updatedAt: new Date(),
-          })
-          .where(
-            and(
-              eq(issues.id, id),
-              eq(issues.status, "in_progress"),
-              eq(issues.assigneeAgentId, agentId),
-              isNull(issues.checkoutRunId),
-              or(isNull(issues.executionRunId), eq(issues.executionRunId, checkoutRunId)),
-            ),
-          )
-          .returning()
-          .then((rows) => rows[0] ?? null);
-        if (adopted) return adopted;
+        // PLA-1956: route through the same transactional, re-verified-under-lock
+        // adoption used by assertCheckoutOwner (PATCH/release) so a yieldable
+        // scheduled_retry holder (PLA-1932) is reclaimed here too, instead of
+        // falling through to "Issue checkout conflict" for a lock the ownership
+        // layer would have let this same run take a moment later.
+        const adopted = await adoptUnownedCheckoutRun({
+          issueId: id,
+          actorAgentId: agentId,
+          actorRunId: checkoutRunId,
+        });
+        if (adopted) {
+          const row = await db.select().from(issues).where(eq(issues.id, id)).then((rows) => rows[0] ?? null);
+          if (!row) throw notFound("Issue not found");
+          const [enriched] = await withIssueLabels(db, [row]);
+          return enriched;
+        }
       }
 
       if (
@@ -6866,33 +6902,6 @@ export function issueService(db: Db) {
         return null;
       };
 
-      const canAdoptUnownedCheckout = async (candidate: {
-        status: string;
-        assigneeAgentId: string | null;
-        checkoutRunId: string | null;
-        executionRunId: string | null;
-      }) => {
-        if (
-          !actorRunId
-          || candidate.status !== "in_progress"
-          || candidate.assigneeAgentId !== actorAgentId
-          || candidate.checkoutRunId != null
-        ) {
-          return false;
-        }
-        if (candidate.executionRunId == null || candidate.executionRunId === actorRunId) return true;
-
-        // Fast pre-check only — not authoritative. adoptUnownedCheckoutRun
-        // re-reads and locks the holder run inside its transaction before
-        // committing to the adoption (PLA-1932).
-        const holderRun = await db
-          .select({ status: heartbeatRuns.status, agentId: heartbeatRuns.agentId, startedAt: heartbeatRuns.startedAt })
-          .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.id, candidate.executionRunId))
-          .then((rows) => rows[0] ?? null);
-        return isYieldableExecutionLockHolder(holderRun, actorAgentId, candidate.assigneeAgentId);
-      };
-
       const resolveOwnership = async (
         candidate: {
           id: string;
@@ -6905,7 +6914,7 @@ export function issueService(db: Db) {
         const sameRunOwnership = resolveSameRunOwnership(candidate);
         if (sameRunOwnership) return { ownership: sameRunOwnership, latest: null };
 
-        if (await canAdoptUnownedCheckout(candidate)) {
+        if (await canAdoptUnownedCheckout(candidate, actorAgentId, actorRunId)) {
           const adopted = await adoptUnownedCheckoutRun({
             issueId: id,
             actorAgentId,
