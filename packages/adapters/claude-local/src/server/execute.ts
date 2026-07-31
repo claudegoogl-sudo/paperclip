@@ -70,6 +70,8 @@ import {
   isClaudeImageProcessingError,
   isClaudePreTurnRateLimitResult,
   isClaudeModelNotFoundError,
+  isClaudeUsageLimitResult,
+  isClaudeNoWorkResult,
 } from "./parse.js";
 import {
   materializeRemoteClaudeConfig,
@@ -1109,6 +1111,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // clean result (subtype=success, is_error=false). The work landed, so this is
     // a success with a dirty exit, not a run failure. Every other non-zero exit
     // — and any is_error=true result — still fails.
+    // A quota limit stops the run *before* its work is done, so it must never
+    // read as a completed run — the wake still has to be retried after the reset.
+    // `usageLimit` matches the message; `noWork` is the wording-independent
+    // backstop for a result that billed nothing and never got past turn one.
+    const usageLimit = isClaudeUsageLimitResult(parsed);
+    const noWork = isClaudeNoWorkResult(parsed);
     const completedDirty =
       !parsedIsError &&
       (proc.exitCode ?? 0) !== 0 &&
@@ -1116,7 +1124,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       !loginMeta.requiresLogin &&
       !clearSessionForMaxTurns &&
       !poisonedPreviousMessageId &&
-      !claudeRefusal;
+      !claudeRefusal &&
+      !usageLimit &&
+      !noWork;
     const failed = parsedIsError || ((proc.exitCode ?? 0) !== 0 && !completedDirty);
     // Validate-before-persist guard: never persist a sessionId whose transcript
     // is known-poisoned. The Claude CLI keeps an on-disk JSONL keyed by the

@@ -84,10 +84,23 @@ async function getAvailablePort(): Promise<number> {
   );
 }
 
+const MAX_RECENT_STARTUP_LOG_LINES = 40;
+
+function recordStartupLogLine(recentLogs: string[], message: unknown): void {
+  const text = typeof message === "string" ? message : String(message ?? "");
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    recentLogs.push(line);
+    if (recentLogs.length > MAX_RECENT_STARTUP_LOG_LINES) recentLogs.shift();
+  }
+}
+
 async function createEmbeddedPostgresTestInstance(tempDirPrefix: string) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), tempDirPrefix));
   const port = await getAvailablePort();
   const EmbeddedPostgres = await getEmbeddedPostgresCtor();
+  const recentLogs: string[] = [];
   const instance = new EmbeddedPostgres({
     databaseDir: dataDir,
     user: "paperclip",
@@ -95,11 +108,11 @@ async function createEmbeddedPostgresTestInstance(tempDirPrefix: string) {
     port,
     persistent: true,
     initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
-    onLog: () => {},
-    onError: () => {},
+    onLog: (message) => recordStartupLogLine(recentLogs, message),
+    onError: (message) => recordStartupLogLine(recentLogs, message),
   });
 
-  return { dataDir, port, instance };
+  return { dataDir, port, instance, recentLogs };
 }
 
 function cleanupEmbeddedPostgresTestDirs(dataDir: string) {
@@ -199,39 +212,67 @@ export async function getEmbeddedPostgresTestSupport(): Promise<EmbeddedPostgres
   return await embeddedPostgresSupportPromise;
 }
 
+const MAX_PORT_COLLISION_ATTEMPTS = 5;
+const PORT_COLLISION_LOG_PATTERN = /address already in use/i;
+
+// getAvailablePort() closes its probe socket before initialise()/start() ever
+// binds it, so a concurrent test worker can grab the same port in between
+// (TOCTOU). When that happens, embedded-postgres's start() rejects with no
+// error object at all (it settles via a bare `reject()` on early process
+// exit) - the only signal is the "Address already in use" line it hands to
+// onLog. Detect that in the captured startup log rather than the thrown error.
+function isLikelyPortCollision(recentLogs: string[]): boolean {
+  return recentLogs.some((line) => PORT_COLLISION_LOG_PATTERN.test(line));
+}
+
 export async function startEmbeddedPostgresTestDatabase(
   tempDirPrefix: string,
 ): Promise<EmbeddedPostgresTestDatabase> {
-  let dataDir: string | null = null;
-  let instance: EmbeddedPostgresInstance | null = null;
+  let lastError: unknown;
 
-  try {
-    const created = await createEmbeddedPostgresTestInstance(tempDirPrefix);
-    dataDir = created.dataDir;
-    instance = created.instance;
-    const { port } = created;
-    await instance.initialise();
-    await instance.start();
+  for (let attempt = 1; attempt <= MAX_PORT_COLLISION_ATTEMPTS; attempt += 1) {
+    let dataDir: string | null = null;
+    let instance: EmbeddedPostgresInstance | null = null;
+    let recentLogs: string[] = [];
 
-    const adminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/postgres`;
-    await ensurePostgresDatabase(adminConnectionString, "paperclip");
-    const connectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`;
-    await applyPendingMigrations(connectionString);
+    try {
+      const created = await createEmbeddedPostgresTestInstance(tempDirPrefix);
+      dataDir = created.dataDir;
+      instance = created.instance;
+      recentLogs = created.recentLogs;
+      const { port } = created;
+      await instance.initialise();
+      await instance.start();
 
-    return {
-      connectionString,
-      cleanup: async () => {
-        await stopEmbeddedPostgresBounded(instance, () => {
-          if (dataDir) cleanupEmbeddedPostgresTestDirs(dataDir);
-        });
-      },
-    };
-  } catch (error) {
-    await stopEmbeddedPostgresBounded(instance, () => {
-      if (dataDir) cleanupEmbeddedPostgresTestDirs(dataDir);
-    });
-    throw new Error(
-      `Failed to start embedded PostgreSQL test database: ${formatEmbeddedPostgresError(error)}`,
-    );
+      const adminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/postgres`;
+      await ensurePostgresDatabase(adminConnectionString, "paperclip");
+      const connectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`;
+      await applyPendingMigrations(connectionString);
+
+      return {
+        connectionString,
+        cleanup: async () => {
+          await stopEmbeddedPostgresBounded(instance, () => {
+            if (dataDir) cleanupEmbeddedPostgresTestDirs(dataDir);
+          });
+        },
+      };
+    } catch (error) {
+      await stopEmbeddedPostgresBounded(instance, () => {
+        if (dataDir) cleanupEmbeddedPostgresTestDirs(dataDir);
+      });
+
+      const canRetry = attempt < MAX_PORT_COLLISION_ATTEMPTS && isLikelyPortCollision(recentLogs);
+      if (!canRetry) {
+        throw new Error(
+          `Failed to start embedded PostgreSQL test database: ${formatEmbeddedPostgresError(error)}`,
+        );
+      }
+      lastError = error;
+    }
   }
+
+  throw new Error(
+    `Failed to start embedded PostgreSQL test database: ${formatEmbeddedPostgresError(lastError)}`,
+  );
 }

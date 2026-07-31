@@ -63,10 +63,6 @@ const generalWorkspacesBGroupName = "general-workspaces-b";
 const generalWorkspacesAProjects = ["@paperclipai/ui", "paperclipai"];
 const generalWorkspacesBProjects = nonServerProjects.filter((project) => !generalWorkspacesAProjects.includes(project));
 const generalGroupNames = [generalServerGroupName, generalWorkspacesAGroupName, generalWorkspacesBGroupName];
-const serializedServerVitestArgs = [
-  "--no-file-parallelism",
-  "--maxWorkers=1",
-];
 
 function walk(dir) {
   const entries = readdirSync(dir);
@@ -311,7 +307,6 @@ function runGeneralGroup(routeTests, groupName, shardIndex = null, shardCount = 
         [
           "--project",
           "@paperclipai/server",
-          ...serializedServerVitestArgs,
           ...shardFiles,
         ],
         `${groupName} shard ${shardIndex + 1}/${shardCount}`,
@@ -324,7 +319,6 @@ function runGeneralGroup(routeTests, groupName, shardIndex = null, shardCount = 
       [
         "--project",
         "@paperclipai/server",
-        ...serializedServerVitestArgs,
         ...excludeRouteArgs,
       ],
       `${groupName} server suites excluding ${routeTests.length} serialized suites`,
@@ -375,9 +369,10 @@ const routeTests = walk(serverTestsDir)
 
 // Every server test file that the general-server group is responsible for,
 // i.e. the whole server project minus the route/authz suites that run in the
-// dedicated serialized shards. Sharding this list across runners is what keeps
-// the general-server lane from becoming the PR critical path: the server vitest
-// config pins maxWorkers to 1, so the only way to parallelize is across jobs.
+// dedicated serialized shards. server/vitest.config.ts now runs this lane with
+// a bounded in-process worker pool (default 2, PAPERCLIP_SERVER_TEST_MAX_WORKERS
+// -overridable); sharding this list across CI runners on top of that is what
+// keeps the general-server lane from becoming the PR critical path.
 // Suites are partitioned by recorded duration (scripts/general-server-shard.mjs)
 // rather than round-robin, so one slow suite cluster can't stretch a single shard.
 const generalServerTestFiles = walk(serverSrcDir)

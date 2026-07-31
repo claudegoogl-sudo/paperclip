@@ -1567,6 +1567,148 @@ describe("claude execute", () => {
       expect(result.errorMessage ?? null).toBeNull();
       expect(result.errorCode ?? null).toBeNull();
     });
+
+    it("PLA-1865: a usage-limit result that did no work is never completedDirty, even when it reports is_error: false", async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-07-28T14:41:00.000Z"));
+      try {
+        const result = await runCase(
+          {
+            type: "result",
+            subtype: "success",
+            session_id: "11111111-1111-4111-8111-111111111111",
+            is_error: false,
+            num_turns: 1,
+            total_cost_usd: 0,
+            duration_api_ms: 0,
+            result: "You've hit your weekly limit · resets Jul 31, 8am (UTC)",
+          },
+          1,
+        );
+
+        // This is the fork.9 defect this ticket blocks: isClaudeCleanCompletionResult()
+        // only checks is_error/subtype, so without the noWork/usageLimit guards this
+        // result reads as a clean completion and gets marked completedDirty.
+        expect(result.completedDirty ?? false).toBe(false);
+        // v722 split `provider_quota` out of `transient_upstream`, and a "hit
+        // your weekly limit" wording matches the provider-quota classifier.
+        expect(result.errorCode).toBe("provider_quota");
+        expect(result.errorFamily).toBe("provider_quota");
+        // PLA-1790's backoff must survive: the wake is retried after the reset,
+        // not treated as done.
+        expect(result.retryNotBefore).toBe("2026-07-31T08:00:00.000Z");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("PLA-1865: a session-limit result is never completedDirty regardless of turn count", async () => {
+      const result = await runCase(
+        {
+          type: "result",
+          subtype: "success",
+          session_id: "22222222-2222-4222-8222-222222222222",
+          is_error: false,
+          num_turns: 1,
+          total_cost_usd: 0,
+          result: "You've hit your session limit · resets 6:50pm (UTC)",
+        },
+        1,
+      );
+
+      expect(result.completedDirty ?? false).toBe(false);
+      // v722 reclassified session-limit hits from transient_upstream to provider_quota.
+      expect(result.errorFamily).toBe("provider_quota");
+    });
+  });
+
+  describe("PLA-1865 replay: real live result_json rows", () => {
+    async function replay(resultEvent: Record<string, unknown>, exitCode: number) {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-replay-"));
+      const workspace = path.join(root, "workspace");
+      const commandPath = path.join(root, "claude");
+      await fs.mkdir(workspace, { recursive: true });
+      await writeFailingClaudeCommand(commandPath, { resultEvent, exitCode });
+      const previousHome = process.env.HOME;
+      process.env.HOME = root;
+      try {
+        return await execute({
+          runId: "run-claude-replay",
+          agent: {
+            id: "agent-1",
+            companyId: "company-1",
+            name: "Claude Coder",
+            adapterType: "claude_local",
+            adapterConfig: { engine: "cli" },
+          },
+          runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+          config: {
+            engine: "cli",
+            command: commandPath,
+            cwd: workspace,
+            promptTemplate: "Follow the paperclip heartbeat.",
+          },
+          context: {},
+          authToken: "run-jwt-token",
+          onLog: async () => {},
+        });
+      } finally {
+        if (previousHome === undefined) delete process.env.HOME;
+        else process.env.HOME = previousHome;
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    }
+
+    // Captured verbatim (minus the adapter's own derived fields, e.g. `errorFamily`)
+    // from `heartbeat_runs.result_json` on this instance's live database,
+    // run id dd0fe9e6-dfbe-4d97-8af6-3f5d4ae19e7c, 2026-07-28T14:46:19.955Z.
+    // The point of this ticket is that a hand-written fixture missed this shape.
+    const liveUsageLimitRow = {
+      type: "result",
+      subtype: "success",
+      session_id: "790767ad-e36b-410b-add9-6ce03807e24c",
+      is_error: true,
+      num_turns: 1,
+      total_cost_usd: 0,
+      duration_api_ms: 0,
+      api_error_status: 429,
+      result: "You've hit your weekly limit · resets Jul 31, 8am (UTC)",
+    };
+
+    // Captured verbatim from the same table, run id
+    // b985f530-2d71-488d-acd9-6951fee616f7, 2026-07-28 (exact timestamp
+    // redacted from this excerpt). This is exactly the PLA-1817 population:
+    // real multi-turn work, non-zero teardown exit, no usage-limit wording.
+    const liveGenuineDirtyRow = {
+      type: "result",
+      subtype: "success",
+      session_id: "8d8110dc-450b-459c-8062-4f1b50796043",
+      is_error: false,
+      num_turns: 14,
+      total_cost_usd: 0.80183175,
+      duration_api_ms: 132112,
+      api_error_status: null,
+      result: "PLA-1840 recovered from stranded-blocked and set to a live continuation path.",
+    };
+
+    it("classifies the live usage-limit row as failed, not succeeded_dirty (exit 1, matches the live shape)", async () => {
+      const result = await replay(liveUsageLimitRow, 1);
+
+      expect(result.completedDirty ?? false).toBe(false);
+      // v722 split `provider_quota` out of `transient_upstream`; this live row's
+      // "hit your weekly limit" wording matches the provider-quota classifier.
+      expect(result.errorCode).toBe("provider_quota");
+      expect(result.errorFamily).toBe("provider_quota");
+    });
+
+    it("classifies the live genuine-dirty-exit row as completedDirty (exit 143, matches the live shape)", async () => {
+      const result = await replay(liveGenuineDirtyRow, 143);
+
+      expect(result.completedDirty).toBe(true);
+      expect(result.errorCode).toBe("dirty_exit");
+      expect(result.errorFamily ?? null).toBeNull();
+      expect(result.retryNotBefore ?? null).toBeNull();
+    });
   });
 
   it("marks a session-limit 429 that never reached the model as a no-op dispatch", async () => {

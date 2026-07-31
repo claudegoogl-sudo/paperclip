@@ -57,6 +57,24 @@ describe("heartbeat stop metadata", () => {
     expect(resolveAgentStatusAfterRun({ outcome: "failed", runningRunCount: 1 })).toBe("running");
   });
 
+  // PLA-1865: a quota/upstream-transient failure is not the agent's fault — the
+  // run stays `failed` (the work really did not happen) but the agent must stay
+  // `idle` so it wakes again once `retryNotBefore` elapses. A genuine failure
+  // (no errorFamily, or a distinct family like a real crash) must still park
+  // the agent in `error`, exactly as the first half of this file's guard
+  // requires — this is the same predicate, pinned in both directions.
+  it("leaves the agent idle after a transient-upstream/quota failure but still parks it after a genuine one", () => {
+    expect(
+      resolveAgentStatusAfterRun({ outcome: "failed", runningRunCount: 0, errorFamily: "transient_upstream" }),
+    ).toBe("idle");
+
+    expect(resolveAgentStatusAfterRun({ outcome: "failed", runningRunCount: 0, errorFamily: null })).toBe("error");
+    expect(resolveAgentStatusAfterRun({ outcome: "failed", runningRunCount: 0 })).toBe("error");
+    expect(
+      resolveAgentStatusAfterRun({ outcome: "timed_out", runningRunCount: 0, errorFamily: "transient_upstream" }),
+    ).toBe("error");
+  });
+
   // A dirty teardown after a clean result must read as a completion with a
   // diagnostic tag, not as an adapter failure.
   it("separates a dirty teardown from an adapter failure", () => {

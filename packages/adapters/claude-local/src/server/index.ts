@@ -15,6 +15,7 @@ export {
   isClaudeProviderQuotaError,
   isClaudeRefusalResult,
   isClaudeUnknownSessionError,
+  extractClaudeRetryNotBefore,
 } from "./parse.js";
 export {
   getQuotaWindows,
