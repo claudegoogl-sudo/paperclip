@@ -67,6 +67,11 @@ import {
 } from "./plugin-local-folders.js";
 import { createPluginSecretsHandler } from "./plugin-secrets-handler.js";
 import { createPluginArtifactsHandler } from "./plugin-artifacts-handler.js";
+import {
+  collectSecretRefPaths,
+  readConfigValueAtPath,
+  writeConfigValueAtPath,
+} from "./json-schema-secret-refs.js";
 import { normalizeIssueAttachmentMaxBytes } from "../attachment-types.js";
 import {
   defaultPluginWakeRateLimiter,
@@ -594,6 +599,31 @@ export function buildSecretsResolveService(
     await ensurePluginAvailableForCompany(params.companyId);
     return secretsHandler.resolve(params);
   };
+}
+
+// ---------------------------------------------------------------------------
+// PLA-1944: structural (canonical) equality for the no-dispatch `config.get`
+// agreement gate. A naive `JSON.stringify(a) === JSON.stringify(b)` compare
+// is key-order-sensitive — two objects that are semantically identical but
+// were written with keys in a different order would be reported as
+// "diverging" and deny a read that should agree. Sort object keys
+// recursively before stringifying so the comparison is order-independent.
+// ---------------------------------------------------------------------------
+
+function canonicalizeForComparison(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalizeForComparison);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      out[key] = canonicalizeForComparison((value as Record<string, unknown>)[key]);
+    }
+    return out;
+  }
+  return value;
+}
+
+function structurallyEqual(a: unknown, b: unknown): boolean {
+  return JSON.stringify(canonicalizeForComparison(a)) === JSON.stringify(canonicalizeForComparison(b));
 }
 
 export function buildHostServices(
@@ -1322,6 +1352,108 @@ export function buildHostServices(
       const base = (configRow?.configJson as Record<string, unknown> | undefined) ?? {};
       if (!override) return { ...base };
       return { ...base, ...override };
+    },
+    /**
+     * PLA-1944 — Option 3 host-minted agreement gate for a no-dispatch
+     * `config.get` (a `setup()`-time read or a background/poll loop with no
+     * active dispatch to pin a tenant). Resolves by checking EVERY owning
+     * `plugin_config` row: agree → return the agreed value; diverge on a
+     * non-secret-ref key → deny loudly.
+     *
+     * READS ONLY, by construction. The security argument is: every owning
+     * row is read to check agreement, so the value returned is never more
+     * than what each owning company's own row already contains — nothing is
+     * disclosed across a company boundary that that company didn't already
+     * have. That argument is specific to reads and does NOT generalise to a
+     * write: a write would need to pick (or fan out to) an owner, which is
+     * an authorization decision this mechanism has no basis to make. There is
+     * no `config.set` in the worker→host wire protocol, and this gate must
+     * never be extended to add one or to back a future write RPC.
+     */
+    async getAgreedOrDeny(): Promise<Record<string, unknown>> {
+      const rows = await registry.listConfigRows(pluginId);
+      if (rows.length === 0) return {};
+      if (rows.length === 1) {
+        await registry.setPluginLastError(pluginId, null);
+        return (rows[0]!.configJson as Record<string, unknown> | undefined) ?? {};
+      }
+
+      const schema = (options.manifest?.instanceConfigSchema ?? null) as
+        | Record<string, unknown>
+        | null;
+      const secretRefPaths = collectSecretRefPaths(schema);
+
+      // Compare with secret-ref paths stripped: those are unioned in
+      // separately below under the distinct-value rule (C2), never used to
+      // deny the whole config.
+      const comparable = rows.map((row) => {
+        let stripped = (row.configJson as Record<string, unknown> | undefined) ?? {};
+        for (const path of secretRefPaths) {
+          stripped = writeConfigValueAtPath(stripped, path, undefined);
+        }
+        return { companyId: row.companyId, config: stripped };
+      });
+
+      const [first, ...rest] = comparable;
+      const agrees = rest.every((entry) => structurallyEqual(entry.config, first!.config));
+
+      if (!agrees) {
+        const divergingKeys = new Set<string>();
+        const keyUnion = new Set<string>();
+        for (const entry of comparable) {
+          for (const key of Object.keys(entry.config)) keyUnion.add(key);
+        }
+        for (const key of keyUnion) {
+          const values = comparable.map((entry) => entry.config[key]);
+          const [firstValue, ...restValues] = values;
+          if (!restValues.every((value) => structurallyEqual(value, firstValue))) {
+            divergingKeys.add(key);
+          }
+        }
+        const companyIds = rows.map((row) => row.companyId);
+        // Operator-only: company ids and disagreeing top-level keys, never
+        // values, never secret-ref paths (even excluded ones).
+        logger.error(
+          { pluginId, pluginKey, companyIds, divergingKeys: [...divergingKeys] },
+          "plugin config.get agreement gate: owning plugin_config rows disagree; denying no-dispatch read",
+        );
+        // Bounded, no company ids: plugins.lastError is plugin-surfaced.
+        await registry.setPluginLastError(
+          pluginId,
+          `config rows disagree across owning companies; see host log for detail`,
+        );
+        throw new Error(
+          `Plugin "${pluginKey}" configuration could not be resolved: owning companies disagree`,
+        );
+      }
+
+      let result: Record<string, unknown> = structuredClone(first!.config);
+      for (const path of secretRefPaths) {
+        const distinct = new Map<string, unknown>();
+        for (const row of rows) {
+          const value = readConfigValueAtPath(
+            (row.configJson as Record<string, unknown> | undefined) ?? {},
+            path,
+          );
+          if (value === null || value === undefined) continue;
+          distinct.set(JSON.stringify(canonicalizeForComparison(value)), value);
+        }
+        if (distinct.size === 0) continue;
+        if (distinct.size === 1) {
+          const [[, value]] = distinct;
+          result = writeConfigValueAtPath(result, path, value);
+          continue;
+        }
+        // 2+ distinct non-null values: drop ONLY this field, never deny the
+        // whole config over a secret-ref divergence.
+        logger.warn(
+          { pluginId, pluginKey, path },
+          "plugin config.get agreement gate: secret-ref field diverges across owning companies; dropping field",
+        );
+      }
+
+      await registry.setPluginLastError(pluginId, null);
+      return result;
     },
   };
 
