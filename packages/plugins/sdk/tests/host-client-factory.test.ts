@@ -642,11 +642,16 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
     expect(resolve).not.toHaveBeenCalled();
   });
 
-  it("PLA-1819: serviceScope is NOT an accepted tenant source for config.get", async () => {
+  it("PLA-1819/PLA-1942: serviceScope is NOT an accepted tenant source for config.get — defers to the host agreement gate instead", async () => {
     // `serviceScope` carries only a runId. `secrets.resolve` can accept it
     // because the server maps that runId to a company; `config.get` has no such
-    // downstream derivation — it needs a concrete companyId to select a row —
-    // so a serviceScope-only read fails closed.
+    // downstream derivation — it needs a concrete companyId to select a row.
+    // A serviceScope-only read is therefore still a "no per-dispatch tenant"
+    // case from `resolveRequiredCompanyId`'s point of view, and — since
+    // PLA-1887/1929/1937/1942 — that case no longer fails closed at the SDK
+    // layer. It defers to the host's multi-row agreement gate the same as any
+    // other true no-scope call: `get`/`getForCompany` are invoked with no
+    // company pin, never with one derived from `serviceScope.runId`.
     const get = vi.fn(async () => ({ apiKey: "unreachable" }));
     const getForCompany = vi.fn(async () => ({ apiKey: "unreachable" }));
     const handlers = createHostClientHandlers({
@@ -655,16 +660,12 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
       services: { config: { get, getForCompany } } as unknown as HostServices,
     });
 
+    const context = { serviceScope: { runId: "service-run-1" } };
     await expect(
-      handlers["config.get"](undefined as never, {
-        serviceScope: { runId: "service-run-1" },
-      }),
-    ).rejects.toMatchObject({
-      name: "InvocationScopeDeniedError",
-      message: expect.stringContaining("company context is required"),
-    });
+      handlers["config.get"](undefined as never, context),
+    ).resolves.toEqual({ apiKey: "unreachable" });
 
-    expect(get).not.toHaveBeenCalled();
+    expect(get).toHaveBeenCalledWith({ companyId: undefined }, context);
     expect(getForCompany).not.toHaveBeenCalled();
   });
 
@@ -856,23 +857,27 @@ describe("createHostClientHandlers config.get per-company scope selection (PLA-7
     expect(getForCompany).not.toHaveBeenCalledWith("company-b");
   });
 
-  it("fails closed with no scope (0 or 2+ in-flight dispatches → no singleInFlightScope)", async () => {
+  it("defers to the host's agreement gate with no scope (0 or 2+ in-flight dispatches → no singleInFlightScope)", async () => {
     const { handlers, get, getForCompany } = makeConfigHandlers();
 
-    // PLA-1819: this used to fall through to the instance-wide `get()`. Since
-    // v2026.722.0 `plugin_config.company_id` is NOT NULL — there is no
-    // instance-wide row, and the host's own handler returns `{}` here. Handing
-    // a plugin `{}` makes it read `config.apiKey` as `undefined` and proceed
-    // unauthenticated, converting a host-side denial into a plugin-side
-    // fail-open. Deny instead (upstream v722's control).
+    // PLA-1819 (superseded by PLA-1887/1929/1937/1942): a true no-scope call
+    // (setup(), a poll loop — no invocationScope, no singleInFlightScope) used
+    // to deny outright, since `plugin_config` is company-scoped and there is
+    // no instance-wide row to fall back to. That was too blunt: a
+    // construction-time read has no per-dispatch tenant to pin, but the host
+    // can still resolve it safely by checking whether every owning row
+    // already agrees (see `getAgreedOrDeny` in
+    // server/src/services/plugin-config-agreement.ts). So `config.get` now
+    // supplies a constant `alternateHostBinding` sentinel, and
+    // `resolveRequiredCompanyId` returns `null` (not a throw) — the call
+    // falls through to `services.config.get({ ...params, companyId:
+    // undefined }, context)`, deferring resolution to the host's
+    // agreement gate rather than denying at the SDK layer.
     await expect(
       handlers["config.get"](undefined as never, {}),
-    ).rejects.toMatchObject({
-      name: "InvocationScopeDeniedError",
-      message: expect.stringContaining("company context is required"),
-    });
+    ).resolves.toEqual({ githubPatSecretId: "instance-wide-secret" });
 
-    expect(get).not.toHaveBeenCalled();
+    expect(get).toHaveBeenCalledWith({ companyId: undefined }, {});
     expect(getForCompany).not.toHaveBeenCalled();
   });
 
@@ -893,6 +898,35 @@ describe("createHostClientHandlers config.get per-company scope selection (PLA-7
 
     expect(getForCompany).not.toHaveBeenCalled();
     expect(get).not.toHaveBeenCalled();
+  });
+
+  it("PLA-1942 A3.3/5.3: config.get remains outside SERVICE_SCOPE_COMPANY_METHODS — a bare serviceScope never resolves a company for it", async () => {
+    // `config.get` must keep deferring to the host's agreement gate
+    // (`companyId: undefined`) rather than joining the `serviceScope`
+    // allowlist. If it ever did, `serviceScope.runId` would resolve to a
+    // company server-side and hand that company's config to a caller with no
+    // per-dispatch tenant pin at all — a materially different (and unsound)
+    // trust model than "every owning row already agrees". This module
+    // deliberately does not export the allowlist (see the SDK's "does NOT
+    // extend the serviceScope allowance to other company-scoped methods"
+    // test for the established behavioral-proof pattern this mirrors), so
+    // the only way to assert absence is behaviorally: `getForCompany` must
+    // never be called, and `get` must be called with no company.
+    const get = vi.fn(async () => ({ apiKey: "resolved-by-host-gate" }));
+    const getForCompany = vi.fn(async () => ({ apiKey: "should-not-be-used" }));
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: [],
+      services: { config: { get, getForCompany } } as unknown as HostServices,
+    });
+
+    const context = { serviceScope: { runId: "service-run-1" } };
+    await expect(handlers["config.get"](undefined as never, context)).resolves.toEqual({
+      apiKey: "resolved-by-host-gate",
+    });
+
+    expect(getForCompany).not.toHaveBeenCalled();
+    expect(get).toHaveBeenCalledWith({ companyId: undefined }, context);
   });
 
   it("falls back to get() when the host implements no per-company delivery", async () => {

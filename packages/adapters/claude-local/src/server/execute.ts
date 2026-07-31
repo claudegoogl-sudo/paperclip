@@ -1165,7 +1165,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // these, but keep it out of `errorFamily`/`retryNotBefore`: the work is done,
     // so this run must never feed the transient-retry machinery.
     const dirtyTeardownCode = completedDirty
-      ? isClaudeTransientUpstreamError({
+      ? isClaudeProviderQuotaError({
+          parsed,
+          stdout: proc.stdout,
+          stderr: proc.stderr,
+          errorMessage,
+        })
+        ? "provider_quota"
+        : isClaudeTransientUpstreamError({
           parsed,
           stdout: proc.stdout,
           stderr: proc.stderr,

@@ -29,9 +29,10 @@ import type {
 } from "@paperclipai/shared";
 import { conflict, notFound } from "../errors.js";
 import { secretService } from "./secrets.js";
+import { readConfigValueAtPath, writeConfigValueAtPath } from "./json-schema-secret-refs.js";
 
 /** Read the manifest's `instanceConfigSchema` off a persisted plugins row. */
-function instanceConfigSchemaOf(plugin: { manifestJson: unknown }): unknown {
+export function instanceConfigSchemaOf(plugin: { manifestJson: unknown }): unknown {
   return (plugin.manifestJson as PaperclipPluginManifestV1 | null)?.instanceConfigSchema ?? null;
 }
 
@@ -297,6 +298,17 @@ export function pluginRegistryService(db: Db) {
         .then((rows) => rows[0] ?? null),
 
     /**
+     * List every owning config row for a plugin, across every company.
+     *
+     * PLA-1937/PLA-1942: this is the security-relevant invariant underneath
+     * the host-minted agreement gate — silent truncation here would turn "all
+     * owning rows agree" into a false positive that masks real divergence.
+     * No LIMIT, no pagination: the whole row set, every time.
+     */
+    listConfigsForPlugin: (pluginId: string) =>
+      db.select().from(pluginConfig).where(eq(pluginConfig.pluginId, pluginId)),
+
+    /**
      * Create or fully replace a plugin's company-scoped configuration.
      * If a config row already exists for the plugin/company pair it is replaced;
      * otherwise a new row is inserted.
@@ -345,6 +357,48 @@ export function pluginRegistryService(db: Db) {
       });
 
       return row;
+    },
+
+    /**
+     * PLA-1937 Condition 1: maintain the read-side agreement invariant on
+     * every write. `POST /api/plugins/:pluginId/config` writes only the
+     * requesting company's row; without this, that row diverges from every
+     * sibling row on its very first ordinary edit and the agreement gate
+     * (`getAgreedOrDeny`) then denies `config.get` for every company sharing
+     * the plugin. Broadcasts the non-secret-ref portion of `configJson`
+     * verbatim into every other owning row, leaving each target row's own
+     * secret-ref fields (per `secretRefPaths`) untouched. Returns the
+     * companyIds of the rows that were updated.
+     */
+    broadcastNonSecretConfig: async (
+      pluginId: string,
+      sourceCompanyId: string,
+      configJson: Record<string, unknown>,
+      secretRefPaths: Iterable<string>,
+    ): Promise<string[]> => {
+      const paths = [...secretRefPaths];
+      const siblingRows = await db
+        .select()
+        .from(pluginConfig)
+        .where(and(eq(pluginConfig.pluginId, pluginId), ne(pluginConfig.companyId, sourceCompanyId)));
+
+      const touched: string[] = [];
+      for (const sibling of siblingRows) {
+        let nextConfig = configJson;
+        for (const path of paths) {
+          nextConfig = writeConfigValueAtPath(
+            nextConfig,
+            path,
+            readConfigValueAtPath((sibling.configJson as Record<string, unknown>) ?? {}, path),
+          );
+        }
+        await db
+          .update(pluginConfig)
+          .set({ configJson: nextConfig, updatedAt: new Date() })
+          .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, sibling.companyId)));
+        touched.push(sibling.companyId);
+      }
+      return touched;
     },
 
     /**

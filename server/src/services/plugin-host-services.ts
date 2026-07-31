@@ -70,6 +70,9 @@ import {
   writePluginLocalFolderTextAtomic,
 } from "./plugin-local-folders.js";
 import { createPluginSecretsHandler } from "./plugin-secrets-handler.js";
+import { getAgreedOrDeny } from "./plugin-config-agreement.js";
+import { collectSecretRefPaths } from "./json-schema-secret-refs.js";
+import { instanceConfigSchemaOf } from "./plugin-registry.js";
 import { createPluginArtifactsHandler } from "./plugin-artifacts-handler.js";
 import { normalizeIssueAttachmentMaxBytes } from "../attachment-types.js";
 import {
@@ -1302,16 +1305,56 @@ export function buildHostServices(
     async get(params?: { companyId?: string }): Promise<Record<string, unknown>> {
       const companyId = params?.companyId;
       if (!companyId) {
-        // The SDK's gated `config.get` wrapper falls through to here when no
-        // dispatch pins a tenant (e.g. a `setup()`-time read). There is no
-        // instance-wide config row to return post-v722, so degrade to empty
-        // rather than throwing — but log it, because a plugin silently seeing
-        // `{}` is otherwise invisible.
-        logger.warn(
-          { pluginId, pluginKey },
-          "plugin config.get with no company scope; returning empty config (plugin_config is company-scoped since v2026.722.0)",
+        // PLA-1887/1929/1937/1942: the SDK's gated `config.get` wrapper falls
+        // through to here when no dispatch pins a tenant — a genuine
+        // construction-time read (setup(), a poll loop, ...). Rather than
+        // degrading to `{}` (which a plugin reads as an absent key and
+        // proceeds unauthenticated/unconfigured, silently) resolve via the
+        // host-minted agreement gate: if every owning `plugin_config` row for
+        // this plugin agrees, hand back the agreed config; if they
+        // genuinely diverge, deny loudly and surface it on plugin health.
+        const plugin = await registry.getById(pluginId);
+        const secretRefPaths = collectSecretRefPaths(
+          (instanceConfigSchemaOf(plugin ?? { manifestJson: null }) as Record<string, unknown> | null) ??
+            null,
         );
-        return {};
+        return getAgreedOrDeny({
+          pluginId,
+          pluginKey,
+          listConfigRows: () => registry.listConfigsForPlugin(pluginId),
+          secretRefPaths,
+          logger,
+          onDeny: async ({ disagreeingKeys }) => {
+            // A2 (PLA-1942): tenant-neutral message ONLY — no company ids, no
+            // row counts. `plugins.lastError` is reachable by any board actor
+            // with membership in at least one company (`assertBoardOrgAccess`
+            // gates GET /plugins, /:pluginId, /:pluginId/health,
+            // /:pluginId/dashboard — none of those require instance-admin),
+            // so writing company ids here would hand a single-tenant viewer
+            // the existence and config state of other tenants. Disagreeing
+            // top-level key NAMES are fine: they're manifest-declared and
+            // already readable by every owning tenant. Company ids and full
+            // detail go only to the `logger.error` call above, which no
+            // company-scoped API exposes. Pass the plugin's current `status`
+            // through unchanged so this never clobbers an unrelated
+            // lifecycle transition.
+            const current = await registry.getById(pluginId);
+            if (!current) return;
+            await registry.updateStatus(pluginId, {
+              status: current.status,
+              lastError: `config-agreement: unscoped config.get denied; owning config rows disagree on key(s): ${disagreeingKeys.join(", ")}. See host log for company detail.`,
+            });
+          },
+          onResolve: async () => {
+            // Clear a previously-recorded divergence back to healthy on the
+            // next clean resolve, or a fixed divergence leaves a permanent
+            // false-positive health failure with no path back to green.
+            const current = await registry.getById(pluginId);
+            if (current?.lastError) {
+              await registry.updateStatus(pluginId, { status: current.status, lastError: null });
+            }
+          },
+        });
       }
       await ensurePluginAvailableForCompany(companyId);
       const configRow = await registry.getConfig(pluginId, companyId);

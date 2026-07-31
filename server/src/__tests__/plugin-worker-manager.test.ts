@@ -1170,10 +1170,21 @@ describe("plugin host company context guards", () => {
       } as unknown as HostServices,
     });
 
-    await expect(handlers["config.get"]({})).rejects.toMatchObject({
-      name: "InvocationScopeDeniedError",
-      message: expect.stringContaining("company context is required"),
-    });
+    // PLA-1887/1929/1937/1942: a true no-scope `config.get({})` (no
+    // invocationScope, no singleInFlightScope, no worker-named company) no
+    // longer denies at the SDK layer — it defers to the host's agreement
+    // gate (`getAgreedOrDeny`), which resolves construction-time reads by
+    // checking whether every owning `plugin_config` row already agrees. The
+    // mocked `services.config.get` here stands in for that host gate.
+    await expect(handlers["config.get"]({})).resolves.toEqual({ apiKey: "unreachable" });
+    expect(configGet).toHaveBeenCalledWith({ companyId: undefined }, undefined);
+    configGet.mockClear();
+
+    // A worker-NAMED company is a different case entirely: it is never
+    // authoritative, and still denies outright even though `config.get` now
+    // supplies an `alternateHostBinding` sentinel — `resolveRequiredCompanyId`'s
+    // "single" branch ignores `alternateHostBinding` and requires a matching
+    // host-derived scope, which is absent here.
     await expect(handlers["config.get"]({ companyId: "company-1" })).rejects.toMatchObject({
       name: "InvocationScopeDeniedError",
       message: expect.stringContaining("company context is required"),

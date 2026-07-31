@@ -970,16 +970,39 @@ export function createHostClientHandlers(
       // "instance-wide fallback" resolved to `{}` — which a plugin reads as an
       // absent key and proceeds unauthenticated. Denying is the only outcome a
       // plugin cannot silently misread as fail-open.
-      // Non-null: only a caller passing `alternateHostBinding` can get null
-      // back, and `config.get` has no downstream company derivation to defer to.
-      const companyId = resolveRequiredCompanyId("config.get", params, context) as string;
-      if (services.config.getForCompany) {
-        return services.config.getForCompany(companyId);
+      //
+      // PLA-1887/1929/1937/1942: a genuine construction-time call (setup(), a
+      // poll loop — no invocationScope, no singleInFlightScope) has no
+      // per-dispatch tenant to pin. Unlike `secrets.resolve`, `config.get`
+      // needs no external data to defer resolution — it can always be
+      // resolved host-side from the plugin's own owning rows. So `config.get`
+      // always supplies a constant (not context-derived) `alternateHostBinding`
+      // sentinel, letting a true no-scope call fall through to the host's
+      // multi-row agreement gate (`getAgreedOrDeny`) instead of denying
+      // outright. A WORKER-NAMED company (`requested.kind === "single"`) still
+      // denies unconditionally regardless — `resolveRequiredCompanyId`'s
+      // "single" branch ignores `alternateHostBinding` entirely, so this
+      // cannot be used to reach a tenant the worker names.
+      const companyId = resolveRequiredCompanyId(
+        "config.get",
+        params,
+        context,
+        "config-agreement-gate",
+      );
+      if (companyId) {
+        if (services.config.getForCompany) {
+          return services.config.getForCompany(companyId);
+        }
+        // v722 plumbs the resolved company through the params object. Only
+        // ever forward the HOST-derived id — never the worker-echoed
+        // `params.companyId` — so this stays a scope *selection* read, not an
+        // enforcement bypass.
+        return services.config.get({ ...params, companyId }, context);
       }
-      // v722 plumbs the resolved company through the params object. Only ever
-      // forward the HOST-derived id — never the worker-echoed `params.companyId`
-      // — so this stays a scope *selection* read, not an enforcement bypass.
-      return services.config.get({ ...params, companyId }, context);
+      // No dispatch-derived scope at all: the host resolves this via
+      // agreement across every owning row (or denies), never from a
+      // worker-supplied field.
+      return services.config.get({ ...params, companyId: undefined }, context);
     }),
 
     "localFolders.declarations": gated("localFolders.declarations", async (params) => {
