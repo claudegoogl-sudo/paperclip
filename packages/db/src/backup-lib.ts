@@ -1,4 +1,13 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import {
+  createReadStream,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+} from "node:fs";
 import { basename, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
@@ -70,6 +79,17 @@ const DEFAULT_BACKUP_WRITE_BUFFER_BYTES = 1024 * 1024;
 const BACKUP_DATA_CURSOR_ROWS = 100;
 const BACKUP_CLI_STDERR_BYTES = 64 * 1024;
 const BACKUP_BREAKPOINT_DETECT_BYTES = 64 * 1024;
+
+/**
+ * Both backup engines emit a fixed preamble (pg_dump's SET/comment header, or
+ * our own "-- Paperclip database backup" + BEGIN/COMMIT wrapper) before a
+ * single byte of schema or row data. That preamble alone runs well past 1KB
+ * for any real database. A decompressed archive below this floor did not
+ * fail cleanly (which throws before an archive is published) — it was
+ * truncated by something outside the process's control, e.g. a mid-write
+ * kill. Anything this small is refused rather than published.
+ */
+const BACKUP_MIN_DECOMPRESSED_BYTES = 1024;
 
 const STATEMENT_BREAKPOINT = "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900";
 
@@ -346,6 +366,81 @@ async function runPgDumpBackup(opts: {
   ]);
 }
 
+/**
+ * Fully decompresses a gzip file and counts the resulting bytes. This is
+ * deliberately NOT a gzip-validity check (a well-formed empty gzip stream is
+ * "valid" and is exactly the failure mode this exists to catch) — it proves
+ * the archive actually contains content.
+ */
+export async function countDecompressedBytes(gzFile: string): Promise<number> {
+  const source = createReadStream(gzFile);
+  const gunzip = createGunzip();
+  source.pipe(gunzip);
+  let total = 0;
+  try {
+    for await (const chunk of gunzip) {
+      total += (chunk as Buffer).length;
+    }
+  } finally {
+    source.destroy();
+    gunzip.destroy();
+  }
+  return total;
+}
+
+/**
+ * Verifies a freshly-written gzip archive's decompressed content against
+ * BACKUP_MIN_DECOMPRESSED_BYTES, then atomically publishes it under its
+ * final name. Callers must write to a `*.tmp` path first and only pass that
+ * path here — this guarantees a process kill mid-write leaves behind an
+ * unpublished `.tmp` file rather than a broken file at the final name that
+ * later code (or the retention janitor) could mistake for a real backup.
+ */
+async function finalizeBackupArchive(tmpFile: string, finalFile: string): Promise<void> {
+  let decompressedBytes: number;
+  try {
+    decompressedBytes = await countDecompressedBytes(tmpFile);
+  } catch (error) {
+    throw new Error(
+      `Backup archive verification failed for ${basename(tmpFile)}: gzip stream is corrupt or truncated (${error instanceof Error ? error.message : String(error)})`,
+    );
+  }
+  if (decompressedBytes < BACKUP_MIN_DECOMPRESSED_BYTES) {
+    throw new Error(
+      `Backup archive verification failed for ${basename(tmpFile)}: decompressed to only ${decompressedBytes} byte(s), below the ${BACKUP_MIN_DECOMPRESSED_BYTES}-byte sanity floor`,
+    );
+  }
+  renameSync(tmpFile, finalFile);
+}
+
+/**
+ * Removes work files left behind by a backup run that never reached a
+ * terminal state (e.g. the process was killed mid-write). Safe to call at
+ * the start of every run: the server's databaseBackupInFlight guard ensures
+ * only one run is ever active, so any matching file found here belongs to a
+ * run that is no longer executing.
+ */
+function sweepStaleBackupArtifacts(backupDir: string, filenamePrefix: string): string[] {
+  if (!existsSync(backupDir)) return [];
+  const swept: string[] = [];
+  for (const name of readdirSync(backupDir)) {
+    if (!name.startsWith(`${filenamePrefix}-`)) continue;
+    if (!name.endsWith(".sql.gz.tmp") && !name.endsWith(".sql")) continue;
+    try {
+      unlinkSync(resolve(backupDir, name));
+      swept.push(name);
+    } catch {
+      // Best-effort; a future run will retry.
+    }
+  }
+  if (swept.length > 0) {
+    console.warn(
+      `[db-backup] swept ${swept.length} stale artifact(s) left by an interrupted backup run: ${swept.join(", ")}`,
+    );
+  }
+  return swept;
+}
+
 async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: number): Promise<void> {
   const psqlBin = process.env.PAPERCLIP_PSQL_PATH || "psql";
   const child = spawn(
@@ -534,8 +629,10 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     await sql.end();
   };
   mkdirSync(opts.backupDir, { recursive: true });
+  sweepStaleBackupArtifacts(opts.backupDir, filenamePrefix);
   const sqlFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}.sql`);
   const backupFile = `${sqlFile}.gz`;
+  const tmpBackupFile = `${backupFile}.tmp`;
   const writer = createBufferedTextFileWriter(sqlFile);
 
   try {
@@ -545,10 +642,11 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         await closeSql();
         await runPgDumpBackup({
           connectionString: opts.connectionString,
-          backupFile,
+          backupFile: tmpBackupFile,
           connectTimeout,
         });
         await writer.abort();
+        await finalizeBackupArchive(tmpBackupFile, backupFile);
         const sizeBytes = statSync(backupFile).size;
         const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
         return {
@@ -557,6 +655,9 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
           prunedCount,
         };
       } catch (error) {
+        if (existsSync(tmpBackupFile)) {
+          try { unlinkSync(tmpBackupFile); } catch { /* ignore */ }
+        }
         if (existsSync(backupFile)) {
           try { unlinkSync(backupFile); } catch { /* ignore */ }
         }
@@ -955,10 +1056,12 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
     await writer.close();
 
-    // Compress the SQL file with gzip
+    // Compress the SQL file with gzip into a tmp file, verify its decompressed
+    // content, then atomically publish it under its final name.
     const sqlReadStream = createReadStream(sqlFile);
-    const gzWriteStream = createWriteStream(backupFile);
+    const gzWriteStream = createWriteStream(tmpBackupFile);
     await pipeline(sqlReadStream, createGzip(), gzWriteStream);
+    await finalizeBackupArchive(tmpBackupFile, backupFile);
     unlinkSync(sqlFile);
 
     const sizeBytes = statSync(backupFile).size;
@@ -971,6 +1074,9 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     };
   } catch (error) {
     await writer.abort();
+    if (existsSync(tmpBackupFile)) {
+      try { unlinkSync(tmpBackupFile); } catch { /* ignore */ }
+    }
     if (existsSync(backupFile)) {
       try { unlinkSync(backupFile); } catch { /* ignore */ }
     }

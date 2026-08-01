@@ -14,11 +14,13 @@ import {
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { gzipSync } from "node:zlib";
 
 import {
   CONFIG,
   parseBackupTimestamp,
   classifyBackups,
+  readGzipUncompressedSize,
   directoryHasFileNewerThan,
   collectFiles,
   classifyRunLogFiles,
@@ -117,6 +119,50 @@ test("classifyBackups never drops unrecognized filenames (conservative default)"
   assert.equal(unrecognized.length, 1);
   assert.equal(unrecognized[0].name, "some-other-file.txt");
   assert.ok(!prune.some((e) => e.name === "some-other-file.txt"));
+});
+
+test("classifyBackups: an empty .gz never displaces a healthy dump from a retention slot (regression)", () => {
+  // Reproduces the production incident: a well-formed-but-empty gzip stream
+  // (decompressedBytes 0, exactly what a 20-byte empty gzip trailer reads
+  // back as) landed at the newest hourly timestamp, immediately ahead of the
+  // last real dump. Only one hourly slot is configured here so the bug --
+  // the empty archive winning the slot purely by being newest, pushing the
+  // real dump into "prune" -- is unambiguous if it regresses.
+  const config = { ...CONFIG, BACKUPS_KEEP_HOURLY: 1, BACKUPS_KEEP_DAILY: 0, BACKUPS_KEEP_WEEKLY: 0 };
+  const entries = [
+    { name: "paperclip-20260731-193824.sql.gz", sizeBytes: 20, decompressedBytes: 0 },
+    { name: "paperclip-20260731-183824.sql.gz", sizeBytes: 280_000_000, decompressedBytes: 1_900_000_000 },
+  ];
+
+  const { keep, prune } = classifyBackups(entries, config);
+
+  assert.deepEqual(keep.map((e) => e.name), ["paperclip-20260731-183824.sql.gz"]);
+  assert.deepEqual(prune.map((e) => e.name), ["paperclip-20260731-193824.sql.gz"]);
+});
+
+test("readGzipUncompressedSize: positive control -- catches a real empty gzip that gzip -t reports as valid", () => {
+  const dir = tmpdir("janitor-gz-floor-");
+  // A well-formed empty gzip stream is exactly the shape of the production
+  // incident file: `gzip -t` on this passes (it IS a structurally valid
+  // gzip member), which is precisely why gzip-validity alone is not a
+  // sufficient check -- see BACKUPS_EMPTY_FLOOR_BYTES / countDecompressedBytes.
+  const emptyGz = path.join(dir, "empty.sql.gz");
+  writeFileSync(emptyGz, gzipSync(Buffer.alloc(0)));
+  assert.equal(readGzipUncompressedSize(emptyGz), 0);
+
+  const healthyGz = path.join(dir, "healthy.sql.gz");
+  writeFileSync(healthyGz, gzipSync(Buffer.from("-- real dump content\n".repeat(500))));
+  assert.ok(readGzipUncompressedSize(healthyGz) > CONFIG.BACKUPS_EMPTY_FLOOR_BYTES);
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("classifyBackups: an empty .gz is pruned even when it is the only backup on disk", () => {
+  const entries = [{ name: "paperclip-20260731-193824.sql.gz", sizeBytes: 20, decompressedBytes: 0 }];
+  const { keep, prune } = classifyBackups(entries, CONFIG);
+  assert.equal(keep.length, 0);
+  assert.equal(prune.length, 1);
+  assert.equal(prune[0].name, "paperclip-20260731-193824.sql.gz");
 });
 
 // ---------------------------------------------------------------------------
@@ -449,15 +495,18 @@ function buildSandbox() {
   mkdirSync(workDir, { recursive: true });
   mkdirSync(tmpDir, { recursive: true });
 
-  // 30 hourly backups -- only the newest 24 should survive.
+  // 30 hourly backups -- only the newest 24 should survive. Real gzip
+  // content (not raw bytes) so the ISIZE-trailer empty-dump floor check
+  // reads these as the healthy, well-above-floor dumps they represent.
   const start = Date.UTC(2026, 6, 31, 12, 0, 0);
+  const fixtureDumpBody = Buffer.from("-- fixture backup row\n".repeat(200));
   for (let i = 0; i < 30; i += 1) {
     const t = new Date(start - i * 60 * 60 * 1000);
     const name = `paperclip-${t.toISOString().slice(0, 10).replace(/-/g, "")}-${t
       .toISOString()
       .slice(11, 19)
       .replace(/:/g, "")}.sql.gz`;
-    writeFileSync(path.join(backupsDir, name), "x".repeat(10));
+    writeFileSync(path.join(backupsDir, name), gzipSync(fixtureDumpBody));
   }
 
   // run-logs: one old, one fresh.

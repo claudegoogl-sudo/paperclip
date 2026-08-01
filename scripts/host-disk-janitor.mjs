@@ -35,9 +35,13 @@
 
 import { execFileSync } from "node:child_process";
 import {
+  closeSync,
   existsSync,
+  fstatSync,
+  openSync,
   readdirSync,
   readFileSync,
+  readSync,
   lstatSync,
   rmSync,
   unlinkSync,
@@ -68,6 +72,13 @@ export const CONFIG = {
   BACKUPS_KEEP_HOURLY: 24,
   BACKUPS_KEEP_DAILY: 7,
   BACKUPS_KEEP_WEEKLY: 4,
+  // A real dump's DDL preamble alone runs well past this (see the matching
+  // BACKUP_MIN_DECOMPRESSED_BYTES floor in packages/db/src/backup-lib.ts,
+  // which rejects any archive this small before it is ever published under
+  // its final name). This is the janitor's independent backstop: it must
+  // never let a below-floor dump occupy an hourly/daily/weekly keep slot,
+  // regardless of how it got there.
+  BACKUPS_EMPTY_FLOOR_BYTES: 1024,
 
   // -- run-logs: ~/.paperclip/instances/default/data/run-logs --
   // Flat age retention on individual leaf files, then prune emptied dirs.
@@ -162,17 +173,65 @@ function isoWeekKey(date) {
 }
 
 /**
+ * Reads a gzip file's uncompressed size from its ISIZE trailer (last 4
+ * bytes, little-endian, mod 2**32) without decompressing it. This is an
+ * O(1) read regardless of archive size, which matters here: the janitor
+ * scans the backups directory on every cron run and these dumps are
+ * hundreds of MB to multiple GB each, so full decompression on every run
+ * would be far too slow (that full-decompression check belongs at write
+ * time instead -- see countDecompressedBytes in backup-lib.ts).
+ *
+ * Known caveat: the mod-2**32 wraparound means a decompressed size over
+ * 4GiB reads back as `actual size - 4GiB`. That can only make a real
+ * multi-GB backup look artificially *small*, never make an empty archive
+ * look non-empty -- so it can never let a truly-empty dump slip past the
+ * floor check below. It could in theory make a huge, healthy backup look
+ * small enough to misclassify as "empty" once dumps approach 4GiB
+ * decompressed; a production-sized dump is typically well under that line.
+ */
+export function readGzipUncompressedSize(filePath) {
+  let fd;
+  try {
+    fd = openSync(filePath, "r");
+    const size = fstatSync(fd).size;
+    if (size < 18) return 0; // smaller than the minimum valid gzip member
+    const trailer = Buffer.alloc(4);
+    readSync(fd, trailer, 0, 4, size - 4);
+    return trailer.readUInt32LE(0);
+  } catch {
+    return 0;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // already closed
+      }
+    }
+  }
+}
+
+/**
  * Classify backup dump files into keep/prune/unrecognized sets.
- * `entries` is [{ name, sizeBytes }]. Pure function -- no filesystem or
- * wall-clock access -- so it is fully unit-testable.
+ * `entries` is [{ name, sizeBytes, decompressedBytes? }]. Pure function --
+ * no filesystem or wall-clock access -- so it is fully unit-testable.
+ * Below-floor entries (see BACKUPS_EMPTY_FLOOR_BYTES) are routed straight to
+ * `prune` and never enter the hourly/daily/weekly slot-assignment pool, so
+ * an empty dump can never displace a healthy one from a keep slot.
  */
 export function classifyBackups(entries, config = CONFIG) {
   const parsed = [];
   const unrecognized = [];
+  const empty = [];
   for (const entry of entries) {
     const ts = parseBackupTimestamp(entry.name, config.BACKUPS_FILENAME_PATTERN);
     if (!ts) {
       unrecognized.push(entry);
+      continue;
+    }
+    const decompressedBytes = entry.decompressedBytes ?? entry.sizeBytes;
+    if (decompressedBytes < config.BACKUPS_EMPTY_FLOOR_BYTES) {
+      empty.push({ ...entry, ts });
       continue;
     }
     parsed.push({ ...entry, ts });
@@ -203,7 +262,7 @@ export function classifyBackups(entries, config = CONFIG) {
     keep.add(e.name);
   }
 
-  const prune = parsed.filter((e) => !keep.has(e.name));
+  const prune = parsed.filter((e) => !keep.has(e.name)).concat(empty);
   return {
     keep: parsed.filter((e) => keep.has(e.name)),
     prune,
@@ -632,7 +691,14 @@ export async function run({ apply = false, nowMs = Date.now(), config = CONFIG }
     const entries = dirExists
       ? readdirSync(config.BACKUPS_DIR, { withFileTypes: true })
           .filter((e) => e.isFile())
-          .map((e) => ({ name: e.name, sizeBytes: statSize(path.join(config.BACKUPS_DIR, e.name)) }))
+          .map((e) => {
+            const fullPath = path.join(config.BACKUPS_DIR, e.name);
+            const sizeBytes = statSize(fullPath);
+            const decompressedBytes = e.name.endsWith(".gz")
+              ? readGzipUncompressedSize(fullPath)
+              : sizeBytes;
+            return { name: e.name, sizeBytes, decompressedBytes };
+          })
       : [];
     const { keep, prune, unrecognized } = classifyBackups(entries, config);
     if (apply) {

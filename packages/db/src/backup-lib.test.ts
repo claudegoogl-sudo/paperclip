@@ -3,7 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
-import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import { createGzip } from "node:zlib";
+import { pipeline } from "node:stream/promises";
+import { createBufferedTextFileWriter, countDecompressedBytes, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -70,6 +72,32 @@ describe("createBufferedTextFileWriter", () => {
     await writer.close();
 
     expect(fs.readFileSync(outputPath, "utf8")).toBe(lines.join("\n"));
+  });
+});
+
+describe("countDecompressedBytes", () => {
+  it("positive control: reads 0 for a well-formed empty gzip stream that gzip -t would still call valid", async () => {
+    // Reproduces the production incident file exactly: a structurally valid
+    // (non-corrupt) gzip stream wrapping zero bytes of content. Gzip
+    // validity alone cannot distinguish this from a real backup -- only
+    // decompressed content does.
+    const tempDir = createTempDir("paperclip-empty-gzip-");
+    const gzPath = path.join(tempDir, "empty.sql.gz");
+    await pipeline(fs.createReadStream("/dev/null"), createGzip(), fs.createWriteStream(gzPath));
+
+    expect(fs.existsSync(gzPath)).toBe(true);
+    await expect(countDecompressedBytes(gzPath)).resolves.toBe(0);
+  });
+
+  it("reads the true decompressed byte count for a real archive", async () => {
+    const tempDir = createTempDir("paperclip-real-gzip-");
+    const sourcePath = path.join(tempDir, "source.sql");
+    const gzPath = path.join(tempDir, "source.sql.gz");
+    const body = "-- real dump content\n".repeat(500);
+    fs.writeFileSync(sourcePath, body);
+    await pipeline(fs.createReadStream(sourcePath), createGzip(), fs.createWriteStream(gzPath));
+
+    await expect(countDecompressedBytes(gzPath)).resolves.toBe(Buffer.byteLength(body));
   });
 });
 
@@ -453,5 +481,77 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
       }
     },
     20_000,
+  );
+
+  it(
+    "leaves no .tmp artifact behind after a successful backup (atomic-rename regression)",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-no-tmp-leftover-");
+      const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+
+      try {
+        await sourceSql.unsafe(`
+          CREATE TABLE "public"."no_tmp_leftover_rows" ("id" serial PRIMARY KEY, "note" text NOT NULL);
+          INSERT INTO "public"."no_tmp_leftover_rows" ("note") VALUES ('row');
+        `);
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-no-tmp-test",
+          backupEngine: "javascript",
+        });
+
+        const remaining = fs.readdirSync(backupDir);
+        expect(remaining).toEqual([path.basename(result.backupFile)]);
+        expect(remaining.some((name) => name.endsWith(".tmp"))).toBe(false);
+        expect(remaining.some((name) => name.endsWith(".sql"))).toBe(false);
+      } finally {
+        await sourceSql.end();
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "sweeps a stale .tmp and orphaned .sql left by a previous interrupted run before backing up (regression)",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-sweep-stale-");
+      const sourceSql = postgres(sourceConnectionString, { max: 1, onnotice: () => {} });
+
+      // Simulate the production incident: a process kill mid-write left a
+      // partial .tmp compression artifact and an uncompressed .sql work file
+      // behind under the SAME filename prefix this run will use.
+      const staleTmp = path.join(backupDir, "paperclip-sweep-test-20260101-000000.sql.gz.tmp");
+      const staleSql = path.join(backupDir, "paperclip-sweep-test-20251231-235900.sql");
+      fs.writeFileSync(staleTmp, "partial gzip bytes from a killed run");
+      fs.writeFileSync(staleSql, "-- uncompressed work file from a killed run\n");
+
+      try {
+        await sourceSql.unsafe(`
+          CREATE TABLE "public"."sweep_test_rows" ("id" serial PRIMARY KEY, "note" text NOT NULL);
+          INSERT INTO "public"."sweep_test_rows" ("note") VALUES ('row');
+        `);
+
+        const result = await runDatabaseBackup({
+          connectionString: sourceConnectionString,
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          filenamePrefix: "paperclip-sweep-test",
+          backupEngine: "javascript",
+        });
+
+        expect(fs.existsSync(staleTmp)).toBe(false);
+        expect(fs.existsSync(staleSql)).toBe(false);
+        expect(fs.existsSync(result.backupFile)).toBe(true);
+        await expect(countDecompressedBytes(result.backupFile)).resolves.toBeGreaterThan(0);
+      } finally {
+        await sourceSql.end();
+      }
+    },
+    30_000,
   );
 });
