@@ -9,6 +9,65 @@ import {
 import { PLUGIN_RPC_ERROR_CODES } from "../src/protocol.js";
 
 describe("createHostClientHandlers invocation company scope", () => {
+  it("rejects worker-selected config and secret company ids without a host invocation scope", async () => {
+    const configGet = vi.fn(async () => ({ apiKeyRef: "unreachable" }));
+    const secretsResolve = vi.fn(async () => "unreachable");
+    const services = {
+      config: { get: configGet },
+      secrets: { resolve: secretsResolve },
+    } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services,
+    });
+
+    await expect(
+      handlers["config.get"]({ companyId: "company-a" }),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    await expect(
+      handlers["secrets.resolve"]({
+        companyId: "company-a",
+        secretRef: { type: "secret_ref", secretId: "secret-a" },
+      }),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    expect(configGet).not.toHaveBeenCalled();
+    expect(secretsResolve).not.toHaveBeenCalled();
+  });
+
+  it("allows explicit config and secret company ids only when they match the host invocation scope", async () => {
+    const configGet = vi.fn(async () => ({ apiKeyRef: "ref" }));
+    const secretsResolve = vi.fn(async () => "resolved");
+    const services = {
+      config: { get: configGet },
+      secrets: { resolve: secretsResolve },
+    } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services,
+    });
+    const context = { invocationScope: { companyId: "company-a" } };
+
+    await expect(
+      handlers["config.get"]({ companyId: "company-a" }, context),
+    ).resolves.toEqual({ apiKeyRef: "ref" });
+    await expect(
+      handlers["secrets.resolve"]({
+        companyId: "company-a",
+        secretRef: { type: "secret_ref", secretId: "secret-a" },
+      }, context),
+    ).resolves.toBe("resolved");
+
+    expect(configGet).toHaveBeenCalledWith({ companyId: "company-a" }, context);
+    expect(secretsResolve).toHaveBeenCalledWith({
+      companyId: "company-a",
+      secretRef: { type: "secret_ref", secretId: "secret-a" },
+    }, context);
+  });
+
   it("rejects company-scoped host calls outside the current invocation company", async () => {
     const projectsList = vi.fn(async () => []);
     const services = {
@@ -173,6 +232,80 @@ describe("createHostClientHandlers invocation company scope", () => {
     expect(searchAudit).not.toHaveBeenCalled();
   });
 
+  it("rejects a human-attributed createComment call when only issue.comments.create is granted", async () => {
+    const createComment = vi.fn(async () => ({ id: "comment-1" }));
+    const services = {
+      issues: { createComment },
+    } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["issue.comments.create"],
+      services,
+    });
+    const context = { invocationScope: { companyId: "company-a" } };
+
+    await expect(
+      handlers["issues.createComment"]({
+        issueId: "issue-a",
+        body: "hello",
+        companyId: "company-a",
+        actorUserId: "user-a",
+      }, context),
+    ).rejects.toBeInstanceOf(CapabilityDeniedError);
+    expect(createComment).not.toHaveBeenCalled();
+  });
+
+  it("allows a human-attributed createComment call once issue.comments.create_human_attributed is also granted", async () => {
+    const createComment = vi.fn(async () => ({ id: "comment-1" }));
+    const services = {
+      issues: { createComment },
+    } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["issue.comments.create", "issue.comments.create_human_attributed"],
+      services,
+    });
+    const context = { invocationScope: { companyId: "company-a" } };
+
+    await expect(
+      handlers["issues.createComment"]({
+        issueId: "issue-a",
+        body: "hello",
+        companyId: "company-a",
+        actorUserId: "user-a",
+      }, context),
+    ).resolves.toEqual({ id: "comment-1" });
+    expect(createComment).toHaveBeenCalledWith({
+      issueId: "issue-a",
+      body: "hello",
+      companyId: "company-a",
+      actorUserId: "user-a",
+    });
+  });
+
+  it("still allows a plain agent-attributed createComment call without the human-attribution capability", async () => {
+    const createComment = vi.fn(async () => ({ id: "comment-2" }));
+    const services = {
+      issues: { createComment },
+    } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["issue.comments.create"],
+      services,
+    });
+    const context = { invocationScope: { companyId: "company-a" } };
+
+    await expect(
+      handlers["issues.createComment"]({
+        issueId: "issue-a",
+        body: "hello",
+        companyId: "company-a",
+        authorAgentId: "agent-a",
+      }, context),
+    ).resolves.toEqual({ id: "comment-2" });
+    expect(createComment).toHaveBeenCalled();
+  });
+
   it("fails closed for a company-scoped call with no resolvable invocation scope", async () => {
     const configure = vi.fn(async () => ({ ok: true }));
     const services = {
@@ -237,10 +370,10 @@ describe("createHostClientHandlers invocation company scope", () => {
       { id: "company-a", name: "Company A" },
       { id: "company-b", name: "Company B" },
     ]);
-    const configGet = vi.fn(async () => ({ value: 1 }));
+    const declarations = vi.fn(async () => ({ value: 1 }));
     const services = {
       companies: { list: companiesList },
-      config: { get: configGet },
+      localFolders: { declarations },
     } as unknown as HostServices;
 
     const handlers = createHostClientHandlers({
@@ -255,8 +388,11 @@ describe("createHostClientHandlers invocation company scope", () => {
       { id: "company-b", name: "Company B" },
     ]);
     // A genuinely no-companyId method (kind "none") still passes with no scope.
+    // PLA-1819: `config.get` is no longer an example of this — it now carries
+    // its own fail-closed company guard inside the handler body, so a
+    // scope-less read is denied. Use a method with no tenant semantics at all.
     await expect(
-      handlers["config.get"](undefined as never, {}),
+      handlers["localFolders.declarations"](undefined as never, {}),
     ).resolves.toEqual({ value: 1 });
   });
 });
@@ -285,10 +421,20 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
       { invocationScope: { companyId: "company-a", runId: "run-xyz" } },
     );
 
-    expect(resolve).toHaveBeenCalledWith({
-      secretRef: "11111111-1111-1111-1111-111111111111",
-      runId: "run-xyz",
-    });
+    expect(resolve).toHaveBeenCalledWith(
+      // v722 plumbs the host-validated call context to HostServices as an
+      // explicit second argument; the back-filled params stay the first.
+      //
+      // PLA-1819: `companyId` is injected from the host-derived pin. The
+      // server's `buildHostServices.secrets.resolve` hard-requires it via
+      // `ensureCompanyId`, so omitting it throws on every dispatch resolve.
+      {
+        secretRef: "11111111-1111-1111-1111-111111111111",
+        runId: "run-xyz",
+        companyId: "company-a",
+      },
+      { invocationScope: { companyId: "company-a", runId: "run-xyz" } },
+    );
   });
 
   it("does NOT overwrite a runId the worker already provided", async () => {
@@ -311,10 +457,14 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
       { invocationScope: { companyId: "company-a", runId: "run-xyz" } },
     );
 
-    expect(resolve).toHaveBeenCalledWith({
-      secretRef: "11111111-1111-1111-1111-111111111111",
-      runId: "worker-supplied-run",
-    });
+    expect(resolve).toHaveBeenCalledWith(
+      {
+        secretRef: "11111111-1111-1111-1111-111111111111",
+        runId: "worker-supplied-run",
+        companyId: "company-a",
+      },
+      { invocationScope: { companyId: "company-a", runId: "run-xyz" } },
+    );
   });
 
   it("forwards untouched when no active invocation carries a runId", async () => {
@@ -334,12 +484,17 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
       { invocationScope: { companyId: "company-a" } },
     );
 
-    // No runId on scope → we pass through unchanged. The server-side handler
-    // will still throw `runcontext_invalid`, which is the desired fail-closed
-    // behaviour for an out-of-dispatch caller.
-    expect(resolve).toHaveBeenCalledWith({
-      secretRef: "11111111-1111-1111-1111-111111111111",
-    });
+    // No runId on scope → no runId back-fill. The server-side handler will
+    // still throw `runcontext_invalid`, which is the desired fail-closed
+    // behaviour for an out-of-dispatch caller. `companyId` is still injected
+    // (PLA-1819) because the scope pins a company even without a runId.
+    expect(resolve).toHaveBeenCalledWith(
+      {
+        secretRef: "11111111-1111-1111-1111-111111111111",
+        companyId: "company-a",
+      },
+      { invocationScope: { companyId: "company-a" } },
+    );
   });
 
   it("back-fills runId on secrets.resolve from the service scope (PLA-768)", async () => {
@@ -362,10 +517,156 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
       { serviceScope: { runId: "service-run-1" } },
     );
 
-    expect(resolve).toHaveBeenCalledWith({
-      secretRef: "11111111-1111-1111-1111-111111111111",
-      runId: "service-run-1",
+    expect(resolve).toHaveBeenCalledWith(
+      {
+        secretRef: "11111111-1111-1111-1111-111111111111",
+        runId: "service-run-1",
+      },
+      { serviceScope: { runId: "service-run-1" } },
+    );
+  });
+
+  it("PLA-1819: injects the host-derived companyId so the v722 server wrapper accepts the call", async () => {
+    // Regression for the defect that shipped in be872d0a4: the branch took
+    // v722's fail-closed guard but declined to inject `companyId`, while v722's
+    // `buildHostServices.secrets.resolve` began hard-requiring it via
+    // `ensureCompanyId`. Half of a matched pair => every dispatch resolve threw
+    // "companyId is required for this operation", the operator's messenger bot
+    // token included. Assert the id actually reaches the service boundary.
+    const resolve = vi.fn(async () => "resolved-value");
+    const services = { secrets: { resolve } } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services,
     });
+
+    await handlers["secrets.resolve"](
+      { secretRef: "11111111-1111-1111-1111-111111111111" } as never,
+      { invocationScope: { companyId: "company-a", runId: "run-xyz" } },
+    );
+
+    const [params] = resolve.mock.calls[0] as [Record<string, unknown>];
+    expect(params.companyId).toBe("company-a");
+  });
+
+  it("PLA-1819: forwards the HOST pin, never the worker-echoed companyId", async () => {
+    // A worker that echoes the *correct* company clears the guard's equality
+    // check. The value forwarded downstream must still be the host-derived pin
+    // — spread last — so params can never become an authority channel even
+    // when the two happen to agree today.
+    const resolve = vi.fn(async () => "resolved-value");
+    const services = { secrets: { resolve } } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services,
+    });
+
+    await handlers["secrets.resolve"](
+      {
+        secretRef: "11111111-1111-1111-1111-111111111111",
+        companyId: "company-a",
+      } as never,
+      { invocationScope: { companyId: "company-a", runId: "run-xyz" } },
+    );
+
+    const [params] = resolve.mock.calls[0] as [Record<string, unknown>];
+    expect(params.companyId).toBe("company-a");
+
+    // And a worker naming a DIFFERENT company is still denied outright.
+    await expect(
+      handlers["secrets.resolve"](
+        {
+          secretRef: "11111111-1111-1111-1111-111111111111",
+          companyId: "company-b",
+        } as never,
+        { invocationScope: { companyId: "company-a", runId: "run-xyz" } },
+      ),
+    ).rejects.toThrow(/company/i);
+    expect(resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it("PLA-1819: omits companyId entirely on the PLA-768 service path", async () => {
+    // The service context carries NO company (`RegisteredServiceRunContext` has
+    // only `runId`), so there is nothing to inject. The absence is what selects
+    // the server wrapper's pass-through branch, where the secrets handler
+    // derives the owning company from the operator-created binding. Injecting a
+    // guessed or defaulted id here would be a tenancy bug.
+    const resolve = vi.fn(async () => "resolved-value");
+    const services = { secrets: { resolve } } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services,
+    });
+
+    await handlers["secrets.resolve"](
+      { secretRef: "11111111-1111-1111-1111-111111111111" } as never,
+      { serviceScope: { runId: "service-run-1" } },
+    );
+
+    const [params] = resolve.mock.calls[0] as [Record<string, unknown>];
+    expect(params).not.toHaveProperty("companyId");
+  });
+
+  it("PLA-1819: serviceScope does not let a worker NAME a company on secrets.resolve", async () => {
+    // The PLA-768 carve-out above lets a scope-less `secrets.resolve` through
+    // because `serviceScope.runId` is host-minted and the server re-derives the
+    // company from (pluginDbId, runId). That must not become a way for the
+    // worker to *choose* the tenant: a worker-supplied `companyId` still has no
+    // host pin to be checked against, so it is denied outright.
+    const resolve = vi.fn(async () => "unreachable");
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services: { secrets: { resolve } } as unknown as HostServices,
+    });
+
+    await expect(
+      handlers["secrets.resolve"](
+        {
+          companyId: "company-attacker",
+          secretRef: "11111111-1111-1111-1111-111111111111",
+        } as never,
+        { serviceScope: { runId: "service-run-1" } },
+      ),
+    ).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("company context is required"),
+    });
+
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
+  it("PLA-1819/PLA-1942: serviceScope is NOT an accepted tenant source for config.get — defers to the host agreement gate instead", async () => {
+    // `serviceScope` carries only a runId. `secrets.resolve` can accept it
+    // because the server maps that runId to a company; `config.get` has no such
+    // downstream derivation — it needs a concrete companyId to select a row.
+    // A serviceScope-only read is therefore still a "no per-dispatch tenant"
+    // case from `resolveRequiredCompanyId`'s point of view, and — since
+    // PLA-1887/1929/1937/1942 — that case no longer fails closed at the SDK
+    // layer. It defers to the host's multi-row agreement gate the same as any
+    // other true no-scope call: `get`/`getForCompany` are invoked with no
+    // company pin, never with one derived from `serviceScope.runId`.
+    const get = vi.fn(async () => ({ apiKey: "unreachable" }));
+    const getForCompany = vi.fn(async () => ({ apiKey: "unreachable" }));
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: [],
+      services: { config: { get, getForCompany } } as unknown as HostServices,
+    });
+
+    const context = { serviceScope: { runId: "service-run-1" } };
+    await expect(
+      handlers["config.get"](undefined as never, context),
+    ).resolves.toEqual({ apiKey: "unreachable" });
+
+    expect(get).toHaveBeenCalledWith({ companyId: undefined }, context);
+    expect(getForCompany).not.toHaveBeenCalled();
   });
 
   it("prefers an active dispatch runId over the service scope (PLA-768)", async () => {
@@ -391,10 +692,20 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
       },
     );
 
-    expect(resolve).toHaveBeenCalledWith({
-      secretRef: "11111111-1111-1111-1111-111111111111",
-      runId: "dispatch-run",
-    });
+    expect(resolve).toHaveBeenCalledWith(
+      {
+        secretRef: "11111111-1111-1111-1111-111111111111",
+        runId: "dispatch-run",
+        // PLA-1819: the dispatch pin also supplies the injected companyId, so
+        // the resolve is attributed to the dispatching company, not the
+        // service context's binding-derived owner.
+        companyId: "company-a",
+      },
+      {
+        invocationScope: { companyId: "company-a", runId: "dispatch-run" },
+        serviceScope: { runId: "service-run-1" },
+      },
+    );
   });
 
   it("back-fills runId on artifacts.fetch symmetrically", async () => {
@@ -546,14 +857,27 @@ describe("createHostClientHandlers config.get per-company scope selection (PLA-7
     expect(getForCompany).not.toHaveBeenCalledWith("company-b");
   });
 
-  it("falls back to instance-wide get() with no scope (0 or 2+ in-flight dispatches → no singleInFlightScope)", async () => {
+  it("defers to the host's agreement gate with no scope (0 or 2+ in-flight dispatches → no singleInFlightScope)", async () => {
     const { handlers, get, getForCompany } = makeConfigHandlers();
 
+    // PLA-1819 (superseded by PLA-1887/1929/1937/1942): a true no-scope call
+    // (setup(), a poll loop — no invocationScope, no singleInFlightScope) used
+    // to deny outright, since `plugin_config` is company-scoped and there is
+    // no instance-wide row to fall back to. That was too blunt: a
+    // construction-time read has no per-dispatch tenant to pin, but the host
+    // can still resolve it safely by checking whether every owning row
+    // already agrees (see `getAgreedOrDeny` in
+    // server/src/services/plugin-config-agreement.ts). So `config.get` now
+    // supplies a constant `alternateHostBinding` sentinel, and
+    // `resolveRequiredCompanyId` returns `null` (not a throw) — the call
+    // falls through to `services.config.get({ ...params, companyId:
+    // undefined }, context)`, deferring resolution to the host's
+    // agreement gate rather than denying at the SDK layer.
     await expect(
       handlers["config.get"](undefined as never, {}),
     ).resolves.toEqual({ githubPatSecretId: "instance-wide-secret" });
 
-    expect(get).toHaveBeenCalledTimes(1);
+    expect(get).toHaveBeenCalledWith({ companyId: undefined }, {});
     expect(getForCompany).not.toHaveBeenCalled();
   });
 
@@ -574,6 +898,35 @@ describe("createHostClientHandlers config.get per-company scope selection (PLA-7
 
     expect(getForCompany).not.toHaveBeenCalled();
     expect(get).not.toHaveBeenCalled();
+  });
+
+  it("PLA-1942 A3.3/5.3: config.get remains outside SERVICE_SCOPE_COMPANY_METHODS — a bare serviceScope never resolves a company for it", async () => {
+    // `config.get` must keep deferring to the host's agreement gate
+    // (`companyId: undefined`) rather than joining the `serviceScope`
+    // allowlist. If it ever did, `serviceScope.runId` would resolve to a
+    // company server-side and hand that company's config to a caller with no
+    // per-dispatch tenant pin at all — a materially different (and unsound)
+    // trust model than "every owning row already agrees". This module
+    // deliberately does not export the allowlist (see the SDK's "does NOT
+    // extend the serviceScope allowance to other company-scoped methods"
+    // test for the established behavioral-proof pattern this mirrors), so
+    // the only way to assert absence is behaviorally: `getForCompany` must
+    // never be called, and `get` must be called with no company.
+    const get = vi.fn(async () => ({ apiKey: "resolved-by-host-gate" }));
+    const getForCompany = vi.fn(async () => ({ apiKey: "should-not-be-used" }));
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: [],
+      services: { config: { get, getForCompany } } as unknown as HostServices,
+    });
+
+    const context = { serviceScope: { runId: "service-run-1" } };
+    await expect(handlers["config.get"](undefined as never, context)).resolves.toEqual({
+      apiKey: "resolved-by-host-gate",
+    });
+
+    expect(getForCompany).not.toHaveBeenCalled();
+    expect(get).toHaveBeenCalledWith({ companyId: undefined }, context);
   });
 
   it("falls back to get() when the host implements no per-company delivery", async () => {

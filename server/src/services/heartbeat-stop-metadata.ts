@@ -1,18 +1,21 @@
 export type HeartbeatRunOutcome =
   | "succeeded"
   | "succeeded_dirty"
+  | "interrupted"
   | "failed"
   | "cancelled"
   | "timed_out";
 
 export type HeartbeatRunStopReason =
   | "completed"
+  | "interrupted"
   | "timeout"
   | "cancelled"
   | "budget_paused"
   | "paused"
   | "max_turns_exhausted"
   | "process_lost"
+  | "unmanaged_background_task_stopped"
   | "completed_dirty_exit"
   | "adapter_failed";
 
@@ -60,16 +63,19 @@ function defaultTimeoutSecForAdapter(adapterType: string) {
 export function resolveAgentStatusAfterRun(input: {
   outcome: HeartbeatRunOutcome;
   runningRunCount: number;
+  keepIdleOnFailure?: boolean;
   errorFamily?: string | null;
 }): "running" | "idle" | "error" {
   if (input.runningRunCount > 0) return "running";
   if (
     input.outcome === "succeeded" ||
     input.outcome === "succeeded_dirty" ||
+    input.outcome === "interrupted" ||
     input.outcome === "cancelled"
   ) {
     return "idle";
   }
+  if (input.outcome === "failed" && input.keepIdleOnFailure) return "idle";
   if (input.outcome === "failed" && input.errorFamily === "transient_upstream") {
     return "idle";
   }
@@ -120,9 +126,11 @@ export function inferHeartbeatRunStopReason(input: {
   if (input.outcome === "succeeded") return "completed";
   // The work completed; only teardown exited badly.
   if (input.outcome === "succeeded_dirty") return "completed_dirty_exit";
+  if (input.outcome === "interrupted") return "interrupted";
   const maxTurnStopReason = normalizeMaxTurnStopReason(input.errorCode);
   if (maxTurnStopReason) return maxTurnStopReason;
   if (input.outcome === "timed_out") return "timeout";
+  if (input.outcome === "failed" && input.errorCode === "unmanaged_background_task_stopped") return "unmanaged_background_task_stopped";
   if (input.outcome === "failed" && input.errorCode === "process_lost") return "process_lost";
   if (input.outcome === "cancelled") {
     const message = (input.errorMessage ?? "").toLowerCase();

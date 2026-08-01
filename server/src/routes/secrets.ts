@@ -18,7 +18,7 @@ import {
   updateUserSecretValueSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
-import { assertBoard, assertCompanyAccess } from "./authz.js";
+import { assertBoard, assertCompanyAccess, getAccessibleResource } from "./authz.js";
 import { logActivity, secretService } from "../services/index.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
 import { forbidden, unauthorized } from "../errors.js";
@@ -61,6 +61,66 @@ export function secretRoutes(db: Db) {
   const router = Router();
   const svc = secretService(db);
   const defaultProvider = getConfiguredSecretProvider();
+
+  function agentSecretContext(req: Parameters<typeof assertBoard>[0]) {
+    if (req.actor.type !== "agent" || !req.actor.agentId || !req.actor.companyId || !req.actor.runId) {
+      throw forbidden("Run-bound agent authentication required");
+    }
+    return {
+      companyId: req.actor.companyId,
+      agentId: req.actor.agentId,
+      actorSource: req.actor.source === "agent_jwt" ? "agent_jwt" as const : "agent_key" as const,
+      keyId: req.actor.keyId ?? null,
+      keyScope: req.actor.keyScope ?? null,
+      heartbeatRunId: req.actor.runId,
+      responsibleUserId: req.actor.onBehalfOfUserId ?? null,
+    };
+  }
+
+  router.get("/agents/me/secrets", async (req, res) => {
+    const context = agentSecretContext(req);
+    const secrets = await svc.listAgentSecretAccess(context.companyId, context);
+    await logActivity(db, {
+      companyId: context.companyId,
+      actorType: "agent",
+      actorId: context.agentId,
+      action: "secret.access.listed",
+      entityType: "agent",
+      entityId: context.agentId,
+      agentId: context.agentId,
+      runId: context.heartbeatRunId,
+      details: { count: secrets.length },
+    });
+    res.json({
+      secrets: secrets.map(({ secretId: _secretId, bindingId: _bindingId, configPath: _configPath, ...secret }) => secret),
+    });
+  });
+
+  router.post("/agents/me/secrets/:key/value", async (req, res) => {
+    const context = agentSecretContext(req);
+    const available = await svc.listAgentSecretAccess(context.companyId, context);
+    const secret = available.find((entry) => entry.key === req.params.key);
+    const unresolvedSecret = secret ? null : await svc.getByKey(context.companyId, req.params.key);
+    if (!secret && !unresolvedSecret) throw forbidden("Secret access is not granted for this agent");
+    const resolution = await svc.resolveSecretValueForAgentAccess(
+      context.companyId,
+      secret?.secretId ?? unresolvedSecret!.id,
+      secret?.versionSelector ?? "latest",
+      {
+        ...context,
+        configPath: secret?.configPath ?? `access.${req.params.key}`,
+        bindingId: secret?.bindingId ?? null,
+        issueId: null,
+        registerForRedaction: () => undefined,
+      },
+    );
+    res.set("Cache-Control", "no-store");
+    res.json({
+      key: secret?.key ?? unresolvedSecret!.key,
+      value: resolution.value,
+      version: resolution.version,
+    });
+  });
 
   router.get("/companies/:companyId/secret-providers", (req, res) => {
     assertBoard(req);
@@ -156,24 +216,16 @@ export function secretRoutes(db: Db) {
 
   router.get("/secret-provider-configs/:id", async (req, res) => {
     assertBoard(req);
-    const existing = await svc.getProviderConfigById(req.params.id as string);
-    if (!existing) {
-      res.status(404).json({ error: "Provider vault not found" });
-      return;
-    }
-    assertCompanyAccess(req, existing.companyId);
+    const existing = await getAccessibleResource(req, res, svc.getProviderConfigById(req.params.id as string), "Provider vault not found");
+    if (!existing) return;
     res.json(existing);
   });
 
   router.patch("/secret-provider-configs/:id", validate(updateSecretProviderConfigSchema), async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
-    const existing = await svc.getProviderConfigById(id);
-    if (!existing) {
-      res.status(404).json({ error: "Provider vault not found" });
-      return;
-    }
-    assertCompanyAccess(req, existing.companyId);
+    const existing = await getAccessibleResource(req, res, svc.getProviderConfigById(id), "Provider vault not found");
+    if (!existing) return;
 
     const updated = await svc.updateProviderConfig(id, {
       displayName: req.body.displayName,
@@ -207,12 +259,8 @@ export function secretRoutes(db: Db) {
   router.delete("/secret-provider-configs/:id", async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
-    const existing = await svc.getProviderConfigById(id);
-    if (!existing) {
-      res.status(404).json({ error: "Provider vault not found" });
-      return;
-    }
-    assertCompanyAccess(req, existing.companyId);
+    const existing = await getAccessibleResource(req, res, svc.getProviderConfigById(id), "Provider vault not found");
+    if (!existing) return;
 
     const removed = await svc.removeProviderConfig(id);
     if (!removed) {
@@ -240,12 +288,8 @@ export function secretRoutes(db: Db) {
   router.post("/secret-provider-configs/:id/default", async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
-    const existing = await svc.getProviderConfigById(id);
-    if (!existing) {
-      res.status(404).json({ error: "Provider vault not found" });
-      return;
-    }
-    assertCompanyAccess(req, existing.companyId);
+    const existing = await getAccessibleResource(req, res, svc.getProviderConfigById(id), "Provider vault not found");
+    if (!existing) return;
 
     const updated = await svc.setDefaultProviderConfig(id);
     if (!updated) {
@@ -273,12 +317,8 @@ export function secretRoutes(db: Db) {
   router.post("/secret-provider-configs/:id/health", async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
-    const existing = await svc.getProviderConfigById(id);
-    if (!existing) {
-      res.status(404).json({ error: "Provider vault not found" });
-      return;
-    }
-    assertCompanyAccess(req, existing.companyId);
+    const existing = await getAccessibleResource(req, res, svc.getProviderConfigById(id), "Provider vault not found");
+    if (!existing) return;
 
     const health = await svc.checkProviderConfigHealth(id);
     if (!health) {
@@ -705,16 +745,14 @@ export function secretRoutes(db: Db) {
   router.post("/secrets/:id/rotate", validate(rotateSecretSchema), async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
-    const existing = await svc.getById(id);
-    if (!existing) {
-      res.status(404).json({ error: "Secret not found" });
-      return;
-    }
-    if (!isCompanyScopedSecret(existing)) {
-      res.status(404).json({ error: "Secret not found" });
-      return;
-    }
-    assertCompanyAccess(req, existing.companyId);
+    const fetched = await svc.getById(id);
+    const existing = await getAccessibleResource(
+      req,
+      res,
+      fetched && isCompanyScopedSecret(fetched) ? fetched : null,
+      "Secret not found",
+    );
+    if (!existing) return;
     if (existing.status === "deleted") {
       res.status(404).json({ error: "Secret not found" });
       return;
@@ -747,16 +785,14 @@ export function secretRoutes(db: Db) {
   router.patch("/secrets/:id", validate(updateSecretSchema), async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
-    const existing = await svc.getById(id);
-    if (!existing) {
-      res.status(404).json({ error: "Secret not found" });
-      return;
-    }
-    if (!isCompanyScopedSecret(existing)) {
-      res.status(404).json({ error: "Secret not found" });
-      return;
-    }
-    assertCompanyAccess(req, existing.companyId);
+    const fetched = await svc.getById(id);
+    const existing = await getAccessibleResource(
+      req,
+      res,
+      fetched && isCompanyScopedSecret(fetched) ? fetched : null,
+      "Secret not found",
+    );
+    if (!existing) return;
     if (existing.status === "deleted") {
       res.status(404).json({ error: "Secret not found" });
       return;
@@ -793,16 +829,14 @@ export function secretRoutes(db: Db) {
   router.get("/secrets/:id/usage", async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
-    const existing = await svc.getById(id);
-    if (!existing) {
-      res.status(404).json({ error: "Secret not found" });
-      return;
-    }
-    if (!isCompanyScopedSecret(existing)) {
-      res.status(404).json({ error: "Secret not found" });
-      return;
-    }
-    assertCompanyAccess(req, existing.companyId);
+    const fetched = await svc.getById(id);
+    const existing = await getAccessibleResource(
+      req,
+      res,
+      fetched && isCompanyScopedSecret(fetched) ? fetched : null,
+      "Secret not found",
+    );
+    if (!existing) return;
     const bindings = await svc.listBindingReferences(existing.companyId, existing.id);
     res.json({ secretId: existing.id, bindings });
   });
@@ -810,16 +844,14 @@ export function secretRoutes(db: Db) {
   router.get("/secrets/:id/access-events", async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
-    const existing = await svc.getById(id);
-    if (!existing) {
-      res.status(404).json({ error: "Secret not found" });
-      return;
-    }
-    if (!isCompanyScopedSecret(existing)) {
-      res.status(404).json({ error: "Secret not found" });
-      return;
-    }
-    assertCompanyAccess(req, existing.companyId);
+    const fetched = await svc.getById(id);
+    const existing = await getAccessibleResource(
+      req,
+      res,
+      fetched && isCompanyScopedSecret(fetched) ? fetched : null,
+      "Secret not found",
+    );
+    if (!existing) return;
     const events = await svc.listAccessEvents(existing.companyId, existing.id);
     res.json(events);
   });
@@ -827,16 +859,14 @@ export function secretRoutes(db: Db) {
   router.delete("/secrets/:id", async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
-    const existing = await svc.getById(id);
-    if (!existing) {
-      res.status(404).json({ error: "Secret not found" });
-      return;
-    }
-    if (!isCompanyScopedSecret(existing)) {
-      res.status(404).json({ error: "Secret not found" });
-      return;
-    }
-    assertCompanyAccess(req, existing.companyId);
+    const fetched = await svc.getById(id);
+    const existing = await getAccessibleResource(
+      req,
+      res,
+      fetched && isCompanyScopedSecret(fetched) ? fetched : null,
+      "Secret not found",
+    );
+    if (!existing) return;
 
     const removed = await svc.remove(id);
     if (!removed) {

@@ -235,10 +235,13 @@ describeEmbeddedPostgres("plugin-loader upgrade_pending (PLA-908)", () => {
     const newPkg = await writePackage(newManifest);
     const pluginId = await seedPlugin(oldManifest, oldPkg);
 
+    const companyId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Platform", issuePrefix: "PLA" });
+
     // Seed plugin-scoped data that must survive the upgrade untouched.
     const [config] = await db
       .insert(pluginConfig)
-      .values({ pluginId, configJson: { apiBase: "https://example.test", retries: 3 } })
+      .values({ pluginId, companyId, configJson: { apiBase: "https://example.test", retries: 3 } })
       .returning();
     const [state] = await db
       .insert(pluginState)
@@ -252,8 +255,6 @@ describeEmbeddedPostgres("plugin-loader upgrade_pending (PLA-908)", () => {
       .returning();
 
     // Secret-ref binding lives in a separate table with no FK to plugins.
-    const companyId = randomUUID();
-    await db.insert(companies).values({ id: companyId, name: "Platform", issuePrefix: "PLA" });
     const [secret] = await db
       .insert(companySecrets)
       .values({ companyId, key: "upgrade_test_secret", name: "Upgrade Test Secret" })

@@ -4,6 +4,7 @@ import {
   agentTaskSessions as agentTaskSessionsTable,
   agents as agentsTable,
   budgetIncidents,
+  companyMemberships,
   costEvents,
   heartbeatRuns,
   invites,
@@ -69,6 +70,9 @@ import {
   writePluginLocalFolderTextAtomic,
 } from "./plugin-local-folders.js";
 import { createPluginSecretsHandler } from "./plugin-secrets-handler.js";
+import { getAgreedOrDeny } from "./plugin-config-agreement.js";
+import { collectSecretRefPaths } from "./json-schema-secret-refs.js";
+import { instanceConfigSchemaOf } from "./plugin-registry.js";
 import { createPluginArtifactsHandler } from "./plugin-artifacts-handler.js";
 import { normalizeIssueAttachmentMaxBytes } from "../attachment-types.js";
 import {
@@ -560,6 +564,45 @@ if (_logFlushInterval.unref) _logFlushInterval.unref();
 /** Maximum time (ms) to keep a session event subscription alive before forcing cleanup. */
 const SESSION_EVENT_SUBSCRIPTION_TIMEOUT_MS = 30 * 60 * 1_000; // 30 minutes
 
+/**
+ * PLA-1819: the `secrets.resolve` host-service wrapper, extracted so tests can
+ * drive the REAL layer instead of stubbing `services: { secrets: handler }`.
+ * That stub is why 143 green tests missed a branch on which every secret
+ * resolution threw: it bypassed this wrapper, where v722's new requirement
+ * lives. An upstream sync is exactly the scenario where a stubbed seam lies to
+ * you — upstream changes both halves of a contract and the stub pins only one.
+ *
+ * Upstream v722 hard-requires `params.companyId` here. That holds for every
+ * dispatch/background resolve, where the SDK injects the host-derived pin. It
+ * cannot hold for the fork-only PLA-768 service context (a setup()-started loop
+ * such as the messenger getUpdates poll): `RegisteredServiceRunContext` carries
+ * no company at all, so no pin exists to inject and none can be derived here —
+ * the owning company is only known after the binding-row lookup inside
+ * `secretsHandler.resolve`.
+ *
+ * An absent `companyId` is NOT a widening. The handler treats `companyId` as a
+ * non-authoritative HINT on every path and re-derives the tenant from the
+ * run-context registry keyed on (pluginDbId, runId), fail-closing with
+ * `runcontext_invalid` when there is no live host-minted context.
+ */
+export function buildSecretsResolveService(
+  secretsHandler: ReturnType<typeof createPluginSecretsHandler>,
+  ensurePluginAvailableForCompany: (companyId: string) => Promise<void>,
+) {
+  return async function resolve(
+    params: Parameters<ReturnType<typeof createPluginSecretsHandler>["resolve"]>[0],
+  ) {
+    if (params.companyId === undefined) {
+      return secretsHandler.resolve(params);
+    }
+    if (!params.companyId) {
+      throw new Error("companyId is required for this operation");
+    }
+    await ensurePluginAvailableForCompany(params.companyId);
+    return secretsHandler.resolve(params);
+  };
+}
+
 export function buildHostServices(
   db: Db,
   pluginId: string,
@@ -822,6 +865,30 @@ export function buildHostServices(
     return record;
   };
 
+  /**
+   * Verify `userId` is an active human member of `companyId` before letting a
+   * plugin attribute a mutation to them. Mirrors the authorization bar the
+   * web app's own board routes apply — a plugin can only ever attribute an
+   * action to an identity that could have taken it in the web app itself.
+   * Used by any plugin capability that accepts an `actorUserId` (currently
+   * `createComment`'s human-attributed path).
+   */
+  const requireActiveHumanMember = async (companyId: string, userId: string): Promise<void> => {
+    const [membership] = await db
+      .select({ id: companyMemberships.id })
+      .from(companyMemberships)
+      .where(and(
+        eq(companyMemberships.companyId, companyId),
+        eq(companyMemberships.principalType, "user"),
+        eq(companyMemberships.principalId, userId),
+        eq(companyMemberships.status, "active"),
+      ))
+      .limit(1);
+    if (!membership) {
+      throw new Error(`actorUserId "${userId}" is not an active human member of this company`);
+    }
+  };
+
   const pluginActivityDetails = (
     details: Record<string, unknown> | null | undefined,
     actor?: { actorAgentId?: string | null; actorUserId?: string | null; actorRunId?: string | null },
@@ -1033,19 +1100,16 @@ export function buildHostServices(
   };
 
   const INVITE_TOKEN_PREFIX = "pcp_invite_";
-  const INVITE_TOKEN_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
-  const INVITE_TOKEN_SUFFIX_LENGTH = 8;
+  // 256 bits of entropy, base64url-encoded. Keep in sync with createInviteToken
+  // in routes/access.ts. The token is public, so it must not be brute-forceable.
+  const INVITE_TOKEN_ENTROPY_BYTES = 32;
   const INVITE_TOKEN_MAX_RETRIES = 5;
   const COMPANY_INVITE_TTL_MS = 72 * 60 * 60 * 1000;
 
   const hashToken = (token: string) => createHash("sha256").update(token).digest("hex");
 
   const createInviteToken = () => {
-    const bytes = randomBytes(INVITE_TOKEN_SUFFIX_LENGTH);
-    let suffix = "";
-    for (let idx = 0; idx < INVITE_TOKEN_SUFFIX_LENGTH; idx += 1) {
-      suffix += INVITE_TOKEN_ALPHABET[bytes[idx]! % INVITE_TOKEN_ALPHABET.length];
-    }
+    const suffix = randomBytes(INVITE_TOKEN_ENTROPY_BYTES).toString("base64url");
     return `${INVITE_TOKEN_PREFIX}${suffix}`;
   };
 
@@ -1233,14 +1297,73 @@ export function buildHostServices(
   // optional method; the cast keeps this file compiling against SDK versions
   // that pre-date the extension (the gated handler duck-types `getForCompany`
   // via `if (services.config.getForCompany)` so the absence is safe).
+  //
+  // v722 made `plugin_config` company-scoped, so `registry.getConfig` now needs a
+  // company. `getForCompany` layers the operator-set
+  // `plugin_company_settings.settingsJson.configOverrides` on top of that row.
   const configService = {
-    async get(): Promise<Record<string, unknown>> {
-      const configRow = await registry.getConfig(pluginId);
+    async get(params?: { companyId?: string }): Promise<Record<string, unknown>> {
+      const companyId = params?.companyId;
+      if (!companyId) {
+        // PLA-1887/1929/1937/1942: the SDK's gated `config.get` wrapper falls
+        // through to here when no dispatch pins a tenant — a genuine
+        // construction-time read (setup(), a poll loop, ...). Rather than
+        // degrading to `{}` (which a plugin reads as an absent key and
+        // proceeds unauthenticated/unconfigured, silently) resolve via the
+        // host-minted agreement gate: if every owning `plugin_config` row for
+        // this plugin agrees, hand back the agreed config; if they
+        // genuinely diverge, deny loudly and surface it on plugin health.
+        const plugin = await registry.getById(pluginId);
+        const secretRefPaths = collectSecretRefPaths(
+          (instanceConfigSchemaOf(plugin ?? { manifestJson: null }) as Record<string, unknown> | null) ??
+            null,
+        );
+        return getAgreedOrDeny({
+          pluginId,
+          pluginKey,
+          listConfigRows: () => registry.listConfigRows(pluginId),
+          secretRefPaths,
+          logger,
+          onDeny: async ({ disagreeingKeys }) => {
+            // A2 (PLA-1942): tenant-neutral message ONLY — no company ids, no
+            // row counts. `plugins.lastError` is reachable by any board actor
+            // with membership in at least one company (`assertBoardOrgAccess`
+            // gates GET /plugins, /:pluginId, /:pluginId/health,
+            // /:pluginId/dashboard — none of those require instance-admin),
+            // so writing company ids here would hand a single-tenant viewer
+            // the existence and config state of other tenants. Disagreeing
+            // top-level key NAMES are fine: they're manifest-declared and
+            // already readable by every owning tenant. Company ids and full
+            // detail go only to the `logger.error` call above, which no
+            // company-scoped API exposes. Pass the plugin's current `status`
+            // through unchanged so this never clobbers an unrelated
+            // lifecycle transition.
+            const current = await registry.getById(pluginId);
+            if (!current) return;
+            await registry.updateStatus(pluginId, {
+              status: current.status,
+              lastError: `config-agreement: unscoped config.get denied; owning config rows disagree on key(s): ${disagreeingKeys.join(", ")}. See host log for company detail.`,
+            });
+          },
+          onResolve: async () => {
+            // Clear a previously-recorded divergence back to healthy on the
+            // next clean resolve, or a fixed divergence leaves a permanent
+            // false-positive health failure with no path back to green.
+            const current = await registry.getById(pluginId);
+            if (current?.lastError) {
+              await registry.updateStatus(pluginId, { status: current.status, lastError: null });
+            }
+          },
+        });
+      }
+      await ensurePluginAvailableForCompany(companyId);
+      const configRow = await registry.getConfig(pluginId, companyId);
       return (configRow?.configJson as Record<string, unknown> | undefined) ?? {};
     },
     async getForCompany(companyId: string): Promise<Record<string, unknown>> {
+      await ensurePluginAvailableForCompany(companyId);
       const [configRow, override] = await Promise.all([
-        registry.getConfig(pluginId),
+        registry.getConfig(pluginId, companyId),
         registry.getCompanyConfigOverride(pluginId, companyId),
       ]);
       const base = (configRow?.configJson as Record<string, unknown> | undefined) ?? {};
@@ -1453,9 +1576,7 @@ export function buildHostServices(
     },
 
     secrets: {
-      async resolve(params) {
-        return secretsHandler.resolve(params);
-      },
+      resolve: buildSecretsResolveService(secretsHandler, ensurePluginAvailableForCompany),
       async mintHandle(params) {
         return secretsHandler.mintHandle(params);
       },
@@ -2287,10 +2408,21 @@ export function buildHostServices(
         // (send-it-back-to-me, approvals, audit). Relays are attributed to the
         // plugin's own agent identity; operator identity, if any, belongs in the
         // comment body/metadata, not in host-minted authorship. (PLA-823 Finding 1.)
+        //
+        // v722 reopens human attribution behind a SEPARATE default-deny
+        // capability (`issue.comments.create_human_attributed`, enforced in the
+        // SDK capability map) PLUS a host-side check that the id is an active
+        // human member of this issue's company. That closes PLA-823 Finding 1's
+        // actual gap — an unprivileged worker still cannot mint user authorship,
+        // and a privileged one can only name identities that could have posted
+        // the comment in the web app.
+        if (params.actorUserId) {
+          await requireActiveHumanMember(companyId, params.actorUserId);
+        }
         const comment = (await issues.addComment(
           issue.id,
           params.body,
-          { agentId: params.authorAgentId },
+          { agentId: params.actorUserId ? undefined : params.authorAgentId, userId: params.actorUserId },
         )) as IssueComment;
         // PLA-888: bind any standalone assets created via artifacts.create onto
         // this comment. attachAssetsToComment re-checks each asset's company
@@ -2312,9 +2444,13 @@ export function buildHostServices(
           action: "issue.comment.created",
           entityType: "issue",
           entityId: issue.id,
-          // Record the true principal only: the plugin's agent identity. Never a
-          // worker-claimed user (would make the audit trail itself spoofable).
-          actor: { actorAgentId: params.authorAgentId ?? null },
+          // Record the true principal. A worker-claimed user id is only ever
+          // recorded after `requireActiveHumanMember` has verified it against
+          // this company's active human members (PLA-823 Finding 1 + v722).
+          actor: {
+            actorAgentId: params.actorUserId ? null : params.authorAgentId ?? null,
+            actorUserId: params.actorUserId ?? null,
+          },
           details: {
             identifier: issue.identifier,
             commentId: comment.id,
@@ -2374,6 +2510,47 @@ export function buildHostServices(
               );
           }
         }
+
+        // Human-attributed comments participate in the same "wake the
+        // assignee" behavior a board user's comment gets in the web app
+        // (routes/issues.ts's addComment route) — a plugin's own
+        // agent-attributed comments never do this. Deliberately narrower
+        // than the HTTP route: no reopen/resume/interrupt/scheduled-retry
+        // handling here, just the core wake. An assignee-less or
+        // closed-status issue is a silent no-op, matching the route's own
+        // guard.
+        if (
+          params.actorUserId
+          && issue.assigneeAgentId
+          && issue.status !== "done"
+          && issue.status !== "cancelled"
+        ) {
+          await heartbeat.wakeup(issue.assigneeAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "issue_commented",
+            payload: {
+              issueId: issue.id,
+              commentId: comment.id,
+              mutation: "comment",
+            },
+            requestedByActorType: "user",
+            requestedByActorId: params.actorUserId,
+            contextSnapshot: {
+              issueId: issue.id,
+              taskId: issue.id,
+              sourceCommentId: comment.id,
+              wakeReason: "issue_commented",
+              source: `plugin:${pluginKey}`,
+            },
+          }).catch((err) => logger.warn({
+            err,
+            issueId: issue.id,
+            commentId: comment.id,
+            agentId: issue.assigneeAgentId,
+          }, "failed to wake assignee on plugin-relayed human comment"));
+        }
+
         return comment;
       },
       async createInteraction(params) {

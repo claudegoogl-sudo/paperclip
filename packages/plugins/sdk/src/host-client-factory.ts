@@ -101,14 +101,17 @@ export interface HostServices {
   /** Provides `config.get`. */
   config: {
     /**
-     * Return the instance-wide plugin configuration. Always available.
+     * Return the plugin configuration for this call. Always available.
      *
      * For multi-tenant deployments, hosts SHOULD also implement
      * {@link HostServices.config.getForCompany} to deliver per-tenant
      * overrides; the gated wrapper for `config.get` consults
      * `getForCompany` first when the invocation carries a company scope.
      */
-    get(): Promise<Record<string, unknown>>;
+    get(
+      params: WorkerToHostMethods["config.get"][0],
+      context?: WorkerHostCallContext,
+    ): Promise<Record<string, unknown>>;
     /**
      * PLA-677: Return the effective plugin configuration for `companyId`,
      * i.e. the instance-wide config merged with this tenant's
@@ -165,7 +168,10 @@ export interface HostServices {
 
   /** Provides `secrets.resolve` and `secrets.mintHandle`. */
   secrets: {
-    resolve(params: WorkerToHostMethods["secrets.resolve"][0]): Promise<string>;
+    resolve(
+      params: WorkerToHostMethods["secrets.resolve"][0],
+      context?: WorkerHostCallContext,
+    ): Promise<string>;
     mintHandle(
       params: WorkerToHostMethods["secrets.mintHandle"][0],
     ): Promise<WorkerToHostMethods["secrets.mintHandle"][1]>;
@@ -835,17 +841,26 @@ export function createHostClientHandlers(
       throw new InvocationScopeDeniedError(
         pluginId,
         method,
-        "no active invocation scope; company-scoped calls must run within a dispatch",
+        // PLA-1819: the leading phrase matches upstream v2026.722.0's contract
+        // for this denial; the remainder is the fork's existing diagnostic.
+        "company context is required; no active invocation scope; company-scoped calls must run within a dispatch",
       );
     }
 
     if (requested.kind === "all") {
       if (method === "companies.list") return;
+      if (!allowedCompanyId) {
+        throw new InvocationScopeDeniedError(pluginId, method, "company context is required");
+      }
       throw new InvocationScopeDeniedError(
         pluginId,
         method,
         `the current invocation is scoped to company "${allowedCompanyId}"`,
       );
+    }
+
+    if (!allowedCompanyId) {
+      throw new InvocationScopeDeniedError(pluginId, method, "company context is required");
     }
 
     if (requested.companyId !== allowedCompanyId) {
@@ -855,6 +870,70 @@ export function createHostClientHandlers(
         `requested company "${requested.companyId}" but the current invocation is scoped to company "${allowedCompanyId}"`,
       );
     }
+  }
+
+  /**
+   * PLA-1819: upstream v2026.722.0's fail-closed guard for the two methods that
+   * read tenant material. Upstream names this `resolveRequiredCompanyId` and
+   * sources the tenant ONLY from `invocationScope`. The fork additionally
+   * accepts `singleInFlightScope`, which is equally host-derived (see
+   * plugin-worker-manager `baseContextForWorkerMessage`: computed from
+   * `activeInvocations`/`pendingRequests`, surfaced only when EXACTLY ONE
+   * dispatch is in flight, never worker-supplied). That is the minimum needed
+   * to keep id-less legacy workers (platform.cad <=0.1.7, klipper) working —
+   * PLA-719/PLA-761. Resolution runs BEFORE the `invalidInvocationScope`
+   * rejection, per the PLA-818 guard-ordering precedent: a worker echoing a
+   * bogus invocation id cannot change which dispatch is in flight, so it gains
+   * no reach.
+   *
+   * `alternateHostBinding` is a HOST-MINTED tenant binding that the server
+   * re-derives the company from downstream. Only `secrets.resolve` supplies one
+   * — `serviceScope.runId` (PLA-768), which the server's secrets handler maps
+   * to a company via the run-context registry keyed on (pluginDbId, runId).
+   * When it is present and no company pin resolves, this returns `null`
+   * (allowed, tenant resolved downstream) rather than denying. Note the
+   * worker-named-company branch below still denies unconditionally without a
+   * pin, so this cannot be used to reach a tenant the worker names.
+   */
+  function resolveRequiredCompanyId(
+    method: WorkerToHostMethodName,
+    params: unknown,
+    context: WorkerHostCallContext | undefined,
+    alternateHostBinding?: string | null,
+  ): string | null {
+    const scopedCompanyId =
+      readNonEmptyString(context?.invocationScope?.companyId) ??
+      readNonEmptyString(context?.singleInFlightScope?.companyId);
+
+    const requested = requestedCompanyScope(method, params);
+    if (requested.kind === "single") {
+      // A worker-named company is never authoritative: it must match a
+      // host-derived pin, and with no pin it is denied outright — even when an
+      // `alternateHostBinding` is present, because there is nothing to check
+      // the worker's claim against.
+      if (!scopedCompanyId) {
+        throw new InvocationScopeDeniedError(pluginId, method, "company context is required");
+      }
+      if (requested.companyId !== scopedCompanyId) {
+        throw new InvocationScopeDeniedError(
+          pluginId,
+          method,
+          `requested company "${requested.companyId}" but the current invocation is scoped to company "${scopedCompanyId}"`,
+        );
+      }
+      return scopedCompanyId;
+    }
+
+    if (scopedCompanyId) return scopedCompanyId;
+    if (readNonEmptyString(alternateHostBinding)) return null;
+
+    throw new InvocationScopeDeniedError(
+      pluginId,
+      method,
+      context?.invalidInvocationScope
+        ? "company context is required; the worker referenced a missing, expired, or unknown invocation scope"
+        : "company context is required",
+    );
   }
 
   /**
@@ -894,28 +973,50 @@ export function createHostClientHandlers(
 
   return {
     // Config
-    "config.get": gated("config.get", async (_params, context) => {
-      // PLA-677: When the invocation carries a company scope and the host
-      // implements per-tenant config delivery, return the company-scoped
-      // effective config; otherwise fall back to the instance-wide config.
+    "config.get": gated("config.get", async (params, context) => {
+      // PLA-677 / PLA-761: return the company-scoped effective config, sourcing
+      // the tenant from `invocationScope` or — for id-less legacy workers that
+      // echo no `paperclipInvocationId` (platform.cad <=0.1.x) — the equally
+      // host-derived `singleInFlightScope`.
       //
-      // PLA-761: id-less legacy workers (e.g. platform.cad ≤0.1.x) echo no
-      // `paperclipInvocationId`, so `invocationScope` is null. Consult the same
-      // host-validated `singleInFlightScope` the runId backfill uses
-      // (`backfillDispatchRunId`) so their per-tenant config — and the secret
-      // refs it carries — resolves to the in-flight dispatch's company rather
-      // than falling through to the instance-wide config. The companyId is
-      // host-derived, never worker-supplied: `config.get` takes no companyId
-      // param, so this is a scope *selection* read, not an enforcement bypass.
-      // With 0 or 2+ in-flight dispatches the host pins no `singleInFlightScope`,
-      // so behavior is unchanged (instance-wide config).
-      const companyId =
-        readNonEmptyString(context?.invocationScope?.companyId) ??
-        readNonEmptyString(context?.singleInFlightScope?.companyId);
-      if (companyId && services.config.getForCompany) {
-        return services.config.getForCompany(companyId);
+      // PLA-1819: adopt upstream v722's fail-closed control. `plugin_config`
+      // is company-scoped (`company_id` NOT NULL) since v722, so the fork's old
+      // "instance-wide fallback" resolved to `{}` — which a plugin reads as an
+      // absent key and proceeds unauthenticated. Denying is the only outcome a
+      // plugin cannot silently misread as fail-open.
+      //
+      // PLA-1887/1929/1937/1942: a genuine construction-time call (setup(), a
+      // poll loop — no invocationScope, no singleInFlightScope) has no
+      // per-dispatch tenant to pin. Unlike `secrets.resolve`, `config.get`
+      // needs no external data to defer resolution — it can always be
+      // resolved host-side from the plugin's own owning rows. So `config.get`
+      // always supplies a constant (not context-derived) `alternateHostBinding`
+      // sentinel, letting a true no-scope call fall through to the host's
+      // multi-row agreement gate (`getAgreedOrDeny`) instead of denying
+      // outright. A WORKER-NAMED company (`requested.kind === "single"`) still
+      // denies unconditionally regardless — `resolveRequiredCompanyId`'s
+      // "single" branch ignores `alternateHostBinding` entirely, so this
+      // cannot be used to reach a tenant the worker names.
+      const companyId = resolveRequiredCompanyId(
+        "config.get",
+        params,
+        context,
+        "config-agreement-gate",
+      );
+      if (companyId) {
+        if (services.config.getForCompany) {
+          return services.config.getForCompany(companyId);
+        }
+        // v722 plumbs the resolved company through the params object. Only
+        // ever forward the HOST-derived id — never the worker-echoed
+        // `params.companyId` — so this stays a scope *selection* read, not an
+        // enforcement bypass.
+        return services.config.get({ ...params, companyId }, context);
       }
-      return services.config.get();
+      // No dispatch-derived scope at all: the host resolves this via
+      // agreement across every owning row (or denies), never from a
+      // worker-supplied field.
+      return services.config.get({ ...params, companyId: undefined }, context);
     }),
 
     "localFolders.declarations": gated("localFolders.declarations", async (params) => {
@@ -992,8 +1093,37 @@ export function createHostClientHandlers(
       // fail-closed throw still fires when there is no active invocation, so a
       // forged worker→host call outside a tool dispatch keeps getting
       // `runcontext_invalid`.
+      //
+      // PLA-1819: adopt upstream v722's fail-closed company guard AND its
+      // matched `companyId` injection. Both halves are required: v722's server
+      // wrapper (`plugin-host-services.ts` `buildHostServices.secrets.resolve`)
+      // hard-requires `params.companyId` via `ensureCompanyId`. Taking the
+      // guard without the injection makes every resolve throw, in-dispatch
+      // included.
+      //
+      // PLA-768 is passed as the alternate host binding: a setup()-started loop
+      // (e.g. the messenger getUpdates poll) resolves with no dispatch in
+      // flight, so no company pin exists — only the host-minted
+      // `serviceScope.runId`, which the server maps to a company itself. A
+      // worker-named `companyId` is still denied outright without a pin.
+      const companyId = resolveRequiredCompanyId(
+        "secrets.resolve",
+        params,
+        context,
+        context?.serviceScope?.runId,
+      );
       const enriched = backfillDispatchRunId(params, context);
-      return services.secrets.resolve(enriched);
+      // Only ever forward the HOST-derived id, spread last so a worker-echoed
+      // `params.companyId` can never survive. The server still treats it as a
+      // non-authoritative HINT and re-derives the dispatching company from the
+      // run-context registry keyed on (pluginDbId, runId) — injecting it buys
+      // the wrapper's `ensurePluginAvailableForCompany` check, not authority.
+      // `null` is the PLA-768 service path: no pin exists to forward, and the
+      // server derives the owning company from the operator-created binding.
+      return services.secrets.resolve(
+        companyId ? { ...enriched, companyId } : enriched,
+        context,
+      );
     }),
 
     // Secrets — borrowed-handle minting (PLA-702 Control 2). Same dispatch
@@ -1158,6 +1288,13 @@ export function createHostClientHandlers(
       return services.issues.listAttachments(params);
     }),
     "issues.createComment": gated("issues.createComment", async (params) => {
+      if (params.actorUserId && !capabilitySet.has("issue.comments.create_human_attributed")) {
+        throw new CapabilityDeniedError(
+          pluginId,
+          "issues.createComment",
+          "issue.comments.create_human_attributed",
+        );
+      }
       return services.issues.createComment(params);
     }),
     "issues.createInteraction": gated("issues.createInteraction", async (params) => {

@@ -18,10 +18,13 @@
  *     ctx.logger.info("Linear sync plugin starting");
  *
  *     // Register a tool. Secrets resolve against the dispatching company of the
- *     // tool call — pass `runCtx.runId` so the host can authorize the ref.
+ *     // tool call — always pass `runCtx.runId` so the host can authorize the ref
+ *     // against the dispatching company (the worker never asserts a company).
  *     ctx.tools.register("create-issue", { displayName: "Create issue" }, async (params, runCtx) => {
  *       const config = await ctx.config.get();
- *       const apiKey = await ctx.secrets.resolve(config.apiKeyRef as string, runCtx.runId);
+ *       const apiKey = await ctx.secrets.resolve(config.apiKeyRef as string, runCtx.runId, {
+ *         configPath: "apiKeyRef",
+ *       });
  *       await ctx.http.fetch(`https://api.linear.app/...`, {
  *         method: "POST",
  *         headers: { Authorization: `Bearer ${apiKey}` },
@@ -56,6 +59,9 @@ import type {
   PluginEnvironmentDestroyLeaseParams,
   PluginEnvironmentExecuteParams,
   PluginEnvironmentExecuteResult,
+  PluginEnvironmentSyncInParams,
+  PluginEnvironmentSyncOutParams,
+  PluginEnvironmentSyncResult,
   PluginEnvironmentStartInteractiveSetupParams,
   PluginEnvironmentInteractiveSetupSession,
   PluginEnvironmentGetInteractiveSetupParams,
@@ -206,8 +212,8 @@ export interface PluginDefinition {
   onHealth?(): Promise<PluginHealthDiagnostics>;
 
   /**
-   * Called when the operator updates the plugin's instance configuration at
-   * runtime, without restarting the worker.
+   * Called when the operator updates this plugin's company-scoped configuration
+   * at runtime, without restarting the worker.
    *
    * If not implemented, the host restarts the worker to apply the new config.
    *
@@ -336,6 +342,27 @@ export interface PluginDefinition {
   onEnvironmentExecute?(
     params: PluginEnvironmentExecuteParams,
   ): Promise<PluginEnvironmentExecuteResult>;
+
+  /**
+   * Optional, opt-in: called before execution to place host files/directories at
+   * target sandbox paths using a provider-native transport instead of the default
+   * base64-over-exec fallback. Defining this hook (together with
+   * `onEnvironmentSyncOut`) advertises `environmentSyncIn`; leaving it undefined
+   * keeps the byte-identical fallback. See `doc/plugins/SANDBOX_FILE_SYNC_HOOKS.md`.
+   */
+  onEnvironmentSyncIn?(
+    params: PluginEnvironmentSyncInParams,
+  ): Promise<PluginEnvironmentSyncResult>;
+
+  /**
+   * Optional, opt-in: called after execution to copy sandbox files/directories
+   * back to target host paths using a provider-native transport. Defining this
+   * hook (together with `onEnvironmentSyncIn`) advertises `environmentSyncOut`.
+   * See `doc/plugins/SANDBOX_FILE_SYNC_HOOKS.md`.
+   */
+  onEnvironmentSyncOut?(
+    params: PluginEnvironmentSyncOutParams,
+  ): Promise<PluginEnvironmentSyncResult>;
 
   /** Called to start an interactive setup sandbox and return redacted connection metadata. */
   onEnvironmentStartInteractiveSetup?(

@@ -1,7 +1,15 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { randomUUID } from "node:crypto";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
+import { companies, createDb, plugins } from "@paperclipai/db";
+import { buildHostServices } from "../services/plugin-host-services.js";
+import { pluginRegistryService } from "../services/plugin-registry.js";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
 import {
   createHostClientHandlers,
   JsonRpcCallError,
@@ -58,6 +66,10 @@ const OVERSIZE_FRAME_WORKER_ENTRYPOINT = path.join(
 const IPC_CHANNEL_WORKER_ENTRYPOINT = path.join(
   FIXTURES_DIR,
   "plugin-worker-ipc-channel.cjs",
+);
+const CONFIG_AGREEMENT_WORKER_ENTRYPOINT = path.join(
+  FIXTURES_DIR,
+  "plugin-worker-config-agreement.cjs",
 );
 
 const TEST_MANIFEST: PaperclipPluginManifestV1 = {
@@ -580,9 +592,12 @@ describe("PLA-673 — back-fill runId for pre-PLA-657 SDK secrets.resolve", () =
       // The wire payload arrived from the worker without runId; the gated
       // wrapper back-filled it from the active invocation scope (which the
       // host populated from the outer dispatcher's runContext).
+      // PLA-1819: the wrapper also injects the host-derived companyId, which
+      // v722's `buildHostServices.secrets.resolve` requires.
       expect(secretsResolve.mock.calls[0]?.[0]).toEqual({
         secretRef: "11111111-1111-1111-1111-111111111111",
         runId: "run-pla673",
+        companyId: "company-a",
       });
     } finally {
       await handle.stop().catch(() => undefined);
@@ -599,23 +614,25 @@ describe("PLA-673 — back-fill runId for pre-PLA-657 SDK secrets.resolve", () =
       } as unknown as HostServices,
     });
     // No active invocation: a forged worker→host call with no
-    // paperclipInvocationId arrives. requireInvocationCompanyScope guards the
-    // company-scoped methods, but `secrets.resolve` is not company-scoped at
-    // the wrapper layer — its fail-closed gate lives in the server-side
-    // secrets handler. To make this independently testable, we invoke the
-    // gated wrapper directly with no invocation scope and assert the params
-    // are forwarded *unchanged* (no runId), so the real handler still throws
-    // `runcontext_invalid`.
+    // paperclipInvocationId arrives.
+    //
+    // PLA-1819: the denial now happens at the WRAPPER, not downstream in the
+    // server-side secrets handler. `resolveRequiredCompanyId` finds no
+    // host-derived tenant (no invocationScope, no singleInFlightScope, and no
+    // serviceScope.runId to defer resolution to) and throws before host
+    // services are entered. The server-side `runcontext_invalid` gate is
+    // untouched and remains the second layer.
     await expect(
       handlers["secrets.resolve"](
         { secretRef: "11111111-1111-1111-1111-111111111111" } as never,
         {},
       ),
-    ).resolves.toEqual("should-not-be-called");
-
-    expect(secretsResolve).toHaveBeenCalledWith({
-      secretRef: "11111111-1111-1111-1111-111111111111",
+    ).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("company context is required"),
     });
+
+    expect(secretsResolve).not.toHaveBeenCalled();
   });
 });
 
@@ -675,9 +692,12 @@ describe("PLA-719 — back-fill runId when the worker echoes no invocation id", 
       // No runId AND no invocation id arrived on the wire; the host resolved
       // the single in-flight executeTool dispatch and the gated wrapper
       // back-filled runId from its host-validated scope.
+      // PLA-1819: companyId comes from the same host-derived singleInFlight pin
+      // the runId came from — never from the worker.
       expect(secretsResolve.mock.calls[0]?.[0]).toEqual({
         secretRef: "11111111-1111-1111-1111-111111111111",
         runId: "run-pla719",
+        companyId: "company-a",
       });
     } finally {
       await handle.stop().catch(() => undefined);
@@ -695,19 +715,23 @@ describe("PLA-719 — back-fill runId when the worker echoes no invocation id", 
     });
 
     // Context with invalidInvocationScope but NO singleInFlightScope models the
-    // ambiguous case (0 or 2+ dispatches in-flight). The wrapper must forward
-    // params unchanged so the server-side secrets handler still throws
-    // `runcontext_invalid`.
+    // ambiguous case (0 or 2+ dispatches in-flight).
+    //
+    // PLA-1819: the wrapper now denies outright instead of forwarding unchanged
+    // and letting the server-side secrets handler throw `runcontext_invalid`.
+    // Same fail-closed outcome, one layer earlier — host services are never
+    // entered.
     await expect(
       handlers["secrets.resolve"](
         { secretRef: "11111111-1111-1111-1111-111111111111" } as never,
         { invalidInvocationScope: true },
       ),
-    ).resolves.toEqual("should-not-be-resolved");
-
-    expect(secretsResolve).toHaveBeenCalledWith({
-      secretRef: "11111111-1111-1111-1111-111111111111",
+    ).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("company context is required"),
     });
+
+    expect(secretsResolve).not.toHaveBeenCalled();
   });
 
   it("back-fills runId from singleInFlightScope while leaving company-scope enforcement to invalidInvocationScope", async () => {
@@ -722,10 +746,13 @@ describe("PLA-719 — back-fill runId when the worker echoes no invocation id", 
       } as unknown as HostServices,
     });
 
-    // secrets.resolve is not company-scoped at the wrapper layer, so
-    // invalidInvocationScope does not block it; singleInFlightScope feeds the
-    // runId back-fill. The runId originates from the host scope, never the
-    // worker params.
+    // singleInFlightScope feeds the runId back-fill. The runId originates from
+    // the host scope, never the worker params.
+    //
+    // PLA-1819: `secrets.resolve` IS now company-guarded at the wrapper, but
+    // `singleInFlightScope.companyId` satisfies the guard (it is host-derived),
+    // so `invalidInvocationScope` still does not block this call — resolution
+    // runs ahead of that rejection, per the PLA-818 ordering precedent.
     await expect(
       handlers["secrets.resolve"](
         { secretRef: "11111111-1111-1111-1111-111111111111" } as never,
@@ -740,18 +767,29 @@ describe("PLA-719 — back-fill runId when the worker echoes no invocation id", 
       ),
     ).resolves.toEqual("run-pla719");
 
-    expect(secretsResolve).toHaveBeenCalledWith({
-      secretRef: "11111111-1111-1111-1111-111111111111",
-      runId: "run-pla719",
-    });
+    // v722 plumbs the host-validated call context to HostServices as an
+    // explicit second argument; the back-filled params stay the first.
+    expect(secretsResolve).toHaveBeenCalledWith(
+      {
+        secretRef: "11111111-1111-1111-1111-111111111111",
+        runId: "run-pla719",
+        companyId: "company-a",
+      },
+      expect.anything(),
+    );
   });
 
   it("cannot widen company scope: a worker naming company-b is denied even when singleInFlightScope is company-a", async () => {
-    // SEC invariant (PLA-721): the new `singleInFlightScope` feeds the runId
-    // back-fill ONLY. `requireInvocationCompanyScope` runs first, never reads
-    // `singleInFlightScope`, and the no-id branch always sets
-    // `invalidInvocationScope` — so a worker that names a *different* company in
-    // params is still denied. This pins that the field can't widen tenant scope.
+    // SEC invariant (PLA-721, narrowed by PLA-1819): a worker that names a
+    // *different* company in params is denied. `requireInvocationCompanyScope`
+    // runs first and never reads `singleInFlightScope`, and the no-id branch
+    // always sets `invalidInvocationScope`.
+    //
+    // PLA-1819 narrows PLA-721's original wording — `singleInFlightScope` no
+    // longer feeds the runId back-fill *only*; for `config.get` and
+    // `secrets.resolve` it is also an accepted tenant source in
+    // `resolveRequiredCompanyId`. It still cannot WIDEN scope: a worker-named
+    // company must equal the host-derived pin or it throws. This test pins that.
     const companiesGet = vi.fn(async (params: { companyId: string }) => ({ id: params.companyId }));
     const handlers = createHostClientHandlers({
       pluginId: "test.plugin",
@@ -897,9 +935,12 @@ describe("PLA-773 — background dispatch run-context (item 1) + redaction clean
       // The worker's id-less secrets.resolve callback was back-filled with the
       // minted background runId — NOT the worker-lifetime service runId.
       expect(secretsResolve).toHaveBeenCalledTimes(1);
+      // PLA-1819: a background dispatch carries a TRIGGERING company, so the
+      // pin exists and is injected — unlike the company-less service context.
       expect(secretsResolve.mock.calls[0]?.[0]).toEqual({
         secretRef: SECRET_REF,
         runId: mintedRunId,
+        companyId: "company-a",
       });
       expect(mintedRunId).not.toBe(handle.serviceRunId);
 
@@ -941,6 +982,178 @@ describe("PLA-773 — background dispatch run-context (item 1) + redaction clean
       clearRunSecretValues(serviceRunId);
       await manager.stopAll().catch(() => undefined);
       registry.dispose();
+    }
+  });
+});
+
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+if (!embeddedPostgresSupport.supported) {
+  // eslint-disable-next-line no-console
+  console.warn(
+    `Skipping plugin-worker-manager PLA-1944 agreement-gate tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
+  );
+}
+
+describeEmbeddedPostgres("PLA-1944 — no-dispatch config.get agreement gate (real worker + real DB)", () => {
+  const PLUGIN_KEY = "test.config-agreement-worker";
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-plugin-worker-config-agreement-");
+    db = createDb(tempDb.connectionString);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(plugins);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  function createEventBusStub() {
+    return {
+      forPlugin() {
+        return { emit: vi.fn(), subscribe: vi.fn(), clear: vi.fn() };
+      },
+    } as any;
+  }
+
+  async function createCompany(prefix: string) {
+    return db
+      .insert(companies)
+      .values({
+        name: `${prefix} ${randomUUID()}`,
+        issuePrefix: `${prefix}${randomUUID().slice(0, 6).toUpperCase()}`,
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+  }
+
+  async function installPlugin() {
+    return db
+      .insert(plugins)
+      .values({
+        pluginKey: PLUGIN_KEY,
+        packageName: "@paperclipai/test-config-agreement-worker",
+        version: "0.0.0",
+        manifestJson: {
+          id: PLUGIN_KEY,
+          version: "0.0.0",
+          displayName: "Config agreement worker test plugin",
+          apiVersion: 1,
+          entrypoints: { worker: "worker.js" },
+        } as any,
+        status: "ready",
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+  }
+
+  it("agrees: a setup()-time config.get with zero active invocations resolves via the agreement gate", async () => {
+    const plugin = await installPlugin();
+    const registry = pluginRegistryService(db);
+    const companyA = await createCompany("WKA");
+    const companyB = await createCompany("WKB");
+    await registry.upsertConfig(plugin.id, companyA.id, { configJson: { defaultBranch: "main" } });
+    await registry.upsertConfig(plugin.id, companyB.id, { configJson: { defaultBranch: "main" } });
+
+    const services = buildHostServices(db, plugin.id, PLUGIN_KEY, createEventBusStub());
+    const handlers = createHostClientHandlers({
+      pluginId: PLUGIN_KEY,
+      capabilities: [],
+      services,
+    });
+    const handle = createPluginWorkerHandle(PLUGIN_KEY, {
+      entrypointPath: CONFIG_AGREEMENT_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: handlers,
+    });
+
+    try {
+      // The fixture fires its no-dispatch config.get BEFORE responding to
+      // `initialize`, so by the time `start()` resolves the agreement gate has
+      // already run against the real, seeded `plugin_config` rows above.
+      await handle.start();
+
+      const outcome = await handle.call("executeTool", {
+        toolName: "reportConfigGetOutcome",
+        parameters: {},
+        runContext: {
+          agentId: "agent-1",
+          runId: "run-pla1944-agree",
+          companyId: companyA.id,
+          projectId: "project-1",
+        },
+      } as unknown as HostToWorkerMethods["executeTool"][0]);
+
+      expect(outcome).toMatchObject({
+        data: {
+          configGetOutcome: {
+            ok: true,
+            result: { defaultBranch: "main" },
+          },
+        },
+      });
+    } finally {
+      services.dispose();
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("diverges: a setup()-time config.get denies AND surfaces a health signal via plugins.lastError", async () => {
+    const plugin = await installPlugin();
+    const registry = pluginRegistryService(db);
+    const companyA = await createCompany("WKC");
+    const companyB = await createCompany("WKD");
+    await registry.upsertConfig(plugin.id, companyA.id, { configJson: { defaultBranch: "main" } });
+    await registry.upsertConfig(plugin.id, companyB.id, { configJson: { defaultBranch: "dev" } });
+
+    const services = buildHostServices(db, plugin.id, PLUGIN_KEY, createEventBusStub());
+    const handlers = createHostClientHandlers({
+      pluginId: PLUGIN_KEY,
+      capabilities: [],
+      services,
+    });
+    const handle = createPluginWorkerHandle(PLUGIN_KEY, {
+      entrypointPath: CONFIG_AGREEMENT_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: handlers,
+    });
+
+    try {
+      await handle.start();
+
+      const outcome = await handle.call("executeTool", {
+        toolName: "reportConfigGetOutcome",
+        parameters: {},
+        runContext: {
+          agentId: "agent-1",
+          runId: "run-pla1944-diverge",
+          companyId: companyA.id,
+          projectId: "project-1",
+        },
+      } as unknown as HostToWorkerMethods["executeTool"][0]);
+
+      expect((outcome as any).data.configGetOutcome.ok).toBe(false);
+
+      // Health signal: plugins.lastError names the divergence, no company ids.
+      const refreshed = await registry.getById(plugin.id);
+      expect(refreshed?.lastError).toBeTruthy();
+      expect(refreshed!.lastError).not.toContain(companyA.id);
+      expect(refreshed!.lastError).not.toContain(companyB.id);
+    } finally {
+      services.dispose();
+      await handle.stop().catch(() => undefined);
     }
   });
 });
@@ -1121,6 +1334,117 @@ describe("plugin worker node IPC channel removal (PLA-1154)", () => {
       // The OOM bypass vector — a raw newline-less write to fd 3 — fails because
       // the fd is not provisioned, so the host never buffers the payload.
       expect(probe.fd3Write.threw).toBe(true);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+});
+
+
+describe("plugin host company context guards", () => {
+  it("rejects config and secret calls without host-issued company context before host services run", async () => {
+    const configGet = vi.fn(async () => ({ apiKey: "unreachable" }));
+    const secretsResolve = vi.fn(async () => "unreachable");
+    const handlers = createHostClientHandlers({
+      pluginId: "test.plugin",
+      capabilities: ["secrets.read-ref"],
+      services: {
+        config: { get: configGet },
+        secrets: { resolve: secretsResolve },
+      } as unknown as HostServices,
+    });
+
+    // PLA-1887/1929/1937/1942: a true no-scope `config.get({})` (no
+    // invocationScope, no singleInFlightScope, no worker-named company) no
+    // longer denies at the SDK layer — it defers to the host's agreement
+    // gate (`getAgreedOrDeny`), which resolves construction-time reads by
+    // checking whether every owning `plugin_config` row already agrees. The
+    // mocked `services.config.get` here stands in for that host gate.
+    await expect(handlers["config.get"]({})).resolves.toEqual({ apiKey: "unreachable" });
+    expect(configGet).toHaveBeenCalledWith({ companyId: undefined }, undefined);
+    configGet.mockClear();
+
+    // A worker-NAMED company is a different case entirely: it is never
+    // authoritative, and still denies outright even though `config.get` now
+    // supplies an `alternateHostBinding` sentinel — `resolveRequiredCompanyId`'s
+    // "single" branch ignores `alternateHostBinding` and requires a matching
+    // host-derived scope, which is absent here.
+    await expect(handlers["config.get"]({ companyId: "company-1" })).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("company context is required"),
+    });
+    await expect(
+      handlers["secrets.resolve"]({
+        secretRef: { type: "secret_ref", secretId: "11111111-1111-4111-8111-111111111111" },
+      }),
+    ).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("company context is required"),
+    });
+    await expect(
+      handlers["secrets.resolve"]({
+        companyId: "company-1",
+        secretRef: { type: "secret_ref", secretId: "11111111-1111-4111-8111-111111111111" },
+      }),
+    ).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("company context is required"),
+    });
+
+    expect(configGet).not.toHaveBeenCalled();
+    expect(secretsResolve).not.toHaveBeenCalled();
+  });
+
+  it("rejects cross-company config and secret reads in scoped worker invocations before host services run", async () => {
+    const configGet = vi.fn(async () => ({ apiKeyRef: "unreachable" }));
+    const secretsResolve = vi.fn(async () => "unreachable");
+    const hostHandlers = createHostClientHandlers({
+      pluginId: "test.plugin",
+      capabilities: ["secrets.read-ref"],
+      services: {
+        config: { get: configGet },
+        secrets: { resolve: secretsResolve },
+      } as unknown as HostServices,
+    });
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers,
+    });
+
+    try {
+      await handle.start();
+
+      for (const hostMethod of ["config.get", "secrets.resolve"] as const) {
+        await expect(handle.call("performAction", {
+          key: "probe",
+          params: {
+            mode: "echo",
+            hostMethod,
+            requestedCompanyId: "company-b",
+          },
+          actorContext: {
+            type: "agent",
+            userId: null,
+            agentId: "agent-1",
+            runId: "run-1",
+            companyId: "company-a",
+          },
+          renderEnvironment: null,
+        })).rejects.toMatchObject({
+          code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED,
+          message: expect.stringContaining('requested company "company-b"'),
+        });
+      }
+
+      expect(configGet).not.toHaveBeenCalled();
+      expect(secretsResolve).not.toHaveBeenCalled();
     } finally {
       await handle.stop().catch(() => undefined);
     }

@@ -7,24 +7,12 @@ import { promisify } from "node:util";
 import { and, asc, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  activityLog,
   agentRuntimeState,
-  agentTaskSessions,
-  agentWakeupRequests,
   agents,
   companies,
-  companySkills,
   createDb,
-  documentRevisions,
-  documents,
-  environmentLeases,
   environments,
   executionWorkspaces,
-  heartbeatRunEvents,
-  heartbeatRuns,
-  issueComments,
-  issueDocuments,
-  issuePlanDecompositions,
   issues,
   projects,
   projectWorkspaces,
@@ -36,6 +24,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -100,15 +89,6 @@ async function waitForRunToFinish(heartbeat: Heartbeat, runId: string, timeoutMs
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   return heartbeat.getRun(runId);
-}
-
-async function waitForHeartbeatIdle(db: Db, timeoutMs = 5_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const runs = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns);
-    if (!runs.some((run) => run.status === "queued" || run.status === "running")) return;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
 }
 
 async function waitForRuntimeStateLastRun(db: Db, agentId: string, runId: string, timeoutMs = 5_000) {
@@ -258,7 +238,6 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
   }, 20_000);
 
   afterEach(async () => {
-    await waitForHeartbeatIdle(db);
     adapterExecute.mockReset();
     adapterExecute.mockImplementation(async () => ({
       exitCode: 0,
@@ -272,33 +251,20 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
       const root = tempRoots.pop();
       if (root) await rm(root, { recursive: true, force: true }).catch(() => undefined);
     }
-    await db.delete(issuePlanDecompositions);
-    await db.delete(issueDocuments);
-    await db.delete(documentRevisions);
-    await db.delete(documents);
-    await db.delete(agentTaskSessions);
-    await db.delete(environmentLeases);
-    await db.delete(activityLog);
-    await db.delete(heartbeatRunEvents);
-    await db.delete(heartbeatRuns);
-    await db.delete(issueComments);
-    await db.delete(issues);
-    await db.delete(projectWorkspaces);
-    await db.delete(projects);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(agents);
-    await db.delete(workspaceOperations);
-    await db.delete(executionWorkspaces);
+    // Heartbeat finalization keeps writing run-linked rows in the background
+    // after the test function returns; see resetEmbeddedPostgresTestDatabase
+    // for why an atomic TRUNCATE ... CASCADE doesn't race that write burst the
+    // way an ordered per-table DELETE chain does.
+    await resetEmbeddedPostgresTestDatabase(db);
+    // environments is a global table, not FK-chained to companies, so the
+    // TRUNCATE ... CASCADE above doesn't touch it.
     await db.delete(environments);
-    await db.delete(companySkills);
-    await db.delete(companies);
   });
 
   afterAll(async () => {
     await db.$client.end();
     await tempDb?.cleanup();
-  });
+  }, 60_000);
 
   it("repairs clean unrecorded branch drift before recording workspace finalization", async () => {
     const repoRoot = await createGitRepo();
@@ -387,7 +353,7 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
     });
   }, 20_000);
 
-  it("fails unrecorded branch drift when the checked-out branch has different commits", async () => {
+  it("adopts unrecorded forward branch drift for finalization without persisting it", async () => {
     const repoRoot = await createGitRepo();
     tempRoots.push(repoRoot);
     const { agentId, issueId } = await seedRunTarget(db, repoRoot);
@@ -420,51 +386,40 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
 
     const finishedRun = await waitForRunToFinish(heartbeat, run!.id);
     expect(finishedRun).toMatchObject({
-      status: "failed",
-      errorCode: "workspace_validation_failed",
-    });
-    const workspaceValidation = (finishedRun?.resultJson as Record<string, unknown> | null)?.workspaceValidation;
-    expect(workspaceValidation).toMatchObject({
-      reason: "git_worktree_branch_incoherence",
-      sourceIssueId: issueId,
-      executionWorkspaceId,
-      expectedBranch: recordedBranch,
-      actualBranch: publishBranch,
-      cleanliness: "clean",
-      provenance: expect.objectContaining({
-        expectedBranchExists: true,
-        actualBranchExists: true,
-        sameHead: false,
-      }),
-      safeRepair: expect.objectContaining({
-        eligible: false,
-        attempted: false,
-        succeeded: false,
-        reason: "expected branch and current HEAD differ",
-      }),
+      status: "succeeded",
+      errorCode: null,
+      error: null,
     });
     await waitForRuntimeStateLastRun(db, agentId, run!.id);
     expect(adapterExecute).toHaveBeenCalledTimes(1);
 
+    const finalizedWorkspace = await db
+      .select({ branchName: executionWorkspaces.branchName })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, executionWorkspaceId!))
+      .then((rows) => rows[0] ?? null);
+    expect(finalizedWorkspace?.branchName).toBe(recordedBranch);
+
     const finalizeOps = await listFinalizeOperations(db, run!.id);
     expect(finalizeOps).toHaveLength(1);
     expect(finalizeOps[0]).toMatchObject({
-      status: "failed",
+      status: "succeeded",
       executionWorkspaceId,
-      stderrExcerpt: expect.stringContaining("Managed git worktree branch check failed"),
     });
     expect(finalizeOps[0]?.metadata).toMatchObject({
       managedGitWorktreeBranch: expect.objectContaining({
         executionWorkspaceId,
-        valid: false,
-        reasonCode: "branch_mismatch",
-        expectedBranchName: recordedBranch,
+        valid: true,
+        reasonCode: null,
+        expectedBranchName: publishBranch,
         actualBranchName: publishBranch,
       }),
-      workspaceValidation: expect.objectContaining({
-        reason: "git_worktree_branch_incoherence",
+      managedGitWorktreeBranchRepair: expect.objectContaining({
+        attempted: true,
+        succeeded: true,
       }),
     });
+    expect(recordedBranch).not.toBe(publishBranch);
   }, 20_000);
 
   it("allows a successful adapter run when the branch transition is recorded before finalization", async () => {

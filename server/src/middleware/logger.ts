@@ -4,6 +4,7 @@ import pino from "pino";
 import { pinoHttp } from "pino-http";
 import { readConfigFile } from "../config-file.js";
 import { resolveDefaultLogsDir, resolveHomeAwarePath } from "../home-paths.js";
+import { HTTP_LOG_REDACT_PATHS } from "./http-log-redaction.js";
 import { shouldSilenceHttpSuccessLog } from "./http-log-policy.js";
 import { redactSecretsForLog, redactSecretsDeepForLog } from "../secret-patterns.js";
 import { redactSensitive } from "./redact-sensitive.js";
@@ -58,8 +59,11 @@ export const logger = pino({
   //   - req.headers.*  → header values; `authorization` → full `[Redacted]`
   // reqBody.* / reqParams / reqQuery and the `msg` line are redacted at their
   // source in the pino-http callbacks below.
+  //
+  // v722 added HTTP_LOG_REDACT_PATHS as a plain path list; union it in here so
+  // upstream's paths keep being redacted under the fork's pattern censor.
   redact: {
-    paths: ["req.url", "req.query.*", "req.headers.*"],
+    paths: ["req.url", "req.query.*", "req.headers.*", ...HTTP_LOG_REDACT_PATHS],
     censor: redactRequestField,
   },
 }, pino.transport({

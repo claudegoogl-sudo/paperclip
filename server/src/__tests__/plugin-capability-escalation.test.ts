@@ -232,6 +232,7 @@ describeEmbeddedPostgres("plugin capability-escalation wiring (PLA-910)", () => 
     // Plugin-scoped data that must survive the upgrade untouched.
     await db.insert(pluginConfig).values({
       pluginId,
+      companyId,
       configJson: { apiBase: "https://example.test" },
     });
 

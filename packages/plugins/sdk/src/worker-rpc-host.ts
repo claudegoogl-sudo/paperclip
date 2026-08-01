@@ -90,6 +90,8 @@ import type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentDestroyLeaseParams,
   PluginEnvironmentExecuteParams,
+  PluginEnvironmentSyncInParams,
+  PluginEnvironmentSyncOutParams,
   PluginEnvironmentRealizeWorkspaceParams,
   PluginEnvironmentReleaseLeaseParams,
   PluginEnvironmentResumeLeaseParams,
@@ -480,8 +482,8 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       },
 
       config: {
-        async get() {
-          return callHost("config.get", {} as Record<string, never>);
+        async get(companyId?: string) {
+          return callHost("config.get", companyId ? { companyId } : {});
         },
       },
 
@@ -654,11 +656,19 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       },
 
       secrets: {
-        async resolve(secretRef: string, runId: string): Promise<string> {
+        async resolve(secretRef, runId, options = {}): Promise<string> {
           // `runId` identifies the active tool dispatch; the host re-derives the
           // dispatching agent's company from it and never trusts the worker for
           // company scope. Pass `runCtx.runId` from inside a tool handler.
-          return callHost("secrets.resolve", { secretRef, runId });
+          // `companyId`/`configPath` (v722) are hints for shared `secret_ref`
+          // bindings only — the host still authorizes against the company it
+          // derives from `runId`.
+          return callHost("secrets.resolve", {
+            secretRef,
+            runId,
+            companyId: options.companyId,
+            configPath: options.configPath,
+          });
         },
         async mintHandle(value: string, runId: string, secretRef?: string): Promise<string> {
           // Exchange resolved plaintext for an opaque borrowed handle
@@ -1030,6 +1040,8 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             // PLA-888: asset ids from ctx.artifacts.create to surface on this
             // comment. Each must belong to the comment's company.
             attachmentIds?: string[];
+            // v722: attribute the comment to a real human company member.
+            actorUserId?: string;
           },
         ) {
           return callHost("issues.createComment", {
@@ -1041,6 +1053,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             wakeAssignee: options?.wakeAssignee,
             refuseClosed: options?.refuseClosed,
             attachmentIds: options?.attachmentIds,
+            actorUserId: options?.actorUserId,
           });
         },
 
@@ -1599,6 +1612,12 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       case "environmentExecute":
         return handleEnvironmentExecute(params as PluginEnvironmentExecuteParams);
 
+      case "environmentSyncIn":
+        return handleEnvironmentSyncIn(params as PluginEnvironmentSyncInParams);
+
+      case "environmentSyncOut":
+        return handleEnvironmentSyncOut(params as PluginEnvironmentSyncOutParams);
+
       case "environmentStartInteractiveSetup":
         return handleEnvironmentStartInteractiveSetup(params as PluginEnvironmentStartInteractiveSetupParams);
 
@@ -1658,6 +1677,8 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     if (plugin.definition.onEnvironmentDestroyLease) supportedMethods.push("environmentDestroyLease");
     if (plugin.definition.onEnvironmentRealizeWorkspace) supportedMethods.push("environmentRealizeWorkspace");
     if (plugin.definition.onEnvironmentExecute) supportedMethods.push("environmentExecute");
+    if (plugin.definition.onEnvironmentSyncIn) supportedMethods.push("environmentSyncIn");
+    if (plugin.definition.onEnvironmentSyncOut) supportedMethods.push("environmentSyncOut");
     if (plugin.definition.onEnvironmentStartInteractiveSetup) supportedMethods.push("environmentStartInteractiveSetup");
     if (plugin.definition.onEnvironmentGetInteractiveSetup) supportedMethods.push("environmentGetInteractiveSetup");
     if (plugin.definition.onEnvironmentCaptureTemplate) supportedMethods.push("environmentCaptureTemplate");
@@ -1980,6 +2001,20 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       throw methodNotImplemented("environmentExecute");
     }
     return plugin.definition.onEnvironmentExecute(params);
+  }
+
+  async function handleEnvironmentSyncIn(params: PluginEnvironmentSyncInParams) {
+    if (!plugin.definition.onEnvironmentSyncIn) {
+      throw methodNotImplemented("environmentSyncIn");
+    }
+    return plugin.definition.onEnvironmentSyncIn(params);
+  }
+
+  async function handleEnvironmentSyncOut(params: PluginEnvironmentSyncOutParams) {
+    if (!plugin.definition.onEnvironmentSyncOut) {
+      throw methodNotImplemented("environmentSyncOut");
+    }
+    return plugin.definition.onEnvironmentSyncOut(params);
   }
 
   async function handleEnvironmentStartInteractiveSetup(params: PluginEnvironmentStartInteractiveSetupParams) {

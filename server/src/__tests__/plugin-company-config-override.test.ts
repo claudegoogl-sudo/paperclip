@@ -234,7 +234,7 @@ describeEmbeddedPostgres("pluginRegistryService.upsertCompanyConfigOverride (PLA
     const pluginId = await seedPlugin();
     const registry = pluginRegistryService(db);
 
-    await registry.upsertConfig(pluginId, {
+    await registry.upsertConfig(pluginId, companyA, {
       configJson: { githubPatSecretId: secretA, label: "ignore-me" },
     });
 
@@ -249,7 +249,7 @@ describeEmbeddedPostgres("pluginRegistryService.upsertCompanyConfigOverride (PLA
     });
 
     // Re-running the same save is idempotent (no duplicate/zombie rows).
-    await registry.upsertConfig(pluginId, {
+    await registry.upsertConfig(pluginId, companyA, {
       configJson: { githubPatSecretId: secretA, label: "ignore-me" },
     });
     expect(await bindingsFor(pluginId)).toHaveLength(1);
@@ -258,21 +258,23 @@ describeEmbeddedPostgres("pluginRegistryService.upsertCompanyConfigOverride (PLA
   it("effective per-tenant config = global plugin_config merged with override", async () => {
     // The host-services `config.getForCompany` shape (mirrored here at the
     // registry layer): start from `plugin_config.configJson` and shallow-merge
-    // the per-tenant `configOverrides` on top.
+    // the per-tenant `configOverrides` on top. Since upstream 0164 scoped
+    // `plugin_config` by company, the base row is companyA's rather than
+    // instance-global; the merge semantics under test are unchanged.
     const companyA = await seedCompany("A");
     const secretA = await seedSecret(companyA, "pat-a");
     const pluginId = await seedPlugin();
     const registry = pluginRegistryService(db);
 
-    // Seed the instance-wide global config with Platform-shape defaults.
-    await registry.upsertConfig(pluginId, {
+    // Seed the base company-scoped config with Platform-shape defaults.
+    await registry.upsertConfig(pluginId, companyA, {
       configJson: { defaultBranch: "main", githubPatSecretId: "00000000-0000-0000-0000-000000000000" },
     });
     await registry.upsertCompanyConfigOverride(pluginId, companyA, {
       githubPatSecretId: secretA,
     });
 
-    const globalConfig = await registry.getConfig(pluginId);
+    const globalConfig = await registry.getConfig(pluginId, companyA);
     const override = await registry.getCompanyConfigOverride(pluginId, companyA);
     const effective = {
       ...((globalConfig?.configJson as Record<string, unknown> | undefined) ?? {}),

@@ -2,23 +2,18 @@ import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  activityLog,
   agents,
-  agentRuntimeState,
-  agentWakeupRequests,
   companies,
   companyMemberships,
-  companySkills,
   createDb,
-  heartbeatRunEvents,
   heartbeatRuns,
-  issueComments,
   issues,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { runningProcesses } from "../adapters/index.ts";
 
@@ -68,34 +63,20 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
     heartbeat = heartbeatService(db);
   }, 20_000);
 
+  // This suite deliberately lets heartbeatService dispatch real runs, which keep
+  // writing heartbeat_runs/heartbeat_run_events (and friends) in the background
+  // after the test function returns. An ordered per-table DELETE chain races that
+  // write burst; see resetEmbeddedPostgresTestDatabase for why an atomic
+  // TRUNCATE ... CASCADE doesn't have that race.
   afterEach(async () => {
     mockAdapterExecute.mockClear();
     runningProcesses.clear();
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      const activeRuns = await db
-        .select()
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.status, "running"));
-      if (activeRuns.length === 0) break;
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    await db.delete(heartbeatRunEvents);
-    await db.delete(issueComments);
-    await db.delete(activityLog);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(issues);
-    await db.delete(agents);
-    await db.delete(companySkills);
-    await db.delete(companyMemberships);
-    await db.delete(companies);
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {
     await tempDb?.cleanup();
-  });
+  }, 60_000);
 
   async function seedCompany() {
     const companyId = randomUUID();

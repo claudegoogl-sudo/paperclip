@@ -30,6 +30,13 @@ function makeFakeDb() {
         insertedValues.push(value);
       }),
     })),
+    // `logActivity` resolves a responsible user first, via
+    // `select().from().where()` lookups that must resolve to no rows here.
+    select: vi.fn(() => ({
+      from: vi.fn(() => ({
+        where: vi.fn(async () => [] as unknown[]),
+      })),
+    })),
   };
   return { db: db as unknown as Parameters<typeof logActivity>[0], insertedValues };
 }

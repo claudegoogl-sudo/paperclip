@@ -29,9 +29,10 @@ import type {
 } from "@paperclipai/shared";
 import { conflict, notFound } from "../errors.js";
 import { secretService } from "./secrets.js";
+import { readConfigValueAtPath, writeConfigValueAtPath } from "./json-schema-secret-refs.js";
 
 /** Read the manifest's `instanceConfigSchema` off a persisted plugins row. */
-function instanceConfigSchemaOf(plugin: { manifestJson: unknown }): unknown {
+export function instanceConfigSchemaOf(plugin: { manifestJson: unknown }): unknown {
   return (plugin.manifestJson as PaperclipPluginManifestV1 | null)?.instanceConfigSchema ?? null;
 }
 
@@ -288,27 +289,52 @@ export function pluginRegistryService(db: Db) {
 
     // ----- Config ---------------------------------------------------------
 
-    /** Retrieve a plugin's instance configuration. */
-    getConfig: (pluginId: string) =>
+    /**
+     * Return EVERY owning `plugin_config` row for a plugin, across all
+     * companies. No LIMIT, no pagination.
+     *
+     * The no-dispatch `config.get` agreement gate
+     * resolves a construction-time read (no dispatch pins a tenant) by
+     * checking whether every owning row agrees. Silent truncation here would
+     * turn "all rows agree" into a false positive that masks real divergence
+     * — the security-relevant invariant the whole gate depends on — so this
+     * accessor is deliberately unpaginated.
+     *
+     * `forUpdate`: row-lock the returned rows for the lifetime
+     * of the caller's transaction. Only pass this from a write path already
+     * inside `db.transaction` — `writePluginConfigWithAgreement` uses it so
+     * two concurrent admin writes to the same plugin serialize on this read
+     * instead of each deciding guard/fan-out off a stale pre-write snapshot.
+     * Never pass it from `getAgreedOrDeny` (the no-dispatch read gate): that
+     * path is READS ONLY by construction, runs outside a write transaction,
+     * and backs a live poll loop — locking it would only add contention.
+     */
+    listConfigRows: (pluginId: string, options?: { forUpdate?: boolean }) => {
+      const query = db.select().from(pluginConfig).where(eq(pluginConfig.pluginId, pluginId));
+      return options?.forUpdate ? query.for("update") : query;
+    },
+
+    /** Retrieve a plugin's company-scoped configuration. */
+    getConfig: (pluginId: string, companyId: string) =>
       db
         .select()
         .from(pluginConfig)
-        .where(eq(pluginConfig.pluginId, pluginId))
+        .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
         .then((rows) => rows[0] ?? null),
 
     /**
-     * Create or fully replace a plugin's instance configuration.
-     * If a config row already exists for the plugin it is replaced;
+     * Create or fully replace a plugin's company-scoped configuration.
+     * If a config row already exists for the plugin/company pair it is replaced;
      * otherwise a new row is inserted.
      */
-    upsertConfig: async (pluginId: string, input: UpsertPluginConfig) => {
+    upsertConfig: async (pluginId: string, companyId: string, input: UpsertPluginConfig) => {
       const plugin = await getById(pluginId);
       if (!plugin) throw notFound("Plugin not found");
 
       const existing = await db
         .select()
         .from(pluginConfig)
-        .where(eq(pluginConfig.pluginId, pluginId))
+        .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
         .then((rows) => rows[0] ?? null);
 
       const row = existing
@@ -319,41 +345,114 @@ export function pluginRegistryService(db: Db) {
               lastError: null,
               updatedAt: new Date(),
             })
-            .where(eq(pluginConfig.pluginId, pluginId))
+            .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
             .returning()
             .then((rows) => rows[0])
         : await db
             .insert(pluginConfig)
             .values({
               pluginId,
+              companyId,
               configJson: input.configJson,
             })
             .returning()
             .then((rows) => rows[0]);
 
       // Maintain company_secret_bindings for any secret-ref fields (PLA-660 model C).
+      // v722 made `plugin_config` company-scoped, so the sync is now scoped to the
+      // same company as the row it mirrors — without this the per-company
+      // allow-list the secrets handler authorizes against is never written.
       await secretService(db).syncPluginSecretBindings({
         pluginId,
         instanceConfigSchema: instanceConfigSchemaOf(plugin),
         previousConfig: existing?.configJson ?? null,
         nextConfig: input.configJson,
+        companyId,
       });
 
       return row;
     },
 
     /**
-     * Partially update a plugin's instance configuration via shallow merge.
+     * PLA-1937 Condition 1: maintain the read-side agreement invariant on
+     * every write. `POST /api/plugins/:pluginId/config` writes only the
+     * requesting company's row; without this, that row diverges from every
+     * sibling row on its very first ordinary edit and the agreement gate
+     * (`getAgreedOrDeny`) then denies `config.get` for every company sharing
+     * the plugin. Broadcasts the non-secret-ref portion of `configJson`
+     * verbatim into every other owning row, leaving each target row's own
+     * secret-ref fields (per `secretRefPaths`) untouched. Returns the
+     * companyIds of the rows that were updated.
+     */
+    broadcastNonSecretConfig: async (
+      pluginId: string,
+      sourceCompanyId: string,
+      configJson: Record<string, unknown>,
+      secretRefPaths: Iterable<string>,
+    ): Promise<string[]> => {
+      const paths = [...secretRefPaths];
+      const siblingRows = await db
+        .select()
+        .from(pluginConfig)
+        .where(and(eq(pluginConfig.pluginId, pluginId), ne(pluginConfig.companyId, sourceCompanyId)));
+
+      const touched: string[] = [];
+      for (const sibling of siblingRows) {
+        let nextConfig = configJson;
+        for (const path of paths) {
+          nextConfig = writeConfigValueAtPath(
+            nextConfig,
+            path,
+            readConfigValueAtPath((sibling.configJson as Record<string, unknown>) ?? {}, path),
+          );
+        }
+        await db
+          .update(pluginConfig)
+          .set({ configJson: nextConfig, updatedAt: new Date() })
+          .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, sibling.companyId)));
+        touched.push(sibling.companyId);
+      }
+      return touched;
+    },
+
+    /**
+     * Overwrite an EXISTING owning row's `config_json` verbatim,
+     * with no secret-ref binding sync.
+     *
+     * Only safe to call when the caller has already preserved that row's own
+     * secret-ref field values unchanged (the `applyToAllCompanies` fan-out
+     * does this via `restoreSecretRefPaths` before calling here) — the whole
+     * point is that this row's `company_secret_bindings` rows stay valid
+     * because nothing at a secret-ref path actually changed. Does not
+     * create a row; the fan-out only ever touches rows that already exist.
+     */
+    setConfigJsonForExistingRow: async (
+      pluginId: string,
+      companyId: string,
+      configJson: Record<string, unknown>,
+    ) => {
+      const rows = await db
+        .update(pluginConfig)
+        .set({ configJson, lastError: null, updatedAt: new Date() })
+        .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
+        .returning();
+
+      if (rows.length === 0) throw notFound("Plugin config not found");
+      return rows[0];
+    },
+
+    /**
+     * Partially update a plugin's company-scoped configuration via shallow merge.
      * If no config row exists yet one is created with the supplied values.
      */
-    patchConfig: async (pluginId: string, input: PatchPluginConfig) => {
+    patchConfig: async (pluginId: string, companyId: string, input: PatchPluginConfig) => {
       const plugin = await getById(pluginId);
       if (!plugin) throw notFound("Plugin not found");
 
       const existing = await db
         .select()
         .from(pluginConfig)
-        .where(eq(pluginConfig.pluginId, pluginId))
+        .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
         .then((rows) => rows[0] ?? null);
 
       const nextConfig = existing
@@ -368,13 +467,14 @@ export function pluginRegistryService(db: Db) {
               lastError: null,
               updatedAt: new Date(),
             })
-            .where(eq(pluginConfig.pluginId, pluginId))
+            .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
             .returning()
             .then((rows) => rows[0])
         : await db
             .insert(pluginConfig)
             .values({
               pluginId,
+              companyId,
               configJson: nextConfig,
             })
             .returning()
@@ -386,6 +486,7 @@ export function pluginRegistryService(db: Db) {
         instanceConfigSchema: instanceConfigSchemaOf(plugin),
         previousConfig: existing?.configJson ?? null,
         nextConfig,
+        companyId,
       });
 
       return row;
@@ -395,11 +496,11 @@ export function pluginRegistryService(db: Db) {
      * Record an error against a plugin's config (e.g. validation failure
      * against the plugin's instanceConfigSchema).
      */
-    setConfigError: async (pluginId: string, lastError: string | null) => {
+    setConfigError: async (pluginId: string, companyId: string, lastError: string | null) => {
       const rows = await db
         .update(pluginConfig)
         .set({ lastError, updatedAt: new Date() })
-        .where(eq(pluginConfig.pluginId, pluginId))
+        .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
         .returning();
 
       if (rows.length === 0) throw notFound("Plugin config not found");
@@ -407,10 +508,10 @@ export function pluginRegistryService(db: Db) {
     },
 
     /** Delete a plugin's config row. */
-    deleteConfig: async (pluginId: string) => {
+    deleteConfig: async (pluginId: string, companyId: string) => {
       const rows = await db
         .delete(pluginConfig)
-        .where(eq(pluginConfig.pluginId, pluginId))
+        .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
         .returning();
 
       return rows[0] ?? null;
