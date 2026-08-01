@@ -1,4 +1,5 @@
 import { type AnyPgColumn, pgTable, uuid, text, timestamp, jsonb, index, integer, bigint, boolean } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 import { agentWakeupRequests } from "./agent_wakeup_requests.js";
@@ -83,6 +84,13 @@ export const heartbeatRuns = pgTable(
       table.companyId,
       table.status,
       table.processStartedAt,
+    ),
+    // Serves the `context_snapshot ->> 'issueId'` run-checkout predicate used by
+    // ~20 call sites in services/heartbeat.ts and services/recovery/service.ts.
+    // See migration 0142 for the indexed expression's cost history.
+    companyContextIssueIdx: index("heartbeat_runs_company_context_issue_idx").on(
+      table.companyId,
+      sql`(${table.contextSnapshot}->>'issueId')`,
     ),
   }),
 );
