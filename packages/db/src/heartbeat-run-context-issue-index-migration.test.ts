@@ -6,7 +6,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./test-embedded-postgres.js";
 
-// Regression test for PLA-2026: heartbeat_runs / agent_wakeup_requests were
+// Regression test: heartbeat_runs / agent_wakeup_requests were
 // filtered on `context_snapshot ->> 'issueId'` / `payload ->> 'issueId'` with
 // no supporting index, forcing a Seq Scan that detoasted every row's (large)
 // JSONB column. Migration 0142 adds expression indexes for both predicates.
@@ -79,10 +79,10 @@ describeEmbeddedPostgres("heartbeat_runs / agent_wakeup_requests issueId index m
       const sql = postgres(database.connectionString, { max: 1, onnotice: () => {} });
       try {
         const [company] = await sql<{ id: string }[]>`
-          INSERT INTO "companies" ("name") VALUES ('PLA-2026 idx test co') RETURNING id
+          INSERT INTO "companies" ("name") VALUES ('issueId idx test co') RETURNING id
         `;
         const [agent] = await sql<{ id: string }[]>`
-          INSERT INTO "agents" ("company_id", "name") VALUES (${company.id}, 'PLA-2026 idx test agent') RETURNING id
+          INSERT INTO "agents" ("company_id", "name") VALUES (${company.id}, 'issueId idx test agent') RETURNING id
         `;
 
         // Bulk-seed enough rows that the predicate is realistically selective
@@ -101,7 +101,7 @@ describeEmbeddedPostgres("heartbeat_runs / agent_wakeup_requests issueId index m
           FROM generate_series(1, 3000) AS gs
         `;
 
-        const targetIssueId = "PLA-2026-target-issue";
+        const targetIssueId = "issue-idx-target-issue";
         const [targetRun] = await sql<{ id: string }[]>`
           INSERT INTO "heartbeat_runs" ("company_id", "agent_id", "status", "context_snapshot")
           VALUES (${company.id}, ${agent.id}, 'running', jsonb_build_object('issueId', ${targetIssueId}))

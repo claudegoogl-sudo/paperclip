@@ -8569,7 +8569,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       | {
           outcome: "scheduled";
           // Widened (not the full row type) because the reused-existing branch
-          // projects a trimmed column set -- see existingContinuation (PLA-2026).
+          // projects a trimmed column set -- see existingContinuation below.
           run: Pick<
             typeof heartbeatRuns.$inferSelect,
             "id" | "status" | "agentId" | "wakeupRequestId" | "scheduledRetryAt" | "scheduledRetryAttempt"
@@ -8606,7 +8606,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // or its downstream aliases (retryRun / scheduleResult.run) -- both internal
         // callers (scheduleBoundedRetryForRun's two call sites) discard the return
         // value, and the only field consumers read are id/status/agentId/
-        // wakeupRequestId/scheduledRetry* (PLA-2026).
+        // wakeupRequestId/scheduledRetry*.
         const existingContinuation = await tx
           .select({
             id: heartbeatRuns.id,
@@ -8931,7 +8931,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return db
       .select({
         // Trimmed: resultJson is never read by summarizeIssueScheduledRetryRun or
-        // retryScheduledRetryNow's callers of this query (PLA-2026). contextSnapshot
+        // retryScheduledRetryNow's callers of this query. contextSnapshot
         // is kept -- retryScheduledRetryNow reads it to build the retry-now payload.
         run: {
           id: heartbeatRuns.id,
@@ -12955,7 +12955,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
 
       while (true) {
-        // Trimmed: only these fields are read from `deferred` below (PLA-2026).
+        // Trimmed: only these fields are read from `deferred` below.
         const deferred = await tx
           .select({
             id: agentWakeupRequests.id,
@@ -14204,7 +14204,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             };
 
             // Trimmed: only id/payload/coalescedCount are read from `existingDeferred`
-            // below (PLA-2026).
+            // below.
             const existingDeferred = await tx
               .select({
                 id: agentWakeupRequests.id,

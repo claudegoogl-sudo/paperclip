@@ -8,7 +8,7 @@
 -- touched to return 0 rows, 59s wall clock, for a single execution of the recovery
 -- checkout query. pg_stat_user_tables showed 578 seq scans / 12.58M tuples read in
 -- 71 minutes -- ~3 GB/min of sustained pglz decompression, 1-2 of 4 vCPU on an
--- otherwise idle fleet. Full diagnosis in PLA-2024/PLA-2026.
+-- otherwise idle fleet.
 --
 -- Both indexes lead with company_id (every call site filters by company first) and
 -- are idempotent: re-running creates nothing new. Use these exact names -- they may
