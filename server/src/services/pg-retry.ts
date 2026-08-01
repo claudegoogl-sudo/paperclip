@@ -1,4 +1,4 @@
-// PLA-597: Postgres transient-failure retry helper.
+// Postgres transient-failure retry helper.
 //
 // Wraps a function that runs a Postgres transaction so that deadlock
 // (SQLSTATE 40P01) and serialization-failure (40001) errors get retried with
@@ -18,7 +18,7 @@ export const RETRYABLE_PG_ERROR_CODES = new Set([
   PG_SERIALIZATION_FAILURE_CODE,
 ]);
 
-// PLA-638: drizzle-orm (>=0.36, this repo is on 0.45) no longer surfaces the
+// drizzle-orm (>=0.36, this repo is on 0.45) no longer surfaces the
 // raw driver error — every failed query is rewrapped as a `DrizzleQueryError`
 // ("Failed query: ...") whose constructor has NO top-level `code`; the original
 // postgres.js `PostgresError` (the one carrying SQLSTATE 40P01) is stashed on
@@ -98,7 +98,7 @@ export async function retryOnTransientPgError<T>(
   fn: () => Promise<T>,
   opts: RetryOnTransientPgErrorOptions = {},
 ): Promise<T> {
-  // PLA-597: default 6 attempts × 25 ms × 2^(n-1) + jitter = ~1.6 s worst-case
+  // Default 6 attempts × 25 ms × 2^(n-1) + jitter = ~1.6 s worst-case
   // added latency, enough headroom for the CI-observed deadlock cluster where
   // a single attempt was sometimes still racing the heartbeat-run lifecycle.
   const maxAttempts = Math.max(1, opts.maxAttempts ?? 6);

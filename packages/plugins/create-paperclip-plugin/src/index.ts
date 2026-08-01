@@ -175,7 +175,7 @@ export function scaffoldPluginProject(options: ScaffoldPluginOptions): string {
       "dev:ui": "paperclip-plugin-dev-server --root . --ui-dir dist/ui --port 4177",
       test: "vitest run --config ./vitest.config.ts",
       typecheck: "tsc --noEmit",
-      // PLA-376 — release-time plugin manifest validation gate. Runs the
+      // Release-time plugin manifest validation gate. Runs the
       // host plugin-manifest validator against `dist/manifest.js` so a
       // tarball cannot be packed/published with a manifest the host will
       // reject at install time. See `scripts/validate-manifest.mjs`.
@@ -200,7 +200,7 @@ export function scaffoldPluginProject(options: ScaffoldPluginOptions): string {
       }
       : {}),
     devDependencies: {
-      // PLA-376: `@paperclipai/shared` is a release-gate dep — the
+      // `@paperclipai/shared` is a release-gate dep — the
       // scaffolded `scripts/validate-manifest.mjs` imports
       // `pluginManifestV1Schema` from it. We resolve it the same way as
       // the SDK: `workspace:*` for in-workspace scaffolds, packed
@@ -713,7 +713,7 @@ paperclipai plugin install ${shellQuote(toPosixPath(outputDir))}
 
   writeFile(path.join(outputDir, ".gitignore"), "dist\nnode_modules\n.paperclip-sdk\n");
 
-  // ── PLA-376 release-time manifest validation gate ──────────────────────
+  // ── Release-time manifest validation gate ───────────────────────────────
   // Every scaffolded plugin inherits the same gate that lives in
   // paperclip-plugin-cad: a `scripts/validate-manifest.mjs` driver, a
   // vitest regression test, and a GitHub Actions workflow. Same code
@@ -723,12 +723,12 @@ paperclipai plugin install ${shellQuote(toPosixPath(outputDir))}
     path.join(outputDir, "scripts", "validate-manifest.mjs"),
     `#!/usr/bin/env node
 /**
- * PLA-376 — release-time plugin manifest validation gate.
+ * Release-time plugin manifest validation gate.
  *
  * Runs the host plugin-manifest validator against the built
  * \`dist/manifest.js\` BEFORE a tarball can be packed/published. v0.1.1
  * of plugin-cad shipped with \`cad:run_script\` tool names that the
- * post-PLA-163 host validator rejects, and the release passed CI before
+ * tool-name-allowlist host validator rejects, and the release passed CI before
  * the operator's install attempt revealed the manifest was unloadable.
  * This gate makes the same class of regression a build failure.
  *
@@ -749,7 +749,7 @@ const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(SCRIPT_DIR, "..");
 
 /**
- * PLA-163 tool-name allowlist — mirrored from the host validator's
+ * Tool-name allowlist — mirrored from the host validator's
  * \`pluginToolDeclarationSchema.name\` regex. Tool names are namespaced
  * at runtime as \`<plugin-id>:<tool-name>\`, so the bare name must not
  * contain \`:\`. A lowercase alnum allowlist also keeps whitespace,
@@ -760,7 +760,7 @@ const REPO_ROOT = resolve(SCRIPT_DIR, "..");
 const TOOL_NAME_REGEX = /^[a-z0-9][a-z0-9._-]*$/;
 const TOOL_NAME_REGEX_MESSAGE =
   "Tool name must start with a lowercase alphanumeric and contain only " +
-  "lowercase letters, digits, dots, hyphens, or underscores (no ':' — see PLA-163)";
+  "lowercase letters, digits, dots, hyphens, or underscores (no ':')";
 
 export function validateManifest(manifest) {
   const errors = [];
@@ -842,7 +842,7 @@ if (isDirectInvocation) {
   writeFile(
     path.join(outputDir, "tests", "validate-manifest.spec.ts"),
     `/**
- * PLA-376 — regression coverage for the release-time manifest gate.
+ * Regression coverage for the release-time manifest gate.
  * Proves the gate catches the v0.1.1 incident shape (a tool name
  * containing ':') and accepts the dot/hyphen/underscore lowercase forms
  * the host validator allows.
@@ -857,7 +857,7 @@ function fixture(toolName: string) {
     apiVersion: 1 as const,
     version: "0.1.0",
     displayName: ${quote(displayName)},
-    description: "fixture for PLA-376 regression coverage",
+    description: "fixture for release-time manifest gate regression coverage",
     author: ${quote(author)},
     categories: [${quote(category)}] as const,
     capabilities: ["agent.tools.register"] as const,
@@ -873,7 +873,7 @@ function fixture(toolName: string) {
   };
 }
 
-describe("validate-manifest gate (PLA-376)", () => {
+describe("validate-manifest gate", () => {
   it("rejects a manifest with a colon in tools[].name (the v0.1.1 incident)", () => {
     const result = validateManifest(fixture("bad:name"));
     expect(result.ok).toBe(false);
@@ -893,7 +893,7 @@ describe("validate-manifest gate (PLA-376)", () => {
     path.join(outputDir, ".github", "workflows", "manifest-validate.yml"),
     `name: Plugin manifest validation (release gate)
 
-# PLA-376 — release-time check that runs the host plugin-manifest
+# Release-time check that runs the host plugin-manifest
 # validator against the built dist/manifest.js BEFORE a tarball can be
 # packed or published. Mirrors the gate at
 # packages/plugins/create-paperclip-plugin/src/index.ts (scaffold).
@@ -937,7 +937,7 @@ jobs:
       - run: npm ci
       - name: Build manifest (and worker)
         run: npm run build
-      - name: Run regression test (PLA-376)
+      - name: Run regression test
         run: npx vitest run --config ./vitest.config.ts tests/validate-manifest.spec.ts
       - name: Validate built manifest
         run: npm run validate:manifest

@@ -37,7 +37,7 @@ function toState(
   };
 }
 
-// PLA-1930: single instance-wide admission gate for the Claude account-wide
+// Single instance-wide admission gate for the Claude account-wide
 // usage limit. Every wake source (issue-comment wake, sweep, routine trigger,
 // scheduled-retry promotion) funnels through `startNextQueuedRunForAgent` /
 // `executeRun` in heartbeat.ts, which consult `isParked()` before dispatching

@@ -568,7 +568,7 @@ export const addIssueCommentSchema = z.object({
   reopen: z.boolean().optional(),
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),
-  // PLA-1657: bind pre-uploaded standalone assets to this comment atomically at
+  // Bind pre-uploaded standalone assets to this comment atomically at
   // create time, so a `comment.created` subscriber (e.g. the media relay) sees
   // them without an attach-after-post race. Mirrors the host bridge
   // `issues.createComment` attachmentIds path.

@@ -858,7 +858,7 @@ export function secretRoutes(db: Db) {
   });
 
   // ---------------------------------------------------------------------------
-  // PLA-735 — operator-only egress review + per-binding enforce-flip surface.
+  // SECURITY-CRITICAL: operator-only egress review + per-binding enforce-flip surface.
   //
   // `assertBoard` is the EG1-provenance gate: it requires `req.actor.type ===
   // "board"` and throws 403 for an agent/worker JWT, so there is NO

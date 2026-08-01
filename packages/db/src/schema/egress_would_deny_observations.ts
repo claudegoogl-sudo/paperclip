@@ -3,8 +3,8 @@ import { companies } from "./companies.js";
 import { companySecretBindings } from "./company_secret_bindings.js";
 
 /**
- * PLA-734 — queryable would-deny egress observations (CTO decision PLA-733,
- * option (b)). The egress chokepoint records, per binding, the normalized
+ * Queryable would-deny egress observations (per CTO decision, option (b)).
+ * The egress chokepoint records, per binding, the normalized
  * destinations a borrowed-handle call WOULD have been denied for under
  * enforcement (the binding is still in log-only / migration mode). Operators
  * read this table to seed per-binding allowlists from real traffic before the

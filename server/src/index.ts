@@ -666,7 +666,7 @@ export async function startServer(): Promise<StartedServer> {
       databaseBackupInFlight = false;
     }
   };
-  // PLA-781: the worker manager and the secrets host-handler MUST share one
+  // SECURITY-CRITICAL: the worker manager and the secrets host-handler MUST share one
   // run-context registry. The manager registers each worker's host-minted
   // service run-context on start (so setup()-loop / background secret resolves
   // can be authorized server-side); the secrets handler reads it on resolve.
@@ -707,7 +707,7 @@ export async function startServer(): Promise<StartedServer> {
     authReady,
     companyDeletionEnabled: config.companyDeletionEnabled,
     pluginMigrationDb: pluginMigrationDb as any,
-    // PLA-910: company the host files plugin capability-escalation board
+    // Company the host files plugin capability-escalation board
     // approvals against. Unset → no gateway wired → loader fails closed.
     escalationApprovalCompanyId:
       process.env.PAPERCLIP_PLUGIN_ESCALATION_COMPANY_ID?.trim() || undefined,

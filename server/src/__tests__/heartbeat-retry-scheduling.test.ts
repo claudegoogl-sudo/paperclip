@@ -1782,7 +1782,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect((retryRun?.contextSnapshot as Record<string, unknown> | null)?.noOpDispatchRetryAttempt).toBe(0);
   });
 
-  // PLA-1930 defect-3 diagnosis: the ticket's live evidence shows `scheduled_retry_attempt`
+  // Defect-3 diagnosis: live evidence shows `scheduled_retry_attempt`
   // flat at 0 across 385 rows and asked whether the attempt counter is broken. It is not —
   // that DB column is intentionally kept flat for no-op dispatches (heartbeat.ts:8364, "a
   // dispatch that never reached the model did not happen, so it must not advance the

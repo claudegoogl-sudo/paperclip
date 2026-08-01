@@ -1,15 +1,16 @@
-// PLA-719 regression fixture: a worker that faithfully emulates the REAL
-// pre-PLA-657 platform.cad worker (cad ≤0.1.7). Unlike
+// Regression fixture: a worker that faithfully emulates the REAL
+// older platform.cad worker (cad ≤0.1.7). Unlike
 // `plugin-worker-legacy-secrets.cjs`, it does NOT echo the host-issued
 // `paperclipInvocationId` on its nested `secrets.resolve` call — the deployed
 // cad worker's `callHost` never threads it (verified: `worker.js` has zero
 // `paperclipInvocation` references). It also omits `runId`.
 //
-// With only PLA-673 in place this call fails closed at the server's secrets
-// handler (`runcontext_invalid`) because the host cannot resolve an invocation
-// scope to back-fill from. PLA-719 lets the host attribute the id-less callback
-// to the single in-flight dispatch and surface its scope via
-// `singleInFlightScope`, so the runId back-fill succeeds.
+// With only the active-invocation-scope back-fill in place this call fails
+// closed at the server's secrets handler (`runcontext_invalid`) because the
+// host cannot resolve an invocation scope to back-fill from. Single-in-flight
+// attribution lets the host attribute the id-less callback to the single
+// in-flight dispatch and surface its scope via `singleInFlightScope`, so the
+// runId back-fill succeeds.
 
 const readline = require("node:readline");
 

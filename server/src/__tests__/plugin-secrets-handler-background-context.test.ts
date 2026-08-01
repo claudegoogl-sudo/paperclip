@@ -1,8 +1,8 @@
 /**
- * PLA-773 — tests for the per-dispatch **background** context resolve path.
+ * Tests for the per-dispatch **background** context resolve path.
  *
  * A background dispatch (`onEvent`) carries a known TRIGGERING company. Unlike
- * the company-less PLA-768 service path (which derives the owning company from
+ * the company-less service path (which derives the owning company from
  * the binding), a background context resolves **scoped to the triggering
  * company** via the company-scoped `findBinding`. This suite verifies:
  *  - GATING (item 1): company A's onEvent resolves company A's bound ref, but
@@ -43,9 +43,9 @@ const { clearRunSecretValues, registeredRunCount } = await import(
 const PLUGIN_DB_ID = "plugin-db-messenger";
 const PLUGIN_KEY = "platform.messenger";
 
-// PLA-806: a non-messenger plugin, used to prove the durable-audit fix is
+// A non-messenger plugin, used to prove the durable-audit fix is
 // plugin-agnostic — any `service:background` resolve is affected, not just the
-// messenger (CTO note on PLA-806 folding in PLA-805 forensics).
+// messenger.
 const PLUGIN_KLIPPER_ID = "plugin-db-klipper";
 const PLUGIN_KLIPPER_KEY = "platform.klipper";
 
@@ -59,7 +59,7 @@ const BG_RUN_B = "00000000-0000-4000-8000-00000000000b";
 interface BuildOpts {
   resolveValue?: string;
   globalRateLimit?: { maxAttempts: number; windowMs: number };
-  // PLA-806: override the plugin identity to prove the audit-durability fix is
+  // Override the plugin identity to prove the audit-durability fix is
   // not messenger-specific. Defaults to the messenger plugin.
   pluginDbId?: string;
   pluginKey?: string;
@@ -126,7 +126,7 @@ afterEach(() => {
   clearRunSecretValues(BG_RUN_B);
 });
 
-describe("background-context secrets.resolve (PLA-773 item 1)", () => {
+describe("background-context secrets.resolve", () => {
   it("resolves company A's bound ref scoped to the triggering company", async () => {
     const { handler, registry, resolverFn, findBinding, findServiceBinding } =
       buildHandler({ resolveValue: "bot-token-A" });
@@ -163,7 +163,7 @@ describe("background-context secrets.resolve (PLA-773 item 1)", () => {
     expect(findServiceBinding).not.toHaveBeenCalled();
   });
 
-  it("audits as a plugin system actor scoped to the triggering company, with a durable null run_id (PLA-806)", async () => {
+  it("audits as a plugin system actor scoped to the triggering company, with a durable null run_id", async () => {
     const { handler, registry } = buildHandler();
     registry.registerBackground(PLUGIN_DB_ID, BG_RUN_A, COMPANY_A);
 
@@ -177,7 +177,7 @@ describe("background-context secrets.resolve (PLA-773 item 1)", () => {
       action: "secret.resolved",
       companyId: COMPANY_A,
       agentId: null,
-      // PLA-806: the background runId is host-minted/synthetic — NOT a
+      // The background runId is host-minted/synthetic — NOT a
       // heartbeat_runs row. Writing it into run_id would 23503 and drop the
       // audit row, so it goes to run_id=NULL with the synthetic id in details.
       runId: null,
@@ -192,10 +192,10 @@ describe("background-context secrets.resolve (PLA-773 item 1)", () => {
     });
   });
 
-  it("PLA-806: a non-messenger (klipper) background resolve is equally durable — run_id null, attribution + plugin actor preserved", async () => {
+  it("a non-messenger (klipper) background resolve is equally durable — run_id null, attribution + plugin actor preserved", async () => {
     // Plugin-agnostic guard: the FK violation that drops the audit row hits ANY
-    // `service:background` resolve, not just the messenger (CTO note folding in
-    // PLA-805 forensics — 151 violations across plugins). Build the handler with
+    // `service:background` resolve, not just the messenger (per forensics
+    // review — 151 violations across plugins). Build the handler with
     // the klipper plugin identity and prove the same durable null-run shape.
     const { handler, registry } = buildHandler({
       pluginDbId: PLUGIN_KLIPPER_ID,
@@ -249,7 +249,7 @@ describe("background-context secrets.resolve (PLA-773 item 1)", () => {
   });
 });
 
-describe("per-tenant background rate bucket (PLA-773 item 3)", () => {
+describe("per-tenant background rate bucket", () => {
   it("GATING: company A exhausting its bucket does not throttle company B", async () => {
     const { handler, registry } = buildHandler({
       globalRateLimit: { maxAttempts: 2, windowMs: 60_000 },

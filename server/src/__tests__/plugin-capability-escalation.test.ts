@@ -58,7 +58,7 @@ function manifest(
   };
 }
 
-describeEmbeddedPostgres("plugin capability-escalation wiring (PLA-910)", () => {
+describeEmbeddedPostgres("plugin capability-escalation wiring", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let packageRoots: string[] = [];
@@ -251,7 +251,7 @@ describeEmbeddedPostgres("plugin capability-escalation wiring (PLA-910)", () => 
     const [approval] = await approvalService(db).list(companyId, "pending");
     expect(approval).toBeTruthy();
 
-    // The production gateway must persist the park-time content digest (PLA-912):
+    // The production gateway must persist the park-time content digest:
     // without it completeUpgrade can never pin the applied bytes to what the board
     // approved and silently falls back to version+caps only.
     expect(isCapabilityEscalationPayload(approval!.payload)).toBe(true);
@@ -272,7 +272,7 @@ describeEmbeddedPostgres("plugin capability-escalation wiring (PLA-910)", () => 
     const approvedContract = await gateway.findApproved({ pluginId });
     expect(approvedContract?.digest).toBe(parkDigest);
 
-    // Completion applies the immutable park-time snapshot (PLA-913), so the row's
+    // Completion applies the immutable park-time snapshot, so the row's
     // packagePath is repointed at the content-addressed snapshot — proving the
     // approved bytes were applied, not whatever the mutable source held at approve
     // time. A swap of newPkg after approval can no longer reach the loader.

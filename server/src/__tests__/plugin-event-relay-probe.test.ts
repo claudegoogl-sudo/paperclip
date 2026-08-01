@@ -1,5 +1,5 @@
 /**
- * PLA-854: tests for the event-relay liveness probe.
+ * Tests for the event-relay liveness probe.
  *
  * The probe warns when a running plugin that previously held event-bus
  * subscriptions drops to zero (a detached board-event relay), without

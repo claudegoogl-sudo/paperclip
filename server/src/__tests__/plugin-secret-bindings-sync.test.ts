@@ -167,7 +167,7 @@ describeEmbeddedPostgres("secretService.syncPluginSecretBindings", () => {
     expect(await bindingsFor(pluginId)).toHaveLength(0);
   });
 
-  it("PLA-677: cross-tenant repoint preserves the prior tenant's binding (multi-tenant safety)", async () => {
+  it("cross-tenant repoint preserves the prior tenant's binding (multi-tenant safety)", async () => {
     // Instance-wide save flipping the global config from companyA's secret to
     // companyB's must NOT silently revoke companyA's binding row. Each tenant's
     // row is independent at resolution time; the per-tenant write route is the

@@ -38,9 +38,9 @@ const SECRET_TEXT_HINTS = [
   "ghu_",
   "ghs_",
   "ghr_",
-  // Fine-grained PAT prefix. The classic `gh[pousr]_` covered above does not
+  // SECURITY-CRITICAL: Fine-grained PAT prefix. The classic `gh[pousr]_` covered above does not
   // subsume it, so without this hint a lone `github_pat_…` short-circuits the
-  // gate below unredacted (PLA-1637).
+  // gate below unredacted.
   "github_pat_",
 ] as const;
 export const REDACTED_EVENT_VALUE = "***REDACTED***";
@@ -48,12 +48,12 @@ export const REDACTED_EVENT_VALUE = "***REDACTED***";
 // Global copy of the shared fine-grained PAT matcher (secret-patterns.ts is the
 // single source of truth). The shared patterns are authored without `g`; the
 // free-form text path replaces every occurrence, so a global copy is needed
-// here (PLA-1637).
+// here.
 const GITHUB_FINE_GRAINED_PAT_TEXT_RE = new RegExp(GITHUB_FINE_GRAINED_PAT_RE.source, "g");
 /**
  * Marker for value-exact redaction of a host-registered secret (e.g. a
  * `vault.read` plaintext). Distinct from {@link REDACTED_EVENT_VALUE} so a
- * value-exact hit is attributable in a persisted record (PLA-697).
+ * value-exact hit is attributable in a persisted record.
  */
 export const REDACTED_VAULT_VALUE = "***REDACTED:vault***";
 
@@ -155,14 +155,14 @@ export function redactEventPayload(payload: Record<string, unknown> | null): Rec
 }
 
 export function redactSensitiveText(input: string): string {
-  // Value-exact scrub runs FIRST and unconditionally: a high-entropy registered
+  // SECURITY-CRITICAL: Value-exact scrub runs FIRST and unconditionally: a high-entropy registered
   // secret may carry no secret-ish hint, so it would survive the
-  // maybeContainsSecretText short-circuit below (PLA-697 / PLA-695 Control 1).
+  // maybeContainsSecretText short-circuit below (Control 1).
   const valueScrubbed = redactRegisteredSecretValues(input, REDACTED_VAULT_VALUE);
   if (!maybeContainsSecretText(valueScrubbed)) return valueScrubbed;
   // The shared adapter-utils GitHub matcher is `\bgh[pousr]_…` and does not
   // cover the fine-grained `github_pat_` shape, so scrub it here with the
-  // canonical secret-patterns matcher after the command-text pass (PLA-1637).
+  // canonical secret-patterns matcher after the command-text pass.
   return redactCommandText(
     valueScrubbed
       .replace(JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`)

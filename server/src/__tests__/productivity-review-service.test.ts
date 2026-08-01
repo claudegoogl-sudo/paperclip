@@ -362,7 +362,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(hold.held).toBe(false);
   });
 
-  // PLA-986: standby wake targets (executionPolicy.standbyWakeTarget=true) sit
+  // Standby wake targets (executionPolicy.standbyWakeTarget=true) sit
   // in_progress indefinitely by design, so long-active + no-comment evidence
   // must never page a reviewer for them.
   it("skips standby wake-target issues entirely despite long-active and no-comment evidence", async () => {
@@ -395,7 +395,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(hold.held).toBe(false);
   });
 
-  // PLA-986 positive control: the gate is the flag value, not the mere presence
+  // Positive control: the gate is the flag value, not the mere presence
   // of an executionPolicy — identical evidence on a non-standby issue still files.
   it("still reviews a non-standby issue with identical long-active and no-comment evidence", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
@@ -423,7 +423,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
   });
 
-  // PLA-141: suppress long_active when the orphan checkoutRunId points at a
+  // Suppress long_active when the orphan checkoutRunId points at a
   // terminal run and there has been no real assignee activity since.
   it("suppresses long_active when checkoutRunId is terminal and no assignee comment is newer than finishedAt", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
@@ -454,7 +454,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
-  // PLA-141 positive control: a still-running checkoutRunId is not "terminal",
+  // Positive control: a still-running checkoutRunId is not "terminal",
   // so the long_active trigger must still fire. Guards against the suppression
   // branch widening accidentally (e.g. dropping the terminal-status gate).
   it("still creates a long_active review when checkoutRunId points to a still-running run", async () => {

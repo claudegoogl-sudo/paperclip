@@ -1,12 +1,12 @@
-// PLA-719 fixture: a pre-PLA-657 (id-less) plugin worker that reads its
+// Fixture: an id-less (pre invocation-id-echoing) plugin worker that reads its
 // effective config from INSIDE its own dispatch, with no background loop.
 //
-// This is the population PLA-719 exists for: the worker echoes no
-// `paperclipInvocationId` even while servicing its own `onEvent`, so
-// `singleInFlightScope` is the only binding the host can attribute the call to.
-// Because it never calls id-less with nothing in flight, PLA-1838's
-// host-observed "owns no dispatch" signal never fires for it and the
-// attribution is preserved.
+// This is the population the single-in-flight attribution exists for: the
+// worker echoes no `paperclipInvocationId` even while servicing its own
+// `onEvent`, so `singleInFlightScope` is the only binding the host can
+// attribute the call to. Because it never calls id-less with nothing in
+// flight, the host-observed "owns no dispatch" signal never fires for it
+// and the attribution is preserved.
 
 const readline = require("node:readline");
 

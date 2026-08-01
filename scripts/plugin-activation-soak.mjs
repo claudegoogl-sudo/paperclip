@@ -2,8 +2,8 @@
 /**
  * plugin-activation-soak.mjs
  *
- * Post-sync activation soak for first-party plugins (PLA-640). Roots in the
- * PLA-639 incident: CAD went `error` on the v525 cut with
+ * Post-sync activation soak for first-party plugins. Roots in an
+ * incident where CAD went `error` on the v525 cut with
  * `Activation failed: Package root not found for plugin "platform.cad"`.
  * The cause was not a manifest/SDK regression — CAD had been installed via
  * `plugin install -l /tmp/pla-447-extract/package`, and the host recorded that
@@ -62,7 +62,7 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 
 /**
  * Directories that systemd-tmpfiles (or equivalent) periodically sweeps. A
- * plugin whose packagePath lives here is a PLA-639 time bomb: it activates once
+ * plugin whose packagePath lives here is a time bomb: it activates once
  * and then breaks on the next restart after the dir ages out.
  */
 export const EPHEMERAL_PATH_ROOTS = ["/tmp", "/var/tmp", "/dev/shm"];
@@ -92,8 +92,7 @@ export function assertPersistentPath(candidate, label, tmpDir = os.tmpdir()) {
   if (isEphemeralPath(candidate, tmpDir)) {
     throw new Error(
       `${label} resolves under an ephemeral/systemd-tmpfiles-swept path (${path.resolve(candidate)}); ` +
-        `plugin packages must live in a persistent dir (e.g. ~/.paperclip/plugin-packages/<name>-<version>/package). ` +
-        `See PLA-639.`,
+        `plugin packages must live in a persistent dir (e.g. ~/.paperclip/plugin-packages/<name>-<version>/package).`,
     );
   }
   return path.resolve(candidate);
@@ -134,7 +133,7 @@ export function classifyPluginStatus(record, opts = {}) {
   if (record.packagePath && isEphemeralPath(record.packagePath, tmpDir)) {
     return {
       ready: false,
-      reason: `activated but packagePath is ephemeral (${record.packagePath}); will break on the next restart — see PLA-639`,
+      reason: `activated but packagePath is ephemeral (${record.packagePath}); will break on the next restart`,
     };
   }
   return { ready: true, reason: null };
@@ -185,7 +184,7 @@ export function parsePluginSpec(raw) {
  * Build the isolated child-host environment. PURE (no I/O) so the isolation
  * invariants are unit-testable.
  *
- * The critical hardening (PLA-650): PAPERCLIP_CONFIG is PINNED to a path under
+ * The critical hardening: PAPERCLIP_CONFIG is PINNED to a path under
  * the throwaway data dir — it is NOT deleted. Deleting it let the host's config
  * resolver (`resolvePaperclipConfigPath` -> `findConfigFileFromAncestors`) walk
  * cwd's ancestors UPWARD; since `~/.paperclip` is an ancestor of the repo
@@ -217,7 +216,7 @@ export function buildHostEnv(opts, baseEnv = process.env) {
     PAPERCLIP_MIGRATION_AUTO_APPLY: "true",
     // Pin (do NOT delete) config into the throwaway data dir; the file is never
     // created, so the host resolves config -> null instead of walking cwd
-    // ancestors up to a live ~/.paperclip/config.json. See PLA-650.
+    // ancestors up to a live ~/.paperclip/config.json.
     PAPERCLIP_CONFIG: path.join(opts.dataDir, "soak-config.json"),
     NODE_ENV: baseEnv.NODE_ENV ?? "production",
   };

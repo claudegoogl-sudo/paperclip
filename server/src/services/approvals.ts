@@ -84,7 +84,7 @@ export function approvalService(db: Db) {
       const conditions = [eq(approvals.companyId, companyId)];
       if (status) conditions.push(eq(approvals.status, status));
       const query = db.select().from(approvals).where(and(...conditions));
-      // Optional defensive bound for the PLA-923 reconcile read; omitted (and
+      // Optional defensive bound for the reconcile read; omitted (and
       // therefore unbounded) for all existing board-route callers.
       return limit === undefined ? query : query.limit(limit);
     },
@@ -185,7 +185,7 @@ export function approvalService(db: Db) {
       }
 
       if (applied) {
-        // PLA-910: apply a board-approved plugin capability escalation to the
+        // Apply a board-approved plugin capability escalation to the
         // parked (`upgrade_pending`) plugin. No-op for non-escalation payloads.
         await dispatchCapabilityEscalationResolution({
           payload: updated.payload,
@@ -214,7 +214,7 @@ export function approvalService(db: Db) {
       }
 
       if (applied) {
-        // PLA-910: restore the parked (`upgrade_pending`) plugin to ready on a
+        // Restore the parked (`upgrade_pending`) plugin to ready on a
         // board rejection. No-op for non-escalation payloads.
         await dispatchCapabilityEscalationResolution({
           payload: updated.payload,

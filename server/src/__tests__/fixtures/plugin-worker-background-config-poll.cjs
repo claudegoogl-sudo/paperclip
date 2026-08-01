@@ -1,4 +1,4 @@
-// PLA-1824 regression fixture: a plugin worker that starts a background poll
+// Regression fixture: a plugin worker that starts a background poll
 // loop at `setup()` time (the shape of the messenger `getUpdates` long-poll).
 //
 // The loop owns NO dispatch, so — exactly like the real SDK, whose
@@ -45,11 +45,12 @@ rl.on("line", (line) => {
     send({
       jsonrpc: "2.0",
       id: message.id,
-      // PLUGIN_FIXTURE_ECHOES_INVOCATION_ID=1 models a modern (post-PLA-657)
-      // SDK, which echoes `paperclipInvocationId` whenever it is inside a
-      // dispatch — so an id-less call from it owns no dispatch. Unset models a
-      // pre-PLA-657 worker (platform.cad ≤0.1.7), which never echoes the id and
-      // therefore still needs PLA-719's single-in-flight attribution.
+      // PLUGIN_FIXTURE_ECHOES_INVOCATION_ID=1 models a modern SDK (after
+      // invocation-id echoing was added), which echoes `paperclipInvocationId`
+      // whenever it is inside a dispatch — so an id-less call from it owns no
+      // dispatch. Unset models an older worker (platform.cad ≤0.1.7, from
+      // before invocation-id echoing), which never echoes the id and
+      // therefore still needs the host's single-in-flight attribution.
       result: {
         ok: true,
         supportedMethods: ["onEvent"],

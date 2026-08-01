@@ -433,8 +433,7 @@ export interface PluginRouteBridgeDeps {
  * lifecycle instance, but the install/enable/disable/uninstall routes run
  * against a route-local lifecycle instance whose events never reach it. Calling
  * `reconciler.reconcile(pluginId)` after each mutation arms/disarms the watcher
- * against the current DB packagePath regardless of which emitter fired. See
- * PLA-1537.
+ * against the current DB packagePath regardless of which emitter fired.
  */
 export interface PluginRouteWatchDeps {
   /** Dev-watcher reconciler; a no-op path is taken when absent. */
@@ -518,7 +517,7 @@ interface PluginToolExecuteRequest {
  * @param toolDeps - Optional tool dispatcher dependencies
  * @param bridgeDeps - Optional bridge proxy dependencies for getData/performAction
  * @param watchDeps - Optional dev-watcher reconciler to re-arm/disarm local
- *   plugin file watchers when a mutation changes the DB packagePath (PLA-1537)
+ *   plugin file watchers when a mutation changes the DB packagePath
  * @returns Express router with plugin routes mounted
  */
 export function pluginRoutes(
@@ -532,7 +531,7 @@ export function pluginRoutes(
 ) {
   const router = Router();
   const registry = pluginRegistryService(db);
-  // PLA-903: process-local sliding-window limiter for agent.tools.register
+  // Process-local sliding-window limiter for agent.tools.register
   // dispatches. Shared across requests for this server instance; resets on
   // restart (intentional — see plugin-tool-dispatch-guard.ts).
   const toolDispatchRateLimiter = createToolDispatchRateLimiter();
@@ -542,7 +541,7 @@ export function pluginRoutes(
   });
   const issuesSvc = issueService(db);
 
-  // PLA-1537: re-arm/disarm the local-plugin file watcher after a lifecycle
+  // Re-arm/disarm the local-plugin file watcher after a lifecycle
   // mutation. Fire-and-forget: reconcile reads the current DB packagePath and
   // is fully self-contained (its own try/catch), so it never blocks or fails
   // the HTTP response.
@@ -1068,7 +1067,7 @@ export function pluginRoutes(
       return;
     }
 
-    // PLA-903 (A+B): enforce the host-side per-dispatcher rate limit and write
+    // Enforce the host-side per-dispatcher rate limit and write
     // exactly one audit row for this authorized dispatch BEFORE handing the
     // call to the plugin worker. A breach fails closed with a 429.
     try {
@@ -2305,7 +2304,7 @@ export function pluginRoutes(
 
     try {
       // Secret references in plugin config are now permitted: company-scoped
-      // resolution landed (PLA-655/PLA-657). The config value is only a pointer
+      // resolution landed. The config value is only a pointer
       // — resolution is authorized at call time against the dispatching
       // company's `company_secret_bindings` by plugin-secrets-handler, so a ref
       // sitting in (instance-wide) config never grants cross-company access.
@@ -2901,7 +2900,7 @@ export function pluginRoutes(
   });
 
   // ===========================================================================
-  // PLA-677: Per-tenant plugin config overrides
+  // Per-tenant plugin config overrides
   //
   // The instance-wide `plugin_config.configJson` is the default for the plugin.
   // Each tenant may layer a per-company override on top via these routes; at

@@ -81,7 +81,7 @@ const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 // allowed (fail-secure-on-omission). The name-based denylist and "mythos"
 // substring below are retained as defense in depth for ids that never reach a
 // registry entry (unknown / Bedrock-qualified) or a flag that was omitted.
-// SECURITY-CRITICAL — see PLA-1421 / PLA-1423.
+// SECURITY-CRITICAL.
 const SAFEGUARDS_LIFTED_FALLBACK_DENYLIST = new Set(["claude-mythos-5"]);
 
 export function isSafeguardsLiftedModel(

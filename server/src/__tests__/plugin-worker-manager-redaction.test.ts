@@ -8,7 +8,7 @@ import { redactSensitiveText, REDACTED_EVENT_VALUE } from "../redaction.js";
 // matches any `ghp_` followed by ≥20 word chars; 36 trailing `A`s satisfies it.
 const SYNTHETIC_GHP = `ghp_${"A".repeat(36)}`;
 
-describe("plugin-worker-manager defense-in-depth host-handler error redaction (PLA-197)", () => {
+describe("plugin-worker-manager defense-in-depth host-handler error redaction", () => {
   it("redacts shape-valid ghp_* tokens from Error.message before they reach logs/JSON-RPC", () => {
     // Simulates the same `try { … } catch (err) { … }` chokepoint used by
     // handleWorkerRequest: the catch block runs `err` through
@@ -46,12 +46,12 @@ describe("plugin-worker-manager defense-in-depth host-handler error redaction (P
   });
 });
 
-describe("redactSensitiveText invariant for synthetic GitHub PAT (PLA-197 wired-correctly proof)", () => {
+describe("redactSensitiveText invariant for synthetic GitHub PAT (wired-correctly proof)", () => {
   // Parallel direct-call test: establishes that the underlying redaction
   // primitive treats `ghp_` + ≥20 word chars as sensitive. If this assertion
   // ever flips, the wrap above is no longer sufficient — both tests must be
   // re-evaluated together. Preferred over a temporarily-bypass-then-revert
-  // proof per CTO routing on PLA-197 (no production-code touch required to
+  // proof per CTO routing (no production-code touch required to
   // demonstrate the invariant).
   it("redacts a synthetic shape-valid ghp_* token to ***REDACTED***", () => {
     const out = redactSensitiveText(SYNTHETIC_GHP);

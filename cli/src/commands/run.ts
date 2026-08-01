@@ -55,7 +55,7 @@ export async function runCommand(opts: RunOptions): Promise<void> {
 
   // Announce the running build loudly so logs make the active binary legible,
   // and fail fast if the operator pinned an expected build/version that this
-  // binary does not satisfy (e.g. systemd resolved upstream via npx). See PLA-632.
+  // binary does not satisfy (e.g. systemd resolved upstream via npx).
   const identity = assertBuildIdentity(cliVersion, readIdentityEnv());
   if (identity.ok) {
     p.log.message(pc.dim(identity.message));

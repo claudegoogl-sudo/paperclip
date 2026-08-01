@@ -248,10 +248,10 @@ export function pluginUiStaticRoutes(db: Db, options: PluginUiStaticRouteOptions
       plugin = await registry.getById(pluginId);
     } catch (error) {
       // drizzle-orm rewraps the driver error as a `DrizzleQueryError` with no
-      // top-level `code`; the postgres.js SQLSTATE lives on `.cause` (PLA-638).
+      // top-level `code`; the postgres.js SQLSTATE lives on `.cause`.
       // 22P02 (invalid_text_representation) means `pluginId` is not a UUID, so
       // fall through to the by-key lookup. A top-level `code` check missed this
-      // and surfaced every plugin-key UI request as a 500 (PLA-873).
+      // and surfaced every plugin-key UI request as a 500.
       if (findPgErrorCode(error) !== "22P02") {
         throw error;
       }

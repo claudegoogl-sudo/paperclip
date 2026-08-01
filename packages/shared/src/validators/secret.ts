@@ -420,7 +420,7 @@ export const remoteSecretImportSchema = z.object({
 export type RemoteSecretImportSelection = z.infer<typeof remoteSecretImportSelectionSchema>;
 export type RemoteSecretImport = z.infer<typeof remoteSecretImportSchema>;
 
-// PLA-735 — operator-only egress review+flip surface for borrowed-handle
+// Operator-only egress review+flip surface for borrowed-handle
 // bindings. The request body only bounds shape/size here; per-entry semantic
 // validation (the egress matcher) and the empty-allowlist enforce guard stay
 // server-side in secretService so the rule lives in one place. The body carries

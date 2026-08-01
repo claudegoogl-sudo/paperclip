@@ -63,7 +63,7 @@ function createGatewayStub() {
         approvalId,
         toVersion: input.toVersion,
         addedCapabilities: input.addedCapabilities,
-        // Anchor the approved contract to the exact package contents (PLA-912),
+        // Anchor the approved contract to the exact package contents,
         // mirroring what the real approvals-backed gateway persists at park.
         digest: input.digest,
       });
@@ -93,11 +93,11 @@ function manifest(
   };
 }
 
-describeEmbeddedPostgres("plugin-loader upgrade_pending (PLA-908)", () => {
+describeEmbeddedPostgres("plugin-loader upgrade_pending", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let packageRoots: string[] = [];
-  // Host-managed dir the loader snapshots verified upgrades into (PLA-913).
+  // Host-managed dir the loader snapshots verified upgrades into.
   // Kept off the real ~/.paperclip/plugins so tests don't pollute the host.
   let localPluginDir!: string;
 
@@ -361,7 +361,7 @@ describeEmbeddedPostgres("plugin-loader upgrade_pending (PLA-908)", () => {
     expect(row?.version).toBe("0.1.0");
   });
 
-  it("refuses to complete an upgrade whose fetched manifest exceeds the approved capabilities (PLA-911 Finding 1)", async () => {
+  it("refuses to complete an upgrade whose fetched manifest exceeds the approved capabilities", async () => {
     const oldManifest = manifest("0.1.0", ["issues.read"]);
     const oldPkg = await writePackage(oldManifest);
     // The package the board reviewed: adds only issues.create.
@@ -375,10 +375,10 @@ describeEmbeddedPostgres("plugin-loader upgrade_pending (PLA-908)", () => {
     // Park + file the approval naming addedCapabilities = ["issues.create"].
     await loader.upgradePlugin(pluginId, { localPath: approvedPkg });
 
-    // Simulate a legacy (pre-PLA-913) approval with no content snapshot/digest
+    // Simulate a legacy approval with no content snapshot/digest
     // so completeUpgrade falls back to re-reading the caller-supplied package —
-    // the path the PLA-911 version/caps binding still guards. With a snapshot
-    // present, PLA-913 ignores the swapped package entirely (covered in
+    // the path the version/caps binding still guards. With a snapshot
+    // present, the loader ignores the swapped package entirely (covered in
     // plugin-loader-upgrade-snapshot.test.ts).
     approvedByPlugin.get(pluginId)!.digest = undefined;
 
@@ -400,7 +400,7 @@ describeEmbeddedPostgres("plugin-loader upgrade_pending (PLA-908)", () => {
     expect(row?.manifestJson.capabilities).toEqual(["issues.read"]);
   });
 
-  it("refuses to complete an upgrade whose fetched version differs from the approved target (PLA-911 Finding 1)", async () => {
+  it("refuses to complete an upgrade whose fetched version differs from the approved target", async () => {
     const oldManifest = manifest("0.1.0", ["issues.read"]);
     const oldPkg = await writePackage(oldManifest);
     const approvedManifest = manifest("0.2.0", ["issues.read", "issues.create"]);
@@ -412,9 +412,9 @@ describeEmbeddedPostgres("plugin-loader upgrade_pending (PLA-908)", () => {
 
     await loader.upgradePlugin(pluginId, { localPath: approvedPkg });
 
-    // Legacy (pre-PLA-913) approval with no snapshot/digest → completeUpgrade
-    // re-reads the caller-supplied package, where the PLA-911 version binding
-    // applies. (A snapshot would make PLA-913 ignore the swapped package.)
+    // Legacy approval with no snapshot/digest → completeUpgrade
+    // re-reads the caller-supplied package, where the version binding
+    // applies. (A snapshot would make the loader ignore the swapped package.)
     approvedByPlugin.get(pluginId)!.digest = undefined;
 
     // A package whose caps stay within the approved set but at a different,
@@ -432,7 +432,7 @@ describeEmbeddedPostgres("plugin-loader upgrade_pending (PLA-908)", () => {
     expect(row?.manifestJson.capabilities).toEqual(["issues.read"]);
   });
 
-  it("refuses to complete an upgrade when the immutable snapshot is tampered after park (PLA-912 digest anchor over PLA-913 snapshot)", async () => {
+  it("refuses to complete an upgrade when the immutable snapshot is tampered after park (digest anchor over snapshot)", async () => {
     const oldManifest = manifest("0.1.0", ["issues.read"]);
     const oldPkg = await writePackage(oldManifest);
     // The package the board reviewed and approved: 0.2.0 adding issues.create.
@@ -443,13 +443,13 @@ describeEmbeddedPostgres("plugin-loader upgrade_pending (PLA-908)", () => {
     const { approvedByPlugin, gateway } = createGatewayStub();
     const loader = makeLoader(gateway);
 
-    // Park: anchors digest D1 over approvedPkg and snapshots it (PLA-913).
+    // Park: anchors digest D1 over approvedPkg and snapshots it.
     await loader.upgradePlugin(pluginId, { localPath: approvedPkg });
     const d1 = approvedByPlugin.get(pluginId)?.digest;
     expect(d1).toMatch(/^sha256:[0-9a-f]{64}$/);
 
     // Now tamper the immutable snapshot itself (the bytes completeUpgrade loads
-    // from). The PLA-912 digest check recomputes over the snapshot and must
+    // from). The digest check recomputes over the snapshot and must
     // reject when it no longer matches the approved digest.
     const snapshotDir = path.join(localPluginDir, ".upgrade-snapshots", d1!.slice("sha256:".length));
     await writeFile(
@@ -469,7 +469,7 @@ describeEmbeddedPostgres("plugin-loader upgrade_pending (PLA-908)", () => {
     expect(row?.manifestJson.capabilities).toEqual(["issues.read"]);
   });
 
-  it("completes an upgrade whose package contents match the approved digest (PLA-912 positive control)", async () => {
+  it("completes an upgrade whose package contents match the approved digest (positive control)", async () => {
     const oldManifest = manifest("0.1.0", ["issues.read"]);
     const oldPkg = await writePackage(oldManifest);
     const approvedManifest = manifest("0.2.0", ["issues.read", "issues.create"]);
@@ -493,7 +493,7 @@ describeEmbeddedPostgres("plugin-loader upgrade_pending (PLA-908)", () => {
     expect(row?.manifestJson.capabilities).toEqual(["issues.read", "issues.create"]);
   });
 
-  it("refuses to park a disabled plugin for a cap-escalating upgrade (PLA-911 Finding 2)", async () => {
+  it("refuses to park a disabled plugin for a cap-escalating upgrade", async () => {
     const oldManifest = manifest("0.1.0", ["issues.read"]);
     const oldPkg = await writePackage(oldManifest);
     const newManifest = manifest("0.2.0", ["issues.read", "issues.create"]);

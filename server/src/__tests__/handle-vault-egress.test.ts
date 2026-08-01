@@ -1,5 +1,5 @@
 /**
- * PLA-723 — handle-vault egress capture + EG3 revocation purge.
+ * handle-vault egress capture + EG3 revocation purge.
  */
 
 import { afterEach, describe, expect, it } from "vitest";

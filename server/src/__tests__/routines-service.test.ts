@@ -1035,7 +1035,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     throw new Error("timed out waiting for a backend to block on a row lock");
   }
 
-  // PLA-1789: a `scheduled_retry` heartbeat run counts as live, so a retry that is never
+  // A `scheduled_retry` heartbeat run counts as live, so a retry that is never
   // promoted pins the execution issue and `skip_if_active` skips every subsequent tick forever.
   async function seedStaleExecutionPin(input: {
     heartbeatRunStatus: "scheduled_retry" | "queued" | "running" | "failed";

@@ -4405,7 +4405,7 @@ export function issueService(db: Db) {
   }
 
   async function clearExecutionRunIfTerminal(issueId: string): Promise<boolean> {
-    // PLA-597: this helper takes overlapping locks on issues + heartbeat_runs
+    // This helper takes overlapping locks on issues + heartbeat_runs
     // and is called pre-authorization from multiple mutation routes; on its
     // own it can deadlock against the heartbeat-run lifecycle and 500 the
     // request before any other code runs. Wrap in retry so transient 40P01
@@ -4460,7 +4460,7 @@ export function issueService(db: Db) {
   }
 
   /**
-   * PLA-141: defensive back-fill for the orphan-`checkoutRunId` lifecycle bug.
+   * Defensive back-fill for the orphan-`checkoutRunId` lifecycle bug.
    *
    * When `releaseIssueExecutionAndPromote` failed to clear `checkoutRunId` (or any
    * other code path leaves it pointing at a terminal heartbeat_runs row), mutation
@@ -4473,7 +4473,7 @@ export function issueService(db: Db) {
    * Returns true if any column was cleared (used by tests; callers can ignore).
    */
   async function clearOrphanCheckoutLocksIfTerminal(issueId: string): Promise<boolean> {
-    // PLA-597: see clearExecutionRunIfTerminal — same lock-ordering risk.
+    // See clearExecutionRunIfTerminal — same lock-ordering risk.
     // Every mutation route calls this pre-auth, so an unwrapped deadlock
     // here surfaces as a 500 before the route's own retry can see it.
     return retryOnTransientPgError(
@@ -4560,9 +4560,9 @@ export function issueService(db: Db) {
   // precondition: a terminal run holds no real claim regardless of who is
   // assigned or what status the issue is currently in.
   //
-  // Retained alongside clearOrphanCheckoutLocksIfTerminal (PLA-141): this
+  // Retained alongside clearOrphanCheckoutLocksIfTerminal: this
   // upstream (v2026.618.0) helper is the in-service self-heal invoked from
-  // `checkout`, while the PLA-141 helper is the pre-auth route guard. They keep
+  // `checkout`, while clearOrphanCheckoutLocksIfTerminal is the pre-auth route guard. They keep
   // separate call sites and test suites, so both are preserved.
   async function clearCheckoutRunIfTerminal(issueId: string): Promise<boolean> {
     return db.transaction(async (tx) => {
@@ -7314,7 +7314,7 @@ export function issueService(db: Db) {
     },
 
     /**
-     * PLA-888: create a standalone `assets` row with NO `issue_attachments`
+     * Create a standalone `assets` row with NO `issue_attachments`
      * binding yet. Returned by `artifacts.create`; the asset is bound to an
      * issue+comment later via {@link attachAssetsToComment} (called from
      * `issues.createComment` with `attachmentIds`). The split exists because
@@ -7349,7 +7349,7 @@ export function issueService(db: Db) {
     },
 
     /**
-     * PLA-888 idempotency: find an existing asset for `(companyId, sha256)` that
+     * Idempotency: find an existing asset for `(companyId, sha256)` that
      * is NOT yet bound to any `issue_attachments` row. A retried
      * `artifacts.create` (same bytes, same company) converges onto this asset
      * instead of storing duplicate bytes. Attached assets are excluded because
@@ -7379,7 +7379,7 @@ export function issueService(db: Db) {
     },
 
     /**
-     * PLA-888: bind previously-created standalone assets (by id) to an issue +
+     * Bind previously-created standalone assets (by id) to an issue +
      * comment. Each asset must belong to the issue's company or the call is
      * rejected (`unprocessable`) — a worker cannot surface a foreign tenant's
      * asset onto its own issue. The insert is idempotent via
@@ -7431,7 +7431,7 @@ export function issueService(db: Db) {
     // the caller's issue guard — is defense in depth: if any write path ever
     // breaks the invariant that an attachment's company_id equals its parent
     // issue's company_id, a foreign row can never surface (not even its
-    // companyId string in metadata). See PLA-1643 (R1 from PLA-1642 review).
+    // companyId string in metadata).
     listAttachments: async (issueId: string, companyId: string) =>
       db
         .select({

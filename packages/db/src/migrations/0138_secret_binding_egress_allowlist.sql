@@ -1,4 +1,4 @@
--- PLA-723: per-binding egress allowlist for borrowed-handle destinations.
+-- Per-binding egress allowlist for borrowed-handle destinations.
 -- `allowed_egress`: operator-set destination allowlist (origin entries / *.host).
 -- `egress_allowlist_enforced`: EG4 secure-by-default. NEW bindings are born
 -- enforcing (column DEFAULT true), so any binding inserted after this migration

@@ -387,10 +387,10 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     thresholds: ProductivityReviewThresholds,
     now: Date,
   ): Promise<ProductivityReviewEvidence | null> {
-    // PLA-986: standby wake targets (executionPolicy.standbyWakeTarget=true)
+    // Standby wake targets (executionPolicy.standbyWakeTarget=true)
     // are designed to sit `in_progress` indefinitely between externally-driven
     // wakes, so long-active / no-comment evidence is meaningless for them.
-    // Skip the issue entirely, mirroring the recovery reconciler (PLA-838).
+    // Skip the issue entirely, mirroring the recovery reconciler.
     if (isStandbyWakeTargetIssue(sourceIssue)) return null;
 
     const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
@@ -485,11 +485,11 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
     let longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
 
-    // PLA-141 / PLA-139 follow-up: suppress `long_active_duration` when the issue's
+    // Suppress `long_active_duration` when the issue's
     // `checkoutRunId` points to a terminal run AND the latest assignee comment on
     // this issue is older than that run's `finished_at`. In that case the issue is
-    // not actually "stuck for N hours" — it is sitting in the orphan-checkoutRunId
-    // state described in PLA-141 and there has been no real assignee activity since
+    // not actually "stuck for N hours" — it is sitting in an orphan-checkoutRunId
+    // state and there has been no real assignee activity since
     // the run completed. The defensive back-fill in mutation handlers will clean up
     // the orphan on next touch; we should not page a reviewer in the meantime.
     if (longActive && sourceIssue.checkoutRunId) {

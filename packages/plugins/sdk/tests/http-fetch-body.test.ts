@@ -1,7 +1,7 @@
 /**
  * Tests for `ctx.http.fetch` body serialization across the worker→host RPC.
  *
- * Covers PLA-516 / PLA-518 — binary and FormData bodies must round-trip
+ * Covers binary and FormData bodies, which must round-trip
  * end-to-end without `String()` corruption.
  *
  * The tests drive the worker through an in-memory bridge: they `initialize`
@@ -297,7 +297,7 @@ describe("ctx.http.fetch body serialization", () => {
   });
 });
 
-describe("ctx.http.fetch response body decoding (PLA-1459)", () => {
+describe("ctx.http.fetch response body decoding", () => {
   // JPEG SOI + APP0: high bytes that a lossy utf8 decode destroys.
   const JPEG_BYTES = new Uint8Array([
     0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46,

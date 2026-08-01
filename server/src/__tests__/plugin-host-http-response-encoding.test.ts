@@ -1,12 +1,12 @@
 /**
- * PLA-1459 — `ctx.http.fetch` response-body encoding.
+ * `ctx.http.fetch` response-body encoding.
  *
  * The host's `executePinnedHttpRequest` must return byte-exact base64 when the
  * SDK worker opts in (`acceptResponseBodyEncoding: "base64"`), and keep the
  * legacy lossy utf8 decode with NO `bodyEncoding` field when it doesn't. Before
  * this fix the host always did `Buffer.concat(chunks).toString("utf8")`, which
  * collapsed every byte >=0x80 to U+FFFD and corrupted binary responses (the
- * first real inbound Telegram photo, PLA-1458).
+ * first real inbound Telegram photo).
  */
 
 import { AddressInfo } from "node:net";
@@ -57,7 +57,7 @@ function targetFor(path: string): ValidatedFetchTarget {
   };
 }
 
-describe("executePinnedHttpRequest response encoding (PLA-1459)", () => {
+describe("executePinnedHttpRequest response encoding", () => {
   it("returns byte-exact base64 for a binary response when opted in", async () => {
     const res = await executePinnedHttpRequest(
       targetFor("/binary"),

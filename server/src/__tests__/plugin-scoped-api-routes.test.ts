@@ -480,7 +480,6 @@ describe.sequential("plugin scoped API routes", () => {
   // sitting between companyResolution and worker dispatch in
   // server/src/routes/plugins.ts:1477. If a future refactor removes that line
   // these tests fail; they assert the gate runs before workerManager.call.
-  // See PLA-101 for context.
   describe("cross-tenant rejection (companyResolution gate)", () => {
     const otherCompanyId = "99999999-9999-4999-8999-999999999999";
     const otherIssueId = "88888888-8888-4888-8888-888888888888";

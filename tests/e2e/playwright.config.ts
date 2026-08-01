@@ -26,7 +26,7 @@ export default defineConfig({
   retries: 0,
   // Pin to a single worker so spec files run strictly sequentially against the
   // shared webServer. Two independent reasons require this:
-  //  - PLA-597: cross-file parallelism is the only path that surfaces the
+  //  - cross-file parallelism is the only path that surfaces the
   //    heartbeat_runs / issues deadlock pair (PATCH /issues:done in one spec
   //    contends with a heartbeat-run lifecycle update in another).
   //  - upstream v2026.618.0: several specs toggle instance-level state (the

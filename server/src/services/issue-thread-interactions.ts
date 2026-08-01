@@ -952,7 +952,7 @@ export function issueThreadInteractionService(db: Db) {
       return row ? hydrateInteraction(row) : null;
     },
 
-    // PLA-923: company-wide pending snapshot for the messenger digest reconcile.
+    // Company-wide pending snapshot for the messenger digest reconcile.
     // Returns a field-minimized projection (no payload/result/PII) directly from
     // SQL — the digest only needs to identify and relay the pending blocker, so
     // we skip hydration (which would parse the payload and could throw on a
@@ -975,7 +975,7 @@ export function issueThreadInteractionService(db: Db) {
           eq(issueThreadInteractions.status, "pending"),
         ))
         .orderBy(asc(issueThreadInteractions.createdAt), asc(issueThreadInteractions.id));
-      // Optional defensive bound for the PLA-923 reconcile read; omitted (and
+      // Optional defensive bound for the reconcile read; omitted (and
       // therefore unbounded) for any non-reconcile caller.
       return limit === undefined ? query : query.limit(limit);
     },
@@ -1755,7 +1755,7 @@ export function issueThreadInteractionService(db: Db) {
         // "superseded_by_comment". When no comment is involved (an authoring
         // agent retracting its OWN ask), use the dedicated "superseded" outcome
         // so the audit trail never falsely claims a comment superseded it
-        // (PLA-1439 F5 / PLA-823 truthful-audit-trail class).
+        // (truthful-audit-trail class).
         const outcome = commentId ? "superseded_by_comment" : "superseded";
         result = { version: 1, outcome, commentId, ...(reason ? { reason } : {}) };
       } else if (current.kind === "ask_user_questions") {

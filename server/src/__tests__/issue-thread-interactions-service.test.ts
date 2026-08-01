@@ -1305,7 +1305,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       { agentId: authorAgentId },
     );
 
-    // PLA-1439 F5: no comment involved (author self-cancel) records the dedicated
+    // F5: no comment involved (author self-cancel) records the dedicated
     // "superseded" outcome, NOT "superseded_by_comment", so the audit trail never
     // falsely claims a comment superseded it.
     expect(superseded).toMatchObject({
@@ -1348,9 +1348,9 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       userId: "local-board",
     });
 
-    // PLA-1438 Part A path: the messenger relays an operator reply as a comment and
+    // Part A path: the messenger relays an operator reply as a comment and
     // resolves the interaction it answered, passing the superseding comment id and
-    // NEVER a userId (must not mint operator user authorship — PLA-823 Finding-1).
+    // NEVER a userId (must not mint operator user authorship).
     const superseded = await interactionsSvc.supersedeInteractionById(
       { id: issueId, companyId },
       created.id,

@@ -1,5 +1,5 @@
 /**
- * Regression tests for PLA-159 — plugin manifest re-import must not return
+ * Regression tests: plugin manifest re-import must not return
  * stale, ESM-cache-pinned content when the underlying file is rebuilt.
  *
  * The bug: `await import('/.../dist/manifest.js')` is keyed by absolute
@@ -46,7 +46,7 @@ async function writeManifestWithTool(
     apiVersion: 1,
     id: "test.pla159",
     version: "1.0.0",
-    displayName: "PLA-159 Fixture",
+    displayName: "Loader Regression Fixture",
     description: "manifest used by plugin-loader regression tests",
     capabilities: ["agent.tools.register"],
     categories: [],
@@ -65,7 +65,7 @@ async function writeManifestWithTool(
   await utimes(manifestPath, mtimeSec, mtimeSec);
 }
 
-describe("plugin-loader / loadManifestModule (PLA-159)", () => {
+describe("plugin-loader / loadManifestModule", () => {
   it("returns the freshly-rewritten manifest from the same path on re-import", async () => {
     const manifestPath = path.join(workDir, "manifest-cache-bust.js");
 
@@ -81,7 +81,7 @@ describe("plugin-loader / loadManifestModule (PLA-159)", () => {
     };
 
     // Without the cache-bust, this would still be 'foo' — the original
-    // bug per PLA-159. With the fix, the rewritten file wins.
+    // bug. With the fix, the rewritten file wins.
     expect(second.tools[0]?.name).toBe("bar");
   });
 
@@ -97,7 +97,7 @@ describe("plugin-loader / loadManifestModule (PLA-159)", () => {
   });
 });
 
-describe("plugin-manifest-validator (PLA-159 roll-in)", () => {
+describe("plugin-manifest-validator", () => {
   const baseManifest = {
     apiVersion: 1,
     id: "test.validator",

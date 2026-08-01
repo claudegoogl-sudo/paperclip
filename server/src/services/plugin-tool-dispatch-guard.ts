@@ -1,5 +1,5 @@
 /**
- * PLA-903 — host-side hardening for `agent.tools.register` tool dispatches.
+ * SECURITY-CRITICAL: host-side hardening for `agent.tools.register` tool dispatches.
  *
  * Every plugin tool reachable through `POST /api/plugins/tools/execute`
  * (server/src/routes/plugins.ts) is contributed via the `agent.tools.register`
@@ -55,7 +55,7 @@ export interface ToolDispatchPolicy {
  * universal) but are not rate-limited (layer B is opt-in per tool).
  */
 export const AGENT_TOOL_DISPATCH_POLICIES: Readonly<Record<string, ToolDispatchPolicy>> = {
-  // PLA-902/903: provisioning tool — 5 topic creations per company+agent per hour.
+  // Provisioning tool — 5 topic creations per company+agent per hour.
   "paperclip-messenger:messenger.create_topic": {
     maxPerWindow: 5,
     windowMs: 60 * 60 * 1000,

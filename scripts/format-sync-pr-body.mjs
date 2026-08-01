@@ -71,7 +71,7 @@ function main() {
 
 > 1. The fork (\`claudegoogl-sudo/paperclip\`) is the install surface for this Paperclip instance, but feature work continues upstream at \`paperclipai/paperclip\`.
 > 2. Without a sync routine the fork drifts; new upstream features never reach this instance.
-> 3. PLA-589 spec'd an automated upstream-sync routine; PLA-603 scaffolds the scripts and state file it invokes.
+> 3. An automated upstream-sync routine was spec'd and scaffolded as the scripts and state file it invokes.
 > 4. Routine ticks fetch \`releases/latest\` with an ETag, branch off fork master, and merge \`upstream/<tag>\`.
 > 5. Trivial conflicts (lockfile, CHANGELOG, prose docs) are auto-resolved; anything else is escalated via a JSON report on stdout.
 > 6. On clean merge, the routine pushes a draft PR (this PR shape) for board-gated landing — auto-merge is never enabled.
@@ -102,7 +102,7 @@ ${fileStat}
 
 ## Model Used
 
-Routine-generated (no model). Initial scaffold authored by Claude Opus 4.7 (\`claude-opus-4-7\`) via Claude Code, extended thinking + tool use (PLA-603).
+Routine-generated (no model). Initial scaffold authored by Claude Opus 4.7 (\`claude-opus-4-7\`) via Claude Code, extended thinking + tool use.
 
 ## Checklist
 

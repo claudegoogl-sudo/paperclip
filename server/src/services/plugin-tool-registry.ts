@@ -104,7 +104,7 @@ export interface ToolExecutionResult {
 }
 
 /**
- * PLA-734 — sink for would-deny egress observations. The chokepoint computes the
+ * Sink for would-deny egress observations. The chokepoint computes the
  * NORMALIZED origin (scheme+host+port — never a raw URL) and the deduped, non-null
  * bindings of a would-deny call and hands them off here fire-and-forget. The sink
  * owns persistence + its own error isolation: harvesting MUST NOT affect the
@@ -458,7 +458,7 @@ export function createPluginToolRegistry(
         "executing tool via plugin worker",
       );
 
-      // PLA-702 Control 2 — borrowed-handle egress substitution chokepoint.
+      // SECURITY-CRITICAL: borrowed-handle egress substitution chokepoint (Control 2).
       //
       // This is the STRUCTURAL chokepoint (RC5 placement): every plugin tool
       // dispatch routes through here, including the `getRegistry()` escape
@@ -475,7 +475,7 @@ export function createPluginToolRegistry(
       // vault (foreign / expired / forged) aborts the call fail-closed (RC5);
       // a literal `vault-handle://` must never leave the host outbound.
       //
-      // PLA-723 Control-2 residual — per-binding egress allowlist. The
+      // SECURITY-CRITICAL: per-binding egress allowlist (Control-2 residual). The
       // destination decision runs BEFORE any plaintext substitution (EG5): we
       // enumerate the borrowed handles present in the RAW parameters and check
       // each handle's OWN captured allowlist against the call's declared,
@@ -528,7 +528,7 @@ export function createPluginToolRegistry(
               "egress would be denied under enforcement; binding is in log-only mode",
             );
 
-            // PLA-734 (option b) — persist a queryable would-deny observation so
+            // Persist a queryable would-deny observation so
             // operators can seed this binding's allowlist before the enforce-flip.
             // We persist the NORMALIZED origin only (scheme+host+port, via the
             // egress parser that already produced `decision.origin`); a non-`ok`
@@ -602,7 +602,7 @@ export function createPluginToolRegistry(
         runContext,
       };
 
-      // PLA-574: register the dispatching agent's runContext under
+      // SECURITY-CRITICAL: register the dispatching agent's runContext under
       // (pluginDbId, runId) so the host's `artifacts.fetch` handler can
       // authorize on the dispatching agent — not the worker JWT — when the
       // worker calls back via the SDK helper. Always deregister to keep the

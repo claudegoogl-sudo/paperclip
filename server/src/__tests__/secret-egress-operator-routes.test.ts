@@ -1,5 +1,5 @@
 /**
- * PLA-735 — operator-only egress review + per-binding enforce-flip routes,
+ * Operator-only egress review + per-binding enforce-flip routes,
  * against a real DB. Pins the SecurityEngineer acceptance criteria at the HTTP
  * boundary:
  *   AC1  operator-authenticated only — an agent JWT is rejected (EG1-provenance)
@@ -32,7 +32,7 @@ import { recordEgressWouldDeny } from "../services/egress-harvest.js";
 const support = await getEmbeddedPostgresTestSupport();
 const describeDb = support.supported ? describe : describe.skip;
 if (!support.supported) {
-  console.warn(`Skipping PLA-735 operator egress route tests: ${support.reason ?? "unsupported environment"}`);
+  console.warn(`Skipping operator egress route tests: ${support.reason ?? "unsupported environment"}`);
 }
 
 function boardActor(companyId: string): Express.Request["actor"] {
@@ -57,7 +57,7 @@ function agentActor(companyId: string): Express.Request["actor"] {
   } as Express.Request["actor"];
 }
 
-describeDb("PLA-735 operator egress routes", () => {
+describeDb("operator egress routes", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 

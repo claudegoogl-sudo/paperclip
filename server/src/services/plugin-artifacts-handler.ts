@@ -1,10 +1,10 @@
 /**
- * Plugin artifacts host-side handler — resolves attachment bytes on behalf of
+ * SECURITY-CRITICAL: Plugin artifacts host-side handler — resolves attachment bytes on behalf of
  * the dispatching agent, enforcing all seven security gates locked in by
- * SecurityEngineer for PLA-574.
+ * SecurityEngineer.
  *
  * The worker calls `ctx.artifacts.fetch(attachmentId)` from a tool handler OR
- * (PLA-897) a background dispatch (`onEvent`/`onWebhook`). The SDK serializes
+ * a background dispatch (`onEvent`/`onWebhook`). The SDK serializes
  * that into a JSON-RPC `artifacts.fetch` request carrying ONLY
  * `{ attachmentId, runId }`. This handler:
  *
@@ -15,7 +15,7 @@
  *  2. Loads the attachment by ID.
  *  3. Authorizes against the run-context's companyId — the **dispatching
  *     agent's** company for a dispatch fetch, or the host-validated
- *     **triggering** company for a background fetch (PLA-897) — NOT the
+ *     **triggering** company for a background fetch — NOT the
  *     worker's tenant. Mismatch + missing attachment are collapsed into a
  *     single `not_found` shape to deny existence/no-access enumeration.
  *  4. Applies a sliding-window rate limit keyed by dispatching agent when
@@ -29,8 +29,8 @@
  *  7. Returns `{ filename, contentType, byteSize, contentBase64 }`. Bytes
  *     are NEVER logged.
  *
- * @see PLA-574 — host-mediated cross-tenant artifact fetch
- * @see PLA-897 — background run-context fetch, scoped to the triggering company
+ * Host-mediated cross-tenant artifact fetch; also covers the background
+ * run-context fetch path, scoped to the triggering company.
  */
 
 import { createHash } from "node:crypto";
@@ -61,7 +61,7 @@ export interface PluginArtifactsFetchResult {
 }
 
 /**
- * PLA-888: request shape for `artifacts.create`. The worker supplies the target
+ * Request shape for `artifacts.create`. The worker supplies the target
  * company plus the bytes (base64); `runId` is the dispatch/service/background
  * run id the host validates against the registry.
  */
@@ -73,7 +73,7 @@ export interface PluginArtifactsCreateParams {
   runId: string;
 }
 
-/** PLA-888: response shape — the created (or deduped) asset id. */
+/** Response shape — the created (or deduped) asset id. */
 export interface PluginArtifactsCreateResult {
   attachmentId: string;
 }
@@ -103,7 +103,7 @@ export interface AttachmentLookup {
 }
 
 /**
- * PLA-888: the asset-write surface `artifacts.create` needs. Implemented by
+ * The asset-write surface `artifacts.create` needs. Implemented by
  * `issueService(db)` (`createStandaloneAsset` / `findReusableUnattachedAsset`).
  * Kept separate from {@link AttachmentLookup} so the read path stays minimal.
  */
@@ -129,10 +129,10 @@ export interface CreateArtifactsHandlerOptions {
   pluginKey: string;
   storage: StorageService;
   attachments: AttachmentLookup;
-  /** PLA-888: asset-write surface for `artifacts.create`. */
+  /** Asset-write surface for `artifacts.create`. */
   assetWriter: AssetWriter;
   /**
-   * PLA-888: resolve the per-company attachment byte ceiling — MUST mirror the
+   * Resolve the per-company attachment byte ceiling — MUST mirror the
    * human upload route (`normalizeIssueAttachmentMaxBytes(company.attachmentMaxBytes)`).
    */
   resolveCompanyMaxBytes(companyId: string): Promise<number>;
@@ -141,7 +141,7 @@ export interface CreateArtifactsHandlerOptions {
   globalRateLimit?: { maxAttempts: number; windowMs: number };
   /** Override the per-(agent, company) sub-bucket limit (default 30/min). */
   perCompanyRateLimit?: { maxAttempts: number; windowMs: number };
-  /** PLA-888: override the per-company write rate limit (default 30/min). */
+  /** Override the per-company write rate limit (default 30/min). */
   writeRateLimit?: { maxAttempts: number; windowMs: number };
   /** Hard ceiling on attachment size streamed through this path. */
   maxByteSize?: number;
@@ -227,11 +227,11 @@ async function readStreamToBuffer(stream: Readable, maxBytes: number): Promise<B
 
 const DEFAULT_GLOBAL = { maxAttempts: 60, windowMs: 60_000 };
 const DEFAULT_PER_COMPANY = { maxAttempts: 30, windowMs: 60_000 };
-/** PLA-888: per-company write ceiling — bounds storage-DoS from the relay path
+/** Per-company write ceiling — bounds storage-DoS from the relay path
  *  where there is no dispatching agent to key off. */
 const DEFAULT_WRITE = { maxAttempts: 30, windowMs: 60_000 };
 /**
- * Default plugin-artifact byte ceiling: 25 MiB (PLA-1147, raised from 10 MiB).
+ * Default plugin-artifact byte ceiling: 25 MiB (raised from 10 MiB).
  *
  * Sized to cover everything Telegram's Bot API `getFile` can deliver (hard 20 MB
  * inbound cap) plus margin for base64/metadata, so an operator can relay a CAD
@@ -299,7 +299,7 @@ export function createPluginArtifactsHandler(
   async function audit(input: {
     outcome: "allowed" | "denied";
     deniedReason?: ArtifactsErrorCode;
-    // PLA-897: a background fetch has no dispatching agent — mirror the create
+    // A background fetch has no dispatching agent — mirror the create
     // audit and allow null (system actor).
     contextKind: "dispatch" | "background";
     dispatchingAgentId: string | null;
@@ -310,11 +310,11 @@ export function createPluginArtifactsHandler(
     toolName: string | null;
     byteSize?: number;
   }) {
-    // PLA-1658: a background fetch's runId is the wire/background-dispatch id,
+    // A background fetch's runId is the wire/background-dispatch id,
     // which has NO heartbeat_runs row (background relays fire on a board event,
     // not a heartbeat run). Storing it in activity_log.run_id violates the
     // nullable FK (SQLSTATE 23503) and the best-effort catch below silently
-    // drops the audit row. Mirror the PLA-806 secret-resolve fix: write
+    // drops the audit row. Mirror the secret-resolve fix: write
     // run_id = NULL and preserve the dispatch id under details.backgroundRunId.
     // Dispatch fetches carry a real heartbeat run and are unchanged.
     const isBackground = input.contextKind === "background";
@@ -322,7 +322,7 @@ export function createPluginArtifactsHandler(
       // We audit against the DISPATCHING agent's company so the activity log
       // shows up in their tenant's audit trail (where the data was actually
       // accessed). The plugin key and outcome are first-class for the
-      // six-field schema PLA-574 §Audit.
+      // six-field schema §Audit.
       await logActivity(db, {
         companyId: input.dispatchingCompanyId,
         actorType: "plugin",
@@ -344,7 +344,7 @@ export function createPluginArtifactsHandler(
           attachmentId: input.attachmentId,
           toolName: input.toolName,
           byteSize: input.byteSize ?? null,
-          // PLA-1658: preserve dispatch attribution for background fetches that
+          // Preserve dispatch attribution for background fetches that
           // can't populate run_id. Dispatch fetches keep run_id and omit this.
           ...(isBackground ? { backgroundRunId: input.runId } : {}),
         },
@@ -355,7 +355,7 @@ export function createPluginArtifactsHandler(
   }
 
   /**
-   * PLA-888: audit the write path. Six fields mirror the fetch audit but the
+   * Audit the write path. Six fields mirror the fetch audit but the
    * action is `artifact.created` and the actor may be a system context (service
    * /background dispatch) with no dispatching agent. Bytes are NEVER recorded —
    * only the sha256 digest + size. Best-effort like {@link audit}.
@@ -430,9 +430,9 @@ export function createPluginArtifactsHandler(
           "no active dispatch for this runId",
         );
       }
-      // PLA-768: a worker-lifetime service context carries NO company, so an
+      // SECURITY-CRITICAL: a worker-lifetime service context carries NO company, so an
       // attachment fetch has no authorization basis — reject it like an unknown
-      // runId. PLA-897: a per-dispatch background context DOES carry the
+      // runId. A per-dispatch background context DOES carry the
       // host-validated triggering company, which is the same scope a dispatch
       // fetch authorizes against (company-level), so it is allowed below with no
       // dispatching agent. A back-compat dispatch entry has `kind` absent, so
@@ -444,7 +444,7 @@ export function createPluginArtifactsHandler(
         );
       }
 
-      // PLA-897: derive the authorizing principal once. Background has a company
+      // Derive the authorizing principal once. Background has a company
       // but no agent (system actor); dispatch has both. Rate-limit/audit keys
       // fall back to the company when there is no agent.
       const authCompanyId = ctx.companyId;
@@ -496,7 +496,7 @@ export function createPluginArtifactsHandler(
       // ---------- Gate 4: authorization ----------
       // For a dispatch fetch, agents are scoped to a single company per the JWT
       // actor model (routes/authz.ts:assertCompanyAccess): the dispatching
-      // agent's company MUST match the attachment's company. PLA-897: a
+      // agent's company MUST match the attachment's company. A
       // background fetch authorizes against the host-validated TRIGGERING company
       // (`authCompanyId`) — same company-level check, correct result. We DO NOT
       // use the worker's tenant for authz in either case.
@@ -550,7 +550,7 @@ export function createPluginArtifactsHandler(
         // Authz (Gate 4) already passed, so an oversize read is a deny by an
         // *authorized* caller. Audit it for symmetry with the other deny
         // gates — otherwise a plugin could repeatedly pull a large attachment
-        // to OOM-stress storage retrieval with zero audit signal (PLA-578 F1).
+        // to OOM-stress storage retrieval with zero audit signal.
         if (err instanceof ArtifactsError && err.code === "too_large") {
           await audit({
             outcome: "denied",
@@ -618,7 +618,7 @@ export function createPluginArtifactsHandler(
       // ---------- Gate 2: per-tenant authorization ----------
       // dispatch / background contexts carry a server-validated company — the
       // claimed `companyId` MUST match it (no cross-tenant write). A service
-      // context (PLA-768, e.g. the messenger inbound relay) carries NO company,
+      // context (e.g. the messenger inbound relay) carries NO company,
       // so the claimed `companyId` is trusted as the write target: the asset is
       // stored under that company's namespace ONLY and is unattached until
       // `issues.createComment` binds it (which independently re-checks the issue's
@@ -626,7 +626,7 @@ export function createPluginArtifactsHandler(
       // storage cost is bounded by the per-company write rate limit below. This
       // deviates from `artifacts.fetch` (which rejects service/background) — a
       // read is scoped to the dispatching agent's access, but an inbound write
-      // legitimately has no agent. See PLA-888 security notes.
+      // legitimately has no agent.
       // A dispatch context's `kind` is optional (absent === "dispatch"), so test
       // for the company-less service kind rather than enumerating the others —
       // otherwise a back-compat dispatch entry (no `kind`) would be misread as
@@ -681,7 +681,7 @@ export function createPluginArtifactsHandler(
       // ---------- Gate 5: decode + size ceiling (per-company, mirrors human route) ----------
       const companyMaxBytes = await resolveCompanyMaxBytes(companyId);
       const ceiling = Math.min(companyMaxBytes, maxByteSize);
-      // PLA-888 review F1: bound the encoded string BEFORE decoding so a hostile
+      // SECURITY-CRITICAL: bound the encoded string BEFORE decoding so a hostile
       // worker cannot force a large transient allocation (the worker→host
       // transport has no frame cap). base64 inflates ~4/3×; reject anything that
       // could not possibly fit under the ceiling once decoded.

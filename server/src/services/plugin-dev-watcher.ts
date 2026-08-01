@@ -35,7 +35,7 @@ export interface PluginDevWatcher {
    * or disarms it when the plugin is no longer a local-path install. Called by
    * the lifecycle mutation routes so runtime install/enable/disable/uninstall
    * moves the watch even though those operations emit on a different lifecycle
-   * emitter than the one this watcher subscribes to. See PLA-1537.
+   * emitter than the one this watcher subscribes to.
    */
   reconcile(pluginId: string): Promise<void>;
   /** Stop all watchers and clean up. */
@@ -176,7 +176,7 @@ export function createPluginDevWatcher(
   const watchers = new Map<string, FSWatcher>();
   // Absolute package path each active watcher is bound to, so a runtime
   // repoint (soft-uninstall + local reinstall from a new dir) can be detected
-  // and the stale watch torn down rather than silently kept. See PLA-1537.
+  // and the stale watch torn down rather than silently kept.
   const watchedPaths = new Map<string, string>();
   const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const fileExists = fsDeps?.existsSync ?? existsSync;
@@ -191,7 +191,7 @@ export function createPluginDevWatcher(
     // Re-arm on path change: if we already watch this plugin but the resolved
     // package path is unchanged, keep the existing watcher (no churn). If the
     // path changed, tear down the stale watch before rewatching the new path
-    // so touches to the old directory stop firing. See PLA-1537.
+    // so touches to the old directory stop firing.
     if (watchers.has(pluginId)) {
       const currentPath = watchedPaths.get(pluginId);
       if (currentPath === absPath) return;

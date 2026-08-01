@@ -31,14 +31,15 @@ const TEST_MANIFEST: PaperclipPluginManifestV1 = {
   entrypoints: { worker: "dist/worker.js" },
 };
 
-describe("PLA-1824 — a background call that owns no dispatch must not inherit another tenant's scope", () => {
+describe("a background call that owns no dispatch must not inherit another tenant's scope", () => {
   // Plugin workers are GLOBAL: one plugin.id is one process shared by every
   // tenant. A loop started in `setup()` (messenger `getUpdates`) services no
   // dispatch, so its worker->host calls carry no `paperclipInvocationId` — the
-  // same wire shape as a pre-PLA-657 legacy worker. PLA-719/PLA-761 attribute
-  // that shape to the single in-flight dispatch, which for a background caller
-  // means reading a tenant's effective config (and the secret-refs it carries)
-  // that the background caller has no claim to.
+  // same wire shape as a legacy worker predating invocation-id echoing. The
+  // fallback attribution logic attributes that shape to the single in-flight
+  // dispatch, which for a background caller means reading a tenant's effective
+  // config (and the secret-refs it carries) that the background caller has no
+  // claim to.
 
   function buildHarness(
     echoesInvocationId: boolean,
@@ -105,17 +106,17 @@ describe("PLA-1824 — a background call that owns no dispatch must not inherit 
     }
   });
 
-  it("still attributes an id-less call to the single in-flight dispatch for a worker that cannot echo the id (PLA-719 preserved)", async () => {
-    // The pre-PLA-657 population (platform.cad ≤0.1.7, klipper) never echoes
+  it("still attributes an id-less call to the single in-flight dispatch for a worker that cannot echo the id (preserved)", async () => {
+    // The legacy population (platform.cad ≤0.1.7, klipper) never echoes
     // `paperclipInvocationId` even while servicing its own dispatch, so the
-    // attribution remains the only way to scope it. Narrowing PLA-1824 must not
+    // attribution remains the only way to scope it. Narrowing the fix above must not
     // take that away.
     //
-    // PLA-1838: this must use a DISPATCH-ONLY fixture. Originally it reused the
+    // This must use a DISPATCH-ONLY fixture. Originally it reused the
     // background-poll worker, so what it actually asserted was that a
     // background loop's id-less `config.get` resolves to the unrelated tenant
-    // whose dispatch is open — the PLA-1838 vulnerability itself, one method
-    // over from `secrets.resolve`, not the PLA-719 affordance it names.
+    // whose dispatch is open — the vulnerability this suite guards against
+    // elsewhere, one method over from `secrets.resolve`, not the affordance it names.
     const { getForCompany, handle } = buildHarness(
       false,
       DISPATCH_CONFIG_GET_WORKER_ENTRYPOINT,

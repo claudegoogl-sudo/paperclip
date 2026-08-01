@@ -89,7 +89,7 @@ describe("redaction", () => {
     expect(result).not.toContain(jwt);
   });
 
-  it("redacts a lone fine-grained github_pat_ with no other secret hint (PLA-1637)", () => {
+  it("redacts a lone fine-grained github_pat_ with no other secret hint", () => {
     // Synthetic, shape-valid probe — never a real credential.
     const finePat = `github_pat_11${"B".repeat(80)}`;
     const result = redactSensitiveText(`rejected input ${finePat} at gate`);

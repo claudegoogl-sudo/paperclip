@@ -1,5 +1,5 @@
 /**
- * PLA-723 EG1-provenance — the egress allowlist captured onto a borrowed handle
+ * EG1-provenance — the egress allowlist captured onto a borrowed handle
  * is OPERATOR-only. It is always derived host-side from the secret's
  * `company_secret_bindings` row keyed by (dispatching company, plugin,
  * secretRef). No worker/agent-passable field on the mintHandle params can set

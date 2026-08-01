@@ -1,5 +1,5 @@
 /**
- * PLA-734 — would-deny egress harvest at the dispatch chokepoint (option b).
+ * Would-deny egress harvest at the dispatch chokepoint (option b).
  *
  * The chokepoint hands the egress-harvest sink the NORMALIZED origin only
  * (scheme+host+port — never a raw path/query URL) and the deduped, non-null
@@ -62,7 +62,7 @@ afterEach(() => {
   clearHostMediatedTools();
 });
 
-describe("PLA-734 would-deny egress harvest at the chokepoint", () => {
+describe("would-deny egress harvest at the chokepoint", () => {
   it("records the NORMALIZED origin only — path/query (and any token in them) stripped", async () => {
     const handle = mintHandle(RUN_ID, SECRET, logOnly(["https://api.github.com"]));
     const obs: Observation[] = [];

@@ -331,7 +331,7 @@ export function pluginRegistryService(db: Db) {
             .returning()
             .then((rows) => rows[0]);
 
-      // Maintain company_secret_bindings for any secret-ref fields (PLA-660 model C).
+      // Maintain company_secret_bindings for any secret-ref fields.
       await secretService(db).syncPluginSecretBindings({
         pluginId,
         instanceConfigSchema: instanceConfigSchemaOf(plugin),
@@ -380,7 +380,7 @@ export function pluginRegistryService(db: Db) {
             .returning()
             .then((rows) => rows[0]);
 
-      // Maintain company_secret_bindings for any secret-ref fields (PLA-660 model C).
+      // Maintain company_secret_bindings for any secret-ref fields.
       await secretService(db).syncPluginSecretBindings({
         pluginId,
         instanceConfigSchema: instanceConfigSchemaOf(plugin),
@@ -471,7 +471,7 @@ export function pluginRegistryService(db: Db) {
             .returning()
             .then((rows) => rows[0])) as PluginCompanySettings;
 
-      // Maintain company_secret_bindings for any secret-ref fields (PLA-660 model C).
+      // Maintain company_secret_bindings for any secret-ref fields.
       // Per-company scope: only secrets owned by THIS company are bound.
       await secretService(db).syncPluginSecretBindings({
         pluginId,
@@ -485,7 +485,7 @@ export function pluginRegistryService(db: Db) {
     },
 
     /**
-     * PLA-677: Per-tenant plugin config overrides.
+     * Per-tenant plugin config overrides.
      *
      * Reads the `configOverrides` sub-tree of a tenant's
      * `plugin_company_settings.settingsJson`. The keys directly match the
@@ -512,7 +512,7 @@ export function pluginRegistryService(db: Db) {
     },
 
     /**
-     * PLA-677: Replace the per-tenant plugin config override.
+     * Replace the per-tenant plugin config override.
      *
      * Preserves other top-level keys of `settingsJson` (e.g. local-folders).
      * Reconciles `company_secret_bindings` for THIS tenant only — cross-tenant
@@ -579,7 +579,7 @@ export function pluginRegistryService(db: Db) {
     },
 
     /**
-     * PLA-677: Clear a tenant's per-tenant plugin config override.
+     * Clear a tenant's per-tenant plugin config override.
      *
      * Equivalent to upsertCompanyConfigOverride(…, {}) but explicitly removes
      * the `configOverrides` key from settingsJson rather than storing an empty

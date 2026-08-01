@@ -377,7 +377,7 @@ describe("extractClaudeRetryNotBefore", () => {
     ).toBeNull();
   });
 
-  // PLA-1930: exact live strings observed in `heartbeat_runs.result_json.result`
+  // Exact live strings observed in `heartbeat_runs.result_json.result`
   // during the 2026-07-31 usage-limit storm. The `·` separator below is the real
   // U+00B7 middle-dot character the CLI emits, not a hyphen.
   it("parses the live dated weekly-limit string to the exact absolute instant", () => {

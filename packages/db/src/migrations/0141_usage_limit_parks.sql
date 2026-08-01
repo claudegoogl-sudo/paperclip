@@ -1,4 +1,4 @@
--- PLA-1930: single instance-wide singleton row recording whether the Claude
+-- Single instance-wide singleton row recording whether the Claude
 -- account is currently parked after a usage-limit hit. Every wake source
 -- (issue-comment wake, sweep, routine trigger, scheduled-retry promotion)
 -- must consult this row via `startNextQueuedRunForAgent` before dispatching a

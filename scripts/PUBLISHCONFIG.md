@@ -1,4 +1,4 @@
-# publishConfig at pack time — fork-build packaging note (PLA-298)
+# publishConfig at pack time — fork-build packaging note
 
 ## Why this exists
 

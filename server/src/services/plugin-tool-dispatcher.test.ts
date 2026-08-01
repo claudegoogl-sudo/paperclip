@@ -5,7 +5,7 @@ import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import { createPluginToolDispatcher } from "./plugin-tool-dispatcher.js";
 
 /**
- * PLA-323 regression: the dispatcher's `registerPluginTools(...)` must thread
+ * Regression: the dispatcher's `registerPluginTools(...)` must thread
  * an optional `pluginDbId` (the plugin row's DB UUID) through to the registry
  * so that each registered tool's `tool.pluginDbId` is the UUID, not the plugin
  * key.
@@ -15,16 +15,16 @@ import { createPluginToolDispatcher } from "./plugin-tool-dispatcher.js";
  * The worker manager is keyed by DB UUID. If `pluginDbId` is left to default
  * to the plugin key (e.g. `"platform.cad"`), every dispatch fails closed with
  * `502 "worker for plugin '<key>' is not running"` even when the worker is
- * running. PLA-308 hit this path for `cad:run_script` / `cad:export`.
+ * running. This previously hit the `cad:run_script` / `cad:export` path.
  */
-describe("PluginToolDispatcher.registerPluginTools — pluginDbId threading (PLA-323)", () => {
+describe("PluginToolDispatcher.registerPluginTools — pluginDbId threading", () => {
   function makeManifest(pluginKey: string): PaperclipPluginManifestV1 {
     return {
       id: pluginKey,
       apiVersion: 1,
       version: "1.0.0",
       displayName: "Test plugin",
-      description: "fixture for PLA-323",
+      description: "fixture for pluginDbId threading regression",
       author: "test",
       categories: ["automation"],
       capabilities: ["agent.tools.register"],

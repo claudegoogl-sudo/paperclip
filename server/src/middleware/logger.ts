@@ -16,7 +16,7 @@ import { redactSensitive } from "./redact-sensitive.js";
  * header is special-cased to a full `[Redacted]` because it is always a
  * credential regardless of shape.
  *
- * The log surface uses the `...ForLog` variant (PLA-842 Finding 1): the
+ * SECURITY-CRITICAL: The log surface uses the `...ForLog` variant: the
  * Option A issuer-allowlist applies ONLY to the write-block (free-text bodies);
  * a live `iss=paperclip` run JWT must never be persisted to `server.log`, so
  * here every JWT shape is redacted regardless of issuer.
@@ -53,7 +53,7 @@ export const logger = pino({
   // Pattern-redact the serialised request fields that pino-http logs. pino-http
   // overrides any req/res serializers we pass it, so log-time `redact` (which
   // runs after serialization) is the reliable hook for these paths:
-  //   - req.url        → the `?q=<token>` URL-query case (PLA-199)
+  //   - req.url        → the `?q=<token>` URL-query case
   //   - req.query.*    → the same query parsed into fields
   //   - req.headers.*  → header values; `authorization` → full `[Redacted]`
   // reqBody.* / reqParams / reqQuery and the `msg` line are redacted at their
@@ -79,7 +79,7 @@ export const logger = pino({
 
 export const httpLogger = pinoHttp({
   logger,
-  // Log-time secret-pattern redaction (PLA-317 §1–§2). The matched substring
+  // SECURITY-CRITICAL: Log-time secret-pattern redaction (§1–§2). The matched substring
   // in any logged value is replaced with its class marker (e.g.
   // `<redacted github_pat>`) before the line is serialised — never a partial
   // value. The pattern set is imported from ../secret-patterns.js, the single
@@ -124,7 +124,7 @@ export const httpLogger = pinoHttp({
 //     api_key, …) so a credential whose value doesn't match a known secret
 //     pattern still never lands on disk (upstream v2026.618.0).
 //  2. the outer `redactSecretsDeepForLog` in `customProps` then scrubs by
-//     *value pattern* (live JWTs, provider keys) anywhere in the tree (PLA-842).
+//     *value pattern* (live JWTs, provider keys) anywhere in the tree.
 function buildHttpLogProps(req: any, res: any): Record<string, unknown> {
   if (res.statusCode >= 400) {
     const ctx = (res as any).__errorContext;

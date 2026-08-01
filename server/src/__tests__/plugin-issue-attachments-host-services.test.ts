@@ -160,7 +160,7 @@ describeEmbeddedPostgres("plugin issues.listAttachments host services", () => {
     // Simulate a broken write path: an attachment on company A's issue whose own
     // company_id has drifted to company B (the invariant
     // issue_attachments.company_id == parent issue company_id is violated). The
-    // DB-layer tenant scope (PLA-1643) must drop the row so its foreign companyId
+    // The DB-layer tenant scope must drop the row so its foreign companyId
     // string never surfaces in metadata, even though the issue guard passes.
     const companyA = await createCompany("ATTA");
     const companyB = await createCompany("ATTB");

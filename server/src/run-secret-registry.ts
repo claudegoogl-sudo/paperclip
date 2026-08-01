@@ -1,5 +1,5 @@
 /**
- * Per-run value-exact secret registry (PLA-697 / PLA-695 Control 1).
+ * SECURITY-CRITICAL: Per-run value-exact secret registry (Control 1).
  *
  * When the host mediates a `vault.read` secret resolution and obtains the
  * decrypted plaintext, the exact byte sequence is registered here keyed by the

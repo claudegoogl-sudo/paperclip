@@ -1,5 +1,5 @@
 /**
- * PLA-697 / PLA-695 Control 1 — host value-exact redaction of vault.read tool
+ * Control 1 — host value-exact redaction of vault.read tool
  * results.
  *
  * When the host mediates a `vault.read` secret resolution it obtains plaintext
@@ -82,7 +82,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("vault.read value-exact redaction (PLA-697)", () => {
+describe("vault.read value-exact redaction", () => {
   it("returns the live plaintext to the agent AND registers it for persistence redaction", async () => {
     const handler = buildHandler(VAULT_VALUE);
 

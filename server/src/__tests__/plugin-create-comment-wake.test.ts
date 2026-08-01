@@ -134,7 +134,7 @@ describeEmbeddedPostgres("plugin issues.createComment wake + identifier resoluti
     expect(stored?.body).toBe("relayed from operator");
   });
 
-  it("never mints user authorship from a worker-supplied authorUserId (PLA-823 Finding 1)", async () => {
+  it("never mints user authorship from a worker-supplied authorUserId", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const identifier = `${issuePrefix(companyId)}-8`;
     const issueId = await seedIssue({ companyId, identifier });
@@ -215,7 +215,7 @@ describeEmbeddedPostgres("plugin issues.createComment wake + identifier resoluti
     expect(wakeups.length).toBe(0);
   });
 
-  it("consults the wake rate limiter per relay and suppresses the wake when it blocks (PLA-829)", async () => {
+  it("consults the wake rate limiter per relay and suppresses the wake when it blocks", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const identifier = `${issuePrefix(companyId)}-10b`;
     const issueId = await seedIssue({ companyId, identifier, status: "in_progress", assigneeAgentId: agentId });
@@ -262,7 +262,7 @@ describeEmbeddedPostgres("plugin issues.createComment wake + identifier resoluti
     expect(wakeups.length).toBe(0);
   });
 
-  it("does NOT wake a body-@mentioned agent — assignee-only wake (PLA-823 Finding 2)", async () => {
+  it("does NOT wake a body-@mentioned agent — assignee-only wake", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent("Assignee");
     const mentionedAgentId = randomUUID();
     await db.insert(agents).values({
@@ -299,7 +299,7 @@ describeEmbeddedPostgres("plugin issues.createComment wake + identifier resoluti
     expect(wokenAgentIds.size).toBe(1);
   });
 
-  it("defaults refuseClosed on when wakeAssignee is set (PLA-823 Finding 3)", async () => {
+  it("defaults refuseClosed on when wakeAssignee is set", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const identifier = `${issuePrefix(companyId)}-11b`;
     const issueId = await seedIssue({ companyId, identifier, status: "cancelled", assigneeAgentId: agentId });

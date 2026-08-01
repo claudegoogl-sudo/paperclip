@@ -1485,7 +1485,7 @@ describe("claude execute", () => {
       expect(result.errorCode ?? null).toBeNull();
     });
 
-    it("PLA-1865: a usage-limit result that did no work is never completedDirty, even when it reports is_error: false", async () => {
+    it("a usage-limit result that did no work is never completedDirty, even when it reports is_error: false", async () => {
       vi.useFakeTimers();
       vi.setSystemTime(new Date("2026-07-28T14:41:00.000Z"));
       try {
@@ -1509,7 +1509,7 @@ describe("claude execute", () => {
         expect(result.completedDirty ?? false).toBe(false);
         expect(result.errorCode).toBe("claude_transient_upstream");
         expect(result.errorFamily).toBe("transient_upstream");
-        // PLA-1790's backoff must survive: the wake is retried after the reset,
+        // The backoff must survive: the wake is retried after the reset,
         // not treated as done.
         expect(result.retryNotBefore).toBe("2026-07-31T08:00:00.000Z");
       } finally {
@@ -1517,7 +1517,7 @@ describe("claude execute", () => {
       }
     });
 
-    it("PLA-1865: a session-limit result is never completedDirty regardless of turn count", async () => {
+    it("a session-limit result is never completedDirty regardless of turn count", async () => {
       const result = await runCase(
         {
           type: "result",
@@ -1536,7 +1536,7 @@ describe("claude execute", () => {
     });
   });
 
-  describe("PLA-1865 replay: real live result_json rows", () => {
+  describe("replay: real live result_json rows", () => {
     async function replay(resultEvent: Record<string, unknown>, exitCode: number) {
       const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-replay-"));
       const workspace = path.join(root, "workspace");
@@ -1590,7 +1590,7 @@ describe("claude execute", () => {
 
     // Captured verbatim from the same table, run id
     // b985f530-2d71-488d-acd9-6951fee616f7, 2026-07-28 (exact timestamp
-    // redacted from this excerpt). This is exactly the PLA-1817 population:
+    // redacted from this excerpt). This is exactly the target population:
     // real multi-turn work, non-zero teardown exit, no usage-limit wording.
     const liveGenuineDirtyRow = {
       type: "result",
@@ -1601,7 +1601,7 @@ describe("claude execute", () => {
       total_cost_usd: 0.80183175,
       duration_api_ms: 132112,
       api_error_status: null,
-      result: "PLA-1840 recovered from stranded-blocked and set to a live continuation path.",
+      result: "Recovered from stranded-blocked and set to a live continuation path.",
     };
 
     it("classifies the live usage-limit row as failed, not succeeded_dirty (exit 1, matches the live shape)", async () => {

@@ -133,10 +133,10 @@ export function errorHandler(
     if (numericStatus === 413) {
       logger.warn(
         {
-          // Direct logger.* call: NOT covered by pino-http `redact.paths`
+          // SECURITY-CRITICAL: Direct logger.* call: NOT covered by pino-http `redact.paths`
           // (those only cover req.url/req.query/req.headers), so scrub the URL
           // here — a `?token=<secret>` on an oversized request would otherwise
-          // land in server.log cleartext (PLA-842 Finding 2).
+          // land in server.log cleartext.
           route: redactSecretsForLog(req.originalUrl),
           method: req.method,
           contentLength: Number.isFinite(contentLength) ? contentLength : null,

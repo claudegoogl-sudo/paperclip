@@ -1,5 +1,5 @@
 /**
- * PLA-734 — would-deny egress harvest STORE (option b), against a real DB.
+ * Would-deny egress harvest STORE (option b), against a real DB.
  *
  * Pins the SE constraints that live in the store: upsert-dedupe (one row per
  * (binding, origin); repeat bumps count + last_seen), per-binding cardinality
@@ -28,10 +28,10 @@ import {
 const support = await getEmbeddedPostgresTestSupport();
 const describeDb = support.supported ? describe : describe.skip;
 if (!support.supported) {
-  console.warn(`Skipping PLA-734 harvest store tests: ${support.reason ?? "unsupported environment"}`);
+  console.warn(`Skipping egress harvest store tests: ${support.reason ?? "unsupported environment"}`);
 }
 
-describeDb("PLA-734 egress harvest store", () => {
+describeDb("egress harvest store", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 

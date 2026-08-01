@@ -127,7 +127,7 @@ function stripStringsAndCommentsForScan(input: string): string {
     .replace(/\/\*[\s\S]*?\*\//g, "");
 }
 
-// TODO(PLA-94 F2): replace this regex/state-machine pass with a real Postgres
+// TODO: replace this regex/state-machine pass with a real Postgres
 // SQL parser (`pgsql-ast-parser` / `libpg_query`) so we can authoritatively
 // walk the FROM/JOIN tree instead of pattern-matching trimmed text. The
 // stopgap intentionally errs conservative: unqualified relation refs are
@@ -340,8 +340,8 @@ export function validatePluginRuntimeQuery(
   if (/\b(insert|update|delete|alter|create|drop|truncate)\b/.test(normalized)) {
     throw new Error("ctx.db.query cannot contain mutation or DDL keywords");
   }
-  // PLA-98: every FROM/JOIN must reference a schema-qualified table so the
-  // public-schema whitelist (coreReadTables) cannot be bypassed via the
+  // SECURITY-CRITICAL: every FROM/JOIN must reference a schema-qualified table
+  // so the public-schema whitelist (coreReadTables) cannot be bypassed via the
   // connection's default search_path. See also the Postgres-layer defense
   // applied in pluginDatabaseService.query (`SET LOCAL search_path`).
   assertRuntimeQueryRefsQualified(statement);
@@ -371,11 +371,11 @@ export function validatePluginRuntimeExecute(query: string, namespace: string): 
   if (/\b(alter|create|drop|truncate)\b/.test(normalized)) {
     throw new Error("ctx.db.execute cannot contain DDL keywords");
   }
-  // PLA-99: every FROM/JOIN (including those inside subqueries) must reference
-  // a schema-qualified table. Without this, writes like
+  // SECURITY-CRITICAL: every FROM/JOIN (including those inside subqueries)
+  // must reference a schema-qualified table. Without this, writes like
   // `UPDATE plugin_test.tbl SET x = (SELECT y FROM agents)` slip past the
   // extractQualifiedRefs check below, which only sees the top-level target.
-  // The Postgres-layer `SET LOCAL search_path` defense (PLA-98) would still
+  // The Postgres-layer `SET LOCAL search_path` defense above would still
   // fail-close at runtime, but the layered-defense story documented in
   // PLUGIN_AUTHORING_GUIDE.md and sdk/README.md requires the application
   // layer to reject these as well.
@@ -651,8 +651,8 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
       const plugin = await getPluginRecord(pluginId);
       const namespace = await getRuntimeNamespace(pluginId);
       validatePluginRuntimeQuery(statement, namespace, plugin.manifestJson.database?.coreReadTables ?? []);
-      // PLA-98: pin the connection's search_path to the plugin namespace so
-      // any unqualified ref that slips past the validator resolves to the
+      // SECURITY-CRITICAL: pin the connection's search_path to the plugin
+      // namespace so any unqualified ref that slips past the validator resolves to the
       // plugin's own schema, not `public`. SET LOCAL only holds inside a
       // transaction, so open one when the client supports it; when `db` is
       // already a transaction-scoped client (upstream v2026.525.0 made
@@ -674,7 +674,7 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
     async execute(pluginId: string, statement: string, params?: unknown[]): Promise<{ rowCount: number }> {
       const namespace = await getRuntimeNamespace(pluginId);
       validatePluginRuntimeExecute(statement, namespace);
-      // PLA-98: same search_path pin as query() — defense in depth. Guard the
+      // SECURITY-CRITICAL: same search_path pin as query() — defense in depth. Guard the
       // optional `transaction` (upstream v2026.525.0) and fall back to pinning
       // on the caller's transaction-scoped client when nesting is unavailable.
       const runPinned = async (client: PluginDatabaseClient): Promise<{ rowCount: number }> => {

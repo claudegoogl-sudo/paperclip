@@ -7,7 +7,7 @@ import {
 } from "./plugin.js";
 
 /**
- * v1 manifest UI slot floor (PLA-122 / PLA-123 / PLA-489): the host mounts
+ * v1 manifest UI slot floor: the host mounts
  * `dashboardWidget` and `page` in v1. Other `PLUGIN_UI_SLOT_TYPES` values
  * remain reserved-but-unrendered, so the manifest validator must reject them
  * at install time with a message that names the supported set.
@@ -295,13 +295,13 @@ describe("plugin managed skill validators", () => {
 // Upstream v2026.525.0 added host-rendered support for `routeSidebar`,
 // `detailTab`, `toolbarButton`, and `companySettingsPage` slots and shipped
 // acceptance tests for them. Our fork's v1 host-rendered floor
-// (PLUGIN_UI_SLOT_TYPES_V1_SUPPORTED = [dashboardWidget, page], PLA-122/123/489)
+// (PLUGIN_UI_SLOT_TYPES_V1_SUPPORTED = [dashboardWidget, page])
 // is enforced on the SAME `pluginUiSlotDeclarationSchema`, so it still narrows
 // install-time acceptance to dashboardWidget + page — these upstream slot types
 // are rejected at the manifest validator until the floor is expanded.
 //
 // This describe block pins the fork's current (stricter) behavior. The
-// floor-vs-upstream interaction is flagged to SecurityEngineer on PLA-623;
+// floor-vs-upstream interaction is flagged to SecurityEngineer for follow-up;
 // flip these to acceptance assertions if/when the floor is widened to admit the
 // upstream-rendered slot types. The upstream superRefine rules (routeSidebar
 // requires routePath, reserved company route protection, companySettingsPage

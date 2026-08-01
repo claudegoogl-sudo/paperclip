@@ -6,7 +6,7 @@ import { logger } from "../middleware/logger.js";
 const log = logger.child({ service: "egress-harvest" });
 
 /**
- * PLA-734 — queryable would-deny egress observations (CTO PLA-733, option (b)).
+ * Queryable would-deny egress observations (option (b)).
  *
  * The egress chokepoint (plugin-tool-registry) calls {@link recordEgressWouldDeny}
  * whenever a borrowed-handle call WOULD have been denied under enforcement but

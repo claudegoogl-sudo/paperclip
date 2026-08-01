@@ -1058,7 +1058,7 @@ describe.sequential("issue comment reopen routes", () => {
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
-  // PLA-1657: attachmentIds on the comment POST body must be bound to the created
+  // attachmentIds on the comment POST body must be bound to the created
   // comment so a `comment.created` subscriber (media relay) sees them with no race.
   it("links attachmentIds on POST comments to the created comment", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("todo"));

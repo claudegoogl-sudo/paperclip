@@ -175,7 +175,7 @@ Some issues are **never meant to be completed**. A catch-all wake target — for
 
 ### The problem this solves
 
-The recovery engine treats a long-lived `in_progress` issue that has no live heartbeat run and no next step as **stranded work** and tries to rescue it. For a standby issue this is a false positive: each sweep fires a `source_scoped_recovery_action` (the "missing disposition / `clear_next_step`" productivity review), which wakes the assignee, posts no progress, and re-parks — an alternating `blocked`/`in_progress` churn loop that burns budget every sweep (~30s cadence in the PLA-834 incident).
+The recovery engine treats a long-lived `in_progress` issue that has no live heartbeat run and no next step as **stranded work** and tries to rescue it. For a standby issue this is a false positive: each sweep fires a `source_scoped_recovery_action` (the "missing disposition / `clear_next_step`" productivity review), which wakes the assignee, posts no progress, and re-parks — an alternating `blocked`/`in_progress` churn loop that burns budget every sweep (~30s cadence observed in production).
 
 Closing the issue is **not** an option (it would break event delivery via `refuseClosed`), and relying on the assignee's heartbeat instructions to self-park in `blocked` is fragile — a single missed instruction restarts the loop.
 

@@ -135,7 +135,7 @@ triggers, untrusted languages, or runtime multi-statement SQL. Runtime
 restricted to namespace-local `INSERT`, `UPDATE`, and `DELETE`.
 
 > **Alpha — `ctx.db` SQL surface.** The runtime SQL validators are still
-> regex-based pending a real Postgres parser (PLA-94 F2). Two contracts you
+> regex-based pending a real Postgres parser. Two contracts you
 > must follow today:
 >
 > 1. **Every `FROM` and `JOIN` must be schema-qualified** (`ctx.db.namespace.tbl`

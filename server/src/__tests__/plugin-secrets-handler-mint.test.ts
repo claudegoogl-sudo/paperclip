@@ -1,7 +1,7 @@
 /**
- * PLA-702 / PLA-695 Control 2 — `secrets.mintHandle` host handler.
+ * Control 2 — `secrets.mintHandle` host handler.
  *
- * Asserts the SecurityEngineer PLA-701 gating criteria that live in the mint
+ * Asserts the SecurityEngineer gating criteria that live in the mint
  * handler:
  *  - RC2: minting registers the plaintext with the Control-1 value-exact
  *    redactor (so the consuming tool's own output is scrubbed), and a

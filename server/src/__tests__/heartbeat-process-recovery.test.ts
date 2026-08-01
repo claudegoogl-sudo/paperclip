@@ -1542,7 +1542,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
     expect(issue?.status).toBe("in_progress");
     expect(issue?.executionRunId).toBeNull();
-    // PLA-141: the reaped (failed) run also clears the matching checkoutRunId
+    // Regression: the reaped (failed) run also clears the matching checkoutRunId
     // atomically so the orphan-checkout state never lingers; the paused-tree
     // hold is what gates further recovery, not a stale checkout lock.
     // Terminal run cleanup releases the checkout lock even when paused-tree recovery is suppressed.
@@ -2500,11 +2500,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
-  // PLA-141: when releaseIssueExecutionAndPromote runs against a routine_execution
+  // When releaseIssueExecutionAndPromote runs against a routine_execution
   // issue whose execution lock is already cleared but whose checkoutRunId still
   // points at this run, the new ownsCheckoutLock branch must clear it. Without
   // that branch the checkoutRunId stays set and wedges every subsequent mutation.
-  it("clears orphan checkoutRunId when the completing run owns it (PLA-141)", async () => {
+  it("clears orphan checkoutRunId when the completing run owns it", async () => {
     const { issueId, runId } = await seedRunFixture({ agentStatus: "running" });
     await db
       .update(issues)
@@ -4566,7 +4566,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(runs).toHaveLength(1);
   });
 
-  it("skips a parent issue when a direct descendant has a live heartbeat run (PLA-321)", async () => {
+  it("skips a parent issue when a direct descendant has a live heartbeat run", async () => {
     const { companyId, agentId, issueId: parentIssueId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
@@ -4656,7 +4656,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(parentAgentWakes.every((row) => row.reason !== "issue_assignment_recovery")).toBe(true);
   });
 
-  it("skips a grandparent issue when only a 2-deep descendant has a live heartbeat run (PLA-321 recursion)", async () => {
+  it("skips a grandparent issue when only a 2-deep descendant has a live heartbeat run (recursion)", async () => {
     const { companyId, agentId, issueId: grandparentIssueId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
@@ -4753,7 +4753,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(recoveryIssues).toHaveLength(0);
   });
 
-  it("skips an in_progress assigned standby wake target instead of escalating it (PLA-838)", async () => {
+  it("skips an in_progress assigned standby wake target instead of escalating it", async () => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
@@ -4816,7 +4816,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
-  it("skips an in_progress assigned issue parked on a pending board approval requested by the assignee (PLA-407)", async () => {
+  it("skips an in_progress assigned issue parked on a pending board approval requested by the assignee", async () => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
@@ -4891,7 +4891,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
-  it("skips an in_progress assigned issue parked on a pending wake_assignee interaction requested by the assignee (PLA-407)", async () => {
+  it("skips an in_progress assigned issue parked on a pending wake_assignee interaction requested by the assignee", async () => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",

@@ -31,8 +31,8 @@ jobs:
 
       # The lockfile is CI-owned, so PRs may not hand-edit pnpm-lock.yaml. Two
       # exemptions: `chore/refresh-lockfile` (the dedicated refresh branch) and
-      # `sync/upstream-*` branches produced by the upstream-sync routine
-      # (PLA-589) — an upstream release merge necessarily carries upstream's
+      # `sync/upstream-*` branches produced by the upstream-sync routine —
+      # an upstream release merge necessarily carries upstream's
       # pnpm-lock.yaml, and the verify/build/e2e jobs install with
       # --frozen-lockfile, so the matching lockfile MUST travel with the sync.
       - name: Block manual lockfile edits
@@ -68,6 +68,20 @@ jobs:
 
       - name: Test no-git-push check
         run: node --test ./scripts/check-no-git-push.test.mjs
+
+      # Regression guard for CONTRIBUTING.md's "No Internal Issue References"
+      # rule: fails if the PR diff adds an internal ticket id, an instance UI
+      # link, an agent:// link, or a localhost/private-IP deep link into the
+      # instance UI. Scoped to added lines only, base...head.
+      - name: Reject internal/instance-local references added in this diff
+        if: github.event_name == 'pull_request'
+        run: >-
+          node ./scripts/check-no-internal-ids.mjs
+          "${{ github.event.pull_request.base.sha }}"
+          "${{ github.event.pull_request.head.sha }}"
+
+      - name: Test no-internal-ids check
+        run: node --test ./scripts/check-no-internal-ids.test.mjs
 
       - name: Test general-server shard partition
         run: node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs
@@ -149,10 +163,10 @@ jobs:
       - name: Verify release registry test coverage
         run: pnpm run test:release-registry
 
-      # PLA-620 — unit-test the upstream-sync routine's idempotency guard
-      # (no-op when a sync PR for the latest tag is already open). Mocks the
-      # GitHub pulls query, so no network/token is required.
-      - name: Verify upstream-sync idempotency (PLA-620)
+      # Unit-test the upstream-sync routine's idempotency guard (no-op when a
+      # sync PR for the latest tag is already open). Mocks the GitHub pulls
+      # query, so no network/token is required.
+      - name: Verify upstream-sync idempotency
         run: pnpm run test:upstream-sync
 
   general_tests:
@@ -272,11 +286,11 @@ jobs:
       - name: Build
         run: pnpm build
 
-      # PLA-376 — exercise the create-paperclip-plugin scaffold's emitted
-      # release-time manifest validation gate. Uses the scaffold's `dist/`
-      # produced by the Build step above; runs the host plugin-manifest
-      # validator against a freshly-scaffolded plugin's wiring.
-      - name: Verify scaffold manifest-validation gate (PLA-376)
+      # Exercise the create-paperclip-plugin scaffold's emitted release-time
+      # manifest validation gate. Uses the scaffold's `dist/` produced by the
+      # Build step above; runs the host plugin-manifest validator against a
+      # freshly-scaffolded plugin's wiring.
+      - name: Verify scaffold manifest-validation gate
         run: pnpm run test:scaffold-create-paperclip-plugin
 
   verify_serialized_server:
@@ -332,11 +346,11 @@ jobs:
   canary_dry_run:
     name: Canary Dry Run
     needs: [policy]
-    # PLA-551: skip on PRs. The dry-run step does `git fetch` over
-    # unauthenticated HTTPS against the fork origin, which 403s while the
-    # fork's GitHub account is suspended (PLA-549). Release canary is still
-    # exercised on push-to-master by .github/workflows/release.yml's
-    # verify_canary job, so PR runs do not need this signal.
+    # Skip on PRs. The dry-run step does `git fetch` over unauthenticated
+    # HTTPS against the fork origin, which 403s while the fork's GitHub
+    # account is suspended. Release canary is still exercised on
+    # push-to-master by .github/workflows/release.yml's verify_canary job,
+    # so PR runs do not need this signal.
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     timeout-minutes: 20

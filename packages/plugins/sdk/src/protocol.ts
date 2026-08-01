@@ -274,8 +274,8 @@ export type PluginRpcErrorCode =
  * `runId` / `agentId` are populated by the host for dispatch-style invocations
  * (executeTool, performAction). They let the host correlate a worker→host
  * callback back to the originating outer dispatch — for example, to fill in
- * `runId` on a `secrets.resolve` call from a worker built against the
- * pre-PLA-657 SDK that did not yet thread the runId itself. The values come
+ * `runId` on a `secrets.resolve` call from a worker built against an
+ * older SDK that did not yet thread the runId itself. The values come
  * entirely from the host-side dispatcher; the worker is never trusted to
  * supply them.
  */
@@ -304,9 +304,9 @@ export interface WorkerHostCallContext {
   invocationScope?: PluginInvocationScope | null;
   invalidInvocationScope?: boolean;
   /**
-   * PLA-719: the host-validated scope of the SINGLE host→worker dispatch that
+   * The host-validated scope of the SINGLE host→worker dispatch that
    * is in-flight when a worker→host call arrives without echoing a
-   * `paperclipInvocationId`. Plugins bundled against a pre-PLA-657 SDK (e.g.
+   * `paperclipInvocationId`. Plugins bundled against an older SDK (e.g.
    * platform.cad ≤0.1.7) never echo the id, so `invocationScope` cannot be
    * resolved for their callbacks. When — and only when — exactly one dispatch
    * is in-flight, that dispatch is unambiguously the one the worker is
@@ -318,7 +318,7 @@ export interface WorkerHostCallContext {
    */
   singleInFlightScope?: PluginInvocationScope | null;
   /**
-   * PLA-768: the worker-lifetime **service run-context**. Unlike
+   * The worker-lifetime **service run-context**. Unlike
    * `invocationScope`/`singleInFlightScope` — which only exist while a
    * host→worker dispatch is in-flight — this is minted once per worker process
    * and surfaced on EVERY worker→host call, so a background dispatch
@@ -373,10 +373,10 @@ export interface InitializeResult {
   /** Optional methods the worker has implemented (e.g. "validateConfig", "onEvent"). */
   supportedMethods?: string[];
   /**
-   * PLA-1824: the worker echoes `paperclipInvocationId` on every worker→host
-   * call it makes while servicing a dispatch. Declared by every SDK from
-   * PLA-657 onward; absent from the pre-PLA-657 workers (platform.cad ≤0.1.7,
-   * klipper) that PLA-719/PLA-761's `singleInFlightScope` attribution exists
+   * The worker echoes `paperclipInvocationId` on every worker→host
+   * call it makes while servicing a dispatch. Declared by every current SDK;
+   * absent from older workers (platform.cad ≤0.1.7,
+   * klipper) that the `singleInFlightScope` attribution mechanism exists
    * for.
    *
    * When this is `true` an id-less worker→host call is, by construction, a call
@@ -1169,13 +1169,13 @@ export interface WorkerToHostMethods {
   // The host looks up the active runContext keyed on (pluginDbId, runId) and
   // authorizes resolution against the DISPATCHING agent's company (not the
   // worker JWT), enforcing per-company `company_secret_bindings`. The worker is
-  // never trusted to assert which company is resolving. See PLA-655/PLA-657.
+  // never trusted to assert which company is resolving.
   "secrets.resolve": [
     params: { secretRef: string; runId: string },
     result: string,
   ];
 
-  // Secrets — borrowed-handle minting (PLA-702 / PLA-695 Control 2).
+  // Secrets — borrowed-handle minting (Control 2).
   //
   // After a plugin resolves a secret's plaintext (via `secrets.resolve` or its
   // own backend), it calls `secrets.mintHandle` to exchange the plaintext for
@@ -1188,7 +1188,7 @@ export interface WorkerToHostMethods {
   // borrowed value off the server-validated runContext, never the worker.
   // Minting also registers the value with the Control-1 value-exact redactor.
   //
-  // `secretRef` (PLA-723) is the UUID of the secret the handle borrows. The
+  // `secretRef` is the UUID of the secret the handle borrows. The
   // host uses it to look up the per-company `company_secret_bindings` row and
   // capture that binding's operator-set egress allowlist onto the handle at
   // mint time. The worker only names WHICH secret it minted; it can never
@@ -1204,7 +1204,7 @@ export interface WorkerToHostMethods {
   //
   // `runId` is the runId of the currently-executing tool dispatch; the
   // tool-dispatch `runCtx.artifacts` client always sends it. The worker-level
-  // `ctx.artifacts` client (PLA-895) omits it on the wire and the host
+  // `ctx.artifacts` client omits it on the wire and the host
   // backfills the active run-context from the worker→host
   // `paperclipInvocationId` (serviceScope/singleInFlightScope), exactly as
   // `secrets.resolve` does from service/background contexts — so the wire type
@@ -1224,7 +1224,7 @@ export interface WorkerToHostMethods {
     },
   ];
 
-  // Artifacts (attachment bytes) — INBOUND write path (PLA-888)
+  // Artifacts (attachment bytes) — INBOUND write path
   //
   // The inverse of `artifacts.fetch`. Stores `contentBase64` bytes as a
   // company-scoped Paperclip asset via the same storage backend the human
@@ -1234,7 +1234,7 @@ export interface WorkerToHostMethods {
   //
   // `runId` is the runId of the currently-executing tool dispatch (sent by the
   // tool-dispatch `runCtx.artifacts` client). The worker-level `ctx.artifacts`
-  // client (PLA-895) omits it on the wire for inbound relay loops (e.g. the
+  // client omits it on the wire for inbound relay loops (e.g. the
   // messenger `getUpdates`/`onWebhook`/`runJob` path) and the host backfills the
   // host-minted service/background run id from the worker→host
   // `paperclipInvocationId` (`backfillDispatchRunId`) before this handler runs —
@@ -1570,7 +1570,7 @@ export interface WorkerToHostMethods {
       wakeAssignee?: boolean;
       refuseClosed?: boolean;
       /**
-       * PLA-888: asset ids returned by `artifacts.create` to surface on this
+       * Asset ids returned by `artifacts.create` to surface on this
        * comment. Each must belong to the comment's company or the call is
        * rejected. Omitted/empty keeps the existing text-only behaviour.
        */
@@ -1587,7 +1587,7 @@ export interface WorkerToHostMethods {
     },
     result: IssueThreadInteraction,
   ];
-  // PLA-1438 Part A: resolve (expire) a single pending interaction the plugin is
+  // Resolve (expire) a single pending interaction the plugin is
   // relaying an operator reply to. Terminal status is always "expired"; never
   // "accepted", so this can never fire accept side-effects. Scoped to the
   // plugin's own company via host-side requireInCompany. Gated by the
@@ -1631,7 +1631,7 @@ export interface WorkerToHostMethods {
     result: void,
   ];
 
-  // Reconcile reads (PLA-923) — authoritative pending-blocker snapshot for the
+  // Reconcile reads — authoritative pending-blocker snapshot for the
   // messenger digest to seed/reconcile on worker startup. Company-scoped,
   // read-only; the host rejects kind:"all" / missing companyId.
   "approvals.list": [

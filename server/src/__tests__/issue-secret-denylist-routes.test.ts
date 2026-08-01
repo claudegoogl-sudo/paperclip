@@ -3,14 +3,14 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
- * PLA-842 AC §2 / §4: the write-block denylist is verified through the REAL
+ * The write-block denylist is verified through the REAL
  * Express route handlers and the REAL structured 422 response — the secret
  * matcher is not mocked. We drive a synthetic secret fixture through each
  * guarded surface (POST create description, PATCH description/comment/title,
  * POST comment body) and assert the API returns 422 naming the matched class,
  * the persistence service is never called (body not stored), and a clean body
  * still passes through to the service. Fixtures are synthetic, shape-valid,
- * non-live values (PLA-177 / PLA-319: zero live secret bytes).
+ * non-live values (zero live secret bytes).
  */
 
 const GITHUB_PAT = `github_pat_${"A".repeat(82)}`;
@@ -244,7 +244,7 @@ describe.sequential("issue write-block secret denylist routes", () => {
     expect(mockIssueService.create).not.toHaveBeenCalled();
   });
 
-  // PLA-842 Finding 3 regression: create-issue `title` is a stored, rendered
+  // Finding 3 regression: create-issue `title` is a stored, rendered
   // free-text field and must be guarded symmetrically with PATCH `title`. Fails
   // on pre-fix code, where the create guard only covered `description`.
   it("blocks a github_pat in a new issue title and never persists", async () => {

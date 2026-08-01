@@ -261,8 +261,8 @@ describe("createHostClientHandlers invocation company scope", () => {
   });
 });
 
-describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
-  // Pre-PLA-657 SDK plugins (e.g. cad-0.1.7) call `ctx.secrets.resolve(secretRef)`
+describe("createHostClientHandlers dispatch runId back-fill", () => {
+  // Older SDK plugins (e.g. cad-0.1.7) call `ctx.secrets.resolve(secretRef)`
   // without threading runId. The new server-side handler requires runId, so
   // the gated wrapper back-fills it from the host-validated active invocation
   // scope (set by the host's executeTool / performAction bracket). The fail-
@@ -342,7 +342,7 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
     });
   });
 
-  it("back-fills runId on secrets.resolve from the service scope (PLA-768)", async () => {
+  it("back-fills runId on secrets.resolve from the service scope", async () => {
     // A setup()-started loop (e.g. messenger getUpdates) or a background
     // dispatch resolves with NO dispatch in flight, so neither invocation nor
     // single-in-flight scope exists — only the host-minted service scope.
@@ -368,7 +368,7 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
     });
   });
 
-  it("prefers an active dispatch runId over the service scope (PLA-768)", async () => {
+  it("prefers an active dispatch runId over the service scope", async () => {
     // When both are present (a tool dispatch happens to run inside a worker that
     // also has a service scope), the active dispatch must win so the resolve is
     // attributed to the dispatching agent, not the system actor.
@@ -457,7 +457,7 @@ describe("createHostClientHandlers dispatch runId back-fill (PLA-673)", () => {
   });
 });
 
-describe("createHostClientHandlers artifacts.create capability gate (PLA-888)", () => {
+describe("createHostClientHandlers artifacts.create capability gate", () => {
   it("denies artifacts.create when the plugin lacks issue.attachments.create", async () => {
     const create = vi.fn(async () => ({ attachmentId: "att-new" }));
     const services = {
@@ -496,9 +496,9 @@ describe("createHostClientHandlers artifacts.create capability gate (PLA-888)", 
   });
 });
 
-describe("createHostClientHandlers config.get per-company scope selection (PLA-761)", () => {
+describe("createHostClientHandlers config.get per-company scope selection", () => {
   // id-less legacy workers (e.g. platform.cad ≤0.1.x) never echo a
-  // `paperclipInvocationId`, so `invocationScope` is null. PLA-719 gave the host
+  // `paperclipInvocationId`, so `invocationScope` is null. The host was given
   // a `singleInFlightScope` (the sole in-flight dispatch's company, host-derived)
   // and wired secrets.resolve/artifacts.fetch to consult it — but config.get was
   // left reading only `invocationScope`, so it fell through to the instance-wide
@@ -596,12 +596,12 @@ describe("createHostClientHandlers config.get per-company scope selection (PLA-7
   });
 });
 
-describe("createHostClientHandlers events.subscribe serviceScope (PLA-810)", () => {
+describe("createHostClientHandlers events.subscribe serviceScope", () => {
   // A single-company plugin sets its `topicMap`, so its `setup()` loop
   // subscribes with a per-company `filter` instead of unfiltered. There is no
   // active dispatch at `setup()`, so the only host-validated context is the
-  // worker-lifetime `serviceScope` (PLA-768). The gate must authorize this
-  // narrower filtered subscribe — denying it (the pre-PLA-810 bug) regressed the
+  // worker-lifetime `serviceScope`. The gate must authorize this
+  // narrower filtered subscribe — denying it (a prior bug) regressed the
   // messenger's subscriptions 5 → 0 and is a least-privilege inversion: the
   // broader unfiltered subscribe was allowed while the narrower one was denied.
   function makeEventsHandlers() {
@@ -661,14 +661,14 @@ describe("createHostClientHandlers events.subscribe serviceScope (PLA-810)", () 
     expect(subscribe).not.toHaveBeenCalled();
   });
 
-  it("allows a company-filtered subscribe under serviceScope even when base context reports invalidInvocationScope (PLA-818)", async () => {
+  it("allows a company-filtered subscribe under serviceScope even when base context reports invalidInvocationScope", async () => {
     const { handlers, subscribe } = makeEventsHandlers();
     const params = {
       eventPattern: "issue.created",
       filter: { companyId: "company-a" },
     };
 
-    // PLA-818: the inbound relay path (onWebhook / getUpdates callback with no
+    // The inbound relay path (onWebhook / getUpdates callback with no
     // resolvable dispatch id) resolves to `invalidInvocationScope` in the host's
     // base context. For an allowlisted, reach-checked method carrying a valid
     // serviceScope this must be authorized — the allowlist bypass is an
@@ -727,11 +727,12 @@ describe("createHostClientHandlers events.subscribe serviceScope (PLA-810)", () 
   });
 });
 
-describe("createHostClientHandlers serviceScope company writes/state (PLA-814)", () => {
-  // Inbound sibling of PLA-810: the messenger `getUpdates` poll loop is started
+describe("createHostClientHandlers serviceScope company writes/state", () => {
+  // Inbound sibling of the events.subscribe serviceScope allowlist: the messenger
+  // `getUpdates` poll loop is started
   // in `setup()` and runs with no active dispatch, so an operator reply it
   // routes calls `issues.createComment` (and reads company-scoped state) under
-  // the bare worker-lifetime `serviceScope` (PLA-768). The gate must authorize
+  // the bare worker-lifetime `serviceScope`. The gate must authorize
   // the narrow allowlist of company-scoped methods that cannot widen reach
   // beyond a host-pinned dispatch — createComment is entity-cross-checked
   // server-side (requireInCompany); company state is the plugin's own data.
@@ -810,11 +811,11 @@ describe("createHostClientHandlers serviceScope company writes/state (PLA-814)",
     expect(createComment).not.toHaveBeenCalled();
   });
 
-  it("allows issues.createComment under serviceScope even when base context reports invalidInvocationScope (PLA-818 inbound relay)", async () => {
-    // PLA-818: the live inbound path — an operator reply routed through
+  it("allows issues.createComment under serviceScope even when base context reports invalidInvocationScope (inbound relay)", async () => {
+    // The live inbound path — an operator reply routed through
     // onWebhook/getUpdates — produces a worker→host createComment whose base
     // context is `invalidInvocationScope` (no resolvable dispatch id). The
-    // PLA-814 allowlist bypass must reach this call: placing the invalid-scope
+    // serviceScope allowlist bypass must reach this call: placing the invalid-scope
     // throw first (the fork.16 bug) made the bypass dead code for the only path
     // it exists to serve. The grant is reach-bounded (server-side
     // requireInCompany) and identical to the scope-less `{}` case already
@@ -832,7 +833,7 @@ describe("createHostClientHandlers serviceScope company writes/state (PLA-814)",
   });
 
   it("still fails closed for a NON-allowlisted company-scoped method under invalidInvocationScope + serviceScope (issues.list)", async () => {
-    // PLA-818 must NOT widen the bypass beyond SERVICE_SCOPE_COMPANY_METHODS.
+    // This bypass must NOT widen beyond SERVICE_SCOPE_COMPANY_METHODS.
     // issues.list trusts companyId as the sole authority (no entity
     // cross-check), so the invalid-scope rejection retains full force for it
     // even with a valid serviceScope present — this is where the throw's
@@ -886,7 +887,7 @@ describe("createHostClientHandlers serviceScope company writes/state (PLA-814)",
   });
 });
 
-describe("createHostClientHandlers issues.resolveInteraction capability + serviceScope (PLA-1438 Part A)", () => {
+describe("createHostClientHandlers issues.resolveInteraction capability + serviceScope", () => {
   // The messenger auto-resolves the interaction an operator answered by free
   // text, from its inbound relay path (no active dispatch → bare serviceScope).
   // The resolve is default-deny (issue.interactions.resolve, messenger-only) and
@@ -972,7 +973,7 @@ describe("createHostClientHandlers issues.resolveInteraction capability + servic
   });
 });
 
-describe("createHostClientHandlers reconcile reads (PLA-923)", () => {
+describe("createHostClientHandlers reconcile reads", () => {
   // The messenger digest seeds/reconciles its pending-blocker set on worker
   // startup by reading the authoritative live set. These reads run from a
   // setup()-started context with no active dispatch, so they must be authorized

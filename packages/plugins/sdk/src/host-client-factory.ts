@@ -110,7 +110,7 @@ export interface HostServices {
      */
     get(): Promise<Record<string, unknown>>;
     /**
-     * PLA-677: Return the effective plugin configuration for `companyId`,
+     * Return the effective plugin configuration for `companyId`,
      * i.e. the instance-wide config merged with this tenant's
      * `plugin_company_settings.settingsJson.configOverrides`.
      *
@@ -185,12 +185,13 @@ export interface HostServices {
    *    toolName).
    * 5. Return base64-encoded bytes plus metadata.
    *
-   * See PLA-574 for the threat model and the seven-point security checklist.
+   * See the threat model and the seven-point security checklist for the full
+   * design rationale.
    */
   artifacts: {
     fetch(params: WorkerToHostMethods["artifacts.fetch"][0]): Promise<WorkerToHostMethods["artifacts.fetch"][1]>;
     /**
-     * Provides `artifacts.create` (PLA-888) — host-mediated inbound attachment
+     * Provides `artifacts.create` — host-mediated inbound attachment
      * store. Inverse of `artifacts.fetch`. The service implementation must:
      * 1. Resolve the runContext keyed on `(pluginId, runId)`.
      * 2. Authorize `params.companyId` against the dispatching/service company
@@ -298,12 +299,12 @@ export interface HostServices {
     delete(params: WorkerToHostMethods["issues.documents.delete"][0]): Promise<WorkerToHostMethods["issues.documents.delete"][1]>;
   };
 
-  /** Provides `approvals.list` — reconcile read of pending board approvals (PLA-923). */
+  /** Provides `approvals.list` — reconcile read of pending board approvals. */
   approvals: {
     list(params: WorkerToHostMethods["approvals.list"][0]): Promise<WorkerToHostMethods["approvals.list"][1]>;
   };
 
-  /** Provides `interactions.list` — reconcile read of pending issue interactions (PLA-923). */
+  /** Provides `interactions.list` — reconcile read of pending issue interactions. */
   interactions: {
     list(params: WorkerToHostMethods["interactions.list"][0]): Promise<WorkerToHostMethods["interactions.list"][1]>;
   };
@@ -452,14 +453,14 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   // Secrets
   "secrets.resolve": "secrets.read-ref",
   // Minting a borrowed handle is part of resolving a secret-ref, so it shares
-  // the same capability gate (PLA-702 Control 2).
+  // the same capability gate.
   "secrets.mintHandle": "secrets.read-ref",
 
   // Artifacts — no capability gate: tool-dispatch implies attachment-read
-  // (host enforces dispatching-agent authz via runContext lookup). See PLA-574.
+  // (host enforces dispatching-agent authz via runContext lookup).
   "artifacts.fetch": null,
   // Writing an attachment is a privileged mutation (unlike read), so it IS
-  // gated behind a dedicated default-deny capability. See PLA-888.
+  // gated behind a dedicated default-deny capability.
   "artifacts.create": "issue.attachments.create",
 
   // Activity
@@ -521,7 +522,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   "issues.createInteraction": "issue.interactions.create",
   "issues.resolveInteraction": "issue.interactions.resolve",
 
-  // Reconcile reads (PLA-923)
+  // Reconcile reads
   "approvals.list": "board.approvals.read",
   "interactions.list": "issue.interactions.read",
 
@@ -574,7 +575,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
 
 /**
  * Company-scoped worker→host methods that are safe to run under the bare,
- * host-minted `serviceScope` (PLA-768) — i.e. from a background dispatch or a
+ * host-minted `serviceScope` — i.e. from a background dispatch or a
  * `setup()`-started loop (e.g. the messenger `getUpdates` poll loop) with NO
  * active dispatch to pin a tenant. Every other company-scoped method keeps
  * failing closed in that state.
@@ -584,7 +585,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
  * `serviceScope` only relaxes *timing* (act while idle), never reach. Three
  * distinct safety arguments, one per entry:
  *
- *  - `events.subscribe` (PLA-810): a company filter requests a STRICT SUBSET of
+ *  - `events.subscribe`: a company filter requests a STRICT SUBSET of
  *    the unconditionally-allowed unfiltered subscribe; the host event bus only
  *    ever *removes* events that fail the filter, so a filter can only NARROW
  *    visibility, never widen it.
@@ -599,7 +600,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
  *    `issue.*` already comments on every company's issues, one dispatch at a
  *    time); serviceScope only removes the "must be mid-dispatch" timing
  *    constraint.
- *  - `artifacts.create` (PLA-888): the host service stores the asset under the
+ *  - `artifacts.create`: the host service stores the asset under the
  *    claimed `companyId`'s own storage namespace only and binds it to that
  *    company's issues; a worker-forged `companyId` cannot reach a foreign
  *    tenant's data, and the human-upload size ceiling + per-company rate limit
@@ -607,7 +608,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
  *    equals the plugin's dispatch-lifetime reach; serviceScope only relaxes the
  *    timing constraint so an inbound relay (e.g. Telegram webhook) can store
  *    while idle.
- *  - `issues.resolveInteraction` (PLA-1438): identical reach argument to
+ *  - `issues.resolveInteraction`: identical reach argument to
  *    `issues.createComment`. The host service independently verifies the target
  *    interaction belongs to the claimed company AND issue (`requireInCompany` +
  *    interaction company/issue cross-check), so a worker-forged `companyId`
@@ -616,7 +617,7 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
  *    no accept side-effects and no continuation wake. The reachable set equals
  *    the plugin's dispatch-lifetime reach; serviceScope only lets the inbound
  *    Telegram relay retire the pending confirmation it just answered while idle.
- *  - `approvals.list` / `interactions.list` (PLA-923): these reconcile reads run
+ *  - `approvals.list` / `interactions.list`: these reconcile reads run
  *    a real, method-scoped plugin↔company availability gate
  *    (`requirePluginEnabledForCompany` in plugin-host-services) BEFORE any
  *    query and fail closed if the plugin is not installed+enabled for the
@@ -691,12 +692,12 @@ export function createHostClientHandlers(
 
   /**
    * Back-fill `runId` on a worker→host params record from the host-validated
-   * active invocation scope when the worker omitted it. PLA-657 changed the
-   * SDK signature of `ctx.secrets.resolve()` to require `runId`; plugins
-   * bundled against the pre-PLA-657 SDK still call without it, which would
-   * otherwise fail closed at the server's secrets handler (PLA-673). The
+   * active invocation scope when the worker omitted it. A prior SDK change
+   * to the signature of `ctx.secrets.resolve()` made `runId` required; plugins
+   * bundled against the older SDK still call without it, which would
+   * otherwise fail closed at the server's secrets handler. The
    * runId we fill in here came from the host's own outer dispatch — never
-   * from the worker — so the security invariants of PLA-657/PLA-574 are
+   * from the worker — so the security invariants of that isolation model are
    * preserved.
    *
    * Only writes when (a) the worker omitted `runId` AND (b) a host-validated
@@ -704,15 +705,17 @@ export function createHostClientHandlers(
    *
    * The scope is sourced, in order, from:
    *   1. `context.invocationScope` — the worker echoed a `paperclipInvocationId`
-   *      the host resolved to an active dispatch (post-PLA-657 SDKs).
-   *   2. `context.singleInFlightScope` — PLA-719: the worker echoed no id (a
-   *      pre-PLA-657 SDK such as platform.cad ≤0.1.7), but exactly one
+   *      the host resolved to an active dispatch (SDKs that thread the
+   *      invocation id).
+   *   2. `context.singleInFlightScope` — the worker echoed no id (a legacy SDK
+   *      such as platform.cad ≤0.1.7 that predates invocation-id threading),
+   *      but exactly one
    *      host→worker dispatch is in-flight, so the host attributes the callback
    *      to it. Both come from the host's own runContext, never from the worker,
-   *      so the PLA-657/PLA-574 isolation model holds: a forged worker→host call
+   *      so the isolation model holds: a forged worker→host call
    *      outside any dispatch surfaces no scope here and still fails closed at
    *      the server's secrets handler (`runcontext_invalid`).
-   *   3. `context.serviceScope` — PLA-768: the host-minted, worker-lifetime
+   *   3. `context.serviceScope` — the host-minted, worker-lifetime
    *      service run-context, surfaced on EVERY worker→host call. It is the
    *      fallback for a background dispatch (`onEvent`/`onWebhook`/`runJob`) or
    *      a loop started in `setup()` (e.g. a `getUpdates` long-poll) that calls
@@ -722,7 +725,7 @@ export function createHostClientHandlers(
    *      system actor at the server with the company derived from the secret
    *      binding — it grants no company scope here.
    *
-   * PLA-1838: `serviceScope` being host-minted is NOT on its own a tenant-
+   * `serviceScope` being host-minted is NOT on its own a tenant-
    * isolation argument for `secrets.resolve`. `contextForWorkerMessage`
    * attaches `serviceScope` unconditionally, so whenever the host attributes a
    * call to a single in-flight dispatch BOTH keys are present and (2) shadows
@@ -731,8 +734,8 @@ export function createHostClientHandlers(
    * no-dispatch caller reaching this with someone else's `singleInFlightScope`
    * resolves that tenant's secret. What keeps (2) off a no-dispatch caller is
    * the host, not this precedence chain: see `baseContextForWorkerMessage` in
-   * plugin-worker-manager (PLA-1824's worker-declared `echoesInvocationId` plus
-   * PLA-1838's host-observed per-method signal). Reordering the chain here is
+   * plugin-worker-manager (the worker-declared `echoesInvocationId` plus
+   * the host-observed per-method signal). Reordering the chain here is
    * NOT the fix — for a legacy id-less worker servicing its own dispatch, (2)
    * is the correct binding and (3) is not.
    */
@@ -783,15 +786,15 @@ export function createHostClientHandlers(
 
     const allowedCompanyId = readNonEmptyString(context?.invocationScope?.companyId);
     if (!allowedCompanyId) {
-      // PLA-810 / PLA-814 / PLA-818: when no dispatch pins a company, authorize
+      // When no dispatch pins a company, authorize
       // the narrow allowlist of company-scoped methods carrying the host-minted,
-      // worker-lifetime `serviceScope` (PLA-768) — i.e. a background dispatch or
+      // worker-lifetime `serviceScope` — i.e. a background dispatch or
       // a loop started in `setup()` (e.g. the messenger `getUpdates` poll loop /
       // inbound `onWebhook` route) that cannot widen the plugin's reach beyond
       // what a host-pinned dispatch already grants (see
       // `SERVICE_SCOPE_COMPANY_METHODS` for the per-method safety argument).
       //
-      // PLA-818 (guard-ordering fix): this bypass is evaluated BEFORE the
+      // Guard-ordering fix: this bypass is evaluated BEFORE the
       // `invalidInvocationScope` rejection below. The inbound relay path resolves
       // to `invalidInvocationScope` in the host's base context (the worker→host
       // callback carries no resolvable dispatch id — see `contextForWorkerMessage`
@@ -895,11 +898,11 @@ export function createHostClientHandlers(
   return {
     // Config
     "config.get": gated("config.get", async (_params, context) => {
-      // PLA-677: When the invocation carries a company scope and the host
+      // When the invocation carries a company scope and the host
       // implements per-tenant config delivery, return the company-scoped
       // effective config; otherwise fall back to the instance-wide config.
       //
-      // PLA-761: id-less legacy workers (e.g. platform.cad ≤0.1.x) echo no
+      // Id-less legacy workers (e.g. platform.cad ≤0.1.x) echo no
       // `paperclipInvocationId`, so `invocationScope` is null. Consult the same
       // host-validated `singleInFlightScope` the runId backfill uses
       // (`backfillDispatchRunId`) so their per-tenant config — and the secret
@@ -984,7 +987,7 @@ export function createHostClientHandlers(
 
     // Secrets
     "secrets.resolve": gated("secrets.resolve", async (params, context) => {
-      // PLA-673 back-compat: plugins bundled against the pre-PLA-657 SDK send
+      // Back-compat: plugins bundled against the older SDK send
       // `{ secretRef }` with no `runId`. Back-fill from the host-validated
       // active invocation scope (populated by the host's executeTool /
       // performAction bracket in plugin-worker-manager.ts:deriveInvocationScope)
@@ -996,7 +999,7 @@ export function createHostClientHandlers(
       return services.secrets.resolve(enriched);
     }),
 
-    // Secrets — borrowed-handle minting (PLA-702 Control 2). Same dispatch
+    // Secrets — borrowed-handle minting (Control 2). Same dispatch
     // run-id back-fill as `secrets.resolve`; the host keys the borrowed value
     // off the server-validated runContext and fail-closes outside a dispatch.
     "secrets.mintHandle": gated("secrets.mintHandle", async (params, context) => {
@@ -1004,16 +1007,16 @@ export function createHostClientHandlers(
       return services.secrets.mintHandle(enriched);
     }),
 
-    // Artifacts (PLA-574) — host enforces dispatching-agent authz via runContext
+    // Artifacts — host enforces dispatching-agent authz via runContext
     "artifacts.fetch": gated("artifacts.fetch", async (params, context) => {
-      // Same back-fill as secrets.resolve. The post-PLA-574 SDK threaded
+      // Same back-fill as secrets.resolve. The current SDK threads
       // runId here from day one, so this only kicks in for legacy callers
       // that bundled an older SDK.
       const enriched = backfillDispatchRunId(params, context);
       return services.artifacts.fetch(enriched);
     }),
 
-    // Artifacts write (PLA-888) — gated behind issue.attachments.create.
+    // Artifacts write — gated behind issue.attachments.create.
     // Same runId back-fill as fetch; the host re-validates company scope and
     // enforces size/mime/idempotency before storing.
     "artifacts.create": gated("artifacts.create", async (params, context) => {
@@ -1167,7 +1170,7 @@ export function createHostClientHandlers(
       return services.issues.resolveInteraction(params);
     }),
 
-    // Reconcile reads (PLA-923) — pending-blocker snapshot for the messenger
+    // Reconcile reads — pending-blocker snapshot for the messenger
     // digest. Beyond the capability + serviceScope gates, each handler hard-
     // rejects a missing/empty `companyId` here. `requestedCompanyScope` maps a
     // missing companyId to `kind:"none"`, which makes `requireInvocationCompanyScope`

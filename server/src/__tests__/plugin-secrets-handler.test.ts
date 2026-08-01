@@ -1,13 +1,13 @@
 /**
- * PLA-657 — tests for the company-scoped `secrets.resolve` handler.
+ * Tests for the company-scoped `secrets.resolve` handler.
  *
- * Covers the SecurityEngineer isolation matrix signed off on PLA-655/PLA-656:
+ * Covers the SecurityEngineer isolation matrix:
  *  - same-company + bound → resolves
  *  - cross-company (real UUID) → not_found, BYTE-IDENTICAL to a nonexistent UUID
  *  - no / forged runContext → runcontext_invalid
  *  - not-bound (or not in the per-company allow-list) → not_found
  *  - rotation honored (handler never caches the resolved value)
- *  - error messages / payload contain no ref or value (PLA-190/PLA-193, R2)
+ *  - error messages / payload contain no ref or value (R2)
  *  - rate limiter keyed on (agent) + (agent, company) — never pluginId (R3),
  *    and one company cannot exhaust another company's bucket
  *  - every distinguishable resolver error collapses to one not_found (R1)
@@ -271,7 +271,7 @@ describe("createPluginSecretsHandler — company-scoped resolution", () => {
     expect(lastInput.actorType).toBe("plugin");
     expect(lastInput.companyId).toBe(COMPANY_A);
     expect(lastInput.details.outcome).toBe("allowed");
-    // PLA-806 (AC3): a foreground agent dispatch carries a REAL heartbeat run,
+    // AC3: a foreground agent dispatch carries a REAL heartbeat run,
     // so run_id is populated with the dispatch runId — never nulled — and the
     // synthetic-run markers used by the background/service paths are absent.
     expect(lastInput.runId).toBe(runId);
