@@ -87,6 +87,9 @@ jobs:
       - name: Test standalone package build concurrency
         run: node --test ./scripts/__tests__/build-standalone-concurrency.test.mjs
 
+      - name: Test host disk janitor
+        run: node --test ./scripts/host-disk-janitor.test.mjs
+
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
 
