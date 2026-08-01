@@ -3,50 +3,40 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { and, eq, or, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
-  agentRuntimeState,
   agentWakeupRequests,
   approvals,
   budgetPolicies,
-  companySecretBindings,
-  companySecrets,
-  companySkills,
   companies,
   costEvents,
-  documentAnnotationAnchorSnapshots,
-  documentAnnotationComments,
-  documentAnnotationThreads,
   createDb,
   documentRevisions,
   documents,
   environmentLeases,
   environments,
-  executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
   issueApprovals,
   issueComments,
   issueDocuments,
-  issuePlanDecompositions,
   issueRecoveryActions,
   issueRelations,
   issueThreadInteractions,
-  issueTreeHoldMembers,
   issueTreeHolds,
   issueWorkProducts,
   issues,
   projects,
   projectWorkspaces,
-  workspaceOperations,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import { runningProcesses } from "../adapters/index.ts";
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 const mockTrackAgentFirstHeartbeat = vi.hoisted(() => vi.fn());
@@ -168,20 +158,6 @@ async function waitForRunToSettle(
   return heartbeat.getRun(runId);
 }
 
-async function waitForValue<T>(
-  read: () => Promise<T | null | undefined>,
-  timeoutMs = 3_000,
-) {
-  const deadline = Date.now() + timeoutMs;
-  let latest: T | null | undefined = null;
-  while (Date.now() < deadline) {
-    latest = await read();
-    if (latest) return latest;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  return latest ?? null;
-}
-
 async function waitForHeartbeatIdle(
   db: ReturnType<typeof createDb>,
   timeoutMs = 3_000,
@@ -200,59 +176,18 @@ async function waitForHeartbeatIdle(
   }
 }
 
-async function cancelActiveRunsForCleanup(
-  db: ReturnType<typeof createDb>,
+async function waitForValue<T>(
+  read: () => Promise<T | null | undefined>,
   timeoutMs = 3_000,
 ) {
   const deadline = Date.now() + timeoutMs;
+  let latest: T | null | undefined = null;
   while (Date.now() < deadline) {
-    const activeRuns = await db
-      .select({
-        id: heartbeatRuns.id,
-        wakeupRequestId: heartbeatRuns.wakeupRequestId,
-      })
-      .from(heartbeatRuns)
-      .where(
-        or(
-          eq(heartbeatRuns.status, "queued"),
-          eq(heartbeatRuns.status, "running"),
-        ),
-      );
-
-    if (activeRuns.length === 0) return;
-
-    const now = new Date();
-    const runIds = activeRuns.map((run) => run.id);
-    const wakeupRequestIds = activeRuns
-      .map((run) => run.wakeupRequestId)
-      .filter((value): value is string => typeof value === "string" && value.length > 0);
-
-    await db
-      .update(heartbeatRuns)
-      .set({
-        status: "cancelled",
-        finishedAt: now,
-        updatedAt: now,
-        errorCode: "test_cleanup",
-        error: "Cancelled by heartbeat-process-recovery test cleanup",
-        processPid: null,
-        processGroupId: null,
-      })
-      .where(inArray(heartbeatRuns.id, runIds));
-
-    if (wakeupRequestIds.length > 0) {
-      await db
-        .update(agentWakeupRequests)
-        .set({
-          status: "cancelled",
-          finishedAt: now,
-          error: "Cancelled by heartbeat-process-recovery test cleanup",
-        })
-        .where(inArray(agentWakeupRequests.id, wakeupRequestIds));
-    }
-
+    latest = await read();
+    if (latest) return latest;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
+  return latest ?? null;
 }
 
 async function spawnOrphanedProcessGroup() {
@@ -334,115 +269,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       }
     }
     cleanupPids.clear();
-    await cancelActiveRunsForCleanup(db, 5_000);
-    let idlePolls = 0;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      const runs = await db
-        .select({
-          status: heartbeatRuns.status,
-          processPid: heartbeatRuns.processPid,
-          processGroupId: heartbeatRuns.processGroupId,
-        })
-        .from(heartbeatRuns);
-      const managedExecutionStillActive = runs.some(
-        (run) =>
-          (run.status === "queued" || run.status === "running") &&
-          !run.processPid &&
-          !run.processGroupId,
-      );
-      if (!managedExecutionStillActive) {
-        idlePolls += 1;
-        if (idlePolls >= 3) break;
-      } else {
-        idlePolls = 0;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    await waitForHeartbeatIdle(db, 5_000);
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await db.delete(activityLog);
-    await db.delete(agentRuntimeState);
-    await db.delete(companySkills);
-    await db.delete(costEvents);
-    await db.delete(workspaceOperations);
-    await db.delete(environmentLeases);
+    // Real spawned/killed processes and in-flight recovery code paths keep writing
+    // heartbeat_runs/agent_wakeup_requests (and friends) in the background after
+    // the test function returns; see resetEmbeddedPostgresTestDatabase for why an
+    // atomic TRUNCATE ... CASCADE doesn't race that write burst the way an
+    // ordered per-table DELETE chain does.
+    await resetEmbeddedPostgresTestDatabase(db);
+    // environments is a global table, not FK-chained to companies, so the
+    // TRUNCATE ... CASCADE above doesn't touch it.
     await db.delete(environments);
-    await db.delete(issuePlanDecompositions);
-    await db.delete(issueThreadInteractions);
-    await db.delete(documentAnnotationComments);
-    await db.delete(documentAnnotationAnchorSnapshots);
-    await db.delete(documentAnnotationThreads);
-    await db.delete(issueWorkProducts);
-    await db.delete(issueComments);
-    await db.delete(issueDocuments);
-    await db.delete(documentRevisions);
-    await db.delete(documents);
-    await db.delete(issueRelations);
-    await db.delete(issueRecoveryActions);
-    await db.delete(issueTreeHoldMembers);
-    await db.delete(issueTreeHolds);
-    await db.delete(issueApprovals);
-    await db.delete(approvals);
-    await db.delete(issueThreadInteractions);
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await db.delete(issueComments);
-      await db.delete(issueDocuments);
-      try {
-        await db.delete(issues);
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await db.delete(activityLog);
-      await db.delete(heartbeatRunEvents);
-      try {
-        await db.delete(heartbeatRuns);
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-    await db.delete(agentWakeupRequests);
-    await db.delete(budgetPolicies);
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await db.delete(agentRuntimeState);
-      try {
-        await db.delete(agents);
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await db.delete(companySkills);
-      await db.delete(workspaceOperations);
-      await db.delete(executionWorkspaces);
-      await db.delete(projectWorkspaces);
-      await db.delete(projects);
-      await db.delete(issuePlanDecompositions);
-      await db.delete(issueThreadInteractions);
-      await db.delete(documentAnnotationComments);
-      await db.delete(documentAnnotationAnchorSnapshots);
-      await db.delete(documentAnnotationThreads);
-      await db.delete(issueDocuments);
-      await db.delete(documentRevisions);
-      await db.delete(documents);
-      await db.delete(companySecretBindings);
-      await db.delete(companySecrets);
-      try {
-        await db.delete(companies);
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
   });
 
   afterAll(async () => {

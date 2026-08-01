@@ -5,19 +5,15 @@ import {
   activityLog,
   agents,
   agentWakeupRequests,
-  agentRuntimeState,
   budgetPolicies,
   companies,
   companyMemberships,
-  companySkills,
   costEvents,
   createDb,
   executionWorkspaces,
-  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueRelations,
-  issueTreeHoldMembers,
   issueTreeHolds,
   issues,
   projects,
@@ -28,6 +24,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -97,31 +94,16 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     // on-demand wake, which dispatches a heartbeat run fire-and-forget (see
     // startNextQueuedRunForAgent → executeRun in the heartbeat service). That
     // background run keeps writing rows (workspace_operations, heartbeat_run_events)
-    // after the awaited call resolves. Deterministically await those in-flight
-    // executions before clearing tables — otherwise an escaping heartbeat_run_events
-    // insert can land between the events delete and the heartbeat_runs delete and
-    // trip the run_events → runs foreign key.
+    // after the awaited call resolves. drainActiveRunExecutions() is a genuine
+    // deterministic wait (it awaits the real in-flight promises the heartbeat
+    // service registers, not a timeout-based poll), so it's worth keeping ahead
+    // of the reset even though resetEmbeddedPostgresTestDatabase's atomic
+    // TRUNCATE ... CASCADE no longer races a write burst the way an ordered
+    // per-table DELETE chain did.
     await heartbeatService(db).drainActiveRunExecutions();
-    await db.delete(activityLog);
-    await db.delete(heartbeatRunEvents);
-    await db.delete(costEvents);
-    await db.delete(workspaceOperations);
-    await db.delete(issueComments);
-    await db.delete(issueTreeHoldMembers);
-    await db.delete(issueTreeHolds);
-    await db.delete(issueRelations);
-    await db.delete(issues);
-    await db.delete(executionWorkspaces);
-    await db.delete(projectWorkspaces);
-    await db.delete(projects);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(budgetPolicies);
-    await db.delete(agents);
-    await db.delete(companyMemberships);
-    await db.delete(companySkills);
-    await db.delete(companies);
+    await resetEmbeddedPostgresTestDatabase(db);
+    // instance_settings is a global table, not FK-chained to companies, so the
+    // TRUNCATE ... CASCADE above doesn't touch it.
     await instanceSettingsService(db).updateExperimental({
       enableIssueGraphLivenessAutoRecovery: false,
       enableIsolatedWorkspaces: false,
