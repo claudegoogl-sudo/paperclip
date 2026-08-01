@@ -8,8 +8,8 @@ import {
   sweepOrphanedEmbeddedPostgresDataDirs,
 } from "./test-embedded-postgres.js";
 
-// PLA-2020: a killed test run (SIGKILL mid-suite) never runs cleanup(), so
-// the ~170MB embedded-Postgres datadir it created is orphaned in os.tmpdir().
+// A killed test run (SIGKILL mid-suite) never runs cleanup(), so the
+// ~170MB embedded-Postgres datadir it created is orphaned in os.tmpdir().
 // These tests cover the startup sweep that reclaims those datadirs, without
 // needing a real Postgres cluster.
 
