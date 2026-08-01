@@ -16,10 +16,21 @@
  *     modifications (`git status --porcelain --untracked-files=no`) whose
  *     HEAD is reachable from at least one remote-tracking branch. Anything
  *     else (stranded commits, tracked edits) is left alone regardless of age.
- *   - All four categories additionally require the directory/file to be
- *     older than its retention threshold, where "age" is the newest mtime of
- *     any file *inside* the tree (never a top-level directory mtime, which a
- *     host reboot resets for everything at once).
+ *   - Backups, run-logs, and worktrees additionally require the directory/
+ *     file to be older than its retention threshold, where "age" is the
+ *     newest mtime of any file *inside* the tree (never a top-level
+ *     directory mtime, which a host reboot resets for everything at once).
+ *   - `/tmp` agent scratch is gated on *liveness*, not age: every real
+ *     scratch directory on this host is 0 days old at any given moment (an
+ *     agent run creates one, uses it, and never cleans it up), so an
+ *     age-only cutoff -- even a short one -- would either delete a live
+ *     run's scratch the instant it goes quiet for a build, or never fire at
+ *     all. A directory is only reap-eligible once no live process anywhere
+ *     on the host has it open as a cwd or file descriptor (see
+ *     isPathReferencedByLiveProcess), which stays true for a run that is
+ *     blocked and has touched nothing for hours. Age is then only a
+ *     small defense-in-depth floor against the sub-second `mkdtemp` race,
+ *     not the liveness determination itself.
  *   - Deleting a worktree directory does not destroy any commit: this host's
  *     worktrees all share one object store (see WORKTREE_ROOTS below) and
  *     branches are additionally pushed to `fork` and `origin`. Only
@@ -43,6 +54,12 @@ import {
   unlinkSync,
   mkdirSync,
   writeFileSync,
+  openSync,
+  fstatSync,
+  readSync,
+  closeSync,
+  readlinkSync,
+  realpathSync,
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -55,6 +72,7 @@ import { fileURLToPath } from "node:url";
 // ---------------------------------------------------------------------------
 const HOME = process.env.PLA_JANITOR_HOME_DIR || os.homedir();
 const DAY_MS = 24 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
 
 export const CONFIG = {
   // -- DB backup dumps: ~/.paperclip/instances/default/data/backups --
@@ -113,7 +131,21 @@ export const CONFIG = {
   // `pla2008-...`) so it cannot collide with `playwright*`.
   TMP_DIR: process.env.PLA_JANITOR_TMP_DIR || os.tmpdir(),
   TMP_SCRATCH_PATTERNS: [/^pcvt-/, /^pla\d/],
-  TMP_MAX_AGE_DAYS: 30,
+  // Liveness -- not age -- is the primary reap gate for this bucket (see
+  // isPathReferencedByLiveProcess/evaluateTmpEntry below). A 30-day age
+  // cutoff was the actual bug this ticket exists to fix: every real
+  // scratch directory on the host is 0 days old at any given moment, so a
+  // day-scale TTL reclaims nothing, indefinitely, while /tmp fills the disk
+  // in hours. TMP_SCRATCH_MIN_AGE_HOURS is a much shorter defense-in-depth
+  // floor -- it only guards the sub-second race between `mkdtemp` and the
+  // owning process's first write -- never the primary "is this run done"
+  // determination, which is liveness, not staleness.
+  TMP_SCRATCH_MIN_AGE_HOURS: 4,
+  // Root of the process table to scan for cwd/fd references into a
+  // candidate scratch directory. Overridable so tests can point this at a
+  // synthetic tree of fake pid/cwd/fd symlinks instead of the real live
+  // process table.
+  PROC_ROOT: process.env.PLA_JANITOR_PROC_ROOT || "/proc",
 
   // -- disk alarm --
   DISK_ALARM_PATH: process.env.PLA_JANITOR_DISK_PATH || "/",
@@ -490,10 +522,140 @@ export function scanTmpCandidates(config = CONFIG) {
     .map((e) => path.join(config.TMP_DIR, e.name));
 }
 
-export function evaluateTmpEntry(entryPath, nowMs, config = CONFIG) {
-  const cutoffMs = nowMs - config.TMP_MAX_AGE_DAYS * DAY_MS;
+/**
+ * Extracts the PID embedded in a `pcvt-<pid>-<invocation>-<rand>` vitest
+ * scratch-root name (see scripts/run-vitest-stable.mjs, which mints one via
+ * `mkdtempSync` and never cleans it up -- that's the whole reason this
+ * bucket exists). Returns `null` for any other shape, including the ad hoc
+ * `pla<ticket>...` agent-scratch directories, which carry no embedded PID.
+ */
+export function extractPcvtPid(dirName) {
+  const match = /^pcvt-(\d+)-/.exec(dirName);
+  return match ? Number(match[1]) : null;
+}
+
+/** True if `pid` names a currently-running process under `procRoot`. */
+function pidIsAlive(pid, procRoot) {
+  return existsSync(path.join(procRoot, String(pid)));
+}
+
+/**
+ * Resolves the cwd and every open file-descriptor target for every process
+ * currently visible under `config.PROC_ROOT`, in one pass over the process
+ * table. Best-effort: a process that exits mid-scan, or a fd/cwd link that
+ * disappears between `readdir` and `readlink`, is skipped, never treated as
+ * an error -- the janitor runs as the same user as every agent/build
+ * process on this host, so a persistent EACCES here would only ever come
+ * from a kernel thread that cannot hold a /tmp scratch handle in the first
+ * place.
+ *
+ * Callers evaluating many candidates (see `run()`) must call this exactly
+ * once and reuse the result -- re-walking every process's every open fd
+ * per-candidate turns an O(processes) scan into O(candidates * processes),
+ * which is minutes of disk-bound syscalls on a host with a few hundred
+ * scratch dirs and a few hundred processes, and is not an acceptable cost
+ * for a job meant to run unattended and frequently.
+ */
+export function collectLiveProcessTargets(config = CONFIG) {
+  const procRoot = config.PROC_ROOT;
+  const targets = [];
+  let pidDirs;
+  try {
+    pidDirs = readdirSync(procRoot, { withFileTypes: true });
+  } catch {
+    return targets;
+  }
+  for (const entry of pidDirs) {
+    if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+    const pidDir = path.join(procRoot, entry.name);
+    try {
+      targets.push(readlinkSync(path.join(pidDir, "cwd")));
+    } catch {
+      // process gone, or no cwd link (kernel thread) -- skip
+    }
+    let fdEntries;
+    try {
+      fdEntries = readdirSync(path.join(pidDir, "fd"));
+    } catch {
+      continue;
+    }
+    for (const fd of fdEntries) {
+      try {
+        targets.push(readlinkSync(path.join(pidDir, "fd", fd)));
+      } catch {
+        // fd closed between readdir and readlink -- skip
+      }
+    }
+  }
+  return targets;
+}
+
+/**
+ * The positive liveness signal /tmp scratch reaping is gated on: true if
+ * any currently-running process has `dirPath` (or anything inside it) open
+ * as its cwd or as a file descriptor. Unlike file mtime, this stays true
+ * for a process that is blocked -- mid network call, mid build -- and has
+ * touched nothing inside the directory for hours. That is exactly the case
+ * acceptance criterion 2 calls out: absence of recent writes must never be
+ * read as "the run is done".
+ *
+ * A file descriptor pointing at an unlinked-but-still-open path (which the
+ * kernel renders as `<path> (deleted)`) still counts as a live reference --
+ * create-then-unlink-but-keep-open is a common temp-file pattern (Postgres
+ * fixtures in particular), and treating it as "no longer referenced" would
+ * be exactly the wrong direction to be wrong in here.
+ *
+ * `liveTargets` lets a caller iterating many candidates pass in a single
+ * `collectLiveProcessTargets()` result instead of re-scanning /proc per
+ * candidate; when omitted it is collected fresh (used by direct/test
+ * callers evaluating one path in isolation).
+ */
+export function isPathReferencedByLiveProcess(dirPath, config = CONFIG, liveTargets = null) {
+  let resolvedDir;
+  try {
+    resolvedDir = realpathSync(dirPath);
+  } catch {
+    return false; // already gone -- nothing left to protect
+  }
+  const targets = liveTargets ?? collectLiveProcessTargets(config);
+  for (const target of targets) {
+    if (target === resolvedDir || isPathAncestorOf(resolvedDir, target)) return true;
+  }
+  return false;
+}
+
+/**
+ * A scratch entry is eligible only once liveness is positively ruled out
+ * two ways, then confirmed old enough to clear the race-window floor:
+ *
+ *   1. No live process anywhere on the host has the directory open as its
+ *      cwd or as any file descriptor (isPathReferencedByLiveProcess).
+ *   2. For the `pcvt-<pid>-...` naming shape specifically, the embedded PID
+ *      is no longer running. This catches the gap the fd/cwd scan alone
+ *      can miss: a vitest invocation whose child process hasn't yet (or
+ *      ever, for a test group that touches no files) opened anything under
+ *      its TMPDIR, but whose parent `run-vitest-stable.mjs` process is
+ *      still synchronously blocked in `spawnSync` waiting on it.
+ *
+ * Both checks can only ever err toward *keeping* a directory longer, never
+ * toward deleting a live one: a dead PID is unambiguous (a PID either is or
+ * isn't in the process table right now), and PID reuse could only cause a
+ * false "still alive", not a false "already dead".
+ *
+ * `liveTargets` -- see isPathReferencedByLiveProcess -- lets `run()` share
+ * one /proc scan across every candidate instead of paying for it per entry.
+ */
+export function evaluateTmpEntry(entryPath, nowMs, config = CONFIG, liveTargets = null) {
+  if (isPathReferencedByLiveProcess(entryPath, config, liveTargets)) {
+    return { path: entryPath, eligible: false, reason: "live-process-reference" };
+  }
+  const pcvtPid = extractPcvtPid(path.basename(entryPath));
+  if (pcvtPid !== null && pidIsAlive(pcvtPid, config.PROC_ROOT)) {
+    return { path: entryPath, eligible: false, reason: "owning-pid-alive" };
+  }
+  const cutoffMs = nowMs - config.TMP_SCRATCH_MIN_AGE_HOURS * HOUR_MS;
   const eligible = !directoryHasFileNewerThan(entryPath, cutoffMs);
-  return { path: entryPath, eligible };
+  return { path: entryPath, eligible, reason: eligible ? null : "too-recent" };
 }
 
 // ---------------------------------------------------------------------------
@@ -710,7 +872,11 @@ export async function run({ apply = false, nowMs = Date.now(), config = CONFIG }
   // -- /tmp scratch --
   {
     const candidates = scanTmpCandidates(config);
-    const evaluations = candidates.map((p) => evaluateTmpEntry(p, nowMs, config));
+    // Collected once and shared across every candidate -- see
+    // collectLiveProcessTargets' docstring for why re-scanning /proc per
+    // candidate is not an acceptable cost here.
+    const liveTargets = collectLiveProcessTargets(config);
+    const evaluations = candidates.map((p) => evaluateTmpEntry(p, nowMs, config, liveTargets));
     const eligible = evaluations.filter((e) => e.eligible);
     const eligibleSizedBytes = eligible.reduce((sum, e) => sum + dirSizeBytes(e.path), 0);
     if (apply) {
@@ -727,6 +893,9 @@ export async function run({ apply = false, nowMs = Date.now(), config = CONFIG }
       eligible: eligible.length,
       reclaimedBytes: eligibleSizedBytes,
       eligiblePaths: eligible.map((e) => e.path),
+      excludedLive: evaluations.filter((e) => e.reason === "live-process-reference").map((e) => e.path),
+      excludedOwningPidAlive: evaluations.filter((e) => e.reason === "owning-pid-alive").map((e) => e.path),
+      excludedTooRecent: evaluations.filter((e) => e.reason === "too-recent").map((e) => e.path),
     };
   }
 
@@ -788,7 +957,8 @@ function printSummary(summary) {
   }
   console.log(
     `tmp scratch: ${c.tmpScratch.eligible}/${c.tmpScratch.totalScanned} entries ${summary.mode === "apply" ? "deleted" : "would delete"}, ` +
-      `${bytesToHuman(c.tmpScratch.reclaimedBytes)} ${summary.mode === "apply" ? "freed" : "reclaimable"}`,
+      `${bytesToHuman(c.tmpScratch.reclaimedBytes)} ${summary.mode === "apply" ? "freed" : "reclaimable"} ` +
+      `(excluded as live: ${c.tmpScratch.excludedLive.length}, excluded as owning-pid-alive: ${c.tmpScratch.excludedOwningPidAlive.length}, excluded as too-recent: ${c.tmpScratch.excludedTooRecent.length})`,
   );
   console.log("");
   const d = summary.diskAlarm;
