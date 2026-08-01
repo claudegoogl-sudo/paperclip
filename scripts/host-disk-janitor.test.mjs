@@ -14,11 +14,13 @@ import {
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import zlib from "node:zlib";
 
 import {
   CONFIG,
   parseBackupTimestamp,
   classifyBackups,
+  gzipUncompressedSizeBytes,
   directoryHasFileNewerThan,
   collectFiles,
   classifyRunLogFiles,
@@ -73,7 +75,7 @@ test("classifyBackups keeps at most 24 hourly + 7 daily + 4 weekly, prunes the r
       .toISOString()
       .slice(11, 19)
       .replace(/:/g, "")}.sql.gz`;
-    entries.push({ name, sizeBytes: 280_000_000 });
+    entries.push({ name, sizeBytes: 280_000_000, effectiveBytes: 280_000_000 });
   }
 
   const { keep, prune, unrecognized } = classifyBackups(entries, CONFIG);
@@ -97,7 +99,7 @@ test("classifyBackups spans hourly/daily/weekly across a long history", () => {
   for (let i = 0; i < 200; i += 1) {
     const t = new Date(start - i * 24 * 60 * 60 * 1000);
     const name = `paperclip-${t.toISOString().slice(0, 10).replace(/-/g, "")}-000000.sql.gz`;
-    entries.push({ name, sizeBytes: 1000 });
+    entries.push({ name, sizeBytes: 1000, effectiveBytes: 280_000_000 });
   }
   const { keep, prune } = classifyBackups(entries, CONFIG);
   // 1/day means "hourly" bucket just grabs the newest 24 distinct days,
@@ -110,13 +112,152 @@ test("classifyBackups spans hourly/daily/weekly across a long history", () => {
 
 test("classifyBackups never drops unrecognized filenames (conservative default)", () => {
   const entries = [
-    { name: "paperclip-20260731-210804.sql.gz", sizeBytes: 100 },
-    { name: "some-other-file.txt", sizeBytes: 50 },
+    { name: "paperclip-20260731-210804.sql.gz", sizeBytes: 100, effectiveBytes: 280_000_000 },
+    { name: "some-other-file.txt", sizeBytes: 50, effectiveBytes: 50 },
   ];
   const { prune, unrecognized } = classifyBackups(entries, CONFIG);
   assert.equal(unrecognized.length, 1);
   assert.equal(unrecognized[0].name, "some-other-file.txt");
   assert.ok(!prune.some((e) => e.name === "some-other-file.txt"));
+});
+
+// ---------------------------------------------------------------------------
+// Corrupt/empty backup dumps: PLA-2018 fail-safe classification
+// ---------------------------------------------------------------------------
+
+test("gzipUncompressedSizeBytes reads the true decompressed size via a short trailer read, not full decompression", () => {
+  const dir = tmpdir("janitor-gziptrailer-");
+
+  const real = Buffer.alloc(500_000, "x");
+  const realGz = zlib.gzipSync(real);
+  writeFileSync(path.join(dir, "real.sql.gz"), realGz);
+  assert.equal(gzipUncompressedSizeBytes(path.join(dir, "real.sql.gz")), 500_000);
+
+  // The live-incident stub: a structurally valid, empty gzip stream.
+  // `gzip -t` passes this; ISIZE correctly reads 0.
+  const emptyGz = zlib.gzipSync(Buffer.alloc(0));
+  writeFileSync(path.join(dir, "empty.sql.gz"), emptyGz);
+  assert.equal(gzipUncompressedSizeBytes(path.join(dir, "empty.sql.gz")), 0);
+
+  // Shorter than any valid gzip stream can be (10-byte header + 8-byte
+  // trailer minimum) -- no trailer to read at all.
+  writeFileSync(path.join(dir, "truncated.sql.gz"), Buffer.from([0x1f, 0x8b, 0x08]));
+  assert.equal(gzipUncompressedSizeBytes(path.join(dir, "truncated.sql.gz")), null);
+
+  assert.equal(gzipUncompressedSizeBytes(path.join(dir, "does-not-exist.sql.gz")), null);
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("classifyBackups: live case -- 20-byte empty .gz stub sharing a timestamp with a valid dump (AC4)", () => {
+  const dir = tmpdir("janitor-livecase-");
+  const ts = "20260731-193824";
+  const validName = `paperclip-${ts}.sql`;
+  const stubName = `paperclip-${ts}.sql.gz`;
+
+  const validPath = path.join(dir, validName);
+  writeFileSync(validPath, Buffer.alloc(1_982_000, "x")); // stand-in for the real ~1.98GB dump
+
+  const stubPath = path.join(dir, stubName);
+  // Generated in-test via gzip-of-empty (equivalent to `gzip < /dev/null`)
+  // rather than committing the live 20-byte binary fixture.
+  const emptyGz = zlib.gzipSync(Buffer.alloc(0));
+  writeFileSync(stubPath, emptyGz);
+  assert.ok(emptyGz.length < 32, `fixture should reproduce the live ~20-byte empty gzip stub, got ${emptyGz.length}`);
+
+  const entries = [
+    { name: validName, sizeBytes: 1_982_000, effectiveBytes: 1_982_000 },
+    { name: stubName, sizeBytes: emptyGz.length, effectiveBytes: gzipUncompressedSizeBytes(stubPath) ?? 0 },
+  ];
+
+  const { keep, prune, invalid } = classifyBackups(entries, CONFIG);
+  assert.ok(keep.some((e) => e.name === validName), "the valid dump must be retained");
+  assert.ok(!keep.some((e) => e.name === stubName), "the empty stub must not consume a retention slot");
+  assert.ok(invalid.some((e) => e.name === stubName), "the empty stub must be classified invalid");
+  assert.ok(prune.some((e) => e.name === stubName), "the empty stub must be eligible for deletion");
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("classifyBackups: disk-full fail-safe -- newest 40 dumps are all empty stubs, older valid backups survive (AC5)", () => {
+  const dir = tmpdir("janitor-diskfull-");
+  const entries = [];
+  const dayMs = 24 * 60 * 60 * 1000;
+  const newest = Date.UTC(2026, 6, 31, 23, 0, 0);
+
+  function nameFor(t) {
+    return `paperclip-${t.toISOString().slice(0, 10).replace(/-/g, "")}-${t
+      .toISOString()
+      .slice(11, 19)
+      .replace(/:/g, "")}.sql.gz`;
+  }
+
+  // Disk-full window: 40 straight hourly dumps, each an empty gzip stub --
+  // exactly what a compressor failing under a full disk produces every
+  // hour. This exceeds the 24+7+4=35 total keep slots, so under the old
+  // (buggy) classifier these stubs alone would have consumed every slot and
+  // pruned every real dump below out from under the retention window.
+  for (let i = 0; i < 40; i += 1) {
+    const t = new Date(newest - i * 60 * 60 * 1000);
+    const name = nameFor(t);
+    const filePath = path.join(dir, name);
+    const emptyGz = zlib.gzipSync(Buffer.alloc(0));
+    writeFileSync(filePath, emptyGz);
+    entries.push({ name, sizeBytes: emptyGz.length, effectiveBytes: gzipUncompressedSizeBytes(filePath) ?? 0 });
+  }
+
+  // Pre-incident history: 10 real daily dumps, older than the entire
+  // disk-full window.
+  const historyStart = newest - 40 * 60 * 60 * 1000;
+  const historyNames = [];
+  for (let i = 1; i <= 10; i += 1) {
+    const t = new Date(historyStart - i * dayMs);
+    const name = nameFor(t);
+    const filePath = path.join(dir, name);
+    const realGz = zlib.gzipSync(Buffer.alloc(2_000_000, "x"));
+    writeFileSync(filePath, realGz);
+    entries.push({ name, sizeBytes: realGz.length, effectiveBytes: gzipUncompressedSizeBytes(filePath) ?? 0 });
+    historyNames.push(name);
+  }
+
+  const { keep, prune, invalid, failSafeTripped } = classifyBackups(entries, CONFIG);
+
+  assert.equal(failSafeTripped, false, "valid backups exist, the zero-valid-backups fail-safe must not trip");
+  assert.equal(invalid.length, 40, "all 40 empty stubs must be classified invalid");
+  for (const name of historyNames) {
+    assert.ok(keep.some((e) => e.name === name), `pre-incident valid dump ${name} must be retained`);
+    assert.ok(!prune.some((e) => e.name === name), `pre-incident valid dump ${name} must not be pruned`);
+  }
+  for (const e of entries.slice(0, 40)) {
+    assert.ok(prune.some((p) => p.name === e.name), `stub ${e.name} must be pruned -- it consumed no retention slot`);
+  }
+
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("classifyBackups: fail-safe refuses to prune when zero valid backups would remain (AC3)", () => {
+  const dir = tmpdir("janitor-allcorrupt-");
+  const entries = [];
+  const newest = Date.UTC(2026, 6, 31, 23, 0, 0);
+  for (let i = 0; i < 5; i += 1) {
+    const t = new Date(newest - i * 60 * 60 * 1000);
+    const name = `paperclip-${t.toISOString().slice(0, 10).replace(/-/g, "")}-${t
+      .toISOString()
+      .slice(11, 19)
+      .replace(/:/g, "")}.sql.gz`;
+    const filePath = path.join(dir, name);
+    const emptyGz = zlib.gzipSync(Buffer.alloc(0));
+    writeFileSync(filePath, emptyGz);
+    entries.push({ name, sizeBytes: emptyGz.length, effectiveBytes: gzipUncompressedSizeBytes(filePath) ?? 0 });
+  }
+
+  const { keep, prune, invalid, failSafeTripped } = classifyBackups(entries, CONFIG);
+  assert.equal(keep.length, 0, "sanity: no valid backups exist in this fixture");
+  assert.equal(invalid.length, 5);
+  assert.equal(prune.length, 0, "must retain everything rather than empty the backups directory");
+  assert.equal(failSafeTripped, true);
+
+  rmSync(dir, { recursive: true, force: true });
 });
 
 // ---------------------------------------------------------------------------
@@ -449,15 +590,20 @@ function buildSandbox() {
   mkdirSync(workDir, { recursive: true });
   mkdirSync(tmpDir, { recursive: true });
 
-  // 30 hourly backups -- only the newest 24 should survive.
+  // 30 hourly backups -- only the newest 24 should survive. Real (small but
+  // genuinely valid) gzip content, not placeholder bytes: these fixtures
+  // exercise rotation/worktree/tmp behavior, not backup-corruption
+  // classification, so they must read as valid under the new
+  // decompressed-size gate rather than tripping the invalid-stub fail-safe.
   const start = Date.UTC(2026, 6, 31, 12, 0, 0);
+  const validBackupContent = zlib.gzipSync(Buffer.alloc(2_000_000, "x"));
   for (let i = 0; i < 30; i += 1) {
     const t = new Date(start - i * 60 * 60 * 1000);
     const name = `paperclip-${t.toISOString().slice(0, 10).replace(/-/g, "")}-${t
       .toISOString()
       .slice(11, 19)
       .replace(/:/g, "")}.sql.gz`;
-    writeFileSync(path.join(backupsDir, name), "x".repeat(10));
+    writeFileSync(path.join(backupsDir, name), validBackupContent);
   }
 
   // run-logs: one old, one fresh.
@@ -655,4 +801,47 @@ test("run() dry-run alarm never makes a network call even when threshold is exce
   assert.equal(summary.diskAlarm.action, null);
   rmSync(home, { recursive: true, force: true });
   for (const remote of remotes) rmSync(remote, { recursive: true, force: true });
+});
+
+test("run() end-to-end: an empty .gz stub sharing a timestamp with a valid dump is pruned, the dump survives --apply (PLA-2018)", async () => {
+  const home = tmpdir("janitor-e2e-corrupt-");
+  const backupsDir = path.join(home, "backups");
+  mkdirSync(backupsDir, { recursive: true });
+
+  const ts = "20260731-193824";
+  const validName = `paperclip-${ts}.sql`;
+  const stubName = `paperclip-${ts}.sql.gz`;
+  writeFileSync(path.join(backupsDir, validName), Buffer.alloc(1_982_000, "x"));
+  writeFileSync(path.join(backupsDir, stubName), zlib.gzipSync(Buffer.alloc(0)));
+
+  const config = {
+    ...CONFIG,
+    BACKUPS_DIR: backupsDir,
+    RUN_LOGS_DIR: path.join(home, "run-logs-unused"),
+    WORKTREE_SCAN_DIRS: [path.join(home, "work-unused")],
+    WORKTREE_HOME_GLOB_ROOT: home,
+    WORKTREE_HOME_GLOB_PATTERNS: [],
+    WORKTREE_OBJECT_STORE_DIR: path.join(home, "no-such-object-store"),
+    TMP_DIR: path.join(home, "tmp-unused"),
+    TMP_SCRATCH_PATTERNS: [],
+    STATE_DIR: path.join(home, "state"),
+    PAPERCLIP_AUTH_JSON_PATH: path.join(home, "no-such-auth.json"),
+    SELF_SCRIPT_PATH: path.join(home, "__self_not_under_any_candidate__", "host-disk-janitor.mjs"),
+  };
+
+  const dryRun = await run({ apply: false, config });
+  assert.equal(dryRun.categories.backups.totalFiles, 2);
+  assert.equal(dryRun.categories.backups.keptFiles, 1);
+  assert.equal(dryRun.categories.backups.invalidFiles, 1, "the summary must surface the corrupt count (AC6)");
+  assert.equal(dryRun.categories.backups.prunedFiles, 1);
+  assert.equal(dryRun.categories.backups.failSafeTripped, false);
+  // Dry-run must not have touched disk.
+  assert.ok(existsSync(path.join(backupsDir, stubName)));
+
+  const applied = await run({ apply: true, config });
+  assert.equal(applied.categories.backups.prunedFiles, 1);
+  assert.ok(existsSync(path.join(backupsDir, validName)), "the valid dump must survive --apply");
+  assert.ok(!existsSync(path.join(backupsDir, stubName)), "the corrupt stub must be deleted by --apply");
+
+  rmSync(home, { recursive: true, force: true });
 });

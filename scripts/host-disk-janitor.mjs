@@ -43,6 +43,10 @@ import {
   unlinkSync,
   mkdirSync,
   writeFileSync,
+  openSync,
+  fstatSync,
+  readSync,
+  closeSync,
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -68,6 +72,14 @@ export const CONFIG = {
   BACKUPS_KEEP_HOURLY: 24,
   BACKUPS_KEEP_DAILY: 7,
   BACKUPS_KEEP_WEEKLY: 4,
+  // A dump is invalid when its *decompressed* content falls below this
+  // floor -- real dumps run ~250-350MB, so this sits far below any genuine
+  // dump while catching empty/truncated stubs. A full disk produces exactly
+  // this failure mode: pg_dump | gzip gets killed mid-stream or emits a
+  // structurally valid but empty gzip trailer, and `gzip -t` alone passes
+  // an empty gzip stream, so validity must be judged on decompressed size,
+  // never on `gzip -t` or the on-disk (compressed) size.
+  BACKUPS_MIN_VALID_BYTES: 1024 * 1024,
 
   // -- run-logs: ~/.paperclip/instances/default/data/run-logs --
   // Flat age retention on individual leaf files, then prune emptied dirs.
@@ -137,6 +149,42 @@ export const CONFIG = {
 // Backups: hourly/daily/weekly rotation
 // ---------------------------------------------------------------------------
 
+/**
+ * Cheap decompressed-size probe for a gzip file: reads only the trailing 8
+ * bytes of the file (the RFC 1952 CRC32 + ISIZE trailer) rather than
+ * decompressing the stream. ISIZE is the uncompressed size modulo 2^32,
+ * which is exact for backup dumps here (hundreds of MB, far under the 4GiB
+ * wrap point) and is precisely what catches an empty/truncated stub: an
+ * empty gzip stream's ISIZE reads 0 even though `gzip -t` passes it as a
+ * structurally valid stream.
+ *
+ * Returns `null` if the file is shorter than 18 bytes -- the minimum size
+ * of any valid gzip stream (10-byte header + 8-byte trailer) -- since there
+ * is then no trailer to read at all. Callers treat `null` the same as a
+ * validity failure (effectively 0 decompressed bytes).
+ */
+export function gzipUncompressedSizeBytes(filePath) {
+  let fd;
+  try {
+    fd = openSync(filePath, "r");
+    const size = fstatSync(fd).size;
+    if (size < 18) return null;
+    const trailer = Buffer.alloc(8);
+    readSync(fd, trailer, 0, 8, size - 8);
+    return trailer.readUInt32LE(4);
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // already closed/gone
+      }
+    }
+  }
+}
+
 /** Parse a backup filename into a comparable Date, or null if unrecognized. */
 export function parseBackupTimestamp(filename, pattern = CONFIG.BACKUPS_FILENAME_PATTERN) {
   const match = pattern.exec(filename);
@@ -162,17 +210,41 @@ function isoWeekKey(date) {
 }
 
 /**
- * Classify backup dump files into keep/prune/unrecognized sets.
- * `entries` is [{ name, sizeBytes }]. Pure function -- no filesystem or
- * wall-clock access -- so it is fully unit-testable.
+ * Classify backup dump files into keep/prune/unrecognized/invalid sets.
+ * `entries` is [{ name, sizeBytes, effectiveBytes }]. `sizeBytes` is the
+ * on-disk footprint (used only for reclaim-byte accounting); `effectiveBytes`
+ * is the validated *decompressed* content size (for `.gz` names, the
+ * gzip-trailer ISIZE via `gzipUncompressedSizeBytes`; for plain `.sql`, the
+ * same as `sizeBytes`) and is what validity is judged on. Pure function --
+ * no filesystem or wall-clock access -- so it is fully unit-testable.
+ *
+ * Retention windows are filled from *valid* entries only: a filename that
+ * parses but whose `effectiveBytes` falls below `BACKUPS_MIN_VALID_BYTES`
+ * never enters the hourly/daily/weekly slot computation, so it can never
+ * displace a real dump out of the retention window -- the exact failure
+ * mode a disk-full compressor producing back-to-back empty stubs would
+ * otherwise trigger. Invalid entries are collected separately and are
+ * always prune-eligible regardless of age.
+ *
+ * Fail-safe: if there are zero valid entries, `keep` is necessarily empty.
+ * Pruning the invalid entries in that state would empty the directory
+ * entirely with no valid backup left standing, so nothing is pruned this
+ * run (`prune` is empty and `failSafeTripped` is true) -- the caller's
+ * summary reports this so a human investigates instead of the janitor
+ * silently deleting the only files present.
  */
 export function classifyBackups(entries, config = CONFIG) {
   const parsed = [];
   const unrecognized = [];
+  const invalid = [];
   for (const entry of entries) {
     const ts = parseBackupTimestamp(entry.name, config.BACKUPS_FILENAME_PATTERN);
     if (!ts) {
       unrecognized.push(entry);
+      continue;
+    }
+    if (!(entry.effectiveBytes >= config.BACKUPS_MIN_VALID_BYTES)) {
+      invalid.push({ ...entry, ts });
       continue;
     }
     parsed.push({ ...entry, ts });
@@ -203,11 +275,16 @@ export function classifyBackups(entries, config = CONFIG) {
     keep.add(e.name);
   }
 
-  const prune = parsed.filter((e) => !keep.has(e.name));
+  const failSafeTripped = keep.size === 0 && (parsed.length > 0 || invalid.length > 0);
+  const validPrune = parsed.filter((e) => !keep.has(e.name));
+  const prune = failSafeTripped ? [] : validPrune.concat(invalid);
+
   return {
     keep: parsed.filter((e) => keep.has(e.name)),
     prune,
     unrecognized,
+    invalid,
+    failSafeTripped,
   };
 }
 
@@ -632,9 +709,19 @@ export async function run({ apply = false, nowMs = Date.now(), config = CONFIG }
     const entries = dirExists
       ? readdirSync(config.BACKUPS_DIR, { withFileTypes: true })
           .filter((e) => e.isFile())
-          .map((e) => ({ name: e.name, sizeBytes: statSize(path.join(config.BACKUPS_DIR, e.name)) }))
+          .map((e) => {
+            const filePath = path.join(config.BACKUPS_DIR, e.name);
+            const sizeBytes = statSize(filePath);
+            // Validity is judged on decompressed content, never the
+            // compressed on-disk size or `gzip -t` alone -- an empty gzip
+            // stream passes `gzip -t` but carries zero bytes of data. The
+            // gzip-trailer read is a cheap, streaming-safe check: it never
+            // decompresses the file, even a 330MB dump.
+            const effectiveBytes = e.name.endsWith(".gz") ? gzipUncompressedSizeBytes(filePath) ?? 0 : sizeBytes;
+            return { name: e.name, sizeBytes, effectiveBytes };
+          })
       : [];
-    const { keep, prune, unrecognized } = classifyBackups(entries, config);
+    const { keep, prune, unrecognized, invalid, failSafeTripped } = classifyBackups(entries, config);
     if (apply) {
       for (const e of prune) {
         try {
@@ -649,6 +736,8 @@ export async function run({ apply = false, nowMs = Date.now(), config = CONFIG }
       keptFiles: keep.length,
       prunedFiles: prune.length,
       unrecognizedFiles: unrecognized.length,
+      invalidFiles: invalid.length,
+      failSafeTripped,
       reclaimedBytes: prune.reduce((sum, e) => sum + e.sizeBytes, 0),
       prunedNames: prune.map((e) => e.name),
     };
@@ -771,8 +860,15 @@ function printSummary(summary) {
   console.log("");
   console.log(
     `backups:     ${c.backups.prunedFiles}/${c.backups.totalFiles} files ${summary.mode === "apply" ? "deleted" : "would delete"}, ` +
-      `${bytesToHuman(c.backups.reclaimedBytes)} ${summary.mode === "apply" ? "freed" : "reclaimable"} (kept ${c.backups.keptFiles}, unrecognized ${c.backups.unrecognizedFiles})`,
+      `${bytesToHuman(c.backups.reclaimedBytes)} ${summary.mode === "apply" ? "freed" : "reclaimable"} ` +
+      `(kept ${c.backups.keptFiles}, unrecognized ${c.backups.unrecognizedFiles}, invalid/corrupt ${c.backups.invalidFiles})`,
   );
+  if (c.backups.failSafeTripped) {
+    console.log(
+      `             FAIL-SAFE: 0 valid backups remain -- retaining all ${c.backups.totalFiles} file(s) instead of ` +
+        `pruning ${c.backups.invalidFiles} invalid/corrupt file(s) (would empty the backups directory)`,
+    );
+  }
   console.log(
     `run-logs:    ${c.runLogs.prunedFiles}/${c.runLogs.totalFiles} files ${summary.mode === "apply" ? "deleted" : "would delete"}, ` +
       `${bytesToHuman(c.runLogs.reclaimedBytes)} ${summary.mode === "apply" ? "freed" : "reclaimable"} (kept ${c.runLogs.keptFiles})`,
