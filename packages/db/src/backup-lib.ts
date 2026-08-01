@@ -37,6 +37,14 @@ export type RunDatabaseBackupOptions = {
   excludeTables?: string[];
   nullifyColumns?: Record<string, string[]>;
   backupEngine?: "auto" | "pg_dump" | "javascript";
+  /**
+   * Post-write sanity floor for the decompressed archive, in bytes. Defaults
+   * to BACKUP_MIN_DECOMPRESSED_BYTES, which assumes a full production-scale
+   * schema. Callers that intentionally target a database that can be tiny by
+   * design (e.g. a from-scratch dev/test fixture) should pass a lower,
+   * explicitly justified floor rather than relying on the production default.
+   */
+  minDecompressedBytes?: number;
 };
 
 export type RunDatabaseBackupResult = {
@@ -83,13 +91,29 @@ const BACKUP_BREAKPOINT_DETECT_BYTES = 64 * 1024;
 /**
  * Both backup engines emit a fixed preamble (pg_dump's SET/comment header, or
  * our own "-- Paperclip database backup" + BEGIN/COMMIT wrapper) before a
- * single byte of schema or row data. That preamble alone runs well past 1KB
- * for any real database. A decompressed archive below this floor did not
- * fail cleanly (which throws before an archive is published) — it was
- * truncated by something outside the process's control, e.g. a mid-write
- * kill. Anything this small is refused rather than published.
+ * single byte of schema or row data. For a full production-scale schema that
+ * preamble plus schema DDL runs well past 1KB for any real database. A
+ * decompressed archive below this floor did not fail cleanly (which throws
+ * before an archive is published) — it was truncated by something outside
+ * the process's control, e.g. a mid-write kill. Anything this small is
+ * refused rather than published. This is the default; callers whose target
+ * database can legitimately be tiny (see BACKUP_MIN_DECOMPRESSED_BYTES_SMALL_TARGET)
+ * pass an explicit lower `minDecompressedBytes`.
  */
 const BACKUP_MIN_DECOMPRESSED_BYTES = 1024;
+
+/**
+ * Floor for callers that intentionally target a database that can be
+ * legitimately tiny by design, not just a narrowed slice of a full schema —
+ * e.g. `worktree reseed`'s embedded-postgres test/dev fixtures, which may
+ * carry only a handful of tables and rows regardless of whether
+ * excludeTables/nullifyColumns are set (verified: a from-scratch dev
+ * worktree seed produced a 454-byte, fully valid archive that the 1KB floor
+ * rejected). This lower floor still rejects a truly empty (0-byte) archive —
+ * the exact failure mode this check exists to catch — while leaving
+ * comfortable margin below any observed real small-target output.
+ */
+export const BACKUP_MIN_DECOMPRESSED_BYTES_SMALL_TARGET = 64;
 
 const STATEMENT_BREAKPOINT = "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900";
 
@@ -390,13 +414,17 @@ export async function countDecompressedBytes(gzFile: string): Promise<number> {
 
 /**
  * Verifies a freshly-written gzip archive's decompressed content against
- * BACKUP_MIN_DECOMPRESSED_BYTES, then atomically publishes it under its
- * final name. Callers must write to a `*.tmp` path first and only pass that
- * path here — this guarantees a process kill mid-write leaves behind an
- * unpublished `.tmp` file rather than a broken file at the final name that
- * later code (or the retention janitor) could mistake for a real backup.
+ * minDecompressedBytes, then atomically publishes it under its final name.
+ * Callers must write to a `*.tmp` path first and only pass that path here —
+ * this guarantees a process kill mid-write leaves behind an unpublished
+ * `.tmp` file rather than a broken file at the final name that later code
+ * (or the retention janitor) could mistake for a real backup.
  */
-async function finalizeBackupArchive(tmpFile: string, finalFile: string): Promise<void> {
+async function finalizeBackupArchive(
+  tmpFile: string,
+  finalFile: string,
+  minDecompressedBytes: number,
+): Promise<void> {
   let decompressedBytes: number;
   try {
     decompressedBytes = await countDecompressedBytes(tmpFile);
@@ -405,9 +433,9 @@ async function finalizeBackupArchive(tmpFile: string, finalFile: string): Promis
       `Backup archive verification failed for ${basename(tmpFile)}: gzip stream is corrupt or truncated (${error instanceof Error ? error.message : String(error)})`,
     );
   }
-  if (decompressedBytes < BACKUP_MIN_DECOMPRESSED_BYTES) {
+  if (decompressedBytes < minDecompressedBytes) {
     throw new Error(
-      `Backup archive verification failed for ${basename(tmpFile)}: decompressed to only ${decompressedBytes} byte(s), below the ${BACKUP_MIN_DECOMPRESSED_BYTES}-byte sanity floor`,
+      `Backup archive verification failed for ${basename(tmpFile)}: decompressed to only ${decompressedBytes} byte(s), below the ${minDecompressedBytes}-byte sanity floor`,
     );
   }
   renameSync(tmpFile, finalFile);
@@ -619,6 +647,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
   const connectTimeout = Math.max(1, Math.trunc(opts.connectTimeoutSeconds ?? 5));
   const backupEngine = opts.backupEngine ?? "auto";
   const canUsePgDump = !hasBackupTransforms(opts);
+  const minDecompressedBytes = opts.minDecompressedBytes ?? BACKUP_MIN_DECOMPRESSED_BYTES;
   const excludedTableNames = normalizeTableNameSet(opts.excludeTables);
   const nullifiedColumnsByTable = normalizeNullifyColumnMap(opts.nullifyColumns);
   let sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
@@ -646,7 +675,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
           connectTimeout,
         });
         await writer.abort();
-        await finalizeBackupArchive(tmpBackupFile, backupFile);
+        await finalizeBackupArchive(tmpBackupFile, backupFile, minDecompressedBytes);
         const sizeBytes = statSync(backupFile).size;
         const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
         return {
@@ -1061,7 +1090,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     const sqlReadStream = createReadStream(sqlFile);
     const gzWriteStream = createWriteStream(tmpBackupFile);
     await pipeline(sqlReadStream, createGzip(), gzWriteStream);
-    await finalizeBackupArchive(tmpBackupFile, backupFile);
+    await finalizeBackupArchive(tmpBackupFile, backupFile, minDecompressedBytes);
     unlinkSync(sqlFile);
 
     const sizeBytes = statSync(backupFile).size;
