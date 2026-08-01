@@ -97,7 +97,9 @@ function recordStartupLogLine(recentLogs: string[], message: unknown): void {
 }
 
 async function createEmbeddedPostgresTestInstance(tempDirPrefix: string) {
+  sweepOrphanedEmbeddedPostgresDataDirs();
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), tempDirPrefix));
+  fs.writeFileSync(ownerPidMarkerPath(dataDir), String(process.pid));
   const port = await getAvailablePort();
   const EmbeddedPostgres = await getEmbeddedPostgresCtor();
   const recentLogs: string[] = [];
@@ -117,6 +119,116 @@ async function createEmbeddedPostgresTestInstance(tempDirPrefix: string) {
 
 function cleanupEmbeddedPostgresTestDirs(dataDir: string) {
   fs.rmSync(dataDir, { recursive: true, force: true });
+  fs.rmSync(ownerPidMarkerPath(dataDir), { force: true });
+}
+
+// A killed run (SIGKILL mid-suite, the routine way a heartbeat run ends here)
+// never gets to run cleanup(), so it leaks the ~170MB datadir. There is no
+// run-lifecycle signal to hook, so instead every new datadir starts with a
+// startup sweep of os.tmpdir() that reclaims *any* leftover Postgres datadir
+// (identified by the PG_VERSION marker, regardless of which caller's
+// tempDirPrefix produced it) whose owning pid is no longer alive.
+const EMBEDDED_POSTGRES_VERSION_MARKER = "PG_VERSION";
+
+function ownerPidMarkerPath(dataDir: string): string {
+  return `${dataDir}.owner-pid`;
+}
+
+function parsePidFileContents(contents: string): number | null {
+  const firstLine = contents.split(/\r?\n/, 1)[0]?.trim();
+  if (!firstLine) return null;
+  const pid = Number.parseInt(firstLine, 10);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+function readPidFile(filePath: string): number | null {
+  try {
+    return parsePidFileContents(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+// Exact liveness, not a guess: process.kill(pid, 0) sends no signal, it only
+// probes whether the pid exists. ESRCH means it's gone. Anything else (alive,
+// EPERM because it's owned by another user, or an unexpected error) fails
+// closed as "alive" so we never remove a datadir we're unsure about.
+export function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code !== "ESRCH";
+  }
+}
+
+export type ReclaimableDataDirCandidate = {
+  hasVersionMarker: boolean;
+  postmasterPid: number | null;
+  ownerPid: number | null;
+};
+
+// Pure decision function, unit-testable without touching a real cluster:
+// hand it what a directory listing says about one entry (does it look like a
+// Postgres datadir, and which pid(s) claim to own it) plus a liveness probe.
+//
+// postmasterPid (written by Postgres itself once it finishes booting) is
+// preferred when present. Most of the orphans this exists to clean up never
+// get that far - they're killed mid-initdb, before Postgres ever writes
+// postmaster.pid - so we fall back to ownerPid, a marker this module writes
+// itself immediately after mkdtemp naming the creating process. If neither
+// marker is present at all, there is no owner on record, so it's an orphan
+// from before this fix (or the exceedingly narrow window between mkdtemp and
+// the marker write) and it's safe to reclaim.
+export function isReclaimableEmbeddedPostgresDataDir(
+  candidate: ReclaimableDataDirCandidate,
+  probeIsPidAlive: (pid: number) => boolean = isPidAlive,
+): boolean {
+  if (!candidate.hasVersionMarker) return false;
+  const ownerPid = candidate.postmasterPid ?? candidate.ownerPid;
+  if (ownerPid === null) return true;
+  return !probeIsPidAlive(ownerPid);
+}
+
+function readReclaimCandidate(entryPath: string): ReclaimableDataDirCandidate | null {
+  let hasVersionMarker: boolean;
+  try {
+    hasVersionMarker = fs.statSync(path.join(entryPath, EMBEDDED_POSTGRES_VERSION_MARKER)).isFile();
+  } catch {
+    return null;
+  }
+  if (!hasVersionMarker) return null;
+
+  return {
+    hasVersionMarker,
+    postmasterPid: readPidFile(path.join(entryPath, "postmaster.pid")),
+    ownerPid: readPidFile(ownerPidMarkerPath(entryPath)),
+  };
+}
+
+// Best-effort only: a failure to reclaim orphaned datadirs must never fail a
+// test run that would otherwise pass, so every layer of this degrades to a
+// no-op rather than throwing into the caller.
+export function sweepOrphanedEmbeddedPostgresDataDirs(tmpDir: string = os.tmpdir()): void {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(tmpDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  for (const entry of entries) {
+    try {
+      if (!entry.isDirectory()) continue;
+      const entryPath = path.join(tmpDir, entry.name);
+      const candidate = readReclaimCandidate(entryPath);
+      if (!candidate || !isReclaimableEmbeddedPostgresDataDir(candidate)) continue;
+      fs.rmSync(entryPath, { recursive: true, force: true });
+      fs.rmSync(ownerPidMarkerPath(entryPath), { force: true });
+    } catch {
+      // Leave this entry for the next sweep rather than failing the caller.
+    }
+  }
 }
 
 function formatEmbeddedPostgresError(error: unknown): string {
