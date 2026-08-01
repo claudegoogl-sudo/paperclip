@@ -7,7 +7,7 @@
 // relayed comment with no ceiling, spamming the target agent and burning
 // budget. The window/cap below bound wakes per (plugin, company, target-agent)
 // so a relay storm collapses to at most `maxWakes` heartbeats per window.
-// (PLA-829: OWASP API4 Unrestricted Resource Consumption / LLM04 Model DoS.)
+// (OWASP API4 Unrestricted Resource Consumption / LLM04 Model DoS.)
 
 export const PLUGIN_WAKE_RATE_LIMIT_WINDOW_MS = 60_000;
 export const PLUGIN_WAKE_RATE_LIMIT_MAX_WAKES = 5;

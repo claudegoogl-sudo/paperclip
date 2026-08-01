@@ -1,5 +1,5 @@
 /**
- * PLA-768 — tests for the worker-lifetime **service** context resolve path.
+ * Tests for the worker-lifetime **service** context resolve path.
  *
  * A background plugin dispatch (onEvent/onWebhook/runJob) or a setup()-started
  * loop resolves secrets from its OWN worker-lifetime run-context — there is no
@@ -115,7 +115,7 @@ afterEach(() => {
   clearRunSecretValues(SERVICE_RUN_ID);
 });
 
-describe("service-context secrets.resolve (PLA-768)", () => {
+describe("service-context secrets.resolve", () => {
   it("resolves a bound ref, deriving the company from the binding", async () => {
     const { handler, registry, resolverFn, findServiceBinding } = buildHandler({
       resolveValue: "bot-token-xyz",
@@ -139,7 +139,7 @@ describe("service-context secrets.resolve (PLA-768)", () => {
     );
   });
 
-  it("audits as a plugin system actor with a null run_id and the synthetic runId preserved in details (PLA-806)", async () => {
+  it("audits as a plugin system actor with a null run_id and the synthetic runId preserved in details", async () => {
     const { handler, registry } = buildHandler();
     registry.registerService(PLUGIN_DB_ID, SERVICE_RUN_ID);
 
@@ -153,7 +153,7 @@ describe("service-context secrets.resolve (PLA-768)", () => {
       action: "secret.resolved",
       companyId: COMPANY_OWNER,
       agentId: null,
-      // PLA-806: the service runId is host-minted/synthetic — NOT a heartbeat_runs
+      // The service runId is host-minted/synthetic — NOT a heartbeat_runs
       // row. It must be written as run_id=NULL so the FK does not silently drop
       // the row; the synthetic id is preserved in details instead.
       runId: null,

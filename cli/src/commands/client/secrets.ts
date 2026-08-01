@@ -111,7 +111,7 @@ export interface EgressReviewBinding {
 }
 
 /**
- * PLA-735 — the operator review console is a high-privilege surface, and the
+ * SECURITY-CRITICAL: the operator review console is a high-privilege surface, and the
  * `origin` strings rendered here are harvested from attacker-influenceable
  * egress destinations (an agent can drive a borrowed handle at an arbitrary
  * URL). Even though the server only persists a normalized scheme+host+port, we
@@ -719,7 +719,7 @@ export function registerSecretCommands(program: Command): void {
       }),
   );
 
-  // PLA-735 — operator-only egress review + per-binding enforce-flip. These call
+  // SECURITY-CRITICAL: operator-only egress review + per-binding enforce-flip. These call
   // the board-authenticated /secret-egress-bindings routes; there is no
   // agent-invokable path. Per-binding by construction (no bulk enforce).
   const egress = secrets

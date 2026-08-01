@@ -26,7 +26,7 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
-// PLA-1930: covers the acceptance criteria not already exercised by
+// Covers the acceptance criteria not already exercised by
 // heartbeat-retry-scheduling.test.ts (attempt-counter compounding) or
 // parse.test.ts (reset-string regression coverage):
 //   AC2 - a park blocks admission through the wake-request dispatch path
@@ -36,7 +36,7 @@ if (!embeddedPostgresSupport.supported) {
 //         and early-clear-on-success semantics pinned.
 //   AC6 - replay against the ticket's literal live result_json / result string.
 //
-// PLA-1967 (narrowing follow-up to PLA-1930/PR#136) adds:
+// A narrowing follow-up (to PR#136) adds:
 //   AC1 - a zero-work failure additionally requires a usage-limit signal string;
 //         the three literal live false-positive strings must not park.
 //   AC2 - "Usage credits are required for this model" is treated as a genuine
@@ -45,7 +45,7 @@ if (!embeddedPostgresSupport.supported) {
 //         still park.
 //   AC4 - the classifier is unreachable for non-failed outcomes, independent of
 //         the call site, via `shouldParkForUsageLimit`.
-describeEmbeddedPostgres("PLA-1930 usage-limit park", () => {
+describeEmbeddedPostgres("usage-limit park", () => {
   let db!: ReturnType<typeof createDb>;
   let heartbeat!: ReturnType<typeof heartbeatService>;
   let usageLimitPark!: ReturnType<typeof usageLimitParkService>;
@@ -61,7 +61,7 @@ describeEmbeddedPostgres("PLA-1930 usage-limit park", () => {
   // The negative-control admission test below deliberately lets a real claim
   // succeed (heartbeat.wakeup -> startNextQueuedRunForAgent -> a fire-and-forget
   // `void executeRun(...)` that this test suite has no seam to await or abort —
-  // see the PLA-1930 comment on `isZeroWorkUsageLimitResult` in heartbeat.ts).
+  // see the comment on `isZeroWorkUsageLimitResult` in heartbeat.ts).
   // Its errors are already caught and logged internally (never rethrown), so it
   // cannot fail a test directly, but it keeps writing to heartbeat_run_events /
   // environment_leases / agent_runtime_state in the background after the test
@@ -146,14 +146,14 @@ describeEmbeddedPostgres("PLA-1930 usage-limit park", () => {
       expect(isZeroWorkUsageLimitResult({ total_cost_usd: 0, duration_api_ms: 0 })).toBe(false);
     });
 
-    // PLA-1967 AC1/AC3: literal live false-positive strings from the ticket's
+    // AC1/AC3: literal live false-positive strings from the ticket's
     // 30-day audit (CTO, queried against heartbeat_runs) — all zero-work but
     // carrying no usage-limit signal, so none of these may park the fleet.
     it.each([
       ["expired OAuth token", "Failed to authenticate. API Error: 401 OAuth access token has expired."],
       ["bad model id", "There's an issue with the selected model (Claude Opus 5.0)..."],
       ["transient 529 overloaded", "API Error: 529 Overloaded..."],
-    ])("PLA-1967: does not park a zero-work failure with no limit signal (%s)", (_label, result) => {
+    ])("does not park a zero-work failure with no limit signal (%s)", (_label, result) => {
       expect(
         isZeroWorkUsageLimitResult({
           total_cost_usd: 0,
@@ -165,12 +165,12 @@ describeEmbeddedPostgres("PLA-1930 usage-limit park", () => {
       ).toBe(false);
     });
 
-    // PLA-1967 AC3: representative genuine live strings must still park.
+    // AC3: representative genuine live strings must still park.
     it.each([
       ["weekly, with date", "You've hit your weekly limit · resets Jul 31, 8am (UTC)"],
       ["weekly, without date", "You've hit your weekly limit · resets 8am (UTC)"],
       ["session", "You've hit your session limit · resets 1:50pm (UTC)"],
-    ])("PLA-1967: still parks a genuine zero-work limit hit (%s)", (_label, result) => {
+    ])("still parks a genuine zero-work limit hit (%s)", (_label, result) => {
       expect(
         isZeroWorkUsageLimitResult({
           total_cost_usd: 0,
@@ -182,10 +182,10 @@ describeEmbeddedPostgres("PLA-1930 usage-limit park", () => {
       ).toBe(true);
     });
 
-    // PLA-1967 AC2: CTO's explicit read — "usage credits are required" is a
+    // AC2: CTO's explicit read — "usage credits are required" is a
     // quota condition and should park, called out here rather than left
     // implicit in the regex.
-    it("PLA-1967 AC2: parks on 'usage credits are required for this model'", () => {
+    it("AC2: parks on 'usage credits are required for this model'", () => {
       expect(
         isZeroWorkUsageLimitResult({
           total_cost_usd: 0,
@@ -197,7 +197,7 @@ describeEmbeddedPostgres("PLA-1930 usage-limit park", () => {
       ).toBe(true);
     });
 
-    it("PLA-1967: signal match is case-insensitive", () => {
+    it("signal match is case-insensitive", () => {
       expect(
         isZeroWorkUsageLimitResult({
           total_cost_usd: 0,
@@ -209,7 +209,7 @@ describeEmbeddedPostgres("PLA-1930 usage-limit park", () => {
     });
   });
 
-  describe("shouldParkForUsageLimit outcome guard (PLA-1967 AC4)", () => {
+  describe("shouldParkForUsageLimit outcome guard (AC4)", () => {
     const zeroWorkLimitResult = {
       total_cost_usd: 0,
       duration_api_ms: 0,
@@ -360,7 +360,7 @@ describeEmbeddedPostgres("PLA-1930 usage-limit park", () => {
     });
   });
 
-  // AC6: replay evidence. Fields below are the LITERAL values quoted in PLA-1930's
+  // AC6: replay evidence. Fields below are the LITERAL values quoted in the ticket's
   // "Verified state" section for heartbeat_runs.id = 1b7ad226-762e-46ba-8699-1ec494a17968
   // (started_at 2026-07-31T07:56:58.195Z), read from the issue text — the underlying
   // /tmp/pla1880-live-result.json on the core host is not reachable from this sandboxed

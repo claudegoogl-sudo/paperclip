@@ -68,7 +68,7 @@ test("findOpenSyncPr throws on a non-ok pulls response", async () => {
   await assert.rejects(() => findOpenSyncPr(BRANCH, { token: "t", fetchImpl }), /pulls query 403/);
 });
 
-// --- PLA-640: post-merge activation-soak gate -----------------------------
+// --- post-merge activation-soak gate ---------------------------------------
 
 test("runActivationSoakGate runs the soak and passes when it exits 0", () => {
   let ran = false;
@@ -84,7 +84,7 @@ test("runActivationSoakGate runs the soak and passes when it exits 0", () => {
 test("runActivationSoakGate aborts the tick when the soak exits non-zero", () => {
   assert.throws(
     () => runActivationSoakGate({ env: {}, runner: () => 1, log: () => {} }),
-    /soak failed \(exit 1\); refusing to advance the sync tick — see PLA-640/,
+    /soak failed \(exit 1\); refusing to advance the sync tick/,
   );
 });
 
@@ -95,7 +95,7 @@ test("runActivationSoakGate aborts when the runner throws (execFileSync non-zero
       runner: () => { const e = new Error("Command failed"); e.status = 2; throw e; },
       log: () => {},
     }),
-    /soak failed \(exit 2\); refusing to advance the sync tick — see PLA-640/,
+    /soak failed \(exit 2\); refusing to advance the sync tick/,
   );
 });
 

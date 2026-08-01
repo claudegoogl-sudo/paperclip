@@ -1,4 +1,4 @@
-// PLA-818 regression fixture: emulates the messenger inbound relay. While
+// Regression fixture: emulates the messenger inbound relay. While
 // servicing a host→worker dispatch (the `onWebhook`/`getUpdates` route), the
 // worker calls back into the host with `issues.createComment` WITHOUT echoing
 // the host-issued `paperclipInvocationId` — the real wire shape of the relay.
@@ -6,8 +6,8 @@
 // The host's base context cannot bind this id-less callback to the in-flight
 // dispatch by id, so it surfaces `invalidInvocationScope: true` (with
 // `singleInFlightScope`) and attaches the worker-lifetime `serviceScope`. Before
-// the PLA-818 guard-ordering fix the SDK gate threw on `invalidInvocationScope`
-// before reaching the PLA-814 serviceScope allowlist bypass, so this createComment
+// the guard-ordering fix the SDK gate threw on `invalidInvocationScope`
+// before reaching the serviceScope allowlist bypass, so this createComment
 // was denied and the operator reply never landed. After the fix the allowlisted,
 // reach-checked createComment is authorized.
 

@@ -57,7 +57,7 @@ describe("heartbeat stop metadata", () => {
     expect(resolveAgentStatusAfterRun({ outcome: "failed", runningRunCount: 1 })).toBe("running");
   });
 
-  // PLA-1865: a quota/upstream-transient failure is not the agent's fault — the
+  // A quota/upstream-transient failure is not the agent's fault — the
   // run stays `failed` (the work really did not happen) but the agent must stay
   // `idle` so it wakes again once `retryNotBefore` elapses. A genuine failure
   // (no errorFamily, or a distinct family like a real crash) must still park

@@ -60,7 +60,7 @@ export const LOCAL_PLUGIN_AUTOBUILD_TIMEOUT_MS = 120_000;
 const STANDALONE_BUNDLED_PLUGIN_SDK_PACKAGE = "@paperclipai/plugin-sdk";
 
 // ---------------------------------------------------------------------------
-// Manifest dynamic-import cache-bust (PLA-159)
+// Manifest dynamic-import cache-bust
 // ---------------------------------------------------------------------------
 
 /**
@@ -85,7 +85,8 @@ const STANDALONE_BUNDLED_PLUGIN_SDK_PACKAGE = "@paperclipai/plugin-sdk";
  * Exported so the regression test in `plugin-loader.test.ts` can exercise the
  * cache-bust property directly without spinning up the full install pipeline.
  *
- * @see PLA-159 — Host bug: plugin manifest re-import hits ESM cache
+ * Host bug this fixes: plugin manifest re-import hits ESM cache
+ * and silently keeps serving the pre-rebuild manifest.
  */
 export async function loadManifestModule(
   manifestPath: string,
@@ -198,11 +199,11 @@ export interface DiscoveredPlugin {
   /** The parsed and validated manifest if available, null if discovery-only. */
   manifest: PaperclipPluginManifestV1 | null;
   /**
-   * Content digest (`sha256:<hex>`) over the resolved package's own files, the
-   * integrity anchor for a parked capability-escalating upgrade (PLA-912). A
-   * version string alone is forgeable for a mutable source (a `localPath` dir
-   * swapped after approval, or a re-published version/tag), so `completeUpgrade`
-   * pins the applied package to the digest captured at park.
+   * SECURITY-CRITICAL: content digest (`sha256:<hex>`) over the resolved
+   * package's own files, the integrity anchor for a parked capability-escalating
+   * upgrade. A version string alone is forgeable for a mutable source (a
+   * `localPath` dir swapped after approval, or a re-published version/tag), so
+   * `completeUpgrade` pins the applied package to the digest captured at park.
    *
    * Populated by {@link fetchAndValidate} (the install/upgrade path). Left
    * undefined by discovery scans, which do not hash every candidate package.
@@ -305,14 +306,12 @@ export interface PluginLoaderOptions {
    * default. Injected (rather than constructed here) so the loader stays free
    * of company/board governance policy; the host wiring decides which company
    * the approval is filed against.
-   *
-   * @see PLA-908
    */
   escalationGateway?: CapabilityEscalationGateway;
 }
 
 // ---------------------------------------------------------------------------
-// Capability-escalation governance (PLA-908)
+// Capability-escalation governance
 // ---------------------------------------------------------------------------
 
 /**
@@ -336,7 +335,7 @@ export interface CapabilityEscalationRequest {
    * Content digest (`sha256:<hex>`) of the exact package the board is approving,
    * captured at park. Persisted on the approval so `completeUpgrade` can pin the
    * applied package to the approved contents and reject a swapped/re-published
-   * package that declares the same version (PLA-912).
+   * package that declares the same version.
    */
   digest: string;
 }
@@ -361,23 +360,21 @@ export interface CapabilityEscalationGateway {
   file(input: CapabilityEscalationRequest): Promise<string>;
 
   /**
-   * Return the *granted* (board-approved) capability-escalation contract for
-   * this plugin, or `null` if none is approved. `completeUpgrade` uses this as
-   * the integrity anchor: the package it applies must match the version and
+   * SECURITY-CRITICAL: return the *granted* (board-approved) capability-escalation
+   * contract for this plugin, or `null` if none is approved. `completeUpgrade` uses
+   * this as the integrity anchor: the package it applies must match the version and
    * stay within the capabilities the board actually saw and approved. The
    * loader self-enforces against this rather than trusting the caller's
-   * upgrade options.
-   *
-   * @see PLA-911 Finding 1 (approve-time TOCTOU)
+   * upgrade options — closing the approve-time TOCTOU where the applied
+   * package could otherwise diverge from what the board reviewed.
    */
   findApproved(input: { pluginId: string }): Promise<ApprovedUpgrade | null>;
 }
 
 /**
- * The capability-escalation contract the board approved for a parked upgrade —
- * the integrity anchor `completeUpgrade` verifies the applied package against.
- *
- * @see PLA-911 Finding 1
+ * SECURITY-CRITICAL: the capability-escalation contract the board approved for
+ * a parked upgrade — the integrity anchor `completeUpgrade` verifies the
+ * applied package against.
  */
 export interface ApprovedUpgrade {
   /** The approval record id. */
@@ -388,7 +385,7 @@ export interface ApprovedUpgrade {
   addedCapabilities: string[];
   /**
    * Content digest (`sha256:<hex>`) of the package the board approved, captured
-   * at park (PLA-912). When present, `completeUpgrade` rejects any fetched
+   * at park. When present, `completeUpgrade` rejects any fetched
    * package whose digest differs — closing the mutable-source TOCTOU residual
    * that the version + caps checks alone leave open. Optional so approvals filed
    * before this anchor existed still resolve (version + caps still enforced).
@@ -650,8 +647,6 @@ export interface PluginLoader {
    * `plugin_state`, secret-ref bindings) and is left untouched. Idempotent: a
    * call against a plugin that is not `upgrade_pending` is a no-op that returns
    * the current row.
-   *
-   * @see PLA-908
    */
   completeUpgrade(
     pluginId: string,
@@ -662,8 +657,6 @@ export interface PluginLoader {
    * Revert a parked (`upgrade_pending`) upgrade after its board approval was
    * rejected. Because parking never mutates the version/manifest/capabilities,
    * this only restores the lifecycle status to `ready`. Idempotent.
-   *
-   * @see PLA-908
    */
   revertPendingUpgrade(pluginId: string): Promise<PluginRecord>;
 
@@ -1063,9 +1056,9 @@ export async function ensureLocalPluginBuilt(
 }
 
 /**
- * Compute a deterministic content digest (`sha256:<hex>`) over a resolved
- * plugin package's own files — the integrity anchor for a parked
- * capability-escalating upgrade (PLA-912).
+ * SECURITY-CRITICAL: compute a deterministic content digest (`sha256:<hex>`)
+ * over a resolved plugin package's own files — the integrity anchor for a
+ * parked capability-escalating upgrade.
  *
  * The digest covers every regular file under `packageRoot`, keyed by its
  * POSIX-normalized relative path and length so a rename, truncation, or content
@@ -1110,12 +1103,12 @@ async function computePackageContentDigest(packageRoot: string): Promise<string>
 }
 
 // ---------------------------------------------------------------------------
-// Verified-upgrade snapshotting to immutable storage (PLA-913)
+// Verified-upgrade snapshotting to immutable storage
 // ---------------------------------------------------------------------------
 
 /**
- * Subdirectory of the local plugin dir holding content-addressed snapshots of
- * verified upgrade packages (PLA-913). Each parked cap-escalating upgrade from a
+ * SECURITY-CRITICAL: subdirectory of the local plugin dir holding
+ * content-addressed snapshots of verified upgrade packages. Each parked cap-escalating upgrade from a
  * local-path source is copied here, keyed by the content digest captured at
  * park, so `completeUpgrade` and the worker load the board-approved bytes from a
  * host-controlled copy instead of re-reading the mutable `localPath` source.
@@ -1512,7 +1505,7 @@ export function pluginLoader(
     const resolvedVersion = manifest.version;
 
     // Content digest of the resolved package — the integrity anchor a parked
-    // upgrade is pinned to at completion (PLA-912).
+    // upgrade is pinned to at completion.
     const digest = await computePackageContentDigest(resolvedPackagePath);
 
     return {
@@ -1526,14 +1519,14 @@ export function pluginLoader(
   }
 
   /**
-   * Snapshot a verified local-path package into content-addressed immutable
-   * storage (PLA-913) and return the snapshot path. Copies the *entire resolved
-   * tree* — including `node_modules` and dereferencing symlinks, which
-   * {@link computePackageContentDigest} deliberately excludes — so the bytes
-   * that will be required at load time are a host-controlled copy, not the
-   * mutable (board-approved but attacker-writable) source dir.
+   * SECURITY-CRITICAL: snapshot a verified local-path package into
+   * content-addressed immutable storage and return the snapshot path. Copies
+   * the *entire resolved tree* — including `node_modules` and dereferencing
+   * symlinks, which {@link computePackageContentDigest} deliberately excludes —
+   * so the bytes that will be required at load time are a host-controlled
+   * copy, not the mutable (board-approved but attacker-writable) source dir.
    *
-   * Closes the two residuals the digest-only anchor (PLA-912) left open:
+   * Closes the two residuals the digest-only anchor left open:
    * - **Verify-then-load TOCTOU**: `completeUpgrade` and the worker load this
    *   snapshot, so a swap of the source *after* approval can no longer reach the
    *   loader — the check-time and use-time bytes are the same immutable copy.
@@ -1587,7 +1580,7 @@ export function pluginLoader(
    * Returns the manifest on success or throws with a descriptive error.
    *
    * Uses {@link loadManifestModule} so install/upgrade observe rebuilds on
-   * disk instead of a stale ESM-cached module — see PLA-159.
+   * disk instead of a stale ESM-cached module.
    */
   async function loadManifestFromPath(
     manifestPath: string,
@@ -2029,7 +2022,6 @@ export function pluginLoader(
      *   the upgrade was applied (`ready`) or parked for approval (`upgrade_pending`).
      * @throws {Error} If the plugin is not found, the new manifest ID differs, or
      *   the upgrade escalates capabilities and no escalation gateway is configured.
-     * @see PLA-908
      */
     async upgradePlugin(
       pluginId: string,
@@ -2089,10 +2081,10 @@ export function pluginLoader(
           );
         }
 
-        // Snapshot the verified bytes to immutable storage BEFORE filing, so the
-        // approval the board sees is backed by a stored, content-addressed copy
-        // and a later swap of the source can reach neither `completeUpgrade` nor
-        // the worker (PLA-913). Only local-path sources load in place; npm
+        // SECURITY-CRITICAL: snapshot the verified bytes to immutable storage
+        // BEFORE filing, so the approval the board sees is backed by a stored,
+        // content-addressed copy and a later swap of the source can reach
+        // neither `completeUpgrade` nor the worker. Only local-path sources load in place; npm
         // packages resolve hoisted deps from the shared `node_modules` and must
         // not be copied in isolation, so they keep the digest-only anchor.
         if (discovered.source === "local-filesystem") {
@@ -2120,7 +2112,7 @@ export function pluginLoader(
           };
         }
 
-        // Lifecycle guard (PLA-911 Finding 2): parking is the `→ upgrade_pending`
+        // SECURITY-CRITICAL lifecycle guard: parking is the `→ upgrade_pending`
         // transition, which `VALID_TRANSITIONS` permits ONLY from `ready`. Refuse
         // to park a plugin an operator has deliberately disabled or that is
         // error-quarantined, so a (later rejected) upgrade cannot silently flip
@@ -2144,7 +2136,7 @@ export function pluginLoader(
             fromCapabilities: [...oldCaps],
             toCapabilities: [...newCaps],
             addedCapabilities,
-            // Anchor the approval to the exact package contents (PLA-912).
+            // Anchor the approval to the exact package contents.
             digest: discovered.digest!,
           }));
 
@@ -2186,33 +2178,33 @@ export function pluginLoader(
     },
 
     // -----------------------------------------------------------------------
-    // completeUpgrade / revertPendingUpgrade (PLA-908)
+    // completeUpgrade / revertPendingUpgrade
     // -----------------------------------------------------------------------
 
     /**
-     * Complete a parked (`upgrade_pending`) upgrade after board approval.
-     * Re-fetches the target package, applies the new version + manifest (and
-     * therefore the new capabilities), and returns the plugin to `ready`.
-     * Plugin-scoped data (`plugin_config`, `plugin_state`, secret-ref bindings)
-     * lives in separate tables and is left untouched. Idempotent.
+     * SECURITY-CRITICAL: complete a parked (`upgrade_pending`) upgrade after
+     * board approval. Re-fetches the target package, applies the new version +
+     * manifest (and therefore the new capabilities), and returns the plugin to
+     * `ready`. Plugin-scoped data (`plugin_config`, `plugin_state`, secret-ref
+     * bindings) lives in separate tables and is left untouched. Idempotent.
      *
-     * The applied package is bound to the board-approved contract (PLA-911
-     * Finding 1): the loader fetches the approval from the escalation gateway
-     * and refuses to apply a package whose version differs from the approved
-     * `toVersion` or whose capability delta exceeds the approved
-     * `addedCapabilities`. This is enforced loader-side rather than trusting the
-     * caller's `upgradeOptions`, so a swapped/re-published package cannot
-     * silently escalate capabilities the board never saw.
+     * The applied package is bound to the board-approved contract: the loader
+     * fetches the approval from the escalation gateway and refuses to apply a
+     * package whose version differs from the approved `toVersion` or whose
+     * capability delta exceeds the approved `addedCapabilities`. This is
+     * enforced loader-side rather than trusting the caller's `upgradeOptions`,
+     * so a swapped/re-published package cannot silently escalate capabilities
+     * the board never saw.
      *
      * The applied package is additionally pinned to the content digest captured
-     * at park (PLA-912): a package declaring the approved version and caps but
-     * carrying different code (a mutable `localPath` swapped after approval) is
+     * at park: a package declaring the approved version and caps but carrying
+     * different code (a mutable `localPath` swapped after approval) is
      * rejected. This closes the code-integrity residual the version + caps
      * checks alone leave open (OWASP A08).
      *
      * For local-path sources the bytes are loaded from the immutable snapshot
-     * taken at park (PLA-913) rather than re-read from the mutable source, which
-     * fully closes the verify-then-load TOCTOU and covers the `node_modules`/
+     * taken at park rather than re-read from the mutable source, which fully
+     * closes the verify-then-load TOCTOU and covers the `node_modules`/
      * symlinked code the digest excludes. The completed row's `packagePath` is
      * repointed at that snapshot so the worker requires the approved bytes.
      */
@@ -2253,12 +2245,12 @@ export function pluginLoader(
         localPath = plugin.packagePath ?? undefined,
       } = upgradeOptions;
 
-      // Prefer the immutable snapshot captured at park (PLA-913) over the
+      // Prefer the immutable snapshot captured at park over the
       // mutable source. Loading the approved bytes from host-controlled storage
       // closes the verify-then-load TOCTOU and covers the `node_modules`/
       // symlinked code the digest excludes: a swap of the source after approval
       // can no longer reach the loader. Falls back to the source only for legacy
-      // approvals with no snapshot (pre-PLA-913, or npm-sourced), preserving the
+      // approvals with no snapshot (predating this anchor, or npm-sourced), preserving the
       // prior digest-only behavior and never widening it.
       let loadFromLocalPath = localPath;
       let snapshotPath: string | null = null;
@@ -2286,7 +2278,7 @@ export function pluginLoader(
         );
       }
 
-      // Approval-binding checks (PLA-911 Finding 1). A version string is not an
+      // SECURITY-CRITICAL approval-binding checks. A version string is not an
       // integrity anchor for a mutable source, so verify BOTH the version and
       // the capability delta against the approved contract; fail closed (no
       // mutation, row stays parked) on any mismatch.
@@ -2315,7 +2307,7 @@ export function pluginLoader(
         );
       }
 
-      // Content-integrity check (PLA-912). The version + caps checks above pass a
+      // SECURITY-CRITICAL content-integrity check. The version + caps checks above pass a
       // package that declares the approved version and caps but carries
       // *different code* (a mutable `localPath` swapped after approval, or a
       // re-published version/tag). Pin to the digest captured at park: fail
@@ -2337,7 +2329,7 @@ export function pluginLoader(
       } else {
         log.warn(
           { pluginId, approvalId: approved.approvalId },
-          "plugin-loader: completeUpgrade has no approved content digest to verify against (approval predates PLA-912) — applying on version + capability checks only",
+          "plugin-loader: completeUpgrade has no approved content digest to verify against (approval predates the digest anchor) — applying on version + capability checks only",
         );
       }
 
@@ -2346,7 +2338,7 @@ export function pluginLoader(
         version: discovered.version,
         manifest: newManifest,
         // Repoint at the immutable snapshot so the worker requires the approved
-        // bytes, not the mutable source (PLA-913). Left unset for legacy/npm
+        // bytes, not the mutable source. Left unset for legacy/npm
         // paths, which keep their existing packagePath.
         ...(snapshotPath ? { packagePath: snapshotPath } : {}),
       });
@@ -2806,7 +2798,7 @@ export function pluginLoader(
       //
       // The bus.forPlugin() call creates the scoped handle if needed.
       //
-      // PLA-854: on a restart (dev-watcher hot reload / crash auto-restart)
+      // On a restart (dev-watcher hot reload / crash auto-restart)
       // unloadSingle() has already called eventBus.clearPlugin(), so this
       // plugin starts with ZERO subscriptions; the new worker process must
       // re-issue every events.subscribe RPC from its setup() for the relay to
@@ -2815,7 +2807,7 @@ export function pluginLoader(
       // after (re)activation) — the authoritative per-subscribe count is logged
       // by the host events.subscribe handler as each subscription lands. A relay
       // that stays at 0 (worker alive but no "plugin event subscription
-      // registered" lines) is the PLA-854 detached-subscription signature.
+      // registered" lines) is the detached-subscription signature.
       // ------------------------------------------------------------------
       const _scopedBus = eventBus.forPlugin(pluginKey);
       registered.eventSubscriptions = eventBus.subscriptionCount(pluginKey);
@@ -2854,7 +2846,7 @@ export function pluginLoader(
         // Pass the DB UUID (`pluginId`) as the third arg so dispatch can correlate
         // each tool to the worker manager (keyed by DB UUID, not by plugin key).
         // Without this, `workerManager.isRunning(tool.pluginDbId)` checks the plugin
-        // KEY against a UUID-keyed map and fails closed — see PLA-323.
+        // KEY against a UUID-keyed map and fails closed.
         toolDispatcher.registerPluginTools(pluginKey, manifest, pluginId);
         registered.tools = toolDeclarations.length;
 

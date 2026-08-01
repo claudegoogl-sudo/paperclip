@@ -319,7 +319,7 @@ describe.sequential("plugin install and upgrade authz", () => {
     expect(mockLifecycle.unload).toHaveBeenCalledWith(pluginId, true);
   }, 20_000);
 
-  it("permits plugin config saves that contain secret refs (resolution is company-binding-gated; PLA-657)", async () => {
+  it("permits plugin config saves that contain secret refs (resolution is company-binding-gated)", async () => {
     readyPlugin();
     mockRegistry.upsertConfig.mockResolvedValue({
       pluginId,
@@ -447,7 +447,7 @@ describe.sequential("scoped plugin API routes", () => {
   }, 20_000);
 });
 
-describe.sequential("plugin per-tenant config override routes (PLA-677)", () => {
+describe.sequential("plugin per-tenant config override routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockRegistry.getCompanyConfigOverride.mockResolvedValue(null);
@@ -1195,7 +1195,7 @@ describe.sequential("plugin tool and bridge authz", () => {
   });
 });
 
-describe.sequential("plugin tool dispatch for agent actors (PLA-39 / PLA-594)", () => {
+describe.sequential("plugin tool dispatch for agent actors", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });

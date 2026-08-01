@@ -1,12 +1,12 @@
-// PLA-673 regression fixture: a worker that emulates the pre-PLA-657 SDK
+// Regression fixture: a worker that emulates an older SDK
 // shape — it issues `secrets.resolve` without a `runId` field. The host's
 // `host-client-factory` gated wrapper is expected to back-fill `runId` from
 // the active invocation scope set by the executeTool / performAction bracket.
 //
 // The fixture also echoes the host-issued `paperclipInvocationId` on the
 // nested call so the host can resolve the invocation context (this is what
-// any real SDK does, including the pre-PLA-657 one — PLA-657 added the runId
-// payload field, not the invocation id echo).
+// any real SDK does, including the older one — a later SDK change added the
+// runId payload field, not the invocation id echo).
 
 const readline = require("node:readline");
 

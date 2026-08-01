@@ -7,7 +7,7 @@ import {
 
 const ACTOR = { pluginId: "plugin-a", companyId: "company-1", agentId: "agent-x" };
 
-describe("plugin wake rate limiter (PLA-829)", () => {
+describe("plugin wake rate limiter", () => {
   it("allows up to the cap then blocks within the window", () => {
     let now = 1_000;
     const limiter = createPluginWakeRateLimiter({ windowMs: 60_000, maxWakes: 3, now: () => now });

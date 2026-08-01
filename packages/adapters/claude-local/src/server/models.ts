@@ -41,7 +41,7 @@ function dedupeModels(models: AdapterModel[]): AdapterModel[] {
     seen.add(id);
     // Preserve all registry fields (e.g. `safeguardsLifted`) — only id/label are
     // normalized. Reconstructing `{ id, label }` here silently dropped the
-    // safeguards flag from the exposed model list. See PLA-1423 / PLA-1451.
+    // safeguards flag from the exposed model list.
     deduped.push({ ...model, id, label: model.label.trim() || id });
   }
   return deduped;

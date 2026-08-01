@@ -1,5 +1,5 @@
 /**
- * PLA-574 — SDK-side tests for `ctx.artifacts.fetch(attachmentId)` inside a
+ * SDK-side tests for `ctx.artifacts.fetch(attachmentId)` inside a
  * tool handler. The worker must send ONLY `{ attachmentId, runId }` on the
  * RPC (no agentId / companyId — those are host-derived to keep the worker
  * untrusted) and must decode the host's base64 response back to a Uint8Array.
@@ -82,7 +82,7 @@ async function runWorkerToolFetch(
         "fetch-artifact",
         {
           displayName: "Fetch artifact",
-          description: "PLA-574 test tool",
+          description: "artifacts-fetch test tool",
           parametersSchema: { type: "object" },
         },
         async (_params, runCtx) => {
@@ -175,7 +175,7 @@ async function runWorkerToolFetch(
         apiVersion: 1,
         version: "1.0.0",
         displayName: "Artifacts Test",
-        description: "PLA-574 test plugin",
+        description: "artifacts-fetch test plugin",
         author: "Paperclip",
         categories: ["automation"],
         capabilities: [],
@@ -201,7 +201,7 @@ async function runWorkerToolFetch(
   return { artifactsCalls, toolResults, toolErrors };
 }
 
-describe("ctx.artifacts.fetch — PLA-574 worker→host wire", () => {
+describe("ctx.artifacts.fetch — worker→host wire", () => {
   it("sends only attachmentId + runId (worker never asserts agent/company identity)", async () => {
     const bytes = Buffer.from("hello bytes", "utf8");
     const inv: FetchInvocation = {
@@ -250,7 +250,7 @@ describe("ctx.artifacts.fetch — PLA-574 worker→host wire", () => {
     });
   });
 
-  it("PLA-888 create: base64-encodes bytes and sends companyId/filename/mimeType/runId only", async () => {
+  it("create: base64-encodes bytes and sends companyId/filename/mimeType/runId only", async () => {
     const raw = new Uint8Array([0x00, 0xff, 0x10, 0x7f, 0x80]);
     let captured: Record<string, unknown> | undefined;
     let returned: { attachmentId: string } | undefined;
@@ -361,7 +361,7 @@ describe("ctx.artifacts.fetch — PLA-574 worker→host wire", () => {
     }
   });
 
-  it("PLA-888 create: rejects empty bytes at the SDK boundary (no RPC sent)", async () => {
+  it("create: rejects empty bytes at the SDK boundary (no RPC sent)", async () => {
     const captured: { errorMessage?: string } = {};
     const calls: unknown[] = [];
     const plugin = definePlugin({
@@ -573,7 +573,7 @@ describe("ctx.artifacts.fetch — PLA-574 worker→host wire", () => {
 });
 
 /**
- * PLA-895 — `ctx.artifacts` on the worker `PluginContext`, reachable from a
+ * `ctx.artifacts` on the worker `PluginContext`, reachable from a
  * NON-tool-dispatch (service/background) context. Here we exercise it from a
  * `runJob` handler, which the host drives with a `paperclipInvocation`. The
  * worker must:
@@ -582,10 +582,10 @@ describe("ctx.artifacts.fetch — PLA-574 worker→host wire", () => {
  *    active service/background run-context (the same path `secrets.resolve`
  *    uses from a `setup()` poll loop),
  *  - and surface the host's `runcontext_invalid` error verbatim on `fetch`
- *    from a service context (documents the PLA-894-B boundary — this issue
- *    must NOT widen service/background reads).
+ *    from a service context (documents that the service/background read
+ *    boundary must NOT be widened).
  */
-describe("ctx.artifacts (worker PluginContext) — PLA-895 service/background", () => {
+describe("ctx.artifacts (worker PluginContext) — service/background", () => {
   interface JobHarness {
     captured?: Record<string, unknown>;
     invocationId?: unknown;
@@ -728,7 +728,7 @@ describe("ctx.artifacts (worker PluginContext) — PLA-895 service/background", 
     expect(h.invocationId).toBe("inv-svc-1");
   });
 
-  it("fetch from a service/background ctx surfaces runcontext_invalid (PLA-894-B boundary not widened)", async () => {
+  it("fetch from a service/background ctx surfaces runcontext_invalid (boundary not widened)", async () => {
     const h = await runJobArtifacts({ fetchAttachmentId: "att-svc-1" });
     expect(h.fetchError).toBeDefined();
     expect(h.fetchError!.message).toContain("runcontext_invalid");

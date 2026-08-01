@@ -894,7 +894,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       },
     },
     artifacts: {
-      // PLA-895: worker-ctx artifacts client. `create` is gated on
+      // Worker-ctx artifacts client. `create` is gated on
       // `issue.attachments.create` and returns a deterministic id; `fetch`
       // returns deterministic bytes so service/background tests have a default.
       async create(input) {
@@ -2545,7 +2545,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         runId: runCtx.runId ?? randomUUID(),
         companyId: runCtx.companyId ?? "company-test",
         projectId: runCtx.projectId ?? "project-test",
-        // PLA-574: provide a default artifacts client for tests that don't
+        // Provide a default artifacts client for tests that don't
         // exercise cross-tenant fetches; throws if invoked so tests that do
         // need it must inject their own client.
         artifacts: runCtx.artifacts ?? {
@@ -2554,7 +2554,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
               "ctx.artifacts.fetch is not stubbed in this test — pass `runCtx.artifacts` to inject a mock",
             );
           },
-          // PLA-888: default create stub throws so tests that exercise the write
+          // Default create stub throws so tests that exercise the write
           // path inject their own client (mirrors the fetch default).
           create: async () => {
             throw new Error(

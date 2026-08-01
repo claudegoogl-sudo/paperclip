@@ -10,8 +10,8 @@ import {
   secretMarker,
 } from "../secret-patterns.js";
 
-// All fixtures are synthetic, shape-valid, non-live values (PLA-177 / PLA-319
-// constraint: zero live secret bytes). The bodies below are deterministic
+// All fixtures are synthetic, shape-valid, non-live values (constraint: zero
+// live secret bytes). The bodies below are deterministic
 // filler that matches each pattern's shape.
 const GITHUB_PAT = `github_pat_${"A".repeat(82)}`;
 const GHP = `ghp_${"a".repeat(36)}`;
@@ -102,7 +102,7 @@ describe("secret-patterns shared module", () => {
     expect(redactSecrets(`x ${paperclip} y`)).toBe(`x ${paperclip} y`);
   });
 
-  // PLA-842 Finding 1: the log-surface variant bypasses the Option A issuer
+  // Finding 1: the log-surface variant bypasses the Option A issuer
   // allowlist so a live iss=paperclip run JWT is never persisted to logs.
   it("redacts Paperclip run JWTs on the LOG surface (ignores Option A)", () => {
     const paperclip = makeJwt({ iss: "paperclip" });
@@ -133,10 +133,10 @@ describe("secret-patterns shared module", () => {
     expect(labels.indexOf("github_pat")).toBeLessThan(labels.indexOf("jwt"));
   });
 
-  // PLA-1175 regression: the github_pat body length is not contractually fixed,
+  // Regression: the github_pat body length is not contractually fixed,
   // so the matcher must be min-length, not exact. The 80- and 90-char cases
   // below FAIL against the old `{82}` regex and PASS against `{36,}`. The
-  // 82-char case (the historical PLA-190/194 leak shape) must keep matching.
+  // 82-char case (the historical leak shape) must keep matching.
   // Fixtures are synthetic, shape-valid filler — never a real token.
   describe("github_pat off-length variants (min-length, not exact)", () => {
     for (const len of [80, 82, 90]) {

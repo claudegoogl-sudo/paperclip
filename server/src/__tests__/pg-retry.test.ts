@@ -12,10 +12,10 @@ const makePgError = (code: string, message = "synthetic") => {
   return err;
 };
 
-// PLA-638: mirror drizzle-orm's DrizzleQueryError — a wrapper Error with NO
+// Mirror drizzle-orm's DrizzleQueryError — a wrapper Error with NO
 // top-level `code`, carrying the real driver error on `.cause`. This is what
 // every failed query actually throws in production (drizzle 0.45.2), and what
-// PLA-597's original top-level-`code`-only check silently failed to retry.
+// the original top-level-`code`-only check silently failed to retry.
 const wrapAsDrizzleQueryError = (cause: unknown) => {
   const err = new Error(
     'Failed query: select "heartbeat_runs"."id" from "heartbeat_runs" where "heartbeat_runs"."id" = $1 for update\nparams: abc',
@@ -48,7 +48,7 @@ describe("isRetryablePgError", () => {
     expect(isRetryablePgError("nope")).toBe(false);
   });
 
-  // PLA-638 regression: the production failure mode.
+  // Regression: the production failure mode.
   it("returns true for a deadlock wrapped in a DrizzleQueryError (.cause)", () => {
     const wrapped = wrapAsDrizzleQueryError(
       makePgError("40P01", "deadlock detected"),
@@ -98,7 +98,7 @@ describe("findPgErrorCode", () => {
     expect(findPgErrorCode(makePgError("22P02", "invalid input"))).toBe("22P02");
   });
 
-  // PLA-873 regression: invalid-uuid lookups arrive drizzle-wrapped, so the
+  // Regression: invalid-uuid lookups arrive drizzle-wrapped, so the
   // plugin-ui-static route's top-level-`code`-only check missed 22P02 and
   // surfaced every plugin-key UI request as a 500. The code lives on `.cause`.
   it("resolves a non-retryable SQLSTATE (22P02) through the DrizzleQueryError wrapper", () => {
@@ -149,7 +149,7 @@ describe("retryOnTransientPgError", () => {
     expect(fn).toHaveBeenCalledTimes(3);
   });
 
-  // PLA-638 regression: before the .cause-chain fix, a wrapped deadlock was
+  // Regression: before the .cause-chain fix, a wrapped deadlock was
   // classified non-retryable and thrown on the first attempt (the 500).
   it("retries a deadlock wrapped in a DrizzleQueryError and eventually succeeds", async () => {
     let calls = 0;
@@ -201,7 +201,7 @@ describe("retryOnTransientPgError", () => {
     expect(fn).toHaveBeenCalledTimes(3);
   });
 
-  it("defaults to 6 attempts when maxAttempts not provided (PLA-597 headroom)", async () => {
+  it("defaults to 6 attempts when maxAttempts not provided (retry headroom)", async () => {
     const err = makePgError("40P01", "deadlock detected");
     const fn = vi.fn(async () => {
       throw err;

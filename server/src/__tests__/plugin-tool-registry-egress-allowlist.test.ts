@@ -1,5 +1,5 @@
 /**
- * PLA-723 — per-binding egress allowlist enforced at the dispatch chokepoint.
+ * Per-binding egress allowlist enforced at the dispatch chokepoint.
  *
  * The decision runs BEFORE substitution (EG5): a denied call aborts with the
  * worker never invoked and the handle never resolved to plaintext.

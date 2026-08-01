@@ -680,7 +680,7 @@ Typed errors surfaced to the worker:
 | `rate_limited`        | Either ceiling tripped                                                                   |
 | `too_large`           | Attachment exceeds the host's per-call payload cap (default 10 MiB)                      |
 
-See PLA-574 for the threat model and seven-point security checklist.
+See the design notes above for the threat model and seven-point security checklist.
 
 ### 13.12 `artifacts.create` (worker → host)
 
@@ -749,7 +749,7 @@ Typed errors surfaced to the worker:
 | `rate_limited`        | Per-company write ceiling tripped                                                        |
 | `too_large`           | Body empty, invalid base64, or larger than `min(company cap, 10 MiB)`                    |
 
-See PLA-888 for the threat model and gate-by-gate rationale.
+See the design notes above for the threat model and gate-by-gate rationale.
 
 ## 14. SDK Surface
 

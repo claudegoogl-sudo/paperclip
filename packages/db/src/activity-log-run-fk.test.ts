@@ -7,7 +7,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./test-embedded-postgres.js";
 
-// Regression for PLA-644: activity_log.runId must use ON DELETE SET NULL so that
+// Regression test: activity_log.runId must use ON DELETE SET NULL so that
 // deleting a heartbeat_runs row (e.g. admin removes an agent/company while a run is
 // still completing and writing activity_log) does not raise
 // "violates foreign key constraint activity_log_run_id_heartbeat_runs_id_fk" (SQLSTATE 23503).
@@ -53,10 +53,10 @@ describeEmbeddedPostgres("activity_log.run_id ON DELETE SET NULL", () => {
         expect(fk?.delete_rule).toBe("SET NULL");
 
         const [company] = await sql.unsafe<{ id: string }[]>(
-          `INSERT INTO "companies" ("name") VALUES ('PLA-644 FK test co') RETURNING id`,
+          `INSERT INTO "companies" ("name") VALUES ('FK test co') RETURNING id`,
         );
         const [agent] = await sql.unsafe<{ id: string }[]>(
-          `INSERT INTO "agents" ("company_id", "name") VALUES ($1, 'PLA-644 FK test agent') RETURNING id`,
+          `INSERT INTO "agents" ("company_id", "name") VALUES ($1, 'FK test agent') RETURNING id`,
           [company.id],
         );
         const [run] = await sql.unsafe<{ id: string }[]>(

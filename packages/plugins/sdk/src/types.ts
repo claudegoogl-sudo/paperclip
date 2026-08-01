@@ -261,7 +261,6 @@ export interface ToolRunContext {
    * handler to read attachments uploaded by an agent in another company.
    *
    * @see {@link ToolRunContextArtifactsClient}
-   * @see PLA-574 — host-mediated cross-tenant artifact fetch
    */
   artifacts: ToolRunContextArtifactsClient;
 }
@@ -294,8 +293,7 @@ export interface ToolRunContextArtifact {
  *
  * The host validates the runContext server-side before returning bytes,
  * rate-limits per dispatching agent, and writes a six-field audit log entry
- * on every call (success or deny). See PLA-574 for the threat model and
- * sequencing constraints.
+ * on every call (success or deny).
  */
 export interface ToolRunContextArtifactsClient {
   /**
@@ -321,7 +319,7 @@ export interface ToolRunContextArtifactsClient {
   fetch(attachmentId: string): Promise<ToolRunContextArtifact>;
 
   /**
-   * PLA-888: store inbound bytes as a company-scoped Paperclip asset (the
+   * Store inbound bytes as a company-scoped Paperclip asset (the
    * inverse of {@link fetch}). Returns `{ attachmentId }` — the asset id, which
    * you pass to `issues.createComment`'s `attachmentIds` to surface the bytes
    * on a comment.
@@ -344,7 +342,7 @@ export interface ToolRunContextArtifactsClient {
 }
 
 /**
- * PLA-888: input to {@link ToolRunContextArtifactsClient.create}.
+ * Input to {@link ToolRunContextArtifactsClient.create}.
  */
 export interface ToolRunContextArtifactCreateInput {
   /** Target company UUID. Must match the dispatching/service scope. */
@@ -366,11 +364,11 @@ export interface ToolRunContextArtifactCreateInput {
  * `getUpdates` long-poll), `onWebhook`, `onEvent`, or `runJob` — as well as
  * from tool dispatch. It takes no `runId`: the host backfills the active
  * run-context from the worker→host `paperclipInvocationId`
- * (PLA-768 `serviceScope` / PLA-719 `singleInFlightScope`), exactly as
+ * (`serviceScope` / `singleInFlightScope`), exactly as
  * {@link PluginSecretsClient.resolve} already does from these contexts.
  *
- * @see PLA-895 — worker-ctx artifacts surface
- * @see PLA-893 — messenger inbound media relay (the unblocked consumer)
+ * @see worker-ctx artifacts surface
+ * @see messenger inbound media relay (the unblocked consumer)
  */
 export interface PluginArtifactsClient {
   /**
@@ -380,7 +378,7 @@ export interface PluginArtifactsClient {
    * (default-deny). Host gates match {@link ToolRunContextArtifactsClient.create}:
    * company scope (cross-tenant writes throw `forbidden`), MIME allowlist, size
    * ceiling, and `(companyId, sha256)` dedupe (idempotent). Authorized from
-   * `service`/`background` contexts (PLA-888 Gate 2) as well as tool dispatch.
+   * `service`/`background` contexts (Gate 2) as well as tool dispatch.
    *
    * Typed error codes via JsonRpcCallError: `runcontext_invalid`, `forbidden`,
    * `too_large`, `rate_limited`.
@@ -392,9 +390,9 @@ export interface PluginArtifactsClient {
    *
    * Works today from a **tool-dispatch** context. From a `service`/`background`
    * context the host currently rejects reads with `runcontext_invalid` — reads
-   * are scoped to the dispatching agent; widening this is the separately
-   * security-reviewed host change PLA-894-B. This SDK surface is already correct
-   * for both: no further SDK change is needed once 894-B lands.
+   * are scoped to the dispatching agent; widening this is a separately
+   * security-reviewed host change. This SDK surface is already correct
+   * for both: no further SDK change is needed once that host change lands.
    */
   fetch(attachmentId: string): Promise<ToolRunContextArtifact>;
 }
@@ -863,7 +861,7 @@ export interface PluginSecretsClient {
 
   /**
    * Exchange a resolved secret plaintext for an opaque **borrowed handle**
-   * (`vault-handle://<runId>/<128-bit-id>`) — PLA-702 / PLA-695 Control 2.
+   * (`vault-handle://<runId>/<128-bit-id>`) — Control 2.
    *
    * Return the handle to the agent INSTEAD of the plaintext. The host keeps the
    * real value in a per-run vault and substitutes it back in only at the
@@ -878,7 +876,7 @@ export interface PluginSecretsClient {
    *
    * @param value - The resolved secret plaintext to borrow.
    * @param runId - The `runCtx.runId` of the active tool dispatch.
-   * @param secretRef - Optional UUID of the secret being borrowed (PLA-723).
+   * @param secretRef - Optional UUID of the secret being borrowed.
    *   When given, the host captures the secret's per-company binding egress
    *   allowlist onto the handle at mint time so downstream egress is gated to
    *   operator-approved destinations. The allowlist is always derived host-side
@@ -1452,7 +1450,7 @@ export interface PluginIssueApprovalSummary {
 
 /**
  * Field-minimized view of a pending board approval, returned by the
- * `approvals.list` reconcile read (PLA-923). Excludes the requester/decider
+ * `approvals.list` reconcile read. Excludes the requester/decider
  * user-id and decision-note PII carried by {@link PluginIssueApprovalSummary};
  * the digest only needs to identify and relay the pending blocker.
  */
@@ -1466,7 +1464,7 @@ export interface PluginPendingApproval {
 
 /**
  * Field-minimized view of a pending issue thread interaction, returned by the
- * `interactions.list` reconcile read (PLA-923). Excludes creator/resolver
+ * `interactions.list` reconcile read. Excludes creator/resolver
  * user-id PII and the free-form payload/result blobs.
  */
 export interface PluginPendingInteraction {
@@ -1480,7 +1478,7 @@ export interface PluginPendingInteraction {
 }
 
 /**
- * `ctx.approvals` — reconcile read of pending board approvals (PLA-923).
+ * `ctx.approvals` — reconcile read of pending board approvals.
  * Requires `board.approvals.read`. Company-scoped and read-only; intended for a
  * digest plugin to seed/reconcile its in-memory blocker set on worker startup.
  */
@@ -1494,7 +1492,7 @@ export interface PluginApprovalsClient {
 
 /**
  * `ctx.interactions` — reconcile read of pending issue thread interactions
- * (PLA-923). Requires `issue.interactions.read`. Company-scoped, read-only.
+ * Requires `issue.interactions.read`. Company-scoped, read-only.
  */
 export interface PluginInteractionsClient {
   /**
@@ -1742,12 +1740,12 @@ export interface PluginIssuesClient {
     companyId: string,
     options?: {
       authorAgentId?: string;
-      /** Resolve the target issue by identifier (e.g. `PLA-822`) instead of `issueId`. */
+      /** Resolve the target issue by identifier (e.g. `ACME-822`) instead of `issueId`. */
       identifier?: string;
       /**
        * Wake the resolved issue's assignee. Body @-mentions are NOT honored as a
        * wake primitive: relay bodies are untrusted, so mention-wake is omitted to
-       * avoid inbound content fanning out heartbeats (see PLA-823 Finding 2).
+       * avoid inbound content fanning out heartbeats.
        */
       wakeAssignee?: boolean;
       /**
@@ -1756,7 +1754,7 @@ export interface PluginIssuesClient {
        */
       refuseClosed?: boolean;
       /**
-       * PLA-888: asset ids returned by `ctx.artifacts.create` to surface on this
+       * Asset ids returned by `ctx.artifacts.create` to surface on this
        * comment. Each must belong to the comment's company. Omit/empty keeps the
        * existing text-only behaviour.
        */
@@ -1770,7 +1768,7 @@ export interface PluginIssuesClient {
     options?: { authorAgentId?: string },
   ): Promise<IssueThreadInteraction>;
   /**
-   * PLA-1438 Part A: retire (expire) a single pending interaction the plugin is
+   * Retire (expire) a single pending interaction the plugin is
    * relaying an operator reply to — e.g. the messenger converting a free-text
    * Telegram reply into a comment and resolving the `request_confirmation` it
    * answered so nothing stays `pending`. Terminal status is always `expired`
@@ -2220,7 +2218,7 @@ export interface PluginContext {
   /**
    * Create and fetch attachment bytes from service/background or tool-dispatch
    * code. `create` requires `issue.attachments.create` (default-deny). Takes no
-   * `runId` — the host backfills the active run-context (PLA-895).
+   * `runId` — the host backfills the active run-context.
    */
   artifacts: PluginArtifactsClient;
 

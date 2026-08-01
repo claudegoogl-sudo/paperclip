@@ -3452,10 +3452,10 @@ export function secretService(db: Db) {
     },
 
     /**
-     * Operator-only: company-scoped review surface for the egress enforce-flip
-     * (PLA-735). Returns every borrowed-handle binding in the company alongside
+     * SECURITY-CRITICAL: operator-only, company-scoped review surface for the egress
+     * enforce-flip. Returns every borrowed-handle binding in the company alongside
      * its CURRENT persisted allowlist + enforcement posture and the harvested
-     * would-deny origins (PLA-734) as SEPARATE suggestion rows.
+     * would-deny origins as SEPARATE suggestion rows.
      *
      * Deliberate shape decisions, all load-bearing for the SE acceptance
      * criteria:
@@ -3513,7 +3513,7 @@ export function secretService(db: Db) {
     },
 
     /**
-     * Operator-only: set/replace a binding's egress allowlist (PLA-731 step 2-3).
+     * SECURITY-CRITICAL: operator-only, set/replace a binding's egress allowlist.
      *
      * This is the only path that writes `allowedEgress`; there is no
      * agent/worker-passable route, preserving EG1-provenance. Entries are
@@ -3551,7 +3551,7 @@ export function secretService(db: Db) {
     },
 
     /**
-     * Operator-only: flip ONE migrated binding to enforcing (PLA-731 step 3-4).
+     * SECURITY-CRITICAL: operator-only, flip ONE migrated binding to enforcing.
      *
      * Deliberately per-binding, never a blanket UPDATE: operators sign off one
      * binding at a time as they review its harvested allowlist, so a misjudged
@@ -3593,7 +3593,7 @@ export function secretService(db: Db) {
           handlesPurged,
           action: "secret.egress_allowlist_enforced",
         },
-        "flipped secret binding egress allowlist to enforcing (PLA-731)",
+        "flipped secret binding egress allowlist to enforcing",
       );
       return { binding: updated, handlesPurged };
     },
@@ -3686,9 +3686,9 @@ export function secretService(db: Db) {
     },
 
     /**
-     * Forward-path maintainer for plugin secret-ref bindings (model C, PLA-660).
+     * Forward-path maintainer for plugin secret-ref bindings (model C).
      *
-     * The one-time PLA-662 backfill (migration 0090) seeds bindings from config
+     * The one-time backfill (migration 0090) seeds bindings from config
      * that predates company-scoped resolution; this is its live counterpart:
      * every time plugin config is saved, each manifest field annotated
      * `format: "secret-ref"` is reconciled into `company_secret_bindings` so the
@@ -3767,7 +3767,7 @@ export function secretService(db: Db) {
 
       let bound = 0;
       let revoked = 0;
-      // PLA-797: secret-ref paths whose value points at a secret that could not
+      // Secret-ref paths whose value points at a secret that could not
       // be bound (orphan UUID, or cross-company in per-company scope). These are
       // exactly the refs that would later fail closed at `ctx.secrets.resolve()`
       // as "secret not found", so we surface them loudly at config time below.
@@ -3779,7 +3779,7 @@ export function secretService(db: Db) {
           if (newRefs.get(dotPath) === oldValue) continue; // unchanged
           const oldOwner = input.companyId ?? (await ownerCompanyFor(oldValue, tx));
           if (!oldOwner) continue; // cannot locate the row to revoke (harmless)
-          // PLA-677: Multi-tenant safety for the instance-wide save path. When
+          // SECURITY-CRITICAL: multi-tenant safety for the instance-wide save path. When
           // the global plugin_config is repointed from one tenant's secret to
           // a different tenant's, the operator's intent is "default ref for
           // the plugin is now <new>" — NOT a per-tenant revoke. Each tenant's
@@ -3851,7 +3851,7 @@ export function secretService(db: Db) {
         { companyScope: input.companyId ?? "instance", bound, revoked },
         "synced plugin secret-ref bindings",
       );
-      // PLA-797: a secret ref persisted to config but left unbound resolves as
+      // A secret ref persisted to config but left unbound resolves as
       // "secret not found" at call time (the messenger poll-loop failure). Warn
       // at config time, naming the paths, so it fails loudly instead of silently.
       if (unboundPaths.length > 0) {

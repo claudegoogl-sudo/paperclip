@@ -1,6 +1,7 @@
 /**
- * Plugin secrets host-side handler — resolves secret references through the
- * Paperclip secret provider system with enforced cross-company isolation.
+ * SECURITY-CRITICAL: plugin secrets host-side handler — resolves secret
+ * references through the Paperclip secret provider system with enforced
+ * cross-company isolation.
  *
  * When a plugin worker calls `ctx.secrets.resolve(secretRef, runId)`, the
  * JSON-RPC request arrives at the host carrying ONLY `{ secretRef, runId }`.
@@ -25,8 +26,8 @@
  *     off the server-validated runContext (never `pluginId`).
  *  6. Emits a value-free allow/deny audit log entry mirroring `artifacts.fetch`.
  *
- * This mirrors the SecurityEngineer-approved `artifacts.fetch` authorization
- * primitive (PLA-574) and the isolation model signed off on PLA-655/PLA-656.
+ * This mirrors the authorization primitive of the sibling `artifacts.fetch`
+ * handler and the reviewed cross-company isolation model.
  *
  * ## Secret Reference Format
  *
@@ -38,7 +39,7 @@
  * ## Security Invariants
  *
  * - Resolved values are NEVER logged, persisted, or included in error
- *   messages (PLUGIN_SPEC.md §22, PLA-190/PLA-193).
+ *   messages (PLUGIN_SPEC.md §22).
  * - Worker-facing errors carry ONLY a typed code from {@link SecretsErrorCode};
  *   the raw ref/secretId never reaches the worker (it may appear only in
  *   server-side structured debug logs).
@@ -47,7 +48,7 @@
  * - The handler never caches resolved values; each call honours rotation.
  *
  * @see PLUGIN_SPEC.md §22 — Secrets
- * @see plugin-artifacts-handler.ts — the sibling authorization primitive (PLA-574)
+ * @see plugin-artifacts-handler.ts — the sibling authorization primitive
  * @see services/secrets.ts — secretService.resolveSecretValue (company-scoped)
  */
 
@@ -70,16 +71,16 @@ import type {
 } from "./plugin-run-context-registry.js";
 
 /**
- * The binding target type used for plugin secret-ref bindings. A binding row
- * is `(companyId, targetType="plugin", targetId=<plugin install UUID>,
- * configPath=<manifest secret-ref path>, secretId)`. This is the per-company
- * allow-list surface SecurityEngineer required (PLA-656 Q3, model C —
- * `company_secret_bindings`).
+ * SECURITY-CRITICAL: the binding target type used for plugin secret-ref
+ * bindings. A binding row is `(companyId, targetType="plugin",
+ * targetId=<plugin install UUID>, configPath=<manifest secret-ref path>,
+ * secretId)`. This is the per-company allow-list surface
+ * (`company_secret_bindings`) that gates which secrets a plugin may resolve.
  */
 export const PLUGIN_SECRET_BINDING_TARGET_TYPE = "plugin";
 
 // ---------------------------------------------------------------------------
-// Typed errors — the ONLY shapes that reach the worker (PLA-656 R2)
+// SECURITY-CRITICAL: typed errors — the ONLY shapes that reach the worker
 // ---------------------------------------------------------------------------
 
 export type SecretsErrorCode =
@@ -89,8 +90,9 @@ export type SecretsErrorCode =
   | "invalid_ref";
 
 /**
- * The only error surfaced to the plugin worker. Messages are generic and
- * MUST NOT echo the raw ref or any secret material (PLA-656 R2, PLUGIN_SPEC §22).
+ * SECURITY-CRITICAL: the only error surfaced to the plugin worker. Messages
+ * are generic and MUST NOT echo the raw ref or any secret material
+ * (PLUGIN_SPEC §22).
  */
 export class SecretsError extends Error {
   readonly code: SecretsErrorCode;
@@ -181,7 +183,8 @@ export interface PluginSecretsResolveParams {
 }
 
 /**
- * Input shape for the `secrets.mintHandle` handler (PLA-702 Control 2). The
+ * SECURITY-CRITICAL: input shape for the `secrets.mintHandle` handler
+ * (the borrowed-handle vault, Control 2). The
  * worker supplies the resolved plaintext plus the opaque dispatch `runId`; the
  * dispatching company/agent is re-derived server-side from the run-context
  * registry (the worker is never trusted for scope).
@@ -194,8 +197,8 @@ export interface PluginSecretsMintHandleParams {
   /** The runId of the currently-executing tool dispatch. */
   runId: string;
   /**
-   * The UUID of the secret being borrowed (PLA-723). The host uses it ONLY to
-   * look up the per-company binding row and capture that binding's
+   * SECURITY-CRITICAL: the UUID of the secret being borrowed. The host uses
+   * it ONLY to look up the per-company binding row and capture that binding's
    * operator-set egress allowlist onto the handle — the worker can never
    * supply the allowlist itself (EG1-provenance). Absent / no-binding mints
    * get the migration-safe log-only posture.
@@ -213,14 +216,14 @@ export interface PluginSecretBindingRow {
   secretId: string;
   configPath: string;
   versionSelector: string | null;
-  /** Operator-set egress destination allowlist (PLA-723, EG1-provenance). */
+  /** Operator-set egress destination allowlist (EG1-provenance). */
   allowedEgress: string[];
   /** EG4: NEW bindings enforce; pre-existing migrate via log-only. */
   egressAllowlistEnforced: boolean;
 }
 
 /**
- * PLA-768: a binding row resolved for a worker-lifetime **service** context,
+ * SECURITY-CRITICAL: a binding row resolved for a worker-lifetime **service** context,
  * where there is no dispatching company. The owning company is derived from the
  * binding itself: a `secretRef` has exactly one owning company, so a
  * `(plugin install, secretId)` binding uniquely determines the company that may
@@ -240,7 +243,7 @@ export interface PluginSecretBindingLookup {
     secretId: string;
   }): Promise<PluginSecretBindingRow | null>;
   /**
-   * PLA-768: find the single binding for `(plugin install, secretId)` WITHOUT a
+   * SECURITY-CRITICAL: find the single binding for `(plugin install, secretId)` WITHOUT a
    * dispatching company, returning the owning company. Fails closed (returns
    * null) if zero rows OR if more than one distinct company has bound the ref to
    * this plugin — an ambiguous derivation must never silently pick a tenant.
@@ -309,8 +312,8 @@ export interface PluginSecretsService {
   resolve(params: PluginSecretsResolveParams): Promise<string>;
 
   /**
-   * Mint an opaque borrowed handle for a resolved secret plaintext within the
-   * server-validated dispatch run (PLA-702 Control 2). Registers the value with
+   * SECURITY-CRITICAL: mint an opaque borrowed handle for a resolved secret
+   * plaintext within the server-validated dispatch run (Control 2). Registers the value with
    * the Control-1 value-exact redactor (fail-closed) before minting, so the
    * consuming tool's own output is also scrubbed from the transcript.
    *
@@ -382,11 +385,11 @@ export function createPluginSecretsHandler(
     perCompanyCfg.windowMs,
     now,
   );
-  // PLA-768: a service/background context has no dispatching agent, so it cannot
+  // A service/background context has no dispatching agent, so it cannot
   // share the per-agent buckets. It gets its own limiter with the same
   // window/limit so a runaway poll loop is still capped.
   //
-  // PLA-773 (item 3): the limiter is keyed per `(plugin, company)` whenever the
+  // The limiter is keyed per `(plugin, company)` whenever the
   // company is known — a background dispatch carries its triggering company, so
   // one tenant's runaway loop can no longer exhaust the bucket every other
   // tenant's background resolves share. The genuinely company-less `setup()`
@@ -422,7 +425,7 @@ export function createPluginSecretsHandler(
         return row;
       },
       async findServiceBinding(input) {
-        // PLA-768: no dispatching company is supplied — derive it from the
+        // No dispatching company is supplied — derive it from the
         // binding. We select ALL rows for (plugin install, secretId) so we can
         // fail closed on ambiguity rather than picking an arbitrary tenant.
         const rows = await db
@@ -476,13 +479,13 @@ export function createPluginSecretsHandler(
    * Best-effort, value-free audit. Failures are logged but never change the
    * decision returned to the worker. Mirrors the artifacts.fetch six-field
    * schema; on a deny the secret's owning company is left null (the scoped
-   * lookup never loaded a cross-company row — see PLA-656 §Audit).
+   * lookup never loaded a cross-company row).
    */
   async function audit(input: {
     outcome: "allowed" | "denied";
     deniedReason?: SecretsErrorCode;
     /**
-     * PLA-768: null for a worker-lifetime **service** context (background
+     * Null for a worker-lifetime **service** context (background
      * dispatch / setup-loop) — there is no dispatching agent. The audit row is
      * still attributed to the plugin system actor (`actorType: "plugin"`).
      */
@@ -492,7 +495,7 @@ export function createPluginSecretsHandler(
     runId: string;
     toolName: string;
     /**
-     * PLA-806: which run-context backs this resolve. A "dispatch" context
+     * Which run-context backs this resolve. A "dispatch" context
      * carries a real `heartbeat_runs` row in `runId`; "service"/"background"
      * contexts carry a host-minted SYNTHETIC runId that is NOT a `heartbeat_runs`
      * row. Writing that synthetic id into `activity_log.run_id` violates the FK
@@ -512,7 +515,7 @@ export function createPluginSecretsHandler(
         entityType: "company_secret",
         entityId: input.secretId,
         agentId: input.dispatchingAgentId,
-        // PLA-806: a synthetic background/service runId is not a heartbeat_runs
+        // A synthetic background/service runId is not a heartbeat_runs
         // row; storing it in run_id would 23503 and drop the audit row.
         runId: isSyntheticRun ? null : input.runId,
         details: {
@@ -527,7 +530,7 @@ export function createPluginSecretsHandler(
           // cannot (and must not) attribute the ref to another tenant.
           secretCompanyId: input.outcome === "allowed" ? input.dispatchingCompanyId : null,
           toolName: input.toolName,
-          // PLA-806: preserve attribution for synthetic-run resolves that can't
+          // Preserve attribution for synthetic-run resolves that can't
           // populate run_id. Foreground dispatches keep run_id and omit these.
           ...(isSyntheticRun
             ? { backgroundRunId: input.runId, runContextKind: input.runContextKind }
@@ -541,7 +544,7 @@ export function createPluginSecretsHandler(
   }
 
   /**
-   * PLA-768: resolve a secret for a worker-lifetime **service** context. Used
+   * SECURITY-CRITICAL: resolve a secret for a worker-lifetime **service** context. Used
    * by background dispatches (onEvent/onWebhook/runJob) and setup()-started
    * loops that resolve secrets outside any agent RPC dispatch.
    *
@@ -657,7 +660,7 @@ export function createPluginSecretsHandler(
   }
 
   /**
-   * PLA-773 (item 1): resolve a secret for a per-dispatch **background** context
+   * SECURITY-CRITICAL: resolve a secret for a per-dispatch **background** context
    * — a background dispatch (`onEvent`/`onWebhook`) that carries a known
    * TRIGGERING company. Unlike {@link resolveForServiceContext}, the company is
    * NOT derived from the binding: it is the host-validated triggering company,
@@ -790,7 +793,7 @@ export function createPluginSecretsHandler(
       }
       const trimmedRef = secretRef.trim();
       if (!isUuidSecretRef(trimmedRef)) {
-        // Generic message — the ref is NEVER echoed (PLA-190/PLA-193, R2).
+        // Generic message — the ref is NEVER echoed.
         throw new SecretsError("invalid_ref", "invalid secret reference");
       }
       if (typeof runId !== "string" || runId.trim().length === 0) {
@@ -805,7 +808,7 @@ export function createPluginSecretsHandler(
         throw new SecretsError("runcontext_invalid", "no active dispatch for this runId");
       }
 
-      // ---------- PLA-768: worker-lifetime service context branch ----------
+      // ---------- Worker-lifetime service context branch ----------
       // A background dispatch (onEvent/onWebhook/runJob) or a setup()-started
       // loop resolves from its OWN tick, outside any agent RPC dispatch. There
       // is no dispatching agent/company; the owning company is derived from the
@@ -816,7 +819,7 @@ export function createPluginSecretsHandler(
         return resolveForServiceContext(trimmedRef, ctx.runId);
       }
 
-      // ---------- PLA-773: per-dispatch background context branch ----------
+      // ---------- Per-dispatch background context branch ----------
       // A background dispatch (onEvent/onWebhook) with a known TRIGGERING
       // company. The owning company is NOT derived from the binding — it is the
       // host-validated triggering company, and the binding lookup is scoped to
@@ -828,7 +831,7 @@ export function createPluginSecretsHandler(
       // ---------- Gate 2: rate limit (global, then per-company) ----------
       // Both buckets are keyed off the server-validated runContext, checked
       // BEFORE any DB lookup so enumeration is strictly bounded and one company
-      // can never exhaust another company's bucket (PLA-656 R3).
+      // can never exhaust another company's bucket.
       if (!globalLimiter.check(`agent:${ctx.agentId}`)) {
         await audit({
           outcome: "denied",
@@ -883,7 +886,7 @@ export function createPluginSecretsHandler(
       // throws distinguishable errors (404 not-found vs 422 cross-company vs
       // secret_deleted/secret_inactive/version_missing/version_inactive). EVERY
       // one of those — plus a provider error — is flattened to a single opaque
-      // not_found at the worker boundary (PLA-656 R1, Q2). The value is never
+      // not_found at the worker boundary. The value is never
       // cached, honouring rotation.
       let value: string;
       try {
@@ -920,7 +923,7 @@ export function createPluginSecretsHandler(
       // PERSISTED tool-result/transcript/run-log record is value-exact redacted
       // by the shared redaction pipeline — the pattern/field-name heuristics
       // cannot reliably catch a high-entropy value embedded in free-form
-      // `content` (PLA-697 / PLA-695 Control 1). The live value still flows back
+      // `content` (Control 1). The live value still flows back
       // to the worker (agent working context) unchanged below; only persisted
       // records are scrubbed. Fail-closed: if registration throws, persistence
       // could later leak the plaintext into the transcript, so we refuse the
@@ -965,7 +968,7 @@ export function createPluginSecretsHandler(
     ): Promise<{ handle: string }> {
       // ---------- Gate 0: shape validation ----------
       // The `value` is the plaintext secret — it is NEVER echoed in errors or
-      // logs (PLA-190/PLA-193, PLA-697 discipline).
+      // logs.
       if (!params || typeof params !== "object") {
         throw new SecretsError("invalid_ref", "invalid mint request");
       }
@@ -984,7 +987,7 @@ export function createPluginSecretsHandler(
       if (!ctx) {
         throw new SecretsError("runcontext_invalid", "no active dispatch for this runId");
       }
-      // PLA-768/PLA-773: borrowed handles are an agent-dispatch primitive (they
+      // Borrowed handles are an agent-dispatch primitive (they
       // scope a plaintext to a single tool call's working context). Neither a
       // worker-lifetime service context nor a per-dispatch background context
       // has such a dispatch, so minting is rejected rather than attributed to a
@@ -1059,7 +1062,7 @@ export function createPluginSecretsHandler(
    * agent/company/tool dimensions are recorded. Failures never change the
    * decision returned to the worker.
    *
-   * PLA-806: `ctx` here is always an agent-DISPATCH context — minting rejects
+   * `ctx` here is always an agent-DISPATCH context — minting rejects
    * service/background contexts at the gate above — so `ctx.runId` is a real
    * `heartbeat_runs` row and is safe to store in `run_id` (no synthetic-id FK
    * drop). If borrowed handles are ever extended to a background/service

@@ -1,5 +1,5 @@
 /**
- * PLA-723 — egress destination allowlist enforcement engine.
+ * Egress destination allowlist enforcement engine.
  *
  * Covers the EG2 origin-canonical normalization bypass set (each fail-closed),
  * the matcher (exact origin, explicit wildcard only, no scheme downgrade), the

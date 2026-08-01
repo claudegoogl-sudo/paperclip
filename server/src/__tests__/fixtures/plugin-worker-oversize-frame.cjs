@@ -1,4 +1,4 @@
-// PLA-1149 regression fixture: a worker that, on demand, emits a single
+// Regression fixture: a worker that, on demand, emits a single
 // worker→host IPC frame far larger than any configured cap, with NO trailing
 // newline, to exercise the host-side bounded frame reader (the host must drop +
 // terminate before buffering the whole payload).

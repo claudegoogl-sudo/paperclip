@@ -3534,7 +3534,7 @@ export function issueRoutes(
   }
 
   /**
-   * Pre-submit secret-pattern denylist (PLA-177 / locked spec PLA-302). Scans
+   * SECURITY-CRITICAL: Pre-submit secret-pattern denylist (locked spec). Scans
    * the named write-side fields against the shared pattern set
    * (../secret-patterns.js — the same module the HTTP logger redactor uses, so
    * the two cannot drift). On a hit it BLOCKS the write with a structured 422
@@ -6979,7 +6979,7 @@ export function issueRoutes(
 
   router.patch("/issues/:id", validate(updateIssueRouteSchema), async (req, res) => {
     const id = req.params.id as string;
-    // PLA-141: defensively back-fill any orphan `checkoutRunId` / `executionRunId`
+    // Defensively back-fill any orphan `checkoutRunId` / `executionRunId`
     // pointing at a terminal heartbeat_runs row before authorization runs. Converts
     // the partial-checkout state into a clean state so the mutation either succeeds
     // (assignee re-checks-out cleanly on next call) or returns a structured 4xx
@@ -7300,7 +7300,7 @@ export function issueRoutes(
 
     let issue;
     try {
-      // PLA-597: the issue PATCH path contends with concurrent heartbeat-run
+      // The issue PATCH path contends with concurrent heartbeat-run
       // mutations (claim/release/cancel) on overlapping rows. Postgres
       // occasionally aborts one transaction with deadlock 40P01; retry it from
       // the app since the rollback leaves no partial state.
@@ -8146,7 +8146,7 @@ export function issueRoutes(
 
   router.post("/issues/:id/checkout", validate(checkoutIssueSchema), async (req, res) => {
     const id = req.params.id as string;
-    // PLA-141: see PATCH route — back-fill orphan-checkout state up front.
+    // See PATCH route — back-fill orphan-checkout state up front.
     await svc.clearOrphanCheckoutLocksIfTerminal(id);
     const issue = await svc.getById(id);
     if (!issue) {
@@ -8232,7 +8232,7 @@ export function issueRoutes(
 
   router.post("/issues/:id/release", async (req, res) => {
     const id = req.params.id as string;
-    // PLA-141: see PATCH route — back-fill orphan-checkout state up front.
+    // See PATCH route — back-fill orphan-checkout state up front.
     await svc.clearOrphanCheckoutLocksIfTerminal(id);
     const existing = await svc.getById(id);
     if (!existing) {
@@ -8691,7 +8691,7 @@ export function issueRoutes(
     },
   );
 
-  // PLA-1438: agent self-service supersede of an interaction it AUTHORED.
+  // Agent self-service supersede of an interaction it AUTHORED.
   // Unlike the board-only accept/reject/cancel routes above, an agent may retire
   // a pending interaction here IFF createdByAgentId === caller (least-privilege:
   // author-only, never blanket resolution authority). Board actors keep full
@@ -9006,7 +9006,7 @@ export function issueRoutes(
 
   router.post("/issues/:id/comments", validate(addIssueCommentSchema), async (req, res) => {
     const id = req.params.id as string;
-    // PLA-141: see PATCH route — back-fill orphan-checkout state up front.
+    // See PATCH route — back-fill orphan-checkout state up front.
     await svc.clearOrphanCheckoutLocksIfTerminal(id);
     const issue = await svc.getById(id);
     if (!issue) {
@@ -9330,7 +9330,7 @@ export function issueRoutes(
       });
     }
 
-    // PLA-1657: bind pre-uploaded standalone assets to this comment before any
+    // Bind pre-uploaded standalone assets to this comment before any
     // downstream `comment.created` fan-out, so a media relay reading attachments
     // at comment-created time sees them (no attach-after-post race). Idempotent
     // and tenant-checked in attachAssetsToComment; mirrors the host bridge path.

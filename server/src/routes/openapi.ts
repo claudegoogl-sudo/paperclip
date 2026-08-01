@@ -141,7 +141,7 @@ import {
   secretProviderConfigDiscoveryPreviewSchema,
   remoteSecretImportPreviewSchema,
   remoteSecretImportSchema,
-  // PLA-735 (fork) — secret egress operator surface
+  // (fork) Secret egress operator surface
   setBindingEgressAllowlistSchema,
   enforceBindingEgressSchema,
   workspaceFileListQuerySchema,
@@ -4846,7 +4846,7 @@ registerCurrentRoute({
   body: remoteSecretImportSchema,
 });
 
-// PLA-735 (fork) — operator-only secret egress review + per-binding allowlist /
+// (fork) Operator-only secret egress review + per-binding allowlist /
 // enforce-flip surface. These routes are mounted in routes/secrets.ts; document
 // them here so the openapi spec stays an exact match for the fork's hardening.
 registerCurrentRoute({
@@ -5152,7 +5152,7 @@ for (const route of [
   });
 }
 
-// PLA-662 (fork) — per-tenant plugin config overrides + secret-binding lifecycle.
+// (fork) Per-tenant plugin config overrides + secret-binding lifecycle.
 // Mounted in routes/plugins.ts; the PUT body is validated inline against the
 // plugin's instanceConfigSchema, so these are registered path-only.
 for (const route of [

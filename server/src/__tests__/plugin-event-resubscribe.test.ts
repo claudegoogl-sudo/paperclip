@@ -1,5 +1,5 @@
 /**
- * Regression + observability test for PLA-854.
+ * Regression + observability test for plugin event subscriptions surviving a worker restart.
  *
  * A plugin worker registers its board-event subscriptions by re-running
  * setup() (and therefore re-issuing every `events.subscribe` RPC) on each
@@ -64,7 +64,7 @@ function spawnWorkerGeneration(eventBus: ReturnType<typeof createPluginEventBus>
   return { services, delivered };
 }
 
-describe("PLA-854: plugin event subscription survives worker restart", () => {
+describe("plugin event subscription survives worker restart", () => {
   it("re-attaches the relay to the new worker after a restart (clearPlugin + re-subscribe)", async () => {
     const eventBus = createPluginEventBus();
 

@@ -28,7 +28,7 @@ function createEventBusStub() {
 
 const PLUGIN_KEY = "paperclip.messenger";
 
-describeEmbeddedPostgres("plugin reconcile reads host services (PLA-923)", () => {
+describeEmbeddedPostgres("plugin reconcile reads host services", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 

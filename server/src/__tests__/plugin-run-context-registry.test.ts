@@ -1,5 +1,5 @@
 /**
- * PLA-768 — run-context registry: dispatch vs. worker-lifetime service entries.
+ * Run-context registry: dispatch vs. worker-lifetime service entries.
  *
  * The registry is the host's authoritative `(pluginDbId, runId) → context`
  * source. Dispatch entries are short-lived and TTL-swept as an orphan safety
@@ -28,7 +28,7 @@ function dispatchCtx(runId: string, registeredAt: number) {
   };
 }
 
-describe("plugin run-context registry (PLA-768)", () => {
+describe("plugin run-context registry", () => {
   it("stores and returns a service entry discriminated by kind", () => {
     const reg = createPluginRunContextRegistry({ sweepIntervalMs: 60_000 });
     reg.registerService(PLUGIN, SERVICE_RUN);
@@ -86,7 +86,7 @@ describe("plugin run-context registry (PLA-768)", () => {
     reg.dispose();
   });
 
-  // PLA-773: per-dispatch background entries carry the triggering company and,
+  // Per-dispatch background entries carry the triggering company and,
   // unlike service entries, ARE TTL-swept (each dispatch is bounded).
   it("stores a background entry with the triggering company discriminated by kind", () => {
     const reg = createPluginRunContextRegistry({ sweepIntervalMs: 60_000 });

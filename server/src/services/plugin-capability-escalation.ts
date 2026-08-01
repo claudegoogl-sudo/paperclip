@@ -1,7 +1,7 @@
 /**
- * Capability-escalation governance wiring (PLA-910).
+ * SECURITY-CRITICAL: Capability-escalation governance wiring.
  *
- * PLA-908 made the plugin loader park a capability-escalating upgrade in
+ * The plugin loader parks a capability-escalating upgrade in
  * `upgrade_pending` and file an approval through an injected
  * {@link CapabilityEscalationGateway}, completing or reverting it on the board's
  * decision. This module supplies the production wiring on top of that gate:
@@ -11,14 +11,14 @@
  *    (the established plugin-governance pattern on this instance) carrying a
  *    `plugin_capability_escalation` payload, and dedups on the
  *    `(pluginId, toVersion)` payload tuple so a repeat upgrade while already
- *    parked does not double-file (PLA-908 criterion 5).
+ *    parked does not double-file.
  * 2. A resolver registry ({@link registerCapabilityEscalationResolver} /
  *    {@link dispatchCapabilityEscalationResolution}). The approvals service
  *    dispatches escalation approvals here on approve/reject; the host registers
  *    a resolver that drives `completeUpgrade` / `revertPendingUpgrade`. The
  *    registry exists purely to break the approvals→loader import cycle.
  *
- * Company-scoping decision (PLA-910): a plugin capability escalation is
+ * Company-scoping decision: a plugin capability escalation is
  * instance-wide but approvals are hard company-scoped, so the gateway files
  * against a single configured "platform" company. When no company is
  * configured, the host wires no gateway and the loader keeps failing closed.
@@ -35,7 +35,7 @@ const log = logger.child({ service: "plugin-capability-escalation" });
 
 /**
  * Approval `type` used for capability-escalation approvals. Reuses the existing
- * board-approval kind (PLA-910 decision: no dedicated approval type) and
+ * board-approval kind (deliberate: no dedicated approval type) and
  * distinguishes escalations by the payload `kind` discriminator below.
  */
 export const CAPABILITY_ESCALATION_APPROVAL_TYPE = "request_board_approval";
@@ -57,7 +57,7 @@ export interface CapabilityEscalationPayload extends Record<string, unknown> {
   addedCapabilities: string[];
   fromCapabilities: string[];
   toCapabilities: string[];
-  // Content digest (`sha256:<hex>`) of the package captured at park (PLA-912).
+  // Content digest (`sha256:<hex>`) of the package captured at park.
   // Persisted so completeUpgrade can pin the applied package to the approved
   // contents. Optional because approvals filed before this anchor existed have
   // no stored digest — the loader's version + caps checks still apply to those.
@@ -166,7 +166,7 @@ export function createApprovalsCapabilityEscalationGateway(input: {
     pluginId: string;
   }): Promise<ApprovedUpgrade | null> {
     // The loader self-enforces against the *granted* contract rather than
-    // trusting the dispatched payload (PLA-911 Finding 1). Escalations
+    // trusting the dispatched payload. Escalations
     // accumulate across upgrades, so among the approved escalation approvals
     // for this plugin we return the most-recently-decided one — the contract
     // for the upgrade currently being completed. completeUpgrade then verifies
@@ -188,7 +188,7 @@ export function createApprovalsCapabilityEscalationGateway(input: {
       toVersion: payload.toVersion,
       addedCapabilities: payload.addedCapabilities,
       // Surface the park-time digest so completeUpgrade can pin the applied
-      // package to the approved contents (PLA-912). `null` for legacy approvals
+      // package to the approved contents. `null` for legacy approvals
       // filed before the digest anchor — the loader then falls back to version +
       // caps checks rather than failing closed on a digest it never captured.
       digest: payload.digest ?? null,

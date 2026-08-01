@@ -1,5 +1,5 @@
 /**
- * PLA-574 — tests for the host-mediated `artifacts.fetch` handler.
+ * Tests for the host-mediated `artifacts.fetch` handler.
  * Covers SecurityEngineer's seven-point checklist:
  *  1. runContext validation (deny-by-default, no JWT fallback)
  *  2. Dispatching-agent authorization (NOT worker JWT)
@@ -166,7 +166,7 @@ function registerCtx(
   });
 }
 
-describe("plugin-artifacts-handler — PLA-574", () => {
+describe("plugin-artifacts-handler", () => {
   beforeEach(() => {
     vi.mocked(logActivity).mockClear();
   });
@@ -223,20 +223,20 @@ describe("plugin-artifacts-handler — PLA-574", () => {
       attachmentCompanyId: "dpr-company",
       attachmentId: "att-1",
       pluginKey: "acme.support",
-      // Six-field audit (PLA-574): toolName comes from the registered
+      // Six-field audit: toolName comes from the registered
       // runContext, not from worker-supplied params.
       toolName: "lookup-screenshot",
     });
   });
 
-  // PLA-1658: a background-context fetch carries the wire/background-dispatch
+  // A background-context fetch carries the wire/background-dispatch
   // runId, which has NO heartbeat_runs row. The old code passed it straight to
   // activity_log.run_id (a nullable FK to heartbeat_runs) → SQLSTATE 23503 →
   // best-effort catch → audit row silently dropped (OWASP A09 logging gap). The
   // fix writes run_id = NULL and preserves the dispatch id under
   // details.backgroundRunId. These assertions FAIL on the old code (which set
   // call.runId to the phantom id and omitted backgroundRunId).
-  it("PLA-1658: background allowed fetch audits with run_id=NULL + details.backgroundRunId", async () => {
+  it("background allowed fetch audits with run_id=NULL + details.backgroundRunId", async () => {
     const { handler, registry, bytes } = buildHandler();
     // A per-dispatch background context: triggering company, no agent, and a
     // host-minted runId with no heartbeat_runs row.
@@ -261,7 +261,7 @@ describe("plugin-artifacts-handler — PLA-574", () => {
     });
   });
 
-  it("PLA-1658: background denied fetch is still logged (run_id=NULL + backgroundRunId)", async () => {
+  it("background denied fetch is still logged (run_id=NULL + backgroundRunId)", async () => {
     // No attachment → Gate 3 deny path. The deny audit must survive too.
     const { handler, registry } = buildHandler({ attachment: null });
     registry.registerBackground("plugin-db-1", "bg-run-2", "dpr-company");
@@ -294,7 +294,7 @@ describe("plugin-artifacts-handler — PLA-574", () => {
       dispatchingAgentId: "agent-plat-1",
       dispatchingCompanyId: "platform-company",
       attachmentCompanyId: "dpr-company",
-      // Six-field audit (PLA-574): deny paths still carry toolName.
+      // Six-field audit: deny paths still carry toolName.
       toolName: "lookup-screenshot",
     });
   });
@@ -355,7 +355,7 @@ describe("plugin-artifacts-handler — PLA-574", () => {
     await expect(
       handler.fetch({ attachmentId: "att-1", runId: "run-1" }),
     ).rejects.toMatchObject({ code: "too_large" });
-    // PLA-578 F1: the oversize deny must still emit a six-field audit so an
+    // F1: the oversize deny must still emit a six-field audit so an
     // authorized caller OOM-stressing storage retrieval leaves a signal.
     expect(logActivity).toHaveBeenCalledWith(
       expect.anything(),
@@ -400,7 +400,7 @@ describe("plugin-artifacts-handler — PLA-574", () => {
   });
 });
 
-describe("plugin-artifacts-handler.fetch — PLA-897 (background run-context)", () => {
+describe("plugin-artifacts-handler.fetch — background run-context", () => {
   beforeEach(() => {
     vi.mocked(logActivity).mockClear();
   });
@@ -425,7 +425,7 @@ describe("plugin-artifacts-handler.fetch — PLA-897 (background run-context)", 
     // System actor: no agentId attributed.
     expect(call.agentId).toBeUndefined();
     expect(call.companyId).toBe("dpr-company");
-    // PLA-1658: the background dispatch runId has no heartbeat_runs row, so it
+    // The background dispatch runId has no heartbeat_runs row, so it
     // must NOT populate the run_id FK; it is preserved under details instead.
     expect(call.runId).toBeNull();
     expect(JSON.stringify(call.details)).not.toContain(bytes.toString("base64"));
@@ -508,7 +508,7 @@ describe("plugin-artifacts-handler.fetch — PLA-897 (background run-context)", 
   });
 });
 
-describe("plugin-artifacts-handler.create — PLA-888", () => {
+describe("plugin-artifacts-handler.create", () => {
   beforeEach(() => {
     vi.mocked(logActivity).mockClear();
   });
@@ -669,13 +669,13 @@ describe("plugin-artifacts-handler.create — PLA-888", () => {
   });
 });
 
-describe("plugin-artifacts-handler.create — PLA-1147 (raised >10 MiB size ceiling)", () => {
+describe("plugin-artifacts-handler.create — raised >10 MiB size ceiling", () => {
   beforeEach(() => {
     vi.mocked(logActivity).mockClear();
   });
 
   const MIB = 1024 * 1024;
-  // The plugin path stores STL/CAD geometry; model/stl is on the PLA-1140 allowlist.
+  // The plugin path stores STL/CAD geometry; model/stl is on the allowlist.
   const STL = "model/stl";
 
   function createParams(contentBase64: string, overrides: Partial<{ companyId: string; runId: string }> = {}) {
@@ -689,7 +689,7 @@ describe("plugin-artifacts-handler.create — PLA-1147 (raised >10 MiB size ceil
   }
 
   it("regression guard: the fresh-install (unset) company ceiling clears 20 MiB so the plugin path isn't silently re-capped to 10 MiB", () => {
-    // PLA-1147 spec point 2: even with NO env tuning and NO per-company override,
+    // Spec point 2: even with NO env tuning and NO per-company override,
     // the Math.min(companyMaxBytes, ...) chain must not pin the plugin path back
     // to the old 10 MiB. If a future change drops DEFAULT_COMPANY_ATTACHMENT_MAX_BYTES
     // or MAX_ATTACHMENT_BYTES below 20 MiB, this fails first with a clear message.
@@ -728,7 +728,7 @@ describe("plugin-artifacts-handler.create — PLA-1147 (raised >10 MiB size ceil
   });
 });
 
-describe("plugin-run-context-registry — PLA-574", () => {
+describe("plugin-run-context-registry", () => {
   it("registers and retrieves by composite key", () => {
     const reg = createPluginRunContextRegistry();
     reg.register("p1", {

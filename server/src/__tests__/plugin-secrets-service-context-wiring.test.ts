@@ -1,17 +1,17 @@
 /**
- * PLA-781 — wiring contract between the plugin worker manager and the secrets
+ * Wiring contract between the plugin worker manager and the secrets
  * host-handler over a SHARED run-context registry.
  *
- * The PLA-768 service-context resolve path was already correct in isolation, but
+ * The service-context resolve path was already correct in isolation, but
  * the running host built the worker manager WITHOUT a registry while the secrets
  * handler read a different one, so `registerService` was a silent no-op and a
  * setup()-loop's `secrets.resolve` always failed Gate 1 with `runcontext_invalid`.
  *
  * These tests drive the REAL worker manager so the service runId is genuinely
  * host-minted (`handle.serviceRunId`) and registered by the manager — NOT
- * hand-registered as the PLA-768 unit tests do. The secrets handler reads the
+ * hand-registered as the unit tests do. The secrets handler reads the
  * SAME registry instance, mirroring the fixed index.ts/app.ts composition. Each
- * case encodes a guardrail from the SEC advisory (PLA-783):
+ * case encodes a guardrail from the SEC advisory:
  *  1. setup()-loop resolve via the manager-minted service runId succeeds, with
  *     the company DERIVED from the binding (`ctx.kind === "service"`).
  *  2. a forged/unregistered runId from the same worker still fails closed with
@@ -129,7 +129,7 @@ afterEach(() => {
   for (const runId of activeRunIds) clearRunSecretValues(runId);
 });
 
-describe("PLA-781 — worker manager ↔ secrets handler shared registry", () => {
+describe("worker manager ↔ secrets handler shared registry", () => {
   it("resolves a setup()-loop secret via the manager-minted service runId (company derived from binding)", async () => {
     const registry = createPluginRunContextRegistry({ sweepIntervalMs: 60_000 });
     const { handler, resolverFn, findServiceBinding } = buildSecretsHandler(registry);

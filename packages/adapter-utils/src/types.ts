@@ -155,7 +155,7 @@ export interface AdapterModel {
    * Marks a model whose provider safeguards have been lifted. Such models must
    * never be used as an automatic fallback/refusal-retry target. The flag lives
    * with the model definition so adding a new model forces an explicit
-   * safe/unsafe decision rather than silently defaulting to allowed. See PLA-1423.
+   * safe/unsafe decision rather than silently defaulting to allowed.
    */
   safeguardsLifted?: boolean;
 }

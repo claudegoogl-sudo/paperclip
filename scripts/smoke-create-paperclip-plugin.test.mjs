@@ -1,5 +1,5 @@
 /**
- * PLA-376 — smoke coverage for the create-paperclip-plugin scaffold's
+ * Smoke coverage for the create-paperclip-plugin scaffold's
  * release-time manifest validation gate.
  *
  * The scaffold change in `packages/plugins/create-paperclip-plugin/src/index.ts`
@@ -10,7 +10,7 @@
  *
  *   1. Calls `scaffoldPluginProject` into a tmp dir inside the repo so the
  *      `useWorkspaceSdk` branch is taken (avoids `pnpm pack` side effects).
- *   2. Asserts every PLA-376 gate file is emitted with the expected key
+ *   2. Asserts every manifest-validation gate file is emitted with the expected key
  *      contents (script + spec + workflow + package.json wiring).
  *   3. Cleans up the tmp dir.
  *
@@ -64,7 +64,7 @@ function rmTmp(stemDir) {
   }
 }
 
-test("scaffold emits PLA-376 manifest validation gate files + wiring", () => {
+test("scaffold emits manifest validation gate files + wiring", () => {
   const stem = makeTmpDir();
   const outputDir = path.join(stem, "smoke-plugin");
   try {
@@ -92,7 +92,7 @@ test("scaffold emits PLA-376 manifest validation gate files + wiring", () => {
     assert.match(
       validateBody,
       /\^\[a-z0-9\]\[a-z0-9\._-\]\*\$/,
-      "validate-manifest.mjs must mirror the PLA-163 tool-name regex",
+      "validate-manifest.mjs must mirror the host's tool-name regex",
     );
     assert.match(validateBody, /paperclipPlugin\.manifest/, "must resolve via package.json#paperclipPlugin.manifest");
 

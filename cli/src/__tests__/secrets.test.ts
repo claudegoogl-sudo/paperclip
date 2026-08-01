@@ -262,7 +262,7 @@ describe("secrets CLI helpers", () => {
   });
 });
 
-describe("PLA-735 sanitizeForTerminal (operator console output encoding)", () => {
+describe("sanitizeForTerminal (operator console output encoding)", () => {
   it("passes a clean origin through unchanged", () => {
     expect(sanitizeForTerminal("https://api.example.com:443")).toBe("https://api.example.com:443");
   });

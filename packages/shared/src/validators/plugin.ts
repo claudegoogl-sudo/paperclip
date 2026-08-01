@@ -117,8 +117,8 @@ export const pluginToolDeclarationSchema = z.object({
   // require a lowercase alnum allowlist to mirror
   // `pluginEnvironmentDriverDeclarationSchema.driverKey` and to keep
   // whitespace, control chars, path separators, and unicode lookalikes out
-  // of the registry key. PLA-58 surfaced a `cad:run_script` typo that this
-  // catches at install/upgrade.
+  // of the registry key. A previously seen `cad:run_script` typo is the kind
+  // of mistake this catches at install/upgrade.
   name: z.string().min(1).regex(
     /^[a-z0-9][a-z0-9._-]*$/,
     "Tool name must start with a lowercase alphanumeric and contain only lowercase letters, digits, dots, hyphens, or underscores",
@@ -331,7 +331,7 @@ export type PluginManagedSkillDeclarationInput = z.infer<typeof pluginManagedSki
  * narrows to the host-rendered subset here so plugins fail at install time
  * instead of installing successfully and then silently never rendering.
  *
- * Tracked in PLA-122 (B4 UI stability contract) / PLA-123. Expand this list
+ * Tracked as part of the UI stability contract. Expand this list
  * as additional slot types reach the v1 host-rendered floor.
  */
 const PLUGIN_UI_SLOT_TYPES_V1_SUPPORTED = ["dashboardWidget", "page"] as const;
@@ -1025,7 +1025,7 @@ export const pluginManifestV1Schema = z.object({
 
     // Tool name shape (lowercase alnum allowlist, no ':' or whitespace) is
     // enforced on `pluginToolDeclarationSchema.name` itself — the allowlist
-    // subsumes the previous colon denylist. See PLA-163 for context.
+    // subsumes the previous colon denylist.
   }
 
   // environment driver keys must be unique within the plugin

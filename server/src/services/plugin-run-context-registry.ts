@@ -1,9 +1,10 @@
 /**
- * In-memory registry of currently-dispatching tool invocations, keyed by
- * `(pluginDbId, runId)`. This is the host's authoritative source-of-truth
- * for "who is the dispatching agent for this in-flight tool call".
+ * SECURITY-CRITICAL: in-memory registry of currently-dispatching tool
+ * invocations, keyed by `(pluginDbId, runId)`. This is the host's
+ * authoritative source-of-truth for "who is the dispatching agent for this
+ * in-flight tool call".
  *
- * PLA-574: A plugin worker is NOT trusted to assert dispatching-agent identity.
+ * A plugin worker is NOT trusted to assert dispatching-agent identity.
  * When the host hands a tool call to a worker, it first registers the agent's
  * runContext here. When the worker calls back via `artifacts.fetch`, the host
  * looks up the entry by `(pluginDbId, runId)` and uses the **registered**
@@ -38,7 +39,7 @@ export interface RegisteredDispatchRunContext {
 }
 
 /**
- * PLA-768: a worker-lifetime **service** run-context. It backs background
+ * SECURITY-CRITICAL: a worker-lifetime **service** run-context. It backs background
  * plugin dispatches (`onEvent`/`onWebhook`/`runJob`) and loops started in
  * `setup()` that call `ctx.secrets.resolve` outside any dispatch. There is NO
  * dispatching agent or company: it is a system actor (`actorType: "plugin"`).
@@ -57,7 +58,7 @@ export interface RegisteredServiceRunContext {
 }
 
 /**
- * PLA-773: a per-dispatch **background** run-context. It backs a single
+ * SECURITY-CRITICAL: a per-dispatch **background** run-context. It backs a single
  * background dispatch (`onEvent`/`onWebhook`) that carries a known TRIGGERING
  * company — unlike the company-less {@link RegisteredServiceRunContext}, which
  * is reserved for `setup()`-started loops and instance-wide `runJob`s.
@@ -88,12 +89,12 @@ export type RegisteredRunContext =
 export interface PluginRunContextRegistry {
   register(pluginDbId: string, ctx: RegisteredDispatchRunContext): void;
   /**
-   * PLA-768: register a worker-lifetime service run-context (system actor).
+   * Register a worker-lifetime service run-context (system actor).
    * Idempotent for a given `(pluginDbId, runId)`.
    */
   registerService(pluginDbId: string, runId: string): void;
   /**
-   * PLA-773: register a per-dispatch background run-context carrying the
+   * Register a per-dispatch background run-context carrying the
    * triggering company. Idempotent for a given `(pluginDbId, runId)`.
    */
   registerBackground(pluginDbId: string, runId: string, companyId: string): void;
@@ -131,7 +132,7 @@ export function createPluginRunContextRegistry(
   const sweep = () => {
     const cutoff = now() - ttlMs;
     for (const [key, value] of entries) {
-      // PLA-768: service entries are worker-lifetime (a poll loop may run for
+      // Service entries are worker-lifetime (a poll loop may run for
       // hours) and removed explicitly on worker stop — never TTL-swept.
       if (value.kind === "service") continue;
       if (value.registeredAt < cutoff) {

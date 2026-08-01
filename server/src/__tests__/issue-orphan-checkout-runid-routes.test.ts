@@ -21,7 +21,7 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { issueService } from "../services/issues.js";
 
-// PLA-141 regression coverage. The bug: `releaseIssueExecutionAndPromote` left
+// Regression coverage. The bug: `releaseIssueExecutionAndPromote` left
 // `checkoutRunId` pointing at a now-terminal heartbeat_runs row when a routine
 // run finished, which then wedged subsequent mutations on that issue. These
 // tests pin the back-fill behaviour at the route layer (so PATCH/comments/
@@ -39,7 +39,7 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
-describeEmbeddedPostgres("orphan checkoutRunId mutation tolerance (PLA-141)", () => {
+describeEmbeddedPostgres("orphan checkoutRunId mutation tolerance", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
@@ -135,7 +135,7 @@ describeEmbeddedPostgres("orphan checkoutRunId mutation tolerance (PLA-141)", ()
     const issueId = randomUUID();
     // Orphan state: routine_execution issue still in_progress, checkoutRunId
     // points at the now-succeeded run, executionRunId already cleared (this is
-    // the exact wedged state PLA-120 was observed in).
+    // the exact wedged state previously observed in production).
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -206,7 +206,7 @@ describeEmbeddedPostgres("orphan checkoutRunId mutation tolerance (PLA-141)", ()
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
-    // PLA-141's guarantee is that a terminal-run orphan lock never wedges the
+    // The guarantee is that a terminal-run orphan lock never wedges the
     // assignee's comment — and it doesn't: the request succeeds (201 above) and
     // `clearOrphanCheckoutLocksIfTerminal` (route prelude) nulls both terminal
     // locks. As of upstream v2026.626.0 the comments route authorizes via

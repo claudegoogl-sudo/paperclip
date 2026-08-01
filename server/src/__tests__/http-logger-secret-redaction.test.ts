@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 
 /**
- * PLA-317 AC §4 / PLA-319 §1: verification reads the ACTUAL log file produced
+ * Verification reads the ACTUAL log file produced
  * by the prod pino transport — not a mocked logger, not an in-process capture
  * stream. We point PAPERCLIP_LOG_DIR at a temp dir, import the real logger
  * module, drive a request through the real `httpLogger`, then read
@@ -21,8 +21,8 @@ const GITHUB_PAT = `github_pat_${"A".repeat(82)}`;
 /**
  * A synthetic JWT whose payload decodes to `iss: "paperclip"` — a Paperclip
  * run/API bearer credential. Option A lets the WRITE-BLOCK surface keep this in
- * free-text bodies, but the LOG surface must scrub it regardless of issuer
- * (PLA-842 Finding 1). Built programmatically so the payload claim is exact;
+ * free-text bodies, but the LOG surface must scrub it regardless of issuer.
+ * Built programmatically so the payload claim is exact;
  * the signature segment is synthetic filler (no live key material).
  */
 const PAPERCLIP_JWT = (() => {
@@ -122,7 +122,7 @@ describe("HTTP logger redaction (real log file)", () => {
     expect(content).not.toContain(GITHUB_PAT);
   });
 
-  // PLA-1175 regression: an off-length fine-grained PAT (90-char body, not the
+  // Regression: an off-length fine-grained PAT (90-char body, not the
   // historical 82) must still be scrubbed from the real log file. Fails against
   // the old exact `{82}` regex, passes against `{36,}`. Synthetic filler only.
   it("redacts an off-length (90-char body) github_pat in the body and URL query", async () => {
@@ -138,7 +138,7 @@ describe("HTTP logger redaction (real log file)", () => {
     expect(content).not.toMatch(/B{20,}/);
   });
 
-  // PLA-842 Finding 1 regression: Option A allows an iss=paperclip run JWT in a
+  // Finding 1 regression: Option A allows an iss=paperclip run JWT in a
   // write-block body, but the LOG surface must still scrub it. A paperclip JWT
   // outside the (force-redacted) authorization header — body leaf + URL query —
   // must not reach disk. Fails on pre-fix code (log path inherited Option A).
@@ -155,7 +155,7 @@ describe("HTTP logger redaction (real log file)", () => {
 });
 
 describe("error-handler 413 path redaction (real log file)", () => {
-  // PLA-842 Finding 2 regression: the 413 branch logs `req.originalUrl` under
+  // Finding 2 regression: the 413 branch logs `req.originalUrl` under
   // key `route`, outside pino `redact.paths`, so a `?token=<secret>` on an
   // oversized request lands in server.log cleartext. Fails on pre-fix code.
   it("redacts a secret in the URL query of an oversized (413) request", async () => {

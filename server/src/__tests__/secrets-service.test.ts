@@ -3004,10 +3004,10 @@ describeEmbeddedPostgres("secretService", () => {
     );
   });
 
-  // PLA-731 (EG4 ruling 2): migration 0092 left every pre-existing binding
+  // EG4 ruling 2: migration 0092 left every pre-existing binding
   // log-only. These cover the operator-driven flip-to-enforce path that closes
   // that time-box one binding at a time.
-  describe("egress allowlist enforce-flip (PLA-731)", () => {
+  describe("egress allowlist enforce-flip", () => {
     const FETCH_TOOL = "platform.http:fetch";
     const RUN_ID = "run-pla731";
     const SECRET_VALUE = "Zx7Qm2Lp9Rt4Wv6Yb1Nc3Df5Gh8Jk0Mn2Pq4Su6Xa";

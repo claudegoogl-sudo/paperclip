@@ -31,7 +31,7 @@ const MANIFEST_SCHEMA = {
   },
 };
 
-describeEmbeddedPostgres("pluginRegistryService.upsertCompanyConfigOverride (PLA-677)", () => {
+describeEmbeddedPostgres("pluginRegistryService.upsertCompanyConfigOverride", () => {
   let stopDb: (() => Promise<void>) | null = null;
   let db!: ReturnType<typeof createDb>;
 
@@ -223,7 +223,7 @@ describeEmbeddedPostgres("pluginRegistryService.upsertCompanyConfigOverride (PLA
     });
   });
 
-  it("PLA-797: instance-wide upsertConfig binds a secret ref to the secret's owning company", async () => {
+  it("instance-wide upsertConfig binds a secret ref to the secret's owning company", async () => {
     // Regression guard for the gap behind the messenger poll-loop failure: a
     // secret ref set through the instance-wide route (POST /plugins/:id/config →
     // registry.upsertConfig) must reconcile company_secret_bindings so

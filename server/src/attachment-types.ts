@@ -39,7 +39,7 @@ export const DEFAULT_ALLOWED_TYPES: readonly string[] = [
 ];
 
 /**
- * PLA-888: MIME allowlist for plugin-created attachments (`artifacts.create`).
+ * SECURITY-CRITICAL: MIME allowlist for plugin-created attachments (`artifacts.create`).
  *
  * The human upload route trusts whatever MIME multer reports (it only
  * normalises, it does not allowlist). The plugin write path is more hostile —
@@ -53,23 +53,23 @@ export const DEFAULT_ALLOWED_TYPES: readonly string[] = [
  *
  * `text/html`, `text/csv` and `application/zip` are excluded from the plugin set
  * even though the human route (`DEFAULT_ALLOWED_TYPES`) allows them: an inbound
- * external relay has no need for active/markup document types (PLA-888 F2 —
- * stored-XSS / formula-injection surface) nor archive containers (PLA-1141 —
- * zip-bomb / smuggling surface), so dropping them minimises the hostile-input
+ * external relay has no need for active/markup document types (stored-XSS /
+ * formula-injection surface) nor archive containers (zip-bomb / smuggling
+ * surface), so dropping them minimises the hostile-input
  * surface. `application/zip` entered `DEFAULT_ALLOWED_TYPES` upstream after the
  * original review, so it is excluded here to preserve the SE-approved posture.
  *
- * PLA-1139/PLA-1140: also includes a broadened set of inert common-file types so
+ * Also includes a broadened set of inert common-file types so
  * an operator can relay everyday documents, CAD models, photos and video through
  * the inbound messenger path: 3D geometry (STL/3MF/OBJ/STEP/glTF/PLY), office
  * documents (Word/Excel/PowerPoint/OpenDocument/RTF) and extra image formats
  * (TIFF/BMP/HEIC/HEIF). These are all static, non-executable payloads with no
  * active/markup/scripting surface, so they extend the auditable type set without
- * widening the hostile-input risk that F2 (text/html, text/csv) guards against.
+ * widening the hostile-input risk that the exclusion above (text/html, text/csv) guards against.
  * Common video containers (MP4/WebM/QuickTime) are already covered via
  * {@link DEFAULT_ALLOWED_TYPES} on this host lineage, so they are not re-listed.
  *
- * Deliberately NOT included pending SecurityEngineer ruling (PLA-1141):
+ * Deliberately NOT included pending SecurityEngineer ruling:
  * `image/svg+xml` (active-content/XSS) and archive containers
  * (zip/gzip/7z/tar — zip-bomb / smuggling). Executables are never added.
  *
@@ -92,7 +92,7 @@ export const PLUGIN_ARTIFACT_ALLOWED_MIME_TYPES: readonly string[] = [
   "audio/wav",
   "audio/x-wav",
   "audio/flac",
-  // PLA-1139/PLA-1140: inert 3D / CAD geometry (static, non-executable).
+  // Inert 3D / CAD geometry (static, non-executable).
   "model/stl",
   "application/vnd.ms-pki.stl",
   "application/sla",
@@ -106,7 +106,7 @@ export const PLUGIN_ARTIFACT_ALLOWED_MIME_TYPES: readonly string[] = [
   "model/gltf-binary",
   "model/gltf+json",
   "model/ply",
-  // PLA-1140: inert office documents.
+  // Inert office documents.
   "application/msword",
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -115,17 +115,17 @@ export const PLUGIN_ARTIFACT_ALLOWED_MIME_TYPES: readonly string[] = [
   "application/vnd.oasis.opendocument.spreadsheet",
   "application/vnd.oasis.opendocument.presentation",
   "application/rtf",
-  // PLA-1140: extra inert image formats (png/jpeg/webp/gif already in DEFAULT_ALLOWED_TYPES).
+  // Extra inert image formats (png/jpeg/webp/gif already in DEFAULT_ALLOWED_TYPES).
   "image/tiff",
   "image/bmp",
   "image/heic",
   "image/heif",
-  // PLA-1140: video containers (mp4/webm/quicktime) are supplied by DEFAULT_ALLOWED_TYPES
+  // Video containers (mp4/webm/quicktime) are supplied by DEFAULT_ALLOWED_TYPES
   // on this fork.626 lineage, so they are intentionally not re-listed here (dedup).
 ];
 
 /**
- * PLA-888: whether `contentType` is permitted for a plugin-created attachment.
+ * Whether `contentType` is permitted for a plugin-created attachment.
  * Exact, case-insensitive match against {@link PLUGIN_ARTIFACT_ALLOWED_MIME_TYPES}.
  */
 export function isAllowedPluginArtifactMimeType(contentType: string): boolean {
@@ -198,7 +198,7 @@ export function isAllowedContentType(contentType: string): boolean {
   return matchesContentType(contentType, allowedPatterns);
 }
 
-// Default raised 10 MiB → 25 MiB (PLA-1147). This is the shared upper bound for
+// Default raised 10 MiB → 25 MiB. This is the shared upper bound for
 // BOTH the human upload route (routes/assets.ts multer limit) and the per-company
 // `normalizeIssueAttachmentMaxBytes` ceiling that the plugin-artifact write path
 // inherits. Raising it is intentional: it is required so a fresh install with no

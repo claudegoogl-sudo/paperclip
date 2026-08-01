@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
-// PLA-873: GET /_plugins/:pluginId/ui/* must serve the bundle when :pluginId is
+// GET /_plugins/:pluginId/ui/* must serve the bundle when :pluginId is
 // the plugin *key* (not a UUID). The registry's by-id lookup throws Postgres
 // 22P02 (invalid_text_representation) for a non-UUID, drizzle-wrapped so the
 // SQLSTATE is on `.cause`. The route must detect that and fall through to the
@@ -54,7 +54,7 @@ async function createApp() {
   return app;
 }
 
-describe("plugin-ui-static key lookup (PLA-873)", () => {
+describe("plugin-ui-static key lookup", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pla873-ui-"));

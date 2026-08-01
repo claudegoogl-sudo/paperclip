@@ -94,7 +94,7 @@ const CRASH_WINDOW_MS = 10 * 60 * 1_000;
 const MAX_STDERR_EXCERPT_CHARS = 8_000;
 
 /**
- * PLA-1149: hard cap on a single worker→host IPC frame (one NDJSON line) in
+ * SECURITY-CRITICAL: hard cap on a single worker→host IPC frame (one NDJSON line) in
  * bytes. The transport is node child-process stdio and the worker controls how many
  * bytes it writes before a newline. Without a cap the host buffers an entire
  * line into memory *before* any application-level size gate runs (e.g. the
@@ -285,7 +285,7 @@ export function formatWorkerFailureMessage(message: string, stderrExcerpt: strin
 }
 
 /**
- * Defense-in-depth redaction for host-handler errors (PLA-190/PLA-193/PLA-197).
+ * SECURITY-CRITICAL: defense-in-depth redaction for host-handler errors.
  *
  * The host-handler dispatch catch-all in {@link createPluginWorkerHandle} sees
  * errors from every host method and forwards the message to both `log.error`
@@ -294,11 +294,11 @@ export function formatWorkerFailureMessage(message: string, stderrExcerpt: strin
  * already fixed at source — but any future handler that interpolates
  * worker-supplied input would leak it on both egress channels unless we scrub
  * here. `redactSensitiveText` covers gh[pousr]_* classic PATs, fine-grained
- * github_pat_* (PLA-1638), sk-* keys, 3-segment JWTs, `Authorization: Bearer`
+ * github_pat_* keys, sk-* keys, 3-segment JWTs, `Authorization: Bearer`
  * headers, env-var-shape *TOKEN/KEY/SECRET*=* and CLI secret flags.
  *
  * Exported so the redaction wrap can be exercised by unit tests without
- * spawning a real worker (PLA-197).
+ * spawning a real worker.
  */
 export function redactHostHandlerErrorMessage(err: unknown): string {
   const raw = err instanceof Error ? err.message : String(err);
@@ -329,7 +329,7 @@ export interface WorkerStartOptions {
   /** Default timeout for RPC calls (ms). Defaults to 30s. */
   rpcTimeoutMs?: number;
   /**
-   * PLA-1149: hard byte cap on a single worker→host IPC frame. Defaults to
+   * Hard byte cap on a single worker→host IPC frame. Defaults to
    * `PAPERCLIP_PLUGIN_MAX_IPC_FRAME_BYTES` or {@link DEFAULT_MAX_IPC_FRAME_BYTES}.
    * Mainly an injection point for tests; production should use the env var.
    */
@@ -369,7 +369,7 @@ interface ActiveInvocation {
   scope: PluginInvocationScope;
   timer?: ReturnType<typeof setTimeout>;
   /**
-   * PLA-773: when this invocation is a company-scoped background dispatch
+   * SECURITY-CRITICAL: when this invocation is a company-scoped background dispatch
    * (`onEvent`), the host-minted per-dispatch run UUID registered in the
    * run-context registry. Deregistered when the invocation clears so the
    * registry stays bounded.
@@ -378,7 +378,7 @@ interface ActiveInvocation {
 }
 
 /**
- * PLA-773 (item 1): host→worker dispatches that carry a TRIGGERING company but
+ * SECURITY-CRITICAL: host→worker dispatches that carry a TRIGGERING company but
  * no dispatching agent. For these, the host mints a per-dispatch
  * **company-scoped** run-context (rather than letting the worker→host
  * `secrets.resolve` fall through to the company-agnostic worker-lifetime
@@ -408,7 +408,7 @@ export interface PluginWorkerHandle {
   readonly pluginId: string;
 
   /**
-   * PLA-768: host-minted, worker-lifetime service run UUID. Surfaced as
+   * SECURITY-CRITICAL: host-minted, worker-lifetime service run UUID. Surfaced as
    * `context.serviceScope.runId` on every worker→host call so a background
    * dispatch or a `setup()`-started loop can resolve secrets outside any
    * dispatch. Stable across crash/auto-restart of this handle; never
@@ -558,7 +558,7 @@ export interface PluginWorkerManager {
  */
 export interface PluginWorkerHandleDeps {
   /**
-   * PLA-773: the shared run-context registry. When provided, a background
+   * SECURITY-CRITICAL: the shared run-context registry. When provided, a background
    * dispatch carrying a triggering company (`onEvent`) mints a per-dispatch
    * company-scoped run-context here so its worker→host `secrets.resolve` is
    * scoped to that company rather than falling through to the company-agnostic
@@ -596,23 +596,23 @@ export function createPluginWorkerHandle(
   const pendingRequests = new Map<string | number, PendingRequest>();
   let nextRequestId = 1;
   const activeInvocations = new Map<string, ActiveInvocation>();
-  // PLA-768: stable, host-minted service run-context for this worker's
+  // SECURITY-CRITICAL: stable, host-minted service run-context for this worker's
   // lifetime. Surfaced on every worker→host call so background dispatches /
   // setup() loops can resolve secrets outside any dispatch.
   const serviceRunId = randomUUID();
 
   // Optional methods reported by the worker during initialization
   let supportedMethods: string[] = [];
-  // PLA-1824: whether the worker declared at `initialize` that it echoes
+  // SECURITY-CRITICAL: whether the worker declared at `initialize` that it echoes
   // `paperclipInvocationId` on dispatch-servicing calls. Reassigned from each
   // successful handshake, so a crash-restarted worker re-declares.
   let echoesInvocationId = false;
-  // PLA-1838: host-observed counterpart to `echoesInvocationId`. Method names
+  // SECURITY-CRITICAL: host-observed counterpart to `echoesInvocationId`. Method names
   // this worker has been seen calling id-less while NO dispatch was in flight
   // — direct proof that it issues that call outside any dispatch, so
   // "exactly one dispatch is in flight" no longer implies the call belongs to
   // it. Unlike the worker's declaration this needs no plugin rebuild, which is
-  // what makes it reach the installed base (PLA-1830). Deliberately NOT reset
+  // what makes it reach the installed base. Deliberately NOT reset
   // on worker crash-restart: `spawnProcess()` respawns inside this same
   // closure, and the signal describes the plugin's code rather than the
   // process, so it should outlive the child. It does NOT survive a new handle
@@ -742,8 +742,8 @@ export function createPluginWorkerHandle(
     if (method === "performAction" && isRecord(params.actorContext)) {
       const companyId = readNonEmptyString(params.actorContext.companyId);
       if (!companyId) return null;
-      // Carry runId/agentId on the scope so a worker→host callback that omits
-      // them (e.g. pre-PLA-657 SDK `secrets.resolve(secretRef)`) can be back-
+      // SECURITY-CRITICAL: carry runId/agentId on the scope so a worker→host callback
+      // that omits them (e.g. an older SDK's `secrets.resolve(secretRef)`) can be back-
       // filled from the host-validated active invocation rather than failing
       // closed. Values come from the host's params, never from the worker.
       const runId = readNonEmptyString(params.actorContext.runId);
@@ -758,9 +758,9 @@ export function createPluginWorkerHandle(
     if (method === "executeTool" && isRecord(params.runContext)) {
       const companyId = readNonEmptyString(params.runContext.companyId);
       if (!companyId) return null;
-      // PLA-673: thread the outer dispatcher's runId/agentId so worker→host
+      // SECURITY-CRITICAL: thread the outer dispatcher's runId/agentId so worker→host
       // callbacks that didn't include them can be reconstructed by the host.
-      // This preserves the PLA-657/PLA-574 security model — the runId is the
+      // This preserves the security model — the runId is the
       // host's own, taken from the dispatch the host issued, never trusted to
       // the worker.
       const runId = readNonEmptyString(params.runContext.runId);
@@ -785,7 +785,7 @@ export function createPluginWorkerHandle(
     ttlMs?: number,
     method?: HostToWorkerMethodName | string,
   ): PluginInvocationContext {
-    // PLA-773: for a background dispatch carrying a triggering company (and no
+    // SECURITY-CRITICAL: for a background dispatch carrying a triggering company (and no
     // dispatching agent runId of its own), mint a per-dispatch company-scoped
     // run-context and surface its runId on the scope. The worker echoes it on
     // its `secrets.resolve` callback (or the host back-fills it from this
@@ -832,20 +832,20 @@ export function createPluginWorkerHandle(
   }
 
   function contextForWorkerMessage(message: JsonRpcRequest | JsonRpcNotification): WorkerHostCallContext {
-    // PLA-768: ALWAYS attach the worker-lifetime service run-context, on top of
+    // SECURITY-CRITICAL: ALWAYS attach the worker-lifetime service run-context, on top of
     // whatever dispatch scope (if any) the message resolves to. The service
     // scope grants no company scope by itself; merging it never widens
     // `invocationScope` enforcement for a method that trusts `companyId` as its
     // sole authority.
     //
-    // PLA-810 / PLA-814 / PLA-818: a NARROW allowlist of company-scoped methods
+    // SECURITY-CRITICAL: a NARROW allowlist of company-scoped methods
     // (`SERVICE_SCOPE_COMPANY_METHODS` in the SDK gate) that are server-side
     // `requireInCompany` reach-checked IS authorized under this serviceScope when
     // no dispatch pins a company — including when base context reports
     // `invalidInvocationScope` for the scope-less inbound relay path (the
     // `onWebhook` / `getUpdates` callback carries no resolvable dispatch id). The
     // SDK gate evaluates that allowlist bypass before its `invalidInvocationScope`
-    // rejection (PLA-818 guard-ordering fix). This does not widen reach: the
+    // rejection (a guard-ordering fix). This does not widen reach: the
     // bypass is reach-checked, and the rejection retains full force for every
     // non-allowlisted company-scoped method.
     return {
@@ -859,14 +859,14 @@ export function createPluginWorkerHandle(
       (message as { paperclipInvocationId?: unknown }).paperclipInvocationId,
     );
     if (!invocationId) {
-      // PLA-719: a pre-PLA-657 worker SDK (e.g. platform.cad ≤0.1.7) does not
+      // SECURITY-CRITICAL: an older worker SDK (e.g. platform.cad ≤0.1.7) does not
       // echo `paperclipInvocationId` on its worker→host callbacks, so we cannot
       // bind this call to an invocation by id. When EXACTLY ONE host→worker
       // dispatch is in-flight, that dispatch is unambiguously the one the worker
       // is servicing, so we surface its host-validated scope as
-      // `singleInFlightScope`. PLA-721 recorded this as feeding the runId
-      // back-fill ONLY; that stopped being true once PLA-761 made `config.get`
-      // select a tenant from it, which is why PLA-1824 gates the whole branch on
+      // `singleInFlightScope`. This was originally recorded as feeding the runId
+      // back-fill ONLY; that stopped being true once `config.get` started to
+      // select a tenant from it, which is why the whole branch is gated on
       // the worker being unable to echo an id in the first place. The runId
       // comes from the host's own runContext, never the worker. We deliberately
       // STILL return `invalidInvocationScope` so company-scope enforcement stays
@@ -881,28 +881,28 @@ export function createPluginWorkerHandle(
         activeInvocations.size > 0 || inFlightInvocationIds.size > 0;
       const method = readNonEmptyString((message as { method?: unknown }).method);
       if (!hasActiveInvocation) {
-        // PLA-1838: an id-less call with nothing in flight is unambiguous —
+        // SECURITY-CRITICAL: an id-less call with nothing in flight is unambiguous —
         // this worker makes this call outside any dispatch. Record it so the
         // attribution below is withdrawn for this method from now on. A worker
         // servicing its own dispatch always has that dispatch in flight, so a
         // dispatch-only legacy worker (platform.cad ≤0.1.7, klipper) can never
-        // trip this and keeps PLA-719 intact.
+        // trip this and keeps the single-in-flight attribution above intact.
         if (method) idlessCallsSeenWithNoDispatch.add(method);
         return {};
       }
-      // PLA-1824: plugin workers are GLOBAL — one worker process serves every
+      // SECURITY-CRITICAL: plugin workers are GLOBAL — one worker process serves every
       // tenant — so "the single in-flight dispatch" is only the caller's own
       // dispatch for a worker that CANNOT echo the id. A worker that declared
       // `echoesInvocationId` at initialize and still sent none is servicing no
       // dispatch at all (a `setup()`-started poll loop, a `runJob`, a timer).
       // Attributing it to whichever tenant happens to be mid-dispatch hands that
       // tenant's effective config — and the secret-refs it carries — to a caller
-      // with no claim to it. Such callers use `serviceScope` (PLA-768), which
+      // with no claim to it. Such callers use `serviceScope`, which
       // `contextForWorkerMessage` attaches unconditionally.
       //
-      // PLA-1838: `echoesInvocationId` is worker-declared, and plugins bundle
+      // SECURITY-CRITICAL: `echoesInvocationId` is worker-declared, and plugins bundle
       // their own SDK copy in `dist/worker.js`, so it stays false for the whole
-      // installed base until each plugin is rebuilt (PLA-1830). The second
+      // installed base until each plugin is rebuilt. The second
       // clause is the host's own observation of the same fact and needs no
       // rebuild: once this worker has issued THIS method id-less with nothing
       // in flight, a later id-less call cannot be assumed to own the single
@@ -957,11 +957,11 @@ export function createPluginWorkerHandle(
         result: result ?? null,
       });
     } catch (err) {
-      // PLA-190/PLA-193/PLA-197: defense-in-depth redaction happens in the
+      // SECURITY-CRITICAL: defense-in-depth redaction happens in the
       // exported redactHostHandlerErrorMessage helper (see its doc comment).
       const safeErrorMessage = redactHostHandlerErrorMessage(err);
       const errorCode = errorCodeForWorkerHostError(err);
-      // PLA-814: surface the JSON-RPC error code and typed error name alongside
+      // Surface the JSON-RPC error code and typed error name alongside
       // the message so a denied/failed in-process host call (e.g. an
       // InvocationScopeDeniedError from a background loop) is diagnosable from
       // logs alone, without correlating to source. `safeErrorMessage` already
@@ -1112,14 +1112,14 @@ export function createPluginWorkerHandle(
       TZ: process.env.TZ ?? "UTC",
     };
 
-    // PLA-1154: use `spawn` with a 3-fd stdio instead of `fork`. The host↔worker
+    // SECURITY-CRITICAL: use `spawn` with a 3-fd stdio instead of `fork`. The host↔worker
     // protocol runs entirely over stdin (host→worker requests) and stdout
-    // (worker→host NDJSON, byte-capped by PLA-1149). It NEVER uses the node IPC
+    // (worker→host NDJSON, byte-capped by the IPC frame cap above). It NEVER uses the node IPC
     // channel: there is no `child.send(...)`/`child.on("message", ...)` anywhere
     // in the host, and the worker SDK transports over `process.stdin`/`stdout`.
     // `fork()` always provisions an IPC channel (fd 3) whose parent-side reader
     // calls `readStart()` and buffers incoming bytes with no application-level
-    // cap — a worker→host OOM vector the PLA-1149 stdout cap does not cover (a
+    // cap — a worker→host OOM vector the stdout cap does not cover (a
     // compromised worker could `process.send({huge})` or `fs.writeSync(3, ...)`).
     // `spawn` with `["pipe","pipe","pipe"]` provisions no IPC channel, removing
     // the surface entirely (Minimize Attack Surface / Least Common Mechanism).
@@ -1155,7 +1155,7 @@ export function createPluginWorkerHandle(
   }
 
   function attachStdioHandlers(child: ChildProcess): void {
-    // Read NDJSON from stdout through a byte-bounded frame reader (PLA-1149).
+    // SECURITY-CRITICAL: read NDJSON from stdout through a byte-bounded frame reader.
     // The reader never buffers more than `maxIpcFrameBytes` of an in-flight
     // frame; an oversized frame is dropped before the host allocates the full
     // payload, audited, and the worker is terminated (fail closed).
@@ -1536,7 +1536,7 @@ export function createPluginWorkerHandle(
   }
 
   /**
-   * PLA-1149: SIGKILL a worker that sent an oversized IPC frame. Deliberately
+   * SECURITY-CRITICAL: SIGKILL a worker that sent an oversized IPC frame. Deliberately
    * does NOT set `intentionalStop`, so {@link handleProcessExit} treats the
    * death as a crash and the normal exponential-backoff / consecutive-crash
    * ceiling applies — a worker that keeps emitting oversized frames is
@@ -1793,7 +1793,7 @@ export interface PluginWorkerManagerOptions {
     willRestart?: boolean;
   }) => void;
   /**
-   * PLA-768: shared run-context registry. When provided, the manager registers
+   * SECURITY-CRITICAL: shared run-context registry. When provided, the manager registers
    * each worker's host-minted service run-context (`handle.serviceRunId`) as a
    * system actor for the worker's lifetime, so background dispatches and
    * `setup()`-started loops can resolve secrets. Deregistered on stop.
@@ -1859,15 +1859,15 @@ export function createPluginWorkerManager(
       });
       workers.set(pluginId, handle);
 
-      // PLA-768: register the worker-lifetime service run-context so background
+      // SECURITY-CRITICAL: register the worker-lifetime service run-context so background
       // dispatches / setup() loops can resolve secrets (system actor). Stable
       // across crash/auto-restart of this handle; removed on stop. The runId is
       // host-minted — it grants no company scope (company is derived from the
       // operator-created secret binding at resolve time).
-      // PLA-781: observability — make the registration (and any missing-registry
+      // Observability: make the registration (and any missing-registry
       // misconfiguration) visible. A `registryWired: false` line here means the
       // manager was built without a registry, so service run-contexts will not
-      // be resolvable by the secrets handler (the PLA-781 wiring bug).
+      // be resolvable by the secrets handler (a wiring bug).
       const registry = managerOptions?.runContextRegistry;
       if (registry) {
         registry.registerService(pluginId, handle.serviceRunId);
@@ -1927,7 +1927,7 @@ export function createPluginWorkerManager(
       log.info({ pluginId }, "stopping plugin worker");
       await handle.stop();
       managerOptions?.runContextRegistry?.deregister(pluginId, handle.serviceRunId);
-      // PLA-773 (item 2): the service runId is TTL-exempt in the redaction map,
+      // SECURITY-CRITICAL: the service runId is TTL-exempt in the redaction map,
       // so without this its resolved plaintext would linger for the process
       // lifetime (lazy prune only). Clear it on stop.
       clearRunSecretValues(handle.serviceRunId);

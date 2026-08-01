@@ -13,7 +13,7 @@ const CLAUDE_TRANSIENT_UPSTREAM_RE =
   /(?:rate[-\s]?limit(?:ed)?|rate_limit_error|too\s+many\s+requests|\b429\b|overloaded(?:_error)?|server\s+overloaded|service\s+unavailable|\b503\b|\b529\b|high\s+demand|try\s+again\s+later|temporarily\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|(?:5[-\s]?hour|weekly|session|usage)\s+limit(?:\s+reached)?|usage\s+cap\s+reached)/i;
 // The trailing `reached` is optional: upstream moved from "You're out of extra
 // usage · resets 4am (UTC)" to "You've hit your weekly limit · resets Jul 31,
-// 8am (UTC)". Requiring "reached" silently killed the PLA-1790 backoff for
+// 8am (UTC)". Requiring "reached" silently killed the usage-limit backoff for
 // every limit result after that wording change.
 const CLAUDE_EXTRA_USAGE_RESET_RE =
   /(?:out\s+of\s+extra\s+usage|extra\s+usage|claude\s+usage\s+limit(?:\s+reached)?|usage\s+cap(?:\s+reached)?|(?:5[-\s]?hour|weekly|session|usage)\s+limit(?:\s+reached)?)[\s\S]{0,80}?\bresets?\s+(?:at\s+)?([^\n()]+?)(?:\s*\(([^)]+)\))?(?:[.!]|\n|$)/i;

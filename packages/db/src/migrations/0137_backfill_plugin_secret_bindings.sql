@@ -1,8 +1,8 @@
 -- Backfill company_secret_bindings from existing plugin secret-ref config
--- (PLA-660 model-C, ships with PLA-657).
+-- (model-C, ships alongside the company-scoped secret resolver).
 --
 -- Derives per-company secret bindings from the secret-ref values operators have
--- already placed in plugin config, so the PLA-657 company-scoped resolver can
+-- already placed in plugin config, so the company-scoped resolver can
 -- authorize them with no manual per-tenant insert. This runs at DB level, so it
 -- sees every tenant (including secret owners the company-scoped agent JWT cannot).
 --
@@ -78,7 +78,7 @@ SELECT DISTINCT ON (cs.company_id, srp.plugin_id, srp.config_path)
   srp.config_path,
   'latest',
   true,
-  'backfill PLA-660',
+  'backfill',
   now(),
   now()
 FROM (

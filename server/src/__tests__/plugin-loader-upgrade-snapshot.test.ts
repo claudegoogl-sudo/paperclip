@@ -81,7 +81,7 @@ function manifest(
 const APPROVED_WORKER = "export const approved = true;\n";
 const TAMPERED_WORKER = "export const tampered = true;\n";
 
-describeEmbeddedPostgres("plugin-loader upgrade snapshot / immutable load (PLA-913)", () => {
+describeEmbeddedPostgres("plugin-loader upgrade snapshot / immutable load", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let packageRoots: string[] = [];

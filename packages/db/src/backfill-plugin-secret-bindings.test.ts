@@ -167,7 +167,7 @@ describeEmbeddedPostgres("0100 backfill company_secret_bindings", () => {
       config_path: "githubPatSecretId",
       version_selector: "latest",
       required: true,
-      label: "backfill PLA-660",
+      label: "backfill",
     });
   });
 
@@ -200,7 +200,7 @@ describeEmbeddedPostgres("0100 backfill company_secret_bindings", () => {
   it("drops a per-company ref to another company's secret, keeps the owner-matched one", async () => {
     // Company A's per-company settings reference A's OWN secret and (at a second
     // secret-ref path) company B's secret UUID. The owner-match constraint keeps the
-    // A->A binding and drops the A->B one. On the pre-PLA-665 SQL the cross-owner ref
+    // A->A binding and drops the A->B one. On the earlier SQL the cross-owner ref
     // fabricated a binding(company_id=B) that B never authored; this case fails there.
     const pluginId = await insertPlugin({
       type: "object",

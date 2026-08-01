@@ -1,13 +1,12 @@
 /**
- * Single source of truth for secret-shape detection on the control plane.
+ * SECURITY-CRITICAL: Single source of truth for secret-shape detection on the control plane.
  *
- * Two surfaces import this module so they cannot drift (PLA-841 / locked
- * specs PLA-302 + PLA-319):
+ * Two surfaces import this module so they cannot drift (locked specs):
  *
- *  1. The write-side pre-submit denylist on issue/comment routes (PLA-177)
+ *  1. The write-side pre-submit denylist on issue/comment routes
  *     — a body that matches blocks the write with a structured 422 naming
  *     the matched pattern class.
- *  2. The HTTP request logger redactor (PLA-317) — a matched substring in a
+ *  2. The HTTP request logger redactor — a matched substring in a
  *     logged value is replaced with the pattern's class marker before the
  *     line is persisted.
  *
@@ -41,7 +40,7 @@ export interface SecretPatternDef {
 /**
  * Decode a JWT-shaped string and decide whether it is a *third-party* token
  * (a real leak risk) versus Paperclip's own run JWT (legitimately pasted in
- * `gh auth status`-style debug output). Option A from PLA-177's known
+ * `gh auth status`-style debug output). Option A from the known
  * overlap: allow `iss === "paperclip"`, block everything else.
  *
  * Conservative on ambiguity: an undecodable / malformed JWT is treated as a
@@ -66,13 +65,13 @@ function isThirdPartyJwt(match: string): boolean {
  * Fine-grained PAT matcher. Body length is NOT contractually fixed; an exact
  * `{82}` silently misses off-length variants (81/83-body, future format
  * changes, a truncated copy). Match a min length instead so the class — not one
- * instance length — is redacted/blocked (PLA-1175). The classic `gh[poust]_`
+ * instance length — is redacted/blocked. The classic `gh[poust]_`
  * classes in the set below stay exact because GitHub documents them at a stable
  * 40-total length.
  *
  * Exported so the free-form host-error redactor (`redactSensitiveText`) reuses
- * this exact shape instead of re-deriving it — the two paths cannot drift
- * (PLA-1637). Authored WITHOUT the global flag like every pattern here; callers
+ * this exact shape instead of re-deriving it — the two paths cannot drift.
+ * Authored WITHOUT the global flag like every pattern here; callers
  * add `g` via `globalCopy`.
  */
 export const GITHUB_FINE_GRAINED_PAT_RE = /github_pat_[A-Za-z0-9_]{36,}/;
@@ -80,10 +79,10 @@ export const GITHUB_FINE_GRAINED_PAT_RE = /github_pat_[A-Za-z0-9_]{36,}/;
 /**
  * Ordered pattern set. Order is load-bearing: specific literal-prefixed
  * classes come before the generic JWT shape so a literal class is never
- * preempted by the broader matcher (PLA-319 §6). The text of each pattern
- * mirrors PLA-177's locked table; the JWT matcher additionally consumes the
+ * preempted by the broader matcher. The text of each pattern
+ * mirrors the locked table; the JWT matcher additionally consumes the
  * optional signature segment so a trailing signature fragment never survives
- * redaction (serves PLA-317 §2 / PLA-319 §4 — no partial value left behind).
+ * redaction — no partial value left behind.
  */
 export const SECRET_PATTERNS: readonly SecretPatternDef[] = [
   { label: "github_pat", regex: GITHUB_FINE_GRAINED_PAT_RE },
@@ -118,7 +117,7 @@ export interface RedactOptions {
   /**
    * When true, the per-pattern `isSecret` gate is bypassed so EVERY shape match
    * is redacted — including Paperclip's own `iss=paperclip` run JWTs. This is
-   * the correct posture for the LOG surface (PLA-842 Finding 1): a run/API JWT
+   * the correct posture for the LOG surface: a run/API JWT
    * is a live bearer credential and must never be persisted to `server.log`,
    * even though the write-block denylist (Option A) legitimately allows it in
    * free-text bodies (an agent pasting `gh auth status`-style debug output).
@@ -172,7 +171,7 @@ export function firstSecretMatch(text: unknown): SecretMatch | null {
  * pattern is applied in set order. By default the `isSecret` gate is honoured
  * so Paperclip's own run JWTs are left intact (Option A — for the write-block
  * surface). Pass `{ ignoreIssuerAllowlist: true }` on the LOG surface so every
- * credential shape is scrubbed regardless of issuer (PLA-842 Finding 1).
+ * credential shape is scrubbed regardless of issuer.
  */
 export function redactSecrets(text: string, opts: RedactOptions = {}): string {
   if (typeof text !== "string" || text.length === 0) return text;
@@ -218,7 +217,7 @@ export function redactSecretsDeep<T>(value: T, opts: RedactOptions = {}): T {
  * `iss=paperclip` run JWT appearing outside the force-redacted `authorization`
  * header (e.g. in a `?token=` query, a body leaf, or an error string) is still
  * scrubbed from `server.log`. The write-block surface keeps the gated variants
- * above (Option A). Same shared pattern set → no drift (PLA-842 Finding 1).
+ * above (Option A). Same shared pattern set → no drift.
  */
 export function redactSecretsForLog(text: string): string {
   return redactSecrets(text, { ignoreIssuerAllowlist: true });

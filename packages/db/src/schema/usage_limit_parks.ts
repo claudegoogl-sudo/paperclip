@@ -2,7 +2,7 @@ import { pgTable, uuid, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core
 import { heartbeatRuns } from "./heartbeat_runs.js";
 
 /**
- * PLA-1930 — single instance-wide singleton row recording whether the Claude
+ * Single instance-wide singleton row recording whether the Claude
  * account is currently parked after a usage-limit hit. The quota this guards
  * is account-wide (not per-agent or per-company), so every wake source
  * (issue-comment wake, sweep, routine trigger, scheduled-retry promotion)

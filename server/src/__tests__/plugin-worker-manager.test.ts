@@ -266,12 +266,12 @@ describe("plugin-worker-manager stderr failure context", () => {
         id: "company-a",
         scopedCompanyId: "company-a",
       });
-      // PLA-673: the invocation scope now carries the dispatching agent's
-      // runId/agentId so worker→host callbacks (e.g. pre-PLA-657
+      // The invocation scope now carries the dispatching agent's
+      // runId/agentId so worker→host callbacks (e.g. legacy
       // `secrets.resolve({secretRef})`) can be back-filled by host-client-
       // factory. The values come from the host's `actorContext` and were
       // already on the wire — they're just exposed via scope now too.
-      // PLA-768: the host-minted worker-lifetime service scope is also surfaced
+      // The host-minted worker-lifetime service scope is also surfaced
       // on every worker→host call (the fallback runId for background/setup-loop
       // secrets.resolve). It never overrides an active dispatch scope.
       expect(companiesGet).toHaveBeenCalledWith(
@@ -318,7 +318,7 @@ describe("plugin-worker-manager stderr failure context", () => {
         },
       } as HostToWorkerMethods["getData"][0])).resolves.toEqual({ id: "company-1" });
 
-      // PLA-768: service scope is always present alongside the echoed scope.
+      // The service scope is always present alongside the echoed scope.
       expect(companiesGet).toHaveBeenCalledWith(
         { companyId: "company-1" },
         {
@@ -520,8 +520,8 @@ describe("plugin-worker-manager stderr failure context", () => {
   });
 });
 
-describe("PLA-673 — back-fill runId for pre-PLA-657 SDK secrets.resolve", () => {
-  // Plugins bundled against the pre-PLA-657 SDK (e.g. platform.cad ≤0.1.7)
+describe("back-fill runId for legacy SDK secrets.resolve", () => {
+  // Plugins bundled against the legacy SDK (e.g. platform.cad ≤0.1.7)
   // call `ctx.secrets.resolve(secretRef)` without threading runId. The new
   // server-side handler requires runId, so any such call would otherwise fail
   // with `runcontext_invalid` even when the host has a valid active dispatch.
@@ -619,12 +619,12 @@ describe("PLA-673 — back-fill runId for pre-PLA-657 SDK secrets.resolve", () =
   });
 });
 
-describe("PLA-719 — back-fill runId when the worker echoes no invocation id", () => {
+describe("back-fill runId when the worker echoes no invocation id", () => {
   // The deployed platform.cad worker (cad ≤0.1.7) sends `secrets.resolve`
   // with neither `runId` NOR `paperclipInvocationId` (verified: its bundled
-  // worker.js has zero `paperclipInvocation` references). PLA-673's back-fill
-  // therefore had nothing to resolve a scope from and the call failed closed
-  // at the server's secrets handler. PLA-719 attributes such an id-less
+  // worker.js has zero `paperclipInvocation` references). The scope back-fill
+  // above therefore had nothing to resolve a scope from and the call failed closed
+  // at the server's secrets handler. This fix attributes such an id-less
   // callback to the SINGLE in-flight host→worker dispatch and surfaces its
   // host-validated scope via `singleInFlightScope`, so the runId back-fill
   // succeeds — without trusting any worker-supplied field.
@@ -747,7 +747,7 @@ describe("PLA-719 — back-fill runId when the worker echoes no invocation id", 
   });
 
   it("cannot widen company scope: a worker naming company-b is denied even when singleInFlightScope is company-a", async () => {
-    // SEC invariant (PLA-721): the new `singleInFlightScope` feeds the runId
+    // SEC invariant: the new `singleInFlightScope` feeds the runId
     // back-fill ONLY. `requireInvocationCompanyScope` runs first, never reads
     // `singleInFlightScope`, and the no-id branch always sets
     // `invalidInvocationScope` — so a worker that names a *different* company in
@@ -782,13 +782,13 @@ describe("PLA-719 — back-fill runId when the worker echoes no invocation id", 
   });
 });
 
-describe("PLA-818 — inbound relay createComment authorized end-to-end under invalidInvocationScope", () => {
+describe("inbound relay createComment authorized end-to-end under invalidInvocationScope", () => {
   // The live fork.16 bug: an operator reply routed through the messenger's
   // onWebhook/getUpdates path calls `ctx.issues.createComment` WITHOUT echoing a
   // resolvable invocation id while a host→worker dispatch is in flight. The host
   // base context surfaces `invalidInvocationScope: true` and attaches the
   // worker-lifetime `serviceScope`. Pre-fix the SDK gate threw on
-  // `invalidInvocationScope` before reaching the PLA-814 allowlist bypass, so the
+  // `invalidInvocationScope` before reaching the allowlist bypass, so the
   // comment was denied and never landed. This proves the FULL chain
   // (contextForWorkerMessage → SDK gate) now authorizes the reach-checked,
   // allowlisted createComment — guarding against a context-shape regression
@@ -850,7 +850,7 @@ describe("PLA-818 — inbound relay createComment authorized end-to-end under in
   });
 });
 
-describe("PLA-773 — background dispatch run-context (item 1) + redaction cleanup (item 2)", () => {
+describe("background dispatch run-context (item 1) + redaction cleanup (item 2)", () => {
   const SECRET_REF = "11111111-1111-4111-8111-111111111111";
 
   it("mints a company-scoped background run-context for an onEvent dispatch and threads its runId to the worker's secrets.resolve", async () => {
@@ -945,7 +945,7 @@ describe("PLA-773 — background dispatch run-context (item 1) + redaction clean
   });
 });
 
-// PLA-1149: bounded worker→host IPC frame reader (OOM hardening).
+// Bounded worker→host IPC frame reader (OOM hardening).
 describe("resolveMaxIpcFrameBytes", () => {
   const ENV_KEY = "PAPERCLIP_PLUGIN_MAX_IPC_FRAME_BYTES";
   const original = process.env[ENV_KEY];
@@ -1056,7 +1056,7 @@ describe("createBoundedFrameReader", () => {
   });
 });
 
-describe("plugin worker IPC frame cap (PLA-1149 end-to-end)", () => {
+describe("plugin worker IPC frame cap (end-to-end)", () => {
   it("terminates a worker that emits an over-limit IPC frame", async () => {
     const handle = createPluginWorkerHandle("test.plugin", {
       entrypointPath: OVERSIZE_FRAME_WORKER_ENTRYPOINT,
@@ -1091,7 +1091,7 @@ describe("plugin worker IPC frame cap (PLA-1149 end-to-end)", () => {
   });
 });
 
-describe("plugin worker node IPC channel removal (PLA-1154)", () => {
+describe("plugin worker node IPC channel removal", () => {
   it("spawns the worker with no live node IPC channel (fd 3 gone)", async () => {
     const handle = createPluginWorkerHandle("test.plugin", {
       entrypointPath: IPC_CHANNEL_WORKER_ENTRYPOINT,

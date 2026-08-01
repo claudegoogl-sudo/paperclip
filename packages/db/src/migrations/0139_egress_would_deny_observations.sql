@@ -1,5 +1,5 @@
--- PLA-734: queryable would-deny egress observation table (CTO decision PLA-733,
--- option (b)). The egress chokepoint records, per binding, the egress-parser-
+-- Queryable would-deny egress observation table (per CTO decision, option (b)).
+-- The egress chokepoint records, per binding, the egress-parser-
 -- NORMALIZED destinations (scheme+host+port only — never a raw path/query URL) a
 -- borrowed-handle call would have been denied for while the binding is in
 -- log-only / migration mode. Operators read this to seed per-binding allowlists.

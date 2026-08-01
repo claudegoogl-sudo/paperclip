@@ -123,7 +123,7 @@ describe("pluginLifecycleManager.restartWorker", () => {
     expect(handle.restart).toHaveBeenCalledTimes(1);
     expect(started).toHaveBeenCalledTimes(1);
     expect(started).toHaveBeenCalledWith({ pluginId: "plugin-1", pluginKey: "example.plugin" });
-    // PLA-854: the bare branch must NOT emit `plugin.worker_stopped`. That event
+    // The bare branch must NOT emit `plugin.worker_stopped`. That event
     // drives the host-service cleanup disposer (services.dispose() ->
     // scopedBus.clear()), which — because a bare bounce reuses the same
     // host-services object — would tear down the subscriptions the restarted
@@ -131,7 +131,7 @@ describe("pluginLifecycleManager.restartWorker", () => {
     expect(stopped).not.toHaveBeenCalled();
   });
 
-  it("clears stale event subscriptions before the bounce so the restarted worker's re-subscription survives (PLA-854)", async () => {
+  it("clears stale event subscriptions before the bounce so the restarted worker's re-subscription survives", async () => {
     mockRegistry.getById.mockResolvedValue(pluginRecord);
     mockRegistry.updateStatus.mockResolvedValue(pluginRecord);
 

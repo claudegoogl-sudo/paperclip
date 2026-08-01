@@ -1,4 +1,4 @@
-// PLA-1838 regression fixture: a plugin worker that starts a background poll
+// Regression fixture: a plugin worker that starts a background poll
 // loop at `setup()` time (the shape of the messenger `getUpdates` long-poll)
 // and resolves a secret ref from inside that loop.
 //
@@ -50,10 +50,10 @@ rl.on("line", (line) => {
     send({
       jsonrpc: "2.0",
       id: message.id,
-      // PLUGIN_FIXTURE_ECHOES_INVOCATION_ID=1 models a modern (post-PLA-657)
-      // SDK. Unset models the installed base (messenger 0.1.42, platform.cad
-      // <=0.1.7), which predates the field and therefore keeps PLA-719's
-      // single-in-flight attribution after PLA-1824.
+      // PLUGIN_FIXTURE_ECHOES_INVOCATION_ID=1 models a modern SDK (after
+      // invocation-id echoing was added). Unset models the installed base
+      // (messenger 0.1.42, platform.cad <=0.1.7), which predates the field
+      // and therefore still relies on the host's single-in-flight attribution.
       result: {
         ok: true,
         supportedMethods: ["onEvent"],

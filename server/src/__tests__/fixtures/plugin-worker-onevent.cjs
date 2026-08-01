@@ -1,6 +1,6 @@
 const readline = require("node:readline");
 
-// PLA-773 fixture: a worker whose `onEvent` background dispatch calls back into
+// Fixture: a worker whose `onEvent` background dispatch calls back into
 // the host via `secrets.resolve`, echoing the host-supplied invocation id but
 // omitting runId — so the host must back-fill runId from the (background)
 // invocation scope it minted for the triggering company.

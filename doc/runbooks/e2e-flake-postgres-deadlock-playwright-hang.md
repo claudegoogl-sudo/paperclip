@@ -1,4 +1,4 @@
-# PLA-597 runbook: fork e2e flake — Postgres deadlock + Playwright install hang
+# Runbook: fork e2e flake — Postgres deadlock + Playwright install hang
 
 ## Symptoms
 
@@ -41,7 +41,7 @@ Because Playwright runs spec files in parallel workers by default and the e2e su
 
 `playwright install --with-deps chromium` is a single CI step combining a browser download and a `sudo apt-get install`. There is no inner timeout; the job-level 30-minute budget is the only ceiling. When apt hangs, the Chrome zip is already on disk but no visible step fails — the entire job is silently cancelled at the 30-minute mark.
 
-## Fix landed (PR #28, branch `pla-597/e2e-flake-fix`)
+## Fix landed (PR #28, branch `e2e-flake-fix`)
 
 1. **Bounded retry in `PATCH /api/issues/:id`.** `server/src/services/pg-retry.ts` provides `retryOnTransientPgError`, which retries on SQLSTATE `40P01` (deadlock_detected) and `40001` (serialization_failure) with bounded exponential backoff + jitter, default 6 attempts (≈1.6 s worst-case latency). The PATCH route handler (`server/src/routes/issues.ts`) wraps both branches of its transaction block in this helper; the pre-auth helpers `clearOrphanCheckoutLocksIfTerminal` and `clearExecutionRunIfTerminal` (`server/src/services/issues.ts`) wrap their own `db.transaction` bodies in the helper too. A rolled-back transaction leaves no partial state, so retrying is safe.
 
@@ -54,7 +54,7 @@ Because Playwright runs spec files in parallel workers by default and the e2e su
 
 - Server unit tests in `server/src/__tests__/pg-retry.test.ts` (9 cases) cover retryable code detection, retry-then-success, exhaustion, and non-retryable rethrow.
 - The retry helper logs each retry at `warn` with the call-site `label`, so even after the mitigation the deadlocks remain visible in `server.log` for trend tracking. Watch for `label=patch_issue` warnings spiking — if they reappear at >1% of PATCH /issues calls, the root-cause fix (unifying the lock order across paths) becomes a real priority.
-- The CTO gate per PLA-597 is three consecutive green e2e runs on `claudegoogl-sudo/paperclip:master` after this PR merges. Track the runs on the Actions tab; reopen PLA-597 if any of the three are red for the same reason.
+- The stability gate for this fix was three consecutive green e2e runs on `claudegoogl-sudo/paperclip:master` after this PR merged. Track the runs on the Actions tab; treat any of the three going red for the same reason as a regression worth reopening.
 
 ## Repro for future regressions
 
@@ -68,6 +68,5 @@ To reproduce the deadlock locally without the full e2e harness:
 ## See also
 
 - PR #28 — `claudegoogl-sudo/paperclip#28` — landing commit set.
-- PLA-575 — the parent issue whose CI red triggered this work.
 - `server/src/services/pg-retry.ts` — the retry helper.
 - `tests/e2e/playwright.config.ts` — single-worker CI pin.

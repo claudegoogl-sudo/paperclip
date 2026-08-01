@@ -35,7 +35,7 @@ test("isEphemeralPath allows persistent paths", () => {
 test("assertPersistentPath throws on ephemeral, returns resolved path otherwise", () => {
   assert.throws(
     () => assertPersistentPath("/tmp/cad/package", "staged package root", TMP),
-    /ephemeral.*PLA-639/s,
+    /ephemeral/s,
   );
   assert.equal(
     assertPersistentPath("/home/paperclip/.paperclip/plugin-packages/cad/package", "x", TMP),
@@ -51,13 +51,13 @@ test("classifyPluginStatus: ready + persistent path passes", () => {
   assert.deepEqual(verdict, { ready: true, reason: null });
 });
 
-test("classifyPluginStatus: this is the PLA-639 trap — ready but /tmp packagePath FAILS", () => {
+test("classifyPluginStatus: this is the ephemeral-path trap — ready but /tmp packagePath FAILS", () => {
   const verdict = classifyPluginStatus(
     { status: "ready", packagePath: "/tmp/pla-447-extract/package", lastError: null },
     { tmpDir: TMP },
   );
   assert.equal(verdict.ready, false);
-  assert.match(verdict.reason, /ephemeral.*PLA-639/s);
+  assert.match(verdict.reason, /ephemeral/s);
 });
 
 test("classifyPluginStatus: error status surfaces lastError", () => {
@@ -105,7 +105,7 @@ test("resolveStagedPackageRoot is deterministic, persistent, and sanitizes scope
   assert.equal(isEphemeralPath(root, TMP), false);
 });
 
-test("buildHostEnv pins PAPERCLIP_CONFIG into the data dir — the PLA-650 isolation invariant", () => {
+test("buildHostEnv pins PAPERCLIP_CONFIG into the data dir — the config isolation invariant", () => {
   const dataDir = "/home/p/.paperclip-soak/data-123";
   // A hostile/legacy inherited env: a live config + a live DATABASE_URL that
   // MUST NOT reach the booted soak host.

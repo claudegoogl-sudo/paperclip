@@ -78,7 +78,7 @@ export interface PluginToolDispatcherOptions {
   /** Database connection for looking up plugin records. */
   db?: Db;
   /**
-   * PLA-574 — registry where the dispatching agent's runContext is recorded
+   * SECURITY-CRITICAL: registry where the dispatching agent's runContext is recorded
    * for the duration of each `executeTool` call so the worker's later
    * `artifacts.fetch` callbacks can be authorized against the dispatching
    * agent (not the worker JWT).
@@ -163,7 +163,7 @@ export interface PluginToolDispatcher {
    * @param pluginKey - The plugin's namespaced key (e.g. `acme.linear`).
    *   Used as the lookup key for tool registration.
    * @param manifest - The plugin manifest containing tool declarations.
-   * @param pluginDbId - The plugin's database UUID. Required (PLA-323):
+   * @param pluginDbId - The plugin's database UUID. Required:
    *   `workerManager` keys running workers by DB UUID, not by pluginKey, so
    *   without this `workerManager.isRunning(...)` always returns false and
    *   every tool dispatch fails with `worker for plugin X is not running`.
@@ -241,7 +241,7 @@ export function createPluginToolDispatcher(
   const { workerManager, lifecycleManager, db, runContextRegistry } = options;
   const log = logger.child({ service: "plugin-tool-dispatcher" });
 
-  // PLA-734 — db-backed would-deny egress harvest sink. Only wired when a db is
+  // Db-backed would-deny egress harvest sink. Only wired when a db is
   // available; the chokepoint calls it fire-and-forget, so persistence runs
   // off the dispatch path and its failures are isolated here (a harvest write
   // must never break tool execution).

@@ -193,8 +193,6 @@ export interface PluginLifecycleManager {
    * (`upgrade_pending`) plugin: complete the upgrade in the loader (apply the
    * new version + capabilities, return to `ready`) and re-activate the worker.
    * Idempotent — a no-op if the plugin is not `upgrade_pending`.
-   *
-   * @see PLA-910
    */
   completeUpgradeApproved(pluginId: string): Promise<PluginRecord>;
 
@@ -202,8 +200,6 @@ export interface PluginLifecycleManager {
    * Restore a parked (`upgrade_pending`) plugin to `ready` after the board
    * rejected its capability escalation, then re-activate the worker at the
    * still-installed (pre-upgrade) version. Idempotent.
-   *
-   * @see PLA-910
    */
   revertUpgradeRejected(pluginId: string): Promise<PluginRecord>;
 
@@ -306,7 +302,7 @@ export interface PluginLifecycleManagerOptions {
    * worker, so the restarted worker's `setup()` re-subscription is the
    * authoritative final state rather than an accumulation on top of dead
    * subscriptions. Also used to log the re-established subscription count so a
-   * detached relay is observable. See PLA-854.
+   * detached relay is observable.
    */
   eventBus?: PluginEventBus;
 }
@@ -687,13 +683,13 @@ export function pluginLifecycleManager(
 
       await deactivatePluginRuntime(pluginId, plugin.pluginKey);
 
-      // 1. Delegate to the loader, which owns the capability-escalation gate
-      //    (PLA-908): a cap-escalating upgrade is *parked* in `upgrade_pending`
-      //    (filing a board approval via the injected gateway, or throwing when
-      //    no gateway is wired — fail closed); a non-escalating upgrade is
-      //    applied in place and the row is left `ready` with the new
+      // SECURITY-CRITICAL: delegate to the loader, which owns the
+      //    capability-escalation gate — a cap-escalating upgrade is *parked* in
+      //    `upgrade_pending` (filing a board approval via the injected gateway, or
+      //    throwing when no gateway is wired — fail closed); a non-escalating
+      //    upgrade is applied in place and the row is left `ready` with the new
       //    version/manifest. We consume that result rather than re-deciding the
-      //    escalation here, so there is a single source of truth (PLA-910).
+      //    escalation here, so there is a single source of truth.
       const result = await pluginLoaderInstance.upgradePlugin(pluginId, { version });
 
       log.info(
@@ -904,7 +900,7 @@ export function pluginLifecycleManager(
           "plugin lifecycle: restarting worker (runtime services unavailable; skipping migration re-apply)",
         );
 
-        // PLA-854: clear the plugin's existing event-bus subscriptions BEFORE
+        // Clear the plugin's existing event-bus subscriptions BEFORE
         // bouncing the worker. The restarted worker re-declares its
         // subscriptions during setup() (`ctx.events.on` -> `events.subscribe`),
         // so this clear makes that re-subscription the authoritative final

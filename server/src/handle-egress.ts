@@ -1,5 +1,5 @@
 /**
- * Per-binding egress destination allowlist (PLA-723 / PLA-703 Control-2 residual).
+ * SECURITY-CRITICAL: Per-binding egress destination allowlist (Control-2 residual).
  *
  * Control 2 ({@link ./handle-vault.ts}) resolves a borrowed handle back to its
  * plaintext at the single worker-dispatch chokepoint
@@ -7,9 +7,8 @@
  * going**. This module gates *where* a resolved handle may egress to, per
  * binding, and is consulted at that same chokepoint BEFORE any substitution.
  *
- * Design: PLA-703 comment `a0a84764`, as amended by the SecurityEngineer
- * APPROVE-WITH-CHANGES verdict on PLA-720 (gating amendments EG1–EG6). The
- * amendments win on any divergence.
+ * Design: as amended by the SecurityEngineer APPROVE-WITH-CHANGES verdict
+ * (gating amendments EG1–EG6). The amendments win on any divergence.
  *
  *  - EG1 — the trust axis is **host-mediated vs plugin-controlled**, not
  *    exec-class vs structured. A tool whose egress the host does not itself
@@ -319,7 +318,7 @@ export function normalizeDestination(kind: EgressKind, raw: unknown): Normalized
  * Render a normalized origin to a canonical, persistable, allowlist-shaped
  * string: `scheme://host:port` (scheme omitted for bare-`host` destinations,
  * port omitted when it is the scheme default / unset). This is the ONLY form of
- * a destination that may be stored (PLA-734): it is derived purely from parser
+ * a destination that may be stored: it is derived purely from parser
  * output (scheme+host+port), so it can never carry a path, query, fragment, or
  * userinfo — the components that leak tokens/PII. Returns `null` for a
  * fail-closed / non-`ok` origin so callers drop unparseable destinations rather
@@ -380,7 +379,7 @@ function parseEntry(entry: string): AllowlistMatcher | null {
 /**
  * True if `entry` is a well-formed operator allowlist entry — i.e. the egress
  * matcher can parse it into a real origin rule. Used by the operator-set path
- * (PLA-731) to reject malformed entries up front rather than silently storing a
+ * to reject malformed entries up front rather than silently storing a
  * dead rule that {@link matchesAllowlist} would skip (an entry that never
  * matches is a footgun once the binding is flipped to enforce).
  */
@@ -455,7 +454,7 @@ export interface EgressDecision {
   /**
    * The destination AFTER egress-parser normalization (scheme+host+port only —
    * NO path/query/fragment). This is the only destination representation safe to
-   * persist (PLA-734 harvest): the raw `destination` above can carry tokens/PII
+   * persist (would-deny harvest): the raw `destination` above can carry tokens/PII
    * in its path/query. `null` when the call is not host-mediated or the
    * destination is undeterminable; `{ ok: false }` when it failed to parse.
    */

@@ -72,7 +72,7 @@ describe("RunLogStore.append() secret redaction", () => {
   });
 });
 
-describe("RunLogStore.append() value-exact vault redaction (PLA-697)", () => {
+describe("RunLogStore.append() value-exact vault redaction", () => {
   // High-entropy value with NO secret-ish field name, no dots, and no secret
   // text hint — so it can ONLY be caught by value-exact matching, not by the
   // pattern/heuristic redactor.
@@ -135,10 +135,10 @@ describe("RunLogStore.append() value-exact vault redaction (PLA-697)", () => {
   });
 });
 
-// ── Finding A regression (PLA-704) ───────────────────────────────────────────
+// ── Finding A regression ──────────────────────────────────────────────────
 // event.message must be routed through redactSensitiveText so value-exact and
 // pattern redactors both see it (not just redactCurrentUserText).
-describe("redactSensitiveText covers event.message field (Finding A, PLA-704)", () => {
+describe("redactSensitiveText covers event.message field (Finding A)", () => {
   const HIGH_ENTROPY = "Zx7Qm2Lp9Rt4Wv6Yb1Nc3Df5Gh8Jk0MnABC";
   const RUN_ID = "run-704-finding-a";
 
@@ -155,10 +155,10 @@ describe("redactSensitiveText covers event.message field (Finding A, PLA-704)", 
   });
 });
 
-// ── Finding B regression (PLA-704) ───────────────────────────────────────────
+// ── Finding B regression ──────────────────────────────────────────────────
 // Short (< 8 char) values must be silently skipped by registerRunSecretValue so
 // they can never cause over-redaction in sibling runs' logs.
-describe("registerRunSecretValue short-value guard (Finding B, PLA-704)", () => {
+describe("registerRunSecretValue short-value guard (Finding B)", () => {
   const SHORT_VALUE = "abc";
   const RUN_A = "run-704-finding-b-a";
   const RUN_B = "run-704-finding-b-b";

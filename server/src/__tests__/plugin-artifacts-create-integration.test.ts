@@ -86,7 +86,7 @@ function createRoundTripStorage() {
   };
 }
 
-describeEmbeddedPostgres("artifacts.create → artifacts.fetch integration (PLA-888)", () => {
+describeEmbeddedPostgres("artifacts.create → artifacts.fetch integration", () => {
   let db!: ReturnType<typeof createDb>;
   let svc!: ReturnType<typeof issueService>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -204,7 +204,7 @@ describeEmbeddedPostgres("artifacts.create → artifacts.fetch integration (PLA-
       .from(issueAttachments);
     expect(attachmentRow?.id).toBeTruthy();
 
-    // Fetch via the existing PLA-574 path using the issue_attachments id.
+    // Fetch via the existing artifacts.fetch path using the issue_attachments id.
     const fetched = await handler.fetch({ attachmentId: attachmentRow!.id, runId });
     expect(fetched.contentType).toBe("audio/ogg");
     expect(fetched.byteSize).toBe(payload.length);

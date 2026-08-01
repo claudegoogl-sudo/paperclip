@@ -22,7 +22,7 @@ const mockIssueService = vi.hoisted(() => ({
   update: vi.fn(),
   getByIdentifier: vi.fn(),
   assertCheckoutOwner: vi.fn(),
-  // PLA-141 introduced a clearOrphanCheckoutLocksIfTerminal call at the top of
+  // A clearOrphanCheckoutLocksIfTerminal call was introduced at the top of
   // every issue mutation route. The PATCH /issues/:id guard test reaches that
   // entry point and would otherwise 500 on an undefined-method TypeError before
   // the environment-selection assertion under test runs.

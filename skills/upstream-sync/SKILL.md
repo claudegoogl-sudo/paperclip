@@ -10,8 +10,7 @@ description: >
 # Upstream Sync
 
 Pulls upstream `paperclipai/paperclip` releases into the
-`claudegoogl-sudo/paperclip` fork. Parent issue: PLA-589 (routine spec);
-scaffolding lands via PLA-603. The weekly cron registration is owned by the
+`claudegoogl-sudo/paperclip` fork. The weekly cron registration is owned by the
 sibling task and lives outside this skill.
 
 > **Direction matters.** This is the inverse of `release_via_fork_install_request`:
@@ -117,16 +116,16 @@ addressed) should advance `.paperclip/upstream-sync.json`.
 
 | Trigger | Destination |
 |---|---|
-| `escalation` bucket from the routine | New child issue under PLA-589, board-visible, includes JSON report verbatim and the upstream tag |
-| `reviewable` bucket from the routine | Same parent (PLA-589), labelled for the calling agent to handle inline |
+| `escalation` bucket from the routine | New child issue under the sync routine's parent task, board-visible, includes JSON report verbatim and the upstream tag |
+| `reviewable` bucket from the routine | Same parent task, labelled for the calling agent to handle inline |
 | PR CI failure on `pr.yml` | Treated as P0 per `public_pr_ci_clean_gate`; fix or close before requesting approval |
 | Upstream API 5xx | Routine exits non-zero with the body; retry on next tick is fine |
 
-## 5b. Plugin-activation soak gate (PLA-640)
+## 5b. Plugin-activation soak gate
 
 After a clean merge, **before** advancing state or pushing, the tick runs a
 plugin-activation soak (`scripts/plugin-activation-soak.mjs` via
-`runActivationSoakGate`). Root cause: PLA-639 — CAD went `error` on the v525
+`runActivationSoakGate`). Root cause: CAD went `error` on the v525
 cut (`Package root not found for plugin "platform.cad"`) because it had been
 installed from a `/tmp` source dir that the host recorded as `packagePath`
 without copying; systemd-tmpfiles swept the dir and the next restart could not
@@ -158,8 +157,8 @@ a failure, never a silent pass.
 
 The routine **never** auto-merges. After the draft PR is green:
 
-1. Agent posts the PR URL on PLA-589 (or the sync sub-issue), with the dry-run
-   output as evidence.
+1. Agent posts the PR URL on the sync routine's parent task (or the sync
+   sub-issue), with the dry-run output as evidence.
 2. Board approves the merge into `claudegoogl-sudo/paperclip:master`.
 3. CTO routes a fork-install request to CEO per
    `release_via_fork_install_request`, and the new fork version reaches this

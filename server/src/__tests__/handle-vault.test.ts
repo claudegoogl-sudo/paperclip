@@ -1,8 +1,8 @@
 /**
- * PLA-702 / PLA-695 Control 2 — borrowed-handle vault unit tests.
+ * Control 2 — borrowed-handle vault unit tests.
  *
  * These exercise the in-memory store directly (no DB / no worker). Each
- * assertion maps to a SecurityEngineer PLA-701 sign-off criterion (RC3/RC5)
+ * assertion maps to a SecurityEngineer sign-off criterion (RC3/RC5)
  * or a confirmed invariant, and FAILS on pre-fix code where the module does
  * not exist.
  */

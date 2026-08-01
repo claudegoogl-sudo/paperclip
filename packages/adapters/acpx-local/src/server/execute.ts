@@ -578,7 +578,7 @@ function uniqueSorted(values: Array<string | null | undefined>): string[] {
   return [...new Set(values.filter((value): value is string => typeof value === "string" && value.length > 0))].sort();
 }
 
-// Phase 4.1 (PAPA-388): the Claude Code SDK that `claude-agent-acp` runs uses
+// Phase 4.1: the Claude Code SDK that `claude-agent-acp` runs uses
 // `settingSources: ["user", "project", "local"]`. By writing a per-worktree
 // `.claude/settings.local.json` we override the user's potentially-restrictive
 // `~/.claude/settings.json` (e.g. `defaultMode: "dontAsk"`, which silently
@@ -1398,7 +1398,7 @@ export function createAcpxLocalExecutor(deps: ExecuteDeps = {}) {
       nonInteractivePermissions: prepared.nonInteractivePermissions,
       timeoutMs: prepared.timeoutSec > 0 ? prepared.timeoutSec * 1000 : undefined,
       // Scope ACPX runtime verbose logs to the claude agent only — that's the
-      // surface we know needs the extra session-event detail (PAPA-388). codex
+      // surface we know needs the extra session-event detail. codex
       // and custom agents already emit their own per-tool output and don't
       // benefit from doubling the log volume.
       verbose: prepared.acpxAgent === "claude",

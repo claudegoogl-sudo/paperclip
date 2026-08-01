@@ -434,9 +434,8 @@ plugin namespace.
 > **Alpha.** `ctx.db.query()` requires every `FROM`/`JOIN` to be
 > schema-qualified (e.g. `ctx.db.namespace.tbl`). Unqualified refs are
 > rejected. All calls run inside a transaction with
-> `SET LOCAL search_path TO <namespace>, pg_temp` as a second line of defense
-> (PLA-98). The validator is regex-based pending a real Postgres SQL parser —
-> see PLA-94 F2.
+> `SET LOCAL search_path TO <namespace>, pg_temp` as a second line of defense.
+> The validator is regex-based pending a real Postgres SQL parser.
 
 ### Trusted Local Folders
 

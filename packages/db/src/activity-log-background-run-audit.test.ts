@@ -6,7 +6,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./test-embedded-postgres.js";
 
-// Regression for PLA-806: a background/service plugin secret resolve carries a
+// Regression test: a background/service plugin secret resolve carries a
 // host-minted SYNTHETIC runId that is NOT a row in heartbeat_runs. Writing that
 // id into activity_log.run_id violates activity_log_run_id_heartbeat_runs_id_fk
 // (SQLSTATE 23503), so the best-effort audit insert is silently dropped and the
@@ -42,7 +42,7 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
-describeEmbeddedPostgres("activity_log durable background secret-resolve audit (PLA-806)", () => {
+describeEmbeddedPostgres("activity_log durable background secret-resolve audit", () => {
   it(
     "a synthetic (non-heartbeat) runId in run_id raises 23503, but run_id=NULL + details.backgroundRunId persists durably",
     async () => {
@@ -52,7 +52,7 @@ describeEmbeddedPostgres("activity_log durable background secret-resolve audit (
       const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
       try {
         const [company] = await sql.unsafe<{ id: string }[]>(
-          `INSERT INTO "companies" ("name") VALUES ('PLA-806 bg-audit co') RETURNING id`,
+          `INSERT INTO "companies" ("name") VALUES ('bg-audit co') RETURNING id`,
         );
 
         // A host-minted background runId that is NOT a heartbeat_runs row.
@@ -120,10 +120,10 @@ describeEmbeddedPostgres("activity_log durable background secret-resolve audit (
       const sql = postgres(connectionString, { max: 1, onnotice: () => {} });
       try {
         const [company] = await sql.unsafe<{ id: string }[]>(
-          `INSERT INTO "companies" ("name") VALUES ('PLA-806 fg-audit co') RETURNING id`,
+          `INSERT INTO "companies" ("name") VALUES ('fg-audit co') RETURNING id`,
         );
         const [agent] = await sql.unsafe<{ id: string }[]>(
-          `INSERT INTO "agents" ("company_id", "name") VALUES ($1, 'PLA-806 fg agent') RETURNING id`,
+          `INSERT INTO "agents" ("company_id", "name") VALUES ($1, 'fg agent') RETURNING id`,
           [company.id],
         );
         const [run] = await sql.unsafe<{ id: string }[]>(

@@ -112,7 +112,7 @@ describe("normalizeContentType", () => {
 });
 
 describe("isAllowedPluginArtifactMimeType", () => {
-  // PLA-1139/PLA-1140: full broadened set of inert common-file types that must pass.
+  // Full broadened set of inert common-file types that must pass.
   const inertAllowed = [
     // 3D / CAD
     "model/stl",
@@ -154,7 +154,7 @@ describe("isAllowedPluginArtifactMimeType", () => {
     }
   });
 
-  it("retains the PLA-888 base image/pdf/audio types", () => {
+  it("retains the base image/pdf/audio types", () => {
     for (const ct of ["image/png", "image/jpeg", "application/pdf", "audio/ogg"]) {
       expect(isAllowedPluginArtifactMimeType(ct)).toBe(true);
     }
@@ -182,7 +182,7 @@ describe("isAllowedPluginArtifactMimeType", () => {
     }
   });
 
-  it("leaves SVG and archive types gated (PLA-1141) until SecurityEngineer rules", () => {
+  it("leaves SVG and archive types gated until SecurityEngineer rules", () => {
     for (const ct of [
       "image/svg+xml",
       "application/zip",

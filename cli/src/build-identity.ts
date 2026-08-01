@@ -1,4 +1,4 @@
-// Boot-time build-identity self-check (PLA-632 defense-in-depth).
+// Boot-time build-identity self-check (defense-in-depth).
 //
 // Fork builds carry a `-fork.<n>` suffix in their version (e.g.
 // `2026.428.1-fork.9`); upstream npm releases do not. When systemd resolves the

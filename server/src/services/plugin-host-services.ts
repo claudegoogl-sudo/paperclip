@@ -425,7 +425,7 @@ const MAX_LOG_MESSAGE_LENGTH = 10_000;
 const MAX_LOG_META_JSON_LENGTH = 50_000;
 
 /**
- * Defensive upper bound on rows returned by the PLA-923 reconcile reads
+ * Defensive upper bound on rows returned by the reconcile reads
  * (`approvals.list` / `interactions.list`). A normal pending set is far smaller,
  * so this is a no-op in practice; it only prevents a pathological pending count
  * from ballooning a single response. When the cap is hit we emit one warn line.
@@ -632,7 +632,7 @@ export function buildHostServices(
   const interactions = issueThreadInteractionService(db);
   const scopedBus = eventBus.forPlugin(pluginKey);
 
-  // PLA-574: artifacts.fetch handler — only available when storage + a
+  // artifacts.fetch handler — only available when storage + a
   // run-context registry are wired. When absent (e.g. legacy test harnesses)
   // the slot stays unwired and any call throws a clear error.
   const artifactsHandler =
@@ -656,7 +656,7 @@ export function buildHostServices(
               };
             },
           },
-          // PLA-888: asset-write surface + per-company size ceiling for
+          // asset-write surface + per-company size ceiling for
           // artifacts.create (mirrors the human upload route's ceiling).
           assetWriter: {
             findReusableUnattachedAsset: (companyId, sha256) =>
@@ -719,7 +719,7 @@ export function buildHostServices(
   const ensurePluginAvailableForCompany = async (_companyId: string) => {};
 
   /**
-   * PLA-923: real, method-scoped availability gate for the reconcile reads
+   * SECURITY-CRITICAL: real, method-scoped availability gate for the reconcile reads
    * (`approvals.list` / `interactions.list`). Unlike the instance-wide no-op
    * stub above, this fail-closes so a cross-tenant-sensitive enumeration can
    * never run for a company the plugin is not genuinely provisioned for. It is
@@ -736,7 +736,7 @@ export function buildHostServices(
    *       (not `uninstalled` / `disabled`);
    *   (d) the company must not have explicitly disabled the plugin
    *       (`enabled !== false`; absent settings row ⇒ default-ON, matching the
-   *       instance-wide install model accepted for PLA-923 3.b).
+   *       instance-wide install model).
    */
   const requirePluginEnabledForCompany = async (companyId: string): Promise<void> => {
     // (a)
@@ -1228,7 +1228,7 @@ export function buildHostServices(
     return { resourceType, resourceId, companyId, policy: null, updatedAt: company.updatedAt };
   };
 
-  // PLA-677: The runtime config service exposes `getForCompany` for per-tenant
+  // The runtime config service exposes `getForCompany` for per-tenant
   // effective config. The SDK's `HostServices.config` interface adds this as an
   // optional method; the cast keeps this file compiling against SDK versions
   // that pre-date the extension (the gated handler duck-types `getForCompany`
@@ -1398,7 +1398,7 @@ export function buildHostServices(
         const { replaced } = params.filter
           ? scopedBus.subscribe(params.eventPattern as any, params.filter as any, handler)
           : scopedBus.subscribe(params.eventPattern as any, handler);
-        // PLA-854 observability: a plugin worker re-runs setup() (and therefore
+        // Observability: a plugin worker re-runs setup() (and therefore
         // re-issues every events.subscribe RPC) on each (re)start — e.g. a
         // dev-watcher hot reload or crash auto-restart. If the host-side
         // subscription ever fails to re-attach, board events silently stop
@@ -2268,7 +2268,7 @@ export function buildHostServices(
       async createComment(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
-        // Resolve target by identifier (e.g. PLA-822) when no issueId is supplied.
+        // Resolve target by identifier (e.g. an issue's public id) when no issueId is supplied.
         // requireInCompany keeps the tenant reach-check: an identifier that resolves
         // to a foreign company throws "Issue not found".
         const issue = params.identifier && !params.issueId
@@ -2281,18 +2281,18 @@ export function buildHostServices(
         if (refuseClosed && isClosed) {
           throw new Error(`Issue is closed (status: ${issue.status})`);
         }
-        // The host must not let a plugin mint *user* authorship. A worker-supplied
-        // user id is untrusted: it would write authorType "user", indistinguishable
-        // from a real board comment, and governance leans on comment authorship
-        // (send-it-back-to-me, approvals, audit). Relays are attributed to the
-        // plugin's own agent identity; operator identity, if any, belongs in the
-        // comment body/metadata, not in host-minted authorship. (PLA-823 Finding 1.)
+        // SECURITY-CRITICAL: the host must not let a plugin mint *user* authorship. A
+        // worker-supplied user id is untrusted: it would write authorType "user",
+        // indistinguishable from a real board comment, and governance leans on
+        // comment authorship (send-it-back-to-me, approvals, audit). Relays are
+        // attributed to the plugin's own agent identity; operator identity, if any,
+        // belongs in the comment body/metadata, not in host-minted authorship.
         const comment = (await issues.addComment(
           issue.id,
           params.body,
           { agentId: params.authorAgentId },
         )) as IssueComment;
-        // PLA-888: bind any standalone assets created via artifacts.create onto
+        // Bind any standalone assets created via artifacts.create onto
         // this comment. attachAssetsToComment re-checks each asset's company
         // against the (already tenant-validated) issue's company, so a worker
         // cannot surface a foreign tenant's asset. Idempotent on the UNIQUE
@@ -2331,14 +2331,14 @@ export function buildHostServices(
           // untrusted operator/Telegram text, and mention-driven wake would let
           // inbound content fan out heartbeat runs to arbitrary same-company agents
           // (indirect prompt-injection / DoS). Capped, rate-limited mention-wake is
-          // tracked as a follow-up. (PLA-823 Finding 2.)
+          // tracked as a follow-up.
           const authorAgentId = params.authorAgentId ?? null;
           const assigneeId = issue.assigneeAgentId;
           const selfComment = Boolean(authorAgentId && authorAgentId === assigneeId);
           // Throttle wakes per (plugin, company, assignee). A relay storm still
           // lands every comment, but only the first `maxWakes`/window enqueue a
           // heartbeat — the rest are dropped so untrusted inbound volume cannot
-          // spam the assignee's runs or burn budget. (PLA-829.)
+          // spam the assignee's runs or burn budget.
           const wakeAllowed =
             assigneeId && !selfComment
               ? wakeRateLimiter.consume({ pluginId, companyId, agentId: assigneeId }).allowed
@@ -2399,7 +2399,7 @@ export function buildHostServices(
         });
         return interaction as any;
       },
-      // PLA-1438 Part A: retire (expire) a single pending interaction the plugin
+      // SECURITY-CRITICAL: retire (expire) a single pending interaction the plugin
       // is relaying an operator reply to. Least-privilege authorization:
       //  - gated by the default-deny `issue.interactions.resolve` capability
       //    (granted only to the messenger manifest),
@@ -2408,7 +2408,7 @@ export function buildHostServices(
       //    (cross-tenant interactionId -> notFound), and
       //  - actor `userId` is ALWAYS null: the messenger acts on the operator's
       //    behalf via free text but must NOT mint operator user authorship in the
-      //    audit trail (PLA-823 Finding-1). Terminal status is always "expired",
+      //    audit trail. Terminal status is always "expired",
       //    never "accepted", so no accept side-effect or continuation wake fires.
       async resolveInteraction(params) {
         const companyId = ensureCompanyId(params.companyId);
@@ -2439,7 +2439,7 @@ export function buildHostServices(
       },
     },
 
-    // PLA-923: reconcile reads. Both run the real, fail-closed
+    // SECURITY-CRITICAL: reconcile reads. Both run the real, fail-closed
     // `requirePluginEnabledForCompany` gate before any query (Complete
     // Mediation) and return a field-minimized projection (no requester/decider
     // user ids, no decision notes, no result blobs). Default to pending when no

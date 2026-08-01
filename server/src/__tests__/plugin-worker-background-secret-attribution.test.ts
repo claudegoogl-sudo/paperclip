@@ -48,17 +48,17 @@ interface ObservedResolve {
   derivedCompanyId: string | undefined;
 }
 
-describe("PLA-1838 — a background secrets.resolve must bind to its own service run-context, not another tenant's in-flight dispatch", () => {
+describe("a background secrets.resolve must bind to its own service run-context, not another tenant's in-flight dispatch", () => {
   // Plugin workers are GLOBAL: one plugin.id is one process shared by every
   // tenant. A loop started in `setup()` (messenger `getUpdates`) services no
   // dispatch, so its worker->host calls carry no `paperclipInvocationId` — the
-  // same wire shape as a pre-PLA-657 legacy worker.
+  // same wire shape as a legacy worker.
   //
-  // PLA-1824 narrows `singleInFlightScope` to workers that cannot echo an id.
+  // A narrowing fix restricts `singleInFlightScope` to workers that cannot echo an id.
   // The installed base (messenger 0.1.42, platform.cad <=0.1.7) predates the
   // `echoesInvocationId` declaration and bundles its own SDK copy, so it keeps
-  // the affordance — and with it this path — until every plugin is rebuilt
-  // (PLA-1830). These tests therefore run the legacy shape.
+  // the affordance — and with it this path — until every plugin is rebuilt.
+  // These tests therefore run the legacy shape.
 
   let registries: PluginRunContextRegistry[] = [];
 
@@ -147,7 +147,7 @@ describe("PLA-1838 — a background secrets.resolve must bind to its own service
       // Now company-a dispatches an event. The fixture holds it open, so it is
       // the single in-flight invocation while the background loop keeps
       // ticking. `registerInvocation` mints a company-a background run-context
-      // for it (PLA-773) and surfaces its runId on `singleInFlightScope`.
+      // for it and surfaces its runId on `singleInFlightScope`.
       await handle.call("onEvent", {
         event: { companyId: "company-a", type: "issue.created" },
       } as unknown as HostToWorkerMethods["onEvent"][0]);
@@ -169,9 +169,9 @@ describe("PLA-1838 — a background secrets.resolve must bind to its own service
     }
   });
 
-  it("still binds an id-less call to the single in-flight dispatch for a legacy worker servicing its own dispatch (PLA-719 preserved)", async () => {
+  it("still binds an id-less call to the single in-flight dispatch for a legacy worker servicing its own dispatch (preserved)", async () => {
     // The discriminator must be "does this call own a dispatch", not "which
-    // scope key is present". A pre-PLA-657 worker resolving a secret from
+    // scope key is present". A legacy worker resolving a secret from
     // inside its own `onEvent` must still reach that dispatch's company —
     // reordering the precedence would break exactly this.
     const registry = createPluginRunContextRegistry();

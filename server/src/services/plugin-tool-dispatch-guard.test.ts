@@ -15,7 +15,7 @@ import {
 import type { LogActivityInput } from "./activity-log.js";
 
 /**
- * PLA-903 regression: the host dispatcher (`POST /api/plugins/tools/execute`)
+ * Regression: the host dispatcher (`POST /api/plugins/tools/execute`)
  * must (B) rate-limit `agent.tools.register` dispatches per
  * `(company, agent, tool)` and (A) write exactly one charset-escaped
  * `plugin_tool.execute` audit row per authorized dispatch. Both layers live in

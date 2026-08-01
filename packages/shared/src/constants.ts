@@ -1,7 +1,7 @@
 export const COMPANY_STATUSES = ["active", "paused", "archived"] as const;
 export type CompanyStatus = (typeof COMPANY_STATUSES)[number];
 
-// 25 MiB. Raised from 10 MiB (PLA-1147) so the plugin-artifact write path —
+// 25 MiB. Raised from 10 MiB so the plugin-artifact write path —
 // whose effective ceiling is Math.min(companyMaxBytes, pluginMaxBytes) — is not
 // silently pinned back to 10 MiB by an unset per-company limit. 25 MiB covers
 // everything Telegram's Bot API getFile can deliver (hard 20 MB inbound cap)

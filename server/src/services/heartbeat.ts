@@ -480,7 +480,7 @@ function buildNoOpDispatchRetrySchedule(input: {
   };
 }
 
-// PLA-1930/PLA-1967: a genuine account-wide usage-limit hit bills nothing and
+// A genuine account-wide usage-limit hit bills nothing and
 // never reaches the model, whatever the adapter's own classification says.
 // Checked independently of `noOpDispatch` (which is Claude/429-specific) so the
 // park gate stays adapter-agnostic. The zero-work conjuncts alone proved too
@@ -491,7 +491,7 @@ function buildNoOpDispatchRetrySchedule(input: {
 // this unless the run *also* never reached the model, and a genuine zero-work
 // failure with no limit wording no longer parks. Every live genuine hit
 // carries a signal, so this removes the false positives at zero cost to true
-// positives (see PLA-1967).
+// positives.
 // Exported for direct unit/replay testing (AC2/AC3/AC6) — the actual dispatch this
 // gates lives deep inside `executeRun`'s adapter-execution path, which is not a
 // practical seam to drive end-to-end from a unit test.
@@ -504,7 +504,7 @@ export function isZeroWorkUsageLimitResult(resultJson: Record<string, unknown>):
   return hasUsageLimitSignal(resultJson.result);
 }
 
-// PLA-1967: minimum signal set from the ticket's live-data audit. "Usage
+// Minimum signal set from the live-data audit. "Usage
 // credits are required for this model" is a quota condition (CTO's explicit
 // read on the 3 live rows), so it's included alongside the weekly/session/
 // rate-limit phrasing rather than left to fall through as a false positive.
@@ -514,7 +514,7 @@ function hasUsageLimitSignal(result: unknown): boolean {
   return typeof result === "string" && USAGE_LIMIT_SIGNAL_RE.test(result);
 }
 
-// PLA-1967 AC4: folds the failed-outcome guard into the classifier's call
+// AC4: folds the failed-outcome guard into the classifier's call
 // site instead of leaving it to the `if (outcome === "failed")` wrapper alone,
 // so a future refactor that moves the call out from under that wrapper still
 // fails closed. Exported so the guard is unit-testable independent of
@@ -10264,7 +10264,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function startNextQueuedRunForAgent(agentId: string) {
     if (getSchedulingSuppression().suppressed) return [];
-    // PLA-1930: single admission choke point for every wake source (issue-comment
+    // Single admission choke point for every wake source (issue-comment
     // wake, sweep, routine trigger, scheduled-retry promotion) — the account-wide
     // usage-limit quota this guards is instance-wide, so the gate must be too.
     if (await usageLimitPark.isParked()) return [];
@@ -10354,7 +10354,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (run.status !== "queued" && run.status !== "running") return;
 
     if (run.status === "queued") {
-      // PLA-1930: defense-in-depth against `startNextQueuedRunForAgent`'s gate —
+      // Defense-in-depth against `startNextQueuedRunForAgent`'s gate —
       // this function is a second, independently reachable path into a claim, and
       // an already-running run above must never be stopped mid-flight by a park
       // that started after it was dispatched.
@@ -12139,7 +12139,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         outcome = "failed";
       }
       const outcomeSucceeded = outcome === "succeeded" || outcome === "succeeded_dirty";
-      // PLA-1930: clear early on the first successful dispatch so a stale park set
+      // Clear early on the first successful dispatch so a stale park set
       // from an earlier (possibly mis-parsed) reset time can never outlive a quota
       // that has, in fact, already recovered.
       if (outcomeSucceeded) {
@@ -12344,7 +12344,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         } else if (outcome === "failed" && readTransientRecoveryContractFromRun(livenessRun)) {
           await scheduleBoundedRetryForRun(livenessRun, agent);
         }
-        // PLA-1930/PLA-1967: a genuinely zero-work usage-limit hit (never billed,
+        // A genuinely zero-work usage-limit hit (never billed,
         // never reached the model, and carrying a limit-signal string) parks every
         // agent in every company until the advertised reset, instead of relying on
         // this one agent's own retry ladder to eventually stop hammering a quota the
@@ -12694,13 +12694,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             failureReason: latestRun?.error ?? undefined,
           });
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
-          // Drop any value-exact secret values registered during this run so a
+          // SECURITY-CRITICAL: Drop any value-exact secret values registered during this run so a
           // rotated secret's stale plaintext is never retained across runs
-          // (PLA-697 / PLA-695 Control 1).
+          // (Control 1).
           clearRunSecretValues(run.id);
-          // Drop any borrowed-handle plaintext minted during this run so a
+          // SECURITY-CRITICAL: Drop any borrowed-handle plaintext minted during this run so a
           // run-A handle can never resolve under a later run and rotated
-          // secrets are not retained (PLA-702 / PLA-695 Control 2).
+          // secrets are not retained (Control 2).
           clearRunHandles(run.id);
           activeRunExecutions.delete(run.id);
           await startNextQueuedRunForAgent(run.agentId);
@@ -12884,7 +12884,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // Sibling lock cleanup is already done above; only the primary issue carries
       // the recovery surface because the comment is attached to a single issue.
       //
-      // PLA-141's checkoutRunId/executionRunId self-heal is now subsumed by the
+      // The checkoutRunId/executionRunId self-heal is now subsumed by the
       // sibling-wide cleanup above (split into two UPDATEs so a retry's
       // executionRunId pointer is never clobbered), so no per-primary cleanup is
       // repeated here.
@@ -15164,7 +15164,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return run ?? null;
     },
 
-    // PLA-1930: observability for the account-wide usage-limit park — lets callers
+    // Observability for the account-wide usage-limit park — lets callers
     // (API route, recovery sweep) distinguish "parked on purpose" from "stuck", so a
     // parked fleet isn't misreported as a stall.
     getUsageLimitParkState: (now?: Date) => usageLimitPark.getState(now),

@@ -166,15 +166,15 @@ export async function createApp(
     pluginMigrationDb?: Db;
     /**
      * Company the host files plugin capability-escalation board approvals
-     * against (PLA-910). A plugin capability escalation is instance-wide but
+     * against. A plugin capability escalation is instance-wide but
      * approvals are company-scoped, so the host files against this single
      * configured "platform" company. When omitted, no escalation gateway is
      * wired and the loader keeps failing closed on a cap-escalating upgrade —
-     * preserving the pre-PLA-908 production default.
+     * preserving the pre-existing production default.
      */
     escalationApprovalCompanyId?: string;
     pluginWorkerManager?: PluginWorkerManager;
-    // PLA-781: the run-context registry the injected pluginWorkerManager was
+    // The run-context registry the injected pluginWorkerManager was
     // built with. MUST be the same instance, so a worker's host-minted service
     // run-context (registered by the manager on worker start) is visible to the
     // secrets host-handler's Gate 1 lookup. When omitted, app creates its own.
@@ -235,17 +235,17 @@ export async function createApp(
   app.use(llmRoutes(db));
 
   const hostServicesDisposers = new Map<string, () => void>();
-  // PLA-854: pluginId -> pluginKey, populated as each plugin's host handlers are
+  // pluginId -> pluginKey, populated as each plugin's host handlers are
   // built. Lets the event-relay probe resolve the bus key (which is the plugin
   // key) for the running workers reported by the worker manager.
   const pluginKeyById = new Map<string, string>();
-  // PLA-574: shared run-context registry tying the dispatching agent's
+  // Shared run-context registry tying the dispatching agent's
   // identity to (pluginDbId, runId) for the duration of each tool call, so the
   // worker's `artifacts.fetch`/`secrets.resolve` callbacks can be authorized
-  // server-side. PLA-768: also holds each worker's worker-lifetime service
+  // server-side. Also holds each worker's worker-lifetime service
   // run-context (system actor) for background secret resolution — created
   // before the worker manager so the manager can register on worker start.
-  // PLA-781: when the caller injects a pre-built pluginWorkerManager (index.ts
+  // When the caller injects a pre-built pluginWorkerManager (index.ts
   // does, so it can also drive heartbeat/routine services), it MUST inject the
   // registry that manager was built with. Otherwise app would create a second,
   // disjoint registry: the manager's registerService would write to its own
@@ -328,9 +328,9 @@ export async function createApp(
   });
   const hostServiceCleanup = createPluginHostServiceCleanup(lifecycle, hostServicesDisposers);
   let viteHtmlRenderer: ReturnType<typeof createCachedViteHtmlRenderer> | null = null;
-  // PLA-910: wire the capability-escalation gateway when a platform company is
+  // Wire the capability-escalation gateway when a platform company is
   // configured. Absent it, the loader receives no gateway and keeps failing
-  // closed on cap-escalating upgrades (pre-PLA-908 production default).
+  // closed on cap-escalating upgrades (pre-existing production default).
   const escalationGateway = opts.escalationApprovalCompanyId
     ? createApprovalsCapabilityEscalationGateway({
         approvals: approvalService(db),
@@ -378,7 +378,7 @@ export async function createApp(
       },
     },
   );
-  // PLA-910: a lifecycle bound to the runtime-services + gateway loader, used
+  // A lifecycle bound to the runtime-services + gateway loader, used
   // only to apply board decisions to parked upgrades (complete/revert + worker
   // re-activation). The approvals service dispatches resolved escalation
   // approvals to this resolver via the module-level registry, breaking the
@@ -391,7 +391,7 @@ export async function createApp(
       await upgradeLifecycle.revertUpgradeRejected(payload.pluginId);
     }
   });
-  // PLA-1537: create the dev-watcher before the plugin routes so the routes can
+  // Create the dev-watcher before the plugin routes so the routes can
   // reconcile the local-plugin file watcher after each lifecycle mutation. The
   // routes run against a route-local lifecycle instance whose domain events
   // never reach this watcher's app-level subscription, so an explicit reconcile
@@ -399,7 +399,7 @@ export async function createApp(
   // Resolve the watch target for a plugin: its local packagePath, but only
   // while the plugin is active ('ready'). Gating on status means reconcile()
   // disarms the watcher on disable/uninstall (status leaves 'ready') even
-  // though disable keeps packagePath in the DB. See PLA-1537.
+  // though disable keeps packagePath in the DB.
   const devWatcher = createPluginDevWatcher(
     lifecycle,
     async (pluginId) => {
@@ -644,7 +644,7 @@ export async function createApp(
     logger.error({ err }, "Failed to load ready plugins on startup");
   });
 
-  // PLA-854: liveness probe that warns if a running plugin's board-event relay
+  // Liveness probe that warns if a running plugin's board-event relay
   // detaches (worker up, zero event-bus subscriptions). Belt-and-suspenders to
   // the per-restart subscription-count log in plugin-lifecycle.
   const eventRelayProbe = createEventRelayProbe({

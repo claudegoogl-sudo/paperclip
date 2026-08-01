@@ -1,5 +1,5 @@
 /**
- * Plugin event-relay liveness probe (PLA-854).
+ * Plugin event-relay liveness probe.
  *
  * A plugin's board-event relay is delivered by in-process subscriptions on the
  * `PluginEventBus`, established when the worker calls `events.subscribe` during

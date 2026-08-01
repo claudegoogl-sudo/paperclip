@@ -1,5 +1,5 @@
 /**
- * PLA-768 — end-to-end seam test for the worker-lifetime service context.
+ * End-to-end seam test for the worker-lifetime service context.
  *
  * Wires the REAL worker→host backfill (`createHostClientHandlers` from the SDK)
  * to the REAL server-side secrets handler + run-context registry, then drives
@@ -40,7 +40,7 @@ const { clearRunSecretValues } = await import("../run-secret-registry.js");
 
 const PLUGIN_DB_ID = "messenger-install-1";
 const PLUGIN_KEY = "platform.messenger";
-// The real bot-token binding from PLA-768 AC4 (value below is a placeholder).
+// The real bot-token binding from AC4 (value below is a placeholder).
 const BOT_TOKEN_SECRET_REF = "aec3df6f-ef95-4572-b786-290e3baa1a8e";
 const OWNER_COMPANY = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const SERVICE_RUN_ID = "00000000-0000-4000-8000-00000000beef";
@@ -51,7 +51,7 @@ function buildWorld() {
     ttlMs: 60_000,
     sweepIntervalMs: 60_000,
   });
-  // The worker-manager registers this at worker start (PLA-768 task #2).
+  // The worker-manager registers this at worker start.
   registry.registerService(PLUGIN_DB_ID, SERVICE_RUN_ID);
 
   const secretsHandler = createPluginSecretsHandler({
@@ -95,7 +95,7 @@ afterEach(() => {
   clearRunSecretValues(SERVICE_RUN_ID);
 });
 
-describe("PLA-768 service-context e2e (messenger getUpdates + onEvent)", () => {
+describe("service-context e2e (messenger getUpdates + onEvent)", () => {
   it("resolves the bot token from a setup()-loop tick with no dispatch in flight", async () => {
     const { handlers } = buildWorld();
 
@@ -109,7 +109,7 @@ describe("PLA-768 service-context e2e (messenger getUpdates + onEvent)", () => {
     expect(value).toBe(TEST_TOKEN);
 
     // Attributed to the plugin system actor — not a spoofed agent/user run.
-    // PLA-806: the synthetic service runId is not a heartbeat_runs row, so the
+    // The synthetic service runId is not a heartbeat_runs row, so the
     // durable audit row writes run_id = NULL and preserves the synthetic id
     // under details.backgroundRunId + details.runContextKind (avoids the 23503
     // FK drop that previously swallowed the whole audit insert).

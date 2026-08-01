@@ -1,8 +1,8 @@
-// PLA-1154 regression fixture: a worker that reports whether it has a live node
+// Regression fixture: a worker that reports whether it has a live node
 // IPC channel (fd 3). The host now spawns workers with a 3-fd stdio and NO ipc
 // entry, so the worker must see no `process.send`, no `process.channel`, and a
 // raw write to fd 3 must fail (the fd does not exist) — proving the worker→host
-// OOM bypass of PLA-1149's stdout frame cap is gone.
+// OOM bypass of the stdout frame cap is gone.
 const readline = require("node:readline");
 const fs = require("node:fs");
 

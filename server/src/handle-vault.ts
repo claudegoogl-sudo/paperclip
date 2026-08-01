@@ -1,7 +1,7 @@
 /**
- * Per-run borrowed-handle vault (PLA-702 / PLA-695 Control 2).
+ * SECURITY-CRITICAL: Per-run borrowed-handle vault (Control 2).
  *
- * Control 1 (PLA-697, {@link ./run-secret-registry.ts}) value-exact redacts a
+ * Control 1 ({@link ./run-secret-registry.ts}) value-exact redacts a
  * resolved secret out of PERSISTED transcript records, but the live plaintext
  * still reaches the agent working context — one reasoning step can copy it into
  * a downstream tool argument and exfiltrate it before any persistence redactor
@@ -20,7 +20,7 @@
  * crash backstop so plaintext is never retained indefinitely if a run dies
  * between mint and finalize.
  *
- * Security invariants (SecurityEngineer PLA-701 sign-off RC1–RC5):
+ * SECURITY-CRITICAL invariants (SecurityEngineer sign-off RC1–RC5):
  *  - RC3: a handle is ALWAYS resolved against the server-validated `runId`
  *    (`vault[ctx.runId][handle]`), NEVER the runId parsed from the handle
  *    token. A run-A handle presented during run B resolves to nothing.
@@ -60,9 +60,9 @@ const HANDLE_ID_BYTES = 16;
 const ENTRY_TTL_MS = 60 * 60 * 1_000;
 
 /**
- * Operator-set egress posture captured into a handle at mint time (PLA-723).
+ * SECURITY-CRITICAL: Operator-set egress posture captured into a handle at mint time.
  *
- * Mint-time capture is deliberate (PLA-720 EG3): the handle carries an
+ * Mint-time capture is deliberate (EG3): the handle carries an
  * immutable allowlist for its lifetime so the egress-time check never re-reads
  * config (no TOCTOU / re-read attack surface). The trade-off — a tightened
  * allowlist not taking effect until TTL — is closed by {@link purgeHandlesByBinding}.
@@ -91,7 +91,7 @@ export interface HandleRecord extends HandleCapture {
 
 /**
  * Default capture for a handle minted without an explicit posture (legacy /
- * test callers, and the pre-PLA-723 mint path). Log-only + empty allowlist =
+ * test callers, and the pre-existing mint path). Log-only + empty allowlist =
  * the migration-safe posture: substitution proceeds but a would-deny audit
  * fires. The PRODUCTION mint path derives capture from the binding row, where
  * NEW bindings are born `enforced: true` (EG4) — the secure default lives there,
@@ -193,7 +193,7 @@ export function resolveHandle(runId: string, handle: string): string | undefined
  * Resolve a single handle to its full record (plaintext + captured egress
  * posture) within `runId`, or `undefined` if this run's vault holds no such
  * handle. Used by the egress chokepoint to make the destination decision from
- * each handle's OWN captured allowlist (PLA-723 EG5) before any substitution.
+ * each handle's OWN captured allowlist (EG5) before any substitution.
  */
 export function getHandleRecord(runId: string, handle: string): HandleRecord | undefined {
   const entry = vault.get(runId);
@@ -204,7 +204,7 @@ export function getHandleRecord(runId: string, handle: string): HandleRecord | u
 /**
  * Collect every distinct borrowed-handle token present in the string leaves of
  * `input` (deep walk). Used at the chokepoint to enumerate the handles a call
- * carries WITHOUT resolving them to plaintext (PLA-723 EG5: decide before
+ * carries WITHOUT resolving them to plaintext (EG5: decide before
  * substitute).
  */
 export function collectHandleTokens(input: unknown): string[] {
@@ -231,8 +231,8 @@ function collectWalk(value: unknown, found: Set<string>): void {
 }
 
 /**
- * Purge every live handle minted under `bindingId`, across all runs (PLA-723
- * EG3). When an operator tightens or revokes a binding's `allowedEgress`, the
+ * Purge every live handle minted under `bindingId`, across all runs (EG3).
+ * When an operator tightens or revokes a binding's `allowedEgress`, the
  * mint-time-captured allowlist on in-flight handles would otherwise keep
  * authorizing egress to a now-removed destination for up to the handle TTL.
  * Calling this on a binding change makes revocation effective immediately.

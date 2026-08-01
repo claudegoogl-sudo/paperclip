@@ -11,7 +11,7 @@
  *   2. GET https://api.github.com/repos/paperclipai/paperclip/releases/latest
  *      with If-None-Match: <state.etag>. On 304 → "no-op: still at <tag>".
  *   3. On 200: if tag_name === state.lastSyncedTag, refresh ETag and exit 0.
- *   3b. Idempotency (PLA-620): before any branch/push/PR work, no-op if a sync
+ *   3b. Idempotency: before any branch/push/PR work, no-op if a sync
  *      PR for <tag> is already open on the fork. The state file only advances
  *      when a sync PR *merges* (board-gated), so every tick between "opened"
  *      and "merged" lands here again for the same tag — a re-run must converge,
@@ -165,7 +165,7 @@ function remoteBranchExists(branch) {
   return git(["ls-remote", "--heads", FORK_REMOTE, branch]).length > 0;
 }
 
-// Default runner for the post-merge activation soak (PLA-640). Shells out to
+// Default runner for the post-merge activation soak. Shells out to
 // scripts/plugin-activation-soak.mjs and returns its exit code. Kept separate
 // (and injectable) so the gate's pass/fail/skip logic can be unit-tested
 // without booting a host.
@@ -181,7 +181,7 @@ function defaultSoakRunner() {
 }
 
 /**
- * Post-sync plugin-activation soak gate (PLA-640, root cause PLA-639).
+ * Post-sync plugin-activation soak gate.
  *
  * An upstream-sync tick MUST NOT silently leave an installed plugin unable to
  * activate. After a clean merge, run the activation soak (install + register +
@@ -208,12 +208,12 @@ function runActivationSoakGate({ env = process.env, runner = defaultSoakRunner, 
   } catch (err) {
     const detail = err && typeof err.status === "number" ? `exit ${err.status}` : String(err?.message ?? err);
     throw new Error(
-      `plugin-activation soak failed (${detail}); refusing to advance the sync tick — see PLA-640`,
+      `plugin-activation soak failed (${detail}); refusing to advance the sync tick`,
     );
   }
   if (code !== 0) {
     throw new Error(
-      `plugin-activation soak failed (exit ${code}); refusing to advance the sync tick — see PLA-640`,
+      `plugin-activation soak failed (exit ${code}); refusing to advance the sync tick`,
     );
   }
   log("soak: passed (CAD/klipper installed + activated to ready with persistent packagePath)");
@@ -248,7 +248,7 @@ async function main() {
 
   const branch = `sync/upstream-${tag}`;
 
-  // Idempotency (PLA-620): a sync PR for this tag may already be open from a
+  // Idempotency: a sync PR for this tag may already be open from a
   // prior tick. The state file only advances on *merge* (board-gated), so until
   // then upstream stays ahead and we re-enter for the same tag. Re-running the
   // branch/push/PR steps would fail on a non-fast-forward push or a 422
@@ -301,7 +301,7 @@ async function main() {
     git(["commit", "--no-edit"]);
   }
 
-  // PLA-640: gate the tick on a plugin-activation soak BEFORE advancing state
+  // Gate the tick on a plugin-activation soak BEFORE advancing state
   // or pushing. A failure here aborts the tick with no state mutation and no
   // PR — the merge commit stays local and a fixed re-run can redo it.
   runActivationSoakGate();

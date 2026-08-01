@@ -142,7 +142,7 @@ describe("plugin database SQL validation", () => {
     ).toThrow(/qualified|namespace/i);
   });
 
-  it("rejects ctx.db.execute with unqualified subquery refs (PLA-99)", () => {
+  it("rejects ctx.db.execute with unqualified subquery refs", () => {
     expect(() =>
       validatePluginRuntimeExecute(
         "UPDATE plugin_test.tbl SET x = (SELECT y FROM agents) WHERE id = $1",
@@ -157,7 +157,7 @@ describe("plugin database SQL validation", () => {
     ).toThrow(/qualified|namespace/i);
   });
 
-  it("allows ctx.db.execute with fully-qualified subquery refs (PLA-99)", () => {
+  it("allows ctx.db.execute with fully-qualified subquery refs", () => {
     expect(() =>
       validatePluginRuntimeExecute(
         "UPDATE plugin_test.tbl SET x = (SELECT y FROM plugin_test.other) WHERE id = $1",

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * pack-public-packages.mjs — PLA-298
+ * pack-public-packages.mjs
  *
  * Pack every public workspace package into a destination directory with the
  * package's `publishConfig` block deep-merged into the top-level manifest
@@ -8,7 +8,7 @@
  *
  * Why: `npm pack` does not apply `publishConfig` (only `npm publish` does).
  * The fork-build flow uses `npm pack` to produce GitHub-Release tarballs
- * (see PLA-289 plan, PLA-298 issue), so without a pre-pack rewrite the
+ * so without a pre-pack rewrite the
  * shipped tarballs declare `exports → ./src/index.ts` and the host crashes
  * on `import "@paperclipai/server"` at runtime. fork-build-1 hit exactly
  * this trap; fork-build-2 was unblocked by manually post-rewriting each

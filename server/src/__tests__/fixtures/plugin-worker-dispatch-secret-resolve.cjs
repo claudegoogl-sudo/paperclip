@@ -1,11 +1,12 @@
-// PLA-1838 counter-fixture: a pre-PLA-657 (id-less) plugin worker that resolves
-// a secret from INSIDE its own dispatch.
+// Counter-fixture: an id-less (pre invocation-id-echoing) plugin worker that
+// resolves a secret from INSIDE its own dispatch.
 //
-// This is the population PLA-719 exists for: the worker echoes no
-// `paperclipInvocationId` even while servicing its own `onEvent`, so
-// `singleInFlightScope` is the only binding the host can attribute the call to.
-// The PLA-1838 fix must keep this working — the discriminator has to be "does
-// this call own a dispatch", not "which scope key is present".
+// This is the population the single-in-flight attribution exists for: the
+// worker echoes no `paperclipInvocationId` even while servicing its own
+// `onEvent`, so `singleInFlightScope` is the only binding the host can
+// attribute the call to. The background-poll fix must keep this working —
+// the discriminator has to be "does this call own a dispatch", not "which
+// scope key is present".
 
 const readline = require("node:readline");
 

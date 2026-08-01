@@ -2987,7 +2987,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
 
-      // PLA-407: An `in_progress` issue parked on a pending board approval
+      // An `in_progress` issue parked on a pending board approval
       // (request_board_approval) or a wake_assignee interaction
       // (ask_user_questions, request_confirmation, …) requested by the
       // current assignee is not stranded — the assignee will resume when the
@@ -2996,7 +2996,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       // `hasExplicitWaitingPath` logic already used by the `in_review` branch
       // via `classifyIssueGraphLiveness`.
       if (issue.status === "in_progress") {
-        // PLA-838: A standby wake target (a perpetually-open catch-all issue
+        // A standby wake target (a perpetually-open catch-all issue
         // such as a plugin inbox) parked between externally-driven wakes is not
         // stranded. Skip without escalating to `blocked` or enqueueing a
         // source_scoped_recovery_action wake; it resumes when an external event

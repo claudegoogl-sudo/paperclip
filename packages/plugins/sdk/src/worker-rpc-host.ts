@@ -662,25 +662,25 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
         },
         async mintHandle(value: string, runId: string, secretRef?: string): Promise<string> {
           // Exchange resolved plaintext for an opaque borrowed handle
-          // (PLA-702 Control 2). Return the handle to the agent instead of the
+          // (Control 2). Return the handle to the agent instead of the
           // plaintext; the host substitutes the real value back in only at a
           // downstream tool's dispatch edge. `runId` is the active dispatch's
           // runCtx.runId, same contract as `resolve`. `secretRef` lets the host
-          // capture the binding's operator egress allowlist onto the handle
-          // (PLA-723); the worker never asserts the allowlist itself.
+          // capture the binding's operator egress allowlist onto the handle;
+          // the worker never asserts the allowlist itself.
           const { handle } = await callHost("secrets.mintHandle", { value, runId, secretRef });
           return handle;
         },
       },
 
-      // PLA-895: worker-level artifacts client (mirror of the tool-dispatch
+      // Worker-level artifacts client (mirror of the tool-dispatch
       // runCtx client, minus runId). It sends NO runId — callHost attaches the
       // worker→host `paperclipInvocationId` and the host backfills the active
       // service/background/dispatch run-context from it, exactly like
       // `secrets.resolve`. `create` is host-gated on `issue.attachments.create`
-      // + company scope (PLA-888); `fetch` works from a tool-dispatch context
-      // today and from service/background once PLA-894-B lands (until then the
-      // host returns `runcontext_invalid` for service/background reads).
+      // + company scope; `fetch` works from a tool-dispatch context
+      // today and from service/background once a follow-up host change lands
+      // (until then the host returns `runcontext_invalid` for service/background reads).
       artifacts: {
         async fetch(attachmentId: string) {
           if (typeof attachmentId !== "string" || attachmentId.length === 0) {
@@ -1027,7 +1027,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             identifier?: string;
             wakeAssignee?: boolean;
             refuseClosed?: boolean;
-            // PLA-888: asset ids from ctx.artifacts.create to surface on this
+            // Asset ids from ctx.artifacts.create to surface on this
             // comment. Each must belong to the comment's company.
             attachmentIds?: string[];
           },
@@ -1664,7 +1664,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     if (plugin.definition.onEnvironmentCancelInteractiveSetup) supportedMethods.push("environmentCancelInteractiveSetup");
     if (plugin.definition.onEnvironmentDeleteTemplate) supportedMethods.push("environmentDeleteTemplate");
 
-    // PLA-1824: this SDK threads `paperclipInvocationId` through
+    // This SDK threads `paperclipInvocationId` through
     // AsyncLocalStorage on every worker→host call made inside a dispatch, so an
     // id-less call from this worker is definitionally a no-dispatch background
     // call and must not inherit an unrelated tenant's in-flight scope.
@@ -1835,7 +1835,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     if (!entry) {
       throw new Error(`No tool handler registered for "${params.toolName}"`);
     }
-    // PLA-574: inject the per-runContext artifacts client. The wire-format
+    // Inject the per-runContext artifacts client. The wire-format
     // runContext carries identity fields only; method shims are added here so
     // tools can do `await ctx.artifacts.fetch(attachmentId)`. The host
     // re-derives the dispatching agent's identity from (pluginDbId, runId);
@@ -1862,7 +1862,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             byteSize: result.byteSize,
           };
         },
-        // PLA-888: inverse of fetch — store inbound bytes as a company-scoped
+        // Inverse of fetch — store inbound bytes as a company-scoped
         // asset. Bytes are base64-encoded for the JSON-RPC payload; the host
         // gates on capability, company scope, size, and MIME before storing.
         async create(input) {

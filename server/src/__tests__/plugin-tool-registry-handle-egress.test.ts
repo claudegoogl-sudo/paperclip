@@ -1,11 +1,11 @@
 /**
- * PLA-702 / PLA-695 Control 2 — egress substitution chokepoint.
+ * Control 2 — egress substitution chokepoint.
  *
  * `plugin-tool-registry.executeTool` is the structural chokepoint where a
  * borrowed handle is swapped back to plaintext for the worker dispatch, while
  * the handle-bearing parameters the caller persists/audits stay untouched.
  *
- * Gating criteria (PLA-701 sign-off):
+ * Gating criteria (sign-off):
  *  - a downstream tool whose param carries the handle receives PLAINTEXT at
  *    execution, while the original (persisted) parameters keep the HANDLE (RC4);
  *  - an unknown/foreign handle at egress fails closed — the literal
