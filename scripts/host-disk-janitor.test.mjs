@@ -122,7 +122,7 @@ test("classifyBackups never drops unrecognized filenames (conservative default)"
 });
 
 // ---------------------------------------------------------------------------
-// Corrupt/empty backup dumps: PLA-2018 fail-safe classification
+// Corrupt/empty backup dumps: fail-safe classification
 // ---------------------------------------------------------------------------
 
 test("gzipUncompressedSizeBytes reads the true decompressed size via a short trailer read, not full decompression", () => {
@@ -803,7 +803,7 @@ test("run() dry-run alarm never makes a network call even when threshold is exce
   for (const remote of remotes) rmSync(remote, { recursive: true, force: true });
 });
 
-test("run() end-to-end: an empty .gz stub sharing a timestamp with a valid dump is pruned, the dump survives --apply (PLA-2018)", async () => {
+test("run() end-to-end: an empty .gz stub sharing a timestamp with a valid dump is pruned, the dump survives --apply", async () => {
   const home = tmpdir("janitor-e2e-corrupt-");
   const backupsDir = path.join(home, "backups");
   mkdirSync(backupsDir, { recursive: true });
