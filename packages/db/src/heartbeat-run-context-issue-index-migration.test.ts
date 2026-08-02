@@ -104,13 +104,13 @@ describeEmbeddedPostgres("heartbeat_runs / agent_wakeup_requests issueId index m
         const targetIssueId = "issue-idx-target-issue";
         const [targetRun] = await sql<{ id: string }[]>`
           INSERT INTO "heartbeat_runs" ("company_id", "agent_id", "status", "context_snapshot")
-          VALUES (${company.id}, ${agent.id}, 'running', jsonb_build_object('issueId', ${targetIssueId}))
+          VALUES (${company.id}, ${agent.id}, 'running', jsonb_build_object('issueId', ${targetIssueId}::text))
           RETURNING id
         `;
         await sql`
           INSERT INTO "agent_wakeup_requests" ("company_id", "agent_id", "source", "status", "payload")
           VALUES (${company.id}, ${agent.id}, 'heartbeat_timer', 'deferred_issue_execution',
-            jsonb_build_object('issueId', ${targetIssueId}))
+            jsonb_build_object('issueId', ${targetIssueId}::text))
         `;
 
         await sql`ANALYZE "heartbeat_runs"`;
