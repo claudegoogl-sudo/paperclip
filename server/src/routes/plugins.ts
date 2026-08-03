@@ -51,7 +51,9 @@ import { pluginLifecycleManager } from "../services/plugin-lifecycle.js";
 import {
   defaultPluginWebhookRateLimiter,
   type PluginWebhookRateLimiter,
+  type PluginWebhookRateLimitTier,
 } from "../services/plugin-webhook-rate-limit.js";
+import { isVerifiedWebhookDelivery } from "../services/plugin-webhook-auth.js";
 import { logger } from "../middleware/logger.js";
 import type { PluginWatchReconciler } from "../services/plugin-dev-watcher.js";
 import {
@@ -2711,6 +2713,11 @@ export function pluginRoutes(
    * guarded by a sliding-window limiter (see plugin-webhook-rate-limit.ts) and a
    * tighter JSON body cap than the rest of the API (see app.ts).
    *
+   * When the manifest declares `webhooks[].auth`, the host additionally checks a
+   * salted token digest to decide *which* limiter budget the delivery is billed
+   * to — verified or anonymous. A mismatch is never a rejection; it falls
+   * through to the anonymous budget (see plugin-webhook-auth.ts).
+   *
    * Response: `{ deliveryId: string, status: string }`
    * Errors:
    * - 404 if plugin not found or endpointKey not declared
@@ -2770,7 +2777,31 @@ export function pluginRoutes(
       return;
     }
 
-    // Step 5: Rate-limit before any write.
+    // Step 5: Decide which rate-limit budget this delivery is billed to.
+    //
+    // Only a request that actually carries the declared token header costs the
+    // config read; an endpoint without `auth`, or a request without the header,
+    // short-circuits to the anonymous tier having done no extra work. That is
+    // what keeps the unauthenticated path exactly as expensive as it was
+    // before this check existed.
+    //
+    // A mismatch is not an error and never returns 401 — see
+    // plugin-webhook-auth.ts for why falling through to the anonymous budget is
+    // the safer failure mode than rejecting.
+    let tier: PluginWebhookRateLimitTier = "anonymous";
+    if (webhookDecl.auth && req.headers[webhookDecl.auth.header.toLowerCase()]) {
+      const config = await registry.getConfig(plugin.id);
+      const verified = isVerifiedWebhookDelivery({
+        auth: webhookDecl.auth,
+        headers: req.headers,
+        config: config?.configJson,
+        pluginId: plugin.id,
+        endpointKey,
+      });
+      if (verified) tier = "verified";
+    }
+
+    // Step 6: Rate-limit before any write.
     //
     // Deliberately placed *after* steps 1-4: the bucket key is then the
     // canonical plugin row id plus a manifest-declared endpoint key, so an
@@ -2782,6 +2813,7 @@ export function pluginRoutes(
       pluginId: plugin.id,
       endpointKey,
       ip: req.ip,
+      tier,
     });
     if (!rateLimit.allowed) {
       // No payload: the body is attacker-controlled and may carry provider
@@ -2793,6 +2825,10 @@ export function pluginRoutes(
           pluginKey: plugin.pluginKey,
           endpointKey,
           scope: rateLimit.scope,
+          // Which budget was exhausted. `verified` means a credentialled
+          // caller outran its own tier; `anonymous` is the ordinary case and
+          // the one an attack shows up in. Never the token, header or digest.
+          tier: rateLimit.tier,
           limit: rateLimit.limit,
           retryAfterSeconds: rateLimit.retryAfterSeconds,
         },
@@ -2807,7 +2843,7 @@ export function pluginRoutes(
       return;
     }
 
-    // Step 6: Extract request data
+    // Step 7: Extract request data
     const requestId = randomUUID();
     const rawHeaders: Record<string, string> = {};
     for (const [key, value] of Object.entries(req.headers)) {
@@ -2826,7 +2862,7 @@ export function pluginRoutes(
     const parsedBody = req.body as unknown;
     const payload = (req.body as Record<string, unknown> | undefined) ?? {};
 
-    // Step 7: Record the delivery in the database
+    // Step 8: Record the delivery in the database
     const startedAt = new Date();
     const [delivery] = await db
       .insert(pluginWebhookDeliveries)
@@ -2840,7 +2876,7 @@ export function pluginRoutes(
       })
       .returning({ id: pluginWebhookDeliveries.id });
 
-    // Step 8: Dispatch to the worker via handleWebhook RPC
+    // Step 9: Dispatch to the worker via handleWebhook RPC
     try {
       await webhookDeps.workerManager.call(plugin.id, "handleWebhook", {
         endpointKey,
@@ -2850,7 +2886,7 @@ export function pluginRoutes(
         requestId,
       });
 
-      // Step 9: Update delivery record to success
+      // Step 10: Update delivery record to success
       const finishedAt = new Date();
       const durationMs = finishedAt.getTime() - startedAt.getTime();
       await db
@@ -2867,7 +2903,7 @@ export function pluginRoutes(
         status: "success",
       });
     } catch (err) {
-      // Step 9 (error): Update delivery record to failed
+      // Step 10 (error): Update delivery record to failed
       const finishedAt = new Date();
       const durationMs = finishedAt.getTime() - startedAt.getTime();
       const errorMessage = err instanceof Error ? err.message : String(err);

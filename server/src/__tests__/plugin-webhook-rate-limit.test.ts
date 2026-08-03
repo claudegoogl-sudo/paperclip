@@ -1,3 +1,5 @@
+import { createHash, createHmac } from "node:crypto";
+
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -5,17 +7,25 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   PLUGIN_WEBHOOK_RATE_LIMIT_MAX_PER_ENDPOINT,
   PLUGIN_WEBHOOK_RATE_LIMIT_MAX_PER_IP,
+  PLUGIN_WEBHOOK_RATE_LIMIT_MAX_PER_VERIFIED_ENDPOINT,
   PLUGIN_WEBHOOK_RATE_LIMIT_WINDOW_MS,
   createPluginWebhookRateLimiter,
 } from "../services/plugin-webhook-rate-limit.js";
+import {
+  computeWebhookTokenDigest,
+  isVerifiedWebhookDelivery,
+  resetPluginWebhookAuthWarnings,
+} from "../services/plugin-webhook-auth.js";
 import { DEFAULT_JSON_BODY_LIMIT, WEBHOOK_JSON_BODY_LIMIT } from "../http/body-limits.js";
 import { PLUGIN_WEBHOOK_INGESTION_PATH_PATTERN } from "../routes/plugin-webhook-paths.js";
 import { pluginRoutes } from "../routes/plugins.js";
 import { errorHandler } from "../middleware/index.js";
+import { logger } from "../middleware/logger.js";
 
 const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
   getByKey: vi.fn(),
+  getConfig: vi.fn(),
 }));
 
 vi.mock("../services/plugin-registry.js", () => ({
@@ -36,6 +46,32 @@ const READY_PLUGIN = {
   manifestJson: {
     capabilities: ["webhooks.receive"],
     webhooks: [{ endpointKey: ENDPOINT_KEY }],
+  },
+};
+
+const TOKEN_HEADER = "x-telegram-bot-api-secret-token";
+const TOKEN_CONFIG_KEY = "webhookTokenDigest";
+const SALT = "e3b0c44298fc1c14";
+const TOKEN = "provider-shared-token-with-plenty-of-entropy";
+
+const WEBHOOK_AUTH = {
+  type: "header-token" as const,
+  header: TOKEN_HEADER,
+  tokenDigestConfigKey: TOKEN_CONFIG_KEY,
+};
+
+/** Same plugin, but declaring the optional credential block. */
+const READY_PLUGIN_WITH_AUTH = {
+  ...READY_PLUGIN,
+  manifestJson: {
+    capabilities: ["webhooks.receive", "webhooks.verify"],
+    webhooks: [{ endpointKey: ENDPOINT_KEY, auth: WEBHOOK_AUTH }],
+  },
+};
+
+const VALID_DIGEST_CONFIG = {
+  configJson: {
+    [TOKEN_CONFIG_KEY]: { salt: SALT, digest: computeWebhookTokenDigest(SALT, TOKEN) },
   },
 };
 
@@ -133,6 +169,84 @@ describe("plugin webhook rate limiter", () => {
     expect(limiter.consume(anonymous).scope).toBe("endpoint");
   });
 
+  it("keeps the verified budget out of reach of an exhausted anonymous bucket", () => {
+    // The ticket in one assertion. An anonymous flood spends the whole
+    // (pluginId, endpointKey) budget; a credentialled delivery to the very same
+    // endpoint must still get through.
+    const limiter = createPluginWebhookRateLimiter({
+      maxPerEndpoint: 2,
+      maxPerIp: 1_000,
+      maxPerVerifiedEndpoint: 3,
+    });
+
+    expect(limiter.consume(ACTOR).allowed).toBe(true);
+    expect(limiter.consume(ACTOR).allowed).toBe(true);
+    expect(limiter.consume(ACTOR).allowed).toBe(false);
+
+    const verified = { ...ACTOR, tier: "verified" as const };
+    expect(limiter.consume(verified).allowed).toBe(true);
+    expect(limiter.consume(verified).allowed).toBe(true);
+    expect(limiter.consume(verified).allowed).toBe(true);
+
+    // ...and the verified tier has its own finite ceiling, so a leaked token
+    // relocates the flood rather than removing the bound.
+    const overrun = limiter.consume(verified);
+    expect(overrun.allowed).toBe(false);
+    expect(overrun.tier).toBe("verified");
+    expect(overrun.limit).toBe(3);
+  });
+
+  it("does not let verified traffic spend the anonymous budget", () => {
+    const limiter = createPluginWebhookRateLimiter({
+      maxPerEndpoint: 2,
+      maxPerIp: 1_000,
+      maxPerVerifiedEndpoint: 10,
+    });
+
+    for (let i = 0; i < 5; i += 1) {
+      expect(limiter.consume({ ...ACTOR, tier: "verified" }).allowed).toBe(true);
+    }
+
+    // The anonymous bucket is untouched by those five deliveries.
+    expect(limiter.consume(ACTOR).allowed).toBe(true);
+    expect(limiter.consume(ACTOR).allowed).toBe(true);
+    expect(limiter.consume(ACTOR).allowed).toBe(false);
+  });
+
+  it("exempts verified traffic from the shared per-IP bucket", () => {
+    // Behind a tunnel with TRUST_PROXY unset every caller shares one apparent
+    // IP. If verified deliveries consumed that bucket, an anonymous flood would
+    // starve them through the side door — the exact failure this ticket fixes.
+    const limiter = createPluginWebhookRateLimiter({
+      maxPerEndpoint: 1_000,
+      maxPerIp: 2,
+      maxPerVerifiedEndpoint: 10,
+    });
+
+    expect(limiter.consume({ ...ACTOR, endpointKey: "a" }).allowed).toBe(true);
+    expect(limiter.consume({ ...ACTOR, endpointKey: "b" }).allowed).toBe(true);
+    expect(limiter.consume({ ...ACTOR, endpointKey: "c" }).scope).toBe("ip");
+
+    expect(limiter.consume({ ...ACTOR, tier: "verified" }).allowed).toBe(true);
+  });
+
+  it("treats an actor with no tier as anonymous", () => {
+    const limiter = createPluginWebhookRateLimiter({ maxPerEndpoint: 1, maxPerIp: 1_000 });
+
+    const first = limiter.consume(ACTOR);
+    expect(first.tier).toBe("anonymous");
+    expect(limiter.consume({ ...ACTOR, tier: "anonymous" }).allowed).toBe(false);
+  });
+
+  it("ships a verified cap strictly above the anonymous per-endpoint cap", () => {
+    expect(PLUGIN_WEBHOOK_RATE_LIMIT_MAX_PER_VERIFIED_ENDPOINT).toBeGreaterThan(
+      PLUGIN_WEBHOOK_RATE_LIMIT_MAX_PER_ENDPOINT,
+    );
+    // Finite by construction: a shared token can leak, and an uncapped verified
+    // tier would just move the DoS behind a credential.
+    expect(Number.isFinite(PLUGIN_WEBHOOK_RATE_LIMIT_MAX_PER_VERIFIED_ENDPOINT)).toBe(true);
+  });
+
   it("ships a per-IP cap strictly above the per-endpoint cap", () => {
     // Load-bearing: behind a proxy with TRUST_PROXY unset every request shares
     // one apparent IP. If the IP cap were the tighter of the two it would bind
@@ -142,6 +256,98 @@ describe("plugin webhook rate limiter", () => {
     );
     expect(PLUGIN_WEBHOOK_RATE_LIMIT_MAX_PER_ENDPOINT).toBeGreaterThan(0);
     expect(PLUGIN_WEBHOOK_RATE_LIMIT_WINDOW_MS).toBeGreaterThan(0);
+  });
+});
+
+describe("plugin webhook token-digest recognition", () => {
+  beforeEach(() => {
+    resetPluginWebhookAuthWarnings();
+  });
+
+  const verify = (over: Partial<Parameters<typeof isVerifiedWebhookDelivery>[0]> = {}) =>
+    isVerifiedWebhookDelivery({
+      auth: WEBHOOK_AUTH,
+      headers: { [TOKEN_HEADER]: TOKEN },
+      config: VALID_DIGEST_CONFIG.configJson,
+      pluginId: PLUGIN_ID,
+      endpointKey: ENDPOINT_KEY,
+      ...over,
+    });
+
+  it("recognises the token behind the salted digest", () => {
+    expect(verify()).toBe(true);
+  });
+
+  it("matches the header name case-insensitively, as HTTP requires", () => {
+    expect(verify({ headers: { [TOKEN_HEADER.toUpperCase().toLowerCase()]: TOKEN } })).toBe(true);
+    expect(verify({ auth: { ...WEBHOOK_AUTH, header: "X-Telegram-Bot-Api-Secret-Token" } })).toBe(true);
+  });
+
+  it("rejects a wrong token, including one differing only in the last byte", () => {
+    expect(verify({ headers: { [TOKEN_HEADER]: `${TOKEN}x` } })).toBe(false);
+    expect(verify({ headers: { [TOKEN_HEADER]: TOKEN.slice(0, -1) } })).toBe(false);
+    expect(verify({ headers: { [TOKEN_HEADER]: "" } })).toBe(false);
+  });
+
+  it("rejects the salt or the digest presented as the token", () => {
+    // A digest is not a bearer credential. Anyone who reads plugin config must
+    // not thereby be able to authenticate.
+    expect(verify({ headers: { [TOKEN_HEADER]: SALT } })).toBe(false);
+    expect(verify({ headers: {
+      [TOKEN_HEADER]: computeWebhookTokenDigest(SALT, TOKEN),
+    } })).toBe(false);
+  });
+
+  it("treats a missing header, absent auth, or a repeated header as unverified", () => {
+    expect(verify({ headers: {} })).toBe(false);
+    expect(verify({ auth: undefined })).toBe(false);
+    // Repeated header arrives as an array; there is no principled way to pick
+    // which copy the provider sent, so it does not count.
+    expect(verify({ headers: { [TOKEN_HEADER]: [TOKEN, "guess"] } })).toBe(false);
+  });
+
+  it("falls through to unverified when the digest config is missing or malformed", () => {
+    const bad = [
+      undefined,
+      {},
+      { [TOKEN_CONFIG_KEY]: "not-an-object" },
+      { [TOKEN_CONFIG_KEY]: { salt: SALT } },
+      { [TOKEN_CONFIG_KEY]: { digest: computeWebhookTokenDigest(SALT, TOKEN) } },
+      // Salt too short to be worth anything against a precomputed table.
+      { [TOKEN_CONFIG_KEY]: { salt: "abc", digest: computeWebhookTokenDigest("abc", TOKEN) } },
+      // Digest that is not 64 hex characters.
+      { [TOKEN_CONFIG_KEY]: { salt: SALT, digest: "deadbeef" } },
+      { [TOKEN_CONFIG_KEY]: { salt: SALT, digest: "z".repeat(64) } },
+    ];
+
+    for (const config of bad) {
+      expect(verify({ config: config as Record<string, unknown> | undefined })).toBe(false);
+    }
+  });
+
+  it("derives the digest the way the spec documents it", () => {
+    // Plugin authors compute this in their own language; pin the exact
+    // construction so the two halves cannot drift.
+    expect(computeWebhookTokenDigest(SALT, TOKEN)).toMatch(/^[0-9a-f]{64}$/);
+    expect(computeWebhookTokenDigest(SALT, TOKEN)).toBe(
+      createHmac("sha256", SALT).update(TOKEN, "utf8").digest("hex"),
+    );
+    expect(computeWebhookTokenDigest(SALT, TOKEN)).not.toBe(computeWebhookTokenDigest(`${SALT}x`, TOKEN));
+  });
+
+  it("is HMAC, not sha256(salt || token), so the stored digest is not a credential", () => {
+    // Why this matters: with a bare `sha256(salt || token)` the digest is
+    // length-extendable. Anyone who could read plugin config would be able to
+    // derive a *different* accepted token from the digest alone, without ever
+    // knowing the real one — which would make the digest a bearer credential
+    // and collapse the premise that it is safe to hold in non-secret config.
+    expect(computeWebhookTokenDigest(SALT, TOKEN)).not.toBe(
+      createHash("sha256").update(SALT + TOKEN, "utf8").digest("hex"),
+    );
+
+    // And the concatenation ambiguity that construction carries is gone: under
+    // sha256(salt || token) these two pairs hash identically.
+    expect(computeWebhookTokenDigest("ab", "cd")).not.toBe(computeWebhookTokenDigest("abc", "d"));
   });
 });
 
@@ -221,8 +427,10 @@ describe("POST /api/plugins/:pluginId/webhooks/:endpointKey resource limits", ()
   beforeEach(() => {
     mockRegistry.getById.mockReset();
     mockRegistry.getByKey.mockReset();
+    mockRegistry.getConfig.mockReset();
     mockRegistry.getById.mockResolvedValue(READY_PLUGIN);
     mockRegistry.getByKey.mockResolvedValue(READY_PLUGIN);
+    mockRegistry.getConfig.mockResolvedValue(null);
   });
 
   const url = `/api/plugins/${PLUGIN_ID}/webhooks/${ENDPOINT_KEY}`;
@@ -312,6 +520,16 @@ describe("POST /api/plugins/:pluginId/webhooks/:endpointKey resource limits", ()
     expect(insert).not.toHaveBeenCalled();
   });
 
+  it("does not read plugin config for an endpoint that declares no auth", async () => {
+    // The "identical to today" promise is partly a cost promise: an anonymous
+    // delivery to an endpoint without `auth` must not pay for a config lookup.
+    const { app } = createWebhookApp();
+
+    await request(app).post(url).send({ update_id: 1 });
+
+    expect(mockRegistry.getConfig).not.toHaveBeenCalled();
+  });
+
   it("leaves other /api/plugins routes on the generic 10mb parser", async () => {
     const { app } = createWebhookApp();
     // 1.2 MB is over the webhook cap but well under the generic one. If the
@@ -323,5 +541,139 @@ describe("POST /api/plugins/:pluginId/webhooks/:endpointKey resource limits", ()
       .send(JSON.stringify({ blob: "x".repeat(1_200_000) }));
 
     expect(res.status).not.toBe(413);
+  });
+});
+
+describe("POST /api/plugins/:pluginId/webhooks/:endpointKey credential tiering", () => {
+  beforeEach(() => {
+    mockRegistry.getById.mockReset();
+    mockRegistry.getByKey.mockReset();
+    mockRegistry.getConfig.mockReset();
+    mockRegistry.getById.mockResolvedValue(READY_PLUGIN_WITH_AUTH);
+    mockRegistry.getByKey.mockResolvedValue(READY_PLUGIN_WITH_AUTH);
+    mockRegistry.getConfig.mockResolvedValue(VALID_DIGEST_CONFIG);
+    resetPluginWebhookAuthWarnings();
+  });
+
+  const url = `/api/plugins/${PLUGIN_ID}/webhooks/${ENDPOINT_KEY}`;
+
+  it("lets a credentialled delivery through an anonymous flood that has exhausted the endpoint budget", async () => {
+    // This is the ticket. An attacker holds the public (pluginId, endpointKey)
+    // bucket at zero; the real provider, which holds the token, must still be
+    // delivered. Asserted as an interleaving, not as two independent counts.
+    const rateLimiter = createPluginWebhookRateLimiter({
+      maxPerEndpoint: 2,
+      maxPerIp: 1_000,
+      maxPerVerifiedEndpoint: 10,
+    });
+    const { app, insert, workerCall } = createWebhookApp({ rateLimiter });
+
+    await request(app).post(url).send({ flood: 1 });
+    await request(app).post(url).send({ flood: 2 });
+    const starved = await request(app).post(url).send({ flood: 3 });
+    expect(starved.status).toBe(429);
+
+    const delivered = await request(app)
+      .post(url)
+      .set(TOKEN_HEADER, TOKEN)
+      .send({ update_id: 42 });
+
+    expect(delivered.status).toBe(200);
+    expect(delivered.body).toMatchObject({ status: "success" });
+
+    // The flood keeps being turned away while verified traffic keeps flowing.
+    expect((await request(app).post(url).send({ flood: 4 })).status).toBe(429);
+    expect((await request(app).post(url).set(TOKEN_HEADER, TOKEN).send({ update_id: 43 })).status).toBe(200);
+
+    // Two anonymous + two verified deliveries reached the database and worker;
+    // the three rejected ones did not.
+    expect(insert).toHaveBeenCalledTimes(4);
+    expect(workerCall).toHaveBeenCalledTimes(4);
+  });
+
+  it("treats a wrong token exactly like an anonymous caller", async () => {
+    const rateLimiter = createPluginWebhookRateLimiter({
+      maxPerEndpoint: 1,
+      maxPerIp: 1_000,
+      maxPerVerifiedEndpoint: 10,
+    });
+    const { app, insert, workerCall } = createWebhookApp({ rateLimiter });
+
+    // Spend the anonymous budget with a bad token, proving it was billed there.
+    const first = await request(app).post(url).set(TOKEN_HEADER, "wrong-token").send({ n: 1 });
+    expect(first.status).toBe(200);
+
+    const second = await request(app).post(url).set(TOKEN_HEADER, "wrong-token").send({ n: 2 });
+    expect(second.status).toBe(429);
+    expect(Number(second.headers["retry-after"])).toBe(second.body.retryAfterSeconds);
+    expect(second.body.error).toMatch(/too many/i);
+
+    // A plain anonymous caller sees the same exhausted bucket — one budget,
+    // not two — and the real token still gets through.
+    expect((await request(app).post(url).send({ n: 3 })).status).toBe(429);
+    expect((await request(app).post(url).set(TOKEN_HEADER, TOKEN).send({ n: 4 })).status).toBe(200);
+
+    expect(insert).toHaveBeenCalledTimes(2);
+    expect(workerCall).toHaveBeenCalledTimes(2);
+  });
+
+  it("reaches the digest check before the delivery insert and the worker RPC", async () => {
+    // A request that is both mismatched *and* over the anonymous limit must
+    // cost nothing: no row, no RPC. If the tier decision had been made after
+    // either, this would be non-zero.
+    const rateLimiter = createPluginWebhookRateLimiter({
+      maxPerEndpoint: 0,
+      maxPerIp: 1_000,
+      maxPerVerifiedEndpoint: 10,
+    });
+    const { app, insert, workerCall } = createWebhookApp({ rateLimiter });
+
+    const res = await request(app).post(url).set(TOKEN_HEADER, "wrong-token").send({ n: 1 });
+
+    expect(res.status).toBe(429);
+    expect(insert).not.toHaveBeenCalled();
+    expect(workerCall).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the anonymous budget when the configured digest is unusable", async () => {
+    // A stale or mistyped digest must degrade to today's behaviour, never to a
+    // hard rejection — a misconfiguration cannot be allowed to take ingestion
+    // down for every tenant sharing the plugin.
+    mockRegistry.getConfig.mockResolvedValue({ configJson: { [TOKEN_CONFIG_KEY]: { salt: SALT } } });
+    const rateLimiter = createPluginWebhookRateLimiter({
+      maxPerEndpoint: 1,
+      maxPerIp: 1_000,
+      maxPerVerifiedEndpoint: 10,
+    });
+    const { app } = createWebhookApp({ rateLimiter });
+
+    expect((await request(app).post(url).set(TOKEN_HEADER, TOKEN).send({ n: 1 })).status).toBe(200);
+    expect((await request(app).post(url).set(TOKEN_HEADER, TOKEN).send({ n: 2 })).status).toBe(429);
+  });
+
+  it("never puts the token, header value or digest in the rate-limit warning", async () => {
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    try {
+      const rateLimiter = createPluginWebhookRateLimiter({
+        maxPerEndpoint: 0,
+        maxPerIp: 1_000,
+        maxPerVerifiedEndpoint: 0,
+      });
+      const { app } = createWebhookApp({ rateLimiter });
+
+      await request(app).post(url).set(TOKEN_HEADER, TOKEN).send({ n: 1 });
+
+      const logged = JSON.stringify(warn.mock.calls);
+      expect(logged).not.toContain(TOKEN);
+      expect(logged).not.toContain(SALT);
+      expect(logged).not.toContain(computeWebhookTokenDigest(SALT, TOKEN));
+      // The one thing the warning does gain is which budget was exhausted.
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({ tier: "verified", endpointKey: ENDPOINT_KEY }),
+        expect.stringMatching(/rate-limited/),
+      );
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

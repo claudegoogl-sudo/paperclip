@@ -95,10 +95,41 @@ export type PluginJobDeclarationInput = z.infer<typeof pluginJobDeclarationSchem
  *
  * @see PLUGIN_SPEC.md §18 — Webhooks
  */
+/**
+ * Validates a {@link PluginWebhookAuthDeclaration} — the optional credential
+ * declaration on a webhook endpoint.
+ *
+ * The host never sees the shared token. It sees a *salted digest* of it, held
+ * in the plugin's instance config under `tokenDigestConfigKey` as
+ * `{ salt, digest }` where `digest = HMAC-SHA256(key = salt, message = token)`
+ * in lowercase hex. The digest is preimage-resistant and not length-extendable,
+ * so it is not itself a secret, needs no `company_secret_bindings` row, and is
+ * therefore readable on the anonymous, pre-company ingestion route — which is
+ * the only reason this works at all.
+ *
+ * @see PLUGIN_SPEC.md §18 — Webhooks
+ */
+export const pluginWebhookAuthDeclarationSchema = z.object({
+  type: z.literal("header-token"),
+  /** HTTP header carrying the token. Matched case-insensitively at request time. */
+  header: z.string().min(1).max(128).regex(
+    /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/,
+    "header must be a valid HTTP field name (RFC 7230 token characters)",
+  ),
+  /** Top-level key in the plugin's instance config holding `{ salt, digest }`. */
+  tokenDigestConfigKey: z.string().min(1).max(100).regex(
+    /^[A-Za-z_][A-Za-z0-9_-]*$/,
+    "tokenDigestConfigKey must be a top-level config key using letters, digits, underscores, or hyphens",
+  ),
+});
+
+export type PluginWebhookAuthDeclarationInput = z.infer<typeof pluginWebhookAuthDeclarationSchema>;
+
 export const pluginWebhookDeclarationSchema = z.object({
   endpointKey: z.string().min(1),
   displayName: z.string().min(1),
   description: z.string().optional(),
+  auth: pluginWebhookAuthDeclarationSchema.optional(),
 });
 
 export type PluginWebhookDeclarationInput = z.infer<typeof pluginWebhookDeclarationSchema>;
@@ -894,6 +925,16 @@ export const pluginManifestV1Schema = z.object({
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message: "Capability 'webhooks.receive' is required when webhooks are declared",
+        path: ["capabilities"],
+      });
+    }
+
+    // webhooks[].auth requires webhooks.verify (PLUGIN_SPEC.md §18.1)
+    const authIndex = manifest.webhooks.findIndex((webhook) => webhook.auth);
+    if (authIndex !== -1 && !manifest.capabilities.includes("webhooks.verify")) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Capability 'webhooks.verify' is required when a webhook declares auth",
         path: ["capabilities"],
       });
     }
