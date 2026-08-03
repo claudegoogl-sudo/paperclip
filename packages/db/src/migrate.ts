@@ -1,5 +1,6 @@
 import {
   applyPendingMigrations,
+  assertSourceTreeMigrationAllowed,
   inspectMigrationPreflight,
   inspectMigrations,
   type MigrationPreflight,
@@ -16,6 +17,12 @@ function logMigrationPreflight(preflight: MigrationPreflight): void {
       `WARNING: migration identity drift for ${entry.migrationFile}: ` +
         `recorded hash ${entry.recordedHash} but current file hashes ${entry.currentHash}. ` +
         `The migration file's contents changed after it was recorded as applied.`,
+    );
+  }
+  for (const migrationFile of preflight.unverifiable) {
+    console.warn(
+      `WARNING: cannot verify migration identity for ${migrationFile}: it is recorded as applied ` +
+        `but this cluster has no identity binding for it, so a content swap cannot be ruled out.`,
     );
   }
 }
@@ -44,6 +51,14 @@ async function main(): Promise<void> {
       console.log("No pending migrations");
       return;
     }
+
+    // Guard the apply path only (dry-run above and db:status are read-only and
+    // ungated): refuse to migrate an explicitly configured external cluster that
+    // looks like production unless the operator has named it in the opt-in.
+    await assertSourceTreeMigrationAllowed({
+      mode: resolved.mode,
+      connectionString: resolved.connectionString,
+    });
 
     console.log(`Applying ${preflight.pending.length} pending migration(s)...`);
     await applyPendingMigrations(resolved.connectionString);

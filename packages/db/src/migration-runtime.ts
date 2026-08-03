@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import path from "node:path";
-import { assertSourceTreeMigrationAllowed, ensurePostgresDatabase, getPostgresDataDirectory } from "./client.js";
+import { ensurePostgresDatabase, getPostgresDataDirectory } from "./client.js";
 import { createEmbeddedPostgresLogBuffer, formatEmbeddedPostgresError } from "./embedded-postgres-error.js";
 import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
 import { resolveDatabaseTarget } from "./runtime-config.js";
@@ -24,6 +24,7 @@ type EmbeddedPostgresCtor = new (opts: {
 }) => EmbeddedPostgresInstance;
 
 export type MigrationConnection = {
+  mode: "postgres" | "embedded-postgres";
   connectionString: string;
   source: string;
   stop: () => Promise<void>;
@@ -116,6 +117,7 @@ async function ensureEmbeddedPostgresConnection(
         `Adopting an existing PostgreSQL instance on port ${preferredPort} for embedded data dir ${dataDir} because postmaster.pid is missing.`,
       );
       return {
+        mode: "embedded-postgres",
         connectionString: `postgres://paperclip:paperclip@127.0.0.1:${preferredPort}/paperclip`,
         source: `embedded-postgres@${preferredPort}`,
         stop: async () => {},
@@ -130,6 +132,7 @@ async function ensureEmbeddedPostgresConnection(
     const adminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/postgres`;
     await ensurePostgresDatabase(adminConnectionString, "paperclip");
     return {
+      mode: "embedded-postgres",
       connectionString: `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`,
       source: `embedded-postgres@${port}`,
       stop: async () => {},
@@ -174,6 +177,7 @@ async function ensureEmbeddedPostgresConnection(
   await ensurePostgresDatabase(adminConnectionString, "paperclip");
 
   return {
+    mode: "embedded-postgres",
     connectionString: `postgres://paperclip:paperclip@127.0.0.1:${selectedPort}/paperclip`,
     source: `embedded-postgres@${selectedPort}`,
     stop: async () => {
@@ -184,24 +188,13 @@ async function ensureEmbeddedPostgresConnection(
 
 export async function resolveMigrationConnection(): Promise<MigrationConnection> {
   const target = resolveDatabaseTarget();
-  const connection: MigrationConnection =
-    target.mode === "postgres"
-      ? {
-          connectionString: target.connectionString,
-          source: target.source,
-          stop: async () => {},
-        }
-      : await ensureEmbeddedPostgresConnection(target.dataDir, target.port);
-
-  // Fail closed before handing back a connection a source-tree tool would
-  // migrate: refuse a populated (production-shaped) cluster unless the operator
-  // has explicitly opted in via PAPERCLIP_ALLOW_PROD_MIGRATE.
-  try {
-    await assertSourceTreeMigrationAllowed(connection.connectionString);
-  } catch (error) {
-    await connection.stop();
-    throw error;
+  if (target.mode === "postgres") {
+    return {
+      mode: "postgres",
+      connectionString: target.connectionString,
+      source: target.source,
+      stop: async () => {},
+    };
   }
-
-  return connection;
+  return ensureEmbeddedPostgresConnection(target.dataDir, target.port);
 }

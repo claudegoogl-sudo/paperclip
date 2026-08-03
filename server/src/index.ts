@@ -190,6 +190,14 @@ export async function startServer(): Promise<StartedServer> {
           `underneath an already-applied name; re-applying it may be unintended.`,
       );
     }
+    if (preflight.unverifiable.length > 0) {
+      logger.warn(
+        { label, unverifiableMigrations: preflight.unverifiable },
+        `${label} cannot verify migration identity for ${preflight.unverifiable.length} already-applied ` +
+          `migration(s) because this cluster has no recorded file identity for them (it predates identity ` +
+          `tracking). A content swap in these files cannot be ruled out; treat "no drift" as undecided, not clean.`,
+      );
+    }
 
     let state = await inspectMigrations(connectionString);
     if (state.status === "needsMigrations" && state.reason === "pending-migrations") {
