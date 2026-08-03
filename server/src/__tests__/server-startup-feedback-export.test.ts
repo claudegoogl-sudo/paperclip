@@ -265,7 +265,7 @@ describe("startServer feedback export wiring", () => {
     });
     createBetterAuthInstanceMock.mockReturnValue({});
     deriveAuthTrustedOriginsMock.mockReturnValue([]);
-    process.env.BETTER_AUTH_SECRET = "test-secret";
+    process.env.BETTER_AUTH_SECRET = "unit-test-strong-secret-0123456789abcdef";
   });
 
   it("passes the feedback export service into createApp so pending traces flush in runtime", async () => {
@@ -387,7 +387,7 @@ describe("startServer authenticated auth origin setup", () => {
     loadConfigMock.mockReturnValue(buildTestConfig());
     createBetterAuthInstanceMock.mockReturnValue({});
     deriveAuthTrustedOriginsMock.mockReturnValue([]);
-    process.env.BETTER_AUTH_SECRET = "test-secret";
+    process.env.BETTER_AUTH_SECRET = "unit-test-strong-secret-0123456789abcdef";
   });
 
   it("derives trusted origins from the detected listen port before auth initializes", async () => {
@@ -431,7 +431,7 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     loadConfigMock.mockReturnValue(buildTestConfig());
-    process.env.BETTER_AUTH_SECRET = "test-secret";
+    process.env.BETTER_AUTH_SECRET = "unit-test-strong-secret-0123456789abcdef";
     delete process.env.PAPERCLIP_API_URL;
   });
 

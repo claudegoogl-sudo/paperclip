@@ -412,6 +412,13 @@ export {
 } from "./network-bind.js";
 
 export {
+  MIN_AUTH_SECRET_LENGTH,
+  WEAK_AUTH_SECRET_DENYLIST,
+  isWeakAuthSecret,
+  weakAuthSecretReason,
+} from "./auth-secret.js";
+
+export {
   REDACTED_ENVIRONMENT_CUSTOM_IMAGE_VALUE,
   redactEnvironmentCustomImageSetupSession,
   redactEnvironmentCustomImageTemplate,
