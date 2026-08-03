@@ -27,6 +27,18 @@ const MIGRATION_URL = new URL(
   import.meta.url,
 );
 
+// 0144 attaches a posture-audit trigger to company_secret_bindings whose body
+// dereferences NEW."egress_allowlist_enforced". It is ordered AFTER 0138, so a
+// genuine pre-0138 database does not have it, and the rollout test below has to
+// detach it while it recreates that shape. Replaying the file is how it goes
+// back: 0144 is idempotent by construction, so restoring this way cannot drift
+// from the trigger the migration actually defines.
+const MIGRATION_0144_URL = new URL(
+  "./migrations/0144_secret_binding_posture_audit.sql",
+  import.meta.url,
+);
+const POSTURE_AUDIT_TRIGGER = "company_secret_binding_posture_audit_trg";
+
 /**
  * Mirrors the runner's splitter (`splitMigrationStatements` in client.ts):
  * it splits on the drizzle statement breakpoint only, never on `;`, which is
@@ -39,11 +51,15 @@ function splitMigrationStatements(content: string): string[] {
     .filter((statement) => statement.length > 0);
 }
 
-async function reapplyMigration0138(sql: postgres.Sql): Promise<void> {
-  const content = await readFile(MIGRATION_URL, "utf8");
+async function reapplyMigration(sql: postgres.Sql, url: URL): Promise<void> {
+  const content = await readFile(url, "utf8");
   for (const statement of splitMigrationStatements(content)) {
     await sql.unsafe(statement);
   }
+}
+
+async function reapplyMigration0138(sql: postgres.Sql): Promise<void> {
+  await reapplyMigration(sql, MIGRATION_URL);
 }
 
 async function seedBinding(
@@ -122,13 +138,19 @@ describeEmbeddedPostgres("secret binding egress enforcement migration (0138) con
       try {
         // Recreate the pre-0138 shape so the migration takes its first-install
         // branch: the column must be absent BEFORE the rows exist, otherwise
-        // this test would not exercise the rollout path at all.
+        // this test would not exercise the rollout path at all. The 0144 trigger
+        // postdates 0138 and reads the very columns being dropped, so it comes
+        // off first and goes back on after the migration has restored them.
+        await sql.unsafe(
+          `DROP TRIGGER IF EXISTS "${POSTURE_AUDIT_TRIGGER}" ON "company_secret_bindings"`,
+        );
         await sql.unsafe(
           `ALTER TABLE "company_secret_bindings" DROP COLUMN "egress_allowlist_enforced", DROP COLUMN "allowed_egress"`,
         );
         const { bindingId } = await seedBinding(sql, "rollout");
 
         await reapplyMigration0138(sql);
+        await reapplyMigration(sql, MIGRATION_0144_URL);
 
         const [row] = await sql<{ egress_allowlist_enforced: boolean; allowed_egress: string[] }[]>`
           SELECT egress_allowlist_enforced, allowed_egress
@@ -138,6 +160,17 @@ describeEmbeddedPostgres("secret binding egress enforcement migration (0138) con
         // live bindings -- the whole point of the migration.
         expect(row.egress_allowlist_enforced).toBe(false);
         expect(row.allowed_egress).toEqual([]);
+
+        // The detach above is scaffolding, not an outcome: if it ever stopped
+        // being reversed, this test would quietly leave posture writes unaudited
+        // and still pass on the assertions that matter to it.
+        const [restored] = await sql<{ count: number }[]>`
+          SELECT count(*)::int AS count FROM pg_trigger
+          WHERE tgrelid = to_regclass('"company_secret_bindings"')
+            AND tgname = ${POSTURE_AUDIT_TRIGGER}
+            AND NOT tgisinternal
+        `;
+        expect(restored.count).toBe(1);
       } finally {
         await sql.end();
       }
