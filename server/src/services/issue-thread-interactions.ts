@@ -967,6 +967,7 @@ export function issueThreadInteractionService(db: Db) {
           status: issueThreadInteractions.status,
           title: issueThreadInteractions.title,
           summary: issueThreadInteractions.summary,
+          payload: issueThreadInteractions.payload,
           createdAt: issueThreadInteractions.createdAt,
         })
         .from(issueThreadInteractions)

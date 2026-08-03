@@ -421,6 +421,76 @@ describe.sequential("issue thread interaction routes", () => {
         details: expect.objectContaining({
           interactionId: "interaction-1",
           interactionKind: "suggest_tasks",
+          interactionSummary: "Suggested task(s): 1\n- One",
+        }),
+      }),
+    );
+  });
+
+  it("carries the prompt text into the created-interaction activity details", async () => {
+    const prompt = "Approve the two-line poller patch that cuts host CPU below 80%?";
+    mockInteractionService.create.mockResolvedValueOnce({
+      id: "interaction-2",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee_on_accept",
+      title: null,
+      summary: null,
+      payload: { version: 1, prompt, acceptLabel: "Approve" },
+      result: null,
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:00:00.000Z",
+    });
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+      .send({ kind: "request_confirmation", payload: { version: 1, prompt } });
+
+    expect(res.status).toBe(201);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.thread_interaction_created",
+        details: expect.objectContaining({
+          interactionKind: "request_confirmation",
+          interactionSummary: prompt,
+        }),
+      }),
+    );
+  });
+
+  it("prefers an author-supplied summary over the rendered payload", async () => {
+    mockInteractionService.create.mockResolvedValueOnce({
+      id: "interaction-3",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "none",
+      title: "Poller patch",
+      summary: "Author-written summary",
+      payload: { version: 1, prompt: "Rendered prompt" },
+      result: null,
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:00:00.000Z",
+    });
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+      .send({ kind: "request_confirmation", payload: { version: 1, prompt: "Rendered prompt" } });
+
+    expect(res.status).toBe(201);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.thread_interaction_created",
+        details: expect.objectContaining({
+          interactionTitle: "Poller patch",
+          interactionSummary: "Author-written summary",
         }),
       }),
     );

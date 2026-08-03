@@ -41,6 +41,12 @@ export {
   type OriginatingActor,
 } from "./issue-attribution.js";
 export {
+  INTERACTION_SUMMARY_MAX_CHARS,
+  INTERACTION_SUMMARY_TRUNCATION_MARKER,
+  summarizeIssueThreadInteractionPayload,
+  truncateInteractionSummary,
+} from "./issue-thread-interaction-summary.js";
+export {
   RESPONSIBLE_USER_DENIAL_CODES,
   describeResponsibleUserDenial,
   isResponsibleUserDenialCode,

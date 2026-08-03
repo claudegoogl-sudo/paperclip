@@ -32,6 +32,7 @@ import {
   pluginOperationIssueOriginKind,
   TERMINAL_HEARTBEAT_RUN_STATUSES,
   isSuccessfulHeartbeatRunStatus,
+  summarizeIssueThreadInteractionPayload,
 } from "@paperclipai/shared";
 import { companyService } from "./companies.js";
 import { agentService } from "./agents.js";
@@ -2496,7 +2497,11 @@ export function buildHostServices(
           kind: row.kind,
           status: row.status,
           title: row.title ?? null,
-          summary: row.summary ?? null,
+          // Falls back to a rendered, length-capped projection of the payload so
+          // a relay that reconciles its pending set still has the question text.
+          // Only the prompt and option labels are rendered; the rest of the
+          // payload (targets, ids, result blobs) stays behind the projection.
+          summary: row.summary ?? summarizeIssueThreadInteractionPayload(row.kind, row.payload),
           createdAt: row.createdAt.toISOString(),
         }));
       },
