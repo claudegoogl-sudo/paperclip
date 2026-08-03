@@ -4,9 +4,11 @@ import { basename } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { MIGRATION_SAFETY_BASELINE } from "./migration-safety-baseline.js";
 import {
+  assertSecurityPostureColumnsResolve,
   isSecurityPostureTable,
   matchedPostureColumns,
   postureColumnsForTable,
+  type SecurityPostureColumn,
 } from "./security-posture-columns.js";
 import {
   getTableSizeEstimate,
@@ -1088,8 +1090,13 @@ function tableIsLarge(table: string, estimates: ReadonlyMap<string, TableSizeEst
  *   are strings assembled at runtime, so no static parser can see them.
  * - a rule/trigger body that rewrites the posture column as a side effect of a
  *   write to some other table.
- * - a column renamed in one migration and mutated under its new name in another,
- *   until the registry is updated to the new name.
+ *
+ * A column renamed or dropped out from under a registry entry used to belong on
+ * that list — the entry would match nothing and this rule would pass while
+ * protecting zero columns. `assertSecurityPostureColumnsResolve` now rejects an
+ * unresolvable entry before any migration is read, so that degradation is an
+ * error instead of a green check.
+ *
  * This rule narrows the class to the columns we named; detection of a posture
  * change nobody registered has to come from a runtime audit trail, not from here.
  */
@@ -1312,8 +1319,24 @@ export function assertSecurityBaselineReasons(
   );
 }
 
-async function main() {
+/**
+ * The whole gate, in the order the CLI runs it.
+ *
+ * Exported so a test can drive the same entry point the migration lint step
+ * does, rather than asserting each guard in isolation and taking it on faith
+ * that `main()` still calls them. `postureEntries` is injectable for exactly
+ * that: a drifted entry must reject *here*, not only in the unit test for
+ * `assertSecurityPostureColumnsResolve`.
+ *
+ * Registry drift is checked before any migration is read. An unresolvable
+ * registry means the security rule below is inspecting statements against pairs
+ * that match nothing, so there is no point running it first and reporting green.
+ */
+export async function runMigrationSafetyCheck(
+  postureEntries?: readonly SecurityPostureColumn[],
+): Promise<string> {
   assertSecurityBaselineReasons();
+  assertSecurityPostureColumnsResolve(undefined, postureEntries);
   const result = analyzeMigrationSafety(await readMigrations());
 
   if (result.newFindings.length > 0) {
@@ -1323,14 +1346,12 @@ async function main() {
   const staleSuffix = result.staleBaselineIds.length > 0
     ? ` (${result.staleBaselineIds.length} stale baseline id(s) ignored)`
     : "";
-  console.log(
-    `Migration safety check passed: ${result.baselineFindings.length} historical finding(s) covered by baseline${staleSuffix}.`,
-  );
+  return `Migration safety check passed: ${result.baselineFindings.length} historical finding(s) covered by baseline${staleSuffix}.`;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
-    await main();
+    console.log(await runMigrationSafetyCheck());
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     console.error(`${basename(process.argv[1])}: ${detail}`);
