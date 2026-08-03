@@ -52,12 +52,18 @@ The database bind address is separate so that exposing the UI does not implicitl
 ```sh
 docker build -t paperclip-local .
 docker run --name paperclip \
-  -p 3100:3100 \
+  -p 127.0.0.1:3100:3100 \
   -e HOST=0.0.0.0 \
   -e PAPERCLIP_HOME=/paperclip \
   -v "$(pwd)/data/docker-paperclip:/paperclip" \
   paperclip-local
 ```
+
+A manual `docker run` has no loopback default of its own: the common
+`-p 3100:3100` shorthand binds every interface and UFW will not filter it, so
+name the bind address explicitly as above. `DOCKER-USER` rules must match the
+**container** port because the chain runs post-DNAT — for example
+`iptables -I DOCKER-USER -p tcp --dport 3100 ! -s 127.0.0.1 -j DROP`.
 
 ## Data Persistence
 
@@ -81,7 +87,7 @@ Pass API keys to enable local adapter runs inside the container:
 
 ```sh
 docker run --name paperclip \
-  -p 3100:3100 \
+  -p 127.0.0.1:3100:3100 \
   -e HOST=0.0.0.0 \
   -e PAPERCLIP_HOME=/paperclip \
   -e OPENAI_API_KEY=sk-... \

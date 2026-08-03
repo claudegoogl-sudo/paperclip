@@ -1,3 +1,5 @@
 [Pod]
 PodName=paperclip
-PublishPort=3100:3100
+# Loopback by default: UFW/iptables INPUT rules do not filter published
+# container ports, so this bind address is the effective control.
+PublishPort=127.0.0.1:3100:3100

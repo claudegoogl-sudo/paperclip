@@ -29,7 +29,7 @@ docker build -t paperclip-local \
 ```sh
 docker build -t paperclip-local . && \
 docker run --name paperclip \
-  -p 3100:3100 \
+  -p 127.0.0.1:3100:3100 \
   -e HOST=0.0.0.0 \
   -e PAPERCLIP_HOME=/paperclip \
   -e BETTER_AUTH_SECRET=$(openssl rand -hex 32) \
@@ -38,6 +38,13 @@ docker run --name paperclip \
 ```
 
 Open: `http://localhost:3100`
+
+`-p 127.0.0.1:3100:3100` keeps the published port on loopback. A manual
+`docker run` has no loopback default of its own — the common `-p 3100:3100`
+shorthand binds every interface, and UFW will not filter it (see
+[Published ports bind to loopback by default](#published-ports-bind-to-loopback-by-default)),
+so always name the bind address explicitly. Use `-p 0.0.0.0:3100:3100` only when
+you deliberately want off-host access.
 
 Data persistence:
 
@@ -62,6 +69,15 @@ network. Override the bind address when you deliberately want off-host access:
 | `PAPERCLIP_DB_BIND_ADDR` | `127.0.0.1` | PostgreSQL port in `docker-compose.yml` |
 | `REVIEW_BIND_ADDR` | `127.0.0.1` | both ports in `docker-compose.untrusted-review.yml` |
 
+`PAPERCLIP_BIND_ADDR` covers the server port in *both* `docker-compose.yml` and
+`docker-compose.quickstart.yml`, and Compose auto-loads `docker/.env` — setting it
+there to widen one stack widens the other stack's server port on its next `up`
+too. The database port is unaffected; it has its own variable.
+
+IPv6 bind addresses need bracket syntax — `PAPERCLIP_BIND_ADDR=[::1]`, not `::1`.
+The bare form expands to `::1:3100:3100`, which Compose will not parse as a
+host/port mapping. Fix that by adding the brackets, not by reaching for `0.0.0.0`.
+
 ```sh
 # Expose the UI on every interface; PostgreSQL stays on loopback.
 PAPERCLIP_BIND_ADDR=0.0.0.0 \
@@ -84,6 +100,21 @@ wider than loopback.
 > address above is the effective control. If you also want firewall
 > enforcement, write the rule in the `DOCKER-USER` chain, which *is* consulted
 > for container traffic.
+>
+> `DOCKER-USER` sees the packet *after* DNAT, so the rule must match the
+> **container** port, not the published host port:
+>
+> ```sh
+> iptables -I DOCKER-USER -p tcp --dport 3100 ! -s 127.0.0.1 -j DROP
+> ```
+>
+> With a remapped host port (`PAPERCLIP_PORT=3200`) a `--dport 3200` rule matches
+> nothing — the same silent no-op as `ufw deny`. Match the pre-DNAT destination
+> instead:
+>
+> ```sh
+> iptables -I DOCKER-USER -p tcp -m conntrack --ctorigdstport 3200 ! -s 127.0.0.1 -j DROP
+> ```
 
 ### Quickstart (embedded SQLite)
 
@@ -180,7 +211,7 @@ If you want local adapter runs inside the container, pass API keys when starting
 
 ```sh
 docker run --name paperclip \
-  -p 3100:3100 \
+  -p 127.0.0.1:3100:3100 \
   -e HOST=0.0.0.0 \
   -e PAPERCLIP_HOME=/paperclip \
   -e OPENAI_API_KEY=... \
