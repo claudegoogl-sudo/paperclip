@@ -30,6 +30,11 @@ if (!embeddedPostgresSupport.supported) {
 const ANCIENT = new Date("2026-01-01T00:00:00.000Z");
 const RECENT = new Date();
 
+// Approximates the ~17 KB context snapshot a real run carries, so the size
+// measurement exercises the TOAST pages that dominate this table on disk
+// rather than just the heap.
+const LARGE_CONTEXT_SNAPSHOT = { summary: "x".repeat(17_000) };
+
 describeEmbeddedPostgres("run history retention", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -59,10 +64,15 @@ describeEmbeddedPostgres("run history retention", () => {
     await tempDb?.cleanup();
   });
 
-  async function seedRun(status: string, createdAt: Date, wakeupRequestId?: string) {
+  async function seedRun(
+    status: string,
+    createdAt: Date,
+    wakeupRequestId?: string,
+    contextSnapshot?: Record<string, unknown>,
+  ) {
     const [row] = await db
       .insert(heartbeatRuns)
-      .values({ companyId, agentId, status, createdAt, wakeupRequestId })
+      .values({ companyId, agentId, status, createdAt, wakeupRequestId, contextSnapshot })
       .returning();
     return row;
   }
@@ -222,35 +232,52 @@ describeEmbeddedPostgres("run history retention", () => {
     "reclaims table size measured off-live on the embedded database",
     async () => {
       for (let i = 0; i < 200; i += 1) {
-        await seedRun("succeeded", ANCIENT);
+        await seedRun("succeeded", ANCIENT, undefined, LARGE_CONTEXT_SNAPSHOT);
         await seedWakeup("skipped", ANCIENT);
       }
 
-      const measure = async () => {
-        const rows = await db.execute(sql`
+      // Prints the before/after table so the size effect is measured evidence
+      // in the test output rather than an assertion nobody can read.
+      const measure = async (label: string) => {
+        const rows = (await db.execute(sql`
           SELECT relname,
                  pg_total_relation_size(c.oid)::bigint AS total_bytes,
                  (SELECT count(*) FROM heartbeat_runs) AS heartbeat_runs_rows,
                  (SELECT count(*) FROM agent_wakeup_requests) AS wakeup_rows
             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
            WHERE n.nspname = 'public' AND relname IN ('heartbeat_runs', 'agent_wakeup_requests')
-        `);
-        return rows as unknown as Array<Record<string, string>>;
+        `)) as unknown as Array<Record<string, string>>;
+        for (const row of rows) {
+          process.stdout.write(
+            `[retention:${label}] ${row.relname}: total=${(Number(row.total_bytes) / 1024).toFixed(0)} KiB\n`,
+          );
+        }
+        process.stdout.write(
+          `[retention:${label}] rows: heartbeat_runs=${rows[0].heartbeat_runs_rows} agent_wakeup_requests=${rows[0].wakeup_rows}\n`,
+        );
+        return rows;
       };
 
-      const before = await measure();
-      const beforeRuns = Number(before[0].heartbeat_runs_rows);
-      const beforeWakeups = Number(before[0].wakeup_rows);
-      expect(beforeRuns).toBe(200);
-      expect(beforeWakeups).toBe(200);
+      const before = await measure("before");
+      expect(Number(before[0].heartbeat_runs_rows)).toBe(200);
+      expect(Number(before[0].wakeup_rows)).toBe(200);
 
       const result = await pruneRunHistory(db, { retentionDays: 14, maxBatches: 100 });
       expect(result.heartbeatRuns.deleted).toBe(200);
       expect(result.agentWakeupRequests.deleted).toBe(200);
 
-      const after = await measure();
+      // VACUUM is what actually returns the dead tuples, including the TOAST
+      // pages the context snapshots occupy. Autovacuum does this on its own
+      // schedule; forcing it here makes the reclaim measurable in one run.
+      await db.execute(sql`VACUUM (ANALYZE) heartbeat_runs, agent_wakeup_requests`);
+
+      const after = await measure("after");
       expect(Number(after[0].heartbeat_runs_rows)).toBe(0);
       expect(Number(after[0].wakeup_rows)).toBe(0);
+
+      const totalBefore = before.reduce((sum, row) => sum + Number(row.total_bytes), 0);
+      const totalAfter = after.reduce((sum, row) => sum + Number(row.total_bytes), 0);
+      expect(totalAfter).toBeLessThan(totalBefore);
     },
     180_000,
   );

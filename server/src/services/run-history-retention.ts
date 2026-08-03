@@ -92,7 +92,7 @@ export async function pruneHeartbeatRuns(
       WHERE "id" IN (
         SELECT "id" FROM "heartbeat_runs"
         WHERE "status" IN ${sql.raw(statusList(TERMINAL_HEARTBEAT_RUN_STATUSES))}
-          AND "created_at" < ${cutoff}
+          AND "created_at" < ${cutoff.toISOString()}::timestamptz
         ORDER BY "created_at"
         LIMIT ${limit}
       )
@@ -123,7 +123,7 @@ export async function pruneAgentWakeupRequests(
       WHERE "id" IN (
         SELECT "requests"."id" FROM "agent_wakeup_requests" AS "requests"
         WHERE "requests"."status" IN ${sql.raw(statusList(TERMINAL_WAKEUP_REQUEST_STATUSES))}
-          AND "requests"."requested_at" < ${cutoff}
+          AND "requests"."requested_at" < ${cutoff.toISOString()}::timestamptz
           AND NOT EXISTS (
             SELECT 1 FROM "heartbeat_runs" AS "runs"
             WHERE "runs"."wakeup_request_id" = "requests"."id"
@@ -216,6 +216,11 @@ function statusList(statuses: readonly string[]): string {
 }
 
 function rowCount(result: unknown): number {
-  const count = (result as { rowCount?: number | null } | undefined)?.rowCount;
-  return typeof count === "number" ? count : 0;
+  // postgres.js reports affected rows as `count` on the returned RowList; the
+  // node-postgres shape uses `rowCount`. Accept either so the prune reports the
+  // truth rather than silently always reporting zero deletions.
+  const row = result as { count?: number | null; rowCount?: number | null } | undefined;
+  if (typeof row?.count === "number") return row.count;
+  if (typeof row?.rowCount === "number") return row.rowCount;
+  return 0;
 }
