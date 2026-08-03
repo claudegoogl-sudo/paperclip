@@ -70,6 +70,9 @@ export interface Config {
   databaseBackupIntervalMinutes: number;
   databaseBackupRetentionDays: number;
   databaseBackupDir: string;
+  runHistoryRetentionEnabled: boolean;
+  runHistoryRetentionDays: number;
+  runHistoryRetentionIntervalMinutes: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -266,6 +269,18 @@ export function loadConfig(): Config {
       fileDatabaseBackup?.dir ??
       resolveDefaultBackupDir(),
   );
+  const runHistoryRetentionEnabled = process.env.PAPERCLIP_RUN_HISTORY_RETENTION_ENABLED !== "false";
+  // 14 days keeps roughly two weeks of run history -- long enough to debug any
+  // incident that is still being worked, short enough that the tables stop
+  // growing without bound.
+  const runHistoryRetentionDays = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_RUN_HISTORY_RETENTION_DAYS) || 14,
+  );
+  const runHistoryRetentionIntervalMinutes = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_RUN_HISTORY_RETENTION_INTERVAL_MINUTES) || 60,
+  );
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -313,6 +328,9 @@ export function loadConfig(): Config {
     databaseBackupIntervalMinutes,
     databaseBackupRetentionDays,
     databaseBackupDir,
+    runHistoryRetentionEnabled,
+    runHistoryRetentionDays,
+    runHistoryRetentionIntervalMinutes,
     serveUi:
       process.env.SERVE_UI !== undefined
         ? process.env.SERVE_UI === "true"
