@@ -137,6 +137,20 @@ async function listJournalMigrationFiles(): Promise<string[]> {
   return entries.map((entry) => entry.fileName);
 }
 
+// Journal file names in the order migrations are applied, which is also the
+// order rows are appended to __drizzle_migrations. Used to correlate a recorded
+// row to its migration file by ordinal when the table has no `name` column.
+async function listOrderedJournalMigrationFiles(): Promise<string[]> {
+  const entries = await listJournalMigrationEntries();
+  return [...entries]
+    .sort((left, right) =>
+      left.order === right.order
+        ? left.fileName.localeCompare(right.fileName)
+        : left.order - right.order,
+    )
+    .map((entry) => entry.fileName);
+}
+
 async function readMigrationFileContent(migrationFile: string): Promise<string> {
   return readFile(new URL(`./migrations/${migrationFile}`, import.meta.url), "utf8");
 }
@@ -261,9 +275,70 @@ async function recordMigrationHistoryEntry(
   );
 }
 
+const MIGRATION_AUDIT_TABLE = "migration_apply_audit";
+
+let cachedBinaryVersion: string | null = null;
+
+// The version string of the package that shipped the migration files. Recorded
+// in the apply audit so an out-of-band content swap under an unchanged version
+// is at least attributable after the fact. Prefers a server-provided
+// PAPERCLIP_VERSION when present, otherwise falls back to this package.
+async function resolveMigrationBinaryVersion(): Promise<string> {
+  const envVersion = process.env.PAPERCLIP_VERSION?.trim();
+  if (envVersion) return envVersion;
+  if (cachedBinaryVersion !== null) return cachedBinaryVersion;
+  try {
+    const raw = await readFile(new URL("../package.json", import.meta.url), "utf8");
+    const parsed = JSON.parse(raw) as { version?: unknown };
+    cachedBinaryVersion = typeof parsed.version === "string" ? parsed.version : "unknown";
+  } catch {
+    cachedBinaryVersion = "unknown";
+  }
+  return cachedBinaryVersion;
+}
+
+// Durable record of what a boot-time migration actually applied. Lives in the
+// same schema as __drizzle_migrations (the drizzle bookkeeping schema, not the
+// application `public` schema) so it never affects migration-state detection or
+// the source-tree populated-cluster guard, both of which count `public` tables.
+async function recordMigrationApplyAudit(
+  sql: SqlExecutor,
+  migrationTableSchema: string,
+  appliedMigrations: Array<{ migrationFile: string; hash: string }>,
+  source: string,
+): Promise<void> {
+  if (appliedMigrations.length === 0) return;
+  const auditTable = `${quoteIdentifier(migrationTableSchema)}.${quoteIdentifier(MIGRATION_AUDIT_TABLE)}`;
+  try {
+    await sql.unsafe(
+      `CREATE TABLE IF NOT EXISTS ${auditTable} (` +
+        `id SERIAL PRIMARY KEY, ` +
+        `applied_at timestamptz NOT NULL DEFAULT now(), ` +
+        `binary_version text NOT NULL, ` +
+        `migration_count integer NOT NULL, ` +
+        `migrations jsonb NOT NULL, ` +
+        `source text` +
+        `)`,
+    );
+    const version = await resolveMigrationBinaryVersion();
+    const migrationsJson = JSON.stringify(
+      appliedMigrations.map((entry) => ({ file: entry.migrationFile, hash: entry.hash })),
+    );
+    await sql.unsafe(
+      `INSERT INTO ${auditTable} (binary_version, migration_count, migrations, source) VALUES (` +
+        `${quoteLiteral(version)}, ${appliedMigrations.length}, ${quoteLiteral(migrationsJson)}::jsonb, ${quoteLiteral(source)})`,
+    );
+  } catch {
+    // Best-effort: the migrations themselves already committed, so a failure to
+    // write the audit row must not crash a server that has otherwise migrated
+    // successfully. The gap is still visible via the absence of an audit row.
+  }
+}
+
 async function applyPendingMigrationsManually(
   url: string,
   pendingMigrations: string[],
+  source = "apply-pending-migrations",
 ): Promise<void> {
   if (pendingMigrations.length === 0) return;
 
@@ -274,6 +349,7 @@ async function applyPendingMigrationsManually(
   );
 
   const sql = createUtilitySql(url);
+  const appliedMigrations: Array<{ migrationFile: string; hash: string }> = [];
   try {
     const { migrationTableSchema, columnNames } = await ensureMigrationJournalTable(sql);
     const qualifiedTable = `${quoteIdentifier(migrationTableSchema)}.${quoteIdentifier(DRIZZLE_MIGRATIONS_TABLE)}`;
@@ -304,7 +380,10 @@ async function applyPendingMigrationsManually(
           folderMillisByFileName.get(migrationFile) ?? Date.now(),
         );
       });
+      appliedMigrations.push({ migrationFile, hash });
     }
+
+    await recordMigrationApplyAudit(sql, migrationTableSchema, appliedMigrations, source);
   } finally {
     await sql.end();
   }
@@ -683,6 +762,171 @@ export async function inspectMigrations(url: string): Promise<MigrationState> {
       pendingMigrations,
       reason: "pending-migrations",
     };
+  } finally {
+    await sql.end();
+  }
+}
+
+export type PendingMigrationDigest = { migrationFile: string; hash: string };
+
+// A pending migration whose file name is already recorded in
+// __drizzle_migrations under a *different* content hash. This is the signature
+// of a migration file whose contents were swapped underneath an unchanged
+// version — the runner would otherwise re-apply it in complete silence.
+export type MigrationIdentityDriftEntry = {
+  migrationFile: string;
+  recordedHash: string;
+  currentHash: string;
+};
+
+export type MigrationPreflight = {
+  pending: PendingMigrationDigest[];
+  drift: MigrationIdentityDriftEntry[];
+};
+
+async function detectMigrationIdentityDrift(
+  sql: SqlExecutor,
+  qualifiedTable: string,
+  columnNames: Set<string>,
+  pendingMigrations: string[],
+  orderedJournalFiles: string[],
+): Promise<MigrationIdentityDriftEntry[]> {
+  if (!columnNames.has("hash") || pendingMigrations.length === 0) return [];
+
+  const hasName = columnNames.has("name");
+  const rows = await sql.unsafe<{ hash: string | null; name?: string | null }[]>(
+    `SELECT hash${hasName ? ", name" : ""} FROM ${qualifiedTable} ORDER BY id`,
+  );
+
+  // Content hash of every migration file currently on disk, so we can tell a
+  // recorded hash that still matches some file (a real, applied migration) from
+  // an orphaned one (its recorded content no longer exists — a swap signature).
+  const currentHashByFile = new Map<string, string>();
+  await Promise.all(
+    orderedJournalFiles.map(async (file) => {
+      try {
+        const content = await readMigrationFileContent(file);
+        currentHashByFile.set(file, createHash("sha256").update(content).digest("hex"));
+      } catch {
+        // File named in the journal is missing on disk; nothing to compare.
+      }
+    }),
+  );
+  const currentHashes = new Set(currentHashByFile.values());
+
+  // Map recorded migration file -> recorded content hash. When a `name` column
+  // exists we trust it; otherwise we correlate each recorded row to a journal
+  // entry by ordinal position, which matches how rows are appended.
+  const recordedHashByFile = new Map<string, string>();
+  if (hasName) {
+    for (const row of rows) {
+      if (typeof row.name === "string" && row.name.length > 0 && typeof row.hash === "string") {
+        if (!recordedHashByFile.has(row.name)) recordedHashByFile.set(row.name, row.hash);
+      }
+    }
+  } else {
+    for (let index = 0; index < rows.length; index += 1) {
+      const file = orderedJournalFiles[index];
+      const hash = rows[index]?.hash;
+      if (typeof file === "string" && typeof hash === "string" && !recordedHashByFile.has(file)) {
+        recordedHashByFile.set(file, hash);
+      }
+    }
+  }
+
+  const drift: MigrationIdentityDriftEntry[] = [];
+  for (const migrationFile of pendingMigrations) {
+    const recordedHash = recordedHashByFile.get(migrationFile);
+    if (recordedHash === undefined) continue;
+    // Without a `name` column the recorded->file mapping is ordinal, so a deleted
+    // middle row (e.g. a reconcile/repair) shifts positions. A recorded hash that
+    // still matches some file on disk is such a shift, not a swap — skip it to
+    // avoid false positives. An orphaned recorded hash is the real drift signal.
+    if (!hasName && currentHashes.has(recordedHash)) continue;
+    const currentHash =
+      currentHashByFile.get(migrationFile) ??
+      createHash("sha256").update(await readMigrationFileContent(migrationFile)).digest("hex");
+    if (recordedHash !== currentHash) {
+      drift.push({ migrationFile, recordedHash, currentHash });
+    }
+  }
+  return drift;
+}
+
+// Read-only report of what applying migrations would do: the pending files with
+// their content hashes, plus any identity-drift entries. Callers log this before
+// applying so an out-of-band content swap is loud instead of silent.
+export async function inspectMigrationPreflight(url: string): Promise<MigrationPreflight> {
+  const state = await inspectMigrations(url);
+  const pendingFiles = state.status === "needsMigrations" ? state.pendingMigrations : [];
+  const pending: PendingMigrationDigest[] = await Promise.all(
+    pendingFiles.map(async (migrationFile) => ({
+      migrationFile,
+      hash: createHash("sha256")
+        .update(await readMigrationFileContent(migrationFile))
+        .digest("hex"),
+    })),
+  );
+
+  let drift: MigrationIdentityDriftEntry[] = [];
+  if (pendingFiles.length > 0) {
+    const sql = createUtilitySql(url);
+    try {
+      const migrationTableSchema = await discoverMigrationTableSchema(sql);
+      if (migrationTableSchema) {
+        const columnNames = await getMigrationTableColumnNames(sql, migrationTableSchema);
+        const qualifiedTable = `${quoteIdentifier(migrationTableSchema)}.${quoteIdentifier(DRIZZLE_MIGRATIONS_TABLE)}`;
+        const orderedJournalFiles = await listOrderedJournalMigrationFiles();
+        drift = await detectMigrationIdentityDrift(
+          sql,
+          qualifiedTable,
+          columnNames,
+          pendingFiles,
+          orderedJournalFiles,
+        );
+      }
+    } finally {
+      await sql.end();
+    }
+  }
+
+  return { pending, drift };
+}
+
+function isTruthyEnvValue(value: string | undefined): boolean {
+  if (value === undefined) return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes";
+}
+
+export function isProdMigrationAllowOptIn(): boolean {
+  return isTruthyEnvValue(process.env.PAPERCLIP_ALLOW_PROD_MIGRATE);
+}
+
+// Guards the source-tree migration/preflight entrypoints (pnpm db:migrate,
+// db:status) against silently attaching to a populated — i.e. production-shaped —
+// cluster. Fails closed: a cluster that already holds application tables is
+// refused unless PAPERCLIP_ALLOW_PROD_MIGRATE is explicitly set. The server's own
+// boot migration does not go through this path and is unaffected.
+export async function assertSourceTreeMigrationAllowed(url: string): Promise<void> {
+  if (isProdMigrationAllowOptIn()) return;
+
+  const sql = createUtilitySql(url);
+  try {
+    const rows = await sql<{ count: number }[]>`
+      select count(*)::int as count
+      from information_schema.tables
+      where table_schema = 'public'
+        and table_type = 'BASE TABLE'
+    `;
+    const tableCount = rows[0]?.count ?? 0;
+    if (tableCount > 0) {
+      throw new Error(
+        `Refusing to run migrations from a source tree against a populated database ` +
+          `(${tableCount} application table(s) present). This looks like a production cluster. ` +
+          `Set PAPERCLIP_ALLOW_PROD_MIGRATE=1 to override if you really intend to migrate it.`,
+      );
+    }
   } finally {
     await sql.end();
   }

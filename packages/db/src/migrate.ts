@@ -1,19 +1,51 @@
-import { applyPendingMigrations, inspectMigrations } from "./client.js";
+import {
+  applyPendingMigrations,
+  inspectMigrationPreflight,
+  inspectMigrations,
+  type MigrationPreflight,
+} from "./client.js";
 import { resolveMigrationConnection } from "./migration-runtime.js";
 
+function logMigrationPreflight(preflight: MigrationPreflight): void {
+  console.log(`Pending migrations: ${preflight.pending.length}`);
+  for (const entry of preflight.pending) {
+    console.log(`  pending ${entry.migrationFile} sha256=${entry.hash}`);
+  }
+  for (const entry of preflight.drift) {
+    console.warn(
+      `WARNING: migration identity drift for ${entry.migrationFile}: ` +
+        `recorded hash ${entry.recordedHash} but current file hashes ${entry.currentHash}. ` +
+        `The migration file's contents changed after it was recorded as applied.`,
+    );
+  }
+}
+
 async function main(): Promise<void> {
+  const dryRun = process.argv.includes("--dry-run") || process.argv.includes("--check");
   const resolved = await resolveMigrationConnection();
 
   console.log(`Migrating database via ${resolved.source}`);
 
   try {
-    const before = await inspectMigrations(resolved.connectionString);
-    if (before.status === "upToDate") {
+    const preflight = await inspectMigrationPreflight(resolved.connectionString);
+    logMigrationPreflight(preflight);
+
+    if (dryRun) {
+      if (preflight.pending.length > 0) {
+        console.log("Dry run: pending migrations were NOT applied.");
+        process.exitCode = 1;
+      } else {
+        console.log("Dry run: database is up to date.");
+      }
+      return;
+    }
+
+    if (preflight.pending.length === 0) {
       console.log("No pending migrations");
       return;
     }
 
-    console.log(`Applying ${before.pendingMigrations.length} pending migration(s)...`);
+    console.log(`Applying ${preflight.pending.length} pending migration(s)...`);
     await applyPendingMigrations(resolved.connectionString);
 
     const after = await inspectMigrations(resolved.connectionString);

@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import path from "node:path";
-import { ensurePostgresDatabase, getPostgresDataDirectory } from "./client.js";
+import { assertSourceTreeMigrationAllowed, ensurePostgresDatabase, getPostgresDataDirectory } from "./client.js";
 import { createEmbeddedPostgresLogBuffer, formatEmbeddedPostgresError } from "./embedded-postgres-error.js";
 import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
 import { resolveDatabaseTarget } from "./runtime-config.js";
@@ -184,13 +184,24 @@ async function ensureEmbeddedPostgresConnection(
 
 export async function resolveMigrationConnection(): Promise<MigrationConnection> {
   const target = resolveDatabaseTarget();
-  if (target.mode === "postgres") {
-    return {
-      connectionString: target.connectionString,
-      source: target.source,
-      stop: async () => {},
-    };
+  const connection: MigrationConnection =
+    target.mode === "postgres"
+      ? {
+          connectionString: target.connectionString,
+          source: target.source,
+          stop: async () => {},
+        }
+      : await ensureEmbeddedPostgresConnection(target.dataDir, target.port);
+
+  // Fail closed before handing back a connection a source-tree tool would
+  // migrate: refuse a populated (production-shaped) cluster unless the operator
+  // has explicitly opted in via PAPERCLIP_ALLOW_PROD_MIGRATE.
+  try {
+    await assertSourceTreeMigrationAllowed(connection.connectionString);
+  } catch (error) {
+    await connection.stop();
+    throw error;
   }
 
-  return ensureEmbeddedPostgresConnection(target.dataDir, target.port);
+  return connection;
 }
