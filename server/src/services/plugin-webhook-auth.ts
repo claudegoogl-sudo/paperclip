@@ -15,23 +15,37 @@
 // secret on this path, and any design that assumes it can is dead on arrival.
 //
 // What the host holds instead is `HMAC-SHA256(key = salt, message = token)` in
-// plain instance config. It is preimage-resistant, so it is not itself a
-// secret, needs no binding row, and is readable anonymously. The host can
-// therefore recognise the token without ever being able to produce it.
+// instance config. It is preimage-resistant with a *known* key — recovering the
+// token still reduces to a SHA-256 preimage — so it is not itself a secret and
+// needs no binding row. It is not, however, world-readable: `GET
+// /api/plugins/:pluginId/config` is board/org-gated, so the reader set is
+// board/org principals, the plugin's own worker (which already holds its own
+// token), and anyone with direct DB or backup access — not anonymous callers
+// and not other tenants' agents. The reason the digest is held here rather than
+// as a `secretRef` is that the host must read it on this anonymous, pre-company
+// route, where `plugin-secrets-handler.ts` cannot resolve a binding at all. So
+// the host can recognise the token without ever being able to produce it.
 //
-// HMAC, not the bare `sha256(salt || token)` the ADR sketched. Two reasons, and
-// both are the difference between "the digest is not a secret" being true and
-// merely sounding true:
+// HMAC, not the bare `sha256(salt || token)` the ADR sketched. Two reasons:
 //
-//  * SHA-256 is length-extendable. Given `sha256(salt || token)` and the length
-//    of the input, an attacker can compute `sha256(salt || token || pad || X)`
-//    without knowing the token — and then present `token || pad || X` as a
-//    token that verifies. The digest would be a forgeable bearer credential,
-//    which is exactly what the design claims it is not. HMAC's inner/outer
-//    construction is not length-extendable.
-//  * Bare concatenation is ambiguous: `(salt="ab", token="cd")` and
-//    `(salt="abc", token="d")` hash identically. HMAC keys the salt instead of
-//    concatenating it, so no such collision exists.
+//  * Bare concatenation is not a canonical encoding: `(salt="ab", token="cd")`
+//    and `(salt="abc", token="d")` hash identically, so the salt/token boundary
+//    is not pinned and two different endpoint configurations can collide. HMAC
+//    keys the salt instead of concatenating it, which removes the ambiguity.
+//  * HMAC is the standard, reviewed keyed-hash construction, so no one has to
+//    re-derive which of the prefix-secret and suffix-secret SHA-256 pitfalls
+//    apply to this particular byte order — a question that is easy to get
+//    backwards. (Length extension, the usual worry, does *not* apply here: it
+//    breaks `H(secret || msg)` where the secret is the *prefix*, whereas here
+//    the salt is the public prefix and the token is the secret suffix. But
+//    rather than rely on that being reasoned out correctly every time, we use
+//    HMAC and stop having the argument.)
+//
+// Note the orientation is inverted from conventional HMAC: the *public* salt is
+// the key and the *secret* token is the message. That is deliberate and safe
+// here — the salt is the per-endpoint public value and the token is what we are
+// recognising — but it will read as a mistake to a reviewer who does not expect
+// it, hence this note.
 //
 // Why a mismatch falls through instead of rejecting
 // -------------------------------------------------

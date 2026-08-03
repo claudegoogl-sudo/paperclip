@@ -69,6 +69,20 @@ const READY_PLUGIN_WITH_AUTH = {
   },
 };
 
+/**
+ * A persisted manifest carrying `auth` but *without* `webhooks.verify` in its
+ * capabilities — the exact artifact the install-time validator rejects, but
+ * which a pre-feature row, a reinstall path, or a direct DB write could leave
+ * behind. The runtime must not trust it into the verified tier.
+ */
+const READY_PLUGIN_WITH_AUTH_NO_VERIFY_CAP = {
+  ...READY_PLUGIN,
+  manifestJson: {
+    capabilities: ["webhooks.receive"],
+    webhooks: [{ endpointKey: ENDPOINT_KEY, auth: WEBHOOK_AUTH }],
+  },
+};
+
 const VALID_DIGEST_CONFIG = {
   configJson: {
     [TOKEN_CONFIG_KEY]: { salt: SALT, digest: computeWebhookTokenDigest(SALT, TOKEN) },
@@ -335,18 +349,20 @@ describe("plugin webhook token-digest recognition", () => {
     expect(computeWebhookTokenDigest(SALT, TOKEN)).not.toBe(computeWebhookTokenDigest(`${SALT}x`, TOKEN));
   });
 
-  it("is HMAC, not sha256(salt || token), so the stored digest is not a credential", () => {
-    // Why this matters: with a bare `sha256(salt || token)` the digest is
-    // length-extendable. Anyone who could read plugin config would be able to
-    // derive a *different* accepted token from the digest alone, without ever
-    // knowing the real one — which would make the digest a bearer credential
-    // and collapse the premise that it is safe to hold in non-secret config.
+  it("is HMAC, not sha256(salt || token), so the salt/token boundary is pinned", () => {
+    // Why HMAC and not bare `sha256(salt || token)`: concatenation is not a
+    // canonical encoding, so the salt/token boundary is not pinned. HMAC keys
+    // the salt instead of concatenating it. (Length extension is *not* the
+    // reason — it breaks `H(secret || msg)` where the secret is the prefix,
+    // whereas here the salt is the public prefix and the token the secret
+    // suffix, so it does not apply.)
     expect(computeWebhookTokenDigest(SALT, TOKEN)).not.toBe(
       createHash("sha256").update(SALT + TOKEN, "utf8").digest("hex"),
     );
 
-    // And the concatenation ambiguity that construction carries is gone: under
-    // sha256(salt || token) these two pairs hash identically.
+    // The concatenation ambiguity is gone: under sha256(salt || token) these two
+    // pairs hash identically, because ("ab","cd") and ("abc","d") are the same
+    // input. HMAC keeps them distinct.
     expect(computeWebhookTokenDigest("ab", "cd")).not.toBe(computeWebhookTokenDigest("abc", "d"));
   });
 });
@@ -647,6 +663,28 @@ describe("POST /api/plugins/:pluginId/webhooks/:endpointKey credential tiering",
     });
     const { app } = createWebhookApp({ rateLimiter });
 
+    expect((await request(app).post(url).set(TOKEN_HEADER, TOKEN).send({ n: 1 })).status).toBe(200);
+    expect((await request(app).post(url).set(TOKEN_HEADER, TOKEN).send({ n: 2 })).status).toBe(429);
+  });
+
+  it("stays anonymous when the manifest declares auth but lacks the webhooks.verify capability", async () => {
+    // Complete mediation: the capability is re-checked at request time against
+    // the persisted manifest, not only at install. A manifest that carries
+    // `auth` but never earned `webhooks.verify` (a stale row, a reinstall path,
+    // a direct DB write) must not reach the verified tier even with the correct
+    // token — the tier decision falls through to the anonymous budget.
+    mockRegistry.getById.mockResolvedValue(READY_PLUGIN_WITH_AUTH_NO_VERIFY_CAP);
+    mockRegistry.getByKey.mockResolvedValue(READY_PLUGIN_WITH_AUTH_NO_VERIFY_CAP);
+    const rateLimiter = createPluginWebhookRateLimiter({
+      maxPerEndpoint: 1,
+      maxPerIp: 1_000,
+      maxPerVerifiedEndpoint: 10,
+    });
+    const { app } = createWebhookApp({ rateLimiter });
+
+    // The correct token is presented, but without the capability grant it earns
+    // nothing: the single anonymous slot is spent and the next delivery — token
+    // and all — is turned away at the anonymous ceiling.
     expect((await request(app).post(url).set(TOKEN_HEADER, TOKEN).send({ n: 1 })).status).toBe(200);
     expect((await request(app).post(url).set(TOKEN_HEADER, TOKEN).send({ n: 2 })).status).toBe(429);
   });
