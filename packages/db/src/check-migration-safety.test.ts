@@ -544,6 +544,44 @@ describe("unqualified mutation of a security-posture column", () => {
     expect(entry?.reason.trim().length).toBeGreaterThan(20);
   });
 
+  it("covers the in-flight rewrite of 0138 so either merge order stays green", () => {
+    // A separate change rewrites 0138's rollout UPDATE into a DO block gated on
+    // whether that run created the column. The finding id hashes the normalized
+    // statement, so the rewrite produces a different id — whichever change lands
+    // second would go red on an uncovered finding. Both texts are baselined.
+    // The rule still fires on the rewritten form by design: it recognises a
+    // selective WHERE, not an arbitrary PL/pgSQL guard.
+    const rewritten = `
+      DO $$
+      DECLARE
+        column_existed boolean;
+      BEGIN
+        SELECT EXISTS (
+          SELECT 1
+          FROM pg_attribute
+          WHERE attrelid = to_regclass('"company_secret_bindings"')
+            AND attname = 'egress_allowlist_enforced'
+            AND attnum > 0
+            AND NOT attisdropped
+        ) INTO column_existed;
+
+        ALTER TABLE "company_secret_bindings"
+          ADD COLUMN IF NOT EXISTS "egress_allowlist_enforced" boolean DEFAULT true NOT NULL;
+
+        IF NOT column_existed THEN
+          UPDATE "company_secret_bindings" SET "egress_allowlist_enforced" = false;
+        END IF;
+      END
+      $$;
+    `;
+    expect(postureFindings(rewritten)).toHaveLength(1);
+
+    const result = analyzeMigrationSafety([{ fileName: MIGRATION_0138, sql: rewritten }], {
+      estimates: testEstimates,
+    });
+    expect(result.newFindings).toEqual([]);
+  });
+
   it("rejects a baseline that silences a security rule without a reason", () => {
     expect(() => assertSecurityBaselineReasons()).not.toThrow();
     expect(() =>
