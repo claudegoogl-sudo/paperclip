@@ -8,9 +8,17 @@ it. Migration `0138` ran `UPDATE "company_secret_bindings" SET
 "egress_allowlist_enforced" = false;` with no `WHERE` and disarmed egress
 enforcement on every binding. Two registered pairs meant the rule's guarantee was
 "the columns someone remembered to register" — absent means unchecked, the same
-fail-open shape the rule exists to fix. This sweep is the answer to that: every
-schema column classified register / do-not-register, with rejections recorded
-below so the analysis does not have to be re-derived.
+fail-open shape the rule exists to fix. This sweep is the answer to that.
+
+**Scope of the claim, stated precisely.** The schema holds ~1,677 columns across
+118 tables. Every one was passed over, but only the candidates are written down:
+53 registered below and in the registry, and roughly 30 rejections recorded here
+because they are the ones a later reader would plausibly re-litigate. The
+remainder — timestamps, foreign keys, titles, bodies, counters — carry no
+recorded decision. So this is a sweep with an audit trail for the interesting
+part, not a per-column classification of all 1,677. Closing that difference is a
+separate mechanical check, tracked separately; until it lands, an unregistered
+column is still an unchecked one.
 
 ## What qualifies
 
@@ -65,7 +73,7 @@ claim that can be falsified by pointing at a consumer I missed.
 | --- | --- |
 | `companies.attachment_max_bytes` | `<= 0` and `NULL` normalise to the *default*, not to unlimited, and every value is `Math.min`-ed against a process ceiling. |
 | `issue_tree_holds.release_policy` | `NULL` normalises to `{strategy:"manual"}`, the strictest value; a flatten fails closed. |
-| `board_api_keys.key_hash` (constant flatten) | A unique index aborts it. Registered anyway for the per-row-rewrite case. |
+| `board_api_keys.key_hash`, `invites.token_hash` (constant flatten) | A unique index aborts it. Registered anyway for the per-row-rewrite case. Note this reasoning does *not* transfer to a hash column without a unique index — see `cli_auth_challenges.secret_hash` / `.pending_key_hash`, which are registered because a constant flatten does succeed there. |
 
 ### Not a security control
 
@@ -100,8 +108,17 @@ privilege being granted.
   absent-means-unprotected shape the rule exists to fix, moved up one level; the
   fix is a classified-inventory test that fails when a schema column appears in
   neither the registry nor a rejection list. Tracked separately.
-- **`session.expires_at`** is registered on library-behaviour grounds. Enforcement
-  is inside `better-auth`, so the direction is not backed by an in-repo predicate.
+- **A human pass misses things.** The first pass over this schema missed four
+  columns, all of the same shape: credential material whose *hash* is the
+  control. `cli_auth_challenges.pending_key_hash` is the sharpest — it is copied
+  verbatim into `board_api_keys.key_hash` when a challenge is approved, so it is
+  an operator-scope credential one join removed from a column that was already
+  registered. They were found by diffing the registry against the schema
+  mechanically rather than by re-reading the tables, which is the argument for
+  the classified-inventory test above.
+- **`session.expires_at`** and **`verification.expires_at`** are registered on
+  library-behaviour grounds. Enforcement is inside `better-auth`, so the
+  direction is not backed by an in-repo predicate.
 - **Parser reach** bounds everything here: a statement shape the checker cannot
   parse is unchecked regardless of what is registered. The known gaps are
   documented on the rule itself and probed in both directions by
@@ -109,6 +126,13 @@ privilege being granted.
 
 ## Result
 
-49 pairs registered across 27 tables, up from the 2-pair seed. Re-running the
+53 pairs registered across 28 tables, up from the 2-pair seed. Re-running the
 lint against all historical migrations surfaced **no new findings**, so nothing
 was baselined and no historical posture flatten needed escalating.
+
+Zero new findings is also what a completely broken registry produces, so it is
+not evidence on its own. The registry is proved live two ways: every pair is
+asserted to resolve against the schema and to be reachable by the rule
+(`security-posture registry coverage` in `check-migration-safety.test.ts`), and
+a planted unqualified write to a newly registered column was confirmed to fail
+the lint at exit 1.

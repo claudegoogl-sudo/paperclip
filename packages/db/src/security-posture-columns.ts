@@ -162,6 +162,11 @@ export const SECURITY_POSTURE_COLUMNS = [
     reason: "Dangerous value 'both': the permissive value, so a flatten lets an agent-only invite mint a human company membership and vice versa.",
   },
   {
+    table: "invites",
+    column: "token_hash",
+    reason: "Credential material; the unique index aborts a constant flatten but not a per-row rewrite, which would re-point every outstanding invite at an attacker-chosen token.",
+  },
+  {
     table: "join_requests",
     column: "status",
     reason: "Dangerous value 'approved': the claim path gates on status alone, so a flatten converts every pending and rejected join request into a redeemable one.",
@@ -180,6 +185,21 @@ export const SECURITY_POSTURE_COLUMNS = [
     table: "cli_auth_challenges",
     column: "requested_access",
     reason: "Dangerous value 'board' (also the column default): strips the instance-admin approval requirement from every pending challenge.",
+  },
+  {
+    table: "cli_auth_challenges",
+    column: "pending_key_hash",
+    reason: "Credential material copied verbatim into board_api_keys.key_hash when a challenge is approved, so a flatten makes the next approval mint an operator-scope board key whose token the attacker already holds. Registered on the same grounds as board_api_keys.key_hash and strictly more exposed: there is no unique index here to abort a constant flatten.",
+  },
+  {
+    table: "cli_auth_challenges",
+    column: "secret_hash",
+    reason: "Credential material under a non-unique index, so an unqualified write succeeds and makes one attacker-known secret address every pending CLI challenge.",
+  },
+  {
+    table: "verification",
+    column: "expires_at",
+    reason: "Lifetime bound on better-auth verification artefacts (email verification, password reset). Same library-behaviour grounds as session.expires_at: enforcement lives in better-auth rather than this repo, and no migration has a legitimate reason to rewrite it unqualified.",
   },
   {
     table: "session",
