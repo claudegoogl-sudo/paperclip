@@ -249,6 +249,7 @@ export const queryKeys = {
     userDefinitionCoverage: (companyId: string, definitionId: string) =>
       ["user-secret-definitions", companyId, definitionId, "coverage"] as const,
     myUserSecrets: (companyId: string) => ["my-user-secrets", companyId] as const,
+    egressBindings: (companyId: string) => ["secret-egress-bindings", companyId] as const,
   },
   companySearch: {
     search: (companyId: string, q: string, scope: string, limit: number, offset: number) =>

@@ -143,6 +143,44 @@ export interface SecretProviderConfigDiscoveryPreviewInput {
   pageSize?: number;
 }
 
+// --- Secret egress bindings (operator-only review + enforce surface) -------
+// These three routes are gated by `assertInteractiveBoard` on the
+// server (a browser session only — a board API key is rejected), so this client
+// is only ever reachable from the operator dashboard, never an agent.
+export type EgressPosture = "log_only" | "enforcing" | "deny_all";
+
+/** A harvested would-deny origin, surfaced UNCHECKED — never pre-applied. */
+export interface EgressSuggestion {
+  origin: string;
+  count: number;
+  firstSeen: string;
+  lastSeen: string;
+  selected: false;
+}
+
+export interface EgressBindingReview {
+  id: string;
+  secretId: string;
+  targetType: string;
+  targetId: string;
+  configPath: string;
+  label: string | null;
+  allowedEgress: string[];
+  egressAllowlistEnforced: boolean;
+  updatedAt: string;
+  posture: EgressPosture;
+  suggestions: EgressSuggestion[];
+}
+
+export interface EgressBindingMutationResult {
+  binding: {
+    id: string;
+    allowedEgress: string[];
+    egressAllowlistEnforced: boolean;
+  };
+  handlesPurged: number;
+}
+
 export const secretsApi = {
   list: (companyId: string) => api.get<CompanySecret[]>(`/companies/${companyId}/secrets`),
   providers: (companyId: string) =>
@@ -230,4 +268,20 @@ export const secretsApi = {
     ),
   remoteImport: (companyId: string, data: RemoteImportInput) =>
     api.post<RemoteSecretImportResult>(`/companies/${companyId}/secrets/remote-import`, data),
+
+  // --- Secret egress bindings (operator-only) ----------------------------
+  listEgressBindings: (companyId: string) =>
+    api.get<{ bindings: EgressBindingReview[] }>(
+      `/companies/${companyId}/secret-egress-bindings`,
+    ),
+  setEgressAllowlist: (companyId: string, bindingId: string, allowedEgress: string[]) =>
+    api.post<EgressBindingMutationResult>(
+      `/companies/${companyId}/secret-egress-bindings/${bindingId}/allowlist`,
+      { allowedEgress },
+    ),
+  enforceEgressBinding: (companyId: string, bindingId: string, allowEmpty?: boolean) =>
+    api.post<EgressBindingMutationResult>(
+      `/companies/${companyId}/secret-egress-bindings/${bindingId}/enforce`,
+      allowEmpty ? { allowEmpty: true } : {},
+    ),
 };

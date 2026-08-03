@@ -18,7 +18,7 @@ import {
   updateUserSecretValueSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
-import { assertBoard, assertCompanyAccess } from "./authz.js";
+import { assertBoard, assertCompanyAccess, assertInteractiveBoard } from "./authz.js";
 import { logActivity, secretService } from "../services/index.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
 import { forbidden, unauthorized } from "../errors.js";
@@ -860,18 +860,31 @@ export function secretRoutes(db: Db) {
   // ---------------------------------------------------------------------------
   // SECURITY-CRITICAL: operator-only egress review + per-binding enforce-flip surface.
   //
-  // `assertBoard` is the EG1-provenance gate: it requires `req.actor.type ===
-  // "board"` and throws 403 for an agent/worker JWT, so there is NO
-  // agent-invokable path to read suggestions, seed an allowlist, or flip a
-  // binding. `assertCompanyAccess` then enforces BOLA (a board user may only
-  // touch companies they belong to), and the service `loadOwnedBinding` re-checks
+  // `assertInteractiveBoard` is the credential-source gate: it
+  // requires `req.actor.type === "board"` AND `req.actor.source === "session"`,
+  // i.e. an authenticated browser session. `assertBoard` alone is NOT enough
+  // here — a board API KEY also resolves to `type: "board"`, and that key lives
+  // in ~/.paperclip/auth.json, a file every same-uid agent on the host can read.
+  // So under plain `assertBoard` any agent could read suggestions, seed an
+  // allowlist, or flip a binding by lifting the operator's key off disk. Gating
+  // on `source === "session"` closes that: it excludes board_key, local_implicit
+  // (local_trusted mode elevates unauthenticated requests to board), cloud_tenant,
+  // and every agent source — only a human at a browser passes.
+  //
+  // `assertCompanyAccess` then enforces BOLA (a board user may only touch
+  // companies they belong to), and the service `loadOwnedBinding` re-checks
   // company ownership on every write so a binding id from another company 404s.
+  //
+  // NOTE: this stricter gate is deliberately scoped to these three routes.
+  // Every other route in this file keeps plain `assertBoard`, and plugin/release
+  // routes elsewhere keep `requireBoard`, so `paperclipai plugin install` and the
+  // on-host release-verification scripts keep working against auth.json unchanged.
   // ---------------------------------------------------------------------------
 
   // Review surface: current allowlist + posture per binding, plus harvested
   // would-deny origins as UNCHECKED suggestions (never auto-applied). Read-only.
   router.get("/companies/:companyId/secret-egress-bindings", async (req, res) => {
-    assertBoard(req);
+    assertInteractiveBoard(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const bindings = await svc.listEgressReview(companyId);
@@ -885,7 +898,7 @@ export function secretRoutes(db: Db) {
     "/companies/:companyId/secret-egress-bindings/:bindingId/allowlist",
     validate(setBindingEgressAllowlistSchema),
     async (req, res) => {
-      assertBoard(req);
+      assertInteractiveBoard(req);
       const companyId = req.params.companyId as string;
       const bindingId = req.params.bindingId as string;
       assertCompanyAccess(req, companyId);
@@ -920,7 +933,7 @@ export function secretRoutes(db: Db) {
     "/companies/:companyId/secret-egress-bindings/:bindingId/enforce",
     validate(enforceBindingEgressSchema),
     async (req, res) => {
-      assertBoard(req);
+      assertInteractiveBoard(req);
       const companyId = req.params.companyId as string;
       const bindingId = req.params.bindingId as string;
       assertCompanyAccess(req, companyId);

@@ -6,6 +6,11 @@
  *   AC2  per-binding flip only — enforcing one binding leaves siblings log-only
  *   AC3  harvested origins are UNCHECKED suggestions, never auto-applied
  *   AC5  company-scoped (BOLA) on every read/write
+ *
+ * The interactive-board gate tightens AC1 by credential SOURCE: a board API KEY (source
+ * "board_key") now also gets 403, because that key is a file every same-uid
+ * agent can read — only an authenticated browser session (source "session")
+ * passes. `boardActor` below is a session actor and is the pass case.
  */
 
 import { randomUUID } from "node:crypto";
@@ -54,6 +59,22 @@ function agentActor(companyId: string): Express.Request["actor"] {
     agentId: "agent-1",
     companyId,
     runId: randomUUID(),
+  } as Express.Request["actor"];
+}
+
+// A board API KEY: type "board" (so it clears the old assertBoard gate) but
+// source "board_key" (a file on disk, not a browser session). The gate rejects it.
+function boardKeyActor(companyId: string): Express.Request["actor"] {
+  return {
+    type: "board",
+    userId: "operator-user",
+    userName: null,
+    userEmail: null,
+    source: "board_key",
+    keyId: "key-1",
+    isInstanceAdmin: true,
+    companyIds: [companyId],
+    memberships: [{ companyId, membershipRole: "admin", status: "active" }],
   } as Express.Request["actor"];
 }
 
@@ -148,6 +169,43 @@ describeDb("operator egress routes", () => {
       .then((rows) => rows[0]);
     expect(row.egressAllowlistEnforced).toBe(false);
     expect(row.allowedEgress).toEqual([]);
+  });
+
+  it("rejects a board API KEY (source board_key) on read and both writes (403)", async () => {
+    const companyId = await seedCompany("kkk");
+    const bindingId = await seedBinding(companyId);
+    const app = appFor(boardKeyActor(companyId));
+
+    const review = await request(app).get(`/api/companies/${companyId}/secret-egress-bindings`);
+    const setList = await request(app)
+      .post(`/api/companies/${companyId}/secret-egress-bindings/${bindingId}/allowlist`)
+      .send({ allowedEgress: ["https://api.example.com"] });
+    const enforce = await request(app)
+      .post(`/api/companies/${companyId}/secret-egress-bindings/${bindingId}/enforce`)
+      .send({ allowEmpty: true });
+
+    expect(review.status, JSON.stringify(review.body)).toBe(403);
+    expect(setList.status, JSON.stringify(setList.body)).toBe(403);
+    expect(enforce.status, JSON.stringify(enforce.body)).toBe(403);
+
+    // No write leaked through: still log-only with an empty allowlist.
+    const row = await db
+      .select()
+      .from(companySecretBindings)
+      .where(eq(companySecretBindings.id, bindingId))
+      .then((rows) => rows[0]);
+    expect(row.egressAllowlistEnforced).toBe(false);
+    expect(row.allowedEgress).toEqual([]);
+  });
+
+  it("a browser session (source session) still passes the read route (200)", async () => {
+    const companyId = await seedCompany("sss");
+    await seedBinding(companyId);
+    const res = await request(appFor(boardActor(companyId))).get(
+      `/api/companies/${companyId}/secret-egress-bindings`,
+    );
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(Array.isArray(res.body.bindings)).toBe(true);
   });
 
   it("AC3: review returns harvested origins as separate UNCHECKED suggestions, allowlist untouched", async () => {
