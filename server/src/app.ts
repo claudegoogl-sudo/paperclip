@@ -78,8 +78,13 @@ import {
 import { createHostClientHandlers } from "@paperclipai/plugin-sdk";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
 import { createCachedViteHtmlRenderer } from "./vite-html-renderer.js";
-import { DEFAULT_JSON_BODY_LIMIT, PORTABLE_JSON_BODY_LIMIT } from "./http/body-limits.js";
+import {
+  DEFAULT_JSON_BODY_LIMIT,
+  PORTABLE_JSON_BODY_LIMIT,
+  WEBHOOK_JSON_BODY_LIMIT,
+} from "./http/body-limits.js";
 import { COMPANY_IMPORT_API_PATH } from "./routes/company-import-paths.js";
+import { PLUGIN_WEBHOOK_INGESTION_PATH_PATTERN } from "./routes/plugin-webhook-paths.js";
 
 type UiMode = "none" | "static" | "vite-dev";
 const FEEDBACK_EXPORT_FLUSH_INTERVAL_MS = 5_000;
@@ -196,6 +201,13 @@ export async function createApp(
 
   app.use(COMPANY_IMPORT_API_PATH, express.json({
     limit: PORTABLE_JSON_BODY_LIMIT,
+    verify: captureRawBody,
+  }));
+  // Ahead of the generic parser so the anonymous webhook ingestion route gets a
+  // tighter ceiling. `verify: captureRawBody` is mandatory here: the route reads
+  // `req.rawBody` to HMAC-verify the exact bytes the provider signed.
+  app.use(PLUGIN_WEBHOOK_INGESTION_PATH_PATTERN, express.json({
+    limit: WEBHOOK_JSON_BODY_LIMIT,
     verify: captureRawBody,
   }));
   app.use(express.json({
