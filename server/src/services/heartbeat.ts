@@ -10586,15 +10586,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       releaseHostRunSlot();
     };
 
-    let run: typeof heartbeatRuns.$inferSelect | null = null;
+    let prologueRun: typeof heartbeatRuns.$inferSelect | null = null;
     try {
       if (getSchedulingSuppression().suppressed) return;
 
-      run = await getRun(runId);
-      if (!run) return;
-      if (run.status !== "queued" && run.status !== "running") return;
+      prologueRun = await getRun(runId);
+      if (!prologueRun) return;
+      if (prologueRun.status !== "queued" && prologueRun.status !== "running") return;
 
-      if (run.status === "queued") {
+      if (prologueRun.status === "queued") {
         // Defense-in-depth against `startNextQueuedRunForAgent`'s gate —
         // this function is a second, independently reachable path into a claim, and
         // an already-running run above must never be stopped mid-flight by a park
@@ -10604,9 +10604,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // path into a claim, so the host ceiling has to hold here too. The run stays queued.
         const reservation = await reserveHostRunSlot();
         if (!reservation.granted) {
-          recordHostCeilingDeferral(run.agentId, {
-            companyId: run.companyId,
-            runId: run.id,
+          recordHostCeilingDeferral(prologueRun.agentId, {
+            companyId: prologueRun.companyId,
+            runId: prologueRun.id,
             hostRunningCount: reservation.hostRunningCount,
             path: "execute_run",
           });
@@ -10614,7 +10614,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         let claimed: Awaited<ReturnType<typeof claimQueuedRun>>;
         try {
-          claimed = await claimQueuedRun(run);
+          claimed = await claimQueuedRun(prologueRun);
         } finally {
           releaseHostRunSlot();
         }
@@ -10622,17 +10622,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // claimQueuedRun can also leave the run queued when dependencies are unresolved.
           return;
         }
-        run = claimed;
+        prologueRun = claimed;
       }
 
-      activeRunExecutions.add(run.id);
+      activeRunExecutions.add(prologueRun.id);
     } finally {
       releaseHeldHostReservation();
     }
 
-    // Unreachable unless the prologue returned early (which never falls through to here); the
-    // guard re-narrows `run` to non-null for the execution body below.
-    if (!run) return;
+    // Unreachable unless the prologue returned early (which never falls through to here). Rebind
+    // to a non-null `let` so the execution body and its closures see a non-nullable `run`: a
+    // hoisted nullable `let` cannot be narrowed inside the many callbacks below (onLog/onSpawn/…).
+    if (!prologueRun) return;
+    let run = prologueRun;
 
     try {
     const agent = await getAgent(run.agentId);
