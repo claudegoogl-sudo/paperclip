@@ -7,6 +7,7 @@ import { publishLiveEvent } from "./live-events.js";
 import { redactCurrentUserValue } from "../log-redaction.js";
 import { sanitizeRecord } from "../redaction.js";
 import { logger } from "../middleware/logger.js";
+import { getActorProvenance } from "../middleware/actor-context.js";
 import type { PluginEventBus } from "./plugin-event-bus.js";
 import { instanceSettingsService } from "./instance-settings.js";
 
@@ -86,6 +87,35 @@ export async function logActivity(db: Db, input: LogActivityInput) {
   const redactedDetails = sanitizedDetails
     ? redactCurrentUserValue(sanitizedDetails, currentUserRedactionOptions)
     : null;
+
+  // Provenance of the credential that authenticated this write, captured centrally
+  // from AsyncLocalStorage rather than at each of logActivity's ~179 call sites.
+  // Null for background work (heartbeats, plugin workers) that runs outside a
+  // request — which itself is meaningful: no request-scoped credential acted.
+  const provenance = getActorProvenance();
+  const actorSource = provenance?.source ?? null;
+  const actorKeyId = provenance?.keyId ?? null;
+
+  // AC4 alert: every activity_log write is a mutation (reads are not logged here),
+  // so a board_key-sourced write is exactly a board-key-authenticated write to a
+  // board-gated route. Surface it at warn with a stable `event` discriminator.
+  // Operators grep: `event=board_key_authenticated_write` (or the JSON key). The
+  // token value is never logged — keyId (a UUID) is the only credential id emitted.
+  if (actorSource === "board_key") {
+    logger.warn(
+      {
+        event: "board_key_authenticated_write",
+        actorSource,
+        actorKeyId,
+        action: input.action,
+        entityType: input.entityType,
+        entityId: input.entityId,
+        companyId: input.companyId,
+      },
+      "board_key-authenticated write to a board-gated route",
+    );
+  }
+
   await db.insert(activityLog).values({
     companyId: input.companyId,
     actorType: input.actorType,
@@ -95,6 +125,8 @@ export async function logActivity(db: Db, input: LogActivityInput) {
     entityId: input.entityId,
     agentId: input.agentId ?? null,
     runId: input.runId ?? null,
+    actorSource,
+    actorKeyId,
     details: redactedDetails,
   });
 
@@ -109,6 +141,8 @@ export async function logActivity(db: Db, input: LogActivityInput) {
       entityId: input.entityId,
       agentId: input.agentId ?? null,
       runId: input.runId ?? null,
+      actorSource,
+      actorKeyId,
       details: redactedDetails,
     },
   });
