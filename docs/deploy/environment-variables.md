@@ -44,6 +44,13 @@ before every dispatch, across all agents and all companies:
   `scheduled_retry` runs hold an issue execution lock but no adapter process, and
   counting `scheduled_retry` would deadlock the scheduler, because such a run can
   only leave that status by being promoted through this same gate.
+- **Liveness:** a `running` run only counts if a process is actually behind it —
+  it is executing in-process or its child pid / process group is still alive. A
+  `running` row left behind by a crashed or restarted process (an orphan the
+  reaper cleans up on its next tick) does not consume the budget, so a few orphans
+  cannot stall every agent. Freshly claimed runs, which are `running` before their
+  process registers, are held by an in-flight admission reservation in the
+  meantime, so they are never double-counted or missed.
 
 The resolved value is logged once at startup as `resolved host-wide concurrent
 run ceiling`, with `source` (`env` or `default`) and the detected `vcpuCount`.

@@ -9373,17 +9373,50 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return Number(count ?? 0);
   }
 
+  // A `running` row occupies a host slot only if a process is actually behind it. This mirrors
+  // `reapOrphanedRuns`' liveness test exactly: a run counts iff the reaper would NOT reap it —
+  // it is tracked in-process (mid-dispatch or executing) or its child pid / process group is
+  // still alive (a detached run whose in-memory handle was lost). A bare `running` row with no
+  // live process is an orphan the reaper cleans up on its ~5-minute tick; counting it would let
+  // a handful of orphans permanently occupy the whole host budget and stall every agent, which
+  // on a ceiling of 4 needs only four dead rows. Fresh claims stay covered by the in-flight
+  // reservation, which is only released once the run is registered in-process — see
+  // `reserveHostRunSlot` and the reservation transfer in `executeRun`.
+  function runOccupiesHostSlot(row: {
+    id: string;
+    processPid: number | null;
+    processGroupId: number | null;
+    adapterType: string;
+  }) {
+    if (liveRunExecutions.has(row.id)) return true;
+    if (isTrackedLocalChildProcessAdapter(row.adapterType)) {
+      if (row.processPid && isProcessAlive(row.processPid)) return true;
+      if (row.processGroupId && isProcessGroupAlive(row.processGroupId)) return true;
+    }
+    return false;
+  }
+
   // The ceiling bounds concurrent *adapter processes*, i.e. CPU, so it counts `running` only —
   // the same status `countRunningRunsForAgent` uses. `queued` and `scheduled_retry` hold an
   // issue execution lock but no process; counting `scheduled_retry` would also be a liveness
   // trap, because a scheduled-retry run can only leave that status by being promoted, and
   // promotion goes back through this same admission gate.
   async function countRunningRunsHostWide() {
-    const [{ count }] = await db
-      .select({ count: sql<number>`count(*)` })
+    const rows = await db
+      .select({
+        id: heartbeatRuns.id,
+        processPid: heartbeatRuns.processPid,
+        processGroupId: heartbeatRuns.processGroupId,
+        adapterType: agents.adapterType,
+      })
       .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
       .where(eq(heartbeatRuns.status, "running"));
-    return Number(count ?? 0);
+    let count = 0;
+    for (const row of rows) {
+      if (runOccupiesHostSlot(row)) count += 1;
+    }
+    return count;
   }
 
   async function countAgentsWithQueuedRuns() {
@@ -10501,12 +10534,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           break;
         }
         visitedRunCount += 1;
+        let claimed: Awaited<ReturnType<typeof claimQueuedRun>> = null;
         try {
-          const claimed = await claimQueuedRun(queuedRun, companyAgents);
-          if (claimed) claimedRuns.push(claimed);
-        } finally {
-          // The claim has already made the run visible as `running`, so the reservation would
-          // otherwise double-count it; a claim that returned null or threw frees the slot.
+          claimed = await claimQueuedRun(queuedRun, companyAgents);
+        } catch (err) {
+          // The reservation is only handed to `executeRun` on a successful claim, so a throw
+          // here frees the slot rather than leaking it.
+          releaseHostRunSlot();
+          throw err;
+        }
+        if (claimed) {
+          claimedRuns.push(claimed);
+          // Keep the reservation held: a just-claimed run is `running` in the DB but has no
+          // process yet, so `countRunningRunsHostWide` does not count it. The reservation is
+          // transferred to `executeRun`, which releases it once the run is registered in-process.
+          // Releasing it here would make the slot look free to a concurrent agent until the run
+          // registered, reopening the admission race (AC4).
+        } else {
+          // No run was claimed (cancelled/blocked/stale); free the slot immediately.
           releaseHostRunSlot();
         }
       }
@@ -10520,7 +10565,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (claimedRuns.length === 0) return [];
 
       for (const claimedRun of claimedRuns) {
-        void executeRun(claimedRun.id).catch((err) => {
+        void executeRun(claimedRun.id, { hostReservationHeld: true }).catch((err) => {
           logger.error({ err, runId: claimedRun.id }, "queued heartbeat execution failed");
         });
       }
@@ -10528,45 +10573,66 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
   }
 
-  async function executeRun(runId: string) {
-    if (getSchedulingSuppression().suppressed) return;
+  async function executeRun(runId: string, opts?: { hostReservationHeld?: boolean }) {
+    // A run claimed by `startNextQueuedRunForAgent` arrives here still holding the host
+    // admission reservation that reserved its slot during claim. That reservation is handed
+    // back the instant the run registers in-process below (where it starts counting toward
+    // `countRunningRunsHostWide` on its own), or on any early return/throw before registration
+    // so the slot is never leaked (AC5).
+    let heldHostReservation = opts?.hostReservationHeld ?? false;
+    const releaseHeldHostReservation = () => {
+      if (!heldHostReservation) return;
+      heldHostReservation = false;
+      releaseHostRunSlot();
+    };
 
-    let run = await getRun(runId);
-    if (!run) return;
-    if (run.status !== "queued" && run.status !== "running") return;
+    let run: typeof heartbeatRuns.$inferSelect | null = null;
+    try {
+      if (getSchedulingSuppression().suppressed) return;
 
-    if (run.status === "queued") {
-      // Defense-in-depth against `startNextQueuedRunForAgent`'s gate —
-      // this function is a second, independently reachable path into a claim, and
-      // an already-running run above must never be stopped mid-flight by a park
-      // that started after it was dispatched.
-      if (await usageLimitPark.isParked()) return;
-      // Same defense-in-depth as the park above: this is a second, independently reachable
-      // path into a claim, so the host ceiling has to hold here too. The run stays queued.
-      const reservation = await reserveHostRunSlot();
-      if (!reservation.granted) {
-        recordHostCeilingDeferral(run.agentId, {
-          companyId: run.companyId,
-          runId: run.id,
-          hostRunningCount: reservation.hostRunningCount,
-          path: "execute_run",
-        });
-        return;
+      run = await getRun(runId);
+      if (!run) return;
+      if (run.status !== "queued" && run.status !== "running") return;
+
+      if (run.status === "queued") {
+        // Defense-in-depth against `startNextQueuedRunForAgent`'s gate —
+        // this function is a second, independently reachable path into a claim, and
+        // an already-running run above must never be stopped mid-flight by a park
+        // that started after it was dispatched.
+        if (await usageLimitPark.isParked()) return;
+        // Same defense-in-depth as the park above: this is a second, independently reachable
+        // path into a claim, so the host ceiling has to hold here too. The run stays queued.
+        const reservation = await reserveHostRunSlot();
+        if (!reservation.granted) {
+          recordHostCeilingDeferral(run.agentId, {
+            companyId: run.companyId,
+            runId: run.id,
+            hostRunningCount: reservation.hostRunningCount,
+            path: "execute_run",
+          });
+          return;
+        }
+        let claimed: Awaited<ReturnType<typeof claimQueuedRun>>;
+        try {
+          claimed = await claimQueuedRun(run);
+        } finally {
+          releaseHostRunSlot();
+        }
+        if (!claimed) {
+          // claimQueuedRun can also leave the run queued when dependencies are unresolved.
+          return;
+        }
+        run = claimed;
       }
-      let claimed: Awaited<ReturnType<typeof claimQueuedRun>>;
-      try {
-        claimed = await claimQueuedRun(run);
-      } finally {
-        releaseHostRunSlot();
-      }
-      if (!claimed) {
-        // claimQueuedRun can also leave the run queued when dependencies are unresolved.
-        return;
-      }
-      run = claimed;
+
+      activeRunExecutions.add(run.id);
+    } finally {
+      releaseHeldHostReservation();
     }
 
-    activeRunExecutions.add(run.id);
+    // Unreachable unless the prologue returned early (which never falls through to here); the
+    // guard re-narrows `run` to non-null for the execution body below.
+    if (!run) return;
 
     try {
     const agent = await getAgent(run.agentId);

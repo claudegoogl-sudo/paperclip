@@ -118,6 +118,11 @@ describeEmbeddedPostgres("host-wide concurrent-run ceiling", () => {
     companyId: string;
     agentId: string;
     status: "queued" | "running";
+    // A `running` row only occupies a host slot if a live process is behind it. `live` stamps
+    // the current (alive) test process pid so the count treats it as a genuine occupant; an
+    // orphan row (no pid) simulates a `running` row whose process is gone — the exact state the
+    // reaper cleans up, which must not consume the host budget.
+    live?: boolean;
   }) {
     const id = randomUUID();
     await db.insert(heartbeatRuns).values({
@@ -126,6 +131,8 @@ describeEmbeddedPostgres("host-wide concurrent-run ceiling", () => {
       agentId: input.agentId,
       status: input.status,
       contextSnapshot: {},
+      startedAt: input.status === "running" ? new Date() : null,
+      processPid: input.status === "running" && input.live ? process.pid : null,
     });
     return id;
   }
@@ -167,7 +174,7 @@ describeEmbeddedPostgres("host-wide concurrent-run ceiling", () => {
   it("AC2: a run refused by the ceiling stays queued, is observable, and is dispatched once a slot frees", async () => {
     const heartbeat = buildHeartbeat(1);
     const occupant = await seedAgent();
-    const occupantRunId = await seedRun({ ...occupant, status: "running" });
+    const occupantRunId = await seedRun({ ...occupant, status: "running", live: true });
 
     const waiting = await seedAgent();
     const waitingRunId = await seedRun({ ...waiting, status: "queued" });
@@ -197,7 +204,7 @@ describeEmbeddedPostgres("host-wide concurrent-run ceiling", () => {
   it("AC5: repeated deferred dispatch passes converge and leak no slots", async () => {
     const heartbeat = buildHeartbeat(1);
     const occupant = await seedAgent();
-    await seedRun({ ...occupant, status: "running" });
+    await seedRun({ ...occupant, status: "running", live: true });
 
     const waiting = await seedAgent();
     const waitingRunId = await seedRun({ ...waiting, status: "queued" });
@@ -238,10 +245,29 @@ describeEmbeddedPostgres("host-wide concurrent-run ceiling", () => {
     const second = await seedAgent();
     expect(first.companyId).not.toBe(second.companyId);
 
-    await seedRun({ ...first, status: "running" });
+    await seedRun({ ...first, status: "running", live: true });
     const blockedRunId = await seedRun({ ...second, status: "queued" });
 
     expect(await heartbeat.startNextQueuedRunForAgent(second.agentId)).toEqual([]);
     expect((await statusesOf([blockedRunId])).get(blockedRunId)).toBe("queued");
+  });
+
+  it("orphan regression: a `running` row with no live process does not consume the host budget", async () => {
+    // Reproduces the low-trust-red-team dispatch regression: bare `running` rows (DB fixtures
+    // with no process behind them, the same state reapOrphanedRuns cleans up) must not count
+    // toward the host ceiling, or a couple of orphans would stall every agent on a low ceiling.
+    const heartbeat = buildHeartbeat(1);
+
+    const orphanAgent = await seedAgent();
+    await seedRun({ ...orphanAgent, status: "running" }); // no `live` -> no pid -> orphan
+
+    const state = await heartbeat.getHostRunCeilingState();
+    expect(state.hostRunningCount).toBe(0);
+
+    const waiting = await seedAgent();
+    const waitingRunId = await seedRun({ ...waiting, status: "queued" });
+
+    const claimed = await heartbeat.startNextQueuedRunForAgent(waiting.agentId);
+    expect(claimed.map((run) => run.id)).toEqual([waitingRunId]);
   });
 });
