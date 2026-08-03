@@ -31,6 +31,7 @@ import {
   agents,
   companies,
   heartbeatRuns,
+  issues,
   pluginLogs,
   pluginWebhookDeliveries,
   projects,
@@ -791,7 +792,46 @@ export function pluginRoutes(
     return companyId === undefined ? base : { ...base, companyId };
   }
 
+  /**
+   * Resolve the project a run belongs to, via the run's context issue.
+   *
+   * Returns `null` when the run is not project-scoped (no context issue, or an
+   * issue with no project). Callers must treat `null` as "unknown" and drop the
+   * field — never as a wildcard, and never as a placeholder value.
+   */
+  async function resolveRunProjectId(runId: string, companyId: string): Promise<string | null> {
+    if (!UUID_REGEX.test(runId) || !UUID_REGEX.test(companyId)) return null;
+    const [run] = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId)))
+      .limit(1);
+    const context = run?.contextSnapshot as Record<string, unknown> | null | undefined;
+    const nestedIssue = context?.paperclipIssue as Record<string, unknown> | null | undefined;
+    const issueId = context?.issueId ?? nestedIssue?.id;
+    if (typeof issueId !== "string" || !UUID_REGEX.test(issueId)) return null;
+    const [issue] = await db
+      .select({ projectId: issues.projectId })
+      .from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
+      .limit(1);
+    return issue?.projectId ?? null;
+  }
+
   async function validateToolRunContextScope(runContext: ToolRunContext): Promise<string | null> {
+    // Every id below indexes a `uuid` column. Screen them here so a malformed
+    // value is a deny rather than a Postgres cast error that escapes the route
+    // as a 500 — the scope check must be total for any input it is handed.
+    if (!UUID_REGEX.test(runContext.companyId) || !UUID_REGEX.test(runContext.agentId)) {
+      return '"runContext.agentId" does not belong to "runContext.companyId"';
+    }
+    if (!UUID_REGEX.test(runContext.runId)) {
+      return '"runContext.runId" does not belong to "runContext.companyId"';
+    }
+    if (runContext.projectId !== undefined && !UUID_REGEX.test(runContext.projectId)) {
+      return '"runContext.projectId" does not belong to "runContext.companyId"';
+    }
+
     const [agent] = await db
       .select({ companyId: agents.companyId })
       .from(agents)
@@ -813,13 +853,19 @@ export function pluginRoutes(
       return '"runContext.runId" does not belong to "runContext.agentId"';
     }
 
-    const [project] = await db
-      .select({ companyId: projects.companyId })
-      .from(projects)
-      .where(eq(projects.id, runContext.projectId))
-      .limit(1);
-    if (!project || project.companyId !== runContext.companyId) {
-      return '"runContext.projectId" does not belong to "runContext.companyId"';
+    // A run that is not project-scoped carries no projectId at all; the
+    // agent/run/company binding above is what authorizes the dispatch. Skipping
+    // the assertion is only correct because the field is absent — a present but
+    // unresolvable value was already denied above.
+    if (runContext.projectId !== undefined) {
+      const [project] = await db
+        .select({ companyId: projects.companyId })
+        .from(projects)
+        .where(eq(projects.id, runContext.projectId))
+        .limit(1);
+      if (!project || project.companyId !== runContext.companyId) {
+        return '"runContext.projectId" does not belong to "runContext.companyId"';
+      }
     }
 
     return null;
@@ -1007,6 +1053,7 @@ export function pluginRoutes(
     if ((body.tool === undefined || body.tool === null) && typeof body.name === "string") {
       body.tool = body.name;
     }
+    let hostResolvedRunContext = false;
     if (
       (body.runContext === undefined || body.runContext === null) &&
       typeof body.runId === "string" &&
@@ -1017,12 +1064,31 @@ export function pluginRoutes(
       // ToolRunContext.artifacts is added downstream by the worker-rpc-host
       // before the worker call (see worker-rpc-host.ts), so we don't synthesise
       // it here — wire shape stays runId/agentId/companyId/projectId only.
+      //
+      // projectId is resolved from the run itself. Earlier builds substituted a
+      // non-uuid sentinel, which made the scope check below fail inside Postgres
+      // and surface as a 500 for every agent dispatch. When the run is not
+      // project-scoped the field is omitted rather than faked.
+      let projectId: string | null;
+      try {
+        projectId = await resolveRunProjectId(body.runId, req.actor.companyId);
+      } catch (err) {
+        // Same rule as the scope check below: a lookup that cannot complete is a
+        // deny, not a 500.
+        logger.error(
+          { err, companyId: req.actor.companyId, runId: body.runId },
+          "plugin tool dispatch run-project resolution failed",
+        );
+        res.status(403).json({ error: '"runContext" could not be validated' });
+        return;
+      }
       body.runContext = {
         runId: body.runId,
         agentId: req.actor.agentId,
         companyId: req.actor.companyId,
-        projectId: "onboarding-fallback",
+        ...(projectId ? { projectId } : {}),
       } as ToolRunContext;
+      hostResolvedRunContext = true;
     }
 
     // Actor-branch guard: agent JWTs reach this route through their own branch;
@@ -1057,7 +1123,15 @@ export function pluginRoutes(
       return;
     }
 
-    if (!runContext.agentId || !runContext.runId || !runContext.companyId || !runContext.projectId) {
+    // Caller-supplied contexts must still name a project. A host-resolved
+    // context omits the field when the run is not project-scoped, which the
+    // scope check handles explicitly rather than by asserting on a fake value.
+    if (
+      !runContext.agentId ||
+      !runContext.runId ||
+      !runContext.companyId ||
+      (!runContext.projectId && !hostResolvedRunContext)
+    ) {
       res.status(400).json({
         error: '"runContext" must include agentId, runId, companyId, and projectId',
       });
@@ -1065,7 +1139,17 @@ export function pluginRoutes(
     }
 
     assertCompanyAccess(req, runContext.companyId);
-    const scopeError = await validateToolRunContextScope(runContext);
+    let scopeError: string | null;
+    try {
+      scopeError = await validateToolRunContextScope(runContext);
+    } catch (err) {
+      // A scope check that cannot complete is a deny, not a 500.
+      logger.error(
+        { err, tool, companyId: runContext.companyId, runId: runContext.runId },
+        "plugin tool dispatch scope validation failed",
+      );
+      scopeError = '"runContext" could not be validated';
+    }
     if (scopeError) {
       res.status(403).json({ error: scopeError });
       return;

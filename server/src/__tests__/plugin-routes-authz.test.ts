@@ -112,6 +112,7 @@ const companyB = "33333333-3333-4333-8333-333333333333";
 const agentA = "44444444-4444-4444-8444-444444444444";
 const runA = "55555555-5555-4555-8555-555555555555";
 const projectA = "66666666-6666-4666-8666-666666666666";
+const issueA = "88888888-8888-4888-8888-888888888888";
 const pluginId = "11111111-1111-4111-8111-111111111111";
 
 function boardActor(overrides: Record<string, unknown> = {}) {
@@ -1266,6 +1267,10 @@ describe.sequential("plugin tool dispatch for agent actors", () => {
     const executeTool = vi.fn().mockResolvedValue({ content: "ok" });
     const { app } = await createApp(agentActor(), {}, {
       db: createSelectQueueDb([
+        // run -> context issue -> project
+        [{ contextSnapshot: { issueId: issueA } }],
+        [{ projectId: projectA }],
+        // scope check: agent, run, project
         [{ companyId: companyA }],
         [{ companyId: companyA, agentId: agentA }],
         [{ companyId: companyA }],
@@ -1295,9 +1300,128 @@ describe.sequential("plugin tool dispatch for agent actors", () => {
         agentId: agentA,
         runId: runA,
         companyId: companyA,
-        projectId: "onboarding-fallback",
+        projectId: projectA,
       }),
     );
+  });
+
+  it("never 500s on the short {tool, runId, parameters} agent shape", async () => {
+    const executeTool = vi.fn().mockResolvedValue({ content: "ok" });
+    const { app } = await createApp(agentActor(), {}, {
+      db: createSelectQueueDb([
+        [{ contextSnapshot: { paperclipIssue: { id: issueA } } }],
+        [{ projectId: projectA }],
+        [{ companyId: companyA }],
+        [{ companyId: companyA, agentId: agentA }],
+        [{ companyId: companyA }],
+      ]),
+      toolDeps: {
+        toolDispatcher: {
+          listToolsForAgent: vi.fn(),
+          getTool: vi.fn(() => ({ name: "paperclip.example:search" })),
+          executeTool,
+        },
+      },
+    });
+
+    const res = await request(app)
+      .post("/api/plugins/tools/execute")
+      .send({ tool: "paperclip.example:search", runId: runA, parameters: { q: "test" } });
+
+    expect(res.status).toBe(200);
+    expect(executeTool).toHaveBeenCalled();
+  });
+
+  it("omits projectId rather than faking one when the run is not project-scoped", async () => {
+    const executeTool = vi.fn().mockResolvedValue({ content: "ok" });
+    const { app } = await createApp(agentActor(), {}, {
+      db: createSelectQueueDb([
+        // run row carries no context issue -> no project to resolve
+        [{ contextSnapshot: null }],
+        [{ companyId: companyA }],
+        [{ companyId: companyA, agentId: agentA }],
+      ]),
+      toolDeps: {
+        toolDispatcher: {
+          listToolsForAgent: vi.fn(),
+          getTool: vi.fn(() => ({ name: "paperclip.example:search" })),
+          executeTool,
+        },
+      },
+    });
+
+    const res = await request(app)
+      .post("/api/plugins/tools/execute")
+      .send({ tool: "paperclip.example:search", runId: runA, parameters: {} });
+
+    expect(res.status).toBe(200);
+    const dispatched = executeTool.mock.calls[0]?.[2] as Record<string, unknown>;
+    expect(dispatched).toMatchObject({ agentId: agentA, runId: runA, companyId: companyA });
+    expect(dispatched).not.toHaveProperty("projectId");
+  });
+
+  it("denies a malformed runContext.projectId without querying the database", async () => {
+    const executeTool = vi.fn();
+    const db = createSelectQueueDb([]);
+    const { app } = await createApp(boardActor(), {}, {
+      db,
+      toolDeps: {
+        toolDispatcher: {
+          listToolsForAgent: vi.fn(),
+          getTool: vi.fn(() => ({ name: "paperclip.example:search" })),
+          executeTool,
+        },
+      },
+    });
+
+    const res = await request(app)
+      .post("/api/plugins/tools/execute")
+      .send({
+        tool: "paperclip.example:search",
+        parameters: {},
+        runContext: {
+          agentId: agentA,
+          runId: runA,
+          companyId: companyA,
+          projectId: "onboarding-fallback",
+        },
+      });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe(
+      '"runContext.projectId" does not belong to "runContext.companyId"',
+    );
+    expect(db.select).not.toHaveBeenCalled();
+    expect(executeTool).not.toHaveBeenCalled();
+  });
+
+  it("turns a scope-check database failure into a deny, not a 500", async () => {
+    const executeTool = vi.fn();
+    const { app } = await createApp(boardActor(), {}, {
+      db: {
+        select: vi.fn(() => {
+          throw new Error("connection terminated");
+        }),
+      },
+      toolDeps: {
+        toolDispatcher: {
+          listToolsForAgent: vi.fn(),
+          getTool: vi.fn(() => ({ name: "paperclip.example:search" })),
+          executeTool,
+        },
+      },
+    });
+
+    const res = await request(app)
+      .post("/api/plugins/tools/execute")
+      .send({
+        tool: "paperclip.example:search",
+        parameters: {},
+        runContext: { agentId: agentA, runId: runA, companyId: companyA, projectId: projectA },
+      });
+
+    expect(res.status).toBe(403);
+    expect(executeTool).not.toHaveBeenCalled();
   });
 
   it("rejects an agent JWT trying to dispatch into another company", async () => {
