@@ -1,5 +1,9 @@
 import { Table, getTableColumns, getTableName, is } from "drizzle-orm";
 import * as schema from "./schema/index.js";
+import {
+  SECURITY_POSTURE_REJECTIONS,
+  type SecurityPostureRejection,
+} from "./security-posture-rejections.js";
 
 export type SecurityPostureColumn = {
   readonly table: string;
@@ -364,6 +368,127 @@ export const SECURITY_POSTURE_COLUMNS = [
     column: "status",
     reason: "Dangerous value 'pending': the sole gate on shipping a captured feedback trace off-instance, so a flatten uploads every local_only trace — including issue payload snapshots — to the external destination without consent.",
   },
+
+  // --- Found by the classified-inventory check, not by the human sweep ---
+  // Enumerating all 1,677 columns surfaced these; two prior passes over the same
+  // schema did not. Each was confirmed against an in-repo predicate before
+  // registering — the reason names that predicate, rather than guessing from the
+  // column name.
+  {
+    table: "routine_triggers",
+    column: "signing_mode",
+    reason: "Dangerous value 'none': routines.ts skips signature verification entirely for that mode, leaving the publicId in the URL as the only secret, so a flatten converts every signed inbound webhook into an unauthenticated one.",
+  },
+  {
+    table: "routine_triggers",
+    column: "enabled",
+    reason: "Dangerous value true: the first half of the trigger admission check, so a flatten re-arms every disabled inbound webhook — including ones disabled in response to abuse.",
+  },
+  {
+    table: "routine_triggers",
+    column: "replay_window_sec",
+    reason: "Dangerous value a large number, or NULL which falls back to 300s: the bound on how long a captured signed request stays replayable, and widening it is invisible in the response.",
+  },
+  {
+    table: "routine_triggers",
+    column: "public_id",
+    reason: "The unguessable half of the trigger URL, and under signing_mode 'none' it is the entire credential; a flatten makes one attacker-known id address every trigger.",
+  },
+  {
+    table: "join_requests",
+    column: "claim_secret_hash",
+    reason: "Compared against the presented claim secret before an invite is redeemed; a flatten makes one attacker-held secret satisfy every pending join request, each of which mints an agent in its company.",
+  },
+  {
+    table: "join_requests",
+    column: "claim_secret_consumed_at",
+    reason: "Dangerous value NULL: the sole single-use marker on a claim secret, so clearing it makes every already-redeemed invite redeemable again.",
+  },
+  {
+    table: "company_secret_versions",
+    column: "status",
+    reason: "Dangerous value 'active': resolution refuses disabled and destroyed versions on this column, so a flatten un-revokes every retired secret version and makes it resolvable again.",
+  },
+  {
+    table: "company_secret_versions",
+    column: "material",
+    reason: "The secret payload itself; an unqualified write copies one version's material across every other version, so a value the attacker controls becomes the resolved secret for bindings they never touched.",
+  },
+  {
+    table: "project_workspaces",
+    column: "setup_command",
+    reason: "Executed by the host as `sh -c <value>` during workspace provisioning; a flatten runs one attacker-chosen command in every project's workspace, across tenants.",
+  },
+  {
+    table: "project_workspaces",
+    column: "cleanup_command",
+    reason: "Same host `sh -c` execution path as setup_command, on the teardown side — and teardown runs even for runs that failed early, so it is the more reliable of the two to reach.",
+  },
+  {
+    table: "pipeline_cases",
+    column: "lease_token",
+    reason: "Dangerous value NULL: lease ownership returns true unconditionally when the token is absent, so a flatten to NULL lets any actor mutate any leased case, and a flatten to a constant hands every case to whoever holds that one token.",
+  },
+  {
+    table: "pipeline_cases",
+    column: "lease_expires_at",
+    reason: "The other half of the same check: a lease is only enforced while this timestamp is in the future, so flattening it to the past disarms lease ownership without touching lease_token.",
+  },
+  {
+    table: "cloud_upstream_connections",
+    column: "token_status",
+    reason: "Dangerous value 'connected': the gate on using an upstream connection at all, so a flatten reactivates expired and revoked cross-instance connections.",
+  },
+  {
+    table: "cloud_upstream_connections",
+    column: "access_token",
+    reason: "Cross-instance bearer credential; an unqualified write transplants one instance's token onto every connection row, pointing other tenants' pushes at a destination the token holder controls.",
+  },
+  {
+    table: "cloud_upstream_connections",
+    column: "private_key_pem",
+    reason: "Signing key for cross-instance requests; a flatten makes one attacker-held key authenticate every connection, and unlike access_token it is not rotated on reconnect.",
+  },
+  {
+    table: "session",
+    column: "token",
+    reason: "The session bearer value better-auth looks sessions up by. Same library-behaviour grounds as session.expires_at: enforcement is out of repo, but no migration has a legitimate reason to rewrite session credentials unqualified, and a constant flatten would give one token every user's session.",
+  },
+  {
+    table: "verification",
+    column: "value",
+    reason: "The verification/password-reset token better-auth matches on; a flatten makes one attacker-known value satisfy every outstanding reset. Registered on the same library-behaviour grounds as verification.expires_at.",
+  },
+  {
+    table: "agents",
+    column: "runtime_config",
+    reason: "A second home for adapterConfig at modelProfiles.*.adapterConfig — guarded by the same mutation assertion as agents.adapter_config, and therefore carrying the same dangerouslySkipPermissions reach. Registering adapter_config alone would leave the bypass reachable through this column.",
+  },
+  {
+    table: "routines",
+    column: "status",
+    reason: "Dangerous value 'active': the trigger admission check requires it, and the mutation paths refuse only 'archived', so a flatten re-arms every archived routine and its inbound triggers.",
+  },
+  {
+    table: "routines",
+    column: "env",
+    reason: "Injected into the agent run environment and screened by assertLowTrustEnvConfigAllowed; a flatten transplants one routine's environment — credentials included — into every routine's runs. Same grounds as environments.env_vars.",
+  },
+  {
+    table: "projects",
+    column: "env",
+    reason: "The project-scoped half of the same run-environment injection, screened by the same low-trust env gate; a flatten crosses tenants because it writes every project row.",
+  },
+  {
+    table: "issues",
+    column: "execution_workspace_preference",
+    reason: "Dangerous value 'reuse_existing': resolves the run onto a previously-used execution workspace instead of a fresh one, carrying the prior run's on-disk residue — checked-out credentials, git remotes, installed dependencies — into the next issue. The project-level version of this decision (projects.execution_workspace_policy) is already registered; this is the same control one level down.",
+  },
+  {
+    table: "issues",
+    column: "execution_workspace_settings",
+    reason: "Its `mode` takes precedence over execution_workspace_preference in workspace resolution, so registering the preference alone would leave the higher-precedence input unguarded.",
+  },
 ] as const satisfies readonly (SecurityPostureColumn & RegisteredPostureColumn)[];
 
 const POSTURE_COLUMNS_BY_TABLE = new Map<string, Set<string>>();
@@ -502,3 +627,144 @@ export function assertSecurityPostureColumnsResolve(
     ].join("\n"),
   );
 }
+
+/** Shortest reason that can carry an argument rather than a shrug. */
+const MIN_REJECTION_REASON_LENGTH = 30;
+
+/**
+ * Fail when a schema column is classified in neither list.
+ *
+ * `assertSecurityPostureColumnsResolve` walks registry -> schema and catches
+ * deletions: an entry that stops resolving because its column was renamed or
+ * dropped. This walks schema -> classification and catches the opposite drift,
+ * additions: a column that exists and is named nowhere, so the rule does not
+ * check it and nothing says so.
+ *
+ * That direction is the one a human pass cannot hold. The sweep that grew the
+ * registry from 2 pairs to 53 missed four columns on its first read of the same
+ * schema it was sweeping, and found them only by diffing mechanically. A
+ * classification that only a re-sweep refreshes is one forgotten sweep from
+ * stale, and staleness here is silent — an unclassified column looks exactly
+ * like a safe one.
+ *
+ * So the contract is a total partition: every column is either a registered
+ * posture column or an explicitly reasoned rejection, and "absent" is not a
+ * third state. Six ways to violate it, all errors:
+ *
+ * 1. a schema column in neither list,
+ * 2. a rejection whose reason is missing or too short to be an argument,
+ * 3. a rejection that enumerates no columns — the whole-table default by
+ *    implication, which would re-open the gap for every column added later,
+ * 4. a rejection naming a table or column that is not in the schema, which is
+ *    the rejection-side twin of a rotted registry entry,
+ * 5. a pair claimed as both a control and not a control, and
+ * 6. either input being vacuously empty.
+ */
+export function assertSchemaColumnsClassified(
+  tables: Record<string, unknown> = schema,
+  registered: readonly SecurityPostureColumn[] = SECURITY_POSTURE_COLUMNS,
+  rejections: readonly SecurityPostureRejection[] = SECURITY_POSTURE_REJECTIONS,
+): void {
+  const index = buildSchemaColumnIndex(tables);
+  if (index.size === 0) {
+    throw new Error(
+      [
+        "Security-posture inventory could not be checked: no drizzle tables were found in the schema.",
+        "There would be nothing to classify, so this fails rather than passing vacuously.",
+      ].join("\n"),
+    );
+  }
+  if (rejections.length === 0) {
+    throw new Error(
+      [
+        "Security-posture rejection list is empty: every unregistered column would be unclassified.",
+        "An empty list cannot make the inventory total, and reporting success on it would mean the",
+        "check passes precisely when it covers nothing. Restore SECURITY_POSTURE_REJECTIONS.",
+      ].join("\n"),
+    );
+  }
+
+  const malformed: string[] = [];
+  const unresolved: string[] = [];
+  const rejected = new Map<string, string>();
+
+  for (const entry of rejections) {
+    const table = entry.table.toLowerCase();
+    if (entry.reason.trim().length < MIN_REJECTION_REASON_LENGTH) {
+      malformed.push(
+        `  ${entry.table} — reason is missing or shorter than ${MIN_REJECTION_REASON_LENGTH} characters`,
+      );
+    }
+    if (entry.columns.length === 0) {
+      malformed.push(
+        `  ${entry.table} — enumerates no columns; a table-level decision must list the columns it was made over`,
+      );
+    }
+
+    const schemaColumns = index.get(table);
+    for (const column of entry.columns) {
+      const normalized = column.toLowerCase();
+      if (!schemaColumns) {
+        unresolved.push(`  ${entry.table}.${column} — table "${entry.table}" is not in the schema`);
+      } else if (!schemaColumns.has(normalized)) {
+        unresolved.push(
+          `  ${entry.table}.${column} — no such column on "${entry.table}" (renamed or dropped?)`,
+        );
+      }
+      rejected.set(`${table}.${normalized}`, entry.reason);
+    }
+  }
+
+  const contradictory = registered
+    .filter((entry) => rejected.has(`${entry.table.toLowerCase()}.${entry.column.toLowerCase()}`))
+    .map(
+      (entry) =>
+        `  ${entry.table}.${entry.column} — registered as a control and rejected as not one`,
+    );
+
+  const unclassified: string[] = [];
+  const registeredKeys = new Set(
+    registered.map((entry) => `${entry.table.toLowerCase()}.${entry.column.toLowerCase()}`),
+  );
+  for (const [table, columns] of [...index].sort(([a], [b]) => a.localeCompare(b))) {
+    for (const column of [...columns].sort()) {
+      const key = `${table}.${column}`;
+      if (registeredKeys.has(key) || rejected.has(key)) continue;
+      unclassified.push(`  ${table}.${column}`);
+    }
+  }
+
+  const problems = [
+    ...(malformed.length > 0
+      ? [`${malformed.length} malformed rejection entry(s):`, ...malformed]
+      : []),
+    ...(unresolved.length > 0
+      ? [
+          `${unresolved.length} rejection(s) that no longer resolve against the schema:`,
+          ...unresolved,
+        ]
+      : []),
+    ...(contradictory.length > 0
+      ? [`${contradictory.length} contradictory classification(s):`, ...contradictory]
+      : []),
+    ...(unclassified.length > 0
+      ? [
+          `${unclassified.length} schema column(s) classified in neither list:`,
+          ...unclassified,
+        ]
+      : []),
+  ];
+  if (problems.length === 0) return;
+
+  throw new Error(
+    [
+      "Security-posture classification is not total.",
+      "Every schema column must be either a registered posture column in SECURITY_POSTURE_COLUMNS",
+      "or an explicitly reasoned entry in SECURITY_POSTURE_REJECTIONS. A column in neither is not",
+      "checked by the migration lint rule, and nothing else reports that — which is the same",
+      "absent-means-unprotected shape the rule exists to fix, one level up.",
+      ...problems,
+    ].join("\n"),
+  );
+}
+

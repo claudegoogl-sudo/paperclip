@@ -10,15 +10,30 @@ enforcement on every binding. Two registered pairs meant the rule's guarantee wa
 "the columns someone remembered to register" — absent means unchecked, the same
 fail-open shape the rule exists to fix. This sweep is the answer to that.
 
-**Scope of the claim, stated precisely.** The schema holds ~1,677 columns across
-118 tables. Every one was passed over, but only the candidates are written down:
-53 registered below and in the registry, and roughly 30 rejections recorded here
-because they are the ones a later reader would plausibly re-litigate. The
-remainder — timestamps, foreign keys, titles, bodies, counters — carry no
-recorded decision. So this is a sweep with an audit trail for the interesting
-part, not a per-column classification of all 1,677. Closing that difference is a
-separate mechanical check, tracked separately; until it lands, an unregistered
-column is still an unchecked one.
+**Scope of the claim, stated precisely.** The schema holds 1,677 columns across
+118 tables, and every one now carries a recorded decision: 76 registered in
+`SECURITY_POSTURE_COLUMNS` and 1,601 rejected with a reason in
+`SECURITY_POSTURE_REJECTIONS`. The two lists are a total partition, enforced by
+`assertSchemaColumnsClassified` — a column in neither fails the migration lint,
+so "absent" is no longer a third state a column can be in.
+
+That totality is what changed since this sweep first shipped. The original pass
+wrote down only the candidates: 53 registered and ~30 rejections argued in prose
+below, with the remainder — timestamps, foreign keys, titles, bodies, counters —
+carrying no recorded decision at all. Those prose tables are kept here as the
+*argument*; the machine-readable list is the artifact the lint reads. Where they
+disagree, the list wins.
+
+**The inventory found what the human pass did not.** Enumerating all 1,677
+columns to build the rejection list surfaced 23 further genuine controls that two
+prior reads of this same schema had missed — among them
+`routine_triggers.signing_mode`, whose `'none'` value disables signature
+verification on an inbound webhook entirely, and
+`project_workspaces.setup_command` / `.cleanup_command`, whose values the host
+executes as `sh -c`. Each was confirmed against an in-repo predicate before being
+registered; none was inferred from its name. This is the sweep's own thesis
+landing on the sweep: the direction that a human pass cannot hold is *additions*,
+because there is no prompt to re-read a table you already classified.
 
 ## What qualifies
 
@@ -103,19 +118,26 @@ privilege being granted.
 
 ## Known limits
 
-- **The registry is a snapshot.** A column added to the schema tomorrow is
-  unregistered, therefore unchecked. Nothing forces a re-sweep. This is the same
-  absent-means-unprotected shape the rule exists to fix, moved up one level; the
-  fix is a classified-inventory test that fails when a schema column appears in
-  neither the registry nor a rejection list. Tracked separately.
-- **A human pass misses things.** The first pass over this schema missed four
-  columns, all of the same shape: credential material whose *hash* is the
-  control. `cli_auth_challenges.pending_key_hash` is the sharpest — it is copied
-  verbatim into `board_api_keys.key_hash` when a challenge is approved, so it is
-  an operator-scope credential one join removed from a column that was already
-  registered. They were found by diffing the registry against the schema
-  mechanically rather than by re-reading the tables, which is the argument for
-  the classified-inventory test above.
+- **The rejections are a snapshot; the *inventory* is not.** A column added
+  tomorrow fails the lint until someone classifies it, so it cannot be silently
+  unchecked. What can still go stale is a rejection's *reason*: a column
+  rejected as "no runtime consumer" stays rejected after a consumer is added for
+  it, and nothing detects that. Rejections are falsifiable by construction —
+  each can be disproved by naming a consumer that reads the column as a
+  predicate — but falsifying one requires a human to look.
+- **Table-level reasons are table-level claims.** A block covering 30 columns
+  asserts "no column here is read as a predicate", not 30 separate analyses. The
+  columns are enumerated rather than implied precisely so that a column added to
+  such a table does not inherit a claim nobody made for it — but the strength of
+  the claim over the columns already listed is one argument, not many.
+- **A human pass misses things.** Two reads of this schema missed 27 columns
+  between them. The first pass missed four, all credential material whose *hash*
+  is the control — `cli_auth_challenges.pending_key_hash` is the sharpest, copied
+  verbatim into `board_api_keys.key_hash` on approval, so an operator-scope
+  credential one join from an already-registered column. Building the total
+  inventory then surfaced 23 more. Neither set was found by re-reading tables;
+  both came out of a mechanical diff against the schema. That is the whole
+  argument for the two resolvability checks.
 - **`session.expires_at`** and **`verification.expires_at`** are registered on
   library-behaviour grounds. Enforcement is inside `better-auth`, so the
   direction is not backed by an in-repo predicate.
@@ -126,13 +148,22 @@ privilege being granted.
 
 ## Result
 
-53 pairs registered across 28 tables, up from the 2-pair seed. Re-running the
-lint against all historical migrations surfaced **no new findings**, so nothing
-was baselined and no historical posture flatten needed escalating.
+76 pairs registered across 33 tables, up from the 2-pair seed, and 1,601 columns
+rejected with reasons — a total classification of the schema. Re-running the lint
+against all historical migrations surfaced **no new findings**, so nothing was
+baselined and no historical posture flatten needed escalating.
 
 Zero new findings is also what a completely broken registry produces, so it is
-not evidence on its own. The registry is proved live two ways: every pair is
+not evidence on its own. The registry is proved live four ways: every pair is
 asserted to resolve against the schema and to be reachable by the rule
-(`security-posture registry coverage` in `check-migration-safety.test.ts`), and
-a planted unqualified write to a newly registered column was confirmed to fail
-the lint at exit 1.
+(`security-posture registry coverage`), every pair is asserted still to name a
+live schema column (`assertSecurityPostureColumnsResolve`, catching renames and
+drops), every schema column is asserted to be classified somewhere
+(`assertSchemaColumnsClassified`, catching additions), and a planted unqualified
+write to a newly registered column was confirmed to fail the lint at exit 1.
+
+The last of those was proved the same way: adding a fabricated
+`project_workspaces.skip_egress_checks` column to the drizzle schema and
+confirming `check:migrations` exits 1 naming that exact pair. All three
+assertions run inside `runMigrationSafetyCheck`, so they share the single CI step
+the rest of the lint already occupies rather than needing a new one.
