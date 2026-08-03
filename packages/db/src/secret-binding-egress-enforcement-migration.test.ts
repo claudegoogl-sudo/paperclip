@@ -123,6 +123,15 @@ describeEmbeddedPostgres("secret binding egress enforcement migration (0138) con
         // Recreate the pre-0138 shape so the migration takes its first-install
         // branch: the column must be absent BEFORE the rows exist, otherwise
         // this test would not exercise the rollout path at all.
+        //
+        // 0144's posture-audit trigger has to go first. It is a later migration
+        // than 0138, so the pre-0138 shape never had it, and DROP COLUMN cannot
+        // cascade it away: a plpgsql function body is not a tracked dependency.
+        // Left installed, plpgsql resolves NEW."egress_allowlist_enforced" on
+        // every write and the seed insert fails with 42703.
+        await sql.unsafe(
+          `DROP TRIGGER IF EXISTS "company_secret_binding_posture_audit_trg" ON "company_secret_bindings"`,
+        );
         await sql.unsafe(
           `ALTER TABLE "company_secret_bindings" DROP COLUMN "egress_allowlist_enforced", DROP COLUMN "allowed_egress"`,
         );
