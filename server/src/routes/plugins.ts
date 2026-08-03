@@ -94,7 +94,6 @@ import {
   setStoredLocalFolder,
 } from "../services/plugin-local-folders.js";
 import { badRequest, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
-import { logger } from "../middleware/logger.js";
 
 /** UI slot declaration extracted from plugin manifest */
 type PluginUiSlotDeclaration = NonNullable<NonNullable<PaperclipPluginManifestV1["ui"]>["slots"]>[number];
