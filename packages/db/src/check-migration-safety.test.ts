@@ -530,11 +530,21 @@ describe("unqualified mutation of a security-posture column", () => {
     expect(finding?.statement).toContain('UPDATE "company_secret_bindings"');
   });
 
-  it("does not lean on the drizzle journal: 0138 says it runs once, and it did not", () => {
-    // 0138's header asserts "The UPDATE runs once (drizzle journal-gated)". The
-    // re-run that flattened the flag disproved it, so the rule must fire on the
-    // statement regardless of what the migration claims about its own execution.
-    expect(migration0138).toContain("drizzle journal-gated");
+  it("does not lean on a migration's own claim that its write runs once", () => {
+    // 0138's header used to assert "The UPDATE runs once (drizzle journal-gated)"
+    // and the re-run that flattened the flag disproved it. That header has since
+    // been rewritten, so the claim is pinned here as a fixture rather than read
+    // off 0138: the property under test is that the rule scores the statement,
+    // never the migration's narration of its own execution. Asserting on 0138's
+    // prose coupled this test to a comment and broke it when the prose was fixed.
+    const claimsRunOnce = `
+      -- The UPDATE runs once (drizzle journal-gated); new rows are untouched.
+      UPDATE "company_secret_bindings" SET "egress_allowlist_enforced" = false;
+    `;
+    expect(postureFindings(claimsRunOnce)).toHaveLength(1);
+
+    // The live file still has to produce exactly one finding, whatever its header
+    // says today -- that is the half of the old assertion worth keeping.
     expect(postureFindings(migration0138)).toHaveLength(1);
   });
 
