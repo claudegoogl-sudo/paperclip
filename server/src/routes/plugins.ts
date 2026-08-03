@@ -47,6 +47,11 @@ import {
 } from "@paperclipai/shared";
 import { pluginRegistryService } from "../services/plugin-registry.js";
 import { pluginLifecycleManager } from "../services/plugin-lifecycle.js";
+import {
+  defaultPluginWebhookRateLimiter,
+  type PluginWebhookRateLimiter,
+} from "../services/plugin-webhook-rate-limit.js";
+import { logger } from "../middleware/logger.js";
 import type { PluginWatchReconciler } from "../services/plugin-dev-watcher.js";
 import {
   getPluginUiContributionMetadata,
@@ -394,6 +399,12 @@ export interface PluginRouteJobDeps {
 export interface PluginRouteWebhookDeps {
   /** The worker manager for dispatching handleWebhook RPC calls. */
   workerManager: PluginWorkerManager;
+  /**
+   * Override the sliding-window limiter guarding the anonymous ingestion route.
+   * Tests inject a limiter with a small window/cap and a fake clock; production
+   * uses the process-wide default so the budget survives a worker restart.
+   */
+  rateLimiter?: PluginWebhookRateLimiter;
 }
 
 /**
@@ -2612,12 +2623,17 @@ export function pluginRoutes(
    *
    * **Note:** This route does NOT require board authentication — webhook
    * endpoints must be publicly accessible for external callers. Signature
-   * verification is the plugin's responsibility.
+   * verification is the plugin's responsibility. Because it is anonymous, it is
+   * guarded by a sliding-window limiter (see plugin-webhook-rate-limit.ts) and a
+   * tighter JSON body cap than the rest of the API (see app.ts).
    *
    * Response: `{ deliveryId: string, status: string }`
    * Errors:
    * - 404 if plugin not found or endpointKey not declared
    * - 400 if plugin is not in ready state or lacks webhooks.receive capability
+   * - 413 if the body exceeds `WEBHOOK_JSON_BODY_LIMIT` (rejected by the parser)
+   * - 429 if the limiter rejects the delivery; carries `Retry-After` and writes
+   *   no delivery row
    * - 502 if the worker is unavailable or the RPC call fails
    */
   router.post("/plugins/:pluginId/webhooks/:endpointKey", async (req, res) => {
@@ -2670,7 +2686,44 @@ export function pluginRoutes(
       return;
     }
 
-    // Step 5: Extract request data
+    // Step 5: Rate-limit before any write.
+    //
+    // Deliberately placed *after* steps 1-4: the bucket key is then the
+    // canonical plugin row id plus a manifest-declared endpoint key, so an
+    // anonymous caller cannot grow the limiter's key space with made-up ids,
+    // and cannot split a plugin's budget by alternating between its uuid and
+    // its key in the URL. Everything expensive — the delivery row insert and
+    // the handleWebhook RPC — is still downstream of this gate.
+    const rateLimit = (webhookDeps.rateLimiter ?? defaultPluginWebhookRateLimiter).consume({
+      pluginId: plugin.id,
+      endpointKey,
+      ip: req.ip,
+    });
+    if (!rateLimit.allowed) {
+      // No payload: the body is attacker-controlled and may carry provider
+      // secrets. The identifiers below are what distinguishes "attack blocked"
+      // from "we are 429ing a real provider".
+      logger.warn(
+        {
+          pluginId: plugin.id,
+          pluginKey: plugin.pluginKey,
+          endpointKey,
+          scope: rateLimit.scope,
+          limit: rateLimit.limit,
+          retryAfterSeconds: rateLimit.retryAfterSeconds,
+        },
+        "plugin webhook ingestion rate-limited; delivery rejected before insert",
+      );
+      res.status(429)
+        .set("Retry-After", String(rateLimit.retryAfterSeconds))
+        .json({
+          error: "Too many webhook deliveries for this endpoint",
+          retryAfterSeconds: rateLimit.retryAfterSeconds,
+        });
+      return;
+    }
+
+    // Step 6: Extract request data
     const requestId = randomUUID();
     const rawHeaders: Record<string, string> = {};
     for (const [key, value] of Object.entries(req.headers)) {
@@ -2689,7 +2742,7 @@ export function pluginRoutes(
     const parsedBody = req.body as unknown;
     const payload = (req.body as Record<string, unknown> | undefined) ?? {};
 
-    // Step 6: Record the delivery in the database
+    // Step 7: Record the delivery in the database
     const startedAt = new Date();
     const [delivery] = await db
       .insert(pluginWebhookDeliveries)
@@ -2703,7 +2756,7 @@ export function pluginRoutes(
       })
       .returning({ id: pluginWebhookDeliveries.id });
 
-    // Step 7: Dispatch to the worker via handleWebhook RPC
+    // Step 8: Dispatch to the worker via handleWebhook RPC
     try {
       await webhookDeps.workerManager.call(plugin.id, "handleWebhook", {
         endpointKey,
@@ -2713,7 +2766,7 @@ export function pluginRoutes(
         requestId,
       });
 
-      // Step 8: Update delivery record to success
+      // Step 9: Update delivery record to success
       const finishedAt = new Date();
       const durationMs = finishedAt.getTime() - startedAt.getTime();
       await db
@@ -2730,7 +2783,7 @@ export function pluginRoutes(
         status: "success",
       });
     } catch (err) {
-      // Step 8 (error): Update delivery record to failed
+      // Step 9 (error): Update delivery record to failed
       const finishedAt = new Date();
       const durationMs = finishedAt.getTime() - startedAt.getTime();
       const errorMessage = err instanceof Error ? err.message : String(err);
