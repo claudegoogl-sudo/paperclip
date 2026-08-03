@@ -8568,7 +8568,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     type ScheduledRetryTransactionResult =
       | {
           outcome: "scheduled";
-          run: typeof heartbeatRuns.$inferSelect;
+          // Widened (not the full row type) because the reused-existing branch
+          // projects a trimmed column set -- see existingContinuation below.
+          run: Pick<
+            typeof heartbeatRuns.$inferSelect,
+            "id" | "status" | "agentId" | "wakeupRequestId" | "scheduledRetryAt" | "scheduledRetryAttempt"
+          >;
           reusedExisting: boolean;
         }
       | {
@@ -8597,8 +8602,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         }
 
+        // Trimmed: contextSnapshot/resultJson are never read from `existingContinuation`
+        // or its downstream aliases (retryRun / scheduleResult.run) -- both internal
+        // callers (scheduleBoundedRetryForRun's two call sites) discard the return
+        // value, and the only field consumers read are id/status/agentId/
+        // wakeupRequestId/scheduledRetry*.
         const existingContinuation = await tx
-          .select()
+          .select({
+            id: heartbeatRuns.id,
+            status: heartbeatRuns.status,
+            agentId: heartbeatRuns.agentId,
+            wakeupRequestId: heartbeatRuns.wakeupRequestId,
+            scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+            scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+          })
           .from(heartbeatRuns)
           .where(
             and(
@@ -8913,7 +8930,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (statuses.length === 0) return null;
     return db
       .select({
-        run: heartbeatRuns,
+        // Trimmed: resultJson is never read by summarizeIssueScheduledRetryRun or
+        // retryScheduledRetryNow's callers of this query. contextSnapshot
+        // is kept -- retryScheduledRetryNow reads it to build the retry-now payload.
+        run: {
+          id: heartbeatRuns.id,
+          status: heartbeatRuns.status,
+          agentId: heartbeatRuns.agentId,
+          retryOfRunId: heartbeatRuns.retryOfRunId,
+          scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+          scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+          scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+          error: heartbeatRuns.error,
+          errorCode: heartbeatRuns.errorCode,
+          contextSnapshot: heartbeatRuns.contextSnapshot,
+        },
         agentName: agents.name,
       })
       .from(heartbeatRuns)
@@ -8932,7 +8963,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   function summarizeIssueScheduledRetryRun(
-    row: { run: typeof heartbeatRuns.$inferSelect; agentName: string | null },
+    row: {
+      run: Pick<
+        typeof heartbeatRuns.$inferSelect,
+        | "id"
+        | "status"
+        | "agentId"
+        | "retryOfRunId"
+        | "scheduledRetryAt"
+        | "scheduledRetryAttempt"
+        | "scheduledRetryReason"
+        | "error"
+        | "errorCode"
+      >;
+      agentName: string | null;
+    },
   ) {
     return {
       runId: row.run.id,
@@ -12910,8 +12955,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
 
       while (true) {
+        // Trimmed: only these fields are read from `deferred` below.
         const deferred = await tx
-          .select()
+          .select({
+            id: agentWakeupRequests.id,
+            agentId: agentWakeupRequests.agentId,
+            payload: agentWakeupRequests.payload,
+            requestedByActorType: agentWakeupRequests.requestedByActorType,
+            requestedByActorId: agentWakeupRequests.requestedByActorId,
+            reason: agentWakeupRequests.reason,
+            source: agentWakeupRequests.source,
+            triggerDetail: agentWakeupRequests.triggerDetail,
+          })
           .from(agentWakeupRequests)
           .where(
             and(
@@ -14148,8 +14203,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot,
             };
 
+            // Trimmed: only id/payload/coalescedCount are read from `existingDeferred`
+            // below.
             const existingDeferred = await tx
-              .select()
+              .select({
+                id: agentWakeupRequests.id,
+                payload: agentWakeupRequests.payload,
+                coalescedCount: agentWakeupRequests.coalescedCount,
+              })
               .from(agentWakeupRequests)
               .where(
                 and(
