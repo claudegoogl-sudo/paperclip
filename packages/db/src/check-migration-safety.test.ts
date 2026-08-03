@@ -1,8 +1,12 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   analyzeMigrationSafety,
+  assertSecurityBaselineReasons,
   type MigrationSafetyInput,
 } from "./check-migration-safety.js";
+import { MIGRATION_SAFETY_BASELINE } from "./migration-safety-baseline.js";
+import { SECURITY_POSTURE_COLUMNS } from "./security-posture-columns.js";
 import {
   TABLE_SIZE_ESTIMATE_FACTOR,
   TABLE_SIZE_BUCKET_THRESHOLDS,
@@ -489,4 +493,271 @@ describe("migration safety check", () => {
 
     expect(result.newFindings).toEqual([]);
   });
+});
+
+const POSTURE_RULE = "unqualified-mutation-security-posture-column";
+const MIGRATION_0138 = "0138_secret_binding_egress_allowlist.sql";
+
+function postureFindings(sql: string) {
+  return analyze(sql).newFindings.filter((finding) => finding.rule === POSTURE_RULE);
+}
+
+describe("unqualified mutation of a security-posture column", () => {
+  // The regression test that matters: the real historical statement, read off
+  // disk, not a synthetic reconstruction of it.
+  const migration0138 = readFileSync(
+    new URL(`./migrations/${MIGRATION_0138}`, import.meta.url),
+    "utf8",
+  );
+
+  it("fires as an error on the real 0138 text that flattened every binding", () => {
+    const result = analyzeMigrationSafety([{ fileName: MIGRATION_0138, sql: migration0138 }], {
+      baselineIds: [],
+      estimates: testEstimates,
+    });
+
+    const finding = result.newFindings.find((entry) => entry.rule === POSTURE_RULE);
+    expect(finding).toBeDefined();
+    expect(finding?.severity).toBe("error");
+    expect(finding?.table).toBe("company_secret_bindings");
+    expect(finding?.message).toContain("egress_allowlist_enforced");
+    expect(finding?.statement).toContain('UPDATE "company_secret_bindings"');
+  });
+
+  it("does not lean on the drizzle journal: 0138 says it runs once, and it did not", () => {
+    // 0138's header asserts "The UPDATE runs once (drizzle journal-gated)". The
+    // re-run that flattened the flag disproved it, so the rule must fire on the
+    // statement regardless of what the migration claims about its own execution.
+    expect(migration0138).toContain("drizzle journal-gated");
+    expect(postureFindings(migration0138)).toHaveLength(1);
+  });
+
+  it("keeps 0138 green in CI through a baseline entry that states a reason", () => {
+    const result = analyzeMigrationSafety([{ fileName: MIGRATION_0138, sql: migration0138 }], {
+      estimates: testEstimates,
+    });
+    expect(result.newFindings).toEqual([]);
+    expect(result.baselineFindings.map((entry) => entry.rule)).toContain(POSTURE_RULE);
+
+    const entry = MIGRATION_SAFETY_BASELINE.find((candidate) => candidate.rule === POSTURE_RULE);
+    expect(entry?.migration).toBe(MIGRATION_0138);
+    expect(entry?.reason.trim().length).toBeGreaterThan(20);
+  });
+
+  it("rejects a baseline that silences a security rule without a reason", () => {
+    expect(() => assertSecurityBaselineReasons()).not.toThrow();
+    expect(() =>
+      assertSecurityBaselineReasons([
+        { id: "deadbeefdeadbeef", rule: POSTURE_RULE, reason: "   " },
+      ]),
+    ).toThrow(/no reason/);
+  });
+
+  it("ignores row count: the registry, not the size bucket, decides", () => {
+    // company_secret_bindings is absent from TABLE_SIZE_ESTIMATES and holds four
+    // rows, so every size-gated rule skips it. This rule must not.
+    const findings = postureFindings(
+      `UPDATE "company_secret_bindings" SET "egress_allowlist_enforced" = false;`,
+    );
+    expect(findings).toHaveLength(1);
+    expect(analyze(`UPDATE "company_secret_bindings" SET "egress_allowlist_enforced" = false;`)
+      .newFindings.map((entry) => entry.rule))
+      .toEqual([POSTURE_RULE]);
+  });
+
+  it("stays silent on a genuinely selective write", () => {
+    expect(
+      postureFindings(`
+        UPDATE "company_secret_bindings"
+        SET "egress_allowlist_enforced" = false
+        WHERE "company_id" = '00000000-0000-0000-0000-000000000000';
+      `),
+    ).toEqual([]);
+  });
+
+  it("stays silent on a non-registered column of a registered table", () => {
+    expect(
+      postureFindings(`UPDATE "company_secret_bindings" SET "updated_at" = now();`),
+    ).toEqual([]);
+  });
+
+  it("treats WHERE true and WHERE 1=1 as unqualified", () => {
+    expect(
+      postureFindings(
+        `UPDATE "company_secret_bindings" SET "egress_allowlist_enforced" = false WHERE true;`,
+      ),
+    ).toHaveLength(1);
+    expect(
+      postureFindings(
+        `UPDATE "company_secret_bindings" SET "allowed_egress" = '{}' WHERE 1 = 1;`,
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("requires the rule to be named: the `all` wildcard does not silence it", () => {
+    const sql = `
+      -- paperclip:migration-safety-ignore all: perf reviewed, four-row table
+      UPDATE "company_secret_bindings" SET "egress_allowlist_enforced" = false;
+    `;
+    expect(postureFindings(sql)).toHaveLength(1);
+  });
+
+  it("honors a per-statement opt-out that names the rule and gives a reason", () => {
+    const sql = `
+      -- paperclip:migration-safety-ignore unqualified-mutation-security-posture-column: one-time arming backfill, reviewed and approved
+      UPDATE "company_secret_bindings" SET "egress_allowlist_enforced" = true;
+    `;
+    expect(postureFindings(sql)).toEqual([]);
+  });
+
+  it("flags an unqualified DELETE and TRUNCATE against a posture table", () => {
+    expect(postureFindings(`DELETE FROM "company_secret_bindings";`)).toHaveLength(1);
+    expect(postureFindings(`TRUNCATE TABLE "company_secret_bindings" CASCADE;`)).toHaveLength(1);
+    expect(postureFindings(`TRUNCATE ONLY public."company_secret_bindings" RESTART IDENTITY;`))
+      .toHaveLength(1);
+    expect(postureFindings(`TRUNCATE "companies", "company_secret_bindings";`)).toHaveLength(1);
+    expect(
+      postureFindings(
+        `DELETE FROM "company_secret_bindings" WHERE "id" = '00000000-0000-0000-0000-000000000000';`,
+      ),
+    ).toEqual([]);
+  });
+
+  it("reports every registered posture column a DELETE takes with the row", () => {
+    const [finding] = postureFindings(`DELETE FROM "company_secret_bindings";`);
+    for (const entry of SECURITY_POSTURE_COLUMNS) {
+      expect(finding?.message).toContain(entry.column);
+    }
+  });
+});
+
+// A lint gate is only as good as the statement shapes its
+// parser reaches: an unparsed line means no rule runs, and the resulting green
+// check is false evidence. Every shape below is asserted in both directions —
+// unqualified must fire, selective must stay silent — so a parser regression
+// that stops reaching a shape fails the first half rather than passing silently.
+describe("unqualified-mutation-security-posture-column parse-miss probe", () => {
+  const unqualified: readonly (readonly [string, string])[] = [
+    [
+      "UPDATE ... FROM ... whose WHERE only constrains the joined table",
+      `UPDATE "company_secret_bindings"
+       SET "allowed_egress" = '{}'
+       FROM "companies" c
+       WHERE c."id" IS NOT NULL;`,
+    ],
+    [
+      "WITH x AS (...) UPDATE ...",
+      `WITH stale AS (SELECT "id" FROM "company_secret_bindings" WHERE "created_at" < now())
+       UPDATE "company_secret_bindings" SET "egress_allowlist_enforced" = false;`,
+    ],
+    [
+      "DELETE inside a CTE, with the outer statement carrying the only WHERE",
+      `WITH removed AS (DELETE FROM "company_secret_bindings" RETURNING "id")
+       SELECT "id" FROM removed WHERE "id" IS NOT NULL;`,
+    ],
+    [
+      "UPDATE inside a DO $$ ... $$ block",
+      `DO $$
+       BEGIN
+         UPDATE "company_secret_bindings" SET "egress_allowlist_enforced" = false;
+       END $$;`,
+    ],
+    [
+      "DO block where a LATER statement is the one carrying a WHERE",
+      `DO $$
+       BEGIN
+         UPDATE "company_secret_bindings" SET "egress_allowlist_enforced" = false;
+         UPDATE "company_secret_bindings" SET "allowed_egress" = '{}'
+           WHERE "id" = '00000000-0000-0000-0000-000000000000';
+       END $$;`,
+    ],
+    [
+      "bare `;` split inside one --> statement-breakpoint segment",
+      `ALTER TABLE "company_secret_bindings" ADD COLUMN IF NOT EXISTS "probe" boolean;--> statement-breakpoint
+       UPDATE "company_secret_bindings" SET "egress_allowlist_enforced" = false;
+       UPDATE "company_secret_bindings" SET "allowed_egress" = '{}'
+         WHERE "id" = '00000000-0000-0000-0000-000000000000';`,
+    ],
+    [
+      "statement isolated by --> statement-breakpoint",
+      `ALTER TABLE "company_secret_bindings" ADD COLUMN IF NOT EXISTS "probe" boolean;--> statement-breakpoint
+       UPDATE "company_secret_bindings" SET "egress_allowlist_enforced" = false;`,
+    ],
+    [
+      "schema-qualified and quoted",
+      `UPDATE public."company_secret_bindings" SET "egress_allowlist_enforced" = false;`,
+    ],
+    [
+      "schema-qualified with a non-public schema",
+      `UPDATE "app"."company_secret_bindings" SET "egress_allowlist_enforced" = false;`,
+    ],
+    [
+      "fully unquoted and mixed case",
+      `UPDATE Public.Company_Secret_Bindings SET Egress_Allowlist_Enforced = FALSE;`,
+    ],
+    [
+      "UPDATE ONLY",
+      `UPDATE ONLY "company_secret_bindings" SET "egress_allowlist_enforced" = false;`,
+    ],
+    [
+      "aliased target",
+      `UPDATE "company_secret_bindings" AS b SET "egress_allowlist_enforced" = false;`,
+    ],
+    [
+      "multi-column SET (a, b) = (...)",
+      `UPDATE "company_secret_bindings"
+       SET ("allowed_egress", "egress_allowlist_enforced") = ('{}', false);`,
+    ],
+    [
+      "posture column assigned alongside a non-posture column",
+      `UPDATE "company_secret_bindings"
+       SET "updated_at" = now(), "egress_allowlist_enforced" = false;`,
+    ],
+  ];
+
+  for (const [shape, sql] of unqualified) {
+    it(`reaches and flags: ${shape}`, () => {
+      expect(postureFindings(sql).length).toBeGreaterThan(0);
+    });
+  }
+
+  const selective: readonly (readonly [string, string])[] = [
+    [
+      "UPDATE ... FROM ... joined back to the target",
+      `UPDATE "company_secret_bindings" b
+       SET "allowed_egress" = '{}'
+       FROM "companies" c
+       WHERE c."id" = b."company_id";`,
+    ],
+    [
+      "WITH x AS (...) UPDATE ... WHERE id IN (x)",
+      `WITH stale AS (SELECT "id" FROM "company_secret_bindings" WHERE "created_at" < now())
+       UPDATE "company_secret_bindings" SET "egress_allowlist_enforced" = false
+       WHERE "id" IN (SELECT "id" FROM stale);`,
+    ],
+    [
+      "UPDATE inside a DO $$ ... $$ block with its own WHERE",
+      `DO $$
+       BEGIN
+         UPDATE "company_secret_bindings" SET "egress_allowlist_enforced" = false
+           WHERE "company_id" = '00000000-0000-0000-0000-000000000000';
+       END $$;`,
+    ],
+    [
+      "sub-select in SET does not leak the sub-select's FROM table",
+      `UPDATE "company_secret_bindings"
+       SET "allowed_egress" = (SELECT "hosts" FROM "companies" WHERE "id" = "company_id")
+       WHERE "id" = '00000000-0000-0000-0000-000000000000';`,
+    ],
+    [
+      "unrelated table with an identically named column",
+      `UPDATE "some_other_table" SET "egress_allowlist_enforced" = false;`,
+    ],
+  ];
+
+  for (const [shape, sql] of selective) {
+    it(`reaches and clears: ${shape}`, () => {
+      expect(postureFindings(sql)).toEqual([]);
+    });
+  }
 });
