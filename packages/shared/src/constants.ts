@@ -769,6 +769,25 @@ export const WAKEUP_REQUEST_STATUSES = [
 ] as const;
 export type WakeupRequestStatus = (typeof WAKEUP_REQUEST_STATUSES)[number];
 
+/**
+ * Wakeup statuses that will never transition again.
+ *
+ * `deferred_issue_execution` is deliberately excluded: the request is parked for
+ * a later execution attempt, so it stays live no matter how old it gets.
+ */
+export const TERMINAL_WAKEUP_REQUEST_STATUSES = [
+  "coalesced",
+  "skipped",
+  "completed",
+  "failed",
+  "cancelled",
+] as const;
+export type TerminalWakeupRequestStatus = (typeof TERMINAL_WAKEUP_REQUEST_STATUSES)[number];
+
+export function isTerminalWakeupRequestStatus(status: string | null | undefined): boolean {
+  return TERMINAL_WAKEUP_REQUEST_STATUSES.includes(status as TerminalWakeupRequestStatus);
+}
+
 export const HEARTBEAT_RUN_STATUSES = [
   "queued",
   "scheduled_retry",

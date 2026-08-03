@@ -31,6 +31,11 @@ import {
 } from "@paperclipai/db";
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
+import {
+  RUN_HISTORY_PRUNE_BATCH_SIZE,
+  RUN_HISTORY_PRUNE_MAX_BATCHES,
+  startRunHistoryRetention,
+} from "./services/run-history-retention.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
 import { setupEnvironmentCustomImageTerminalWebSocketServer } from "./realtime/environment-custom-image-terminal-ws.js";
@@ -1038,6 +1043,23 @@ export async function startServer(): Promise<StartedServer> {
         // runServerDatabaseBackup already logs the failure with context.
       });
     }, backupIntervalMs);
+  }
+
+  if (config.runHistoryRetentionEnabled) {
+    logger.info(
+      {
+        retentionDays: config.runHistoryRetentionDays,
+        intervalMinutes: config.runHistoryRetentionIntervalMinutes,
+        batchSize: RUN_HISTORY_PRUNE_BATCH_SIZE,
+        maxBatchesPerTick: RUN_HISTORY_PRUNE_MAX_BATCHES,
+      },
+      "Run history retention enabled",
+    );
+    startRunHistoryRetention(
+      db,
+      config.runHistoryRetentionIntervalMinutes * 60 * 1000,
+      config.runHistoryRetentionDays,
+    );
   }
 
   // Wait for external adapters to finish loading before accepting requests.
