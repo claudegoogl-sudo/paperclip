@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { getTableColumns, getTableName } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import {
   analyzeMigrationSafety,
@@ -6,7 +7,8 @@ import {
   type MigrationSafetyInput,
 } from "./check-migration-safety.js";
 import { MIGRATION_SAFETY_BASELINE } from "./migration-safety-baseline.js";
-import { SECURITY_POSTURE_COLUMNS } from "./security-posture-columns.js";
+import * as schema from "./schema/index.js";
+import { SECURITY_POSTURE_COLUMNS, postureColumnsForTable } from "./security-posture-columns.js";
 import {
   TABLE_SIZE_ESTIMATE_FACTOR,
   TABLE_SIZE_BUCKET_THRESHOLDS,
@@ -653,7 +655,14 @@ describe("unqualified mutation of a security-posture column", () => {
     expect(postureFindings(`TRUNCATE TABLE "company_secret_bindings" CASCADE;`)).toHaveLength(1);
     expect(postureFindings(`TRUNCATE ONLY public."company_secret_bindings" RESTART IDENTITY;`))
       .toHaveLength(1);
-    expect(postureFindings(`TRUNCATE "companies", "company_secret_bindings";`)).toHaveLength(1);
+    // Both named tables are registered since the PLA-2159 sweep, so the
+    // multi-table form must report one finding per table rather than
+    // collapsing to the first match.
+    expect(
+      postureFindings(`TRUNCATE "companies", "company_secret_bindings";`)
+        .map((finding) => finding.table)
+        .sort(),
+    ).toEqual(["companies", "company_secret_bindings"]);
     expect(
       postureFindings(
         `DELETE FROM "company_secret_bindings" WHERE "id" = '00000000-0000-0000-0000-000000000000';`,
@@ -663,9 +672,14 @@ describe("unqualified mutation of a security-posture column", () => {
 
   it("reports every registered posture column a DELETE takes with the row", () => {
     const [finding] = postureFindings(`DELETE FROM "company_secret_bindings";`);
-    for (const entry of SECURITY_POSTURE_COLUMNS) {
-      expect(finding?.message).toContain(entry.column);
+    const columns = postureColumnsForTable("company_secret_bindings");
+    expect(columns.length).toBeGreaterThan(0);
+    for (const column of columns) {
+      expect(finding?.message).toContain(column);
     }
+    // Scoped to the deleted table: posture columns registered elsewhere must
+    // not be attributed to this row.
+    expect(finding?.message).not.toContain("membership_role");
   });
 });
 
@@ -798,4 +812,61 @@ describe("unqualified-mutation-security-posture-column parse-miss probe", () => 
       expect(postureFindings(sql)).toEqual([]);
     });
   }
+});
+
+describe("security-posture registry coverage (PLA-2159)", () => {
+  const schemaColumns = (() => {
+    const byTable = new Map<string, Set<string>>();
+    for (const value of Object.values(schema as Record<string, unknown>)) {
+      let table: string;
+      let columns: Record<string, { name: string }>;
+      try {
+        table = getTableName(value as never);
+        columns = getTableColumns(value as never) as Record<string, { name: string }>;
+      } catch {
+        continue;
+      }
+      if (!table || !columns) continue;
+      byTable.set(table, new Set(Object.values(columns).map((column) => column.name)));
+    }
+    return byTable;
+  })();
+
+  it("discovers the schema it is about to validate against", () => {
+    // Guards the two tests below from passing vacuously on an empty map.
+    expect(schemaColumns.size).toBeGreaterThan(100);
+    expect(schemaColumns.get("company_secret_bindings")).toContain("egress_allowlist_enforced");
+  });
+
+  it.each(SECURITY_POSTURE_COLUMNS.map((entry) => [`${entry.table}.${entry.column}`, entry] as const))(
+    "%s names a real schema column",
+    (_label, entry) => {
+      // A typo here does not fail loudly — it silently un-registers the column
+      // and the rule goes back to fail-open on it, which is the exact shape
+      // this registry exists to prevent.
+      expect(schemaColumns.get(entry.table)).toBeDefined();
+      expect(schemaColumns.get(entry.table)).toContain(entry.column);
+    },
+  );
+
+  it.each(SECURITY_POSTURE_COLUMNS.map((entry) => [`${entry.table}.${entry.column}`, entry] as const))(
+    "%s is reachable by the rule",
+    (_label, entry) => {
+      expect(postureFindings(`UPDATE "${entry.table}" SET "${entry.column}" = NULL;`)).toHaveLength(1);
+    },
+  );
+
+  it("stays registry-driven: an unregistered column on a registered table does not fire", () => {
+    expect(schemaColumns.get("issues")).toContain("title");
+    expect(postureFindings(`UPDATE "issues" SET "title" = '';`)).toEqual([]);
+  });
+
+  it("states the dangerous direction in every reason", () => {
+    // The checker enforces that a reason is non-empty; it cannot judge quality.
+    // The sweep's contract is that a reviewer can see *which* value is the
+    // permissive one without re-deriving it, so hold the reasons to that.
+    for (const entry of SECURITY_POSTURE_COLUMNS) {
+      expect(entry.reason.trim().length, `${entry.table}.${entry.column}`).toBeGreaterThan(40);
+    }
+  });
 });
