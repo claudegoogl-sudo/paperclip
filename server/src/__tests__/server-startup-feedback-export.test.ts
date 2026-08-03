@@ -290,11 +290,15 @@ describe("startServer feedback export wiring", () => {
       suppressed: true,
       reason: "worktree_instance",
     });
-    let intervalCallback: (() => void) | null = null;
+    // startServer registers more than one interval. Select the scheduler tick by
+    // its configured period instead of keeping only the last registration, or any
+    // unrelated interval registered after it silently replaces the callback under
+    // test and every assertion below stops testing anything.
+    const registeredIntervals: { callback: () => void; ms: number }[] = [];
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
-      .mockImplementation(((callback: () => void) => {
-        intervalCallback = callback;
+      .mockImplementation(((callback: () => void, ms: number) => {
+        registeredIntervals.push({ callback, ms });
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
 
@@ -305,8 +309,9 @@ describe("startServer feedback export wiring", () => {
       expect(heartbeatServiceMock.tickTimers).not.toHaveBeenCalled();
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).toHaveBeenCalledTimes(1);
 
-      expect(intervalCallback).not.toBeNull();
-      intervalCallback?.();
+      const schedulerTicks = registeredIntervals.filter((entry) => entry.ms === 30000);
+      expect(schedulerTicks).toHaveLength(1);
+      schedulerTicks[0]?.callback();
       await Promise.resolve();
       await Promise.resolve();
 
