@@ -1,0 +1,21 @@
+-- Records the acting credential's provenance on every activity_log row so an
+-- operator dashboard click (source = session) can be told apart, after the fact,
+-- from an agent presenting the operator's board API key out of
+-- ~/.paperclip/auth.json (source = board_key). Before this, activity_log carried
+-- no auth source and no credential id, so the two logged identically once the
+-- caller omitted the X-Paperclip-Run-Id header.
+--
+-- actor_source is the resolved credential class from actorMiddleware
+-- (session | board_key | agent_key | agent_jwt | local_implicit | cloud_tenant | none).
+-- actor_key_id is the board API key id (a UUID) when the write was authenticated
+-- by a board key; NULL otherwise. The token value itself is never stored.
+--
+-- Both columns are nullable with no default, so ADD COLUMN is a metadata-only
+-- change (no table rewrite, no long lock) even on the ~1.1M-row activity_log.
+-- Existing rows keep NULL provenance and stay unattributable by design: this is
+-- NOT a retroactive backfill. Guessing provenance for the ~6,695 pre-existing
+-- null-run_id operator rows would poison the one trustworthy signal being created.
+--
+-- Idempotent: IF NOT EXISTS means re-running this file creates nothing new.
+ALTER TABLE "activity_log" ADD COLUMN IF NOT EXISTS "actor_source" text;--> statement-breakpoint
+ALTER TABLE "activity_log" ADD COLUMN IF NOT EXISTS "actor_key_id" uuid;

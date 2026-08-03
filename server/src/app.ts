@@ -8,6 +8,7 @@ import type { InspectDatabaseBackupHealthOptions } from "./services/database-bac
 import type { StorageService } from "./storage/types.js";
 import { httpLogger, errorHandler, requestQueryCancellation } from "./middleware/index.js";
 import { actorMiddleware } from "./middleware/auth.js";
+import { actorProvenanceMiddleware } from "./middleware/actor-context.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
 import { privateHostnameGuard, resolvePrivateHostnameAllowSet } from "./middleware/private-hostname-guard.js";
 import { applyTrustProxy, parseTrustProxyEnv } from "./middleware/trust-proxy.js";
@@ -240,6 +241,9 @@ export async function createApp(
       resolveSession: opts.resolveSession,
     }),
   );
+  // Capture the authenticated credential's provenance into AsyncLocalStorage so
+  // logActivity can record it centrally. Must run after actorMiddleware.
+  app.use(actorProvenanceMiddleware());
   app.use("/api/auth", authRoutes(db));
   if (opts.betterAuthHandler) {
     app.all("/api/auth/{*authPath}", opts.betterAuthHandler);
