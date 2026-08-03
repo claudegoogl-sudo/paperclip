@@ -868,4 +868,20 @@ describe("security-posture registry coverage", () => {
       expect(entry.reason.trim().length, `${entry.table}.${entry.column}`).toBeGreaterThan(40);
     }
   });
+
+  it("covers credential-hash columns, not just the key tables they feed", () => {
+    // The first pass registered board_api_keys.key_hash but missed
+    // cli_auth_challenges.pending_key_hash, which board-auth copies verbatim
+    // into that column when a CLI challenge is approved. Flattening the
+    // upstream one mints an operator-scope board key from an attacker-chosen
+    // token, and unlike board_api_keys.key_hash there is no unique index to
+    // abort a constant flatten — so the upstream column is the more exposed
+    // of the pair, not the lesser.
+    for (const column of ["pending_key_hash", "secret_hash"]) {
+      expect(schemaColumns.get("cli_auth_challenges")).toContain(column);
+      expect(postureColumnsForTable("cli_auth_challenges")).toContain(column);
+    }
+    expect(postureColumnsForTable("board_api_keys")).toContain("key_hash");
+    expect(postureColumnsForTable("invites")).toContain("token_hash");
+  });
 });
