@@ -535,11 +535,14 @@ describe("unqualified mutation of a security-posture column", () => {
     expect(finding?.statement).toContain('UPDATE "company_secret_bindings"');
   });
 
-  it("does not lean on the drizzle journal: 0138 says it runs once, and it did not", () => {
-    // 0138's header asserts "The UPDATE runs once (drizzle journal-gated)". The
-    // re-run that flattened the flag disproved it, so the rule must fire on the
-    // statement regardless of what the migration claims about its own execution.
-    expect(migration0138).toContain("drizzle journal-gated");
+  it("does not lean on the migration's own re-run guard to stay silent", () => {
+    // 0138 was rewritten (#166) to guard its rollout UPDATE inside a DO block on
+    // whether that run created the column, so it no longer leans on the drizzle
+    // journal to run once. The rule must still fire on the unqualified UPDATE
+    // regardless of whatever guard the migration wraps it in — it recognises a
+    // selective WHERE, not an arbitrary PL/pgSQL guard. The DO block confirms the
+    // guard shape reached; the assertion is that it does not suppress the finding.
+    expect(migration0138).toContain("DO $$");
     expect(postureFindings(migration0138)).toHaveLength(1);
   });
 
