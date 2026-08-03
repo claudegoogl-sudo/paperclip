@@ -173,12 +173,16 @@ Build and run Paperclip in Docker:
 ```sh
 docker build -t paperclip-local .
 docker run --name paperclip \
-  -p 3100:3100 \
+  -p 127.0.0.1:3100:3100 \
   -e HOST=0.0.0.0 \
   -e PAPERCLIP_HOME=/paperclip \
   -v "$(pwd)/data/docker-paperclip:/paperclip" \
   paperclip-local
 ```
+
+The `127.0.0.1:` prefix keeps the published port host-only. A plain
+`-p 3100:3100` binds every interface, and UFW does not filter Docker-published
+ports — see `doc/DOCKER.md` for the details.
 
 Or use Compose:
 

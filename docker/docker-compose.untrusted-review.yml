@@ -16,8 +16,10 @@ services:
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
     ports:
-      - "${REVIEW_PAPERCLIP_PORT:-3100}:3100"
-      - "${REVIEW_VITE_PORT:-5173}:5173"
+      # Loopback by default: UFW/iptables INPUT rules do not filter
+      # Docker-published ports, so this bind address is the effective control.
+      - "${REVIEW_BIND_ADDR:-127.0.0.1}:${REVIEW_PAPERCLIP_PORT:-3100}:3100"
+      - "${REVIEW_BIND_ADDR:-127.0.0.1}:${REVIEW_VITE_PORT:-5173}:5173"
     volumes:
       - review-home:/home/reviewer
       - review-work:/work

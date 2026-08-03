@@ -11,7 +11,9 @@ services:
       timeout: 5s
       retries: 30
     ports:
-      - "5432:5432"
+      # Loopback by default: UFW/iptables INPUT rules do not filter
+      # Docker-published ports, so this bind address is the effective control.
+      - "${PAPERCLIP_DB_BIND_ADDR:-127.0.0.1}:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
 
@@ -20,7 +22,9 @@ services:
       context: ..
       dockerfile: Dockerfile
     ports:
-      - "3100:3100"
+      # Loopback by default: UFW/iptables INPUT rules do not filter
+      # Docker-published ports, so this bind address is the effective control.
+      - "${PAPERCLIP_BIND_ADDR:-127.0.0.1}:3100:3100"
     environment:
       DATABASE_URL: postgres://paperclip:paperclip@db:5432/paperclip
       PORT: "3100"
