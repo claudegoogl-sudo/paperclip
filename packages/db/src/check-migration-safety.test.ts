@@ -1,12 +1,18 @@
 import { readFileSync } from "node:fs";
+import { boolean, pgTable, text, uuid } from "drizzle-orm/pg-core";
 import { describe, expect, it } from "vitest";
 import {
   analyzeMigrationSafety,
   assertSecurityBaselineReasons,
+  runMigrationSafetyCheck,
   type MigrationSafetyInput,
 } from "./check-migration-safety.js";
 import { MIGRATION_SAFETY_BASELINE } from "./migration-safety-baseline.js";
-import { SECURITY_POSTURE_COLUMNS } from "./security-posture-columns.js";
+import {
+  assertSecurityPostureColumnsResolve,
+  SECURITY_POSTURE_COLUMNS,
+  type SecurityPostureColumn,
+} from "./security-posture-columns.js";
 import {
   TABLE_SIZE_ESTIMATE_FACTOR,
   TABLE_SIZE_BUCKET_THRESHOLDS,
@@ -798,4 +804,98 @@ describe("unqualified-mutation-security-posture-column parse-miss probe", () => 
       expect(postureFindings(sql)).toEqual([]);
     });
   }
+});
+
+describe("security-posture registry resolves against the schema", () => {
+  // Fixtures are real drizzle tables, not hand-built name maps, so the test also
+  // exercises the database-name extraction. A fixture keyed on `egressAllowlistEnforced`
+  // rather than on `egress_allowlist_enforced` would pass a hand-built map and
+  // still miss every rename in real SQL.
+  const baseColumns = {
+    id: uuid("id").primaryKey(),
+    companyId: uuid("company_id").notNull(),
+    allowedEgress: text("allowed_egress").notNull(),
+  };
+
+  const enforcedEntry = SECURITY_POSTURE_COLUMNS.find(
+    (entry) => entry.column === "egress_allowlist_enforced",
+  );
+
+  it("registers egress_allowlist_enforced, which the drift fixtures below rename away", () => {
+    expect(enforcedEntry).toBeDefined();
+  });
+
+  it("passes against the live schema", () => {
+    expect(() => assertSecurityPostureColumnsResolve()).not.toThrow();
+  });
+
+  it("fails when a registered column is renamed, naming the pair", () => {
+    const renamed = {
+      companySecretBindings: pgTable("company_secret_bindings", {
+        ...baseColumns,
+        egressAllowlistEnforcedV2: boolean("egress_allowlist_enforced_v2").notNull(),
+      }),
+    };
+
+    expect(() => assertSecurityPostureColumnsResolve(renamed)).toThrow(
+      /company_secret_bindings\.egress_allowlist_enforced/,
+    );
+    // The rename is the innocent-looking case, so the message has to point at it
+    // and show the name that replaced it.
+    expect(() => assertSecurityPostureColumnsResolve(renamed)).toThrow(
+      /renamed\?.*egress_allowlist_enforced_v2/,
+    );
+  });
+
+  it("fails when a registered column is dropped, naming the pair", () => {
+    const dropped = { companySecretBindings: pgTable("company_secret_bindings", baseColumns) };
+
+    expect(() => assertSecurityPostureColumnsResolve(dropped)).toThrow(
+      /company_secret_bindings\.egress_allowlist_enforced/,
+    );
+  });
+
+  it("fails when the registered table itself is renamed away", () => {
+    const moved = {
+      companySecretBindings: pgTable("company_secret_bindings_v2", {
+        ...baseColumns,
+        egressAllowlistEnforced: boolean("egress_allowlist_enforced").notNull(),
+      }),
+    };
+
+    expect(() => assertSecurityPostureColumnsResolve(moved)).toThrow(
+      /company_secret_bindings\.egress_allowlist_enforced .*is not in the schema/,
+    );
+  });
+
+  it("fails closed rather than passing vacuously when no table is reachable", () => {
+    expect(() => assertSecurityPostureColumnsResolve({})).toThrow(/no drizzle tables were found/);
+  });
+
+  it("resolves case-insensitively, matching how the rule folds SQL identifiers", () => {
+    const shouting: readonly SecurityPostureColumn[] = [
+      {
+        table: "COMPANY_SECRET_BINDINGS",
+        column: "EGRESS_ALLOWLIST_ENFORCED",
+        reason: "unquoted SQL identifiers fold to lowercase",
+      },
+    ];
+
+    expect(() => assertSecurityPostureColumnsResolve(undefined, shouting)).not.toThrow();
+  });
+
+  it("rejects drift from the same entry point the migration lint step runs", async () => {
+    const drifted: readonly SecurityPostureColumn[] = [
+      {
+        table: "company_secret_bindings",
+        column: "egress_allowlist_enforced_v2",
+        reason: "stale entry left behind by a rename",
+      },
+    ];
+
+    await expect(runMigrationSafetyCheck(drifted)).rejects.toThrow(
+      /company_secret_bindings\.egress_allowlist_enforced_v2/,
+    );
+    await expect(runMigrationSafetyCheck()).resolves.toMatch(/Migration safety check passed/);
+  });
 });
