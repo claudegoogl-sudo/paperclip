@@ -10,6 +10,20 @@ import {
   scanDiffForForbiddenIds,
 } from "./check-no-internal-ids.mjs";
 
+/**
+ * Fake `git` for runCheck: dispatches the two subcommands it calls. `diff`
+ * returns the unified diff; `ls-tree --name-only <baseRef>` returns the paths
+ * that count as already released at the base ref.
+ */
+function fakeGit({ diff = "", releasedPaths = [] }) {
+  return (_cmd, args) => {
+    const sub = args[0];
+    if (sub === "diff") return diff;
+    if (sub === "ls-tree") return releasedPaths.join("\n");
+    throw new Error(`unexpected git subcommand: ${sub}`);
+  };
+}
+
 function unifiedDiff(file, { oldStart = 1, oldLines = 0, newStart = 1, newLines, body }) {
   const resolvedNewLines = newLines ?? body.split("\n").length;
   return [
@@ -143,18 +157,41 @@ test("self-exclusion: the checker script and its test file are excluded from sca
   assert.deepEqual(scanDiffForForbiddenIds(diff), []);
 });
 
-// --- Migration exclusion: released migrations are append-only (comments
-// included), so the scrub must not want to rewrite their comments. The
-// remedy for an id in a migration is a NEW forward migration. Excluded by
-// the `packages/db/src/migrations/**` prefix, not an exact path. -----------
+// --- Migration exclusion is keyed on RELEASE state, not a path prefix -------
+//
+// Released migrations (present at the base ref) are append-only, comments
+// included, so the scrub must not want to rewrite them — that is computed in
+// runCheck from `git ls-tree <baseRef>`, not baked into the pure scan. A
+// migration ADDED in this PR is not released yet and is still scanned.
 
-test("migration exclusion: an internal id inside a migration file is NOT flagged", () => {
+test("migration exclusion: a RELEASED migration's id is not flagged (present at base)", () => {
   const ticketId = ["PLA", "-", "138"].join("");
-  const diff = unifiedDiff("packages/db/src/migrations/0138_secret_binding_egress_allowlist.sql", {
-    newStart: 1,
-    body: `+-- see ${ticketId} for context`,
+  const migration = "packages/db/src/migrations/0138_secret_binding_egress_allowlist.sql";
+  const diff = unifiedDiff(migration, { newStart: 1, body: `+-- see ${ticketId} for context` });
+  const code = runCheck({
+    baseRef: "base",
+    headRef: "head",
+    execImpl: fakeGit({ diff, releasedPaths: [migration] }),
+    log: () => {},
+    error: () => {},
   });
-  assert.deepEqual(scanDiffForForbiddenIds(diff), []);
+  assert.equal(code, 0);
+});
+
+test("migration exclusion: a NEW migration's id IS flagged (absent at base, becomes append-only on merge)", () => {
+  const ticketId = ["PLA", "-", "300"].join("");
+  const migration = "packages/db/src/migrations/0300_new_thing.sql";
+  const diff = unifiedDiff(migration, { newStart: 1, body: `+-- see ${ticketId} for context` });
+  const errors = [];
+  const code = runCheck({
+    baseRef: "base",
+    headRef: "head",
+    execImpl: fakeGit({ diff, releasedPaths: [] }), // not released at base
+    log: () => {},
+    error: (m) => errors.push(m),
+  });
+  assert.equal(code, 1);
+  assert.ok(errors.some((m) => m.includes(migration)));
 });
 
 test("migration exclusion: the same id in a NON-migration file is still flagged", () => {
@@ -166,15 +203,6 @@ test("migration exclusion: the same id in a NON-migration file is still flagged"
   const findings = scanDiffForForbiddenIds(diff);
   assert.equal(findings.length, 1);
   assert.equal(findings[0].patternName, "internal-ticket-id");
-});
-
-test("migration exclusion: meta/_journal.json under the prefix is also excluded", () => {
-  const ticketId = ["PLA", "-", "1"].join("");
-  const diff = unifiedDiff("packages/db/src/migrations/meta/_journal.json", {
-    newStart: 1,
-    body: `+  "note": "${ticketId}"`,
-  });
-  assert.deepEqual(scanDiffForForbiddenIds(diff), []);
 });
 
 test("scanAddedLinesForForbiddenIds: custom excludedPaths override is respected", () => {
@@ -211,7 +239,7 @@ test("runCheck: exits 1 and prints findings when the diff adds a forbidden form"
   const code = runCheck({
     baseRef: "base-sha",
     headRef: "head-sha",
-    execImpl: () => diff,
+    execImpl: fakeGit({ diff, releasedPaths: [] }),
     log: (msg) => logs.push(msg),
     error: (msg) => errors.push(msg),
   });
@@ -225,7 +253,7 @@ test("runCheck: exits 0 on a clean diff", () => {
   const code = runCheck({
     baseRef: "base-sha",
     headRef: "head-sha",
-    execImpl: () => diff,
+    execImpl: fakeGit({ diff, releasedPaths: [] }),
     log: () => {},
     error: () => {},
   });

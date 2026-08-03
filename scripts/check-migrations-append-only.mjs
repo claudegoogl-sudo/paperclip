@@ -14,10 +14,16 @@
  * boot. A DDL migration re-running against a populated schema can silently
  * revert data or drop a control that was flipped after the original run.
  *
- * This guard compares every migration listed in `_journal.json` at the PR's
- * base ref against the same path at the PR head, and fails if the content
- * hash of any file present in both has changed. It runs in the PR `policy`
- * job (fetch-depth: 0), the same workflow as the other packages/db checks.
+ * Identity is CONTENT, not path. So this guard keys on the git blob OID (which
+ * is exactly a content hash): for every migration journaled at the PR's base
+ * ref, it requires that migration's base blob to still exist *somewhere* under
+ * the migrations dir at head. It fails when the released bytes have vanished.
+ *
+ * This closes the whole class, including the rename-bypass a path-keyed check
+ * misses: pairing a comment edit with a rename (or a delete + re-add under a
+ * new name) changes the file's path so a path-keyed compare finds nothing, yet
+ * the runner still re-applies the DML because the content — hence the hash —
+ * is new. Keying on blob OID makes the invariant path-independent.
  *
  * Base ref: the PR base commit (`base.sha`, i.e. the tip of the branch being
  * merged into — normally `master`). A migration is treated as "released" when
@@ -25,16 +31,29 @@
  * than a release tag keeps the check self-contained to the PR diff and needs
  * no tag lookup.
  *
- * Allowed, by construction:
- *   - Adding a new migration file (not journaled at base → never compared).
+ * Allowed, by construction (the base blob still exists at head):
+ *   - Adding a new migration file (its OID is simply new; existing OIDs are
+ *     untouched).
  *   - Renaming a byte-identical file, i.e. renumbering identical content: the
- *     old path is absent at head (skipped) and the new path is not journaled
- *     at base (never compared). The runner tolerates such renames because the
- *     content hash is unchanged, so this guard must too.
+ *     OID is unchanged, so it is still present under the new name at head. The
+ *     runner tolerates such renames because the content hash is unchanged, so
+ *     this guard must too.
+ *
+ * Rejected (the base blob is gone at head):
+ *   - Editing a released migration in place.
+ *   - Renaming a released migration *and* editing its bytes.
+ *   - Deleting a released migration. Deletion diverges fresh databases from
+ *     existing ones, and "delete + re-add under a new name" is the rename
+ *     bypass in two steps, so a vanished released blob is a violation.
  *
  * If a released migration genuinely must change (e.g. it contains an internal
  * id that leaked), the correct remedy is a NEW forward migration, never an
- * edit to the released file.
+ * edit to (or removal of) the released file.
+ *
+ * Fails closed: if either ref is not resolvable to a commit (history not
+ * fetched, bad object), the guard errors rather than reporting a green "nothing
+ * changed" it never actually verified. It needs full history (fetch-depth: 0)
+ * and runs in the PR `policy` job alongside the other packages/db checks.
  */
 
 import { execFileSync } from "node:child_process";
@@ -63,44 +82,59 @@ export function parseJournalTags(journalText) {
 }
 
 /**
- * Pure core: given the base-ref journal tags and two readers that return a
- * migration's content at a ref (or `null` when the path is absent at that
- * ref), return the list of released migrations whose content hash changed.
+ * Pure core, keyed on CONTENT SURVIVAL rather than on path.
  *
- * `readBase`/`readHead` are `(relPath: string) => string | null`.
+ * A released migration is a violation when its base blob OID (git's blob OID is
+ * a content hash, so OID equality *is* byte equality) no longer exists anywhere
+ * under the migrations dir at head. This single invariant covers the in-place
+ * edit, the rename-plus-edit bypass, and deletion, while allowing the two cases
+ * the runner tolerates — a byte-identical renumber (OID preserved) and adding a
+ * brand-new migration (existing OIDs untouched).
+ *
+ * @param {object}              args
+ * @param {string[]}            args.baseTags   migration tags journaled at base
+ * @param {Map<string,string>}  args.baseBlobs  relPath -> blob OID present at base under the migrations dir
+ * @param {Set<string>}         args.headOids   set of blob OIDs present at head under the migrations dir
+ * @returns {{ file: string, baseOid: string }[]} released migrations whose bytes are gone at head
  */
-export function findChangedReleasedMigrations({ baseTags, readBase, readHead }) {
+export function findReleasedMigrationViolations({ baseTags, baseBlobs, headOids }) {
   const findings = [];
   for (const tag of baseTags) {
     const relPath = `${MIGRATIONS_DIR}/${tag}.sql`;
-    const baseContent = readBase(relPath);
-    const headContent = readHead(relPath);
-    // Present in BOTH is the only case we compare: a file that is gone at head
-    // is a rename/removal, not an in-place content change, and byte-identical
-    // renames must stay allowed.
-    if (baseContent === null || headContent === null) continue;
-    const baseHash = sha256(baseContent);
-    const headHash = sha256(headContent);
-    if (baseHash !== headHash) {
-      findings.push({ file: relPath, baseHash, headHash });
-    }
+    const oid = baseBlobs.get(relPath);
+    // Journaled but not present as a file at base: nothing released to protect.
+    if (oid === undefined) continue;
+    if (!headOids.has(oid)) findings.push({ file: relPath, baseOid: oid });
   }
   return findings;
 }
 
+/**
+ * Render enriched findings for the CI log. Each finding carries the released
+ * path, its base sha256, and — when the same path still exists at head (an
+ * in-place edit) — the head sha256; for a rename/delete there is no single head
+ * path, so `headHash` is `null`.
+ */
 export function formatFindings(findings) {
   const header =
-    "ERROR: this PR changes the content of one or more already-released (journaled) database migrations.\n" +
+    "ERROR: this PR removes the released bytes of one or more already-released (journaled) database migrations.\n" +
     "Released migrations are append-only, comments included.\n\n" +
     "The migration runner identifies a migration by sha256 of the whole file (packages/db/src/client.ts)\n" +
-    "and dedupes on that hash alone, so changing a released migration's bytes — even just its comment\n" +
-    "header — mints a new identity and RE-APPLIES the migration on every existing database.\n\n";
+    "and dedupes on that hash alone. Editing a released migration's bytes — even just its comment header,\n" +
+    "and even paired with a rename — mints a new identity and RE-APPLIES the migration on every existing\n" +
+    "database. Deleting one diverges fresh databases from existing ones. Identity is content, not path.\n\n";
   const body = findings
-    .map((f) => `  ${f.file}\n    base sha256: ${f.baseHash}\n    head sha256: ${f.headHash}`)
+    .map((f) => {
+      const headLine =
+        f.headHash === null
+          ? "    head: released bytes no longer present under the migrations dir (renamed with edits, or deleted)"
+          : `    head sha256: ${f.headHash}`;
+      return `  ${f.file}\n    base sha256: ${f.baseHash}\n${headLine}`;
+    })
     .join("\n");
   const footer =
-    "\n\nRevert the change to the released file(s) above. If a released migration genuinely must change,\n" +
-    "add a NEW forward migration instead of editing the released one.";
+    "\n\nRestore the released file(s) above byte-for-byte (a byte-identical renumber is fine). If a released\n" +
+    "migration genuinely must change, add a NEW forward migration instead of editing or removing it.";
   return `${header}${body}${footer}`;
 }
 
@@ -111,12 +145,47 @@ function gitShowOrNull(execImpl, ref, relPath) {
       encoding: "utf8",
       maxBuffer: 1024 * 1024 * 64,
       // Absent paths are expected (renames/removals); swallow git's "fatal:
-      // path does not exist" stderr so it doesn't clutter the CI log.
+      // path does not exist" stderr so it doesn't clutter the CI log. Safe to
+      // swallow because runCheck has already proven the ref itself resolves, so
+      // a failure here can only mean "path absent at this ref", not "bad ref".
       stdio: ["ignore", "pipe", "ignore"],
     });
   } catch {
-    // `git show ref:path` exits non-zero when the path is absent at that ref.
     return null;
+  }
+}
+
+/**
+ * Return `Map<relPath, blobOid>` for every blob under the migrations dir at
+ * `ref`. `git ls-tree -r` lines are `<mode> SP <type> SP <oid> TAB <path>`.
+ */
+function gitLsTreeBlobs(execImpl, ref) {
+  const out = execImpl("git", ["ls-tree", "-r", ref, "--", MIGRATIONS_DIR], {
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024 * 64,
+  });
+  const blobs = new Map();
+  for (const line of out.split("\n")) {
+    if (!line) continue;
+    const tab = line.indexOf("\t");
+    if (tab === -1) continue;
+    const oid = line.slice(0, tab).split(/\s+/)[2];
+    const relPath = line.slice(tab + 1);
+    if (oid) blobs.set(relPath, oid);
+  }
+  return blobs;
+}
+
+/** True when `ref` resolves to a commit object. Used to fail closed on an unfetched/bad ref. */
+function refResolvesToCommit(execImpl, ref) {
+  try {
+    execImpl("git", ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -124,6 +193,20 @@ export function runCheck({ baseRef, headRef, execImpl = execFileSync, log = cons
   if (!baseRef || !headRef) {
     error("check-migrations-append-only: both baseRef and headRef are required");
     return 1;
+  }
+
+  // Fail CLOSED on an unreadable ref. `git show`/`ls-tree` cannot distinguish
+  // "path legitimately absent" from "ref not fetched / bad object", so verify
+  // both refs resolve to commits first — otherwise a history/fetch problem
+  // would sail through as a green "nothing changed" that verified nothing.
+  for (const ref of [baseRef, headRef]) {
+    if (!refResolvesToCommit(execImpl, ref)) {
+      error(
+        `check-migrations-append-only: ref "${ref}" is not resolvable to a commit — refusing to pass (fail closed). ` +
+          "Ensure the workflow fetches full history (fetch-depth: 0).",
+      );
+      return 1;
+    }
   }
 
   const journalText = gitShowOrNull(execImpl, baseRef, JOURNAL_PATH);
@@ -135,17 +218,31 @@ export function runCheck({ baseRef, headRef, execImpl = execFileSync, log = cons
   }
 
   const baseTags = parseJournalTags(journalText);
-  const findings = findChangedReleasedMigrations({
-    baseTags,
-    readBase: (relPath) => gitShowOrNull(execImpl, baseRef, relPath),
-    readHead: (relPath) => gitShowOrNull(execImpl, headRef, relPath),
-  });
+  if (baseTags.length === 0) {
+    log(`  ✓  ${JOURNAL_PATH} at base ref lists no migrations; nothing released to check.`);
+    return 0;
+  }
 
-  if (findings.length > 0) {
-    error(formatFindings(findings));
+  const baseBlobs = gitLsTreeBlobs(execImpl, baseRef);
+  const headOids = new Set(gitLsTreeBlobs(execImpl, headRef).values());
+
+  const violations = findReleasedMigrationViolations({ baseTags, baseBlobs, headOids });
+
+  if (violations.length > 0) {
+    const enriched = violations.map((v) => {
+      const baseContent = gitShowOrNull(execImpl, baseRef, v.file);
+      const headContent = gitShowOrNull(execImpl, headRef, v.file);
+      return {
+        file: v.file,
+        baseHash: baseContent === null ? "(unreadable)" : sha256(baseContent),
+        // Same path still present at head => in-place edit; absent => rename/delete.
+        headHash: headContent === null ? null : sha256(headContent),
+      };
+    });
+    error(formatFindings(enriched));
     return 1;
   }
-  log(`  ✓  No released migration content changed (checked ${baseTags.length} journaled migrations).`);
+  log(`  ✓  All ${baseTags.length} released migrations' bytes are still present at head (append-only preserved).`);
   return 0;
 }
 

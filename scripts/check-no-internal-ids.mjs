@@ -26,23 +26,12 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+export const MIGRATIONS_DIR = "packages/db/src/migrations";
+
 export const EXCLUDED_PATHS = new Set([
   "scripts/check-no-internal-ids.mjs",
   "scripts/check-no-internal-ids.test.mjs",
 ]);
-
-// Path *prefixes* excluded from the scan (matched with startsWith, so this is
-// the glob `packages/db/src/migrations/**`).
-//
-// Released database migrations are append-only, comments included: the runner
-// identifies a migration by the sha256 of the whole file, so rewriting a
-// migration's comment to scrub an id changes its identity and re-applies it on
-// every existing database (see scripts/check-migrations-append-only.mjs). The
-// scrub guard and the append-only guard would otherwise fight — the scrub
-// wanting to rewrite the comment, the append-only guard forbidding exactly
-// that. If a released migration genuinely contains an internal id, the correct
-// remedy is a NEW forward migration, never an edit to the released file.
-export const EXCLUDED_PREFIXES = ["packages/db/src/migrations/"];
 
 // Internal ticket ids follow this instance's own `{PREFIX}-{NUMBER}` scheme.
 // Matched case-sensitively: lowercase env-var-style / fixture identifiers
@@ -119,14 +108,10 @@ export function extractAddedLines(diffText) {
 }
 
 /** Scan pre-extracted added lines for forbidden forms. Returns findings; empty = clean. */
-export function scanAddedLinesForForbiddenIds(
-  addedLines,
-  { excludedPaths = EXCLUDED_PATHS, excludedPrefixes = EXCLUDED_PREFIXES } = {},
-) {
+export function scanAddedLinesForForbiddenIds(addedLines, { excludedPaths = EXCLUDED_PATHS } = {}) {
   const findings = [];
   for (const { file, lineNumber, content } of addedLines) {
     if (excludedPaths.has(file)) continue;
-    if (excludedPrefixes.some((prefix) => file.startsWith(prefix))) continue;
     for (const { name, pattern, describe } of FORBIDDEN_PATTERNS) {
       const match = pattern.exec(content);
       if (match) {
@@ -168,7 +153,30 @@ export function runCheck({ baseRef, headRef, execImpl = execFileSync, log = cons
     encoding: "utf8",
     maxBuffer: 1024 * 1024 * 64,
   });
-  const findings = scanDiffForForbiddenIds(diffText);
+
+  // Exclude only migrations that are ALREADY RELEASED (present at the base
+  // ref). Those are append-only, comments included, so the scrub must not want
+  // to rewrite them — that would fight the append-only guard and re-apply the
+  // migration on every existing database (see check-migrations-append-only.mjs;
+  // the remedy for an id in a released migration is a NEW forward migration).
+  //
+  // A migration ADDED in this PR is NOT released yet, carries no re-apply risk,
+  // and — once it merges it becomes append-only forever — is the last chance to
+  // catch a leaked id, so the scan still runs on it. Keying on the base ref
+  // (not a blanket path prefix) makes the excluded set exactly the protected
+  // set instead of a strict superset.
+  const releasedMigrations = new Set(
+    execImpl("git", ["ls-tree", "-r", "--name-only", baseRef, "--", MIGRATIONS_DIR], {
+      encoding: "utf8",
+      maxBuffer: 1024 * 1024 * 64,
+    })
+      .split("\n")
+      .filter(Boolean),
+  );
+
+  const findings = scanDiffForForbiddenIds(diffText, {
+    excludedPaths: new Set([...EXCLUDED_PATHS, ...releasedMigrations]),
+  });
   if (findings.length > 0) {
     error(formatFindings(findings));
     return 1;
