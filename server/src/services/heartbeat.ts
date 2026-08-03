@@ -178,7 +178,8 @@ import {
 import { recoveryService } from "./recovery/service.js";
 import { productivityReviewService } from "./productivity-review.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
-import { withAgentStartLock } from "./agent-start-lock.js";
+import { withAgentStartLock, withHostAdmissionLock } from "./agent-start-lock.js";
+import { HOST_MAX_CONCURRENT_RUNS_ENV_VAR, resolveHostRunCeiling } from "./host-run-ceiling.js";
 import {
   evaluateAgentInvokability,
   evaluateAgentInvokabilityFromDb,
@@ -5059,6 +5060,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const runtimeEnv = options.runtimeEnv ?? process.env;
   const getSchedulingSuppression = () => resolveHeartbeatSchedulingSuppression(runtimeEnv);
 
+  const hostRunCeiling = resolveHostRunCeiling(runtimeEnv[HOST_MAX_CONCURRENT_RUNS_ENV_VAR]);
+  logger.info(
+    {
+      hostMaxConcurrentRuns: hostRunCeiling.value,
+      source: hostRunCeiling.source,
+      vcpuCount: hostRunCeiling.vcpuCount,
+      envVar: HOST_MAX_CONCURRENT_RUNS_ENV_VAR,
+      ...(hostRunCeiling.invalidEnvValue ? { ignoredEnvValue: hostRunCeiling.invalidEnvValue } : {}),
+    },
+    "resolved host-wide concurrent run ceiling",
+  );
+
+  // Slots taken between a successful admission decision and the moment the claim makes the
+  // run visible as `running` in the DB. Held only across `claimQueuedRun` and always released
+  // in a `finally`, so a crashed or cancelled claim cannot leak a slot; a process restart
+  // drops them entirely and the DB count becomes authoritative again.
+  let inFlightHostRunReservations = 0;
+  let hostCeilingDeferralCount = 0;
+  // Insertion-ordered, so draining it after a slot frees rotates through the deferred agents
+  // instead of always re-offering the slot to whoever asked most recently.
+  const hostCeilingDeferredAgentIds = new Set<string>();
+
   const runLogStore = getRunLogStore();
   const secretsSvc = secretService(db);
   const companySkills = companySkillService(db);
@@ -9350,6 +9373,83 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return Number(count ?? 0);
   }
 
+  // The ceiling bounds concurrent *adapter processes*, i.e. CPU, so it counts `running` only —
+  // the same status `countRunningRunsForAgent` uses. `queued` and `scheduled_retry` hold an
+  // issue execution lock but no process; counting `scheduled_retry` would also be a liveness
+  // trap, because a scheduled-retry run can only leave that status by being promoted, and
+  // promotion goes back through this same admission gate.
+  async function countRunningRunsHostWide() {
+    const [{ count }] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "running"));
+    return Number(count ?? 0);
+  }
+
+  async function countAgentsWithQueuedRuns() {
+    const [{ count }] = await db
+      .select({ count: sql<number>`count(distinct ${heartbeatRuns.agentId})` })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "queued"));
+    return Number(count ?? 0);
+  }
+
+  /**
+   * Atomically decides whether one more run may start host-wide. The DB count and the
+   * reservation increment happen inside `withHostAdmissionLock`, so two agents dispatching
+   * concurrently cannot both read the same pre-claim count. Deliberately does *not* wrap the
+   * claim itself — see the note on `withHostAdmissionLock`.
+   */
+  async function reserveHostRunSlot() {
+    return withHostAdmissionLock(async () => {
+      const hostRunningCount = await countRunningRunsHostWide();
+      const hostInUse = hostRunningCount + inFlightHostRunReservations;
+      if (hostInUse >= hostRunCeiling.value) {
+        return { granted: false as const, hostRunningCount, hostInUse };
+      }
+      inFlightHostRunReservations += 1;
+      return { granted: true as const, hostRunningCount, hostInUse };
+    });
+  }
+
+  function releaseHostRunSlot() {
+    inFlightHostRunReservations = Math.max(0, inFlightHostRunReservations - 1);
+  }
+
+  function recordHostCeilingDeferral(agentId: string, details: Record<string, unknown>) {
+    hostCeilingDeferralCount += 1;
+    hostCeilingDeferredAgentIds.add(agentId);
+    logger.warn(
+      {
+        agentId,
+        hostMaxConcurrentRuns: hostRunCeiling.value,
+        hostCeilingSource: hostRunCeiling.source,
+        inFlightHostRunReservations,
+        hostCeilingDeferralCount,
+        deferredAgentCount: hostCeilingDeferredAgentIds.size,
+        ...details,
+      },
+      "heartbeat dispatch deferred by host concurrent-run ceiling",
+    );
+  }
+
+  /**
+   * Called when a run leaves the `running` status and frees a host slot. Agents deferred by the
+   * ceiling are otherwise only re-driven by their own next wake, which is what would turn a
+   * bounded queue into a stalled one.
+   */
+  async function drainHostCeilingDeferrals(alreadyDrivenAgentId: string | null) {
+    if (hostCeilingDeferredAgentIds.size === 0) return;
+    const deferredAgentIds = [...hostCeilingDeferredAgentIds];
+    hostCeilingDeferredAgentIds.clear();
+    for (const deferredAgentId of deferredAgentIds) {
+      if (deferredAgentId === alreadyDrivenAgentId) continue;
+      await startNextQueuedRunForAgent(deferredAgentId).catch((err) => {
+        logger.error({ err, agentId: deferredAgentId }, "host ceiling deferral re-dispatch failed");
+      });
+    }
+  }
+
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect, companyAgents?: AgentOrgRow[]) {
     if (run.status !== "queued") return run;
     const agent = await getAgent(run.agentId);
@@ -10374,12 +10474,49 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return left.createdAt.getTime() - right.createdAt.getTime();
       });
 
+      // Fairness: the per-agent cap stays the primary gate, but when the host ceiling is the
+      // scarce resource an agent may take at most an equal share of it per dispatch pass. With
+      // more contenders than slots this degrades to exactly one run each, which is when
+      // starvation actually matters; with a single contender it is a no-op.
+      const contendingAgentCount = await countAgentsWithQueuedRuns();
+      const fairShareSlots = Math.max(1, Math.floor(hostRunCeiling.value / Math.max(1, contendingAgentCount)));
+      const grantedSlots = Math.min(availableSlots, fairShareSlots);
+
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
+      let visitedRunCount = 0;
+      let hostCeilingDeferred = false;
       for (const queuedRun of prioritizedRuns) {
-        if (claimedRuns.length >= availableSlots) break;
-        const claimed = await claimQueuedRun(queuedRun, companyAgents);
-        if (claimed) claimedRuns.push(claimed);
+        if (claimedRuns.length >= grantedSlots) break;
+        const reservation = await reserveHostRunSlot();
+        if (!reservation.granted) {
+          hostCeilingDeferred = true;
+          recordHostCeilingDeferral(agentId, {
+            companyId: agent.companyId,
+            hostRunningCount: reservation.hostRunningCount,
+            queuedRunCount: prioritizedRuns.length,
+            claimedRunCount: claimedRuns.length,
+            contendingAgentCount,
+            fairShareSlots,
+          });
+          break;
+        }
+        visitedRunCount += 1;
+        try {
+          const claimed = await claimQueuedRun(queuedRun, companyAgents);
+          if (claimed) claimedRuns.push(claimed);
+        } finally {
+          // The claim has already made the run visible as `running`, so the reservation would
+          // otherwise double-count it; a claim that returned null or threw frees the slot.
+          releaseHostRunSlot();
+        }
       }
+      // Work left behind because the fair share truncated this pass is throttled by host-wide
+      // scarcity just like an outright deferral, so it must be re-offered when a slot frees.
+      const fairShareThrottled = !hostCeilingDeferred
+        && grantedSlots < availableSlots
+        && visitedRunCount < prioritizedRuns.length;
+      if (fairShareThrottled) hostCeilingDeferredAgentIds.add(agentId);
+      else if (!hostCeilingDeferred) hostCeilingDeferredAgentIds.delete(agentId);
       if (claimedRuns.length === 0) return [];
 
       for (const claimedRun of claimedRuns) {
@@ -10404,7 +10541,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // an already-running run above must never be stopped mid-flight by a park
       // that started after it was dispatched.
       if (await usageLimitPark.isParked()) return;
-      const claimed = await claimQueuedRun(run);
+      // Same defense-in-depth as the park above: this is a second, independently reachable
+      // path into a claim, so the host ceiling has to hold here too. The run stays queued.
+      const reservation = await reserveHostRunSlot();
+      if (!reservation.granted) {
+        recordHostCeilingDeferral(run.agentId, {
+          companyId: run.companyId,
+          runId: run.id,
+          hostRunningCount: reservation.hostRunningCount,
+          path: "execute_run",
+        });
+        return;
+      }
+      let claimed: Awaited<ReturnType<typeof claimQueuedRun>>;
+      try {
+        claimed = await claimQueuedRun(run);
+      } finally {
+        releaseHostRunSlot();
+      }
       if (!claimed) {
         // claimQueuedRun can also leave the run queued when dependencies are unresolved.
         return;
@@ -12749,6 +12903,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           clearRunHandles(run.id);
           activeRunExecutions.delete(run.id);
           await startNextQueuedRunForAgent(run.agentId);
+          await drainHostCeilingDeferrals(run.agentId);
         }
   }
 
@@ -14708,6 +14863,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     await finalizeAgentStatus(run.agentId, "cancelled");
     await startNextQueuedRunForAgent(run.agentId);
+    await drainHostCeilingDeferrals(run.agentId);
     return cancelled;
   }
 
@@ -15078,6 +15234,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     reapOrphanedRuns,
 
+    /**
+     * The scheduler's admission entry point: applies the per-agent cap, the host-wide ceiling
+     * and the fair share, and returns the runs it actually claimed. `resumeQueuedRuns` is a
+     * loop over this.
+     */
+    startNextQueuedRunForAgent,
+
     promoteDueScheduledRetries,
     retryScheduledRetryNow,
 
@@ -15229,5 +15392,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // (API route, recovery sweep) distinguish "parked on purpose" from "stuck", so a
     // parked fleet isn't misreported as a stall.
     getUsageLimitParkState: (now?: Date) => usageLimitPark.getState(now),
+
+    getHostRunCeilingState: async () => ({
+      maxConcurrentRuns: hostRunCeiling.value,
+      source: hostRunCeiling.source,
+      vcpuCount: hostRunCeiling.vcpuCount,
+      hostRunningCount: await countRunningRunsHostWide(),
+      inFlightReservations: inFlightHostRunReservations,
+      deferralCount: hostCeilingDeferralCount,
+      deferredAgentIds: [...hostCeilingDeferredAgentIds],
+    }),
   };
 }
