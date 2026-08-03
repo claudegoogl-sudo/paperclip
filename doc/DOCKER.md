@@ -50,6 +50,41 @@ All persisted under your bind mount (`./data/docker-paperclip` in the example ab
 
 ## Docker Compose
 
+### Published ports bind to loopback by default
+
+Every port published by the shipped Compose files binds to `127.0.0.1`, so a
+default `docker compose up` is reachable from the host only, not from the
+network. Override the bind address when you deliberately want off-host access:
+
+| Variable | Default | Applies to |
+|----------|---------|------------|
+| `PAPERCLIP_BIND_ADDR` | `127.0.0.1` | Paperclip server port in `docker-compose.yml` and `docker-compose.quickstart.yml` |
+| `PAPERCLIP_DB_BIND_ADDR` | `127.0.0.1` | PostgreSQL port in `docker-compose.yml` |
+| `REVIEW_BIND_ADDR` | `127.0.0.1` | both ports in `docker-compose.untrusted-review.yml` |
+
+```sh
+# Expose the UI on every interface; PostgreSQL stays on loopback.
+PAPERCLIP_BIND_ADDR=0.0.0.0 \
+PAPERCLIP_PUBLIC_URL=http://<host>:3100 \
+BETTER_AUTH_SECRET=$(openssl rand -hex 32) \
+  docker compose -f docker/docker-compose.quickstart.yml up --build
+```
+
+Server and database bind addresses are separate on purpose: exposing the UI
+should not implicitly expose PostgreSQL, which `docker-compose.yml` starts with
+the well-known development password `paperclip`. Change `POSTGRES_PASSWORD` and
+the matching `DATABASE_URL` before setting `PAPERCLIP_DB_BIND_ADDR` to anything
+wider than loopback.
+
+> **UFW does not filter Docker-published ports.** Docker installs its own DNAT
+> rules in `nat/PREROUTING` and filters container traffic in the `DOCKER` chain
+> hanging off `FORWARD`, so published ports never traverse the `INPUT` chain
+> that UFW's default-deny policy governs. `ufw deny 5432` will be accepted, will
+> show up in `ufw status`, and will silently do nothing. The publish bind
+> address above is the effective control. If you also want firewall
+> enforcement, write the rule in the `DOCKER-USER` chain, which *is* consulted
+> for container traffic.
+
 ### Quickstart (embedded SQLite)
 
 Single container, no external database. Data persists via a bind mount.
@@ -62,6 +97,7 @@ BETTER_AUTH_SECRET=$(openssl rand -hex 32) \
 Defaults:
 
 - host port: `3100`
+- published bind address: `127.0.0.1` (host-only)
 - persistent data dir: `./data/docker-paperclip`
 
 Optional overrides:
@@ -87,6 +123,8 @@ BETTER_AUTH_SECRET=$(openssl rand -hex 32) \
 ```
 
 PostgreSQL data persists in a named Docker volume (`pgdata`). Paperclip data persists in `paperclip-data`.
+
+Both published ports bind to `127.0.0.1` by default (see [Published ports bind to loopback by default](#published-ports-bind-to-loopback-by-default)). The server reaches PostgreSQL over the Compose network at `db:5432`, so the published `5432` exists only for host-side tooling such as `psql -h 127.0.0.1`.
 
 ### Untrusted PR review
 
