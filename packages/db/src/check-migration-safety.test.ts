@@ -655,9 +655,8 @@ describe("unqualified mutation of a security-posture column", () => {
     expect(postureFindings(`TRUNCATE TABLE "company_secret_bindings" CASCADE;`)).toHaveLength(1);
     expect(postureFindings(`TRUNCATE ONLY public."company_secret_bindings" RESTART IDENTITY;`))
       .toHaveLength(1);
-    // Both named tables are registered since the PLA-2159 sweep, so the
-    // multi-table form must report one finding per table rather than
-    // collapsing to the first match.
+    // Both named tables are registered, so the multi-table form must report
+    // one finding per table rather than collapsing to the first match.
     expect(
       postureFindings(`TRUNCATE "companies", "company_secret_bindings";`)
         .map((finding) => finding.table)
@@ -814,7 +813,7 @@ describe("unqualified-mutation-security-posture-column parse-miss probe", () => 
   }
 });
 
-describe("security-posture registry coverage (PLA-2159)", () => {
+describe("security-posture registry coverage", () => {
   const schemaColumns = (() => {
     const byTable = new Map<string, Set<string>>();
     for (const value of Object.values(schema as Record<string, unknown>)) {

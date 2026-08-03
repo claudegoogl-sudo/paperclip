@@ -19,7 +19,7 @@ export type SecurityPostureColumn = {
  * that default.
  *
  * It started as a two-pair seed of the columns `0138` actually flattened. It is
- * now the output of a full schema sweep (PLA-2159): every column was classified
+ * now the output of a full schema sweep: every column was classified
  * register / do-not-register, and the rejections are recorded with their reasons
  * in `doc/SECURITY-POSTURE-COLUMN-SWEEP.md` so the analysis does not
  * have to be re-derived. Adding a column to the schema does not add it here —
@@ -31,7 +31,7 @@ export type SecurityPostureColumn = {
  * write look innocuous in review.
  */
 export const SECURITY_POSTURE_COLUMNS = [
-  // --- Egress (the 0138 incident; PLA-2116) ---
+  // --- Egress (the columns migration `0138` flattened) ---
   {
     table: "company_secret_bindings",
     column: "egress_allowlist_enforced",

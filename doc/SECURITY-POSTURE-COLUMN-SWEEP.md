@@ -3,10 +3,14 @@
 Backing analysis for `packages/db/src/security-posture-columns.ts`, the registry
 that drives the migration-lint rule `unqualified-mutation-security-posture-column`.
 
-Sweep performed for PLA-2159; the rule and the two-pair seed came from
-PLA-2142, and the incident that motivated both was PLA-2116 — migration
-`0138` ran `UPDATE "company_secret_bindings" SET "egress_allowlist_enforced" =
-false;` with no `WHERE` and disarmed egress enforcement on every binding.
+The rule shipped with a two-pair seed: the columns of the incident that motivated
+it. Migration `0138` ran `UPDATE "company_secret_bindings" SET
+"egress_allowlist_enforced" = false;` with no `WHERE` and disarmed egress
+enforcement on every binding. Two registered pairs meant the rule's guarantee was
+"the columns someone remembered to register" — absent means unchecked, the same
+fail-open shape the rule exists to fix. This sweep is the answer to that: every
+schema column classified register / do-not-register, with rejections recorded
+below so the analysis does not have to be re-derived.
 
 ## What qualifies
 
