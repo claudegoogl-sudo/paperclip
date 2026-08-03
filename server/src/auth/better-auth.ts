@@ -10,7 +10,7 @@ import {
   authUsers,
   authVerifications,
 } from "@paperclipai/db";
-import { weakAuthSecretReason } from "@paperclipai/shared";
+import { weakAuthSecretEnvReason } from "@paperclipai/shared";
 import type { Config } from "../config.js";
 import { resolvePaperclipInstanceId } from "../home-paths.js";
 
@@ -134,7 +134,7 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
     );
   }
   if (config.deploymentMode === "authenticated") {
-    const reason = weakAuthSecretReason(secret);
+    const reason = weakAuthSecretEnvReason(process.env);
     if (reason) {
       throw new Error(
         `The configured auth secret ${reason}. In authenticated mode this must be a strong, ` +

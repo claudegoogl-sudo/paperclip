@@ -1,4 +1,4 @@
-import { inferBindModeFromHost, weakAuthSecretReason } from "@paperclipai/shared";
+import { inferBindModeFromHost, weakAuthSecretEnvReason } from "@paperclipai/shared";
 import type { PaperclipConfig } from "../config/schema.js";
 import type { CheckResult } from "./index.js";
 
@@ -38,7 +38,7 @@ export function deploymentAuthCheck(config: PaperclipConfig): CheckResult {
     };
   }
 
-  const weakReason = weakAuthSecretReason(secret);
+  const weakReason = weakAuthSecretEnvReason(process.env);
   if (weakReason) {
     return {
       name: "Deployment/auth mode",

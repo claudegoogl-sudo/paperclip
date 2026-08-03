@@ -75,4 +75,24 @@ describe("createBetterAuthInstance weak auth secret rejection", () => {
     process.env.BETTER_AUTH_SECRET = "b".repeat(64);
     expect(() => boot("authenticated")).not.toThrow();
   });
+
+  it("throws in authenticated mode when a strong BETTER_AUTH_SECRET hides a denylisted PAPERCLIP_AGENT_JWT_SECRET", () => {
+    // Mirror bypass: better-auth resolves BETTER_AUTH_SECRET first, but agent-auth-jwt
+    // resolves PAPERCLIP_AGENT_JWT_SECRET first, so the weak value still signs agent JWTs.
+    process.env.BETTER_AUTH_SECRET = "b".repeat(64);
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "secret";
+    expect(() => boot("authenticated")).toThrow(/PAPERCLIP_AGENT_JWT_SECRET/);
+  });
+
+  it("throws in authenticated mode when a strong BETTER_AUTH_SECRET hides a too-short PAPERCLIP_AGENT_JWT_SECRET", () => {
+    process.env.BETTER_AUTH_SECRET = "b".repeat(64);
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "short";
+    expect(() => boot("authenticated")).toThrow(/PAPERCLIP_AGENT_JWT_SECRET/);
+  });
+
+  it("boots in authenticated mode when both secrets are strong and distinct", () => {
+    process.env.BETTER_AUTH_SECRET = "b".repeat(64);
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "c".repeat(64);
+    expect(() => boot("authenticated")).not.toThrow();
+  });
 });

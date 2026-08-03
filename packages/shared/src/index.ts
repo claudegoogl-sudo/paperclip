@@ -412,9 +412,11 @@ export {
 } from "./network-bind.js";
 
 export {
+  AUTH_SECRET_ENV_KEYS,
   MIN_AUTH_SECRET_LENGTH,
   WEAK_AUTH_SECRET_DENYLIST,
   isWeakAuthSecret,
+  weakAuthSecretEnvReason,
   weakAuthSecretReason,
 } from "./auth-secret.js";
 
