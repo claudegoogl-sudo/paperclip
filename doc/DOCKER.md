@@ -87,10 +87,10 @@ BETTER_AUTH_SECRET=$(openssl rand -hex 32) \
 ```
 
 Server and database bind addresses are separate on purpose: exposing the UI
-should not implicitly expose PostgreSQL, which `docker-compose.yml` starts with
-the well-known development password `paperclip`. Change `POSTGRES_PASSWORD` and
-the matching `DATABASE_URL` before setting `PAPERCLIP_DB_BIND_ADDR` to anything
-wider than loopback.
+should not implicitly expose PostgreSQL. `docker-compose.yml` will not start
+until you choose a PostgreSQL password (see
+[PostgreSQL password](#postgresql-password)), but keep the database on loopback
+regardless unless you specifically need off-host database access.
 
 > **UFW does not filter Docker-published ports.** Docker installs its own DNAT
 > rules in `nat/PREROUTING` and filters container traffic in the `DOCKER` chain
@@ -147,6 +147,28 @@ Pass `OPENAI_API_KEY` and/or `ANTHROPIC_API_KEY` to enable local adapter runs.
 ### Full stack (with PostgreSQL)
 
 Paperclip server + PostgreSQL 17. The database is health-checked before the server starts.
+
+#### PostgreSQL password
+
+This stack has no default PostgreSQL password. `POSTGRES_PASSWORD` is required,
+and Compose refuses to start without it. Generate one per stack and put it in
+`docker/.env`, which Compose auto-loads:
+
+```sh
+printf 'POSTGRES_PASSWORD=%s\n' "$(openssl rand -hex 32)" >> docker/.env
+```
+
+A shipped default would be the same password on every install and public with
+the repo, and this database holds agent credentials and secret material —
+PostgreSQL's `COPY ... FROM PROGRAM` turns database access into command
+execution inside the container. Failing to start is the safer default.
+
+The same variable is interpolated into the server's `DATABASE_URL`, so the two
+cannot drift. Because the value lands in a URL userinfo field, use a password
+with no URL-reserved characters — the `openssl rand -hex 32` output above
+qualifies — or percent-encode it. Changing `POSTGRES_PASSWORD` after first
+start does not change the password on an existing `pgdata` volume; use
+`ALTER ROLE paperclip WITH PASSWORD ...` for that, or discard the volume.
 
 ```sh
 BETTER_AUTH_SECRET=$(openssl rand -hex 32) \
@@ -254,16 +276,23 @@ The `docker/quadlet/` directory contains unit files to run Paperclip + PostgreSQ
 3. Create a secrets env file (keep out of version control):
 
    ```sh
+   PGPASS=$(openssl rand -hex 32)
    cat > ~/.config/containers/systemd/paperclip.env <<EOL
    BETTER_AUTH_SECRET=$(openssl rand -hex 32)
    POSTGRES_USER=paperclip
-   POSTGRES_PASSWORD=paperclip
+   POSTGRES_PASSWORD=${PGPASS}
    POSTGRES_DB=paperclip
-   DATABASE_URL=postgres://paperclip:paperclip@127.0.0.1:5432/paperclip
+   DATABASE_URL=postgres://paperclip:${PGPASS}@127.0.0.1:5432/paperclip
    # OPENAI_API_KEY=sk-...
    # ANTHROPIC_API_KEY=sk-...
    EOL
+   chmod 600 ~/.config/containers/systemd/paperclip.env
+   unset PGPASS
    ```
+
+   Generate the password rather than reusing a documented one: this file is the
+   only place the Quadlet units get it, so a value copied from these docs is a
+   credential shared with every other reader.
 
 4. Create the data directory and start:
 
