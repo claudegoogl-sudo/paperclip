@@ -69,6 +69,15 @@ jobs:
       - name: Test no-git-push check
         run: node --test ./scripts/check-no-git-push.test.mjs
 
+      # Published container ports bypass the INPUT chain that UFW governs, so the
+      # publish bind address is the effective control. Guard against a new
+      # service reintroducing a bare `"8080:8080"` in a shipped stack.
+      - name: Reject non-loopback port publishes in shipped container stacks
+        run: node ./scripts/check-compose-loopback-bind.mjs
+
+      - name: Test compose loopback-bind check
+        run: node --test ./scripts/check-compose-loopback-bind.test.mjs
+
       # Regression guard for CONTRIBUTING.md's "No Internal Issue References"
       # rule: fails if the PR diff adds an internal ticket id, an instance UI
       # link, an agent:// link, or a localhost/private-IP deep link into the
