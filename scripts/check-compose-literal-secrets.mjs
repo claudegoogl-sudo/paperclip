@@ -23,6 +23,17 @@
  * a line-based lint, not a YAML parser, so treat a green result as "the common
  * mistakes are caught", not as a proof that no credential can exist.
  *
+ * Rule 2 (URL userinfo, below) runs line-wide, independent of key parsing,
+ * because a credential-bearing URL is not identifiable by key name — gating it
+ * behind a parseable key would reopen the very fail-open it exists to close (a
+ * hyphenated `x-database-url:` extension key with an anchored DSN would slip the
+ * key parser and take the whole line with it). Known residual bypasses, accepted
+ * as out of scope for a line-based lint: a DSN inside a flow-mapping list item
+ * (`- {KEY: value}`, not valid Compose for `environment:`) and a lower-case
+ * secret key with its value on the next line (the bare-key rule is deliberately
+ * restricted to upper-case env-var names so `secrets:` and other structural keys
+ * stay out).
+ *
  * Two kinds of offense:
  *   1. A secret-named key (`*PASSWORD*`, `*SECRET*`, `*TOKEN*`, `*API_KEY*`, ...)
  *      whose value is anything other than a pure interpolation. A non-empty
@@ -234,7 +245,7 @@ export function flowMappingEntries(rawValue) {
 
   const entries = [];
   for (const part of splitTopLevel(inner[1], ",")) {
-    const pair = /^\s*["']?([A-Za-z_][A-Za-z0-9_]*)["']?\s*:\s*([\s\S]*?)\s*$/.exec(part);
+    const pair = /^\s*["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?\s*:\s*([\s\S]*?)\s*$/.exec(part);
     if (pair) entries.push({ key: pair[1], value: pair[2] });
   }
   return entries.length > 0 ? entries : null;
@@ -270,7 +281,7 @@ export function entriesForLine(line) {
 
   // `KEY: value`, tolerating a quoted key (`"KEY": value`). A flow-mapping value
   // is expanded so a secret nested in `{...}` is still inspected.
-  const mapping = /^["']?([A-Za-z_][A-Za-z0-9_]*)["']?:\s+([\s\S]+)$/.exec(text);
+  const mapping = /^["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?:\s+([\s\S]+)$/.exec(text);
   if (mapping) {
     return flowMappingEntries(mapping[2]) ?? [{ key: mapping[1], value: mapping[2] }];
   }
@@ -300,16 +311,35 @@ export function findOffenses(text) {
     const previous = index > 0 ? lines[index - 1] : "";
     if (line.includes(ALLOW_MARKER) || previous.includes(ALLOW_MARKER)) continue;
 
+    // Rule 2 runs line-wide, before and independent of key parsing. A URL with a
+    // literal userinfo password is a finding wherever it sits — a hyphenated
+    // extension key (`x-database-url:`), an anchor definition, a bare list item,
+    // a block-scalar continuation — none of which `entriesForLine` yields a
+    // parseable entry for. Gating the URL rule behind a parseable key was the
+    // fail-open that let the idiomatic `x-`/anchor DRY construct reintroduce the
+    // duplicated credential this gate exists to reject.
+    const urlResult = classifyUrlValue(stripComment(line));
+    if (!urlResult.ok) {
+      offenses.push({
+        lineNumber: index + 1,
+        key: null,
+        reason: urlResult.reason,
+        line: line.trim(),
+      });
+    }
+
     for (const entry of entriesForLine(line)) {
       const result = classifyEntry(entry.key, entry.value);
-      if (!result.ok) {
-        offenses.push({
-          lineNumber: index + 1,
-          key: entry.key,
-          reason: result.reason,
-          line: line.trim(),
-        });
-      }
+      // De-dup: when the per-entry pass reports the same URL offense the
+      // line-wide pass already recorded (an ordinary `DATABASE_URL: postgres://…`
+      // line), flag it once, not twice.
+      if (result.ok || (!urlResult.ok && result.reason === urlResult.reason)) continue;
+      offenses.push({
+        lineNumber: index + 1,
+        key: entry.key,
+        reason: result.reason,
+        line: line.trim(),
+      });
     }
   }
 

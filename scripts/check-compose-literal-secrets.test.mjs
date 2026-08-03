@@ -202,6 +202,39 @@ test("R4: rejects a DSN embedded in a wrapper value", () => {
   assert.match(offenses[0].reason, /userinfo field/);
 });
 
+test("B2/P1: rejects a hyphenated x- extension key carrying a literal DSN (anchor idiom)", () => {
+  const offenses = findOffenses(
+    "x-database-url: &db-url postgres://paperclip:paperclip@db:5432/paperclip\n" +
+      "services:\n  server:\n    environment:\n      DATABASE_URL: *db-url\n",
+  );
+  assert.equal(offenses.length, 1);
+  assert.equal(offenses[0].lineNumber, 1);
+  assert.equal(offenses[0].key, null);
+  assert.match(offenses[0].reason, /userinfo field/);
+});
+
+test("B2/P4: rejects a bare DSN list item that is not a KEY=value entry", () => {
+  const offenses = findOffenses(composeWith("- postgres://paperclip:paperclip@db:5432/x"));
+  assert.equal(offenses.length, 1);
+  assert.equal(offenses[0].key, null);
+  assert.match(offenses[0].reason, /userinfo field/);
+});
+
+test("B2/P5: rejects a DSN carried on a block-scalar continuation line", () => {
+  const offenses = findOffenses(
+    "services:\n  db:\n    command: |\n      psql postgres://paperclip:paperclip@db:5432/x\n",
+  );
+  assert.equal(offenses.length, 1);
+  assert.equal(offenses[0].lineNumber, 4);
+  assert.match(offenses[0].reason, /userinfo field/);
+});
+
+test("B2: an ordinary DATABASE_URL offense is flagged exactly once, not twice", () => {
+  const offenses = findOffenses(composeWith("DATABASE_URL: postgres://paperclip:paperclip@db:5432/paperclip"));
+  assert.equal(offenses.length, 1);
+  assert.match(offenses[0].reason, /userinfo field/);
+});
+
 test("the repository's own shipped stacks pass", () => {
   const repoRoot = path.resolve(import.meta.dirname, "..");
   assert.equal(runCheck({ repoRoot, log: () => {}, error: console.error }), 0);
