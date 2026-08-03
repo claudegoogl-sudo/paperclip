@@ -1090,6 +1090,7 @@ function tableIsLarge(table: string, estimates: ReadonlyMap<string, TableSizeEst
  *   are strings assembled at runtime, so no static parser can see them.
  * - a rule/trigger body that rewrites the posture column as a side effect of a
  *   write to some other table.
+ *
  * A column renamed or dropped out from under a registry entry used to belong on
  * that list — the entry would match nothing and this rule would pass while
  * protecting zero columns. `assertSecurityPostureColumnsResolve` now rejects an
