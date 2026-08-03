@@ -17,6 +17,11 @@
  * Scope (mirrors check-compose-loopback-bind.mjs):
  *   - `docker/*.yml` — `KEY: value` and `- KEY=value` entries.
  *   - `docker/quadlet/*` — `Environment=KEY=value` entries.
+ * The scan is a single non-recursive pass over those two locations: nested
+ * directories (`docker/agent-runtime/`, `docker/untrusted-review/`, ...) and
+ * non-`.yml` files (`docker/ecs-task-definition.json`) are out of scope. This is
+ * a line-based lint, not a YAML parser, so treat a green result as "the common
+ * mistakes are caught", not as a proof that no credential can exist.
  *
  * Two kinds of offense:
  *   1. A secret-named key (`*PASSWORD*`, `*SECRET*`, `*TOKEN*`, `*API_KEY*`, ...)
@@ -151,7 +156,9 @@ export function classifyUrlValue(rawValue) {
   const value = unquote(rawValue);
   const masked = maskInterpolations(value);
 
-  const match = /^[A-Za-z][A-Za-z0-9+.-]*:\/\/([^/?#]*)@/.exec(masked);
+  // Not `^`-anchored: a DSN embedded in a larger value (`--dsn=postgres://u:pw@h`,
+  // a `command:`/`args:` wrapper) carries the same credential and must be caught.
+  const match = /[A-Za-z][A-Za-z0-9+.-]*:\/\/([^/?#]*)@/.exec(masked);
   if (!match) return { ok: true };
 
   const separator = match[1].indexOf(":");
@@ -169,6 +176,18 @@ export function classifyUrlValue(rawValue) {
 }
 
 function classifyEntry(key, value) {
+  // A secret-named key with no inline value (`POSTGRES_PASSWORD:` alone): the
+  // credential could live in a block or next-line scalar this line-based check
+  // cannot see. Fail closed instead of passing silently.
+  if (value === null) {
+    return {
+      ok: false,
+      reason:
+        "secret-named key has no inline value; a block or next-line scalar could carry a literal " +
+        "credential this line-based check cannot see. Put the value inline as `${VAR:?reason}`, " +
+        "or add an allow marker if it is genuinely not a credential.",
+    };
+  }
   if (SECRET_KEY_PATTERN.test(key) && !SECRET_FILE_KEY_PATTERN.test(key)) {
     const result = classifySecretValue(value);
     if (!result.ok) return result;
@@ -177,26 +196,99 @@ function classifyEntry(key, value) {
 }
 
 /**
- * Pull `KEY: value`, `- KEY=value` and `Environment=KEY=value` out of one line.
- * Deliberately indentation-agnostic: a secret-named key anywhere in a shipped
- * stack file is a finding regardless of which block it sits in.
+ * Split `text` on `delimiter` occurrences that sit at brace depth 0 and outside
+ * quotes, so a `,` inside `${VAR:?a, b}` or a quoted scalar does not split a
+ * flow-mapping entry.
  */
-export function extractEntry(line) {
+function splitTopLevel(text, delimiter) {
+  const parts = [];
+  let depth = 0;
+  let inSingle = false;
+  let inDouble = false;
+  let start = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (!inDouble && char === "'") inSingle = !inSingle;
+    else if (!inSingle && char === '"') inDouble = !inDouble;
+    else if (!inSingle && !inDouble) {
+      if (char === "{") depth += 1;
+      else if (char === "}") depth = Math.max(0, depth - 1);
+      else if (char === delimiter && depth === 0) {
+        parts.push(text.slice(start, index));
+        start = index + 1;
+      }
+    }
+  }
+  parts.push(text.slice(start));
+  return parts;
+}
+
+/**
+ * Expand a YAML flow mapping (`{KEY: value, KEY2: value2}`) into its entries so a
+ * secret nested in flow style is inspected. Returns `null` when the value is not
+ * a flow mapping.
+ */
+export function flowMappingEntries(rawValue) {
+  const inner = /^\{([\s\S]*)\}$/.exec(unquote(rawValue).trim());
+  if (!inner) return null;
+
+  const entries = [];
+  for (const part of splitTopLevel(inner[1], ",")) {
+    const pair = /^\s*["']?([A-Za-z_][A-Za-z0-9_]*)["']?\s*:\s*([\s\S]*?)\s*$/.exec(part);
+    if (pair) entries.push({ key: pair[1], value: pair[2] });
+  }
+  return entries.length > 0 ? entries : null;
+}
+
+/**
+ * Pull the `{ key, value }` entries out of one line: `KEY: value`, `- KEY=value`,
+ * `Environment=KEY=value`, quoted variants of each, and flow mappings. A
+ * secret-named key with no inline value yields `value: null` so it can be failed
+ * closed. Deliberately indentation-agnostic: a secret-named key anywhere in a
+ * shipped stack file is a finding regardless of which block it sits in.
+ *
+ * A value this parser cannot read must run *no* rule silently — that is fail-open
+ * in the one place meant to catch the next contributor — so every accepted shape
+ * is unquoted and re-parsed rather than skipped.
+ */
+export function entriesForLine(line) {
   const text = stripComment(line).trim();
-  if (text === "") return null;
+  if (text === "") return [];
 
   const environmentDirective = /^Environment=([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(text);
   if (environmentDirective) {
-    return { key: environmentDirective[1], value: environmentDirective[2] };
+    return [{ key: environmentDirective[1], value: environmentDirective[2] }];
   }
 
-  const listItem = /^-\s*([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(text);
-  if (listItem) return { key: listItem[1], value: listItem[2] };
+  // `- KEY=value`, including the quoted `- "KEY=value"` / `- 'KEY=value'` forms:
+  // quoting a list entry is ordinary Compose style and was a silent bypass.
+  const listItem = /^-\s*([\s\S]+)$/.exec(text);
+  if (listItem) {
+    const pair = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/.exec(unquote(listItem[1]));
+    return pair ? [{ key: pair[1], value: pair[2] }] : [];
+  }
 
-  const mapping = /^([A-Za-z_][A-Za-z0-9_]*):\s+([\s\S]+)$/.exec(text);
-  if (mapping) return { key: mapping[1], value: mapping[2] };
+  // `KEY: value`, tolerating a quoted key (`"KEY": value`). A flow-mapping value
+  // is expanded so a secret nested in `{...}` is still inspected.
+  const mapping = /^["']?([A-Za-z_][A-Za-z0-9_]*)["']?:\s+([\s\S]+)$/.exec(text);
+  if (mapping) {
+    return flowMappingEntries(mapping[2]) ?? [{ key: mapping[1], value: mapping[2] }];
+  }
 
-  return null;
+  // Secret-named key with the value on the following line or in a block scalar.
+  // Restricted to env-var-style upper-case keys so structural keys such as
+  // `secrets:` are not swept in.
+  const bareKey = /^["']?([A-Z][A-Z0-9_]*)["']?:\s*$/.exec(text);
+  if (bareKey && SECRET_KEY_PATTERN.test(bareKey[1]) && !SECRET_FILE_KEY_PATTERN.test(bareKey[1])) {
+    return [{ key: bareKey[1], value: null }];
+  }
+
+  return [];
+}
+
+/** Back-compat single-entry accessor: the first entry on the line, or `null`. */
+export function extractEntry(line) {
+  return entriesForLine(line)[0] ?? null;
 }
 
 export function findOffenses(text) {
@@ -208,17 +300,16 @@ export function findOffenses(text) {
     const previous = index > 0 ? lines[index - 1] : "";
     if (line.includes(ALLOW_MARKER) || previous.includes(ALLOW_MARKER)) continue;
 
-    const entry = extractEntry(line);
-    if (!entry) continue;
-
-    const result = classifyEntry(entry.key, entry.value);
-    if (!result.ok) {
-      offenses.push({
-        lineNumber: index + 1,
-        key: entry.key,
-        reason: result.reason,
-        line: line.trim(),
-      });
+    for (const entry of entriesForLine(line)) {
+      const result = classifyEntry(entry.key, entry.value);
+      if (!result.ok) {
+        offenses.push({
+          lineNumber: index + 1,
+          key: entry.key,
+          reason: result.reason,
+          line: line.trim(),
+        });
+      }
     }
   }
 

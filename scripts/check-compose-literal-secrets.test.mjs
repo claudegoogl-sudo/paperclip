@@ -8,8 +8,10 @@ import {
   ALLOW_MARKER,
   classifySecretValue,
   classifyUrlValue,
+  entriesForLine,
   extractEntry,
   findOffenses,
+  flowMappingEntries,
   maskInterpolations,
   runCheck,
 } from "./check-compose-literal-secrets.mjs";
@@ -132,6 +134,72 @@ test("runCheck walks docker/*.yml and docker/quadlet/* and reports offenses", ()
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("B1: rejects a quoted list-form env entry in both quote styles", () => {
+  for (const line of ['- "POSTGRES_PASSWORD=paperclip"', "- 'POSTGRES_PASSWORD=paperclip'"]) {
+    const offenses = findOffenses(composeWith(line));
+    assert.equal(offenses.length, 1, line);
+    assert.equal(offenses[0].key, "POSTGRES_PASSWORD");
+    assert.match(offenses[0].reason, /literal credential/);
+  }
+});
+
+test("B1: extractEntry unquotes the list-form key=value", () => {
+  assert.deepEqual(extractEntry('      - "POSTGRES_PASSWORD=paperclip"'), {
+    key: "POSTGRES_PASSWORD",
+    value: "paperclip",
+  });
+  assert.deepEqual(extractEntry("      - 'POSTGRES_PASSWORD=paperclip'"), {
+    key: "POSTGRES_PASSWORD",
+    value: "paperclip",
+  });
+  // A quoted interpolation stays accepted.
+  assert.deepEqual(findOffenses(composeWith('- "POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?x}"')), []);
+});
+
+test("R1: rejects a quoted mapping key", () => {
+  const offenses = findOffenses(composeWith('"POSTGRES_PASSWORD": paperclip'));
+  assert.equal(offenses.length, 1);
+  assert.equal(offenses[0].key, "POSTGRES_PASSWORD");
+  assert.match(offenses[0].reason, /literal credential/);
+});
+
+test("R2: inspects a secret nested in a flow mapping", () => {
+  const flagged = findOffenses(
+    "services:\n  db:\n    environment: {POSTGRES_USER: paperclip, POSTGRES_PASSWORD: paperclip}\n",
+  );
+  assert.equal(flagged.length, 1);
+  assert.equal(flagged[0].key, "POSTGRES_PASSWORD");
+
+  assert.deepEqual(
+    findOffenses('services:\n  db:\n    environment: {POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?x}"}\n'),
+    [],
+  );
+  assert.equal(flowMappingEntries("plain-scalar"), null);
+});
+
+test("R3: fails closed on a secret key with no inline value", () => {
+  const offenses = findOffenses("services:\n  db:\n    environment:\n      POSTGRES_PASSWORD:\n");
+  assert.equal(offenses.length, 1);
+  assert.equal(offenses[0].key, "POSTGRES_PASSWORD");
+  assert.match(offenses[0].reason, /no inline value/);
+});
+
+test("R3: does not sweep in structural or _FILE keys", () => {
+  const text =
+    "secrets:\n  db_password:\n    file: ./db_password.txt\n" +
+    "services:\n  db:\n    environment:\n      POSTGRES_PASSWORD_FILE:\n";
+  assert.deepEqual(findOffenses(text), []);
+  assert.deepEqual(entriesForLine("  secrets:"), []);
+});
+
+test("R4: rejects a DSN embedded in a wrapper value", () => {
+  const offenses = findOffenses(
+    composeWith("DATABASE_URL: --dsn=postgres://paperclip:paperclip@db:5432/x"),
+  );
+  assert.equal(offenses.length, 1);
+  assert.match(offenses[0].reason, /userinfo field/);
 });
 
 test("the repository's own shipped stacks pass", () => {
