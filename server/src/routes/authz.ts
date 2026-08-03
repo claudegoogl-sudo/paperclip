@@ -35,6 +35,26 @@ export function assertBoard(req: Request) {
   }
 }
 
+// A stricter gate than assertBoard for secret-egress review + mutation:
+// separation of duties by credential SOURCE, not just actor type.
+// assertBoard only checks `type === "board"`, and a board API
+// KEY resolves to a board actor — but that key lives in ~/.paperclip/auth.json,
+// a file readable by every agent running under the same host uid, so "board"
+// alone proves nothing about a human being present. `source === "session"` is
+// the only actor source that comes from an authenticated browser session
+// (auth.ts sets it from a BetterAuth session, never from a file on disk). It
+// deliberately excludes board_key, local_implicit (local_trusted mode elevates
+// unauthenticated requests to board), cloud_tenant, and every agent source.
+export function requireInteractiveBoard(req: Request): boolean {
+  return req.actor.type === "board" && req.actor.source === "session";
+}
+
+export function assertInteractiveBoard(req: Request) {
+  if (!requireInteractiveBoard(req)) {
+    throw forbidden("Interactive operator session required");
+  }
+}
+
 export function hasBoardOrgAccess(req: Request) {
   if (req.actor.type !== "board") {
     return false;

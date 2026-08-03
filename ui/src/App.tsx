@@ -68,6 +68,7 @@ import { CompanyInvites } from "./pages/CompanyInvites";
 import { CompanySkills } from "./pages/CompanySkills";
 import { SkillStudio } from "./pages/SkillStudio";
 import { Secrets } from "./pages/Secrets";
+import { EgressBindings } from "./pages/EgressBindings";
 import { CompanyExport } from "./pages/CompanyExport";
 import { CompanyImport } from "./pages/CompanyImport";
 import { DesignGuide } from "./pages/DesignGuide";
@@ -144,6 +145,7 @@ function boardRoutes() {
         <Route path="apps/:connectionId" element={<Navigate to="setup" replace />} />
         <Route path="apps/:connectionId/:tab" element={<AppDetail />} />
       </Route>
+      <Route path="company/settings/secrets/egress" element={<EgressBindings />} />
       <Route path="company/settings/instance" element={<Navigate to="general" replace />} />
       <Route path="company/settings/instance/profile" element={<ProfileSettings />} />
       <Route path="company/settings/instance/general" element={<InstanceGeneralSettings />} />

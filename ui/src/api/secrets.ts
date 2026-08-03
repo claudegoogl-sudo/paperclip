@@ -32,6 +32,11 @@ export interface SecretUsageResponse {
  * re-derived in the UI from `egressAllowlistEnforced` + `allowedEgress.length`.
  * That re-inference is what left the born-enforcing bindings invisible and is
  * what `server/src/services/egress-posture.ts` exists to prevent.
+ *
+ * The egress-binding routes behind these types are gated by
+ * `assertInteractiveBoard` on the server (a browser session only — a board API
+ * key is rejected), so this client is only ever reachable from the operator
+ * dashboard, never an agent.
  */
 export type EgressPosture = "log_only" | "enforcing" | "deny_all";
 
