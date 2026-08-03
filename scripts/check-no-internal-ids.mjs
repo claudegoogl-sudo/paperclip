@@ -31,6 +31,19 @@ export const EXCLUDED_PATHS = new Set([
   "scripts/check-no-internal-ids.test.mjs",
 ]);
 
+// Path *prefixes* excluded from the scan (matched with startsWith, so this is
+// the glob `packages/db/src/migrations/**`).
+//
+// Released database migrations are append-only, comments included: the runner
+// identifies a migration by the sha256 of the whole file, so rewriting a
+// migration's comment to scrub an id changes its identity and re-applies it on
+// every existing database (see scripts/check-migrations-append-only.mjs). The
+// scrub guard and the append-only guard would otherwise fight — the scrub
+// wanting to rewrite the comment, the append-only guard forbidding exactly
+// that. If a released migration genuinely contains an internal id, the correct
+// remedy is a NEW forward migration, never an edit to the released file.
+export const EXCLUDED_PREFIXES = ["packages/db/src/migrations/"];
+
 // Internal ticket ids follow this instance's own `{PREFIX}-{NUMBER}` scheme.
 // Matched case-sensitively: lowercase env-var-style / fixture identifiers
 // (e.g. `pla-447-extract` as an example tmp-dir name) are a different,
@@ -106,10 +119,14 @@ export function extractAddedLines(diffText) {
 }
 
 /** Scan pre-extracted added lines for forbidden forms. Returns findings; empty = clean. */
-export function scanAddedLinesForForbiddenIds(addedLines, { excludedPaths = EXCLUDED_PATHS } = {}) {
+export function scanAddedLinesForForbiddenIds(
+  addedLines,
+  { excludedPaths = EXCLUDED_PATHS, excludedPrefixes = EXCLUDED_PREFIXES } = {},
+) {
   const findings = [];
   for (const { file, lineNumber, content } of addedLines) {
     if (excludedPaths.has(file)) continue;
+    if (excludedPrefixes.some((prefix) => file.startsWith(prefix))) continue;
     for (const { name, pattern, describe } of FORBIDDEN_PATTERNS) {
       const match = pattern.exec(content);
       if (match) {

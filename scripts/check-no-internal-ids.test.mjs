@@ -143,6 +143,40 @@ test("self-exclusion: the checker script and its test file are excluded from sca
   assert.deepEqual(scanDiffForForbiddenIds(diff), []);
 });
 
+// --- Migration exclusion: released migrations are append-only (comments
+// included), so the scrub must not want to rewrite their comments. The
+// remedy for an id in a migration is a NEW forward migration. Excluded by
+// the `packages/db/src/migrations/**` prefix, not an exact path. -----------
+
+test("migration exclusion: an internal id inside a migration file is NOT flagged", () => {
+  const ticketId = ["PLA", "-", "138"].join("");
+  const diff = unifiedDiff("packages/db/src/migrations/0138_secret_binding_egress_allowlist.sql", {
+    newStart: 1,
+    body: `+-- see ${ticketId} for context`,
+  });
+  assert.deepEqual(scanDiffForForbiddenIds(diff), []);
+});
+
+test("migration exclusion: the same id in a NON-migration file is still flagged", () => {
+  const ticketId = ["PLA", "-", "138"].join("");
+  const diff = unifiedDiff("packages/db/src/client.ts", {
+    newStart: 1,
+    body: `+// see ${ticketId} for context`,
+  });
+  const findings = scanDiffForForbiddenIds(diff);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].patternName, "internal-ticket-id");
+});
+
+test("migration exclusion: meta/_journal.json under the prefix is also excluded", () => {
+  const ticketId = ["PLA", "-", "1"].join("");
+  const diff = unifiedDiff("packages/db/src/migrations/meta/_journal.json", {
+    newStart: 1,
+    body: `+  "note": "${ticketId}"`,
+  });
+  assert.deepEqual(scanDiffForForbiddenIds(diff), []);
+});
+
 test("scanAddedLinesForForbiddenIds: custom excludedPaths override is respected", () => {
   const ticketId = ["PLA", "-", "2"].join("");
   const added = [{ file: "notes.md", lineNumber: 3, content: `see ${ticketId}` }];
