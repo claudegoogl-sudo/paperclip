@@ -54,6 +54,10 @@ import {
   type PluginWebhookRateLimitTier,
 } from "../services/plugin-webhook-rate-limit.js";
 import { isVerifiedWebhookDelivery } from "../services/plugin-webhook-auth.js";
+import {
+  generateWebhookToken,
+  WebhookTokenEntropyError,
+} from "../services/plugin-webhook-token.js";
 import { logger } from "../middleware/logger.js";
 import type { PluginWatchReconciler } from "../services/plugin-dev-watcher.js";
 import {
@@ -2450,6 +2454,110 @@ export function pluginRoutes(
   });
 
   /**
+   * POST /api/plugins/:pluginId/webhooks/:endpointKey/token
+   *
+   * Mint (or rotate) the shared token for a webhook endpoint that declares
+   * `auth` (PLUGIN_SPEC §18.1), and store its `{ salt, digest }` into the
+   * plugin's instance config under the declaration's `tokenDigestConfigKey`.
+   *
+   * This is the enforcement point for the 128-bit entropy floor: the host
+   * generates the token so the operator never chooses a weak one. The digest is
+   * offline-brute-forceable by anyone who can read plugin config, so a low-
+   * entropy token would be recoverable in seconds — a floor that lived only in
+   * documentation is a wish, not a floor.
+   *
+   * The token is returned **once** in the response for the operator to paste
+   * into the provider; the host writes only the digest and never persists the
+   * token. Re-running rotates: a fresh salt/digest replaces the old pair, which
+   * is idempotent in the sense that the config always converges to a valid
+   * recogniser for the token just printed.
+   *
+   * Request body (optional):
+   * - `token`: bring-your-own token. Rejected below the 128-bit floor (a length
+   *   ceiling check — the explicit, discouraged escape hatch). Omit it to let
+   *   the host generate one, which is the recommended path.
+   *
+   * Response: `{ token, endpointKey, header, tokenDigestConfigKey }`
+   * Errors:
+   * - 400 if the endpoint has no `header-token` auth declaration, or a supplied
+   *   token is below the floor
+   * - 404 if the plugin or endpointKey is not found
+   */
+  router.post("/plugins/:pluginId/webhooks/:endpointKey/token", async (req, res) => {
+    assertInstanceAdmin(req);
+    const { pluginId, endpointKey } = req.params;
+
+    const plugin = await resolvePlugin(registry, pluginId);
+    if (!plugin) {
+      res.status(404).json({ error: "Plugin not found" });
+      return;
+    }
+
+    const webhookDecl = (plugin.manifestJson?.webhooks ?? []).find(
+      (w) => w.endpointKey === endpointKey,
+    );
+    if (!webhookDecl) {
+      res.status(404).json({
+        error: `Webhook endpoint '${endpointKey}' is not declared by this plugin`,
+      });
+      return;
+    }
+    const auth = webhookDecl.auth;
+    if (!auth || auth.type !== "header-token") {
+      res.status(400).json({
+        error: `Webhook endpoint '${endpointKey}' does not declare header-token auth; there is no token to generate`,
+      });
+      return;
+    }
+
+    const body = req.body as { token?: unknown } | undefined;
+    const suppliedToken = body?.token;
+    if (suppliedToken !== undefined && typeof suppliedToken !== "string") {
+      res.status(400).json({ error: '"token" must be a string when provided' });
+      return;
+    }
+
+    let generated;
+    try {
+      generated = generateWebhookToken(suppliedToken);
+    } catch (err) {
+      if (err instanceof WebhookTokenEntropyError) {
+        res.status(400).json({ error: err.message });
+        return;
+      }
+      throw err;
+    }
+
+    // Merge into existing config so unrelated keys survive the rotation.
+    const existing = await registry.getConfig(plugin.id);
+    const configJson: Record<string, unknown> = {
+      ...(existing?.configJson ?? {}),
+      [auth.tokenDigestConfigKey]: generated.digestConfig,
+    };
+
+    await registry.upsertConfig(plugin.id, { configJson });
+    // Never log the token; the digest key is the only detail worth an audit trail.
+    await logPluginMutationActivity(req, "plugin.config.updated", plugin.id, {
+      pluginId: plugin.id,
+      pluginKey: plugin.pluginKey,
+      webhookEndpointKey: endpointKey,
+      tokenDigestConfigKey: auth.tokenDigestConfigKey,
+      action: "webhook-token-generated",
+    });
+    logger.info(
+      { pluginId: plugin.id, endpointKey, tokenDigestConfigKey: auth.tokenDigestConfigKey },
+      "generated webhook token digest for plugin endpoint",
+    );
+
+    res.json({
+      token: generated.token,
+      endpointKey,
+      header: auth.header,
+      tokenDigestConfigKey: auth.tokenDigestConfigKey,
+    });
+  });
+
+  /**
    * POST /api/plugins/:pluginId/config/test
    *
    * Test a plugin configuration without persisting it by calling the plugin
@@ -2788,8 +2896,20 @@ export function pluginRoutes(
     // A mismatch is not an error and never returns 401 — see
     // plugin-webhook-auth.ts for why falling through to the anonymous budget is
     // the safer failure mode than rejecting.
+    //
+    // The `webhooks.verify` capability is re-checked here, at request time,
+    // against the *persisted* manifest — the same complete-mediation reason step
+    // 3 re-checks `webhooks.receive` rather than trusting install-time
+    // validation. Without it, a persisted manifest carrying `auth` that never
+    // passed the validator (a pre-feature row, a reinstall path, a direct DB
+    // write) could reach the verified tier with no grant. Absent the capability,
+    // the delivery stays anonymous.
     let tier: PluginWebhookRateLimitTier = "anonymous";
-    if (webhookDecl.auth && req.headers[webhookDecl.auth.header.toLowerCase()]) {
+    if (
+      webhookDecl.auth &&
+      capabilities.includes("webhooks.verify") &&
+      req.headers[webhookDecl.auth.header.toLowerCase()]
+    ) {
       const config = await registry.getConfig(plugin.id);
       const verified = isVerifiedWebhookDelivery({
         auth: webhookDecl.auth,

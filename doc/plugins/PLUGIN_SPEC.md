@@ -1131,7 +1131,15 @@ Requires the `webhooks.verify` capability. Without it, a manifest carrying `auth
 }
 ```
 
-The operator stores the matching value in the plugin's instance config under that key:
+**Generate the token — do not choose one.** The host ships a generator that is the recipe below, so operators never hand-pick a token:
+
+```
+paperclipai plugin webhook-token <pluginId> <endpointKey>
+```
+
+It mints a 128-bit token (`crypto.randomBytes(16)` → base62), mints the salt (`crypto.randomBytes(12)` → hex — the operator does not get to pick it), stores `{ salt, digest }` into instance config under the endpoint's `tokenDigestConfigKey`, and prints the token **once** for you to paste into the provider. The host never persists the token; only the digest is stored. Re-running rotates the pair.
+
+The stored value looks like this:
 
 ```jsonc
 {
@@ -1142,14 +1150,15 @@ The operator stores the matching value in the plugin's instance config under tha
 }
 ```
 
-**Construction.** `digest = HMAC-SHA256(key = salt, message = token)`, lowercase hex. HMAC rather than `sha256(salt || token)` deliberately: SHA-256 is length-extendable, so a bare-concatenation digest would let anyone who can read it derive a *new* accepted token without knowing the real one — the digest would be a bearer credential, which is exactly what this design must not hold. Bare concatenation is also ambiguous (`salt="ab",token="cd"` and `salt="abc",token="d"` collide). HMAC has neither property. Derive the value with `computeWebhookTokenDigest(salt, token)` from the host rather than reimplementing it.
+**Construction.** `digest = HMAC-SHA256(key = salt, message = token)`, lowercase hex. HMAC rather than `sha256(salt || token)` for two reasons. First, bare concatenation is not a canonical encoding: `salt="ab", token="cd"` and `salt="abc", token="d"` hash identically, so the salt/token boundary is not pinned and two different endpoint configurations can collide. HMAC keys the salt instead of concatenating it, which removes the ambiguity. Second, HMAC is the standard, reviewed keyed-hash construction, so no one has to re-derive which of the prefix-secret and suffix-secret SHA-256 pitfalls apply to this particular byte order — a question that is easy to get backwards. (Length extension is *not* one of them: it breaks `H(secret || message)` where the secret is the *prefix*, whereas here the salt is the public prefix and the token is the secret suffix, so it does not apply. Recovering the token from the digest still reduces to a SHA-256 preimage with a known key.) Note the orientation is inverted from conventional HMAC — the *public* salt is the key and the *secret* token is the message — which is deliberate and safe here. Derive the value with `computeWebhookTokenDigest(salt, token)` from the host rather than reimplementing it.
 
 **Requirements.**
 
 - The token is a credential and must be stored as one on the provider side; it never enters plugin config or the manifest.
-- Minimum **128 bits of entropy** in the token (e.g. 22+ chars of base62, or 32 hex). The digest is readable by anyone who can read plugin config, so a low-entropy token is brute-forceable offline regardless of the salt.
+- Minimum **128 bits of entropy** in the token, enforced at **generation**: `paperclipai plugin webhook-token` mints it, so the floor is a floor and not a wish. The host cannot measure a token's entropy from a digest, so it cannot enforce the floor at verification time — an operator-chosen `paperclip-webhook-2026` (~40 bits) passes a digest check but falls offline in a fraction of a second. Bringing your own token is an explicit escape hatch (`--token`) and is refused when it is too short to possibly carry 128 bits (a length ceiling — a necessary, not sufficient, check; prefer the generator). The digest is held in **instance** config — `GET /api/plugins/:pluginId/config` is board/org-gated, so it is readable by board/org principals, the plugin's own worker, and anyone with direct DB or backup access, but **not** by anonymous callers or other tenants' agents. Any member of that reader set can brute-force a low-entropy token offline regardless of the salt (the salt only defeats precomputed tables and cross-endpoint digest reuse), and a backup outlives the credential — so the entropy floor holds even though the config is not world-readable.
+- The digest is read from **instance** config only; it is **not** merged with per-company `configOverrides` (unlike what a worker sees via `ctx.config.get()`). A tenant who can write company config-overrides therefore cannot plant a digest and promote its own traffic into the verified tier.
 - Salt: at least 16 characters, unique per endpoint. It is not secret; it exists so the stored digest resists precomputed tables and so two plugins sharing a token do not share a digest.
-- Rotation: write the new `{ salt, digest }`, then update the provider. During the gap, deliveries fall back to the anonymous budget — they are not lost.
+- Rotation: re-run `paperclipai plugin webhook-token` (it writes a fresh `{ salt, digest }`), then update the provider. During the gap, deliveries fall back to the anonymous budget — they are not lost.
 
 **Semantics.**
 

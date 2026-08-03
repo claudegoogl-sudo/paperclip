@@ -91,6 +91,10 @@ interface PluginStreamOptions extends BaseClientOptions {
   durationMs?: string;
 }
 
+interface PluginWebhookTokenOptions extends BaseClientOptions {
+  token?: string;
+}
+
 interface PluginCompanyOptions extends PluginJsonOptions {
   companyId?: string;
 }
@@ -661,6 +665,51 @@ export function registerPluginCommands(program: Command): void {
                 `  ${pc.cyan(`paperclipai plugin install ${ex.localPath}`)}`,
             );
           }
+        } catch (err) {
+          handleCommandError(err);
+        }
+      }),
+  );
+
+  // -------------------------------------------------------------------------
+  // plugin webhook-token
+  // -------------------------------------------------------------------------
+  addCommonClientOptions(
+    plugin
+      .command("webhook-token <pluginId> <endpointKey>")
+      .description(
+        "Generate a 128-bit shared token for a webhook endpoint and store its digest (PLUGIN_SPEC §18.1)",
+      )
+      .option(
+        "--token <token>",
+        "Bring your own token instead of generating one (rejected below the 128-bit floor)",
+      )
+      .action(async (pluginId: string, endpointKey: string, opts: PluginWebhookTokenOptions) => {
+        try {
+          const ctx = resolveCommandContext(opts);
+          const result = await ctx.api.post<{
+            token: string;
+            endpointKey: string;
+            header: string;
+            tokenDigestConfigKey: string;
+          }>(
+            `/api/plugins/${encodeURIComponent(pluginId)}/webhooks/${encodeURIComponent(endpointKey)}/token`,
+            opts.token ? { token: opts.token } : {},
+          );
+
+          if (ctx.json) {
+            printOutput(result, { json: true });
+            return;
+          }
+
+          console.log(
+            `${pc.green("Webhook token generated.")} The digest is now stored in plugin config under ` +
+              `${pc.bold(result.tokenDigestConfigKey)}.\n\n` +
+              `${pc.bold("Token (shown once — it is not stored and cannot be recovered):")}\n` +
+              `  ${pc.cyan(result.token)}\n\n` +
+              `Set it on the provider as the ${pc.bold(result.header)} header value for endpoint ` +
+              `${pc.bold(result.endpointKey)}.`,
+          );
         } catch (err) {
           handleCommandError(err);
         }
