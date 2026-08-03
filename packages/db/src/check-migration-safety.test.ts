@@ -872,6 +872,20 @@ describe("security-posture registry resolves against the schema", () => {
     expect(() => assertSecurityPostureColumnsResolve({})).toThrow(/no drizzle tables were found/);
   });
 
+  it("fails closed rather than passing vacuously when the registry itself is empty", () => {
+    // The registry-side twin of the case above. Emptying the registry — a merge
+    // conflict resolved the wrong way, say — degrades the rule to zero coverage in
+    // a single edit, and there is no surviving entry for the per-entry loop to
+    // report, so without this it reads as a clean pass.
+    expect(() => assertSecurityPostureColumnsResolve(undefined, [])).toThrow(/registry is empty/);
+  });
+
+  it("rejects an emptied registry from the same entry point the migration lint step runs", async () => {
+    // Otherwise the CLI prints "Migration safety check passed" and exits 0 while
+    // the rule covers nothing.
+    await expect(runMigrationSafetyCheck([])).rejects.toThrow(/registry is empty/);
+  });
+
   it("resolves case-insensitively, matching how the rule folds SQL identifiers", () => {
     const shouting: readonly SecurityPostureColumn[] = [
       {

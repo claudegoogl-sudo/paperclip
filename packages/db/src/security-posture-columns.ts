@@ -151,7 +151,12 @@ export function buildSchemaColumnIndex(tables: Record<string, unknown>): SchemaC
  * missing table means the table itself was renamed or dropped, a missing column
  * on a present table is the likelier and more innocent-looking case, a rename.
  *
- * A schema with no reachable tables also throws rather than vacuously passing.
+ * Both vacuous inputs throw rather than passing: a schema with no reachable
+ * tables, and an empty registry. An empty registry is the bulk form of the very
+ * degradation this function exists to catch — every entry gone at once instead of
+ * one entry rotted — and it is indistinguishable in the output from a drifted one,
+ * so it cannot be allowed to report success.
+ *
  * Note this only proves the registry agrees with the *drizzle* schema; a column
  * renamed in raw SQL without the matching schema edit is out of reach here (and
  * would break every query against that table).
@@ -160,6 +165,17 @@ export function assertSecurityPostureColumnsResolve(
   tables: Record<string, unknown> = schema,
   entries: readonly SecurityPostureColumn[] = SECURITY_POSTURE_COLUMNS,
 ): void {
+  if (entries.length === 0) {
+    throw new Error(
+      [
+        "Security-posture registry is empty: there are no (table, column) pairs left to protect.",
+        "The migration lint rule would still run and still report success while covering zero",
+        "columns, which is the same false evidence a drifted entry produces. Restore the entries,",
+        "or retire the rule in the same change that empties them.",
+      ].join("\n"),
+    );
+  }
+
   const index = buildSchemaColumnIndex(tables);
   if (index.size === 0) {
     throw new Error(
