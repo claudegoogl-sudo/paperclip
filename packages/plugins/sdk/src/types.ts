@@ -252,8 +252,12 @@ export interface ToolRunContext {
   runId: string;
   /** UUID of the company the run belongs to. */
   companyId: string;
-  /** UUID of the project the run belongs to. */
-  projectId: string;
+  /**
+   * UUID of the project the run belongs to. Absent when the run is not
+   * project-scoped — the host omits the field rather than substituting a
+   * placeholder, so `undefined` means "unknown", never "any project".
+   */
+  projectId?: string;
   /**
    * Cross-tenant artifact fetch client. The host authorizes on behalf of
    * the dispatching agent identified by `agentId` + `companyId`, not on
