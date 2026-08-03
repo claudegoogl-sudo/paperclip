@@ -47,6 +47,7 @@ import { logger } from "../middleware/logger.js";
 import { isValidAllowlistEntry } from "../handle-egress.js";
 import { purgeHandlesByBinding } from "../handle-vault.js";
 import { listEgressWouldDeny, type EgressWouldDenyObservationRow } from "./egress-harvest.js";
+import { egressPostureFor } from "./egress-posture.js";
 import {
   collectSecretRefPaths,
   isUuidSecretRef,
@@ -3497,6 +3498,11 @@ export function secretService(db: Db) {
 
       return bindings.map((binding) => ({
         ...binding,
+        // Derived, never stored. `enforced = true` with an empty allowlist is
+        // deny-all for this secret; returning the pair as two raw fields leaves
+        // that inference to the reader, and it is the inference nobody made for
+        // the bindings born enforcing with an empty allowlist.
+        posture: egressPostureFor(binding),
         // Harvested would-deny origins as UNCHECKED suggestions. `selected` is
         // hard-coded false: the surface presents them un-applied and the
         // operator opts each one in. Never derived from `allowedEgress` — a

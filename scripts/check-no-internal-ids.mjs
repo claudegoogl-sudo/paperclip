@@ -26,6 +26,8 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+export const MIGRATIONS_DIR = "packages/db/src/migrations";
+
 export const EXCLUDED_PATHS = new Set([
   "scripts/check-no-internal-ids.mjs",
   "scripts/check-no-internal-ids.test.mjs",
@@ -151,7 +153,30 @@ export function runCheck({ baseRef, headRef, execImpl = execFileSync, log = cons
     encoding: "utf8",
     maxBuffer: 1024 * 1024 * 64,
   });
-  const findings = scanDiffForForbiddenIds(diffText);
+
+  // Exclude only migrations that are ALREADY RELEASED (present at the base
+  // ref). Those are append-only, comments included, so the scrub must not want
+  // to rewrite them — that would fight the append-only guard and re-apply the
+  // migration on every existing database (see check-migrations-append-only.mjs;
+  // the remedy for an id in a released migration is a NEW forward migration).
+  //
+  // A migration ADDED in this PR is NOT released yet, carries no re-apply risk,
+  // and — once it merges it becomes append-only forever — is the last chance to
+  // catch a leaked id, so the scan still runs on it. Keying on the base ref
+  // (not a blanket path prefix) makes the excluded set exactly the protected
+  // set instead of a strict superset.
+  const releasedMigrations = new Set(
+    execImpl("git", ["ls-tree", "-r", "--name-only", baseRef, "--", MIGRATIONS_DIR], {
+      encoding: "utf8",
+      maxBuffer: 1024 * 1024 * 64,
+    })
+      .split("\n")
+      .filter(Boolean),
+  );
+
+  const findings = scanDiffForForbiddenIds(diffText, {
+    excludedPaths: new Set([...EXCLUDED_PATHS, ...releasedMigrations]),
+  });
   if (findings.length > 0) {
     error(formatFindings(findings));
     return 1;

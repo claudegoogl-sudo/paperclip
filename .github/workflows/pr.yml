@@ -93,13 +93,38 @@ jobs:
       # instance UI. Scoped to added lines only, base...head.
       - name: Reject internal/instance-local references added in this diff
         if: github.event_name == 'pull_request'
-        run: >-
-          node ./scripts/check-no-internal-ids.mjs
-          "${{ github.event.pull_request.base.sha }}"
-          "${{ github.event.pull_request.head.sha }}"
+        env:
+          # Pass GitHub context through env, never interpolated into the shell
+          # line: these two are GitHub-generated hex, but this is the canonical
+          # Actions script-injection shape and must not be templated near
+          # attacker-controlled fields (head_ref, title, body). The script reads
+          # PR_BASE_SHA/PR_HEAD_SHA.
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node ./scripts/check-no-internal-ids.mjs
 
       - name: Test no-internal-ids check
         run: node --test ./scripts/check-no-internal-ids.test.mjs
+
+      # Released database migrations are append-only, comments included. The
+      # runner identifies a migration by sha256 of the whole file and dedupes
+      # on that hash alone, so editing an already-released migration re-applies
+      # it on every existing database. Fail if any migration journaled at the
+      # base ref has different bytes at head. Needs git history (fetch-depth: 0
+      # above), so it lives here in policy alongside the other diff-based
+      # guards, in the same workflow as the packages/db build checks.
+      - name: Reject content changes to released (append-only) migrations
+        if: github.event_name == 'pull_request'
+        env:
+          # Pass GitHub context through env rather than interpolating into the
+          # shell line (canonical Actions script-injection shape). The script
+          # reads PR_BASE_SHA/PR_HEAD_SHA.
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node ./scripts/check-migrations-append-only.mjs
+
+      - name: Test migrations append-only check
+        run: node --test ./scripts/check-migrations-append-only.test.mjs
 
       - name: Test general-server shard partition
         run: node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs

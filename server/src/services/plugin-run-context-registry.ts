@@ -30,8 +30,8 @@ export interface RegisteredDispatchRunContext {
   companyId: string;
   /** UUID of the dispatching agent's run. */
   runId: string;
-  /** UUID of the dispatching agent's project. */
-  projectId: string;
+  /** UUID of the dispatching agent's project; absent when the run has no project. */
+  projectId?: string;
   /** Tool the worker was asked to execute (for audit-log context). */
   toolName: string;
   /** Wall-clock when the entry was added (for TTL sweep). */

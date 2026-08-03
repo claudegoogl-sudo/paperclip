@@ -15,7 +15,7 @@ export const costEvents = pgTable(
     issueId: uuid("issue_id").references(() => issues.id),
     projectId: uuid("project_id").references(() => projects.id),
     goalId: uuid("goal_id").references(() => goals.id),
-    heartbeatRunId: uuid("heartbeat_run_id").references(() => heartbeatRuns.id),
+    heartbeatRunId: uuid("heartbeat_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
     billingCode: text("billing_code"),
     provider: text("provider").notNull(),
     biller: text("biller").notNull().default("unknown"),
@@ -49,5 +49,9 @@ export const costEvents = pgTable(
       table.companyId,
       table.heartbeatRunId,
     ),
+    // Single-column index for the ON DELETE set null referential-integrity
+    // probe, which filters on the run column alone and cannot use the composite
+    // (company_id, ...) index. See migration 0143.
+    heartbeatRunIdx: index("cost_events_heartbeat_run_idx").on(table.heartbeatRunId),
   }),
 );

@@ -31,6 +31,11 @@ import {
 } from "@paperclipai/db";
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
+import {
+  RUN_HISTORY_PRUNE_BATCH_SIZE,
+  RUN_HISTORY_PRUNE_MAX_BATCHES,
+  startRunHistoryRetention,
+} from "./services/run-history-retention.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
 import { setupEnvironmentCustomImageTerminalWebSocketServer } from "./realtime/environment-custom-image-terminal-ws.js";
@@ -53,6 +58,10 @@ import {
   reconcileAdapterAvailability,
 } from "./services/adapter-registry-bootstrap.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
+import {
+  EGRESS_POSTURE_SWEEP_INTERVAL_MS,
+  startEgressPostureSweep,
+} from "./services/egress-posture.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { createPluginRunContextRegistry } from "./services/plugin-run-context-registry.js";
@@ -1022,6 +1031,11 @@ export async function startServer(): Promise<StartedServer> {
     }, config.heartbeatSchedulerIntervalMs);
   }
 
+  // Deliberately NOT inside the `heartbeatSchedulerEnabled` block above, and not
+  // subject to heartbeat suppression: a security-posture check that silently
+  // stops running when an unrelated scheduling flag is off is failure-open.
+  startEgressPostureSweep(db as any, EGRESS_POSTURE_SWEEP_INTERVAL_MS);
+
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
 
@@ -1038,6 +1052,23 @@ export async function startServer(): Promise<StartedServer> {
         // runServerDatabaseBackup already logs the failure with context.
       });
     }, backupIntervalMs);
+  }
+
+  if (config.runHistoryRetentionEnabled) {
+    logger.info(
+      {
+        retentionDays: config.runHistoryRetentionDays,
+        intervalMinutes: config.runHistoryRetentionIntervalMinutes,
+        batchSize: RUN_HISTORY_PRUNE_BATCH_SIZE,
+        maxBatchesPerTick: RUN_HISTORY_PRUNE_MAX_BATCHES,
+      },
+      "Run history retention enabled",
+    );
+    startRunHistoryRetention(
+      db,
+      config.runHistoryRetentionIntervalMinutes * 60 * 1000,
+      config.runHistoryRetentionDays,
+    );
   }
 
   // Wait for external adapters to finish loading before accepting requests.

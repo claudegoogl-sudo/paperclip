@@ -31,6 +31,7 @@ import {
   agents,
   companies,
   heartbeatRuns,
+  issues,
   pluginLogs,
   pluginWebhookDeliveries,
   projects,
@@ -47,6 +48,11 @@ import {
 } from "@paperclipai/shared";
 import { pluginRegistryService } from "../services/plugin-registry.js";
 import { pluginLifecycleManager } from "../services/plugin-lifecycle.js";
+import {
+  defaultPluginWebhookRateLimiter,
+  type PluginWebhookRateLimiter,
+} from "../services/plugin-webhook-rate-limit.js";
+import { logger } from "../middleware/logger.js";
 import type { PluginWatchReconciler } from "../services/plugin-dev-watcher.js";
 import {
   getPluginUiContributionMetadata,
@@ -394,6 +400,12 @@ export interface PluginRouteJobDeps {
 export interface PluginRouteWebhookDeps {
   /** The worker manager for dispatching handleWebhook RPC calls. */
   workerManager: PluginWorkerManager;
+  /**
+   * Override the sliding-window limiter guarding the anonymous ingestion route.
+   * Tests inject a limiter with a small window/cap and a fake clock; production
+   * uses the process-wide default so the budget survives a worker restart.
+   */
+  rateLimiter?: PluginWebhookRateLimiter;
 }
 
 /**
@@ -780,7 +792,46 @@ export function pluginRoutes(
     return companyId === undefined ? base : { ...base, companyId };
   }
 
+  /**
+   * Resolve the project a run belongs to, via the run's context issue.
+   *
+   * Returns `null` when the run is not project-scoped (no context issue, or an
+   * issue with no project). Callers must treat `null` as "unknown" and drop the
+   * field — never as a wildcard, and never as a placeholder value.
+   */
+  async function resolveRunProjectId(runId: string, companyId: string): Promise<string | null> {
+    if (!UUID_REGEX.test(runId) || !UUID_REGEX.test(companyId)) return null;
+    const [run] = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId)))
+      .limit(1);
+    const context = run?.contextSnapshot as Record<string, unknown> | null | undefined;
+    const nestedIssue = context?.paperclipIssue as Record<string, unknown> | null | undefined;
+    const issueId = context?.issueId ?? nestedIssue?.id;
+    if (typeof issueId !== "string" || !UUID_REGEX.test(issueId)) return null;
+    const [issue] = await db
+      .select({ projectId: issues.projectId })
+      .from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
+      .limit(1);
+    return issue?.projectId ?? null;
+  }
+
   async function validateToolRunContextScope(runContext: ToolRunContext): Promise<string | null> {
+    // Every id below indexes a `uuid` column. Screen them here so a malformed
+    // value is a deny rather than a Postgres cast error that escapes the route
+    // as a 500 — the scope check must be total for any input it is handed.
+    if (!UUID_REGEX.test(runContext.companyId) || !UUID_REGEX.test(runContext.agentId)) {
+      return '"runContext.agentId" does not belong to "runContext.companyId"';
+    }
+    if (!UUID_REGEX.test(runContext.runId)) {
+      return '"runContext.runId" does not belong to "runContext.companyId"';
+    }
+    if (runContext.projectId !== undefined && !UUID_REGEX.test(runContext.projectId)) {
+      return '"runContext.projectId" does not belong to "runContext.companyId"';
+    }
+
     const [agent] = await db
       .select({ companyId: agents.companyId })
       .from(agents)
@@ -802,13 +853,19 @@ export function pluginRoutes(
       return '"runContext.runId" does not belong to "runContext.agentId"';
     }
 
-    const [project] = await db
-      .select({ companyId: projects.companyId })
-      .from(projects)
-      .where(eq(projects.id, runContext.projectId))
-      .limit(1);
-    if (!project || project.companyId !== runContext.companyId) {
-      return '"runContext.projectId" does not belong to "runContext.companyId"';
+    // A run that is not project-scoped carries no projectId at all; the
+    // agent/run/company binding above is what authorizes the dispatch. Skipping
+    // the assertion is only correct because the field is absent — a present but
+    // unresolvable value was already denied above.
+    if (runContext.projectId !== undefined) {
+      const [project] = await db
+        .select({ companyId: projects.companyId })
+        .from(projects)
+        .where(eq(projects.id, runContext.projectId))
+        .limit(1);
+      if (!project || project.companyId !== runContext.companyId) {
+        return '"runContext.projectId" does not belong to "runContext.companyId"';
+      }
     }
 
     return null;
@@ -996,6 +1053,7 @@ export function pluginRoutes(
     if ((body.tool === undefined || body.tool === null) && typeof body.name === "string") {
       body.tool = body.name;
     }
+    let hostResolvedRunContext = false;
     if (
       (body.runContext === undefined || body.runContext === null) &&
       typeof body.runId === "string" &&
@@ -1006,12 +1064,31 @@ export function pluginRoutes(
       // ToolRunContext.artifacts is added downstream by the worker-rpc-host
       // before the worker call (see worker-rpc-host.ts), so we don't synthesise
       // it here — wire shape stays runId/agentId/companyId/projectId only.
+      //
+      // projectId is resolved from the run itself. Earlier builds substituted a
+      // non-uuid sentinel, which made the scope check below fail inside Postgres
+      // and surface as a 500 for every agent dispatch. When the run is not
+      // project-scoped the field is omitted rather than faked.
+      let projectId: string | null;
+      try {
+        projectId = await resolveRunProjectId(body.runId, req.actor.companyId);
+      } catch (err) {
+        // Same rule as the scope check below: a lookup that cannot complete is a
+        // deny, not a 500.
+        logger.error(
+          { err, companyId: req.actor.companyId, runId: body.runId },
+          "plugin tool dispatch run-project resolution failed",
+        );
+        res.status(403).json({ error: '"runContext" could not be validated' });
+        return;
+      }
       body.runContext = {
         runId: body.runId,
         agentId: req.actor.agentId,
         companyId: req.actor.companyId,
-        projectId: "onboarding-fallback",
+        ...(projectId ? { projectId } : {}),
       } as ToolRunContext;
+      hostResolvedRunContext = true;
     }
 
     // Actor-branch guard: agent JWTs reach this route through their own branch;
@@ -1046,7 +1123,15 @@ export function pluginRoutes(
       return;
     }
 
-    if (!runContext.agentId || !runContext.runId || !runContext.companyId || !runContext.projectId) {
+    // Caller-supplied contexts must still name a project. A host-resolved
+    // context omits the field when the run is not project-scoped, which the
+    // scope check handles explicitly rather than by asserting on a fake value.
+    if (
+      !runContext.agentId ||
+      !runContext.runId ||
+      !runContext.companyId ||
+      (!runContext.projectId && !hostResolvedRunContext)
+    ) {
       res.status(400).json({
         error: '"runContext" must include agentId, runId, companyId, and projectId',
       });
@@ -1054,7 +1139,17 @@ export function pluginRoutes(
     }
 
     assertCompanyAccess(req, runContext.companyId);
-    const scopeError = await validateToolRunContextScope(runContext);
+    let scopeError: string | null;
+    try {
+      scopeError = await validateToolRunContextScope(runContext);
+    } catch (err) {
+      // A scope check that cannot complete is a deny, not a 500.
+      logger.error(
+        { err, tool, companyId: runContext.companyId, runId: runContext.runId },
+        "plugin tool dispatch scope validation failed",
+      );
+      scopeError = '"runContext" could not be validated';
+    }
     if (scopeError) {
       res.status(403).json({ error: scopeError });
       return;
@@ -2612,12 +2707,17 @@ export function pluginRoutes(
    *
    * **Note:** This route does NOT require board authentication — webhook
    * endpoints must be publicly accessible for external callers. Signature
-   * verification is the plugin's responsibility.
+   * verification is the plugin's responsibility. Because it is anonymous, it is
+   * guarded by a sliding-window limiter (see plugin-webhook-rate-limit.ts) and a
+   * tighter JSON body cap than the rest of the API (see app.ts).
    *
    * Response: `{ deliveryId: string, status: string }`
    * Errors:
    * - 404 if plugin not found or endpointKey not declared
    * - 400 if plugin is not in ready state or lacks webhooks.receive capability
+   * - 413 if the body exceeds `WEBHOOK_JSON_BODY_LIMIT` (rejected by the parser)
+   * - 429 if the limiter rejects the delivery; carries `Retry-After` and writes
+   *   no delivery row
    * - 502 if the worker is unavailable or the RPC call fails
    */
   router.post("/plugins/:pluginId/webhooks/:endpointKey", async (req, res) => {
@@ -2670,7 +2770,44 @@ export function pluginRoutes(
       return;
     }
 
-    // Step 5: Extract request data
+    // Step 5: Rate-limit before any write.
+    //
+    // Deliberately placed *after* steps 1-4: the bucket key is then the
+    // canonical plugin row id plus a manifest-declared endpoint key, so an
+    // anonymous caller cannot grow the limiter's key space with made-up ids,
+    // and cannot split a plugin's budget by alternating between its uuid and
+    // its key in the URL. Everything expensive — the delivery row insert and
+    // the handleWebhook RPC — is still downstream of this gate.
+    const rateLimit = (webhookDeps.rateLimiter ?? defaultPluginWebhookRateLimiter).consume({
+      pluginId: plugin.id,
+      endpointKey,
+      ip: req.ip,
+    });
+    if (!rateLimit.allowed) {
+      // No payload: the body is attacker-controlled and may carry provider
+      // secrets. The identifiers below are what distinguishes "attack blocked"
+      // from "we are 429ing a real provider".
+      logger.warn(
+        {
+          pluginId: plugin.id,
+          pluginKey: plugin.pluginKey,
+          endpointKey,
+          scope: rateLimit.scope,
+          limit: rateLimit.limit,
+          retryAfterSeconds: rateLimit.retryAfterSeconds,
+        },
+        "plugin webhook ingestion rate-limited; delivery rejected before insert",
+      );
+      res.status(429)
+        .set("Retry-After", String(rateLimit.retryAfterSeconds))
+        .json({
+          error: "Too many webhook deliveries for this endpoint",
+          retryAfterSeconds: rateLimit.retryAfterSeconds,
+        });
+      return;
+    }
+
+    // Step 6: Extract request data
     const requestId = randomUUID();
     const rawHeaders: Record<string, string> = {};
     for (const [key, value] of Object.entries(req.headers)) {
@@ -2689,7 +2826,7 @@ export function pluginRoutes(
     const parsedBody = req.body as unknown;
     const payload = (req.body as Record<string, unknown> | undefined) ?? {};
 
-    // Step 6: Record the delivery in the database
+    // Step 7: Record the delivery in the database
     const startedAt = new Date();
     const [delivery] = await db
       .insert(pluginWebhookDeliveries)
@@ -2703,7 +2840,7 @@ export function pluginRoutes(
       })
       .returning({ id: pluginWebhookDeliveries.id });
 
-    // Step 7: Dispatch to the worker via handleWebhook RPC
+    // Step 8: Dispatch to the worker via handleWebhook RPC
     try {
       await webhookDeps.workerManager.call(plugin.id, "handleWebhook", {
         endpointKey,
@@ -2713,7 +2850,7 @@ export function pluginRoutes(
         requestId,
       });
 
-      // Step 8: Update delivery record to success
+      // Step 9: Update delivery record to success
       const finishedAt = new Date();
       const durationMs = finishedAt.getTime() - startedAt.getTime();
       await db
@@ -2730,7 +2867,7 @@ export function pluginRoutes(
         status: "success",
       });
     } catch (err) {
-      // Step 8 (error): Update delivery record to failed
+      // Step 9 (error): Update delivery record to failed
       const finishedAt = new Date();
       const durationMs = finishedAt.getTime() - startedAt.getTime();
       const errorMessage = err instanceof Error ? err.message : String(err);

@@ -1104,6 +1104,8 @@ Rules:
 3. Signature verification happens in plugin code using secret refs resolved by the host.
 4. Every delivery is recorded.
 5. Webhook handling must be idempotent.
+6. The route is anonymous, so the host bounds it. Request bodies are capped at 1 MB (tighter than the 10 MB the rest of the API allows); a larger body is rejected by the body parser with `413` before the plugin sees it. The raw signed bytes are still preserved for signature verification.
+7. The host applies a sliding-window rate limit keyed primarily on `(pluginId, endpointKey)`, with a looser additive per-IP bucket. Over-limit deliveries get `429` with a `Retry-After` header and are **not** recorded or dispatched to the worker, so a provider that retries on `429` loses nothing. Providers expected to exceed ~120 deliveries per minute to a single endpoint need the host limits raised.
 
 ## 19. UI Extension Model
 

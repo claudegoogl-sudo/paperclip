@@ -650,6 +650,40 @@ DB backups are not full instance filesystem backups. For full local disaster
 recovery, also back up local storage files and the local encrypted secrets key if
 those providers are enabled.
 
+## Run History Retention
+
+`heartbeat_runs` and `agent_wakeup_requests` accumulate a row per run and per
+wakeup and are never read once the run finishes, so without retention they grow
+without bound. `heartbeat_runs.context_snapshot` is the expensive part: it is a
+large JSONB column, so most of that table's on-disk size is TOAST rather than
+heap, and it inflates every database dump.
+
+The server prunes them on a timer. Defaults:
+
+- enabled
+- every 60 minutes
+- delete terminal rows older than 14 days
+
+Only terminal rows are eligible. Live statuses (`queued`, `scheduled_retry`,
+`running`, and the wakeup `deferred_issue_execution` park state) are never
+deleted at any age, and a wakeup request is kept for as long as any surviving
+run still references it. Each sweep deletes in batches of 1,000 rows with a
+ceiling of 20 batches per table per tick, so a large backlog drains over
+successive sweeps instead of one long-running statement.
+
+Environment overrides:
+
+- `PAPERCLIP_RUN_HISTORY_RETENTION_ENABLED=true|false`
+- `PAPERCLIP_RUN_HISTORY_RETENTION_DAYS=<days>`
+- `PAPERCLIP_RUN_HISTORY_RETENTION_INTERVAL_MINUTES=<minutes>`
+
+Each sweep logs what it deleted, and warns when it stops at the per-tick batch
+ceiling with a backlog still pending.
+
+Deleting a run deletes its `heartbeat_run_events`. `cost_events`,
+`finance_events` and `agent_task_sessions` rows are kept and only lose the run
+back-reference, so billing history survives retention.
+
 ## Secrets in Dev
 
 Agent env vars now support secret references. By default, secret values are stored with local encryption and only secret refs are persisted in agent config.
