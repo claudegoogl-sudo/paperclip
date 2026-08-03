@@ -88,6 +88,7 @@ export { userSecretDefinitions } from "./user_secret_definitions.js";
 export { companySecrets } from "./company_secrets.js";
 export { companySecretVersions } from "./company_secret_versions.js";
 export { companySecretBindings } from "./company_secret_bindings.js";
+export { companySecretBindingPostureAudit } from "./company_secret_binding_posture_audit.js";
 export { egressWouldDenyObservations } from "./egress_would_deny_observations.js";
 export { userSecretDeclarations } from "./user_secret_declarations.js";
 export { secretAccessEvents } from "./secret_access_events.js";
