@@ -157,6 +157,15 @@ describe("webhook ingestion body-parser mount path", () => {
     expect(PLUGIN_WEBHOOK_INGESTION_PATH_PATTERN.test("/api/companies/import")).toBe(false);
   });
 
+  it("matches case variants, because Express routes case-insensitively by default", () => {
+    expect(PLUGIN_WEBHOOK_INGESTION_PATH_PATTERN.test(`/API/plugins/${PLUGIN_ID}/webhooks/${ENDPOINT_KEY}`)).toBe(true);
+    expect(PLUGIN_WEBHOOK_INGESTION_PATH_PATTERN.test(`/api/plugins/${PLUGIN_ID}/WEBHOOKS/${ENDPOINT_KEY}`)).toBe(true);
+    expect(PLUGIN_WEBHOOK_INGESTION_PATH_PATTERN.test(`/Api/Plugins/${PLUGIN_ID}/Webhooks/${ENDPOINT_KEY}`)).toBe(true);
+
+    // Widening to case variants must not widen to sibling routes.
+    expect(PLUGIN_WEBHOOK_INGESTION_PATH_PATTERN.test(`/API/plugins/${PLUGIN_ID}/WEBHOOKS`)).toBe(false);
+  });
+
   it("keeps the webhook cap tighter than the generic one", () => {
     expect(DEFAULT_JSON_BODY_LIMIT).toBe("10mb");
     expect(WEBHOOK_JSON_BODY_LIMIT).toBe("1mb");
@@ -276,6 +285,30 @@ describe("POST /api/plugins/:pluginId/webhooks/:endpointKey resource limits", ()
 
     expect(res.status).toBe(413);
     expect(res.body).toMatchObject({ error: "Request entity too large", code: "entity.too.large" });
+    expect(insert).not.toHaveBeenCalled();
+  });
+
+  it("applies the tighter cap regardless of path case, matching Express's router", async () => {
+    const { app, insert } = createWebhookApp();
+    const oversized = JSON.stringify({ blob: "x".repeat(1_200_000) });
+
+    // Express routes case-insensitively by default, so these all reach the
+    // handler. The body-parser mount must agree, or the cap is opt-out: a
+    // case-varied path would fall through to the generic 10mb parser and give
+    // an anonymous caller 10x the jsonb write this route is meant to bound.
+    for (const path of [
+      `/API/plugins/${PLUGIN_ID}/webhooks/${ENDPOINT_KEY}`,
+      `/api/plugins/${PLUGIN_ID}/WEBHOOKS/${ENDPOINT_KEY}`,
+      `/Api/Plugins/${PLUGIN_ID}/Webhooks/${ENDPOINT_KEY}`,
+    ]) {
+      const res = await request(app)
+        .post(path)
+        .set("content-type", "application/json")
+        .send(oversized);
+
+      expect(res.status, `${path} must hit the 1mb cap, not the generic 10mb one`).toBe(413);
+    }
+
     expect(insert).not.toHaveBeenCalled();
   });
 
