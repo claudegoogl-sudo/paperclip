@@ -7,6 +7,7 @@ import {
   MIGRATIONS_DIR,
   findReleasedMigrationViolations,
   formatFindings,
+  isRunnerVisibleMigration,
   parseJournalTags,
   runCheck,
 } from "./check-migrations-append-only.mjs";
@@ -300,4 +301,51 @@ test("runCheck: exits 1 with a usage error when refs are missing", () => {
   const code = runCheck({ baseRef: "", headRef: "head", execImpl: () => "", error: (m) => errors.push(m) });
   assert.equal(code, 1);
   assert.ok(errors[0].includes("baseRef and headRef are required"));
+});
+
+// --- F5: survival must be measured over runner-visible files only -----------
+
+test("isRunnerVisibleMigration: only `.sql` directly under the migrations dir", () => {
+  assert.equal(isRunnerVisibleMigration(`${MIGRATIONS_DIR}/0138_egress.sql`), true);
+  assert.equal(isRunnerVisibleMigration(`${MIGRATIONS_DIR}/0138_egress.sql.orig`), false);
+  assert.equal(isRunnerVisibleMigration(`${MIGRATIONS_DIR}/meta/0138_egress.sql`), false);
+  assert.equal(isRunnerVisibleMigration(`${MIGRATIONS_DIR}/meta/_journal.json`), false);
+  assert.equal(isRunnerVisibleMigration(`other/dir/0138_egress.sql`), false);
+});
+
+test("runCheck REGRESSION (F5): exits 1 when a released migration is edited in place but its base bytes survive at a sibling `.sql.orig`", () => {
+  // The runner reads only `.sql` files directly in the dir, so a `*.sql.orig`
+  // copy does NOT keep the released migration applied — yet a survival check
+  // over every blob would see the old bytes and wrongly pass.
+  const relPath = `${MIGRATIONS_DIR}/0138_egress.sql`;
+  const released = "-- egress (ticket ABC-138)\nUPDATE t SET egress_allowlist_enforced = false;\n";
+  const trees = {
+    base: { [JOURNAL_PATH]: journal(["0138_egress"]), [relPath]: released },
+    head: {
+      [JOURNAL_PATH]: journal(["0138_egress"]),
+      [relPath]: "-- egress\nUPDATE t SET egress_allowlist_enforced = false;\n", // header scrubbed => new identity
+      [`${relPath}.orig`]: released, // old bytes parked where the runner never reads
+    },
+  };
+  const errors = [];
+  const code = runCheck({ baseRef: "base", headRef: "head", execImpl: fakeGit(trees), log: () => {}, error: (m) => errors.push(m) });
+  assert.equal(code, 1);
+  assert.ok(errors.some((m) => m.includes("0138_egress.sql")));
+});
+
+test("runCheck REGRESSION (F5): exits 1 when the surviving base bytes are only a copy under `meta/`", () => {
+  const relPath = `${MIGRATIONS_DIR}/0138_egress.sql`;
+  const released = "-- egress (ticket ABC-138)\nUPDATE t SET egress_allowlist_enforced = false;\n";
+  const trees = {
+    base: { [JOURNAL_PATH]: journal(["0138_egress"]), [relPath]: released },
+    head: {
+      [JOURNAL_PATH]: journal(["0138_egress"]),
+      [relPath]: "-- egress\nUPDATE t SET egress_allowlist_enforced = false;\n",
+      [`${MIGRATIONS_DIR}/meta/0138_egress.sql`]: released, // real `.sql` but in a subdirectory
+    },
+  };
+  const errors = [];
+  const code = runCheck({ baseRef: "base", headRef: "head", execImpl: fakeGit(trees), log: () => {}, error: (m) => errors.push(m) });
+  assert.equal(code, 1);
+  assert.ok(errors.some((m) => m.includes("0138_egress.sql")));
 });

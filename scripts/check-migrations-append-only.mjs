@@ -16,8 +16,12 @@
  *
  * Identity is CONTENT, not path. So this guard keys on the git blob OID (which
  * is exactly a content hash): for every migration journaled at the PR's base
- * ref, it requires that migration's base blob to still exist *somewhere* under
- * the migrations dir at head. It fails when the released bytes have vanished.
+ * ref, it requires that migration's base blob to still exist at head as a file
+ * the runner actually reads — a `.sql` file directly in the migrations dir, no
+ * subdirectory (client.ts is non-recursive). It fails when the released bytes
+ * have vanished from that runner-visible set. Bytes parked where the runner
+ * never looks (a stray `*.sql.orig` merge artifact, or a copy under `meta/`)
+ * do not keep the migration applied, so they do not satisfy the invariant.
  *
  * This closes the whole class, including the rename-bypass a path-keyed check
  * misses: pairing a comment edit with a rename (or a delete + re-add under a
@@ -64,6 +68,15 @@ import { fileURLToPath } from "node:url";
 
 export const MIGRATIONS_DIR = "packages/db/src/migrations";
 export const JOURNAL_PATH = `${MIGRATIONS_DIR}/meta/_journal.json`;
+
+/**
+ * True when `relPath` is a migration the runner will actually read: a `.sql`
+ * file directly in the migrations dir, no subdirectory. Mirrors client.ts.
+ */
+export function isRunnerVisibleMigration(relPath) {
+  if (!relPath.startsWith(`${MIGRATIONS_DIR}/`) || !relPath.endsWith(".sql")) return false;
+  return !relPath.slice(MIGRATIONS_DIR.length + 1).includes("/");
+}
 
 function sha256(content) {
   return createHash("sha256").update(content).digest("hex");
@@ -224,7 +237,14 @@ export function runCheck({ baseRef, headRef, execImpl = execFileSync, log = cons
   }
 
   const baseBlobs = gitLsTreeBlobs(execImpl, baseRef);
-  const headOids = new Set(gitLsTreeBlobs(execImpl, headRef).values());
+  // Survival must be measured over the files the RUNNER actually reads: `.sql`
+  // files directly in the migrations dir (client.ts readdir + isFile +
+  // endsWith(".sql"), non-recursive). Bytes parked where the runner never looks
+  // — a stray `*.sql.orig` merge artifact, or a copy under `meta/` — do not
+  // keep the released migration applied, so they must not satisfy the invariant.
+  const headOids = new Set(
+    [...gitLsTreeBlobs(execImpl, headRef)].filter(([p]) => isRunnerVisibleMigration(p)).map(([, oid]) => oid),
+  );
 
   const violations = findReleasedMigrationViolations({ baseTags, baseBlobs, headOids });
 
