@@ -15,6 +15,7 @@ import {
   createPluginWorkerHandle,
   createPluginWorkerManager,
   formatWorkerFailureMessage,
+  resolveInitializeTimeoutMs,
   resolveMaxIpcFrameBytes,
 } from "../services/plugin-worker-manager.js";
 import { createPluginRunContextRegistry } from "../services/plugin-run-context-registry.js";
@@ -58,6 +59,10 @@ const OVERSIZE_FRAME_WORKER_ENTRYPOINT = path.join(
 const IPC_CHANNEL_WORKER_ENTRYPOINT = path.join(
   FIXTURES_DIR,
   "plugin-worker-ipc-channel.cjs",
+);
+const SLOW_INITIALIZE_WORKER_ENTRYPOINT = path.join(
+  FIXTURES_DIR,
+  "plugin-worker-slow-initialize.cjs",
 );
 
 const TEST_MANIFEST: PaperclipPluginManifestV1 = {
@@ -974,6 +979,99 @@ describe("resolveMaxIpcFrameBytes", () => {
     expect(resolveMaxIpcFrameBytes(Number.NaN)).toBe(def);
     process.env[ENV_KEY] = "not-a-number";
     expect(resolveMaxIpcFrameBytes()).toBe(def);
+  });
+});
+
+// Configurable `initialize` RPC timeout.
+describe("resolveInitializeTimeoutMs", () => {
+  const ENV_KEY = "PAPERCLIP_PLUGIN_INITIALIZE_TIMEOUT_MS";
+  const original = process.env[ENV_KEY];
+
+  afterEach(() => {
+    if (original === undefined) delete process.env[ENV_KEY];
+    else process.env[ENV_KEY] = original;
+  });
+
+  it("defaults to 15000ms when the env var is unset", () => {
+    delete process.env[ENV_KEY];
+    expect(resolveInitializeTimeoutMs()).toBe(15_000);
+  });
+
+  it("honors a valid env override when no explicit override is given", () => {
+    process.env[ENV_KEY] = "45000";
+    expect(resolveInitializeTimeoutMs()).toBe(45_000);
+  });
+
+  it("prefers an explicit override over the env var", () => {
+    process.env[ENV_KEY] = "45000";
+    expect(resolveInitializeTimeoutMs(5_000)).toBe(5_000);
+  });
+
+  it("ignores non-numeric or non-positive values and falls back to the default", () => {
+    delete process.env[ENV_KEY];
+    const def = resolveInitializeTimeoutMs();
+    expect(def).toBe(15_000);
+    expect(resolveInitializeTimeoutMs(0)).toBe(def);
+    expect(resolveInitializeTimeoutMs(-5)).toBe(def);
+    expect(resolveInitializeTimeoutMs(Number.NaN)).toBe(def);
+
+    process.env[ENV_KEY] = "not-a-number";
+    expect(resolveInitializeTimeoutMs()).toBe(def);
+
+    process.env[ENV_KEY] = "0";
+    expect(resolveInitializeTimeoutMs()).toBe(def);
+
+    process.env[ENV_KEY] = "-100";
+    expect(resolveInitializeTimeoutMs()).toBe(def);
+  });
+
+  it("clamps to the hard MAX_RPC_TIMEOUT_MS ceiling", () => {
+    const fifteenMinutesMs = 15 * 60 * 1_000;
+    expect(resolveInitializeTimeoutMs(fifteenMinutesMs + 60_000)).toBe(fifteenMinutesMs);
+    process.env[ENV_KEY] = String(fifteenMinutesMs + 60_000);
+    expect(resolveInitializeTimeoutMs()).toBe(fifteenMinutesMs);
+  });
+});
+
+describe("initialize timeout diagnosability", () => {
+  it("kills the worker, marks it crashed, and surfaces a diagnosable timeout message", async () => {
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: SLOW_INITIALIZE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: { initializeDelayMs: 60_000 },
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers: {},
+      // Small override so the test doesn't wait anywhere near 60s for the
+      // fixture's deliberately-slow initialize response.
+      initializeTimeoutMs: 50,
+    });
+
+    try {
+      const rejection: Error = await handle.start().then(
+        () => {
+          throw new Error("expected handle.start() to reject");
+        },
+        (err: unknown) => err as Error,
+      );
+
+      expect(rejection.message).toContain(
+        'Worker initialize for "test.plugin" did not complete within 50ms',
+      );
+      // Budget-attribution language: a reader should not assume the plugin's
+      // own setup() is at fault from this message alone.
+      expect(rejection.message).toContain(
+        "startup, worker bundle import, and the plugin's setup()",
+      );
+      expect(rejection.message).toContain("PAPERCLIP_PLUGIN_INITIALIZE_TIMEOUT_MS");
+
+      expect(handle.status).toBe("crashed");
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
   });
 });
 
