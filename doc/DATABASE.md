@@ -157,7 +157,12 @@ which would otherwise be silently re-applied. Three mechanisms cooperate:
   exact per-name lookup, it survives a scrubbed or renumbered Drizzle journal.
   A pending, previously-applied file on a cluster that predates identity tracking
   cannot be checked; it is reported separately as **unverifiable** ("no drift" there
-  means undecided, not clean) rather than silently treated as clean.
+  means undecided, not clean) rather than silently treated as clean. On a cluster
+  with no identity table at all, *every* pending file is unverifiable — nothing there
+  is attributable yet. Once tracking starts, the journal row count at that instant is
+  frozen in `drizzle.migration_identity_watermark` and is what separates a legacy
+  file from a genuinely new one; a live row count would shrink when a journal row is
+  deleted and would report the newest applied file as clean.
 - **Dry run.** `pnpm db:migrate --dry-run` (or `--check`) reports pending migrations,
   drift, and unverifiable files without applying anything, exiting non-zero if any
   migration is pending. `pnpm db:status` is likewise read-only. Neither is gated.

@@ -28,6 +28,26 @@ const DRIFT_TARGET = "0030_rich_magneto.sql";
 const EARLIER_MIGRATION = "0020_white_anita_blake.sql";
 const BOGUS_HASH = "0".repeat(64);
 
+// The most recently applied migration. A rebuilt package swaps the newest file
+// most often, and it is the one position where a live `count(*)` of journal rows
+// cannot classify a pending file as previously-applied — its own row is the one
+// that went missing.
+async function latestMigrationFile(): Promise<string> {
+  const journal = JSON.parse(
+    await fs.promises.readFile(new URL("./migrations/meta/_journal.json", import.meta.url), "utf8"),
+  ) as { entries: Array<{ idx: number; tag: string }> };
+  const latest = [...journal.entries].sort((left, right) => left.idx - right.idx).at(-1);
+  if (!latest) throw new Error("migration journal is empty");
+  return `${latest.tag}.sql`;
+}
+
+// A cluster that predates identity tracking entirely: production's shape, and
+// the state every existing deployment is in on the first boot after this ships.
+async function dropIdentityTracking(sql: postgres.Sql): Promise<void> {
+  await sql.unsafe(`DROP TABLE "drizzle"."migration_file_identity"`);
+  await sql.unsafe(`DROP TABLE "drizzle"."migration_identity_watermark"`);
+}
+
 async function createTempDatabase(): Promise<string> {
   const db = await startEmbeddedPostgresTestDatabase("paperclip-mig-guard-");
   cleanups.push(db.cleanup);
@@ -202,6 +222,82 @@ describeEmbeddedPostgres("migration identity drift", () => {
       // drift, but explicitly undecidable.
       expect(preflight.drift).toEqual([]);
       expect(preflight.unverifiable).toEqual([DRIFT_TARGET]);
+    },
+    40_000,
+  );
+
+  it(
+    "reports unverifiable on a cluster with no identity table at all",
+    async () => {
+      const connectionString = await createTempDatabase();
+
+      const realHash = await migrationHash(DRIFT_TARGET);
+      await withSql(connectionString, async (sql) => {
+        await dropIdentityTracking(sql);
+        await sql.unsafe(`DELETE FROM "drizzle"."__drizzle_migrations" WHERE hash = $1`, [
+          realHash,
+        ]);
+        await sql.unsafe(`DROP TABLE "company_logos"`);
+      });
+
+      const preflight = await inspectMigrationPreflight(connectionString);
+      expect(preflight.pending.map((entry) => entry.migrationFile)).toEqual([DRIFT_TARGET]);
+      expect(preflight.drift).toEqual([]);
+      expect(preflight.unverifiable).toEqual([DRIFT_TARGET]);
+    },
+    40_000,
+  );
+
+  it(
+    "reports unverifiable for the most recently applied file with no identity table",
+    async () => {
+      // The blind spot a live journal `count(*)` leaves: this file is pending
+      // *because* its own journal row is gone, so its ordinal always equals the
+      // remaining row count and never falls inside it. Reported clean before the
+      // frozen watermark, on exactly the cluster shape production is in.
+      const connectionString = await createTempDatabase();
+
+      const latestFile = await latestMigrationFile();
+      const latestHash = await migrationHash(latestFile);
+      await withSql(connectionString, async (sql) => {
+        await dropIdentityTracking(sql);
+        await sql.unsafe(`DELETE FROM "drizzle"."__drizzle_migrations" WHERE hash = $1`, [
+          latestHash,
+        ]);
+      });
+
+      const preflight = await inspectMigrationPreflight(connectionString);
+      expect(preflight.pending.map((entry) => entry.migrationFile)).toEqual([latestFile]);
+      expect(preflight.drift).toEqual([]);
+      expect(preflight.unverifiable).toEqual([latestFile]);
+    },
+    40_000,
+  );
+
+  it(
+    "reports unverifiable for the most recently applied file when its identity is scrubbed",
+    async () => {
+      // Same tail blind spot with identity tracking present: deleting both the
+      // identity row and the journal row leaves nothing to compare against, and
+      // the frozen watermark is what still places the file inside the applied
+      // range after its journal row is gone.
+      const connectionString = await createTempDatabase();
+
+      const latestFile = await latestMigrationFile();
+      const latestHash = await migrationHash(latestFile);
+      await withSql(connectionString, async (sql) => {
+        await sql.unsafe(`DELETE FROM "drizzle"."migration_file_identity" WHERE name = $1`, [
+          latestFile,
+        ]);
+        await sql.unsafe(`DELETE FROM "drizzle"."__drizzle_migrations" WHERE hash = $1`, [
+          latestHash,
+        ]);
+      });
+
+      const preflight = await inspectMigrationPreflight(connectionString);
+      expect(preflight.pending.map((entry) => entry.migrationFile)).toEqual([latestFile]);
+      expect(preflight.drift).toEqual([]);
+      expect(preflight.unverifiable).toEqual([latestFile]);
     },
     40_000,
   );

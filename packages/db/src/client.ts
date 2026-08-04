@@ -277,6 +277,7 @@ async function recordMigrationHistoryEntry(
 
 const MIGRATION_AUDIT_TABLE = "migration_apply_audit";
 const MIGRATION_IDENTITY_TABLE = "migration_file_identity";
+const MIGRATION_IDENTITY_WATERMARK_TABLE = "migration_identity_watermark";
 
 let cachedPackageVersion: string | null = null;
 
@@ -321,7 +322,53 @@ async function ensureMigrationIdentityTable(
       `first_recorded_at timestamptz NOT NULL DEFAULT now()` +
       `)`,
   );
+  await ensureMigrationIdentityWatermark(sql, migrationTableSchema);
   return identityTable;
+}
+
+// The number of journal rows present at the instant identity tracking began on
+// this cluster. Files below it were applied before any identity could be bound
+// and are permanently unverifiable; files at or above it are expected to carry
+// one. Frozen on first write, because the live `count(*)` shrinks when a journal
+// row is deleted — which silently reclassifies the most recently applied files
+// as "not yet applied" and hides a swap of exactly the file most likely to be
+// swapped.
+async function ensureMigrationIdentityWatermark(
+  sql: SqlExecutor,
+  migrationTableSchema: string,
+): Promise<void> {
+  const watermarkTable = `${quoteIdentifier(migrationTableSchema)}.${quoteIdentifier(MIGRATION_IDENTITY_WATERMARK_TABLE)}`;
+  const journalTable = `${quoteIdentifier(migrationTableSchema)}.${quoteIdentifier(DRIZZLE_MIGRATIONS_TABLE)}`;
+  await sql.unsafe(
+    `CREATE TABLE IF NOT EXISTS ${watermarkTable} (` +
+      `singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton), ` +
+      `legacy_applied_count integer NOT NULL, ` +
+      `recorded_at timestamptz NOT NULL DEFAULT now()` +
+      `)`,
+  );
+  await sql.unsafe(
+    `INSERT INTO ${watermarkTable} (singleton, legacy_applied_count) ` +
+      `SELECT true, count(*)::int FROM ${journalTable} ` +
+      `ON CONFLICT (singleton) DO NOTHING`,
+  );
+}
+
+// Returns null when no watermark is recorded, i.e. identity tracking has not
+// started (or the table was removed) and no pending file can be shown clean.
+async function loadMigrationIdentityWatermark(
+  sql: SqlExecutor,
+  migrationTableSchema: string,
+): Promise<number | null> {
+  const watermarkTable = `${quoteIdentifier(migrationTableSchema)}.${quoteIdentifier(MIGRATION_IDENTITY_WATERMARK_TABLE)}`;
+  try {
+    const rows = await sql.unsafe<{ legacy_applied_count: number | null }[]>(
+      `SELECT legacy_applied_count FROM ${watermarkTable} LIMIT 1`,
+    );
+    const value = rows[0]?.legacy_applied_count;
+    return typeof value === "number" ? value : null;
+  } catch {
+    return null;
+  }
 }
 
 async function recordMigrationFileIdentity(
@@ -917,17 +964,20 @@ export type MigrationPreflight = {
 async function detectMigrationDrift(
   sql: SqlExecutor,
   migrationTableSchema: string,
-  qualifiedJournalTable: string,
   pendingMigrations: string[],
   orderedJournalFiles: string[],
 ): Promise<{ drift: MigrationIdentityDriftEntry[]; unverifiable: string[] }> {
   if (pendingMigrations.length === 0) return { drift: [], unverifiable: [] };
 
   const identities = await loadMigrationFileIdentities(sql, migrationTableSchema);
-  const appliedRows = await sql.unsafe<{ count: number }[]>(
-    `SELECT count(*)::int AS count FROM ${qualifiedJournalTable}`,
-  );
-  const appliedCount = appliedRows[0]?.count ?? 0;
+  // No identity table at all: nothing on this cluster is attributable, so no
+  // pending file can be shown clean. Report every one of them rather than
+  // inferring anything from ordinals. Self-limiting — the next apply creates
+  // the table and the watermark below takes over.
+  if (identities === null) {
+    return { drift: [], unverifiable: [...pendingMigrations] };
+  }
+  const legacyAppliedCount = await loadMigrationIdentityWatermark(sql, migrationTableSchema);
 
   const drift: MigrationIdentityDriftEntry[] = [];
   const unverifiable: string[] = [];
@@ -935,19 +985,20 @@ async function detectMigrationDrift(
     const currentHash = createHash("sha256")
       .update(await readMigrationFileContent(migrationFile))
       .digest("hex");
-    const recordedHash = identities?.get(migrationFile);
+    const recordedHash = identities.get(migrationFile);
     if (recordedHash !== undefined) {
       if (recordedHash !== currentHash) {
         drift.push({ migrationFile, recordedHash, currentHash });
       }
       continue;
     }
-    // No recorded identity for this pending file. If the journal indicates it
-    // was already applied (its ordinal falls within the applied rows) we cannot
-    // decide whether its content was swapped. A genuinely new migration sits
-    // beyond the applied range and is not flagged.
+    // No recorded identity for this pending file. If it predates identity
+    // tracking (its ordinal is below the frozen watermark) we cannot decide
+    // whether its content was swapped. A migration authored after tracking
+    // began sits at or above the watermark and is genuinely new, not flagged.
+    // A missing watermark leaves nothing to decide against, so fail closed.
     const ordinal = orderedJournalFiles.indexOf(migrationFile);
-    if (ordinal >= 0 && ordinal < appliedCount) {
+    if (legacyAppliedCount === null || (ordinal >= 0 && ordinal < legacyAppliedCount)) {
       unverifiable.push(migrationFile);
     }
   }
@@ -977,12 +1028,10 @@ export async function inspectMigrationPreflight(url: string): Promise<MigrationP
     try {
       const migrationTableSchema = await discoverMigrationTableSchema(sql);
       if (migrationTableSchema) {
-        const qualifiedTable = `${quoteIdentifier(migrationTableSchema)}.${quoteIdentifier(DRIZZLE_MIGRATIONS_TABLE)}`;
         const orderedJournalFiles = await listOrderedJournalMigrationFiles();
         ({ drift, unverifiable } = await detectMigrationDrift(
           sql,
           migrationTableSchema,
-          qualifiedTable,
           pendingFiles,
           orderedJournalFiles,
         ));
