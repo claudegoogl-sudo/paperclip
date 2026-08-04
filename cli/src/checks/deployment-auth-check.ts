@@ -1,4 +1,4 @@
-import { inferBindModeFromHost } from "@paperclipai/shared";
+import { inferBindModeFromHost, validateAuthSecretStrength } from "@paperclipai/shared";
 import type { PaperclipConfig } from "../config/schema.js";
 import type { CheckResult } from "./index.js";
 
@@ -26,7 +26,7 @@ export function deploymentAuthCheck(config: PaperclipConfig): CheckResult {
   }
 
   const secret =
-    process.env.BETTER_AUTH_SECRET?.trim() ??
+    process.env.BETTER_AUTH_SECRET?.trim() ||
     process.env.PAPERCLIP_AGENT_JWT_SECRET?.trim();
   if (!secret) {
     return {
@@ -35,6 +35,17 @@ export function deploymentAuthCheck(config: PaperclipConfig): CheckResult {
       message: "authenticated mode requires BETTER_AUTH_SECRET (or PAPERCLIP_AGENT_JWT_SECRET)",
       canRepair: false,
       repairHint: "Set BETTER_AUTH_SECRET before starting Paperclip",
+    };
+  }
+
+  const strengthError = validateAuthSecretStrength(secret, mode);
+  if (strengthError) {
+    return {
+      name: "Deployment/auth mode",
+      status: "fail",
+      message: strengthError,
+      canRepair: false,
+      repairHint: "Generate one with: openssl rand -hex 32",
     };
   }
 
