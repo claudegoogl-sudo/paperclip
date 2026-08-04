@@ -42,9 +42,9 @@ function oidSet(tree) {
 
 /**
  * Fake `git` over a two-ref in-memory tree. `trees` maps ref -> { relPath: content }.
- * Supports the three subcommands runCheck uses: `rev-parse`, `show`, `ls-tree`.
+ * Supports the four subcommands runCheck uses: `rev-parse`, `show`, `ls-tree`, `merge-base`.
  */
-function fakeGit(trees) {
+function fakeGit(trees, mergeBaseOverrides = new Map()) {
   return (_cmd, args) => {
     const sub = args[0];
     if (sub === "rev-parse") {
@@ -71,6 +71,18 @@ function fakeGit(trees) {
         .filter(([p]) => p.startsWith(`${MIGRATIONS_DIR}/`))
         .map(([p, content]) => `100644 blob ${oid(content)}\t${p}`)
         .join("\n");
+    }
+    if (sub === "merge-base") {
+      // ["merge-base", "<ref1>", "<ref2>"]
+      const ref1 = args[1];
+      const ref2 = args[2];
+      // Check for explicit override first (for "behind master" test cases)
+      const key = `${ref1}..${ref2}`;
+      const reverseKey = `${ref2}..${ref1}`;
+      if (mergeBaseOverrides.has(key)) return mergeBaseOverrides.get(key);
+      if (mergeBaseOverrides.has(reverseKey)) return mergeBaseOverrides.get(reverseKey);
+      // Default: return ref1 as the merge-base (simplest case for most tests)
+      return ref1;
     }
     throw new Error(`unexpected git subcommand: ${sub}`);
   };
@@ -348,4 +360,98 @@ test("runCheck REGRESSION (F5): exits 1 when the surviving base bytes are only a
   const code = runCheck({ baseRef: "base", headRef: "head", execImpl: fakeGit(trees), log: () => {}, error: (m) => errors.push(m) });
   assert.equal(code, 1);
   assert.ok(errors.some((m) => m.includes("0138_egress.sql")));
+});
+
+// --- F6: merge-base prevents false positives for PRs behind master -----------
+
+test("runCheck: exits 0 when head is behind base (merge-base has no new migrations)", () => {
+  // Scenario: base (master tip) has migrations 0138-0144, head (PR branch) was cut
+  // before 0138 landed, so head only has up to 0137. The merge-base is head's
+  // tip (where the branch diverged), which only journals 0000-0137. Guard passes.
+  const m0138 = `${MIGRATIONS_DIR}/0138_new.sql`;
+  const m0139 = `${MIGRATIONS_DIR}/0139_even_newer.sql`;
+  const trees = {
+    base: {
+      [JOURNAL_PATH]: journal(["0000_alpha", "0138_new", "0139_even_newer"]),
+      [`${MIGRATIONS_DIR}/0000_alpha.sql`]: "SELECT 1;\n",
+      [m0138]: "CREATE TABLE foo (id int);\n",
+      [m0139]: "CREATE TABLE bar (id int);\n",
+    },
+    head: {
+      [JOURNAL_PATH]: journal(["0000_alpha"]),
+      [`${MIGRATIONS_DIR}/0000_alpha.sql`]: "SELECT 1;\n",
+    },
+  };
+  // merge-base returns "head" because head is where the branch diverged
+  const mergeBaseOverrides = new Map([["base..head", "head"]]);
+  const logs = [];
+  const code = runCheck({
+    baseRef: "base",
+    headRef: "head",
+    execImpl: fakeGit(trees, mergeBaseOverrides),
+    log: (m) => logs.push(m),
+    error: () => {},
+  });
+  assert.equal(code, 0, "head behind base must pass");
+  assert.ok(logs.some((m) => m.includes("still present at head")));
+});
+
+test("runCheck: exits 1 when head is behind base AND edits a released migration", () => {
+  // Same scenario as above, but head edits 0000_alpha (which IS in the merge-base).
+  // Guard must fail because the merge-base contains the original bytes.
+  const m0138 = `${MIGRATIONS_DIR}/0138_new.sql`;
+  const alphaPath = `${MIGRATIONS_DIR}/0000_alpha.sql`;
+  const original = "SELECT 1;\n";
+  const edited = "SELECT 1; -- edited\n";
+  const trees = {
+    base: {
+      [JOURNAL_PATH]: journal(["0000_alpha", "0138_new"]),
+      [alphaPath]: original,
+      [m0138]: "CREATE TABLE foo (id int);\n",
+    },
+    mergeBase: {
+      // The commit where the branch diverged (has original 0000_alpha, not 0138)
+      [JOURNAL_PATH]: journal(["0000_alpha"]),
+      [alphaPath]: original,
+    },
+    head: {
+      // Current PR state (edits 0000_alpha)
+      [JOURNAL_PATH]: journal(["0000_alpha"]),
+      [alphaPath]: edited,
+    },
+  };
+  const mergeBaseOverrides = new Map([["base..head", "mergeBase"]]);
+  const errors = [];
+  const code = runCheck({
+    baseRef: "base",
+    headRef: "head",
+    execImpl: fakeGit(trees, mergeBaseOverrides),
+    log: () => {},
+    error: (m) => errors.push(m),
+  });
+  assert.equal(code, 1, "edit in merge-base must fail");
+  assert.ok(errors.some((m) => m.includes("0000_alpha.sql")));
+  assert.ok(errors.some((m) => /head sha256:/.test(m)), "in-place edit reports a head hash");
+});
+
+test("runCheck: fails closed when merge-base cannot be computed (unrelated histories)", () => {
+  const trees = {
+    base: { [JOURNAL_PATH]: journal(["0000_alpha"]) },
+    head: { [JOURNAL_PATH]: journal(["0000_alpha"]) },
+  };
+  // merge-base returns null (simulated by throwing)
+  const throwingGit = (_cmd, args) => {
+    if (args[0] === "merge-base") throw new Error("fatal: not a valid commit name");
+    return fakeGit(trees)(_cmd, args);
+  };
+  const errors = [];
+  const code = runCheck({
+    baseRef: "base",
+    headRef: "head",
+    execImpl: throwingGit,
+    log: () => {},
+    error: (m) => errors.push(m),
+  });
+  assert.equal(code, 1);
+  assert.ok(errors.some((m) => /failed to compute merge-base/.test(m)));
 });
