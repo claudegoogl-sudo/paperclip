@@ -4,12 +4,14 @@ import { basename } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { MIGRATION_SAFETY_BASELINE } from "./migration-safety-baseline.js";
 import {
+  assertSchemaColumnsClassified,
   assertSecurityPostureColumnsResolve,
   isSecurityPostureTable,
   matchedPostureColumns,
   postureColumnsForTable,
   type SecurityPostureColumn,
 } from "./security-posture-columns.js";
+import type { SecurityPostureRejection } from "./security-posture-rejections.js";
 import {
   assertTenancyBindingKeysResolve,
   matchedTenancyKeys,
@@ -1402,16 +1404,20 @@ export function assertSecurityBaselineReasons(
  * that: a drifted entry must reject *here*, not only in the unit test for
  * `assertSecurityPostureColumnsResolve`.
  *
- * Registry drift is checked before any migration is read. An unresolvable
- * registry means the security rule below is inspecting statements against pairs
- * that match nothing, so there is no point running it first and reporting green.
+ * Registry drift is checked before any migration is read, in both directions.
+ * An unresolvable registry means the security rule below is inspecting
+ * statements against pairs that match nothing, and an unclassified schema column
+ * means the rule is not inspecting it at all — neither is worth running the
+ * migration pass on top of and reporting green.
  */
 export async function runMigrationSafetyCheck(
   postureEntries?: readonly SecurityPostureColumn[],
+  rejectionEntries?: readonly SecurityPostureRejection[],
 ): Promise<string> {
   assertSecurityBaselineReasons();
   assertSecurityPostureColumnsResolve(undefined, postureEntries);
   assertTenancyBindingKeysResolve();
+  assertSchemaColumnsClassified(undefined, postureEntries, rejectionEntries);
   const result = analyzeMigrationSafety(await readMigrations());
 
   if (result.newFindings.length > 0) {

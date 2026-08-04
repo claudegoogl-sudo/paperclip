@@ -8,11 +8,16 @@ import {
   type MigrationSafetyInput,
 } from "./check-migration-safety.js";
 import { MIGRATION_SAFETY_BASELINE } from "./migration-safety-baseline.js";
+import * as schema from "./schema/index.js";
 import {
+  assertSchemaColumnsClassified,
   assertSecurityPostureColumnsResolve,
+  buildSchemaColumnIndex,
+  postureColumnsForTable,
   SECURITY_POSTURE_COLUMNS,
   type SecurityPostureColumn,
 } from "./security-posture-columns.js";
+import type { SecurityPostureRejection } from "./security-posture-rejections.js";
 import {
   TABLE_SIZE_ESTIMATE_FACTOR,
   TABLE_SIZE_BUCKET_THRESHOLDS,
@@ -669,7 +674,13 @@ describe("unqualified mutation of a security-posture column", () => {
     expect(postureFindings(`TRUNCATE TABLE "company_secret_bindings" CASCADE;`)).toHaveLength(1);
     expect(postureFindings(`TRUNCATE ONLY public."company_secret_bindings" RESTART IDENTITY;`))
       .toHaveLength(1);
-    expect(postureFindings(`TRUNCATE "companies", "company_secret_bindings";`)).toHaveLength(1);
+    // Both named tables are registered, so the multi-table form must report
+    // one finding per table rather than collapsing to the first match.
+    expect(
+      postureFindings(`TRUNCATE "companies", "company_secret_bindings";`)
+        .map((finding) => finding.table)
+        .sort(),
+    ).toEqual(["companies", "company_secret_bindings"]);
     expect(
       postureFindings(
         `DELETE FROM "company_secret_bindings" WHERE "id" = '00000000-0000-0000-0000-000000000000';`,
@@ -679,9 +690,14 @@ describe("unqualified mutation of a security-posture column", () => {
 
   it("reports every registered posture column a DELETE takes with the row", () => {
     const [finding] = postureFindings(`DELETE FROM "company_secret_bindings";`);
-    for (const entry of SECURITY_POSTURE_COLUMNS) {
-      expect(finding?.message).toContain(entry.column);
+    const columns = postureColumnsForTable("company_secret_bindings");
+    expect(columns.length).toBeGreaterThan(0);
+    for (const column of columns) {
+      expect(finding?.message).toContain(column);
     }
+    // Scoped to the deleted table: posture columns registered elsewhere must
+    // not be attributed to this row.
+    expect(finding?.message).not.toContain("membership_role");
   });
 });
 
@@ -816,6 +832,48 @@ describe("unqualified-mutation-security-posture-column parse-miss probe", () => 
   }
 });
 
+describe("security-posture registry coverage", () => {
+  const schemaColumns = buildSchemaColumnIndex(schema as Record<string, unknown>);
+
+  it("discovers the schema it is about to validate against", () => {
+    // Guards the two tests below from passing vacuously on an empty map.
+    expect(schemaColumns.size).toBeGreaterThan(100);
+    expect(schemaColumns.get("company_secret_bindings")).toContain("egress_allowlist_enforced");
+  });
+
+  it.each(SECURITY_POSTURE_COLUMNS.map((entry) => [`${entry.table}.${entry.column}`, entry] as const))(
+    "%s names a real schema column",
+    (_label, entry) => {
+      // A typo here does not fail loudly — it silently un-registers the column
+      // and the rule goes back to fail-open on it, which is the exact shape
+      // this registry exists to prevent.
+      expect(schemaColumns.get(entry.table)).toBeDefined();
+      expect(schemaColumns.get(entry.table)).toContain(entry.column);
+    },
+  );
+
+  it.each(SECURITY_POSTURE_COLUMNS.map((entry) => [`${entry.table}.${entry.column}`, entry] as const))(
+    "%s is reachable by the rule",
+    (_label, entry) => {
+      expect(postureFindings(`UPDATE "${entry.table}" SET "${entry.column}" = NULL;`)).toHaveLength(1);
+    },
+  );
+
+  it("stays registry-driven: an unregistered column on a registered table does not fire", () => {
+    expect(schemaColumns.get("issues")).toContain("title");
+    expect(postureFindings(`UPDATE "issues" SET "title" = '';`)).toEqual([]);
+  });
+
+  it("states the dangerous direction in every reason", () => {
+    // The checker enforces that a reason is non-empty; it cannot judge quality.
+    // The sweep's contract is that a reviewer can see *which* value is the
+    // permissive one without re-deriving it, so hold the reasons to that.
+    for (const entry of SECURITY_POSTURE_COLUMNS) {
+      expect(entry.reason.trim().length, `${entry.table}.${entry.column}`).toBeGreaterThan(40);
+    }
+  });
+});
+
 describe("security-posture registry resolves against the schema", () => {
   // Fixtures are real drizzle tables, not hand-built name maps, so the test also
   // exercises the database-name extraction. A fixture keyed on `egressAllowlistEnforced`
@@ -920,6 +978,149 @@ describe("security-posture registry resolves against the schema", () => {
     await expect(runMigrationSafetyCheck(drifted)).rejects.toThrow(
       /company_secret_bindings\.egress_allowlist_enforced_v2/,
     );
+    await expect(runMigrationSafetyCheck()).resolves.toMatch(/Migration safety check passed/);
+  });
+});
+
+describe("security-posture classification is total", () => {
+  // Fixtures are real drizzle tables for the same reason as the block above: the
+  // check reads *database* column names, and a hand-built map keyed on camelCase
+  // TS properties would pass while missing every real column.
+  const fixtureSchema = (extra: Record<string, unknown> = {}) => ({
+    companySecretBindings: pgTable("company_secret_bindings", {
+      id: uuid("id").primaryKey(),
+      egressAllowlistEnforced: boolean("egress_allowlist_enforced").notNull(),
+      label: text("label"),
+      ...extra,
+    }),
+  });
+
+  const registered: readonly SecurityPostureColumn[] = [
+    {
+      table: "company_secret_bindings",
+      column: "egress_allowlist_enforced",
+      reason: "Per-binding egress enforcement switch; false is the permissive value.",
+    },
+  ];
+  const rejections: readonly SecurityPostureRejection[] = [
+    {
+      table: "company_secret_bindings",
+      columns: ["id", "label"],
+      reason: "Surrogate key and display label; neither is read as a security predicate.",
+    },
+  ];
+
+  const classify = (
+    extra?: Record<string, unknown>,
+    entries: readonly SecurityPostureRejection[] = rejections,
+  ) => () => assertSchemaColumnsClassified(fixtureSchema(extra), registered, entries);
+
+  it("passes against the live schema and the real lists", () => {
+    expect(() => assertSchemaColumnsClassified()).not.toThrow();
+  });
+
+  it("passes when every fixture column is classified", () => {
+    expect(classify()).not.toThrow();
+  });
+
+  it("fails when a schema column is classified in neither list, naming the pair", () => {
+    // The whole point of the check: a column added to the schema next week is in
+    // neither list, so the migration lint rule does not check it and nothing else
+    // says so. This is the assertion that is red before the fix.
+    expect(classify({ sourceTrust: text("source_trust") })).toThrow(
+      /company_secret_bindings\.source_trust/,
+    );
+    expect(classify({ sourceTrust: text("source_trust") })).toThrow(/classified in neither list/);
+  });
+
+  it("fails on a rejection with no usable reason", () => {
+    // The reason is the falsifiable claim. An entry without one silences the
+    // check while recording no decision, which is worse than the gap it fills.
+    expect(
+      classify(undefined, [{ table: "company_secret_bindings", columns: ["id", "label"], reason: "n/a" }]),
+    ).toThrow(/reason is missing or shorter/);
+  });
+
+  it("fails on a rejection that enumerates no columns", () => {
+    // A table-level decision with no column list is the whole-table default by
+    // implication, and absence is exactly what must not confer a classification.
+    expect(
+      classify(undefined, [
+        ...rejections,
+        {
+          table: "company_secret_bindings",
+          columns: [],
+          reason: "Everything else on this table is fine, honest — the shape AC5 forbids.",
+        },
+      ]),
+    ).toThrow(/enumerates no columns/);
+  });
+
+  it("fails when a rejection names a column that is not in the schema", () => {
+    // The rejection-side twin of a rotted registry entry: the column was renamed
+    // or dropped, and the surviving entry now classifies nothing.
+    expect(
+      classify(undefined, [
+        ...rejections,
+        {
+          table: "company_secret_bindings",
+          columns: ["label_v2"],
+          reason: "Stale entry left behind by a rename; classifies no live column.",
+        },
+      ]),
+    ).toThrow(/company_secret_bindings\.label_v2 — no such column/);
+  });
+
+  it("fails when a pair is claimed as both a control and not a control", () => {
+    expect(
+      classify(undefined, [
+        ...rejections,
+        {
+          table: "company_secret_bindings",
+          columns: ["egress_allowlist_enforced"],
+          reason: "Contradicts the registry entry for the same pair, so one of them is stale.",
+        },
+      ]),
+    ).toThrow(/registered as a control and rejected as not one/);
+  });
+
+  it("resolves case-insensitively, matching how the rule folds SQL identifiers", () => {
+    expect(
+      classify(undefined, [
+        {
+          table: "COMPANY_SECRET_BINDINGS",
+          columns: ["ID", "LABEL"],
+          reason: "Unquoted SQL identifiers fold to lowercase, so the check must too.",
+        },
+      ]),
+    ).not.toThrow();
+  });
+
+  it("fails closed rather than passing vacuously when no table is reachable", () => {
+    expect(() => assertSchemaColumnsClassified({}, registered, rejections)).toThrow(
+      /no drizzle tables were found/,
+    );
+  });
+
+  it("fails closed rather than passing vacuously when the rejection list is empty", () => {
+    // The symmetric guard. An emptied rejection list makes every unregistered
+    // column unclassified, so without this the check would report success at
+    // precisely the moment it stopped covering anything.
+    expect(classify(undefined, [])).toThrow(/rejection list is empty/);
+  });
+
+  it("rejects an unclassified column from the same entry point the migration lint step runs", async () => {
+    // Guards against the check existing but never being called: otherwise the CLI
+    // prints "Migration safety check passed" and exits 0 with the gap wide open.
+    await expect(
+      runMigrationSafetyCheck(undefined, [
+        {
+          table: "company_secret_bindings",
+          columns: ["label"],
+          reason: "A rejection list covering one column out of the whole schema.",
+        },
+      ]),
+    ).rejects.toThrow(/classified in neither list/);
     await expect(runMigrationSafetyCheck()).resolves.toMatch(/Migration safety check passed/);
   });
 });
