@@ -85,6 +85,10 @@ describe("requireInteractiveBoard actor matrix (AC3)", () => {
     expect(requireInteractiveBoard(makeReq(actorsBySource.session))).toBe(true);
   });
 
+  it("a board actor with no source at all is denied (fail-closed)", () => {
+    expect(requireInteractiveBoard(makeReq({ type: "board", userId: "x" }))).toBe(false);
+  });
+
   it.each([
     "board_key",
     "local_implicit",
