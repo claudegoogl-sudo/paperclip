@@ -428,21 +428,23 @@ describe("Secrets page layout", () => {
     const vaultRoot = createRoot(container);
     await act(async () => {
       vaultRoot.render(
-        <ProviderVaultsTab
-          providers={providers}
-          providerConfigs={providerConfigs as CompanySecretProviderConfig[]}
-          loading={false}
-          error={null}
-          onRetry={vi.fn()}
-          onCreate={vi.fn()}
-          onEdit={vi.fn()}
-          onDisable={vi.fn()}
-          onRemove={vi.fn()}
-          onSetDefault={vi.fn()}
-          onHealthCheck={vi.fn()}
-          onImportSecrets={vi.fn()}
-          pendingActionId={null}
-        />,
+        <MemoryRouter>
+          <ProviderVaultsTab
+            providers={providers}
+            providerConfigs={providerConfigs as CompanySecretProviderConfig[]}
+            loading={false}
+            error={null}
+            onRetry={vi.fn()}
+            onCreate={vi.fn()}
+            onEdit={vi.fn()}
+            onDisable={vi.fn()}
+            onRemove={vi.fn()}
+            onSetDefault={vi.fn()}
+            onHealthCheck={vi.fn()}
+            onImportSecrets={vi.fn()}
+            pendingActionId={null}
+          />
+        </MemoryRouter>,
       );
     });
     await flushReact();
