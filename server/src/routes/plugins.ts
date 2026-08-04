@@ -56,6 +56,7 @@ import {
 import { isVerifiedWebhookDelivery } from "../services/plugin-webhook-auth.js";
 import {
   generateWebhookToken,
+  isWebhookTokenDigestConfig,
   WebhookTokenEntropyError,
 } from "../services/plugin-webhook-token.js";
 import { logger } from "../middleware/logger.js";
@@ -2530,6 +2531,21 @@ export function pluginRoutes(
 
     // Merge into existing config so unrelated keys survive the rotation.
     const existing = await registry.getConfig(plugin.id);
+    // Defence in depth against a manifest that predates the install-time
+    // collision guard: never blind-overwrite a config key holding anything other
+    // than a prior `{salt, digest}` pair. Overwriting a secret-ref here would
+    // tear down its `company_secret_bindings` row instance-wide via
+    // `syncPluginSecretBindings`. Refuse rather than destroy.
+    const existingValue = existing?.configJson?.[auth.tokenDigestConfigKey];
+    if (existingValue !== undefined && !isWebhookTokenDigestConfig(existingValue)) {
+      res.status(409).json({
+        error:
+          `Config key '${auth.tokenDigestConfigKey}' already holds a non-digest value; `
+          + "refusing to overwrite it. Point the webhook's tokenDigestConfigKey at a dedicated, "
+          + "unused config key.",
+      });
+      return;
+    }
     const configJson: Record<string, unknown> = {
       ...(existing?.configJson ?? {}),
       [auth.tokenDigestConfigKey]: generated.digestConfig,

@@ -26,10 +26,20 @@ import { computeWebhookTokenDigest } from "./plugin-webhook-auth.js";
 export const WEBHOOK_TOKEN_ENTROPY_FLOOR_BITS = 128;
 
 /**
- * Token entropy in bytes. 16 bytes = 128 bits, exactly the floor. base62 of 16
- * bytes is 22 characters — the "22+ chars of base62" the spec cites.
+ * Token entropy in bytes. 16 bytes = 128 bits, exactly the floor.
  */
 const TOKEN_ENTROPY_BYTES = 16;
+
+/**
+ * Canonical rendered length: base62 of a 128-bit value needs at most
+ * ceil(128 / log2(62)) = 22 characters. Every token is left-padded to exactly
+ * this width so the string is fixed-width and so the length-ceiling check
+ * (`maxTokenEntropyBits`) never *under*-counts a legitimately generated token —
+ * a 22-char string over base62 has a ceiling of 22·log2(62) ≈ 131 bits, above
+ * the floor. Padding is with the zero digit and is a bijection, so it preserves
+ * the full 128 bits of entropy.
+ */
+const TOKEN_BASE62_LENGTH = 22;
 
 /**
  * Salt entropy in bytes. The salt is not a secret (it only defeats precomputed
@@ -69,9 +79,12 @@ function encodeBase62(bytes: Buffer): string {
   return BASE62_ALPHABET[0].repeat(leadingZeros) + out;
 }
 
-/** Generates a fresh 128-bit token, base62-encoded. */
+/** Generates a fresh 128-bit token, base62-encoded, left-padded to a fixed width. */
 export function generateWebhookTokenSecret(): string {
-  return encodeBase62(randomBytes(TOKEN_ENTROPY_BYTES));
+  return encodeBase62(randomBytes(TOKEN_ENTROPY_BYTES)).padStart(
+    TOKEN_BASE62_LENGTH,
+    BASE62_ALPHABET[0],
+  );
 }
 
 /** Generates a fresh salt, hex-encoded, that the operator does not get to pick. */
@@ -135,6 +148,22 @@ export function assertWebhookTokenMeetsFloor(token: string): void {
 export interface WebhookTokenDigestConfig {
   salt: string;
   digest: string;
+}
+
+/**
+ * True when a stored config value is already a webhook token digest pair. Used
+ * by the mint route to refuse overwriting a config key that holds anything else
+ * (e.g. a secret-ref), which would be destructive.
+ */
+export function isWebhookTokenDigestConfig(
+  value: unknown,
+): value is WebhookTokenDigestConfig {
+  return (
+    typeof value === "object"
+    && value !== null
+    && typeof (value as Record<string, unknown>).salt === "string"
+    && typeof (value as Record<string, unknown>).digest === "string"
+  );
 }
 
 /**

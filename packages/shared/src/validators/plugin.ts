@@ -102,10 +102,15 @@ export type PluginJobDeclarationInput = z.infer<typeof pluginJobDeclarationSchem
  * The host never sees the shared token. It sees a *salted digest* of it, held
  * in the plugin's instance config under `tokenDigestConfigKey` as
  * `{ salt, digest }` where `digest = HMAC-SHA256(key = salt, message = token)`
- * in lowercase hex. The digest is preimage-resistant and not length-extendable,
- * so it is not itself a secret, needs no `company_secret_bindings` row, and is
- * therefore readable on the anonymous, pre-company ingestion route — which is
- * the only reason this works at all.
+ * in lowercase hex. Recovering the token from the digest is a SHA-256 preimage,
+ * and because the token carries at least 128 bits (§18.1, enforced at
+ * generation), that preimage is computationally out of reach even for the config
+ * reader set. On that basis the digest is not itself a secret, needs no
+ * `company_secret_bindings` row, and is held in instance config that only board/
+ * org principals, the plugin's own worker, and DB/backup access can read — not
+ * the anonymous ingestion route. A weak, operator-chosen token below the floor
+ * would make the digest effectively the secret, which is exactly why the floor
+ * exists and why the default mint path never lets the operator choose.
  *
  * @see PLUGIN_SPEC.md §18 — Webhooks
  */
@@ -937,6 +942,35 @@ export const pluginManifestV1Schema = z.object({
         message: "Capability 'webhooks.verify' is required when a webhook declares auth",
         path: ["capabilities"],
       });
+    }
+
+    // `tokenDigestConfigKey` must name an unclaimed config key. The mint route
+    // blind-merges the `{salt, digest}` value over whatever lives at this key,
+    // and `upsertConfig` re-syncs secret-ref bindings from the resulting config
+    // (`syncPluginSecretBindings`). If the key already backs a declared config
+    // field — a secret-ref in particular — minting a token would silently
+    // destroy that value and, for a secret-ref, tear down the
+    // `company_secret_bindings` row for every tenant of this global plugin.
+    // Reject at install time so the destructive path is unreachable.
+    const declaredConfigKeys = new Set(
+      manifest.instanceConfigSchema
+        && typeof manifest.instanceConfigSchema.properties === "object"
+        && manifest.instanceConfigSchema.properties !== null
+        ? Object.keys(manifest.instanceConfigSchema.properties as Record<string, unknown>)
+        : [],
+    );
+    for (const [index, webhook] of manifest.webhooks.entries()) {
+      const key = webhook.auth?.tokenDigestConfigKey;
+      if (key && declaredConfigKeys.has(key)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            `tokenDigestConfigKey '${key}' collides with a key declared in instanceConfigSchema; `
+            + "the webhook token digest must live under its own dedicated config key so minting a "
+            + "token cannot overwrite existing config (including secret-ref bindings)",
+          path: ["webhooks", index, "auth", "tokenDigestConfigKey"],
+        });
+      }
     }
   }
 

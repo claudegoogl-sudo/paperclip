@@ -430,6 +430,38 @@ describe("plugin manifest webhook auth declaration", () => {
     }
   });
 
+  it("rejects a tokenDigestConfigKey that collides with a declared instanceConfigSchema key", () => {
+    // The mint route blind-merges the {salt,digest} over this key and re-syncs
+    // secret-ref bindings from the result; a collision with a secret-ref key
+    // would silently destroy that binding instance-wide. Reject at install.
+    const result = pluginManifestV1Schema.safeParse({
+      ...(manifestWithWebhook(
+        { ...BARE_WEBHOOK, auth: { ...WEBHOOK_AUTH, tokenDigestConfigKey: "botToken" } },
+        ["webhooks.receive", "webhooks.verify"],
+      ) as Record<string, unknown>),
+      instanceConfigSchema: {
+        type: "object",
+        properties: { botToken: { type: "string", format: "secret-ref" } },
+      },
+    });
+    expect(result.success).toBe(false);
+    expect(JSON.stringify(result.error?.issues)).toContain("botToken");
+  });
+
+  it("accepts a tokenDigestConfigKey that names its own dedicated config key", () => {
+    const result = pluginManifestV1Schema.safeParse({
+      ...(manifestWithWebhook(
+        { ...BARE_WEBHOOK, auth: { ...WEBHOOK_AUTH, tokenDigestConfigKey: "webhookTokenDigest" } },
+        ["webhooks.receive", "webhooks.verify"],
+      ) as Record<string, unknown>),
+      instanceConfigSchema: {
+        type: "object",
+        properties: { botToken: { type: "string", format: "secret-ref" } },
+      },
+    });
+    expect(result.success).toBe(true);
+  });
+
   it("keeps webhooks.verify meaningless without webhooks, so it cannot widen anything alone", () => {
     // The capability grants no host access by itself; it only unlocks the
     // manifest field. Declaring it with no webhooks is inert, not an error.

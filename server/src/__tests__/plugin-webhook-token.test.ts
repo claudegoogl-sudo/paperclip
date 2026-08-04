@@ -4,13 +4,11 @@ import type { PluginWebhookAuthDeclaration } from "@paperclipai/shared";
 
 import { isVerifiedWebhookDelivery } from "../services/plugin-webhook-auth.js";
 import {
-  WEBHOOK_TOKEN_ENTROPY_FLOOR_BITS,
   WebhookTokenEntropyError,
   assertWebhookTokenMeetsFloor,
   generateWebhookSalt,
   generateWebhookToken,
   generateWebhookTokenSecret,
-  maxTokenEntropyBits,
 } from "../services/plugin-webhook-token.js";
 
 const auth: PluginWebhookAuthDeclaration = {
@@ -20,13 +18,11 @@ const auth: PluginWebhookAuthDeclaration = {
 };
 
 describe("generateWebhookTokenSecret", () => {
-  it("mints a base62 token that clears the 128-bit floor", () => {
-    for (let i = 0; i < 20; i++) {
+  it("mints a fixed-width 22-char base62 token", () => {
+    for (let i = 0; i < 50; i++) {
       const token = generateWebhookTokenSecret();
       expect(/^[0-9A-Za-z]+$/.test(token)).toBe(true);
-      expect(maxTokenEntropyBits(token)).toBeGreaterThanOrEqual(
-        WEBHOOK_TOKEN_ENTROPY_FLOOR_BITS,
-      );
+      expect(token.length).toBe(22);
     }
   });
 

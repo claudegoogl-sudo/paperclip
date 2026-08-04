@@ -702,6 +702,10 @@ export function registerPluginCommands(program: Command): void {
             return;
           }
 
+          if (!result) {
+            throw new Error("Webhook token generation returned no response body.");
+          }
+
           console.log(
             `${pc.green("Webhook token generated.")} The digest is now stored in plugin config under ` +
               `${pc.bold(result.tokenDigestConfigKey)}.\n\n` +

@@ -4185,6 +4185,18 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "post",
+  path: "/api/plugins/{pluginId}/webhooks/{endpointKey}/token",
+  tags: ["plugins"],
+  summary: "Generate a shared token for a webhook endpoint and store its digest",
+  request: {
+    params: z.object({ pluginId: z.string(), endpointKey: z.string() }),
+    body: jsonBody(z.object({ token: z.string().optional() })),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
   method: "get",
   path: "/api/plugins/{pluginId}/dashboard",
   tags: ["plugins"],
