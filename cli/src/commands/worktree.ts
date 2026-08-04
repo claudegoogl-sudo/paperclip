@@ -46,6 +46,7 @@ import {
   createEmbeddedPostgresLogBuffer,
   formatEmbeddedPostgresError,
   prepareEmbeddedPostgresNativeRuntime,
+  BACKUP_MIN_DECOMPRESSED_BYTES_SMALL_TARGET,
 } from "@paperclipai/db";
 import type { Command } from "commander";
 import { ensureAgentJwtSecret, loadPaperclipEnvFile, mergePaperclipEnvEntries, readPaperclipEnvEntries, resolvePaperclipEnvFile } from "../config/env.js";
@@ -1317,6 +1318,9 @@ async function seedWorktreeDatabase(input: {
       includeMigrationJournal: true,
       excludeTables: seedPlan.excludedTables,
       nullifyColumns: seedPlan.nullifyColumns,
+      // Worktree seed sources are dev/test fixtures and can legitimately be
+      // far smaller than a production schema (see BACKUP_MIN_DECOMPRESSED_BYTES_SMALL_TARGET).
+      minDecompressedBytes: BACKUP_MIN_DECOMPRESSED_BYTES_SMALL_TARGET,
     });
 
     targetHandle = await ensureEmbeddedPostgres(

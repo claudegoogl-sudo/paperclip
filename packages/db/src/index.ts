@@ -25,6 +25,7 @@ export {
   runDatabaseBackup,
   runDatabaseRestore,
   formatDatabaseBackupResult,
+  BACKUP_MIN_DECOMPRESSED_BYTES_SMALL_TARGET,
   type BackupRetentionPolicy,
   type RunDatabaseBackupOptions,
   type RunDatabaseBackupResult,
