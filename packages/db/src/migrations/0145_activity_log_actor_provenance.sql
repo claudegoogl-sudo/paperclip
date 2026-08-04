@@ -7,8 +7,11 @@
 --
 -- actor_source is the resolved credential class from actorMiddleware
 -- (session | board_key | agent_key | agent_jwt | local_implicit | cloud_tenant | none).
--- actor_key_id is the board API key id (a UUID) when the write was authenticated
--- by a board key; NULL otherwise. The token value itself is never stored.
+-- actor_key_id is the id (a UUID) of the API key that authenticated the write:
+-- the board API key id when actor_source = 'board_key', the agent API key id when
+-- actor_source = 'agent_key', NULL for sources that carry no key (session,
+-- agent_jwt, local_implicit, none). Always interpret it together with
+-- actor_source. The token value itself is never stored.
 --
 -- Both columns are nullable with no default, so ADD COLUMN is a metadata-only
 -- change (no table rewrite, no long lock) even on the ~1.1M-row activity_log.

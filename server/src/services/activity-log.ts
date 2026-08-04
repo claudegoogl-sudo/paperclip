@@ -102,7 +102,7 @@ export async function logActivity(db: Db, input: LogActivityInput) {
   // Operators grep: `event=board_key_authenticated_write` (or the JSON key). The
   // token value is never logged — keyId (a UUID) is the only credential id emitted.
   if (actorSource === "board_key") {
-    logger.warn(
+    logger.info(
       {
         event: "board_key_authenticated_write",
         actorSource,
@@ -142,7 +142,6 @@ export async function logActivity(db: Db, input: LogActivityInput) {
       agentId: input.agentId ?? null,
       runId: input.runId ?? null,
       actorSource,
-      actorKeyId,
       details: redactedDetails,
     },
   });

@@ -25,14 +25,6 @@ export function getActorProvenance(): ActorProvenance | null {
 }
 
 /**
- * Runs `fn` with `provenance` bound to AsyncLocalStorage. Exposed so tests and
- * non-Express entry points can establish context the same way the middleware does.
- */
-export function runWithActorProvenance<T>(provenance: ActorProvenance, fn: () => T): T {
-  return actorProvenanceStore.run(provenance, fn);
-}
-
-/**
  * Express middleware that captures `req.actor`'s credential provenance into
  * AsyncLocalStorage for the remainder of the request. Must be registered AFTER
  * `actorMiddleware`, which is what populates `req.actor`.
