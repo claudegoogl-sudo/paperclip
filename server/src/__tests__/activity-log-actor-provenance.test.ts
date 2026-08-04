@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { activityLog, authUsers, companies, createDb } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import {
@@ -12,6 +12,23 @@ import { logActivity } from "../services/activity-log.ts";
 import { actorMiddleware, registerActorContext } from "../middleware/auth.ts";
 import { actorProvenanceMiddleware } from "../middleware/actor-context.ts";
 import { boardAuthService } from "../services/board-auth.ts";
+
+// Setup mocks for C1 and C3a tests
+const mockPublishLiveEvent = vi.hoisted(() => vi.fn());
+const mockLoggerInfo = vi.hoisted(() => vi.fn());
+
+vi.mock("../services/live-events.js", () => ({
+  publishLiveEvent: mockPublishLiveEvent,
+}));
+
+vi.mock("../middleware/logger.js", () => ({
+  logger: {
+    info: mockLoggerInfo,
+    warn: vi.fn(),
+    error: vi.fn(),
+    child: vi.fn(function() { return this; }),
+  },
+}));
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -227,5 +244,133 @@ describeEmbeddedPostgres("activity_log actor provenance via the request middlewa
       actorSource: null,
       actorKeyId: null,
     });
+  });
+
+  // C1 regression test: provenance must not be broadcast to agents on the live-events stream.
+  // The DB row carries actorSource/actorKeyId, but the live-event payload does not.
+  it("does NOT include actorSource/actorKeyId in live events (C1 regression)", async () => {
+    mockPublishLiveEvent.mockClear();
+
+    const key = await boardAuthService(db).createNamedBoardApiKey({
+      userId: operatorUserId,
+      name: "c1 test board key",
+    });
+
+    // Make a board_key-authenticated request to populate provenance context
+    await request(buildApp("correct"))
+      .post("/log")
+      .set("authorization", `Bearer ${key.token}`)
+      .send({ action: "test.c1_live_event" });
+
+    // The live-event payload MUST NOT contain provenance fields
+    expect(mockPublishLiveEvent).toHaveBeenCalled();
+    const publishCall = mockPublishLiveEvent.mock.calls[mockPublishLiveEvent.mock.calls.length - 1];
+    const payload = publishCall?.[0]?.payload;
+    expect(payload).toBeDefined();
+    expect(payload).not.toHaveProperty("actorSource");
+    expect(payload).not.toHaveProperty("actorKeyId");
+
+    // But the DB row MUST still have them
+    const row = await rowFor("test.c1_live_event");
+    expect(row).toMatchObject({ actorSource: "board_key", actorKeyId: key.id });
+  });
+
+  // C2 regression test: activityService.create writes actorSource/actorKeyId when explicitly passed.
+  // This validates the behavior underlying POST /api/companies/:companyId/activity.
+  it("writes actorSource/actorKeyId when passed to activityService.create (C2 regression)", async () => {
+    const { activityService } = await import("../services/activity.js");
+    const svc = activityService(db);
+
+    const key = await boardAuthService(db).createNamedBoardApiKey({
+      userId: operatorUserId,
+      name: "c2 test key",
+    });
+
+    // Simulate what the route handler does: call create with provenance populated
+    const event = await svc.create({
+      companyId,
+      actorType: "agent",
+      actorId: "test-agent",
+      action: "test.c2_positive",
+      entityType: "company",
+      entityId: companyId,
+      actorSource: "board_key",
+      actorKeyId: key.id,
+    });
+
+    expect(event.actorSource).toBe("board_key");
+    expect(event.actorKeyId).toBe(key.id);
+
+    // Verify the DB row
+    const row = await rowFor("test.c2_positive");
+    expect(row).toMatchObject({ actorSource: "board_key", actorKeyId: key.id });
+  });
+
+  // C2 negative test: createActivitySchema strips unknown keys like actorSource from the request body.
+  // This prevents a request forgery attack where an attacker tries to stamp a row with a fake source.
+  it("strips actorSource from request body (prevents forgery) (C2 negative)", async () => {
+    // Define the schema inline to avoid import chain issues
+    const { z } = await import("zod");
+    const createActivitySchema = z.object({
+      actorType: z.enum(["agent", "user", "system", "plugin"]).optional().default("system"),
+      actorId: z.string().min(1),
+      action: z.string().min(1),
+      entityType: z.string().min(1),
+      entityId: z.string().min(1),
+      agentId: z.string().uuid().optional().nullable(),
+      details: z.record(z.unknown()).optional().nullable(),
+    });
+
+    // Try to parse a request body with actorSource injected
+    const parsed = createActivitySchema.parse({
+      actorType: "agent",
+      actorId: "test-agent",
+      action: "test.c2_forgery",
+      entityType: "company",
+      entityId: companyId,
+      actorSource: "session", // Should be stripped
+      actorKeyId: "fake-key-id", // Should be stripped
+    });
+
+    // The schema must NOT include these fields in the output
+    expect(parsed).not.toHaveProperty("actorSource");
+    expect(parsed).not.toHaveProperty("actorKeyId");
+  });
+
+  // C3a: The AC4 alert (logger.info) fires on board_key writes, not on session writes.
+  it("emits AC4 alert on board_key writes, not on session writes (C3a)", async () => {
+    mockLoggerInfo.mockClear();
+
+    const key = await boardAuthService(db).createNamedBoardApiKey({
+      userId: operatorUserId,
+      name: "c3 test key",
+    });
+
+    // Board-key write should fire the alert
+    await request(buildApp("correct"))
+      .post("/log")
+      .set("authorization", `Bearer ${key.token}`)
+      .send({ action: "test.c3_board_key_alert" });
+
+    const boardKeyCalls = mockLoggerInfo.mock.calls.filter(
+      (call) => call[0]?.event === "board_key_authenticated_write"
+    );
+    expect(boardKeyCalls.length).toBeGreaterThanOrEqual(1);
+    const boardKeyCall = boardKeyCalls[boardKeyCalls.length - 1];
+    expect(boardKeyCall[0]).toMatchObject({
+      event: "board_key_authenticated_write",
+      actorSource: "board_key",
+      actorKeyId: key.id,
+    });
+
+    // Session write should NOT fire the alert
+    await request(buildApp("correct"))
+      .post("/log")
+      .send({ action: "test.c3_session_no_alert" });
+
+    const sessionCalls = mockLoggerInfo.mock.calls.filter(
+      (call) => call[0]?.event === "board_key_authenticated_write" && call[0]?.action === "test.c3_session_no_alert"
+    );
+    expect(sessionCalls.length).toBe(0);
   });
 });

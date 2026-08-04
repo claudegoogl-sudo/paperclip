@@ -141,7 +141,6 @@ export async function logActivity(db: Db, input: LogActivityInput) {
       entityId: input.entityId,
       agentId: input.agentId ?? null,
       runId: input.runId ?? null,
-      actorSource,
       details: redactedDetails,
     },
   });
