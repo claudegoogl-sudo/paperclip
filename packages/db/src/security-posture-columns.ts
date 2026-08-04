@@ -39,7 +39,9 @@ type PostureColumnOf<T extends PostureTableShape> = {
  * means adding that table's `PostureColumnOf<...>` here, which is exactly the
  * deliberate edit the registry is supposed to require.
  */
-type RegisteredPostureColumn = PostureColumnOf<typeof schema.companySecretBindings>;
+type RegisteredPostureColumn =
+  | PostureColumnOf<typeof schema.companySecretBindings>
+  | PostureColumnOf<typeof schema.activityLog>;
 
 /**
  * Columns whose value *is* a security control, not data about one.
@@ -71,6 +73,16 @@ export const SECURITY_POSTURE_COLUMNS = [
     table: "company_secret_bindings",
     column: "allowed_egress",
     reason: "Destination allowlist the enforcement switch evaluates; emptying it is equivalent to disarming it.",
+  },
+  {
+    table: "activity_log",
+    column: "actor_source",
+    reason: "Auth credential class for the write (board_key / agent_key / session / etc.); NULL obscures provenance.",
+  },
+  {
+    table: "activity_log",
+    column: "actor_key_id",
+    reason: "API key UUID qualified by actor_source; clearing it buries which credential authenticated the write.",
   },
 ] as const satisfies readonly (SecurityPostureColumn & RegisteredPostureColumn)[];
 
