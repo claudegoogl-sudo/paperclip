@@ -262,7 +262,7 @@ describeEmbeddedPostgres("activity_log actor provenance via the request middlewa
       .set("authorization", `Bearer ${key.token}`)
       .send({ action: "test.c1_live_event" });
 
-    // Per PLA-2209 security ruling: live-event payload carries actorSource but NOT actorKeyId
+    // Per security ruling: live-event payload carries actorSource but NOT actorKeyId
     expect(mockPublishLiveEvent).toHaveBeenCalled();
     const publishCall = mockPublishLiveEvent.mock.calls[mockPublishLiveEvent.mock.calls.length - 1];
     const payload = publishCall?.[0]?.payload;
