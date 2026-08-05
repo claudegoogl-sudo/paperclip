@@ -832,6 +832,111 @@ describe("unqualified-mutation-security-posture-column parse-miss probe", () => 
   }
 });
 
+const TENANCY_RULE = "unqualified-mutation-tenancy-key";
+
+function tenancyFindings(sql: string) {
+  return analyze(sql).newFindings.filter((finding) => finding.rule === TENANCY_RULE);
+}
+
+describe("unqualified mutation of a tenancy or binding-scope key", () => {
+  it("fires on an unqualified UPDATE that sets company_id", () => {
+    expect(tenancyFindings(`UPDATE "companies" SET "company_id" = '00000000-0000-0000-0000-000000000000';`))
+      .toHaveLength(1);
+  });
+
+  it("fires on an unqualified UPDATE that sets scope_id on a scope-key table", () => {
+    expect(
+      tenancyFindings(`UPDATE "plugin_state" SET "scope_id" = '00000000-0000-0000-0000-000000000000';`),
+    ).toHaveLength(1);
+    expect(
+      tenancyFindings(`UPDATE "budget_policies" SET "scope_id" = '00000000-0000-0000-0000-000000000000';`),
+    ).toHaveLength(1);
+  });
+
+  it("fires on an unqualified UPDATE that sets scope_kind on a scope-key table", () => {
+    expect(tenancyFindings(`UPDATE "plugin_state" SET "scope_kind" = 'company';`)).toHaveLength(1);
+    expect(tenancyFindings(`UPDATE "plugin_entities" SET "scope_kind" = 'company';`)).toHaveLength(1);
+  });
+
+  it("fires on an unqualified UPDATE that sets scope_type on a scope-key table", () => {
+    expect(tenancyFindings(`UPDATE "budget_policies" SET "scope_type" = 'company';`)).toHaveLength(1);
+    expect(tenancyFindings(`UPDATE "workspace_runtime_services" SET "scope_type" = 'company';`))
+      .toHaveLength(1);
+  });
+
+  it("fires on an unqualified UPDATE that sets policy_id on budget_incidents", () => {
+    expect(tenancyFindings(`UPDATE "budget_incidents" SET "policy_id" = '00000000-0000-0000-0000-000000000000';`))
+      .toHaveLength(1);
+  });
+
+  it("does NOT fire on policy_id on tables where it's not a tenancy key", () => {
+    // budget_policies has policy_id as a regular column, not a tenancy key
+    expect(
+      tenancyFindings(`UPDATE "budget_policies" SET "policy_id" = '00000000-0000-0000-0000-000000000000';`),
+    ).toHaveLength(0);
+  });
+
+  it("does NOT fire on scope columns on tables where they're not tenancy keys", () => {
+    // env_vars has scope_type/scope_id but they're configuration, not tenancy
+    expect(tenancyFindings(`UPDATE "env_vars" SET "scope_type" = 'company';`)).toHaveLength(0);
+    expect(tenancyFindings(`UPDATE "env_vars" SET "scope_id" = '00000000-0000-0000-0000-000000000000';`))
+      .toHaveLength(0);
+  });
+
+  it("stays silent on a qualified UPDATE with a selective WHERE", () => {
+    expect(
+      tenancyFindings(`UPDATE "plugin_state" SET "scope_id" = 'x' WHERE "id" = '00000000-0000-0000-0000-000000000000';`),
+    ).toEqual([]);
+    expect(
+      tenancyFindings(`UPDATE "companies" SET "company_id" = 'x' WHERE "id" = '00000000-0000-0000-0000-000000000000';`),
+    ).toEqual([]);
+  });
+
+  it("treats WHERE true and WHERE 1=1 as unqualified", () => {
+    expect(tenancyFindings(`UPDATE "plugin_state" SET "scope_id" = 'x' WHERE true;`)).toHaveLength(1);
+    expect(tenancyFindings(`UPDATE "companies" SET "company_id" = 'x' WHERE 1 = 1;`)).toHaveLength(1);
+  });
+
+  it("does NOT fire on DELETE or TRUNCATE — tenancy checks run on read, not row existence", () => {
+    expect(tenancyFindings(`DELETE FROM "plugin_state";`)).toHaveLength(0);
+    expect(tenancyFindings(`TRUNCATE "companies";`)).toHaveLength(0);
+  });
+
+  it("requires the rule to be named: the `all` wildcard does not silence it", () => {
+    const sql = `
+      -- paperclip:migration-safety-ignore all: perf reviewed, small table
+      UPDATE "plugin_state" SET "scope_id" = '00000000-0000-0000-0000-000000000000';
+    `;
+    expect(tenancyFindings(sql)).toHaveLength(1);
+  });
+
+  it("honors a per-statement opt-out that names the rule and gives a reason", () => {
+    const sql = `
+      -- paperclip:migration-safety-ignore unqualified-mutation-tenancy-key: one-time backfill, reviewed and approved
+      UPDATE "plugin_state" SET "scope_id" = '00000000-0000-0000-0000-000000000000';
+    `;
+    expect(tenancyFindings(sql)).toEqual([]);
+  });
+
+  it("flags multiple tenancy columns set in the same UPDATE", () => {
+    const [finding] = tenancyFindings(
+      `UPDATE "plugin_state" SET "scope_kind" = 'company', "scope_id" = '00000000-0000-0000-0000-000000000000';`,
+    );
+    expect(finding?.message).toContain("scope_kind");
+    expect(finding?.message).toContain("scope_id");
+  });
+
+  it("matches columns case-insensitively", () => {
+    expect(tenancyFindings(`UPDATE "plugin_state" SET "COMPANY_ID" = 'x';`)).toHaveLength(1);
+    expect(tenancyFindings(`UPDATE "plugin_state" SET "Scope_Id" = 'x';`)).toHaveLength(1);
+  });
+
+  it("handles mixed-case table and column names", () => {
+    expect(tenancyFindings(`UPDATE "PLUGIN_STATE" SET "SCOPE_ID" = 'x';`)).toHaveLength(1);
+    expect(tenancyFindings(`UPDATE "Companies" SET "Company_Id" = 'x';`)).toHaveLength(1);
+  });
+});
+
 describe("security-posture registry coverage", () => {
   const schemaColumns = buildSchemaColumnIndex(schema as Record<string, unknown>);
 

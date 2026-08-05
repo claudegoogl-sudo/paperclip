@@ -12,6 +12,7 @@ import {
   type SecurityPostureColumn,
 } from "./security-posture-columns.js";
 import type { SecurityPostureRejection } from "./security-posture-rejections.js";
+import { isTenancyKey, matchedTenancyKeys } from "./tenancy-key-columns.js";
 import {
   getTableSizeEstimate,
   isKnownLargeTable,
@@ -25,13 +26,15 @@ export type MigrationSafetyRule =
   | "batched-mutation-large-table-missing-index"
   | "full-table-mutation-large-table"
   | "large-create-index-not-concurrently"
-  | "unqualified-mutation-security-posture-column";
+  | "unqualified-mutation-security-posture-column"
+  | "unqualified-mutation-tenancy-key";
 
 // Rules that model security risk rather than performance risk. Excluded from the
 // `migration-safety-ignore all` wildcard so a perf-motivated blanket ignore
 // cannot quietly disarm a security check — silencing these must name the rule.
 const SECURITY_RULES = new Set<MigrationSafetyRule>([
   "unqualified-mutation-security-posture-column",
+  "unqualified-mutation-tenancy-key",
 ]);
 
 export type MigrationSafetySeverity = "error" | "warning";
@@ -101,6 +104,10 @@ const RULE_METADATA: Record<MigrationSafetyRule, RuleMetadata> = {
   "unqualified-mutation-security-posture-column": {
     severity: "error",
     message: "Unqualified mutation of a registered security-posture column",
+  },
+  "unqualified-mutation-tenancy-key": {
+    severity: "error",
+    message: "Unqualified UPDATE that sets a tenancy or binding-scope key",
   },
 };
 
@@ -1132,6 +1139,69 @@ function securityPostureFinding(
   );
 }
 
+/**
+ * Rule `unqualified-mutation-tenancy-key` (error).
+ *
+ * Fires on an `UPDATE` that assigns a tenancy or binding-scope key without a
+ * selective `WHERE`. Unlike security-posture columns (where the *value* is a
+ * control), tenancy keys have no dangerous value — every value is correct for
+ * exactly one tenant. The danger is re-pointing every row to the wrong scope.
+ *
+ * This rule covers:
+ * - `company_id` on any table (pattern-based: near-universal, identical semantics)
+ * - `scope_type`, `scope_kind`, `scope_id` on tables where they're tenancy boundaries
+ * - `policy_id` on `budget_incidents` (incidents are scoped to their policy)
+ *
+ * See `tenancy-key-columns.ts` for the full enumeration strategy and rationale.
+ *
+ * Opt out per statement with the shared ignore comment and a reason:
+ * `-- paperclip:migration-safety-ignore unqualified-mutation-tenancy-key: <reason>`.
+ * The `all` wildcard does not cover this rule (see `SECURITY_RULES`), and
+ * baselining it requires a non-empty reason (see `assertSecurityBaselineReasons`).
+ *
+ * Statement shapes covered:
+ * - plain `UPDATE ... SET ...` with and without `WHERE`
+ * - `UPDATE ... SET ... FROM ...`
+ * - `WITH x AS (...) UPDATE ...`, and `UPDATE` inside a `DO $$ ... $$` block
+ * - segments split on `--> statement-breakpoint` and on a bare `;`
+ * - quoted, unquoted, and schema-qualified names
+ * - `SET (a, b) = (...)` multi-column assignment
+ *
+ * Known gaps:
+ * - dynamic SQL: `EXECUTE format('UPDATE %I SET ...', tbl)` — table and column
+ *   are strings assembled at runtime, so static analysis cannot see them
+ * - indirect writes via rules/triggers on other tables
+ */
+function tenancyKeyFinding(
+  mutation: MutationInfo,
+  migration: string,
+  statement: string,
+  estimates: ReadonlyMap<string, TableSizeEstimate>,
+): MigrationSafetyFinding | null {
+  const rule = "unqualified-mutation-tenancy-key" as const;
+  if (isIgnored(statement, rule)) return null;
+
+  // Only UPDATE is relevant here — DELETE/TRUNCATE remove the row entirely,
+  // and the tenancy check runs on read, not on the row's existence
+  if (mutation.kind !== "update") return null;
+
+  const endIndex = mutationBodyEnd(mutation.statementSql, mutation.keywordIndex);
+  if (!isUnqualifiedMutation(mutation, endIndex)) return null;
+
+  const setColumns = updateSetColumns(mutation, endIndex);
+  const tenancyColumns = matchedTenancyKeys(mutation.table, setColumns);
+  if (tenancyColumns.length === 0) return null;
+
+  return makeFinding(
+    rule,
+    migration,
+    mutation.table,
+    statement,
+    estimates,
+    `columns=${tenancyColumns.join(", ")}`,
+  );
+}
+
 export function analyzeMigrationSafety(
   migrations: readonly MigrationSafetyInput[],
   options: {
@@ -1173,6 +1243,9 @@ export function analyzeMigrationSafety(
       for (const mutation of allMutations) {
         const finding = securityPostureFinding(mutation, migration.fileName, statement, estimates);
         if (finding) addFindingOnce(findings, seen, finding);
+
+        const tenancyFinding = tenancyKeyFinding(mutation, migration.fileName, statement, estimates);
+        if (tenancyFinding) addFindingOnce(findings, seen, tenancyFinding);
       }
 
       const mutations = allMutations.filter(
