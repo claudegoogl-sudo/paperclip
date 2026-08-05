@@ -262,12 +262,12 @@ describeEmbeddedPostgres("activity_log actor provenance via the request middlewa
       .set("authorization", `Bearer ${key.token}`)
       .send({ action: "test.c1_live_event" });
 
-    // The live-event payload MUST NOT contain provenance fields
+    // Per PLA-2209 security ruling: live-event payload carries actorSource but NOT actorKeyId
     expect(mockPublishLiveEvent).toHaveBeenCalled();
     const publishCall = mockPublishLiveEvent.mock.calls[mockPublishLiveEvent.mock.calls.length - 1];
     const payload = publishCall?.[0]?.payload;
     expect(payload).toBeDefined();
-    expect(payload).not.toHaveProperty("actorSource");
+    expect(payload).toHaveProperty("actorSource", "board_key");
     expect(payload).not.toHaveProperty("actorKeyId");
 
     // But the DB row MUST still have them
