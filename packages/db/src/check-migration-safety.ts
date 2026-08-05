@@ -4,6 +4,15 @@ import { basename } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { MIGRATION_SAFETY_BASELINE } from "./migration-safety-baseline.js";
 import {
+  assertSchemaColumnsClassified,
+  assertSecurityPostureColumnsResolve,
+  isSecurityPostureTable,
+  matchedPostureColumns,
+  postureColumnsForTable,
+  type SecurityPostureColumn,
+} from "./security-posture-columns.js";
+import type { SecurityPostureRejection } from "./security-posture-rejections.js";
+import {
   getTableSizeEstimate,
   isKnownLargeTable,
   type TableSizeEstimate,
@@ -15,7 +24,15 @@ export type MigrationSafetyRule =
   | "loop-mutation-large-table"
   | "batched-mutation-large-table-missing-index"
   | "full-table-mutation-large-table"
-  | "large-create-index-not-concurrently";
+  | "large-create-index-not-concurrently"
+  | "unqualified-mutation-security-posture-column";
+
+// Rules that model security risk rather than performance risk. Excluded from the
+// `migration-safety-ignore all` wildcard so a perf-motivated blanket ignore
+// cannot quietly disarm a security check — silencing these must name the rule.
+const SECURITY_RULES = new Set<MigrationSafetyRule>([
+  "unqualified-mutation-security-posture-column",
+]);
 
 export type MigrationSafetySeverity = "error" | "warning";
 
@@ -55,7 +72,10 @@ type CreateIndexInfo = {
   readonly statement: string;
 };
 
+type MutationKind = "update" | "delete" | "truncate";
+
 type MutationInfo = {
+  readonly kind: MutationKind;
   readonly table: string;
   readonly statementSql: string;
   readonly keywordIndex: number;
@@ -77,6 +97,10 @@ const RULE_METADATA: Record<MigrationSafetyRule, RuleMetadata> = {
   "large-create-index-not-concurrently": {
     severity: "warning",
     message: "CREATE INDEX on a known-large table is missing CONCURRENTLY",
+  },
+  "unqualified-mutation-security-posture-column": {
+    severity: "error",
+    message: "Unqualified mutation of a registered security-posture column",
   },
 };
 
@@ -196,7 +220,8 @@ function ignoreRules(statement: string): Set<string> {
 
 function isIgnored(statement: string, rule: MigrationSafetyRule): boolean {
   const ignored = ignoreRules(statement);
-  return ignored.has(rule) || ignored.has("all");
+  if (ignored.has(rule)) return true;
+  return !SECURITY_RULES.has(rule) && ignored.has("all");
 }
 
 function skipSingleQuotedLiteral(statement: string, startIndex: number): number {
@@ -658,29 +683,67 @@ function parseCreateIndexes(statement: string): CreateIndexInfo[] {
   return indexes;
 }
 
+// Any schema qualifier, not just `public.`. A security rule that reads
+// `app.company_secret_bindings` as table `app` would fail open.
+const SCHEMA_QUALIFIER = String.raw`(?:(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*\.\s*)?`;
+const TABLE_REFERENCE = String.raw`(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))`;
+const OPTIONAL_ALIAS = String.raw`(?:\s+(?:AS\s+)?(?:"?[A-Za-z_][A-Za-z0-9_]*"?))?`;
+
 function parseMutations(statement: string): MutationInfo[] {
   const mutations: MutationInfo[] = [];
   const sql = stripSqlComments(statement);
-  const updatePattern =
-    /\bUPDATE\s+(?:ONLY\s+)?(?:(?:"public"|public)\s*\.\s*)?(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))(?:\s+(?:AS\s+)?(?:"?([A-Za-z_][A-Za-z0-9_]*)"?))?/gi;
-  const deletePattern =
-    /\bDELETE\s+FROM\s+(?:ONLY\s+)?(?:(?:"public"|public)\s*\.\s*)?(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))(?:\s+(?:AS\s+)?(?:"?([A-Za-z_][A-Za-z0-9_]*)"?))?/gi;
+  const updatePattern = new RegExp(
+    String.raw`\bUPDATE\s+(?:ONLY\s+)?${SCHEMA_QUALIFIER}${TABLE_REFERENCE}${OPTIONAL_ALIAS}`,
+    "gi",
+  );
+  const deletePattern = new RegExp(
+    String.raw`\bDELETE\s+FROM\s+(?:ONLY\s+)?${SCHEMA_QUALIFIER}${TABLE_REFERENCE}${OPTIONAL_ALIAS}`,
+    "gi",
+  );
 
   for (const match of sql.matchAll(updatePattern)) {
     const table = normalizeIdentifier(match[1] ?? match[2] ?? "");
     if (table) {
-      mutations.push({ table, statementSql: sql, keywordIndex: match.index ?? 0 });
+      mutations.push({ kind: "update", table, statementSql: sql, keywordIndex: match.index ?? 0 });
     }
   }
 
   for (const match of sql.matchAll(deletePattern)) {
     const table = normalizeIdentifier(match[1] ?? match[2] ?? "");
     if (table) {
-      mutations.push({ table, statementSql: sql, keywordIndex: match.index ?? 0 });
+      mutations.push({ kind: "delete", table, statementSql: sql, keywordIndex: match.index ?? 0 });
     }
   }
 
+  for (const truncate of parseTruncates(sql)) {
+    mutations.push(truncate);
+  }
+
   return mutations;
+}
+
+function parseTruncates(sql: string): MutationInfo[] {
+  const truncates: MutationInfo[] = [];
+  const pattern =
+    /\bTRUNCATE\b(?:\s+TABLE\b)?\s+([\s\S]*?)(?=\b(?:RESTART|CONTINUE|CASCADE|RESTRICT)\b|;|$)/gi;
+  const tableReference = new RegExp(String.raw`^(?:ONLY\s+)?${SCHEMA_QUALIFIER}${TABLE_REFERENCE}`, "i");
+
+  for (const match of sql.matchAll(pattern)) {
+    for (const entry of splitSqlList(match[1] ?? "")) {
+      const reference = entry.trim().match(tableReference);
+      const table = normalizeIdentifier(reference?.[1] ?? reference?.[2] ?? "");
+      if (table) {
+        truncates.push({
+          kind: "truncate",
+          table,
+          statementSql: sql,
+          keywordIndex: match.index ?? 0,
+        });
+      }
+    }
+  }
+
+  return truncates;
 }
 
 function hasDoLoop(statement: string): boolean {
@@ -778,6 +841,115 @@ function hasSelectiveWhere(mutation: MutationInfo): boolean {
   return true;
 }
 
+/**
+ * Index just past the mutation's own body: the first top-level `;` after the
+ * mutation keyword, the `)` closing an enclosing CTE, or end of input.
+ *
+ * The size rules scan a whole `splitSqlStatements` unit, which is safe for them
+ * because a missed finding only costs a perf warning. The security rule cannot
+ * afford that. A `DO $$ ... $$` block, or a segment between two
+ * `--> statement-breakpoint` markers, holds several statements in one unit — and
+ * an unbounded scan lets a *later* statement's `WHERE` vouch for an earlier
+ * unqualified write.
+ */
+function mutationBodyEnd(sql: string, startIndex: number): number {
+  let depth = 0;
+  let index = startIndex;
+
+  while (index < sql.length) {
+    const next = skipSqlTrivia(sql, index);
+    if (next !== index) {
+      index = next;
+      continue;
+    }
+
+    const char = sql[index];
+    if (char === "(") {
+      depth += 1;
+      index += 1;
+      continue;
+    }
+    if (char === ")") {
+      if (depth === 0) return index;
+      depth -= 1;
+      index += 1;
+      continue;
+    }
+    if (char === ";" && depth === 0) return index;
+    index += 1;
+  }
+
+  return sql.length;
+}
+
+/** Left-hand side of a `SET` assignment, i.e. everything before its top-level `=`. */
+function assignmentTarget(assignment: string): string {
+  let depth = 0;
+  let index = 0;
+
+  while (index < assignment.length) {
+    const next = skipSqlTrivia(assignment, index);
+    if (next !== index) {
+      index = next;
+      continue;
+    }
+
+    const char = assignment[index];
+    if (char === "(") {
+      depth += 1;
+      index += 1;
+      continue;
+    }
+    if (char === ")") {
+      depth = Math.max(0, depth - 1);
+      index += 1;
+      continue;
+    }
+    if (char === "=" && depth === 0) return assignment.slice(0, index);
+    index += 1;
+  }
+
+  return "";
+}
+
+/**
+ * Columns assigned by an `UPDATE`'s `SET` clause.
+ *
+ * Handles both `SET a = 1, b = 2` and the multi-column `SET (a, b) = (1, 2)`
+ * form. Sub-selects are skipped by paren depth, so `SET a = (SELECT ... FROM y)`
+ * does not leak `y`'s columns.
+ */
+function updateSetColumns(mutation: MutationInfo, endIndex: number): string[] {
+  const body = mutation.statementSql.slice(mutation.keywordIndex, endIndex);
+  const setKeyword = keywordOccurrences(body, /^\bSET\b/i).find((entry) => entry.depth === 0);
+  if (!setKeyword) return [];
+
+  const assignmentsStart = setKeyword.index + setKeyword.length;
+  const terminator = keywordOccurrences(body, /^\b(?:FROM|WHERE|RETURNING)\b/i).find(
+    (entry) => entry.depth === 0 && entry.index >= assignmentsStart,
+  );
+  const assignments = body.slice(assignmentsStart, terminator?.index ?? body.length);
+
+  return splitSqlList(assignments).flatMap((assignment) =>
+    identifierList(assignmentTarget(assignment)),
+  );
+}
+
+/**
+ * True when the mutation writes every row of its target table.
+ *
+ * `TRUNCATE` has no predicate at all. For `UPDATE`/`DELETE` this reuses the
+ * shared selectivity heuristic — which already rejects `WHERE true` and
+ * `WHERE 1=1` — but over the mutation's own body only.
+ */
+function isUnqualifiedMutation(mutation: MutationInfo, endIndex: number): boolean {
+  if (mutation.kind === "truncate") return true;
+  return !hasSelectiveWhere({
+    ...mutation,
+    statementSql: mutation.statementSql.slice(0, endIndex),
+  });
+}
+
 function hasLeadingOrderPrefix(
   supportIndex: CreateIndexInfo,
   orderColumns: readonly string[],
@@ -847,6 +1019,7 @@ function makeFinding(
   table: string,
   statement: string,
   estimates: ReadonlyMap<string, TableSizeEstimate>,
+  detail?: string,
 ): MigrationSafetyFinding {
   const metadata = RULE_METADATA[rule];
   return {
@@ -856,7 +1029,7 @@ function makeFinding(
     migration,
     table,
     statement: statementExcerpt(statement),
-    message: `${metadata.message} (${estimateSuffix(table, estimates)})`,
+    message: `${metadata.message} (${detail ?? estimateSuffix(table, estimates)})`,
   };
 }
 
@@ -881,6 +1054,82 @@ function estimatesByTable(
 function tableIsLarge(table: string, estimates: ReadonlyMap<string, TableSizeEstimate>): boolean {
   if (estimates.size > 0) return estimates.get(table)?.bucket === "large";
   return isKnownLargeTable(table);
+}
+
+/**
+ * Rule `unqualified-mutation-security-posture-column` (error).
+ *
+ * Fires on an `UPDATE` that assigns a column in `SECURITY_POSTURE_COLUMNS`
+ * without a selective `WHERE`, and on an unqualified `DELETE`/`TRUNCATE` against
+ * a table that holds one. `WHERE true` and `WHERE 1=1` count as unqualified.
+ *
+ * Deliberately independent of `table-size-estimates.ts`. The size rules model
+ * *performance* risk, under which the statement that caused the incident —
+ * `UPDATE "company_secret_bindings" SET "egress_allowlist_enforced" = false;`
+ * over a handful of rows — is the safest line in the migration. Under a security
+ * lens it is the most dangerous one, because those rows are the egress gate. Row
+ * count is the wrong axis for this class, and the size registry additionally
+ * fails open: a table absent from it silently buckets as `"small"`.
+ *
+ * Opt out per statement with the shared ignore comment and a reason:
+ * `-- paperclip:migration-safety-ignore unqualified-mutation-security-posture-column: <reason>`.
+ * The `all` wildcard does not cover this rule (see `SECURITY_RULES`), and
+ * baselining it requires a non-empty reason (see `assertSecurityBaselineReasons`).
+ * Neither the drizzle journal nor "this only runs once" is a mitigation — `0138`
+ * asserted exactly that in its header comment and it is what failed.
+ *
+ * Statement shapes the parser reaches (each covered by a test):
+ * - plain `UPDATE ... SET ...` with and without `WHERE`
+ * - `UPDATE ... SET ... FROM ...`
+ * - `WITH x AS (...) UPDATE ...`, and `UPDATE` inside a `DO $$ ... $$` block
+ * - segments split on `--> statement-breakpoint` and on a bare `;`, including a
+ *   qualified statement following an unqualified one inside the same segment
+ * - quoted, unquoted, and schema-qualified names (`public."company_secret_bindings"`)
+ * - `SET (a, b) = (...)` multi-column assignment; mixed-case identifiers
+ *
+ * Known gaps — shapes the parser cannot reach, so the rule is silent on them:
+ * - dynamic SQL: `EXECUTE format('UPDATE %I SET ...', tbl)`. The table and column
+ *   are strings assembled at runtime, so no static parser can see them.
+ * - a rule/trigger body that rewrites the posture column as a side effect of a
+ *   write to some other table.
+ *
+ * A column renamed or dropped out from under a registry entry used to belong on
+ * that list — the entry would match nothing and this rule would pass while
+ * protecting zero columns. `assertSecurityPostureColumnsResolve` now rejects an
+ * unresolvable entry before any migration is read, so that degradation is an
+ * error instead of a green check.
+ *
+ * This rule narrows the class to the columns we named; detection of a posture
+ * change nobody registered has to come from a runtime audit trail, not from here.
+ */
+function securityPostureFinding(
+  mutation: MutationInfo,
+  migration: string,
+  statement: string,
+  estimates: ReadonlyMap<string, TableSizeEstimate>,
+): MigrationSafetyFinding | null {
+  const rule = "unqualified-mutation-security-posture-column" as const;
+  if (!isSecurityPostureTable(mutation.table)) return null;
+  if (isIgnored(statement, rule)) return null;
+
+  const endIndex = mutationBodyEnd(mutation.statementSql, mutation.keywordIndex);
+  if (!isUnqualifiedMutation(mutation, endIndex)) return null;
+
+  // DELETE and TRUNCATE remove the row, so they take every posture column with it.
+  const columns =
+    mutation.kind === "update"
+      ? matchedPostureColumns(mutation.table, updateSetColumns(mutation, endIndex))
+      : postureColumnsForTable(mutation.table);
+  if (columns.length === 0) return null;
+
+  return makeFinding(
+    rule,
+    migration,
+    mutation.table,
+    statement,
+    estimates,
+    `kind=${mutation.kind}, columns=${columns.join(", ")}`,
+  );
 }
 
 export function analyzeMigrationSafety(
@@ -919,8 +1168,16 @@ export function analyzeMigrationSafety(
         }
       }
 
-      const mutations = parseMutations(statement)
-        .filter((mutation) => tableIsLarge(mutation.table, estimates));
+      const allMutations = parseMutations(statement);
+
+      for (const mutation of allMutations) {
+        const finding = securityPostureFinding(mutation, migration.fileName, statement, estimates);
+        if (finding) addFindingOnce(findings, seen, finding);
+      }
+
+      const mutations = allMutations.filter(
+        (mutation) => mutation.kind !== "truncate" && tableIsLarge(mutation.table, estimates),
+      );
       for (const mutation of mutations) {
         const hasSupportIndex = hasMatchingSupportIndex(migrationIndexes, mutation, statement);
 
@@ -1017,16 +1274,75 @@ function formatFinding(finding: MigrationSafetyFinding): string {
 
 function formatNewFindings(findings: readonly MigrationSafetyFinding[]): string {
   const rendered = findings.map(formatFinding).join("\n\n");
+  const securityGuidance = findings.some((finding) => SECURITY_RULES.has(finding.rule))
+    ? [
+        "",
+        "A security finding is listed below. Scope the statement with a WHERE that names",
+        "the rows you mean, or opt out for that statement with an explicit reason:",
+        "`-- paperclip:migration-safety-ignore <rule>: <reason>`. The `all` wildcard does",
+        "not cover security rules, and journal-gating is not a mitigation.",
+      ]
+    : [];
+
   return [
     `Migration safety check found ${findings.length} new finding(s).`,
     "Add a same-migration support index, use CONCURRENTLY where applicable, or add",
     "`-- paperclip:migration-safety-ignore <rule>: <reason>` next to the statement.",
+    ...securityGuidance,
     "",
     rendered,
   ].join("\n");
 }
 
-async function main() {
+/**
+ * Baselining a security finding must carry a reason.
+ *
+ * Silent baselining is the quietest way to defeat this rule: the finding still
+ * exists, CI still goes green, and nothing in the diff says why. Enforced in the
+ * checker rather than only in a test so it sits on the same path every migration
+ * must cross.
+ */
+export function assertSecurityBaselineReasons(
+  entries: readonly { readonly id: string; readonly rule: string; readonly reason: string }[] =
+    MIGRATION_SAFETY_BASELINE,
+): void {
+  const unexplained = entries.filter(
+    (entry) =>
+      SECURITY_RULES.has(entry.rule as MigrationSafetyRule) && entry.reason.trim().length === 0,
+  );
+  if (unexplained.length === 0) return;
+
+  throw new Error(
+    [
+      `Migration safety baseline has ${unexplained.length} security finding(s) with no reason.`,
+      "A security rule may only be baselined with an explicit justification.",
+      ...unexplained.map((entry) => `  ${entry.rule} id=${entry.id}`),
+    ].join("\n"),
+  );
+}
+
+/**
+ * The whole gate, in the order the CLI runs it.
+ *
+ * Exported so a test can drive the same entry point the migration lint step
+ * does, rather than asserting each guard in isolation and taking it on faith
+ * that `main()` still calls them. `postureEntries` is injectable for exactly
+ * that: a drifted entry must reject *here*, not only in the unit test for
+ * `assertSecurityPostureColumnsResolve`.
+ *
+ * Registry drift is checked before any migration is read, in both directions.
+ * An unresolvable registry means the security rule below is inspecting
+ * statements against pairs that match nothing, and an unclassified schema column
+ * means the rule is not inspecting it at all — neither is worth running the
+ * migration pass on top of and reporting green.
+ */
+export async function runMigrationSafetyCheck(
+  postureEntries?: readonly SecurityPostureColumn[],
+  rejectionEntries?: readonly SecurityPostureRejection[],
+): Promise<string> {
+  assertSecurityBaselineReasons();
+  assertSecurityPostureColumnsResolve(undefined, postureEntries);
+  assertSchemaColumnsClassified(undefined, postureEntries, rejectionEntries);
   const result = analyzeMigrationSafety(await readMigrations());
 
   if (result.newFindings.length > 0) {
@@ -1036,14 +1352,12 @@ async function main() {
   const staleSuffix = result.staleBaselineIds.length > 0
     ? ` (${result.staleBaselineIds.length} stale baseline id(s) ignored)`
     : "";
-  console.log(
-    `Migration safety check passed: ${result.baselineFindings.length} historical finding(s) covered by baseline${staleSuffix}.`,
-  );
+  return `Migration safety check passed: ${result.baselineFindings.length} historical finding(s) covered by baseline${staleSuffix}.`;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
-    await main();
+    console.log(await runMigrationSafetyCheck());
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     console.error(`${basename(process.argv[1])}: ${detail}`);

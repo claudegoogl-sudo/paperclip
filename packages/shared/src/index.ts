@@ -1689,3 +1689,9 @@ export {
   type CreateEnvironmentCustomImageTerminalSessionToken,
   type EnvironmentCustomImageTerminalSessionToken,
 } from "./validators/environment-custom-images.js";
+
+export {
+  validateAuthSecretStrength,
+  WEAK_SECRET_DENYLIST,
+  MIN_SECRET_LENGTH,
+} from "./auth-secret.js";

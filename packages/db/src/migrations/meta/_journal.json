@@ -995,6 +995,13 @@
       "when": 1783100700000,
       "tag": "0143_run_history_retention",
       "breakpoints": true
+    },
+    {
+      "idx": 144,
+      "version": "7",
+      "when": 1783100800000,
+      "tag": "0144_secret_binding_posture_audit",
+      "breakpoints": true
     }
   ]
 }

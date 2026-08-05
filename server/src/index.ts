@@ -59,6 +59,10 @@ import {
   reconcileAdapterAvailability,
 } from "./services/adapter-registry-bootstrap.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
+import {
+  EGRESS_POSTURE_SWEEP_INTERVAL_MS,
+  startEgressPostureSweep,
+} from "./services/egress-posture.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { createPluginRunContextRegistry } from "./services/plugin-run-context-registry.js";
@@ -1061,6 +1065,11 @@ export async function startServer(): Promise<StartedServer> {
       }
     }, config.heartbeatSchedulerIntervalMs);
   }
+
+  // Deliberately NOT inside the `heartbeatSchedulerEnabled` block above, and not
+  // subject to heartbeat suppression: a security-posture check that silently
+  // stops running when an unrelated scheduling flag is off is failure-open.
+  startEgressPostureSweep(db as any, EGRESS_POSTURE_SWEEP_INTERVAL_MS);
 
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
