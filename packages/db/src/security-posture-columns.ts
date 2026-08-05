@@ -97,7 +97,6 @@ export const SECURITY_POSTURE_COLUMNS = [
     column: "allowed_egress",
     reason: "Destination allowlist the enforcement switch evaluates; emptying it is equivalent to disarming it.",
   },
-  },
 
   // --- Authorization and identity ---
   {
