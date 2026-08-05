@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - ci/master-postmerge-tests-verify-red
 
 concurrency:
   group: postmerge-${{ github.sha }}

@@ -47,6 +47,10 @@ function analyze(sql: string) {
 }
 
 describe("migration safety check", () => {
+  it("DELIBERATE FAILURE for master-postmerge verification", () => {
+    expect(true).toBe(false);
+  });
+
   it("documents the large table threshold used by the estimates", () => {
     expect(TABLE_SIZE_BUCKET_THRESHOLDS.largeRows).toBe(1_000_000);
     expect(testEstimates[0]?.estimatedRows).toBeGreaterThanOrEqual(
