@@ -73,6 +73,11 @@ export interface Config {
   runHistoryRetentionEnabled: boolean;
   runHistoryRetentionDays: number;
   runHistoryRetentionIntervalMinutes: number;
+  pluginWebhookDeliveryRetentionEnabled: boolean;
+  pluginWebhookDeliverySuccessRetentionDays: number;
+  pluginWebhookDeliveryFailedRetentionDays: number;
+  pluginWebhookDeliveryMaxRows: number;
+  pluginWebhookDeliveryRetentionIntervalMinutes: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -281,6 +286,33 @@ export function loadConfig(): Config {
     1,
     Number(process.env.PAPERCLIP_RUN_HISTORY_RETENTION_INTERVAL_MINUTES) || 60,
   );
+  const pluginWebhookDeliveryRetentionEnabled =
+    process.env.PAPERCLIP_PLUGIN_WEBHOOK_DELIVERY_RETENTION_ENABLED !== "false";
+  // Success rows: 3 days. A success row only proves the delivery reached the
+  // worker; once observed it has no diagnostic value. Three days covers a long
+  // weekend's "did we get it?" check without accumulating high-volume noise.
+  const pluginWebhookDeliverySuccessRetentionDays = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_PLUGIN_WEBHOOK_DELIVERY_SUCCESS_RETENTION_DAYS) || 3,
+  );
+  // Failed rows: 30 days. Failed deliveries are the incident audit trail
+  // for delivery / signature / dispatch investigations. 30 days outlives the
+  // typical on-call rotation.
+  const pluginWebhookDeliveryFailedRetentionDays = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_PLUGIN_WEBHOOK_DELIVERY_FAILED_RETENTION_DAYS) || 30,
+  );
+  // Max-rows cap. This is the load-bearing bound: age alone permits
+  // ~169 GB/day at the documented ingestion ceiling. 1,000,000 rows
+  // is roughly 1 GB on disk for the typical ~1 KB JSONB row.
+  const pluginWebhookDeliveryMaxRows = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_PLUGIN_WEBHOOK_DELIVERY_MAX_ROWS) || 1_000_000,
+  );
+  const pluginWebhookDeliveryRetentionIntervalMinutes = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_PLUGIN_WEBHOOK_DELIVERY_RETENTION_INTERVAL_MINUTES) || 60,
+  );
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -339,6 +371,11 @@ export function loadConfig(): Config {
     runHistoryRetentionEnabled,
     runHistoryRetentionDays,
     runHistoryRetentionIntervalMinutes,
+    pluginWebhookDeliveryRetentionEnabled,
+    pluginWebhookDeliverySuccessRetentionDays,
+    pluginWebhookDeliveryFailedRetentionDays,
+    pluginWebhookDeliveryMaxRows,
+    pluginWebhookDeliveryRetentionIntervalMinutes,
     serveUi:
       process.env.SERVE_UI !== undefined
         ? process.env.SERVE_UI === "true"
