@@ -4,6 +4,12 @@ import path from "node:path";
 import { ensurePostgresDatabase, getPostgresDataDirectory } from "./client.js";
 import { createEmbeddedPostgresLogBuffer, formatEmbeddedPostgresError } from "./embedded-postgres-error.js";
 import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
+import {
+  buildEmbeddedPostgresConnectionString,
+  buildEmbeddedPostgresConstructorOptions,
+  resolveEmbeddedPostgresPasswordForStartup,
+  rotateEmbeddedPostgresAuthIfNeeded,
+} from "./embedded-postgres-auth.js";
 import { resolveDatabaseTarget } from "./runtime-config.js";
 
 type EmbeddedPostgresInstance = {
@@ -18,7 +24,9 @@ type EmbeddedPostgresCtor = new (opts: {
   password: string;
   port: number;
   persistent: boolean;
+  authMethod?: "scram-sha-256" | "password" | "md5";
   initdbFlags?: string[];
+  postgresFlags?: string[];
   onLog?: (message: unknown) => void;
   onError?: (message: unknown) => void;
 }) => EmbeddedPostgresInstance;
@@ -100,7 +108,12 @@ async function ensureEmbeddedPostgresConnection(
   const pgVersionFile = path.resolve(dataDir, "PG_VERSION");
   const runningPid = readRunningPostmasterPid(postmasterPidFile);
   const runningPort = readPidFilePort(postmasterPidFile);
-  const preferredAdminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${preferredPort}/postgres`;
+  const startupPasswordResolution = resolveEmbeddedPostgresPasswordForStartup(dataDir);
+  const preferredAdminConnectionString = buildEmbeddedPostgresConnectionString({
+    port: preferredPort,
+    database: "postgres",
+    password: startupPasswordResolution.password,
+  });
   const logBuffer = createEmbeddedPostgresLogBuffer();
 
   if (!runningPid && existsSync(pgVersionFile)) {
@@ -116,9 +129,18 @@ async function ensureEmbeddedPostgresConnection(
       process.emitWarning(
         `Adopting an existing PostgreSQL instance on port ${preferredPort} for embedded data dir ${dataDir} because postmaster.pid is missing.`,
       );
+      const rotated = await rotateEmbeddedPostgresAuthIfNeeded({
+        dataDir,
+        port: preferredPort,
+        currentPassword: startupPasswordResolution.password,
+      });
       return {
         mode: "embedded-postgres",
-        connectionString: `postgres://paperclip:paperclip@127.0.0.1:${preferredPort}/paperclip`,
+        connectionString: buildEmbeddedPostgresConnectionString({
+          port: preferredPort,
+          database: "paperclip",
+          password: rotated.password,
+        }),
         source: `embedded-postgres@${preferredPort}`,
         stop: async () => {},
       };
@@ -129,26 +151,38 @@ async function ensureEmbeddedPostgresConnection(
 
   if (runningPid) {
     const port = runningPort ?? preferredPort;
-    const adminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/postgres`;
+    const adminConnectionString = buildEmbeddedPostgresConnectionString({
+      port,
+      database: "postgres",
+      password: startupPasswordResolution.password,
+    });
     await ensurePostgresDatabase(adminConnectionString, "paperclip");
+    const rotated = await rotateEmbeddedPostgresAuthIfNeeded({
+      dataDir,
+      port,
+      currentPassword: startupPasswordResolution.password,
+    });
     return {
       mode: "embedded-postgres",
-      connectionString: `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`,
+      connectionString: buildEmbeddedPostgresConnectionString({
+        port,
+        database: "paperclip",
+        password: rotated.password,
+      }),
       source: `embedded-postgres@${port}`,
       stop: async () => {},
     };
   }
 
-  const instance = new EmbeddedPostgres({
-    databaseDir: dataDir,
-    user: "paperclip",
-    password: "paperclip",
-    port: selectedPort,
-    persistent: true,
-    initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
-    onLog: logBuffer.append,
-    onError: logBuffer.append,
-  });
+  const instance = new EmbeddedPostgres(
+    buildEmbeddedPostgresConstructorOptions({
+      dataDir,
+      port: selectedPort,
+      password: startupPasswordResolution.password,
+      onLog: logBuffer.append,
+      onError: logBuffer.append,
+    }),
+  );
 
   if (!existsSync(path.resolve(dataDir, "PG_VERSION"))) {
     try {
@@ -173,12 +207,25 @@ async function ensureEmbeddedPostgresConnection(
     });
   }
 
-  const adminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${selectedPort}/postgres`;
+  const rotated = await rotateEmbeddedPostgresAuthIfNeeded({
+    dataDir,
+    port: selectedPort,
+    currentPassword: startupPasswordResolution.password,
+  });
+  const adminConnectionString = buildEmbeddedPostgresConnectionString({
+    port: selectedPort,
+    database: "postgres",
+    password: rotated.password,
+  });
   await ensurePostgresDatabase(adminConnectionString, "paperclip");
 
   return {
     mode: "embedded-postgres",
-    connectionString: `postgres://paperclip:paperclip@127.0.0.1:${selectedPort}/paperclip`,
+    connectionString: buildEmbeddedPostgresConnectionString({
+      port: selectedPort,
+      database: "paperclip",
+      password: rotated.password,
+    }),
     source: `embedded-postgres@${selectedPort}`,
     stop: async () => {
       await instance.stop();

@@ -29,6 +29,11 @@ import {
   companies,
   companyMemberships,
   instanceUserRoles,
+  buildEmbeddedPostgresConnectionString,
+  buildEmbeddedPostgresConstructorOptions,
+  resolveEmbeddedPostgresPasswordForStartup,
+  rotateEmbeddedPostgresAuthIfNeeded,
+  scrubEmbeddedPostgresConnectionString,
 } from "@paperclipai/db";
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
@@ -105,7 +110,9 @@ type EmbeddedPostgresCtor = new (opts: {
   password: string;
   port: number;
   persistent: boolean;
+  authMethod?: "scram-sha-256" | "password" | "md5";
   initdbFlags?: string[];
+  postgresFlags?: string[];
   onLog?: (message: unknown) => void;
   onError?: (message: unknown) => void;
 }) => EmbeddedPostgresInstance;
@@ -418,14 +425,26 @@ export async function startServer(): Promise<StartedServer> {
         logger.info({ embeddedPostgresLog: line }, "embedded-postgres");
       }
     };
-    const logEmbeddedPostgresFailure = (phase: "initialise" | "start", err: unknown) => {
+    const logEmbeddedPostgresFailure = (phase: "initialise" | "start" | "rotate", err: unknown) => {
       const recentLogs = logBuffer.getRecentLogs();
       if (recentLogs.length > 0) {
+        const safeRecentLogs = recentLogs.map((line) =>
+          scrubEmbeddedPostgresConnectionString(line),
+        );
+        const safeErr =
+          err instanceof Error
+            ? new Error(
+                scrubEmbeddedPostgresConnectionString(err.message),
+                { cause: err },
+              )
+            : typeof err === "string"
+              ? scrubEmbeddedPostgresConnectionString(err)
+              : err;
         logger.error(
           {
             phase,
-            recentLogs,
-            err,
+            recentLogs: safeRecentLogs,
+            err: safeErr,
           },
           "Embedded PostgreSQL failed; showing buffered startup logs",
         );
@@ -462,10 +481,15 @@ export async function startServer(): Promise<StartedServer> {
     };
 
     const runningPid = getRunningPid();
+    const startupPasswordResolution = resolveEmbeddedPostgresPasswordForStartup(dataDir);
     if (runningPid) {
       logger.warn(`Embedded PostgreSQL already running; reusing existing process (pid=${runningPid}, port=${port})`);
     } else {
-      const configuredAdminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${configuredPort}/postgres`;
+      const configuredAdminConnectionString = buildEmbeddedPostgresConnectionString({
+        port: configuredPort,
+        database: "postgres",
+        password: startupPasswordResolution.password,
+      });
       try {
         const actualDataDir = await getPostgresDataDirectory(configuredAdminConnectionString);
         if (
@@ -484,17 +508,19 @@ export async function startServer(): Promise<StartedServer> {
           logger.warn(`Embedded PostgreSQL port is in use; using next free port (requestedPort=${configuredPort}, selectedPort=${detectedPort})`);
         }
         port = detectedPort;
+        // Intentionally log only dataDir and port — never the connection string.
+        // The connection string contains the per-install password and must not
+        // reach a log line.
         logger.info(`Using embedded PostgreSQL because no DATABASE_URL set (dataDir=${dataDir}, port=${port})`);
-        embeddedPostgres = new EmbeddedPostgres({
-          databaseDir: dataDir,
-          user: "paperclip",
-          password: "paperclip",
-          port,
-          persistent: true,
-          initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
-          onLog: appendEmbeddedPostgresLog,
-          onError: appendEmbeddedPostgresLog,
-        });
+        embeddedPostgres = new EmbeddedPostgres(
+          buildEmbeddedPostgresConstructorOptions({
+            dataDir,
+            port,
+            password: startupPasswordResolution.password,
+            onLog: appendEmbeddedPostgresLog,
+            onError: appendEmbeddedPostgresLog,
+          }),
+        );
 
         if (!clusterAlreadyInitialized) {
           try {
@@ -527,13 +553,61 @@ export async function startServer(): Promise<StartedServer> {
       }
     }
 
-    const embeddedAdminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/postgres`;
+    // Converge auth on every start: rotate legacy/per-install-mismatch to the
+    // cred file, then rewrite pg_hba.conf to scram-sha-256 and reload. No-op
+    // when the cred file already matches the running role and pg_hba is
+    // already scram-only. Must run after the cluster is reachable.
+    let embeddedPassword: string = startupPasswordResolution.password;
+    try {
+      const rotation = await rotateEmbeddedPostgresAuthIfNeeded({
+        dataDir,
+        port,
+        currentPassword: startupPasswordResolution.password,
+        onEvent: (event) => {
+          if (event.kind === "no-op") {
+            logger.debug({ reason: event.reason }, "embedded PostgreSQL auth: no rotation needed");
+          } else if (event.kind === "rotate") {
+            logger.warn({ reason: event.reason }, "embedded PostgreSQL auth: rotating per-install password");
+          } else if (event.kind === "pg-hba-rewrite") {
+            logger.warn(
+              { backupPath: event.backupPath },
+              "embedded PostgreSQL auth: rewrote pg_hba.conf to scram-sha-256",
+            );
+          } else if (event.kind === "reload") {
+            logger.info("embedded PostgreSQL auth: reloaded cluster to apply scram-sha-256 pg_hba");
+          }
+        },
+      });
+      embeddedPassword = rotation.password;
+      if (rotation.rotated || rotation.pgHbaRewritten) {
+        logger.info(
+          { rotated: rotation.rotated, pgHbaRewritten: rotation.pgHbaRewritten },
+          "embedded PostgreSQL auth converged",
+        );
+      }
+    } catch (err) {
+      logEmbeddedPostgresFailure("rotate", err);
+      throw formatEmbeddedPostgresError(err, {
+        fallbackMessage: `Failed to converge embedded PostgreSQL auth in ${dataDir} on port ${port}`,
+        recentLogs: logBuffer.getRecentLogs(),
+      });
+    }
+
+    const embeddedAdminConnectionString = buildEmbeddedPostgresConnectionString({
+      port,
+      database: "postgres",
+      password: embeddedPassword,
+    });
     const dbStatus = await ensurePostgresDatabase(embeddedAdminConnectionString, "paperclip");
     if (dbStatus === "created") {
       logger.info("Created embedded PostgreSQL database: paperclip");
     }
 
-    const embeddedConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`;
+    const embeddedConnectionString = buildEmbeddedPostgresConnectionString({
+      port,
+      database: "paperclip",
+      password: embeddedPassword,
+    });
     const shouldAutoApplyFirstRunMigrations = !clusterAlreadyInitialized || dbStatus === "created";
     if (shouldAutoApplyFirstRunMigrations) {
       logger.info("Detected first-run embedded PostgreSQL setup; applying pending migrations automatically");
