@@ -3307,7 +3307,7 @@ describeEmbeddedPostgres("secretService", () => {
       await svc.setBindingEgressAllowlist({
         companyId,
         bindingId,
-        allowedEgress: ["https://api.example.com", "*.internal"],
+        allowedEgress: ["https://api.example.com", "*.internal.example"],
       });
       await svc.enforceBindingEgress({ companyId, bindingId });
 
@@ -3319,7 +3319,7 @@ describeEmbeddedPostgres("secretService", () => {
         })
         .from(companySecretBindings)
         .where(eq(companySecretBindings.id, bindingId));
-      expect(beforeReconcile[0].allowedEgress).toEqual(["https://api.example.com", "*.internal"]);
+      expect(beforeReconcile[0].allowedEgress).toEqual(["https://api.example.com", "*.internal.example"]);
       expect(beforeReconcile[0].egressAllowlistEnforced).toBe(true);
 
       // Trigger reconcile by re-saving the same config (simulating config save)
@@ -3335,7 +3335,7 @@ describeEmbeddedPostgres("secretService", () => {
         })
         .from(companySecretBindings)
         .where(eq(companySecretBindings.id, bindingId));
-      expect(afterReconcile[0].allowedEgress).toEqual(["https://api.example.com", "*.internal"]);
+      expect(afterReconcile[0].allowedEgress).toEqual(["https://api.example.com", "*.internal.example"]);
       expect(afterReconcile[0].egressAllowlistEnforced).toBe(true);
     });
 
@@ -3352,7 +3352,7 @@ describeEmbeddedPostgres("secretService", () => {
 
       // Create initial binding via env sync
       await svc.syncEnvBindingsForTarget(companyId, target, {
-        API_KEY: { type: "secret_ref", key: secret.id, version: "latest" },
+        API_KEY: { type: "secret_ref", secretId: secret.id, version: "latest" },
       });
 
       // Set egress allowlist and enforce it
@@ -3360,6 +3360,7 @@ describeEmbeddedPostgres("secretService", () => {
         .select()
         .from(companySecretBindings)
         .where(eq(companySecretBindings.companyId, companyId));
+      expect(bindings.length).toBeGreaterThan(0);
       const bindingId = bindings[0].id;
       await svc.setBindingEgressAllowlist({
         companyId,
@@ -3381,7 +3382,7 @@ describeEmbeddedPostgres("secretService", () => {
 
       // Trigger reconcile by re-saving the same env config
       await svc.syncEnvBindingsForTarget(companyId, target, {
-        API_KEY: { type: "secret_ref", key: secret.id, version: "latest" },
+        API_KEY: { type: "secret_ref", secretId: secret.id, version: "latest" },
       });
 
       // Assert egress settings survive unchanged
