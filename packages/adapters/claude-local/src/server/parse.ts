@@ -138,14 +138,24 @@ export function detectClaudeLoginRequired(input: {
   stdout: string;
   stderr: string;
 }): { requiresLogin: boolean; loginUrl: string | null } {
-  const resultText = asString(input.parsed?.result, "").trim();
-  const messages = [resultText, ...extractClaudeErrorMessages(input.parsed ?? {}), input.stdout, input.stderr]
-    .join("\n")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
+  // When the CLI emitted a structured result envelope, auth/limit/no-work
+  // detection must read ONLY structured fields (`parsed.result` + CLI error
+  // fields). Scanning raw stdout/stderr on top re-scans the full stream-json
+  // transcript, so any tool result or agent prose that mentions "log in"
+  // false-positives as `requiresLogin` and flips a clean success to
+  // `claude_auth_required`. The `!parsed` branch keeps raw-text scanning
+  // because there is no other signal available there.
+  const pooledRawText = input.parsed
+    ? [asString(input.parsed.result, "").trim(), ...extractClaudeErrorMessages(input.parsed)]
+        .map((msg) => msg.trim())
+        .filter(Boolean)
+    : [input.stdout, input.stderr]
+        .join("\n")
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
 
-  const requiresLogin = messages.some((line) => CLAUDE_AUTH_REQUIRED_RE.test(line));
+  const requiresLogin = pooledRawText.some((line) => CLAUDE_AUTH_REQUIRED_RE.test(line));
   return {
     requiresLogin,
     loginUrl: extractClaudeLoginUrl([input.stdout, input.stderr].join("\n")),

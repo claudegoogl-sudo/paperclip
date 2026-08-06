@@ -41,6 +41,101 @@ describe("detectClaudeLoginRequired", () => {
       }).requiresLogin,
     ).toBe(false);
   });
+
+  // When a clean result envelope is present, the detector must NOT scan raw
+  // stdout/stderr. The transcript body of a real agent run can contain
+  // auth-regex-matching text (security-review logs, tool output referencing
+  // /login, etc.) without the run itself requiring login. Scanning raw stdout
+  // on top of the envelope false-positives `requiresLogin`, which flips a
+  // clean success to `claude_auth_required`.
+  it("does not scan raw stdout/stderr when a clean result envelope is present", () => {
+    const transcriptContainingAuthText = [
+      JSON.stringify({
+        type: "system",
+        subtype: "init",
+        session_id: "sess-success",
+        model: "claude-sonnet-4-6",
+      }),
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [
+            {
+              type: "text",
+              text: "Inspecting the auth flow: the response was unauthorized, so the user must run `claude login` to refresh the token.",
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        session_id: "sess-success",
+        result: "Shipped the prevention gate for the auth-detector fix.",
+        usage: { input_tokens: 4, cache_read_input_tokens: 0, output_tokens: 4 },
+      }),
+    ].join("\n");
+
+    expect(
+      detectClaudeLoginRequired({
+        parsed: {
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          result: "Shipped the prevention gate for the auth-detector fix.",
+        },
+        stdout: transcriptContainingAuthText,
+        stderr: "",
+      }).requiresLogin,
+    ).toBe(false);
+  });
+
+  // Genuine auth failure path (AC 4): auth text in `parsed.result` or the CLI
+  // error fields still yields `requiresLogin: true` because the structured
+  // candidates are scanned.
+  it("still classifies auth-required when the structured result field carries the login prompt", () => {
+    expect(
+      detectClaudeLoginRequired({
+        parsed: {
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          result: "You are not logged in. Please run `claude login` to continue.",
+        },
+        stdout: "",
+        stderr: "",
+      }).requiresLogin,
+    ).toBe(true);
+  });
+
+  it("still classifies auth-required when the structured errors[] carries the login prompt", () => {
+    expect(
+      detectClaudeLoginRequired({
+        parsed: {
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          result: "",
+          errors: [{ type: "authentication", message: "invalid API key — please run /login" }],
+        },
+        stdout: "",
+        stderr: "",
+      }).requiresLogin,
+    ).toBe(true);
+  });
+
+  // The `!parsed` branch must keep raw-text scanning — it is the only signal
+  // available when the CLI failed before emitting a structured result.
+  it("falls back to raw stdout/stderr scanning when no parsed envelope is present", () => {
+    expect(
+      detectClaudeLoginRequired({
+        parsed: null,
+        stdout: " debris from a teardown trace ",
+        stderr: "Please run claude login",
+      }).requiresLogin,
+    ).toBe(true);
+  });
 });
 
 describe("isClaudeTransientUpstreamError", () => {
