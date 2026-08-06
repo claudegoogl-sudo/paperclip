@@ -375,7 +375,7 @@ describeEmbeddedPostgres("activity_log actor provenance via the request middlewa
   });
 
   // Unknown/unset actor sources must not default to "session"
-  it("logs unknown/unset actor source as unknown, never as session", async () => {
+  it("logs unknown/unset actor source as local_implicit (safe fallback), never as session", async () => {
     const app = buildApp("correct");
 
     // Directly call getActorInfo with a request that has an unset source
@@ -392,9 +392,9 @@ describeEmbeddedPostgres("activity_log actor provenance via the request middlewa
     // Import getActorInfo
     const { getActorInfo } = await import("../routes/authz");
 
-    // Test with unset source
+    // Test with unset source - should fall back to "local_implicit", never "session"
     const result1 = getActorInfo(mockReq as any);
-    expect(result1.actorSource).toBe("unknown");
+    expect(result1.actorSource).toBe("local_implicit");
     expect(result1.actorSource).not.toBe("session");
 
     // Test with an unrecognized source value

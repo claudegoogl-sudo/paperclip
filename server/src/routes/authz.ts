@@ -147,7 +147,9 @@ export function getActorInfo(req: Request): (
     };
   }
 
-  const actorSource = req.actor.source === "session" ? "session" : (req.actor.source ?? "unknown");
+  const actorSource = req.actor.source === "session"
+    ? "session"
+    : (req.actor.source ?? "local_implicit") as "local_implicit" | "session" | "board_key" | "cloud_tenant";
 
   return {
     actorType: "user" as const,
