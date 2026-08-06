@@ -40,6 +40,8 @@
     "test:check-no-git-push": "node --test scripts/check-no-git-push.test.mjs",
     "check:no-internal-ids": "node scripts/check-no-internal-ids.mjs",
     "test:check-no-internal-ids": "node --test scripts/check-no-internal-ids.test.mjs",
+    "check:env-example-connection-string": "node scripts/check-env-example-connection-string.mjs",
+    "test:check-env-example-connection-string": "node --test scripts/check-env-example-connection-string.test.mjs",
     "test:hermes-gateway-smoke": "node --test scripts/smoke/hermes-gateway-smoke.test.mjs",
     "docs:dev": "cd docs && npx mintlify dev",
     "smoke:hermes-gateway-join": "./scripts/smoke/hermes-gateway-join.sh",
