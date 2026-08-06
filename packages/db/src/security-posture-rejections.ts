@@ -429,7 +429,7 @@ export const SECURITY_POSTURE_REJECTIONS = [
       "agent_id", "biller", "billing_code", "billing_type", "cached_input_tokens",
       "company_id", "cost_cents", "created_at", "goal_id", "heartbeat_run_id", "id",
       "input_tokens", "issue_id", "model", "occurred_at", "output_tokens", "project_id",
-      "provider"
+      "provider", "run_identifier"
     ],
     reason: "Per-invocation cost and token telemetry. Spend enforcement reads budget_policies, which is registered; these rows are the measurement, not the limit.",
   },
