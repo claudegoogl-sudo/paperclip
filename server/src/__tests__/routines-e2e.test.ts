@@ -383,7 +383,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
       .where(eq(issues.id, runRes.body.linkedIssueId));
 
     expect(issue?.description).toBe("Review paperclip for high bugs");
-    expect(true).toBe(false); // TEMPORARY: trigger e2e failure for PLA-2313 red-run demonstration
+    expect(true).toBe(false); // TEMPORARY: trigger e2e failure for red-run demonstration
   });
 
   it("allows drafting a routine without defaults and running it with one-off overrides", async () => {
