@@ -43,9 +43,23 @@ PAPERCLIP_BIND_ADDR=0.0.0.0 PAPERCLIP_PUBLIC_URL=http://<host>:3100 \
   docker compose -f docker/docker-compose.quickstart.yml up --build
 ```
 
-The database bind address is separate so that exposing the UI does not implicitly expose PostgreSQL, which `docker-compose.yml` starts with the well-known development password `paperclip`. Change `POSTGRES_PASSWORD` and the matching `DATABASE_URL` before widening `PAPERCLIP_DB_BIND_ADDR`.
+The database bind address is separate so that exposing the UI does not implicitly expose PostgreSQL. `docker-compose.yml` will not start until you set a PostgreSQL password (see [PostgreSQL Password](#postgresql-password)); keep the database on loopback regardless unless you specifically need off-host database access.
 
 > **UFW does not filter Docker-published ports.** Docker publishes via DNAT in `nat/PREROUTING` and filters container traffic in the `DOCKER` chain off `FORWARD`, so published ports never traverse the `INPUT` chain that UFW's default-deny policy governs. A `ufw deny 5432` rule is accepted, appears in `ufw status`, and silently has no effect. The bind address is the effective control; for firewall enforcement as well, use the `DOCKER-USER` chain.
+
+## PostgreSQL Password
+
+`docker/docker-compose.yml` — the full stack with a dedicated PostgreSQL container — ships no default password. `POSTGRES_PASSWORD` is required and Compose refuses to start without it. Generate one per stack in `docker/.env`, which Compose auto-loads and which is gitignored:
+
+```sh
+printf 'POSTGRES_PASSWORD=%s\n' "$(openssl rand -hex 32)" >> docker/.env
+```
+
+A shipped default would be the same password on every install and public with the repo, and this database holds agent credentials and secret material — PostgreSQL's `COPY ... FROM PROGRAM` turns database access into command execution inside the container. Failing to start is the safer default.
+
+The same variable is interpolated into the server's `DATABASE_URL`, so the two cannot drift. The value lands in a URL userinfo field, so use a password with no URL-reserved characters (the `openssl rand -hex 32` output above qualifies) or percent-encode it. Changing `POSTGRES_PASSWORD` after first start does not change the password on an existing `pgdata` volume — use `ALTER ROLE paperclip WITH PASSWORD ...` or discard the volume.
+
+The quickstart above is unaffected: it is a single container with embedded storage and no PostgreSQL service.
 
 ## Manual Docker Build
 
