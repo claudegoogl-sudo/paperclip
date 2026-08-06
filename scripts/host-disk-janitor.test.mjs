@@ -28,6 +28,8 @@ import {
   isPathAncestorOf,
   scanTmpCandidates,
   evaluateTmpEntry,
+  extractPcvtPid,
+  isPathReferencedByLiveProcess,
   parseDfUsePercent,
   run,
 } from "./host-disk-janitor.mjs";
@@ -35,6 +37,8 @@ import {
 function tmpdir(prefix) {
   return mkdtempSync(path.join(os.tmpdir(), prefix));
 }
+
+const HOUR_MS_TEST = 60 * 60 * 1000;
 
 function touch(filePath, { mtime } = {}) {
   mkdirSync(path.dirname(filePath), { recursive: true });
@@ -468,6 +472,162 @@ test("evaluateTmpEntry excludes an empty scratch dir created moments ago (blocke
   const now = Date.now();
   assert.equal(evaluateTmpEntry(emptyEntry, now, CONFIG).eligible, false);
   rmSync(dir, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// /tmp scratch: liveness gate
+//
+// The 30-day age-only gate above is the bug this ticket exists to fix: every
+// real scratch dir on the host is 0 days old at any given moment, so it
+// never fired. These tests cover the replacement liveness mechanism instead
+// of age: isPathReferencedByLiveProcess (fd/cwd scan) and the pcvt-<pid>
+// embedded-PID check, using a synthetic PROC_ROOT so no test depends on or
+// touches the real process table.
+// ---------------------------------------------------------------------------
+
+/** Builds a fake /proc tree: procs = [{ pid, cwd?, fds?: string[] }]. */
+function buildFakeProcRoot(prefix, procs) {
+  const procRoot = tmpdir(prefix);
+  for (const proc of procs) {
+    const pidDir = path.join(procRoot, String(proc.pid));
+    mkdirSync(pidDir, { recursive: true });
+    if (proc.cwd) symlinkSync(proc.cwd, path.join(pidDir, "cwd"));
+    if (proc.fds) {
+      const fdDir = path.join(pidDir, "fd");
+      mkdirSync(fdDir, { recursive: true });
+      proc.fds.forEach((target, i) => symlinkSync(target, path.join(fdDir, String(i))));
+    }
+  }
+  return procRoot;
+}
+
+test("isPathReferencedByLiveProcess is true when a live process holds an open fd inside the directory", () => {
+  const dir = tmpdir("janitor-live-fd-");
+  const procRoot = buildFakeProcRoot("janitor-proc-", [
+    { pid: 5001, cwd: "/some/unrelated/cwd", fds: [path.join(dir, "socket")] },
+  ]);
+  const config = { ...CONFIG, PROC_ROOT: procRoot };
+  assert.equal(isPathReferencedByLiveProcess(dir, config), true);
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(procRoot, { recursive: true, force: true });
+});
+
+test("isPathReferencedByLiveProcess is true when a live process's cwd is inside the directory", () => {
+  const dir = tmpdir("janitor-live-cwd-");
+  const nested = path.join(dir, "work", "repo");
+  mkdirSync(nested, { recursive: true });
+  const procRoot = buildFakeProcRoot("janitor-proc-", [{ pid: 5002, cwd: nested }]);
+  const config = { ...CONFIG, PROC_ROOT: procRoot };
+  assert.equal(isPathReferencedByLiveProcess(dir, config), true);
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(procRoot, { recursive: true, force: true });
+});
+
+test("isPathReferencedByLiveProcess is false when no live process references the directory", () => {
+  const dir = tmpdir("janitor-dead-");
+  const procRoot = buildFakeProcRoot("janitor-proc-", [
+    { pid: 5003, cwd: "/home/paperclip", fds: ["/dev/null", "/var/log/somewhere.log"] },
+  ]);
+  const config = { ...CONFIG, PROC_ROOT: procRoot };
+  assert.equal(isPathReferencedByLiveProcess(dir, config), false);
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(procRoot, { recursive: true, force: true });
+});
+
+test("extractPcvtPid parses the run-vitest-stable.mjs naming shape and rejects everything else", () => {
+  assert.equal(extractPcvtPid("pcvt-306204-1-aUFt2B"), 306204);
+  assert.equal(extractPcvtPid("pcvt-42-13-zzz"), 42);
+  assert.equal(extractPcvtPid("pla1999_verify"), null);
+  assert.equal(extractPcvtPid("pcvt-alone-h"), null); // non-numeric shard, not a pid
+});
+
+test("evaluateTmpEntry never treats a live run's scratch as a candidate, however stale its mtime (AC2)", () => {
+  const dir = tmpdir("janitor-tmpentry-live-");
+  const scratch = path.join(dir, "pla1999_verify");
+  // Simulates a run blocked on a long build: content is far older than the
+  // hour-scale floor, but a process still has the directory open.
+  touch(path.join(scratch, "partial-build.log"), { mtime: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000) });
+  const procRoot = buildFakeProcRoot("janitor-proc-", [{ pid: 6001, fds: [path.join(scratch, "partial-build.log")] }]);
+  const config = { ...CONFIG, PROC_ROOT: procRoot };
+  const result = evaluateTmpEntry(scratch, Date.now(), config);
+  assert.equal(result.eligible, false);
+  assert.equal(result.reason, "live-process-reference");
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(procRoot, { recursive: true, force: true });
+});
+
+test("evaluateTmpEntry never treats a pcvt-<pid> scratch as a candidate while the embedded pid is alive, even with no fd/cwd reference yet (AC2)", () => {
+  const dir = tmpdir("janitor-tmpentry-pcvt-live-");
+  const scratch = path.join(dir, "pcvt-6002-1-XyzAbc");
+  // A test group with nothing written into TMPDIR yet: no fd/cwd reference
+  // exists at all, only the parent run-vitest-stable.mjs PID being alive.
+  mkdirSync(scratch, { recursive: true });
+  const procRoot = buildFakeProcRoot("janitor-proc-", [{ pid: 6002 }]); // alive, but references nothing
+  const config = { ...CONFIG, PROC_ROOT: procRoot };
+  const result = evaluateTmpEntry(scratch, Date.now(), config);
+  assert.equal(result.eligible, false);
+  assert.equal(result.reason, "owning-pid-alive");
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(procRoot, { recursive: true, force: true });
+});
+
+test("evaluateTmpEntry reaps a completed run's scratch once liveness clears and it's older than the min-age floor (AC2/AC4)", () => {
+  const dir = tmpdir("janitor-tmpentry-done-");
+  const scratch = path.join(dir, "pla1999-ac5");
+  touch(path.join(scratch, "output.txt"), { mtime: new Date(Date.now() - 5 * HOUR_MS_TEST) });
+  // Empty process table -- no process anywhere references this path.
+  const procRoot = buildFakeProcRoot("janitor-proc-", []);
+  const config = { ...CONFIG, PROC_ROOT: procRoot, TMP_SCRATCH_MIN_AGE_HOURS: 4 };
+  const result = evaluateTmpEntry(scratch, Date.now(), config);
+  assert.equal(result.eligible, true);
+  assert.equal(result.reason, null);
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(procRoot, { recursive: true, force: true });
+});
+
+test("evaluateTmpEntry reaps a pcvt-<pid> scratch once the embedded pid is dead and nothing references it (AC2/AC4)", () => {
+  const dir = tmpdir("janitor-tmpentry-pcvt-done-");
+  const scratch = path.join(dir, "pcvt-6003-1-DeadPid");
+  touch(path.join(scratch, "t", "leftover.sock"), { mtime: new Date(Date.now() - 5 * HOUR_MS_TEST) });
+  // procRoot has no pid 6003 dir at all -- process has exited.
+  const procRoot = buildFakeProcRoot("janitor-proc-", [{ pid: 9999, cwd: "/home/paperclip" }]);
+  const config = { ...CONFIG, PROC_ROOT: procRoot, TMP_SCRATCH_MIN_AGE_HOURS: 4 };
+  const result = evaluateTmpEntry(scratch, Date.now(), config);
+  assert.equal(result.eligible, true);
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(procRoot, { recursive: true, force: true });
+});
+
+test("evaluateTmpEntry still excludes a too-fresh scratch dir even once liveness clears (race-window floor)", () => {
+  const dir = tmpdir("janitor-tmpentry-fresh-");
+  const scratch = path.join(dir, "pla2019-fresh");
+  touch(path.join(scratch, "just-started.txt")); // mtime = now
+  const procRoot = buildFakeProcRoot("janitor-proc-", []);
+  const config = { ...CONFIG, PROC_ROOT: procRoot, TMP_SCRATCH_MIN_AGE_HOURS: 4 };
+  const result = evaluateTmpEntry(scratch, Date.now(), config);
+  assert.equal(result.eligible, false);
+  assert.equal(result.reason, "too-recent");
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(procRoot, { recursive: true, force: true });
+});
+
+test("evaluateTmpEntry handles an empty scratch dir under the liveness gate (empty-tree ctime fallback, blocker 1 regression)", () => {
+  const dir = tmpdir("janitor-tmpentry-empty-live-");
+  const emptyEntry = path.join(dir, "pla9004");
+  mkdirSync(emptyEntry);
+  const procRoot = buildFakeProcRoot("janitor-proc-", []);
+  const config = { ...CONFIG, PROC_ROOT: procRoot, TMP_SCRATCH_MIN_AGE_HOURS: 4 };
+  // Created moments ago -- must not be reaped even though nothing
+  // references it, same "absence of evidence must mean keep" invariant
+  // directoryHasFileNewerThan already enforces for worktrees/run-logs.
+  assert.equal(evaluateTmpEntry(emptyEntry, Date.now(), config).eligible, false);
+  // Once "now" clears the empty dir's own ctime by more than the floor
+  // (can't backdate ctime directly -- see the directoryHasFileNewerThan
+  // ctime-fallback test above), it becomes eligible.
+  const future = Date.now() + (config.TMP_SCRATCH_MIN_AGE_HOURS * HOUR_MS_TEST + 5000);
+  assert.equal(evaluateTmpEntry(emptyEntry, future, config).eligible, true);
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(procRoot, { recursive: true, force: true });
 });
 
 // ---------------------------------------------------------------------------
