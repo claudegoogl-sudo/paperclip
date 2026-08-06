@@ -3,7 +3,7 @@ import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import {
   agents,
   companies,
@@ -3276,5 +3276,149 @@ describeEmbeddedPostgres("secretService", () => {
         actorId: "user-without-membership",
       }),
     ).rejects.toThrow(/active member|secrets:read|forbidden/i);
+  });
+
+  // Regression test for egress allowlist preservation across reconcile
+  describe("binding reconcile preserves egress allowlist", () => {
+    it("preserves allowedEgress and egressAllowlistEnforced across syncSecretRefsForTarget reconcile", async () => {
+      const companyId = await seedCompany();
+      const svc = secretService(db);
+      const secret = await svc.create(companyId, {
+        name: "test-secret",
+        provider: "local_encrypted",
+        value: "secret-value",
+      });
+
+      const target = { targetType: "environment" as const, targetId: "env-1" };
+      const configPath = "apiKey";
+
+      // Create initial binding
+      await svc.syncSecretRefsForTarget(companyId, target, [
+        { secretId: secret.id, configPath, required: true },
+      ]);
+
+      // Set egress allowlist and enforce it
+      const bindings = await db
+        .select()
+        .from(companySecretBindings)
+        .where(
+          eq(companySecretBindings.companyId, companyId),
+        );
+      const bindingId = bindings[0].id;
+      await svc.setBindingEgressAllowlist({
+        companyId,
+        bindingId,
+        allowedEgress: ["https://api.example.com", "*.internal.example"],
+      });
+      await svc.enforceBindingEgress({ companyId, bindingId });
+
+      // Verify egress settings are applied
+      const beforeReconcile = await db
+        .select({
+          allowedEgress: companySecretBindings.allowedEgress,
+          egressAllowlistEnforced: companySecretBindings.egressAllowlistEnforced,
+        })
+        .from(companySecretBindings)
+        .where(
+          and(
+            eq(companySecretBindings.companyId, companyId),
+            eq(companySecretBindings.configPath, configPath),
+          ),
+        );
+      expect(beforeReconcile[0].allowedEgress).toEqual(["https://api.example.com", "*.internal.example"]);
+      expect(beforeReconcile[0].egressAllowlistEnforced).toBe(true);
+
+      // Trigger reconcile by re-saving the same config (simulating config save)
+      await svc.syncSecretRefsForTarget(companyId, target, [
+        { secretId: secret.id, configPath, required: true },
+      ]);
+
+      // Assert egress settings survive unchanged (query by configPath since ID may change)
+      const afterReconcile = await db
+        .select({
+          allowedEgress: companySecretBindings.allowedEgress,
+          egressAllowlistEnforced: companySecretBindings.egressAllowlistEnforced,
+        })
+        .from(companySecretBindings)
+        .where(
+          and(
+            eq(companySecretBindings.companyId, companyId),
+            eq(companySecretBindings.configPath, configPath),
+          ),
+        );
+      expect(afterReconcile[0]).toBeDefined();
+      expect(afterReconcile[0].allowedEgress).toEqual(["https://api.example.com", "*.internal.example"]);
+      expect(afterReconcile[0].egressAllowlistEnforced).toBe(true);
+    });
+
+    it("preserves allowedEgress and egressAllowlistEnforced across syncEnvBindingsForTarget reconcile", async () => {
+      const companyId = await seedCompany();
+      const svc = secretService(db);
+      const secret = await svc.create(companyId, {
+        name: "test-secret",
+        provider: "local_encrypted",
+        value: "secret-value",
+      });
+
+      const target = { targetType: "environment" as const, targetId: "env-2" };
+
+      // Create initial binding via env sync
+      await svc.syncEnvBindingsForTarget(companyId, target, {
+        API_KEY: { type: "secret_ref", secretId: secret.id, version: "latest" },
+      });
+
+      // Set egress allowlist and enforce it
+      const bindings = await db
+        .select()
+        .from(companySecretBindings)
+        .where(eq(companySecretBindings.companyId, companyId));
+      expect(bindings.length).toBeGreaterThan(0);
+      const bindingId = bindings[0].id;
+      const configPath = bindings[0].configPath;
+      await svc.setBindingEgressAllowlist({
+        companyId,
+        bindingId,
+        allowedEgress: ["https://api.github.com"],
+      });
+      await svc.enforceBindingEgress({ companyId, bindingId });
+
+      // Verify egress settings are applied
+      const beforeReconcile = await db
+        .select({
+          allowedEgress: companySecretBindings.allowedEgress,
+          egressAllowlistEnforced: companySecretBindings.egressAllowlistEnforced,
+        })
+        .from(companySecretBindings)
+        .where(
+          and(
+            eq(companySecretBindings.companyId, companyId),
+            eq(companySecretBindings.configPath, configPath),
+          ),
+        );
+      expect(beforeReconcile[0].allowedEgress).toEqual(["https://api.github.com"]);
+      expect(beforeReconcile[0].egressAllowlistEnforced).toBe(true);
+
+      // Trigger reconcile by re-saving the same env config
+      await svc.syncEnvBindingsForTarget(companyId, target, {
+        API_KEY: { type: "secret_ref", secretId: secret.id, version: "latest" },
+      });
+
+      // Assert egress settings survive unchanged (query by configPath since ID may change)
+      const afterReconcile = await db
+        .select({
+          allowedEgress: companySecretBindings.allowedEgress,
+          egressAllowlistEnforced: companySecretBindings.egressAllowlistEnforced,
+        })
+        .from(companySecretBindings)
+        .where(
+          and(
+            eq(companySecretBindings.companyId, companyId),
+            eq(companySecretBindings.configPath, configPath),
+          ),
+        );
+      expect(afterReconcile[0]).toBeDefined();
+      expect(afterReconcile[0].allowedEgress).toEqual(["https://api.github.com"]);
+      expect(afterReconcile[0].egressAllowlistEnforced).toBe(true);
+    });
   });
 });

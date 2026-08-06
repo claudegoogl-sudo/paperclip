@@ -3637,6 +3637,31 @@ export function secretService(db: Db) {
       const pathPrefixes = [...new Set(normalizedRefs.map((ref) => ref.configPath.split(".")[0]))];
 
       await db.transaction(async (tx) => {
+        // Capture existing egress allowlist settings before deletion
+        const existingBindings = await tx
+          .select({
+            configPath: companySecretBindings.configPath,
+            allowedEgress: companySecretBindings.allowedEgress,
+            egressAllowlistEnforced: companySecretBindings.egressAllowlistEnforced,
+          })
+          .from(companySecretBindings)
+          .where(
+            and(
+              eq(companySecretBindings.companyId, companyId),
+              eq(companySecretBindings.targetType, target.targetType),
+              eq(companySecretBindings.targetId, target.targetId),
+            ),
+          );
+        const egressSettings = new Map(
+          existingBindings.map((b) => [
+            b.configPath,
+            {
+              allowedEgress: b.allowedEgress,
+              egressAllowlistEnforced: b.egressAllowlistEnforced,
+            },
+          ])
+        );
+
         if (options?.replaceAll) {
           await tx
             .delete(companySecretBindings)
@@ -3676,16 +3701,21 @@ export function secretService(db: Db) {
         }
         if (normalizedRefs.length === 0) return;
         await tx.insert(companySecretBindings).values(
-          normalizedRefs.map((ref) => ({
-            companyId,
-            secretId: ref.secretId,
-            targetType: target.targetType,
-            targetId: target.targetId,
-            configPath: ref.configPath,
-            versionSelector: String(ref.versionSelector),
-            required: ref.required,
-            label: ref.label,
-          })),
+          normalizedRefs.map((ref) => {
+            const existing = egressSettings.get(ref.configPath);
+            return {
+              companyId,
+              secretId: ref.secretId,
+              targetType: target.targetType,
+              targetId: target.targetId,
+              configPath: ref.configPath,
+              versionSelector: String(ref.versionSelector),
+              required: ref.required,
+              label: ref.label,
+              allowedEgress: existing?.allowedEgress ?? [],
+              egressAllowlistEnforced: existing?.egressAllowlistEnforced ?? true,
+            };
+          }),
         );
       });
       return normalizedRefs;
@@ -3937,6 +3967,32 @@ export function secretService(db: Db) {
       }
 
       const writeBindings = async (targetDb: SecretBindingDb) => {
+        // Capture existing egress allowlist settings before deletion
+        const existingBindings = await targetDb
+          .select({
+            configPath: companySecretBindings.configPath,
+            allowedEgress: companySecretBindings.allowedEgress,
+            egressAllowlistEnforced: companySecretBindings.egressAllowlistEnforced,
+          })
+          .from(companySecretBindings)
+          .where(
+            and(
+              eq(companySecretBindings.companyId, companyId),
+              eq(companySecretBindings.targetType, target.targetType),
+              eq(companySecretBindings.targetId, target.targetId),
+              like(companySecretBindings.configPath, `${pathPrefix}.%`),
+            ),
+          );
+        const egressSettings = new Map(
+          existingBindings.map((b) => [
+            b.configPath,
+            {
+              allowedEgress: b.allowedEgress,
+              egressAllowlistEnforced: b.egressAllowlistEnforced,
+            },
+          ])
+        );
+
         await targetDb
           .delete(companySecretBindings)
           .where(
@@ -3949,15 +4005,20 @@ export function secretService(db: Db) {
           );
         if (refs.length === 0) return;
         await targetDb.insert(companySecretBindings).values(
-          refs.map((ref) => ({
-            companyId,
-            secretId: ref.secretId,
-            targetType: target.targetType,
-            targetId: target.targetId,
-            configPath: ref.configPath,
-            versionSelector: String(ref.versionSelector),
-            required: true,
-          })),
+          refs.map((ref) => {
+            const existing = egressSettings.get(ref.configPath);
+            return {
+              companyId,
+              secretId: ref.secretId,
+              targetType: target.targetType,
+              targetId: target.targetId,
+              configPath: ref.configPath,
+              versionSelector: String(ref.versionSelector),
+              required: true,
+              allowedEgress: existing?.allowedEgress ?? [],
+              egressAllowlistEnforced: existing?.egressAllowlistEnforced ?? true,
+            };
+          }),
           );
       };
 
