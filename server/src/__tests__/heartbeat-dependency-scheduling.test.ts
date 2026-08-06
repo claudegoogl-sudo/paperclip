@@ -125,7 +125,11 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       }
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Quiescence period: heartbeatRunEvents may be written after run status transitions
+    // to terminal (e.g., appendRunEvent at heartbeat.ts:10288 after setRunStatus).
+    // The polling above only checks heartbeatRuns.status, so we wait a bit for
+    // post-status-change async side effects to complete before teardown.
+    await new Promise((resolve) => setTimeout(resolve, 150));
     await db.delete(environmentLeases);
     await db.delete(activityLog);
     await db.delete(companySkills);

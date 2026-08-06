@@ -301,6 +301,14 @@ export function loadConfig(): Config {
     throw new Error(resolvedBind.errors[0]);
   }
 
+  // Emit a warning when sign-up is open on an authenticated deployment
+  if (deploymentMode === "authenticated" && authDisableSignUp === false) {
+    console.warn(
+      "[paperclip] Open sign-up is enabled on an authenticated deployment. " +
+        "Set PAPERCLIP_AUTH_DISABLE_SIGN_UP=true to close sign-up and restrict access to invited users only."
+    );
+  }
+
   return {
     deploymentMode,
     deploymentExposure,
