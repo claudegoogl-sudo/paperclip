@@ -78,6 +78,15 @@ jobs:
       - name: Test compose loopback-bind check
         run: node --test ./scripts/check-compose-loopback-bind.test.mjs
 
+      # A credential we ship is the same credential on every install, and it is
+      # public with the repo. Shipped stacks must fail closed on `${VAR:?...}`
+      # rather than boot on a well-known default.
+      - name: Reject literal credentials in shipped container stacks
+        run: node ./scripts/check-compose-literal-secrets.mjs
+
+      - name: Test compose literal-secrets check
+        run: node --test ./scripts/check-compose-literal-secrets.test.mjs
+
       # Regression guard for CONTRIBUTING.md's "No Internal Issue References"
       # rule: fails if the PR diff adds an internal ticket id, an instance UI
       # link, an agent:// link, or a localhost/private-IP deep link into the
