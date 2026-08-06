@@ -1,4 +1,4 @@
-import { inferBindModeFromHost, validateAuthSecretStrength } from "@paperclipai/shared";
+import { inferBindModeFromHost, weakAuthSecretEnvReason } from "@paperclipai/shared";
 import type { PaperclipConfig } from "../config/schema.js";
 import type { CheckResult } from "./index.js";
 
@@ -38,14 +38,14 @@ export function deploymentAuthCheck(config: PaperclipConfig): CheckResult {
     };
   }
 
-  const strengthError = validateAuthSecretStrength(secret, mode);
-  if (strengthError) {
+  const weakReason = weakAuthSecretEnvReason(process.env);
+  if (weakReason) {
     return {
       name: "Deployment/auth mode",
       status: "fail",
-      message: strengthError,
+      message: `authenticated mode auth secret ${weakReason}`,
       canRepair: false,
-      repairHint: "Generate one with: openssl rand -hex 32",
+      repairHint: "Generate a strong secret with `openssl rand -hex 32` and set BETTER_AUTH_SECRET",
     };
   }
 

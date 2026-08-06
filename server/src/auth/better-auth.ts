@@ -10,9 +10,9 @@ import {
   authUsers,
   authVerifications,
 } from "@paperclipai/db";
+import { weakAuthSecretEnvReason } from "@paperclipai/shared";
 import type { Config } from "../config.js";
 import { resolvePaperclipInstanceId } from "../home-paths.js";
-import { validateAuthSecretStrength } from "@paperclipai/shared";
 
 export type BetterAuthSessionUser = {
   id: string;
@@ -133,12 +133,16 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
       "Generate one with: openssl rand -hex 32",
     );
   }
-
-  const strengthError = validateAuthSecretStrength(secret, config.deploymentMode);
-  if (strengthError) {
-    throw new Error(strengthError);
+  if (config.deploymentMode === "authenticated") {
+    const reason = weakAuthSecretEnvReason(process.env);
+    if (reason) {
+      throw new Error(
+        `The configured auth secret ${reason}. In authenticated mode this must be a strong, ` +
+        "unique value that does not appear in the known-weak denylist. " +
+        "Generate one with: openssl rand -hex 32",
+      );
+    }
   }
-
   const disableSecureCookies = shouldDisableSecureAuthCookies({
     deploymentMode: config.deploymentMode,
     deploymentExposure: config.deploymentExposure,
