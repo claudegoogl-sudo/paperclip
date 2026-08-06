@@ -154,4 +154,19 @@ export const MIGRATION_SAFETY_BASELINE = [
     table: "issue_comments",
     reason: "Batched DO-loop backfill with keyset pagination (LIMIT 5000 per batch); reviewed and approved as part of PAP-1505 fix. Already merged to master before this guard landed.",
   },
+  {
+    id: "c09f592bfbb07e3d",
+    rule: "unqualified-mutation-security-posture-column",
+    migration: "0138_secret_binding_egress_allowlist.sql",
+    table: "company_secret_bindings",
+    reason: "The statement this rule exists to prevent: a re-run of this migration re-applied the unqualified UPDATE and cleared the egress-enforcement flag on every existing binding. 0138 is already applied in every environment and its text is immutable history, so it is baselined rather than edited; the flattened rows are remediated separately. Baselined for history only — any NEW unqualified write to a posture column must fail CI.",
+  },
+  {
+    id: "581d6169b285ee0f",
+    rule: "unqualified-mutation-security-posture-column",
+    migration: "0138_secret_binding_egress_allowlist.sql",
+    table: "company_secret_bindings",
+    reason:
+      "Same statement as the entry above, after the in-flight rewrite that wraps it in a DO block gated on whether this run created the column. The rollout UPDATE is still textually unqualified, so the rule fires by design — it recognises a selective WHERE, not an arbitrary PL/pgSQL guard, because a guard that is subtly wrong is invisible to a static check. The guard was reviewed: it makes re-application a no-op. Entered here so the finding is covered whichever way the two changes land; the entry is inert (reported as a stale id) until the rewrite merges.",
+  },
 ] as const satisfies readonly MigrationSafetyBaselineEntry[];

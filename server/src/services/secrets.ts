@@ -47,6 +47,7 @@ import { logger } from "../middleware/logger.js";
 import { isValidAllowlistEntry } from "../handle-egress.js";
 import { purgeHandlesByBinding } from "../handle-vault.js";
 import { listEgressWouldDeny, type EgressWouldDenyObservationRow } from "./egress-harvest.js";
+import { egressPostureFor } from "./egress-posture.js";
 import {
   collectSecretRefPaths,
   isUuidSecretRef,
@@ -3497,6 +3498,11 @@ export function secretService(db: Db) {
 
       return bindings.map((binding) => ({
         ...binding,
+        // Derived, never stored. `enforced = true` with an empty allowlist is
+        // deny-all for this secret; returning the pair as two raw fields leaves
+        // that inference to the reader, and it is the inference nobody made for
+        // the bindings born enforcing with an empty allowlist.
+        posture: egressPostureFor(binding),
         // Harvested would-deny origins as UNCHECKED suggestions. `selected` is
         // hard-coded false: the surface presents them un-applied and the
         // operator opts each one in. Never derived from `allowedEgress` — a
@@ -3631,6 +3637,31 @@ export function secretService(db: Db) {
       const pathPrefixes = [...new Set(normalizedRefs.map((ref) => ref.configPath.split(".")[0]))];
 
       await db.transaction(async (tx) => {
+        // Capture existing egress allowlist settings before deletion
+        const existingBindings = await tx
+          .select({
+            configPath: companySecretBindings.configPath,
+            allowedEgress: companySecretBindings.allowedEgress,
+            egressAllowlistEnforced: companySecretBindings.egressAllowlistEnforced,
+          })
+          .from(companySecretBindings)
+          .where(
+            and(
+              eq(companySecretBindings.companyId, companyId),
+              eq(companySecretBindings.targetType, target.targetType),
+              eq(companySecretBindings.targetId, target.targetId),
+            ),
+          );
+        const egressSettings = new Map(
+          existingBindings.map((b) => [
+            b.configPath,
+            {
+              allowedEgress: b.allowedEgress,
+              egressAllowlistEnforced: b.egressAllowlistEnforced,
+            },
+          ])
+        );
+
         if (options?.replaceAll) {
           await tx
             .delete(companySecretBindings)
@@ -3670,16 +3701,21 @@ export function secretService(db: Db) {
         }
         if (normalizedRefs.length === 0) return;
         await tx.insert(companySecretBindings).values(
-          normalizedRefs.map((ref) => ({
-            companyId,
-            secretId: ref.secretId,
-            targetType: target.targetType,
-            targetId: target.targetId,
-            configPath: ref.configPath,
-            versionSelector: String(ref.versionSelector),
-            required: ref.required,
-            label: ref.label,
-          })),
+          normalizedRefs.map((ref) => {
+            const existing = egressSettings.get(ref.configPath);
+            return {
+              companyId,
+              secretId: ref.secretId,
+              targetType: target.targetType,
+              targetId: target.targetId,
+              configPath: ref.configPath,
+              versionSelector: String(ref.versionSelector),
+              required: ref.required,
+              label: ref.label,
+              allowedEgress: existing?.allowedEgress ?? [],
+              egressAllowlistEnforced: existing?.egressAllowlistEnforced ?? true,
+            };
+          }),
         );
       });
       return normalizedRefs;
@@ -3931,6 +3967,32 @@ export function secretService(db: Db) {
       }
 
       const writeBindings = async (targetDb: SecretBindingDb) => {
+        // Capture existing egress allowlist settings before deletion
+        const existingBindings = await targetDb
+          .select({
+            configPath: companySecretBindings.configPath,
+            allowedEgress: companySecretBindings.allowedEgress,
+            egressAllowlistEnforced: companySecretBindings.egressAllowlistEnforced,
+          })
+          .from(companySecretBindings)
+          .where(
+            and(
+              eq(companySecretBindings.companyId, companyId),
+              eq(companySecretBindings.targetType, target.targetType),
+              eq(companySecretBindings.targetId, target.targetId),
+              like(companySecretBindings.configPath, `${pathPrefix}.%`),
+            ),
+          );
+        const egressSettings = new Map(
+          existingBindings.map((b) => [
+            b.configPath,
+            {
+              allowedEgress: b.allowedEgress,
+              egressAllowlistEnforced: b.egressAllowlistEnforced,
+            },
+          ])
+        );
+
         await targetDb
           .delete(companySecretBindings)
           .where(
@@ -3943,15 +4005,20 @@ export function secretService(db: Db) {
           );
         if (refs.length === 0) return;
         await targetDb.insert(companySecretBindings).values(
-          refs.map((ref) => ({
-            companyId,
-            secretId: ref.secretId,
-            targetType: target.targetType,
-            targetId: target.targetId,
-            configPath: ref.configPath,
-            versionSelector: String(ref.versionSelector),
-            required: true,
-          })),
+          refs.map((ref) => {
+            const existing = egressSettings.get(ref.configPath);
+            return {
+              companyId,
+              secretId: ref.secretId,
+              targetType: target.targetType,
+              targetId: target.targetId,
+              configPath: ref.configPath,
+              versionSelector: String(ref.versionSelector),
+              required: true,
+              allowedEgress: existing?.allowedEgress ?? [],
+              egressAllowlistEnforced: existing?.egressAllowlistEnforced ?? true,
+            };
+          }),
           );
       };
 

@@ -10,6 +10,7 @@ import {
   authUsers,
   authVerifications,
 } from "@paperclipai/db";
+import { weakAuthSecretEnvReason } from "@paperclipai/shared";
 import type { Config } from "../config.js";
 import { resolvePaperclipInstanceId } from "../home-paths.js";
 
@@ -125,12 +126,22 @@ export function deriveAuthTrustedOrigins(config: Config, opts?: { listenPort?: n
 export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins: string[]): BetterAuthInstance {
   const baseUrl = config.authBaseUrlMode === "explicit" ? config.authPublicBaseUrl : undefined;
   const publicUrl = process.env.PAPERCLIP_PUBLIC_URL?.trim() || baseUrl;
-  const secret = process.env.BETTER_AUTH_SECRET ?? process.env.PAPERCLIP_AGENT_JWT_SECRET;
+  const secret = process.env.BETTER_AUTH_SECRET?.trim() || process.env.PAPERCLIP_AGENT_JWT_SECRET?.trim();
   if (!secret) {
     throw new Error(
       "BETTER_AUTH_SECRET (or PAPERCLIP_AGENT_JWT_SECRET) must be set. " +
-      "For local development, set BETTER_AUTH_SECRET=paperclip-dev-secret in your .env file.",
+      "Generate one with: openssl rand -hex 32",
     );
+  }
+  if (config.deploymentMode === "authenticated") {
+    const reason = weakAuthSecretEnvReason(process.env);
+    if (reason) {
+      throw new Error(
+        `The configured auth secret ${reason}. In authenticated mode this must be a strong, ` +
+        "unique value that does not appear in the known-weak denylist. " +
+        "Generate one with: openssl rand -hex 32",
+      );
+    }
   }
   const disableSecureCookies = shouldDisableSecureAuthCookies({
     deploymentMode: config.deploymentMode,

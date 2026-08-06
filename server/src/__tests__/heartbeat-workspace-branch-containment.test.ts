@@ -621,6 +621,11 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
 
   afterEach(async () => {
     await waitForHeartbeatIdle(db);
+    // Quiescence period: heartbeatRunEvents may be written after run status transitions
+    // to terminal (e.g., appendRunEvent at heartbeat.ts:10288 after setRunStatus).
+    // waitForHeartbeatIdle only polls heartbeatRuns.status, so we wait a bit for
+    // post-status-change async side effects to complete before teardown.
+    await new Promise((resolve) => setTimeout(resolve, 150));
     adapterExecute.mockReset();
     adapterExecute.mockImplementation(async () => ({
       exitCode: 0,

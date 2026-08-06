@@ -94,6 +94,16 @@ git push -u origin <descriptive-name>
 git push origin --delete <old-name>
 ```
 
+### Keep Your Branch Up to Date
+
+Before your PR can be merged, keep your branch up to date with `master` and ensure all CI checks pass. If your branch falls behind, update it:
+
+```bash
+gh pr update-branch <pr-number> -R claudegoogl-sudo/paperclip
+```
+
+The required check that must pass is `verify`.
+
 ### Model Used (Required)
 
 Every PR must include a **Model Used** section specifying which AI model produced or assisted with the change. Include the provider, exact model ID/version, context window size, and any relevant capability details (e.g., reasoning mode, tool use). If no AI was used, write "None — human-authored". This applies to all contributors — human and AI alike.

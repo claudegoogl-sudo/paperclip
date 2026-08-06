@@ -106,6 +106,11 @@ The Compose file also exposes Vite's default port:
 
 - `http://localhost:5173`
 
+Both ports bind to `127.0.0.1` by default, so the untrusted container is not
+reachable from the network. Set `REVIEW_BIND_ADDR` (for example `0.0.0.0`) only
+if you knowingly want to expose it. Note that UFW does not filter
+Docker-published ports — see `doc/DOCKER.md`.
+
 Notes:
 
 - `pnpm install` can run untrusted lifecycle scripts from the PR. That is why this happens inside the isolated container instead of on your host.

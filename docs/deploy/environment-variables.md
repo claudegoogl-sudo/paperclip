@@ -22,6 +22,48 @@ All environment variables that Paperclip uses for server configuration.
 | `PAPERCLIP_DEPLOYMENT_MODE` | `local_trusted` | Runtime mode override |
 | `PAPERCLIP_DEPLOYMENT_EXPOSURE` | `private` | Exposure policy when deployment mode is `authenticated` |
 | `PAPERCLIP_API_URL` | (auto-derived) | Paperclip API base URL. When set externally (e.g., via Kubernetes ConfigMap, load balancer, or reverse proxy), the server preserves the value instead of deriving it from the listen host and port. Useful for deployments where the public-facing URL differs from the local bind address. |
+| `PAPERCLIP_MAX_CONCURRENT_RUNS_HOST` | `ceil(vCPU / 2)` | Host-wide ceiling on concurrently executing agent runs — see [Host-wide run concurrency](#host-wide-run-concurrency). |
+
+## Host-wide run concurrency
+
+An agent's `heartbeat.maxConcurrentRuns` is a **per-agent** limit. Because every
+agent has its own, the sum across an instance can be far larger than the host can
+actually execute — 38 agents at the default of 20 each is 760 theoretical
+concurrent runs regardless of how many cores the box has.
+
+`PAPERCLIP_MAX_CONCURRENT_RUNS_HOST` is a second, **host-wide** ceiling checked
+before every dispatch, across all agents and all companies:
+
+- **Default:** `ceil(vCPU / 2)`, where vCPU is Node's `availableParallelism()`.
+  That is quota-aware, so on a host whose cgroup limits it to 4 cores of an
+  8-core machine the default resolves to `2`, not `4`. Set the variable
+  explicitly to pin a value.
+- **Range:** clamped to `1`–`50`. A value below `1`, a non-number, or an empty
+  string is ignored and the default is used.
+- **Counted statuses:** only runs in the `running` status count. `queued` and
+  `scheduled_retry` runs hold an issue execution lock but no adapter process, and
+  counting `scheduled_retry` would deadlock the scheduler, because such a run can
+  only leave that status by being promoted through this same gate.
+- **Liveness:** a `running` run only counts if a process is actually behind it —
+  it is executing in-process or its child pid / process group is still alive. A
+  `running` row left behind by a crashed or restarted process (an orphan the
+  reaper cleans up on its next tick) does not consume the budget, so a few orphans
+  cannot stall every agent. Freshly claimed runs, which are `running` before their
+  process registers, are held by an in-flight admission reservation in the
+  meantime, so they are never double-counted or missed.
+
+The resolved value is logged once at startup as `resolved host-wide concurrent
+run ceiling`, with `source` (`env` or `default`) and the detected `vcpuCount`.
+
+Runs refused by the ceiling **stay queued** — they are never cancelled or failed —
+and are re-offered a slot as soon as a running run finishes. Each refusal logs
+`heartbeat dispatch deferred by host concurrent-run ceiling` at `warn` with the
+current host count and ceiling, so throttling is distinguishable from idleness.
+
+When the ceiling is the scarce resource, a single agent may claim at most
+`ceil / (agents with queued work)` runs per dispatch pass, so one busy agent
+cannot take the whole host budget. The per-agent `maxConcurrentRuns` still
+applies as a secondary gate.
 
 ## Run-path Integrity
 
