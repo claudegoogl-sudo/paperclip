@@ -1,6 +1,6 @@
 export {};
 
-import type { AgentApiKeyScope } from "@paperclipai/shared";
+import type { AgentApiKeyScope, BoardApiKeyScope } from "@paperclipai/shared";
 
 declare global {
   namespace Express {
@@ -26,6 +26,11 @@ declare global {
         isInstanceAdmin?: boolean;
         keyId?: string;
         keyScope?: AgentApiKeyScope;
+        // Board-key scope. Only meaningful when source === "board_key".
+        // Null/absent = unscoped (key inherits user authority); kind:plugin_ops
+        // restricts the key to plugin ops + issue read/comment. Enforced by
+        // enforceBoardKeyScopeMiddleware in server/src/middleware/auth.ts.
+        boardKeyScope?: BoardApiKeyScope;
         runId?: string;
         onBehalfOfUserId?: string | null;
         source?: "local_implicit" | "session" | "board_key" | "agent_key" | "agent_jwt" | "cloud_tenant" | "none";

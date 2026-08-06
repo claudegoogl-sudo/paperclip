@@ -2826,7 +2826,11 @@ export function accessRoutes(
     const keys = await boardAuth.listBoardApiKeys(req.actor.userId, {
       includeInactive: req.query.includeInactive === "true",
     });
-    res.json(keys);
+    res.json(keys.map((key) => ({
+      ...key,
+      scope: key.scopeConfig ?? null,
+      scopeConfig: undefined,
+    })));
   });
 
   router.post(
@@ -2845,6 +2849,7 @@ export function accessRoutes(
         userId: req.actor.userId,
         name: req.body.name,
         expiresAt: req.body.expiresAt === undefined ? undefined : req.body.expiresAt,
+        scope: req.body.scope ?? null,
       });
       const companyIds = await boardAuth.resolveBoardActivityCompanyIds({
         userId: req.actor.userId,

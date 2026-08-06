@@ -1,4 +1,5 @@
-import { pgTable, uuid, text, timestamp, index, uniqueIndex } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, index, uniqueIndex, jsonb } from "drizzle-orm/pg-core";
+import type { BoardApiKeyScope } from "@paperclipai/shared";
 import { authUsers } from "./auth.js";
 
 export const boardApiKeys = pgTable(
@@ -8,6 +9,12 @@ export const boardApiKeys = pgTable(
     userId: text("user_id").notNull().references(() => authUsers.id, { onDelete: "cascade" }),
     name: text("name").notNull(),
     keyHash: text("key_hash").notNull(),
+    // Scope of this key. Null/absent means unscoped (the key inherits its
+    // user's full authority) and is the column default, so existing keys keep
+    // their current behaviour on deploy. { kind: "plugin_ops" } restricts the
+    // key to plugin install/enable/disable/upgrade/config + issue read/comment.
+    // See enforceBoardKeyScopeMiddleware in server/src/middleware/auth.ts.
+    scopeConfig: jsonb("scope_config").$type<BoardApiKeyScope | null>(),
     lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
     expiresAt: timestamp("expires_at", { withTimezone: true }),

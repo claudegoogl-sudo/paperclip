@@ -77,6 +77,11 @@ async function connectWizard(opts: ConnectOptions) {
     apiBase,
     requestedAccess: "board",
     requestedCompanyId: opts.companyId ?? resolvedProfile.profile.companyId ?? null,
+    // The bootstrap credential that lands in ~/.paperclip/auth.json must be
+    // plugin_ops-scoped, not unscoped. Every prior `paperclipai connect` left
+    // an unscoped owner key behind as a bootstrap by-product; this closes that
+    // mint site at the source.
+    requestedKeyScope: { kind: "plugin_ops" },
     command: "paperclipai connect",
   });
   const boardApi = new PaperclipApiClient({ apiBase, apiKey: boardLogin.token });
@@ -91,9 +96,15 @@ async function connectWizard(opts: ConnectOptions) {
       optional: true,
     });
     const tokenName = opts.tokenName?.trim() || `cli-board-${new Date().toISOString()}`;
+    // The persistent board key minted by `paperclipai connect` must also be
+    // plugin_ops-scoped. The server enforces this regardless (the scope
+    // middleware force-inherits the acting key's scope on any successor), but
+    // the CLI sends the explicit scope so the request is self-describing and a
+    // future server-side audit can reconstruct intent.
     const key = await boardApi.post<CreatedBoardKey>("/api/board-api-keys", createBoardApiKeySchema.parse({
       name: tokenName,
       requestedCompanyId: company?.id ?? null,
+      scope: { kind: "plugin_ops" },
     }));
     if (!key) throw new Error("Failed to create board token");
     upsertProfile(profileName, {
