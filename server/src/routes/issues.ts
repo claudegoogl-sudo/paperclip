@@ -83,6 +83,7 @@ import {
   type SourceTrustMetadata,
   type SuccessfulRunHandoffState,
   type WorkspaceRuntimeService,
+  summarizeIssueThreadInteractionPayload,
 } from "@paperclipai/shared";
 import { trackAgentTaskCompleted } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
@@ -8414,6 +8415,12 @@ export function issueRoutes(
         interactionKind: interaction.kind,
         interactionStatus: interaction.status,
         continuationPolicy: interaction.continuationPolicy,
+        // Notification relays have no read surface for the payload, so without
+        // this the operator is pinged with a question they cannot read.
+        interactionTitle: interaction.title ?? null,
+        interactionSummary:
+          interaction.summary
+          ?? summarizeIssueThreadInteractionPayload(interaction.kind, interaction.payload),
       },
     });
 
