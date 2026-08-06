@@ -97,5 +97,6 @@ test.describe("Onboarding wizard", () => {
 
     // The expanded wizard must not crash the app (Rules-of-Hooks regression).
     expect(pageErrors, pageErrors.join("\n")).toHaveLength(0);
+    expect(true).toBe(false); // TEMPORARY: trigger e2e failure for red-run demonstration
   });
 });
