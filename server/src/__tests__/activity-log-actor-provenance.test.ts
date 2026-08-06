@@ -374,8 +374,8 @@ describeEmbeddedPostgres("activity_log actor provenance via the request middlewa
     expect(sessionCalls.length).toBe(0);
   });
 
-  // PLA-2235 AC-C: Unknown/unset actor sources must not default to "session"
-  it("logs unknown/unset actor source as unknown, never as session (PLA-2235)", async () => {
+  // Unknown/unset actor sources must not default to "session"
+  it("logs unknown/unset actor source as unknown, never as session", async () => {
     const app = buildApp("correct");
 
     // Directly call getActorInfo with a request that has an unset source

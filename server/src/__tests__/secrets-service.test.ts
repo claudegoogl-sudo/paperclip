@@ -3278,8 +3278,8 @@ describeEmbeddedPostgres("secretService", () => {
     ).rejects.toThrow(/active member|secrets:read|forbidden/i);
   });
 
-  // PLA-2235 AC-A: Regression test for egress allowlist preservation across reconcile
-  describe("binding reconcile preserves egress allowlist (PLA-2235)", () => {
+  // Regression test for egress allowlist preservation across reconcile
+  describe("binding reconcile preserves egress allowlist", () => {
     it("preserves allowedEgress and egressAllowlistEnforced across syncSecretRefsForTarget reconcile", async () => {
       const companyId = await seedCompany();
       const svc = secretService(db);

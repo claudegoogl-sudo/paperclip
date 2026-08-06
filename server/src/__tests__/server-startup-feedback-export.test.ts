@@ -522,7 +522,7 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
   });
 });
 
-describe("boot warning for open sign-up on authenticated deployments (PLA-2235)", () => {
+describe("boot warning for open sign-up on authenticated deployments", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
