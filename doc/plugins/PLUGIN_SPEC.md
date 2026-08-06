@@ -1105,7 +1105,70 @@ Rules:
 4. Every delivery is recorded.
 5. Webhook handling must be idempotent.
 6. The route is anonymous, so the host bounds it. Request bodies are capped at 1 MB (tighter than the 10 MB the rest of the API allows); a larger body is rejected by the body parser with `413` before the plugin sees it. The raw signed bytes are still preserved for signature verification.
-7. The host applies a sliding-window rate limit keyed primarily on `(pluginId, endpointKey)`, with a looser additive per-IP bucket. Over-limit deliveries get `429` with a `Retry-After` header and are **not** recorded or dispatched to the worker, so a provider that retries on `429` loses nothing. Providers expected to exceed ~120 deliveries per minute to a single endpoint need the host limits raised.
+7. The host applies a sliding-window rate limit keyed primarily on `(pluginId, endpointKey)`, with a looser additive per-IP bucket. Over-limit deliveries get `429` with a `Retry-After` header and are **not** recorded or dispatched to the worker. A `429` is data loss, not a deferral: providers have finite retry budgets, and Telegram in particular drops updates once its retry window closes. Providers expected to exceed ~120 deliveries per minute to a single endpoint need the host limits raised, or an `auth` declaration (§18.1) so their traffic is billed to the larger verified budget.
+8. Both `pluginId` and `endpointKey` are public, so anyone can spend the anonymous budget for an endpoint. Because plugins are global — one row, one worker, every tenant — that starves real deliveries instance-wide. §18.1 is the mitigation.
+
+## 18.1 Credential-Tiered Rate Limiting
+
+A webhook may declare a shared token the provider sends on every delivery. The host recognises it and bills the delivery to a separate, larger budget. This is **not** authentication: a delivery that fails the check is never rejected, it just stays on the anonymous budget.
+
+Requires the `webhooks.verify` capability. Without it, a manifest carrying `auth` fails validation at install.
+
+```jsonc
+{
+  "capabilities": ["webhooks.receive", "webhooks.verify"],
+  "webhooks": [
+    {
+      "endpointKey": "telegram",
+      "displayName": "Telegram updates",
+      "auth": {
+        "type": "header-token",
+        "header": "X-Telegram-Bot-Api-Secret-Token",
+        "tokenDigestConfigKey": "webhookTokenDigest"
+      }
+    }
+  ]
+}
+```
+
+**Generate the token — do not choose one.** The host ships a generator that is the recipe below, so operators never hand-pick a token:
+
+```
+paperclipai plugin webhook-token <pluginId> <endpointKey>
+```
+
+It mints a 128-bit token (`crypto.randomBytes(16)` → base62), mints the salt (`crypto.randomBytes(12)` → hex — the operator does not get to pick it), stores `{ salt, digest }` into instance config under the endpoint's `tokenDigestConfigKey`, and prints the token **once** for you to paste into the provider. The host never persists the token; only the digest is stored. Re-running rotates the pair.
+
+The stored value looks like this:
+
+```jsonc
+{
+  "webhookTokenDigest": {
+    "salt": "e3b0c44298fc1c14",
+    "digest": "9f2c…"   // 64 lowercase hex chars
+  }
+}
+```
+
+**Construction.** `digest = HMAC-SHA256(key = salt, message = token)`, lowercase hex. HMAC rather than `sha256(salt || token)` for two reasons. First, bare concatenation is not a canonical encoding: `salt="ab", token="cd"` and `salt="abc", token="d"` hash identically, so the salt/token boundary is not pinned and two different endpoint configurations can collide. HMAC keys the salt instead of concatenating it, which removes the ambiguity. Second, HMAC is the standard, reviewed keyed-hash construction, so no one has to re-derive which of the prefix-secret and suffix-secret SHA-256 pitfalls apply to this particular byte order — a question that is easy to get backwards. (Length extension is *not* one of them: it breaks `H(secret || message)` where the secret is the *prefix*, whereas here the salt is the public prefix and the token is the secret suffix, so it does not apply. Recovering the token from the digest still reduces to a SHA-256 preimage with a known key.) Note the orientation is inverted from conventional HMAC — the *public* salt is the key and the *secret* token is the message — which is deliberate and safe here. Derive the value with `computeWebhookTokenDigest(salt, token)` from the host rather than reimplementing it.
+
+**Requirements.**
+
+- The token is a credential and must be stored as one on the provider side; it never enters plugin config or the manifest.
+- Minimum **128 bits of entropy** in the token, enforced at **generation**: `paperclipai plugin webhook-token` mints it, so the floor is a floor and not a wish. The host cannot measure a token's entropy from a digest, so it cannot enforce the floor at verification time — an operator-chosen `paperclip-webhook-2026` (~40 bits) passes a digest check but falls offline in a fraction of a second. Bringing your own token is an explicit escape hatch (`--token`) and is refused when it is too short to possibly carry 128 bits (a length ceiling — a necessary, not sufficient, check; prefer the generator). The digest is held in **instance** config — `GET /api/plugins/:pluginId/config` is board/org-gated, so it is readable by board/org principals, the plugin's own worker, and anyone with direct DB or backup access, but **not** by anonymous callers or other tenants' agents. Any member of that reader set can brute-force a low-entropy token offline regardless of the salt (the salt only defeats precomputed tables and cross-endpoint digest reuse), and a backup outlives the credential — so the entropy floor holds even though the config is not world-readable.
+- The digest is read from **instance** config only; it is **not** merged with per-company `configOverrides` (unlike what a worker sees via `ctx.config.get()`). A tenant who can write company config-overrides therefore cannot plant a digest and promote its own traffic into the verified tier.
+- Salt: at least 16 characters, unique per endpoint. It is not secret; it exists so the stored digest resists precomputed tables and so two plugins sharing a token do not share a digest.
+- Rotation: re-run `paperclipai plugin webhook-token` (it writes a fresh `{ salt, digest }`), then update the provider. During the gap, deliveries fall back to the anonymous budget — they are not lost.
+
+**Semantics.**
+
+- Header matched case-insensitively. A header repeated in one request is treated as absent (ambiguous, and accepting any copy would let a caller staple a guess onto a legitimate request).
+- Comparison is constant-time over fixed-width digests, and happens **before** the delivery row is written and before the worker RPC.
+- Match → verified budget (600/min per endpoint, and exempt from the per-IP bucket, which an anonymous flood behind a shared tunnel IP would otherwise use to starve it). No match, no header, or no `auth` → the anonymous budget, byte-for-byte as before.
+- A missing or malformed digest config is a misconfiguration, not an outage: the host logs once per endpoint and falls through to the anonymous budget. Hard-rejecting would turn one stale digest into total ingestion failure for every tenant sharing the plugin.
+- The token, the presented header value, and the digest are never logged. The `429` warning carries only the tier (`verified` / `anonymous`).
+
+This bounds starvation; it does not authenticate the caller. Plugins that must reject forged deliveries still verify the provider's signature in worker code against a secret ref (§18 rule 3) — the host cannot do that here, because this route is anonymous and pre-company while secret refs resolve through a company binding.
 
 ## 19. UI Extension Model
 

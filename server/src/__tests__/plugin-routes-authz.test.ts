@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
   getByKey: vi.fn(),
+  getConfig: vi.fn(),
   upsertConfig: vi.fn(),
   getCompanySettings: vi.fn(),
   upsertCompanySettings: vi.fn(),
@@ -1511,5 +1512,167 @@ describe.sequential("plugin tool dispatch for agent actors", () => {
 
     expect(res.status).toBe(403);
     expect(executeTool).not.toHaveBeenCalled();
+  });
+});
+
+describe.sequential("webhook token mint route", () => {
+  const endpointKey = "telegram";
+  const digestKey = "webhookTokenDigest";
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function mintablePlugin(overrides: Record<string, unknown> = {}) {
+    mockRegistry.getById.mockResolvedValue({
+      id: pluginId,
+      pluginKey: "paperclip.example",
+      version: "1.0.0",
+      status: "ready",
+      manifestJson: {
+        webhooks: [
+          {
+            endpointKey,
+            displayName: "Telegram",
+            auth: {
+              type: "header-token",
+              header: "x-telegram-bot-api-secret-token",
+              tokenDigestConfigKey: digestKey,
+            },
+          },
+        ],
+      },
+      ...overrides,
+    });
+  }
+
+  function adminApp() {
+    return createApp({
+      type: "board",
+      userId: "admin-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [],
+    });
+  }
+
+  it("rejects a non-instance-admin board user with 403 and never writes config", async () => {
+    mintablePlugin();
+    const { app } = await createApp(boardActor());
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/webhooks/${endpointKey}/token`)
+      .send({});
+
+    expect(res.status).toBe(403);
+    expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
+  });
+
+  it("rejects an agent JWT with 403 and never writes config", async () => {
+    mintablePlugin();
+    const { app } = await createApp(agentActor());
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/webhooks/${endpointKey}/token`)
+      .send({});
+
+    expect(res.status).toBe(403);
+    expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
+  });
+
+  it("mints a token for an instance admin, stores only the digest, and never persists the token", async () => {
+    mintablePlugin();
+    mockRegistry.getConfig.mockResolvedValue({ configJson: {} });
+    mockRegistry.upsertConfig.mockResolvedValue(undefined);
+    const { app } = await adminApp();
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/webhooks/${endpointKey}/token`)
+      .send({});
+
+    expect(res.status).toBe(200);
+    expect(typeof res.body.token).toBe("string");
+    expect(res.body.tokenDigestConfigKey).toBe(digestKey);
+
+    expect(mockRegistry.upsertConfig).toHaveBeenCalledTimes(1);
+    const persisted = mockRegistry.upsertConfig.mock.calls[0][1].configJson;
+    const stored = persisted[digestKey];
+    expect(typeof stored.salt).toBe("string");
+    expect(typeof stored.digest).toBe("string");
+    // The plaintext token must never touch the persisted config.
+    expect(JSON.stringify(persisted)).not.toContain(res.body.token);
+  });
+
+  it("returns 404 for an unknown plugin", async () => {
+    mockRegistry.getById.mockResolvedValue(null);
+    mockRegistry.getByKey.mockResolvedValue(null);
+    const { app } = await adminApp();
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/webhooks/${endpointKey}/token`)
+      .send({});
+
+    expect(res.status).toBe(404);
+    expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 for an endpointKey the plugin does not declare", async () => {
+    mintablePlugin();
+    const { app } = await adminApp();
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/webhooks/not-declared/token`)
+      .send({});
+
+    expect(res.status).toBe(404);
+    expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 for an endpoint that declares no header-token auth", async () => {
+    mockRegistry.getById.mockResolvedValue({
+      id: pluginId,
+      pluginKey: "paperclip.example",
+      version: "1.0.0",
+      status: "ready",
+      manifestJson: { webhooks: [{ endpointKey, displayName: "Telegram" }] },
+    });
+    const { app } = await adminApp();
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/webhooks/${endpointKey}/token`)
+      .send({});
+
+    expect(res.status).toBe(400);
+    expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 for a supplied token below the entropy floor", async () => {
+    mintablePlugin();
+    mockRegistry.getConfig.mockResolvedValue({ configJson: {} });
+    const { app } = await adminApp();
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/webhooks/${endpointKey}/token`)
+      .send({ token: "short" });
+
+    expect(res.status).toBe(400);
+    expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
+  });
+
+  it("returns 409 rather than overwriting a config key that holds a non-digest value (secret-ref)", async () => {
+    mintablePlugin();
+    // The key already backs a real config value — e.g. a secret-ref. Overwriting
+    // it would tear down its binding instance-wide, so refuse.
+    mockRegistry.getConfig.mockResolvedValue({
+      configJson: { [digestKey]: { secretRef: "company-secret-123" } },
+    });
+    const { app } = await adminApp();
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/webhooks/${endpointKey}/token`)
+      .send({});
+
+    expect(res.status).toBe(409);
+    expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
   });
 });
