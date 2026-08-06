@@ -37,6 +37,11 @@ import {
   RUN_HISTORY_PRUNE_MAX_BATCHES,
   startRunHistoryRetention,
 } from "./services/run-history-retention.js";
+import {
+  PLUGIN_WEBHOOK_DELIVERY_PRUNE_BATCH_SIZE,
+  PLUGIN_WEBHOOK_DELIVERY_PRUNE_MAX_BATCHES,
+  startPluginWebhookDeliveryRetention,
+} from "./services/plugin-webhook-delivery-retention.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
 import { setupEnvironmentCustomImageTerminalWebSocketServer } from "./realtime/environment-custom-image-terminal-ws.js";
@@ -1103,6 +1108,27 @@ export async function startServer(): Promise<StartedServer> {
       db,
       config.runHistoryRetentionIntervalMinutes * 60 * 1000,
       config.runHistoryRetentionDays,
+    );
+  }
+
+  if (config.pluginWebhookDeliveryRetentionEnabled) {
+    logger.info(
+      {
+        successRetentionDays: config.pluginWebhookDeliverySuccessRetentionDays,
+        failedRetentionDays: config.pluginWebhookDeliveryFailedRetentionDays,
+        maxRows: config.pluginWebhookDeliveryMaxRows,
+        intervalMinutes: config.pluginWebhookDeliveryRetentionIntervalMinutes,
+        batchSize: PLUGIN_WEBHOOK_DELIVERY_PRUNE_BATCH_SIZE,
+        maxBatchesPerTick: PLUGIN_WEBHOOK_DELIVERY_PRUNE_MAX_BATCHES,
+      },
+      "Plugin webhook delivery retention enabled",
+    );
+    startPluginWebhookDeliveryRetention(
+      db,
+      config.pluginWebhookDeliveryRetentionIntervalMinutes * 60 * 1000,
+      config.pluginWebhookDeliverySuccessRetentionDays,
+      config.pluginWebhookDeliveryFailedRetentionDays,
+      config.pluginWebhookDeliveryMaxRows,
     );
   }
 

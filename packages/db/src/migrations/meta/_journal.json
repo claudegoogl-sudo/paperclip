@@ -1016,6 +1016,13 @@
       "when": 1783101000000,
       "tag": "0146_cost_events_denormalise_run_identifier",
       "breakpoints": true
+    },
+    {
+      "idx": 147,
+      "version": "7",
+      "when": 1783101100000,
+      "tag": "0147_plugin_webhook_deliveries_retention",
+      "breakpoints": true
     }
   ]
 }
