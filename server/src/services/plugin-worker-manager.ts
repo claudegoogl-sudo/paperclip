@@ -66,8 +66,17 @@ const DEFAULT_RPC_TIMEOUT_MS = 30_000;
 /** Hard upper bound for any RPC timeout (15 minutes). Prevents unbounded waits. */
 const MAX_RPC_TIMEOUT_MS = 15 * 60 * 1_000;
 
-/** Timeout for the initialize RPC call. */
-const INITIALIZE_TIMEOUT_MS = 15_000;
+/**
+ * Default timeout for the `initialize` RPC call, in milliseconds. Overridable
+ * via `PAPERCLIP_PLUGIN_INITIALIZE_TIMEOUT_MS` (see
+ * {@link resolveInitializeTimeoutMs}). This single budget has to cover three
+ * phases that happen before the plugin's own code runs — Node process
+ * startup, the worker bundle's module import, and the plugin's `setup()` —
+ * only the last of which is under plugin-author control. On a contended host
+ * the first two can dominate, so this is deliberately configurable rather
+ * than hardcoded.
+ */
+const DEFAULT_INITIALIZE_TIMEOUT_MS = 15_000;
 
 /** Timeout for the shutdown RPC call before escalating to SIGTERM. */
 const SHUTDOWN_DRAIN_MS = 10_000;
@@ -119,6 +128,35 @@ export function resolveMaxIpcFrameBytes(override?: number): number {
   const fromEnv = Number(process.env.PAPERCLIP_PLUGIN_MAX_IPC_FRAME_BYTES);
   if (Number.isFinite(fromEnv) && fromEnv > 0) return Math.floor(fromEnv);
   return DEFAULT_MAX_IPC_FRAME_BYTES;
+}
+
+/**
+ * Resolve the `initialize` RPC timeout, preferring an explicit override (used
+ * by tests and per-deployment tuning), then the
+ * `PAPERCLIP_PLUGIN_INITIALIZE_TIMEOUT_MS` env var, then
+ * {@link DEFAULT_INITIALIZE_TIMEOUT_MS}. A non-numeric or non-positive env
+ * value is ignored (with a warning) rather than silently coerced — a bad
+ * value should not collapse activation to `setTimeout(fn, 0)`-style
+ * immediate timeouts. Clamped to {@link MAX_RPC_TIMEOUT_MS}, the same hard
+ * ceiling every other RPC timeout respects.
+ */
+export function resolveInitializeTimeoutMs(override?: number): number {
+  if (typeof override === "number" && Number.isFinite(override) && override > 0) {
+    return Math.min(Math.floor(override), MAX_RPC_TIMEOUT_MS);
+  }
+  const raw = process.env.PAPERCLIP_PLUGIN_INITIALIZE_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === "") {
+    return DEFAULT_INITIALIZE_TIMEOUT_MS;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    logger.warn(
+      { value: raw },
+      "invalid PAPERCLIP_PLUGIN_INITIALIZE_TIMEOUT_MS (must be a positive number), falling back to default",
+    );
+    return DEFAULT_INITIALIZE_TIMEOUT_MS;
+  }
+  return Math.min(Math.floor(parsed), MAX_RPC_TIMEOUT_MS);
 }
 
 /**
@@ -328,6 +366,14 @@ export interface WorkerStartOptions {
   hostHandlers: WorkerToHostHandlers;
   /** Default timeout for RPC calls (ms). Defaults to 30s. */
   rpcTimeoutMs?: number;
+  /**
+   * Timeout for the `initialize` RPC call (ms). Defaults to
+   * `PAPERCLIP_PLUGIN_INITIALIZE_TIMEOUT_MS` or
+   * {@link DEFAULT_INITIALIZE_TIMEOUT_MS}. Mainly an injection point for
+   * tests; production should use the env var. See
+   * {@link resolveInitializeTimeoutMs}.
+   */
+  initializeTimeoutMs?: number;
   /**
    * Hard byte cap on a single worker→host IPC frame. Defaults to
    * `PAPERCLIP_PLUGIN_MAX_IPC_FRAME_BYTES` or {@link DEFAULT_MAX_IPC_FRAME_BYTES}.
@@ -638,6 +684,7 @@ export function createPluginWorkerHandle(
   const rpcTimeoutMs = options.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
   const autoRestart = options.autoRestart ?? true;
   const maxIpcFrameBytes = resolveMaxIpcFrameBytes(options.maxIpcFrameBytes);
+  const initializeTimeoutMs = resolveInitializeTimeoutMs(options.initializeTimeoutMs);
 
   // -----------------------------------------------------------------------
   // Status management
@@ -1396,7 +1443,7 @@ export function createPluginWorkerHandle(
       const result = await callInternal(
         "initialize",
         initParams,
-        INITIALIZE_TIMEOUT_MS,
+        initializeTimeoutMs,
       ) as
         | { ok?: boolean; supportedMethods?: string[]; echoesInvocationId?: boolean }
         | undefined;
@@ -1406,12 +1453,51 @@ export function createPluginWorkerHandle(
       supportedMethods = result.supportedMethods ?? [];
       echoesInvocationId = result.echoesInvocationId === true;
     } catch (err) {
-      // Initialize failed — kill the process and propagate
-      const msg = err instanceof Error ? err.message : String(err);
-      log.error({ err: msg }, "worker initialize failed");
+      // Initialize failed — kill the process and propagate. There is no
+      // ready-handshake between spawn and this call (a wire-protocol change,
+      // deliberately deferred as future work), so `initializeTimeoutMs`
+      // covers three phases and only the last is under plugin-author
+      // control: (1) Node process fork/exec + V8 startup, (2) the worker
+      // bundle's module import, (3) the plugin's own `setup()`. Log the
+      // elapsed wall time since spawn plus the captured stderr excerpt so a
+      // timeout here is diagnosable as a possible host/environment issue
+      // rather than automatically blamed on the plugin.
+      const rawMsg = err instanceof Error ? err.message : String(err);
+      const elapsedSinceSpawnMs = startedAt !== null ? Date.now() - startedAt : null;
+      const isTimeout =
+        err instanceof JsonRpcCallError && err.code === PLUGIN_RPC_ERROR_CODES.TIMEOUT;
+      const msg = isTimeout
+        ? `Worker initialize for "${pluginId}" did not complete within ${initializeTimeoutMs}ms ` +
+          `(elapsed ${elapsedSinceSpawnMs}ms since process spawn). This budget covers Node process ` +
+          `startup, worker bundle import, and the plugin's setup() — a slow host (CPU contention, a ` +
+          `large bundle) can exhaust it before the plugin's own code even runs, so do not assume the ` +
+          `plugin's setup() is at fault. Override via PAPERCLIP_PLUGIN_INITIALIZE_TIMEOUT_MS.`
+        : `Worker initialize failed for "${pluginId}": ${rawMsg}`;
+      log.error(
+        {
+          err: rawMsg,
+          isTimeout,
+          initializeTimeoutMs,
+          elapsedSinceSpawnMs,
+        },
+        "worker initialize failed",
+      );
+      // SECURITY/RESILIENCE NOTE: killProcess() sets
+      // `intentionalStop = true` *before* killing, so the exit this
+      // triggers is handled by handleProcessExit()'s `wasIntentional`
+      // branch — it does NOT increment the crash counter and does NOT call
+      // scheduleRestart(). In other words, an initialize timeout/failure
+      // does not schedule a background auto-restart the way a genuine
+      // runtime crash does; the worker is left in "crashed" status and
+      // recovery is entirely up to whoever called start() (e.g.
+      // PluginLifecycleService#startWorker / #enable) reacting to the
+      // rejected promise below. This is intentional (MAX_CONSECUTIVE_CRASHES
+      // backoff is for post-initialize crashes), but it means a caller that
+      // swallows this rejection without retrying leaves the plugin
+      // permanently down with no self-healing restart in flight.
       await killProcess();
       setStatus("crashed");
-      throw new Error(`Worker initialize failed for "${pluginId}": ${msg}`);
+      throw new Error(formatWorkerFailureMessage(msg, stderrExcerpt));
     }
 
     // Reset crash counter on successful start
