@@ -120,6 +120,21 @@ CI is required to be green, but the `e2e` job in particular can occasionally fai
 2. **If the same step fails twice in a row, treat it as a real failure** — investigate before merging, even if the logs look "infra-shaped". File a follow-up issue rather than retrying a third time.
 3. **Never disable a check to land a PR.** If a check is genuinely useless, remove it in its own PR with justification.
 
+#### Where merged-state verification happens
+
+Pre-merge verification is the **PR** workflow ([`.github/workflows/pr.yml`](.github/workflows/pr.yml)). Post-merge verification of the merged result is the `verify_canary` job in the **Release** workflow ([`.github/workflows/release.yml`](.github/workflows/release.yml)), which runs on every push to `master` (gated `if: github.event_name == 'push'`, no repo guard).
+
+`verify_canary` runs the release package-map check, `pnpm -r typecheck`, `pnpm test:run`, and `pnpm build`. `pnpm test:run` defaults to mode `all`, which covers **both** the general groups **and** the serialized server suites — which is why there is no duplicate push-triggered test job on `master`.
+
+It does **not** run the PR-only gates, so do not assume `verify_canary` mirrors PR CI:
+
+- The PR `policy` job's diff-based static gates (hand-edited lockfile, `git push` in adapter/runtime code, non-loopback compose port publishes, internal-id scrub, released-migrations-append-only).
+- The *Verify release registry test coverage* and *Verify upstream-sync idempotency* steps.
+- The scaffold manifest-validation gate.
+- `e2e` (which is `workflow_dispatch`-only everywhere, PRs included).
+
+A red `Release` run on `master` is a **P0**: the merged result is broken, and every open PR inherits it. Fix forward or revert — do not wave it through on an unrelated PR. Attribution: the merge that broke `master` is not the PR that displays the breakage, so start bisecting from the last green `Release` run on `master`, not from whichever PR you happen to be looking at.
+
 ### Telemetry Changes
 
 If your change adds, removes, or modifies emitted telemetry events, update the [Telemetry Data Contract](packages/shared/src/telemetry/README.md) in the same PR. Keep clients emitting raw dimension values and avoid documenting or relying on private delivery details.
