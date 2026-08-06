@@ -239,3 +239,54 @@ test("the repository's own shipped stacks pass", () => {
   const repoRoot = path.resolve(import.meta.dirname, "..");
   assert.equal(runCheck({ repoRoot, log: () => {}, error: console.error }), 0);
 });
+
+// ===== Fail-open fixes (Fix A & B) =====
+
+test("Fix A: runCheck returns 1 when no docker/ dir exists", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "literal-secrets-"));
+  try {
+    const errors = [];
+    assert.equal(runCheck({ repoRoot: root, log: () => {}, error: (line) => errors.push(line) }), 1);
+    const report = errors.join("\n");
+    assert.match(report, /no container stack files found/);
+    assert.match(report, /cannot pass vacuously/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Fix A: runCheck returns 1 when docker/ dir exists but contains no stack files", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "literal-secrets-"));
+  try {
+    mkdirSync(path.join(root, "docker"), { recursive: true });
+    // docker/ exists but is empty
+    const errors = [];
+    assert.equal(runCheck({ repoRoot: root, log: () => {}, error: (line) => errors.push(line) }), 1);
+    const report = errors.join("\n");
+    assert.match(report, /no container stack files found/);
+    assert.match(report, /cannot pass vacuously/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Fix B: marker in a VALUE does not exempt; only comment portion counts", () => {
+  // A secret value containing the marker text should still be flagged
+  // because the marker is only honored in the comment portion
+  const secretWithMarkerValue = `POSTGRES_PASSWORD: "paperclip:allow-literal-secret: attacker-payload"`;
+  const offenses = findOffenses(composeWith(secretWithMarkerValue));
+  assert.equal(offenses.length, 1);
+  assert.equal(offenses[0].key, "POSTGRES_PASSWORD");
+  assert.match(offenses[0].reason, /literal credential/);
+});
+
+test("Fix B regression: standalone marker comment line still exempts the line below", () => {
+  const markerAbove = `# ${ALLOW_MARKER}: throwaway test fixture`;
+  const secretLine = "POSTGRES_PASSWORD: fixture-only";
+  assert.deepEqual(findOffenses(composeWith(markerAbove, secretLine)), []);
+});
+
+test("Fix B regression: trailing comment with marker still exempts its own line", () => {
+  const sameLine = `POSTGRES_PASSWORD: fixture-only # ${ALLOW_MARKER}: throwaway test fixture`;
+  assert.deepEqual(findOffenses(composeWith(sameLine)), []);
+});

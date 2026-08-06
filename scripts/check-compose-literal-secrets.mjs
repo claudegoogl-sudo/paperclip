@@ -309,7 +309,8 @@ export function findOffenses(text) {
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
     const previous = index > 0 ? lines[index - 1] : "";
-    if (line.includes(ALLOW_MARKER) || previous.includes(ALLOW_MARKER)) continue;
+    const commentOf = (l) => l.slice(stripComment(l).length);
+    if (commentOf(line).includes(ALLOW_MARKER) || commentOf(previous).includes(ALLOW_MARKER)) continue;
 
     // Rule 2 runs line-wide, before and independent of key parsing. A URL with a
     // literal userinfo password is a finding wherever it sits — a hyphenated
@@ -395,6 +396,14 @@ export function runCheck({
   const quadletRoot = path.resolve(repoRoot, quadletDir);
   if (statSyncSafe(quadletRoot)?.isDirectory()) {
     for (const absolute of listFiles(quadletRoot, () => true)) scan(absolute);
+  }
+
+  if (scanned === 0) {
+    error(
+      `ERROR: no container stack files found under \`${composeDir}\`. The literal-credential gate ` +
+        "cannot pass vacuously: if the shipped stacks moved, point this check at the new location.",
+    );
+    return 1;
   }
 
   if (allOffenses.length > 0) {
