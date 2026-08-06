@@ -3290,10 +3290,11 @@ describeEmbeddedPostgres("secretService", () => {
       });
 
       const target = { targetType: "environment" as const, targetId: "env-1" };
+      const configPath = "apiKey";
 
       // Create initial binding
       await svc.syncSecretRefsForTarget(companyId, target, [
-        { secretId: secret.id, configPath: "apiKey", required: true },
+        { secretId: secret.id, configPath, required: true },
       ]);
 
       // Set egress allowlist and enforce it
@@ -3318,23 +3319,34 @@ describeEmbeddedPostgres("secretService", () => {
           egressAllowlistEnforced: companySecretBindings.egressAllowlistEnforced,
         })
         .from(companySecretBindings)
-        .where(eq(companySecretBindings.id, bindingId));
+        .where(
+          and(
+            eq(companySecretBindings.companyId, companyId),
+            eq(companySecretBindings.configPath, configPath),
+          ),
+        );
       expect(beforeReconcile[0].allowedEgress).toEqual(["https://api.example.com", "*.internal.example"]);
       expect(beforeReconcile[0].egressAllowlistEnforced).toBe(true);
 
       // Trigger reconcile by re-saving the same config (simulating config save)
       await svc.syncSecretRefsForTarget(companyId, target, [
-        { secretId: secret.id, configPath: "apiKey", required: true },
+        { secretId: secret.id, configPath, required: true },
       ]);
 
-      // Assert egress settings survive unchanged
+      // Assert egress settings survive unchanged (query by configPath since ID may change)
       const afterReconcile = await db
         .select({
           allowedEgress: companySecretBindings.allowedEgress,
           egressAllowlistEnforced: companySecretBindings.egressAllowlistEnforced,
         })
         .from(companySecretBindings)
-        .where(eq(companySecretBindings.id, bindingId));
+        .where(
+          and(
+            eq(companySecretBindings.companyId, companyId),
+            eq(companySecretBindings.configPath, configPath),
+          ),
+        );
+      expect(afterReconcile[0]).toBeDefined();
       expect(afterReconcile[0].allowedEgress).toEqual(["https://api.example.com", "*.internal.example"]);
       expect(afterReconcile[0].egressAllowlistEnforced).toBe(true);
     });
@@ -3362,6 +3374,7 @@ describeEmbeddedPostgres("secretService", () => {
         .where(eq(companySecretBindings.companyId, companyId));
       expect(bindings.length).toBeGreaterThan(0);
       const bindingId = bindings[0].id;
+      const configPath = bindings[0].configPath;
       await svc.setBindingEgressAllowlist({
         companyId,
         bindingId,
@@ -3376,7 +3389,12 @@ describeEmbeddedPostgres("secretService", () => {
           egressAllowlistEnforced: companySecretBindings.egressAllowlistEnforced,
         })
         .from(companySecretBindings)
-        .where(eq(companySecretBindings.id, bindingId));
+        .where(
+          and(
+            eq(companySecretBindings.companyId, companyId),
+            eq(companySecretBindings.configPath, configPath),
+          ),
+        );
       expect(beforeReconcile[0].allowedEgress).toEqual(["https://api.github.com"]);
       expect(beforeReconcile[0].egressAllowlistEnforced).toBe(true);
 
@@ -3385,14 +3403,20 @@ describeEmbeddedPostgres("secretService", () => {
         API_KEY: { type: "secret_ref", secretId: secret.id, version: "latest" },
       });
 
-      // Assert egress settings survive unchanged
+      // Assert egress settings survive unchanged (query by configPath since ID may change)
       const afterReconcile = await db
         .select({
           allowedEgress: companySecretBindings.allowedEgress,
           egressAllowlistEnforced: companySecretBindings.egressAllowlistEnforced,
         })
         .from(companySecretBindings)
-        .where(eq(companySecretBindings.id, bindingId));
+        .where(
+          and(
+            eq(companySecretBindings.companyId, companyId),
+            eq(companySecretBindings.configPath, configPath),
+          ),
+        );
+      expect(afterReconcile[0]).toBeDefined();
       expect(afterReconcile[0].allowedEgress).toEqual(["https://api.github.com"]);
       expect(afterReconcile[0].egressAllowlistEnforced).toBe(true);
     });
