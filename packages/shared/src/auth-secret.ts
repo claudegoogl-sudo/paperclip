@@ -1,56 +1,50 @@
-/**
- * Known-weak auth secret denylist (case-insensitive).
- * These values are commonly used as defaults or placeholders and must not be used
- * in authenticated mode where they sign forgeable JWTs.
- */
-const WEAK_SECRET_DENYLIST = new Set([
+export const MIN_AUTH_SECRET_LENGTH = 32;
+
+// Case-insensitive; entries are stored lowercase so callers compare against a
+// lowercased secret. These are the well-known placeholder values that must
+// never sign sessions or agent JWTs in authenticated mode.
+export const WEAK_AUTH_SECRET_DENYLIST: readonly string[] = [
   "paperclip-dev-secret",
   "changeme",
   "secret",
   "test-secret",
-]);
+];
 
-/**
- * Minimum required length for an auth secret in authenticated mode.
- * 32 bytes = 256 bits of entropy when hex-encoded.
- */
-const MIN_SECRET_LENGTH = 32;
-
-/**
- * Check if an auth secret is known-weak or too short.
- * Returns null if the secret passes validation, or an error message describing the problem.
- *
- * This check applies ONLY in authenticated mode. Local mode intentionally permits weak
- * secrets for development convenience.
- *
- * @param secret - The resolved auth secret value (after fallback from BETTER_AUTH_SECRET to PAPERCLIP_AGENT_JWT_SECRET)
- * @param deploymentMode - The current deployment mode ("authenticated" | "local_trusted" | ...)
- * @returns null if valid, or an error string if invalid
- */
-export function validateAuthSecretStrength(
-  secret: string,
-  deploymentMode: string,
-): string | null {
-  // Only enforce in authenticated mode
-  if (deploymentMode !== "authenticated") {
-    return null;
+// Returns a human-readable reason when the secret is known-weak, or null when
+// it is acceptable. Operates on the effective (post-fallback) secret so that a
+// weak PAPERCLIP_AGENT_JWT_SECRET cannot slip through a BETTER_AUTH_SECRET-only
+// check — that variable is what actually signs agent JWTs.
+export function weakAuthSecretReason(secret: string): string | null {
+  const value = secret.trim();
+  if (WEAK_AUTH_SECRET_DENYLIST.includes(value.toLowerCase())) {
+    return "matches a well-known default/placeholder value";
   }
-
-  // Check minimum length
-  if (secret.length < MIN_SECRET_LENGTH) {
-    return `Auth secret must be at least ${MIN_SECRET_LENGTH} characters in authenticated mode (got ${secret.length}). Generate one with: openssl rand -hex 32`;
+  if (value.length < MIN_AUTH_SECRET_LENGTH) {
+    return `is shorter than ${MIN_AUTH_SECRET_LENGTH} characters`;
   }
-
-  // Check denylist (case-insensitive)
-  const normalized = secret.toLowerCase();
-  if (WEAK_SECRET_DENYLIST.has(normalized)) {
-    return `Auth secret "${secret}" is known-weak and must not be used in authenticated mode. Generate one with: openssl rand -hex 32`;
-  }
-
   return null;
 }
 
-/**
- * The denylist of known-weak secrets for testing purposes.
- */
-export { WEAK_SECRET_DENYLIST, MIN_SECRET_LENGTH };
+export function isWeakAuthSecret(secret: string): boolean {
+  return weakAuthSecretReason(secret) !== null;
+}
+
+// Every environment variable that can end up signing sessions or agent JWTs.
+// The session resolver (better-auth) prefers BETTER_AUTH_SECRET while the
+// agent-JWT resolver (agent-auth-jwt) prefers PAPERCLIP_AGENT_JWT_SECRET, so
+// when both are set they can select different values.
+export const AUTH_SECRET_ENV_KEYS = ["BETTER_AUTH_SECRET", "PAPERCLIP_AGENT_JWT_SECRET"] as const;
+
+// Returns "<VAR> <reason>" for the first weak secret among all signing-capable
+// variables, or null. Checks every set variable because the two resolvers have
+// opposite precedence — checking only the one better-auth happens to pick can
+// miss the value that actually signs agent tokens.
+export function weakAuthSecretEnvReason(env: Record<string, string | undefined>): string | null {
+  for (const key of AUTH_SECRET_ENV_KEYS) {
+    const value = env[key]?.trim();
+    if (!value) continue; // unset/empty is the fallback case, not a weak value
+    const reason = weakAuthSecretReason(value);
+    if (reason) return `${key} ${reason}`;
+  }
+  return null;
+}

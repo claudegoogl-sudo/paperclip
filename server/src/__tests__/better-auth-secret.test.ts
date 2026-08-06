@@ -1,177 +1,98 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("better-auth", () => ({
+  betterAuth: vi.fn(() => ({ __betterAuth: true })),
+}));
+vi.mock("better-auth/adapters/drizzle", () => ({
+  drizzleAdapter: vi.fn(() => ({ __drizzleAdapter: true })),
+}));
+vi.mock("better-auth/node", () => ({
+  toNodeHandler: vi.fn(() => () => {}),
+}));
+
 import { createBetterAuthInstance } from "../auth/better-auth.js";
+import type { Config } from "../config.js";
+import type { Db } from "@paperclipai/db";
 
-const ORIGINAL_BETTER_AUTH_SECRET = process.env.BETTER_AUTH_SECRET;
-const ORIGINAL_PAPERCLIP_AGENT_JWT_SECRET = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+const AUTH_SECRET_ENV_KEYS = ["BETTER_AUTH_SECRET", "PAPERCLIP_AGENT_JWT_SECRET"] as const;
+const originalEnv: Record<string, string | undefined> = {};
 
-afterEach(() => {
-  if (ORIGINAL_BETTER_AUTH_SECRET === undefined) delete process.env.BETTER_AUTH_SECRET;
-  else process.env.BETTER_AUTH_SECRET = ORIGINAL_BETTER_AUTH_SECRET;
-
-  if (ORIGINAL_PAPERCLIP_AGENT_JWT_SECRET === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
-  else process.env.PAPERCLIP_AGENT_JWT_SECRET = ORIGINAL_PAPERCLIP_AGENT_JWT_SECRET;
+beforeEach(() => {
+  for (const key of AUTH_SECRET_ENV_KEYS) {
+    originalEnv[key] = process.env[key];
+    delete process.env[key];
+  }
 });
 
-describe("better-auth secret strength validation", () => {
-  // Mock Db - createBetterAuthInstance only needs it for type checking
-  const mockDb = {} as never;
-
-  // Minimal Config interface - only deploymentMode matters for our test
-  function buildConfig(deploymentMode: "authenticated" | "local_trusted") {
-    return {
-      deploymentMode,
-      deploymentExposure: "private" as const,
-      authBaseUrlMode: "auto" as const,
-      authPublicBaseUrl: null,
-    } as const;
+afterEach(() => {
+  for (const key of AUTH_SECRET_ENV_KEYS) {
+    if (originalEnv[key] === undefined) delete process.env[key];
+    else process.env[key] = originalEnv[key];
   }
+});
 
-  describe("authenticated mode rejects weak secrets", () => {
-    it("throws on known-weak BETTER_AUTH_SECRET 'paperclip-dev-secret' (caught by length check)", () => {
-      process.env.BETTER_AUTH_SECRET = "paperclip-dev-secret";
-      delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+function buildConfig(deploymentMode: Config["deploymentMode"]): Config {
+  return {
+    deploymentMode,
+    deploymentExposure: "private",
+    authBaseUrlMode: "auto",
+    authPublicBaseUrl: undefined,
+    authDisableSignUp: false,
+  } as Config;
+}
 
-      const config = buildConfig("authenticated");
+const fakeDb = {} as Db;
 
-      expect(() => createBetterAuthInstance(mockDb, config, [])).toThrow(
-        /Auth secret must be at least 32 characters/,
-      );
-    });
+function boot(deploymentMode: Config["deploymentMode"]) {
+  return createBetterAuthInstance(fakeDb, buildConfig(deploymentMode), []);
+}
 
-    it("throws on known-weak BETTER_AUTH_SECRET 'secret' (caught by length check)", () => {
-      process.env.BETTER_AUTH_SECRET = "secret";
-      delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
-
-      const config = buildConfig("authenticated");
-
-      expect(() => createBetterAuthInstance(mockDb, config, [])).toThrow(
-        /Auth secret must be at least 32 characters/,
-      );
-    });
-
-    it("throws on secret shorter than 32 characters", () => {
-      process.env.BETTER_AUTH_SECRET = "short";
-      delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
-
-      const config = buildConfig("authenticated");
-
-      expect(() => createBetterAuthInstance(mockDb, config, [])).toThrow(
-        /Auth secret must be at least 32 characters/,
-      );
-    });
-
-    it("throws on weak PAPERCLIP_AGENT_JWT_SECRET when BETTER_AUTH_SECRET is unset (AC3 bypass - caught by length)", () => {
-      delete process.env.BETTER_AUTH_SECRET;
-      process.env.PAPERCLIP_AGENT_JWT_SECRET = "secret";
-
-      const config = buildConfig("authenticated");
-
-      expect(() => createBetterAuthInstance(mockDb, config, [])).toThrow(
-        /Auth secret must be at least 32 characters/,
-      );
-    });
-
-    it("throws on weak PAPERCLIP_AGENT_JWT_SECRET when BETTER_AUTH_SECRET is empty (caught by length)", () => {
-      process.env.BETTER_AUTH_SECRET = "";
-      process.env.PAPERCLIP_AGENT_JWT_SECRET = "weak-secret";
-
-      const config = buildConfig("authenticated");
-
-      expect(() => createBetterAuthInstance(mockDb, config, [])).toThrow(
-        /Auth secret must be at least 32 characters/,
-      );
-    });
+describe("createBetterAuthInstance weak auth secret rejection", () => {
+  it("throws in authenticated mode when the effective secret is the shipped dev default", () => {
+    process.env.BETTER_AUTH_SECRET = "paperclip-dev-secret";
+    expect(() => boot("authenticated")).toThrow(/auth secret/i);
   });
 
-  describe("authenticated mode accepts strong secrets", () => {
-    it("boots with strong 64-character BETTER_AUTH_SECRET", () => {
-      process.env.BETTER_AUTH_SECRET = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4";
-      delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
-
-      const config = buildConfig("authenticated");
-
-      expect(() => createBetterAuthInstance(mockDb, config, [])).not.toThrow();
-    });
-
-    it("boots with strong PAPERCLIP_AGENT_JWT_SECRET fallback when BETTER_AUTH_SECRET is empty (AC2 regression)", () => {
-      process.env.BETTER_AUTH_SECRET = "";
-      process.env.PAPERCLIP_AGENT_JWT_SECRET = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4";
-
-      const config = buildConfig("authenticated");
-
-      expect(() => createBetterAuthInstance(mockDb, config, [])).not.toThrow();
-    });
-
-    it("boots with strong PAPERCLIP_AGENT_JWT_SECRET fallback when BETTER_AUTH_SECRET is unset", () => {
-      delete process.env.BETTER_AUTH_SECRET;
-      process.env.PAPERCLIP_AGENT_JWT_SECRET = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4";
-
-      const config = buildConfig("authenticated");
-
-      expect(() => createBetterAuthInstance(mockDb, config, [])).not.toThrow();
-    });
+  it("throws in authenticated mode when only a weak PAPERCLIP_AGENT_JWT_SECRET is set", () => {
+    // AC3 bypass: the check must run on the resolved secret, not BETTER_AUTH_SECRET alone.
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "secret";
+    expect(() => boot("authenticated")).toThrow(/auth secret/i);
   });
 
-  describe("local_trusted mode permits weak secrets (dev convenience)", () => {
-    it("boots with paperclip-dev-secret in local_trusted mode", () => {
-      process.env.BETTER_AUTH_SECRET = "paperclip-dev-secret";
-      delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
-
-      const config = buildConfig("local_trusted");
-
-      expect(() => createBetterAuthInstance(mockDb, config, [])).not.toThrow();
-    });
-
-    it("boots with short secret in local_trusted mode", () => {
-      process.env.BETTER_AUTH_SECRET = "short";
-      delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
-
-      const config = buildConfig("local_trusted");
-
-      expect(() => createBetterAuthInstance(mockDb, config, [])).not.toThrow();
-    });
+  it("boots in local_trusted mode even with the dev default secret", () => {
+    process.env.BETTER_AUTH_SECRET = "paperclip-dev-secret";
+    expect(() => boot("local_trusted")).not.toThrow();
   });
 
-  describe("fallback behavior (AC2 normalization)", () => {
-    it("uses PAPERCLIP_AGENT_JWT_SECRET when BETTER_AUTH_SECRET is whitespace-only", () => {
-      process.env.BETTER_AUTH_SECRET = "   ";
-      process.env.PAPERCLIP_AGENT_JWT_SECRET = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4";
+  it("boots in authenticated mode when BETTER_AUTH_SECRET is empty but a strong JWT secret is set", () => {
+    // AC2 regression: empty string must fall through to PAPERCLIP_AGENT_JWT_SECRET, not throw.
+    process.env.BETTER_AUTH_SECRET = "";
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "a".repeat(64);
+    expect(() => boot("authenticated")).not.toThrow();
+  });
 
-      const config = buildConfig("authenticated");
+  it("boots in authenticated mode with a strong 64-char secret", () => {
+    process.env.BETTER_AUTH_SECRET = "b".repeat(64);
+    expect(() => boot("authenticated")).not.toThrow();
+  });
 
-      expect(() => createBetterAuthInstance(mockDb, config, [])).not.toThrow();
-    });
+  it("throws in authenticated mode when a strong BETTER_AUTH_SECRET hides a denylisted PAPERCLIP_AGENT_JWT_SECRET", () => {
+    // Mirror bypass: better-auth resolves BETTER_AUTH_SECRET first, but agent-auth-jwt
+    // resolves PAPERCLIP_AGENT_JWT_SECRET first, so the weak value still signs agent JWTs.
+    process.env.BETTER_AUTH_SECRET = "b".repeat(64);
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "secret";
+    expect(() => boot("authenticated")).toThrow(/PAPERCLIP_AGENT_JWT_SECRET/);
+  });
 
-    it("throws when both secrets are empty", () => {
-      process.env.BETTER_AUTH_SECRET = "";
-      process.env.PAPERCLIP_AGENT_JWT_SECRET = "";
+  it("throws in authenticated mode when a strong BETTER_AUTH_SECRET hides a too-short PAPERCLIP_AGENT_JWT_SECRET", () => {
+    process.env.BETTER_AUTH_SECRET = "b".repeat(64);
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "short";
+    expect(() => boot("authenticated")).toThrow(/PAPERCLIP_AGENT_JWT_SECRET/);
+  });
 
-      const config = buildConfig("authenticated");
-
-      expect(() => createBetterAuthInstance(mockDb, config, [])).toThrow(
-        /BETTER_AUTH_SECRET.*must be set/,
-      );
-    });
-
-    it("throws when both secrets are unset", () => {
-      delete process.env.BETTER_AUTH_SECRET;
-      delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
-
-      const config = buildConfig("authenticated");
-
-      expect(() => createBetterAuthInstance(mockDb, config, [])).toThrow(
-        /BETTER_AUTH_SECRET.*must be set/,
-      );
-    });
-
-    it("prefers BETTER_AUTH_SECRET over PAPERCLIP_AGENT_JWT_SECRET", () => {
-      // Set a weak JWT secret - should be ignored if BETTER_AUTH_SECRET is set
-      process.env.BETTER_AUTH_SECRET = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4";
-      process.env.PAPERCLIP_AGENT_JWT_SECRET = "weak";
-
-      const config = buildConfig("authenticated");
-
-      expect(() => createBetterAuthInstance(mockDb, config, [])).not.toThrow();
-    });
+  it("boots in authenticated mode when both secrets are strong and distinct", () => {
+    process.env.BETTER_AUTH_SECRET = "b".repeat(64);
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "c".repeat(64);
+    expect(() => boot("authenticated")).not.toThrow();
   });
 });

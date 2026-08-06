@@ -266,7 +266,7 @@ describe("startServer feedback export wiring", () => {
     });
     createBetterAuthInstanceMock.mockReturnValue({});
     deriveAuthTrustedOriginsMock.mockReturnValue([]);
-    process.env.BETTER_AUTH_SECRET = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4";
+    process.env.BETTER_AUTH_SECRET = "unit-test-strong-secret-0123456789abcdef";
   });
 
   it("passes the feedback export service into createApp so pending traces flush in runtime", async () => {
@@ -388,7 +388,7 @@ describe("startServer authenticated auth origin setup", () => {
     loadConfigMock.mockReturnValue(buildTestConfig());
     createBetterAuthInstanceMock.mockReturnValue({});
     deriveAuthTrustedOriginsMock.mockReturnValue([]);
-    process.env.BETTER_AUTH_SECRET = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4";
+    process.env.BETTER_AUTH_SECRET = "unit-test-strong-secret-0123456789abcdef";
   });
 
   it("derives trusted origins from the detected listen port before auth initializes", async () => {
@@ -432,7 +432,7 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     loadConfigMock.mockReturnValue(buildTestConfig());
-    process.env.BETTER_AUTH_SECRET = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4";
+    process.env.BETTER_AUTH_SECRET = "unit-test-strong-secret-0123456789abcdef";
     delete process.env.PAPERCLIP_API_URL;
   });
 
