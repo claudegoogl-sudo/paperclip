@@ -100,6 +100,16 @@ export const SECURITY_POSTURE_COLUMNS = [
 
   // --- Authorization and identity ---
   {
+    table: "activity_log",
+    column: "actor_source",
+    reason: "Auth credential class for the write (board_key / agent_key / session / etc.); NULL obscures provenance.",
+  },
+  {
+    table: "activity_log",
+    column: "actor_key_id",
+    reason: "API key UUID qualified by actor_source; clearing it buries which credential authenticated the write.",
+  },
+  {
     table: "agents",
     column: "role",
     reason: "Dangerous value 'ceo': an unconditional early-return in the authorization service, so a flatten grants every agent agent-creation and runtime-management authority.",

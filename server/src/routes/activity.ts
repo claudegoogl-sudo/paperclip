@@ -7,6 +7,7 @@ import { activityService, normalizeActivityLimit } from "../services/activity.js
 import { assertAuthenticated, assertBoard, assertCompanyAccess } from "./authz.js";
 import { accessService, heartbeatService, issueService } from "../services/index.js";
 import { sanitizeRecord } from "../redaction.js";
+import { getActorProvenance } from "../middleware/actor-context.js";
 
 const createActivitySchema = z.object({
   actorType: z.enum(["agent", "user", "system", "plugin"]).optional().default("system"),
@@ -92,10 +93,13 @@ export function activityRoutes(db: Db) {
     assertBoard(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    const provenance = getActorProvenance();
     const event = await svc.create({
       companyId,
       ...req.body,
       details: req.body.details ? sanitizeRecord(req.body.details) : null,
+      actorSource: provenance?.source ?? null,
+      actorKeyId: provenance?.keyId ?? null,
     });
     res.status(201).json(event);
   });
