@@ -110,6 +110,43 @@ async function runPnpm(cwd: string, args: string[]) {
   await execFileAsync("pnpm", args, { cwd });
 }
 
+// Some hosts running this suite (including self-hosted Paperclip agent runners) have a
+// real `paperclipai` CLI installed system-wide. Tests that exercise provision-worktree.sh's
+// "no CLI available" fallback path must not let that ambient binary leak in via PATH, or
+// they end up invoking the real CLI against real host state instead of the fixture under
+// test. This mirrors the rest of the ambient PATH (so `pnpm`, `node`, coreutils, etc. keep
+// working) while omitting any `paperclipai` entry.
+let ambientPathWithoutPaperclipaiPromise: Promise<string> | null = null;
+
+async function ambientPathWithoutPaperclipai(): Promise<string> {
+  if (!ambientPathWithoutPaperclipaiPromise) {
+    ambientPathWithoutPaperclipaiPromise = (async () => {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-ambient-path-"));
+      const seen = new Set<string>();
+      for (const ambientDir of (process.env.PATH ?? "").split(path.delimiter).filter(Boolean)) {
+        let entries: string[];
+        try {
+          entries = await fs.readdir(ambientDir);
+        } catch {
+          continue;
+        }
+        for (const entry of entries) {
+          if (entry === "paperclipai" || seen.has(entry)) continue;
+          seen.add(entry);
+          try {
+            await fs.symlink(path.join(ambientDir, entry), path.join(dir, entry));
+          } catch {
+            // A duplicate or unreadable entry; the earlier PATH dir's copy wins, matching
+            // normal PATH lookup order.
+          }
+        }
+      }
+      return dir;
+    })();
+  }
+  return ambientPathWithoutPaperclipaiPromise;
+}
+
 async function createTempRepo(defaultBranch = "main") {
   const repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-repo-"));
   await runGit(repoRoot, ["init"]);
@@ -1197,7 +1234,7 @@ describe("realizeExecutionWorkspace", () => {
     // Keep this server-side fixture on provision-worktree.sh's config writer path;
     // CLI/database seeding is covered by the CLI worktree tests.
     await fs.symlink(process.execPath, path.join(isolatedBin, "node"));
-    process.env.PATH = `${isolatedBin}${path.delimiter}/usr/bin${path.delimiter}/bin`;
+    process.env.PATH = `${isolatedBin}${path.delimiter}${await ambientPathWithoutPaperclipai()}`;
 
     await fs.mkdir(sharedConfigDir, { recursive: true });
     await fs.writeFile(
@@ -1432,33 +1469,44 @@ describe("realizeExecutionWorkspace", () => {
     await runGit(repoRoot, ["add", "."]);
     await runGit(repoRoot, ["commit", "-m", "Add pnpm workspace fixture"]);
 
-    const workspace = await realizeExecutionWorkspace({
-      base: {
-        baseCwd: repoRoot,
-        source: "project_primary",
-        projectId: "project-1",
-        workspaceId: "workspace-1",
-        repoUrl: null,
-        repoRef: "HEAD",
-      },
-      config: {
-        workspaceStrategy: {
-          type: "git_worktree",
-          branchTemplate: "{{issue.identifier}}-{{slug}}",
-          provisionCommand: "bash ./scripts/provision-worktree.sh",
+    const previousPath = process.env.PATH;
+    process.env.PATH = await ambientPathWithoutPaperclipai();
+    let workspace: RealizedExecutionWorkspace;
+    try {
+      workspace = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "HEAD",
         },
-      },
-      issue: {
-        id: "issue-1",
-        identifier: "PAP-551",
-        title: "Provision local workspace dependencies",
-      },
-      agent: {
-        id: "agent-1",
-        name: "Codex Coder",
-        companyId: "company-1",
-      },
-    });
+        config: {
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "{{issue.identifier}}-{{slug}}",
+            provisionCommand: "bash ./scripts/provision-worktree.sh",
+          },
+        },
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-551",
+          title: "Provision local workspace dependencies",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+      });
+    } finally {
+      if (previousPath === undefined) {
+        delete process.env.PATH;
+      } else {
+        process.env.PATH = previousPath;
+      }
+    }
 
     expect((await fs.lstat(path.join(workspace.cwd, "node_modules"))).isSymbolicLink()).toBe(false);
     expect((await fs.lstat(path.join(workspace.cwd, "server", "node_modules"))).isSymbolicLink()).toBe(false);
@@ -1512,33 +1560,44 @@ describe("realizeExecutionWorkspace", () => {
     await runGit(repoRoot, ["add", "package.json", "pnpm-lock.yaml", "scripts/provision-worktree.sh"]);
     await runGit(repoRoot, ["commit", "-m", "Add minimal provision fixture"]);
 
-    const workspace = await realizeExecutionWorkspace({
-      base: {
-        baseCwd: repoRoot,
-        source: "project_primary",
-        projectId: "project-1",
-        workspaceId: "workspace-1",
-        repoUrl: null,
-        repoRef: "HEAD",
-      },
-      config: {
-        workspaceStrategy: {
-          type: "git_worktree",
-          branchTemplate: "{{issue.identifier}}-{{slug}}",
-          provisionCommand: "bash ./scripts/provision-worktree.sh",
+    const previousPath = process.env.PATH;
+    process.env.PATH = await ambientPathWithoutPaperclipai();
+    let workspace: RealizedExecutionWorkspace;
+    try {
+      workspace = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "HEAD",
         },
-      },
-      issue: {
-        id: "issue-1",
-        identifier: "PAP-552",
-        title: "Install without moved symlinks",
-      },
-      agent: {
-        id: "agent-1",
-        name: "Codex Coder",
-        companyId: "company-1",
-      },
-    });
+        config: {
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "{{issue.identifier}}-{{slug}}",
+            provisionCommand: "bash ./scripts/provision-worktree.sh",
+          },
+        },
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-552",
+          title: "Install without moved symlinks",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+      });
+    } finally {
+      if (previousPath === undefined) {
+        delete process.env.PATH;
+      } else {
+        process.env.PATH = previousPath;
+      }
+    }
 
     await expect(fs.readFile(path.join(workspace.cwd, ".paperclip", "config.json"), "utf8")).resolves.toContain(
       "\"database\"",
@@ -1603,11 +1662,12 @@ describe("realizeExecutionWorkspace", () => {
       );
       await fs.chmod(fakePnpmPath, 0o755);
 
+      const safePath = await ambientPathWithoutPaperclipai();
       const runScript = () => execFileAsync(scriptPath, [], {
         cwd: worktreeRoot,
         env: {
           ...process.env,
-          PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+          PATH: `${fakeBin}:${safePath}`,
           PAPERCLIP_WORKSPACE_BASE_CWD: baseRoot,
           PAPERCLIP_WORKSPACE_CWD: worktreeRoot,
         },
@@ -1844,7 +1904,7 @@ describe("realizeExecutionWorkspace", () => {
         cwd: worktreeRoot,
         env: {
           ...process.env,
-          PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+          PATH: `${fakeBin}:${await ambientPathWithoutPaperclipai()}`,
           PAPERCLIP_WORKSPACE_BASE_CWD: baseRoot,
           PAPERCLIP_WORKSPACE_CWD: worktreeRoot,
         },
@@ -1924,33 +1984,44 @@ describe("realizeExecutionWorkspace", () => {
     await runGit(repoRoot, ["add", "."]);
     await runGit(repoRoot, ["commit", "-m", "Add pnpm workspace fixture"]);
 
-    const workspace = await realizeExecutionWorkspace({
-      base: {
-        baseCwd: repoRoot,
-        source: "project_primary",
-        projectId: "project-1",
-        workspaceId: "workspace-1",
-        repoUrl: null,
-        repoRef: "HEAD",
-      },
-      config: {
-        workspaceStrategy: {
-          type: "git_worktree",
-          branchTemplate: "{{issue.identifier}}-{{slug}}",
-          provisionCommand: "bash ./scripts/provision-worktree.sh",
+    const previousPath = process.env.PATH;
+    process.env.PATH = await ambientPathWithoutPaperclipai();
+    let workspace: RealizedExecutionWorkspace;
+    try {
+      workspace = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "HEAD",
         },
-      },
-      issue: {
-        id: "issue-1",
-        identifier: "PAP-551",
-        title: "Provision local workspace dependencies",
-      },
-      agent: {
-        id: "agent-1",
-        name: "Codex Coder",
-        companyId: "company-1",
-      },
-    });
+        config: {
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "{{issue.identifier}}-{{slug}}",
+            provisionCommand: "bash ./scripts/provision-worktree.sh",
+          },
+        },
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-551",
+          title: "Provision local workspace dependencies",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+      });
+    } finally {
+      if (previousPath === undefined) {
+        delete process.env.PATH;
+      } else {
+        process.env.PATH = previousPath;
+      }
+    }
 
     expect((await fs.lstat(path.join(workspace.cwd, "node_modules"))).isSymbolicLink()).toBe(false);
     expect((await fs.lstat(path.join(workspace.cwd, "server", "node_modules"))).isSymbolicLink()).toBe(false);
