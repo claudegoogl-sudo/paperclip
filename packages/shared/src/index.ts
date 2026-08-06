@@ -1698,12 +1698,3 @@ export {
   type CreateEnvironmentCustomImageTerminalSessionToken,
   type EnvironmentCustomImageTerminalSessionToken,
 } from "./validators/environment-custom-images.js";
-
-export {
-  MIN_AUTH_SECRET_LENGTH,
-  WEAK_AUTH_SECRET_DENYLIST,
-  weakAuthSecretReason,
-  isWeakAuthSecret,
-  AUTH_SECRET_ENV_KEYS,
-  weakAuthSecretEnvReason,
-} from "./auth-secret.js";
