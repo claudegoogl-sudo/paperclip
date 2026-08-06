@@ -119,6 +119,52 @@ test("classifyBackups never drops unrecognized filenames (conservative default)"
   assert.ok(!prune.some((e) => e.name === "some-other-file.txt"));
 });
 
+test("classifyBackups excludes unverified archives from keep slots (AC7)", () => {
+  // 74 hourly dumps, newest 24 are normally always kept. Mark the newest one
+  // as unverified (ISIZE=0 / truncated) -- it must NOT take a keep slot, so
+  // the 25th-newest gets promoted into the hourly keep set instead.
+  const entries = [];
+  const start = Date.UTC(2026, 6, 31, 21, 8, 4);
+  for (let i = 0; i < 74; i += 1) {
+    const t = new Date(start - i * 60 * 60 * 1000);
+    const name = `paperclip-${t.toISOString().slice(0, 10).replace(/-/g, "")}-${t
+      .toISOString()
+      .slice(11, 19)
+      .replace(/:/g, "")}.sql.gz`;
+    entries.push({ name, sizeBytes: 280_000_000, verified: i !== 0 });
+  }
+  const { keep, unverified } = classifyBackups(entries, CONFIG);
+  // The newest entry is unverified, so it must not occupy a keep slot.
+  const newestName = entries[0].name;
+  assert.ok(!keep.some((e) => e.name === newestName), "unverified archive must not be in keep");
+  assert.ok(unverified.some((e) => e.name === newestName), "unverified archive must be surfaced");
+  // run() deletes both `unverified` and `prune`, so unverified archives are
+  // their own bucket (disjoint from prune) -- the keep-slot exclusion is the
+  // load-bearing assertion for AC7.
+  // Promoted: the 25th-newest would normally be pruned but here takes the
+  // freed hourly slot, so keep still has the full complement.
+  assert.ok(keep.length >= 24);
+});
+
+test("classifyBackups treats undefined `verified` as verified (purity default)", () => {
+  // Synthetic test fixtures and callers that do not care about content checks
+  // must keep working: omitting `verified` is the same as `verified: true`.
+  const entries = [
+    { name: "paperclip-20260731-210804.sql.gz", sizeBytes: 100 },
+    { name: "paperclip-20260730-210804.sql.gz", sizeBytes: 100, verified: true },
+    { name: "paperclip-20260729-210804.sql.gz", sizeBytes: 100, verified: false },
+  ];
+  const { keep, unverified } = classifyBackups(entries, CONFIG);
+  const keepNames = new Set(keep.map((e) => e.name));
+  assert.ok(keepNames.has("paperclip-20260731-210804.sql.gz"), "undefined verified keeps slot");
+  assert.ok(keepNames.has("paperclip-20260730-210804.sql.gz"), "verified:true keeps slot");
+  assert.ok(
+    !keepNames.has("paperclip-20260729-210804.sql.gz"),
+    "verified:false excluded from keep",
+  );
+  assert.equal(unverified.length, 1);
+});
+
 // ---------------------------------------------------------------------------
 // Age helper: newest-inner-file, not top-level mtime
 // ---------------------------------------------------------------------------
