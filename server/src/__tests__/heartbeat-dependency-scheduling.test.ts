@@ -2,25 +2,17 @@ import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  activityLog,
-  agents,
-  agentRuntimeState,
   agentWakeupRequests,
-  companySkills,
+  agents,
   companies,
   createDb,
-  documentRevisions,
-  documents,
-  environmentLeases,
   environments,
   executionWorkspaces,
-  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
-  issueDocuments,
+  issues,
   issueRelations,
   issueTreeHolds,
-  issues,
   workspaceOperations,
 } from "@paperclipai/db";
 import {
@@ -29,6 +21,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { runningProcesses } from "../adapters/index.ts";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -111,58 +104,14 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       model: "test-model",
     }));
     runningProcesses.clear();
-    let idlePolls = 0;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      const runs = await db
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns);
-      const hasActiveRun = runs.some((run) => run.status === "queued" || run.status === "running");
-      if (!hasActiveRun) {
-        idlePolls += 1;
-        if (idlePolls >= 3) break;
-      } else {
-        idlePolls = 0;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    // Quiescence period: heartbeatRunEvents may be written after run status transitions
-    // to terminal (e.g., appendRunEvent at heartbeat.ts:10288 after setRunStatus).
-    // The polling above only checks heartbeatRuns.status, so we wait a bit for
-    // post-status-change async side effects to complete before teardown.
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    await db.delete(environmentLeases);
-    await db.delete(activityLog);
-    await db.delete(companySkills);
-    await db.delete(issueComments);
-    await db.delete(issueDocuments);
-    await db.delete(documentRevisions);
-    await db.delete(documents);
-    await db.delete(issueRelations);
-    await db.delete(issueTreeHolds);
-    await db.delete(issues);
-    await db.delete(heartbeatRunEvents);
-    await db.delete(activityLog);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(agents);
-    await db.delete(companySkills);
+    // Heartbeat finalization keeps writing run-linked rows in the background
+    // after the test function returns; see resetEmbeddedPostgresTestDatabase
+    // for why an atomic TRUNCATE ... CASCADE doesn't race that write burst the
+    // way an ordered per-table DELETE chain does.
+    await resetEmbeddedPostgresTestDatabase(db);
+    // environments is a global table, not FK-chained to companies, so the
+    // TRUNCATE ... CASCADE above doesn't touch it.
     await db.delete(environments);
-    await db.delete(workspaceOperations);
-    await db.delete(executionWorkspaces);
-    await db.delete(environmentLeases);
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      try {
-        await db.transaction(async (tx) => {
-          await tx.delete(companySkills);
-          await tx.delete(companies);
-        });
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
   });
 
   afterAll(async () => {

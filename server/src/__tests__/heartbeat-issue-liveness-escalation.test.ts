@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -24,6 +24,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -103,7 +104,11 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
-    await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
+    // Heartbeat finalization keeps writing run-linked rows in the background
+    // after the test function returns; see resetEmbeddedPostgresTestDatabase
+    // for why an atomic TRUNCATE ... CASCADE doesn't race that write burst the
+    // way an ordered per-table DELETE chain does.
+    await resetEmbeddedPostgresTestDatabase(db);
     await instanceSettingsService(db).updateExperimental({
       enableIssueGraphLivenessAutoRecovery: false,
       enableIsolatedWorkspaces: false,
