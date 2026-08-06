@@ -3168,6 +3168,70 @@ describeEmbeddedPostgres("secretService", () => {
         svc.enforceBindingEgress({ companyId: otherCompany, bindingId }),
       ).rejects.toThrow(/not found/i);
     });
+
+    it("turns enforcement OFF when enforced=false (surface ships before gate flip)", async () => {
+      const { companyId, svc, bindingId } = await seedMigratedBinding();
+      await svc.setBindingEgressAllowlist({
+        companyId,
+        bindingId,
+        allowedEgress: ["https://api.github.com"],
+      });
+      await svc.enforceBindingEgress({ companyId, bindingId });
+      const pre = await reloadBinding(bindingId);
+      expect(pre.egressAllowlistEnforced).toBe(true);
+
+      // Operator confirms "Stop enforcing" in the UI; the panel sends enforced=false.
+      const off = await svc.enforceBindingEgress({ companyId, bindingId, enforced: false });
+      expect(off.binding.egressAllowlistEnforced).toBe(false);
+      // allowEmpty is irrelevant in the off direction.
+      const offAgain = await svc.enforceBindingEgress({
+        companyId,
+        bindingId,
+        enforced: false,
+        allowEmpty: true,
+      });
+      expect(offAgain.binding.egressAllowlistEnforced).toBe(false);
+
+      // Row in DB matches.
+      const row = await reloadBinding(bindingId);
+      expect(row.egressAllowlistEnforced).toBe(false);
+      // Allowlist contents are preserved across the off-flip.
+      expect(row.allowedEgress).toEqual(["https://api.github.com"]);
+    });
+
+    it("purges in-flight handles on the off-flip too (EG3)", async () => {
+      const { companyId, svc, bindingId } = await seedMigratedBinding();
+      await svc.setBindingEgressAllowlist({
+        companyId,
+        bindingId,
+        allowedEgress: ["https://api.github.com"],
+      });
+      await svc.enforceBindingEgress({ companyId, bindingId });
+
+      // Handle minted under enforced=true.
+      const handle = mintHandle(RUN_ID, SECRET_VALUE, {
+        allowedEgress: ["https://api.github.com"],
+        enforced: true,
+        bindingId,
+      });
+      expect(getHandleRecord(RUN_ID, handle)).toBeDefined();
+
+      const off = await svc.enforceBindingEgress({ companyId, bindingId, enforced: false });
+      expect(off.handlesPurged).toBe(1);
+      expect(getHandleRecord(RUN_ID, handle)).toBeUndefined();
+    });
+
+    it("defaults enforced to true for back-compat with pre-surface callers", async () => {
+      const { companyId, svc, bindingId } = await seedMigratedBinding();
+      await svc.setBindingEgressAllowlist({
+        companyId,
+        bindingId,
+        allowedEgress: ["https://api.github.com"],
+      });
+      // No `enforced` field at all — the pre-existing call shape.
+      const flip = await svc.enforceBindingEgress({ companyId, bindingId });
+      expect(flip.binding.egressAllowlistEnforced).toBe(true);
+    });
   });
 
   it("records audited ephemeral secret access without requiring a persisted binding", async () => {

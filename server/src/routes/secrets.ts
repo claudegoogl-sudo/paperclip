@@ -925,9 +925,11 @@ export function secretRoutes(db: Db) {
       const bindingId = req.params.bindingId as string;
       assertCompanyAccess(req, companyId);
 
+      const enforced = req.body.enforced !== false;
       const result = await svc.enforceBindingEgress({
         companyId,
         bindingId,
+        enforced,
         allowEmpty: req.body.allowEmpty,
       });
 
@@ -935,7 +937,9 @@ export function secretRoutes(db: Db) {
         companyId,
         actorType: "user",
         actorId: req.actor.userId ?? "board",
-        action: "secret.egress_allowlist_enforced",
+        action: enforced
+          ? "secret.egress_allowlist_enforced"
+          : "secret.egress_allowlist_unenforced",
         entityType: "secret_binding",
         entityId: bindingId,
         details: {

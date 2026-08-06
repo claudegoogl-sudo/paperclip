@@ -3557,28 +3557,40 @@ export function secretService(db: Db) {
     },
 
     /**
-     * SECURITY-CRITICAL: operator-only, flip ONE migrated binding to enforcing.
+     * SECURITY-CRITICAL: operator-only, flip ONE migrated binding's enforcement
+     * posture (enforce ←→ log_only).
      *
      * Deliberately per-binding, never a blanket UPDATE: operators sign off one
      * binding at a time as they review its harvested allowlist, so a misjudged
      * allowlist breaks a single binding rather than every migrated secret at
      * once (no breakage cliff).
      *
-     * Refuses to enforce a binding whose `allowedEgress` is empty (that would
-     * deny ALL egress) unless `allowEmpty` is set for a deliberate deny-all.
+     * Direction is controlled by `enforced` (default `true` for back-compat with
+     * callers that pre-date the operator-reachable surface). `enforced: false`
+     * turns enforcement OFF — the operator-surface "Stop enforcing" confirm is
+     * the only path that sends it. Refuses to enforce a binding whose
+     * `allowedEgress` is empty (that would deny ALL egress) unless `allowEmpty`
+     * is set for a deliberate deny-all; the empty-allowlist guard does not apply
+     * to the off direction.
      *
-     * On flip, purges in-flight handles minted under this binding (EG3) so the
-     * next mint captures `enforced: true` immediately instead of at handle TTL.
-     * Idempotent: re-flipping an already-enforcing binding is a no-op flip plus
-     * an idempotent purge.
+     * On either flip, purges in-flight handles minted under this binding (EG3)
+     * so the next mint captures the new posture immediately instead of at
+     * handle TTL. Idempotent: re-flipping an already-enforcing binding is a
+     * no-op flip plus an idempotent purge.
      */
     enforceBindingEgress: async (input: {
       companyId: string;
       bindingId: string;
+      enforced?: boolean;
       allowEmpty?: boolean;
     }) => {
       const binding = await loadOwnedBinding(input.companyId, input.bindingId);
-      if (binding.allowedEgress.length === 0 && input.allowEmpty !== true) {
+      const nextEnforced = input.enforced !== false;
+      if (
+        nextEnforced &&
+        binding.allowedEgress.length === 0 &&
+        input.allowEmpty !== true
+      ) {
         throw conflict(
           `Refusing to enforce egress on binding ${binding.id} with an empty allowlist ` +
             `(would deny all egress for this secret). Seed allowedEgress first, or pass ` +
@@ -3587,7 +3599,7 @@ export function secretService(db: Db) {
       }
       const updated = await db
         .update(companySecretBindings)
-        .set({ egressAllowlistEnforced: true, updatedAt: new Date() })
+        .set({ egressAllowlistEnforced: nextEnforced, updatedAt: new Date() })
         .where(eq(companySecretBindings.id, binding.id))
         .returning()
         .then((rows) => rows[0]);
@@ -3597,9 +3609,13 @@ export function secretService(db: Db) {
           companyId: input.companyId,
           bindingId: binding.id,
           handlesPurged,
-          action: "secret.egress_allowlist_enforced",
+          action: nextEnforced
+            ? "secret.egress_allowlist_enforced"
+            : "secret.egress_allowlist_unenforced",
         },
-        "flipped secret binding egress allowlist to enforcing",
+        nextEnforced
+          ? "flipped secret binding egress allowlist to enforcing"
+          : "flipped secret binding egress allowlist back to log_only",
       );
       return { binding: updated, handlesPurged };
     },
