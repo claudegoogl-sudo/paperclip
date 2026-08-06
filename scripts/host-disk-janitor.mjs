@@ -35,7 +35,10 @@
 
 import { execFileSync } from "node:child_process";
 import {
+  closeSync,
   existsSync,
+  openSync,
+  readSync,
   readdirSync,
   readFileSync,
   lstatSync,
@@ -162,6 +165,34 @@ function isoWeekKey(date) {
 }
 
 /**
+ * Read the ISIZE field from a gzip archive (last 4 bytes, little-endian).
+ * Returns null if the file cannot be read.
+ */
+function readGzipIsize(archivePath) {
+  try {
+    const stat = lstatSync(archivePath);
+    const buffer = Buffer.alloc(4);
+    const fd = openSync(archivePath, "r");
+    try {
+      readSync(fd, buffer, 0, 4, stat.size - 4);
+      return buffer.readUInt32LE(0);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Check if a gzip archive passes verification (has non-zero ISIZE).
+ */
+function isArchiveVerified(archivePath) {
+  const isize = readGzipIsize(archivePath);
+  return isize !== null && isize > 0;
+}
+
+/**
  * Classify backup dump files into keep/prune/unrecognized sets.
  * `entries` is [{ name, sizeBytes }]. Pure function -- no filesystem or
  * wall-clock access -- so it is fully unit-testable.
@@ -169,14 +200,31 @@ function isoWeekKey(date) {
 export function classifyBackups(entries, config = CONFIG) {
   const parsed = [];
   const unrecognized = [];
+  const unverified = [];
+
   for (const entry of entries) {
+    // Exclude .partial files and .sql files (only .sql.gz are complete backups)
+    if (!entry.name.endsWith(".sql.gz") || entry.name.endsWith(".partial")) {
+      unrecognized.push(entry);
+      continue;
+    }
+
     const ts = parseBackupTimestamp(entry.name, config.BACKUPS_FILENAME_PATTERN);
     if (!ts) {
       unrecognized.push(entry);
       continue;
     }
+
+    // Check verification - unverified archives cannot occupy keep slots
+    const fullPath = path.join(config.BACKUPS_DIR, entry.name);
+    if (!isArchiveVerified(fullPath)) {
+      unverified.push(entry);
+      continue;
+    }
+
     parsed.push({ ...entry, ts });
   }
+
   parsed.sort((a, b) => b.ts.getTime() - a.ts.getTime());
 
   const keep = new Set();
@@ -208,6 +256,7 @@ export function classifyBackups(entries, config = CONFIG) {
     keep: parsed.filter((e) => keep.has(e.name)),
     prune,
     unrecognized,
+    unverified,
   };
 }
 
@@ -634,9 +683,10 @@ export async function run({ apply = false, nowMs = Date.now(), config = CONFIG }
           .filter((e) => e.isFile())
           .map((e) => ({ name: e.name, sizeBytes: statSize(path.join(config.BACKUPS_DIR, e.name)) }))
       : [];
-    const { keep, prune, unrecognized } = classifyBackups(entries, config);
+    const { keep, prune, unrecognized, unverified } = classifyBackups(entries, config);
     if (apply) {
-      for (const e of prune) {
+      // Delete unverified and pruned files
+      for (const e of [...unverified, ...prune]) {
         try {
           unlinkSync(path.join(config.BACKUPS_DIR, e.name));
         } catch {
@@ -649,8 +699,10 @@ export async function run({ apply = false, nowMs = Date.now(), config = CONFIG }
       keptFiles: keep.length,
       prunedFiles: prune.length,
       unrecognizedFiles: unrecognized.length,
-      reclaimedBytes: prune.reduce((sum, e) => sum + e.sizeBytes, 0),
+      unverifiedFiles: unverified.length,
+      reclaimedBytes: [...unverified, ...prune].reduce((sum, e) => sum + e.sizeBytes, 0),
       prunedNames: prune.map((e) => e.name),
+      unverifiedNames: unverified.map((e) => e.name),
     };
   }
 
@@ -771,7 +823,7 @@ function printSummary(summary) {
   console.log("");
   console.log(
     `backups:     ${c.backups.prunedFiles}/${c.backups.totalFiles} files ${summary.mode === "apply" ? "deleted" : "would delete"}, ` +
-      `${bytesToHuman(c.backups.reclaimedBytes)} ${summary.mode === "apply" ? "freed" : "reclaimable"} (kept ${c.backups.keptFiles}, unrecognized ${c.backups.unrecognizedFiles})`,
+      `${bytesToHuman(c.backups.reclaimedBytes)} ${summary.mode === "apply" ? "freed" : "reclaimable"} (kept ${c.backups.keptFiles}, unrecognized ${c.backups.unrecognizedFiles}, unverified ${c.backups.unverifiedFiles})`,
   );
   console.log(
     `run-logs:    ${c.runLogs.prunedFiles}/${c.runLogs.totalFiles} files ${summary.mode === "apply" ? "deleted" : "would delete"}, ` +

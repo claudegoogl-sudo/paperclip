@@ -1,4 +1,4 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { closeSync, createReadStream, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
@@ -122,15 +122,28 @@ function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, fi
   const weeklyCutoff = now - Math.max(1, retention.weeklyWeeks) * 7 * 24 * 60 * 60 * 1000;
   const monthlyCutoff = now - Math.max(1, retention.monthlyMonths) * 30 * 24 * 60 * 60 * 1000;
 
-  type BackupEntry = { name: string; fullPath: string; mtimeMs: number };
+  type BackupEntry = { name: string; fullPath: string; mtimeMs: number; verified: boolean };
   const entries: BackupEntry[] = [];
 
   for (const name of readdirSync(backupDir)) {
     if (!name.startsWith(`${filenamePrefix}-`)) continue;
-    if (!name.endsWith(".sql") && !name.endsWith(".sql.gz")) continue;
+    // Only .sql.gz files are backups; .sql files are intermediate, .partial are incomplete
+    if (!name.endsWith(".sql.gz")) continue;
+    // Exclude .partial files
+    if (name.endsWith(".partial")) continue;
+
     const fullPath = resolve(backupDir, name);
     const stat = statSync(fullPath);
-    entries.push({ name, fullPath, mtimeMs: stat.mtimeMs });
+    const verified = isArchiveVerified(fullPath);
+
+    // Unverified archives cannot occupy keep slots
+    if (!verified) {
+      // Delete unverified archives immediately
+      unlinkSync(fullPath);
+      continue;
+    }
+
+    entries.push({ name, fullPath, mtimeMs: stat.mtimeMs, verified });
   }
 
   // Sort newest first so the first entry per week/month bucket is the one we keep
@@ -292,6 +305,167 @@ function appendCapturedStderr(previous: string, chunk: Buffer | string): string 
   return Buffer.from(next, "utf8").subarray(-BACKUP_CLI_STDERR_BYTES).toString("utf8");
 }
 
+/**
+ * Read the ISIZE field from a gzip archive (last 4 bytes, little-endian).
+ * ISIZE is the uncompressed size modulo 2^32.
+ */
+export async function readGzipIsize(archivePath: string): Promise<number> {
+  const stat = statSync(archivePath);
+  const buffer = Buffer.alloc(4);
+  const file = await openFile(archivePath, "r");
+  try {
+    const { bytesRead } = await file.read(buffer, 0, 4, stat.size - 4);
+    if (bytesRead !== 4) {
+      throw new Error(`Failed to read ISIZE from ${archivePath}: only ${bytesRead} bytes read`);
+    }
+    return buffer.readUInt32LE(0);
+  } finally {
+    await file.close();
+  }
+}
+
+/**
+ * Verify a gzip archive contains the expected uncompressed size.
+ * For files >= 4GB, ISIZE wraps, so we must stream to verify.
+ */
+export async function verifyGzipUncompressedSize(archivePath: string, expectedSize: number): Promise<void> {
+  const expectedSizeMod32 = expectedSize >>> 0; // mod 2^32
+
+  // For files under 4GB, ISIZE is exact
+  if (expectedSize < 2 ** 32) {
+    const isize = await readGzipIsize(archivePath);
+    if (isize !== expectedSizeMod32) {
+      throw new Error(
+        `Backup verification failed: compressed archive ISIZE ${isize} does not match source size ${expectedSize}`,
+      );
+    }
+    return;
+  }
+
+  // For files >= 4GB, ISIZE wraps, so stream through byte counter
+  let byteCount = 0;
+  const raw = createReadStream(archivePath);
+  const stream = raw.pipe(createGunzip());
+
+  try {
+    for await (const chunk of stream) {
+      byteCount += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk));
+    }
+  } finally {
+    stream.destroy();
+    raw.destroy();
+  }
+
+  // Byte count should match expected size exactly
+  if (byteCount !== expectedSize) {
+    throw new Error(
+      `Backup verification failed: streamed decompressed size ${byteCount} does not match source size ${expectedSize}`,
+    );
+  }
+}
+
+/**
+ * Verify a pg_dump gzip archive has non-zero content and contains plausible dump markers.
+ * No source size to compare against for pg_dump.
+ */
+export async function verifyPgDumpArchive(archivePath: string): Promise<void> {
+  let byteCount = 0;
+  let hasPlausibleContent = false;
+
+  // Look for markers that indicate a real pg_dump output
+  const plausibleMarkers = [
+    "--",
+    "CREATE",
+    "ALTER",
+    "INSERT",
+    "SELECT",
+    "SET",
+    "BEGIN",
+    "COMMIT",
+  ];
+
+  const raw = createReadStream(archivePath);
+  const stream = raw.pipe(createGunzip());
+  let tailBuffer = "";
+
+  try {
+    for await (const chunk of stream) {
+      byteCount += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk));
+      const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+
+      // Check for plausible pg_dump markers
+      for (const marker of plausibleMarkers) {
+        if (text.toUpperCase().includes(marker)) {
+          hasPlausibleContent = true;
+          break;
+        }
+      }
+      if (hasPlausibleContent) break;
+
+      // Keep last few KB to check for dump tail markers
+      tailBuffer = (tailBuffer + text).slice(-8192);
+    }
+  } finally {
+    stream.destroy();
+    raw.destroy();
+  }
+
+  if (byteCount === 0) {
+    throw new Error(
+      `Backup verification failed: archive decompressed to zero bytes`,
+    );
+  }
+
+  // Check for common pg_dump tail markers
+  const tailUpper = tailBuffer.toUpperCase();
+  const hasTailMarker = plausibleMarkers.some(m => tailUpper.includes(m));
+
+  if (!hasPlausibleContent || !hasTailMarker) {
+    throw new Error(
+      `Backup verification failed: archive does not contain plausible pg_dump content`,
+    );
+  }
+}
+
+/**
+ * Write a failure marker file for backup verification failures.
+ * This is read by inspectDatabaseBackupHealth via alertFileCandidates.
+ */
+export function writeBackupFailureMarker(backupDir: string, reason: string, sourcePath: string): void {
+  const failurePath = resolve(backupDir, "db-backup-to-s3.failure");
+  const message = `Backup verification failed: ${reason}. Source file preserved at: ${sourcePath}`;
+  writeFileSync(failurePath, message, "utf8");
+}
+
+/**
+ * Synchronous version of readGzipIsize for use in retention checks.
+ * Reads only the last 4 bytes of the file to extract ISIZE.
+ */
+function readGzipIsizeSync(archivePath: string): number {
+  const stat = statSync(archivePath);
+  const buffer = Buffer.alloc(4);
+  const fd = openSync(archivePath, "r");
+  try {
+    readSync(fd, buffer, 0, 4, stat.size - 4);
+    return buffer.readUInt32LE(0);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Check if a gzip archive passes verification (has non-zero ISIZE).
+ * Returns true if verified, false if verification fails.
+ */
+export function isArchiveVerified(archivePath: string): boolean {
+  try {
+    const isize = readGzipIsizeSync(archivePath);
+    return isize > 0;
+  } catch {
+    return false;
+  }
+}
+
 async function waitForChildExit(child: ReturnType<typeof spawn>, label: string): Promise<void> {
   let stderr = "";
   child.stderr?.on("data", (chunk) => {
@@ -317,6 +491,8 @@ async function runPgDumpBackup(opts: {
   connectTimeout: number;
 }): Promise<void> {
   const pgDumpBin = process.env.PAPERCLIP_PG_DUMP_PATH || "pg_dump";
+  const partialFile = `${opts.backupFile}.partial`;
+
   const child = spawn(
     pgDumpBin,
     [
@@ -341,9 +517,15 @@ async function runPgDumpBackup(opts: {
   }
 
   await Promise.all([
-    pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile)),
+    pipeline(child.stdout, createGzip(), createWriteStream(partialFile)),
     waitForChildExit(child, pgDumpBin),
   ]);
+
+  // Verify the archive before making it live
+  await verifyPgDumpArchive(partialFile);
+
+  // Atomic rename
+  renameSync(partialFile, opts.backupFile);
 }
 
 async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: number): Promise<void> {
@@ -955,11 +1137,29 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
     await writer.close();
 
-    // Compress the SQL file with gzip
+    // Capture source size for verification
+    const sourceSize = statSync(sqlFile).size;
+
+    // Compress the SQL file with gzip to a .partial filename
+    const partialFile = `${backupFile}.partial`;
     const sqlReadStream = createReadStream(sqlFile);
-    const gzWriteStream = createWriteStream(backupFile);
+    const gzWriteStream = createWriteStream(partialFile);
     await pipeline(sqlReadStream, createGzip(), gzWriteStream);
-    unlinkSync(sqlFile);
+
+    try {
+      // Verify uncompressed size matches source exactly
+      await verifyGzipUncompressedSize(partialFile, sourceSize);
+
+      // Verification passed: delete raw SQL and atomically rename
+      unlinkSync(sqlFile);
+      renameSync(partialFile, backupFile);
+    } catch (verificationError) {
+      // Verification failed: keep raw SQL, delete partial, write marker, throw
+      unlinkSync(partialFile);
+      const backupDir = opts.backupDir;
+      writeBackupFailureMarker(backupDir, String(verificationError), sqlFile);
+      throw verificationError;
+    }
 
     const sizeBytes = statSync(backupFile).size;
     const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
@@ -971,10 +1171,17 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     };
   } catch (error) {
     await writer.abort();
+    // Only delete backupFile if it exists (not for verification failures)
     if (existsSync(backupFile)) {
       try { unlinkSync(backupFile); } catch { /* ignore */ }
     }
-    if (existsSync(sqlFile)) {
+    // Clean up any stray .partial file
+    const partialFile = `${backupFile}.partial`;
+    if (existsSync(partialFile)) {
+      try { unlinkSync(partialFile); } catch { /* ignore */ }
+    }
+    // Note: sqlFile is preserved on verification failure, deleted on success
+    if (existsSync(sqlFile) && !(error instanceof Error && error.message.includes("Backup verification failed"))) {
       try { unlinkSync(sqlFile); } catch { /* ignore */ }
     }
     throw error;
