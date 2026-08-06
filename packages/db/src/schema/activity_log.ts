@@ -18,6 +18,15 @@ export const activityLog = pgTable(
     // deleting a heartbeat_runs row doesn't violate the FK constraint;
     // re-submit upstream once the fork PR freeze lifts.
     runId: uuid("run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
+    // Provenance of the credential that authenticated the write (migration 0145).
+    // actorSource is the resolved credential class from actorMiddleware
+    // ("session", "board_key", "agent_key", etc.); actorKeyId is the API key id
+    // qualified by actorSource: the board API key id when actor_source = 'board_key',
+    // the agent API key id when actor_source = 'agent_key', null for sources that
+    // carry no key (session, agent_jwt, local_implicit, none). Populated centrally
+    // by logActivity from AsyncLocalStorage — never carries the token value itself.
+    actorSource: text("actor_source"),
+    actorKeyId: uuid("actor_key_id"),
     details: jsonb("details").$type<Record<string, unknown>>(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },

@@ -4,12 +4,20 @@ import { basename } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { MIGRATION_SAFETY_BASELINE } from "./migration-safety-baseline.js";
 import {
+  assertSchemaColumnsClassified,
   assertSecurityPostureColumnsResolve,
   isSecurityPostureTable,
   matchedPostureColumns,
   postureColumnsForTable,
   type SecurityPostureColumn,
 } from "./security-posture-columns.js";
+import type { SecurityPostureRejection } from "./security-posture-rejections.js";
+import {
+  assertTenancyBindingKeysResolve,
+  matchedTenancyKeys,
+  tenancyKeysForTable,
+  type TenancyBindingKey,
+} from "./tenancy-binding-keys.js";
 import {
   getTableSizeEstimate,
   isKnownLargeTable,
@@ -23,13 +31,15 @@ export type MigrationSafetyRule =
   | "batched-mutation-large-table-missing-index"
   | "full-table-mutation-large-table"
   | "large-create-index-not-concurrently"
-  | "unqualified-mutation-security-posture-column";
+  | "unqualified-mutation-security-posture-column"
+  | "unqualified-mutation-tenancy-key";
 
 // Rules that model security risk rather than performance risk. Excluded from the
 // `migration-safety-ignore all` wildcard so a perf-motivated blanket ignore
 // cannot quietly disarm a security check — silencing these must name the rule.
 const SECURITY_RULES = new Set<MigrationSafetyRule>([
   "unqualified-mutation-security-posture-column",
+  "unqualified-mutation-tenancy-key",
 ]);
 
 export type MigrationSafetySeverity = "error" | "warning";
@@ -99,6 +109,10 @@ const RULE_METADATA: Record<MigrationSafetyRule, RuleMetadata> = {
   "unqualified-mutation-security-posture-column": {
     severity: "error",
     message: "Unqualified mutation of a registered security-posture column",
+  },
+  "unqualified-mutation-tenancy-key": {
+    severity: "error",
+    message: "Unqualified mutation of a tenancy or binding-scope key",
   },
 };
 
@@ -1130,6 +1144,65 @@ function securityPostureFinding(
   );
 }
 
+/**
+ * Detect unqualified mutations of tenancy/binding-scope keys.
+ *
+ * This rule catches the same pattern as securityPostureFinding, but for a
+ * different threat model: tenancy and binding-scope keys determine *which
+ * scope* a row belongs to, not what security posture it has. Flattening one
+ * re-points a row at the wrong tenant — the enforcement still runs correctly,
+ * just against the wrong scope.
+ *
+ * Tenancy keys include:
+ * - `company_id` on any table (universal tenancy column)
+ * - Explicitly-registered scope keys: `scope_kind`/`scope_id` on plugin_state,
+ *   plugin_entities, budget_policies, workspace_runtime_services, budget_incidents
+ * - `policy_id` on budget_incidents (parent policy binding)
+ *
+ * Detection is the same as security-posture: an UPDATE/DELETE/TRUNCATE without
+ * a selective WHERE clause that touches a registered tenancy key.
+ *
+ * Known limitation: for DELETE/TRUNCATE, this only reports explicitly-registered
+ * scope keys, not `company_id`. The parser doesn't have the table's column list
+ * available at analysis time, so it can't know whether `company_id` exists.
+ * This is acceptable because:
+ * - Unqualified DELETE/TRUNCATE on a tenanted table is already suspicious
+ * - UPDATE SET company_id = ... is the common dangerous pattern, and IS caught
+ * - New tables with company_id will still be protected for UPDATE statements
+ */
+function tenancyBindingKeyFinding(
+  mutation: MutationInfo,
+  migration: string,
+  statement: string,
+  estimates: ReadonlyMap<string, TableSizeEstimate>,
+): MigrationSafetyFinding | null {
+  const rule = "unqualified-mutation-tenancy-key" as const;
+  if (isIgnored(statement, rule)) return null;
+
+  const endIndex = mutationBodyEnd(mutation.statementSql, mutation.keywordIndex);
+  if (!isUnqualifiedMutation(mutation, endIndex)) return null;
+
+  let columns: string[];
+  if (mutation.kind === "update") {
+    // For UPDATE, we have the SET clause and can check for company_id.
+    columns = matchedTenancyKeys(mutation.table, updateSetColumns(mutation, endIndex));
+  } else {
+    // For DELETE/TRUNCATE, we can only report explicitly-registered scope keys,
+    // because we don't know if the table has company_id without reading the schema.
+    columns = tenancyKeysForTable(mutation.table).filter((c) => c !== "company_id");
+  }
+  if (columns.length === 0) return null;
+
+  return makeFinding(
+    rule,
+    migration,
+    mutation.table,
+    statement,
+    estimates,
+    `kind=${mutation.kind}, columns=${columns.join(", ")}`,
+  );
+}
+
 export function analyzeMigrationSafety(
   migrations: readonly MigrationSafetyInput[],
   options: {
@@ -1171,6 +1244,9 @@ export function analyzeMigrationSafety(
       for (const mutation of allMutations) {
         const finding = securityPostureFinding(mutation, migration.fileName, statement, estimates);
         if (finding) addFindingOnce(findings, seen, finding);
+
+        const tenancyFinding = tenancyBindingKeyFinding(mutation, migration.fileName, statement, estimates);
+        if (tenancyFinding) addFindingOnce(findings, seen, tenancyFinding);
       }
 
       const mutations = allMutations.filter(
@@ -1328,15 +1404,20 @@ export function assertSecurityBaselineReasons(
  * that: a drifted entry must reject *here*, not only in the unit test for
  * `assertSecurityPostureColumnsResolve`.
  *
- * Registry drift is checked before any migration is read. An unresolvable
- * registry means the security rule below is inspecting statements against pairs
- * that match nothing, so there is no point running it first and reporting green.
+ * Registry drift is checked before any migration is read, in both directions.
+ * An unresolvable registry means the security rule below is inspecting
+ * statements against pairs that match nothing, and an unclassified schema column
+ * means the rule is not inspecting it at all — neither is worth running the
+ * migration pass on top of and reporting green.
  */
 export async function runMigrationSafetyCheck(
   postureEntries?: readonly SecurityPostureColumn[],
+  rejectionEntries?: readonly SecurityPostureRejection[],
 ): Promise<string> {
   assertSecurityBaselineReasons();
   assertSecurityPostureColumnsResolve(undefined, postureEntries);
+  assertTenancyBindingKeysResolve();
+  assertSchemaColumnsClassified(undefined, postureEntries, rejectionEntries);
   const result = analyzeMigrationSafety(await readMigrations());
 
   if (result.newFindings.length > 0) {

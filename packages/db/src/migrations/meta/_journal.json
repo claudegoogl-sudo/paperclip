@@ -1002,6 +1002,13 @@
       "when": 1783100800000,
       "tag": "0144_secret_binding_posture_audit",
       "breakpoints": true
+    },
+    {
+      "idx": 145,
+      "version": "7",
+      "when": 1783100900000,
+      "tag": "0145_activity_log_actor_provenance",
+      "breakpoints": true
     }
   ]
 }

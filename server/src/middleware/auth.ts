@@ -1,5 +1,5 @@
 import { createHash, timingSafeEqual } from "node:crypto";
-import type { Request, RequestHandler } from "express";
+import type { Application, Request, RequestHandler } from "express";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -15,6 +15,7 @@ import {
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
 import { isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
+import { actorProvenanceMiddleware } from "./actor-context.js";
 import { logger } from "./logger.js";
 import { boardAuthService } from "../services/board-auth.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
@@ -371,6 +372,23 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
 
     next();
   };
+}
+
+/**
+ * Registers the actor-resolution + provenance-capture middleware pair on `app`
+ * in the one order that works: `actorMiddleware` populates `req.actor`, then
+ * `actorProvenanceMiddleware` binds its credential provenance into
+ * AsyncLocalStorage so `logActivity` records it centrally.
+ *
+ * Both `createApp` (production wiring) and the provenance regression test go
+ * through this single function on purpose: dropping the provenance registration
+ * here turns that test red instead of letting production silently write NULL
+ * provenance forever — the failure mode an audit control cannot afford.
+ */
+export function registerActorContext(app: Application, db: Db, opts: ActorMiddlewareOptions): void {
+  app.use(actorMiddleware(db, opts));
+  // Must run after actorMiddleware, which is what populates req.actor.
+  app.use(actorProvenanceMiddleware());
 }
 
 export async function resolveCloudTenantActor(db: Db, req: Request): Promise<Express.Request["actor"] | null> {

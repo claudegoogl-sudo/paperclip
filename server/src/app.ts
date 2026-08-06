@@ -7,7 +7,7 @@ import type { DeploymentExposure, DeploymentMode } from "@paperclipai/shared";
 import type { InspectDatabaseBackupHealthOptions } from "./services/database-backup-health.js";
 import type { StorageService } from "./storage/types.js";
 import { httpLogger, errorHandler, requestQueryCancellation } from "./middleware/index.js";
-import { actorMiddleware } from "./middleware/auth.js";
+import { registerActorContext } from "./middleware/auth.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
 import { privateHostnameGuard, resolvePrivateHostnameAllowSet } from "./middleware/private-hostname-guard.js";
 import { applyTrustProxy, parseTrustProxyEnv } from "./middleware/trust-proxy.js";
@@ -234,12 +234,14 @@ export async function createApp(
       bindHost: opts.bindHost,
     }),
   );
-  app.use(
-    actorMiddleware(db, {
-      deploymentMode: opts.deploymentMode,
-      resolveSession: opts.resolveSession,
-    }),
-  );
+  // Resolve the acting credential (req.actor) and bind its provenance into
+  // AsyncLocalStorage so logActivity records it centrally. The provenance
+  // regression test drives the same registerActorContext, so removing the
+  // provenance registration turns that test red instead of silently logging NULL.
+  registerActorContext(app, db, {
+    deploymentMode: opts.deploymentMode,
+    resolveSession: opts.resolveSession,
+  });
   app.use("/api/auth", authRoutes(db));
   if (opts.betterAuthHandler) {
     app.all("/api/auth/{*authPath}", opts.betterAuthHandler);

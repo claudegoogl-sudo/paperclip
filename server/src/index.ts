@@ -18,6 +18,7 @@ import {
   formatEmbeddedPostgresError,
   getPostgresDataDirectory,
   inspectMigrations,
+  inspectMigrationPreflight,
   applyPendingMigrations,
   createEmbeddedPostgresLogBuffer,
   prepareEmbeddedPostgresNativeRuntime,
@@ -168,6 +169,40 @@ export async function startServer(): Promise<StartedServer> {
     opts?: EnsureMigrationsOptions,
   ): Promise<MigrationSummary> {
     const autoApply = opts?.autoApply === true;
+
+    // Before applying anything, record what the pending set is and flag identity
+    // drift — a migration whose file contents changed after it was recorded as
+    // applied. This makes an out-of-band package/content swap loud instead of a
+    // silent boot-time re-run.
+    const preflight = await inspectMigrationPreflight(connectionString);
+    if (preflight.pending.length > 0) {
+      logger.info(
+        { label, pendingMigrations: preflight.pending },
+        `${label} has ${preflight.pending.length} pending migration(s)`,
+      );
+    }
+    for (const drift of preflight.drift) {
+      logger.warn(
+        {
+          label,
+          migrationFile: drift.migrationFile,
+          recordedHash: drift.recordedHash,
+          currentHash: drift.currentHash,
+        },
+        `${label} migration identity drift: ${drift.migrationFile} was recorded as applied under a ` +
+          `different content hash than the file now on disk. The migration file's contents changed ` +
+          `underneath an already-applied name; re-applying it may be unintended.`,
+      );
+    }
+    if (preflight.unverifiable.length > 0) {
+      logger.warn(
+        { label, unverifiableMigrations: preflight.unverifiable },
+        `${label} cannot verify migration identity for ${preflight.unverifiable.length} already-applied ` +
+          `migration(s) because this cluster has no recorded file identity for them (it predates identity ` +
+          `tracking). A content swap in these files cannot be ruled out; treat "no drift" as undecided, not clean.`,
+      );
+    }
+
     let state = await inspectMigrations(connectionString);
     if (state.status === "needsMigrations" && state.reason === "pending-migrations") {
       const repair = await reconcilePendingMigrationHistory(connectionString);
