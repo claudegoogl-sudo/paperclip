@@ -188,6 +188,11 @@ export const SECURITY_POSTURE_COLUMNS = [
   },
   {
     table: "board_api_keys",
+    column: "scope_config",
+    reason: "Dangerous value NULL/{kind:'standard'}/unparseable: normalizeBoardApiKeyScope returns {kind:'standard'} on any parse failure, so clearing it silently unscopes every plugin_ops key back to full authority.",
+  },
+  {
+    table: "board_api_keys",
     column: "expires_at",
     reason: "Dangerous value NULL: the lookup short-circuits on !expiresAt, so NULL means never expires and makes every operator-scope key immortal.",
   },
@@ -250,6 +255,11 @@ export const SECURITY_POSTURE_COLUMNS = [
     table: "cli_auth_challenges",
     column: "requested_access",
     reason: "Dangerous value 'board' (also the column default): strips the instance-admin approval requirement from every pending challenge.",
+  },
+  {
+    table: "cli_auth_challenges",
+    column: "pending_key_scope_config",
+    reason: "Dangerous value NULL/{kind:'standard'}/unparseable: written verbatim onto board_api_keys.scope_config when the challenge is approved, so a flatten here is a flatten there — every plugin_ops login lands as an unscoped owner key.",
   },
   {
     table: "cli_auth_challenges",

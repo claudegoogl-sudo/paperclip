@@ -1,4 +1,5 @@
-import { pgTable, uuid, text, timestamp, index } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, index, jsonb } from "drizzle-orm/pg-core";
+import type { BoardApiKeyScope } from "@paperclipai/shared";
 import { authUsers } from "./auth.js";
 import { companies } from "./companies.js";
 import { boardApiKeys } from "./board_api_keys.js";
@@ -14,6 +15,11 @@ export const cliAuthChallenges = pgTable(
     requestedCompanyId: uuid("requested_company_id").references(() => companies.id, { onDelete: "set null" }),
     pendingKeyHash: text("pending_key_hash").notNull(),
     pendingKeyName: text("pending_key_name").notNull(),
+    // Scope to write onto the board API key when this challenge is approved.
+    // Null/absent means unscoped (the historical behaviour). The CLI's connect
+    // path populates this with { kind: "plugin_ops" } so the bootstrap key
+    // landed in ~/.paperclip/auth.json is scoped, not unscoped.
+    pendingKeyScopeConfig: jsonb("pending_key_scope_config").$type<BoardApiKeyScope | null>(),
     approvedByUserId: text("approved_by_user_id").references(() => authUsers.id, { onDelete: "set null" }),
     boardApiKeyId: uuid("board_api_key_id").references(() => boardApiKeys.id, { onDelete: "set null" }),
     approvedAt: timestamp("approved_at", { withTimezone: true }),

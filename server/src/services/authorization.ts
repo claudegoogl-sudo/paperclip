@@ -11,7 +11,7 @@ import {
   principalPermissionGrants,
   projects,
 } from "@paperclipai/db";
-import type { AgentApiKeyScope, PermissionKey, PrincipalType, TaskBridgeAgentKeyScope } from "@paperclipai/shared";
+import type { AgentApiKeyScope, BoardApiKeyScope, PermissionKey, PrincipalType, TaskBridgeAgentKeyScope } from "@paperclipai/shared";
 import { LOW_TRUST_REVIEW_PRESET, extractAgentMentionIds, type LowTrustBoundary } from "@paperclipai/shared";
 import {
   LOW_TRUST_ISSUE_ANCESTRY_MAX_DEPTH,
@@ -34,6 +34,7 @@ export type AuthorizationActor =
     companyId?: string | null;
     keyId?: string | null;
     keyScope?: AgentApiKeyScope | null;
+    boardKeyScope?: BoardApiKeyScope | null;
     runId?: string | null;
     onBehalfOfUserId?: string | null;
     source?:
