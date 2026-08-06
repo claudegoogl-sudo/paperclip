@@ -81,6 +81,20 @@ describe("better-auth secret strength validation", () => {
         /Auth secret must be at least 32 characters/,
       );
     });
+
+    it("throws on denylisted PAPERCLIP_AGENT_JWT_SECRET 'secret' even with strong BETTER_AUTH_SECRET", () => {
+      // Denylist check catches the mirror bypass where agent JWTs are signed
+      // with a weak/denylisted key that better-auth never validated.
+      // Note: 'secret' is only 6 chars, so it fails the length check before denylist.
+      process.env.BETTER_AUTH_SECRET = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4";
+      process.env.PAPERCLIP_AGENT_JWT_SECRET = "secret";
+
+      const config = buildConfig("authenticated");
+
+      expect(() => createBetterAuthInstance(mockDb, config, [])).toThrow(
+        /PAPERCLIP_AGENT_JWT_SECRET: .* must be at least 32 characters/,
+      );
+    });
   });
 
   describe("authenticated mode accepts strong secrets", () => {
@@ -105,6 +119,15 @@ describe("better-auth secret strength validation", () => {
     it("boots with strong PAPERCLIP_AGENT_JWT_SECRET fallback when BETTER_AUTH_SECRET is unset", () => {
       delete process.env.BETTER_AUTH_SECRET;
       process.env.PAPERCLIP_AGENT_JWT_SECRET = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4";
+
+      const config = buildConfig("authenticated");
+
+      expect(() => createBetterAuthInstance(mockDb, config, [])).not.toThrow();
+    });
+
+    it("boots with both BETTER_AUTH_SECRET and PAPERCLIP_AGENT_JWT_SECRET strong", () => {
+      process.env.BETTER_AUTH_SECRET = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4";
+      process.env.PAPERCLIP_AGENT_JWT_SECRET = "b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c";
 
       const config = buildConfig("authenticated");
 
@@ -164,14 +187,18 @@ describe("better-auth secret strength validation", () => {
       );
     });
 
-    it("prefers BETTER_AUTH_SECRET over PAPERCLIP_AGENT_JWT_SECRET", () => {
-      // Set a weak JWT secret - should be ignored if BETTER_AUTH_SECRET is set
+    it("throws when PAPERCLIP_AGENT_JWT_SECRET is weak even if BETTER_AUTH_SECRET is strong (FINDING-1 mirror bypass)", () => {
+      // Both keys must be strong in authenticated mode — agent JWTs are signed
+      // with PAPERCLIP_AGENT_JWT_SECRET, so a weak value there means forgeable tokens
+      // even if BETTER_AUTH_SECRET (used for better-auth sessions) is strong.
       process.env.BETTER_AUTH_SECRET = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4";
-      process.env.PAPERCLIP_AGENT_JWT_SECRET = "weak";
+      process.env.PAPERCLIP_AGENT_JWT_SECRET = "secret";
 
       const config = buildConfig("authenticated");
 
-      expect(() => createBetterAuthInstance(mockDb, config, [])).not.toThrow();
+      expect(() => createBetterAuthInstance(mockDb, config, [])).toThrow(
+        /PAPERCLIP_AGENT_JWT_SECRET: .* must be at least 32 characters/,
+      );
     });
   });
 });

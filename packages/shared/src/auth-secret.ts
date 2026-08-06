@@ -17,6 +17,16 @@ const WEAK_SECRET_DENYLIST = new Set([
 const MIN_SECRET_LENGTH = 32;
 
 /**
+ * All environment variables that can hold auth secrets.
+ * Better-auth prefers BETTER_AUTH_SECRET; agent JWT signing prefers PAPERCLIP_AGENT_JWT_SECRET.
+ * BOTH must be strong in authenticated mode — either can be used to sign forgeable tokens.
+ */
+export const AUTH_SECRET_ENV_KEYS = [
+  "BETTER_AUTH_SECRET",
+  "PAPERCLIP_AGENT_JWT_SECRET",
+] as const;
+
+/**
  * Check if an auth secret is known-weak or too short.
  * Returns null if the secret passes validation, or an error message describing the problem.
  *
@@ -45,6 +55,44 @@ export function validateAuthSecretStrength(
   const normalized = secret.toLowerCase();
   if (WEAK_SECRET_DENYLIST.has(normalized)) {
     return `Auth secret "${secret}" is known-weak and must not be used in authenticated mode. Generate one with: openssl rand -hex 32`;
+  }
+
+  return null;
+}
+
+/**
+ * Check if ANY set (non-empty after trim) auth secret is weak.
+ *
+ * This prevents a mirror bypass where BETTER_AUTH_SECRET is strong (satisfying
+ * better-auth's validation) but PAPERCLIP_AGENT_JWT_SECRET is weak (used to sign
+ * agent JWTs). Both keys must be strong in authenticated mode.
+ *
+ * @param env - Process environment containing the secret variables
+ * @param deploymentMode - The current deployment mode
+ * @returns null if all set secrets are valid, or an error string describing the first weak secret found
+ */
+export function weakAuthSecretEnvReason(
+  env: Record<string, string | undefined>,
+  deploymentMode: string,
+): string | null {
+  // Only enforce in authenticated mode
+  if (deploymentMode !== "authenticated") {
+    return null;
+  }
+
+  for (const key of AUTH_SECRET_ENV_KEYS) {
+    const rawValue = env[key];
+    if (!rawValue) continue; // Skip unset keys (AC2 fallthrough)
+
+    const value = rawValue.trim();
+    if (value === "") continue; // Skip empty keys (AC2 fallthrough)
+
+    // Check this specific key
+    const error = validateAuthSecretStrength(value, deploymentMode);
+    if (error) {
+      // Add the key name to the error message for clarity
+      return `${key}: ${error}`;
+    }
   }
 
   return null;

@@ -12,7 +12,7 @@ import {
 } from "@paperclipai/db";
 import type { Config } from "../config.js";
 import { resolvePaperclipInstanceId } from "../home-paths.js";
-import { validateAuthSecretStrength } from "@paperclipai/shared";
+import { weakAuthSecretEnvReason } from "@paperclipai/shared";
 
 export type BetterAuthSessionUser = {
   id: string;
@@ -134,7 +134,9 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
     );
   }
 
-  const strengthError = validateAuthSecretStrength(secret, config.deploymentMode);
+  // Validate BOTH keys (not just the resolved one) to prevent mirror bypass
+  // where agent JWTs are signed with a weak key that better-auth never checked.
+  const strengthError = weakAuthSecretEnvReason(process.env, config.deploymentMode);
   if (strengthError) {
     throw new Error(strengthError);
   }

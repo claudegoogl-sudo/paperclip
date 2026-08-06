@@ -1692,6 +1692,8 @@ export {
 
 export {
   validateAuthSecretStrength,
+  weakAuthSecretEnvReason,
+  AUTH_SECRET_ENV_KEYS,
   WEAK_SECRET_DENYLIST,
   MIN_SECRET_LENGTH,
 } from "./auth-secret.js";

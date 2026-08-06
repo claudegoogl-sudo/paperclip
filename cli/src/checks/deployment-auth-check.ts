@@ -1,4 +1,4 @@
-import { inferBindModeFromHost, validateAuthSecretStrength } from "@paperclipai/shared";
+import { inferBindModeFromHost, weakAuthSecretEnvReason } from "@paperclipai/shared";
 import type { PaperclipConfig } from "../config/schema.js";
 import type { CheckResult } from "./index.js";
 
@@ -38,7 +38,9 @@ export function deploymentAuthCheck(config: PaperclipConfig): CheckResult {
     };
   }
 
-  const strengthError = validateAuthSecretStrength(secret, mode);
+  // Validate BOTH keys (not just the resolved one) to prevent mirror bypass
+  // where agent JWTs are signed with a weak key that better-auth never checked.
+  const strengthError = weakAuthSecretEnvReason(process.env, mode);
   if (strengthError) {
     return {
       name: "Deployment/auth mode",
