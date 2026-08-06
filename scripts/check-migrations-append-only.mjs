@@ -29,11 +29,13 @@
  * the runner still re-applies the DML because the content — hence the hash —
  * is new. Keying on blob OID makes the invariant path-independent.
  *
- * Base ref: the PR base commit (`base.sha`, i.e. the tip of the branch being
- * merged into — normally `master`). A migration is treated as "released" when
- * it is already journaled on that base ref; comparing against the base rather
- * than a release tag keeps the check self-contained to the PR diff and needs
- * no tag lookup.
+ * Base ref: the merge-base of the PR head and the base ref (`base.sha` is the
+ * tip of the branch being merged into, normally `master`). The merge-base is the
+ * common ancestor where the PR branch diverged; using it instead of the base
+ * tip ensures a PR that is merely behind master is not punished for migrations
+ * it never had. A migration is treated as "released" when it is already journaled
+ * at that merge-base; comparing against the merge-base rather than a release tag
+ * keeps the check self-contained to the PR diff and needs no tag lookup.
  *
  * Allowed, by construction (the base blob still exists at head):
  *   - Adding a new migration file (its OID is simply new; existing OIDs are
@@ -202,6 +204,21 @@ function refResolvesToCommit(execImpl, ref) {
   }
 }
 
+/**
+ * Compute the merge-base of two refs using `git merge-base`. Returns the SHA
+ * of the common ancestor, or `null` if the refs have unrelated histories.
+ */
+function gitMergeBase(execImpl, ref1, ref2) {
+  try {
+    return execImpl("git", ["merge-base", ref1, ref2], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
 export function runCheck({ baseRef, headRef, execImpl = execFileSync, log = console.log, error = console.error } = {}) {
   if (!baseRef || !headRef) {
     error("check-migrations-append-only: both baseRef and headRef are required");
@@ -222,21 +239,33 @@ export function runCheck({ baseRef, headRef, execImpl = execFileSync, log = cons
     }
   }
 
-  const journalText = gitShowOrNull(execImpl, baseRef, JOURNAL_PATH);
+  // Resolve the effective base as the merge-base of baseRef and headRef. This
+  // ensures a PR that is merely behind master is not punished for migrations it
+  // never had — the merge-base is the common ancestor where the branch diverged.
+  const effectiveBase = gitMergeBase(execImpl, baseRef, headRef);
+  if (!effectiveBase) {
+    error(
+      `check-migrations-append-only: failed to compute merge-base of "${baseRef}" and "${headRef}" — refusing to pass (fail closed). ` +
+        "This usually indicates unrelated histories.",
+    );
+    return 1;
+  }
+
+  const journalText = gitShowOrNull(execImpl, effectiveBase, JOURNAL_PATH);
   if (journalText === null) {
-    // No journal at the base ref (e.g. a brand-new tree): nothing is
+    // No journal at the effective base (e.g. a brand-new tree): nothing is
     // "released" yet, so there is nothing to protect.
-    log(`  ✓  No ${JOURNAL_PATH} at base ref; no released migrations to check.`);
+    log(`  ✓  No ${JOURNAL_PATH} at effective base; no released migrations to check.`);
     return 0;
   }
 
   const baseTags = parseJournalTags(journalText);
   if (baseTags.length === 0) {
-    log(`  ✓  ${JOURNAL_PATH} at base ref lists no migrations; nothing released to check.`);
+    log(`  ✓  ${JOURNAL_PATH} at effective base lists no migrations; nothing released to check.`);
     return 0;
   }
 
-  const baseBlobs = gitLsTreeBlobs(execImpl, baseRef);
+  const baseBlobs = gitLsTreeBlobs(execImpl, effectiveBase);
   // Survival must be measured over the files the RUNNER actually reads: `.sql`
   // files directly in the migrations dir (client.ts readdir + isFile +
   // endsWith(".sql"), non-recursive). Bytes parked where the runner never looks
@@ -250,7 +279,7 @@ export function runCheck({ baseRef, headRef, execImpl = execFileSync, log = cons
 
   if (violations.length > 0) {
     const enriched = violations.map((v) => {
-      const baseContent = gitShowOrNull(execImpl, baseRef, v.file);
+      const baseContent = gitShowOrNull(execImpl, effectiveBase, v.file);
       const headContent = gitShowOrNull(execImpl, headRef, v.file);
       return {
         file: v.file,
