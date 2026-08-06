@@ -114,7 +114,7 @@ function monthKey(date: Date): string {
  * - Monthly tier: keep the NEWEST backup per calendar month for `monthlyMonths` months
  * - Everything else is deleted
  */
-function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, filenamePrefix: string): number {
+export function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, filenamePrefix: string): number {
   if (!existsSync(backupDir)) return 0;
 
   const now = Date.now();
@@ -124,6 +124,7 @@ function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, fi
 
   type BackupEntry = { name: string; fullPath: string; mtimeMs: number; verified: boolean };
   const entries: BackupEntry[] = [];
+  let unverifiedDeleted = 0;
 
   for (const name of readdirSync(backupDir)) {
     if (!name.startsWith(`${filenamePrefix}-`)) continue;
@@ -140,6 +141,7 @@ function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, fi
     if (!verified) {
       // Delete unverified archives immediately
       unlinkSync(fullPath);
+      unverifiedDeleted += 1;
       continue;
     }
 
@@ -189,7 +191,7 @@ function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, fi
     unlinkSync(filePath);
   }
 
-  return toDelete.length;
+  return toDelete.length + unverifiedDeleted;
 }
 
 function formatBackupSize(sizeBytes: number): string {

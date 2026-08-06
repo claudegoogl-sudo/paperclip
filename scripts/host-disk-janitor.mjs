@@ -166,11 +166,14 @@ function isoWeekKey(date) {
 
 /**
  * Read the ISIZE field from a gzip archive (last 4 bytes, little-endian).
- * Returns null if the file cannot be read.
+ * Returns null if the file cannot be read or is too small to be a valid gzip
+ * archive. This is the same on-disk check used by backup-lib's runBackup, but
+ * duplicated here so the janitor does not depend on the db package.
  */
-function readGzipIsize(archivePath) {
+export function readGzipIsize(archivePath) {
   try {
     const stat = lstatSync(archivePath);
+    if (stat.size < 8) return null;
     const buffer = Buffer.alloc(4);
     const fd = openSync(archivePath, "r");
     try {
@@ -187,15 +190,21 @@ function readGzipIsize(archivePath) {
 /**
  * Check if a gzip archive passes verification (has non-zero ISIZE).
  */
-function isArchiveVerified(archivePath) {
+export function isArchiveVerified(archivePath) {
   const isize = readGzipIsize(archivePath);
   return isize !== null && isize > 0;
 }
 
 /**
  * Classify backup dump files into keep/prune/unrecognized sets.
- * `entries` is [{ name, sizeBytes }]. Pure function -- no filesystem or
- * wall-clock access -- so it is fully unit-testable.
+ *
+ * `entries` is `[{ name, sizeBytes, verified? }]`. Pure function -- no
+ * filesystem or wall-clock access -- so it is fully unit-testable. Callers
+ * that have access to the filesystem should populate `verified` from
+ * `isArchiveVerified()`; entries with `verified === false` are excluded from
+ * keep slots (AC7) and surfaced in `unverified` instead. Entries with
+ * `verified === undefined` default to "verified" so synthetic test fixtures
+ * and callers that do not care about content checks keep working.
  */
 export function classifyBackups(entries, config = CONFIG) {
   const parsed = [];
@@ -215,9 +224,10 @@ export function classifyBackups(entries, config = CONFIG) {
       continue;
     }
 
-    // Check verification - unverified archives cannot occupy keep slots
-    const fullPath = path.join(config.BACKUPS_DIR, entry.name);
-    if (!isArchiveVerified(fullPath)) {
+    // AC7: an archive that fails content verification cannot occupy a keep
+    // slot. `verified === undefined` is treated as verified so the function
+    // remains pure and unit-testable without touching the filesystem.
+    if (entry.verified === false) {
       unverified.push(entry);
       continue;
     }
@@ -678,11 +688,22 @@ export async function run({ apply = false, nowMs = Date.now(), config = CONFIG }
   // -- backups --
   {
     const dirExists = existsSync(config.BACKUPS_DIR);
-    const entries = dirExists
+    const rawEntries = dirExists
       ? readdirSync(config.BACKUPS_DIR, { withFileTypes: true })
           .filter((e) => e.isFile())
-          .map((e) => ({ name: e.name, sizeBytes: statSize(path.join(config.BACKUPS_DIR, e.name)) }))
+          .map((e) => {
+            const fullPath = path.join(config.BACKUPS_DIR, e.name);
+            return { name: e.name, sizeBytes: statSize(fullPath), fullPath };
+          })
       : [];
+    // Populate `verified` from disk so classifyBackups stays pure. .sql.gz is
+    // the only shape we treat as a backup candidate; only those need an ISIZE
+    // probe (cheap: 4 bytes per file).
+    const entries = rawEntries.map((e) =>
+      e.name.endsWith(".sql.gz") && !e.name.endsWith(".partial")
+        ? { ...e, verified: isArchiveVerified(e.fullPath) }
+        : e,
+    );
     const { keep, prune, unrecognized, unverified } = classifyBackups(entries, config);
     if (apply) {
       // Delete unverified and pruned files
