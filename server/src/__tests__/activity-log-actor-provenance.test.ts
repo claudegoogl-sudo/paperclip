@@ -373,4 +373,48 @@ describeEmbeddedPostgres("activity_log actor provenance via the request middlewa
     );
     expect(sessionCalls.length).toBe(0);
   });
+
+  // PLA-2235 AC-C: Unknown/unset actor sources must not default to "session"
+  it("logs unknown/unset actor source as unknown, never as session (PLA-2235)", async () => {
+    const app = buildApp("correct");
+
+    // Directly call getActorInfo with a request that has an unset source
+    // Simulate a request with unset source by creating a mock request
+    const mockReq = {
+      actor: {
+        type: "user" as const,
+        userId: operatorUserId,
+        source: undefined as "session" | "board_key" | "cloud_tenant" | "local_implicit" | undefined,
+        runId: null,
+      },
+    };
+
+    // Import getActorInfo
+    const { getActorInfo } = await import("../routes/authz");
+
+    // Test with unset source
+    const result1 = getActorInfo(mockReq as any);
+    expect(result1.actorSource).toBe("unknown");
+    expect(result1.actorSource).not.toBe("session");
+
+    // Test with an unrecognized source value
+    mockReq.actor.source = "some_future_source" as any;
+    const result2 = getActorInfo(mockReq as any);
+    expect(result2.actorSource).toBe("some_future_source");
+    expect(result2.actorSource).not.toBe("session");
+
+    // Test that explicit "session" source is still preserved
+    mockReq.actor.source = "session";
+    const result3 = getActorInfo(mockReq as any);
+    expect(result3.actorSource).toBe("session");
+
+    // Test other recognized sources are preserved
+    mockReq.actor.source = "board_key";
+    const result4 = getActorInfo(mockReq as any);
+    expect(result4.actorSource).toBe("board_key");
+
+    mockReq.actor.source = "cloud_tenant";
+    const result5 = getActorInfo(mockReq as any);
+    expect(result5.actorSource).toBe("cloud_tenant");
+  });
 });

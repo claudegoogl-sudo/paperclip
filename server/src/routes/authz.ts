@@ -147,12 +147,7 @@ export function getActorInfo(req: Request): (
     };
   }
 
-  const actorSource =
-    req.actor.source === "local_implicit" ||
-      req.actor.source === "board_key" ||
-      req.actor.source === "cloud_tenant"
-      ? req.actor.source
-      : "session";
+  const actorSource = req.actor.source === "session" ? "session" : (req.actor.source ?? "unknown");
 
   return {
     actorType: "user" as const,
