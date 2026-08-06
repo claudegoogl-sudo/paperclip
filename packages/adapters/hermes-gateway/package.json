@@ -1,6 +1,6 @@
 {
   "name": "@paperclipai/adapter-hermes-gateway",
-  "version": "0.1.0",
+  "version": "2026.707.0-fork.12",
   "description": "Deprecated compatibility shim for Hermes Gateway; use @paperclipai/hermes-paperclip-adapter/gateway",
   "type": "module",
   "license": "MIT",
