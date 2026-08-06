@@ -10424,6 +10424,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const costs = costService(db, budgetHooks);
       await costs.createEvent(agent.companyId, {
         heartbeatRunId: run.id,
+        runIdentifier: run.id,
         agentId: agent.id,
         issueId: ledgerScope.issueId,
         projectId: ledgerScope.projectId,
