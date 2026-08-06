@@ -8,7 +8,6 @@ describe("agent local JWT", () => {
   const ttlEnv = "PAPERCLIP_AGENT_JWT_TTL_SECONDS";
   const issuerEnv = "PAPERCLIP_AGENT_JWT_ISSUER";
   const audienceEnv = "PAPERCLIP_AGENT_JWT_AUDIENCE";
-  const disableLegacyFallbackEnv = "PAPERCLIP_AGENT_JWT_DISABLE_LEGACY_FALLBACK";
   const instanceIdEnv = "PAPERCLIP_INSTANCE_ID";
 
   const originalEnv = {
@@ -17,7 +16,6 @@ describe("agent local JWT", () => {
     ttl: process.env[ttlEnv],
     issuer: process.env[issuerEnv],
     audience: process.env[audienceEnv],
-    disableLegacyFallback: process.env[disableLegacyFallbackEnv],
     instanceId: process.env[instanceIdEnv],
   };
 
@@ -27,7 +25,6 @@ describe("agent local JWT", () => {
     process.env[ttlEnv] = "3600";
     delete process.env[issuerEnv];
     delete process.env[audienceEnv];
-    delete process.env[disableLegacyFallbackEnv];
     delete process.env[instanceIdEnv];
     vi.useFakeTimers();
   });
@@ -44,8 +41,6 @@ describe("agent local JWT", () => {
     else process.env[issuerEnv] = originalEnv.issuer;
     if (originalEnv.audience === undefined) delete process.env[audienceEnv];
     else process.env[audienceEnv] = originalEnv.audience;
-    if (originalEnv.disableLegacyFallback === undefined) delete process.env[disableLegacyFallbackEnv];
-    else process.env[disableLegacyFallbackEnv] = originalEnv.disableLegacyFallback;
     if (originalEnv.instanceId === undefined) delete process.env[instanceIdEnv];
     else process.env[instanceIdEnv] = originalEnv.instanceId;
   });
@@ -132,17 +127,13 @@ describe("agent local JWT", () => {
     expect(verifyLocalAgentJwt(tampered)).toBeNull();
   });
 
-  it("accepts legacy tokens signed with the master secret (backward compat)", () => {
-    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
-    const masterSecret = process.env[secretEnv]!;
-
-    // Hand-craft a token signed directly with the master secret, simulating a
-    // JWT issued before per-company derivation existed.
+  // Helper: hand-craft a token signed with the raw master secret (legacy path).
+  function craftLegacyMasterSecretToken(masterSecret: string, companyId: string) {
     const now = Math.floor(Date.now() / 1000);
     const header = { alg: "HS256", typ: "JWT" };
     const claims = {
       sub: "agent-legacy",
-      company_id: "company-legacy",
+      company_id: companyId,
       adapter_type: "claude_local",
       run_id: "run-legacy",
       iat: now,
@@ -154,15 +145,20 @@ describe("agent local JWT", () => {
     const claimsB64 = Buffer.from(JSON.stringify(claims), "utf8").toString("base64url");
     const signingInput = `${headerB64}.${claimsB64}`;
     const legacySig = createHmac("sha256", masterSecret).update(signingInput).digest("base64url");
-    const legacyToken = `${signingInput}.${legacySig}`;
+    return `${signingInput}.${legacySig}`;
+  }
 
-    const verified = verifyLocalAgentJwt(legacyToken);
-    expect(verified).toMatchObject({
-      sub: "agent-legacy",
-      company_id: "company-legacy",
-      adapter_type: "claude_local",
-      run_id: "run-legacy",
-    });
+  it("rejects raw-master-secret-signed tokens under default config (fail-closed)", () => {
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    // Hand-craft a token signed directly with the master secret, simulating a
+    // JWT issued before per-company derivation existed (or a forged token
+    // produced by an attacker who recovered the shared master secret). The
+    // verifier must reject it under the default configuration: the only
+    // accepted signature is the one bound to the per-instance, per-company
+    // derived key. The raw-master verification fallback that used to
+    // grandfather these tokens has been removed.
+    const legacyToken = craftLegacyMasterSecretToken(process.env[secretEnv]!, "company-legacy");
+    expect(verifyLocalAgentJwt(legacyToken)).toBeNull();
   });
 
   // --- Instance isolation (PAP-12899) ---------------------------------------
@@ -192,9 +188,9 @@ describe("agent local JWT", () => {
     expect(verifyLocalAgentJwt(forkToken!)?.company_id).toBe("company-1");
 
     // Now switch to the live control plane (same shared secret, "default"
-    // instance) and confirm the fork token no longer authenticates — neither
-    // its instance-scoped signature nor the legacy master-secret fallback
-    // matches, so reads and writes are both refused.
+    // instance) and confirm the fork token no longer authenticates — its
+    // instance-scoped signature was derived under a different instanceId, so
+    // reads and writes are both refused.
     process.env[instanceIdEnv] = "default";
     expect(verifyLocalAgentJwt(forkToken!)).toBeNull();
   });
@@ -231,12 +227,13 @@ describe("agent local JWT", () => {
     expect(verifyLocalAgentJwt(tampered)).toBeNull();
   });
 
-  it("still rejects the master-secret legacy fallback once it is disabled (full instance isolation)", () => {
+  it("still rejects the master-secret legacy fallback across instances (full instance isolation)", () => {
     vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
-    process.env[disableLegacyFallbackEnv] = "true";
     process.env[instanceIdEnv] = "default";
-    // The legacy fallback signs with the raw shared secret and is therefore
-    // instance-agnostic; disabling it closes that residual cross-instance hole.
+    // The legacy fallback signed with the raw shared secret and was therefore
+    // instance-agnostic; under the default fail-closed configuration that
+    // path is gone, so a master-secret-forged token cannot authenticate even
+    // on the instance whose secret was used to sign it.
     const legacyToken = craftLegacyMasterSecretToken(process.env[secretEnv]!, "company-1");
     expect(verifyLocalAgentJwt(legacyToken)).toBeNull();
   });
@@ -248,56 +245,5 @@ describe("agent local JWT", () => {
     const claims = verifyLocalAgentJwt(token!);
     expect(claims).not.toBeNull();
     expect(claims!.exp - claims!.iat).toBe(60 * 60);
-  });
-
-  // Helper: hand-craft a token signed with the raw master secret (legacy path).
-  function craftLegacyMasterSecretToken(masterSecret: string, companyId: string) {
-    const now = Math.floor(Date.now() / 1000);
-    const header = { alg: "HS256", typ: "JWT" };
-    const claims = {
-      sub: "agent-legacy",
-      company_id: companyId,
-      adapter_type: "claude_local",
-      run_id: "run-legacy",
-      iat: now,
-      exp: now + 3600,
-      iss: "paperclip",
-      aud: "paperclip-api",
-    };
-    const headerB64 = Buffer.from(JSON.stringify(header), "utf8").toString("base64url");
-    const claimsB64 = Buffer.from(JSON.stringify(claims), "utf8").toString("base64url");
-    const signingInput = `${headerB64}.${claimsB64}`;
-    const legacySig = createHmac("sha256", masterSecret).update(signingInput).digest("base64url");
-    return `${signingInput}.${legacySig}`;
-  }
-
-  it("accepts master-secret-signed tokens when PAPERCLIP_AGENT_JWT_DISABLE_LEGACY_FALLBACK is unset", () => {
-    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
-    delete process.env[disableLegacyFallbackEnv];
-    const legacyToken = craftLegacyMasterSecretToken(process.env[secretEnv]!, "company-legacy");
-    const verified = verifyLocalAgentJwt(legacyToken);
-    expect(verified).not.toBeNull();
-    expect(verified!.company_id).toBe("company-legacy");
-  });
-
-  it("rejects master-secret-signed tokens when PAPERCLIP_AGENT_JWT_DISABLE_LEGACY_FALLBACK is enabled", () => {
-    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
-    process.env[disableLegacyFallbackEnv] = "true";
-    const legacyToken = craftLegacyMasterSecretToken(process.env[secretEnv]!, "company-legacy");
-    expect(verifyLocalAgentJwt(legacyToken)).toBeNull();
-  });
-
-  it("still verifies per-company-signed tokens when PAPERCLIP_AGENT_JWT_DISABLE_LEGACY_FALLBACK is enabled", () => {
-    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
-    process.env[disableLegacyFallbackEnv] = "true";
-    const token = createLocalAgentJwt("agent-1", "company-1", "claude_local", "run-1");
-    expect(token).not.toBeNull();
-    const verified = verifyLocalAgentJwt(token!);
-    expect(verified).toMatchObject({
-      sub: "agent-1",
-      company_id: "company-1",
-      adapter_type: "claude_local",
-      run_id: "run-1",
-    });
   });
 });
