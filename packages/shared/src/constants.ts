@@ -1043,6 +1043,12 @@ export const PLUGIN_CAPABILITIES = [
   "events.emit",
   "jobs.schedule",
   "webhooks.receive",
+  // Opt-in: lets a plugin declare `webhooks[].auth` so the host can tell an
+  // authenticated delivery from an anonymous one and bill it to a separate,
+  // larger rate-limit budget. Gated rather than implicit so that adding the
+  // field is a deliberate act by the plugin author, matching how every other
+  // manifest feature block is capability-guarded.
+  "webhooks.verify",
   "api.routes.register",
   "http.outbound",
   "secrets.read-ref",

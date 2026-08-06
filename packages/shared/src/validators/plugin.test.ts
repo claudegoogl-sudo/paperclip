@@ -335,3 +335,147 @@ describe("plugin UI slot validators — gated by fork v1 floor", () => {
     },
   );
 });
+
+/**
+ * `webhooks[].auth` — the optional credential declaration that lets the host
+ * bill a delivery to a larger rate-limit budget.
+ *
+ * The compatibility requirement is load-bearing: plugins bundle their own SDK,
+ * so a manifest written against an older SDK must keep validating and
+ * installing unchanged. Absence of `auth` therefore has to mean "today's
+ * behaviour", never "invalid".
+ */
+function manifestWithWebhook(webhook: Record<string, unknown>, capabilities: string[]): unknown {
+  return {
+    id: "test.plugin",
+    apiVersion: 1,
+    version: "1.0.0",
+    displayName: "Test Plugin",
+    description: "Manifest fixture for webhook auth validator coverage.",
+    author: "Test",
+    categories: ["connector"],
+    capabilities,
+    entrypoints: { worker: "./dist/worker.js" },
+    webhooks: [webhook],
+  };
+}
+
+const BARE_WEBHOOK = { endpointKey: "telegram", displayName: "Telegram" };
+
+const WEBHOOK_AUTH = {
+  type: "header-token",
+  header: "x-telegram-bot-api-secret-token",
+  tokenDigestConfigKey: "webhookTokenDigest",
+};
+
+describe("plugin manifest webhook auth declaration", () => {
+  it("accepts a webhook with no auth key, exactly as before", () => {
+    const result = pluginManifestV1Schema.safeParse(
+      manifestWithWebhook(BARE_WEBHOOK, ["webhooks.receive"]),
+    );
+    expect(result.success).toBe(true);
+  });
+
+  it("accepts a declared auth block when webhooks.verify is present", () => {
+    const result = pluginManifestV1Schema.safeParse(
+      manifestWithWebhook(
+        { ...BARE_WEBHOOK, auth: WEBHOOK_AUTH },
+        ["webhooks.receive", "webhooks.verify"],
+      ),
+    );
+    expect(result.success).toBe(true);
+  });
+
+  it("requires webhooks.verify before a plugin may declare auth", () => {
+    const result = pluginManifestV1Schema.safeParse(
+      manifestWithWebhook({ ...BARE_WEBHOOK, auth: WEBHOOK_AUTH }, ["webhooks.receive"]),
+    );
+    expect(result.success).toBe(false);
+    expect(JSON.stringify(result.error?.issues)).toContain("webhooks.verify");
+  });
+
+  it("rejects an unknown auth type rather than silently ignoring it", () => {
+    // A scheme the host cannot evaluate must fail at install, not quietly
+    // downgrade every delivery to the anonymous budget at runtime.
+    const result = pluginManifestV1Schema.safeParse(
+      manifestWithWebhook(
+        { ...BARE_WEBHOOK, auth: { ...WEBHOOK_AUTH, type: "hmac-signature" } },
+        ["webhooks.receive", "webhooks.verify"],
+      ),
+    );
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects a header name that is not a valid HTTP field name", () => {
+    for (const header of ["", "x token", "x:token", "x\nInjected: 1"]) {
+      const result = pluginManifestV1Schema.safeParse(
+        manifestWithWebhook(
+          { ...BARE_WEBHOOK, auth: { ...WEBHOOK_AUTH, header } },
+          ["webhooks.receive", "webhooks.verify"],
+        ),
+      );
+      expect(result.success, `header ${JSON.stringify(header)} must be rejected`).toBe(false);
+    }
+  });
+
+  it("rejects a token digest config key that is not a plain top-level key", () => {
+    for (const key of ["", "nested.key", "with space", "-leading-dash"]) {
+      const result = pluginManifestV1Schema.safeParse(
+        manifestWithWebhook(
+          { ...BARE_WEBHOOK, auth: { ...WEBHOOK_AUTH, tokenDigestConfigKey: key } },
+          ["webhooks.receive", "webhooks.verify"],
+        ),
+      );
+      expect(result.success, `config key ${JSON.stringify(key)} must be rejected`).toBe(false);
+    }
+  });
+
+  it("rejects a tokenDigestConfigKey that collides with a declared instanceConfigSchema key", () => {
+    // The mint route blind-merges the {salt,digest} over this key and re-syncs
+    // secret-ref bindings from the result; a collision with a secret-ref key
+    // would silently destroy that binding instance-wide. Reject at install.
+    const result = pluginManifestV1Schema.safeParse({
+      ...(manifestWithWebhook(
+        { ...BARE_WEBHOOK, auth: { ...WEBHOOK_AUTH, tokenDigestConfigKey: "botToken" } },
+        ["webhooks.receive", "webhooks.verify"],
+      ) as Record<string, unknown>),
+      instanceConfigSchema: {
+        type: "object",
+        properties: { botToken: { type: "string", format: "secret-ref" } },
+      },
+    });
+    expect(result.success).toBe(false);
+    expect(JSON.stringify(result.error?.issues)).toContain("botToken");
+  });
+
+  it("accepts a tokenDigestConfigKey that names its own dedicated config key", () => {
+    const result = pluginManifestV1Schema.safeParse({
+      ...(manifestWithWebhook(
+        { ...BARE_WEBHOOK, auth: { ...WEBHOOK_AUTH, tokenDigestConfigKey: "webhookTokenDigest" } },
+        ["webhooks.receive", "webhooks.verify"],
+      ) as Record<string, unknown>),
+      instanceConfigSchema: {
+        type: "object",
+        properties: { botToken: { type: "string", format: "secret-ref" } },
+      },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("keeps webhooks.verify meaningless without webhooks, so it cannot widen anything alone", () => {
+    // The capability grants no host access by itself; it only unlocks the
+    // manifest field. Declaring it with no webhooks is inert, not an error.
+    const result = pluginManifestV1Schema.safeParse({
+      id: "test.plugin",
+      apiVersion: 1,
+      version: "1.0.0",
+      displayName: "Test Plugin",
+      description: "Manifest fixture for webhook auth validator coverage.",
+      author: "Test",
+      categories: ["connector"],
+      capabilities: ["webhooks.verify"],
+      entrypoints: { worker: "./dist/worker.js" },
+    });
+    expect(result.success).toBe(true);
+  });
+});
