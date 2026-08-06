@@ -1700,7 +1700,10 @@ export {
 } from "./validators/environment-custom-images.js";
 
 export {
-  validateAuthSecretStrength,
-  WEAK_SECRET_DENYLIST,
-  MIN_SECRET_LENGTH,
+  MIN_AUTH_SECRET_LENGTH,
+  WEAK_AUTH_SECRET_DENYLIST,
+  weakAuthSecretReason,
+  isWeakAuthSecret,
+  AUTH_SECRET_ENV_KEYS,
+  weakAuthSecretEnvReason,
 } from "./auth-secret.js";
