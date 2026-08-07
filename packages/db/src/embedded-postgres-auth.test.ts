@@ -2,7 +2,7 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
 import {
   LEGACY_EMBEDDED_POSTGRES_PASSWORD,
@@ -20,10 +20,54 @@ import {
   writeEmbeddedPostgresCredential,
 } from "./embedded-postgres-auth.js";
 import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
-import { getEmbeddedPostgresTestSupport } from "./test-embedded-postgres.js";
+import {
+  getEmbeddedPostgresTestSupport,
+  sweepOrphanedEmbeddedPostgresDataDirs,
+} from "./test-embedded-postgres.js";
 
 const embeddedSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbedded = embeddedSupport.supported ? describe : describe.skip;
+
+// Mirror the robustness patterns in test-embedded-postgres.ts: capture startup
+// logs so init/start failures are diagnosable (the library wires initdb's
+// stderr nowhere, so without this a CI flake is a silent exit code), sweep
+// orphaned data dirs left by killed runs before each test, and retry on
+// transient startup failures. The library's init/start is known to flake
+// under CI runner contention; without retry, a single initdb exit 1 takes
+// the whole suite red.
+const MAX_STARTUP_ATTEMPTS = 5;
+const MAX_RECENT_STARTUP_LOG_LINES = 40;
+
+function recordStartupLogLine(recentLogs: string[], message: unknown): void {
+  const text = typeof message === "string" ? message : String(message ?? "");
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    recentLogs.push(line);
+    if (recentLogs.length > MAX_RECENT_STARTUP_LOG_LINES) recentLogs.shift();
+  }
+}
+
+function formatStartupFailure(error: unknown, recentLogs: string[]): string {
+  const errMsg =
+    error instanceof Error && error.message.length > 0
+      ? error.message
+      : typeof error === "string" && error.length > 0
+        ? error
+        : "embedded Postgres startup failed (no error object; likely a port collision or early exit)";
+  const tail =
+    recentLogs.length > 0
+      ? recentLogs.slice(-15).join("\n  ")
+      : "(no captured log lines; library may not wire initdb stderr)";
+  return `${errMsg}\n  Captured startup log (tail):\n  ${tail}`;
+}
+
+function wipeDataDirForRetry(dataDir: string): void {
+  // initdb refuses to run on a non-empty directory, so a partial initdb from
+  // a failed attempt must be cleared before the next try.
+  fs.rmSync(dataDir, { recursive: true, force: true });
+  fs.mkdirSync(dataDir, { recursive: true });
+}
 
 const cleanups: Array<() => Promise<void>> = [];
 
@@ -76,20 +120,42 @@ async function importEmbeddedPostgres() {
 
 async function startLegacyCluster(dataDir: string, port: number): Promise<RealInstance> {
   const EmbeddedPostgres = await importEmbeddedPostgres();
-  const instance = new EmbeddedPostgres({
-    databaseDir: dataDir,
-    user: "paperclip",
-    password: LEGACY_EMBEDDED_POSTGRES_PASSWORD,
-    port,
-    persistent: true,
-    authMethod: "password",
-    initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
-    onLog: () => {},
-    onError: () => {},
-  });
-  await instance.initialise();
-  await instance.start();
-  return { instance, dataDir, port };
+  let lastError: unknown = null;
+  let lastLogs: string[] = [];
+
+  for (let attempt = 1; attempt <= MAX_STARTUP_ATTEMPTS; attempt += 1) {
+    const recentLogs: string[] = [];
+    const instance = new EmbeddedPostgres({
+      databaseDir: dataDir,
+      user: "paperclip",
+      password: LEGACY_EMBEDDED_POSTGRES_PASSWORD,
+      port,
+      persistent: true,
+      authMethod: "password",
+      initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
+      onLog: (m: unknown) => recordStartupLogLine(recentLogs, m),
+      onError: (m: unknown) => recordStartupLogLine(recentLogs, m),
+    });
+
+    try {
+      await instance.initialise();
+      await instance.start();
+      return { instance, dataDir, port };
+    } catch (error) {
+      await instance.stop().catch(() => undefined);
+      lastError = error;
+      lastLogs = recentLogs;
+      if (attempt === MAX_STARTUP_ATTEMPTS) break;
+      // initdb refuses a non-empty dir, so wipe before retrying. The cred
+      // file lives BESIDE the dir, not inside, so this is safe.
+      wipeDataDirForRetry(dataDir);
+    }
+  }
+
+  throw new Error(
+    `startLegacyCluster failed after ${MAX_STARTUP_ATTEMPTS} attempts: ` +
+      formatStartupFailure(lastError, lastLogs),
+  );
 }
 
 async function stopRealInstance(real: RealInstance): Promise<void> {
@@ -190,6 +256,11 @@ describe("embedded-postgres-auth: pure helpers", () => {
 });
 
 describeEmbedded("embedded-postgres-auth: real-cluster rotation + fresh initdb", () => {
+  beforeEach(() => {
+    // Cheap insurance against killed-run orphans before each real-cluster test.
+    sweepOrphanedEmbeddedPostgresDataDirs();
+  });
+
   it("fresh initdb writes a cred file, scram pg_hba, and explicit loopback bind", async () => {
     const EmbeddedPostgres = await importEmbeddedPostgres();
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-fresh-init-"));
