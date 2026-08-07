@@ -6,10 +6,13 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
 import {
   LEGACY_EMBEDDED_POSTGRES_PASSWORD,
+  assertEmbeddedPostgresSocketPathWithinLimit,
   buildEmbeddedPostgresConnectionString,
   buildEmbeddedPostgresConstructorOptions,
   buildScramSha256PgHba,
   credentialFilePathFor,
+  embeddedPostgresSocketFilePath,
+  embeddedPostgresSocketRuntimeRoot,
   embeddedPostgresSqlOptions,
   ensureEmbeddedPostgresSocketDir,
   generateEmbeddedPostgresPassword,
@@ -399,21 +402,63 @@ describe("embedded-postgres-auth: pure helpers", () => {
     expect(embeddedPostgresSqlOptions("/tmp/x.socket")).toEqual({ host: "/tmp/x.socket" });
   });
 
-  it("socketDirectoryPathFor places the dir beside the data dir with dotfile suffix", () => {
+  it("socketDirectoryPathFor returns a short, stable, per-install dir under the runtime root", () => {
     const dataDir = path.join(os.tmpdir(), "paperclip-sock-test", "db");
-    expect(socketDirectoryPathFor(dataDir)).toBe(`${dataDir}.socket`);
-    expect(path.dirname(socketDirectoryPathFor(dataDir))).toBe(path.dirname(dataDir));
-    expect(socketDirectoryPathFor(`${dataDir}/`)).toBe(`${dataDir}.socket`);
+    const socketDir = socketDirectoryPathFor(dataDir);
+    // Lives under the runtime root, not beside the (possibly deep) data dir.
+    expect(path.dirname(socketDir)).toBe(embeddedPostgresSocketRuntimeRoot());
+    expect(path.basename(socketDir)).toMatch(/^paperclip-pg-[0-9a-f]{16}$/);
+    // Stable: same data dir -> same dir; trailing slash normalised.
+    expect(socketDirectoryPathFor(dataDir)).toBe(socketDir);
+    expect(socketDirectoryPathFor(`${dataDir}/`)).toBe(socketDir);
+    // Per-install: a different data dir gets a different dir.
+    expect(socketDirectoryPathFor(path.join(os.tmpdir(), "other", "db"))).not.toBe(
+      socketDir,
+    );
+  });
+
+  it("socketDirectoryPathFor length is independent of data-dir depth (sun_path regression)", () => {
+    // The old `<dataDir>.socket` sibling grew with the data dir and overflowed
+    // the 107-byte AF_UNIX limit for deeply nested worktree/instance dirs. The
+    // hashed dir must stay a fixed short length no matter how deep the data dir.
+    const shallow = socketDirectoryPathFor(path.join(os.tmpdir(), "db"));
+    const deep = socketDirectoryPathFor(
+      path.join(os.tmpdir(), "a".repeat(200), "b".repeat(200), "instances", "x", "db"),
+    );
+    expect(path.basename(shallow).length).toBe(path.basename(deep).length);
+    // The full socket file path for the deep data dir must fit the limit.
+    expect(() =>
+      assertEmbeddedPostgresSocketPathWithinLimit(deep, 54400),
+    ).not.toThrow();
+    expect(Buffer.byteLength(embeddedPostgresSocketFilePath(deep, 54400), "utf8")).toBeLessThanOrEqual(107);
+  });
+
+  it("assertEmbeddedPostgresSocketPathWithinLimit throws when the socket path overflows", () => {
+    // A pathologically long runtime root (e.g. a 120-char TMPDIR) must fail
+    // fast with a clear message rather than let postgres FATAL at bind time.
+    const longDir = `/${"z".repeat(120)}`;
+    expect(() => assertEmbeddedPostgresSocketPathWithinLimit(longDir, 54400)).toThrow(
+      /over the .* platform limit/,
+    );
+    // A short dir is accepted.
+    expect(() =>
+      assertEmbeddedPostgresSocketPathWithinLimit("/tmp/paperclip-pg-abc", 54400),
+    ).not.toThrow();
   });
 
   it("ensureEmbeddedPostgresSocketDir creates a 0700 dir and refuses an insecure existing one", () => {
-    const parent = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-sock-unit-"));
-    cleanups.push(async () => { fs.rmSync(parent, { recursive: true, force: true }); });
-    const dataDir = path.join(parent, "db");
-    fs.mkdirSync(dataDir, { recursive: true });
+    const dataDir = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-sock-unit-")),
+      "db",
+    );
+    const socketDir = socketDirectoryPathFor(dataDir);
+    cleanups.push(async () => {
+      fs.rmSync(path.dirname(dataDir), { recursive: true, force: true });
+      fs.rmSync(socketDir, { recursive: true, force: true });
+    });
 
-    const socketDir = ensureEmbeddedPostgresSocketDir(dataDir);
-    expect(socketDir).toBe(socketDirectoryPathFor(dataDir));
+    const created = ensureEmbeddedPostgresSocketDir(dataDir);
+    expect(created).toBe(socketDir);
     expect(fs.existsSync(socketDir)).toBe(true);
     expect((fs.statSync(socketDir).mode & 0o777)).toBe(0o700);
 
@@ -424,6 +469,24 @@ describe("embedded-postgres-auth: pure helpers", () => {
     // If the dir is later widened to world-readable, the next call refuses.
     fs.chmodSync(socketDir, 0o755);
     expect(() => ensureEmbeddedPostgresSocketDir(dataDir)).toThrow(/insecure mode/);
+  });
+
+  it("ensureEmbeddedPostgresSocketDir refuses a symlink squatting the socket-dir path", () => {
+    const dataDir = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-sock-symlink-")),
+      "db",
+    );
+    const socketDir = socketDirectoryPathFor(dataDir);
+    const decoy = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-sock-decoy-"));
+    cleanups.push(async () => {
+      fs.rmSync(path.dirname(dataDir), { recursive: true, force: true });
+      fs.rmSync(socketDir, { recursive: true, force: true });
+      fs.rmSync(decoy, { recursive: true, force: true });
+    });
+
+    // Pre-seed a symlink at the socket-dir path (attacker redirecting the bind).
+    fs.symlinkSync(decoy, socketDir);
+    expect(() => ensureEmbeddedPostgresSocketDir(dataDir)).toThrow(/symlink/);
   });
 
   it("readPidFileSocketDir returns null for missing or malformed pid files", () => {
@@ -455,11 +518,15 @@ describe("embedded-postgres-auth: pure helpers", () => {
     expect(readPidFileSocketDir(pidFile)).toBe("/a");
   });
 
-  it("buildEmbeddedPostgresConstructorOptions kills TCP, moves socket to sibling dir, tightens socket perms", () => {
+  it("buildEmbeddedPostgresConstructorOptions kills TCP, moves socket to the hashed dir, tightens socket perms", () => {
     const parent = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-ctor-unit-"));
-    cleanups.push(async () => { fs.rmSync(parent, { recursive: true, force: true }); });
     const dataDir = path.join(parent, "db");
     fs.mkdirSync(dataDir, { recursive: true });
+    const socketDir = socketDirectoryPathFor(dataDir);
+    cleanups.push(async () => {
+      fs.rmSync(parent, { recursive: true, force: true });
+      fs.rmSync(socketDir, { recursive: true, force: true });
+    });
 
     const opts = buildEmbeddedPostgresConstructorOptions({
       dataDir,
@@ -469,19 +536,19 @@ describe("embedded-postgres-auth: pure helpers", () => {
     expect(opts.authMethod).toBe("scram-sha-256");
     expect(opts.user).toBe("paperclip");
     expect(opts.persistent).toBe(true);
-    // AC1+AC2+AC3: kill TCP, move socket to sibling dir, tighten perms.
+    // AC1+AC2+AC3: kill TCP, move socket to the short hashed dir, tighten perms.
     expect(opts.postgresFlags).toEqual([
       "-c",
       "listen_addresses=",
       "-c",
-      `unix_socket_directories=${socketDirectoryPathFor(dataDir)}`,
+      `unix_socket_directories=${socketDir}`,
       "-c",
       "unix_socket_permissions=0700",
     ]);
     // The constructor must have eagerly created the socket dir at 0700 so the
     // postgres bind cannot race a permissions drift.
-    expect(fs.existsSync(socketDirectoryPathFor(dataDir))).toBe(true);
-    expect((fs.statSync(socketDirectoryPathFor(dataDir)).mode & 0o777)).toBe(0o700);
+    expect(fs.existsSync(socketDir)).toBe(true);
+    expect((fs.statSync(socketDir).mode & 0o777)).toBe(0o700);
   });
 
   it("scrubEmbeddedPostgresConnectionString redacts the password in any postgres URL", () => {
@@ -549,8 +616,8 @@ describeEmbedded("embedded-postgres-auth: real-cluster rotation + fresh initdb",
     // AC5: pg_hba is scram-sha-256 only.
     expect(isPgHbaScramOnly(dataDir)).toBe(true);
 
-    // Acceptance (kill TCP + move socket + tighten perms): socket at
-    // <dataDir>.socket, mode 0700; no /tmp socket.
+    // Acceptance (kill TCP + move socket + tighten perms): socket in the short
+    // per-install hashed dir, mode 0700; no /tmp socket.
     const socketDir = socketDirectoryPathFor(dataDir);
     const socketFile = path.join(socketDir, `.s.PGSQL.${actualPort}`);
     expect(fs.existsSync(socketFile)).toBe(true);
@@ -598,6 +665,69 @@ describeEmbedded("embedded-postgres-auth: real-cluster rotation + fresh initdb",
       }),
     ).resolves.toBeUndefined();
   }, 60_000);
+
+  it("boots with a deeply nested data dir (sun_path regression: old sibling socket would overflow)", async () => {
+    // A data dir deep enough that the OLD `<dataDir>.socket/.s.PGSQL.<port>`
+    // path would exceed the 107-byte AF_UNIX limit and postgres would FATAL at
+    // bind ("could not create any Unix-domain sockets"). With the short hashed
+    // socket dir the path is length-independent, so the cluster must boot. This
+    // test fails against the pre-fix sibling-socket code.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-deep-sock-"));
+    const deepDataDir = path.join(
+      root,
+      "instances",
+      "a".repeat(40),
+      "workspaces",
+      "b".repeat(40),
+      ".paperclip-source",
+      "instances",
+      "default",
+      "db",
+    );
+    fs.mkdirSync(deepDataDir, { recursive: true });
+    const socketDir = socketDirectoryPathFor(deepDataDir);
+    cleanups.push(async () => {
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(credentialFilePathFor(deepDataDir), { force: true });
+      fs.rmSync(socketDir, { recursive: true, force: true });
+    });
+
+    // Guard the guard: the pre-fix sibling path really would have overflowed.
+    expect(
+      Buffer.byteLength(`${deepDataDir}.socket/.s.PGSQL.00000`, "utf8"),
+    ).toBeGreaterThan(107);
+
+    const port = await allocatePort();
+    const startup = resolveEmbeddedPostgresPasswordForStartup(deepDataDir);
+    const { instance, port: actualPort } = await startFreshInstanceWithDataDir(
+      deepDataDir,
+      port,
+      startup.password,
+    );
+    cleanups.push(async () => { await instance.stop().catch(() => undefined); });
+
+    // The cluster booted: the socket lives in the short hashed dir and the full
+    // socket path is within the platform limit.
+    const socketFile = embeddedPostgresSocketFilePath(socketDir, actualPort);
+    expect(fs.existsSync(socketFile)).toBe(true);
+    expect(Buffer.byteLength(socketFile, "utf8")).toBeLessThanOrEqual(107);
+
+    // And it is actually reachable over that socket.
+    const admin = postgres(
+      buildEmbeddedPostgresConnectionString({
+        port: actualPort,
+        database: "postgres",
+        password: startup.password,
+      }),
+      { max: 1, onnotice: () => {}, ...embeddedPostgresSqlOptions(socketDir) },
+    );
+    try {
+      const rows = await admin`SELECT 1 as ok`;
+      expect(Number(rows[0].ok)).toBe(1);
+    } finally {
+      await admin.end({ timeout: 5 }).catch(() => undefined);
+    }
+  });
 
   it("legacy data dir rotates on next start: ALTER ROLE, cred file, scram pg_hba, reload", async () => {
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-legacy-rotate-"));
