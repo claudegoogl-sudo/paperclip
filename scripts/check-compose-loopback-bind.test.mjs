@@ -187,11 +187,40 @@ test("runCheck passes on a loopback-only tree and fails on a bare publish", () =
 });
 
 test("runCheck ignores compose files outside docker/", () => {
+  // The gate scopes its scan to `docker/`. A bare publish placed *outside*
+  // that root (e.g. in `examples/`) must be ignored — but only when the
+  // shipped `docker/` root itself is present and clean. Without a real
+  // `docker/` directory the gate would otherwise exit 0 from a 0-file scan,
+  // which is the fail-open defect covered by the next test.
   const tmpRoot = mkdtempSync(path.join(os.tmpdir(), "compose-loopback-scope-"));
   try {
+    mkdirSync(path.join(tmpRoot, "docker"), { recursive: true });
     mkdirSync(path.join(tmpRoot, "examples"), { recursive: true });
+    writeFileSync(
+      path.join(tmpRoot, "docker/docker-compose.yml"),
+      composeWith('"${PAPERCLIP_DB_BIND_ADDR:-127.0.0.1}:5432:5432"'),
+    );
     writeFileSync(path.join(tmpRoot, "examples/docker-compose.yml"), composeWith('"5432:5432"'));
     assert.equal(runCheck({ repoRoot: tmpRoot, log: () => {}, error: () => {} }), 0);
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test("runCheck fails closed when the docker/ scan root is missing", () => {
+  // Regression: previously, a missing `docker/` directory caused `scanned`
+  // to stay at 0 and the success path returned 0 — a security control
+  // silently degrading to zero coverage while reporting green.
+  const tmpRoot = mkdtempSync(path.join(os.tmpdir(), "compose-loopback-empty-"));
+  try {
+    const errors = [];
+    const code = runCheck({ repoRoot: tmpRoot, log: () => {}, error: (msg) => errors.push(msg) });
+    assert.equal(code, 1);
+    assert.ok(errors.some((line) => line.includes("scanned 0 file")), "expected fail-closed header");
+    assert.ok(
+      errors.some((line) => line.includes("docker")),
+      "expected the missing docker/ root to be named",
+    );
   } finally {
     rmSync(tmpRoot, { recursive: true, force: true });
   }
