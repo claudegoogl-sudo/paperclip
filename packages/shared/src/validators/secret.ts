@@ -437,6 +437,12 @@ export const setBindingEgressAllowlistSchema = z.object({
 });
 
 export const enforceBindingEgressSchema = z.object({
+  // Direction of the flip. Defaults to `true` (the historical behavior) so the
+  // pre-existing callers that send `{ allowEmpty: true }` or `{}` keep working.
+  // When `false`, the binding is flipped back to `log_only` (enforcement off) —
+  // used by the operator surface's "Stop enforcing" confirm. allowEmpty is
+  // ignored in that direction.
+  enforced: z.boolean().optional(),
   // Deliberate deny-all opt-in: flip a binding whose allowlist is empty (denies
   // ALL egress for that secret). Defaults to false so the common path refuses
   // an accidental empty-allowlist enforce.
