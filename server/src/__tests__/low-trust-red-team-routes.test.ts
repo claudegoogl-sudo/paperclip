@@ -62,6 +62,13 @@ async function waitFor(condition: () => boolean | Promise<boolean>, timeoutMs = 
   throw new Error("Timed out waiting for condition");
 }
 
+// Drain activity_log before each retry of the FK-sensitive delete chain.
+// A heartbeat wake can register after the test body ends and emit an
+// activity_log row referencing one of the seeded agents; if that row lands
+// between the activity_log drain and `db.delete(agents)`, the agents delete
+// throws `activity_log_agent_id_agents_id_fk` and tears the suite down with
+// it. Re-draining on every attempt lets a late-arriving row clear before the
+// agents delete is retried, instead of failing the whole suite.
 async function deleteHeartbeatRunsAndWakeupsAfterActivityLogDrains(db: Db) {
   let lastError: unknown = null;
   for (let attempt = 0; attempt < 10; attempt += 1) {
@@ -69,6 +76,9 @@ async function deleteHeartbeatRunsAndWakeupsAfterActivityLogDrains(db: Db) {
     try {
       await db.delete(heartbeatRuns);
       await db.delete(agentWakeupRequests);
+      await db.delete(issues);
+      await db.delete(agentRuntimeState);
+      await db.delete(agents);
       return;
     } catch (error) {
       lastError = error;
@@ -532,12 +542,8 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
     await db.delete(documents);
     await db.delete(issueComments);
     await db.delete(issueRelations);
-    await db.delete(activityLog);
     await db.delete(heartbeatRunEvents);
     await deleteHeartbeatRunsAndWakeupsAfterActivityLogDrains(db);
-    await db.delete(issues);
-    await db.delete(agentRuntimeState);
-    await db.delete(agents);
     await db.delete(projects);
     await db.delete(companySkills);
     await db.delete(companies);
