@@ -9,6 +9,7 @@ import {
 import {
   buildEmbeddedPostgresConnectionString,
   readEmbeddedPostgresCredential,
+  socketDirectoryPathFor,
 } from "./embedded-postgres-auth.js";
 
 type PartialConfig = {
@@ -71,6 +72,7 @@ function resolveConnectionString(config: PartialConfig | null): string {
     port,
     database: "paperclip",
     password: cred.password,
+    socketDir: dataDir ? socketDirectoryPathFor(dataDir) : undefined,
   });
 }
 
