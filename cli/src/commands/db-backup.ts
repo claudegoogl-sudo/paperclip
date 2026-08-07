@@ -1,7 +1,12 @@
 import path from "node:path";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
-import { formatDatabaseBackupResult, runDatabaseBackup } from "@paperclipai/db";
+import {
+  buildEmbeddedPostgresConnectionString,
+  formatDatabaseBackupResult,
+  readEmbeddedPostgresCredential,
+  runDatabaseBackup,
+} from "@paperclipai/db";
 import {
   expandHomePrefix,
   resolveDefaultBackupDir,
@@ -28,8 +33,21 @@ function resolveConnectionString(configPath?: string): { value: string; source: 
   }
 
   const port = config?.database.embeddedPostgresPort ?? 54329;
+  const dataDir = config?.database.embeddedPostgresDataDir;
+  const cred = dataDir ? readEmbeddedPostgresCredential(dataDir) : null;
+  if (!cred) {
+    throw new Error(
+      `Cannot resolve embedded PostgreSQL connection: no per-install credential file found beside ` +
+        `${dataDir ? `data dir ${dataDir}` : "the data dir (none configured)"}. ` +
+        `Start the Paperclip server once so it generates one, then re-run this command.`,
+    );
+  }
   return {
-    value: `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`,
+    value: buildEmbeddedPostgresConnectionString({
+      port,
+      database: "paperclip",
+      password: cred.password,
+    }),
     source: `embedded-postgres@${port}`,
   };
 }

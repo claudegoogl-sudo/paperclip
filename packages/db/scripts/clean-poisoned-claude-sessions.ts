@@ -28,6 +28,10 @@ import os from "node:os";
 import path from "node:path";
 import { and, eq, isNotNull, sql } from "drizzle-orm";
 import { createDb } from "../src/client.js";
+import {
+  buildEmbeddedPostgresConnectionString,
+  readEmbeddedPostgresCredential,
+} from "../src/embedded-postgres-auth.js";
 import { agentTaskSessions } from "../src/schema/index.js";
 
 const CLAUDE_ADAPTER_TYPE = "claude_local";
@@ -213,6 +217,7 @@ function readDatabaseUrlFromConfig(configPath: string): string {
     database?: {
       mode?: string;
       embeddedPostgresPort?: number;
+      embeddedPostgresDataDir?: string;
       connectionString?: string;
     };
   };
@@ -220,7 +225,20 @@ function readDatabaseUrlFromConfig(configPath: string): string {
     return parsed.database.connectionString;
   }
   const port = parsed.database?.embeddedPostgresPort ?? 54329;
-  return `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`;
+  const dataDir = parsed.database?.embeddedPostgresDataDir;
+  const cred = dataDir ? readEmbeddedPostgresCredential(dataDir) : null;
+  if (!cred) {
+    throw new Error(
+      `Cannot resolve embedded PostgreSQL connection: no per-install credential file found beside ` +
+        `${dataDir ? `data dir ${dataDir}` : "the data dir (none configured)"}. ` +
+        `Start the Paperclip server once so it generates one, then re-run this script.`,
+    );
+  }
+  return buildEmbeddedPostgresConnectionString({
+    port,
+    database: "paperclip",
+    password: cred.password,
+  });
 }
 
 function defaultConfigPath(): string | null {

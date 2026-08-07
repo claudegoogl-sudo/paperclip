@@ -127,9 +127,19 @@ test("runCheck fails when scoped tree contains an unapproved git push", () => {
 });
 
 test("runCheck ignores opt-in marker outside the scoped tree", () => {
+  // The gate scopes its walk to adapter/runtime roots. A `git push` call
+  // placed *outside* those roots (e.g. in `scripts/release.mjs`) must be
+  // ignored — but only when at least one scan root is present and clean.
+  // Without any scan root the gate would otherwise exit 0 from a 0-file
+  // scan, which is the fail-open defect covered by the dedicated test below.
   const tmpRoot = mkdtempSync(path.join(os.tmpdir(), "no-git-push-scope-"));
   try {
+    mkdirSync(path.join(tmpRoot, "packages/adapters/sample/src"), { recursive: true });
     mkdirSync(path.join(tmpRoot, "scripts"), { recursive: true });
+    writeFileSync(
+      path.join(tmpRoot, "packages/adapters/sample/src/index.ts"),
+      "export const ok = 1;\n",
+    );
     writeFileSync(
       path.join(tmpRoot, "scripts/release.mjs"),
       "execSync('git push origin v1.2.3');\n",
@@ -164,6 +174,26 @@ test("collectScannableFiles skips node_modules, dist, and .d.ts", () => {
     );
     const relatives = files.map((entry) => entry.relative).sort();
     assert.deepEqual(relatives, ["packages/adapters/sample/src/index.ts"]);
+  } finally {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test("runCheck fails closed when none of the expected scan roots exist", () => {
+  // Regression: previously, a repo where every adapter/runtime scan root
+  // was missing produced an empty `allOffenses` list and the success path
+  // returned 0 — a security control silently degrading to zero coverage
+  // while reporting green.
+  const tmpRoot = mkdtempSync(path.join(os.tmpdir(), "no-git-push-empty-"));
+  try {
+    const errors = [];
+    const code = runCheck({ repoRoot: tmpRoot, log: () => {}, error: (msg) => errors.push(msg) });
+    assert.equal(code, 1);
+    assert.ok(errors.some((line) => line.includes("scanned 0 file")), "expected fail-closed header");
+    assert.ok(
+      errors.some((line) => line.includes("packages/adapters")),
+      "expected a missing scan root to be named",
+    );
   } finally {
     rmSync(tmpRoot, { recursive: true, force: true });
   }

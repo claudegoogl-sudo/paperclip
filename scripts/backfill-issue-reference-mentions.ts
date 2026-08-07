@@ -1,4 +1,9 @@
-import { companies, createDb } from "../packages/db/src/index.js";
+import {
+  buildEmbeddedPostgresConnectionString,
+  companies,
+  createDb,
+  readEmbeddedPostgresCredential,
+} from "../packages/db/src/index.js";
 import { loadConfig } from "../server/src/config.js";
 import { issueReferenceService } from "../server/src/services/issue-references.js";
 
@@ -11,10 +16,23 @@ function parseFlag(name: string): string | null {
 
 async function main() {
   const config = loadConfig();
-  const dbUrl =
-    process.env.DATABASE_URL?.trim()
-    || config.databaseUrl
-    || `postgres://paperclip:paperclip@127.0.0.1:${config.embeddedPostgresPort}/paperclip`;
+  let dbUrl: string | undefined =
+    process.env.DATABASE_URL?.trim() || config.databaseUrl;
+  if (!dbUrl) {
+    const cred = readEmbeddedPostgresCredential(config.embeddedPostgresDataDir);
+    if (!cred) {
+      throw new Error(
+        `Cannot resolve embedded PostgreSQL connection: no per-install credential file found beside ` +
+          `data dir ${config.embeddedPostgresDataDir}. ` +
+          `Start the Paperclip server once so it generates one, then re-run this script.`,
+      );
+    }
+    dbUrl = buildEmbeddedPostgresConnectionString({
+      port: config.embeddedPostgresPort,
+      database: "paperclip",
+      password: cred.password,
+    });
+  }
 
   const db = createDb(dbUrl);
   const refs = issueReferenceService(db);
