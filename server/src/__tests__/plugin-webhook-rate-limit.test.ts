@@ -18,7 +18,7 @@ import {
 } from "../services/plugin-webhook-auth.js";
 import { DEFAULT_JSON_BODY_LIMIT, WEBHOOK_JSON_BODY_LIMIT } from "../http/body-limits.js";
 import { PLUGIN_WEBHOOK_INGESTION_PATH_PATTERN } from "../routes/plugin-webhook-paths.js";
-import { pluginRoutes } from "../routes/plugins.js";
+import { PLUGIN_WEBHOOK_CONFIG_MEMO_TTL_MS, pluginRoutes } from "../routes/plugins.js";
 import { errorHandler } from "../middleware/index.js";
 import { logger } from "../middleware/logger.js";
 
@@ -403,6 +403,15 @@ function createWebhookApp(options: {
   rateLimiter?: ReturnType<typeof createPluginWebhookRateLimiter>;
   workerCall?: ReturnType<typeof vi.fn>;
   insert?: ReturnType<typeof vi.fn>;
+  now?: () => number;
+  /**
+   * Force header values on the parsed request before the route reads them.
+   * Node's HTTP layer comma-joins duplicate custom headers into a single
+   * string, so a genuine repeated-header (`string[]`) shape — which a proxy or
+   * programmatic caller can still produce — cannot be reproduced over the wire
+   * with supertest. This injects it deterministically.
+   */
+  forceHeaders?: Record<string, string | string[]>;
 } = {}) {
   const insert = options.insert ?? vi.fn(() => ({
     values: () => ({ returning: () => Promise.resolve([{ id: "delivery-1" }]) }),
@@ -424,6 +433,9 @@ function createWebhookApp(options: {
   app.use(express.json({ limit: DEFAULT_JSON_BODY_LIMIT, verify: captureRawBody }));
   app.use((req, _res, next) => {
     req.actor = { type: "board", userId: "user-1" } as typeof req.actor;
+    if (options.forceHeaders) {
+      Object.assign(req.headers, options.forceHeaders);
+    }
     next();
   });
 
@@ -432,7 +444,11 @@ function createWebhookApp(options: {
     db as never,
     { installPlugin: vi.fn() } as never,
     undefined,
-    { workerManager: { call: workerCall } as never, rateLimiter: options.rateLimiter },
+    {
+      workerManager: { call: workerCall } as never,
+      rateLimiter: options.rateLimiter,
+      now: options.now,
+    },
   ));
   app.use(errorHandler);
 
@@ -713,5 +729,100 @@ describe("POST /api/plugins/:pluginId/webhooks/:endpointKey credential tiering",
     } finally {
       warn.mockRestore();
     }
+  });
+});
+
+describe("POST /api/plugins/:pluginId/webhooks/:endpointKey pre-limiter config read", () => {
+  beforeEach(() => {
+    mockRegistry.getById.mockReset();
+    mockRegistry.getByKey.mockReset();
+    mockRegistry.getConfig.mockReset();
+    mockRegistry.getById.mockResolvedValue(READY_PLUGIN_WITH_AUTH);
+    mockRegistry.getByKey.mockResolvedValue(READY_PLUGIN_WITH_AUTH);
+    mockRegistry.getConfig.mockResolvedValue(VALID_DIGEST_CONFIG);
+    resetPluginWebhookAuthWarnings();
+  });
+
+  const url = `/api/plugins/${PLUGIN_ID}/webhooks/${ENDPOINT_KEY}`;
+
+  it("collapses a burst of presence-header requests to a single config read", async () => {
+    // A flood carrying the declared header must not translate into a flood of
+    // pre-limiter SELECTs. Within one TTL window the config is read once and
+    // every subsequent delivery is served from the memo.
+    let now = 1_000;
+    const rateLimiter = createPluginWebhookRateLimiter({
+      maxPerEndpoint: 1_000,
+      maxPerIp: 1_000,
+      maxPerVerifiedEndpoint: 1_000,
+    });
+    const { app } = createWebhookApp({ rateLimiter, now: () => now });
+
+    for (let i = 0; i < 20; i += 1) {
+      now += 100; // still well inside the 5s TTL
+      const res = await request(app).post(url).set(TOKEN_HEADER, TOKEN).send({ n: i });
+      expect(res.status).toBe(200);
+    }
+
+    expect(mockRegistry.getConfig).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads fresh config once the TTL lapses, so a rotation takes effect", async () => {
+    // The memo is bounded: past the TTL the next delivery re-reads config, which
+    // is what lets a rotated digest start being recognised within the window.
+    let now = 1_000;
+    const rateLimiter = createPluginWebhookRateLimiter({
+      maxPerEndpoint: 1_000,
+      maxPerIp: 1_000,
+      maxPerVerifiedEndpoint: 1_000,
+    });
+    const { app } = createWebhookApp({ rateLimiter, now: () => now });
+
+    await request(app).post(url).set(TOKEN_HEADER, TOKEN).send({ n: 1 });
+    expect(mockRegistry.getConfig).toHaveBeenCalledTimes(1);
+
+    // Still cached one millisecond before expiry.
+    now += PLUGIN_WEBHOOK_CONFIG_MEMO_TTL_MS - 1;
+    await request(app).post(url).set(TOKEN_HEADER, TOKEN).send({ n: 2 });
+    expect(mockRegistry.getConfig).toHaveBeenCalledTimes(1);
+
+    // One millisecond past the TTL forces a fresh read.
+    now += 2;
+    await request(app).post(url).set(TOKEN_HEADER, TOKEN).send({ n: 3 });
+    expect(mockRegistry.getConfig).toHaveBeenCalledTimes(2);
+  });
+
+  it("short-circuits a repeated (array) header to anonymous without a config read", async () => {
+    // A repeated header arrives as `string[]`: truthy, but never verifiable. It
+    // must bail to the anonymous tier *before* the config read, not read, fail
+    // to verify, and bill the anonymous budget anyway.
+    const rateLimiter = createPluginWebhookRateLimiter({
+      maxPerEndpoint: 1,
+      maxPerIp: 1_000,
+      maxPerVerifiedEndpoint: 10,
+    });
+    const { app } = createWebhookApp({
+      rateLimiter,
+      forceHeaders: { [TOKEN_HEADER]: [TOKEN, "second-copy"] },
+    });
+
+    const first = await request(app).post(url).send({ n: 1 });
+    expect(first.status).toBe(200);
+
+    expect(mockRegistry.getConfig).not.toHaveBeenCalled();
+
+    // Billed to the anonymous budget (cap 1), so the next anonymous delivery is
+    // turned away — confirming the array copy never reached the verified tier.
+    const second = await request(app).post(url).send({ n: 2 });
+    expect(second.status).toBe(429);
+  });
+
+  it("skips the config read for an empty header value", async () => {
+    // An empty string is present-but-worthless; it can never verify, so it costs
+    // nothing, exactly as before this memo existed.
+    const { app } = createWebhookApp();
+
+    const res = await request(app).post(url).set(TOKEN_HEADER, "").send({ n: 1 });
+    expect(res.status).toBe(200);
+    expect(mockRegistry.getConfig).not.toHaveBeenCalled();
   });
 });
