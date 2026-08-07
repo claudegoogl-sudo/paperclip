@@ -152,17 +152,28 @@ vi.mock("../services/index.js", () => ({
   workProductService: () => ({}),
 }));
 
+// Hoist the SUT module load OUT OF the test body. The first dynamic import of
+// routes/issues.js (~10k lines of TypeScript) eats ~4-5s of vite transform on
+// the 4-vCPU shared agent host, which sat right on the default 5s testTimeout
+// and flaked near-deterministically when the box was under concurrent load.
+// CI ubuntu-latest runners do the same transform in ~3s, so the suite is
+// consistently green there. Top-level await moves the cost into module load
+// (not subject to any test's timeout budget) and keeps the per-test 5s
+// timeout as a real failure detector for the denylist code path itself — a
+// hang there would be fail-open and must remain visible as a fast red, not
+// absorbed into a bumped timeout.
+const [{ issueRoutes }, { errorHandler }] = await Promise.all([
+  import("../routes/issues.js"),
+  import("../middleware/index.js"),
+]);
+
 function createApp() {
   const app = express();
   app.use(express.json());
   return app;
 }
 
-async function installActor(app: express.Express, actor?: Record<string, unknown>) {
-  const [{ issueRoutes }, { errorHandler }] = await Promise.all([
-    import("../routes/issues.js"),
-    import("../middleware/index.js"),
-  ]);
+function installActor(app: express.Express, actor?: Record<string, unknown>) {
   app.use((req, _res, next) => {
     (req as express.Request & { actor: unknown }).actor = actor ?? {
       type: "board",
