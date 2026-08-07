@@ -1,14 +1,16 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 
 import postgres from "postgres";
@@ -27,16 +29,20 @@ const PASSWORD_ALPHABET =
   "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 const PASSWORD_LENGTH = 32;
 const CREDENTIAL_FILE_SUFFIX = ".pg-credential";
-// Sibling directory of the data dir that holds the unix-domain socket. The
-// cred file already uses the `<dataDir>.pg-credential` sibling pattern; the
-// socket dir mirrors it. Sibling rather than inside the data dir because
-// Postgres requires 0700 ownership of the data dir itself and we do not want
-// to widen or complicate that contract.
-export const SOCKET_DIRECTORY_SUFFIX = ".socket";
+// Name prefix for the per-install socket directory. The full name is
+// `<prefix><hash-of-dataDir>` (see socketDirectoryPathFor) — a fixed short
+// length that does NOT grow with the data-dir depth.
+export const SOCKET_DIRECTORY_NAME_PREFIX = "paperclip-pg-";
 // Directory mode: only the data-dir owner may traverse or connect. The socket
 // file inside is also tightened via `unix_socket_permissions=0700` so the
 // cluster cannot accidentally inherit the libpq default `0777`.
 const SOCKET_DIRECTORY_MODE = 0o700;
+// AF_UNIX `sun_path` limit: 108 bytes incl. NUL on Linux (107 usable), 104 on
+// macOS/BSD (103 usable). Postgres binds `<socketDir>/.s.PGSQL.<port>` and
+// FATALs ("could not create any Unix-domain sockets") if the path overflows.
+// The hashed socket dir keeps us well under this; the guard below is a
+// fail-fast belt against a pathologically long TMPDIR/XDG_RUNTIME_DIR.
+const UNIX_SOCKET_PATH_MAX_BYTES = process.platform === "darwin" ? 103 : 107;
 
 export type EmbeddedPostgresDatabase = "postgres" | "paperclip";
 
@@ -65,25 +71,113 @@ export function credentialFilePathFor(dataDir: string): string {
   return `${dataDir.replace(/\/+$/, "")}${CREDENTIAL_FILE_SUFFIX}`;
 }
 
-export function socketDirectoryPathFor(dataDir: string): string {
-  return `${dataDir.replace(/\/+$/, "")}${SOCKET_DIRECTORY_SUFFIX}`;
+// Root directory that holds per-install socket dirs. Prefer $XDG_RUNTIME_DIR
+// (/run/user/<uid>: already 0700 and NOT world-writable) when it is set to an
+// absolute path; fall back to os.tmpdir(). Kept short and independent of the
+// data-dir path so the `<root>/paperclip-pg-<hash>/.s.PGSQL.<port>` socket path
+// stays well under the AF_UNIX sun_path limit regardless of data-dir depth.
+export function embeddedPostgresSocketRuntimeRoot(): string {
+  const xdg = process.env.XDG_RUNTIME_DIR;
+  if (xdg && path.isAbsolute(xdg)) return xdg;
+  return tmpdir();
 }
 
-// Idempotent: create the socket directory beside the data dir with mode 0700
-// and assert the final mode. Mirrors the cred-file mode check so a future
-// permissions drift is caught at startup rather than discovered by an
-// attacker. Safe to call on every start.
+// Short, stable, per-install socket directory. Derived from a hash of the data
+// dir so it is (a) unique per install, (b) identical on every start for a given
+// data dir — warm-restart detection and every `postgres()` call site agree on
+// the path — and (c) a fixed short length independent of how deep the data dir
+// is nested. The previous `<dataDir>.socket` sibling overflowed the AF_UNIX
+// 107-byte path limit for deeply nested worktree/instance data dirs, so the
+// postmaster could not create the socket and the cluster never booted.
+export function socketDirectoryPathFor(dataDir: string): string {
+  const normalized = dataDir.replace(/\/+$/, "");
+  const hash = createHash("sha256").update(normalized).digest("hex").slice(0, 16);
+  return path.join(
+    embeddedPostgresSocketRuntimeRoot(),
+    `${SOCKET_DIRECTORY_NAME_PREFIX}${hash}`,
+  );
+}
+
+// The socket file postgres binds inside the socket directory.
+export function embeddedPostgresSocketFilePath(
+  socketDir: string,
+  port: number,
+): string {
+  return path.join(socketDir, `.s.PGSQL.${port}`);
+}
+
+// Fail fast (with a clear, actionable message) if the socket path would
+// overflow the platform's AF_UNIX limit, rather than letting postgres FATAL
+// with an opaque "could not create any Unix-domain sockets".
+export function assertEmbeddedPostgresSocketPathWithinLimit(
+  socketDir: string,
+  port: number,
+): void {
+  const socketPath = embeddedPostgresSocketFilePath(socketDir, port);
+  const bytes = Buffer.byteLength(socketPath, "utf8");
+  if (bytes > UNIX_SOCKET_PATH_MAX_BYTES) {
+    throw new Error(
+      `Embedded PostgreSQL unix socket path ${socketPath} is ${bytes} bytes, ` +
+        `over the ${UNIX_SOCKET_PATH_MAX_BYTES}-byte platform limit. Set a ` +
+        `shorter XDG_RUNTIME_DIR or TMPDIR so the socket directory fits.`,
+    );
+  }
+}
+
+// Idempotent: create the per-install socket directory with mode 0700 and assert
+// it is a real, self-owned, 0700 directory. The runtime root can be shared and
+// world-writable (/tmp), so we fail closed on the ways an attacker could
+// pre-seed the path: a symlink (redirects the bind), a non-directory, a dir we
+// do not own (name squatting), or group/world-accessible mode (permission
+// drift). Mirrors the cred-file mode check. Safe to call on every start.
 export function ensureEmbeddedPostgresSocketDir(dataDir: string): string {
   const socketDir = socketDirectoryPathFor(dataDir);
-  if (!existsSync(socketDir)) {
-    mkdirSync(socketDir, { recursive: true, mode: SOCKET_DIRECTORY_MODE });
-    // mkdir's mode is masked by umask; force the final mode on the freshly
-    // created dir so the assertion below cannot fail on a future start.
-    try {
-      chmodSync(socketDir, SOCKET_DIRECTORY_MODE);
-    } catch {
-      // best effort; the strict mode check below refuses insecure dirs.
+  // lstat (not stat) so we inspect the entry itself, never its symlink target.
+  let existing: ReturnType<typeof lstatSync> | null = null;
+  try {
+    existing = lstatSync(socketDir);
+  } catch {
+    existing = null;
+  }
+  if (existing) {
+    if (existing.isSymbolicLink()) {
+      throw new Error(
+        `Embedded PostgreSQL socket directory at ${socketDir} is a symlink; ` +
+          `refusing to start (possible socket-hijack via a pre-created link).`,
+      );
     }
+    if (!existing.isDirectory()) {
+      throw new Error(
+        `Embedded PostgreSQL socket path at ${socketDir} exists but is not a ` +
+          `directory. Remove it so a fresh 0700 socket dir can be created.`,
+      );
+    }
+    if (
+      typeof process.getuid === "function" &&
+      existing.uid !== process.getuid()
+    ) {
+      throw new Error(
+        `Embedded PostgreSQL socket directory at ${socketDir} is owned by uid ` +
+          `${existing.uid}, not this process (uid ${process.getuid()}). ` +
+          `Refusing to start (possible socket-dir squatting).`,
+      );
+    }
+    if ((existing.mode & 0o077) !== 0) {
+      throw new Error(
+        `Embedded PostgreSQL socket directory at ${socketDir} has insecure mode ` +
+          `${(existing.mode & 0o777).toString(8)}: must be 0700 ` +
+          `(no group or world access). Refusing to start.`,
+      );
+    }
+    return socketDir;
+  }
+  mkdirSync(socketDir, { recursive: true, mode: SOCKET_DIRECTORY_MODE });
+  // mkdir's mode is masked by umask; force the final mode on the freshly
+  // created dir so the assertion below cannot fail on a future start.
+  try {
+    chmodSync(socketDir, SOCKET_DIRECTORY_MODE);
+  } catch {
+    // best effort; the strict mode check below refuses insecure dirs.
   }
   const stat = statSync(socketDir);
   if ((stat.mode & 0o077) !== 0) {
@@ -269,6 +363,9 @@ export function buildEmbeddedPostgresConstructorOptions(
   // Ensure the socket directory exists with mode 0700 before postgres tries
   // to bind into it. Idempotent and cheap; safe to call on every start.
   const socketDir = ensureEmbeddedPostgresSocketDir(input.dataDir);
+  // Fail fast with a clear message if the socket path would overflow the
+  // platform's AF_UNIX limit (rather than an opaque postgres FATAL at bind).
+  assertEmbeddedPostgresSocketPathWithinLimit(socketDir, input.port);
   return {
     databaseDir: input.dataDir,
     user: EMBEDDED_POSTGRES_USER,
@@ -556,8 +653,9 @@ export function scrubEmbeddedPostgresConnectionString(input: string): string {
 //   line 5: socket dir(s) — comma-separated unix_socket_directories
 //   line 6: listen_addresses
 //   line 7: shmem key
-// After this change, line 5 is our `<dataDir>.socket` directory. Legacy
-// clusters have `/tmp` there (the postgres default).
+// After this change, line 5 is our short per-install `paperclip-pg-<hash>`
+// socket dir (see socketDirectoryPathFor). Legacy clusters have `/tmp` (the
+// postgres default) or the earlier `<dataDir>.socket` sibling there.
 export function readPidFileSocketDir(postmasterPidFile: string): string | null {
   if (!existsSync(postmasterPidFile)) return null;
   try {
@@ -685,11 +783,12 @@ export async function stopRunningEmbeddedPostgres(
   return true;
 }
 
-// Detect a legacy cluster (socket dir on postmaster.pid line 5 differs
-// from our expected `<dataDir>.socket`) and stop it so the caller can start
-// fresh with new flags. No-op when the running cluster already uses our
-// socket dir, or when no cluster is running. Idempotent: callers can invoke
-// it on every startup without checking first.
+// Detect a legacy cluster (socket dir on postmaster.pid line 5 differs from our
+// expected per-install socket dir — i.e. the old `/tmp` default or the earlier
+// `<dataDir>.socket` sibling) and stop it so the caller can start fresh with
+// new flags. No-op when the running cluster already uses our socket dir, or when
+// no cluster is running. Idempotent: callers can invoke it on every startup
+// without checking first.
 export async function migrateLegacyEmbeddedPostgresSocket(
   dataDir: string,
 ): Promise<{ stoppedLegacyCluster: boolean; legacySocketDir: string | null }> {
