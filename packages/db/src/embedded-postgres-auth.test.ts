@@ -35,8 +35,18 @@ const describeEmbedded = embeddedSupport.supported ? describe : describe.skip;
 // transient startup failures. The library's init/start is known to flake
 // under CI runner contention; without retry, a single initdb exit 1 takes
 // the whole suite red.
+//
+// Two distinct retry shapes are needed:
+//   - initdb flake: the data dir is partially populated; initdb refuses a
+//     non-empty dir on the next attempt, so we wipe before retrying.
+//   - port collision (TOCTOU): allocatePort() closes its probe socket before
+//     embedded-postgres binds it, so a concurrent worker can grab the port in
+//     between. embedded-postgres's start() then rejects with bare undefined
+//     (no Error) — the only signal is the "address already in use" line on
+//     onLog. Re-allocate the port and retry; the data dir is fine.
 const MAX_STARTUP_ATTEMPTS = 5;
 const MAX_RECENT_STARTUP_LOG_LINES = 40;
+const PORT_COLLISION_LOG_PATTERN = /address already in use/i;
 
 function recordStartupLogLine(recentLogs: string[], message: unknown): void {
   const text = typeof message === "string" ? message : String(message ?? "");
@@ -67,6 +77,10 @@ function wipeDataDirForRetry(dataDir: string): void {
   // a failed attempt must be cleared before the next try.
   fs.rmSync(dataDir, { recursive: true, force: true });
   fs.mkdirSync(dataDir, { recursive: true });
+}
+
+function isLikelyPortCollision(recentLogs: string[]): boolean {
+  return recentLogs.some((line) => PORT_COLLISION_LOG_PATTERN.test(line));
 }
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -118,8 +132,12 @@ async function importEmbeddedPostgres() {
   return mod.default as new (opts: any) => RealInstance["instance"];
 }
 
-async function startLegacyCluster(dataDir: string, port: number): Promise<RealInstance> {
+async function startLegacyCluster(
+  dataDir: string,
+  initialPort: number,
+): Promise<RealInstance> {
   const EmbeddedPostgres = await importEmbeddedPostgres();
+  let port = initialPort;
   let lastError: unknown = null;
   let lastLogs: string[] = [];
 
@@ -146,14 +164,118 @@ async function startLegacyCluster(dataDir: string, port: number): Promise<RealIn
       lastError = error;
       lastLogs = recentLogs;
       if (attempt === MAX_STARTUP_ATTEMPTS) break;
-      // initdb refuses a non-empty dir, so wipe before retrying. The cred
-      // file lives BESIDE the dir, not inside, so this is safe.
-      wipeDataDirForRetry(dataDir);
+      if (isLikelyPortCollision(recentLogs)) {
+        // embedded-postgres's start() rejects with bare undefined on early
+        // process exit; the only signal is the log line. Re-allocate the
+        // port and retry; the data dir is fine because the failure was
+        // after initdb, not during it.
+        port = await allocatePort();
+      } else {
+        // initdb flake: wipe before retrying (initdb refuses a non-empty
+        // dir). The cred file lives BESIDE the dir, not inside, so this
+        // is safe.
+        wipeDataDirForRetry(dataDir);
+      }
     }
   }
 
   throw new Error(
     `startLegacyCluster failed after ${MAX_STARTUP_ATTEMPTS} attempts: ` +
+      formatStartupFailure(lastError, lastLogs),
+  );
+}
+
+// Re-open an existing data dir with the new builder (no initialise()).
+// Retries on port collision by re-allocating the port. The data dir is not
+// touched on retry — it already has content from a prior startLegacyCluster
+// call, and wiping it would destroy the test scenario.
+async function reopenInstanceWithDataDir(
+  dataDir: string,
+  initialPort: number,
+  password: string,
+): Promise<{ instance: RealInstance["instance"]; port: number }> {
+  const EmbeddedPostgres = await importEmbeddedPostgres();
+  let port = initialPort;
+  let lastError: unknown = null;
+  let lastLogs: string[] = [];
+
+  for (let attempt = 1; attempt <= MAX_STARTUP_ATTEMPTS; attempt += 1) {
+    const recentLogs: string[] = [];
+    const instance = new EmbeddedPostgres(
+      buildEmbeddedPostgresConstructorOptions({
+        dataDir,
+        port,
+        password,
+        onLog: (m: unknown) => recordStartupLogLine(recentLogs, m),
+        onError: (m: unknown) => recordStartupLogLine(recentLogs, m),
+      }),
+    );
+
+    try {
+      await instance.start();
+      return { instance, port };
+    } catch (error) {
+      await instance.stop().catch(() => undefined);
+      lastError = error;
+      lastLogs = recentLogs;
+      if (attempt === MAX_STARTUP_ATTEMPTS) break;
+      // embedded-postgres rejects with bare undefined on early process exit;
+      // for a re-open the most likely cause is port collision. If it isn't,
+      // surface immediately rather than swallowing a real defect.
+      if (!isLikelyPortCollision(recentLogs)) break;
+      port = await allocatePort();
+    }
+  }
+
+  throw new Error(
+    `reopenInstanceWithDataDir failed after ${MAX_STARTUP_ATTEMPTS} attempts: ` +
+      formatStartupFailure(lastError, lastLogs),
+  );
+}
+
+// First-boot start: initialise() + start() on a fresh data dir. Retries on
+// initdb flake (wipe + retry) or port collision (re-allocate port).
+async function startFreshInstanceWithDataDir(
+  dataDir: string,
+  initialPort: number,
+  password: string,
+): Promise<{ instance: RealInstance["instance"]; port: number }> {
+  const EmbeddedPostgres = await importEmbeddedPostgres();
+  let port = initialPort;
+  let lastError: unknown = null;
+  let lastLogs: string[] = [];
+
+  for (let attempt = 1; attempt <= MAX_STARTUP_ATTEMPTS; attempt += 1) {
+    const recentLogs: string[] = [];
+    const instance = new EmbeddedPostgres(
+      buildEmbeddedPostgresConstructorOptions({
+        dataDir,
+        port,
+        password,
+        onLog: (m: unknown) => recordStartupLogLine(recentLogs, m),
+        onError: (m: unknown) => recordStartupLogLine(recentLogs, m),
+      }),
+    );
+
+    try {
+      await instance.initialise();
+      await instance.start();
+      return { instance, port };
+    } catch (error) {
+      await instance.stop().catch(() => undefined);
+      lastError = error;
+      lastLogs = recentLogs;
+      if (attempt === MAX_STARTUP_ATTEMPTS) break;
+      if (isLikelyPortCollision(recentLogs)) {
+        port = await allocatePort();
+      } else {
+        wipeDataDirForRetry(dataDir);
+      }
+    }
+  }
+
+  throw new Error(
+    `startFreshInstanceWithDataDir failed after ${MAX_STARTUP_ATTEMPTS} attempts: ` +
       formatStartupFailure(lastError, lastLogs),
   );
 }
@@ -262,7 +384,6 @@ describeEmbedded("embedded-postgres-auth: real-cluster rotation + fresh initdb",
   });
 
   it("fresh initdb writes a cred file, scram pg_hba, and explicit loopback bind", async () => {
-    const EmbeddedPostgres = await importEmbeddedPostgres();
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-fresh-init-"));
     cleanups.push(async () => {
       fs.rmSync(dataDir, { recursive: true, force: true });
@@ -275,17 +396,11 @@ describeEmbedded("embedded-postgres-auth: real-cluster rotation + fresh initdb",
     const startup = resolveEmbeddedPostgresPasswordForStartup(dataDir);
     expect(startup.source).toBe("generated");
 
-    const instance = new EmbeddedPostgres(
-      buildEmbeddedPostgresConstructorOptions({
-        dataDir,
-        port,
-        password: startup.password,
-        onLog: () => {},
-        onError: () => {},
-      }),
+    const { instance, port: actualPort } = await startFreshInstanceWithDataDir(
+      dataDir,
+      port,
+      startup.password,
     );
-    await instance.initialise();
-    await instance.start();
     cleanups.push(async () => { await instance.stop().catch(() => undefined); });
 
     // AC2: credential persisted at initdb time.
@@ -307,7 +422,7 @@ describeEmbedded("embedded-postgres-auth: real-cluster rotation + fresh initdb",
     // to postmaster.opts verbatim, so we read the running GUC.
     const admin = postgres(
       buildEmbeddedPostgresConnectionString({
-        port,
+        port: actualPort,
         database: "postgres",
         password: startup.password,
       }),
@@ -344,23 +459,17 @@ describeEmbedded("embedded-postgres-auth: real-cluster rotation + fresh initdb",
     expect(startup.source).toBe("legacy-fallback");
     expect(startup.password).toBe(LEGACY_EMBEDDED_POSTGRES_PASSWORD);
 
-    const EmbeddedPostgres = await importEmbeddedPostgres();
-    const instance = new EmbeddedPostgres(
-      buildEmbeddedPostgresConstructorOptions({
-        dataDir,
-        port,
-        password: startup.password,
-        onLog: () => {},
-        onError: () => {},
-      }),
+    const { instance, port: actualPort } = await reopenInstanceWithDataDir(
+      dataDir,
+      port,
+      startup.password,
     );
-    await instance.start();
     cleanups.push(async () => { await instance.stop().catch(() => undefined); });
 
     // Step 3: rotation must converge.
     const rotation = await rotateEmbeddedPostgresAuthIfNeeded({
       dataDir,
-      port,
+      port: actualPort,
       currentPassword: startup.password,
     });
     expect(rotation.rotated).toBe(true);
@@ -381,7 +490,7 @@ describeEmbedded("embedded-postgres-auth: real-cluster rotation + fresh initdb",
     // literal (so a leaked source literal stops being useful).
     const goodAdmin = postgres(
       buildEmbeddedPostgresConnectionString({
-        port,
+        port: actualPort,
         database: "postgres",
         password: rotation.password,
       }),
@@ -396,7 +505,7 @@ describeEmbedded("embedded-postgres-auth: real-cluster rotation + fresh initdb",
 
     const badAdmin = postgres(
       buildEmbeddedPostgresConnectionString({
-        port,
+        port: actualPort,
         database: "postgres",
         password: LEGACY_EMBEDDED_POSTGRES_PASSWORD,
       }),
@@ -418,23 +527,17 @@ describeEmbedded("embedded-postgres-auth: real-cluster rotation + fresh initdb",
     const legacy = await startLegacyCluster(dataDir, port);
     await stopRealInstance(legacy);
 
-    const EmbeddedPostgres = await importEmbeddedPostgres();
-    const instance = new EmbeddedPostgres(
-      buildEmbeddedPostgresConstructorOptions({
-        dataDir,
-        port,
-        password: LEGACY_EMBEDDED_POSTGRES_PASSWORD,
-        onLog: () => {},
-        onError: () => {},
-      }),
+    const { instance, port: actualPort } = await reopenInstanceWithDataDir(
+      dataDir,
+      port,
+      LEGACY_EMBEDDED_POSTGRES_PASSWORD,
     );
-    await instance.start();
     cleanups.push(async () => { await instance.stop().catch(() => undefined); });
 
     const firstStartup = resolveEmbeddedPostgresPasswordForStartup(dataDir);
     const first = await rotateEmbeddedPostgresAuthIfNeeded({
       dataDir,
-      port,
+      port: actualPort,
       currentPassword: firstStartup.password,
     });
     expect(first.rotated).toBe(true);
@@ -444,7 +547,7 @@ describeEmbedded("embedded-postgres-auth: real-cluster rotation + fresh initdb",
     expect(secondStartup.source).toBe("cred-file");
     const second = await rotateEmbeddedPostgresAuthIfNeeded({
       dataDir,
-      port,
+      port: actualPort,
       currentPassword: secondStartup.password,
     });
     expect(second.rotated).toBe(false);
@@ -469,22 +572,16 @@ describeEmbedded("embedded-postgres-auth: real-cluster rotation + fresh initdb",
     // Bootstrap + rotate so the cred file exists.
     const legacy = await startLegacyCluster(dataDir, port);
     await stopRealInstance(legacy);
-    const EmbeddedPostgres = await importEmbeddedPostgres();
-    const instance = new EmbeddedPostgres(
-      buildEmbeddedPostgresConstructorOptions({
-        dataDir,
-        port,
-        password: LEGACY_EMBEDDED_POSTGRES_PASSWORD,
-        onLog: () => {},
-        onError: () => {},
-      }),
+    const { instance, port: actualPort } = await reopenInstanceWithDataDir(
+      dataDir,
+      port,
+      LEGACY_EMBEDDED_POSTGRES_PASSWORD,
     );
-    await instance.start();
     cleanups.push(async () => { await instance.stop().catch(() => undefined); });
     const firstStartup = resolveEmbeddedPostgresPasswordForStartup(dataDir);
     const first = await rotateEmbeddedPostgresAuthIfNeeded({
       dataDir,
-      port,
+      port: actualPort,
       currentPassword: firstStartup.password,
     });
     expect(first.rotated).toBe(true);
@@ -505,7 +602,7 @@ describeEmbedded("embedded-postgres-auth: real-cluster rotation + fresh initdb",
     await expect(
       rotateEmbeddedPostgresAuthIfNeeded({
         dataDir,
-        port,
+        port: actualPort,
         currentPassword: after.password,
       }),
     ).rejects.toThrow();
