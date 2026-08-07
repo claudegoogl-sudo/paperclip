@@ -87,6 +87,17 @@ jobs:
       - name: Test compose literal-secrets check
         run: node --test ./scripts/check-compose-literal-secrets.test.mjs
 
+      # Same hazard as the compose stack gate above, scoped to `.env.example`:
+      # a connection string that embeds a password in URL userinfo is a
+      # credential the moment the repo is public. The rule is narrow on
+      # purpose (URLs only) so it does not couple to BETTER_AUTH_SECRET,
+      # which is a separate ticket.
+      - name: Reject literal connection-string credentials in .env.example
+        run: node ./scripts/check-env-example-connection-string.mjs
+
+      - name: Test .env.example connection-string check
+        run: node --test ./scripts/check-env-example-connection-string.test.mjs
+
       # Regression guard for CONTRIBUTING.md's "No Internal Issue References"
       # rule: fails if the PR diff adds an internal ticket id, an instance UI
       # link, an agent:// link, or a localhost/private-IP deep link into the
