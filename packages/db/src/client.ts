@@ -4,6 +4,7 @@ import { migrate as migratePg } from "drizzle-orm/postgres-js/migrator";
 import { readFile, readdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import postgres from "postgres";
+import { resolveEmbeddedPostgresConnection } from "./embedded-postgres-auth.js";
 import { enableQueryCancellation } from "./query-cancellation.js";
 import * as schema from "./schema/index.js";
 
@@ -12,7 +13,8 @@ const DRIZZLE_MIGRATIONS_TABLE = "__drizzle_migrations";
 const MIGRATIONS_JOURNAL_JSON = fileURLToPath(new URL("./migrations/meta/_journal.json", import.meta.url));
 
 function createUtilitySql(url: string) {
-  return postgres(url, { max: 1, onnotice: () => {} });
+  const { connectionString, sqlOptions } = resolveEmbeddedPostgresConnection(url);
+  return postgres(connectionString, { max: 1, onnotice: () => {}, ...sqlOptions });
 }
 
 function isSafeIdentifier(value: string): boolean {
@@ -71,9 +73,11 @@ export function resolveDbPoolOptions(): { max: number; statementTimeoutMs: numbe
 
 export function createDb(url: string) {
   const { max, statementTimeoutMs } = resolveDbPoolOptions();
-  const sql = postgres(url, {
+  const { connectionString, sqlOptions } = resolveEmbeddedPostgresConnection(url);
+  const sql = postgres(connectionString, {
     max,
     connection: { statement_timeout: statementTimeoutMs },
+    ...sqlOptions,
   });
   // Queries issued inside a cancellation scope (see query-cancellation.ts) are
   // cancelled when that scope aborts, so an abandoned request stops holding its

@@ -6,6 +6,7 @@ import {
   formatDatabaseBackupResult,
   readEmbeddedPostgresCredential,
   runDatabaseBackup,
+  socketDirectoryPathFor,
 } from "@paperclipai/db";
 import {
   expandHomePrefix,
@@ -47,8 +48,9 @@ function resolveConnectionString(configPath?: string): { value: string; source: 
       port,
       database: "paperclip",
       password: cred.password,
+      socketDir: dataDir ? socketDirectoryPathFor(dataDir) : undefined,
     }),
-    source: `embedded-postgres@${port}`,
+    source: `embedded-postgres@${dataDir ? socketDirectoryPathFor(dataDir) : "(no dataDir)"}:${port}`,
   };
 }
 
