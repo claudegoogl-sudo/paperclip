@@ -44,6 +44,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import { runningProcesses } from "../adapters/index.ts";
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 const mockTrackAgentFirstHeartbeat = vi.hoisted(() => vi.fn());
@@ -321,114 +322,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
     cleanupPids.clear();
     await cancelActiveRunsForCleanup(db, 5_000);
-    let idlePolls = 0;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      const runs = await db
-        .select({
-          status: heartbeatRuns.status,
-          processPid: heartbeatRuns.processPid,
-          processGroupId: heartbeatRuns.processGroupId,
-        })
-        .from(heartbeatRuns);
-      const managedExecutionStillActive = runs.some(
-        (run) =>
-          (run.status === "queued" || run.status === "running") &&
-          !run.processPid &&
-          !run.processGroupId,
-      );
-      if (!managedExecutionStillActive) {
-        idlePolls += 1;
-        if (idlePolls >= 3) break;
-      } else {
-        idlePolls = 0;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    await new Promise((resolve) => setTimeout(resolve, 50));
     await waitForHeartbeatIdle(db, 5_000);
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await db.delete(activityLog);
-    await db.delete(agentRuntimeState);
-    await db.delete(companySkills);
-    await db.delete(costEvents);
-    await db.delete(workspaceOperations);
-    await db.delete(environmentLeases);
+    // This suite spawns real background recovery work that can deadlock
+    // (SQLSTATE 40P01) against an ACCESS EXCLUSIVE TRUNCATE lock under
+    // contention; resetEmbeddedPostgresTestDatabase wraps the TRUNCATE in the
+    // shared Postgres transient-error retry rather than inventing a second
+    // mechanism. See helpers/reset-test-database.ts.
+    await resetEmbeddedPostgresTestDatabase(db);
+    // environments is a global table, not FK-chained to companies, so the
+    // TRUNCATE ... CASCADE above doesn't touch it.
     await db.delete(environments);
-    await db.delete(issuePlanDecompositions);
-    await db.delete(issueThreadInteractions);
-    await db.delete(documentAnnotationComments);
-    await db.delete(documentAnnotationAnchorSnapshots);
-    await db.delete(documentAnnotationThreads);
-    await db.delete(issueWorkProducts);
-    await db.delete(issueComments);
-    await db.delete(issueDocuments);
-    await db.delete(documentRevisions);
-    await db.delete(documents);
-    await db.delete(issueRelations);
-    await db.delete(issueRecoveryActions);
-    await db.delete(issueTreeHoldMembers);
-    await db.delete(issueTreeHolds);
-    await db.delete(issueApprovals);
-    await db.delete(approvals);
-    await db.delete(issueThreadInteractions);
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await db.delete(issueComments);
-      await db.delete(issueDocuments);
-      try {
-        await db.delete(issues);
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await db.delete(activityLog);
-      await db.delete(heartbeatRunEvents);
-      try {
-        await db.delete(heartbeatRuns);
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-    await db.delete(agentWakeupRequests);
-    await db.delete(budgetPolicies);
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await db.delete(agentRuntimeState);
-      try {
-        await db.delete(agents);
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await db.delete(companySkills);
-      await db.delete(workspaceOperations);
-      await db.delete(executionWorkspaces);
-      await db.delete(projectWorkspaces);
-      await db.delete(projects);
-      await db.delete(issuePlanDecompositions);
-      await db.delete(issueThreadInteractions);
-      await db.delete(documentAnnotationComments);
-      await db.delete(documentAnnotationAnchorSnapshots);
-      await db.delete(documentAnnotationThreads);
-      await db.delete(issueDocuments);
-      await db.delete(documentRevisions);
-      await db.delete(documents);
-      await db.delete(companySecretBindings);
-      await db.delete(companySecrets);
-      try {
-        await db.delete(companies);
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
   });
 
   afterAll(async () => {

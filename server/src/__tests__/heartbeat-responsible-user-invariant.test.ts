@@ -2,17 +2,12 @@ import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  activityLog,
   agents,
-  agentRuntimeState,
   agentWakeupRequests,
   companies,
   companyMemberships,
-  companySkills,
   createDb,
-  heartbeatRunEvents,
   heartbeatRuns,
-  issueComments,
   issues,
 } from "@paperclipai/db";
 import {
@@ -21,6 +16,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { runningProcesses } from "../adapters/index.ts";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -71,26 +67,11 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
   afterEach(async () => {
     mockAdapterExecute.mockClear();
     runningProcesses.clear();
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      const activeRuns = await db
-        .select()
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.status, "running"));
-      if (activeRuns.length === 0) break;
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    await db.delete(heartbeatRunEvents);
-    await db.delete(issueComments);
-    await db.delete(activityLog);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(issues);
-    await db.delete(agents);
-    await db.delete(companySkills);
-    await db.delete(companyMemberships);
-    await db.delete(companies);
+    // Heartbeat finalization keeps writing run-linked rows in the background
+    // after the test function returns; see resetEmbeddedPostgresTestDatabase
+    // for why an atomic TRUNCATE ... CASCADE doesn't race that write burst the
+    // way an ordered per-table DELETE chain does.
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {
