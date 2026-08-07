@@ -18,5 +18,14 @@ export default defineConfig({
       hooks: "list",
     },
     setupFiles: ["./src/__tests__/setup-supertest.ts"],
+    // Symmetric startup/teardown budget: every embedded-Postgres `beforeAll`
+    // already passes `20_000` per-file. Without this line, the matching
+    // `afterAll` cleanup hooks run on vitest's 10s default `hookTimeout`, so
+    // on a loaded runner teardown overruns the budget and reddens a passing
+    // suite. The per-file `beforeAll` 20_000 is preserved (it's a no-op once
+    // the global is 20s), but the global is what keeps the teardown side
+    // honest. See packages/db/src/test-embedded-postgres.ts for the
+    // SIGKILL-escalation path that bounds cleanup() well inside this budget.
+    hookTimeout: 20_000,
   },
 });
