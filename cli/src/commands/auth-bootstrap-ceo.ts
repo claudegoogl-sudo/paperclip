@@ -2,7 +2,13 @@ import { createHash, randomBytes } from "node:crypto";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
 import { and, eq, gt, isNull } from "drizzle-orm";
-import { createDb, instanceUserRoles, invites } from "@paperclipai/db";
+import {
+  buildEmbeddedPostgresConnectionString,
+  createDb,
+  instanceUserRoles,
+  invites,
+  readEmbeddedPostgresCredential,
+} from "@paperclipai/db";
 import { inferBindModeFromHost } from "@paperclipai/shared";
 import { loadPaperclipEnvFile } from "../config/env.js";
 import { readConfig, resolveConfigPath } from "../config/store.js";
@@ -24,7 +30,20 @@ function resolveDbUrl(configPath?: string, explicitDbUrl?: string) {
   }
   if (config?.database.mode === "embedded-postgres") {
     const port = config.database.embeddedPostgresPort ?? 54329;
-    return `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`;
+    const dataDir = config.database.embeddedPostgresDataDir;
+    const cred = dataDir ? readEmbeddedPostgresCredential(dataDir) : null;
+    if (!cred) {
+      throw new Error(
+        `Cannot resolve embedded PostgreSQL connection for bootstrap: no per-install ` +
+          `credential file found beside ${dataDir ? `data dir ${dataDir}` : "the data dir (none configured)"}. ` +
+          `Start the Paperclip server once so it generates one.`,
+      );
+    }
+    return buildEmbeddedPostgresConnectionString({
+      port,
+      database: "paperclip",
+      password: cred.password,
+    });
   }
   return null;
 }

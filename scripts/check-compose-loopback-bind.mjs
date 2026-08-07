@@ -33,6 +33,8 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+import { failClosedOnEmptyScan } from "./policy-gate-fail-closed.mjs";
+
 const DEFAULT_COMPOSE_DIR = "docker";
 const DEFAULT_QUADLET_DIR = "docker/quadlet";
 const COMPOSE_EXTENSIONS = new Set([".yml", ".yaml"]);
@@ -370,6 +372,20 @@ export function runCheck({
     );
     return 1;
   }
+
+  // Fail-closed guard: the gate's mandatory scan root is `composeDir` (the
+  // `docker/` directory by default). `quadletDir` is optional — it is only
+  // scanned when it exists — so an absent quadlet directory is not a policy
+  // failure. If `composeDir` is missing or emptied, `scanned` stays at zero
+  // and the gate must error rather than silently report green at zero
+  // coverage. See `scripts/policy-gate-fail-closed.mjs` for the rationale.
+  const emptyScanExit = failClosedOnEmptyScan({
+    scannedCount: scanned,
+    expectedRoots: [{ path: composeRoot, label: "compose directory" }],
+    error,
+    gateName: "check-compose-loopback-bind",
+  });
+  if (emptyScanExit !== null) return emptyScanExit;
 
   log(`  ✓  All published ports in ${scanned} container stack file(s) bind to loopback by default.`);
   return 0;
