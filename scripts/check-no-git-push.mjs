@@ -22,6 +22,8 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+import { failClosedOnEmptyScan } from "./policy-gate-fail-closed.mjs";
+
 const DEFAULT_SCAN_ROOTS = [
   "packages/adapters",
   "packages/adapter-utils",
@@ -148,12 +150,21 @@ export function collectScannableFiles(absoluteRoot, repoRoot) {
   return results;
 }
 
-export function runCheck({ repoRoot, scanRoots = DEFAULT_SCAN_ROOTS, log = console.log, error = console.error } = {}) {
+export function runCheck({
+  repoRoot,
+  scanRoots = DEFAULT_SCAN_ROOTS,
+  log = console.log,
+  error = console.error,
+} = {}) {
   const allOffenses = [];
+  let scanned = 0;
+  const expectedRoots = [];
 
   for (const scanRoot of scanRoots) {
     const absoluteRoot = path.resolve(repoRoot, scanRoot);
+    expectedRoots.push({ path: absoluteRoot, label: scanRoot });
     const files = collectScannableFiles(absoluteRoot, repoRoot);
+    scanned += files.length;
     for (const file of files) {
       let text;
       try {
@@ -181,6 +192,18 @@ export function runCheck({ repoRoot, scanRoots = DEFAULT_SCAN_ROOTS, log = conso
     );
     return 1;
   }
+
+  // Fail-closed guard: if none of the expected adapter/runtime scan roots
+  // yielded any files, the gate has lost its inputs (rename, move, or an
+  // emptied tree) and must error rather than silently report green at zero
+  // coverage. See `scripts/policy-gate-fail-closed.mjs` for the rationale.
+  const emptyScanExit = failClosedOnEmptyScan({
+    scannedCount: scanned,
+    expectedRoots,
+    error,
+    gateName: "check-no-git-push",
+  });
+  if (emptyScanExit !== null) return emptyScanExit;
 
   log(`  ✓  No unapproved \`git push\` invocations found in adapter/runtime code.`);
   return 0;
