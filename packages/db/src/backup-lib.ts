@@ -8,6 +8,33 @@ import { createGunzip, createGzip } from "node:zlib";
 import postgres from "postgres";
 import { resolveEmbeddedPostgresConnection } from "./embedded-postgres-auth.js";
 
+// Build the `pg_dump`/`psql` `--dbname` argument (and the password to pass via
+// PGPASSWORD) for a socket-only embedded cluster. libpq gives an explicit host
+// in the connection *string* precedence over the PGHOST env var, so a URL that
+// pins `host=127.0.0.1` shells out to TCP even when PGHOST points at the unix
+// socket — and against a socket-only cluster (TCP listener killed) that is
+// refused. Emit a libpq keyword/value conninfo with `host=<socketDir>` and no
+// TCP host instead. The password rides in PGPASSWORD (env), never in argv, so
+// it cannot leak via `ps`.
+export function embeddedSocketConninfo(input: {
+  connectionString: string;
+  socketDir: string;
+}): { dbnameArg: string; password: string | null } {
+  const url = new URL(input.connectionString);
+  const user = url.username ? decodeURIComponent(url.username) : "";
+  const password = url.password ? decodeURIComponent(url.password) : null;
+  const dbname = url.pathname.replace(/^\//, "");
+  const port = url.port;
+  // Single-quote each value and escape `'` and `\` per libpq conninfo rules.
+  const kv = (key: string, value: string): string =>
+    `${key}='${value.replace(/(['\\])/g, "\\$1")}'`;
+  const parts = [kv("host", input.socketDir)];
+  if (port) parts.push(kv("port", port));
+  if (user) parts.push(kv("user", user));
+  if (dbname) parts.push(kv("dbname", dbname));
+  return { dbnameArg: parts.join(" "), password };
+}
+
 // Decode a possibly-sentinel-carrying embedded connection string into the
 // arguments a `postgres()` call needs: the sentinel is stripped and, when a
 // unix socket is present, returned as the `{ host }` options override.
@@ -512,13 +539,26 @@ async function runPgDumpBackup(opts: {
   const partialFile = `${opts.backupFile}.partial`;
 
   // Strip the `?paperclip_socket=` sentinel: libpq has no such URI option and
-  // would reject it. When a unix socket is present, expose it via PGHOST so a
-  // host that does have pg_dump can still reach the socket-only cluster.
+  // would reject it. When a unix socket is present, route pg_dump over it via a
+  // `host=<socketDir>` conninfo (a URL that also pins host=127.0.0.1 would win
+  // over PGHOST and hit the killed TCP listener) with the password in
+  // PGPASSWORD, not argv.
   const resolved = resolveEmbeddedPostgresConnection(opts.connectionString);
+  const socketDir =
+    "host" in resolved.sqlOptions ? resolved.sqlOptions.host : null;
+  const socketConn = socketDir
+    ? embeddedSocketConninfo({
+        connectionString: resolved.connectionString,
+        socketDir,
+      })
+    : null;
+  const dbnameArg = socketConn
+    ? socketConn.dbnameArg
+    : resolved.connectionString;
   const child = spawn(
     pgDumpBin,
     [
-      `--dbname=${resolved.connectionString}`,
+      `--dbname=${dbnameArg}`,
       "--format=plain",
       "--clean",
       "--if-exists",
@@ -529,7 +569,9 @@ async function runPgDumpBackup(opts: {
       stdio: ["ignore", "pipe", "pipe"],
       env: {
         ...process.env,
-        ...("host" in resolved.sqlOptions ? { PGHOST: resolved.sqlOptions.host } : {}),
+        ...(socketConn?.password != null
+          ? { PGPASSWORD: socketConn.password }
+          : {}),
         PGCONNECT_TIMEOUT: String(opts.connectTimeout),
       },
     },
@@ -553,13 +595,25 @@ async function runPgDumpBackup(opts: {
 
 async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: number): Promise<void> {
   const psqlBin = process.env.PAPERCLIP_PSQL_PATH || "psql";
-  // Strip the `?paperclip_socket=` sentinel (see runPgDumpBackup) and surface
-  // any unix socket via PGHOST.
+  // Strip the `?paperclip_socket=` sentinel and, when a unix socket is present,
+  // route psql over it via a `host=<socketDir>` conninfo + PGPASSWORD (see
+  // runPgDumpBackup for why a host-pinned URL would miss the socket).
   const resolved = resolveEmbeddedPostgresConnection(opts.connectionString);
+  const socketDir =
+    "host" in resolved.sqlOptions ? resolved.sqlOptions.host : null;
+  const socketConn = socketDir
+    ? embeddedSocketConninfo({
+        connectionString: resolved.connectionString,
+        socketDir,
+      })
+    : null;
+  const dbnameArg = socketConn
+    ? socketConn.dbnameArg
+    : resolved.connectionString;
   const child = spawn(
     psqlBin,
     [
-      `--dbname=${resolved.connectionString}`,
+      `--dbname=${dbnameArg}`,
       "--set=ON_ERROR_STOP=1",
       "--quiet",
       "--no-psqlrc",
@@ -568,7 +622,9 @@ async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: 
       stdio: ["pipe", "ignore", "pipe"],
       env: {
         ...process.env,
-        ...("host" in resolved.sqlOptions ? { PGHOST: resolved.sqlOptions.host } : {}),
+        ...(socketConn?.password != null
+          ? { PGPASSWORD: socketConn.password }
+          : {}),
         PGCONNECT_TIMEOUT: String(connectTimeout),
       },
     },
