@@ -3,6 +3,12 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { applyPendingMigrations, ensurePostgresDatabase } from "./client.js";
+import {
+  buildEmbeddedPostgresConnectionString,
+  buildEmbeddedPostgresConstructorOptions,
+  resolveEmbeddedPostgresPasswordForStartup,
+  rotateEmbeddedPostgresAuthIfNeeded,
+} from "./embedded-postgres-auth.js";
 import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
 
 type EmbeddedPostgresInstance = {
@@ -17,7 +23,9 @@ type EmbeddedPostgresCtor = new (opts: {
   password: string;
   port: number;
   persistent: boolean;
+  authMethod?: "scram-sha-256" | "password" | "md5";
   initdbFlags?: string[];
+  postgresFlags?: string[];
   onLog?: (message: unknown) => void;
   onError?: (message: unknown) => void;
 }) => EmbeddedPostgresInstance;
@@ -103,18 +111,18 @@ async function createEmbeddedPostgresTestInstance(tempDirPrefix: string) {
   const port = await getAvailablePort();
   const EmbeddedPostgres = await getEmbeddedPostgresCtor();
   const recentLogs: string[] = [];
-  const instance = new EmbeddedPostgres({
-    databaseDir: dataDir,
-    user: "paperclip",
-    password: "paperclip",
-    port,
-    persistent: true,
-    initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
-    onLog: (message) => recordStartupLogLine(recentLogs, message),
-    onError: (message) => recordStartupLogLine(recentLogs, message),
-  });
+  const startupPasswordResolution = resolveEmbeddedPostgresPasswordForStartup(dataDir);
+  const instance = new EmbeddedPostgres(
+    buildEmbeddedPostgresConstructorOptions({
+      dataDir,
+      port,
+      password: startupPasswordResolution.password,
+      onLog: (message) => recordStartupLogLine(recentLogs, message),
+      onError: (message) => recordStartupLogLine(recentLogs, message),
+    }),
+  );
 
-  return { dataDir, port, instance, recentLogs };
+  return { dataDir, port, instance, recentLogs, startupPasswordResolution };
 }
 
 function cleanupEmbeddedPostgresTestDirs(dataDir: string) {
@@ -249,6 +257,11 @@ async function probeEmbeddedPostgresSupport(): Promise<EmbeddedPostgresTestSuppo
     instance = created.instance;
     await instance.initialise();
     await instance.start();
+    await rotateEmbeddedPostgresAuthIfNeeded({
+      dataDir,
+      port: created.port,
+      currentPassword: created.startupPasswordResolution.password,
+    });
     return { supported: true };
   } catch (error) {
     return {
@@ -300,9 +313,22 @@ export async function startEmbeddedPostgresTestDatabase(
       await instance.initialise();
       await instance.start();
 
-      const adminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/postgres`;
+      const rotation = await rotateEmbeddedPostgresAuthIfNeeded({
+        dataDir,
+        port,
+        currentPassword: created.startupPasswordResolution.password,
+      });
+      const adminConnectionString = buildEmbeddedPostgresConnectionString({
+        port,
+        database: "postgres",
+        password: rotation.password,
+      });
       await ensurePostgresDatabase(adminConnectionString, "paperclip");
-      const connectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`;
+      const connectionString = buildEmbeddedPostgresConnectionString({
+        port,
+        database: "paperclip",
+        password: rotation.password,
+      });
       await applyPendingMigrations(connectionString);
 
       return {

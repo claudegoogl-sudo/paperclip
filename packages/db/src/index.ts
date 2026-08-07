@@ -41,6 +41,33 @@ export {
   formatEmbeddedPostgresError,
 } from "./embedded-postgres-error.js";
 export {
+  EMBEDDED_POSTGRES_AUTH_METHOD,
+  EMBEDDED_POSTGRES_HOST,
+  EMBEDDED_POSTGRES_USER,
+  LEGACY_EMBEDDED_POSTGRES_PASSWORD,
+  buildEmbeddedPostgresConnectionString,
+  buildEmbeddedPostgresConstructorOptions,
+  buildScramSha256PgHba,
+  credentialFilePathFor,
+  generateEmbeddedPostgresPassword,
+  isPgHbaScramOnly,
+  readEmbeddedPostgresCredential,
+  resolveEmbeddedPostgresPasswordForStartup,
+  rewritePgHbaToScram,
+  rotateEmbeddedPostgresAuthIfNeeded,
+  scrubEmbeddedPostgresConnectionString,
+  writeEmbeddedPostgresCredential,
+  type BuildEmbeddedPostgresConnectionStringInput,
+  type EmbeddedPostgresAuthMethod,
+  type EmbeddedPostgresConstructorOptions,
+  type EmbeddedPostgresCredential,
+  type EmbeddedPostgresDatabase,
+  type ResolvedEmbeddedPostgresPassword,
+  type RotateEmbeddedPostgresAuthEvent,
+  type RotateEmbeddedPostgresAuthInput,
+  type RotateEmbeddedPostgresAuthResult,
+} from "./embedded-postgres-auth.js";
+export {
   ensureLinuxSharedLibraryAliases,
   prepareEmbeddedPostgresNativeRuntime,
 } from "./embedded-postgres-native.js";

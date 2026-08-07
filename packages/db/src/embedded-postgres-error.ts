@@ -1,6 +1,17 @@
 const DEFAULT_RECENT_LOG_LIMIT = 40;
 const RECENT_LOG_SUMMARY_LINES = 8;
 
+// Connection strings can leak into Postgres's stderr when an auth or connection
+// error references the URL the client tried to reach. Scrub on read so neither
+// formatEmbeddedPostgresError nor any direct getRecentLogs() consumer can land
+// the per-install password in a log file.
+const POSTGRES_URL_PASSWORD_RE =
+  /(postgres(?:ql)?:\/\/[A-Za-z0-9._~%-]*):[A-Za-z0-9._~%-]+@/g;
+
+function scrubConnectionString(value: string): string {
+  return value.replace(POSTGRES_URL_PASSWORD_RE, "$1:[redacted]@");
+}
+
 function toError(error: unknown, fallbackMessage: string): Error {
   if (error instanceof Error) return error;
   if (error === undefined) return new Error(fallbackMessage);
@@ -60,7 +71,7 @@ export function createEmbeddedPostgresLogBuffer(limit = DEFAULT_RECENT_LOG_LIMIT
       }
     },
     getRecentLogs() {
-      return [...recentLogs];
+      return recentLogs.map((line) => scrubConnectionString(line));
     },
   };
 }
@@ -74,7 +85,7 @@ export function formatEmbeddedPostgresError(
 ): Error {
   const baseError = toError(error, input.fallbackMessage);
   const recentLogs = input.recentLogs ?? [];
-  const parts = [baseError.message];
+  const parts = [scrubConnectionString(baseError.message)];
   const hint = detectEmbeddedPostgresHint(recentLogs);
   const recentSummary = summarizeRecentLogs(recentLogs);
 

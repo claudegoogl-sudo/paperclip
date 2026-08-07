@@ -6,12 +6,17 @@ import {
   resolveDefaultBackupDir,
   resolvePaperclipConfigPathForInstance,
 } from "@paperclipai/shared/home-paths";
+import {
+  buildEmbeddedPostgresConnectionString,
+  readEmbeddedPostgresCredential,
+} from "./embedded-postgres-auth.js";
 
 type PartialConfig = {
   database?: {
     mode?: "embedded-postgres" | "postgres";
     connectionString?: string;
     embeddedPostgresPort?: number;
+    embeddedPostgresDataDir?: string;
     backup?: {
       dir?: string;
       retentionDays?: number;
@@ -49,7 +54,24 @@ function resolveConnectionString(config: PartialConfig | null): string {
   }
 
   const port = resolveEmbeddedPort(config);
-  return `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`;
+  // Read the per-install password from the cred file beside the data dir. If
+  // the cred file is missing (e.g. the server hasn't been started since this
+  // fix shipped), there's nothing safe to fall back to — surface that clearly
+  // rather than guessing a legacy literal.
+  const dataDir = config?.database?.embeddedPostgresDataDir;
+  const cred = dataDir ? readEmbeddedPostgresCredential(dataDir) : null;
+  if (!cred) {
+    throw new Error(
+      `Cannot resolve embedded PostgreSQL connection: no per-install credential file found beside ` +
+        `${dataDir ? `data dir ${dataDir}` : "the data dir (none configured)"}. ` +
+        `Start the Paperclip server once so it generates one, then re-run db:backup.`,
+    );
+  }
+  return buildEmbeddedPostgresConnectionString({
+    port,
+    database: "paperclip",
+    password: cred.password,
+  });
 }
 
 function resolveBackupDir(config: PartialConfig | null): string {
