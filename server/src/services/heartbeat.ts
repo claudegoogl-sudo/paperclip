@@ -10359,6 +10359,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return productivityReviews.reconcileProductivityReviews(opts);
   }
 
+  async function reconcileHighCommentVolumeAlerts(opts?: {
+    now?: Date;
+    companyId?: string;
+    threshold?: number;
+  }) {
+    return productivityReviews.reconcileHighCommentVolumeAlerts(opts);
+  }
+
   async function reconcileTaskWatchdogs(opts?: { companyId?: string | null; runId?: string | null }) {
     return taskWatchdogs.reconcileTaskWatchdogs(opts);
   }
@@ -15344,6 +15352,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     scanSilentActiveRuns,
 
     reconcileProductivityReviews,
+
+    reconcileHighCommentVolumeAlerts,
 
     reconcileTaskWatchdogs,
 

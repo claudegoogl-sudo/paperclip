@@ -1031,6 +1031,11 @@ export async function startServer(): Promise<StartedServer> {
         if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
           logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
         }
+
+        const commentAlerts = await heartbeat.reconcileHighCommentVolumeAlerts();
+        if (commentAlerts.alerted > 0 || commentAlerts.failed > 0) {
+          logger.warn({ ...commentAlerts }, "startup high-comment-volume monitor raised alerts");
+        }
       })().catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
       });
@@ -1136,6 +1141,12 @@ export async function startServer(): Promise<StartedServer> {
             const reviewed = await heartbeat.reconcileProductivityReviews();
             if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
               logger.warn({ ...reviewed }, "periodic productivity reconciliation created or updated review work");
+            }
+          })
+          .then(async () => {
+            const commentAlerts = await heartbeat.reconcileHighCommentVolumeAlerts();
+            if (commentAlerts.alerted > 0 || commentAlerts.failed > 0) {
+              logger.warn({ ...commentAlerts }, "periodic high-comment-volume monitor raised alerts");
             }
           })
           .catch((err) => {
