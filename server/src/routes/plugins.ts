@@ -413,6 +413,11 @@ export interface PluginRouteWebhookDeps {
    * uses the process-wide default so the budget survives a worker restart.
    */
   rateLimiter?: PluginWebhookRateLimiter;
+  /**
+   * Clock for the pre-limiter config memo's TTL. Defaults to `Date.now`; tests
+   * inject a fake clock to advance past the TTL and assert a fresh read.
+   */
+  now?: () => number;
 }
 
 /**
@@ -539,6 +544,18 @@ interface PluginToolExecuteRequest {
  *   plugin file watchers when a mutation changes the DB packagePath
  * @returns Express router with plugin routes mounted
  */
+/**
+ * TTL for the pre-limiter webhook config memo (Step 5 of the ingestion handler).
+ *
+ * Bounds how long a cached `{salt,digest}` may lag a rotation. §18.1's rotation
+ * procedure writes the new digest and *then* updates the provider; deliveries
+ * fall through to the anonymous budget during that gap with no loss, so a memo
+ * this short only widens an already-tolerated window. Kept small so an operator
+ * never waits long for a rotation to take effect, but large enough that a burst
+ * of presence-header requests collapses to a single config read.
+ */
+export const PLUGIN_WEBHOOK_CONFIG_MEMO_TTL_MS = 5_000;
+
 export function pluginRoutes(
   db: Db,
   loader: ReturnType<typeof pluginLoader>,
@@ -550,6 +567,31 @@ export function pluginRoutes(
 ) {
   const router = Router();
   const registry = pluginRegistryService(db);
+
+  // Process-local, TTL-bounded memo for the pre-limiter config read on the
+  // anonymous webhook ingestion path (Step 5 of the POST handler below). Keyed
+  // on the resolved plugin row id — never a URL param — so an anonymous caller
+  // cannot grow the key space; the bound is the count of installed plugins.
+  // Caches the `null`/no-config case too: an endpoint that declares `auth` but
+  // has no digest configured is exactly where a presence-header flood would
+  // otherwise pay for a repeated SELECT that always fails to verify.
+  const webhookConfigNow = webhookDeps?.now ?? Date.now;
+  const webhookConfigMemo = new Map<
+    string,
+    { expiresAt: number; value: Awaited<ReturnType<typeof registry.getConfig>> }
+  >();
+  const readWebhookConfigMemoized = async (pluginId: string) => {
+    const now = webhookConfigNow();
+    const hit = webhookConfigMemo.get(pluginId);
+    if (hit && hit.expiresAt > now) return hit.value;
+    const value = await registry.getConfig(pluginId);
+    webhookConfigMemo.set(pluginId, {
+      value,
+      expiresAt: now + PLUGIN_WEBHOOK_CONFIG_MEMO_TTL_MS,
+    });
+    return value;
+  };
+
   // Process-local sliding-window limiter for agent.tools.register
   // dispatches. Shared across requests for this server instance; resets on
   // restart (intentional — see plugin-tool-dispatch-guard.ts).
@@ -2921,20 +2963,25 @@ export function pluginRoutes(
     // write) could reach the verified tier with no grant. Absent the capability,
     // the delivery stays anonymous.
     let tier: PluginWebhookRateLimitTier = "anonymous";
-    if (
-      webhookDecl.auth &&
-      capabilities.includes("webhooks.verify") &&
-      req.headers[webhookDecl.auth.header.toLowerCase()]
-    ) {
-      const config = await registry.getConfig(plugin.id);
-      const verified = isVerifiedWebhookDelivery({
-        auth: webhookDecl.auth,
-        headers: req.headers,
-        config: config?.configJson,
-        pluginId: plugin.id,
-        endpointKey,
-      });
-      if (verified) tier = "verified";
+    if (webhookDecl.auth && capabilities.includes("webhooks.verify")) {
+      const headerValue = req.headers[webhookDecl.auth.header.toLowerCase()];
+      // Only a single, non-empty header value can ever verify. A repeated
+      // header arrives as `string[]` — truthy, but `isVerifiedWebhookDelivery`
+      // has no principled copy to check, so it can never reach the verified
+      // tier; bail here before paying for the config read rather than reading,
+      // failing, and billing the anonymous budget anyway. Absent or empty
+      // header is likewise anonymous at no cost.
+      if (typeof headerValue === "string" && headerValue.length > 0) {
+        const config = await readWebhookConfigMemoized(plugin.id);
+        const verified = isVerifiedWebhookDelivery({
+          auth: webhookDecl.auth,
+          headers: req.headers,
+          config: config?.configJson,
+          pluginId: plugin.id,
+          endpointKey,
+        });
+        if (verified) tier = "verified";
+      }
     }
 
     // Step 6: Rate-limit before any write.
