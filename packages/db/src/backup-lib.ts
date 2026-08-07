@@ -6,6 +6,22 @@ import { open as openFile } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import { createGunzip, createGzip } from "node:zlib";
 import postgres from "postgres";
+import { resolveEmbeddedPostgresConnection } from "./embedded-postgres-auth.js";
+
+// Decode a possibly-sentinel-carrying embedded connection string into the
+// arguments a `postgres()` call needs: the sentinel is stripped and, when a
+// unix socket is present, returned as the `{ host }` options override.
+function openBackupSql(
+  connectionString: string,
+  connectTimeout: number,
+): ReturnType<typeof postgres> {
+  const resolved = resolveEmbeddedPostgresConnection(connectionString);
+  return postgres(resolved.connectionString, {
+    max: 1,
+    connect_timeout: connectTimeout,
+    ...resolved.sqlOptions,
+  });
+}
 
 export type BackupRetentionPolicy = {
   dailyDays: number;
@@ -501,10 +517,14 @@ async function runPgDumpBackup(opts: {
   const pgDumpBin = process.env.PAPERCLIP_PG_DUMP_PATH || "pg_dump";
   const partialFile = `${opts.backupFile}.partial`;
 
+  // Strip the `?paperclip_socket=` sentinel: libpq has no such URI option and
+  // would reject it. When a unix socket is present, expose it via PGHOST so a
+  // host that does have pg_dump can still reach the socket-only cluster.
+  const resolved = resolveEmbeddedPostgresConnection(opts.connectionString);
   const child = spawn(
     pgDumpBin,
     [
-      `--dbname=${opts.connectionString}`,
+      `--dbname=${resolved.connectionString}`,
       "--format=plain",
       "--clean",
       "--if-exists",
@@ -515,6 +535,7 @@ async function runPgDumpBackup(opts: {
       stdio: ["ignore", "pipe", "pipe"],
       env: {
         ...process.env,
+        ...("host" in resolved.sqlOptions ? { PGHOST: resolved.sqlOptions.host } : {}),
         PGCONNECT_TIMEOUT: String(opts.connectTimeout),
       },
     },
@@ -538,10 +559,13 @@ async function runPgDumpBackup(opts: {
 
 async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: number): Promise<void> {
   const psqlBin = process.env.PAPERCLIP_PSQL_PATH || "psql";
+  // Strip the `?paperclip_socket=` sentinel (see runPgDumpBackup) and surface
+  // any unix socket via PGHOST.
+  const resolved = resolveEmbeddedPostgresConnection(opts.connectionString);
   const child = spawn(
     psqlBin,
     [
-      `--dbname=${opts.connectionString}`,
+      `--dbname=${resolved.connectionString}`,
       "--set=ON_ERROR_STOP=1",
       "--quiet",
       "--no-psqlrc",
@@ -550,6 +574,7 @@ async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: 
       stdio: ["pipe", "ignore", "pipe"],
       env: {
         ...process.env,
+        ...("host" in resolved.sqlOptions ? { PGHOST: resolved.sqlOptions.host } : {}),
         PGCONNECT_TIMEOUT: String(connectTimeout),
       },
     },
@@ -716,7 +741,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
   const canUsePgDump = !hasBackupTransforms(opts);
   const excludedTableNames = normalizeTableNameSet(opts.excludeTables);
   const nullifiedColumnsByTable = normalizeNullifyColumnMap(opts.nullifyColumns);
-  let sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
+  let sql = openBackupSql(opts.connectionString, connectTimeout);
   let sqlClosed = false;
   const closeSql = async () => {
     if (sqlClosed) return;
@@ -753,7 +778,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         if (backupEngine === "pg_dump") {
           throw error;
         }
-        sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
+        sql = openBackupSql(opts.connectionString, connectTimeout);
         sqlClosed = false;
       }
     }
@@ -1089,7 +1114,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       if (backupEngine !== "javascript" && nullifiedColumns.size === 0) {
         emit(`COPY ${qualifiedTableName} (${colNames}) FROM stdin;`);
         await writer.writeRaw("\n");
-        const copySql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
+        const copySql = openBackupSql(opts.connectionString, connectTimeout);
         try {
           const copyStream = await copySql
             .unsafe(`COPY ${qualifiedTableName} (${colNames}) TO STDOUT`)
@@ -1213,7 +1238,7 @@ export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promi
     }
   }
 
-  const sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
+  const sql = openBackupSql(opts.connectionString, connectTimeout);
 
   try {
     await sql`SELECT 1`;
