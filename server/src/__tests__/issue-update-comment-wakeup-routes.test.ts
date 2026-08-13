@@ -513,6 +513,73 @@ describe("issue update comment wakeups", () => {
     );
   });
 
+  it("suppresses the assignee wake for an operator-deliver marker comment", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-operator-deliver",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "[[operator-deliver]]\n\nOutbound status update for the operator.",
+    });
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${existing.id}/comments`)
+      .send({
+        body: "[[operator-deliver]]\n\nOutbound status update for the operator.",
+      });
+
+    expect(res.status).toBe(201);
+    // findMentionedAgents runs after the wake block, so waiting on it proves
+    // the wake fan-out already executed (and chose to suppress).
+    await vi.waitFor(() =>
+      expect(mockIssueService.findMentionedAgents).toHaveBeenCalledWith(
+        existing.companyId,
+        "[[operator-deliver]]\n\nOutbound status update for the operator.",
+      ),
+    );
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("still wakes the assignee for a genuine inbound Telegram relay comment (no marker)", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    const relayBody = "**Operator reply via Telegram**\n\nlooks good, ship it";
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-inbound-relay",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: relayBody,
+    });
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${existing.id}/comments`)
+      .send({ body: relayBody, authorType: "system" });
+
+    expect(res.status).toBe(201);
+    await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1));
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        source: "automation",
+        reason: "issue_commented",
+        payload: expect.objectContaining({
+          issueId: existing.id,
+          commentId: "comment-inbound-relay",
+          mutation: "comment",
+        }),
+      }),
+    );
+  });
+
   it("does not route a plain-text agent name on a human-owned issue comment", async () => {
     const existing = makeIssue({
       assigneeAgentId: null,

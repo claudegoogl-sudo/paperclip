@@ -265,6 +265,7 @@ export {
   PIPELINE_AUTOMATION_DEFAULT_TITLE_TEMPLATE,
   PLUGIN_EVENT_TYPES,
   PLUGIN_BRIDGE_ERROR_CODES,
+  OPERATOR_DELIVER_MARKER,
   type CompanyStatus,
   type DeploymentMode,
   type DeploymentExposure,

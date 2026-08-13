@@ -49,6 +49,7 @@ import {
   issueDocumentKeySchema,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   ISSUE_WATCHDOG_DISCOVERY_KINDS,
+  OPERATOR_DELIVER_MARKER,
   TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND,
   rejectIssueThreadInteractionSchema,
   restoreIssueDocumentRevisionSchema,
@@ -9484,11 +9485,20 @@ export function issueRoutes(
       const assigneeId = currentIssue.assigneeAgentId;
       const actorIsAgent = actor.actorType === "agent";
       const selfComment = actorIsAgent && actor.actorId === assigneeId;
+      // Outbound operator-delivery comments (body begins with the marker) are
+      // posted with the host/board token and stored as authorType "user", so
+      // without this guard they wake the assignee and echo our own outbound
+      // message back as fake inbound operator input. Suppress ONLY the non-reopen
+      // `issue_commented` assignee wake; the reopen and @mention paths below are
+      // untouched. Keyed off the body prefix (not authorType) so it holds
+      // regardless of which token posted.
+      const isOperatorDeliverComment =
+        comment.body.trimStart().startsWith(OPERATOR_DELIVER_MARKER);
       // Re-derive closed-ness from the post-mutation issue so the auto-approval
       // transition (in_review -> done) suppresses a stale `issue_commented` wake
       // to the returnAssignee for an already-completed issue.
       const skipWake = selfComment || isClosedIssueStatus(currentIssue.status);
-      if (assigneeId && (reopened || !skipWake)) {
+      if (assigneeId && (reopened || (!skipWake && !isOperatorDeliverComment))) {
         if (reopened) {
           addWakeup(assigneeId, {
             source: "automation",
