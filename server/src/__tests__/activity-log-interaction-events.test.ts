@@ -16,6 +16,7 @@ vi.mock("../services/live-events.js", () => ({
 const {
   eventTypeForActivityAction,
   pluginPayloadExtrasForActivityAction,
+  projectInteractionForPluginEvent,
   logActivity,
   setPluginEventBus,
 } = await import("../services/activity-log.ts");
@@ -123,6 +124,212 @@ describe("activity-log plugin event bridge — issue.interaction.*", () => {
       outcome: "created",
       agentId,
       runId,
+    });
+  });
+
+  it("carries the projected interaction questions/options on issue.interaction.created", async () => {
+    const { bus, emitted } = makeCapturingBus();
+    setPluginEventBus(bus);
+    const { db } = makeFakeDb();
+
+    const issueId = "00000000-0000-4000-8000-0000000000a2";
+    const interaction = {
+      id: "00000000-0000-4000-8000-0000000000a3",
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        title: "Pick a deploy target",
+        questions: [
+          {
+            id: "q1",
+            prompt: "Which environment?",
+            selectionMode: "single",
+            options: [
+              { id: "staging", label: "Staging", description: "Non-prod" },
+              { id: "prod", label: "Production" },
+            ],
+          },
+        ],
+      },
+    };
+
+    await logActivity(db, {
+      companyId: "00000000-0000-4000-8000-0000000000a1",
+      actorType: "agent",
+      actorId: "00000000-0000-4000-8000-0000000000a4",
+      action: "issue.thread_interaction_created",
+      entityType: "issue",
+      entityId: issueId,
+      details: {
+        interactionId: interaction.id,
+        interactionKind: interaction.kind,
+        interactionStatus: interaction.status,
+        continuationPolicy: interaction.continuationPolicy,
+        interaction: projectInteractionForPluginEvent(interaction),
+      },
+    });
+
+    await vi.waitFor(() => expect(emitted).toHaveLength(1), { timeout: 1_000 });
+    expect(emitted[0].payload).toMatchObject({
+      interactionId: interaction.id,
+      interactionKind: "ask_user_questions",
+      interaction: {
+        id: interaction.id,
+        kind: "ask_user_questions",
+        title: "Pick a deploy target",
+        questions: [
+          {
+            id: "q1",
+            prompt: "Which environment?",
+            selectionMode: "single",
+            options: [
+              { id: "staging", label: "Staging", description: "Non-prod" },
+              { id: "prod", label: "Production" },
+            ],
+          },
+        ],
+      },
+    });
+  });
+
+  describe("projectInteractionForPluginEvent", () => {
+    it("projects request_confirmation into a single-select accept/reject question", () => {
+      const projected = projectInteractionForPluginEvent({
+        id: "int-1",
+        kind: "request_confirmation",
+        payload: {
+          version: 1,
+          prompt: "Ship the release?",
+          acceptLabel: "Ship it",
+          rejectLabel: "Hold",
+        },
+      });
+      expect(projected).toEqual({
+        id: "int-1",
+        kind: "request_confirmation",
+        questions: [
+          {
+            id: "int-1",
+            prompt: "Ship the release?",
+            selectionMode: "single",
+            options: [
+              { id: "accept", label: "Ship it" },
+              { id: "reject", label: "Hold" },
+            ],
+          },
+        ],
+      });
+    });
+
+    it("defaults accept/reject labels for request_confirmation", () => {
+      const projected = projectInteractionForPluginEvent({
+        id: "int-1b",
+        kind: "request_confirmation",
+        payload: { version: 1, prompt: "Proceed?" },
+      });
+      expect(projected?.questions[0].options).toEqual([
+        { id: "accept", label: "Accept" },
+        { id: "reject", label: "Reject" },
+      ]);
+    });
+
+    it("projects request_checkbox_confirmation into a multi-select question", () => {
+      const projected = projectInteractionForPluginEvent({
+        id: "int-2",
+        kind: "request_checkbox_confirmation",
+        payload: {
+          version: 1,
+          prompt: "Pick files to delete",
+          options: [
+            { id: "a", label: "a.txt", description: "old" },
+            { id: "b", label: "b.txt" },
+          ],
+        },
+      });
+      expect(projected).toEqual({
+        id: "int-2",
+        kind: "request_checkbox_confirmation",
+        questions: [
+          {
+            id: "int-2",
+            prompt: "Pick files to delete",
+            selectionMode: "multi",
+            options: [
+              { id: "a", label: "a.txt", description: "old" },
+              { id: "b", label: "b.txt" },
+            ],
+          },
+        ],
+      });
+    });
+
+    it("projects suggest_tasks into a multi-select of task drafts", () => {
+      const projected = projectInteractionForPluginEvent({
+        id: "int-3",
+        kind: "suggest_tasks",
+        payload: {
+          version: 1,
+          tasks: [
+            { clientKey: "t1", title: "Fix bug", description: "the login bug" },
+            { clientKey: "t2", title: "Write docs" },
+          ],
+        },
+      });
+      expect(projected).toEqual({
+        id: "int-3",
+        kind: "suggest_tasks",
+        questions: [
+          {
+            id: "int-3",
+            prompt: "Proposed tasks",
+            selectionMode: "multi",
+            options: [
+              { id: "t1", label: "Fix bug", description: "the login bug" },
+              { id: "t2", label: "Write docs" },
+            ],
+          },
+        ],
+      });
+    });
+
+    it("caps option description to 200 chars and total options/questions", () => {
+      const longDescription = "x".repeat(500);
+      const manyOptions = Array.from({ length: 40 }, (_, i) => ({
+        id: `o${i}`,
+        label: `Option ${i}`,
+        description: longDescription,
+      }));
+      const manyQuestions = Array.from({ length: 25 }, (_, i) => ({
+        id: `q${i}`,
+        prompt: `Question ${i}`,
+        selectionMode: "single" as const,
+        options: manyOptions,
+      }));
+      const projected = projectInteractionForPluginEvent({
+        id: "int-4",
+        kind: "ask_user_questions",
+        payload: { version: 1, questions: manyQuestions },
+      });
+      expect(projected?.questions.length).toBe(20);
+      expect(projected?.questions[0].options.length).toBe(30);
+      expect(projected?.questions[0].options[0].description?.length).toBe(200);
+    });
+
+    it("returns null for a missing or malformed interaction", () => {
+      expect(projectInteractionForPluginEvent(null)).toBeNull();
+      expect(projectInteractionForPluginEvent(undefined)).toBeNull();
+      expect(projectInteractionForPluginEvent({ id: "x" } as never)).toBeNull();
+    });
+
+    it("projects an unknown kind to an empty questions list without throwing", () => {
+      const projected = projectInteractionForPluginEvent({
+        id: "int-5",
+        kind: "something_new",
+        payload: { anything: true },
+      });
+      expect(projected).toEqual({ id: "int-5", kind: "something_new", questions: [] });
     });
   });
 

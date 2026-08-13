@@ -58,6 +58,175 @@ export function pluginPayloadExtrasForActivityAction(action: string): Record<str
   return outcome ? { outcome } : {};
 }
 
+// --- Interaction event enrichment -------------------------------------------
+// Chat-relay plugins subscribe to `issue.interaction.created`, but the
+// event historically carried only interactionId/interactionKind, so the operator
+// received a contentless ping. We attach a small, bounded projection of the
+// interaction's questions/options so a subscribed plugin can render the prompt
+// and choices without needing a new read capability. Bounds cap operator-authored
+// text and total option/question counts so the event payload stays small.
+const MAX_PROJECTED_QUESTIONS = 20;
+const MAX_PROJECTED_OPTIONS_PER_QUESTION = 30;
+const MAX_PROMPT_LENGTH = 500;
+const MAX_LABEL_LENGTH = 160;
+const MAX_OPTION_DESCRIPTION_LENGTH = 200;
+
+export interface ProjectedInteractionOption {
+  id: string;
+  label: string;
+  description?: string;
+}
+
+export interface ProjectedInteractionQuestion {
+  id: string;
+  prompt: string;
+  selectionMode: "single" | "multi";
+  options: ProjectedInteractionOption[];
+}
+
+export interface ProjectedInteraction {
+  id: string;
+  kind: string;
+  title?: string;
+  questions: ProjectedInteractionQuestion[];
+}
+
+interface InteractionForProjection {
+  id: string;
+  kind: string;
+  payload?: unknown;
+}
+
+function clip(value: unknown, max: number): string {
+  const s = typeof value === "string" ? value : String(value ?? "");
+  return s.length > max ? s.slice(0, max) : s;
+}
+
+function projectOptions(
+  rawOptions: unknown,
+  idField: string,
+  labelField: string,
+): ProjectedInteractionOption[] {
+  if (!Array.isArray(rawOptions)) return [];
+  const options: ProjectedInteractionOption[] = [];
+  for (const raw of rawOptions.slice(0, MAX_PROJECTED_OPTIONS_PER_QUESTION)) {
+    if (!raw || typeof raw !== "object") continue;
+    const o = raw as Record<string, unknown>;
+    const rawId = o[idField];
+    const rawLabel = o[labelField];
+    if (typeof rawId !== "string" || typeof rawLabel !== "string") continue;
+    const option: ProjectedInteractionOption = {
+      id: clip(rawId, MAX_LABEL_LENGTH),
+      label: clip(rawLabel, MAX_LABEL_LENGTH),
+    };
+    if (typeof o.description === "string" && o.description.length > 0) {
+      option.description = clip(o.description, MAX_OPTION_DESCRIPTION_LENGTH);
+    }
+    options.push(option);
+  }
+  return options;
+}
+
+/**
+ * Normalize a hydrated issue-thread interaction into a bounded questions/options
+ * projection for the `issue.interaction.created` plugin event. Returns `null`
+ * for a missing/malformed interaction and never throws — the caller runs this
+ * inline while building the activity-log details, so a throw would break the
+ * interaction-create request.
+ *
+ * Only questions/options (and an optional title) are projected — target/href,
+ * secret refs, and result data are deliberately omitted to minimize what a
+ * subscribed plugin sees.
+ */
+export function projectInteractionForPluginEvent(
+  interaction: InteractionForProjection | null | undefined,
+): ProjectedInteraction | null {
+  if (!interaction || typeof interaction.id !== "string" || typeof interaction.kind !== "string") {
+    return null;
+  }
+  try {
+    const payload = (interaction.payload ?? {}) as Record<string, unknown>;
+    const questions: ProjectedInteractionQuestion[] = [];
+    let title: string | undefined;
+
+    switch (interaction.kind) {
+      case "ask_user_questions": {
+        if (typeof payload.title === "string" && payload.title.length > 0) {
+          title = clip(payload.title, MAX_PROMPT_LENGTH);
+        }
+        const rawQuestions = Array.isArray(payload.questions) ? payload.questions : [];
+        for (const raw of rawQuestions.slice(0, MAX_PROJECTED_QUESTIONS)) {
+          if (!raw || typeof raw !== "object") continue;
+          const q = raw as Record<string, unknown>;
+          if (typeof q.id !== "string" || typeof q.prompt !== "string") continue;
+          questions.push({
+            id: clip(q.id, MAX_LABEL_LENGTH),
+            prompt: clip(q.prompt, MAX_PROMPT_LENGTH),
+            selectionMode: q.selectionMode === "multi" ? "multi" : "single",
+            options: projectOptions(q.options, "id", "label"),
+          });
+        }
+        break;
+      }
+      case "request_checkbox_confirmation": {
+        if (typeof payload.prompt === "string") {
+          questions.push({
+            id: interaction.id,
+            prompt: clip(payload.prompt, MAX_PROMPT_LENGTH),
+            selectionMode: "multi",
+            options: projectOptions(payload.options, "id", "label"),
+          });
+        }
+        break;
+      }
+      case "request_confirmation": {
+        if (typeof payload.prompt === "string") {
+          const accept = typeof payload.acceptLabel === "string" ? payload.acceptLabel : "Accept";
+          const reject = typeof payload.rejectLabel === "string" ? payload.rejectLabel : "Reject";
+          questions.push({
+            id: interaction.id,
+            prompt: clip(payload.prompt, MAX_PROMPT_LENGTH),
+            selectionMode: "single",
+            options: [
+              { id: "accept", label: clip(accept, MAX_LABEL_LENGTH) },
+              { id: "reject", label: clip(reject, MAX_LABEL_LENGTH) },
+            ],
+          });
+        }
+        break;
+      }
+      case "suggest_tasks": {
+        const options = projectOptions(payload.tasks, "clientKey", "title");
+        if (options.length > 0) {
+          questions.push({
+            id: interaction.id,
+            prompt: "Proposed tasks",
+            selectionMode: "multi",
+            options,
+          });
+        }
+        break;
+      }
+      default:
+        break;
+    }
+
+    const projected: ProjectedInteraction = {
+      id: interaction.id,
+      kind: interaction.kind,
+      questions,
+    };
+    if (title) projected.title = title;
+    return projected;
+  } catch (err) {
+    logger.warn(
+      { err, interactionId: interaction.id, kind: interaction.kind },
+      "failed to project interaction for plugin event",
+    );
+    return { id: interaction.id, kind: interaction.kind, questions: [] };
+  }
+}
+
 export function publishPluginDomainEvent(event: PluginEvent): void {
   if (!_pluginEventBus) return;
   void _pluginEventBus.emit(event).then(({ errors }) => {
