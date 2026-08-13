@@ -22,6 +22,15 @@ export type BindMode = (typeof BIND_MODES)[number];
 export const AUTH_BASE_URL_MODES = ["auto", "explicit"] as const;
 export type AuthBaseUrlMode = (typeof AUTH_BASE_URL_MODES)[number];
 
+// Leading marker on an outbound operator-delivery comment body. The messenger
+// relay keys off this prefix to forward a comment to the operator, so it is
+// load-bearing regardless of which token posted the comment. Host/board-token
+// deliveries are stored with authorType "user" and would otherwise wake the
+// issue assignee — echoing our own outbound message back as fake inbound input.
+// The comment wake fan-out suppresses the assignee `issue_commented` wake when a
+// trimmed comment body begins with this marker.
+export const OPERATOR_DELIVER_MARKER = "[[operator-deliver]]";
+
 export const AGENT_STATUSES = [
   "active",
   "paused",
