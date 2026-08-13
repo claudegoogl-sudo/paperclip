@@ -121,6 +121,10 @@ function registerModuleMocks() {
       disableForIssue: vi.fn(async () => null),
     }),
     logActivity: mockLogActivity,
+    projectInteractionForPluginEvent: (interaction: { id?: unknown; kind?: unknown } | null | undefined) =>
+      interaction && typeof interaction.id === "string" && typeof interaction.kind === "string"
+        ? { id: interaction.id, kind: interaction.kind, questions: [] }
+        : null,
     projectService: () => ({}),
     routineService: () => ({
       syncRunStatusForIssue: vi.fn(async () => undefined),
