@@ -9031,6 +9031,26 @@ export function issueRoutes(
     }
 
     const actor = getActorInfo(req);
+    // Guard A: reject operator-delivery comments that are not agent-authored.
+    // The messenger relay only forwards agent-authored comments to the operator;
+    // a host/board/user-token marked comment is silently dropped by the relay yet
+    // still persisted, so the thread looks delivered while nobody was paged.
+    // Reject at write time (before any persistence or wake) so the sender is
+    // forced onto the agent-token path, which both relays correctly and (via the
+    // wake fan-out guard below) does not echo. Keyed off the leading marker prefix
+    // on the trimmed body, matching the documented placement on the first line.
+    if (
+      typeof req.body.body === "string" &&
+      req.body.body.trimStart().startsWith(OPERATOR_DELIVER_MARKER) &&
+      actor.actorType !== "agent"
+    ) {
+      res.status(422).json({
+        error:
+          `Operator-delivery comments (body beginning with "${OPERATOR_DELIVER_MARKER}") must be authored by an agent token. ` +
+          "The messenger relay only forwards agent-authored comments to the operator; host/board/user-token deliveries are dropped by the relay and would never reach the operator. Post this comment with an agent token instead.",
+      });
+      return;
+    }
     const reopenRequested = req.body.reopen === true;
     const resumeRequested = req.body.resume === true;
     const interruptRequested = req.body.interrupt === true;
@@ -9485,13 +9505,15 @@ export function issueRoutes(
       const assigneeId = currentIssue.assigneeAgentId;
       const actorIsAgent = actor.actorType === "agent";
       const selfComment = actorIsAgent && actor.actorId === assigneeId;
-      // Outbound operator-delivery comments (body begins with the marker) are
-      // posted with the host/board token and stored as authorType "user", so
-      // without this guard they wake the assignee and echo our own outbound
-      // message back as fake inbound operator input. Suppress ONLY the non-reopen
-      // `issue_commented` assignee wake; the reopen and @mention paths below are
-      // untouched. Keyed off the body prefix (not authorType) so it holds
-      // regardless of which token posted.
+      // Guard B: outbound operator-delivery comments (body begins with the marker)
+      // are outbound-to-operator by definition and are never an inbound task for
+      // the assignee, so an assignee wake would just echo our own message back as
+      // fake inbound operator input. Guard A above has already rejected any
+      // non-agent-authored marked comment, so the marked comments that reach here
+      // are agent-authored (relayed to the operator by messenger). Suppress ONLY
+      // the non-reopen `issue_commented` assignee wake; the reopen and @mention
+      // paths below are untouched. Keyed off the body prefix so it holds regardless
+      // of which agent posted.
       const isOperatorDeliverComment =
         comment.body.trimStart().startsWith(OPERATOR_DELIVER_MARKER);
       // Re-derive closed-ness from the post-mutation issue so the auto-approval

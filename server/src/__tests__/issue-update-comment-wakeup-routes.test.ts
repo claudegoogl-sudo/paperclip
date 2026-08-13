@@ -166,9 +166,35 @@ function registerModuleMocks() {
     }),
     workProductService: () => ({}),
   }));
+  // Agent-authored writes resolve source trust by querying the DB, which the
+  // stubbed `{}` db in this suite cannot serve. Stub it to a no-trust result so
+  // agent-actor comment POSTs exercise the wake fan-out rather than the db.
+  vi.doMock("../services/source-trust.js", async () => {
+    const actual = await vi.importActual<typeof import("../services/source-trust.js")>(
+      "../services/source-trust.js",
+    );
+    return { ...actual, resolveActorSourceTrustForIssue: vi.fn(async () => null) };
+  });
 }
 
-async function createApp() {
+const BOARD_ACTOR = {
+  type: "board",
+  userId: "local-board",
+  companyIds: ["company-1"],
+  source: "local_implicit",
+  isInstanceAdmin: false,
+};
+
+function agentActor(agentId: string) {
+  return {
+    type: "agent",
+    agentId,
+    companyId: "company-1",
+    source: "agent_key",
+  };
+}
+
+async function createApp(actor: Record<string, unknown> = BOARD_ACTOR) {
   const [{ errorHandler }, { issueRoutes }] = await Promise.all([
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
     vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
@@ -176,13 +202,7 @@ async function createApp() {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
-      type: "board",
-      userId: "local-board",
-      companyIds: ["company-1"],
-      source: "local_implicit",
-      isInstanceAdmin: false,
-    };
+    (req as any).actor = actor;
     next();
   });
   app.use("/api", issueRoutes({} as any, {} as any));
@@ -513,7 +533,39 @@ describe("issue update comment wakeups", () => {
     );
   });
 
-  it("suppresses the assignee wake for an operator-deliver marker comment", async () => {
+  // Guard A (AC1): a marked comment from a non-agent actor is rejected at write
+  // time, because the messenger relay only forwards agent-authored comments — a
+  // host/board/user-token delivery would be silently dropped and never reach the
+  // operator, so it must fail loudly instead of succeeding-and-dropping.
+  it("rejects an operator-deliver marker comment from a non-agent actor at write time", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+
+    const res = await request(await createApp(BOARD_ACTOR))
+      .post(`/api/issues/${existing.id}/comments`)
+      .send({
+        body: "[[operator-deliver]]\n\nOutbound status update for the operator.",
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toContain("[[operator-deliver]]");
+    expect(res.body.error).toContain("agent token");
+    // Not persisted, and no wake enqueued.
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  // Guard B (AC2): a marked comment from an agent actor (relayed to the operator
+  // by messenger) is accepted and persisted, but does NOT wake the assignee — an
+  // outbound-to-operator delivery is never an inbound task for the assignee, and
+  // waking it would echo our own message back as fake operator input. The posting
+  // agent is deliberately NOT the assignee so suppression is proven by the marker
+  // guard rather than the self-comment guard.
+  it("accepts but does not wake the assignee for an agent-authored operator-deliver comment", async () => {
     const existing = makeIssue({
       assigneeAgentId: ASSIGNEE_AGENT_ID,
       assigneeUserId: null,
@@ -527,13 +579,14 @@ describe("issue update comment wakeups", () => {
       body: "[[operator-deliver]]\n\nOutbound status update for the operator.",
     });
 
-    const res = await request(await createApp())
+    const res = await request(await createApp(agentActor(MENTIONED_AGENT_ID)))
       .post(`/api/issues/${existing.id}/comments`)
       .send({
         body: "[[operator-deliver]]\n\nOutbound status update for the operator.",
       });
 
     expect(res.status).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalled();
     // findMentionedAgents runs after the wake block, so waiting on it proves
     // the wake fan-out already executed (and chose to suppress).
     await vi.waitFor(() =>
