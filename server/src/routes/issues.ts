@@ -109,6 +109,7 @@ import {
   documentService,
   documentAnnotationService,
   logActivity,
+  projectInteractionForPluginEvent,
   projectService,
   routineService,
   workProductService,
@@ -8415,6 +8416,7 @@ export function issueRoutes(
         interactionKind: interaction.kind,
         interactionStatus: interaction.status,
         continuationPolicy: interaction.continuationPolicy,
+        interaction: projectInteractionForPluginEvent(interaction),
       },
     });
 
