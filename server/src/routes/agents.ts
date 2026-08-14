@@ -3618,7 +3618,7 @@ export function agentRoutes(
     }
     assertCompanyAccess(req, existing.companyId);
     const decision = typeof req.body?.decision === "string" ? req.body.decision : "";
-    if (!["snooze", "continue", "dismissed_false_positive"].includes(decision)) {
+    if (!["snooze", "continue", "dismissed_false_positive", "terminate"].includes(decision)) {
       res.status(400).json({ error: "Unsupported watchdog decision" });
       return;
     }
@@ -3635,7 +3635,7 @@ export function agentRoutes(
     const row = await recovery.recordWatchdogDecision({
       runId: existing.id,
       actor: req.actor,
-      decision: decision as "snooze" | "continue" | "dismissed_false_positive",
+      decision: decision as "snooze" | "continue" | "dismissed_false_positive" | "terminate",
       evaluationIssueId,
       reason,
       snoozedUntil,
