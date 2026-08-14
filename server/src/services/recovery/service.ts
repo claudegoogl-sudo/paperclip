@@ -30,7 +30,7 @@ import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
-import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local-service-supervisor.js";
+import { isPidAlive, isProcessGroupAlive, terminateLocalService, verifyProcessStartIdentity } from "../local-service-supervisor.js";
 import { redactCurrentUserText } from "../../log-redaction.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { logActivity } from "../activity-log.js";
@@ -1283,6 +1283,27 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         outcome: "no_process_metadata",
         adapterType: input.runningAgent.adapterType,
       };
+    }
+
+    // With no live in-memory handle the pid/pgid come from persisted metadata, which the
+    // OS may have recycled onto an unrelated process after a server restart. Verify the
+    // survivor is the same process we spawned (kernel start time vs. the spawn timestamp)
+    // before signalling; skip on any inability to positively confirm identity.
+    if (!running) {
+      const verdict = await verifyProcessStartIdentity(
+        typeof pid === "number" ? pid : (processGroupId as number),
+        input.run.processStartedAt?.getTime(),
+      );
+      if (verdict === "mismatch") {
+        runningProcesses.delete(input.run.id);
+        return {
+          attempted: false,
+          outcome: "skipped_identity_unverified",
+          adapterType: input.runningAgent.adapterType,
+          pid,
+          processGroupId,
+        };
+      }
     }
 
     const wasAlive =
