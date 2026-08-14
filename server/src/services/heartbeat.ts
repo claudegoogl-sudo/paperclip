@@ -140,6 +140,7 @@ import { buildPlanReviewContext } from "./plan-review-context.js";
 import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { workspaceOperationService, type WorkspaceOperationRecorder } from "./workspace-operations.js";
 import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
+import { reapRunMcpDescendants } from "./mcp-orphan-reaper.js";
 import {
   buildExecutionWorkspaceAdapterConfig,
   gateProjectExecutionWorkspacePolicy,
@@ -4796,18 +4797,23 @@ async function terminateHeartbeatRunProcess(input: {
   const processGroupId = input.processGroupId ?? null;
   if (typeof pid !== "number" && typeof processGroupId !== "number") return;
 
-  await terminateLocalService(
-    {
-      pid:
-        typeof pid === "number" && Number.isInteger(pid) && pid > 0
-          ? pid
-          : (processGroupId ?? 0),
-      processGroupId:
-        typeof processGroupId === "number" && Number.isInteger(processGroupId) && processGroupId > 0
-          ? processGroupId
-          : null,
-    },
-    input.graceMs ? { forceAfterMs: input.graceMs } : undefined,
+  // Snapshot MCP descendants before the group is torn down (ppid links intact),
+  // kill the group, then reap any MCP that escaped the group into its own
+  // session. Covers both normal exit and watchdog/cancel teardown.
+  await reapRunMcpDescendants({ pid, processGroupId }, () =>
+    terminateLocalService(
+      {
+        pid:
+          typeof pid === "number" && Number.isInteger(pid) && pid > 0
+            ? pid
+            : (processGroupId ?? 0),
+        processGroupId:
+          typeof processGroupId === "number" && Number.isInteger(processGroupId) && processGroupId > 0
+            ? processGroupId
+            : null,
+      },
+      input.graceMs ? { forceAfterMs: input.graceMs } : undefined,
+    ),
   );
 }
 

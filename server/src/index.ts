@@ -68,6 +68,7 @@ import {
   parseAdapterRegistryEnv,
   reconcileAdapterAvailability,
 } from "./services/adapter-registry-bootstrap.js";
+import { reapOrphanedMcpProcessesOnStartup } from "./services/mcp-orphan-reaper.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
 import {
   EGRESS_POSTURE_SWEEP_INTERVAL_MS,
@@ -947,6 +948,19 @@ export async function startServer(): Promise<StartedServer> {
   } catch (err) {
     logger.error({ err }, "failed to apply forced execution policy from environment");
     throw err;
+  }
+
+  // Sweep MCP child processes (e.g. Playwright MCP) that were orphaned to init
+  // by a prior crash or watchdog kill. Runs regardless of heartbeat scheduling
+  // so leaked strays never accumulate across restarts. Safe matching only:
+  // MCP command + ppid==1.
+  try {
+    const reaped = await reapOrphanedMcpProcessesOnStartup();
+    if (reaped.length > 0) {
+      logger.warn({ reapedPids: reaped }, "startup swept orphaned MCP child processes");
+    }
+  } catch (err) {
+    logger.error({ err }, "startup MCP orphan sweep failed");
   }
 
   if (config.heartbeatSchedulerEnabled) {
