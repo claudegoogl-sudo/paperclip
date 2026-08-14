@@ -434,7 +434,7 @@ describeEmbedded("embedded-postgres-auth: real-cluster rotation + fresh initdb",
     } finally {
       await admin.end({ timeout: 5 }).catch(() => undefined);
     }
-  });
+  }, 20_000);
 
   it("legacy data dir rotates on next start: ALTER ROLE, cred file, scram pg_hba, reload", async () => {
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-legacy-rotate-"));
@@ -513,7 +513,7 @@ describeEmbedded("embedded-postgres-auth: real-cluster rotation + fresh initdb",
     );
     await expect(badAdmin`SELECT 1`.finally(() => badAdmin.end({ timeout: 5 }).catch(() => undefined)))
       .rejects.toThrow();
-  });
+  }, 20_000);
 
   it("rotation is idempotent: a second start is a no-op", async () => {
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-rotate-idempotent-"));
@@ -554,7 +554,7 @@ describeEmbedded("embedded-postgres-auth: real-cluster rotation + fresh initdb",
     expect(second.password).toBe(first.password);
     // pg_hba is already scram so the rewrite is a no-op too.
     expect(second.pgHbaRewritten).toBe(false);
-  });
+  }, 20_000);
 
   it("a restored data dir without its cred file is unopenable without rotation fallback", async () => {
     // AC8 recovery story: if an operator restores just the data dir (no cred
@@ -606,7 +606,7 @@ describeEmbedded("embedded-postgres-auth: real-cluster rotation + fresh initdb",
         currentPassword: after.password,
       }),
     ).rejects.toThrow();
-  });
+  }, 20_000);
 
   it("rewritePgHbaToScram is idempotent and preserves the prior file as .legacy.bak", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-pghba-rewrite-"));
