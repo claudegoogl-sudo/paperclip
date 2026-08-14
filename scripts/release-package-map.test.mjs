@@ -6,6 +6,7 @@ import {
   checkConfiguration,
   findUnpublishableWorkspaceEdges,
   getReleasePackages,
+  getStampVersionPackages,
 } from "./release-package-map.mjs";
 
 function pkg(name, { publishFromCi, ...deps } = {}) {
@@ -33,6 +34,40 @@ test("Hermes release surface publishes the unified built-in package and keeps ga
   assert.equal(hermes?.publishFromCi, true);
   assert.equal(gatewayShim?.dir, "packages/adapters/hermes-gateway");
   assert.equal(gatewayShim?.publishFromCi, false);
+});
+
+test("stampVersion defaults to publishFromCi and every CI-published package is stamped", () => {
+  const packages = buildReleasePackagePlan();
+  for (const pkg of packages) {
+    assert.equal(typeof pkg.stampVersion, "boolean");
+    if (pkg.publishFromCi) {
+      assert.equal(pkg.stampVersion, true, `${pkg.name} is publishFromCi but not stamped`);
+    }
+  }
+});
+
+test("version-stamping is a superset of CI publishing", () => {
+  const stampNames = new Set(getStampVersionPackages().map((pkg) => pkg.name));
+  for (const pkg of getReleasePackages()) {
+    assert.ok(stampNames.has(pkg.name), `${pkg.name} is published but not stamped`);
+  }
+});
+
+test("the gateway shim is version-stamped without being published from CI", () => {
+  const gatewayName = "@paperclipai/adapter-hermes-gateway";
+  const gatewayShim = buildReleasePackagePlan().find((pkg) => pkg.name === gatewayName);
+
+  assert.equal(gatewayShim?.publishFromCi, false);
+  assert.equal(gatewayShim?.stampVersion, true);
+
+  assert.ok(
+    getStampVersionPackages().some((pkg) => pkg.name === gatewayName),
+    "gateway shim must be in the version-stamping set",
+  );
+  assert.ok(
+    !getReleasePackages().some((pkg) => pkg.name === gatewayName),
+    "gateway shim must stay out of the CI-publish set",
+  );
 });
 
 test("release package configuration validates successfully", () => {

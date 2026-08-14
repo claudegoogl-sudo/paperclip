@@ -3,11 +3,6 @@ import { existsSync, readFileSync, readdirSync, renameSync, writeFileSync } from
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const scriptDir = dirname(fileURLToPath(import.meta.url));
-const packageDir = resolve(scriptDir, "..");
-const packageJsonPath = join(packageDir, "package.json");
-const devPackageJsonPath = join(packageDir, "package.dev.json");
-
 function findRepoRoot(startDir) {
   let current = startDir;
   while (current !== dirname(current)) {
@@ -71,36 +66,68 @@ function rewriteWorkspaceDeps(deps, workspaceVersions) {
   );
 }
 
-const pkg = readJson(packageJsonPath);
-const publishConfig = pkg.publishConfig ?? {};
+/**
+ * Rewrite this package's manifest into its published shape (exports/main/types
+ * promoted from publishConfig, workspace: deps resolved to concrete versions).
+ *
+ * Returns true when the transform ran, false when it was a no-op.
+ *
+ * Idempotency: the fork-build packer (scripts/pack-public-packages.mjs) already
+ * applies publishConfig onto the manifest and DELETES the publishConfig key
+ * before invoking `pnpm pack`, which fires this prepack. In that flow the
+ * manifest is already in its published shape and carries no publishConfig, so
+ * there is nothing to do — running the transform would throw on the missing
+ * publishConfig.exports. The standalone `npm publish` path still carries
+ * publishConfig and transforms normally.
+ */
+export function preparePublishPackage(packageDir) {
+  const packageJsonPath = join(packageDir, "package.json");
+  const devPackageJsonPath = join(packageDir, "package.dev.json");
 
-if (existsSync(devPackageJsonPath)) {
-  throw new Error(`Refusing to overwrite existing ${devPackageJsonPath}`);
+  const pkg = readJson(packageJsonPath);
+
+  if (pkg.publishConfig === undefined) {
+    return false;
+  }
+
+  const publishConfig = pkg.publishConfig;
+
+  if (existsSync(devPackageJsonPath)) {
+    throw new Error(`Refusing to overwrite existing ${devPackageJsonPath}`);
+  }
+
+  if (!publishConfig.exports) {
+    throw new Error(`${pkg.name} is missing publishConfig.exports`);
+  }
+
+  const repoRoot = findRepoRoot(packageDir);
+  const workspaceVersions = repoRoot ? collectWorkspaceVersions(repoRoot) : new Map();
+
+  renameSync(packageJsonPath, devPackageJsonPath);
+
+  const nextPublishConfig = { ...publishConfig };
+  delete nextPublishConfig.exports;
+  delete nextPublishConfig.main;
+  delete nextPublishConfig.types;
+
+  const publishPkg = {
+    ...pkg,
+    exports: publishConfig.exports,
+    main: publishConfig.main,
+    types: publishConfig.types,
+    publishConfig: nextPublishConfig,
+    dependencies: rewriteWorkspaceDeps(pkg.dependencies, workspaceVersions),
+    optionalDependencies: rewriteWorkspaceDeps(pkg.optionalDependencies, workspaceVersions),
+    peerDependencies: rewriteWorkspaceDeps(pkg.peerDependencies, workspaceVersions),
+  };
+
+  writeFileSync(packageJsonPath, `${JSON.stringify(publishPkg, null, 2)}\n`);
+  return true;
 }
 
-if (!publishConfig.exports) {
-  throw new Error(`${pkg.name} is missing publishConfig.exports`);
+const scriptDir = dirname(fileURLToPath(import.meta.url));
+const isDirect =
+  process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isDirect) {
+  preparePublishPackage(resolve(scriptDir, ".."));
 }
-
-const repoRoot = findRepoRoot(packageDir);
-const workspaceVersions = repoRoot ? collectWorkspaceVersions(repoRoot) : new Map();
-
-renameSync(packageJsonPath, devPackageJsonPath);
-
-const nextPublishConfig = { ...publishConfig };
-delete nextPublishConfig.exports;
-delete nextPublishConfig.main;
-delete nextPublishConfig.types;
-
-const publishPkg = {
-  ...pkg,
-  exports: publishConfig.exports,
-  main: publishConfig.main,
-  types: publishConfig.types,
-  publishConfig: nextPublishConfig,
-  dependencies: rewriteWorkspaceDeps(pkg.dependencies, workspaceVersions),
-  optionalDependencies: rewriteWorkspaceDeps(pkg.optionalDependencies, workspaceVersions),
-  peerDependencies: rewriteWorkspaceDeps(pkg.peerDependencies, workspaceVersions),
-};
-
-writeFileSync(packageJsonPath, `${JSON.stringify(publishPkg, null, 2)}\n`);
