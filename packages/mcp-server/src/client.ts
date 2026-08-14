@@ -1,4 +1,4 @@
-import type { PaperclipMcpConfig } from "./config.js";
+import { DEFAULT_MCP_FETCH_TIMEOUT_MS, type PaperclipMcpConfig } from "./config.js";
 
 export class PaperclipApiError extends Error {
   readonly status: number;
@@ -92,11 +92,31 @@ export class PaperclipApiClient {
       headers["X-Paperclip-Run-Id"] = this.config.runId;
     }
 
-    const response = await fetch(url, {
-      method,
-      headers,
-      body: options.body === undefined ? undefined : JSON.stringify(options.body),
-    });
+    const timeoutMs = this.config.fetchTimeoutMs ?? DEFAULT_MCP_FETCH_TIMEOUT_MS;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method,
+        headers,
+        body: options.body === undefined ? undefined : JSON.stringify(options.body),
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new PaperclipApiError({
+          status: 504,
+          method: method.toUpperCase(),
+          path,
+          body: null,
+          message: `${method.toUpperCase()} ${path} timed out after ${timeoutMs}ms`,
+        });
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
     const parsedBody = await parseResponseBody(response);
 
     if (!response.ok) {

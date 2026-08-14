@@ -111,3 +111,18 @@ These are set automatically by the server when invoking agents:
 |----------|-------------|
 | `ANTHROPIC_API_KEY` | Anthropic API key (for Claude Code adapter) |
 | `OPENAI_API_KEY` | OpenAI API key (for Codex adapter) |
+
+## MCP Tool-Call Timeouts (Claude Code adapter)
+
+Claude Code leaves MCP tool calls effectively unbounded by default (~28h), so a
+non-returning tool (including external MCP servers such as `@playwright/mcp`) can
+hang a run indefinitely and wedge its issue's execution lock. The adapter injects
+safe ceilings into the Claude CLI environment unless an operator sets them
+explicitly (via `config.env` or the host process env).
+
+| Variable | Description |
+|----------|-------------|
+| `MCP_TOOL_TIMEOUT` | Per-tool-call wall-clock ceiling in ms passed to the Claude CLI. Injected default `300000` (5 min) when unset. |
+| `MCP_TIMEOUT` | MCP server startup timeout in ms passed to the Claude CLI. Injected default `30000` (30s) when unset. |
+| `PAPERCLIP_MCP_TOOL_TIMEOUT_MS` | Tunes the injected `MCP_TOOL_TIMEOUT` default. |
+| `PAPERCLIP_MCP_STARTUP_TIMEOUT_MS` | Tunes the injected `MCP_TIMEOUT` default. |
