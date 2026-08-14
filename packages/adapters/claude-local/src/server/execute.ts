@@ -166,6 +166,36 @@ function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean 
   return typeof raw === "string" && raw.trim().length > 0;
 }
 
+// Claude Code leaves MCP tool calls unbounded by default (~28h), so a
+// non-returning tool (e.g. an external @playwright/mcp call) can hang a run
+// indefinitely and wedge its issue's execution lock. Apply safe per-tool-call
+// and startup ceilings unless an operator has set them explicitly.
+const DEFAULT_MCP_TOOL_TIMEOUT_MS = 300_000;
+const DEFAULT_MCP_STARTUP_TIMEOUT_MS = 30_000;
+
+function resolvePositiveIntEnv(raw: string | undefined, fallback: number): number {
+  if (typeof raw === "string" && raw.trim().length > 0) {
+    const parsed = Number.parseInt(raw.trim(), 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return fallback;
+}
+
+export function applyMcpTimeoutDefaults(env: Record<string, string>, processEnv: NodeJS.ProcessEnv): void {
+  const processHasValue = (key: string): boolean =>
+    typeof processEnv[key] === "string" && processEnv[key]!.trim().length > 0;
+  if (!hasNonEmptyEnvValue(env, "MCP_TOOL_TIMEOUT") && !processHasValue("MCP_TOOL_TIMEOUT")) {
+    env.MCP_TOOL_TIMEOUT = String(
+      resolvePositiveIntEnv(processEnv.PAPERCLIP_MCP_TOOL_TIMEOUT_MS, DEFAULT_MCP_TOOL_TIMEOUT_MS),
+    );
+  }
+  if (!hasNonEmptyEnvValue(env, "MCP_TIMEOUT") && !processHasValue("MCP_TIMEOUT")) {
+    env.MCP_TIMEOUT = String(
+      resolvePositiveIntEnv(processEnv.PAPERCLIP_MCP_STARTUP_TIMEOUT_MS, DEFAULT_MCP_STARTUP_TIMEOUT_MS),
+    );
+  }
+}
+
 function isBedrockAuth(env: Record<string, string>): boolean {
   return (
     env.CLAUDE_CODE_USE_BEDROCK === "1" ||
@@ -313,6 +343,7 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
   for (const [key, value] of Object.entries(shapedEnvConfig)) {
     if (typeof value === "string") env[key] = value;
   }
+  applyMcpTimeoutDefaults(env, process.env);
 
   if (!hasExplicitApiKey && authToken) {
     env.PAPERCLIP_API_KEY = authToken;
