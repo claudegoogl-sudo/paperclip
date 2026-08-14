@@ -139,7 +139,7 @@ import {
 import { buildPlanReviewContext } from "./plan-review-context.js";
 import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { workspaceOperationService, type WorkspaceOperationRecorder } from "./workspace-operations.js";
-import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
+import { isProcessGroupAlive, terminateLocalService, verifyProcessStartIdentity } from "./local-service-supervisor.js";
 import { reapRunMcpDescendants } from "./mcp-orphan-reaper.js";
 import {
   buildExecutionWorkspaceAdapterConfig,
@@ -4788,14 +4788,66 @@ function isProcessAlive(pid: number | null | undefined) {
   }
 }
 
-async function terminateHeartbeatRunProcess(input: {
+type TerminateHeartbeatRunOutcome = "terminated" | "skipped_identity_unverified" | "no_process";
+
+export async function terminateHeartbeatRunProcess(input: {
   pid: number | null | undefined;
   processGroupId: number | null | undefined;
   graceMs?: number;
-}) {
+  // When there is no live in-memory child handle, the pid/pgid come from persisted
+  // metadata that the OS may have recycled onto an unrelated process after a server
+  // restart. Callers without a trusted handle pass the recorded spawn time so we can
+  // confirm the survivor is the process we spawned before signalling.
+  //
+  // identityMode selects how a non-matching identity is treated:
+  //  - "process" (default): the persisted pid is expected to still be alive; any inability
+  //    to positively match (dead/unreadable pid, missing/skewed start time) means the pid
+  //    was recycled onto — or is now — an unrelated live process, so the kill is skipped
+  //    (fail-closed). Used by the cancel / wakeup-cancel no-handle branches, which signal a
+  //    persisted pid that, if recycled, may be an unrelated *live* process.
+  //  - "descendant-group": reached only after the parent pid was confirmed dead, so the
+  //    only thing alive is an orphaned descendant group whose leader (pid === pgid) is gone.
+  //    A dead leader cannot be a live recycled process, so we proceed and reap the orphans;
+  //    we skip only when the group leader is *still alive* with a start time that does not
+  //    match — the one shape in which this branch could signal a live recycled group.
+  //
+  // Trusted-handle callers pass trustedHandle:true to bypass the gate entirely.
+  trustedHandle?: boolean;
+  identityMode?: "process" | "descendant-group";
+  expectedProcessStartedAt?: Date | number | null;
+  runId?: string;
+}): Promise<TerminateHeartbeatRunOutcome> {
   const pid = input.pid ?? null;
   const processGroupId = input.processGroupId ?? null;
-  if (typeof pid !== "number" && typeof processGroupId !== "number") return;
+  if (typeof pid !== "number" && typeof processGroupId !== "number") return "no_process";
+
+  if (!input.trustedHandle) {
+    const identityMode = input.identityMode ?? "process";
+    // Anchor identity on the group leader (pid === pgid) for descendant-group reaps, and on
+    // the persisted pid for the cancel paths.
+    const target =
+      identityMode === "descendant-group"
+        ? (typeof processGroupId === "number" ? processGroupId : (pid as number))
+        : (typeof pid === "number" ? pid : (processGroupId as number));
+    // In descendant-group mode a dead leader is not a live recycled process, so only a live
+    // leader is worth verifying; verifying a dead leader would always mismatch and wrongly
+    // block reaping the legitimate orphaned descendants.
+    const shouldVerify = identityMode === "process" || isProcessAlive(target);
+    if (shouldVerify) {
+      const expectedStartEpochMs =
+        input.expectedProcessStartedAt instanceof Date
+          ? input.expectedProcessStartedAt.getTime()
+          : input.expectedProcessStartedAt;
+      const verdict = await verifyProcessStartIdentity(target, expectedStartEpochMs);
+      if (verdict === "mismatch") {
+        logger.warn(
+          { runId: input.runId, targetPid: pid, targetProcessGroupId: processGroupId, identityMode },
+          "skipped heartbeat run process termination: recycled pid/pgid could not be identity-verified",
+        );
+        return "skipped_identity_unverified";
+      }
+    }
+  }
 
   // Snapshot MCP descendants before the group is torn down (ppid links intact),
   // kill the group, then reap any MCP that escaped the group into its own
@@ -4815,6 +4867,7 @@ async function terminateHeartbeatRunProcess(input: {
       input.graceMs ? { forceAfterMs: input.graceMs } : undefined,
     ),
   );
+  return "terminated";
 }
 
 function buildProcessLossMessage(run: {
@@ -10242,11 +10295,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       let descendantOnlyCleanup = false;
       if (processGroupAlive) {
-        descendantOnlyCleanup = true;
-        await terminateHeartbeatRunProcess({
+        // No live in-memory handle here (runningProcesses.has(run.id) was skipped above),
+        // and the parent pid was confirmed dead by the processPidAlive check above, so the
+        // pgid was reconstructed from persisted metadata. descendant-group mode reaps the
+        // orphaned group whose leader is gone but skips the kill if the leader is somehow
+        // still alive with a mismatched start time (a recycled live group); only claim a
+        // descendant-group teardown when the signal was actually sent.
+        const outcome = await terminateHeartbeatRunProcess({
           pid: run.processPid,
           processGroupId: run.processGroupId,
+          identityMode: "descendant-group",
+          expectedProcessStartedAt: run.processStartedAt,
+          runId: run.id,
         });
+        descendantOnlyCleanup = outcome === "terminated";
       }
 
       const shouldRetry = tracksLocalChild && (!!run.processPid || !!run.processGroupId) && (run.processLossRetryCount ?? 0) < 1;
@@ -14909,11 +14971,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           pid: running.child.pid ?? run.processPid,
           processGroupId: running.processGroupId ?? run.processGroupId,
           graceMs: Math.max(1, running.graceSec) * 1000,
+          trustedHandle: true,
         });
       } else if (run.processPid || run.processGroupId) {
         await terminateHeartbeatRunProcess({
           pid: run.processPid,
           processGroupId: run.processGroupId,
+          expectedProcessStartedAt: run.processStartedAt,
+          runId: run.id,
         });
       }
     } finally {
@@ -14982,12 +15047,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           pid: running.child.pid ?? run.processPid,
           processGroupId: running.processGroupId ?? run.processGroupId,
           graceMs: Math.max(1, running.graceSec) * 1000,
+          trustedHandle: true,
         });
         runningProcesses.delete(run.id);
       } else if (run.processPid || run.processGroupId) {
         await terminateHeartbeatRunProcess({
           pid: run.processPid,
           processGroupId: run.processGroupId,
+          expectedProcessStartedAt: run.processStartedAt,
+          runId: run.id,
         });
       }
       await releaseIssueExecutionAndPromote(run);
