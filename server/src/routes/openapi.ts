@@ -3197,7 +3197,7 @@ registry.registerPath({
   request: {
     params: z.object({ runId: z.string() }),
     body: jsonBody(z.object({
-      decision: z.enum(["snooze", "continue", "dismissed_false_positive"]),
+      decision: z.enum(["snooze", "continue", "dismissed_false_positive", "terminate"]),
       evaluationIssueId: z.string().optional().nullable(),
       reason: z.string().optional().nullable(),
       snoozedUntil: z.string().datetime().optional().nullable(),
