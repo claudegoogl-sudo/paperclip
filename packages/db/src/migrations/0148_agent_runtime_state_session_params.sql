@@ -1,0 +1,20 @@
+-- Persist adapter session-resume params for the system/heartbeat runtime session.
+--
+-- The claude-local adapter already busts a resumed session when the instruction
+-- prompt bundle changes: it compares the stored `promptBundleKey` in
+-- `runtime.sessionParams` against the freshly-computed bundle key and starts a
+-- fresh session on mismatch. But `agent_runtime_state` — the home for the
+-- system/heartbeat session (no per-issue task key) — had no column to hold those
+-- params. Only per-issue sessions persisted them, in
+-- `agent_task_sessions.session_params_json`. So for a heartbeat agent the stored
+-- key was always empty, the guard's `length === 0` short-circuit always matched,
+-- and a pinned session was never busted when its AGENTS.md/charter changed.
+--
+-- This column gives system sessions the same session-params home the per-issue
+-- table already has (mirrors `agent_task_sessions.session_params_json`: nullable
+-- jsonb, no default). Nullable-add is metadata-only in PostgreSQL — no table
+-- rewrite, no blocking lock at scale. `agent_runtime_state` is one row per agent
+-- (small), so no large-table mutation concerns apply.
+--
+-- Idempotent: re-running creates nothing new.
+ALTER TABLE "agent_runtime_state" ADD COLUMN IF NOT EXISTS "session_params_json" jsonb;

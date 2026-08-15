@@ -210,7 +210,7 @@ export const SECURITY_POSTURE_REJECTIONS = [
     table: "agent_runtime_state",
     columns: [
       "adapter_type", "agent_id", "company_id", "created_at", "last_error", "last_run_id",
-      "last_run_status", "session_id", "state_json", "total_cached_input_tokens",
+      "last_run_status", "session_id", "session_params_json", "state_json", "total_cached_input_tokens",
       "total_cost_cents", "total_input_tokens", "total_output_tokens", "updated_at"
     ],
     reason: "Runtime bookkeeping and token/cost counters for the current session. Read for display and continuation, not as a predicate in any authorization, egress or sandbox decision.",

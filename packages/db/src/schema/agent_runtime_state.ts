@@ -9,6 +9,12 @@ export const agentRuntimeState = pgTable(
     companyId: uuid("company_id").notNull().references(() => companies.id),
     adapterType: text("adapter_type").notNull(),
     sessionId: text("session_id"),
+    // Adapter session-resume params (promptBundleKey/cwd/sessionId) for the
+    // system/heartbeat session. Per-issue sessions persist these in
+    // agent_task_sessions.session_params_json; system sessions had no home for
+    // them, so the adapter's prompt-bundle resume guard never had a stored key
+    // to compare against and never busted a resumed session on charter edits.
+    sessionParamsJson: jsonb("session_params_json").$type<Record<string, unknown>>(),
     stateJson: jsonb("state_json").$type<Record<string, unknown>>().notNull().default({}),
     lastRunId: uuid("last_run_id"),
     lastRunStatus: text("last_run_status"),
