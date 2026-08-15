@@ -10465,7 +10465,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agent: typeof agents.$inferSelect,
     run: typeof heartbeatRuns.$inferSelect,
     result: AdapterExecutionResult,
-    session: { legacySessionId: string | null },
+    session: { legacySessionId: string | null; sessionParams?: Record<string, unknown> | null },
     normalizedUsage?: UsageTotals | null,
   ) {
     await ensureRuntimeState(agent);
@@ -10485,6 +10485,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .set({
         adapterType: agent.adapterType,
         sessionId: session.legacySessionId,
+        // Persist the system/heartbeat session's resume params (promptBundleKey,
+        // cwd, sessionId) so the adapter's prompt-bundle resume guard can bust a
+        // pinned session when the charter/instructions change. `undefined` means
+        // "leave unchanged" — the failure path never clobbers a stored session.
+        ...(session.sessionParams !== undefined ? { sessionParamsJson: session.sessionParams } : {}),
         lastRunId: run.id,
         lastRunStatus: run.status,
         lastError: result.errorMessage ?? null,
@@ -11294,6 +11299,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const resetTaskSession = shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
     const sessionResetReason = sessionConfigFreshness.reasons.join("; ") || null;
     const taskSessionForRun = resetTaskSession ? null : taskSession;
+    // System/heartbeat sessions (no taskKey) have no agent_task_sessions row, so
+    // their resume params live on agent_runtime_state.session_params_json. Reading
+    // them here lets the persisted promptBundleKey flow into runtime.sessionParams
+    // so the adapter's resume guard busts a pinned session when the charter
+    // changes. Honour a requested reset so we don't resume when a fresh session is
+    // intended, and never source these for per-issue runs (taskKey present).
+    const systemSessionParamsJson =
+      !taskKey && !resetTaskSession ? (runtime.sessionParamsJson ?? null) : null;
     const previousSessionParams =
       explicitResumeSessionParams ??
       (isCanonicalSessionIdForAdapter(agent.adapterType, explicitResumeSessionDisplayId)
@@ -11302,7 +11315,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       normalizeResumeParamsForAdapter(
         agent.adapterType,
         stripPaperclipSessionMetadataFromSessionParams(
-          sessionCodec.deserialize(taskSessionForRun?.sessionParamsJson ?? null),
+          sessionCodec.deserialize(taskSessionForRun?.sessionParamsJson ?? systemSessionParamsJson),
         ),
       );
     const {
@@ -12809,6 +12822,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (finalizedRun) {
         await updateRuntimeState(agent, finalizedRun, adapterResult, {
           legacySessionId: nextSessionState.legacySessionId,
+          // Per-issue sessions store their params in agent_task_sessions
+          // (below); only the system/heartbeat session (no taskKey) records its
+          // resume params on agent_runtime_state so the prompt-bundle guard can
+          // bust it when the charter changes. `null` clears them on session drop.
+          sessionParams: taskKey ? undefined : (nextSessionState.params ?? null),
         }, normalizedUsage);
         if (taskKey) {
           if (adapterResult.clearSession || (!nextSessionState.params && !nextSessionState.displayId)) {
