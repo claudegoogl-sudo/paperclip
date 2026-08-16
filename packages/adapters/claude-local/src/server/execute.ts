@@ -69,6 +69,7 @@ import { claudeCommandSupportsEffortFlag } from "./cli-capabilities.js";
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
 import { isBedrockModelId } from "./models.js";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
+import { buildRuntimeContractFingerprint } from "./runtime-contract.js";
 import { buildClaudeExecutionPermissionArgs } from "./permissions.js";
 import { SANDBOX_INSTALL_COMMAND, models as ADAPTER_MODELS } from "../index.js";
 
@@ -542,6 +543,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     instructionsContents: combinedInstructionsContents,
     onLog,
   });
+  // Fingerprint of host-side runtime-contract inputs (e.g. /live CONTRACT.md,
+  // macjob.py, the active MCP config). A change to any of them busts the pinned
+  // session on the next trigger even though the injected instructions are
+  // unchanged, so the prompt-bundle auto-bust alone would keep resuming stale
+  // precedent. Empty when unconfigured => no behavior change.
+  const runtimeContractFingerprintPaths = asStringArray(config.runtimeContractFingerprintPaths);
+  const runtimeContractFingerprint = await buildRuntimeContractFingerprint(runtimeContractFingerprintPaths);
   const useManagedRemoteClaudeConfig =
     executionTargetIsRemote &&
     adapterExecutionTargetUsesManagedHome(executionTarget) &&
@@ -695,6 +703,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const runtimeSessionCwd = asString(runtimeSessionParams.cwd, "");
   const runtimeRemoteExecution = parseObject(runtimeSessionParams.remoteExecution);
   const runtimePromptBundleKey = asString(runtimeSessionParams.promptBundleKey, "");
+  const runtimeRuntimeContractFingerprint = asString(runtimeSessionParams.runtimeContractFingerprint, "");
   // A stored task session (its id lives in sessionParams) is expected to carry a
   // prompt-bundle pin. Without one we cannot tell whether the agent charter /
   // instructions changed since the session was saved, so the prompt-bundle
@@ -710,6 +719,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     runtimePromptBundleKey.length > 0
       ? runtimePromptBundleKey === promptBundle.bundleKey
       : !storedSessionMissingPromptBundlePin;
+  // Runtime-contract auto-bust: when the current fingerprint is configured
+  // (non-empty) and differs from the one stored with the session, refuse to
+  // resume so a fresh session re-pins to the new contract. A stored fingerprint
+  // that is empty (session predates the feature or the input was unconfigured
+  // when saved) is treated as "no opinion" and does not bust — mirrors the
+  // prompt-bundle pin's lenient handling and keeps AC4 (unconfigured => current
+  // behavior) intact.
+  const runtimeContractMismatch =
+    runtimeSessionId.length > 0 &&
+    runtimeContractFingerprint.length > 0 &&
+    runtimeRuntimeContractFingerprint.length > 0 &&
+    runtimeRuntimeContractFingerprint !== runtimeContractFingerprint;
+  const hasMatchingRuntimeContract = !runtimeContractMismatch;
   const isValidUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(runtimeSessionId);
   const promptBundlePinMissing = storedSessionMissingPromptBundlePin && isValidUuid;
   const promptBundlePinMismatch =
@@ -718,6 +740,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     runtimeSessionId.length > 0 &&
     isValidUuid &&
     hasMatchingPromptBundle &&
+    hasMatchingRuntimeContract &&
     claudeSessionCwdMatchesExecutionTarget({
       runtimeSessionCwd,
       effectiveExecutionCwd,
@@ -751,7 +774,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       "stdout",
       `[paperclip] Claude session "${runtimeSessionId}" does not match the current remote execution identity and will not be resumed in "${effectiveExecutionCwd}". Starting a fresh remote session.\n`,
     );
-  } else if (runtimeSessionId && isValidUuid && !canResumeSession && !promptBundlePinMismatch && !promptBundlePinMissing) {
+  } else if (
+    runtimeSessionId &&
+    isValidUuid &&
+    !canResumeSession &&
+    !promptBundlePinMismatch &&
+    !promptBundlePinMissing &&
+    !runtimeContractMismatch
+  ) {
     await onLog(
       "stdout",
       `[paperclip] Claude session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${effectiveExecutionCwd}".\n`,
@@ -761,6 +791,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     await onLog(
       "stdout",
       `[paperclip] Claude session "${runtimeSessionId}" was saved for prompt bundle "${runtimePromptBundleKey}" and will not be resumed with "${promptBundle.bundleKey}".\n`,
+    );
+  }
+  // Observability: surface a runtime-contract bust explicitly so a fresh-session
+  // start is diagnosable from the run log (e.g. /live flipped CONTRACT.md).
+  if (runtimeContractMismatch) {
+    await onLog(
+      "stdout",
+      `[paperclip] Claude session "${runtimeSessionId}" was saved for runtime-contract fingerprint "${runtimeRuntimeContractFingerprint}" but the host-side runtime contract now fingerprints as "${runtimeContractFingerprint}"; it will not be resumed. Starting a fresh session.\n`,
     );
   }
   // Observability guard: a session id with no stored prompt-bundle pin cannot be
@@ -1045,6 +1083,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         sessionId: resolvedSessionId,
         cwd,
         promptBundleKey: promptBundle.bundleKey,
+        ...(runtimeContractFingerprint ? { runtimeContractFingerprint } : {}),
         ...(executionTargetIsRemote
           ? {
               remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
