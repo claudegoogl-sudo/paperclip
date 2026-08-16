@@ -126,6 +126,11 @@ describeDb("plugin config-egress operator routes", () => {
     return companyId;
   }
 
+  /** Give `companyId` an explicit `enabled = true` settings row for the plugin — the write routes require it. */
+  async function enablePlugin(pluginId: string, companyId: string): Promise<void> {
+    await db.insert(pluginCompanySettings).values({ pluginId, companyId, enabled: true, settingsJson: {} });
+  }
+
   it("AC1: rejects an agent JWT on read and both writes (403, EG1-provenance)", async () => {
     const pluginId = await seedPlugin();
     const companyId = await seedCompany("aaa");
@@ -169,6 +174,7 @@ describeDb("plugin config-egress operator routes", () => {
   it("set-allowlist rejects a configKey that isn't a declared format:uri instance-config key", async () => {
     const pluginId = await seedPlugin();
     const companyId = await seedCompany("ccc");
+    await enablePlugin(pluginId, companyId);
 
     const res = await request(appFor(boardActor(companyId)))
       .post(`/api/companies/${companyId}/plugins/${pluginId}/config-egress/notARealKey/allowlist`)
@@ -181,6 +187,7 @@ describeDb("plugin config-egress operator routes", () => {
     const pluginId = await seedPlugin();
     const companyA = await seedCompany("ddd");
     const companyB = await seedCompany("eee");
+    await enablePlugin(pluginId, companyA);
     const appA = appFor(boardActor(companyA));
 
     const setRes = await request(appA)
@@ -223,5 +230,31 @@ describeDb("plugin config-egress operator routes", () => {
 
     const crossCompany = await request(appA).get(`/api/companies/${companyB}/plugins/${pluginId}/config-egress`);
     expect(crossCompany.status, JSON.stringify(crossCompany.body)).toBe(403);
+  });
+
+  it("least-privilege: a board user of a company that doesn't run the plugin is rejected on both writes, no row created", async () => {
+    const pluginId = await seedPlugin();
+    // companyNoRow: default-available plugin, never explicitly enabled (no settings row).
+    const companyNoRow = await seedCompany("hhh");
+    // companyDisabled: an explicit enabled=false row — the plugin is turned OFF for it.
+    const companyDisabled = await seedCompany("iii");
+    await db.insert(pluginCompanySettings).values({ pluginId, companyId: companyDisabled, enabled: false, settingsJson: {} });
+
+    for (const companyId of [companyNoRow, companyDisabled]) {
+      const appC = appFor(boardActor(companyId));
+
+      const setList = await request(appC)
+        .post(`/api/companies/${companyId}/plugins/${pluginId}/config-egress/moonrakerBaseUrl/allowlist`)
+        .send({ allowedEgress: ["https://secondary.example"] });
+      const enforce = await request(appC)
+        .post(`/api/companies/${companyId}/plugins/${pluginId}/config-egress/moonrakerBaseUrl/enforce`)
+        .send({});
+
+      expect(setList.status, JSON.stringify(setList.body)).toBe(403);
+      expect(enforce.status, JSON.stringify(enforce.body)).toBe(403);
+    }
+
+    const rows = await db.select().from(pluginConfigEgressAllowlist).where(eq(pluginConfigEgressAllowlist.pluginId, pluginId));
+    expect(rows).toHaveLength(0);
   });
 });
