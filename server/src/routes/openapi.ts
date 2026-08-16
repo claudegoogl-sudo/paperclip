@@ -144,6 +144,9 @@ import {
   // (fork) Secret egress operator surface
   setBindingEgressAllowlistSchema,
   enforceBindingEgressSchema,
+  // (fork) Plugin config-key egress operator surface
+  setPluginConfigEgressAllowlistSchema,
+  enforcePluginConfigEgressAllowlistSchema,
   workspaceFileListQuerySchema,
   workspaceFileResourceQuerySchema,
 } from "@paperclipai/shared";
@@ -4882,6 +4885,32 @@ registerCurrentRoute({
   tags: ["secrets"],
   summary: "Toggle egress enforcement for a secret binding",
   body: enforceBindingEgressSchema,
+});
+
+// (fork) Operator-only plugin config-key egress review + allowlist /
+// enforce-flip surface. These routes are mounted in routes/plugin-config-egress.ts;
+// document them here so the openapi spec stays an exact match for the fork's hardening.
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/plugins/{pluginId}/config-egress",
+  tags: ["plugins"],
+  summary: "Review plugin config-key egress allowlist and would-deny suggestions",
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/plugins/{pluginId}/config-egress/{configKey}/allowlist",
+  tags: ["plugins"],
+  summary: "Set the egress allowlist for a plugin config key",
+  body: setPluginConfigEgressAllowlistSchema,
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/plugins/{pluginId}/config-egress/{configKey}/enforce",
+  tags: ["plugins"],
+  summary: "Toggle egress enforcement for a plugin config key (plugin-wide effect)",
+  body: enforcePluginConfigEgressAllowlistSchema,
 });
 
 for (const route of [

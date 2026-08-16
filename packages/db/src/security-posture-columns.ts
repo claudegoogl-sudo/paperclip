@@ -97,6 +97,16 @@ export const SECURITY_POSTURE_COLUMNS = [
     column: "allowed_egress",
     reason: "Destination allowlist the enforcement switch evaluates; emptying it is equivalent to disarming it.",
   },
+  {
+    table: "plugin_config_egress_allowlist",
+    column: "egress_allowlist_enforced",
+    reason: "Per-plugin config-key egress enforcement switch; false = ctx.http.fetch egress is log-only. Enforcement is plugin-wide OR'd across companies, so flipping one row governs the whole plugin.",
+  },
+  {
+    table: "plugin_config_egress_allowlist",
+    column: "allowed_egress",
+    reason: "Operator-added extra destinations layered on the config key's own value; the enforcement switch evaluates it, so a blanket widen admits attacker-chosen origins plugin-wide.",
+  },
 
   // --- Authorization and identity ---
   {

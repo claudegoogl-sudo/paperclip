@@ -22,7 +22,7 @@ import { plugins } from "./plugins.js";
  * boundary.
  *
  * Amendment A3: rows backfilled for already-installed plugin instances are
- * born `egress_allowlist_enforced = false` (log-only) — see migration 0141.
+ * born `egress_allowlist_enforced = false` (log-only) — see migration 0149.
  * `DEFAULT true` applies only to rows created after this ships (new installs /
  * new config keys), matching the 0138 precedent.
  */

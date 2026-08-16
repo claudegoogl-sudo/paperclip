@@ -933,6 +933,16 @@ export const SECURITY_POSTURE_REJECTIONS = [
     reason: "Per-plugin last-error and timestamps. The column carrying secret-ref bindings and per-company policy, config_json, is registered.",
   },
   {
+    table: "plugin_config_egress_allowlist",
+    columns: ["company_id", "config_key", "created_at", "id", "plugin_id", "updated_at"],
+    reason: "Row identity, tenant/config-key addressing, and timestamps for the config-key egress allowlist. The enforcement switch and destination list, egress_allowlist_enforced and allowed_egress, are registered.",
+  },
+  {
+    table: "plugin_config_egress_would_deny_observations",
+    columns: ["count", "first_seen", "id", "last_seen", "origin", "plugin_id"],
+    reason: "Counters recording config-key egress destinations that would have been denied in log-only mode. Diagnostic evidence for the enforcement switch, never consulted by it.",
+  },
+  {
     table: "plugin_database_namespaces",
     columns: [
       "created_at", "id", "namespace_mode", "namespace_name", "plugin_id", "plugin_key",
