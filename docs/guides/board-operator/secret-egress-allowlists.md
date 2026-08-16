@@ -148,17 +148,23 @@ workflow as the per-binding mechanism above, at company-scoped routes under
 > your own company's row is still log-only); the enforce route's response
 > makes the same effect explicit via `pluginWideEnforced: true`.
 
-> **Coverage.** This mechanism only gates a worker's `ctx.http.fetch`. Two
-> notable transports are **not** covered:
-> - **Vault** (`paperclip-plugin-vault`) makes its own outbound HTTP calls via
->   `globalThis.fetch` directly inside the plugin process, never through
->   `ctx.http.fetch` — this allowlist has no effect on vault egress.
+> **Coverage.** This mechanism only gates a worker's `ctx.http.fetch`.
+> **Vault** (`paperclip-plugin-vault`) now routes every Vaultwarden request
+> through `ctx.http.fetch` (its `serverUrl` config key is declared
+> `format:"uri"`), so vault egress **is** a subject of this mechanism, exactly
+> like klipper's `moonrakerBaseUrl`: its `serverUrl` origin is harvested into
+> would-deny suggestions and can be flipped to enforce — plugin-wide and
+> log-only until an operator flips enforce, subject to the same
+> **not-a-per-tenant-boundary** caveat as above. One transport is still **not**
+> covered:
 > - **Klipper's Moonraker WebSocket connection** (`new WebSocket(url)` in
 >   `MoonrakerClient`) is a separate transport from `ctx.http.fetch` and is
 >   also not covered — only klipper's plain HTTP calls to Moonraker are gated.
 >
-> Do not treat either plugin as "egress-controlled" on the strength of this
-> mechanism alone.
+> Do not treat klipper as fully "egress-controlled" on the strength of this
+> mechanism alone: its Moonraker WebSocket transport is unaffected. And
+> remember that vault's coverage, like every config-key binding here, is
+> plugin-wide and log-only until an operator explicitly enforces it.
 
 ### HTTP API
 
