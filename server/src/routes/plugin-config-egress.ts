@@ -17,7 +17,12 @@ import {
 // secret-binding surface in `routes/secrets.ts`, same authz shape:
 // `assertBoard` is the EG1-provenance gate (agent/worker JWTs get 403 — no
 // agent-invokable path to read suggestions, seed an allowlist, or flip a row),
-// `assertCompanyAccess` enforces BOLA on top.
+// `assertCompanyAccess` enforces BOLA on top. The two WRITE routes
+// additionally require the acting company to actually run the plugin (an
+// `enabled = true` plugin_company_settings row) via `assertUriConfigKey` —
+// least-privilege so a board operator of a company that doesn't run the plugin
+// can't seed/flip the shared, plugin-wide allowlist (see A2). Review stays
+// ungated so posture is visible regardless.
 //
 // IMPORTANT asymmetry these routes must not paper over: every route here is
 // company-scoped (path-scoped `companyId`), but per operator amendment A2

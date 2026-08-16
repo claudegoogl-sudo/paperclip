@@ -8,7 +8,7 @@ import {
   normalizeDestination,
   type NormalizedOrigin,
 } from "../handle-egress.js";
-import { badRequest, notFound } from "../errors.js";
+import { badRequest, forbidden, notFound } from "../errors.js";
 import { collectUriConfigPaths, readConfigValueAtPath } from "./json-schema-secret-refs.js";
 import { pluginRegistryService } from "./plugin-registry.js";
 import {
@@ -210,11 +210,38 @@ export async function enforcePluginConfigEgress(
 // single company's row to enforcing makes the WHOLE PLUGIN enforce.
 // ---------------------------------------------------------------------------
 
-/** Throws if `pluginId` doesn't exist or `configKey` isn't a declared `format:"uri"` instance-config key. */
-async function assertUriConfigKey(db: Db, pluginId: string, configKey: string): Promise<void> {
+/**
+ * Guards the two write paths below. Throws if:
+ *  - `pluginId` doesn't exist (404), or
+ *  - `companyId` does not run the plugin — no `enabled = true`
+ *    `plugin_company_settings` row (403, least-privilege), or
+ *  - `configKey` isn't a declared `format:"uri"` instance-config key (400).
+ *
+ * The enabled check narrows the set of principals who can seed/flip a
+ * `plugin_config_egress_allowlist` row. Per A2 the runtime deny decision is
+ * plugin-wide (unions/ORs every enabled company's row), so without this a
+ * board operator of a company that doesn't even run the plugin could still
+ * influence the shared worker's egress allowlist and plugin-wide enforcement.
+ * "Enabled" is deliberately the SAME notion the runtime union uses
+ * (`listEnabledCompanySettings` — an explicit `enabled = true` row), so the
+ * only companies allowed to write are exactly those whose config already
+ * participates in the union. Read (review) stays ungated: an operator must be
+ * able to see the plugin-wide posture even for a company that isn't running
+ * the plugin.
+ */
+async function assertUriConfigKey(
+  db: Db,
+  companyId: string,
+  pluginId: string,
+  configKey: string,
+): Promise<void> {
   const registry = pluginRegistryService(db);
   const plugin = await registry.getById(pluginId);
   if (!plugin) throw notFound(`Plugin ${pluginId} not found`);
+  const settings = await registry.getCompanySettings(pluginId, companyId);
+  if (!settings?.enabled) {
+    throw forbidden(`Plugin ${pluginId} is not enabled for company ${companyId}`);
+  }
   const schema = (plugin.manifestJson as { instanceConfigSchema?: unknown } | null | undefined)
     ?.instanceConfigSchema as Record<string, unknown> | null | undefined;
   if (!collectUriConfigPaths(schema).has(configKey)) {
@@ -318,7 +345,7 @@ export async function setPluginConfigEgressAllowlist(
   db: Db,
   params: { companyId: string; pluginId: string; configKey: string; allowedEgress: string[] },
 ): Promise<{ configKey: string; allowedEgress: string[]; egressAllowlistEnforced: boolean }> {
-  await assertUriConfigKey(db, params.pluginId, params.configKey);
+  await assertUriConfigKey(db, params.companyId, params.pluginId, params.configKey);
 
   const cleaned = [...new Set(params.allowedEgress.map((e) => e.trim()).filter((e) => e.length > 0))];
   for (const entry of cleaned) {
@@ -366,7 +393,7 @@ export async function enforcePluginConfigEgressAllowlist(
   db: Db,
   params: { companyId: string; pluginId: string; configKey: string },
 ): Promise<{ configKey: string; allowedEgress: string[]; egressAllowlistEnforced: boolean }> {
-  await assertUriConfigKey(db, params.pluginId, params.configKey);
+  await assertUriConfigKey(db, params.companyId, params.pluginId, params.configKey);
 
   const updated = await db
     .insert(pluginConfigEgressAllowlist)
