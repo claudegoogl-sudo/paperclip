@@ -695,9 +695,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const runtimeSessionCwd = asString(runtimeSessionParams.cwd, "");
   const runtimeRemoteExecution = parseObject(runtimeSessionParams.remoteExecution);
   const runtimePromptBundleKey = asString(runtimeSessionParams.promptBundleKey, "");
+  // A stored task session (its id lives in sessionParams) is expected to carry a
+  // prompt-bundle pin. Without one we cannot tell whether the agent charter /
+  // instructions changed since the session was saved, so the prompt-bundle
+  // auto-bust can never fire and the session resumes forever against a possibly
+  // stale charter. Refuse to resume such a session — a fresh session re-pins to
+  // the current bundle and converges on the next heartbeat. Sessions supplied
+  // only via runtime.sessionId (e.g. in-run poison recovery) are not stored task
+  // sessions and keep resuming as before.
+  const storedSessionId = asString(runtimeSessionParams.sessionId, "");
+  const storedSessionMissingPromptBundlePin =
+    storedSessionId.length > 0 && runtimePromptBundleKey.length === 0;
   const hasMatchingPromptBundle =
-    runtimePromptBundleKey.length === 0 || runtimePromptBundleKey === promptBundle.bundleKey;
+    runtimePromptBundleKey.length > 0
+      ? runtimePromptBundleKey === promptBundle.bundleKey
+      : !storedSessionMissingPromptBundlePin;
   const isValidUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(runtimeSessionId);
+  const promptBundlePinMissing = storedSessionMissingPromptBundlePin && isValidUuid;
+  const promptBundlePinMismatch =
+    runtimeSessionId.length > 0 && runtimePromptBundleKey.length > 0 && runtimePromptBundleKey !== promptBundle.bundleKey;
   const canResumeSession =
     runtimeSessionId.length > 0 &&
     isValidUuid &&
@@ -735,16 +751,26 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       "stdout",
       `[paperclip] Claude session "${runtimeSessionId}" does not match the current remote execution identity and will not be resumed in "${effectiveExecutionCwd}". Starting a fresh remote session.\n`,
     );
-  } else if (runtimeSessionId && isValidUuid && !canResumeSession) {
+  } else if (runtimeSessionId && isValidUuid && !canResumeSession && !promptBundlePinMismatch && !promptBundlePinMissing) {
     await onLog(
       "stdout",
       `[paperclip] Claude session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${effectiveExecutionCwd}".\n`,
     );
   }
-  if (runtimeSessionId && runtimePromptBundleKey.length > 0 && runtimePromptBundleKey !== promptBundle.bundleKey) {
+  if (promptBundlePinMismatch) {
     await onLog(
       "stdout",
       `[paperclip] Claude session "${runtimeSessionId}" was saved for prompt bundle "${runtimePromptBundleKey}" and will not be resumed with "${promptBundle.bundleKey}".\n`,
+    );
+  }
+  // Observability guard: a session id with no stored prompt-bundle pin cannot be
+  // checked against the current bundle, so the prompt-bundle auto-bust cannot
+  // fire for it. Surface it explicitly instead of silently resuming (or silently
+  // starting fresh) so a stale-session symptom is diagnosable from the run log.
+  if (promptBundlePinMissing) {
+    await onLog(
+      "stdout",
+      `[paperclip] Claude session "${runtimeSessionId}" has no stored prompt-bundle pin (sessionParams.promptBundleKey missing); it will not be resumed so instruction/charter changes take effect. Starting a fresh session pinned to prompt bundle "${promptBundle.bundleKey}".\n`,
     );
   }
   const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
