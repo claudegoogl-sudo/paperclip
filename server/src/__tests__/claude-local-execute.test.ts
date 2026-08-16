@@ -1272,6 +1272,120 @@ describe("claude execute", () => {
     }
   }, 15_000);
 
+  it("does not resume a Claude session whose stored params lack a prompt-bundle pin", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-nopin-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "claude");
+    const capturePath1 = path.join(root, "capture-before.json");
+    const capturePath2 = path.join(root, "capture-after.json");
+    const instructionsPath = path.join(root, "AGENTS.md");
+    const paperclipHome = path.join(root, "paperclip-home");
+    const logs: string[] = [];
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.writeFile(instructionsPath, "Stable instructions.\n", "utf8");
+    await writeFakeClaudeCommand(commandPath);
+
+    const previousHome = process.env.HOME;
+    const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+    const previousPaperclipInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    process.env.HOME = root;
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+
+    try {
+      const first = await execute({
+        runId: "run-before",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          instructionsFilePath: instructionsPath,
+          env: {
+            PAPERCLIP_TEST_CAPTURE_PATH: capturePath1,
+          },
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      expect(first.exitCode).toBe(0);
+      expect(typeof first.sessionParams?.promptBundleKey).toBe("string");
+
+      // Simulate a legacy / externally-pinned session: a valid session id with no
+      // stored prompt-bundle pin. Instructions are unchanged, so under the old
+      // permissive behavior (missing pin counted as a match) this would resume.
+      const { promptBundleKey: _dropped, ...pinlessParams } = (first.sessionParams ?? {}) as Record<
+        string,
+        unknown
+      >;
+      expect(pinlessParams).not.toHaveProperty("promptBundleKey");
+
+      const second = await execute({
+        runId: "run-after",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Claude Coder",
+          adapterType: "claude_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: pinlessParams,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          instructionsFilePath: instructionsPath,
+          env: {
+            PAPERCLIP_TEST_CAPTURE_PATH: capturePath2,
+          },
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async (_stream, chunk) => {
+          logs.push(chunk);
+        },
+      });
+
+      expect(second.exitCode).toBe(0);
+      expect(second.errorMessage).toBeNull();
+
+      const after = JSON.parse(await fs.readFile(capturePath2, "utf8")) as CapturePayload;
+      // A missing pin must force a fresh session, not a resume...
+      expect(after.argv).not.toContain("--resume");
+      // ...it is re-pinned to the current bundle so it converges on the next run...
+      expect(typeof second.sessionParams?.promptBundleKey).toBe("string");
+      // ...and the reason is observable in the run log.
+      expect(logs.join("")).toContain("has no stored prompt-bundle pin");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+      if (previousPaperclipInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousPaperclipInstanceId;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   it("classifies Claude 'out of extra usage' failures as transient upstream errors", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-transient-"));
     const workspace = path.join(root, "workspace");
