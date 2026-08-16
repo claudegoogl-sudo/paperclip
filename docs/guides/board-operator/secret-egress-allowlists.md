@@ -120,3 +120,68 @@ Both writes emit an activity-log entry (`secret.egress_allowlist_set`,
 
 All three operations are safe to re-run. Re-setting the same allowlist or
 re-flipping an already-enforced binding converges to the same state.
+
+## Plugin config-key egress allowlist
+
+A second, independent mechanism gates a plugin's `ctx.http.fetch` calls
+against destinations derived from that plugin's **own declared instance
+config** — specifically, any config key the plugin's manifest marks
+`format: "uri"` (klipper's `moonrakerBaseUrl` is the first real subject: a
+company points klipper at its own Moonraker host, and that host is
+automatically the allowed destination). A config key's own declared value is
+always part of the effective allowlist; you only ever need to review and add
+*extra* destinations (e.g. a secondary printer host) or would-deny
+suggestions from real traffic — the same review → set-allowlist → enforce
+workflow as the per-binding mechanism above, at company-scoped routes under
+`/api/companies/:companyId/plugins/:pluginId/config-egress/...`.
+
+> **Not a per-tenant boundary.** Unlike the per-binding mechanism above, the
+> config-key egress decision has no trustworthy per-call company context (the
+> plugin worker's `ctx.http.fetch` only receives a URL), so it
+> is evaluated **plugin-wide**: the effective allowlist is the UNION of every
+> company's declared config value for that key, and enforcement is **OR**'d
+> across every company's row for the plugin. Flipping *any one* company's row
+> to enforced makes the whole plugin start enforcing for every company that
+> has it enabled — including companies that never reviewed their own
+> suggestions. The review response's `pluginWideEnforced` field always
+> reflects this effective, plugin-wide posture (which may be `true` even when
+> your own company's row is still log-only); the enforce route's response
+> makes the same effect explicit via `pluginWideEnforced: true`.
+
+> **Coverage.** This mechanism only gates a worker's `ctx.http.fetch`. Two
+> notable transports are **not** covered:
+> - **Vault** (`paperclip-plugin-vault`) makes its own outbound HTTP calls via
+>   `globalThis.fetch` directly inside the plugin process, never through
+>   `ctx.http.fetch` — this allowlist has no effect on vault egress.
+> - **Klipper's Moonraker WebSocket connection** (`new WebSocket(url)` in
+>   `MoonrakerClient`) is a separate transport from `ctx.http.fetch` and is
+>   also not covered — only klipper's plain HTTP calls to Moonraker are gated.
+>
+> Do not treat either plugin as "egress-controlled" on the strength of this
+> mechanism alone.
+
+### HTTP API
+
+| Method & path | Purpose |
+| --- | --- |
+| `GET /api/companies/:companyId/plugins/:pluginId/config-egress` | Review: every `format:"uri"` config key the plugin declares, this company's own declared value + operator-added allowlist extras, this company's row posture, the effective plugin-wide posture (`pluginWideEnforced`), and plugin-wide harvested suggestions (each unselected). |
+| `POST /api/companies/:companyId/plugins/:pluginId/config-egress/:configKey/allowlist` | Replace this company's operator-added extra destinations for `configKey`. Body: `{ "allowedEgress": ["https://secondary-printer.example", …] }`. Never touches enforcement. |
+| `POST /api/companies/:companyId/plugins/:pluginId/config-egress/:configKey/enforce` | Flip this company's row for `configKey` to enforced — **plugin-wide effect, see above**. Body: `{}` (no `allowEmpty` — the plugin's own declared config value is always allowed, so there is no empty-allowlist-denies-everything footgun to opt out of). |
+
+All three are board-authenticated only (`403` for an agent/worker token) and
+company-scoped for BOLA (`403` for a company you do not belong to). Both
+writes emit an activity-log entry (`plugin.config_egress_allowlist_set`,
+`plugin.config_egress_allowlist_enforced`).
+
+Setting an allowlist entry for a `configKey` the plugin does not declare as
+`format:"uri"` is refused (`400`).
+
+There is currently no CLI for this surface (HTTP API only). There is also no
+bulk/enforce-all action — though note that, unlike the per-binding mechanism,
+even a single enforce call already has a plugin-wide blast radius (see above),
+so a one-at-a-time flip buys less isolation here than it does for a secret
+binding.
+
+Shipping this mechanism does not itself flip any instance to enforcing —
+every existing plugin config-key row starts (and stays) log-only until an
+operator explicitly reviews suggestions and calls the enforce route.

@@ -70,6 +70,7 @@ import {
 } from "./plugin-local-folders.js";
 import { createPluginSecretsHandler } from "./plugin-secrets-handler.js";
 import { createPluginArtifactsHandler } from "./plugin-artifacts-handler.js";
+import { enforcePluginConfigEgress } from "./plugin-config-egress.js";
 import { normalizeIssueAttachmentMaxBytes } from "../attachment-types.js";
 import {
   defaultPluginWakeRateLimiter,
@@ -163,7 +164,10 @@ export interface ValidatedFetchTarget {
   useTls: boolean;
 }
 
-async function validateAndResolveFetchUrl(urlString: string): Promise<ValidatedFetchTarget> {
+async function validateAndResolveFetchUrl(
+  urlString: string,
+  checkConfigEgress?: (urlString: string) => Promise<void>,
+): Promise<ValidatedFetchTarget> {
   let parsed: URL;
   try {
     parsed = new URL(urlString);
@@ -175,6 +179,14 @@ async function validateAndResolveFetchUrl(urlString: string): Promise<ValidatedF
     throw new Error(
       `Disallowed protocol "${parsed.protocol}" — only http: and https: are permitted`,
     );
+  }
+
+  // Plugin config-key egress allowlist. Runs AFTER protocol
+  // validation but BEFORE the DNS resolve/pin below — a denied destination
+  // must never be resolved or connected to. Fail-closed: a lookup error
+  // throws (see enforcePluginConfigEgress), it never silently allows.
+  if (checkConfigEgress) {
+    await checkConfigEgress(urlString);
   }
 
   // Resolve the hostname to an IP and check for private ranges.
@@ -1427,7 +1439,11 @@ export function buildHostServices(
       async fetch(params) {
         // SSRF protection: validate protocol whitelist + block private IPs.
         // Resolve once, then connect directly to that IP to prevent DNS rebinding.
-        const target = await validateAndResolveFetchUrl(params.url);
+        // Gate on the plugin's own declared config-key egress
+        // allowlist before any DNS resolution happens.
+        const target = await validateAndResolveFetchUrl(params.url, (url) =>
+          enforcePluginConfigEgress(db, pluginId, url),
+        );
 
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), PLUGIN_FETCH_TIMEOUT_MS);

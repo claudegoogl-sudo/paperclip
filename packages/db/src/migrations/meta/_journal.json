@@ -1030,6 +1030,20 @@
       "when": 1783101200000,
       "tag": "0148_agent_runtime_state_session_params",
       "breakpoints": true
+    },
+    {
+      "idx": 149,
+      "version": "7",
+      "when": 1783101300000,
+      "tag": "0149_plugin_config_egress_allowlist",
+      "breakpoints": true
+    },
+    {
+      "idx": 150,
+      "version": "7",
+      "when": 1783101400000,
+      "tag": "0150_plugin_config_egress_would_deny_observations",
+      "breakpoints": true
     }
   ]
 }
