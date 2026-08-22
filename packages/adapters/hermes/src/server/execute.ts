@@ -593,6 +593,14 @@ export async function execute(
   const result = await runChildProcess(ctx.runId, hermesCmd, args, {
     cwd,
     env,
+    // Do NOT inherit the server process env. `env` above is a complete
+    // least-privilege set (allowlistedProcessEnv + userEnv + buildPaperclipEnv +
+    // explicit PAPERCLIP_* injections). Inheriting process.env underneath it —
+    // as the default runChildProcess behavior does — would re-leak every
+    // non-PAPERCLIP_ server secret (MAC_PW, ZAI_API_KEY, other agents' keys, …)
+    // to the child, defeating the allowlist. A hermes agent on a prompt-logging
+    // provider could `printenv` those into a third-party-retained log.
+    inheritServerEnv: false,
     timeoutSec,
     graceSec,
     onLog: wrappedOnLog,
