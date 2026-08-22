@@ -52,6 +52,67 @@ import {
 } from "./detect-model.js";
 
 // ---------------------------------------------------------------------------
+// Environment allowlist (default-deny)
+// ---------------------------------------------------------------------------
+
+/**
+ * Non-secret process-env vars a Hermes child genuinely needs to run.
+ * Everything else in the Paperclip server env (provider keys, PATs, bot
+ * tokens, other companies' secrets) is dropped. Per-agent credentials must be
+ * supplied via adapterConfig.env, which is layered on top of this allowlist.
+ *
+ * NOTE: PYTHONPATH/PYTHONHOME are intentionally absent — the hermes shim
+ * (~/.local/bin/hermes) already unsets them before exec'ing the venv binary,
+ * so passing them through would be a no-op at best.
+ */
+const ENV_ALLOWLIST_EXACT = new Set<string>([
+  // Filesystem / process identity
+  "HOME",
+  "PATH",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "PWD",
+  "TMPDIR",
+  // Locale / time
+  "TZ",
+  "LANG",
+  "LC_ALL",
+  "TERM",
+  // Runtime mode
+  "NODE_ENV",
+  // TLS trust roots (needed for outbound HTTPS to inference providers)
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+]);
+
+/**
+ * Prefix families that are allowlisted wholesale. These namespaces hold
+ * non-secret locale (LC_*) and desktop/base-dir (XDG_*) settings.
+ */
+const ENV_ALLOWLIST_PREFIXES = ["LC_", "XDG_"];
+
+function isAllowlistedEnvKey(key: string): boolean {
+  if (ENV_ALLOWLIST_EXACT.has(key)) return true;
+  return ENV_ALLOWLIST_PREFIXES.some((p) => key.startsWith(p));
+}
+
+/**
+ * Build the base child env by filtering the server process env down to the
+ * default-deny allowlist above. Undefined values are skipped.
+ */
+export function allowlistedProcessEnv(
+  source: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (value === undefined) continue;
+    if (isAllowlistedEnvKey(key)) out[key] = value;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Config helpers
 // ---------------------------------------------------------------------------
 
@@ -453,9 +514,17 @@ export async function execute(
   }
 
   // ── Build environment ──────────────────────────────────────────────────
+  // SECURITY (default-deny): never blanket-inherit the Paperclip server env.
+  // The server process holds every company's/agent's secrets (provider keys,
+  // GitHub PATs, telegram/bot tokens, etc.). A cloaked/logging inference model
+  // that gets a shell toolset could `printenv` and exfiltrate all of them into
+  // a third-party log. Only non-secret runtime essentials are allowlisted here;
+  // per-agent credentials must flow through adapterConfig.env (userEnv) and the
+  // explicit Paperclip injections below (buildPaperclipEnv + PAPERCLIP_API_KEY),
+  // which are the agent's own least-privilege values.
   const userEnv = config.env as Record<string, string> | undefined;
   const env: Record<string, string> = {
-    ...(process.env as Record<string, string>),
+    ...allowlistedProcessEnv(),
     ...(userEnv && typeof userEnv === "object" ? userEnv : {}),
     ...buildPaperclipEnv(ctx.agent),
   };
