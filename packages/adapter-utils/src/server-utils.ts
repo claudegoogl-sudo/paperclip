@@ -2035,6 +2035,47 @@ export function ensurePathInEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return { ...env, PATH: defaultPathForPlatform() };
 }
 
+// Claude Code nesting-guard env vars. Stripped from every spawned child so
+// `claude` processes don't refuse to start with "cannot be launched inside
+// another session". These leak in when the Paperclip server itself is started
+// from within a Claude Code session (e.g. `npx paperclipai run` in a terminal
+// owned by Claude Code) or when cron inherits a contaminated shell env.
+export const CLAUDE_CODE_NESTING_VARS = [
+  "CLAUDECODE",
+  "CLAUDE_CODE_ENTRYPOINT",
+  "CLAUDE_CODE_SESSION",
+  "CLAUDE_CODE_PARENT_SESSION",
+] as const;
+
+/**
+ * Compute the exact env handed to `spawn` for a child process. This is the
+ * single, unit-testable merge boundary — the security invariant lives here, at
+ * the actual spawn boundary (complete mediation), not one layer above it.
+ *
+ * - `inheritServerEnv` (default `true`): the child inherits the server process
+ *   env minus PAPERCLIP_* (`sanitizeInheritedPaperclipEnv`), with `env` layered
+ *   on top. Historical behavior for `claude-local`/`gemini-local`/etc.
+ * - `inheritServerEnv === false`: default-deny — the child env is built from
+ *   `env` alone, so no unlisted server secret can reach the child. The hermes
+ *   adapter uses this because its child may run on a prompt-logging provider.
+ *
+ * The CLAUDE_CODE_* nesting-var strip and `ensurePathInEnv` apply either way.
+ */
+export function buildChildEnv(
+  env: Record<string, string>,
+  opts: { inheritServerEnv?: boolean; processEnv?: NodeJS.ProcessEnv } = {},
+): NodeJS.ProcessEnv {
+  const inheritServerEnv = opts.inheritServerEnv !== false;
+  const source = opts.processEnv ?? process.env;
+  const rawMerged: NodeJS.ProcessEnv = inheritServerEnv
+    ? { ...sanitizeInheritedPaperclipEnv(source), ...env }
+    : { ...env };
+  for (const key of CLAUDE_CODE_NESTING_VARS) {
+    delete rawMerged[key];
+  }
+  return ensurePathInEnv(rawMerged);
+}
+
 export async function ensureAbsoluteDirectory(
   cwd: string,
   opts: { createIfMissing?: boolean } = {},
@@ -2820,6 +2861,20 @@ export async function runChildProcess(
     env: Record<string, string>;
     timeoutSec: number;
     graceSec: number;
+    /**
+     * When `true` (default), the child env is `opts.env` layered on top of the
+     * server's own process env (minus PAPERCLIP_* via
+     * `sanitizeInheritedPaperclipEnv`). This is the historical behavior that
+     * `claude-local`/`gemini-local`/`cursor-local`/`acpx-local` rely on.
+     *
+     * When `false`, the server process env is NOT inherited: the child env is
+     * built from `opts.env` alone (default-deny). Callers that construct a
+     * complete least-privilege env — e.g. the hermes adapter, whose child may
+     * run on a prompt-logging provider — must set this so no unlisted server
+     * secret reaches the spawned process. The CLAUDE_CODE_* nesting-var strip
+     * and `ensurePathInEnv` still apply to the result.
+     */
+    inheritServerEnv?: boolean;
     onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
     onLogError?: (err: unknown, runId: string, message: string) => void;
     onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
@@ -2830,27 +2885,9 @@ export async function runChildProcess(
 ): Promise<RunProcessResult> {
   const onLogError = opts.onLogError ?? ((err, id, msg) => console.warn({ err, runId: id }, msg));
   return new Promise<RunProcessResult>((resolve, reject) => {
-    const rawMerged: NodeJS.ProcessEnv = {
-      ...sanitizeInheritedPaperclipEnv(process.env),
-      ...opts.env,
-    };
-
-    // Strip Claude Code nesting-guard env vars so spawned `claude` processes
-    // don't refuse to start with "cannot be launched inside another session".
-    // These vars leak in when the Paperclip server itself is started from
-    // within a Claude Code session (e.g. `npx paperclipai run` in a terminal
-    // owned by Claude Code) or when cron inherits a contaminated shell env.
-    const CLAUDE_CODE_NESTING_VARS = [
-      "CLAUDECODE",
-      "CLAUDE_CODE_ENTRYPOINT",
-      "CLAUDE_CODE_SESSION",
-      "CLAUDE_CODE_PARENT_SESSION",
-    ] as const;
-    for (const key of CLAUDE_CODE_NESTING_VARS) {
-      delete rawMerged[key];
-    }
-
-    const mergedEnv = ensurePathInEnv(rawMerged);
+    const mergedEnv = buildChildEnv(opts.env, {
+      inheritServerEnv: opts.inheritServerEnv,
+    });
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
       remoteExecution: opts.remoteExecution ?? null,
       remoteEnv: opts.remoteExecution ? opts.env : null,
