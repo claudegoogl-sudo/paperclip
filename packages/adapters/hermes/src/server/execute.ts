@@ -117,50 +117,82 @@ export function allowlistedProcessEnv(
 // ---------------------------------------------------------------------------
 
 /**
- * Providers whose upstream retains/logs the full prompt + tool output of every
- * request. A key injected into a child running against one of these can leak
- * out of the child's own context (prompt injection, `curl -v` header
- * reflection, a naive `echo $PAPERCLIP_API_KEY`) straight into a third party's
- * logs. Keep in sync with the cloaked/stealth routing offered by these hosts.
+ * INTERNAL (trusted) provider allowlist — the ONLY inference targets that may
+ * receive the broad run-scoped board key (`ctx.authToken`).
+ *
+ * "Internal" here means "trusted not to retain/leak the key into third-party
+ * readable logs" — NOT "on an internal network". These are the direct
+ * first-party Anthropic API (the same upstream `claude_local` already sends this
+ * key to, so allowlisting it is parity with the accepted baseline) and the
+ * in-process `claude_local` runtime.
+ *
+ * This is a DEFAULT-DENY allowlist, not a denylist. Any provider not in this set
+ * — including `auto`, every current external provider (openrouter, nous,
+ * copilot, zai, minimax, huggingface, kimi-coding, kilocode, …), and any
+ * provider added to Hermes in the future — is treated as untrusted and must bind
+ * a `task_bridge`-scoped key to run. A denylist would silently leak the broad
+ * key to (a) a future external-logging provider nobody remembered to add and
+ * (b) `provider=auto` routing to an external upstream under a benign model name;
+ * inverting to an allowlist closes both by construction. Adding a provider here
+ * is a deliberate, reviewed trust decision — the safe per-agent opt-in for any
+ * other provider is binding a scoped key, not widening this set.
  */
-const EXTERNAL_LOGGING_PROVIDERS = new Set(["openrouter"]);
+const INTERNAL_KEY_PROVIDERS = new Set(["anthropic", "claude_local", "claude-local"]);
 
 /**
  * Cloaked / "stealth" model slugs (e.g. `stealth/ox-alpha`, cloaked review
  * models) route through external-logging upstreams even when the resolved
- * `--provider` is `auto`. Match defensively on the model name so the fail-closed
- * guard below cannot be side-stepped by leaving the provider unset.
+ * `--provider` looks benign. Defense-in-depth: even a provider on the internal
+ * allowlist is downgraded to untrusted if the model slug indicates cloaked
+ * routing, so the fail-closed guard cannot be side-stepped via the model name.
  */
 const STEALTH_MODEL_PATTERN = /(^|\/)(stealth|cloak|ox-)/i;
 
 /**
- * True when the spawned Hermes child would talk to an inference target that
- * retains/logs its full request context, i.e. a target that must never receive
- * the broad run-scoped board key.
+ * True when the broad run-scoped board key MAY be injected for this spawn
+ * target: the provider is on the explicit internal allowlist AND the model slug
+ * shows no cloaked/stealth routing. Everything else is untrusted (default-deny).
+ */
+export function isInternalKeyTarget(
+  provider: string | undefined,
+  model?: string,
+): boolean {
+  if (!provider) return false; // undefined / unresolved → untrusted
+  if (!INTERNAL_KEY_PROVIDERS.has(provider.toLowerCase())) return false;
+  if (model && STEALTH_MODEL_PATTERN.test(model)) return false; // defensive
+  return true;
+}
+
+/**
+ * True when the spawned Hermes child would talk to an inference target that must
+ * NOT receive the broad run-scoped board key — i.e. anything not on the internal
+ * allowlist. This is the fail-closed complement of {@link isInternalKeyTarget};
+ * an unknown or future external-logging provider is external by default.
  */
 export function isExternalLoggingTarget(
   provider: string | undefined,
-  model: string | undefined,
+  model?: string,
 ): boolean {
-  if (provider && EXTERNAL_LOGGING_PROVIDERS.has(provider.toLowerCase())) return true;
-  if (model && STEALTH_MODEL_PATTERN.test(model)) return true;
-  return false;
+  return !isInternalKeyTarget(provider, model);
 }
 
 /**
  * Decide which value to inject as the child's `PAPERCLIP_API_KEY`.
  *
- * Security contract:
+ * Security contract (DEFAULT-DENY):
  *
  *  1. An operator-bound `task_bridge`-scoped key (from `adapterConfig.env`,
  *     either `PAPERCLIP_API_KEY` or the documented `PAPERCLIP_BRIDGE_API_KEY`)
  *     always wins and is never overwritten by the broad run-scoped `authToken`.
- *  2. For external-logging providers (openrouter / cloaked stealth models), the
- *     broad `authToken` must NEVER be injected. If no scoped key is bound, fail
- *     closed — refuse to spawn — rather than silently leaking the broad key.
- *     The dangerous path is explicit opt-in (bind a scoped key), not the default.
- *  3. For internal, non-internet-facing providers (e.g. claude_local) the run
- *     `authToken` remains the fallback, so existing behavior is unchanged.
+ *     This is the sanctioned per-agent opt-in for ANY provider.
+ *  2. Otherwise the broad `authToken` is injected ONLY when the target is on the
+ *     internal provider allowlist ({@link isInternalKeyTarget}). For every other
+ *     provider — auto, all external providers, and any future provider — fail
+ *     closed: refuse to spawn rather than leak the broad key into a third-party
+ *     log. The dangerous path is explicit opt-in (bind a scoped key), never the
+ *     default.
+ *  3. Internal, allowlisted providers keep the `authToken` fallback, so existing
+ *     behavior for those targets is unchanged.
  *
  * Returns the key to inject, or `undefined` when there is nothing to inject.
  * Throws for case 2 (fail closed).
@@ -182,18 +214,20 @@ export function resolveSpawnApiKey(opts: {
   // 1. Operator-bound scoped key always wins.
   if (boundKey) return boundKey;
 
-  // 2. External-logging target with no scoped key bound → fail closed.
-  if (isExternalLoggingTarget(opts.provider, opts.model)) {
+  // 2. Default-deny: the broad run key is injected only for internal allowlisted
+  //    targets. Everything else fails closed.
+  if (!isInternalKeyTarget(opts.provider, opts.model)) {
     throw new Error(
       `[hermes] Refusing to spawn: inference target (provider=${opts.provider ?? "auto"}` +
-        `${opts.model ? `, model=${opts.model}` : ""}) logs full request context upstream, ` +
-        `but no task_bridge-scoped key is bound. Bind a task_bridge key via ` +
-        `adapterConfig.env (PAPERCLIP_API_KEY or PAPERCLIP_BRIDGE_API_KEY) to authorize; ` +
-        `the broad run-scoped key is never injected for external-logging providers.`,
+        `${opts.model ? `, model=${opts.model}` : ""}) is not on the internal provider ` +
+        `allowlist, so it may retain/log the full request context upstream. No ` +
+        `task_bridge-scoped key is bound, and the broad run-scoped key is never ` +
+        `injected for non-allowlisted targets. Bind a task_bridge key via ` +
+        `adapterConfig.env (PAPERCLIP_API_KEY or PAPERCLIP_BRIDGE_API_KEY) to authorize.`,
     );
   }
 
-  // 3. Internal provider fallback: the run-scoped board key.
+  // 3. Internal, allowlisted provider fallback: the run-scoped board key.
   return typeof opts.authToken === "string" && opts.authToken.length > 0
     ? opts.authToken
     : undefined;
@@ -618,12 +652,14 @@ export async function execute(
 
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
 
-  // Inject PAPERCLIP_API_KEY for the child, but NEVER force the broad run-scoped
-  // authToken onto an external-logging provider.
-  // An operator-bound task_bridge key (adapterConfig.env, already layered into
-  // `env` above) wins; for openrouter / cloaked stealth models with no scoped
-  // key bound we fail closed rather than leak the broad key into a third-party
-  // log. Internal providers (e.g. claude_local) keep the authToken fallback.
+  // Inject PAPERCLIP_API_KEY for the child under a DEFAULT-DENY posture: the
+  // broad run-scoped authToken is injected ONLY for providers on the internal
+  // allowlist (isInternalKeyTarget). An operator-bound task_bridge key
+  // (adapterConfig.env, already layered into `env` above) always wins; for any
+  // non-allowlisted target (auto, every external provider, and any future
+  // provider) with no scoped key bound we fail closed rather than leak the broad
+  // key into a third-party log. Internal providers (anthropic / claude_local)
+  // keep the authToken fallback.
   const boundBridgeKey =
     cfgString(userEnv?.PAPERCLIP_API_KEY) ||
     cfgString(userEnv?.PAPERCLIP_BRIDGE_API_KEY);
