@@ -4,6 +4,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { isExternalLoggingTarget, resolveSpawnApiKey } from "./execute.js";
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const helperPath = path.resolve(__dirname, "../../skills/paperclip-task-bridge/paperclip-task.mjs");
 const apiKey = "pc_test_secret_should_not_print";
@@ -180,5 +182,71 @@ describe("paperclip-task-bridge helper", () => {
     expect(commentRequest?.body).toMatchObject({ body: "Progress from Hermes" });
     expect(patchRequest?.body).toMatchObject({ status: "in_review", comment: "Ready" });
     expect(comment.stdout + update.stdout).not.toContain(apiKey);
+  });
+});
+
+describe("resolveSpawnApiKey (external-logging key posture)", () => {
+  // Synthetic, shape-valid fixtures only — never a live key value.
+  const BOUND_BRIDGE_KEY = "pc_task_bridge_synthetic_fixture_key";
+  const BROAD_RUN_TOKEN = "pc_broad_run_scoped_authtoken_fixture";
+
+  it("keeps a bound task_bridge key for openrouter (never the broad authToken)", () => {
+    const key = resolveSpawnApiKey({
+      boundKey: BOUND_BRIDGE_KEY,
+      authToken: BROAD_RUN_TOKEN,
+      provider: "openrouter",
+      model: "stealth/ox-alpha",
+    });
+    expect(key).toBe(BOUND_BRIDGE_KEY);
+    expect(key).not.toBe(BROAD_RUN_TOKEN);
+  });
+
+  it("fails closed for openrouter when no scoped key is bound", () => {
+    expect(() =>
+      resolveSpawnApiKey({
+        boundKey: undefined,
+        authToken: BROAD_RUN_TOKEN,
+        provider: "openrouter",
+        model: "some-model",
+      }),
+    ).toThrow(/Refusing to spawn/);
+  });
+
+  it("fails closed for a cloaked stealth model even when provider is auto", () => {
+    expect(() =>
+      resolveSpawnApiKey({
+        boundKey: undefined,
+        authToken: BROAD_RUN_TOKEN,
+        provider: "auto",
+        model: "stealth/ox-alpha",
+      }),
+    ).toThrow(/Refusing to spawn/);
+  });
+
+  it("keeps the authToken fallback for internal providers (no regression)", () => {
+    const key = resolveSpawnApiKey({
+      boundKey: undefined,
+      authToken: BROAD_RUN_TOKEN,
+      provider: "anthropic",
+      model: "claude-sonnet-4",
+    });
+    expect(key).toBe(BROAD_RUN_TOKEN);
+  });
+
+  it("never throws for an internal provider even without any key", () => {
+    const key = resolveSpawnApiKey({
+      boundKey: undefined,
+      authToken: undefined,
+      provider: "anthropic",
+      model: "claude-sonnet-4",
+    });
+    expect(key).toBeUndefined();
+  });
+
+  it("classifies external-logging targets by provider and model", () => {
+    expect(isExternalLoggingTarget("openrouter", "any-model")).toBe(true);
+    expect(isExternalLoggingTarget("auto", "stealth/ox-alpha")).toBe(true);
+    expect(isExternalLoggingTarget("anthropic", "claude-sonnet-4")).toBe(false);
+    expect(isExternalLoggingTarget("auto", undefined)).toBe(false);
   });
 });

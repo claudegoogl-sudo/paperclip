@@ -113,6 +113,93 @@ export function allowlistedProcessEnv(
 }
 
 // ---------------------------------------------------------------------------
+// PAPERCLIP_API_KEY injection (default-deny for external-logging providers)
+// ---------------------------------------------------------------------------
+
+/**
+ * Providers whose upstream retains/logs the full prompt + tool output of every
+ * request. A key injected into a child running against one of these can leak
+ * out of the child's own context (prompt injection, `curl -v` header
+ * reflection, a naive `echo $PAPERCLIP_API_KEY`) straight into a third party's
+ * logs. Keep in sync with the cloaked/stealth routing offered by these hosts.
+ */
+const EXTERNAL_LOGGING_PROVIDERS = new Set(["openrouter"]);
+
+/**
+ * Cloaked / "stealth" model slugs (e.g. `stealth/ox-alpha`, cloaked review
+ * models) route through external-logging upstreams even when the resolved
+ * `--provider` is `auto`. Match defensively on the model name so the fail-closed
+ * guard below cannot be side-stepped by leaving the provider unset.
+ */
+const STEALTH_MODEL_PATTERN = /(^|\/)(stealth|cloak|ox-)/i;
+
+/**
+ * True when the spawned Hermes child would talk to an inference target that
+ * retains/logs its full request context, i.e. a target that must never receive
+ * the broad run-scoped board key.
+ */
+export function isExternalLoggingTarget(
+  provider: string | undefined,
+  model: string | undefined,
+): boolean {
+  if (provider && EXTERNAL_LOGGING_PROVIDERS.has(provider.toLowerCase())) return true;
+  if (model && STEALTH_MODEL_PATTERN.test(model)) return true;
+  return false;
+}
+
+/**
+ * Decide which value to inject as the child's `PAPERCLIP_API_KEY`.
+ *
+ * Security contract:
+ *
+ *  1. An operator-bound `task_bridge`-scoped key (from `adapterConfig.env`,
+ *     either `PAPERCLIP_API_KEY` or the documented `PAPERCLIP_BRIDGE_API_KEY`)
+ *     always wins and is never overwritten by the broad run-scoped `authToken`.
+ *  2. For external-logging providers (openrouter / cloaked stealth models), the
+ *     broad `authToken` must NEVER be injected. If no scoped key is bound, fail
+ *     closed — refuse to spawn — rather than silently leaking the broad key.
+ *     The dangerous path is explicit opt-in (bind a scoped key), not the default.
+ *  3. For internal, non-internet-facing providers (e.g. claude_local) the run
+ *     `authToken` remains the fallback, so existing behavior is unchanged.
+ *
+ * Returns the key to inject, or `undefined` when there is nothing to inject.
+ * Throws for case 2 (fail closed).
+ */
+export function resolveSpawnApiKey(opts: {
+  /** Operator-bound key from adapterConfig.env (PAPERCLIP_API_KEY or _BRIDGE_). */
+  boundKey?: string;
+  /** The broad, same-company, run-scoped board key (ctx.authToken). */
+  authToken?: string;
+  /** Resolved inference provider for this spawn. */
+  provider: string | undefined;
+  /** Resolved model name for this spawn. */
+  model?: string;
+}): string | undefined {
+  const boundKey =
+    typeof opts.boundKey === "string" && opts.boundKey.length > 0
+      ? opts.boundKey
+      : undefined;
+  // 1. Operator-bound scoped key always wins.
+  if (boundKey) return boundKey;
+
+  // 2. External-logging target with no scoped key bound → fail closed.
+  if (isExternalLoggingTarget(opts.provider, opts.model)) {
+    throw new Error(
+      `[hermes] Refusing to spawn: inference target (provider=${opts.provider ?? "auto"}` +
+        `${opts.model ? `, model=${opts.model}` : ""}) logs full request context upstream, ` +
+        `but no task_bridge-scoped key is bound. Bind a task_bridge key via ` +
+        `adapterConfig.env (PAPERCLIP_API_KEY or PAPERCLIP_BRIDGE_API_KEY) to authorize; ` +
+        `the broad run-scoped key is never injected for external-logging providers.`,
+    );
+  }
+
+  // 3. Internal provider fallback: the run-scoped board key.
+  return typeof opts.authToken === "string" && opts.authToken.length > 0
+    ? opts.authToken
+    : undefined;
+}
+
+// ---------------------------------------------------------------------------
 // Config helpers
 // ---------------------------------------------------------------------------
 
@@ -531,8 +618,33 @@ export async function execute(
 
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
 
-  // BUG FIX: Inject authToken as PAPERCLIP_API_KEY (matches adapter-claude-local behavior)
-  if ((ctx as any).authToken) env.PAPERCLIP_API_KEY = (ctx as any).authToken;
+  // Inject PAPERCLIP_API_KEY for the child, but NEVER force the broad run-scoped
+  // authToken onto an external-logging provider.
+  // An operator-bound task_bridge key (adapterConfig.env, already layered into
+  // `env` above) wins; for openrouter / cloaked stealth models with no scoped
+  // key bound we fail closed rather than leak the broad key into a third-party
+  // log. Internal providers (e.g. claude_local) keep the authToken fallback.
+  const boundBridgeKey =
+    cfgString(userEnv?.PAPERCLIP_API_KEY) ||
+    cfgString(userEnv?.PAPERCLIP_BRIDGE_API_KEY);
+  let spawnApiKey: string | undefined;
+  try {
+    spawnApiKey = resolveSpawnApiKey({
+      boundKey: boundBridgeKey,
+      authToken: (ctx as any).authToken,
+      provider: resolvedProvider,
+      model,
+    });
+  } catch (err) {
+    await ctx.onLog("stderr", `${(err as Error).message}\n`);
+    throw err;
+  }
+  if (spawnApiKey) {
+    env.PAPERCLIP_API_KEY = spawnApiKey;
+  } else {
+    // Nothing authorized to inject — make sure no stray value survives.
+    delete env.PAPERCLIP_API_KEY;
+  }
 
   // BUG FIX: Read task context from ctx.context (wake context), not ctx.config (adapter config)
   const ctxContext = (ctx as any).context || {};
