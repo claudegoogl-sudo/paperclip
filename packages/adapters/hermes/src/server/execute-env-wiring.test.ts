@@ -78,6 +78,12 @@ describe("hermes execute() child-env wiring", () => {
   it("calls runChildProcess with inheritServerEnv:false and a secret-free env", async () => {
     const ctx = makeCtx({
       cwd: process.cwd(),
+      // Pin to an internal (allowlisted) provider. This test exercises the
+      // env-inheritance / least-privilege path, which is orthogonal to the
+      // bound-key posture; under the default-deny key logic an unresolved
+      // provider ("auto") fails closed before reaching runChildProcess, so we
+      // must select a provider that keeps the authToken-fallback path live.
+      provider: "anthropic",
       env: { OPENROUTER_API_KEY: "sk-or-agent-own-key" },
     });
 
@@ -102,5 +108,78 @@ describe("hermes execute() child-env wiring", () => {
     // Non-secret runtime essentials pass through the allowlist.
     expect(typeof opts.env.PATH).toBe("string");
     expect((opts.env.PATH ?? "").length).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * execute()-level regression for the hermes bound-key wiring.
+ *
+ * The unit tests for `resolveSpawnApiKey` (paperclip-task-bridge.test.ts) cover
+ * the helper in isolation. These tests cover the *call-site wiring* inside
+ * `execute()` that the helper depends on:
+ *
+ *  1. `boundBridgeKey` is read from `config.env` (userEnv) ONLY — never from the
+ *     merged `env` (which spreads `allowlistedProcessEnv()` / process.env) nor
+ *     from a stray host `process.env.PAPERCLIP_API_KEY`. A host key must not be
+ *     mistaken for an operator-bound task_bridge key and must not downgrade the
+ *     fail-closed behavior for an external-logging target.
+ *  2. The `else { delete env.PAPERCLIP_API_KEY }` scrub actually fires, so when
+ *     nothing is authorized to inject, no stray value survives into the child
+ *     env — even if one leaked in via the base env.
+ *
+ * Vulnerability class: Sensitive Information Disclosure / Excessive Agency
+ * (OWASP LLM06 / broad credential leak into a prompt-logging upstream).
+ * Synthetic fixtures only — no live keys.
+ */
+describe("hermes execute() bound-key wiring", () => {
+  const HOST_STRAY_KEY = "pat-host-stray-NEVER-a-bound-key";
+
+  beforeEach(() => {
+    runChildProcess.mockClear();
+  });
+
+  afterEach(() => {
+    delete process.env.PAPERCLIP_API_KEY;
+    vi.restoreAllMocks();
+  });
+
+  it("fails closed for an external-logging target even when a stray host process.env.PAPERCLIP_API_KEY is set (host key is never the bound key)", async () => {
+    // A stray broad key in the server's own env must NOT be treated as the
+    // operator-bound task_bridge key. boundBridgeKey reads config.env only.
+    process.env.PAPERCLIP_API_KEY = HOST_STRAY_KEY;
+
+    const ctx = makeCtx({
+      cwd: process.cwd(),
+      provider: "openrouter", // external-logging target
+      // NOTE: adapterConfig.env has NO PAPERCLIP_API_KEY / PAPERCLIP_BRIDGE_API_KEY.
+      // ctx.authToken (the broad run-scoped key) is set by makeCtx, mirroring reality.
+    });
+
+    // Fail closed: refuse to spawn rather than leak a broad key upstream.
+    await expect(execute(ctx)).rejects.toThrow(/Refusing to spawn/i);
+    // The child is never spawned.
+    expect(runChildProcess).not.toHaveBeenCalled();
+  });
+
+  it("scrubs PAPERCLIP_API_KEY from the child env for an internal provider with no bound key and no authToken", async () => {
+    // Even a stray host value must not survive into the spawned env when there
+    // is nothing authorized to inject (the delete-scrub branch must fire).
+    process.env.PAPERCLIP_API_KEY = HOST_STRAY_KEY;
+
+    const ctx = makeCtx({
+      cwd: process.cwd(),
+      provider: "anthropic", // internal, allowlisted target → no fail-closed
+    });
+    // No run-scoped key available: nothing to fall back to.
+    delete (ctx as { authToken?: string }).authToken;
+
+    await execute(ctx);
+
+    expect(runChildProcess).toHaveBeenCalledTimes(1);
+    const opts = (runChildProcess.mock.calls[0] as unknown[])[3] as {
+      env: Record<string, string>;
+    };
+    // The scrub fired: no PAPERCLIP_API_KEY leaks into the child.
+    expect(opts.env.PAPERCLIP_API_KEY).toBeUndefined();
   });
 });
