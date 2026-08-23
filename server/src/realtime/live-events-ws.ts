@@ -5,7 +5,7 @@ import type { Duplex } from "node:stream";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentApiKeys, companyMemberships, instanceUserRoles } from "@paperclipai/db";
-import type { DeploymentMode } from "@paperclipai/shared";
+import { isAgentApiKeyExpired, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "../middleware/logger.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
@@ -182,6 +182,17 @@ async function authorizeUpgrade(
     .then((rows) => rows[0] ?? null);
 
   if (!key || key.companyId !== companyId) {
+    return null;
+  }
+
+  // Fail-closed expiry backstop: reject a key past `expiresAt` on the
+  // live-events socket the same way the HTTP resolver does, independent of
+  // `revokedAt`.
+  if (isAgentApiKeyExpired(key.expiresAt)) {
+    logger.warn(
+      { keyId: key.id, agentId: key.agentId, companyId: key.companyId, expiresAt: key.expiresAt },
+      "Rejected expired agent API key on live-events socket",
+    );
     return null;
   }
 

@@ -32,7 +32,14 @@ function createSelectChain(rowsForTable: (table: unknown) => unknown[]) {
 
 function createDbState(input: {
   agent: { id: string; companyId: string; status?: string };
-  agentKey?: { id: string; agentId: string; companyId: string; keyHash: string; responsibleUserId?: string | null };
+  agentKey?: {
+    id: string;
+    agentId: string;
+    companyId: string;
+    keyHash: string;
+    responsibleUserId?: string | null;
+    expiresAt?: Date | null;
+  };
   run?: { id: string; companyId: string; agentId: string; responsibleUserId?: string | null };
 }) {
   const activity: Array<Record<string, unknown>> = [];
@@ -50,6 +57,7 @@ function createDbState(input: {
         responsibleUserId: input.agentKey.responsibleUserId ?? null,
         revokedAt: null,
         scopeConfig: null,
+        expiresAt: input.agentKey.expiresAt ?? null,
       }
     : null;
   const runRow = input.run
@@ -314,6 +322,68 @@ describe("agent auth middleware", () => {
       onBehalfOfUserId: "user-key",
       source: "agent_key",
     });
+  });
+
+  it("rejects an agent key past its expiresAt even when revokedAt is null, and audits it", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const keyId = randomUUID();
+    const token = "pcp_test_expired_agent_key";
+    // revokedAt stays null (see createDbState); the key is live except for its
+    // expiry — this is exactly the missed-revoke failure mode we are guarding.
+    const { db, activity } = createDbState({
+      agent: { id: agentId, companyId },
+      agentKey: {
+        id: keyId,
+        agentId,
+        companyId,
+        keyHash: hashToken(token),
+        responsibleUserId: "user-key",
+        expiresAt: new Date(Date.now() - 60_000),
+      },
+    });
+
+    const res = await request(createApp(db))
+      .get(`/companies/${companyId}/protected`)
+      .set("Authorization", `Bearer ${token}`);
+
+    // Fail-closed: the expired key never becomes an actor, so company access is
+    // denied (401 unauthorized, not 403 forbidden).
+    expect(res.status).toBe(401);
+    expect(activity).toHaveLength(1);
+    expect(activity[0]).toMatchObject({
+      companyId,
+      actorType: "agent",
+      actorId: agentId,
+      action: "auth.agent_key_expired",
+      entityType: "agent_api_key",
+      entityId: keyId,
+      details: { method: "GET", url: `/companies/${companyId}/protected` },
+    });
+  });
+
+  it("accepts an agent key whose expiresAt is still in the future", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const token = "pcp_test_unexpired_agent_key";
+    const { db } = createDbState({
+      agent: { id: agentId, companyId },
+      agentKey: {
+        id: randomUUID(),
+        agentId,
+        companyId,
+        keyHash: hashToken(token),
+        responsibleUserId: "user-key",
+        expiresAt: new Date(Date.now() + 3_600_000),
+      },
+    });
+
+    const res = await request(createApp(db))
+      .get("/actor")
+      .set("Authorization", `Bearer ${token}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ type: "agent", agentId, companyId, source: "agent_key" });
   });
 
   it("rejects agent keys that lack a responsible user binding and audits the denial", async () => {

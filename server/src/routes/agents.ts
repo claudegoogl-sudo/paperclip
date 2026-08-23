@@ -3216,6 +3216,8 @@ export function agentRoutes(
     }
     const key = await svc.createApiKey(id, req.body.name, req.body.scope, {
       responsibleUserId: req.actor.userId ?? null,
+      ttlSeconds: req.body.ttlSeconds ?? null,
+      expiresAt: req.body.expiresAt ?? null,
     });
 
     await logActivity(db, {
@@ -3230,6 +3232,9 @@ export function agentRoutes(
         name: key.name,
         scope: key.scope,
         responsibleUserId: key.responsibleUserId,
+        // Effective expiry after the cross-company ceiling is applied — records
+        // the actual lifetime granted, not the requested one.
+        expiresAt: key.expiresAt ? key.expiresAt.toISOString() : null,
       },
     });
 
