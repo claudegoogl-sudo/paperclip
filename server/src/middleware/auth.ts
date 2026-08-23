@@ -133,7 +133,7 @@ async function auditAgentKeyMissingResponsibleUser(
   }
 }
 
-async function auditAgentKeyExpired(
+export async function auditAgentKeyExpired(
   db: Db,
   input: { companyId: string; agentId: string; keyId: string; expiresAt: Date | null; method: string; url: string },
 ) {
