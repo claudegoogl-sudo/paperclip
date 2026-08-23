@@ -136,6 +136,16 @@ Create task bridge keys with a parent issue or project boundary. Do not expose
 normal claimed Paperclip agent API keys to internet-facing Hermes chat/webhook
 task-bridge surfaces.
 
+### External-logging providers fail closed
+
+The adapter never injects the broad run-scoped board key into a child running
+against an external-logging inference target (provider \`openrouter\`, or a
+cloaked/\`stealth\` model). For those targets you MUST bind a \`task_bridge\`-scoped
+key via \`adapterConfig.env\` (\`PAPERCLIP_API_KEY\` or \`PAPERCLIP_BRIDGE_API_KEY\`);
+if none is bound the run refuses to spawn rather than leak the broad key into a
+third-party log. Internal providers (e.g. \`claude_local\`, \`anthropic\`) keep the
+run-scoped fallback and are unaffected.
+
 ## Available Template Variables
 
 - \`{{agentId}}\` — Paperclip agent ID
