@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildSkillMentionHref } from "@paperclipai/shared";
 import {
   LOW_TRUST_REVIEW_PRESET,
+  SANCTIONED_BRIDGE_ENV_KEY,
   applyRunScopedMentionedSkillKeys,
   extractMentionedSkillIdsFromSources,
   resolveExecutionRunAdapterConfig,
@@ -710,5 +711,184 @@ describe("applyRunScopedMentionedSkillKeys", () => {
         ],
       },
     });
+  });
+});
+
+// Sanctioned task_bridge credential delivery (separated-identity design).
+// The total PAPERCLIP_* strip stays intact (run identity unspoofable, INV-1); the
+// operator-bound task_bridge secret is delivered — and ONLY delivered — into the
+// distinct PAPERCLIP_BRIDGE_API_KEY slot, gated on an operator secret_ref (INV-2)
+// and a task_bridge scope check (INV-3), with the value redacted (INV-5).
+describe("resolveExecutionRunAdapterConfig — sanctioned task_bridge bridge key", () => {
+  const BRIDGE_SECRET_REF = {
+    type: "secret_ref" as const,
+    secretId: "0000b41d-9e00-4000-8000-000000000001",
+    version: "latest" as const,
+  };
+
+  function mockAgentConfigResolver(env: Record<string, unknown>) {
+    // Mirrors the real resolver: agent adapterConfig env is already stripped of
+    // PAPERCLIP_* by the caller before it reaches resolveAdapterConfigForRuntime.
+    return vi.fn(async (_companyId: string, config: Record<string, unknown>) => ({
+      config: { ...config, env: { ...env } },
+      secretKeys: new Set<string>(),
+      manifest: [],
+    }));
+  }
+
+  it("delivers an operator secret_ref bridge key into PAPERCLIP_BRIDGE_API_KEY when the resolved key is task_bridge-scoped (INV-2/INV-3, acceptance 1a)", async () => {
+    const resolveAdapterConfigForRuntime = mockAgentConfigResolver({ AGENT_ONLY: "agent-only" });
+    const resolveEnvBindings = vi.fn().mockResolvedValue({
+      env: { [SANCTIONED_BRIDGE_ENV_KEY]: "pat-task-bridge-resolved" },
+      secretKeys: new Set([SANCTIONED_BRIDGE_ENV_KEY]),
+      manifest: [],
+    });
+    const verifyTaskBridgeScope = vi.fn(async () => true);
+
+    const result = await resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      agentId: "agent-1",
+      executionRunConfig: {
+        env: {
+          AGENT_ONLY: "agent-only",
+          [SANCTIONED_BRIDGE_ENV_KEY]: BRIDGE_SECRET_REF,
+        },
+      },
+      projectEnv: null,
+      secretsSvc: { resolveAdapterConfigForRuntime, resolveEnvBindings } as any,
+      verifyTaskBridgeScope,
+    });
+
+    // The bridge value is delivered into the distinct sanctioned slot...
+    expect(result.resolvedConfig.env).toMatchObject({
+      AGENT_ONLY: "agent-only",
+      [SANCTIONED_BRIDGE_ENV_KEY]: "pat-task-bridge-resolved",
+    });
+    // ...and never as run identity (INV-1).
+    expect((result.resolvedConfig.env as Record<string, unknown>).PAPERCLIP_API_KEY).toBeUndefined();
+    // The live credential is redacted (INV-5).
+    expect(result.secretKeys.has(SANCTIONED_BRIDGE_ENV_KEY)).toBe(true);
+    // The raw secret_ref binding survived the strip and was resolved via the
+    // agent consumer context.
+    expect(resolveEnvBindings).toHaveBeenCalledWith(
+      "company-1",
+      { [SANCTIONED_BRIDGE_ENV_KEY]: BRIDGE_SECRET_REF },
+      expect.objectContaining({ consumerType: "agent", consumerId: "agent-1" }),
+    );
+    // Scope was verified against the resolved value.
+    expect(verifyTaskBridgeScope).toHaveBeenCalledWith("pat-task-bridge-resolved");
+  });
+
+  it("fails closed (no delivery) when the resolved key is NOT task_bridge-scoped (INV-3)", async () => {
+    const resolveAdapterConfigForRuntime = mockAgentConfigResolver({ AGENT_ONLY: "agent-only" });
+    const resolveEnvBindings = vi.fn().mockResolvedValue({
+      env: { [SANCTIONED_BRIDGE_ENV_KEY]: "pat-broad-standard-key" },
+      secretKeys: new Set([SANCTIONED_BRIDGE_ENV_KEY]),
+      manifest: [],
+    });
+    const verifyTaskBridgeScope = vi.fn(async () => false); // wrong scope
+
+    const result = await resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      agentId: "agent-1",
+      executionRunConfig: {
+        env: { [SANCTIONED_BRIDGE_ENV_KEY]: BRIDGE_SECRET_REF },
+      },
+      projectEnv: null,
+      secretsSvc: { resolveAdapterConfigForRuntime, resolveEnvBindings } as any,
+      verifyTaskBridgeScope,
+    });
+
+    expect((result.resolvedConfig.env as Record<string, unknown>)[SANCTIONED_BRIDGE_ENV_KEY]).toBeUndefined();
+    expect(result.secretKeys.has(SANCTIONED_BRIDGE_ENV_KEY)).toBe(false);
+    expect(verifyTaskBridgeScope).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed (no delivery) when no scope verifier is wired (INV-3 fail-closed default)", async () => {
+    const resolveAdapterConfigForRuntime = mockAgentConfigResolver({});
+    const resolveEnvBindings = vi.fn().mockResolvedValue({
+      env: { [SANCTIONED_BRIDGE_ENV_KEY]: "pat-task-bridge-resolved" },
+      secretKeys: new Set([SANCTIONED_BRIDGE_ENV_KEY]),
+      manifest: [],
+    });
+
+    const result = await resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      agentId: "agent-1",
+      executionRunConfig: {
+        env: { [SANCTIONED_BRIDGE_ENV_KEY]: BRIDGE_SECRET_REF },
+      },
+      projectEnv: null,
+      secretsSvc: { resolveAdapterConfigForRuntime, resolveEnvBindings } as any,
+      // no verifyTaskBridgeScope
+    });
+
+    expect((result.resolvedConfig.env as Record<string, unknown>)[SANCTIONED_BRIDGE_ENV_KEY]).toBeUndefined();
+  });
+
+  it.each([
+    ["a bare inline string", "pat-agent-self-granted"],
+    ["an inline plain binding", { type: "plain", value: "pat-agent-self-granted" }],
+    ["a per-user secret ref", { type: "user_secret_ref", key: "MY_KEY" }],
+  ])("fails closed for %s bridge binding (INV-2: operator secret_ref only)", async (_label, binding) => {
+    const resolveAdapterConfigForRuntime = mockAgentConfigResolver({ AGENT_ONLY: "agent-only" });
+    const resolveEnvBindings = vi.fn();
+    const verifyTaskBridgeScope = vi.fn(async () => true);
+
+    const result = await resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      agentId: "agent-1",
+      executionRunConfig: {
+        env: { [SANCTIONED_BRIDGE_ENV_KEY]: binding as unknown },
+      },
+      projectEnv: null,
+      secretsSvc: { resolveAdapterConfigForRuntime, resolveEnvBindings } as any,
+      verifyTaskBridgeScope,
+    });
+
+    expect((result.resolvedConfig.env as Record<string, unknown>)[SANCTIONED_BRIDGE_ENV_KEY]).toBeUndefined();
+    // A non-secret_ref binding is refused before any resolution or scope check.
+    expect(resolveEnvBindings).not.toHaveBeenCalled();
+    expect(verifyTaskBridgeScope).not.toHaveBeenCalled();
+  });
+
+  it("keeps run-identity keys stripped even alongside a valid bridge binding (INV-1 regression, acceptance 1b)", async () => {
+    const resolveAdapterConfigForRuntime = mockAgentConfigResolver({ AGENT_ONLY: "agent-only" });
+    const resolveEnvBindings = vi.fn().mockResolvedValue({
+      env: { [SANCTIONED_BRIDGE_ENV_KEY]: "pat-task-bridge-resolved" },
+      secretKeys: new Set([SANCTIONED_BRIDGE_ENV_KEY]),
+      manifest: [],
+    });
+    const verifyTaskBridgeScope = vi.fn(async () => true);
+
+    const result = await resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      agentId: "agent-1",
+      executionRunConfig: {
+        env: {
+          // Agent-settable run-identity spoof attempts — must all be stripped and
+          // must NOT reach resolveAdapterConfigForRuntime.
+          PAPERCLIP_API_KEY: { type: "secret_ref", secretId: "11111111-1111-1111-1111-111111111111", version: "latest" },
+          PAPERCLIP_RUN_ID: "spoofed-run",
+          PAPERCLIP_API_URL: "http://evil.example",
+          AGENT_ONLY: "agent-only",
+          [SANCTIONED_BRIDGE_ENV_KEY]: BRIDGE_SECRET_REF,
+        },
+      },
+      projectEnv: null,
+      secretsSvc: { resolveAdapterConfigForRuntime, resolveEnvBindings } as any,
+      verifyTaskBridgeScope,
+    });
+
+    // The agent env handed to the resolver had every PAPERCLIP_* key stripped
+    // (including the bridge binding — it is re-resolved on a separate path).
+    expect(resolveAdapterConfigForRuntime.mock.calls[0]?.[1]).toEqual({ env: { AGENT_ONLY: "agent-only" } });
+    // Run identity never appears in the resolved child env...
+    const env = result.resolvedConfig.env as Record<string, unknown>;
+    expect(env.PAPERCLIP_API_KEY).toBeUndefined();
+    expect(env.PAPERCLIP_RUN_ID).toBeUndefined();
+    expect(env.PAPERCLIP_API_URL).toBeUndefined();
+    // ...only the sanctioned bridge slot is delivered.
+    expect(env[SANCTIONED_BRIDGE_ENV_KEY]).toBe("pat-task-bridge-resolved");
   });
 });

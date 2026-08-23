@@ -161,6 +161,39 @@ describe("hermes execute() bound-key wiring", () => {
     expect(runChildProcess).not.toHaveBeenCalled();
   });
 
+  it("spawns an external-logging target using the operator-bound PAPERCLIP_BRIDGE_API_KEY from config.env (bound key wins)", async () => {
+    // The server delivers the operator-bound task_bridge credential into
+    // adapterConfig.env.PAPERCLIP_BRIDGE_API_KEY. It must authorize an external
+    // provider and be injected as the child's PAPERCLIP_API_KEY.
+    const ctx = makeCtx({
+      cwd: process.cwd(),
+      provider: "openrouter", // external-logging target
+      env: { PAPERCLIP_BRIDGE_API_KEY: "pat-operator-bound-task-bridge" },
+    });
+
+    await execute(ctx);
+
+    expect(runChildProcess).toHaveBeenCalledTimes(1);
+    const opts = (runChildProcess.mock.calls[0] as unknown[])[3] as {
+      env: Record<string, string>;
+    };
+    expect(opts.env.PAPERCLIP_API_KEY).toBe("pat-operator-bound-task-bridge");
+  });
+
+  it("does NOT accept config.env.PAPERCLIP_API_KEY as the bridge key — external target still fails closed (INV-6)", async () => {
+    // The PAPERCLIP_API_KEY fallback was removed: only PAPERCLIP_BRIDGE_API_KEY is
+    // a bound key. A PAPERCLIP_API_KEY in adapterConfig.env must not smuggle the
+    // run-identity slot into the bridge path for a non-allowlisted provider.
+    const ctx = makeCtx({
+      cwd: process.cwd(),
+      provider: "openrouter", // external-logging target
+      env: { PAPERCLIP_API_KEY: "pat-not-a-bridge-key" },
+    });
+
+    await expect(execute(ctx)).rejects.toThrow(/Refusing to spawn/i);
+    expect(runChildProcess).not.toHaveBeenCalled();
+  });
+
   it("scrubs PAPERCLIP_API_KEY from the child env for an internal provider with no bound key and no authToken", async () => {
     // Even a stray host value must not survive into the spawned env when there
     // is nothing authorized to inject (the delete-scrub branch must fire).
