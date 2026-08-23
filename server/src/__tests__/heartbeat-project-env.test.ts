@@ -751,8 +751,11 @@ describe("resolveExecutionRunAdapterConfig — sanctioned task_bridge bridge key
       executionRunConfig: {
         env: {
           AGENT_ONLY: "agent-only",
-          [SANCTIONED_BRIDGE_ENV_KEY]: BRIDGE_SECRET_REF,
         },
+      },
+      // The bridge secret_ref lives in the agent's board-gated adapterConfig env.
+      boardGatedAgentEnv: {
+        [SANCTIONED_BRIDGE_ENV_KEY]: BRIDGE_SECRET_REF,
       },
       projectEnv: null,
       secretsSvc: { resolveAdapterConfigForRuntime, resolveEnvBindings } as any,
@@ -791,9 +794,8 @@ describe("resolveExecutionRunAdapterConfig — sanctioned task_bridge bridge key
     const result = await resolveExecutionRunAdapterConfig({
       companyId: "company-1",
       agentId: "agent-1",
-      executionRunConfig: {
-        env: { [SANCTIONED_BRIDGE_ENV_KEY]: BRIDGE_SECRET_REF },
-      },
+      executionRunConfig: { env: {} },
+      boardGatedAgentEnv: { [SANCTIONED_BRIDGE_ENV_KEY]: BRIDGE_SECRET_REF },
       projectEnv: null,
       secretsSvc: { resolveAdapterConfigForRuntime, resolveEnvBindings } as any,
       verifyTaskBridgeScope,
@@ -815,9 +817,8 @@ describe("resolveExecutionRunAdapterConfig — sanctioned task_bridge bridge key
     const result = await resolveExecutionRunAdapterConfig({
       companyId: "company-1",
       agentId: "agent-1",
-      executionRunConfig: {
-        env: { [SANCTIONED_BRIDGE_ENV_KEY]: BRIDGE_SECRET_REF },
-      },
+      executionRunConfig: { env: {} },
+      boardGatedAgentEnv: { [SANCTIONED_BRIDGE_ENV_KEY]: BRIDGE_SECRET_REF },
       projectEnv: null,
       secretsSvc: { resolveAdapterConfigForRuntime, resolveEnvBindings } as any,
       // no verifyTaskBridgeScope
@@ -838,9 +839,8 @@ describe("resolveExecutionRunAdapterConfig — sanctioned task_bridge bridge key
     const result = await resolveExecutionRunAdapterConfig({
       companyId: "company-1",
       agentId: "agent-1",
-      executionRunConfig: {
-        env: { [SANCTIONED_BRIDGE_ENV_KEY]: binding as unknown },
-      },
+      executionRunConfig: { env: {} },
+      boardGatedAgentEnv: { [SANCTIONED_BRIDGE_ENV_KEY]: binding as unknown },
       projectEnv: null,
       secretsSvc: { resolveAdapterConfigForRuntime, resolveEnvBindings } as any,
       verifyTaskBridgeScope,
@@ -872,8 +872,11 @@ describe("resolveExecutionRunAdapterConfig — sanctioned task_bridge bridge key
           PAPERCLIP_RUN_ID: "spoofed-run",
           PAPERCLIP_API_URL: "http://evil.example",
           AGENT_ONLY: "agent-only",
-          [SANCTIONED_BRIDGE_ENV_KEY]: BRIDGE_SECRET_REF,
         },
+      },
+      // Bridge binding comes from the board-gated adapterConfig env.
+      boardGatedAgentEnv: {
+        [SANCTIONED_BRIDGE_ENV_KEY]: BRIDGE_SECRET_REF,
       },
       projectEnv: null,
       secretsSvc: { resolveAdapterConfigForRuntime, resolveEnvBindings } as any,
@@ -890,5 +893,48 @@ describe("resolveExecutionRunAdapterConfig — sanctioned task_bridge bridge key
     expect(env.PAPERCLIP_API_URL).toBeUndefined();
     // ...only the sanctioned bridge slot is delivered.
     expect(env[SANCTIONED_BRIDGE_ENV_KEY]).toBe("pat-task-bridge-resolved");
+  });
+
+  // Regression (INV-2 hardening): a bridge secret_ref supplied ONLY via
+  // the issue-override-merged executionRunConfig.env — with NO board-gated binding
+  // for the running agent — must fail closed. The bridge binding is resolved solely
+  // from `boardGatedAgentEnv`, so the issue-override path is never even read: no
+  // resolution and no scope check happen, and nothing is delivered. This holds even
+  // when the override binding WOULD resolve to a valid, correctly-scoped key.
+  it("fails closed when the bridge secret_ref is only an issue-override (no board-gated binding)", async () => {
+    const resolveAdapterConfigForRuntime = mockAgentConfigResolver({ AGENT_ONLY: "agent-only" });
+    // A resolver that WOULD hand back a valid, correctly-scoped key if consulted.
+    const resolveEnvBindings = vi.fn().mockResolvedValue({
+      env: { [SANCTIONED_BRIDGE_ENV_KEY]: "pat-task-bridge-resolved" },
+      secretKeys: new Set([SANCTIONED_BRIDGE_ENV_KEY]),
+      manifest: [],
+    });
+    const verifyTaskBridgeScope = vi.fn(async () => true);
+
+    const result = await resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      agentId: "agent-1",
+      // Simulates an agent-settable issue-assignee adapterConfig override that got
+      // shallow-merged into the run config. It carries a well-formed operator-style
+      // secret_ref, but the agent — not the operator — placed it here.
+      executionRunConfig: {
+        env: {
+          AGENT_ONLY: "agent-only",
+          [SANCTIONED_BRIDGE_ENV_KEY]: BRIDGE_SECRET_REF,
+        },
+      },
+      // The agent's board-gated adapterConfig env carries NO bridge binding.
+      boardGatedAgentEnv: { AGENT_ONLY: "agent-only" },
+      projectEnv: null,
+      secretsSvc: { resolveAdapterConfigForRuntime, resolveEnvBindings } as any,
+      verifyTaskBridgeScope,
+    });
+
+    // No bridge credential is delivered...
+    expect((result.resolvedConfig.env as Record<string, unknown>)[SANCTIONED_BRIDGE_ENV_KEY]).toBeUndefined();
+    expect(result.secretKeys.has(SANCTIONED_BRIDGE_ENV_KEY)).toBe(false);
+    // ...and the issue-override binding was never even resolved or scope-checked.
+    expect(resolveEnvBindings).not.toHaveBeenCalled();
+    expect(verifyTaskBridgeScope).not.toHaveBeenCalled();
   });
 });

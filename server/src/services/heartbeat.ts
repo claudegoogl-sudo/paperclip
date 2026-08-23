@@ -722,10 +722,19 @@ export const SANCTIONED_BRIDGE_ENV_KEY = "PAPERCLIP_BRIDGE_API_KEY";
  * returns `null` and no credential is delivered (the hermes adapter then
  * default-denies non-allowlisted providers).
  *
- *  - INV-2: the binding MUST be an operator-set `secret_ref`. adapterConfig.env is
- *    board/operator-gated (agents cannot self-set it), so a `secret_ref` there is
- *    operator authorization. A bare string, an inline `plain` value, or a per-user
- *    `user_secret_ref` is refused.
+ *  - INV-2: the binding MUST be an operator-set `secret_ref`, and it is read from
+ *    the RAW env the caller supplies as `rawAgentEnv` — which MUST be the agent's
+ *    board-gated adapterConfig revision (`agents.adapterConfig`), NOT the
+ *    issue-override-merged execution-run config. Issue-assignee adapterConfig
+ *    overrides are agent-settable and shallow-merged into the run config; reading
+ *    the bridge binding from the board-gated revision keeps a future
+ *    issue-override/secret-binding refactor from opening a self-authorization
+ *    path. The `secret_ref` alone is not the authorization boundary: resolution
+ *    still requires an operator `companySecretBindings` row pinned to
+ *    `(companyId, secretId, targetType=agent, targetId=<running agent>,
+ *    configPath=env.PAPERCLIP_BRIDGE_API_KEY)` (secrets.ts), so the operator, not
+ *    the agent, authorizes the consumer. A bare string, an inline `plain` value,
+ *    or a per-user `user_secret_ref` is refused.
  *  - INV-3: the resolved secret MUST be an agent API key whose scope kind is
  *    `task_bridge`; any other scope (standard / board / broad) is refused via the
  *    injected `verifyTaskBridgeScope` check. No verifier ⇒ scope unprovable ⇒
@@ -805,6 +814,16 @@ export async function resolveExecutionRunAdapterConfig(input: {
   projectId?: string | null;
   routineId?: string | null;
   executionRunConfig: Record<string, unknown>;
+  /**
+   * The agent's board-gated adapterConfig env (RAW `agents.adapterConfig.env`,
+   * BEFORE the issue-assignee override merge and before the PAPERCLIP_* strip).
+   * This — not `executionRunConfig.env` — is the authorization source for the
+   * sanctioned `PAPERCLIP_BRIDGE_API_KEY` binding (INV-2). Reading it here rather
+   * than from the issue-override-merged run config keeps an agent-settable issue
+   * override from ever supplying or shadowing the bridge secret_ref. Omit it to
+   * fail closed (no bridge credential delivered).
+   */
+  boardGatedAgentEnv?: unknown;
   projectEnv: unknown;
   routineEnv?: unknown;
   secretsSvc: RuntimeConfigSecretResolver;
@@ -1076,14 +1095,19 @@ export async function resolveExecutionRunAdapterConfig(input: {
   }
   // Sanctioned task_bridge credential delivery (separated-identity design). The total
   // PAPERCLIP_* strip above removed any PAPERCLIP_BRIDGE_API_KEY binding along with
-  // run identity; re-resolve it here from the RAW (pre-strip) agent env through a
-  // dedicated, operator-binding-gated, scope-constrained path and deliver it into
-  // the single sanctioned slot AFTER the strip. Run identity is never touched: the
-  // value lands only under PAPERCLIP_BRIDGE_API_KEY, never PAPERCLIP_API_KEY (INV-1).
+  // run identity; re-resolve it here from the agent's BOARD-GATED adapterConfig env
+  // (`boardGatedAgentEnv`, the raw pre-strip `agents.adapterConfig.env`), NOT from
+  // the issue-override-merged `executionRunConfig.env`. Issue-assignee adapterConfig
+  // overrides are agent-settable and shallow-merged into the run config, so reading
+  // the bridge binding from the board-gated revision closes any self-authorization
+  // path a future override/secret-binding refactor might otherwise open (INV-2).
+  // The value is delivered into the single sanctioned slot AFTER the strip. Run
+  // identity is never touched: it lands only under PAPERCLIP_BRIDGE_API_KEY, never
+  // PAPERCLIP_API_KEY (INV-1).
   if (input.agentId) {
     const bridgeResolution = await resolveSanctionedBridgeEnvBinding({
       companyId: input.companyId,
-      rawAgentEnv: input.executionRunConfig.env,
+      rawAgentEnv: input.boardGatedAgentEnv,
       secretsSvc: input.secretsSvc,
       verifyTaskBridgeScope: input.verifyTaskBridgeScope,
       context: {
@@ -11327,6 +11351,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       routineId: routineEnvContext.routineId,
       responsibleUserId,
       executionRunConfig,
+      // INV-2: the sanctioned bridge binding is resolved from the agent's
+      // board-gated adapterConfig env (`agents.adapterConfig.env`), not the
+      // issue-override-merged run config, so an agent-settable issue override
+      // can never supply or shadow the task_bridge credential.
+      boardGatedAgentEnv: config.env,
       projectEnv: projectContext?.env ?? null,
       routineEnv: routineEnvContext.env,
       secretsSvc,
@@ -11341,7 +11370,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             expiresAt: agentApiKeys.expiresAt,
           })
           .from(agentApiKeys)
-          .where(and(eq(agentApiKeys.keyHash, tokenHash), isNull(agentApiKeys.revokedAt)))
+          // INFO (defense-in-depth): scope the lookup to this run's company so an
+          // operator who accidentally stores a cross-company key as a company
+          // secret cannot have it pass the task_bridge scope check here. Boundary
+          // enforcement (projectId/parentIssueId/allowedAssigneeAgentIds) still
+          // belongs at the task_bridge API on use; this is a cheap extra fence.
+          .where(and(
+            eq(agentApiKeys.keyHash, tokenHash),
+            eq(agentApiKeys.companyId, agent.companyId),
+            isNull(agentApiKeys.revokedAt),
+          ))
           .limit(1);
         if (!row) return false;
         if (isAgentApiKeyExpired(row.expiresAt)) return false;
