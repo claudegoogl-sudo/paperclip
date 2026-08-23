@@ -181,10 +181,10 @@ export function isExternalLoggingTarget(
  *
  * Security contract (DEFAULT-DENY):
  *
- *  1. An operator-bound `task_bridge`-scoped key (from `adapterConfig.env`,
- *     either `PAPERCLIP_API_KEY` or the documented `PAPERCLIP_BRIDGE_API_KEY`)
- *     always wins and is never overwritten by the broad run-scoped `authToken`.
- *     This is the sanctioned per-agent opt-in for ANY provider.
+ *  1. An operator-bound `task_bridge`-scoped key (delivered by the server into
+ *     `adapterConfig.env.PAPERCLIP_BRIDGE_API_KEY`) always wins and is never
+ *     overwritten by the broad run-scoped `authToken`. This is the sanctioned
+ *     per-agent opt-in for ANY provider.
  *  2. Otherwise the broad `authToken` is injected ONLY when the target is on the
  *     internal provider allowlist ({@link isInternalKeyTarget}). For every other
  *     provider — auto, all external providers, and any future provider — fail
@@ -198,7 +198,7 @@ export function isExternalLoggingTarget(
  * Throws for case 2 (fail closed).
  */
 export function resolveSpawnApiKey(opts: {
-  /** Operator-bound key from adapterConfig.env (PAPERCLIP_API_KEY or _BRIDGE_). */
+  /** Operator-bound key from adapterConfig.env.PAPERCLIP_BRIDGE_API_KEY. */
   boundKey?: string;
   /** The broad, same-company, run-scoped board key (ctx.authToken). */
   authToken?: string;
@@ -223,7 +223,7 @@ export function resolveSpawnApiKey(opts: {
         `allowlist, so it may retain/log the full request context upstream. No ` +
         `task_bridge-scoped key is bound, and the broad run-scoped key is never ` +
         `injected for non-allowlisted targets. Bind a task_bridge key via ` +
-        `adapterConfig.env (PAPERCLIP_API_KEY or PAPERCLIP_BRIDGE_API_KEY) to authorize.`,
+        `adapterConfig.env (PAPERCLIP_BRIDGE_API_KEY) to authorize.`,
     );
   }
 
@@ -660,9 +660,14 @@ export async function execute(
   // provider) with no scoped key bound we fail closed rather than leak the broad
   // key into a third-party log. Internal providers (anthropic / claude_local)
   // keep the authToken fallback.
-  const boundBridgeKey =
-    cfgString(userEnv?.PAPERCLIP_API_KEY) ||
-    cfgString(userEnv?.PAPERCLIP_BRIDGE_API_KEY);
+  // INV-6: the bound task_bridge credential is read from the distinct
+  // PAPERCLIP_BRIDGE_API_KEY slot ONLY. The PAPERCLIP_API_KEY fallback is
+  // deliberately dropped: PAPERCLIP_API_KEY is the platform-injected run-identity
+  // JWT (a broad, wrong-scope credential), so accepting it as the "bridge" key
+  // would both fail the task_bridge guard and mask the real bridge slot. The
+  // server heartbeat delivers the operator-bound task_bridge secret into
+  // PAPERCLIP_BRIDGE_API_KEY after its total PAPERCLIP_* strip.
+  const boundBridgeKey = cfgString(userEnv?.PAPERCLIP_BRIDGE_API_KEY);
   let spawnApiKey: string | undefined;
   try {
     spawnApiKey = resolveSpawnApiKey({

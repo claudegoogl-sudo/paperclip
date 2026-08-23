@@ -19,6 +19,8 @@ import {
   TERMINAL_HEARTBEAT_RUN_STATUSES,
   UNSUCCESSFUL_HEARTBEAT_RUN_STATUSES,
   isSuccessfulHeartbeatRunStatus,
+  isAgentApiKeyExpired,
+  normalizeAgentApiKeyScope,
   type IssueExecutionMonitorClearReason,
   type IssueExecutionMonitorPolicy,
   type IssueExecutionMonitorRecoveryPolicy,
@@ -29,6 +31,7 @@ import {
 } from "@paperclipai/shared";
 import {
   agents,
+  agentApiKeys,
   agentConfigRevisions,
   agentRuntimeState,
   agentTaskSessions,
@@ -700,6 +703,96 @@ function assertLowTrustEnvConfigAllowed(envValue: unknown, source: string) {
   }
 }
 
+/**
+ * The single env slot the platform delivers an operator-bound `task_bridge`
+ * credential into, AFTER the total PAPERCLIP_* run-identity strip (the
+ * separated-identity design, "Approach 2"). Run identity (`PAPERCLIP_API_KEY` / `_RUN_ID` / `_API_URL` /
+ * `_TASK_ID` and every other `PAPERCLIP_*` key) stays inside the unchanged total
+ * strip and is injected only by the platform; this key is the ONLY carve-out and
+ * is never treated as run identity — the hermes adapter reads it solely as the
+ * task_bridge credential (INV-1, INV-6).
+ */
+export const SANCTIONED_BRIDGE_ENV_KEY = "PAPERCLIP_BRIDGE_API_KEY";
+
+/**
+ * Resolve the operator-bound `task_bridge` credential for
+ * `PAPERCLIP_BRIDGE_API_KEY` from the RAW (pre-strip) agent adapterConfig env,
+ * enforcing the security invariants below (INV-2/INV-3/INV-5). Fail-closed by
+ * construction: any deviation
+ * returns `null` and no credential is delivered (the hermes adapter then
+ * default-denies non-allowlisted providers).
+ *
+ *  - INV-2: the binding MUST be an operator-set `secret_ref`. adapterConfig.env is
+ *    board/operator-gated (agents cannot self-set it), so a `secret_ref` there is
+ *    operator authorization. A bare string, an inline `plain` value, or a per-user
+ *    `user_secret_ref` is refused.
+ *  - INV-3: the resolved secret MUST be an agent API key whose scope kind is
+ *    `task_bridge`; any other scope (standard / board / broad) is refused via the
+ *    injected `verifyTaskBridgeScope` check. No verifier ⇒ scope unprovable ⇒
+ *    refuse.
+ *  - INV-5: the caller adds the returned `secretKeys` to the run-config redaction
+ *    set so the live credential is masked in logs.
+ */
+export async function resolveSanctionedBridgeEnvBinding(input: {
+  companyId: string;
+  rawAgentEnv: unknown;
+  secretsSvc: Pick<RuntimeConfigSecretResolver, "resolveEnvBindings">;
+  verifyTaskBridgeScope?: (resolvedKey: string) => Promise<boolean>;
+  context?: Parameters<RuntimeConfigSecretResolver["resolveEnvBindings"]>[2];
+}): Promise<{ value: string; secretKeys: Set<string> } | null> {
+  const rawBinding = parseObject(input.rawAgentEnv)[SANCTIONED_BRIDGE_ENV_KEY];
+  if (rawBinding === undefined) return null;
+  const parsed = envBindingSchema.safeParse(rawBinding);
+  if (!parsed.success) {
+    logger.warn(
+      { companyId: input.companyId, envKey: SANCTIONED_BRIDGE_ENV_KEY },
+      "sanctioned bridge env binding is malformed; failing closed (no bridge key injected)",
+    );
+    return null;
+  }
+  const binding = parsed.data;
+  // INV-2: operator-set secret_ref only. Reject legacy inline string, `plain`
+  // values, and per-user secret refs — none is an operator company secret_ref.
+  const isSecretRef =
+    typeof binding === "object" && binding !== null && binding.type === "secret_ref";
+  if (!isSecretRef) {
+    logger.warn(
+      { companyId: input.companyId, envKey: SANCTIONED_BRIDGE_ENV_KEY },
+      "sanctioned bridge env binding is not an operator secret_ref; failing closed (no bridge key injected)",
+    );
+    return null;
+  }
+  let value: string | undefined;
+  let secretKeys = new Set<string>();
+  try {
+    const resolution = await input.secretsSvc.resolveEnvBindings(
+      input.companyId,
+      { [SANCTIONED_BRIDGE_ENV_KEY]: binding },
+      input.context,
+    );
+    value = resolution.env[SANCTIONED_BRIDGE_ENV_KEY];
+    secretKeys = resolution.secretKeys;
+  } catch (err) {
+    // Missing backing secret / provider error ⇒ fail closed (INV-2). Never leak
+    // the value or a partial secret into logs.
+    logger.warn(
+      { companyId: input.companyId, envKey: SANCTIONED_BRIDGE_ENV_KEY, err: (err as Error).message },
+      "sanctioned bridge secret failed to resolve; failing closed (no bridge key injected)",
+    );
+    return null;
+  }
+  if (typeof value !== "string" || value.length === 0) return null;
+  // INV-3: fail-closed unless the resolved key is a task_bridge-scoped agent key.
+  if (!input.verifyTaskBridgeScope || !(await input.verifyTaskBridgeScope(value))) {
+    logger.warn(
+      { companyId: input.companyId, envKey: SANCTIONED_BRIDGE_ENV_KEY },
+      "sanctioned bridge key is not task_bridge-scoped (or unverifiable); failing closed (no bridge key injected)",
+    );
+    return null;
+  }
+  return { value, secretKeys };
+}
+
 export async function resolveExecutionRunAdapterConfig(input: {
   companyId: string;
   agentId?: string | null;
@@ -716,6 +809,13 @@ export async function resolveExecutionRunAdapterConfig(input: {
   routineEnv?: unknown;
   secretsSvc: RuntimeConfigSecretResolver;
   trustPreset?: TrustPresetResolution;
+  /**
+   * Verifies that a resolved `PAPERCLIP_BRIDGE_API_KEY` value is a
+   * `task_bridge`-scoped agent API key (INV-3). When omitted, the
+   * sanctioned bridge credential is NOT delivered (fail-closed). The production
+   * caller wires this to a DB scope lookup; tests inject a stub.
+   */
+  verifyTaskBridgeScope?: (resolvedKey: string) => Promise<boolean>;
   requiredScopedEnvBinding?: {
     keys: string[];
     consumerScopes: Array<"agent" | "project">;
@@ -972,6 +1072,40 @@ export async function resolveExecutionRunAdapterConfig(input: {
     };
     for (const key of routineEnvResolution.secretKeys) {
       secretKeys.add(key);
+    }
+  }
+  // Sanctioned task_bridge credential delivery (separated-identity design). The total
+  // PAPERCLIP_* strip above removed any PAPERCLIP_BRIDGE_API_KEY binding along with
+  // run identity; re-resolve it here from the RAW (pre-strip) agent env through a
+  // dedicated, operator-binding-gated, scope-constrained path and deliver it into
+  // the single sanctioned slot AFTER the strip. Run identity is never touched: the
+  // value lands only under PAPERCLIP_BRIDGE_API_KEY, never PAPERCLIP_API_KEY (INV-1).
+  if (input.agentId) {
+    const bridgeResolution = await resolveSanctionedBridgeEnvBinding({
+      companyId: input.companyId,
+      rawAgentEnv: input.executionRunConfig.env,
+      secretsSvc: input.secretsSvc,
+      verifyTaskBridgeScope: input.verifyTaskBridgeScope,
+      context: {
+        consumerType: "agent",
+        consumerId: input.agentId,
+        actorType: "agent",
+        actorId: input.agentId,
+        responsibleUserId: input.responsibleUserId ?? null,
+        issueId: input.issueId ?? null,
+        heartbeatRunId: input.heartbeatRunId ?? null,
+        ...(lowTrustAllowedBindingIds !== undefined ? { allowedBindingIds: lowTrustAllowedBindingIds } : {}),
+      },
+    });
+    if (bridgeResolution) {
+      resolvedConfig.env = {
+        ...parseObject(resolvedConfig.env),
+        [SANCTIONED_BRIDGE_ENV_KEY]: bridgeResolution.value,
+      };
+      for (const key of bridgeResolution.secretKeys) {
+        secretKeys.add(key); // INV-5: mask the live credential in run-config logging.
+      }
+      secretKeys.add(SANCTIONED_BRIDGE_ENV_KEY);
     }
   }
   // Pre-dispatch credential gate for codex_local: a managed Codex home with no
@@ -11197,6 +11331,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       routineEnv: routineEnvContext.env,
       secretsSvc,
       trustPreset,
+      // INV-3: only a task_bridge-scoped, non-revoked, non-expired
+      // agent API key may be delivered into PAPERCLIP_BRIDGE_API_KEY.
+      verifyTaskBridgeScope: async (resolvedKey: string) => {
+        const tokenHash = createHash("sha256").update(resolvedKey).digest("hex");
+        const [row] = await db
+          .select({
+            scopeConfig: agentApiKeys.scopeConfig,
+            expiresAt: agentApiKeys.expiresAt,
+          })
+          .from(agentApiKeys)
+          .where(and(eq(agentApiKeys.keyHash, tokenHash), isNull(agentApiKeys.revokedAt)))
+          .limit(1);
+        if (!row) return false;
+        if (isAgentApiKeyExpired(row.expiresAt)) return false;
+        return normalizeAgentApiKeyScope(row.scopeConfig).kind === "task_bridge";
+      },
       requiredScopedEnvBinding: pushCapabilityPreflightRequired
         ? {
             keys: [...PUSH_CAPABILITY_ENV_KEYS],

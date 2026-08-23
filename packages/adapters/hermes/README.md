@@ -225,6 +225,30 @@ Create issues in Paperclip and assign them to your Hermes agent. On each heartbe
 | `timeoutSec` | number | `300` | Execution timeout in seconds |
 | `graceSec` | number | `10` | Grace period before SIGKILL |
 
+### Spawn-key posture (default-deny) and authorizing a non-allowlisted provider
+
+`hermes_local` builds a least-privilege child env and decides which Paperclip key
+(if any) to inject as the child's `PAPERCLIP_API_KEY` under a **default-deny**
+policy:
+
+- The broad, run-scoped board key is injected **only** for providers on the
+  internal allowlist (`anthropic`, `claude_local`) whose model shows no
+  cloaked/stealth routing. Every other target — `auto`, all external providers,
+  any future provider — fails closed and refuses to spawn rather than leak the
+  broad key into a third-party (prompt-logging) upstream.
+- To authorize a non-allowlisted provider (e.g. `openrouter`, cloaked/stealth
+  models), an **operator** binds a `task_bridge`-scoped agent API key into
+  `adapterConfig.env.PAPERCLIP_BRIDGE_API_KEY` (a secret_ref, never an inline
+  value). The Paperclip server delivers that credential into the child's
+  `PAPERCLIP_BRIDGE_API_KEY` after stripping all platform-owned `PAPERCLIP_*`
+  run-identity keys; the adapter reads the bound key from
+  `PAPERCLIP_BRIDGE_API_KEY` **only** (the run-identity `PAPERCLIP_API_KEY` is
+  never accepted as a bridge credential) and injects it as the child's key.
+
+Create the bridge key with `scope.kind = "task_bridge"` and a `parentIssueId` or
+`projectId` boundary. A bound key that is not `task_bridge`-scoped, or that is
+supplied inline instead of as an operator secret_ref, is refused (fail-closed).
+
 ### Tools
 
 | Field | Type | Default | Description |
