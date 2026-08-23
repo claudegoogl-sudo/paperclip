@@ -183,6 +183,11 @@ export const SECURITY_POSTURE_COLUMNS = [
   },
   {
     table: "agent_api_keys",
+    column: "expires_at",
+    reason: "Dangerous value NULL/far-future: auth fails closed on expires_at <= now independent of revoked_at, so flattening it to NULL removes the max-TTL backstop and makes cross-company keys live forever.",
+  },
+  {
+    table: "agent_api_keys",
     column: "scope_config",
     reason: "Dangerous value NULL/unparseable: the normalizer returns {kind:'standard'} on any parse failure, so clearing it silently unscopes every task_bridge key.",
   },

@@ -13,7 +13,7 @@ import {
   instanceUserRoles,
 } from "@paperclipai/db";
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
-import { isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
+import { isAgentApiKeyExpired, isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { actorProvenanceMiddleware } from "./actor-context.js";
 import { logger } from "./logger.js";
@@ -129,6 +129,33 @@ async function auditAgentKeyMissingResponsibleUser(
     logger.warn(
       { err, companyId: input.companyId, agentId: input.agentId, keyId: input.keyId },
       "Failed to audit rejected agent key without responsible user binding",
+    );
+  }
+}
+
+async function auditAgentKeyExpired(
+  db: Db,
+  input: { companyId: string; agentId: string; keyId: string; expiresAt: Date | null; method: string; url: string },
+) {
+  try {
+    await db.insert(activityLog).values({
+      companyId: input.companyId,
+      actorType: "agent",
+      actorId: input.agentId,
+      action: "auth.agent_key_expired",
+      entityType: "agent_api_key",
+      entityId: input.keyId,
+      ...(isUuidLike(input.agentId) ? { agentId: input.agentId } : {}),
+      details: {
+        method: input.method,
+        url: input.url,
+        expiresAt: input.expiresAt ? input.expiresAt.toISOString() : null,
+      },
+    });
+  } catch (err) {
+    logger.warn(
+      { err, companyId: input.companyId, agentId: input.agentId, keyId: input.keyId },
+      "Failed to audit rejected expired agent key",
     );
   }
 }
@@ -254,6 +281,27 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       .from(agentApiKeys)
       .where(and(eq(agentApiKeys.keyHash, tokenHash), isNull(agentApiKeys.revokedAt)))
       .then((rows) => rows[0] ?? null);
+
+    // Fail-closed expiry backstop: a key past `expiresAt` is rejected
+    // even when `revokedAt` is null, so a missed manual revoke can no longer
+    // leave a key usable forever. Rejected here as unauthenticated rather than
+    // matched, so downstream sees `actor.type === "none"`.
+    if (key && isAgentApiKeyExpired(key.expiresAt)) {
+      logger.warn(
+        { keyId: key.id, agentId: key.agentId, companyId: key.companyId, expiresAt: key.expiresAt },
+        "Rejected expired agent API key",
+      );
+      await auditAgentKeyExpired(db, {
+        companyId: key.companyId,
+        agentId: key.agentId,
+        keyId: key.id,
+        expiresAt: key.expiresAt ?? null,
+        method: req.method,
+        url: req.originalUrl,
+      });
+      next();
+      return;
+    }
 
     if (!key) {
       const claims = verifyLocalAgentJwt(token);

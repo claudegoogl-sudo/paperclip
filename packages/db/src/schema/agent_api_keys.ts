@@ -15,6 +15,10 @@ export const agentApiKeys = pgTable(
     scopeConfig: jsonb("scope_config").$type<AgentApiKeyScope | null>(),
     lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    // Hard expiry backstop enforced at auth time independent of `revokedAt`
+    // NULL means the key never auto-expires. Cross-company
+    // (`task_bridge`) keys are always clamped to a ceiling at mint time.
+    expiresAt: timestamp("expires_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
