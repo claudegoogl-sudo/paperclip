@@ -1051,6 +1051,13 @@
       "when": 1783101500000,
       "tag": "0151_agent_api_keys_expires_at",
       "breakpoints": true
+    },
+    {
+      "idx": 152,
+      "version": "7",
+      "when": 1783101600000,
+      "tag": "0152_board_api_keys_scope_config",
+      "breakpoints": true
     }
   ]
 }

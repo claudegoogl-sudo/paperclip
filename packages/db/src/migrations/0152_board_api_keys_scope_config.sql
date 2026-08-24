@@ -1,0 +1,29 @@
+-- Scoped board principal: carry a per-key scope on board_api_keys (and a
+-- pending-scope handoff on cli_auth_challenges) so a board key can be minted
+-- with reduced authority instead of always inheriting its user's full reach.
+--
+-- Today every board key is unscoped: a credential that exists to run
+-- `paperclip plugin install` also clears assertCanManageInstanceSettings on
+-- every tenant because the key resolves to its user (often an owner + the
+-- instance's sole instance_admin). The in-repo precedent is
+-- agent_api_keys.scope_config; this migration mirrors that shape so the two
+-- scoping mechanisms are not divergent.
+--
+-- Scope taxonomy is intentionally minimal — this is not a general
+-- permission system:
+--   NULL / absent           — unscoped. Existing keys keep their current
+--                             behaviour on deploy (no behaviour change).
+--   {"kind":"standard"}     — explicit unscoped. Wire-equivalent to NULL.
+--   {"kind":"plugin_ops"}   — restricted to plugin install/enable/disable/
+--                             upgrade/config + issue read/comment. Enforced
+--                             by enforceBoardKeyScopeMiddleware in
+--                             server/src/middleware/auth.ts.
+--
+-- Both columns are nullable jsonb with no default, so each ADD COLUMN is a
+-- metadata-only change (no table rewrite, no long lock) — same shape as
+-- 0145_actor_provenance. No backfill: existing keys stay NULL = unscoped,
+-- which is the deploy-time no-behaviour-change requirement.
+--
+-- Idempotent: IF NOT EXISTS means re-running this file creates nothing new.
+ALTER TABLE "board_api_keys" ADD COLUMN IF NOT EXISTS "scope_config" jsonb;--> statement-breakpoint
+ALTER TABLE "cli_auth_challenges" ADD COLUMN IF NOT EXISTS "pending_key_scope_config" jsonb;

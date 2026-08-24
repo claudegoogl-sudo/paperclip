@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import pc from "picocolors";
+import type { BoardApiKeyScope } from "@paperclipai/shared";
 import { buildCliCommandLabel } from "./command-label.js";
 import { resolveDefaultCliAuthPath } from "../config/home.js";
 
@@ -202,6 +203,7 @@ export async function loginBoardCli(params: {
   apiBase: string;
   requestedAccess: RequestedAccess;
   requestedCompanyId?: string | null;
+  requestedKeyScope?: BoardApiKeyScope | null;
   clientName?: string | null;
   command?: string;
   storePath?: string;
@@ -220,6 +222,13 @@ export async function loginBoardCli(params: {
       clientName: params.clientName?.trim() || "paperclipai cli",
       requestedAccess: params.requestedAccess,
       requestedCompanyId: params.requestedCompanyId?.trim() || null,
+      // Every CLI-minted board key lands as plugin_ops-scoped unless the
+      // caller explicitly overrides. An old server that doesn't know the field
+      // strips it (Zod default) and the key lands unscoped, but that is the
+      // historical behaviour, not a regression. A new server persists it onto
+      // cli_auth_challenges.pending_key_scope_config and writes it through to
+      // board_api_keys.scope_config on approval.
+      requestedKeyScope: params.requestedKeyScope ?? { kind: "plugin_ops" },
     }),
   });
 
