@@ -1644,6 +1644,13 @@
       "when": 1786985500000,
       "tag": "0238_agent_api_keys_expires_at",
       "breakpoints": true
+    },
+    {
+      "idx": 239,
+      "version": "7",
+      "when": 1786985600000,
+      "tag": "0239_board_api_keys_scope_config",
+      "breakpoints": true
     }
   ]
 }

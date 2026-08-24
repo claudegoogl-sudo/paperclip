@@ -70,11 +70,45 @@ export const boardCliAuthAccessLevelSchema = z.enum([
 
 export type BoardCliAuthAccessLevel = z.infer<typeof boardCliAuthAccessLevelSchema>;
 
+// Board API key scope. Mirrors the shape of agentApiKeyScopeSchema: a
+// discriminated union so the database representation can grow without a second
+// scoping mechanism. Null/absent on the column means unscoped — the column
+// default is NULL so existing keys keep their current behaviour on deploy.
+//
+//   { kind: "standard" }  — explicit unscoped (equivalent to NULL on the wire).
+//   { kind: "plugin_ops" } — restricted to plugin install/enable/disable/upgrade/
+//                            config + issue read/comment. See
+//                            enforceBoardKeyScopeMiddleware in server/src/middleware/auth.ts.
+export const standardBoardKeyScopeSchema = z.object({
+  kind: z.literal("standard"),
+}).strict();
+
+export const pluginOpsBoardKeyScopeSchema = z.object({
+  kind: z.literal("plugin_ops"),
+}).strict();
+
+export const boardApiKeyScopeSchema = z.union([
+  standardBoardKeyScopeSchema,
+  pluginOpsBoardKeyScopeSchema,
+]);
+
+export type BoardApiKeyScope = z.infer<typeof boardApiKeyScopeSchema>;
+
+export function normalizeBoardApiKeyScope(value: unknown): BoardApiKeyScope {
+  const parsed = boardApiKeyScopeSchema.safeParse(value);
+  return parsed.success ? parsed.data : { kind: "standard" };
+}
+
+export function isPluginOpsBoardKeyScope(value: unknown): boolean {
+  return normalizeBoardApiKeyScope(value).kind === "plugin_ops";
+}
+
 export const createCliAuthChallengeSchema = z.object({
   command: z.string().min(1).max(240),
   clientName: z.string().max(120).optional().nullable(),
   requestedAccess: boardCliAuthAccessLevelSchema.default("board"),
   requestedCompanyId: z.string().uuid().optional().nullable(),
+  requestedKeyScope: boardApiKeyScopeSchema.optional().nullable(),
 });
 
 export type CreateCliAuthChallenge = z.infer<typeof createCliAuthChallengeSchema>;
@@ -89,6 +123,7 @@ export const createBoardApiKeySchema = z.object({
   name: z.string().trim().min(1).max(120).default("paperclipai cli"),
   expiresAt: z.coerce.date().optional().nullable(),
   requestedCompanyId: z.string().uuid().optional().nullable(),
+  scope: boardApiKeyScopeSchema.optional().nullable(),
 });
 
 export type CreateBoardApiKey = z.infer<typeof createBoardApiKeySchema>;

@@ -271,7 +271,7 @@ export const SECURITY_POSTURE_REJECTIONS = [
   {
     table: "board_api_keys",
     columns: ["created_at", "id", "last_used_at", "name", "user_id"],
-    reason: "Naming and last-use metadata. The authentication predicates on this table are revoked_at, expires_at and key_hash, which are registered.",
+    reason: "Naming and last-use metadata. The authentication predicates on this table are revoked_at, expires_at, key_hash and scope_config, which are registered.",
   },
   {
     table: "budget_incidents",
@@ -296,7 +296,7 @@ export const SECURITY_POSTURE_REJECTIONS = [
       "approved_by_user_id", "board_api_key_id", "cancelled_at", "client_name", "command",
       "created_at", "id", "pending_key_name", "requested_company_id", "updated_at"
     ],
-    reason: "Client naming, command text and lifecycle timestamps for a pending CLI login. The credential and gate columns — pending_key_hash, secret_hash, expires_at, requested_access — are registered.",
+    reason: "Client naming, command text and lifecycle timestamps for a pending CLI login. The credential and gate columns — pending_key_hash, pending_key_scope_config, secret_hash, expires_at, requested_access — are registered.",
   },
   {
     table: "cloud_upstream_connections",

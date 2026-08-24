@@ -14,6 +14,7 @@ import {
 } from "@paperclipai/db";
 import type {
   AgentApiKeyScope,
+  BoardApiKeyScope,
   InboxAgentPolicyMode,
   PermissionKey,
   PrincipalType,
@@ -43,6 +44,7 @@ export type AuthorizationActor =
     companyId?: string | null;
     keyId?: string | null;
     keyScope?: AgentApiKeyScope | null;
+    boardKeyScope?: BoardApiKeyScope | null;
     runId?: string | null;
     onBehalfOfUserId?: string | null;
     source?:
