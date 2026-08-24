@@ -119,6 +119,76 @@ function bucketFor(files) {
   return "reviewable";
 }
 
+// A merge between two lines with no shared commit aborts with this message and
+// produces ZERO conflicted files, so the conflict-count path treats it as a
+// "clean" merge and then crashes at `git commit`. Detect it explicitly.
+function isUnrelatedHistoriesError(stderr) {
+  return /unrelated histories/i.test(String(stderr ?? ""));
+}
+
+// The escalation report emitted when a tag cannot be merged for a structural
+// reason (no common ancestor). Same shape as the conflict-escalation report,
+// with an explicit reason so the board can distinguish it from a normal
+// too-big-to-auto-resolve escalation. `unresolvedFiles` is "N/A" because the
+// merge never produced a working tree to inspect.
+function unrelatedHistoriesReport(tag) {
+  return {
+    tag,
+    bucket: "escalation",
+    reason: "unrelated-histories",
+    unresolvedFiles: "N/A (no common ancestor between fork master and upstream tag)",
+  };
+}
+
+// `git merge-base <base> <ref>` exits non-zero (throwing through our `git`
+// helper) when the two commits share no ancestor. Normalize that — and an empty
+// stdout — to "" so callers can treat "no common ancestor" as one condition.
+function mergeBaseOrEmpty(base, ref, gitImpl = git) {
+  try {
+    return gitImpl(["merge-base", base, ref]);
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Attempt the upstream merge, classifying the outcome so `main` can route a
+ * structurally-impossible merge to a clean exit-2 escalation instead of
+ * crashing at `git commit`.
+ *
+ * Two independent signals route to escalation (acceptance #1): an empty
+ * merge-base *before* the merge, and a `merge --no-ff` that aborts with
+ * "unrelated histories". Neither relies on the conflicted-file count, which is
+ * zero in exactly this case. On the stderr path the started merge is aborted so
+ * the working tree is left clean (acceptance #2).
+ *
+ * @returns {{ escalate: true, exitCode: 2, report: object }
+ *          | { escalate: false, mergeFailed: boolean }}
+ */
+function classifyMerge({ tag, base, git: gitImpl = git }) {
+  if (mergeBaseOrEmpty(base, `refs/tags/${tag}`, gitImpl) === "") {
+    return { escalate: true, exitCode: 2, report: unrelatedHistoriesReport(tag) };
+  }
+  try {
+    // `tag` is a release tag fetched into refs/tags/ by `git fetch upstream --tags`,
+    // not a branch — `${UPSTREAM_REMOTE}/${tag}` would resolve to a non-existent
+    // remote-tracking ref and abort the merge ("not something we can merge").
+    gitImpl(["merge", "--no-ff", "-m", `sync(upstream): ${tag}`, `refs/tags/${tag}`]);
+    return { escalate: false, mergeFailed: false };
+  } catch (err) {
+    if (isUnrelatedHistoriesError(err?.stderr)) {
+      // Leave the working tree clean; there is no merge to keep.
+      try {
+        gitImpl(["merge", "--abort"]);
+      } catch {
+        // no merge in progress (e.g. git refused before touching the tree)
+      }
+      return { escalate: true, exitCode: 2, report: unrelatedHistoriesReport(tag) };
+    }
+    return { escalate: false, mergeFailed: true };
+  }
+}
+
 // Pure selection: given the array returned by the pulls list endpoint, pick the
 // open PR whose head is our sync branch on the fork. GitHub's `head` filter is
 // already scoped, but we re-check defensively (state + ref + fork owner).
@@ -280,15 +350,19 @@ async function main() {
 
   git(["checkout", "-B", branch, `${FORK_REMOTE}/${FORK_BASE_BRANCH}`]);
 
-  let mergeFailed = false;
-  try {
-    // `tag` is a release tag fetched into refs/tags/ by `git fetch upstream --tags`,
-    // not a branch — `${UPSTREAM_REMOTE}/${tag}` would resolve to a non-existent
-    // remote-tracking ref and abort the merge ("not something we can merge").
-    git(["merge", "--no-ff", "-m", `sync(upstream): ${tag}`, `refs/tags/${tag}`]);
-  } catch {
-    mergeFailed = true;
+  // Classify the merge up front. A structurally-impossible merge (no common
+  // ancestor — e.g. an orphan fork master with no upstream lineage) escalates
+  // cleanly with exit 2 rather than crashing at `git commit`: it produces zero
+  // conflicted files, so the conflict-count path below would wrongly treat it
+  // as clean.
+  const merge = classifyMerge({ tag, base: `${FORK_REMOTE}/${FORK_BASE_BRANCH}`, git });
+  if (merge.escalate) {
+    // No commit, no push, no cursor advance; working tree left clean.
+    console.log(JSON.stringify(merge.report));
+    return merge.exitCode;
   }
+
+  const mergeFailed = merge.mergeFailed;
 
   if (mergeFailed) {
     runConflictResolver();
@@ -370,4 +444,14 @@ if (invokedDirectly) {
     });
 }
 
-export { findOpenSyncPr, pickOpenSyncPr, remoteBranchExists, runActivationSoakGate, main };
+export {
+  findOpenSyncPr,
+  pickOpenSyncPr,
+  remoteBranchExists,
+  runActivationSoakGate,
+  classifyMerge,
+  isUnrelatedHistoriesError,
+  unrelatedHistoriesReport,
+  mergeBaseOrEmpty,
+  main,
+};
