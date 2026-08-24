@@ -45,24 +45,31 @@ Docker note: the Docker quickstart image also uses embedded PostgreSQL by defaul
 
 ## 2. Local PostgreSQL (Docker)
 
-For a full PostgreSQL server locally, use the included Docker Compose setup:
+For a full PostgreSQL server locally, use the included Docker Compose setup.
+The compose file lives under `docker/`, so run the command from the repository
+root:
 
 ```sh
-docker compose up -d
+docker compose -f docker/docker-compose.yml up -d
 ```
 
-This starts PostgreSQL 17 on `localhost:5432`. Then set the connection string:
+This starts PostgreSQL 17 on `localhost:5432`. The stack requires an explicit
+`POSTGRES_PASSWORD` and refuses to start without one; see
+[PostgreSQL password](DOCKER.md#postgresql-password) for the recipe.
+
+Copy the example env and set `DATABASE_URL` to a connection string that uses
+the password you just generated:
 
 ```sh
 cp .env.example .env
-# .env already contains:
-# DATABASE_URL=postgres://paperclip:paperclip@localhost:5432/paperclip
+# Edit .env and set DATABASE_URL, e.g.:
+# DATABASE_URL=postgres://paperclip:YOUR_PASSWORD@localhost:5432/paperclip
 ```
 
 Run migrations:
 
 ```sh
-DATABASE_URL=postgres://paperclip:paperclip@localhost:5432/paperclip \
+DATABASE_URL=postgres://paperclip:YOUR_PASSWORD@localhost:5432/paperclip \
   pnpm db:migrate
 ```
 
@@ -153,6 +160,66 @@ The database mode is controlled by `DATABASE_URL`:
 | `postgres://...supabase.com...` | Hosted Supabase |
 
 Your Drizzle schema (`packages/db/src/schema/`) stays the same regardless of mode.
+
+## Migration integrity guardrails
+
+Boot-time and `pnpm db:migrate` runs guard against an out-of-band content swap —
+a migration file whose contents changed while its version string stayed the same,
+which would otherwise be silently re-applied. Three mechanisms cooperate:
+
+- **File-identity drift detection.** When a migration is applied, its file name is
+  bound to the content hash it carried, in a dedicated `drizzle.migration_file_identity`
+  table (separate from the Drizzle journal and outside the dedup path). Before
+  applying, any pending file whose recorded identity hash differs from the file now
+  on disk is reported as **drift** and logged as a warning. Because the check is an
+  exact per-name lookup, it survives a scrubbed or renumbered Drizzle journal.
+  A pending, previously-applied file on a cluster that predates identity tracking
+  cannot be checked; it is reported separately as **unverifiable** ("no drift" there
+  means undecided, not clean) rather than silently treated as clean. On a cluster
+  with no identity table at all, *every* pending file is unverifiable — nothing there
+  is attributable yet. Once tracking starts, the journal row count at that instant is
+  frozen in `drizzle.migration_identity_watermark` and is what separates a legacy
+  file from a genuinely new one; a live row count would shrink when a journal row is
+  deleted and would report the newest applied file as clean.
+- **Dry run.** `pnpm db:migrate --dry-run` (or `--check`) reports pending migrations,
+  drift, and unverifiable files without applying anything, exiting non-zero if any
+  migration is pending. `pnpm db:status` is likewise read-only. Neither is gated.
+- **Source-tree production guard.** `pnpm db:migrate` only *applies* against the
+  local embedded dev cluster without ceremony. An explicitly configured external
+  Postgres target that already holds application tables is refused and fails closed,
+  unless `PAPERCLIP_ALLOW_PROD_MIGRATE` names that exact database:
+
+  ```sh
+  # refused: external cluster "app_prod" already has tables
+  DATABASE_URL=postgres://.../app_prod pnpm db:migrate
+  # allowed: opt-in names the target database explicitly
+  PAPERCLIP_ALLOW_PROD_MIGRATE=app_prod DATABASE_URL=postgres://.../app_prod pnpm db:migrate
+  ```
+
+  The opt-in must match the resolved database name; a bare truthy value does not
+  authorise migrating an arbitrary cluster.
+
+Every applied batch also writes a durable audit row (per-file hash, count, package
+version, and any `PAPERCLIP_VERSION` env override) to `drizzle.migration_apply_audit`,
+best-effort so a failed audit write never crashes an otherwise-migrated server.
+
+## Connection pool behavior
+
+The application pool is sized by `PAPERCLIP_DB_POOL_MAX` and every statement runs under `PAPERCLIP_DB_STATEMENT_TIMEOUT_MS` (see [environment variables](../docs/deploy/environment-variables.md)). Both are backstops. The pool is a fixed resource, so the thing that turns a slow query into an outage is a query holding a connection longer than anyone needs its result.
+
+That is what happens when an HTTP client gives up: the driver runs a query to completion whether or not the request is still there. Paperclip closes that gap with a request-scoped cancellation scope:
+
+- `server/src/middleware/request-query-cancellation.ts` opens a scope per request and aborts it when the socket closes before the response started.
+- `packages/db/src/query-cancellation.ts` tracks the queries issued inside that scope and cancels them on abort, which returns their connections to the pool immediately instead of at `statement_timeout`.
+- A cancelled query fails with SQLSTATE `57014`, and the middleware logs one `warn` per abandoned request with the route and a `cancelledQueries` count — the signal to watch if pool pressure returns.
+
+Three deliberate exclusions:
+
+- **`GET`/`HEAD` only.** Cancelling a mutation partway through would leave the database in a state nobody asked for, so an abandoned write is allowed to finish.
+- **Nothing is cancelled once the response has started.** A streaming response (SSE) sends headers first and keeps querying afterwards; its own close handling owns that teardown.
+- **Transactions are not covered.** `sql.begin` runs on its own reserved connection, and cancelling one statement mid-transaction would abort work the caller may still be committing.
+
+One caveat when writing handlers: a Drizzle query builder does not touch the database until it is awaited, so only queries **awaited** inside the request scope are cancellable. Returning a builder from a request handler and awaiting it elsewhere silently opts that query out.
 
 ## Migration authoring checklist
 

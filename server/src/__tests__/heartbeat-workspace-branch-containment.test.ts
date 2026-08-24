@@ -861,14 +861,20 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
   }, 20_000);
 
   afterEach(async () => {
-    // Await every in-flight background heartbeat run to quiescence before the
-    // deletes below. resumeQueuedRuns claims a run and dispatches its execution
-    // fire-and-forget, and the containment path can dispatch a follow-up
-    // recovery wakeup, so a run or wakeup can still write heartbeat_runs and
-    // issues rows when teardown starts. The shared drain also awaits an
-    // in-flight wakeup that is still before run registration, which a plain run
-    // table status poll cannot see.
-    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+        // Await every in-flight background heartbeat run to quiescence before the
+        // deletes below. resumeQueuedRuns claims a run and dispatches its execution
+        // fire-and-forget, and the containment path can dispatch a follow-up
+        // recovery wakeup, so a run or wakeup can still write heartbeat_runs and
+        // issues rows when teardown starts. The shared drain also awaits an
+        // in-flight wakeup that is still before run registration, which a plain run
+        // table status poll cannot see.
+        await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+        // Quiescence period: heartbeatRunEvents may be written after run status transitions
+        // to terminal (e.g., appendRunEvent at heartbeat.ts:10288 after setRunStatus).
+        // The shared drain awaits runs and in-flight wakeups but not post-terminal event
+        // writes, so we still wait a bit for post-status-change async side effects to
+        // complete before teardown.
+        await new Promise((resolve) => setTimeout(resolve, 150));
     adapterExecute.mockReset();
     adapterExecute.mockImplementation(async () => ({
       exitCode: 0,

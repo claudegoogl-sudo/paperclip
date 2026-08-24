@@ -184,12 +184,97 @@ export function normalizeAgentApiKeyScope(value: unknown): AgentApiKeyScope {
   return parsed.success ? parsed.data : { kind: "standard" };
 }
 
+/**
+ * A `task_bridge` scope lets a key reach projects/parent-issues that may belong
+ * to *other* companies — the cross-company case. Standard keys stay inside the
+ * agent's own company. Cross-company keys carry the tighter TTL ceiling.
+ */
+export function agentApiKeyScopeIsCrossCompany(scope: AgentApiKeyScope | null | undefined): boolean {
+  return scope?.kind === "task_bridge";
+}
+
+/**
+ * Hard server-side maximum lifetime for a minted *cross-company* agent key.
+ * Enforced at mint time regardless of what the caller requests (least
+ * privilege): a missing TTL, an oversized TTL, or a far-future `expiresAt` all
+ * clamp to this ceiling. 24h.
+ */
+export const CROSS_COMPANY_AGENT_KEY_MAX_TTL_SECONDS = 24 * 60 * 60;
+
 export const createAgentKeySchema = z.object({
   name: z.string().min(1).default("default"),
   scope: agentApiKeyScopeSchema.optional().default({ kind: "standard" }),
+  /**
+   * Optional caller-requested lifetime. `ttlSeconds` is relative to mint time;
+   * `expiresAt` is an absolute instant (ISO string or Date). If both are
+   * present, `expiresAt` wins. Cross-company keys are clamped to
+   * {@link CROSS_COMPANY_AGENT_KEY_MAX_TTL_SECONDS}.
+   */
+  ttlSeconds: z.number().int().positive().optional(),
+  expiresAt: z.coerce.date().optional(),
 });
 
 export type CreateAgentKey = z.infer<typeof createAgentKeySchema>;
+
+export interface ResolveAgentKeyExpiryInput {
+  scope?: AgentApiKeyScope | null;
+  ttlSeconds?: number | null;
+  expiresAt?: Date | string | null;
+  /** Injected for deterministic tests; defaults to the current instant. */
+  now?: Date;
+}
+
+/**
+ * Resolve the effective `expiresAt` to persist for a newly minted key, applying
+ * the cross-company ceiling. Pure/synchronous so it is unit-testable without a
+ * DB. Returns `null` when the key should never auto-expire.
+ *
+ * - Cross-company (`task_bridge`) keys: clamp to the ceiling. A requested
+ *   expiry *shorter* than the ceiling is honoured (shorter is always safe);
+ *   anything missing or longer collapses to `now + ceiling`.
+ * - Same-company / standard keys: honour an explicit request verbatim,
+ *   otherwise never auto-expire (current behaviour, unchanged).
+ */
+export function computeAgentKeyExpiresAt(input: ResolveAgentKeyExpiryInput): Date | null {
+  const now = input.now ?? new Date();
+  const nowMs = now.getTime();
+
+  let requestedMs: number | null = null;
+  if (input.expiresAt != null) {
+    const d = input.expiresAt instanceof Date ? input.expiresAt : new Date(input.expiresAt);
+    if (!Number.isNaN(d.getTime())) requestedMs = d.getTime();
+  } else if (
+    input.ttlSeconds != null
+    && Number.isFinite(input.ttlSeconds)
+    && input.ttlSeconds > 0
+  ) {
+    requestedMs = nowMs + Math.floor(input.ttlSeconds) * 1000;
+  }
+
+  if (agentApiKeyScopeIsCrossCompany(input.scope)) {
+    const ceilingMs = nowMs + CROSS_COMPANY_AGENT_KEY_MAX_TTL_SECONDS * 1000;
+    if (requestedMs == null || requestedMs > ceilingMs) return new Date(ceilingMs);
+    return new Date(requestedMs);
+  }
+
+  return requestedMs == null ? null : new Date(requestedMs);
+}
+
+/**
+ * Fail-closed expiry check used by every auth resolver. A key with a non-null
+ * `expiresAt` at or before `now` is rejected independent of `revokedAt`
+ * `null` means non-expiring. An unparseable value is treated as
+ * expired: a corrupt lifetime must not grant access.
+ */
+export function isAgentApiKeyExpired(
+  expiresAt: Date | string | null | undefined,
+  now: Date = new Date(),
+): boolean {
+  if (expiresAt == null) return false;
+  const d = expiresAt instanceof Date ? expiresAt : new Date(expiresAt);
+  if (Number.isNaN(d.getTime())) return true;
+  return d.getTime() <= now.getTime();
+}
 
 export const agentMineInboxQuerySchema = z.object({
   userId: z.string().trim().min(1),

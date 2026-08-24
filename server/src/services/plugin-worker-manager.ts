@@ -18,10 +18,9 @@
  * @see PLUGIN_SPEC.md §13 — Host-Worker Protocol
  */
 
-import { fork, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { createInterface, type Interface as ReadlineInterface } from "node:readline";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import {
   JSONRPC_VERSION,
@@ -57,6 +56,9 @@ import type {
 import { getActiveStepContext } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import { CLAUDE_SETUP_TOKEN_COMMAND } from "@paperclipai/adapter-claude-local/server";
 import { logger } from "../middleware/logger.js";
+import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js";
+import { clearRunSecretValues } from "../run-secret-registry.js";
+import { redactSensitiveText } from "../redaction.js";
 import { traceparentFromContextToken } from "../instrumentation.js";
 
 // ---------------------------------------------------------------------------
@@ -160,6 +162,133 @@ const SETUP_TOKEN_PTY_OPEN_FAILED = "SETUP_TOKEN_PTY_OPEN_FAILED";
  * rate-limits the record so a flood of dropped chunks writes at most one line
  * per window with a running count. */
 const EXECUTE_LOG_DROP_LOG_INTERVAL_MS = 1_000;
+/**
+ * SECURITY-CRITICAL: hard cap on a single worker→host IPC frame (one NDJSON line) in
+ * bytes. The transport is node child-process stdio and the worker controls how many
+ * bytes it writes before a newline. Without a cap the host buffers an entire
+ * line into memory *before* any application-level size gate runs (e.g. the
+ * artifacts `create` byte ceiling in plugin-artifacts-handler.ts), so a
+ * compromised or buggy worker can OOM the host with one oversized frame. Plugin
+ * workers are global/shared across tenants, so one bad frame is a host-wide
+ * transient. This default sits well above the largest legitimate frame — a
+ * base64 artifact `create` at the 25 MiB ceiling is ≈35 MiB plus a small JSON
+ * envelope — while bounding catastrophic allocation. Override per deployment via
+ * `PAPERCLIP_PLUGIN_MAX_IPC_FRAME_BYTES`.
+ */
+const DEFAULT_MAX_IPC_FRAME_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Resolve the per-frame IPC byte cap, preferring an explicit override (used by
+ * tests and per-deployment tuning), then the env var, then the safe default.
+ */
+export function resolveMaxIpcFrameBytes(override?: number): number {
+  if (typeof override === "number" && Number.isFinite(override) && override > 0) {
+    return Math.floor(override);
+  }
+  const fromEnv = Number(process.env.PAPERCLIP_PLUGIN_MAX_IPC_FRAME_BYTES);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return Math.floor(fromEnv);
+  return DEFAULT_MAX_IPC_FRAME_BYTES;
+}
+
+/**
+ * Options for {@link createBoundedFrameReader}.
+ */
+export interface BoundedFrameReaderOptions {
+  /** Hard cap on a single newline-delimited frame, in bytes (inclusive). */
+  maxFrameBytes: number;
+  /** Invoked with each complete frame (newline stripped, decoded as UTF-8). */
+  onFrame: (line: string) => void;
+  /**
+   * Invoked once per oversized frame, as soon as the accumulated bytes for the
+   * current (still newline-less) frame would exceed `maxFrameBytes` — i.e.
+   * BEFORE the whole payload is buffered. `bytesSeen` is how many bytes of the
+   * offending frame had been observed at the trip point (≤ maxFrameBytes plus
+   * one transport chunk); the host never allocates the full payload. After this
+   * fires the reader discards bytes up to the next newline to resynchronize, so
+   * subsequent valid frames still parse. The caller decides whether to also
+   * terminate the worker.
+   */
+  onOversize: (info: { bytesSeen: number; limit: number }) => void;
+}
+
+/**
+ * A pushed-bytes line reader. Unlike node `readline`, it enforces a hard byte
+ * ceiling on a single newline-delimited frame and never buffers more than
+ * `maxFrameBytes` of an in-flight frame. Feed it raw stdout/stderr chunks via
+ * {@link BoundedFrameReader.push}.
+ */
+export interface BoundedFrameReader {
+  /** Feed the next chunk of bytes read from the worker stream. */
+  push(chunk: Buffer): void;
+}
+
+export function createBoundedFrameReader(
+  options: BoundedFrameReaderOptions,
+): BoundedFrameReader {
+  const { maxFrameBytes, onFrame, onOversize } = options;
+  const NEWLINE = 0x0a;
+
+  let pending: Buffer[] = [];
+  let pendingBytes = 0;
+  // After an oversize frame we drop bytes until the next newline to realign on
+  // a frame boundary rather than misparsing the tail of the giant frame.
+  let resyncing = false;
+
+  function trip(extraBytes: number): void {
+    const bytesSeen = pendingBytes + extraBytes;
+    pending = [];
+    pendingBytes = 0;
+    onOversize({ bytesSeen, limit: maxFrameBytes });
+  }
+
+  return {
+    push(chunk: Buffer): void {
+      let offset = 0;
+      while (offset < chunk.length) {
+        if (resyncing) {
+          const nl = chunk.indexOf(NEWLINE, offset);
+          if (nl === -1) return; // whole remainder is still the oversized frame
+          resyncing = false;
+          offset = nl + 1;
+          continue;
+        }
+
+        const nl = chunk.indexOf(NEWLINE, offset);
+        if (nl === -1) {
+          const tail = chunk.subarray(offset);
+          if (pendingBytes + tail.length > maxFrameBytes) {
+            resyncing = true;
+            trip(tail.length);
+            return;
+          }
+          pending.push(tail);
+          pendingBytes += tail.length;
+          return;
+        }
+
+        const frameLen = nl - offset;
+        if (pendingBytes + frameLen > maxFrameBytes) {
+          // Newline is in this chunk, so we can resync immediately past it.
+          trip(frameLen);
+          offset = nl + 1;
+          continue;
+        }
+
+        let frame: Buffer;
+        if (pending.length === 0) {
+          frame = chunk.subarray(offset, nl);
+        } else {
+          pending.push(chunk.subarray(offset, nl));
+          frame = Buffer.concat(pending);
+          pending = [];
+          pendingBytes = 0;
+        }
+        onFrame(frame.toString("utf8"));
+        offset = nl + 1;
+      }
+    },
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -249,6 +378,27 @@ export function resolveRpcCallTimeoutMs(
 }
 
 /**
+ * SECURITY-CRITICAL: defense-in-depth redaction for host-handler errors.
+ *
+ * The host-handler dispatch catch-all in {@link createPluginWorkerHandle} sees
+ * errors from every host method and forwards the message to both `log.error`
+ * and the JSON-RPC `error.message` returned to the worker. Host handlers must
+ * never echo raw caller input into an error message — the secrets handler is
+ * already fixed at source — but any future handler that interpolates
+ * worker-supplied input would leak it on both egress channels unless we scrub
+ * here. `redactSensitiveText` covers gh[pousr]_* classic PATs, fine-grained
+ * github_pat_* keys, sk-* keys, 3-segment JWTs, `Authorization: Bearer`
+ * headers, env-var-shape *TOKEN/KEY/SECRET*=* and CLI secret flags.
+ *
+ * Exported so the redaction wrap can be exercised by unit tests without
+ * spawning a real worker.
+ */
+export function redactHostHandlerErrorMessage(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  return redactSensitiveText(raw);
+}
+
+/**
  * Options for starting a worker process.
  */
 export interface WorkerStartOptions {
@@ -271,6 +421,12 @@ export interface WorkerStartOptions {
   hostHandlers: WorkerToHostHandlers;
   /** Default timeout for RPC calls (ms). Defaults to 30s. */
   rpcTimeoutMs?: number;
+  /**
+   * Hard byte cap on a single worker→host IPC frame. Defaults to
+   * `PAPERCLIP_PLUGIN_MAX_IPC_FRAME_BYTES` or {@link DEFAULT_MAX_IPC_FRAME_BYTES}.
+   * Mainly an injection point for tests; production should use the env var.
+   */
+  maxIpcFrameBytes?: number;
   /** Whether to auto-restart on crash. Defaults to true. */
   autoRestart?: boolean;
   /** Node.js execArgv passed to the child process. */
@@ -345,6 +501,13 @@ interface PendingRequest {
 interface ActiveInvocation {
   scope: PluginInvocationScope;
   timer?: ReturnType<typeof setTimeout>;
+  /**
+   * SECURITY-CRITICAL: when this invocation is a company-scoped background dispatch
+   * (`onEvent`), the host-minted per-dispatch run UUID registered in the
+   * run-context registry. Deregistered when the invocation clears so the
+   * registry stays bounded.
+   */
+  backgroundRunId?: string;
   // The host-minted W3C `traceparent` for the active startup span, or undefined
   // when no startup span is active. The span host handler reads it to mint the
   // parentage, so a worker never supplies the parent itself.
@@ -418,6 +581,21 @@ interface ExecuteLogRoute {
   crossCompanyBlocked: boolean;
 }
 
+/**
+ * SECURITY-CRITICAL: host→worker dispatches that carry a TRIGGERING company but
+ * no dispatching agent. For these, the host mints a per-dispatch
+ * **company-scoped** run-context (rather than letting the worker→host
+ * `secrets.resolve` fall through to the company-agnostic worker-lifetime
+ * service path), so a global plugin worker handling company A's event can only
+ * resolve secrets company A bound to it. `runJob` is deliberately absent: jobs
+ * are instance-wide and carry no triggering company, so they keep using the
+ * company-less service path.
+ */
+const BACKGROUND_DISPATCH_METHODS: ReadonlySet<string> = new Set([
+  "onEvent",
+  "onWebhook",
+]);
+
 // ---------------------------------------------------------------------------
 // PluginWorkerHandle — manages a single worker process
 // ---------------------------------------------------------------------------
@@ -432,6 +610,16 @@ interface ExecuteLogRoute {
 export interface PluginWorkerHandle {
   /** The plugin ID this worker serves. */
   readonly pluginId: string;
+
+  /**
+   * SECURITY-CRITICAL: host-minted, worker-lifetime service run UUID. Surfaced as
+   * `context.serviceScope.runId` on every worker→host call so a background
+   * dispatch or a `setup()`-started loop can resolve secrets outside any
+   * dispatch. Stable across crash/auto-restart of this handle; never
+   * worker-supplied. The manager registers it in the run-context registry as a
+   * system actor for the handle's lifetime.
+   */
+  readonly serviceRunId: string;
 
   /** Current worker status. */
   readonly status: WorkerStatus;
@@ -605,6 +793,21 @@ export interface PluginWorkerManager {
 // ---------------------------------------------------------------------------
 
 /**
+ * Internal dependencies injected by the manager (not part of the caller-facing
+ * {@link WorkerStartOptions}).
+ */
+export interface PluginWorkerHandleDeps {
+  /**
+   * SECURITY-CRITICAL: the shared run-context registry. When provided, a background
+   * dispatch carrying a triggering company (`onEvent`) mints a per-dispatch
+   * company-scoped run-context here so its worker→host `secrets.resolve` is
+   * scoped to that company rather than falling through to the company-agnostic
+   * worker-lifetime service path.
+   */
+  runContextRegistry?: PluginRunContextRegistry;
+}
+
+/**
  * Create a handle for a single plugin worker process.
  *
  * @internal Exported for testing; consumers should use `createPluginWorkerManager`.
@@ -612,8 +815,10 @@ export interface PluginWorkerManager {
 export function createPluginWorkerHandle(
   pluginId: string,
   options: WorkerStartOptions,
+  deps: PluginWorkerHandleDeps = {},
 ): PluginWorkerHandle {
   const log = logger.child({ service: "plugin-worker", pluginId });
+  const runContextRegistry = deps.runContextRegistry;
   const emitter = new EventEmitter();
   /**
    * Higher than default (10) to accommodate multiple subscribers to
@@ -623,8 +828,6 @@ export function createPluginWorkerHandle(
 
   // Worker process state
   let childProcess: ChildProcess | null = null;
-  let readline: ReadlineInterface | null = null;
-  let stderrReadline: ReadlineInterface | null = null;
   let status: WorkerStatus = "stopped";
   let startedAt: number | null = null;
   let stderrExcerpt = "";
@@ -633,6 +836,10 @@ export function createPluginWorkerHandle(
   const pendingRequests = new Map<string | number, PendingRequest>();
   let nextRequestId = 1;
   const activeInvocations = new Map<string, ActiveInvocation>();
+  // SECURITY-CRITICAL: stable, host-minted service run-context for this worker's
+  // lifetime. Surfaced on every worker→host call so background dispatches /
+  // setup() loops can resolve secrets outside any dispatch.
+  const serviceRunId = randomUUID();
   // Host-owned execute routes, keyed by the host-issued invocation id. Only an
   // `environmentExecute` call with a log sink registers a route here. The
   // `execute.log` router delivers only through this map — never through the
@@ -696,6 +903,23 @@ export function createPluginWorkerHandle(
 
   // Optional methods reported by the worker during initialization
   let supportedMethods: string[] = [];
+  // SECURITY-CRITICAL: whether the worker declared at `initialize` that it echoes
+  // `paperclipInvocationId` on dispatch-servicing calls. Reassigned from each
+  // successful handshake, so a crash-restarted worker re-declares.
+  let echoesInvocationId = false;
+  // SECURITY-CRITICAL: host-observed counterpart to `echoesInvocationId`. Method names
+  // this worker has been seen calling id-less while NO dispatch was in flight
+  // — direct proof that it issues that call outside any dispatch, so
+  // "exactly one dispatch is in flight" no longer implies the call belongs to
+  // it. Unlike the worker's declaration this needs no plugin rebuild, which is
+  // what makes it reach the installed base. Deliberately NOT reset
+  // on worker crash-restart: `spawnProcess()` respawns inside this same
+  // closure, and the signal describes the plugin's code rather than the
+  // process, so it should outlive the child. It does NOT survive a new handle
+  // (host restart, or plugin disable→enable), which reopens the learning
+  // window until the worker is next observed calling id-less with no dispatch
+  // in flight. It can only ever narrow what the worker is granted.
+  const idlessCallsSeenWithNoDispatch = new Set<string>();
 
   // Crash tracking for exponential backoff
   let consecutiveCrashes = 0;
@@ -713,6 +937,7 @@ export function createPluginWorkerHandle(
 
   const rpcTimeoutMs = options.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
   const autoRestart = options.autoRestart ?? true;
+  const maxIpcFrameBytes = resolveMaxIpcFrameBytes(options.maxIpcFrameBytes);
 
   // -----------------------------------------------------------------------
   // Status management
@@ -824,12 +1049,35 @@ export function createPluginWorkerHandle(
 
     if (method === "performAction" && isRecord(params.actorContext)) {
       const companyId = readNonEmptyString(params.actorContext.companyId);
-      return companyId ? { companyId } : null;
+      if (!companyId) return null;
+      // SECURITY-CRITICAL: carry runId/agentId on the scope so a worker→host callback
+      // that omits them (e.g. an older SDK's `secrets.resolve(secretRef)`) can be back-
+      // filled from the host-validated active invocation rather than failing
+      // closed. Values come from the host's params, never from the worker.
+      const runId = readNonEmptyString(params.actorContext.runId);
+      const agentId = readNonEmptyString(params.actorContext.agentId);
+      return {
+        companyId,
+        ...(runId ? { runId } : {}),
+        ...(agentId ? { agentId } : {}),
+      };
     }
 
     if (method === "executeTool" && isRecord(params.runContext)) {
       const companyId = readNonEmptyString(params.runContext.companyId);
-      return companyId ? { companyId } : null;
+      if (!companyId) return null;
+      // SECURITY-CRITICAL: thread the outer dispatcher's runId/agentId so worker→host
+      // callbacks that didn't include them can be reconstructed by the host.
+      // This preserves the security model — the runId is the
+      // host's own, taken from the dispatch the host issued, never trusted to
+      // the worker.
+      const runId = readNonEmptyString(params.runContext.runId);
+      const agentId = readNonEmptyString(params.runContext.agentId);
+      return {
+        companyId,
+        ...(runId ? { runId } : {}),
+        ...(agentId ? { agentId } : {}),
+      };
     }
 
     if (method === "onEvent" && isRecord(params.event)) {
@@ -840,24 +1088,42 @@ export function createPluginWorkerHandle(
     return null;
   }
 
-  function registerInvocation(scope: PluginInvocationScope, ttlMs?: number): PluginInvocationContext {
-    // Mint a W3C `traceparent` from the active startup span, so the worker's
-    // provider span can parent to it. The host keeps the value on its own record
-    // (below) and never trusts the worker to supply the parent. Outside a
-    // measured startup step there is no active span, so this is undefined.
-    const activeStep = getActiveStepContext();
-    const traceparent = activeStep
-      ? traceparentFromContextToken(activeStep.parentContext)
-      : undefined;
+  function registerInvocation(
+    scope: PluginInvocationScope,
+    ttlMs?: number,
+    method?: HostToWorkerMethodName | string,
+  ): PluginInvocationContext {
+    // SECURITY-CRITICAL: for a background dispatch carrying a triggering company (and no
+    // dispatching agent runId of its own), mint a per-dispatch company-scoped
+    // run-context and surface its runId on the scope. The worker echoes it on
+    // its `secrets.resolve` callback (or the host back-fills it from this
+    // scope), so the resolve is company-scoped instead of falling through to
+    // the company-agnostic worker-lifetime service path.
+    let effectiveScope = scope;
+    let backgroundRunId: string | undefined;
+    if (
+      method !== undefined &&
+      BACKGROUND_DISPATCH_METHODS.has(method) &&
+      scope.companyId &&
+      !scope.runId &&
+      runContextRegistry
+    ) {
+      backgroundRunId = randomUUID();
+      effectiveScope = { ...scope, runId: backgroundRunId };
+      runContextRegistry.registerBackground(pluginId, backgroundRunId, scope.companyId);
+    }
+
     const invocation: PluginInvocationContext = {
       id: randomUUID(),
-      scope,
+      scope: effectiveScope,
       ...(traceparent ? { traceparent } : {}),
+      ...(backgroundRunId ? { backgroundRunId } : {}),
     };
-    const entry: ActiveInvocation = { scope, traceparent };
+    const entry: ActiveInvocation = { scope: effectiveScope, traceparent, backgroundRunId };
     if (ttlMs !== undefined) {
       entry.timer = setTimeout(() => {
         activeInvocations.delete(invocation.id);
+        if (backgroundRunId) runContextRegistry?.deregister(pluginId, backgroundRunId);
       }, ttlMs);
       if (entry.timer.unref) entry.timer.unref();
     }
@@ -869,6 +1135,9 @@ export function createPluginWorkerHandle(
     if (!invocation) return;
     const entry = activeInvocations.get(invocation.id);
     if (entry?.timer) clearTimeout(entry.timer);
+    if (entry?.backgroundRunId) {
+      runContextRegistry?.deregister(pluginId, entry.backgroundRunId);
+    }
     activeInvocations.delete(invocation.id);
   }
 
@@ -1304,17 +1573,55 @@ export function createPluginWorkerHandle(
   }
 
   function contextForWorkerMessage(message: JsonRpcRequest | JsonRpcNotification): WorkerHostCallContext {
+    // SECURITY-CRITICAL: ALWAYS attach the worker-lifetime service run-context, on top of
+    // whatever dispatch scope (if any) the message resolves to. The service
+    // scope grants no company scope by itself; merging it never widens
+    // `invocationScope` enforcement for a method that trusts `companyId` as its
+    // sole authority.
+    //
+    // SECURITY-CRITICAL: a NARROW allowlist of company-scoped methods
+    // (`SERVICE_SCOPE_COMPANY_METHODS` in the SDK gate) that are server-side
+    // `requireInCompany` reach-checked IS authorized under this serviceScope when
+    // no dispatch pins a company — including when base context reports
+    // `invalidInvocationScope` for the scope-less inbound relay path (the
+    // `onWebhook` / `getUpdates` callback carries no resolvable dispatch id). The
+    // SDK gate evaluates that allowlist bypass before its `invalidInvocationScope`
+    // rejection (a guard-ordering fix). This does not widen reach: the
+    // bypass is reach-checked, and the rejection retains full force for every
+    // non-allowlisted company-scoped method.
+    return {
+      ...baseContextForWorkerMessage(message),
+      serviceScope: { runId: serviceRunId },
+    };
+  }
+
+  function baseContextForWorkerMessage(message: JsonRpcRequest | JsonRpcNotification): WorkerHostCallContext {
     const invocationId = readNonEmptyString(
       (message as { paperclipInvocationId?: unknown }).paperclipInvocationId,
     );
     if (!invocationId) {
-      // No host-issued invocation is being echoed. This is a genuinely
-      // proactive worker→host call (timer/loop). If it references a company the
-      // plugin is authorized to act on proactively, resolve it to that
-      // company's scope so the governed-access gate admits it. This never
-      // widens access beyond the plugin's configured companies, and only
-      // applies when the worker is NOT inside a host-issued invocation (which
-      // would carry an id and keep its strict single-company match below).
+      // SECURITY-CRITICAL: an older worker SDK (e.g. platform.cad ≤0.1.7) does not
+      // echo `paperclipInvocationId` on its worker→host callbacks, so we cannot
+      // bind this call to an invocation by id. When EXACTLY ONE host→worker
+      // dispatch is in-flight, that dispatch is unambiguously the one the worker
+      // is servicing, so we surface its host-validated scope as
+      // `singleInFlightScope`. This was originally recorded as feeding the runId
+      // back-fill ONLY; that stopped being true once `config.get` started to
+      // select a tenant from it, which is why the whole branch is gated on
+      // the worker being unable to echo an id in the first place. The runId
+      // comes from the host's own runContext, never the worker. We deliberately
+      // STILL return `invalidInvocationScope` so company-scope enforcement stays
+      // strict — a worker can never name an arbitrary target company off this.
+      // With 0 or 2+ dispatches in-flight we cannot attribute the call and fall
+      // through to the fail-closed behaviour (no scope surfaced).
+      const inFlightInvocationIds = new Set<string>();
+      for (const pending of pendingRequests.values()) {
+        if (pending.invocationId) inFlightInvocationIds.add(pending.invocationId);
+      // Upstream (LOOA-629/695): a proactive plugin (chat gateway) does company-scoped
+      // work from its own timers/loops. An id-less call that references one of the
+      // plugin's configured companies resolves to that company's scope. This never
+      // widens access beyond the loader-seeded allowlist; in-invocation calls keep
+      // the strict single-company match below.
       const proactiveCompanyId = referencedCompanyId(
         message.method,
         (message as { params?: unknown }).params,
@@ -1322,9 +1629,48 @@ export function createPluginWorkerHandle(
       if (proactiveCompanyId && proactiveCompanyScopes.has(proactiveCompanyId)) {
         return { invocationScope: { companyId: proactiveCompanyId } };
       }
-      const hasActiveInvocation = activeInvocations.size > 0 ||
-        Array.from(pendingRequests.values()).some((pending) => pending.invocationId);
-      return hasActiveInvocation ? { invalidInvocationScope: true } : {};
+      }
+      const hasActiveInvocation =
+        activeInvocations.size > 0 || inFlightInvocationIds.size > 0;
+      const method = readNonEmptyString((message as { method?: unknown }).method);
+      if (!hasActiveInvocation) {
+        // SECURITY-CRITICAL: an id-less call with nothing in flight is unambiguous —
+        // this worker makes this call outside any dispatch. Record it so the
+        // attribution below is withdrawn for this method from now on. A worker
+        // servicing its own dispatch always has that dispatch in flight, so a
+        // dispatch-only legacy worker (platform.cad ≤0.1.7, klipper) can never
+        // trip this and keeps the single-in-flight attribution above intact.
+        if (method) idlessCallsSeenWithNoDispatch.add(method);
+        return {};
+      }
+      // SECURITY-CRITICAL: plugin workers are GLOBAL — one worker process serves every
+      // tenant — so "the single in-flight dispatch" is only the caller's own
+      // dispatch for a worker that CANNOT echo the id. A worker that declared
+      // `echoesInvocationId` at initialize and still sent none is servicing no
+      // dispatch at all (a `setup()`-started poll loop, a `runJob`, a timer).
+      // Attributing it to whichever tenant happens to be mid-dispatch hands that
+      // tenant's effective config — and the secret-refs it carries — to a caller
+      // with no claim to it. Such callers use `serviceScope`, which
+      // `contextForWorkerMessage` attaches unconditionally.
+      //
+      // SECURITY-CRITICAL: `echoesInvocationId` is worker-declared, and plugins bundle
+      // their own SDK copy in `dist/worker.js`, so it stays false for the whole
+      // installed base until each plugin is rebuilt. The second
+      // clause is the host's own observation of the same fact and needs no
+      // rebuild: once this worker has issued THIS method id-less with nothing
+      // in flight, a later id-less call cannot be assumed to own the single
+      // dispatch that happens to be open. Per-method rather than per-worker so
+      // an unrelated startup `log` cannot withdraw `secrets.resolve`'s binding.
+      let singleInFlightScope: PluginInvocationScope | undefined;
+      const ownsNoDispatch = method !== null && idlessCallsSeenWithNoDispatch.has(method);
+      if (!echoesInvocationId && !ownsNoDispatch && inFlightInvocationIds.size === 1) {
+        const [onlyId] = inFlightInvocationIds;
+        const entry = onlyId ? activeInvocations.get(onlyId) : undefined;
+        if (entry) singleInFlightScope = entry.scope;
+      }
+      return singleInFlightScope
+        ? { invalidInvocationScope: true, singleInFlightScope }
+        : { invalidInvocationScope: true };
     }
     const entry = activeInvocations.get(invocationId);
     if (!entry) return { invalidInvocationScope: true };
@@ -1364,14 +1710,31 @@ export function createPluginWorkerHandle(
         result: result ?? null,
       });
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : String(err);
-      log.error({ method, err: errorMessage }, "host handler error");
+      // SECURITY-CRITICAL: defense-in-depth redaction happens in the
+      // exported redactHostHandlerErrorMessage helper (see its doc comment).
+      const safeErrorMessage = redactHostHandlerErrorMessage(err);
+      const errorCode = errorCodeForWorkerHostError(err);
+      // Surface the JSON-RPC error code and typed error name alongside
+      // the message so a denied/failed in-process host call (e.g. an
+      // InvocationScopeDeniedError from a background loop) is diagnosable from
+      // logs alone, without correlating to source. `safeErrorMessage` already
+      // carries the (redacted) human reason; `errorCode`/`errorName` make the
+      // failure class queryable.
+      log.error(
+        {
+          method,
+          err: safeErrorMessage,
+          errorCode,
+          errorName: err instanceof Error ? err.name : undefined,
+        },
+        "host handler error",
+      );
       try {
         sendMessage(
           createErrorResponse(
             request.id,
-            errorCodeForWorkerHostError(err),
-            errorMessage,
+            errorCode,
+            safeErrorMessage,
           ),
         );
       } catch {
@@ -1456,13 +1819,25 @@ export function createPluginWorkerHandle(
         );
         return;
       }
-      const allowedCompanyId = context.invocationScope?.companyId;
-      if (allowedCompanyId && companyId !== allowedCompanyId) {
-        log.warn(
-          { method: notification.method, companyId, allowedCompanyId },
-          "dropping plugin stream notification outside invocation company scope",
-        );
-        return;
+      const allowedCompanyId = readNonEmptyString(context.invocationScope?.companyId);
+      if (companyId) {
+        // Fail closed (matches requireInvocationCompanyScope): a company-scoped
+        // stream notification with no resolvable invocation scope cannot be
+        // tenant-verified — drop it rather than forwarding it under no pin.
+        if (!allowedCompanyId) {
+          log.warn(
+            { method: notification.method, companyId },
+            "dropping company-scoped plugin stream notification with no resolvable invocation scope",
+          );
+          return;
+        }
+        if (companyId !== allowedCompanyId) {
+          log.warn(
+            { method: notification.method, companyId, allowedCompanyId },
+            "dropping plugin stream notification outside invocation company scope",
+          );
+          return;
+        }
       }
 
       // Track open channels so we can emit synthetic close on crash
@@ -1509,31 +1884,96 @@ export function createPluginWorkerHandle(
       TZ: process.env.TZ ?? "UTC",
     };
 
-    const child = fork(options.entrypointPath, [], {
-      stdio: ["pipe", "pipe", "pipe", "ipc"],
-      execArgv: options.execArgv ?? [],
-      env: workerEnv,
-      // Don't let the child keep the parent alive
-      detached: false,
-    });
+    // SECURITY-CRITICAL: use `spawn` with a 3-fd stdio instead of `fork`. The host↔worker
+    // protocol runs entirely over stdin (host→worker requests) and stdout
+    // (worker→host NDJSON, byte-capped by the IPC frame cap above). It NEVER uses the node IPC
+    // channel: there is no `child.send(...)`/`child.on("message", ...)` anywhere
+    // in the host, and the worker SDK transports over `process.stdin`/`stdout`.
+    // `fork()` always provisions an IPC channel (fd 3) whose parent-side reader
+    // calls `readStart()` and buffers incoming bytes with no application-level
+    // cap — a worker→host OOM vector the stdout cap does not cover (a
+    // compromised worker could `process.send({huge})` or `fs.writeSync(3, ...)`).
+    // `spawn` with `["pipe","pipe","pipe"]` provisions no IPC channel, removing
+    // the surface entirely (Minimize Attack Surface / Least Common Mechanism).
+    // `fork`'s node args are `execArgv` before the module path; replicate that.
+    const child = spawn(
+      process.execPath,
+      [...(options.execArgv ?? []), options.entrypointPath],
+      {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: workerEnv,
+        // Don't let the child keep the parent alive
+        detached: false,
+      },
+    );
+
+    // Defense-in-depth: assert no IPC channel exists. `spawn` with a 3-fd stdio
+    // never creates one, but if a future change reintroduces it, sever the
+    // channel and audit rather than silently leaving the uncapped fd-3 bypass
+    // open.
+    if (child.channel != null) {
+      log.error(
+        { audit: "plugin.worker.ipc.unexpected_channel", pid: child.pid },
+        "worker spawned with an unexpected node IPC channel; disconnecting to close the uncapped fd-3 OOM vector",
+      );
+      try {
+        child.disconnect();
+      } catch {
+        // Channel may already be torn down.
+      }
+    }
 
     return child;
   }
 
   function attachStdioHandlers(child: ChildProcess): void {
-    // Read NDJSON from stdout
+    // SECURITY-CRITICAL: read NDJSON from stdout through a byte-bounded frame reader.
+    // The reader never buffers more than `maxIpcFrameBytes` of an in-flight
+    // frame; an oversized frame is dropped before the host allocates the full
+    // payload, audited, and the worker is terminated (fail closed).
     if (child.stdout) {
-      readline = createInterface({ input: child.stdout });
-      readline.on("line", handleLine);
+      const stdoutReader = createBoundedFrameReader({
+        maxFrameBytes: maxIpcFrameBytes,
+        onFrame: handleLine,
+        onOversize: ({ bytesSeen, limit }) => {
+          log.error(
+            {
+              audit: "plugin.worker.ipc.oversize_frame",
+              stream: "stdout",
+              bytesSeen,
+              limit,
+            },
+            "worker IPC frame exceeded hard size cap; dropping frame and terminating worker",
+          );
+          terminateForOversizeFrame();
+        },
+      });
+      child.stdout.on("data", (chunk: Buffer) => stdoutReader.push(chunk));
     }
 
-    // Capture stderr for logging
+    // Capture stderr for logging, also byte-bounded so a worker cannot OOM the
+    // host with a giant newline-less stderr line. Oversized stderr is truncated
+    // rather than fatal — it is a logging channel, not the IPC transport.
     if (child.stderr) {
-      stderrReadline = createInterface({ input: child.stderr });
-      stderrReadline.on("line", (line: string) => {
-        stderrExcerpt = appendStderrExcerpt(stderrExcerpt, line);
-        log.warn({ stream: "stderr" }, `[plugin stderr] ${line}`);
+      const stderrReader = createBoundedFrameReader({
+        maxFrameBytes: maxIpcFrameBytes,
+        onFrame: (line: string) => {
+          stderrExcerpt = appendStderrExcerpt(stderrExcerpt, line);
+          log.warn({ stream: "stderr" }, `[plugin stderr] ${line}`);
+        },
+        onOversize: ({ bytesSeen, limit }) => {
+          log.warn(
+            {
+              audit: "plugin.worker.ipc.oversize_frame",
+              stream: "stderr",
+              bytesSeen,
+              limit,
+            },
+            "worker stderr line exceeded hard size cap; truncating",
+          );
+        },
       });
+      child.stderr.on("data", (chunk: Buffer) => stderrReader.push(chunk));
     }
 
     // Handle process exit
@@ -1565,15 +2005,9 @@ export function createPluginWorkerHandle(
   ): void {
     const wasIntentional = intentionalStop;
 
-    // Clean up readline interfaces
-    if (readline) {
-      readline.close();
-      readline = null;
-    }
-    if (stderrReadline) {
-      stderrReadline.close();
-      stderrReadline = null;
-    }
+    // The stdout/stderr readers are plain `data` listeners on the child's
+    // streams, which are destroyed when the process exits — no explicit
+    // teardown needed.
     childProcess = null;
     startedAt = null;
 
@@ -1740,11 +2174,14 @@ export function createPluginWorkerHandle(
         "initialize",
         initParams,
         INITIALIZE_TIMEOUT_MS,
-      ) as { ok?: boolean; supportedMethods?: string[] } | undefined;
+      ) as
+        | { ok?: boolean; supportedMethods?: string[]; echoesInvocationId?: boolean }
+        | undefined;
       if (!result || !result.ok) {
         throw new Error("Worker initialize returned ok=false");
       }
       supportedMethods = result.supportedMethods ?? [];
+      echoesInvocationId = result.echoesInvocationId === true;
     } catch (err) {
       // Initialize failed — kill the process and propagate
       const msg = err instanceof Error ? err.message : String(err);
@@ -1875,6 +2312,22 @@ export function createPluginWorkerHandle(
     });
   }
 
+  /**
+   * SECURITY-CRITICAL: SIGKILL a worker that sent an oversized IPC frame. Deliberately
+   * does NOT set `intentionalStop`, so {@link handleProcessExit} treats the
+   * death as a crash and the normal exponential-backoff / consecutive-crash
+   * ceiling applies — a worker that keeps emitting oversized frames is
+   * eventually abandoned rather than restarted forever.
+   */
+  function terminateForOversizeFrame(): void {
+    if (!childProcess) return;
+    try {
+      childProcess.kill("SIGKILL");
+    } catch {
+      // Process may already be dead.
+    }
+  }
+
   async function killProcess(): Promise<void> {
     if (!childProcess) return;
     intentionalStop = true;
@@ -1922,7 +2375,7 @@ export function createPluginWorkerHandle(
       const id = nextRequestId++;
       const timeout = resolveRpcCallTimeoutMs(timeoutMs, rpcTimeoutMs);
       const invocationScope = deriveInvocationScope(method, params);
-      const invocation = invocationScope ? registerInvocation(invocationScope) : null;
+      const invocation = invocationScope ? registerInvocation(invocationScope, undefined, method) : null;
       // Register the host-owned execute route only for an execute call that
       // carries a log sink. The company id comes from the host-derived
       // invocation scope, never from the worker. This binds the sink to the
@@ -2015,6 +2468,10 @@ export function createPluginWorkerHandle(
       return pluginId;
     },
 
+    get serviceRunId() {
+      return serviceRunId;
+    },
+
     get status() {
       return status;
     },
@@ -2066,10 +2523,7 @@ export function createPluginWorkerHandle(
     notify(method: string, params: unknown) {
       if (status !== "running") return;
       const invocationScope = deriveInvocationScope(method, params);
-      // Notifications have no response to settle on, so the invocation scope
-      // is GC'd by TTL. Call-path invocations are registered without a TTL and
-      // cleared on settlement, so they survive arbitrarily long call timeouts.
-      const invocation = invocationScope ? registerInvocation(invocationScope, MAX_RPC_TIMEOUT_MS) : null;
+      const invocation = invocationScope ? registerInvocation(invocationScope, MAX_RPC_TIMEOUT_MS, method) : null;
       try {
         sendMessage({
           jsonrpc: JSONRPC_VERSION,
@@ -2145,6 +2599,13 @@ export interface PluginWorkerManagerOptions {
     signal?: string | null;
     willRestart?: boolean;
   }) => void;
+  /**
+   * SECURITY-CRITICAL: shared run-context registry. When provided, the manager registers
+   * each worker's host-minted service run-context (`handle.serviceRunId`) as a
+   * system actor for the worker's lifetime, so background dispatches and
+   * `setup()`-started loops can resolve secrets. Deregistered on stop.
+   */
+  runContextRegistry?: PluginRunContextRegistry;
 }
 
 /**
@@ -2200,8 +2661,33 @@ export function createPluginWorkerManager(
         );
       }
 
-      const handle = createPluginWorkerHandle(pluginId, options);
+      const handle = createPluginWorkerHandle(pluginId, options, {
+        runContextRegistry: managerOptions?.runContextRegistry,
+      });
       workers.set(pluginId, handle);
+
+      // SECURITY-CRITICAL: register the worker-lifetime service run-context so background
+      // dispatches / setup() loops can resolve secrets (system actor). Stable
+      // across crash/auto-restart of this handle; removed on stop. The runId is
+      // host-minted — it grants no company scope (company is derived from the
+      // operator-created secret binding at resolve time).
+      // Observability: make the registration (and any missing-registry
+      // misconfiguration) visible. A `registryWired: false` line here means the
+      // manager was built without a registry, so service run-contexts will not
+      // be resolvable by the secrets handler (a wiring bug).
+      const registry = managerOptions?.runContextRegistry;
+      if (registry) {
+        registry.registerService(pluginId, handle.serviceRunId);
+        log.info(
+          { pluginId, serviceRunId: handle.serviceRunId, registryWired: true },
+          "registered worker-lifetime service run-context",
+        );
+      } else {
+        log.warn(
+          { pluginId, serviceRunId: handle.serviceRunId, registryWired: false },
+          "no run-context registry wired into worker manager; service/setup() secret resolves will fail",
+        );
+      }
 
       // Subscribe to crash/ready events for live event forwarding
       if (managerOptions?.onWorkerEvent) {
@@ -2247,6 +2733,11 @@ export function createPluginWorkerManager(
 
       log.info({ pluginId }, "stopping plugin worker");
       await handle.stop();
+      managerOptions?.runContextRegistry?.deregister(pluginId, handle.serviceRunId);
+      // SECURITY-CRITICAL: the service runId is TTL-exempt in the redaction map,
+      // so without this its resolved plaintext would linger for the process
+      // lifetime (lazy prune only). Clear it on stop.
+      clearRunSecretValues(handle.serviceRunId);
       workers.delete(pluginId);
     },
 
@@ -2268,6 +2759,8 @@ export function createPluginWorkerManager(
       const promises = Array.from(workers.values()).map(async (handle) => {
         try {
           await handle.stop();
+          managerOptions?.runContextRegistry?.deregister(handle.pluginId, handle.serviceRunId);
+          clearRunSecretValues(handle.serviceRunId);
         } catch (err) {
           log.error(
             {

@@ -52,6 +52,9 @@ importers:
       '@clack/prompts':
         specifier: ^0.11.0
         version: 0.11.0
+      '@paperclipai/adapter-acpx-local':
+        specifier: workspace:*
+        version: link:../packages/adapters/acpx-local
       '@paperclipai/adapter-claude-local':
         specifier: workspace:*
         version: link:../packages/adapters/claude-local
@@ -131,6 +134,31 @@ importers:
     devDependencies:
       '@types/node':
         specifier: ^22.20.1
+        version: 22.20.1
+      typescript:
+        specifier: ^5.7.3
+        version: 5.9.3
+
+  packages/adapters/acpx-local:
+    dependencies:
+      '@agentclientprotocol/claude-agent-acp':
+        specifier: ^0.52.0
+        version: 0.52.0(@anthropic-ai/sdk@0.81.0(zod@4.4.3))(@modelcontextprotocol/sdk@1.30.0(zod@4.4.3))
+      '@paperclipai/adapter-utils':
+        specifier: workspace:*
+        version: link:../../adapter-utils
+      '@zed-industries/codex-acp':
+        specifier: ^0.12.0
+        version: 0.12.0
+      acpx:
+        specifier: ^0.11.2
+        version: 0.11.2
+      picocolors:
+        specifier: ^1.1.1
+        version: 1.1.1
+    devDependencies:
+      '@types/node':
+        specifier: ^22.19.21
         version: 22.20.1
       typescript:
         specifier: ^5.7.3
@@ -740,6 +768,9 @@ importers:
       '@opentelemetry/api':
         specifier: ^1.9.0
         version: 1.9.1
+      '@paperclipai/adapter-acpx-local':
+        specifier: workspace:*
+        version: link:../packages/adapters/acpx-local
       '@paperclipai/adapter-claude-local':
         specifier: workspace:*
         version: link:../packages/adapters/claude-local
@@ -912,6 +943,9 @@ importers:
       '@mdxeditor/editor':
         specifier: ^3.55.0
         version: 3.55.0(@codemirror/language@6.12.4)(@lezer/highlight@1.2.3)(@types/react-dom@19.2.3(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)(typescript@5.9.3)(yjs@13.6.29)
+      '@paperclipai/adapter-acpx-local':
+        specifier: workspace:*
+        version: link:../packages/adapters/acpx-local
       '@paperclipai/adapter-claude-local':
         specifier: workspace:*
         version: link:../packages/adapters/claude-local
@@ -1060,6 +1094,11 @@ packages:
   '@adobe/css-tools@4.5.0':
     resolution: {integrity: sha512-6OzddxPio9UiWTCemp4N8cYLV2ZN1ncRnV1cVGtve7dhPOtRkleRyx32GQCYSwDYgaHU3USMm84tNsvKzRCa1Q==}
 
+  '@agentclientprotocol/claude-agent-acp@0.52.0':
+    resolution: {integrity: sha512-IvbKJ8EBaamuXtYB5RSD/PEk2Mz5XczQrfo90wG2iOjhko3o7HOSueysCTyCvPZn+px6Kbuot8TLIvTad2J2zw==}
+    engines: {node: '>=22'}
+    hasBin: true
+
   '@agentclientprotocol/claude-agent-acp@0.66.0':
     resolution: {integrity: sha512-BwalxKsxZzHZGEs+X9hV3biErLE7PHWoao2hmyP3QBWXxvMHbc1F1tzDE95ZA47Fle+KBYf2gKpgy1MJ+ZmVlw==}
     engines: {node: '>=22'}
@@ -1068,6 +1107,16 @@ packages:
   '@agentclientprotocol/codex-acp@1.1.7':
     resolution: {integrity: sha512-bhFLbGtOMEw6+PAp33vNERb6dXlULOfV3mWbRdps4v7sY7PHha/C2T1dnlG0yVcvBu9W+NYPzL0CAupnVoFTiQ==}
     hasBin: true
+
+  '@agentclientprotocol/sdk@0.28.1':
+    resolution: {integrity: sha512-Z2Frs6YtPhnZZ+XwFXyQkRDXY0fn8FjCalEs0W4yUhQnY4TztmNq0/RnfzWdFN3vqT3h0jTz5klzYbZHGxCDyQ==}
+    peerDependencies:
+      zod: ^3.25.0 || ^4.0.0
+
+  '@agentclientprotocol/sdk@1.0.0':
+    resolution: {integrity: sha512-5FHgLbLZhSAq9F+9SU7AOCXTDzaw/IYx/AvMjrZDs/YFZ9ZPxkdn9ti3fSkny0huHfj2hrqF6pqdns9gN5/Fig==}
+    peerDependencies:
+      zod: ^3.25.0 || ^4.0.0
 
   '@agentclientprotocol/sdk@1.2.1':
     resolution: {integrity: sha512-jwYUdOQR7tc+Zfch53VL4JJyUNK/46q03uUTYb+PjECsmnNl94XFXOfYLJ8RBpMNidXd1rpOAVgb0vqD98xImA==}
@@ -1082,9 +1131,19 @@ packages:
   '@antfu/install-pkg@1.1.0':
     resolution: {integrity: sha512-MGQsmw10ZyI+EJo45CdSER4zEb+p31LpDAFp2Z3gkSd1yqVZGi0Ebx++YTEMonJy4oChEMLsxZ64j8FH6sSqtQ==}
 
+  '@anthropic-ai/claude-agent-sdk-darwin-arm64@0.3.191':
+    resolution: {integrity: sha512-rmpi5ONfuuw7oXdzyr9QJB5sK9Rr1MmdOUsiGutVFpcAqqSXpVYLmMvfaarmXvItgfwgGprzrGDfcAeAQHSUGw==}
+    cpu: [arm64]
+    os: [darwin]
+
   '@anthropic-ai/claude-agent-sdk-darwin-arm64@0.3.220':
     resolution: {integrity: sha512-7VxlbEosK7DODiOnsjoVd0DSJzbnaPrM2jelMHI0y8zx1UnLS3WC6EFUXbvy74F2sXqEznh2tzn7EKWInaRN6Q==}
     cpu: [arm64]
+    os: [darwin]
+
+  '@anthropic-ai/claude-agent-sdk-darwin-x64@0.3.191':
+    resolution: {integrity: sha512-b/4pfSFTC2gkc0RoGSJ5B3DWo77qZFMi2hRlx8kwaRDiefeIOnbJu42gDBrs4F8nSJJug77HM9AsG6XHXvt5Fg==}
+    cpu: [x64]
     os: [darwin]
 
   '@anthropic-ai/claude-agent-sdk-darwin-x64@0.3.220':
@@ -1092,8 +1151,18 @@ packages:
     cpu: [x64]
     os: [darwin]
 
+  '@anthropic-ai/claude-agent-sdk-linux-arm64-musl@0.3.191':
+    resolution: {integrity: sha512-+Gg7lKwYDr8uiA37EBMYI63if+YGdbrFt2tcRFBB4IhdVf5r1IkKwQ8rEYV6Y0nqGTKoXLh3bRc5QWOe5JwgbQ==}
+    cpu: [arm64]
+    os: [linux]
+
   '@anthropic-ai/claude-agent-sdk-linux-arm64-musl@0.3.220':
     resolution: {integrity: sha512-OHoZOZ8Cf2TBr6oXIXPwyvUxj9jrq2w8E4poA8dMpacXszcPSPiCQCMuuOh4aWJzfeJE1+TtWxhKMVb2csXyZQ==}
+    cpu: [arm64]
+    os: [linux]
+
+  '@anthropic-ai/claude-agent-sdk-linux-arm64@0.3.191':
+    resolution: {integrity: sha512-vm526e3InpItmh+Ua8a49eGTpFJvZTYLURX9ppKrtFb+Wo7rOgoXmK/Hzf/crEU7h72xtaD7PIOXm4P+psxO3w==}
     cpu: [arm64]
     os: [linux]
 
@@ -1102,8 +1171,18 @@ packages:
     cpu: [arm64]
     os: [linux]
 
+  '@anthropic-ai/claude-agent-sdk-linux-x64-musl@0.3.191':
+    resolution: {integrity: sha512-tUwwIXpPBrzJge3E4SQJQX8PuC+lxPb5xQBmyLsWxyjttlgpFpTG/jWPVQO5qH0HgYaEJS5JALHFiYcXwVrEkg==}
+    cpu: [x64]
+    os: [linux]
+
   '@anthropic-ai/claude-agent-sdk-linux-x64-musl@0.3.220':
     resolution: {integrity: sha512-K+FWj+LcGhC1Z7wqeWoLxm1iemcba5xKpLLFVwYm4V6HyMx3ruYd/2r2TiQtjT+JWeNFWIys0ScHiItR6vWAiA==}
+    cpu: [x64]
+    os: [linux]
+
+  '@anthropic-ai/claude-agent-sdk-linux-x64@0.3.191':
+    resolution: {integrity: sha512-wj43/l0Behb4UWYt6Lomq2W7jhmuU7ARsEP0el6gLGCR348PDeqLGcB4dMOcYMGRZv8TYKfnhDwJnX4pJBT1vQ==}
     cpu: [x64]
     os: [linux]
 
@@ -1112,15 +1191,33 @@ packages:
     cpu: [x64]
     os: [linux]
 
+  '@anthropic-ai/claude-agent-sdk-win32-arm64@0.3.191':
+    resolution: {integrity: sha512-J8aTOi7n6AM7tHFlKt6hlJ4rue0TbY2glqcI2r6K3iK7Fmzvt9zfg00+l8fWKOais4K+8jqJCC4WSCUlz6+tKQ==}
+    cpu: [arm64]
+    os: [win32]
+
   '@anthropic-ai/claude-agent-sdk-win32-arm64@0.3.220':
     resolution: {integrity: sha512-rIwgq0UwQExWl6KrHUyC4w5KwpL9l6nd95aUTx6RitexaAuEw//xtfTVLnuE4hDDQZFkzEwpdKc3nxDWoGcUbA==}
     cpu: [arm64]
+    os: [win32]
+
+  '@anthropic-ai/claude-agent-sdk-win32-x64@0.3.191':
+    resolution: {integrity: sha512-1rYlPuM9PS37IPCE/sAG7A7oCrWnIb0J7EY6eQBdImdXHEjwBngZ3E8KbtEM79fUTA3C810LqrnFpjOmNExLMA==}
+    cpu: [x64]
     os: [win32]
 
   '@anthropic-ai/claude-agent-sdk-win32-x64@0.3.220':
     resolution: {integrity: sha512-MuOuXhbr66HlGaWXD2f3w0k2PsvmnbkwcUZ0dAe2poFLdl72GC2dapwwOBefxm9QmoNqk9+jmv/dSKGOVWyvLw==}
     cpu: [x64]
     os: [win32]
+
+  '@anthropic-ai/claude-agent-sdk@0.3.191':
+    resolution: {integrity: sha512-DM9oYbt+WAb/CiD8l/CO6akqPKfyZ4sL1e+lP2O2eS9IR0f58sf90xWeji7V+/zfnIp+jyH3hJ3V6r7odCdB8g==}
+    engines: {node: '>=18.0.0'}
+    peerDependencies:
+      '@anthropic-ai/sdk': '>=0.93.0'
+      '@modelcontextprotocol/sdk': ^1.29.0
+      zod: ^4.0.0
 
   '@anthropic-ai/claude-agent-sdk@0.3.220':
     resolution: {integrity: sha512-glc7SdwPkOkLw8oxwLo9PKTdLJGqW/PIR4urWXFoRtX9YllwozsEVc5Tc1+EvLSkfrsxPJqQWqOgpjUOQXf1oA==}
@@ -5238,6 +5335,53 @@ packages:
   '@xterm/xterm@6.0.0':
     resolution: {integrity: sha512-TQwDdQGtwwDt+2cgKDLn0IRaSxYu1tSUjgKarSDkUM0ZNiSRXFpjxEsvc/Zgc5kq5omJ+V0a8/kIM2WD3sMOYg==}
 
+  '@zed-industries/codex-acp-darwin-arm64@0.12.0':
+    resolution: {integrity: sha512-RvTXH21sLpswEo8xLeQXcA/uWZauyNP1y+WI6b355+/o7sQ5wrvBkxt+NyhaJXJIQvbfdpl04LND4cmM+DTcNg==}
+    cpu: [arm64]
+    os: [darwin]
+    deprecated: This package has been replaced by @agentclientprotocol/codex-acp. Please migrate to continue receiving updates.
+    hasBin: true
+
+  '@zed-industries/codex-acp-darwin-x64@0.12.0':
+    resolution: {integrity: sha512-N7EhrUTioix3L21qnm6kZzAESc+B7Mac+/uW3khn/UQe7fJJ7u1ojbgMPDdGo/8Xm6HBBXgak2NOj7mJ+NNXSw==}
+    cpu: [x64]
+    os: [darwin]
+    deprecated: This package has been replaced by @agentclientprotocol/codex-acp. Please migrate to continue receiving updates.
+    hasBin: true
+
+  '@zed-industries/codex-acp-linux-arm64@0.12.0':
+    resolution: {integrity: sha512-Kq35FclgZiSMBKyf80PnCvvJ3xfMjZIkPJXpci35U/VqXVQelhHCwYWwA3waTxvW07tNHxsehv1eQICz7wZdVQ==}
+    cpu: [arm64]
+    os: [linux]
+    deprecated: This package has been replaced by @agentclientprotocol/codex-acp. Please migrate to continue receiving updates.
+    hasBin: true
+
+  '@zed-industries/codex-acp-linux-x64@0.12.0':
+    resolution: {integrity: sha512-twmX9noSqfgWgVkGG1dd9u20Pxp8vNRXggvJ61RQSrNYITGuqHil2F3ViYICZoXyr9w1gok28bWG5DU2d9adPg==}
+    cpu: [x64]
+    os: [linux]
+    deprecated: This package has been replaced by @agentclientprotocol/codex-acp. Please migrate to continue receiving updates.
+    hasBin: true
+
+  '@zed-industries/codex-acp-win32-arm64@0.12.0':
+    resolution: {integrity: sha512-VoFsTIrQopO917x2EpxYXm3jTIoSknCbzP76FwX9uOThlRms+M+fHWJ4kJttOPpeofz1ulAS3vPVMQ3WNlvnhw==}
+    cpu: [arm64]
+    os: [win32]
+    deprecated: This package has been replaced by @agentclientprotocol/codex-acp. Please migrate to continue receiving updates.
+    hasBin: true
+
+  '@zed-industries/codex-acp-win32-x64@0.12.0':
+    resolution: {integrity: sha512-HImgXGIYgW6Wxr3rylrHS7Dzs35zvcQQB7eqAEWZ2Lj+3AxP/7TViW9KkjS+PTPnVWqpTkz0hYDQhk63Ruw3JA==}
+    cpu: [x64]
+    os: [win32]
+    deprecated: This package has been replaced by @agentclientprotocol/codex-acp. Please migrate to continue receiving updates.
+    hasBin: true
+
+  '@zed-industries/codex-acp@0.12.0':
+    resolution: {integrity: sha512-0d7gRzOiYTgDmIyh783mCcq50h3mdOg/TtKdLfBIghOLushpQRwhuLjKK8Q9hxZfNlPL0Ua56DoPjnsW8amf8g==}
+    deprecated: This package has been replaced by @agentclientprotocol/codex-acp. Please migrate to continue receiving updates.
+    hasBin: true
+
   abbrev@1.1.1:
     resolution: {integrity: sha512-nne9/IiQ/hzIhY6pdDnbBtz7DjPTKrY00P/zvPSm5pOFkl6xuGrGnXn/VtTNNfNtAfZ9/1RtehkszU9qcTii0Q==}
 
@@ -5253,6 +5397,11 @@ packages:
   acorn@8.17.0:
     resolution: {integrity: sha512-xRQbDb9BnwDafYNn6Vwl839DYVjqXYb1XVGtWAZ1kcDc6iwAL4hg3B1dZlRiuENFeO2H53gFG3in621AdERVAg==}
     engines: {node: '>=0.4.0'}
+    hasBin: true
+
+  acpx@0.11.2:
+    resolution: {integrity: sha512-ksTmfJDVqUAJJXsNDamEno03AMZ/aAZzXk/h5nt61VsLc/jcpoDMfCVpErzuYNJjwCd0V6Zm5o6F8OoqxsjQWA==}
+    engines: {node: '>=22.13.0'}
     hasBin: true
 
   acpx@0.12.0:
@@ -8695,6 +8844,15 @@ snapshots:
 
   '@adobe/css-tools@4.5.0': {}
 
+  '@agentclientprotocol/claude-agent-acp@0.52.0(@anthropic-ai/sdk@0.81.0(zod@4.4.3))(@modelcontextprotocol/sdk@1.30.0(zod@4.4.3))':
+    dependencies:
+      '@agentclientprotocol/sdk': 1.0.0(zod@3.25.76)
+      '@anthropic-ai/claude-agent-sdk': 0.3.191(@anthropic-ai/sdk@0.81.0(zod@4.4.3))(@modelcontextprotocol/sdk@1.30.0(zod@4.4.3))(zod@3.25.76)
+      zod: 3.25.76
+    transitivePeerDependencies:
+      - '@anthropic-ai/sdk'
+      - '@modelcontextprotocol/sdk'
+
   '@agentclientprotocol/claude-agent-acp@0.66.0(@anthropic-ai/sdk@0.81.0(zod@3.25.76))(@modelcontextprotocol/sdk@1.30.0(zod@3.25.76))':
     dependencies:
       '@agentclientprotocol/sdk': 1.3.0(zod@3.25.76)
@@ -8713,6 +8871,14 @@ snapshots:
       vscode-jsonrpc: 9.0.1
       zod: 4.4.3
 
+  '@agentclientprotocol/sdk@0.28.1(zod@4.4.3)':
+    dependencies:
+      zod: 4.4.3
+
+  '@agentclientprotocol/sdk@1.0.0(zod@3.25.76)':
+    dependencies:
+      zod: 3.25.76
+
   '@agentclientprotocol/sdk@1.2.1(zod@4.4.3)':
     dependencies:
       zod: 4.4.3
@@ -8730,29 +8896,68 @@ snapshots:
       package-manager-detector: 1.8.0
       tinyexec: 1.3.0
 
+  '@anthropic-ai/claude-agent-sdk-darwin-arm64@0.3.191':
+    optional: true
+
   '@anthropic-ai/claude-agent-sdk-darwin-arm64@0.3.220':
+    optional: true
+
+  '@anthropic-ai/claude-agent-sdk-darwin-x64@0.3.191':
     optional: true
 
   '@anthropic-ai/claude-agent-sdk-darwin-x64@0.3.220':
     optional: true
 
+  '@anthropic-ai/claude-agent-sdk-linux-arm64-musl@0.3.191':
+    optional: true
+
   '@anthropic-ai/claude-agent-sdk-linux-arm64-musl@0.3.220':
+    optional: true
+
+  '@anthropic-ai/claude-agent-sdk-linux-arm64@0.3.191':
     optional: true
 
   '@anthropic-ai/claude-agent-sdk-linux-arm64@0.3.220':
     optional: true
 
+  '@anthropic-ai/claude-agent-sdk-linux-x64-musl@0.3.191':
+    optional: true
+
   '@anthropic-ai/claude-agent-sdk-linux-x64-musl@0.3.220':
+    optional: true
+
+  '@anthropic-ai/claude-agent-sdk-linux-x64@0.3.191':
     optional: true
 
   '@anthropic-ai/claude-agent-sdk-linux-x64@0.3.220':
     optional: true
 
+  '@anthropic-ai/claude-agent-sdk-win32-arm64@0.3.191':
+    optional: true
+
   '@anthropic-ai/claude-agent-sdk-win32-arm64@0.3.220':
+    optional: true
+
+  '@anthropic-ai/claude-agent-sdk-win32-x64@0.3.191':
     optional: true
 
   '@anthropic-ai/claude-agent-sdk-win32-x64@0.3.220':
     optional: true
+
+  '@anthropic-ai/claude-agent-sdk@0.3.191(@anthropic-ai/sdk@0.81.0(zod@4.4.3))(@modelcontextprotocol/sdk@1.30.0(zod@4.4.3))(zod@3.25.76)':
+    dependencies:
+      '@anthropic-ai/sdk': 0.81.0(zod@4.4.3)
+      '@modelcontextprotocol/sdk': 1.30.0(zod@4.4.3)
+      zod: 3.25.76
+    optionalDependencies:
+      '@anthropic-ai/claude-agent-sdk-darwin-arm64': 0.3.191
+      '@anthropic-ai/claude-agent-sdk-darwin-x64': 0.3.191
+      '@anthropic-ai/claude-agent-sdk-linux-arm64': 0.3.191
+      '@anthropic-ai/claude-agent-sdk-linux-arm64-musl': 0.3.191
+      '@anthropic-ai/claude-agent-sdk-linux-x64': 0.3.191
+      '@anthropic-ai/claude-agent-sdk-linux-x64-musl': 0.3.191
+      '@anthropic-ai/claude-agent-sdk-win32-arm64': 0.3.191
+      '@anthropic-ai/claude-agent-sdk-win32-x64': 0.3.191
 
   '@anthropic-ai/claude-agent-sdk@0.3.220(@anthropic-ai/sdk@0.81.0(zod@3.25.76))(@modelcontextprotocol/sdk@1.30.0(zod@3.25.76))(zod@3.25.76)':
     dependencies:
@@ -8774,6 +8979,12 @@ snapshots:
       json-schema-to-ts: 3.1.1
     optionalDependencies:
       zod: 3.25.76
+
+  '@anthropic-ai/sdk@0.81.0(zod@4.4.3)':
+    dependencies:
+      json-schema-to-ts: 3.1.1
+    optionalDependencies:
+      zod: 4.4.3
 
   '@asamuzakjp/css-color@5.0.1':
     dependencies:
@@ -10743,6 +10954,28 @@ snapshots:
       raw-body: 3.0.2
       zod: 3.25.76
       zod-to-json-schema: 3.25.2(zod@3.25.76)
+    transitivePeerDependencies:
+      - supports-color
+
+  '@modelcontextprotocol/sdk@1.30.0(zod@4.4.3)':
+    dependencies:
+      '@hono/node-server': 2.1.0(hono@4.13.2)
+      ajv: 8.20.0
+      ajv-formats: 3.0.1(ajv@8.20.0)
+      content-type: 1.0.5
+      cors: 2.8.6
+      cross-spawn: 7.0.6
+      eventsource: 3.0.7
+      eventsource-parser: 3.1.1
+      express: 5.2.1
+      express-rate-limit: 8.6.2(express@5.2.1)
+      hono: 4.13.2
+      jose: 6.2.8
+      json-schema-typed: 8.0.2
+      pkce-challenge: 5.0.1
+      raw-body: 3.0.2
+      zod: 4.4.3
+      zod-to-json-schema: 3.25.2(zod@4.4.3)
     transitivePeerDependencies:
       - supports-color
 
@@ -12986,6 +13219,33 @@ snapshots:
 
   '@xterm/xterm@6.0.0': {}
 
+  '@zed-industries/codex-acp-darwin-arm64@0.12.0':
+    optional: true
+
+  '@zed-industries/codex-acp-darwin-x64@0.12.0':
+    optional: true
+
+  '@zed-industries/codex-acp-linux-arm64@0.12.0':
+    optional: true
+
+  '@zed-industries/codex-acp-linux-x64@0.12.0':
+    optional: true
+
+  '@zed-industries/codex-acp-win32-arm64@0.12.0':
+    optional: true
+
+  '@zed-industries/codex-acp-win32-x64@0.12.0':
+    optional: true
+
+  '@zed-industries/codex-acp@0.12.0':
+    optionalDependencies:
+      '@zed-industries/codex-acp-darwin-arm64': 0.12.0
+      '@zed-industries/codex-acp-darwin-x64': 0.12.0
+      '@zed-industries/codex-acp-linux-arm64': 0.12.0
+      '@zed-industries/codex-acp-linux-x64': 0.12.0
+      '@zed-industries/codex-acp-win32-arm64': 0.12.0
+      '@zed-industries/codex-acp-win32-x64': 0.12.0
+
   abbrev@1.1.1:
     optional: true
 
@@ -12999,6 +13259,18 @@ snapshots:
       acorn: 8.17.0
 
   acorn@8.17.0: {}
+
+  acpx@0.11.2:
+    dependencies:
+      '@agentclientprotocol/sdk': 0.28.1(zod@4.4.3)
+      commander: 15.0.0
+      skillflag: 0.2.0
+      tsx: 4.23.1
+      zod: 4.4.3
+    transitivePeerDependencies:
+      - bare-abort-controller
+      - bare-buffer
+      - react-native-b4a
 
   acpx@0.12.0(patch_hash=x3fethhotv43zektyl5prdwf54):
     dependencies:
@@ -17074,6 +17346,10 @@ snapshots:
   zod-to-json-schema@3.25.2(zod@3.25.76):
     dependencies:
       zod: 3.25.76
+
+  zod-to-json-schema@3.25.2(zod@4.4.3):
+    dependencies:
+      zod: 4.4.3
 
   zod@3.25.76: {}
 

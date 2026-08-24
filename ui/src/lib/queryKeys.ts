@@ -405,6 +405,7 @@ export const queryKeys = {
     myUserSecrets: (companyId: string) => ["my-user-secrets", companyId] as const,
     proposals: (companyId: string, status: string = "pending") =>
       ["secret-proposals", companyId, status] as const,
+    egressBindings: (companyId: string) => ["secret-egress-bindings", companyId] as const,
   },
   companySearch: {
     search: (companyId: string, q: string, scope: string, limit: number, offset: number) =>

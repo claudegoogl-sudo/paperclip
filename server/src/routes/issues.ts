@@ -55,6 +55,7 @@ import {
   issueDocumentKeySchema,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   ISSUE_WATCHDOG_DISCOVERY_KINDS,
+  OPERATOR_DELIVER_MARKER,
   TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND,
   ONBOARDING_FIRST_TASK_ORIGIN_KIND,
   rejectIssueThreadInteractionSchema,
@@ -133,6 +134,7 @@ import {
   documentAnnotationService,
   logActivity,
   publishActivity,
+  projectInteractionForPluginEvent,
   projectService,
   routineService,
   workProductService,
@@ -152,6 +154,8 @@ import {
 } from "../services/task-watchdog-scope.js";
 import type { TaskWatchdogServiceDeps, taskWatchdogService } from "../services/task-watchdogs.js";
 import { logger } from "../middleware/logger.js";
+import { firstSecretMatch } from "../secret-patterns.js";
+import { retryOnTransientPgError } from "../services/pg-retry.js";
 import { badRequest, conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
 import { privateJsonEtag } from "../middleware/private-json-etag.js";
 import { createRequestPromiseMemo } from "../lib/request-promise-memo.js";
@@ -4960,6 +4964,54 @@ export function issueRoutes(
     return false;
   }
 
+  /**
+   * SECURITY-CRITICAL: Pre-submit secret-pattern denylist (locked spec). Scans
+   * the named write-side fields against the shared pattern set
+   * (../secret-patterns.js — the same module the HTTP logger redactor uses, so
+   * the two cannot drift). On a hit it BLOCKS the write with a structured 422
+   * naming the matched pattern class and the offending field — it does NOT
+   * silently strip, and it never echoes the matched value back. An
+   * operator-facing log line is emitted carrying only the class label + actor
+   * + issue id (no token bytes). JWT/`PAPERCLIP_API_KEY` overlap is handled
+   * inside the shared matcher via Option A (allow `iss=paperclip`).
+   */
+  function assertNoSecretPatternInWritePayload(
+    req: Request,
+    res: Response,
+    fields: Array<{ name: string; value: unknown }>,
+    context: { issueId?: string | null; companyId?: string | null },
+  ): boolean {
+    for (const field of fields) {
+      const match = firstSecretMatch(field.value);
+      if (!match) continue;
+      const actor = getActorInfo(req);
+      logger.warn(
+        {
+          event: "secret_pattern_blocked",
+          blockedPattern: match.label,
+          surface: field.name,
+          actorType: actor.actorType,
+          agentId: actor.agentId,
+          issueId: context.issueId ?? null,
+          companyId: context.companyId ?? null,
+        },
+        `Blocked write containing secret pattern (${match.label}) in field "${field.name}"`,
+      );
+      res.status(422).json({
+        error:
+          `Request field "${field.name}" matches a blocked secret pattern (${match.label}). ` +
+          `Remove or redact the secret and resubmit — the value was not stored.`,
+        blockedPattern: match.label,
+        surface: field.name,
+        details: {
+          securityPrinciples: ["Secure Defaults", "Fail Closed"],
+        },
+      });
+      return false;
+    }
+    return true;
+  }
+
   async function assertExplicitResumeIntentAllowed(
     req: Request,
     res: Response,
@@ -6171,7 +6223,7 @@ export function issueRoutes(
         svc.listReviewAttention(issue.companyId, [issue]).then((map) => map.get(issue.id) ?? null),
         svc.listProductivityReviews(issue.companyId, [issue.id]).then((map) => map.get(issue.id) ?? null),
         svc.getCurrentScheduledRetry(issue.id),
-        svc.listAttachments(issue.id),
+        svc.listAttachments(issue.id, issue.companyId),
         documentsSvc.getIssueDocumentByKey(issue.id, ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY),
         currentExecutionWorkspacePromise,
         recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id),
@@ -8055,6 +8107,10 @@ export function issueRoutes(
   router.post("/companies/:companyId/issues", applyCreateIssueStatusDefault, validate(createIssueSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    if (!assertNoSecretPatternInWritePayload(req, res, [
+      { name: "title", value: req.body.title },
+      { name: "description", value: req.body.description },
+    ], { companyId })) return;
     if (isSkillTestScopedActor(req)) {
       res.status(403).json({
         error: "Skill-test run tokens cannot create issues.",
@@ -8942,8 +8998,19 @@ export function issueRoutes(
 
   router.patch("/issues/:id", validate(updateIssueRouteSchema), async (req, res) => {
     const id = req.params.id as string;
+    // Defensively back-fill any orphan `checkoutRunId` / `executionRunId`
+    // pointing at a terminal heartbeat_runs row before authorization runs. Converts
+    // the partial-checkout state into a clean state so the mutation either succeeds
+    // (assignee re-checks-out cleanly on next call) or returns a structured 4xx
+    // instead of 5xx-ing on the orphan.
+    await svc.clearOrphanCheckoutLocksIfTerminal(id);
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
+    if (!assertNoSecretPatternInWritePayload(req, res, [
+      { name: "description", value: req.body.description },
+      { name: "comment", value: req.body.comment },
+      { name: "title", value: req.body.title },
+    ], { issueId: existing.id, companyId: existing.companyId })) return;
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
     if (req.actor.type === "agent" && req.body.onBehalfOfUserId != null) {
       await auditAgentIssueCommentAttributionSpoof({
@@ -9523,8 +9590,14 @@ export function issueRoutes(
       || persistReviewActivityTransactionally
       || reviewPolicySensitiveMutationRequested;
     try {
-      if (shouldUseTransactionalIssueUpdate) {
-        issue = await db.transaction(async (tx) => {
+      // The issue PATCH path contends with concurrent heartbeat-run
+      // mutations (claim/release/cancel) on overlapping rows. Postgres
+      // occasionally aborts one transaction with deadlock 40P01; retry it from
+      // the app since the rollback leaves no partial state.
+      issue = await retryOnTransientPgError(
+        async () => {
+        if (shouldUseTransactionalIssueUpdate) {
+          return db.transaction(async (tx) => {
           if (
             reviewPolicySensitiveMutationRequested
             && !(await assertLockedReviewPolicyAllowsMutation(tx))
@@ -9554,10 +9627,12 @@ export function issueRoutes(
           await persistReviewTransitionActivity(tx, updated);
 
           return updated;
-        });
-      } else {
-        issue = await updateIssue();
-      }
+          });
+        }
+        return updateIssue();
+        },
+        { label: "patch_issue" },
+      );
     } catch (err) {
       if (err instanceof HttpError && err.status === 422) {
         logger.warn(
@@ -10500,7 +10575,7 @@ export function issueRoutes(
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
-    const attachments = await svc.listAttachments(id);
+    const attachments = await svc.listAttachments(id, existing.companyId);
 
     const issue = await svc.remove(id);
     if (!issue) {
@@ -10535,6 +10610,8 @@ export function issueRoutes(
 
   router.post("/issues/:id/checkout", validate(checkoutIssueSchema), async (req, res) => {
     const id = req.params.id as string;
+    // See PATCH route — back-fill orphan-checkout state up front.
+    await svc.clearOrphanCheckoutLocksIfTerminal(id);
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!issue) return;
 
@@ -10661,6 +10738,8 @@ export function issueRoutes(
 
   router.post("/issues/:id/release", async (req, res) => {
     const id = req.params.id as string;
+    // See PATCH route — back-fill orphan-checkout state up front.
+    await svc.clearOrphanCheckoutLocksIfTerminal(id);
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
@@ -11379,6 +11458,77 @@ export function issueRoutes(
     },
   );
 
+  // Agent self-service supersede of an interaction it AUTHORED.
+  // Unlike the board-only accept/reject/cancel routes above, an agent may retire
+  // a pending interaction here IFF createdByAgentId === caller (least-privilege:
+  // author-only, never blanket resolution authority). Board actors keep full
+  // authority. Terminal state is "expired" (no continuation wake).
+  router.post(
+    "/issues/:id/interactions/:interactionId/supersede",
+    validate(cancelIssueThreadInteractionSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const interactionId = req.params.interactionId as string;
+      const issue = await svc.getById(id);
+      if (!issue) {
+        res.status(404).json({ error: "Issue not found" });
+        return;
+      }
+      assertCompanyAccess(req, issue.companyId);
+
+      const interactionSvc = issueThreadInteractionService(db);
+      if (req.actor.type === "agent") {
+        if (
+          req.actor.runId
+          && !(await assertTaskWatchdogIssueMutationAllowed(req, res, issue, { allowWatchdogIssue: false }))
+        ) {
+          return;
+        }
+        const existing = await interactionSvc.getById(interactionId);
+        if (!existing || existing.companyId !== issue.companyId || existing.issueId !== issue.id) {
+          res.status(404).json({ error: "Interaction not found" });
+          return;
+        }
+        if (existing.createdByAgentId !== req.actor.agentId) {
+          res.status(403).json({ error: "Agents can only supersede interactions they authored" });
+          return;
+        }
+      } else {
+        assertBoard(req);
+      }
+
+      const actor = getActorInfo(req);
+      const interaction = await interactionSvc.supersedeInteractionById(
+        issue,
+        interactionId,
+        { reason: req.body?.reason ?? null },
+        {
+          agentId: actor.agentId,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        },
+      );
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.thread_interaction_superseded",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          interactionId: interaction.id,
+          interactionKind: interaction.kind,
+          interactionStatus: interaction.status,
+          supersededByActorType: actor.actorType,
+        },
+      });
+
+      res.json(interaction);
+    },
+  );
+
   router.get("/issues/:id/comments/:commentId", async (req, res) => {
     const id = req.params.id as string;
     const commentId = req.params.commentId as string;
@@ -11615,6 +11765,8 @@ export function issueRoutes(
 
   router.post("/issues/:id/comments", validate(addIssueCommentSchema), async (req, res) => {
     const id = req.params.id as string;
+    // See PATCH route — back-fill orphan-checkout state up front.
+    await svc.clearOrphanCheckoutLocksIfTerminal(id);
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!issue) return;
     if (req.actor.type === "agent" && req.body.onBehalfOfUserId != null) {
@@ -11628,6 +11780,9 @@ export function issueRoutes(
       await denyIssueWrite(req, res, issue, "issue_write_attribution_spoof_rejected");
       return;
     }
+    if (!assertNoSecretPatternInWritePayload(req, res, [
+      { name: "body", value: req.body.body },
+    ], { issueId: issue.id, companyId: issue.companyId })) return;
     const commentAccessDecision = await assertAgentIssueCommentAllowed(req, res, issue);
     if (!commentAccessDecision) return;
     const commentAuthorizationReason = issueWriteAuthorizationReason(req, commentAccessDecision);
@@ -11638,6 +11793,25 @@ export function issueRoutes(
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(issue);
 
     const actor = getActorInfo(req);
+    // Guard A: reject operator-delivery comments that are not agent-authored.
+    // The messenger relay only forwards agent-authored comments to the operator;
+    // a host/board/user-token marked comment is silently dropped by the relay yet
+    // still persisted, so the thread looks delivered while nobody was paged.
+    // Reject at write time (before any persistence or wake) so the sender is
+    // forced onto the agent-token path, which both relays correctly and (via the
+    // wake fan-out guard below) does not echo. Keyed off the leading marker prefix
+    // on the trimmed body, matching the documented placement on the first line.
+    if (
+      typeof req.body.body === "string" &&
+      req.body.body.trimStart().startsWith(OPERATOR_DELIVER_MARKER) &&
+      actor.actorType !== "agent"
+    ) {
+      res.status(422).json({
+        error:
+          `Operator-delivery comments (body beginning with "${OPERATOR_DELIVER_MARKER}") must be authored by an agent token. ` +
+          "The messenger relay only forwards agent-authored comments to the operator; host/board/user-token deliveries are dropped by the relay and would never reach the operator. Post this comment with an agent token instead.",
+      });
+    }
     const commentPresentation = req.body.presentation ??
       await deriveRecoveryCommentPresentation(req, issue.companyId, req.body.body);
     const reopenRequested = req.body.reopen === true;
@@ -11995,6 +12169,23 @@ export function issueRoutes(
       });
     }
 
+    // Bind pre-uploaded standalone assets to this comment before any
+    // downstream `comment.created` fan-out, so a media relay reading attachments
+    // at comment-created time sees them (no attach-after-post race). Idempotent
+    // and tenant-checked in attachAssetsToComment; mirrors the host bridge path.
+    const commentAttachmentIds = Array.isArray(req.body.attachmentIds)
+      ? req.body.attachmentIds.filter(
+          (assetId: unknown): assetId is string => typeof assetId === "string" && assetId.length > 0,
+        )
+      : [];
+    if (commentAttachmentIds.length > 0) {
+      await svc.attachAssetsToComment({
+        issueId: currentIssue.id,
+        issueCommentId: comment.id,
+        assetIds: commentAttachmentIds,
+      });
+    }
+
     await issueReferencesSvc.syncComment(comment.id);
     await externalObjectsSvc.syncCommentSafely(comment.id);
     const commentReferenceSummaryAfter = await issueReferencesSvc.listIssueReferenceSummary(currentIssue.id);
@@ -12024,6 +12215,7 @@ export function issueRoutes(
         bodySnippet: comment.body.slice(0, 120),
         identifier: currentIssue.identifier,
         issueTitle: currentIssue.title,
+        ...(commentAttachmentIds.length > 0 ? { attachmentCount: commentAttachmentIds.length } : {}),
         authorizationReason: commentAuthorizationReason,
         ...(isDirectParentReportDecision(commentAccessDecision)
           ? { directParentReportGrant: true }
@@ -12163,11 +12355,22 @@ export function issueRoutes(
       const assigneeId = wakeIssueSnapshot.assigneeAgentId;
       const actorIsAgent = actor.actorType === "agent";
       const selfComment = actorIsAgent && actor.actorId === assigneeId;
+      // Guard B: outbound operator-delivery comments (body begins with the marker)
+      // are outbound-to-operator by definition and are never an inbound task for
+      // the assignee, so an assignee wake would just echo our own message back as
+      // fake inbound operator input. Guard A above has already rejected any
+      // non-agent-authored marked comment, so the marked comments that reach here
+      // are agent-authored (relayed to the operator by messenger). Suppress ONLY
+      // the non-reopen `issue_commented` assignee wake; the reopen and @mention
+      // paths below are untouched. Keyed off the body prefix so it holds regardless
+      // of which agent posted.
+      const isOperatorDeliverComment =
+        comment.body.trimStart().startsWith(OPERATOR_DELIVER_MARKER);
       // Re-derive closed-ness from the post-mutation issue so the auto-approval
       // transition (in_review -> done) suppresses a stale `issue_commented` wake
       // to the returnAssignee for an already-completed issue.
       const skipWake = selfComment || isClosedIssueStatus(wakeIssueSnapshot.status);
-      if (assigneeId && (reopened || !skipWake)) {
+      if (assigneeId && (reopened || (!skipWake && !isOperatorDeliverComment))) {
         if (reopened) {
           addWakeup(assigneeId, {
             source: "automation",

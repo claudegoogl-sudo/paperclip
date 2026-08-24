@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildHeartbeatRunStopMetadata,
   mergeHeartbeatRunStopMetadata,
+  resolveAgentStatusAfterRun,
   resolveHeartbeatRunTimeoutPolicy,
 } from "./heartbeat-stop-metadata.js";
 
@@ -40,6 +41,62 @@ describe("heartbeat stop metadata", () => {
       stopReason: "timeout",
       timeoutFired: true,
     });
+  });
+
+  // A dirty teardown used to park the agent in `error` on the back of a run
+  // that had already done its work. The regression guard in the second half
+  // matters more than the fix — real failures must still park the agent.
+  it("leaves the agent idle after a dirty teardown but still parks it after a real failure", () => {
+    expect(resolveAgentStatusAfterRun({ outcome: "succeeded_dirty", runningRunCount: 0 })).toBe("idle");
+    expect(resolveAgentStatusAfterRun({ outcome: "succeeded", runningRunCount: 0 })).toBe("idle");
+    expect(resolveAgentStatusAfterRun({ outcome: "cancelled", runningRunCount: 0 })).toBe("idle");
+
+    expect(resolveAgentStatusAfterRun({ outcome: "failed", runningRunCount: 0 })).toBe("error");
+    expect(resolveAgentStatusAfterRun({ outcome: "timed_out", runningRunCount: 0 })).toBe("error");
+
+    expect(resolveAgentStatusAfterRun({ outcome: "failed", runningRunCount: 1 })).toBe("running");
+  });
+
+  // A quota/upstream-transient failure is not the agent's fault — the
+  // run stays `failed` (the work really did not happen) but the agent must stay
+  // `idle` so it wakes again once `retryNotBefore` elapses. A genuine failure
+  // (no errorFamily, or a distinct family like a real crash) must still park
+  // the agent in `error`, exactly as the first half of this file's guard
+  // requires — this is the same predicate, pinned in both directions.
+  it("leaves the agent idle after a transient-upstream/quota failure but still parks it after a genuine one", () => {
+    expect(
+      resolveAgentStatusAfterRun({ outcome: "failed", runningRunCount: 0, errorFamily: "transient_upstream" }),
+    ).toBe("idle");
+
+    expect(resolveAgentStatusAfterRun({ outcome: "failed", runningRunCount: 0, errorFamily: null })).toBe("error");
+    expect(resolveAgentStatusAfterRun({ outcome: "failed", runningRunCount: 0 })).toBe("error");
+    expect(
+      resolveAgentStatusAfterRun({ outcome: "timed_out", runningRunCount: 0, errorFamily: "transient_upstream" }),
+    ).toBe("error");
+  });
+
+  // A dirty teardown after a clean result must read as a completion with a
+  // diagnostic tag, not as an adapter failure.
+  it("separates a dirty teardown from an adapter failure", () => {
+    expect(
+      buildHeartbeatRunStopMetadata({
+        adapterType: "claude_local",
+        adapterConfig: {},
+        outcome: "succeeded_dirty",
+        errorCode: "dirty_exit",
+        errorMessage: "Claude reported a successful result but the process exited with code 1",
+      }).stopReason,
+    ).toBe("completed_dirty_exit");
+
+    expect(
+      buildHeartbeatRunStopMetadata({
+        adapterType: "claude_local",
+        adapterConfig: {},
+        outcome: "failed",
+        errorCode: "adapter_failed",
+        errorMessage: "Claude run failed",
+      }).stopReason,
+    ).toBe("adapter_failed");
   });
 
   it("distinguishes budget cancellation from manual cancellation", () => {

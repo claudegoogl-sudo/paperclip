@@ -10,8 +10,20 @@ import {
   isClaudeRefusalResult,
   isClaudeUnknownSessionError,
   isClaudeImageProcessingError,
+  isClaudePreTurnRateLimitResult,
   isClaudeModelNotFoundError,
 } from "./parse.js";
+
+const SESSION_LIMIT_RESULT = {
+  type: "result",
+  subtype: "error_during_execution",
+  is_error: true,
+  num_turns: 1,
+  duration_api_ms: 0,
+  total_cost_usd: 0,
+  api_error_status: 429,
+  result: "You've hit your session limit · resets 1:50pm (UTC)",
+} satisfies Record<string, unknown>;
 
 describe("detectClaudeLoginRequired", () => {
   it("classifies Claude's invalid API key login prompt as auth required", () => {
@@ -103,6 +115,55 @@ describe("detectClaudeLoginRequired", () => {
     ).toBe(false);
   });
 
+  // When a clean result envelope is present, the detector must NOT scan raw
+  // stdout/stderr. The transcript body of a real agent run can contain
+  // auth-regex-matching text (security-review logs, tool output referencing
+  // /login, etc.) without the run itself requiring login. Scanning raw stdout
+  // on top of the envelope false-positives `requiresLogin`, which flips a
+  // clean success to `claude_auth_required`.
+  it("does not scan raw stdout/stderr when a clean result envelope is present", () => {
+    const transcriptContainingAuthText = [
+      JSON.stringify({
+        type: "system",
+        subtype: "init",
+        session_id: "sess-success",
+        model: "claude-sonnet-4-6",
+      }),
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [
+            {
+              type: "text",
+              text: "Inspecting the auth flow: the response was unauthorized, so the user must run `claude login` to refresh the token.",
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        session_id: "sess-success",
+        result: "Shipped the prevention gate for the auth-detector fix.",
+        usage: { input_tokens: 4, cache_read_input_tokens: 0, output_tokens: 4 },
+      }),
+    ].join("\n");
+
+    expect(
+      detectClaudeLoginRequired({
+        parsed: {
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          result: "Shipped the prevention gate for the auth-detector fix.",
+        },
+        stdout: transcriptContainingAuthText,
+        stderr: "",
+      }).requiresLogin,
+    ).toBe(false);
+  });
+
   it("does not classify a success whose result text repeats a token phrase", () => {
     // The model's own answer repeats a token phrase, so the phrase lands in the
     // parsed result. The run is a success, so the failure gate keeps it healthy.
@@ -144,6 +205,51 @@ describe("detectClaudeLoginRequired", () => {
         stderr: "",
       }).requiresLogin,
     ).toBe(false);
+  });
+  // Genuine auth failure path (AC 4): auth text in `parsed.result` or the CLI
+  // error fields still yields `requiresLogin: true` because the structured
+  // candidates are scanned.
+  it("still classifies auth-required when the structured result field carries the login prompt", () => {
+    expect(
+      detectClaudeLoginRequired({
+        parsed: {
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          result: "You are not logged in. Please run `claude login` to continue.",
+        },
+        stdout: "",
+        stderr: "",
+      }).requiresLogin,
+    ).toBe(true);
+  });
+
+  it("still classifies auth-required when the structured errors[] carries the login prompt", () => {
+    expect(
+      detectClaudeLoginRequired({
+        parsed: {
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          result: "",
+          errors: [{ type: "authentication", message: "invalid API key — please run /login" }],
+        },
+        stdout: "",
+        stderr: "",
+      }).requiresLogin,
+    ).toBe(true);
+  });
+
+  // The `!parsed` branch must keep raw-text scanning — it is the only signal
+  // available when the CLI failed before emitting a structured result.
+  it("falls back to raw stdout/stderr scanning when no parsed envelope is present", () => {
+    expect(
+      detectClaudeLoginRequired({
+        parsed: null,
+        stdout: " debris from a teardown trace ",
+        stderr: "Please run claude login",
+      }).requiresLogin,
+    ).toBe(true);
   });
 });
 
@@ -247,6 +353,10 @@ describe("isClaudeTransientUpstreamError", () => {
         stderr: "Please log in. Run `claude login` first.",
       }),
     ).toBe(false);
+  });
+
+  it("classifies the session-limit failure as transient", () => {
+    expect(isClaudeTransientUpstreamError({ parsed: SESSION_LIMIT_RESULT })).toBe(true);
   });
 
   it("does not classify max-turns or unknown-session as transient", () => {
@@ -477,6 +587,103 @@ describe("extractClaudeRetryNotBefore", () => {
     expect(
       extractClaudeRetryNotBefore({ errorMessage: "Overloaded. Try again later." }, new Date()),
     ).toBeNull();
+  });
+
+  it("parses the session-limit reset time later the same day", () => {
+    const now = new Date("2026-07-26T12:30:00.000Z");
+    expect(
+      extractClaudeRetryNotBefore({ parsed: SESSION_LIMIT_RESULT }, now)?.toISOString(),
+    ).toBe("2026-07-26T13:50:00.000Z");
+  });
+
+  it("rolls the session-limit reset time to tomorrow when it has already passed today", () => {
+    const now = new Date("2026-07-26T14:30:00.000Z");
+    expect(
+      extractClaudeRetryNotBefore({ parsed: SESSION_LIMIT_RESULT }, now)?.toISOString(),
+    ).toBe("2026-07-27T13:50:00.000Z");
+  });
+
+  it("resolves a session-limit reset time in a non-UTC zone", () => {
+    const now = new Date("2026-07-26T12:30:00.000Z");
+    expect(
+      extractClaudeRetryNotBefore(
+        { errorMessage: "You've hit your session limit · resets 1:50pm (America/New_York)" },
+        now,
+      )?.toISOString(),
+    ).toBe("2026-07-26T17:50:00.000Z");
+  });
+
+  it("returns null for a session limit whose reset time is unparseable", () => {
+    expect(
+      extractClaudeRetryNotBefore(
+        { errorMessage: "You've hit your session limit · resets soon" },
+        new Date("2026-07-26T12:30:00.000Z"),
+      ),
+    ).toBeNull();
+  });
+
+  // Exact live strings observed in `heartbeat_runs.result_json.result`
+  // during the 2026-07-31 usage-limit storm. The `·` separator below is the real
+  // U+00B7 middle-dot character the CLI emits, not a hyphen.
+  it("parses the live dated weekly-limit string to the exact absolute instant", () => {
+    const now = new Date("2026-07-30T10:00:00.000Z");
+    expect(
+      extractClaudeRetryNotBefore(
+        { errorMessage: "You've hit your weekly limit · resets Jul 31, 8am (UTC)" },
+        now,
+      )?.toISOString(),
+    ).toBe("2026-07-31T08:00:00.000Z");
+  });
+
+  it("parses the live undated weekly-limit string to the next occurrence of the clock time, not the true weekly reset", () => {
+    // The live wording sometimes drops the date ("resets 8am (UTC)" with no
+    // "Jul 31,"), which is indistinguishable from a same-day clock hint. Master
+    // falls through to nextClockTimeInTimeZone and returns the *next* 8am UTC —
+    // for a weekly limit this can under-wait by up to ~7 days. That is an
+    // accepted, converging behavior (the park re-arms on the next limit hit),
+    // not a bug, so this test pins it as a deliberate, documented decision.
+    const now = new Date("2026-07-25T10:00:00.000Z");
+    expect(
+      extractClaudeRetryNotBefore(
+        { errorMessage: "You've hit your weekly limit · resets 8am (UTC)" },
+        now,
+      )?.toISOString(),
+    ).toBe("2026-07-26T08:00:00.000Z");
+  });
+
+  it("parses the live session-limit string to the exact absolute instant", () => {
+    const now = new Date("2026-07-31T10:00:00.000Z");
+    expect(
+      extractClaudeRetryNotBefore(
+        { errorMessage: "You've hit your session limit · resets 6:50pm (UTC)" },
+        now,
+      )?.toISOString(),
+    ).toBe("2026-07-31T18:50:00.000Z");
+  });
+});
+
+describe("isClaudePreTurnRateLimitResult", () => {
+  it("classifies a session-limit 429 that never reached the model", () => {
+    expect(isClaudePreTurnRateLimitResult(SESSION_LIMIT_RESULT)).toBe(true);
+  });
+
+  it("does not classify a 429 that billed model turns", () => {
+    expect(
+      isClaudePreTurnRateLimitResult({
+        ...SESSION_LIMIT_RESULT,
+        duration_api_ms: 4_210,
+        total_cost_usd: 0.12,
+      }),
+    ).toBe(false);
+  });
+
+  it("does not classify non-429 failures", () => {
+    expect(
+      isClaudePreTurnRateLimitResult({ ...SESSION_LIMIT_RESULT, api_error_status: 500 }),
+    ).toBe(false);
+    expect(isClaudePreTurnRateLimitResult({ ...SESSION_LIMIT_RESULT, api_error_status: undefined }))
+      .toBe(false);
+    expect(isClaudePreTurnRateLimitResult(null)).toBe(false);
   });
 });
 

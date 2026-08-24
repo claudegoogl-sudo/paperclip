@@ -20,6 +20,7 @@ import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
   getAgentWorkEligibility,
   isUuidLike,
+  computeAgentKeyExpiresAt,
   normalizeAgentApiKeyScope,
   normalizeAgentUrlKey,
   type AgentEligibilityAgent,
@@ -1056,7 +1057,11 @@ export function agentService(db: Db) {
       id: string,
       name: string,
       scope: AgentApiKeyScope = { kind: "standard" },
-      options?: { responsibleUserId?: string | null },
+      options?: {
+        responsibleUserId?: string | null;
+        ttlSeconds?: number | null;
+        expiresAt?: Date | string | null;
+      },
     ) => {
       const existing = await getById(id);
       if (!existing) throw notFound("Agent not found");
@@ -1066,6 +1071,15 @@ export function agentService(db: Db) {
       if (existing.status === "terminated") {
         throw conflict("Cannot create keys for terminated agents");
       }
+
+      // Enforce the cross-company max-TTL ceiling and honour any caller TTL
+      // before persisting. `expiresAt` is the authoritative backstop
+      // the auth resolver checks on every request, independent of `revokedAt`.
+      const expiresAt = computeAgentKeyExpiresAt({
+        scope,
+        ttlSeconds: options?.ttlSeconds ?? null,
+        expiresAt: options?.expiresAt ?? null,
+      });
 
       const token = createToken();
       const keyHash = hashToken(token);
@@ -1078,6 +1092,7 @@ export function agentService(db: Db) {
           keyHash,
           responsibleUserId: options?.responsibleUserId?.trim() || null,
           scopeConfig: scope.kind === "standard" ? null : scope,
+          expiresAt,
         })
         .returning()
         .then((rows) => rows[0]);
@@ -1088,6 +1103,7 @@ export function agentService(db: Db) {
         scope: normalizeAgentApiKeyScope(created.scopeConfig),
         responsibleUserId: created.responsibleUserId,
         token,
+        expiresAt: created.expiresAt,
         createdAt: created.createdAt,
       };
     },
@@ -1101,6 +1117,7 @@ export function agentService(db: Db) {
           scopeConfig: agentApiKeys.scopeConfig,
           createdAt: agentApiKeys.createdAt,
           revokedAt: agentApiKeys.revokedAt,
+          expiresAt: agentApiKeys.expiresAt,
         })
         .from(agentApiKeys)
         .where(eq(agentApiKeys.agentId, id))
@@ -1111,6 +1128,7 @@ export function agentService(db: Db) {
           responsibleUserId: row.responsibleUserId,
           createdAt: row.createdAt,
           revokedAt: row.revokedAt,
+          expiresAt: row.expiresAt,
         }))),
 
     getKeyById: async (keyId: string) =>
@@ -1124,6 +1142,7 @@ export function agentService(db: Db) {
           scopeConfig: agentApiKeys.scopeConfig,
           createdAt: agentApiKeys.createdAt,
           revokedAt: agentApiKeys.revokedAt,
+          expiresAt: agentApiKeys.expiresAt,
         })
         .from(agentApiKeys)
         .where(eq(agentApiKeys.id, keyId))

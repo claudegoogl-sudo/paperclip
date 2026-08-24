@@ -7,6 +7,7 @@ import { agentService } from "./agents.js";
 import { budgetService } from "./budgets.js";
 import { notifyHireApproved } from "./hire-hook.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { dispatchCapabilityEscalationResolution } from "./plugin-capability-escalation.js";
 
 export function approvalService(db: Db) {
   const agentsSvc = agentService(db);
@@ -86,10 +87,13 @@ export function approvalService(db: Db) {
   }
 
   return {
-    list: (companyId: string, status?: string) => {
+    list: (companyId: string, status?: string, limit?: number) => {
       const conditions = [eq(approvals.companyId, companyId)];
       if (status) conditions.push(eq(approvals.status, status));
-      return db.select().from(approvals).where(and(...conditions));
+      const query = db.select().from(approvals).where(and(...conditions));
+      // Optional defensive bound for the reconcile read; omitted (and
+      // therefore unbounded) for all existing board-route callers.
+      return limit === undefined ? query : query.limit(limit);
     },
 
     getById: (id: string) =>
@@ -207,6 +211,16 @@ export function approvalService(db: Db) {
         }
       }
 
+      if (applied) {
+        // Apply a board-approved plugin capability escalation to the
+        // parked (`upgrade_pending`) plugin. No-op for non-escalation payloads.
+        await dispatchCapabilityEscalationResolution({
+          payload: updated.payload,
+          outcome: "approved",
+          approvalId: updated.id,
+        });
+      }
+
       return { approval: updated, applied };
     },
 
@@ -224,6 +238,16 @@ export function approvalService(db: Db) {
         if (payloadAgentId) {
           await agentsSvc.terminate(payloadAgentId);
         }
+      }
+
+      if (applied) {
+        // Restore the parked (`upgrade_pending`) plugin to ready on a
+        // board rejection. No-op for non-escalation payloads.
+        await dispatchCapabilityEscalationResolution({
+          payload: updated.payload,
+          outcome: "rejected",
+          approvalId: updated.id,
+        });
       }
 
       return { approval: updated, applied };

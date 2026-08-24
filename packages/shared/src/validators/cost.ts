@@ -7,6 +7,7 @@ export const createCostEventSchema = z.object({
   projectId: z.string().uuid().optional().nullable(),
   goalId: z.string().uuid().optional().nullable(),
   heartbeatRunId: z.string().uuid().optional().nullable(),
+  runIdentifier: z.string().optional(),
   billingCode: z.string().optional().nullable(),
   provider: z.string().min(1),
   biller: z.string().min(1).optional(),
@@ -21,6 +22,7 @@ export const createCostEventSchema = z.object({
 }).transform((value) => ({
   ...value,
   biller: value.biller ?? value.provider,
+  runIdentifier: value.runIdentifier ?? value.heartbeatRunId,
 }));
 
 export type CreateCostEvent = z.infer<typeof createCostEventSchema>;

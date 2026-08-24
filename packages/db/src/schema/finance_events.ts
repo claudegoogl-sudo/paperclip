@@ -16,7 +16,7 @@ export const financeEvents = pgTable(
     issueId: uuid("issue_id").references(() => issues.id, { onDelete: "set null" }),
     projectId: uuid("project_id").references(() => projects.id),
     goalId: uuid("goal_id").references(() => goals.id),
-    heartbeatRunId: uuid("heartbeat_run_id").references(() => heartbeatRuns.id),
+    heartbeatRunId: uuid("heartbeat_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
     costEventId: uuid("cost_event_id").references(() => costEvents.id),
     billingCode: text("billing_code"),
     description: text("description"),
@@ -59,6 +59,10 @@ export const financeEvents = pgTable(
       table.companyId,
       table.heartbeatRunId,
     ),
+    // Single-column index for the ON DELETE set null referential-integrity
+    // probe, which filters on the run column alone and cannot use the composite
+    // (company_id, ...) index. See migration 0143.
+    heartbeatRunIdx: index("finance_events_heartbeat_run_idx").on(table.heartbeatRunId),
     companyCostEventIdx: index("finance_events_company_cost_event_idx").on(
       table.companyId,
       table.costEventId,

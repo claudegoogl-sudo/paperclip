@@ -1,5 +1,5 @@
-import { sql } from "drizzle-orm";
 import { pgTable, uuid, text, timestamp, jsonb, integer, index, uniqueIndex } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 
@@ -44,5 +44,11 @@ export const agentWakeupRequests = pgTable(
       table.companyId,
       sql`(${table.payload} ->> 'issueId')`,
     ),
+    // Serves the retention prune scan. The partial predicate must stay in sync
+    // with TERMINAL_WAKEUP_REQUEST_STATUSES or the prune falls back to a Seq
+    // Scan; a test asserts the two match. See migration 0230.
+    retentionIdx: index("agent_wakeup_requests_retention_idx")
+      .on(table.requestedAt)
+      .where(sql`${table.status} IN ('coalesced', 'skipped', 'completed', 'failed', 'cancelled')`),
   }),
 );

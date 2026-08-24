@@ -30,8 +30,16 @@ export function parseSecretRefBindingObject(value: unknown): SecretRefBindingObj
   return null;
 }
 
-export function collectSecretRefPaths(
+/**
+ * Walk a JSON schema's `properties` (recursing into `allOf`/`anyOf`/`oneOf`
+ * branches) and collect the dot-paths of every leaf whose `format` equals
+ * `targetFormat`. Shared walker behind {@link collectSecretRefPaths} (format
+ * `"secret-ref"`) and {@link collectUriConfigPaths} (format `"uri"`) so both
+ * stay in lockstep on schema-shape handling instead of drifting apart.
+ */
+function collectFormatPaths(
   schema: Record<string, unknown> | null | undefined,
+  targetFormat: string,
 ): Set<string> {
   const paths = new Set<string>();
   if (!schema || typeof schema !== "object") return paths;
@@ -51,7 +59,7 @@ export function collectSecretRefPaths(
     for (const [key, propertySchema] of Object.entries(properties)) {
       if (!propertySchema || typeof propertySchema !== "object") continue;
       const path = prefix ? `${prefix}.${key}` : key;
-      if (propertySchema.format === "secret-ref") {
+      if (propertySchema.format === targetFormat) {
         paths.add(path);
       }
       walk(propertySchema, path);
@@ -60,6 +68,23 @@ export function collectSecretRefPaths(
 
   walk(schema, "");
   return paths;
+}
+
+export function collectSecretRefPaths(
+  schema: Record<string, unknown> | null | undefined,
+): Set<string> {
+  return collectFormatPaths(schema, "secret-ref");
+}
+
+/**
+ * Dot-paths of every `format: "uri"` field in a plugin's
+ * `instanceConfigSchema` — the config keys a host-derived egress allowlist can
+ * be keyed on (e.g. klipper's `moonrakerBaseUrl`).
+ */
+export function collectUriConfigPaths(
+  schema: Record<string, unknown> | null | undefined,
+): Set<string> {
+  return collectFormatPaths(schema, "uri");
 }
 
 export function readConfigValueAtPath(

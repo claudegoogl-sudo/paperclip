@@ -99,6 +99,39 @@ export interface PluginWebhookDeclaration {
   displayName: string;
   /** Optional description of what this webhook handles. */
   description?: string;
+  /**
+   * Optional credential declaration. Present means the host can distinguish an
+   * authenticated delivery from an anonymous one and bill it to a separate,
+   * larger rate-limit budget. Absent means every delivery to this endpoint uses
+   * the anonymous budget.
+   *
+   * Requires the `webhooks.verify` capability.
+   */
+  auth?: PluginWebhookAuthDeclaration;
+}
+
+/**
+ * Declares how the host recognises an authenticated delivery to a webhook
+ * endpoint.
+ *
+ * The host only ever holds `HMAC-SHA256(key = salt, message = token)` — read
+ * from the plugin's instance config at `tokenDigestConfigKey` — never the
+ * token. That is what makes the check possible on a route that is anonymous and
+ * pre-company, where no `company_secret_bindings` lookup can be performed.
+ *
+ * A mismatch is *not* a rejection: the delivery falls through to the anonymous
+ * budget and is rate-limited exactly as an undeclared endpoint would be, so a
+ * stale digest degrades to today's behaviour rather than causing an outage.
+ *
+ * @see PLUGIN_SPEC.md §18.4 — Authenticated deliveries
+ */
+export interface PluginWebhookAuthDeclaration {
+  /** Only scheme today: a shared token carried in a request header. */
+  type: "header-token";
+  /** HTTP header carrying the token. Matched case-insensitively. */
+  header: string;
+  /** Top-level instance-config key holding `{ salt, digest }`. */
+  tokenDigestConfigKey: string;
 }
 
 /**

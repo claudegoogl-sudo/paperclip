@@ -21,38 +21,17 @@ const CLAUDE_AUTH_TOKEN_FAILURE_RE =
 const URL_RE = /(https?:\/\/[^\s'"`<>()[\]{};,!?]+[^\s'"`<>()[\]{};,!.?:]+)/gi;
 
 const CLAUDE_TRANSIENT_UPSTREAM_RE =
-  /(?:rate[-\s]?limit(?:ed)?|rate_limit_error|too\s+many\s+requests|\b429\b|overloaded(?:_error)?|server\s+overloaded|service\s+unavailable|\b503\b|\b529\b|high\s+demand|try\s+again\s+later|temporarily\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached)/i;
+  /(?:rate[-\s]?limit(?:ed)?|rate_limit_error|too\s+many\s+requests|\b429\b|overloaded(?:_error)?|server\s+overloaded|service\s+unavailable|\b503\b|\b529\b|high\s+demand|try\s+again\s+later|temporarily\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|(?:5[-\s]?hour|weekly|session|usage)\s+limit(?:\s+reached)?|usage\s+cap\s+reached)/i;
+// The trailing `reached` is optional: upstream moved from "You're out of extra
+// usage · resets 4am (UTC)" to "You've hit your weekly limit · resets Jul 31,
+// 8am (UTC)". Requiring "reached" silently killed the usage-limit backoff for
+// every limit result after that wording change.
+const CLAUDE_EXTRA_USAGE_RESET_RE =
+  /(?:out\s+of\s+extra\s+usage|extra\s+usage|claude\s+usage\s+limit(?:\s+reached)?|usage\s+cap(?:\s+reached)?|(?:5[-\s]?hour|weekly|session|usage)\s+limit(?:\s+reached)?)[\s\S]{0,80}?\bresets?\s+(?:at\s+)?([^\n()]+?)(?:\s*\(([^)]+)\))?(?:[.!]|\n|$)/i;
 const CLAUDE_PROVIDER_QUOTA_RE =
   /(?:you(?:'|’)ve\s+hit\s+your\s+session\s+limit|session\s+limit\s+(?:reached|exceeded)|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached|servicequotaexceededexception)/i;
 const CLAUDE_MODEL_NOT_FOUND_RE =
   /(?:\b404\b[\s\S]{0,120})?(?:model[\s_-]*(?:not[\s_-]*found|does not exist|unknown|invalid)|unknown[\s_-]*model)/i;
-const CLAUDE_EXTRA_USAGE_RESET_RE =
-  /(?:you(?:'|’)ve\s+hit\s+your\s+session\s+limit|session\s+limit\s+(?:reached|exceeded)|out\s+of\s+extra\s+usage|extra\s+usage|usage\s+limit\s+reached|usage\s+cap\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|claude\s+usage\s+limit\s+reached)[\s\S]{0,120}?\bresets?\s+(?:at\s+)?([^\n()]+?)(?:\s*\(([^)]+)\))?(?:[.!]|\n|$)/i;
-
-/**
- * Sum the per-model usage ledger from a Claude CLI result event. The result
- * event's top-level `usage` reflects only the main-loop message chain, so it
- * undercounts output tokens whenever subagents or sidechains ran; `modelUsage`
- * is the CLI's authoritative per-model accounting (it is what backs /cost).
- * Cache-creation tokens are billed prompt tokens, so they count as input.
- */
-export function claudeModelUsageTotals(modelUsage: unknown): UsageSummary | null {
-  const byModel = parseObject(modelUsage);
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let cachedInputTokens = 0;
-  let sawEntry = false;
-  for (const value of Object.values(byModel)) {
-    const entry = parseObject(value);
-    if (Object.keys(entry).length === 0) continue;
-    sawEntry = true;
-    inputTokens += asNumber(entry.inputTokens, 0) + asNumber(entry.cacheCreationInputTokens, 0);
-    outputTokens += asNumber(entry.outputTokens, 0);
-    cachedInputTokens += asNumber(entry.cacheReadInputTokens, 0);
-  }
-  if (!sawEntry) return null;
-  return { inputTokens, outputTokens, cachedInputTokens };
-}
 
 export function parseClaudeStreamJson(stdout: string) {
   let sessionId: string | null = null;
@@ -211,15 +190,26 @@ export function detectClaudeLoginRequired(input: {
   const parsed = input.parsed ?? null;
   const resultText = asString(parsed?.result, "").trim();
 
-  // The legacy login-prompt markers keep their broad scope. They match against
-  // every output line, which includes the parsed result, the parsed errors, and
-  // the raw stdout and stderr.
-  const promptLines = [resultText, ...extractClaudeErrorMessages(parsed ?? {}), input.stdout, input.stderr]
-    .join("\n")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const loginPrompt = promptLines.some((line) => CLAUDE_LOGIN_PROMPT_RE.test(line));
+  // When the CLI emitted a structured result envelope, auth/limit/no-work
+  // detection must read ONLY structured fields (`parsed.result` + CLI error
+  // fields). Scanning raw stdout/stderr on top re-scans the full stream-json
+  // transcript, so any tool result or agent prose that mentions "log in"
+  // false-positives as `requiresLogin` and flips a clean success to
+  // `claude_auth_required`. The `!parsed` branch keeps raw-text scanning
+  // because there is no other signal available there.
+  const pooledRawText = input.parsed
+    ? [asString(input.parsed.result, "").trim(), ...extractClaudeErrorMessages(input.parsed)]
+        .map((msg) => msg.trim())
+        .filter(Boolean)
+    : [input.stdout, input.stderr]
+        .join("\n")
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+
+  // The legacy login-prompt markers keep their role for the pooled lines
+  // above: structured fields when an envelope exists, raw output otherwise.
+  const loginPrompt = pooledRawText.some((line) => CLAUDE_LOGIN_PROMPT_RE.test(line));
 
   // The token-failure markers match only against the parsed terminal fields of
   // a failed run. The raw stdout is untrusted, so a model that prints a token
@@ -266,6 +256,19 @@ export function isClaudeModelNotFoundError(input: {
     ...(parsed ? extractClaudeErrorMessages(parsed) : []),
   ];
   return messages.some((message) => CLAUDE_MODEL_NOT_FOUND_RE.test(message));
+}
+
+/**
+ * The CLI reported that it finished its work cleanly. This is deliberately
+ * strict: it requires both the positive `subtype=success` marker and
+ * `is_error=false`, so an absent/unknown subtype never reads as success.
+ */
+export function isClaudeCleanCompletionResult(
+  parsed: Record<string, unknown> | null | undefined,
+): boolean {
+  if (!parsed) return false;
+  if (parsed.is_error !== false) return false;
+  return asString(parsed.subtype, "").trim().toLowerCase() === "success";
 }
 
 export function isClaudeMaxTurnsResult(parsed: Record<string, unknown> | null | undefined): boolean {
@@ -340,6 +343,70 @@ export function isClaudeImageProcessingError(parsed: Record<string, unknown>): b
   return allMessages.some((msg) =>
     /could not process image/i.test(msg),
   );
+}
+
+function readZeroableNumber(value: unknown): number | null {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+/**
+ * A session-limit 429 is reported as a result the CLI never spent any model time on.
+ * `num_turns` is unreliable here (observed as 1 on a dispatch that never reached the
+ * model), so zero billed cost *and* zero API time are what actually prove it.
+ */
+export function isClaudePreTurnRateLimitResult(
+  parsed: Record<string, unknown> | null | undefined,
+): boolean {
+  if (!parsed) return false;
+  if (readZeroableNumber(parsed.api_error_status) !== 429) return false;
+  return (
+    readZeroableNumber(parsed.total_cost_usd) === 0 &&
+    readZeroableNumber(parsed.duration_api_ms) === 0
+  );
+}
+
+/**
+ * Anchored on purpose. A usage-limit result is the *entire* result payload the
+ * CLI emits, so the message always starts the text. Matching the phrase
+ * anywhere in `result` instead misreads a genuine run that merely wrote about a
+ * limit in its summary — two such rows exist in the live corpus, one of which is
+ * a real dirty-exit success whose report opens "Delivered (messageId 672)" and
+ * goes on to mention "session-limit recovery".
+ */
+const CLAUDE_USAGE_LIMIT_RESULT_RE =
+  /^(?:you(?:['’`]|&#39;)?ve\s+hit\s+your\s+(?:weekly|session|usage|5[-\s]?hour)\s+limit|claude\s+usage\s+limit\s+reached|(?:weekly|session|usage|5[-\s]?hour)\s+limit\s+reached)/i;
+
+/**
+ * The account ran out of quota, so the CLI stopped early. This is never a
+ * completed run, no matter how many turns landed before the limit hit.
+ */
+export function isClaudeUsageLimitResult(
+  parsed: Record<string, unknown> | null | undefined,
+): boolean {
+  if (!parsed) return false;
+  const candidates = [asString(parsed.result, ""), ...extractClaudeErrorMessages(parsed)];
+  return candidates.some((text) => CLAUDE_USAGE_LIMIT_RESULT_RE.test(text.trim()));
+}
+
+/**
+ * A result that billed nothing and never got past the first turn did no work,
+ * whatever it claims in `subtype`. This is the wording-independent backstop for
+ * `isClaudeUsageLimitResult`: it keeps holding if upstream rephrases the limit
+ * message.
+ */
+export function isClaudeNoWorkResult(
+  parsed: Record<string, unknown> | null | undefined,
+): boolean {
+  if (!parsed) return false;
+  const cost = readZeroableNumber(parsed.total_cost_usd);
+  const turns = readZeroableNumber(parsed.num_turns);
+  if (cost === null || turns === null) return false;
+  return cost === 0 && turns <= 1;
 }
 
 function buildClaudeTransientHaystack(input: {
@@ -432,6 +499,37 @@ function dateFromTimeZoneWallClock(input: {
   return candidate;
 }
 
+/**
+ * The reset message names a month and day but no year, so pick the next
+ * occurrence — rolling to next year keeps a late-December limit that resets in
+ * January from landing ~11 months in the past.
+ */
+function nextDatedTimeInTimeZone(input: {
+  now: Date;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  timeZoneHint: string;
+}): Date | null {
+  const timeZone = normalizeResetTimeZone(input.timeZoneHint);
+  if (!timeZone) return null;
+
+  const nowParts = readTimeZoneParts(input.now, timeZone);
+  for (const year of [nowParts.year, nowParts.year + 1]) {
+    const candidate = dateFromTimeZoneWallClock({
+      year,
+      month: input.month,
+      day: input.day,
+      hour: input.hour,
+      minute: input.minute,
+      timeZone,
+    });
+    if (candidate && candidate.getTime() > input.now.getTime()) return candidate;
+  }
+  return null;
+}
+
 function nextClockTimeInTimeZone(input: {
   now: Date;
   hour: number;
@@ -467,8 +565,28 @@ function nextClockTimeInTimeZone(input: {
   return retryAt;
 }
 
+const MONTH_NAMES = [
+  "jan", "feb", "mar", "apr", "may", "jun",
+  "jul", "aug", "sep", "oct", "nov", "dec",
+];
+
 function parseClaudeResetClockTime(clockText: string, now: Date, timeZoneHint?: string | null): Date | null {
-  const normalized = clockText.trim().replace(/\s+/g, " ");
+  let normalized = clockText.trim().replace(/\s+/g, " ");
+
+  // A weekly limit resets on a named day ("Jul 31, 8am"); a session limit just
+  // names a clock time. Peel the date off first so the clock parse below is
+  // shared by both.
+  let resetDate: { month: number; day: number } | null = null;
+  const dated = normalized.match(/^([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(.+)$/);
+  if (dated) {
+    const monthIndex = MONTH_NAMES.indexOf((dated[1] ?? "").slice(0, 3).toLowerCase());
+    const day = Number.parseInt(dated[2] ?? "", 10);
+    if (monthIndex >= 0 && Number.isInteger(day) && day >= 1 && day <= 31) {
+      resetDate = { month: monthIndex + 1, day };
+      normalized = dated[3] ?? "";
+    }
+  }
+
   const match = normalized.match(/^(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\.?/i);
   if (!match) return null;
 
@@ -479,6 +597,18 @@ function parseClaudeResetClockTime(clockText: string, now: Date, timeZoneHint?: 
 
   let hour24 = hour12 % 12;
   if ((match[3] ?? "").toLowerCase() === "p") hour24 += 12;
+
+  if (resetDate) {
+    const dateRetryAt = nextDatedTimeInTimeZone({
+      now,
+      month: resetDate.month,
+      day: resetDate.day,
+      hour: hour24,
+      minute,
+      timeZoneHint: timeZoneHint ?? "UTC",
+    });
+    if (dateRetryAt) return dateRetryAt;
+  }
 
   if (timeZoneHint) {
     const explicitRetryAt = nextClockTimeInTimeZone({

@@ -30,12 +30,6 @@ function parseNumber(value: string | undefined, fallback: number) {
   return Math.floor(parsed);
 }
 
-function parseBooleanEnv(value: string | undefined): boolean {
-  if (!value) return false;
-  const normalized = value.trim().toLowerCase();
-  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
-}
-
 function jwtConfig() {
   const secret = process.env.PAPERCLIP_AGENT_JWT_SECRET?.trim() || process.env.BETTER_AUTH_SECRET?.trim();
   if (!secret) return null;
@@ -57,7 +51,6 @@ function jwtConfig() {
     // the source instance. Folding this into the signing-key derivation is what
     // prevents a fork-minted token from authenticating against the live plane.
     instanceId: resolvePaperclipInstanceId(),
-    disableLegacyFallback: parseBooleanEnv(process.env.PAPERCLIP_AGENT_JWT_DISABLE_LEGACY_FALLBACK),
   };
 }
 
@@ -75,14 +68,13 @@ function jwtConfig() {
  *    instanceId ("default"), so a fork token — signed under the fork's
  *    instanceId — never matches. See PAP-12896 for the incident this closes.
  *
- * The instance-wide master secret is never used to sign new tokens — it is
- * retained only as a verification fallback so that tokens issued before this
- * change continue to validate. NOTE: that legacy fallback is instance-agnostic
- * (it signs with the raw shared secret), so complete cryptographic instance
- * isolation additionally requires disabling it once outstanding legacy tokens
- * have expired (set PAPERCLIP_AGENT_JWT_DISABLE_LEGACY_FALLBACK=true). Normal
- * fork-minted run tokens are already rejected without that step because they
- * are signed with the derived key, not the raw master secret.
+ * The instance-wide master secret is never used to sign OR verify tokens.
+ * The previous raw-master verification fallback (instance-agnostic, retained
+ * only to grandfather tokens issued before per-company derivation) has been
+ * removed: it was an instance-isolation bypass and every live instance now
+ * mints exclusively under the derived key, so any legacy token has long
+ * since expired. There is no escape hatch; if raw-master verification is
+ * ever required again it must be reintroduced explicitly.
  *
  * The derivation domain-separates with the `jwt:` prefix so the same master
  * secret can safely be reused for other HMAC purposes without key reuse.
@@ -179,30 +171,22 @@ export function verifyLocalAgentJwt(token: string): LocalAgentJwtClaims | null {
   if (!claimedCompanyId) return null;
 
   const signingInput = `${headerB64}.${claimsB64}`;
-  // Try the per-instance, per-company derived key first (current tokens),
-  // deriving under THIS control plane's own instanceId. A token minted by a
-  // worktree/fork instance was signed under a different instanceId, so it will
-  // not match here — that is the boundary that keeps fork tokens out of the
-  // live plane (PAP-12896/PAP-12899). Fall back to the raw master secret so
-  // tokens issued before per-company derivation existed continue to verify —
-  // this preserves backward compatibility for any outstanding tokens (TTL
-  // bounds the legacy window naturally).
+  // Verify only under the per-instance, per-company derived key (current
+  // tokens), deriving under THIS control plane's own instanceId. A token
+  // minted by a worktree/fork instance was signed under a different
+  // instanceId, so it will not match here — that is the boundary that keeps
+  // fork tokens out of the live plane (PAP-12896/PAP-12899).
   //
-  // Operators should set `PAPERCLIP_AGENT_JWT_DISABLE_LEGACY_FALLBACK=true`
-  // approximately one JWT TTL (~48h by default, see PAPERCLIP_AGENT_JWT_TTL_SECONDS)
-  // after deploying per-company signing. Once set, the master-secret fallback
-  // is disabled and only tokens validating under the per-instance/per-company
-  // derived key are accepted — closing the window in which a leaked master
-  // secret could be used to forge tokens with arbitrary future `exp` values for
-  // any tenant, and completing cryptographic isolation between control-plane
-  // instances (the raw-secret fallback is instance-agnostic).
+  // The raw-master verification fallback has been removed. It was
+  // instance-agnostic, so any token forged with the shared master secret
+  // would have validated across control-plane instances. Live verification
+  // confirms every agent JWT is now minted under the derived key and the
+  // TTL has aged out the legacy window, so the fallback is fail-closed by
+  // default with no escape hatch. A leaked master secret can no longer be
+  // used to forge tenant-spanning tokens against this verifier.
   const perCompanyKey = deriveCompanySigningKey(config.secret, claimedCompanyId, config.instanceId);
   const perCompanySig = signPayload(perCompanyKey, signingInput);
-  let signatureOk = safeCompare(signature, perCompanySig);
-  if (!signatureOk && !config.disableLegacyFallback) {
-    const legacySig = signPayload(config.secret, signingInput);
-    signatureOk = safeCompare(signature, legacySig);
-  }
+  const signatureOk = safeCompare(signature, perCompanySig);
   if (!signatureOk) return null;
 
   const sub = typeof claims.sub === "string" ? claims.sub : null;
@@ -231,10 +215,12 @@ export function verifyLocalAgentJwt(token: string): LocalAgentJwtClaims | null {
 
   // Enforce the minting instance when the claim is present. The instance-scoped
   // signing key above is the real cryptographic boundary; this claim check is
-  // defense-in-depth that yields a clean, cheap rejection (and, once legacy
-  // tokens have aged out, guards the master-secret fallback path too). Legacy
-  // tokens minted before this claim existed omit it and are still accepted, so
-  // enforcement is conditional — matching how iss/aud are handled above.
+  // defense-in-depth that yields a clean, cheap rejection of any token that
+  // happens to carry a mismatched instance_id. The raw-master fallback that
+  // used to make this check load-bearing for instance isolation has been
+  // removed; every accepted token is now bound to a derived key under THIS
+  // instance's id, so enforcement here is conditional — matching how iss/aud
+  // are handled above.
   const instanceClaim = typeof claims.instance_id === "string" ? claims.instance_id : undefined;
   if (instanceClaim && instanceClaim !== config.instanceId) return null;
 

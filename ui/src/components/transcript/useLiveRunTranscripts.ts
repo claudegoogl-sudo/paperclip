@@ -1,6 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import type { LiveEvent } from "@paperclipai/shared";
+import {
+  isSuccessfulHeartbeatRunStatus,
+  isTerminalHeartbeatRunStatus,
+  type LiveEvent,
+} from "@paperclipai/shared";
 import { ApiError } from "../../api/client";
 import { instanceSettingsApi } from "../../api/instanceSettings";
 import { heartbeatsApi } from "../../api/heartbeats";
@@ -68,12 +72,8 @@ function readString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
-function isTerminalStatus(status: string): boolean {
-  return status === "failed" || status === "timed_out" || status === "cancelled" || status === "interrupted" || status === "succeeded";
-}
-
 function canReadPersistedLog(run: RunTranscriptSource): boolean {
-  return run.status === "running" || isTerminalStatus(run.status);
+  return run.status === "running" || isTerminalHeartbeatRunStatus(run.status);
 }
 
 function runKnownLogBytes(run: RunTranscriptSource): number | null {
@@ -161,7 +161,7 @@ export function useLiveRunTranscripts({
 
   const runById = useMemo(() => new Map(normalizedRuns.map((run) => [run.id, run])), [normalizedRuns]);
   const activeRunIds = useMemo(
-    () => new Set(normalizedRuns.filter((run) => run.status === "running").map((run) => run.id)),
+    () => new Set(normalizedRuns.filter((run) => !isTerminalHeartbeatRunStatus(run.status)).map((run) => run.id)),
     [normalizedRuns],
   );
   const runIdsKey = useMemo(
@@ -304,7 +304,7 @@ export function useLiveRunTranscripts({
           logOffsetByRunRef.current.set(run.id, offset + result.content.length);
         }
       } catch (error) {
-        if (error instanceof ApiError && error.status === 404 && isTerminalStatus(run.status)) {
+        if (error instanceof ApiError && error.status === 404 && isTerminalHeartbeatRunStatus(run.status)) {
           missingTerminalLogRunIdsRef.current.add(run.id);
         }
       } finally {
@@ -324,14 +324,14 @@ export function useLiveRunTranscripts({
     };
 
     void readAll();
-    const activeRuns = readableRuns.filter((run) => run.status === "running");
-    // The realtime websocket is the primary live source when enabled, so the
-    // recurring poll only needs to run as a slow fallback rather than doubling
-    // the live update work every couple of seconds.
-    const effectivePollMs = enableRealtimeUpdates
-      ? Math.max(logPollIntervalMs, REALTIME_FALLBACK_POLL_INTERVAL_MS)
-      : logPollIntervalMs;
-    const interval = activeRuns.length > 0 && effectivePollMs > 0
+      const activeRuns = normalizedRuns.filter((run) => !isTerminalHeartbeatRunStatus(run.status));
+      // The realtime websocket is the primary live source when enabled, so the
+      // recurring poll only needs to run as a slow fallback rather than doubling
+      // the live update work every couple of seconds.
+      const effectivePollMs = enableRealtimeUpdates
+        ? Math.max(logPollIntervalMs, REALTIME_FALLBACK_POLL_INTERVAL_MS)
+        : logPollIntervalMs;
+      const interval = activeRuns.length > 0 && effectivePollMs > 0
       ? window.setInterval(() => {
           void Promise.all(activeRuns.map((run) => readRunLog(run)));
         }, effectivePollMs)
@@ -436,7 +436,7 @@ export function useLiveRunTranscripts({
           const status = readString(payload["status"]) ?? "updated";
           appendChunks(runId, [{
             ts: event.createdAt,
-            stream: isTerminalStatus(status) && status !== "succeeded" ? "stderr" : "system",
+            stream: isTerminalHeartbeatRunStatus(status) && !isSuccessfulHeartbeatRunStatus(status) ? "stderr" : "system",
             chunk: `run ${status}`,
             dedupeKey: `socket:status:${runId}:${status}:${readString(payload["finishedAt"]) ?? ""}`,
           }]);

@@ -256,8 +256,153 @@ export interface ToolRunContext {
   runId: string;
   /** UUID of the company the run belongs to. */
   companyId: string;
-  /** UUID of the project the run belongs to. */
-  projectId: string;
+  /**
+   * UUID of the project the run belongs to. Absent when the run is not
+   * project-scoped — the host omits the field rather than substituting a
+   * placeholder, so `undefined` means "unknown", never "any project".
+   */
+  projectId?: string;
+  /**
+   * Cross-tenant artifact fetch client. The host authorizes on behalf of
+   * the dispatching agent identified by `agentId` + `companyId`, not on
+   * behalf of the plugin worker's tenant. Use this from inside a tool
+   * handler to read attachments uploaded by an agent in another company.
+   *
+   * @see {@link ToolRunContextArtifactsClient}
+   */
+  artifacts: ToolRunContextArtifactsClient;
+}
+
+/**
+ * Resolved artifact (attachment) bytes returned by
+ * {@link ToolRunContextArtifactsClient.fetch}.
+ */
+export interface ToolRunContextArtifact {
+  /** Raw attachment bytes. */
+  bytes: Uint8Array;
+  /** Original filename if known, otherwise `"attachment"`. */
+  filename: string;
+  /** MIME content type. */
+  contentType: string;
+  /** Total size in bytes. */
+  byteSize: number;
+}
+
+/**
+ * `runCtx.artifacts` — fetch attachment bytes on behalf of the dispatching
+ * agent during a tool call.
+ *
+ * Authorization is performed against the **dispatching agent** (the agent
+ * identified by this `ToolRunContext`), not against the plugin worker's own
+ * tenant. The attachment is fetchable iff the dispatching agent has read
+ * access to the attachment-owning company. This enables a Platform-tenant
+ * worker to resolve a DPR-tenant attachment when a DPR agent dispatched the
+ * tool call.
+ *
+ * The host validates the runContext server-side before returning bytes,
+ * rate-limits per dispatching agent, and writes a six-field audit log entry
+ * on every call (success or deny).
+ */
+export interface ToolRunContextArtifactsClient {
+  /**
+   * Fetch attachment bytes by ID.
+   *
+   * Returns `{ bytes, filename, contentType, byteSize }` on success.
+   *
+   * Throws on failure with a typed error code surfaced via JsonRpcCallError:
+   * - `runcontext_invalid` — the runContext was not server-validated or has
+   *   expired. Also surfaces if a worker tries to forge a runId.
+   * - `forbidden` — the dispatching agent does not have read access to the
+   *   attachment-owning company.
+   * - `not_found` — the attachment does not exist OR the dispatching agent
+   *   cannot see it (collapsed to a single error shape to prevent
+   *   enumeration via timing/error-shape oracles).
+   * - `rate_limited` — too many fetches from this dispatching agent (host
+   *   enforces both a global per-agent ceiling and a per-(agent, attachment
+   *   company) sub-bucket).
+   *
+   * @param attachmentId - The attachment UUID to fetch.
+   * @returns Attachment bytes + metadata.
+   */
+  fetch(attachmentId: string): Promise<ToolRunContextArtifact>;
+
+  /**
+   * Store inbound bytes as a company-scoped Paperclip asset (the
+   * inverse of {@link fetch}). Returns `{ attachmentId }` — the asset id, which
+   * you pass to `issues.createComment`'s `attachmentIds` to surface the bytes
+   * on a comment.
+   *
+   * Requires the `issue.attachments.create` capability (default-deny; declare
+   * it in the manifest). The host:
+   * - authorizes `companyId` against the dispatching/service scope (rejects
+   *   cross-tenant writes with `forbidden`),
+   * - enforces the human-upload size ceiling and a MIME allowlist (images,
+   *   common documents, audio/voice); disallowed types throw `forbidden`,
+   * - dedupes on `(companyId, sha256)` so retries converge (idempotent).
+   *
+   * Typed error codes via JsonRpcCallError: `runcontext_invalid`, `forbidden`,
+   * `too_large`, `rate_limited`.
+   *
+   * @param input - target company, filename, MIME type, and raw bytes.
+   * @returns `{ attachmentId }` — the created (or deduped) asset id.
+   */
+  create(input: ToolRunContextArtifactCreateInput): Promise<{ attachmentId: string }>;
+}
+
+/**
+ * Input to {@link ToolRunContextArtifactsClient.create}.
+ */
+export interface ToolRunContextArtifactCreateInput {
+  /** Target company UUID. Must match the dispatching/service scope. */
+  companyId: string;
+  /** Original filename (used for the stored asset's display name). */
+  filename: string;
+  /** MIME type; must be in the host's plugin-artifact allowlist. */
+  mimeType: string;
+  /** Raw bytes to store. */
+  bytes: Uint8Array;
+}
+
+/**
+ * `ctx.artifacts` — worker-level attachment client available on the full
+ * {@link PluginContext}, not only inside a tool handler.
+ *
+ * Same method shape as {@link ToolRunContextArtifactsClient}, but reachable
+ * from **service/background** code — a `setup()`-started loop (e.g. a
+ * `getUpdates` long-poll), `onWebhook`, `onEvent`, or `runJob` — as well as
+ * from tool dispatch. It takes no `runId`: the host backfills the active
+ * run-context from the worker→host `paperclipInvocationId`
+ * (`serviceScope` / `singleInFlightScope`), exactly as
+ * {@link PluginSecretsClient.resolve} already does from these contexts.
+ *
+ * @see worker-ctx artifacts surface
+ * @see messenger inbound media relay (the unblocked consumer)
+ */
+export interface PluginArtifactsClient {
+  /**
+   * Store inbound bytes as a company-scoped Paperclip asset, returning
+   * `{ attachmentId }` for use in {@link PluginIssuesClient.createComment}'s
+   * `attachmentIds`. Requires the `issue.attachments.create` capability
+   * (default-deny). Host gates match {@link ToolRunContextArtifactsClient.create}:
+   * company scope (cross-tenant writes throw `forbidden`), MIME allowlist, size
+   * ceiling, and `(companyId, sha256)` dedupe (idempotent). Authorized from
+   * `service`/`background` contexts (Gate 2) as well as tool dispatch.
+   *
+   * Typed error codes via JsonRpcCallError: `runcontext_invalid`, `forbidden`,
+   * `too_large`, `rate_limited`.
+   */
+  create(input: ToolRunContextArtifactCreateInput): Promise<{ attachmentId: string }>;
+
+  /**
+   * Fetch attachment bytes by ID on behalf of the dispatching run-context.
+   *
+   * Works today from a **tool-dispatch** context. From a `service`/`background`
+   * context the host currently rejects reads with `runcontext_invalid` — reads
+   * are scoped to the dispatching agent; widening this is a separately
+   * security-reviewed host change. This SDK surface is already correct
+   * for both: no further SDK change is needed once that host change lands.
+   */
+  fetch(attachmentId: string): Promise<ToolRunContextArtifact>;
 }
 
 /**
@@ -620,6 +765,30 @@ export interface PluginDatabaseClient {
 }
 
 /**
+ * Permitted body shapes for `ctx.http.fetch`. Widened beyond
+ * `RequestInit.body` so plugins can pass binary payloads (FormData,
+ * Uint8Array, ArrayBuffer, Buffer) end-to-end without manual base64
+ * plumbing through the worker→host RPC.
+ */
+export type PluginHttpFetchBody =
+  | string
+  | Uint8Array
+  | ArrayBuffer
+  | Buffer
+  | FormData;
+
+/**
+ * `RequestInit`-shaped options accepted by `ctx.http.fetch`. Mirrors the
+ * fields the SDK forwards over the worker→host RPC, but with a widened
+ * `body` type to accept binary/multipart payloads.
+ */
+export interface PluginHttpFetchInit {
+  method?: string;
+  headers?: HeadersInit;
+  body?: PluginHttpFetchBody | null;
+}
+
+/**
  * `ctx.http` — make outbound HTTP requests.
  *
  * Requires `http.outbound` capability.
@@ -634,11 +803,23 @@ export interface PluginHttpClient {
    * Plugins may also use standard Node `fetch` or other libraries directly —
    * this client exists for host-managed tracing and audit logging.
    *
+   * The `init.body` field accepts strings as well as binary/multipart
+   * payloads (`Uint8Array`, `ArrayBuffer`, `Buffer`, `FormData`). Binary
+   * bodies travel as base64 over the worker→host RPC and are decoded back
+   * to bytes before they hit the wire, so byte-exact payloads (e.g.
+   * gzip-compressed JSON, gcode uploads) round-trip without corruption.
+   *
+   * When `init.body instanceof FormData` and the caller did not set a
+   * `Content-Type` header, the SDK fills in
+   * `multipart/form-data; boundary=<boundary>` to match what `fetch()`
+   * would emit natively.
+   *
    * @param url - Target URL
-   * @param init - Standard `RequestInit` options
+   * @param init - Standard `RequestInit`-shaped options; see
+   *               {@link PluginHttpFetchInit} for the widened `body` type.
    * @returns The response
    */
-  fetch(url: string, init?: RequestInit): Promise<Response>;
+  fetch(url: string, init?: PluginHttpFetchInit): Promise<Response>;
 }
 
 /**
@@ -650,25 +831,72 @@ export interface PluginHttpClient {
  * company-scoped config. This client resolves a bound ref through the
  * Paperclip secret provider system at execution time.
  *
+ * Resolution is scoped to the **dispatching company** of the active tool call:
+ * the host re-derives the company from the `runId` you pass (never from the
+ * worker) and authorizes the ref against that company's
+ * `company_secret_bindings`. Resolution is therefore only possible from inside
+ * a tool handler, where `runCtx.runId` is available. Calls without a valid
+ * active-dispatch `runId` fail closed.
+ *
  * @see PLUGIN_SPEC.md §22 — Secrets
  */
 export interface PluginSecretsClient {
   /**
-   * Resolve a secret reference to its current value.
+   * Resolve a secret reference to its current value, scoped to the dispatching
+   * company of the active tool call.
    *
    * The reference must be the shared `secret_ref` object shape from plugin
-   * config. Legacy string UUID references fail closed.
+   * config. Legacy string UUID references fail closed. Pass `runCtx.runId`
+   * (via `options.runId`) so the host can authorize resolution against the
+   * dispatching company.
    *
    * Secret values are resolved at call time and must never be cached or
    * written to logs, config, or other persistent storage.
    *
-   * @param secretRef - The secret reference object from plugin config
-   * @returns The resolved secret value
+   * Throws a typed error (surfaced via JsonRpcCallError):
+   * - `invalid_ref` — the ref is not a well-formed secret UUID.
+   * - `runcontext_invalid` — no active dispatch for this `runId` (e.g. called
+   *   outside a tool handler, or a forged/expired `runId`).
+   * - `not_found` — the ref is not bound for the dispatching company, does not
+   *   exist, or cannot be resolved (collapsed to one shape to prevent
+   *   cross-company existence enumeration).
+   * - `rate_limited` — too many resolutions from this dispatching agent.
+   *
+   * @param secretRef - The secret reference object from plugin config.
+   * @param options.runId - The `runCtx.runId` of the active tool dispatch,
+   *   when resolving from inside a tool handler.
+   * @returns The resolved secret value.
    */
   resolve(
     secretRef: string | EnvSecretRefBinding,
-    options?: { companyId?: string; configPath?: string },
+    options?: { runId?: string; companyId?: string; configPath?: string },
   ): Promise<string>;
+
+  /**
+   * Exchange a resolved secret plaintext for an opaque **borrowed handle**
+   * (`vault-handle://<runId>/<128-bit-id>`) — Control 2.
+   *
+   * Return the handle to the agent INSTEAD of the plaintext. The host keeps the
+   * real value in a per-run vault and substitutes it back in only at the
+   * worker-dispatch edge of a downstream tool call, so the transcript and the
+   * persisted call record only ever contain the handle, never the secret. The
+   * value is also registered with the Control-1 value-exact redactor.
+   *
+   * Fail-closed: on any error, do NOT fall back to returning plaintext.
+   *
+   * Throws the same typed errors as {@link resolve} (`runcontext_invalid`,
+   * `rate_limited`, …) when minting is refused.
+   *
+   * @param value - The resolved secret plaintext to borrow.
+   * @param runId - The `runCtx.runId` of the active tool dispatch.
+   * @param secretRef - Optional UUID of the secret being borrowed.
+   *   When given, the host captures the secret's per-company binding egress
+   *   allowlist onto the handle at mint time so downstream egress is gated to
+   *   operator-approved destinations. The allowlist is always derived host-side
+   *   from the binding row — naming the ref never lets the worker set it.
+   * @returns The opaque borrowed handle string.
+   */
+  mintHandle(value: string, runId: string, secretRef?: string): Promise<string>;
 }
 
 /**
@@ -1285,6 +1513,53 @@ export interface PluginIssueApprovalSummary {
   createdAt: string;
 }
 
+/**
+ * Field-minimized view of a pending board approval, returned by the
+ * `approvals.list` reconcile read. Excludes the requester/decider
+ * user-id and decision-note PII carried by {@link PluginIssueApprovalSummary};
+ * the digest only needs to identify and relay the pending blocker.
+ */
+export interface PluginPendingApproval {
+  id: string;
+  type: string;
+  status: string;
+  payload: Record<string, unknown>;
+  createdAt: string;
+}
+
+/**
+ * Field-minimized view of a pending issue thread interaction, returned by the
+ * `interactions.list` reconcile read. Excludes creator/resolver
+ * user-id PII and the free-form payload/result blobs.
+ */
+export interface PluginPendingInteraction {
+  id: string;
+  issueId: string;
+  kind: string;
+  status: string;
+  title: string | null;
+  summary: string | null;
+  createdAt: string;
+}
+
+/**
+ * `ctx.approvals` — reconcile read of pending board approvals.
+ * Requires `board.approvals.read`. Company-scoped and read-only; intended for a
+ * digest plugin to seed/reconcile its in-memory blocker set on worker startup.
+ */
+/**
+ * `ctx.interactions` — reconcile read of pending issue thread interactions
+ * Requires `issue.interactions.read`. Company-scoped, read-only.
+ */
+export interface PluginInteractionsClient {
+  /**
+   * List issue thread interactions for a company. Defaults to
+   * `status:"pending"` when `status` is omitted. The host rejects a
+   * missing/empty `companyId`.
+   */
+  list(companyId: string, status?: string): Promise<PluginPendingInteraction[]>;
+}
+
 export interface PluginIssueCostSummary {
   costCents: number;
   inputTokens: number;
@@ -1360,6 +1635,25 @@ export interface PluginIssueSubtree {
   assignees?: Record<string, PluginIssueAssigneeSummary>;
 }
 
+/**
+ * Attachment metadata exposed to plugin workers. Deliberately a
+ * narrowed projection of the host `issue_attachments` row: raw storage details
+ * (provider, objectKey, sha256) are withheld so a worker cannot address the
+ * blob store directly — asset bytes go through `ctx.artifacts.fetch(assetId)`.
+ * `issueCommentId` is null for issue-level attachments not bound to a comment.
+ */
+export interface PluginIssueAttachment {
+  id: string;
+  companyId: string;
+  issueId: string;
+  issueCommentId: string | null;
+  assetId: string;
+  contentType: string | null;
+  byteSize: number | null;
+  originalFilename: string | null;
+  createdAt: Date | string;
+}
+
 export interface PluginIssueSummariesClient {
   /**
    * Read the compact orchestration inputs a workflow plugin needs for an
@@ -1398,6 +1692,7 @@ export interface PluginIssueAttachmentContent {
  * - `issues.wakeup` for assignment wakeup requests
  * - `issues.orchestration.read` for orchestration summaries
  * - `issue.comments.read` for `listComments`
+ * - `issue.attachments.read` for `listAttachments`
  * - `issue.comments.create` for `createComment`
  * - `issue.comments.create_human_attributed` for `createComment` calls that pass `actorUserId`
  * - `issue.interactions.create` for `createInteraction`, `suggestTasks`, `askUserQuestions`, `requestConfirmation`, and `requestCheckboxConfirmation`
@@ -1507,6 +1802,14 @@ export interface PluginIssuesClient {
   ): Promise<PluginIssueWakeupBatchResult[]>;
   listComments(issueId: string, companyId: string): Promise<IssueComment[]>;
   /**
+   * List the attachments bound to an issue and its comments. Lets a
+   * worker map a `issue.comment.created` event onto the asset ids attached to
+   * that comment (filter the returned rows by `issueCommentId`), then fetch each
+   * via `ctx.artifacts.fetch(assetId)`. Company-scoped: returns `[]` for an
+   * issue outside `companyId`. Requires `issue.attachments.read` (default-deny).
+   */
+  listAttachments(issueId: string, companyId: string): Promise<PluginIssueAttachment[]>;
+  /**
    * Post a comment on an issue.
    *
    * Pass `authorAgentId` to attribute the comment to the plugin's own agent
@@ -1528,13 +1831,51 @@ export interface PluginIssuesClient {
     issueId: string,
     body: string,
     companyId: string,
-    options?: { authorAgentId?: string; actorUserId?: string },
+    options?: {
+      authorAgentId?: string;
+      /** Resolve the target issue by identifier (e.g. `ACME-822`) instead of `issueId`. */
+      actorUserId?: string;
+      identifier?: string;
+      /**
+       * Wake the resolved issue's assignee. Body @-mentions are NOT honored as a
+       * wake primitive: relay bodies are untrusted, so mention-wake is omitted to
+       * avoid inbound content fanning out heartbeats.
+       */
+      wakeAssignee?: boolean;
+      /**
+       * Throw instead of inserting when the target issue is done/cancelled.
+       * Defaults to `true` when `wakeAssignee` is set; pass `false` to opt out.
+       */
+      refuseClosed?: boolean;
+      /**
+       * Asset ids returned by `ctx.artifacts.create` to surface on this
+       * comment. Each must belong to the comment's company. Omit/empty keeps the
+       * existing text-only behaviour.
+       */
+      attachmentIds?: string[];
+    },
   ): Promise<IssueComment>;
   createInteraction(
     issueId: string,
     interaction: CreateIssueThreadInteraction,
     companyId: string,
     options?: { authorAgentId?: string },
+  ): Promise<IssueThreadInteraction>;
+  /**
+   * Retire (expire) a single pending interaction the plugin is
+   * relaying an operator reply to — e.g. the messenger converting a free-text
+   * Telegram reply into a comment and resolving the `request_confirmation` it
+   * answered so nothing stays `pending`. Terminal status is always `expired`
+   * (never `accepted`), so this cannot trigger accept side-effects. Requires the
+   * default-deny `issue.interactions.resolve` capability. When `supersedingCommentId`
+   * is given the outcome is `superseded_by_comment` + that comment; otherwise the
+   * outcome is the dedicated `superseded`.
+   */
+  resolveInteraction(
+    issueId: string,
+    interactionId: string,
+    companyId: string,
+    options?: { supersedingCommentId?: string | null; reason?: string | null },
   ): Promise<IssueThreadInteraction>;
   suggestTasks(
     issueId: string,
@@ -2096,6 +2437,13 @@ export interface PluginContext {
   /** Resolve secret references. Requires `secrets.read-ref`. */
   secrets: PluginSecretsClient;
 
+  /**
+   * Create and fetch attachment bytes from service/background or tool-dispatch
+   * code. `create` requires `issue.attachments.create` (default-deny). Takes no
+   * `runId` — the host backfills the active run-context.
+   */
+  artifacts: PluginArtifactsClient;
+
   /** Write activity log entries. Requires `activity.log.write`. */
   activity: PluginActivityClient;
 
@@ -2125,6 +2473,9 @@ export interface PluginContext {
 
   /** Read and decide company approvals. Requires `approvals.read` / `approvals.respond`. */
   approvals: PluginApprovalsClient;
+
+  /** Reconcile read of pending issue thread interactions. Requires `issue.interactions.read`. */
+  interactions: PluginInteractionsClient;
 
   /** Read and manage agents. Requires `agents.read` for reads; `agents.pause` / `agents.resume` / `agents.invoke` for write ops. */
   agents: PluginAgentsClient;

@@ -14,7 +14,8 @@ coverage/
 .AppleDouble
 .LSOverride
 data/
-.paperclip/
+.paperclip/*
+!.paperclip/upstream-sync.json
 .pnpm-store/
 tmp-*
 cli/tmp/

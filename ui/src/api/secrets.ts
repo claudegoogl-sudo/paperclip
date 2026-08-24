@@ -26,6 +26,47 @@ export interface SecretUsageResponse {
   bindings: CompanySecretUsageBinding[];
 }
 
+/**
+ * Posture of a borrowed-handle binding, as derived server-side by
+ * `egressPostureFor`. Read from the response's `posture` field — never
+ * re-derived in the UI from `egressAllowlistEnforced` + `allowedEgress.length`.
+ * That re-inference is what left the born-enforcing bindings invisible and is
+ * what `server/src/services/egress-posture.ts` exists to prevent.
+ */
+export type EgressPosture = "log_only" | "enforcing" | "deny_all";
+
+export interface EgressBindingSuggestion {
+  origin: string;
+  count: number;
+  firstSeen: string;
+  lastSeen: string;
+  /** Always `false` server-side. Never pre-check or derive from allowedEgress. */
+  selected: false;
+}
+
+export interface EgressBinding {
+  id: string;
+  secretId: string;
+  targetType: string;
+  targetId: string;
+  configPath: string;
+  label: string | null;
+  allowedEgress: string[];
+  egressAllowlistEnforced: boolean;
+  updatedAt: string;
+  posture: EgressPosture;
+  suggestions: EgressBindingSuggestion[];
+}
+
+export interface EgressBindingsResponse {
+  bindings: EgressBinding[];
+}
+
+export interface EgressAllowlistResponse {
+  binding: EgressBinding;
+  handlesPurged: number;
+}
+
 /** One "My secrets" row: a company definition paired with the current user's own value (if set). */
 export interface MyUserSecretEntry {
   definition: UserSecretDefinition;
@@ -251,5 +292,33 @@ export const secretsApi = {
     api.post<SecretProposalView>(
       `/companies/${companyId}/secret-proposals/${proposalId}/reject`,
       data,
+    ),
+
+  // --- Operator-only egress review + per-binding enforce-flip surface -----
+  // Bindings are returned company-wide; filter client-side on `secretId`.
+  // Allowlist writes are REPLACE semantics (full merged list), not append.
+  // Surface `handlesPurged` in the success toast when non-zero so re-minted
+  // consumers are not a surprise.
+  listEgressBindings: (companyId: string) =>
+    api.get<EgressBindingsResponse>(
+      `/companies/${companyId}/secret-egress-bindings`,
+    ),
+  setEgressAllowlist: (
+    companyId: string,
+    bindingId: string,
+    allowedEgress: string[],
+  ) =>
+    api.post<EgressAllowlistResponse>(
+      `/companies/${companyId}/secret-egress-bindings/${bindingId}/allowlist`,
+      { allowedEgress },
+    ),
+  setEgressEnforcement: (
+    companyId: string,
+    bindingId: string,
+    input: { enforced: boolean; allowEmpty?: boolean },
+  ) =>
+    api.post<EgressAllowlistResponse>(
+      `/companies/${companyId}/secret-egress-bindings/${bindingId}/enforce`,
+      input.enforced ? { enforced: true, allowEmpty: input.allowEmpty } : { enforced: false },
     ),
 };

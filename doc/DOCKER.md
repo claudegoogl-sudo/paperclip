@@ -29,7 +29,7 @@ docker build -t paperclip-local \
 ```sh
 docker build -t paperclip-local . && \
 docker run --name paperclip \
-  -p 3100:3100 \
+  -p 127.0.0.1:3100:3100 \
   -e HOST=0.0.0.0 \
   -e PAPERCLIP_HOME=/paperclip \
   -e BETTER_AUTH_SECRET=$(openssl rand -hex 32) \
@@ -39,6 +39,13 @@ docker run --name paperclip \
 ```
 
 Open: `http://localhost:3100`
+
+`-p 127.0.0.1:3100:3100` keeps the published port on loopback. A manual
+`docker run` has no loopback default of its own — the common `-p 3100:3100`
+shorthand binds every interface, and UFW will not filter it (see
+[Published ports bind to loopback by default](#published-ports-bind-to-loopback-by-default)),
+so always name the bind address explicitly. Use `-p 0.0.0.0:3100:3100` only when
+you deliberately want off-host access.
 
 Data persistence:
 
@@ -50,6 +57,65 @@ Data persistence:
 All persisted under your bind mount (`./data/docker-paperclip` in the example above).
 
 ## Docker Compose
+
+### Published ports bind to loopback by default
+
+Every port published by the shipped Compose files binds to `127.0.0.1`, so a
+default `docker compose up` is reachable from the host only, not from the
+network. Override the bind address when you deliberately want off-host access:
+
+| Variable | Default | Applies to |
+|----------|---------|------------|
+| `PAPERCLIP_BIND_ADDR` | `127.0.0.1` | Paperclip server port in `docker-compose.yml` and `docker-compose.quickstart.yml` |
+| `PAPERCLIP_DB_BIND_ADDR` | `127.0.0.1` | PostgreSQL port in `docker-compose.yml` |
+| `REVIEW_BIND_ADDR` | `127.0.0.1` | both ports in `docker-compose.untrusted-review.yml` |
+
+`PAPERCLIP_BIND_ADDR` covers the server port in *both* `docker-compose.yml` and
+`docker-compose.quickstart.yml`, and Compose auto-loads `docker/.env` — setting it
+there to widen one stack widens the other stack's server port on its next `up`
+too. The database port is unaffected; it has its own variable.
+
+IPv6 bind addresses need bracket syntax — `PAPERCLIP_BIND_ADDR=[::1]`, not `::1`.
+The bare form expands to `::1:3100:3100`, which Compose will not parse as a
+host/port mapping. Fix that by adding the brackets, not by reaching for `0.0.0.0`.
+
+```sh
+# Expose the UI on every interface; PostgreSQL stays on loopback.
+PAPERCLIP_BIND_ADDR=0.0.0.0 \
+PAPERCLIP_PUBLIC_URL=http://<host>:3100 \
+BETTER_AUTH_SECRET=$(openssl rand -hex 32) \
+  docker compose -f docker/docker-compose.quickstart.yml up --build
+```
+
+Server and database bind addresses are separate on purpose: exposing the UI
+should not implicitly expose PostgreSQL. `docker-compose.yml` will not start
+until you choose a PostgreSQL password (see
+[PostgreSQL password](#postgresql-password)), but keep the database on loopback
+regardless unless you specifically need off-host database access.
+
+> **UFW does not filter Docker-published ports.** Docker installs its own DNAT
+> rules in `nat/PREROUTING` and filters container traffic in the `DOCKER` chain
+> hanging off `FORWARD`, so published ports never traverse the `INPUT` chain
+> that UFW's default-deny policy governs. `ufw deny 5432` will be accepted, will
+> show up in `ufw status`, and will silently do nothing. The publish bind
+> address above is the effective control. If you also want firewall
+> enforcement, write the rule in the `DOCKER-USER` chain, which *is* consulted
+> for container traffic.
+>
+> `DOCKER-USER` sees the packet *after* DNAT, so the rule must match the
+> **container** port, not the published host port:
+>
+> ```sh
+> iptables -I DOCKER-USER -p tcp --dport 3100 ! -s 127.0.0.1 -j DROP
+> ```
+>
+> With a remapped host port (`PAPERCLIP_PORT=3200`) a `--dport 3200` rule matches
+> nothing — the same silent no-op as `ufw deny`. Match the pre-DNAT destination
+> instead:
+>
+> ```sh
+> iptables -I DOCKER-USER -p tcp -m conntrack --ctorigdstport 3200 ! -s 127.0.0.1 -j DROP
+> ```
 
 ### Quickstart (embedded SQLite)
 
@@ -64,6 +130,7 @@ PAPERCLIP_TOOL_ACTION_SIGNING_SECRET=$(openssl rand -hex 32) \
 Defaults:
 
 - host port: `3100`
+- published bind address: `127.0.0.1` (host-only)
 - persistent data dir: `./data/docker-paperclip`
 
 Optional overrides:
@@ -83,12 +150,36 @@ Pass `OPENAI_API_KEY` and/or `ANTHROPIC_API_KEY` to enable local adapter runs.
 
 Paperclip server + PostgreSQL 17. The database is health-checked before the server starts.
 
+#### PostgreSQL password
+
+This stack has no default PostgreSQL password. `POSTGRES_PASSWORD` is required,
+and Compose refuses to start without it. Generate one per stack and put it in
+`docker/.env`, which Compose auto-loads:
+
+```sh
+printf 'POSTGRES_PASSWORD=%s\n' "$(openssl rand -hex 32)" >> docker/.env
+```
+
+A shipped default would be the same password on every install and public with
+the repo, and this database holds agent credentials and secret material —
+PostgreSQL's `COPY ... FROM PROGRAM` turns database access into command
+execution inside the container. Failing to start is the safer default.
+
+The same variable is interpolated into the server's `DATABASE_URL`, so the two
+cannot drift. Because the value lands in a URL userinfo field, use a password
+with no URL-reserved characters — the `openssl rand -hex 32` output above
+qualifies — or percent-encode it. Changing `POSTGRES_PASSWORD` after first
+start does not change the password on an existing `pgdata` volume; use
+`ALTER ROLE paperclip WITH PASSWORD ...` for that, or discard the volume.
+
 ```sh
 BETTER_AUTH_SECRET=$(openssl rand -hex 32) \
   docker compose -f docker/docker-compose.yml up --build
 ```
 
 PostgreSQL data persists in a named Docker volume (`pgdata`). Paperclip data persists in `paperclip-data`.
+
+Both published ports bind to `127.0.0.1` by default (see [Published ports bind to loopback by default](#published-ports-bind-to-loopback-by-default)). The server reaches PostgreSQL over the Compose network at `db:5432`, so the published `5432` exists only for host-side tooling such as `psql -h 127.0.0.1`.
 
 ### Untrusted PR review
 
@@ -144,7 +235,7 @@ If you want local adapter runs inside the container, pass API keys when starting
 
 ```sh
 docker run --name paperclip \
-  -p 3100:3100 \
+  -p 127.0.0.1:3100:3100 \
   -e HOST=0.0.0.0 \
   -e PAPERCLIP_HOME=/paperclip \
   -e OPENAI_API_KEY=... \
@@ -187,17 +278,24 @@ The `docker/quadlet/` directory contains unit files to run Paperclip + PostgreSQ
 3. Create a secrets env file (keep out of version control):
 
    ```sh
+   PGPASS=$(openssl rand -hex 32)
    cat > ~/.config/containers/systemd/paperclip.env <<EOL
    BETTER_AUTH_SECRET=$(openssl rand -hex 32)
    PAPERCLIP_TOOL_ACTION_SIGNING_SECRET=$(openssl rand -hex 32)
    POSTGRES_USER=paperclip
-   POSTGRES_PASSWORD=paperclip
+   POSTGRES_PASSWORD=${PGPASS}
    POSTGRES_DB=paperclip
-   DATABASE_URL=postgres://paperclip:paperclip@127.0.0.1:5432/paperclip
+   DATABASE_URL=postgres://paperclip:${PGPASS}@127.0.0.1:5432/paperclip
    # OPENAI_API_KEY=sk-...
    # ANTHROPIC_API_KEY=sk-...
    EOL
+   chmod 600 ~/.config/containers/systemd/paperclip.env
+   unset PGPASS
    ```
+
+   Generate the password rather than reusing a documented one: this file is the
+   only place the Quadlet units get it, so a value copied from these docs is a
+   credential shared with every other reader.
 
 4. Create the data directory and start:
 

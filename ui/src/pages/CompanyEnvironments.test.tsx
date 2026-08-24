@@ -477,7 +477,7 @@ describe("CompanyEnvironments — test provider button", () => {
       delete (globalThis as any).WebSocket;
     }
     vi.restoreAllMocks();
-    vi.clearAllMocks();
+    vi.resetAllMocks();
   });
 
   it("shows the testing state only on the clicked environment's button", async () => {

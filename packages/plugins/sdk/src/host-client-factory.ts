@@ -104,6 +104,12 @@ export interface HostServices {
       params: WorkerToHostMethods["config.get"][0],
       context?: WorkerHostCallContext,
     ): Promise<Record<string, unknown>>;
+    /**
+     * Fork: per-tenant effective config delivery (instance-wide config merged
+     * with this tenant's overrides). Optional — when omitted the gated
+     * wrapper falls back to `get`, preserving single-tenant behaviour.
+     */
+    getForCompany?(companyId: string): Promise<Record<string, unknown>>;
   };
 
   /** Provides trusted company-scoped local folder helpers. */
@@ -148,12 +154,48 @@ export interface HostServices {
     fetch(params: WorkerToHostMethods["http.fetch"][0]): Promise<WorkerToHostMethods["http.fetch"][1]>;
   };
 
-  /** Provides `secrets.resolve`. */
+  /** Provides `secrets.resolve` and `secrets.mintHandle`. */
   secrets: {
     resolve(
       params: WorkerToHostMethods["secrets.resolve"][0],
       context?: WorkerHostCallContext,
     ): Promise<string>;
+    mintHandle(
+      params: WorkerToHostMethods["secrets.mintHandle"][0],
+    ): Promise<WorkerToHostMethods["secrets.mintHandle"][1]>;
+  };
+
+  /**
+   * Provides `artifacts.fetch` — host-mediated cross-tenant attachment fetch.
+   *
+   * The service implementation is expected to:
+   * 1. Look up the runContext keyed on `(pluginId, runId)` (the factory passes
+   *    the runtime `pluginId` separately via closure when constructing the
+   *    `HostServices` for a given plugin).
+   * 2. Authorize against the dispatching agent's company, NOT the worker JWT.
+   * 3. Rate-limit per dispatching agent.
+   * 4. Audit-log with the six fields (attachmentId, attachmentCompanyId,
+   *    dispatchingAgentId, dispatchingAgentCompanyId, pluginInstanceId,
+   *    toolName).
+   * 5. Return base64-encoded bytes plus metadata.
+   *
+   * See the threat model and the seven-point security checklist for the full
+   * design rationale.
+   */
+  artifacts: {
+    fetch(params: WorkerToHostMethods["artifacts.fetch"][0]): Promise<WorkerToHostMethods["artifacts.fetch"][1]>;
+    /**
+     * Provides `artifacts.create` — host-mediated inbound attachment
+     * store. Inverse of `artifacts.fetch`. The service implementation must:
+     * 1. Resolve the runContext keyed on `(pluginId, runId)`.
+     * 2. Authorize `params.companyId` against the dispatching/service company
+     *    scope (same resolution `fetch` uses); reject cross-tenant writes.
+     * 3. Enforce the human-upload size ceiling and the plugin-artifact MIME
+     *    allowlist.
+     * 4. Dedupe on (companyId, sha256) so retries converge (idempotent).
+     * 5. Audit-log without ever recording the bytes.
+     */
+    create(params: WorkerToHostMethods["artifacts.create"][0]): Promise<WorkerToHostMethods["artifacts.create"][1]>;
   };
 
   /** Provides `activity.log`. */
@@ -245,12 +287,14 @@ export interface HostServices {
     requestWakeups(params: WorkerToHostMethods["issues.requestWakeups"][0]): Promise<WorkerToHostMethods["issues.requestWakeups"][1]>;
     getOrchestrationSummary(params: WorkerToHostMethods["issues.summaries.getOrchestration"][0]): Promise<WorkerToHostMethods["issues.summaries.getOrchestration"][1]>;
     listComments(params: WorkerToHostMethods["issues.listComments"][0]): Promise<WorkerToHostMethods["issues.listComments"][1]>;
+    listAttachments(params: WorkerToHostMethods["issues.listAttachments"][0]): Promise<WorkerToHostMethods["issues.listAttachments"][1]>;
     createComment(params: WorkerToHostMethods["issues.createComment"][0]): Promise<WorkerToHostMethods["issues.createComment"][1]>;
     createInteraction(params: WorkerToHostMethods["issues.createInteraction"][0]): Promise<WorkerToHostMethods["issues.createInteraction"][1]>;
     listInteractions(params: WorkerToHostMethods["issues.listInteractions"][0]): Promise<WorkerToHostMethods["issues.listInteractions"][1]>;
     respondInteraction(params: WorkerToHostMethods["issues.respondInteraction"][0]): Promise<WorkerToHostMethods["issues.respondInteraction"][1]>;
     listAttachments(params: WorkerToHostMethods["issues.listAttachments"][0]): Promise<WorkerToHostMethods["issues.listAttachments"][1]>;
     getAttachmentContent(params: WorkerToHostMethods["issues.getAttachmentContent"][0]): Promise<WorkerToHostMethods["issues.getAttachmentContent"][1]>;
+    resolveInteraction(params: WorkerToHostMethods["issues.resolveInteraction"][0]): Promise<WorkerToHostMethods["issues.resolveInteraction"][1]>;
   };
 
   /** Provides `approvals.list`, `approvals.get`, `approvals.decide`. */
@@ -266,6 +310,11 @@ export interface HostServices {
     get(params: WorkerToHostMethods["issues.documents.get"][0]): Promise<WorkerToHostMethods["issues.documents.get"][1]>;
     upsert(params: WorkerToHostMethods["issues.documents.upsert"][0]): Promise<WorkerToHostMethods["issues.documents.upsert"][1]>;
     delete(params: WorkerToHostMethods["issues.documents.delete"][0]): Promise<WorkerToHostMethods["issues.documents.delete"][1]>;
+  };
+
+  /** Provides `interactions.list` — fork reconcile read of pending issue interactions. */
+  interactions: {
+    list(params: WorkerToHostMethods["interactions.list"][0]): Promise<WorkerToHostMethods["interactions.list"][1]>;
   };
 
   /** Provides `agents.list`, `agents.get`, `agents.pause`, `agents.resume`, `agents.invoke`. */
@@ -376,7 +425,13 @@ export type HostClientHandlers = {
  *
  * @see PLUGIN_SPEC.md §15 — Capability Model
  */
-const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | null> = {
+// Values are a required capability, an any-of list of accepted capabilities
+// (fork: reconcile reads accept either the upstream or the fork grant), or
+// null for no capability requirement.
+const METHOD_CAPABILITY_MAP: Record<
+  WorkerToHostMethodName,
+  PluginCapability | PluginCapability[] | null
+> = {
   // Config — always allowed
   "config.get": null,
 
@@ -411,6 +466,16 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
 
   // Secrets
   "secrets.resolve": "secrets.read-ref",
+  // Minting a borrowed handle is part of resolving a secret-ref, so it shares
+  // the same capability gate.
+  "secrets.mintHandle": "secrets.read-ref",
+
+  // Artifacts — no capability gate: tool-dispatch implies attachment-read
+  // (host enforces dispatching-agent authz via runContext lookup).
+  "artifacts.fetch": null,
+  // Writing an attachment is a privileged mutation (unlike read), so it IS
+  // gated behind a dedicated default-deny capability.
+  "artifacts.create": "issue.attachments.create",
 
   // Activity
   "activity.log": "activity.log.write",
@@ -466,17 +531,27 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   "issues.requestWakeups": "issues.wakeup",
   "issues.summaries.getOrchestration": "issues.orchestration.read",
   "issues.listComments": "issue.comments.read",
+  // Reading attachment metadata is a default-deny read, gated separately from
+  // comment text so a plugin must opt in before it can enumerate asset ids.
+  // The asset bytes still go through artifacts.fetch. Restored after a prior
+  // SDK reset dropped this method, which broke outbound media relay.
+  "issues.listAttachments": "issue.attachments.read",
   "issues.createComment": "issue.comments.create",
   "issues.createInteraction": "issue.interactions.create",
   "issues.listInteractions": "issue.interactions.read",
   "issues.respondInteraction": "issue.interactions.respond",
+  "issues.resolveInteraction": "issue.interactions.resolve",
   "issues.listAttachments": "issue.attachments.read",
   "issues.getAttachmentContent": "issue.attachments.read",
 
-  // Approvals
-  "approvals.list": "approvals.read",
+  // Approvals — fork keeps the reconcile-read grant as an accepted
+  // alternative capability; EITHER grant authorizes the read.
+  "approvals.list": ["approvals.read", "board.approvals.read"],
   "approvals.get": "approvals.read",
   "approvals.decide": "approvals.respond",
+
+  // Reconcile reads
+  "interactions.list": "issue.interactions.read",
 
   // Issue Documents
   "issues.documents.list": "issue.documents.read",
@@ -525,6 +600,80 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   "authorization.audit.search": "authorization.audit.read",
 };
 
+/**
+ * Company-scoped worker→host methods that are safe to run under the bare,
+ * host-minted `serviceScope` — i.e. from a background dispatch or a
+ * `setup()`-started loop (e.g. the messenger `getUpdates` poll loop) with NO
+ * active dispatch to pin a tenant. Every other company-scoped method keeps
+ * failing closed in that state.
+ *
+ * The bar for membership is that the call cannot widen which companies/entities
+ * the plugin can reach beyond what a host-pinned dispatch already allows — the
+ * `serviceScope` only relaxes *timing* (act while idle), never reach. Three
+ * distinct safety arguments, one per entry:
+ *
+ *  - `events.subscribe`: a company filter requests a STRICT SUBSET of
+ *    the unconditionally-allowed unfiltered subscribe; the host event bus only
+ *    ever *removes* events that fail the filter, so a filter can only NARROW
+ *    visibility, never widen it.
+ *  - `state.get` / `state.set` / `state.delete`: company-scoped plugin state is
+ *    the plugin's OWN data, partitioned by `(pluginId, company)`. Reading or
+ *    writing its company-B partition leaks nothing cross-tenant and is reachable
+ *    during any company-B dispatch anyway.
+ *  - `issues.createComment`: the host service independently verifies the target
+ *    issue belongs to the claimed company (`requireInCompany`), so a
+ *    worker-forged `companyId` cannot reach a foreign issue. The reachable set
+ *    equals the plugin's dispatch-lifetime reach (a plugin subscribed to
+ *    `issue.*` already comments on every company's issues, one dispatch at a
+ *    time); serviceScope only removes the "must be mid-dispatch" timing
+ *    constraint.
+ *  - `artifacts.create`: the host service stores the asset under the
+ *    claimed `companyId`'s own storage namespace only and binds it to that
+ *    company's issues; a worker-forged `companyId` cannot reach a foreign
+ *    tenant's data, and the human-upload size ceiling + per-company rate limit
+ *    bound storage cost. As with `issues.createComment`, the reachable set
+ *    equals the plugin's dispatch-lifetime reach; serviceScope only relaxes the
+ *    timing constraint so an inbound relay (e.g. Telegram webhook) can store
+ *    while idle.
+ *  - `issues.resolveInteraction`: identical reach argument to
+ *    `issues.createComment`. The host service independently verifies the target
+ *    interaction belongs to the claimed company AND issue (`requireInCompany` +
+ *    interaction company/issue cross-check), so a worker-forged `companyId`
+ *    cannot reach a foreign tenant's interaction. It can only transition a
+ *    *pending* interaction to terminal `expired` (never `accepted`), so it fires
+ *    no accept side-effects and no continuation wake. The reachable set equals
+ *    the plugin's dispatch-lifetime reach; serviceScope only lets the inbound
+ *    Telegram relay retire the pending confirmation it just answered while idle.
+ *  - `approvals.list` / `interactions.list`: these reconcile reads run
+ *    a real, method-scoped plugin↔company availability gate
+ *    (`requirePluginEnabledForCompany` in plugin-host-services) BEFORE any
+ *    query and fail closed if the plugin is not installed+enabled for the
+ *    claimed company. That gate is the entity cross-check that the excluded
+ *    `issues.list` lacks: a worker-forged `companyId` can only reach a company
+ *    the plugin is genuinely provisioned for, so the reachable set equals the
+ *    plugin's install reach (== its instance-wide event-stream reach, the very
+ *    set the digest already accumulates). serviceScope only relaxes the timing
+ *    constraint so the digest can reconcile on worker startup / poll with no
+ *    active dispatch. Both reject `kind:"all"` and missing/empty `companyId`, so
+ *    no single call can enumerate across tenants.
+ *
+ * Deliberately excluded: any method that trusts `companyId` as the SOLE
+ * authority with no entity cross-check (e.g. `issues.list`, `companies.get`).
+ * Those must not run with a worker-chosen company outside a host-pinned
+ * dispatch, or a background loop could enumerate arbitrary tenants.
+ */
+const SERVICE_SCOPE_COMPANY_METHODS: ReadonlySet<WorkerToHostMethodName> = new Set([
+  "events.subscribe",
+  "state.get",
+  "state.set",
+  "state.delete",
+  "issues.createComment",
+  "issues.resolveInteraction",
+  "artifacts.create",
+  "approvals.list",
+  "interactions.list",
+]);
+
 // ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
@@ -568,6 +717,69 @@ export function createHostClientHandlers(
     return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
   }
 
+  /**
+   * Back-fill `runId` on a worker→host params record from the host-validated
+   * active invocation scope when the worker omitted it. A prior SDK change
+   * to the signature of `ctx.secrets.resolve()` made `runId` required; plugins
+   * bundled against the older SDK still call without it, which would
+   * otherwise fail closed at the server's secrets handler. The
+   * runId we fill in here came from the host's own outer dispatch — never
+   * from the worker — so the security invariants of that isolation model are
+   * preserved.
+   *
+   * Only writes when (a) the worker omitted `runId` AND (b) a host-validated
+   * scope carries a runId.
+   *
+   * The scope is sourced, in order, from:
+   *   1. `context.invocationScope` — the worker echoed a `paperclipInvocationId`
+   *      the host resolved to an active dispatch (SDKs that thread the
+   *      invocation id).
+   *   2. `context.singleInFlightScope` — the worker echoed no id (a legacy SDK
+   *      such as platform.cad ≤0.1.7 that predates invocation-id threading),
+   *      but exactly one
+   *      host→worker dispatch is in-flight, so the host attributes the callback
+   *      to it. Both come from the host's own runContext, never from the worker,
+   *      so the isolation model holds: a forged worker→host call
+   *      outside any dispatch surfaces no scope here and still fails closed at
+   *      the server's secrets handler (`runcontext_invalid`).
+   *   3. `context.serviceScope` — the host-minted, worker-lifetime
+   *      service run-context, surfaced on EVERY worker→host call. It is the
+   *      fallback for a background dispatch (`onEvent`/`onWebhook`/`runJob`) or
+   *      a loop started in `setup()` (e.g. a `getUpdates` long-poll) that calls
+   *      `secrets.resolve` with NO dispatch in flight, so neither scope above
+   *      exists. Checked last so an active dispatch's runId always wins. The
+   *      service runId is host-minted (never worker-supplied) and resolves to a
+   *      system actor at the server with the company derived from the secret
+   *      binding — it grants no company scope here.
+   *
+   * `serviceScope` being host-minted is NOT on its own a tenant-
+   * isolation argument for `secrets.resolve`. `contextForWorkerMessage`
+   * attaches `serviceScope` unconditionally, so whenever the host attributes a
+   * call to a single in-flight dispatch BOTH keys are present and (2) shadows
+   * (3). The runId written here IS the tenant binding — the server's secrets
+   * handler re-derives the company from `(pluginDbId, runId)` — so a
+   * no-dispatch caller reaching this with someone else's `singleInFlightScope`
+   * resolves that tenant's secret. What keeps (2) off a no-dispatch caller is
+   * the host, not this precedence chain: see `baseContextForWorkerMessage` in
+   * plugin-worker-manager (the worker-declared `echoesInvocationId` plus
+   * the host-observed per-method signal). Reordering the chain here is
+   * NOT the fix — for a legacy id-less worker servicing its own dispatch, (2)
+   * is the correct binding and (3) is not.
+   */
+  function backfillDispatchRunId<P>(
+    params: P,
+    context: WorkerHostCallContext | undefined,
+  ): P {
+    if (!isRecord(params)) return params;
+    if (readNonEmptyString((params as Record<string, unknown>).runId)) return params;
+    const scopedRunId =
+      readNonEmptyString(context?.invocationScope?.runId) ??
+      readNonEmptyString(context?.singleInFlightScope?.runId) ??
+      readNonEmptyString(context?.serviceScope?.runId);
+    if (!scopedRunId) return params;
+    return { ...params, runId: scopedRunId } as P;
+  }
+
   function requestedCompanyScope(
     method: WorkerToHostMethodName,
     params: unknown,
@@ -599,11 +811,61 @@ export function createHostClientHandlers(
     const requested = requestedCompanyScope(method, params);
     if (requested.kind === "none") return;
 
-    if (context?.invalidInvocationScope) {
+    const allowedCompanyId = readNonEmptyString(context?.invocationScope?.companyId);
+    if (!allowedCompanyId) {
+      // When no dispatch pins a company, authorize
+      // the narrow allowlist of company-scoped methods carrying the host-minted,
+      // worker-lifetime `serviceScope` — i.e. a background dispatch or
+      // a loop started in `setup()` (e.g. the messenger `getUpdates` poll loop /
+      // inbound `onWebhook` route) that cannot widen the plugin's reach beyond
+      // what a host-pinned dispatch already grants (see
+      // `SERVICE_SCOPE_COMPANY_METHODS` for the per-method safety argument).
+      //
+      // Guard-ordering fix: this bypass is evaluated BEFORE the
+      // `invalidInvocationScope` rejection below. The inbound relay path resolves
+      // to `invalidInvocationScope` in the host's base context (the worker→host
+      // callback carries no resolvable dispatch id — see `contextForWorkerMessage`
+      // / `baseContextForWorkerMessage` in plugin-worker-manager), so placing the
+      // throw first made this bypass dead code for the only path it exists to
+      // serve. Reaching the bypass here grants NO reach beyond the scope-less
+      // (`{}`) case already allowed below: these exact allowlist methods are
+      // server-side `requireInCompany` reach-checked, so a worker-forged
+      // `companyId` cannot reach a foreign tenant regardless of whether the
+      // worker echoed a bad id or no id. `requested.kind === "single"` ensures a
+      // concrete target company (`kind: "all"` still fails closed below), and a
+      // present `serviceScope.runId` is required. The `invalidInvocationScope`
+      // throw below retains full force for every NON-allowlisted company-scoped
+      // method, which is where its protective value actually lives.
+      if (
+        requested.kind === "single" &&
+        readNonEmptyString(context?.serviceScope?.runId) &&
+        SERVICE_SCOPE_COMPANY_METHODS.has(method)
+      ) {
+        return;
+      }
+      // The worker referenced a scope the host could not resolve to an active
+      // dispatch (missing/expired/unknown id, or a background call the host could
+      // not attribute). For non-allowlisted company-scoped methods this still
+      // fails closed — serviceScope cannot launder it into reach the method's own
+      // entity cross-check does not already grant.
+      if (context?.invalidInvocationScope) {
+        throw new InvocationScopeDeniedError(
+          pluginId,
+          method,
+          "the worker referenced a missing, expired, or unknown invocation scope",
+        );
+      }
+      // Fail closed (Complete Mediation / Fail Securely): a company-scoped
+      // worker→host call arrived with no resolvable invocation scope — e.g. an
+      // idle-window call between dispatches where the host pinned no tenant.
+      // Deny rather than silently letting the tenant pin be bypassed.
+      // companies.list legitimately enumerates every company and carries no
+      // pin, so it stays allowed.
+      if (method === "companies.list") return;
       throw new InvocationScopeDeniedError(
         pluginId,
         method,
-        "the worker referenced a missing, expired, or unknown invocation scope",
+        "no active invocation scope; company-scoped calls must run within a dispatch",
       );
     }
 
@@ -677,6 +939,12 @@ export function createHostClientHandlers(
   ): void {
     const required = METHOD_CAPABILITY_MAP[method];
     if (required === null) return; // No capability required
+    if (Array.isArray(required)) {
+      // Fork: any-of list — the method is authorized when the plugin holds at
+      // least one of the accepted grants.
+      if (required.some((c) => capabilitySet.has(c))) return;
+      throw new CapabilityDeniedError(pluginId, method, required.join('" or "'));
+    }
     if (capabilitySet.has(required)) return;
     throw new CapabilityDeniedError(pluginId, method, required);
   }
@@ -706,8 +974,36 @@ export function createHostClientHandlers(
   return {
     // Config
     "config.get": gated("config.get", async (params, context) => {
-      const companyId = resolveRequiredCompanyId("config.get", params, context);
-      return services.config.get({ ...params, companyId }, context);
+      // Fork scope selection: consult the same host-validated
+      // `singleInFlightScope` the runId backfill uses so id-less legacy
+      // workers (no `paperclipInvocationId` echo) resolve per-tenant config
+      // from the in-flight dispatch's company. The companyId is
+      // host-derived, never worker-supplied: with 0 or 2+ in-flight
+      // dispatches no `singleInFlightScope` is pinned and behavior is
+      // unchanged (instance-wide config).
+      const scopedCompanyId =
+        readNonEmptyString(context?.invocationScope?.companyId) ??
+        readNonEmptyString(context?.singleInFlightScope?.companyId);
+      const requested = readNonEmptyString(
+        (params as { companyId?: unknown } | undefined)?.companyId,
+      );
+      if (requested && requested !== scopedCompanyId) {
+        // Upstream: a worker-named company must match the host-validated scope.
+        throw new InvocationScopeDeniedError(
+          pluginId,
+          "config.get",
+          scopedCompanyId
+            ? `requested company "${requested}" but the current invocation is scoped to company "${scopedCompanyId}"`
+            : "company context is required",
+        );
+      }
+      if (scopedCompanyId && services.config.getForCompany) {
+        return services.config.getForCompany(scopedCompanyId);
+      }
+      if (scopedCompanyId) {
+        return services.config.get({ ...params, companyId: scopedCompanyId }, context);
+      }
+      return services.config.get();
     }),
 
     "localFolders.declarations": gated("localFolders.declarations", async (params) => {
@@ -776,8 +1072,50 @@ export function createHostClientHandlers(
 
     // Secrets
     "secrets.resolve": gated("secrets.resolve", async (params, context) => {
-      const companyId = resolveRequiredCompanyId("secrets.resolve", params, context);
-      return services.secrets.resolve({ ...params, companyId }, context);
+      // Back-compat: plugins bundled against the older SDK send
+      // `{ secretRef }` with no `runId`. Back-fill from the host-validated
+      // active invocation scope (populated by the host's executeTool /
+      // performAction bracket in plugin-worker-manager.ts:deriveInvocationScope)
+      // so dispatch lookups succeed for legacy callers. The secrets handler's
+      // fail-closed throw still fires when there is no active invocation, so a
+      // forged worker→host call outside a tool dispatch keeps getting
+      // `runcontext_invalid`.
+      const enriched = backfillDispatchRunId(params, context);
+      const requestedCompanyId = readNonEmptyString(
+        (params as { companyId?: unknown }).companyId,
+      );
+      if (requestedCompanyId) {
+        // Upstream: a worker-supplied companyId is authorized against the
+        // host-validated invocation scope before dispatch.
+        const companyId = resolveRequiredCompanyId("secrets.resolve", enriched, context);
+        return services.secrets.resolve({ ...enriched, companyId }, context);
+      }
+      return services.secrets.resolve(enriched);
+    }),
+
+    // Secrets — borrowed-handle minting (Control 2). Same dispatch
+    // run-id back-fill as `secrets.resolve`; the host keys the borrowed value
+    // off the server-validated runContext and fail-closes outside a dispatch.
+    "secrets.mintHandle": gated("secrets.mintHandle", async (params, context) => {
+      const enriched = backfillDispatchRunId(params, context);
+      return services.secrets.mintHandle(enriched);
+    }),
+
+    // Artifacts — host enforces dispatching-agent authz via runContext
+    "artifacts.fetch": gated("artifacts.fetch", async (params, context) => {
+      // Same back-fill as secrets.resolve. The current SDK threads
+      // runId here from day one, so this only kicks in for legacy callers
+      // that bundled an older SDK.
+      const enriched = backfillDispatchRunId(params, context);
+      return services.artifacts.fetch(enriched);
+    }),
+
+    // Artifacts write — gated behind issue.attachments.create.
+    // Same runId back-fill as fetch; the host re-validates company scope and
+    // enforces size/mime/idempotency before storing.
+    "artifacts.create": gated("artifacts.create", async (params, context) => {
+      const enriched = backfillDispatchRunId(params, context);
+      return services.artifacts.create(enriched);
     }),
 
     // Activity
@@ -918,6 +1256,9 @@ export function createHostClientHandlers(
     "issues.listComments": gated("issues.listComments", async (params) => {
       return services.issues.listComments(params);
     }),
+    "issues.listAttachments": gated("issues.listAttachments", async (params) => {
+      return services.issues.listAttachments(params);
+    }),
     "issues.createComment": gated("issues.createComment", async (params) => {
       if (params.actorUserId && !capabilitySet.has("issue.comments.create_human_attributed")) {
         throw new CapabilityDeniedError(
@@ -937,6 +1278,9 @@ export function createHostClientHandlers(
     "issues.respondInteraction": gated("issues.respondInteraction", async (params) => {
       return services.issues.respondInteraction(params);
     }),
+    "issues.resolveInteraction": gated("issues.resolveInteraction", async (params) => {
+      return services.issues.resolveInteraction(params);
+    }),
     "issues.listAttachments": gated("issues.listAttachments", async (params) => {
       return services.issues.listAttachments(params);
     }),
@@ -946,6 +1290,13 @@ export function createHostClientHandlers(
 
     // Approvals
     "approvals.list": gated("approvals.list", async (params) => {
+      if (!readNonEmptyString(params.companyId)) {
+        throw new InvocationScopeDeniedError(
+          pluginId,
+          "approvals.list",
+          "a concrete companyId is required; cross-tenant enumeration is not permitted",
+        );
+      }
       return services.approvals.list(params);
     }),
     "approvals.get": gated("approvals.get", async (params) => {
@@ -953,6 +1304,20 @@ export function createHostClientHandlers(
     }),
     "approvals.decide": gated("approvals.decide", async (params) => {
       return services.approvals.decide(params);
+    }),
+
+    // Fork reconcile reads — pending-blocker snapshot for the messenger
+    // digest. Beyond the capability + serviceScope gates, each handler hard-
+    // rejects a missing/empty `companyId` here (bridge-level complete mediation).
+    "interactions.list": gated("interactions.list", async (params) => {
+      if (!readNonEmptyString(params.companyId)) {
+        throw new InvocationScopeDeniedError(
+          pluginId,
+          "interactions.list",
+          "a concrete companyId is required; cross-tenant enumeration is not permitted",
+        );
+      }
+      return services.interactions.list(params);
     }),
 
     // Issue Documents

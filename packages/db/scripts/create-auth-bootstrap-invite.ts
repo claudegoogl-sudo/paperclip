@@ -3,6 +3,10 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { and, eq, gt, isNull } from "drizzle-orm";
 import { createDb } from "../src/client.js";
+import {
+  buildEmbeddedPostgresConnectionString,
+  readEmbeddedPostgresCredential,
+} from "../src/embedded-postgres-auth.js";
 import { invites } from "../src/schema/index.js";
 
 function hashToken(token: string) {
@@ -31,15 +35,31 @@ async function main() {
     database?: {
       mode?: string;
       embeddedPostgresPort?: number;
+      embeddedPostgresDataDir?: string;
       connectionString?: string;
     };
   };
-  const dbUrl =
-    config.database?.mode === "postgres"
-      ? config.database.connectionString
-      : `postgres://paperclip:paperclip@127.0.0.1:${config.database?.embeddedPostgresPort ?? 54329}/paperclip`;
+  let dbUrl: string | undefined;
+  if (config.database?.mode === "postgres") {
+    dbUrl = config.database.connectionString;
+  } else if (config.database?.mode === "embedded-postgres" || !config.database?.mode) {
+    const port = config.database?.embeddedPostgresPort ?? 54329;
+    const dataDir = config.database?.embeddedPostgresDataDir;
+    const cred = dataDir ? readEmbeddedPostgresCredential(dataDir) : null;
+    if (cred) {
+      dbUrl = buildEmbeddedPostgresConnectionString({
+        port,
+        database: "paperclip",
+        password: cred.password,
+      });
+    }
+  }
   if (!dbUrl) {
-    throw new Error(`Could not resolve database connection from ${configPath}`);
+    throw new Error(
+      `Could not resolve database connection from ${configPath} ` +
+        `(embedded-postgres mode requires a per-install credential file beside the data dir; ` +
+        `start the Paperclip server once so it generates one).`,
+    );
   }
 
   const db = createDb(dbUrl);

@@ -1548,6 +1548,102 @@
       "when": 1786983999395,
       "tag": "0222_orphan_cleanup_env_reference_survives_delete",
       "breakpoints": true
+    },
+    {
+      "idx": 223,
+      "when": 1786984000000,
+      "tag": "0223_activity_log_run_id_set_null",
+      "breakpoints": true
+    },
+    {
+      "idx": 224,
+      "when": 1786984100000,
+      "tag": "0224_backfill_plugin_secret_bindings",
+      "breakpoints": true
+    },
+    {
+      "idx": 225,
+      "when": 1786984200000,
+      "tag": "0225_secret_binding_egress_allowlist",
+      "breakpoints": true
+    },
+    {
+      "idx": 226,
+      "when": 1786984300000,
+      "tag": "0226_egress_would_deny_observations",
+      "breakpoints": true
+    },
+    {
+      "idx": 227,
+      "when": 1786984400000,
+      "tag": "0227_activity_log_company_entity_created_idx",
+      "breakpoints": true
+    },
+    {
+      "idx": 228,
+      "when": 1786984500000,
+      "tag": "0228_usage_limit_parks",
+      "breakpoints": true
+    },
+    {
+      "idx": 229,
+      "when": 1786984600000,
+      "tag": "0229_heartbeat_runs_context_issue_idx",
+      "breakpoints": true
+    },
+    {
+      "idx": 230,
+      "when": 1786984700000,
+      "tag": "0230_run_history_retention",
+      "breakpoints": true
+    },
+    {
+      "idx": 231,
+      "when": 1786984800000,
+      "tag": "0231_secret_binding_posture_audit",
+      "breakpoints": true
+    },
+    {
+      "idx": 232,
+      "when": 1786984900000,
+      "tag": "0232_activity_log_actor_provenance",
+      "breakpoints": true
+    },
+    {
+      "idx": 233,
+      "when": 1786985000000,
+      "tag": "0233_cost_events_denormalise_run_identifier",
+      "breakpoints": true
+    },
+    {
+      "idx": 234,
+      "when": 1786985100000,
+      "tag": "0234_plugin_webhook_deliveries_retention",
+      "breakpoints": true
+    },
+    {
+      "idx": 235,
+      "when": 1786985200000,
+      "tag": "0235_agent_runtime_state_session_params",
+      "breakpoints": true
+    },
+    {
+      "idx": 236,
+      "when": 1786985300000,
+      "tag": "0236_plugin_config_egress_allowlist",
+      "breakpoints": true
+    },
+    {
+      "idx": 237,
+      "when": 1786985400000,
+      "tag": "0237_plugin_config_egress_would_deny_observations",
+      "breakpoints": true
+    },
+    {
+      "idx": 238,
+      "when": 1786985500000,
+      "tag": "0238_agent_api_keys_expires_at",
+      "breakpoints": true
     }
   ]
 }

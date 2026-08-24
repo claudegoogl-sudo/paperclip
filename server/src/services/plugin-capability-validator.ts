@@ -79,6 +79,8 @@ const OPERATION_CAPABILITIES: Record<string, readonly PluginCapability[]> = {
   "costs.list": ["costs.read"],
   "costs.get": ["costs.read"],
   "issues.summaries.getOrchestration": ["issues.orchestration.read"],
+  "approvals.list": ["board.approvals.read"],
+  "interactions.list": ["issue.interactions.read"],
   "db.namespace": ["database.namespace.read"],
   "db.query": ["database.namespace.read"],
   "localFolders.declarations": [],
@@ -104,6 +106,7 @@ const OPERATION_CAPABILITIES: Record<string, readonly PluginCapability[]> = {
   "issue.interactions.respond": ["issue.interactions.respond"],
   "approvals.respond": ["approvals.respond"],
   "approvals.decide": ["approvals.respond"],
+  "issues.resolveInteraction": ["issue.interactions.resolve"],
   "activity.log": ["activity.log.write"],
   "metrics.write": ["metrics.write"],
   "telemetry.track": ["telemetry.track"],
@@ -128,6 +131,7 @@ const OPERATION_CAPABILITIES: Record<string, readonly PluginCapability[]> = {
   "webhooks.receive": ["webhooks.receive"],
   "http.request": ["http.outbound"],
   "secrets.resolve": ["secrets.read-ref"],
+  "secrets.mintHandle": ["secrets.read-ref"],
 
   // Agent tools
   "agent.tools.register": ["agent.tools.register"],

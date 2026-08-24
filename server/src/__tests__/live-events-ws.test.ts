@@ -1,9 +1,79 @@
+import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { activityLog, agentApiKeys, boardApiKeys } from "@paperclipai/db";
 import { setupLiveEventsWebSocketServer } from "../realtime/live-events-ws.js";
 import { logger } from "../middleware/logger.js";
+
+function hashToken(token: string) {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+function createSelectChain(rowsForTable: (table: unknown) => unknown[]) {
+  return {
+    from(table: unknown) {
+      return {
+        where() {
+          return Promise.resolve(rowsForTable(table));
+        },
+      };
+    },
+  };
+}
+
+// Mirrors the DB mock used by agent-auth-middleware.test.ts so the WS upgrade
+// path exercises the same expired-key rejection + audit behaviour as the HTTP
+// resolver, and captures the activity_log rows it inserts.
+function createDbState(input: {
+  agentKey?: {
+    id: string;
+    agentId: string;
+    companyId: string;
+    keyHash: string;
+    expiresAt?: Date | null;
+  };
+}) {
+  const activity: Array<Record<string, unknown>> = [];
+  const keyRow = input.agentKey
+    ? {
+        id: input.agentKey.id,
+        agentId: input.agentKey.agentId,
+        companyId: input.agentKey.companyId,
+        keyHash: input.agentKey.keyHash,
+        revokedAt: null,
+        scopeConfig: null,
+        expiresAt: input.agentKey.expiresAt ?? null,
+      }
+    : null;
+
+  const db = {
+    select: () =>
+      createSelectChain((table) => {
+        if (table === boardApiKeys) return [];
+        if (table === agentApiKeys) return keyRow ? [keyRow] : [];
+        return [];
+      }),
+    update: () => ({
+      set() {
+        return {
+          where() {
+            return Promise.resolve([]);
+          },
+        };
+      },
+    }),
+    insert: (table: unknown) => ({
+      values(values: Record<string, unknown>) {
+        if (table === activityLog) activity.push(values);
+        return Promise.resolve([]);
+      },
+    }),
+  } as never;
+
+  return { db, activity };
+}
 
 vi.mock("../middleware/logger.js", () => ({
   logger: {
@@ -103,6 +173,56 @@ describe("setupLiveEventsWebSocketServer", () => {
     );
     expect(socket.endedChunks).toEqual([]);
     expect(socket.destroyed).toBe(true);
+  });
+
+  it("rejects an expired agent key on the WS upgrade and audits it (parity with the HTTP resolver)", async () => {
+    const companyId = "company-1";
+    const agentId = randomUUID();
+    const keyId = randomUUID();
+    const token = "pcp_test_expired_ws_key";
+    // revokedAt stays null (see createDbState); the key is live except for its
+    // expiry — the same missed-revoke failure mode the HTTP resolver guards.
+    const { db, activity } = createDbState({
+      agentKey: {
+        id: keyId,
+        agentId,
+        companyId,
+        keyHash: hashToken(token),
+        expiresAt: new Date(Date.now() - 60_000),
+      },
+    });
+
+    const server = new EventEmitter();
+    setupLiveEventsWebSocketServer(server as never, db, { deploymentMode: "authenticated" });
+    const socket = new FakeUpgradeSocket();
+
+    server.emit(
+      "upgrade",
+      createUpgradeRequest({
+        method: "GET",
+        url: `/api/companies/${companyId}/events/ws?token=${token}`,
+      }),
+      socket as unknown as Duplex,
+      Buffer.alloc(0),
+    );
+    await flushPromises();
+    await flushPromises();
+
+    // Fail-closed: the expired key never authorizes, so the upgrade is refused.
+    expect(socket.endedChunks[0]).toContain("403 Forbidden");
+    // Detection parity: the same audit row the HTTP path writes. The url must be
+    // the bare pathname — never the query string that carries the token.
+    expect(activity).toHaveLength(1);
+    expect(activity[0]).toMatchObject({
+      companyId,
+      actorType: "agent",
+      actorId: agentId,
+      action: "auth.agent_key_expired",
+      entityType: "agent_api_key",
+      entityId: keyId,
+      details: { method: "GET", url: `/api/companies/${companyId}/events/ws` },
+    });
+    expect(JSON.stringify(activity[0])).not.toContain(token);
   });
 
   it("destroys and cleans up listeners after flushing a rejection response", async () => {

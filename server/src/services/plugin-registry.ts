@@ -28,6 +28,12 @@ import type {
   PluginWebhookDeliveryStatus,
 } from "@paperclipai/shared";
 import { conflict, notFound } from "../errors.js";
+import { secretService } from "./secrets.js";
+
+/** Read the manifest's `instanceConfigSchema` off a persisted plugins row. */
+function instanceConfigSchemaOf(plugin: { manifestJson: unknown }): unknown {
+  return (plugin.manifestJson as PaperclipPluginManifestV1 | null)?.instanceConfigSchema ?? null;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -201,6 +207,7 @@ export function pluginRegistryService(db: Db) {
         packageName?: string;
         version?: string;
         manifest?: PaperclipPluginManifestV1;
+        packagePath?: string;
       },
     ) => {
       const plugin = await getById(id);
@@ -211,6 +218,7 @@ export function pluginRegistryService(db: Db) {
       };
       if (data.packageName !== undefined) setClause.packageName = data.packageName;
       if (data.version !== undefined) setClause.version = data.version;
+      if (data.packagePath !== undefined) setClause.packagePath = data.packagePath;
       if (data.manifest !== undefined) {
         setClause.manifestJson = data.manifest;
         setClause.apiVersion = data.manifest.apiVersion;
@@ -325,28 +333,39 @@ export function pluginRegistryService(db: Db) {
         .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
         .then((rows) => rows[0] ?? null);
 
-      if (existing) {
-        return db
-          .update(pluginConfig)
-          .set({
-            configJson: input.configJson,
-            lastError: null,
-            updatedAt: new Date(),
-          })
-          .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
-          .returning()
-          .then((rows) => rows[0]);
-      }
+      const row = existing
+        ? await db
+            .update(pluginConfig)
+            .set({
+              configJson: input.configJson,
+              lastError: null,
+              updatedAt: new Date(),
+            })
+            .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
+            .returning()
+            .then((rows) => rows[0])
+        : await db
+            .insert(pluginConfig)
+            .values({
+              pluginId,
+              companyId,
+              configJson: input.configJson,
+            })
+            .returning()
+            .then((rows) => rows[0]);
 
-      return db
-        .insert(pluginConfig)
-        .values({
-          pluginId,
-          companyId,
-          configJson: input.configJson,
-        })
-        .returning()
-        .then((rows) => rows[0]);
+      // Maintain company_secret_bindings for any secret-ref fields. Adapted to
+      // upstream's company-scoped plugin_config: the config row is per-company,
+      // so the binding sync runs in that company's scope.
+      await secretService(db).syncPluginSecretBindings({
+        pluginId,
+        companyId,
+        instanceConfigSchema: instanceConfigSchemaOf(plugin),
+        previousConfig: existing?.configJson ?? null,
+        nextConfig: input.configJson,
+      });
+
+      return row;
     },
 
     /**
@@ -363,29 +382,43 @@ export function pluginRegistryService(db: Db) {
         .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
         .then((rows) => rows[0] ?? null);
 
-      if (existing) {
-        const merged = { ...existing.configJson, ...input.configJson };
-        return db
-          .update(pluginConfig)
-          .set({
-            configJson: merged,
-            lastError: null,
-            updatedAt: new Date(),
-          })
-          .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
-          .returning()
-          .then((rows) => rows[0]);
-      }
+      const nextConfig = existing
+        ? { ...existing.configJson, ...input.configJson }
+        : input.configJson;
 
-      return db
-        .insert(pluginConfig)
-        .values({
-          pluginId,
-          companyId,
-          configJson: input.configJson,
-        })
-        .returning()
-        .then((rows) => rows[0]);
+      const row = existing
+        ? await db
+            .update(pluginConfig)
+            .set({
+              configJson: nextConfig,
+              lastError: null,
+              updatedAt: new Date(),
+            })
+            .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
+            .returning()
+            .then((rows) => rows[0])
+        : await db
+            .insert(pluginConfig)
+            .values({
+              pluginId,
+              companyId,
+              configJson: nextConfig,
+            })
+            .returning()
+            .then((rows) => rows[0]);
+
+      // Maintain company_secret_bindings for any secret-ref fields. Adapted to
+      // upstream's company-scoped plugin_config: the config row is per-company,
+      // so the binding sync runs in that company's scope.
+      await secretService(db).syncPluginSecretBindings({
+        pluginId,
+        companyId,
+        instanceConfigSchema: instanceConfigSchemaOf(plugin),
+        previousConfig: existing?.configJson ?? null,
+        nextConfig,
+      });
+
+      return row;
     },
 
     /**
@@ -426,6 +459,23 @@ export function pluginRegistryService(db: Db) {
         ))
         .then((rows) => rows[0] ?? null) as Promise<PluginCompanySettings | null>,
 
+    /**
+     * Every ENABLED company-settings row for a plugin, across all
+     * companies. Used by the config-key egress allowlist chokepoint to compute
+     * the plugin-wide union of a `format:"uri"` config value (operator amendment
+     * A2 — the runtime deny decision is plugin-scoped, not per-call
+     * company-scoped, because there is no trustworthy per-call company context
+     * on the `ctx.http.fetch` path).
+     */
+    listEnabledCompanySettings: (pluginId: string): Promise<PluginCompanySettings[]> =>
+      db
+        .select()
+        .from(pluginCompanySettings)
+        .where(and(
+          eq(pluginCompanySettings.pluginId, pluginId),
+          eq(pluginCompanySettings.enabled, true),
+        )) as Promise<PluginCompanySettings[]>,
+
     /** Create or replace company-scoped plugin settings. */
     upsertCompanySettings: async (
       pluginId: string,
@@ -444,31 +494,190 @@ export function pluginRegistryService(db: Db) {
         ))
         .then((rows) => rows[0] ?? null);
 
-      if (existing) {
-        return db
-          .update(pluginCompanySettings)
-          .set({
-            enabled: input.enabled ?? existing.enabled,
-            settingsJson: input.settingsJson,
-            lastError: input.lastError ?? null,
-            updatedAt: new Date(),
-          })
-          .where(eq(pluginCompanySettings.id, existing.id))
-          .returning()
-          .then((rows) => rows[0]) as Promise<PluginCompanySettings>;
-      }
+      const row = (existing
+        ? await db
+            .update(pluginCompanySettings)
+            .set({
+              enabled: input.enabled ?? existing.enabled,
+              settingsJson: input.settingsJson,
+              lastError: input.lastError ?? null,
+              updatedAt: new Date(),
+            })
+            .where(eq(pluginCompanySettings.id, existing.id))
+            .returning()
+            .then((rows) => rows[0])
+        : await db
+            .insert(pluginCompanySettings)
+            .values({
+              pluginId,
+              companyId,
+              enabled: input.enabled ?? true,
+              settingsJson: input.settingsJson,
+              lastError: input.lastError ?? null,
+            })
+            .returning()
+            .then((rows) => rows[0])) as PluginCompanySettings;
 
-      return db
-        .insert(pluginCompanySettings)
-        .values({
-          pluginId,
-          companyId,
-          enabled: input.enabled ?? true,
-          settingsJson: input.settingsJson,
-          lastError: input.lastError ?? null,
+      // Maintain company_secret_bindings for any secret-ref fields.
+      // Per-company scope: only secrets owned by THIS company are bound.
+      await secretService(db).syncPluginSecretBindings({
+        pluginId,
+        instanceConfigSchema: instanceConfigSchemaOf(plugin),
+        previousConfig: (existing?.settingsJson as Record<string, unknown> | undefined) ?? null,
+        nextConfig: input.settingsJson,
+        companyId,
+      });
+
+      return row;
+    },
+
+    /**
+     * Per-tenant plugin config overrides.
+     *
+     * Reads the `configOverrides` sub-tree of a tenant's
+     * `plugin_company_settings.settingsJson`. The keys directly match the
+     * plugin's `instanceConfigSchema` so secret-ref paths line up with the
+     * binding-sync schema walker.
+     */
+    getCompanyConfigOverride: async (
+      pluginId: string,
+      companyId: string,
+    ): Promise<Record<string, unknown> | null> => {
+      const settings = await db
+        .select()
+        .from(pluginCompanySettings)
+        .where(and(
+          eq(pluginCompanySettings.pluginId, pluginId),
+          eq(pluginCompanySettings.companyId, companyId),
+        ))
+        .then((rows) => rows[0] ?? null);
+      const overrides = (settings?.settingsJson as Record<string, unknown> | undefined)
+        ?.configOverrides;
+      return overrides && typeof overrides === "object" && !Array.isArray(overrides)
+        ? (overrides as Record<string, unknown>)
+        : null;
+    },
+
+    /**
+     * Replace the per-tenant plugin config override.
+     *
+     * Preserves other top-level keys of `settingsJson` (e.g. local-folders).
+     * Reconciles `company_secret_bindings` for THIS tenant only — cross-tenant
+     * binding rows are untouched. Empty `configJson` clears all per-tenant
+     * bindings for this plugin/tenant (revoke-only sync).
+     */
+    upsertCompanyConfigOverride: async (
+      pluginId: string,
+      companyId: string,
+      configJson: Record<string, unknown>,
+    ): Promise<PluginCompanySettings> => {
+      const plugin = await getById(pluginId);
+      if (!plugin) throw notFound("Plugin not found");
+
+      const existing = await db
+        .select()
+        .from(pluginCompanySettings)
+        .where(and(
+          eq(pluginCompanySettings.pluginId, pluginId),
+          eq(pluginCompanySettings.companyId, companyId),
+        ))
+        .then((rows) => rows[0] ?? null);
+
+      const existingSettings = (existing?.settingsJson as Record<string, unknown> | undefined) ?? {};
+      const existingOverride = existingSettings.configOverrides;
+      const previousOverride =
+        existingOverride && typeof existingOverride === "object" && !Array.isArray(existingOverride)
+          ? (existingOverride as Record<string, unknown>)
+          : null;
+      const nextSettings = { ...existingSettings, configOverrides: configJson };
+
+      const row = (existing
+        ? await db
+            .update(pluginCompanySettings)
+            .set({
+              settingsJson: nextSettings,
+              updatedAt: new Date(),
+            })
+            .where(eq(pluginCompanySettings.id, existing.id))
+            .returning()
+            .then((rows) => rows[0])
+        : await db
+            .insert(pluginCompanySettings)
+            .values({
+              pluginId,
+              companyId,
+              enabled: true,
+              settingsJson: nextSettings,
+            })
+            .returning()
+            .then((rows) => rows[0])) as PluginCompanySettings;
+
+      // Reconcile bindings on the configOverrides sub-tree (where the
+      // manifest's secret-ref paths actually live), scoped to this tenant.
+      await secretService(db).syncPluginSecretBindings({
+        pluginId,
+        instanceConfigSchema: instanceConfigSchemaOf(plugin),
+        previousConfig: previousOverride,
+        nextConfig: configJson,
+        companyId,
+      });
+
+      return row;
+    },
+
+    /**
+     * Clear a tenant's per-tenant plugin config override.
+     *
+     * Equivalent to upsertCompanyConfigOverride(…, {}) but explicitly removes
+     * the `configOverrides` key from settingsJson rather than storing an empty
+     * object. Revokes all of this tenant's plugin bindings for paths that were
+     * previously in the override.
+     */
+    deleteCompanyConfigOverride: async (
+      pluginId: string,
+      companyId: string,
+    ): Promise<PluginCompanySettings | null> => {
+      const plugin = await getById(pluginId);
+      if (!plugin) throw notFound("Plugin not found");
+
+      const existing = await db
+        .select()
+        .from(pluginCompanySettings)
+        .where(and(
+          eq(pluginCompanySettings.pluginId, pluginId),
+          eq(pluginCompanySettings.companyId, companyId),
+        ))
+        .then((rows) => rows[0] ?? null);
+      if (!existing) return null;
+
+      const existingSettings = (existing.settingsJson as Record<string, unknown> | undefined) ?? {};
+      const existingOverride = existingSettings.configOverrides;
+      const previousOverride =
+        existingOverride && typeof existingOverride === "object" && !Array.isArray(existingOverride)
+          ? (existingOverride as Record<string, unknown>)
+          : null;
+      const { configOverrides: _drop, ...rest } = existingSettings as { configOverrides?: unknown } & Record<string, unknown>;
+      void _drop;
+
+      const row = await db
+        .update(pluginCompanySettings)
+        .set({
+          settingsJson: rest,
+          updatedAt: new Date(),
         })
+        .where(eq(pluginCompanySettings.id, existing.id))
         .returning()
-        .then((rows) => rows[0]) as Promise<PluginCompanySettings>;
+        .then((rows) => rows[0]) as PluginCompanySettings;
+
+      await secretService(db).syncPluginSecretBindings({
+        pluginId,
+        instanceConfigSchema: instanceConfigSchemaOf(plugin),
+        previousConfig: previousOverride,
+        nextConfig: null,
+        companyId,
+      });
+
+      return row;
     },
 
     // ----- Entities -------------------------------------------------------

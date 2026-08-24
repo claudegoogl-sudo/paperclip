@@ -1,4 +1,4 @@
-import type { DashboardRunActivityDay, HeartbeatRun } from "@paperclipai/shared";
+import { isSuccessfulHeartbeatRunStatus, type DashboardRunActivityDay, type HeartbeatRun } from "@paperclipai/shared";
 
 /* ---- Utilities ---- */
 
@@ -95,7 +95,7 @@ function aggregateRuns(runs: readonly HeartbeatRun[] = []): DashboardRunActivity
     const day = new Date(run.createdAt).toISOString().slice(0, 10);
     const entry = grouped.get(day);
     if (!entry) continue;
-    if (run.status === "succeeded") {
+    if (isSuccessfulHeartbeatRunStatus(run.status)) {
       entry.succeeded++;
     } else if (run.status === "failed" || run.status === "timed_out") {
       // A flat run list has no retry-chain linkage, so recovery can't be derived

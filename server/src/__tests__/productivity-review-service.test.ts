@@ -16,9 +16,11 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { MAX_ISSUE_REQUEST_DEPTH } from "@paperclipai/shared";
 import {
+  DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW,
   DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS,
   DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
   DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS,
+  HIGH_COMMENT_VOLUME_ALERT_ORIGIN_KIND,
   PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX,
   PRODUCTIVITY_REVIEW_ORIGIN_KIND,
   productivityReviewService,
@@ -55,6 +57,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     startedAt?: Date;
     parentId?: string | null;
     originKind?: string;
+    executionPolicy?: Record<string, unknown>;
   }) {
     const companyId = randomUUID();
     const managerId = randomUUID();
@@ -103,6 +106,7 @@ describeEmbeddedPostgres("productivity review service", () => {
       assigneeAgentId: coderId,
       parentId: opts?.parentId ?? null,
       originKind: opts?.originKind ?? "manual",
+      executionPolicy: opts?.executionPolicy ?? null,
       issueNumber: 1,
       identifier: `${issuePrefix}-1`,
       startedAt: opts?.startedAt ?? createdAt,
@@ -527,6 +531,129 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(1);
   });
 
+  // Standby wake targets (executionPolicy.standbyWakeTarget=true) sit
+  // in_progress indefinitely by design, so long-active + no-comment evidence
+  // must never page a reviewer for them.
+  it("skips standby wake-target issues entirely despite long-active and no-comment evidence", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      executionPolicy: { standbyWakeTarget: true },
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+    const hold = await service.isProductivityReviewContinuationHoldActive({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      agentId: seeded.coderId,
+      now,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+    expect(hold.held).toBe(false);
+  });
+
+  // Positive control: the gate is the flag value, not the mere presence
+  // of an executionPolicy — identical evidence on a non-standby issue still files.
+  it("still reviews a non-standby issue with identical long-active and no-comment evidence", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+      executionPolicy: { standbyWakeTarget: false },
+    });
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+  });
+
+  // Suppress long_active when the orphan checkoutRunId points at a
+  // terminal run and there has been no real assignee activity since.
+  it("suppresses long_active when checkoutRunId is terminal and no assignee comment is newer than finishedAt", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const runId = randomUUID();
+    const finishedAt = new Date(now.getTime() - 60 * 60 * 1000);
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "succeeded",
+      invocationSource: "assignment",
+      startedAt: new Date(finishedAt.getTime() - 30_000),
+      finishedAt,
+      contextSnapshot: { issueId: seeded.issueId },
+    });
+    await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, seeded.issueId));
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // Positive control: a still-running checkoutRunId is not "terminal",
+  // so the long_active trigger must still fire. Guards against the suppression
+  // branch widening accidentally (e.g. dropping the terminal-status gate).
+  it("still creates a long_active review when checkoutRunId points to a still-running run", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+    });
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "running",
+      invocationSource: "assignment",
+      startedAt: new Date(now.getTime() - 60 * 60 * 1000),
+      contextSnapshot: { issueId: seeded.issueId },
+    });
+    await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, seeded.issueId));
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+  });
+
   it("creates a high-churn review even when every sampled run has a progress comment", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
@@ -758,5 +885,208 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(result.failed).toBe(0);
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.requestDepth).toBe(MAX_ISSUE_REQUEST_DEPTH);
+  });
+
+  async function insertPlainComments(input: {
+    companyId: string;
+    issueId: string;
+    authorAgentId: string;
+    count: number;
+    now: Date;
+  }) {
+    await db.insert(issueComments).values(
+      Array.from({ length: input.count }, (_unused, index) => {
+        const createdAt = new Date(input.now.getTime() - index * 1000);
+        return {
+          companyId: input.companyId,
+          issueId: input.issueId,
+          authorAgentId: input.authorAgentId,
+          body: `Chatter ${index}`,
+          createdAt,
+          updatedAt: createdAt,
+        };
+      }),
+    );
+  }
+
+  async function listHighCommentVolumeAlerts(companyId: string) {
+    return db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, HIGH_COMMENT_VOLUME_ALERT_ORIGIN_KIND)))
+      .orderBy(issues.createdAt);
+  }
+
+  // AC1 kill-switch: PRODUCTIVITY_REVIEW_ENABLED=false short-circuits the
+  // reviewer to a zero-work, creates-nothing result.
+  it("short-circuits reconciliation when the kill-switch env flag is false", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    const disabled = productivityReviewService(db, { env: { PRODUCTIVITY_REVIEW_ENABLED: "false" } });
+    const result = await disabled.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.disabled).toBe(true);
+    expect(result.scanned).toBe(0);
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+
+    // Positive control: identical evidence with the flag enabled (default) still files.
+    const enabled = productivityReviewService(db, { env: {} });
+    const enabledResult = await enabled.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+    expect(enabledResult.disabled).toBe(false);
+    expect(enabledResult.created).toBe(1);
+  });
+
+  // AC2 high-comment-volume alert: crossing the threshold raises exactly one
+  // deduplicated alert per offending issue, and a re-run does not duplicate.
+  it("raises exactly one deduplicated high-comment-volume alert per offending issue", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertPlainComments({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      authorAgentId: seeded.coderId,
+      count: 4,
+      now,
+    });
+
+    const service = productivityReviewService(db);
+    const first = await service.reconcileHighCommentVolumeAlerts({ now, companyId: seeded.companyId, threshold: 3 });
+    const second = await service.reconcileHighCommentVolumeAlerts({ now, companyId: seeded.companyId, threshold: 3 });
+
+    expect(first.threshold).toBe(3);
+    expect(first.scanned).toBe(1);
+    expect(first.alerted).toBe(1);
+    expect(second.alerted).toBe(0);
+    expect(second.existing).toBe(1);
+
+    const alerts = await listHighCommentVolumeAlerts(seeded.companyId);
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]?.parentId).toBe(seeded.issueId);
+    expect(alerts[0]?.assigneeAgentId).toBe(seeded.managerId);
+    expect(alerts[0]?.originId).toBe(seeded.issueId);
+    expect(alerts[0]?.originFingerprint).toBe(`high-comment-volume-alert:${seeded.issueId}`);
+    expect(alerts[0]?.description).toContain("Comment count: 4");
+    expect(alerts[0]?.description).toContain("Alert threshold: 3");
+  });
+
+  it("does not raise a high-comment-volume alert below the threshold", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertPlainComments({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      authorAgentId: seeded.coderId,
+      count: 2,
+      now,
+    });
+
+    const result = await productivityReviewService(db).reconcileHighCommentVolumeAlerts({
+      now,
+      companyId: seeded.companyId,
+      threshold: 3,
+    });
+
+    expect(result.scanned).toBe(0);
+    expect(result.alerted).toBe(0);
+    expect(await listHighCommentVolumeAlerts(seeded.companyId)).toHaveLength(0);
+  });
+
+  // AC3 invariant regression guards: pin the three existing rate-limits so a
+  // future refactor cannot silently reopen the runaway-comment failure mode.
+  describe("productivity review invariants (regression)", () => {
+    it("(a) a second reconcile pass over the same source does not create a second open review", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+      const openReviews = (await listProductivityReviews(seeded.companyId)).filter(
+        (review) => review.status !== "done" && review.status !== "cancelled",
+      );
+      expect(openReviews).toHaveLength(1);
+    });
+
+    it("(b) refresh comments are capped at DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+      const service = productivityReviewService(db);
+      await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+      const [review] = await listProductivityReviews(seeded.companyId);
+
+      for (let pass = 1; pass <= DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS + 3; pass += 1) {
+        await service.reconcileProductivityReviews({
+          now: new Date(now.getTime() + pass * DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS),
+          companyId: seeded.companyId,
+        });
+      }
+
+      expect(await listRefreshComments(review!.id)).toHaveLength(DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS);
+    });
+
+    it("(c) creations per source are capped in the rolling 24h window", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+      await db.insert(issues).values(
+        Array.from({ length: DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW }, (_unused, index) => {
+          // Outside the 6h resolved-review snooze window but inside the 24h
+          // creation window, so the guard under test is the creation cap.
+          const createdAt = new Date(now.getTime() - (index + 8) * 60 * 60 * 1000);
+          return {
+            id: randomUUID(),
+            companyId: seeded.companyId,
+            title: `Prior productivity review ${index + 1}`,
+            status: "done" as const,
+            priority: "high" as const,
+            originKind: PRODUCTIVITY_REVIEW_ORIGIN_KIND,
+            originId: seeded.issueId,
+            originFingerprint: `productivity-review:${seeded.issueId}`,
+            parentId: seeded.issueId,
+            issueNumber: index + 2,
+            identifier: `${seeded.issuePrefix}-${index + 2}`,
+            createdAt,
+            updatedAt: createdAt,
+          };
+        }),
+      );
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(0);
+      expect(result.creationCapped).toBe(1);
+    });
   });
 });

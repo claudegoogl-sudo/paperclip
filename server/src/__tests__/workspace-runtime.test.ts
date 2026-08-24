@@ -8,7 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { parse as parseEnvContents } from "dotenv";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   activityLog,
   agents,
@@ -391,6 +391,19 @@ function createWorkspaceOperationRecorderDouble() {
   return { recorder, operations };
 }
 
+// Tests in this file exercise code paths (dev-runner-worktree.ts,
+// scripts/provision-worktree.sh) that fall back to the operator's real
+// `~/.paperclip-worktrees` whenever PAPERCLIP_WORKTREES_DIR is unset. Default
+// every test onto a private, per-test temp directory so none of them can
+// read or write the real host home, then let individual tests still opt
+// into their own isolated home (e.g. to assert on its exact contents).
+let ambientWorktreesHomeForTest: string | null = null;
+
+beforeEach(async () => {
+  ambientWorktreesHomeForTest = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktrees-ambient-"));
+  process.env.PAPERCLIP_WORKTREES_DIR = ambientWorktreesHomeForTest;
+});
+
 afterEach(async () => {
   await Promise.all(
     Array.from(leasedRunIds).map(async (runId) => {
@@ -403,6 +416,10 @@ afterEach(async () => {
   delete process.env.PAPERCLIP_INSTANCE_ID;
   delete process.env.PAPERCLIP_WORKTREES_DIR;
   delete process.env.DATABASE_URL;
+  if (ambientWorktreesHomeForTest) {
+    await fs.rm(ambientWorktreesHomeForTest, { recursive: true, force: true });
+    ambientWorktreesHomeForTest = null;
+  }
   await resetRuntimeServicesForTests();
 });
 
@@ -1740,7 +1757,7 @@ describe("realizeExecutionWorkspace", () => {
   it("reinstalls worktree-local pnpm dependencies when package metadata changes", async () => {
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-stale-deps-"));
     const baseRoot = path.join(tempRoot, "base");
-    const worktreeRoot = path.join(tempRoot, "worktree");
+    const worktreeRoot = path.join(tempRoot, "worktree-stale-deps");
     const fakeBin = path.join(tempRoot, "bin");
     const fakePnpmPath = path.join(fakeBin, "pnpm");
     const scriptPath = path.join(worktreeRoot, "provision-worktree.sh");
@@ -1833,7 +1850,7 @@ describe("realizeExecutionWorkspace", () => {
   it("fails instead of writing an unseeded fallback config when worktree init errors after CLI detection succeeds", async () => {
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-provision-fail-"));
     const baseRoot = path.join(tempRoot, "base");
-    const worktreeRoot = path.join(tempRoot, "worktree");
+    const worktreeRoot = path.join(tempRoot, "worktree-provision-fail");
     const fakeBin = path.join(tempRoot, "bin");
     const fakePnpmPath = path.join(fakeBin, "pnpm");
     const scriptPath = path.join(worktreeRoot, "provision-worktree.sh");
@@ -1889,7 +1906,7 @@ describe("realizeExecutionWorkspace", () => {
   it("regenerates stale worktree config that points at another host", async () => {
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-stale-config-"));
     const baseRoot = path.join(tempRoot, "base");
-    const worktreeRoot = path.join(tempRoot, "worktree");
+    const worktreeRoot = path.join(tempRoot, "worktree-stale-config");
     const fakeBin = path.join(tempRoot, "bin");
     const fakePnpmPath = path.join(fakeBin, "pnpm");
     const scriptPath = path.join(worktreeRoot, "provision-worktree.sh");
@@ -1980,7 +1997,7 @@ describe("realizeExecutionWorkspace", () => {
   it("retries worktree-local pnpm install without a frozen lockfile when the lockfile is outdated", async () => {
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-outdated-lockfile-"));
     const baseRoot = path.join(tempRoot, "base");
-    const worktreeRoot = path.join(tempRoot, "worktree");
+    const worktreeRoot = path.join(tempRoot, "worktree-outdated-lockfile");
     const fakeBin = path.join(tempRoot, "bin");
     const fakePnpmPath = path.join(fakeBin, "pnpm");
     const scriptPath = path.join(worktreeRoot, "provision-worktree.sh");

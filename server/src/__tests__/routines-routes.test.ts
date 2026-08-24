@@ -671,4 +671,58 @@ describe("routine routes", () => {
     });
     expect(mockTrackRoutineCreated).toHaveBeenCalledWith(expect.anything());
   });
+
+  it("rejects a nested triggers array on routine creation instead of silently dropping it", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await request(app)
+      .post(`/api/companies/${companyId}/routines`)
+      .send({
+        projectId,
+        title: "Daily routine",
+        assigneeAgentId: agentId,
+        triggers: [{ kind: "schedule", cronExpression: "0 9 * * *", timezone: "UTC" }],
+      });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Validation error");
+    expect(res.body.details).toEqual([expect.objectContaining({
+      code: "unrecognized_keys",
+      keys: ["triggers"],
+      message: "Unrecognized key(s) in object: 'triggers'",
+    })]);
+    expect(mockRoutineService.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects a nested triggers array on routine update instead of silently dropping it", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await request(app)
+      .patch(`/api/routines/${routineId}`)
+      .send({
+        title: "Daily routine",
+        triggers: [{ kind: "schedule", cronExpression: "0 9 * * *", timezone: "UTC" }],
+      });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe("Validation error");
+    expect(res.body.details).toEqual([expect.objectContaining({
+      code: "unrecognized_keys",
+      keys: ["triggers"],
+      message: "Unrecognized key(s) in object: 'triggers'",
+    })]);
+    expect(mockRoutineService.update).not.toHaveBeenCalled();
+  });
 });

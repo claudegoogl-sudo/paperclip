@@ -1,6 +1,7 @@
 import { and, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests, agents, heartbeatRuns, issues } from "@paperclipai/db";
+import { isSuccessfulHeartbeatRunStatus } from "@paperclipai/shared";
 import type { IssueCommentMetadata, IssueCommentPresentation, RunLivenessState } from "@paperclipai/shared";
 import { withRecoveryModelProfileHint } from "./model-profile-hint.js";
 import {
@@ -78,7 +79,7 @@ type IssueRow = Pick<
   | "assigneeAgentId"
   | "assigneeUserId"
   | "executionState"
-  | "originKind"
+  | "executionPolicy"
 >;
 type AgentRow = Pick<typeof agents.$inferSelect, "id" | "companyId" | "status">;
 type NoticeIssue = Pick<typeof issues.$inferSelect, "id" | "identifier" | "title" | "status">;
@@ -316,6 +317,10 @@ function fenceUntrustedText(value: string) {
   return [`${fence}text`, value, fence].join("\n");
 }
 
+export function isStandbyWakeTargetIssue(issue: Pick<IssueRow, "executionPolicy">) {
+  return readRecord(issue.executionPolicy).standbyWakeTarget === true;
+}
+
 function isCorrectiveHandoffRun(run: HeartbeatRunRow) {
   const context = readRecord(run.contextSnapshot);
   return context.handoffRequired === true ||
@@ -452,7 +457,7 @@ export function decideSuccessfulRunHandoff(input: {
 }): SuccessfulRunHandoffDecision {
   const { run, issue, agent } = input;
 
-  if (run.status !== "succeeded") return { kind: "skip", reason: "source run did not succeed" };
+  if (!isSuccessfulHeartbeatRunStatus(run.status)) return { kind: "skip", reason: "source run did not succeed" };
   if (isCorrectiveHandoffRun(run)) return { kind: "skip", reason: "source run is already a corrective handoff run" };
   if (isRecoveryActionDrivenRun(run)) return { kind: "skip", reason: "recovery action run owns its own follow-up path" };
   if (isIssueMonitorMaintenanceRun(run)) return { kind: "skip", reason: "issue monitor run owns its own recovery path" };
@@ -470,6 +475,9 @@ export function decideSuccessfulRunHandoff(input: {
   }
   if (issue.assigneeUserId) return { kind: "skip", reason: "issue is human-owned" };
   if (issue.status !== "in_progress") return { kind: "skip", reason: `issue status ${issue.status} is a valid disposition` };
+  if (isStandbyWakeTargetIssue(issue)) {
+    return { kind: "skip", reason: "issue is a standby wake target parked between external events" };
+  }
   if (issue.executionState) return { kind: "skip", reason: "issue has execution policy state" };
   if (isPluginManagedIssueLifecycle(issue)) {
     return { kind: "skip", reason: "issue lifecycle is owned by a plugin" };

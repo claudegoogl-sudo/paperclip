@@ -9,11 +9,15 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   agents,
   authUsers,
+  buildEmbeddedPostgresConnectionString,
+  buildEmbeddedPostgresConstructorOptions,
   companies,
   createDb,
   issueComments,
   issues,
   projects,
+  readEmbeddedPostgresCredential,
+  resolveEmbeddedPostgresPasswordForStartup,
   routines,
   routineTriggers,
 } from "@paperclipai/db";
@@ -914,21 +918,35 @@ describe("worktree helpers", () => {
           fs.readFileSync(path.join(worktreeRoot, ".paperclip", "config.json"), "utf8"),
         ) as PaperclipConfig;
         const { default: EmbeddedPostgres } = await import("embedded-postgres");
-        const targetPg = new EmbeddedPostgres({
-          databaseDir: targetConfig.database.embeddedPostgresDataDir,
-          user: "paperclip",
-          password: "paperclip",
-          port: targetConfig.database.embeddedPostgresPort,
-          persistent: true,
-          initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
-          onLog: () => {},
-          onError: () => {},
-        });
+        // After the seed flow, the target data dir's per-install credential
+        // file is the source of truth for the role password. Read it and use
+        // it both to construct the cluster handle and to connect.
+        const targetCred = readEmbeddedPostgresCredential(
+          targetConfig.database.embeddedPostgresDataDir,
+        );
+        const targetPassword =
+          targetCred?.password
+          ?? resolveEmbeddedPostgresPasswordForStartup(
+            targetConfig.database.embeddedPostgresDataDir,
+          ).password;
+        const targetPg = new EmbeddedPostgres(
+          buildEmbeddedPostgresConstructorOptions({
+            dataDir: targetConfig.database.embeddedPostgresDataDir,
+            port: targetConfig.database.embeddedPostgresPort,
+            password: targetPassword,
+            onLog: () => {},
+            onError: () => {},
+          }),
+        );
 
         await targetPg.start();
         try {
           const targetDb = createDb(
-            `postgres://paperclip:paperclip@127.0.0.1:${targetConfig.database.embeddedPostgresPort}/paperclip`,
+            buildEmbeddedPostgresConnectionString({
+              port: targetConfig.database.embeddedPostgresPort,
+              database: "paperclip",
+              password: targetPassword,
+            }),
           );
           const seededUsers = await targetDb.select().from(authUsers);
           expect(seededUsers.some((row) => row.email === "existing@paperclip.ing")).toBe(true);

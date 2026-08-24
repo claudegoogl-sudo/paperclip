@@ -43,6 +43,21 @@ describe("normalizeIssueExecutionPolicy", () => {
     expect(normalizeIssueExecutionPolicy({ stages: [] })).toBeNull();
   });
 
+  it("preserves standbyWakeTarget even with no stages or monitor", () => {
+    const result = normalizeIssueExecutionPolicy({ stages: [], standbyWakeTarget: true });
+    expect(result).not.toBeNull();
+    expect(result!.standbyWakeTarget).toBe(true);
+    expect(result!.stages).toEqual([]);
+  });
+
+  it("does not retain a false/absent standbyWakeTarget marker", () => {
+    expect(normalizeIssueExecutionPolicy({ stages: [], standbyWakeTarget: false })).toBeNull();
+    const withStage = normalizeIssueExecutionPolicy({
+      stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+    });
+    expect(withStage!.standbyWakeTarget).toBeUndefined();
+  });
+
   it("throws when all participants are invalid (missing agentId)", () => {
     expect(() =>
       normalizeIssueExecutionPolicy({

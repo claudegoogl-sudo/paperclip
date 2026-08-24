@@ -13,7 +13,7 @@ export const agentTaskSessions = pgTable(
     taskKey: text("task_key").notNull(),
     sessionParamsJson: jsonb("session_params_json").$type<Record<string, unknown>>(),
     sessionDisplayId: text("session_display_id"),
-    lastRunId: uuid("last_run_id").references(() => heartbeatRuns.id),
+    lastRunId: uuid("last_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
     lastError: text("last_error"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
@@ -35,5 +35,9 @@ export const agentTaskSessions = pgTable(
       table.taskKey,
       table.updatedAt,
     ),
+    // Single-column index for the ON DELETE set null referential-integrity
+    // probe, which filters on the run column alone and cannot use the composite
+    // (company_id, ...) index. See migration 0143.
+    lastRunIdx: index("agent_task_sessions_last_run_idx").on(table.lastRunId),
   }),
 );

@@ -31,6 +31,7 @@ import {
   agents,
   companies,
   heartbeatRuns,
+  issues,
   pluginLogs,
   pluginWebhookDeliveries,
   projects,
@@ -48,12 +49,32 @@ import {
 import { pluginRegistryService } from "../services/plugin-registry.js";
 import { pluginLifecycleManager } from "../services/plugin-lifecycle.js";
 import {
+  defaultPluginWebhookRateLimiter,
+  type PluginWebhookRateLimiter,
+  type PluginWebhookRateLimitTier,
+} from "../services/plugin-webhook-rate-limit.js";
+import { isVerifiedWebhookDelivery } from "../services/plugin-webhook-auth.js";
+import {
+  generateWebhookToken,
+  isWebhookTokenDigestConfig,
+  WebhookTokenEntropyError,
+} from "../services/plugin-webhook-token.js";
+import { logger } from "../middleware/logger.js";
+import type { PluginWatchReconciler } from "../services/plugin-dev-watcher.js";
+import {
   getPluginUiContributionMetadata,
   listMissingDeclaredPluginEntrypoints,
   pluginLoader,
   REPO_ROOT,
 } from "../services/plugin-loader.js";
+import { extractSecretRefPathsFromConfig } from "../services/plugin-secrets-handler.js";
+import { secretService } from "../services/secrets.js";
 import { logActivity } from "../services/activity-log.js";
+import {
+  createToolDispatchRateLimiter,
+  guardAndAuditToolDispatch,
+  RateLimitExceededError,
+} from "../services/plugin-tool-dispatch-guard.js";
 import { publishGlobalLiveEvent } from "../services/live-events.js";
 import { issueService } from "../services/issues.js";
 import type { PluginJobScheduler } from "../services/plugin-job-scheduler.js";
@@ -67,7 +88,6 @@ import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sd
 import {
   assertAuthenticated,
   assertBoard,
-  assertBoardOrAgent,
   assertBoardOrgAccess,
   assertCompanyAccess,
   assertInstanceAdmin,
@@ -83,6 +103,7 @@ import {
 } from "../services/plugin-local-folders.js";
 import {
   extractSecretRefBindingsFromConfig,
+  extractSecretRefPathsFromConfig,
 } from "../services/plugin-secrets-handler.js";
 import {
   canonicalizeLocalPluginPath,
@@ -397,6 +418,17 @@ export interface PluginRouteJobDeps {
 export interface PluginRouteWebhookDeps {
   /** The worker manager for dispatching handleWebhook RPC calls. */
   workerManager: PluginWorkerManager;
+  /**
+   * Override the sliding-window limiter guarding the anonymous ingestion route.
+   * Tests inject a limiter with a small window/cap and a fake clock; production
+   * uses the process-wide default so the budget survives a worker restart.
+   */
+  rateLimiter?: PluginWebhookRateLimiter;
+  /**
+   * Clock for the pre-limiter config memo's TTL. Defaults to `Date.now`; tests
+   * inject a fake clock to advance past the TTL and assert a fresh read.
+   */
+  now?: () => number;
 }
 
 /**
@@ -426,6 +458,21 @@ export interface PluginRouteBridgeDeps {
   workerManager: PluginWorkerManager;
   /** Optional stream bus for SSE push from worker to UI. */
   streamBus?: PluginStreamBus;
+}
+
+/**
+ * Optional dependencies for keeping local plugin file watchers in sync with the
+ * DB packagePath as lifecycle mutations happen at runtime.
+ *
+ * The dev-watcher subscribes to lifecycle domain events on the app-level
+ * lifecycle instance, but the install/enable/disable/uninstall routes run
+ * against a route-local lifecycle instance whose events never reach it. Calling
+ * `reconciler.reconcile(pluginId)` after each mutation arms/disarms the watcher
+ * against the current DB packagePath regardless of which emitter fired.
+ */
+export interface PluginRouteWatchDeps {
+  /** Dev-watcher reconciler; a no-op path is taken when absent. */
+  reconciler: PluginWatchReconciler;
 }
 
 export interface PluginRouteToolGatewayDeps {
@@ -508,8 +555,22 @@ interface PluginToolExecuteRequest {
  * @param webhookDeps - Optional webhook ingestion dependencies
  * @param toolDeps - Optional tool dispatcher dependencies
  * @param bridgeDeps - Optional bridge proxy dependencies for getData/performAction
+ * @param watchDeps - Optional dev-watcher reconciler to re-arm/disarm local
+ *   plugin file watchers when a mutation changes the DB packagePath
  * @returns Express router with plugin routes mounted
  */
+/**
+ * TTL for the pre-limiter webhook config memo (Step 5 of the ingestion handler).
+ *
+ * Bounds how long a cached `{salt,digest}` may lag a rotation. §18.1's rotation
+ * procedure writes the new digest and *then* updates the provider; deliveries
+ * fall through to the anonymous budget during that gap with no loss, so a memo
+ * this short only widens an already-tolerated window. Kept small so an operator
+ * never waits long for a rotation to take effect, but large enough that a burst
+ * of presence-header requests collapses to a single config read.
+ */
+export const PLUGIN_WEBHOOK_CONFIG_MEMO_TTL_MS = 5_000;
+
 export function pluginRoutes(
   db: Db,
   loader: ReturnType<typeof pluginLoader>,
@@ -518,14 +579,52 @@ export function pluginRoutes(
   toolDeps?: PluginRouteToolDeps,
   bridgeDeps?: PluginRouteBridgeDeps,
   toolGatewayDeps?: PluginRouteToolGatewayDeps,
+  watchDeps?: PluginRouteWatchDeps,
 ) {
   const router = Router();
   const registry = pluginRegistryService(db);
+
+  // Process-local, TTL-bounded memo for the pre-limiter config read on the
+  // anonymous webhook ingestion path (Step 5 of the POST handler below). Keyed
+  // on the resolved plugin row id — never a URL param — so an anonymous caller
+  // cannot grow the key space; the bound is the count of installed plugins.
+  // Caches the `null`/no-config case too: an endpoint that declares `auth` but
+  // has no digest configured is exactly where a presence-header flood would
+  // otherwise pay for a repeated SELECT that always fails to verify.
+  const webhookConfigNow = webhookDeps?.now ?? Date.now;
+  const webhookConfigMemo = new Map<
+    string,
+    { expiresAt: number; value: Awaited<ReturnType<typeof registry.getConfig>> }
+  >();
+  const readWebhookConfigMemoized = async (pluginId: string) => {
+    const now = webhookConfigNow();
+    const hit = webhookConfigMemo.get(pluginId);
+    if (hit && hit.expiresAt > now) return hit.value;
+    const value = await registry.getConfig(pluginId);
+    webhookConfigMemo.set(pluginId, {
+      value,
+      expiresAt: now + PLUGIN_WEBHOOK_CONFIG_MEMO_TTL_MS,
+    });
+    return value;
+  };
+
+  // Process-local sliding-window limiter for agent.tools.register
+  // dispatches. Shared across requests for this server instance; resets on
+  // restart (intentional — see plugin-tool-dispatch-guard.ts).
+  const toolDispatchRateLimiter = createToolDispatchRateLimiter();
   const lifecycle = pluginLifecycleManager(db, {
     loader,
     workerManager: bridgeDeps?.workerManager ?? webhookDeps?.workerManager,
   });
   const issuesSvc = issueService(db);
+
+  // Re-arm/disarm the local-plugin file watcher after a lifecycle
+  // mutation. Fire-and-forget: reconcile reads the current DB packagePath and
+  // is fully self-contained (its own try/catch), so it never blocks or fails
+  // the HTTP response.
+  const reconcileWatch = (pluginId: string): void => {
+    void watchDeps?.reconciler.reconcile(pluginId);
+  };
 
   function matchScopedApiRoute(route: PluginApiRouteDeclaration, method: string, requestPath: string) {
     if (route.method !== method) return null;
@@ -788,7 +887,46 @@ export function pluginRoutes(
     return companyId === undefined ? base : { ...base, companyId };
   }
 
+  /**
+   * Resolve the project a run belongs to, via the run's context issue.
+   *
+   * Returns `null` when the run is not project-scoped (no context issue, or an
+   * issue with no project). Callers must treat `null` as "unknown" and drop the
+   * field — never as a wildcard, and never as a placeholder value.
+   */
+  async function resolveRunProjectId(runId: string, companyId: string): Promise<string | null> {
+    if (!UUID_REGEX.test(runId) || !UUID_REGEX.test(companyId)) return null;
+    const [run] = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId)))
+      .limit(1);
+    const context = run?.contextSnapshot as Record<string, unknown> | null | undefined;
+    const nestedIssue = context?.paperclipIssue as Record<string, unknown> | null | undefined;
+    const issueId = context?.issueId ?? nestedIssue?.id;
+    if (typeof issueId !== "string" || !UUID_REGEX.test(issueId)) return null;
+    const [issue] = await db
+      .select({ projectId: issues.projectId })
+      .from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
+      .limit(1);
+    return issue?.projectId ?? null;
+  }
+
   async function validateToolRunContextScope(runContext: ToolRunContext): Promise<string | null> {
+    // Every id below indexes a `uuid` column. Screen them here so a malformed
+    // value is a deny rather than a Postgres cast error that escapes the route
+    // as a 500 — the scope check must be total for any input it is handed.
+    if (!UUID_REGEX.test(runContext.companyId) || !UUID_REGEX.test(runContext.agentId)) {
+      return '"runContext.agentId" does not belong to "runContext.companyId"';
+    }
+    if (!UUID_REGEX.test(runContext.runId)) {
+      return '"runContext.runId" does not belong to "runContext.companyId"';
+    }
+    if (runContext.projectId !== undefined && !UUID_REGEX.test(runContext.projectId)) {
+      return '"runContext.projectId" does not belong to "runContext.companyId"';
+    }
+
     const [agent] = await db
       .select({ companyId: agents.companyId })
       .from(agents)
@@ -810,13 +948,19 @@ export function pluginRoutes(
       return '"runContext.runId" does not belong to "runContext.agentId"';
     }
 
-    const [project] = await db
-      .select({ companyId: projects.companyId })
-      .from(projects)
-      .where(eq(projects.id, runContext.projectId))
-      .limit(1);
-    if (!project || project.companyId !== runContext.companyId) {
-      return '"runContext.projectId" does not belong to "runContext.companyId"';
+    // A run that is not project-scoped carries no projectId at all; the
+    // agent/run/company binding above is what authorizes the dispatch. Skipping
+    // the assertion is only correct because the field is absent — a present but
+    // unresolvable value was already denied above.
+    if (runContext.projectId !== undefined) {
+      const [project] = await db
+        .select({ companyId: projects.companyId })
+        .from(projects)
+        .where(eq(projects.id, runContext.projectId))
+        .limit(1);
+      if (!project || project.companyId !== runContext.companyId) {
+        return '"runContext.projectId" does not belong to "runContext.companyId"';
+      }
     }
 
     return null;
@@ -948,7 +1092,15 @@ export function pluginRoutes(
    * Errors: 501 if tool dispatcher is not configured
    */
   router.get("/plugins/tools", async (req, res) => {
-    assertBoardOrAgent(req);
+    if (req.actor.type === "agent") {
+      if (!req.actor.companyId) {
+        res.status(403).json({ error: "Agent token missing company scope" });
+        return;
+      }
+      assertCompanyAccess(req, req.actor.companyId);
+    } else {
+      assertBoardOrgAccess(req);
+    }
 
     if (!toolDeps) {
       res.status(501).json({ error: "Plugin tool dispatch is not enabled" });
@@ -995,16 +1147,74 @@ export function pluginRoutes(
    * - 502 if the plugin worker is unavailable or the RPC call fails
    */
   router.post("/plugins/tools/execute", async (req, res) => {
-    assertBoardOrAgent(req);
+    const rawBody = (req.body ?? {}) as Record<string, unknown>;
+
+    // Body-shape adapter: v0.1.6 wake-comment clients send {name, parameters, runId};
+    // the legacy board shape is {tool, parameters, runContext}. Accept both so a
+    // single fork build serves v0.1.5 (board) and v0.1.6 (agent) callers without
+    // stranding already-deployed clients. Synthesised runContext fields are
+    // cross-checked below by validateToolRunContextScope.
+    const body = { ...rawBody } as unknown as PluginToolExecuteRequest & {
+      name?: unknown;
+      runId?: unknown;
+    };
+    if ((body.tool === undefined || body.tool === null) && typeof body.name === "string") {
+      body.tool = body.name;
+    }
+    let hostResolvedRunContext = false;
+    if (
+      (body.runContext === undefined || body.runContext === null) &&
+      typeof body.runId === "string" &&
+      req.actor.type === "agent" &&
+      req.actor.agentId &&
+      req.actor.companyId
+    ) {
+      // ToolRunContext.artifacts is added downstream by the worker-rpc-host
+      // before the worker call (see worker-rpc-host.ts), so we don't synthesise
+      // it here — wire shape stays runId/agentId/companyId/projectId only.
+      //
+      // projectId is resolved from the run itself. Earlier builds substituted a
+      // non-uuid sentinel, which made the scope check below fail inside Postgres
+      // and surface as a 500 for every agent dispatch. When the run is not
+      // project-scoped the field is omitted rather than faked.
+      let projectId: string | null;
+      try {
+        projectId = await resolveRunProjectId(body.runId, req.actor.companyId);
+      } catch (err) {
+        // Same rule as the scope check below: a lookup that cannot complete is a
+        // deny, not a 500.
+        logger.error(
+          { err, companyId: req.actor.companyId, runId: body.runId },
+          "plugin tool dispatch run-project resolution failed",
+        );
+        res.status(403).json({ error: '"runContext" could not be validated' });
+        return;
+      }
+      body.runContext = {
+        runId: body.runId,
+        agentId: req.actor.agentId,
+        companyId: req.actor.companyId,
+        ...(projectId ? { projectId } : {}),
+      } as ToolRunContext;
+      hostResolvedRunContext = true;
+    }
+
+    // Actor-branch guard: agent JWTs reach this route through their own branch;
+    // company scope is enforced by assertCompanyAccess, and validateToolRunContextScope
+    // below checks the run/agent/project tuple. Board callers keep the prior guard.
+    if (req.actor.type === "agent") {
+      const companyId = (body.runContext as ToolRunContext | undefined)?.companyId;
+      if (!companyId) {
+        res.status(400).json({ error: '"runContext.companyId" required for agent dispatch' });
+        return;
+      }
+      assertCompanyAccess(req, companyId);
+    } else {
+      assertBoardOrgAccess(req);
+    }
 
     if (!toolDeps) {
       res.status(501).json({ error: "Plugin tool dispatch is not enabled" });
-      return;
-    }
-
-    const body = (req.body as PluginToolExecuteRequest | undefined);
-    if (!body) {
-      res.status(400).json({ error: "Request body is required" });
       return;
     }
 
@@ -1021,7 +1231,15 @@ export function pluginRoutes(
       return;
     }
 
-    if (!runContext.agentId || !runContext.runId || !runContext.companyId || !runContext.projectId) {
+    // Caller-supplied contexts must still name a project. A host-resolved
+    // context omits the field when the run is not project-scoped, which the
+    // scope check handles explicitly rather than by asserting on a fake value.
+    if (
+      !runContext.agentId ||
+      !runContext.runId ||
+      !runContext.companyId ||
+      (!runContext.projectId && !hostResolvedRunContext)
+    ) {
       res.status(400).json({
         error: '"runContext" must include agentId, runId, companyId, and projectId',
       });
@@ -1029,7 +1247,17 @@ export function pluginRoutes(
     }
 
     assertCompanyAccess(req, runContext.companyId);
-    const scopeError = await validateToolRunContextScope(runContext);
+    let scopeError: string | null;
+    try {
+      scopeError = await validateToolRunContextScope(runContext);
+    } catch (err) {
+      // A scope check that cannot complete is a deny, not a 500.
+      logger.error(
+        { err, tool, companyId: runContext.companyId, runId: runContext.runId },
+        "plugin tool dispatch scope validation failed",
+      );
+      scopeError = '"runContext" could not be validated';
+    }
     if (scopeError) {
       res.status(403).json({ error: scopeError });
       return;
@@ -1069,6 +1297,25 @@ export function pluginRoutes(
     if (!registeredTool) {
       res.status(404).json({ error: `Tool "${tool}" not found` });
       return;
+    }
+
+    // Enforce the host-side per-dispatcher rate limit and write
+    // exactly one audit row for this authorized dispatch BEFORE handing the
+    // call to the plugin worker. A breach fails closed with a 429.
+    try {
+      await guardAndAuditToolDispatch({
+        db,
+        namespacedTool: tool,
+        runContext,
+        parameters,
+        rateLimiter: toolDispatchRateLimiter,
+      });
+    } catch (err) {
+      if (err instanceof RateLimitExceededError) {
+        res.status(429).json({ error: err.message, code: err.code });
+        return;
+      }
+      throw err;
     }
 
     try {
@@ -1202,6 +1449,7 @@ export function pluginRoutes(
       const existingPlugin = await registry.getByKey(discovered.manifest.id);
       if (existingPlugin) {
         await lifecycle.load(existingPlugin.id);
+        reconcileWatch(existingPlugin.id);
         const updated = await registry.getById(existingPlugin.id);
         await logPluginMutationActivity(req, "plugin.installed", existingPlugin.id, {
           pluginId: existingPlugin.id,
@@ -1979,6 +2227,7 @@ export function pluginRoutes(
 
     try {
       const result = await lifecycle.unload(plugin.id, purge);
+      reconcileWatch(plugin.id);
       await logPluginMutationActivity(req, "plugin.uninstalled", plugin.id, {
         pluginId: plugin.id,
         pluginKey: plugin.pluginKey,
@@ -2014,6 +2263,7 @@ export function pluginRoutes(
 
     try {
       const result = await lifecycle.enable(plugin.id);
+      reconcileWatch(plugin.id);
       await logPluginMutationActivity(req, "plugin.enabled", plugin.id, {
         pluginId: plugin.id,
         pluginKey: plugin.pluginKey,
@@ -2054,6 +2304,7 @@ export function pluginRoutes(
 
     try {
       const result = await lifecycle.disable(plugin.id, reason);
+      reconcileWatch(plugin.id);
       await logPluginMutationActivity(req, "plugin.disabled", plugin.id, {
         pluginId: plugin.id,
         pluginKey: plugin.pluginKey,
@@ -2334,6 +2585,11 @@ export function pluginRoutes(
         { replaceAll: true },
       );
 
+      // Secret references in plugin config are permitted: the config value is
+      // only a pointer — resolution is authorized at call time against the
+      // dispatching company's `company_secret_bindings` by
+      // plugin-secrets-handler (fork deny-by-default egress gate), so a ref
+      // sitting in config never grants cross-company access.
       const result = await registry.upsertConfig(plugin.id, companyId, {
         companyId,
         configJson: body.configJson,
@@ -2393,6 +2649,125 @@ export function pluginRoutes(
       const message = err instanceof Error ? err.message : String(err);
       res.status(400).json({ error: message });
     }
+  });
+
+  /**
+   * POST /api/plugins/:pluginId/webhooks/:endpointKey/token
+   *
+   * Mint (or rotate) the shared token for a webhook endpoint that declares
+   * `auth` (PLUGIN_SPEC §18.1), and store its `{ salt, digest }` into the
+   * plugin's instance config under the declaration's `tokenDigestConfigKey`.
+   *
+   * This is the enforcement point for the 128-bit entropy floor: the host
+   * generates the token so the operator never chooses a weak one. The digest is
+   * offline-brute-forceable by anyone who can read plugin config, so a low-
+   * entropy token would be recoverable in seconds — a floor that lived only in
+   * documentation is a wish, not a floor.
+   *
+   * The token is returned **once** in the response for the operator to paste
+   * into the provider; the host writes only the digest and never persists the
+   * token. Re-running rotates: a fresh salt/digest replaces the old pair, which
+   * is idempotent in the sense that the config always converges to a valid
+   * recogniser for the token just printed.
+   *
+   * Request body (optional):
+   * - `token`: bring-your-own token. Rejected below the 128-bit floor (a length
+   *   ceiling check — the explicit, discouraged escape hatch). Omit it to let
+   *   the host generate one, which is the recommended path.
+   *
+   * Response: `{ token, endpointKey, header, tokenDigestConfigKey }`
+   * Errors:
+   * - 400 if the endpoint has no `header-token` auth declaration, or a supplied
+   *   token is below the floor
+   * - 404 if the plugin or endpointKey is not found
+   */
+  router.post("/plugins/:pluginId/webhooks/:endpointKey/token", async (req, res) => {
+    assertInstanceAdmin(req);
+    const { pluginId, endpointKey } = req.params;
+
+    const plugin = await resolvePlugin(registry, pluginId);
+    if (!plugin) {
+      res.status(404).json({ error: "Plugin not found" });
+      return;
+    }
+
+    const webhookDecl = (plugin.manifestJson?.webhooks ?? []).find(
+      (w) => w.endpointKey === endpointKey,
+    );
+    if (!webhookDecl) {
+      res.status(404).json({
+        error: `Webhook endpoint '${endpointKey}' is not declared by this plugin`,
+      });
+      return;
+    }
+    const auth = webhookDecl.auth;
+    if (!auth || auth.type !== "header-token") {
+      res.status(400).json({
+        error: `Webhook endpoint '${endpointKey}' does not declare header-token auth; there is no token to generate`,
+      });
+      return;
+    }
+
+    const body = req.body as { token?: unknown } | undefined;
+    const suppliedToken = body?.token;
+    if (suppliedToken !== undefined && typeof suppliedToken !== "string") {
+      res.status(400).json({ error: '"token" must be a string when provided' });
+      return;
+    }
+
+    let generated;
+    try {
+      generated = generateWebhookToken(suppliedToken);
+    } catch (err) {
+      if (err instanceof WebhookTokenEntropyError) {
+        res.status(400).json({ error: err.message });
+        return;
+      }
+      throw err;
+    }
+
+    // Merge into existing config so unrelated keys survive the rotation.
+    const existing = await registry.getConfig(plugin.id);
+    // Defence in depth against a manifest that predates the install-time
+    // collision guard: never blind-overwrite a config key holding anything other
+    // than a prior `{salt, digest}` pair. Overwriting a secret-ref here would
+    // tear down its `company_secret_bindings` row instance-wide via
+    // `syncPluginSecretBindings`. Refuse rather than destroy.
+    const existingValue = existing?.configJson?.[auth.tokenDigestConfigKey];
+    if (existingValue !== undefined && !isWebhookTokenDigestConfig(existingValue)) {
+      res.status(409).json({
+        error:
+          `Config key '${auth.tokenDigestConfigKey}' already holds a non-digest value; `
+          + "refusing to overwrite it. Point the webhook's tokenDigestConfigKey at a dedicated, "
+          + "unused config key.",
+      });
+      return;
+    }
+    const configJson: Record<string, unknown> = {
+      ...(existing?.configJson ?? {}),
+      [auth.tokenDigestConfigKey]: generated.digestConfig,
+    };
+
+    await registry.upsertConfig(plugin.id, { configJson });
+    // Never log the token; the digest key is the only detail worth an audit trail.
+    await logPluginMutationActivity(req, "plugin.config.updated", plugin.id, {
+      pluginId: plugin.id,
+      pluginKey: plugin.pluginKey,
+      webhookEndpointKey: endpointKey,
+      tokenDigestConfigKey: auth.tokenDigestConfigKey,
+      action: "webhook-token-generated",
+    });
+    logger.info(
+      { pluginId: plugin.id, endpointKey, tokenDigestConfigKey: auth.tokenDigestConfigKey },
+      "generated webhook token digest for plugin endpoint",
+    );
+
+    res.json({
+      token: generated.token,
+      endpointKey,
+      header: auth.header,
+      tokenDigestConfigKey: auth.tokenDigestConfigKey,
+    });
   });
 
   /**
@@ -2659,12 +3034,22 @@ export function pluginRoutes(
    *
    * **Note:** This route does NOT require board authentication — webhook
    * endpoints must be publicly accessible for external callers. Signature
-   * verification is the plugin's responsibility.
+   * verification is the plugin's responsibility. Because it is anonymous, it is
+   * guarded by a sliding-window limiter (see plugin-webhook-rate-limit.ts) and a
+   * tighter JSON body cap than the rest of the API (see app.ts).
+   *
+   * When the manifest declares `webhooks[].auth`, the host additionally checks a
+   * salted token digest to decide *which* limiter budget the delivery is billed
+   * to — verified or anonymous. A mismatch is never a rejection; it falls
+   * through to the anonymous budget (see plugin-webhook-auth.ts).
    *
    * Response: `{ deliveryId: string, status: string }`
    * Errors:
    * - 404 if plugin not found or endpointKey not declared
    * - 400 if plugin is not in ready state or lacks webhooks.receive capability
+   * - 413 if the body exceeds `WEBHOOK_JSON_BODY_LIMIT` (rejected by the parser)
+   * - 429 if the limiter rejects the delivery; carries `Retry-After` and writes
+   *   no delivery row
    * - 502 if the worker is unavailable or the RPC call fails
    */
   router.post("/plugins/:pluginId/webhooks/:endpointKey", async (req, res) => {
@@ -2717,7 +3102,90 @@ export function pluginRoutes(
       return;
     }
 
-    // Step 5: Extract request data
+    // Step 5: Decide which rate-limit budget this delivery is billed to.
+    //
+    // Only a request that actually carries the declared token header costs the
+    // config read; an endpoint without `auth`, or a request without the header,
+    // short-circuits to the anonymous tier having done no extra work. That is
+    // what keeps the unauthenticated path exactly as expensive as it was
+    // before this check existed.
+    //
+    // A mismatch is not an error and never returns 401 — see
+    // plugin-webhook-auth.ts for why falling through to the anonymous budget is
+    // the safer failure mode than rejecting.
+    //
+    // The `webhooks.verify` capability is re-checked here, at request time,
+    // against the *persisted* manifest — the same complete-mediation reason step
+    // 3 re-checks `webhooks.receive` rather than trusting install-time
+    // validation. Without it, a persisted manifest carrying `auth` that never
+    // passed the validator (a pre-feature row, a reinstall path, a direct DB
+    // write) could reach the verified tier with no grant. Absent the capability,
+    // the delivery stays anonymous.
+    let tier: PluginWebhookRateLimitTier = "anonymous";
+    if (webhookDecl.auth && capabilities.includes("webhooks.verify")) {
+      const headerValue = req.headers[webhookDecl.auth.header.toLowerCase()];
+      // Only a single, non-empty header value can ever verify. A repeated
+      // header arrives as `string[]` — truthy, but `isVerifiedWebhookDelivery`
+      // has no principled copy to check, so it can never reach the verified
+      // tier; bail here before paying for the config read rather than reading,
+      // failing, and billing the anonymous budget anyway. Absent or empty
+      // header is likewise anonymous at no cost.
+      if (typeof headerValue === "string" && headerValue.length > 0) {
+        const config = await readWebhookConfigMemoized(plugin.id);
+        const verified = isVerifiedWebhookDelivery({
+          auth: webhookDecl.auth,
+          headers: req.headers,
+          config: config?.configJson,
+          pluginId: plugin.id,
+          endpointKey,
+        });
+        if (verified) tier = "verified";
+      }
+    }
+
+    // Step 6: Rate-limit before any write.
+    //
+    // Deliberately placed *after* steps 1-4: the bucket key is then the
+    // canonical plugin row id plus a manifest-declared endpoint key, so an
+    // anonymous caller cannot grow the limiter's key space with made-up ids,
+    // and cannot split a plugin's budget by alternating between its uuid and
+    // its key in the URL. Everything expensive — the delivery row insert and
+    // the handleWebhook RPC — is still downstream of this gate.
+    const rateLimit = (webhookDeps.rateLimiter ?? defaultPluginWebhookRateLimiter).consume({
+      pluginId: plugin.id,
+      endpointKey,
+      ip: req.ip,
+      tier,
+    });
+    if (!rateLimit.allowed) {
+      // No payload: the body is attacker-controlled and may carry provider
+      // secrets. The identifiers below are what distinguishes "attack blocked"
+      // from "we are 429ing a real provider".
+      logger.warn(
+        {
+          pluginId: plugin.id,
+          pluginKey: plugin.pluginKey,
+          endpointKey,
+          scope: rateLimit.scope,
+          // Which budget was exhausted. `verified` means a credentialled
+          // caller outran its own tier; `anonymous` is the ordinary case and
+          // the one an attack shows up in. Never the token, header or digest.
+          tier: rateLimit.tier,
+          limit: rateLimit.limit,
+          retryAfterSeconds: rateLimit.retryAfterSeconds,
+        },
+        "plugin webhook ingestion rate-limited; delivery rejected before insert",
+      );
+      res.status(429)
+        .set("Retry-After", String(rateLimit.retryAfterSeconds))
+        .json({
+          error: "Too many webhook deliveries for this endpoint",
+          retryAfterSeconds: rateLimit.retryAfterSeconds,
+        });
+      return;
+    }
+
+    // Step 7: Extract request data
     const requestId = randomUUID();
     const rawHeaders: Record<string, string> = {};
     for (const [key, value] of Object.entries(req.headers)) {
@@ -2736,7 +3204,7 @@ export function pluginRoutes(
     const parsedBody = req.body as unknown;
     const payload = (req.body as Record<string, unknown> | undefined) ?? {};
 
-    // Step 6: Record the delivery in the database
+    // Step 8: Record the delivery in the database
     const startedAt = new Date();
     const [delivery] = await db
       .insert(pluginWebhookDeliveries)
@@ -2750,7 +3218,7 @@ export function pluginRoutes(
       })
       .returning({ id: pluginWebhookDeliveries.id });
 
-    // Step 7: Dispatch to the worker via handleWebhook RPC
+    // Step 9: Dispatch to the worker via handleWebhook RPC
     try {
       await webhookDeps.workerManager.call(plugin.id, "handleWebhook", {
         endpointKey,
@@ -2760,7 +3228,7 @@ export function pluginRoutes(
         requestId,
       });
 
-      // Step 8: Update delivery record to success
+      // Step 10: Update delivery record to success
       const finishedAt = new Date();
       const durationMs = finishedAt.getTime() - startedAt.getTime();
       await db
@@ -2777,7 +3245,7 @@ export function pluginRoutes(
         status: "success",
       });
     } catch (err) {
-      // Step 8 (error): Update delivery record to failed
+      // Step 10 (error): Update delivery record to failed
       const finishedAt = new Date();
       const durationMs = finishedAt.getTime() - startedAt.getTime();
       const errorMessage = err instanceof Error ? err.message : String(err);
@@ -2944,6 +3412,168 @@ export function pluginRoutes(
     });
 
     res.json(status);
+  });
+
+  // ===========================================================================
+  // Per-tenant plugin config overrides
+  //
+  // The instance-wide `plugin_config.configJson` is the default for the plugin.
+  // Each tenant may layer a per-company override on top via these routes; at
+  // dispatch time the worker's `ctx.config.get()` resolves the effective config
+  // (override-then-default) for the dispatching company. The companion binding
+  // table `company_secret_bindings` is kept in sync with this override only —
+  // cross-tenant rows are never affected by another tenant's write.
+  // ===========================================================================
+
+  /**
+   * GET /api/plugins/:pluginId/companies/:companyId/config-overrides
+   *
+   * Read the per-tenant plugin config override for the given company.
+   * Returns `{ pluginId, companyId, configJson }` where `configJson` may be
+   * an empty object when no override is set.
+   */
+  router.get("/plugins/:pluginId/companies/:companyId/config-overrides", async (req, res) => {
+    assertBoardOrgAccess(req);
+    const { pluginId, companyId } = req.params;
+    assertCompanyAccess(req, companyId);
+
+    const plugin = await resolvePlugin(registry, pluginId);
+    if (!plugin) {
+      res.status(404).json({ error: "Plugin not found" });
+      return;
+    }
+
+    const override = await registry.getCompanyConfigOverride(plugin.id, companyId);
+    res.json({
+      pluginId: plugin.id,
+      companyId,
+      configJson: override ?? {},
+    });
+  });
+
+  /**
+   * PUT /api/plugins/:pluginId/companies/:companyId/config-overrides
+   *
+   * Replace the per-tenant plugin config override (full-replace semantics).
+   * Validates `configJson` against the plugin's `instanceConfigSchema` and
+   * rejects any secret-ref UUID whose owning company differs from the route's
+   * `companyId` (422). Reconciles `company_secret_bindings` for THIS tenant
+   * only — cross-tenant binding rows are untouched.
+   *
+   * Errors:
+   * - 400 if body is missing or validation fails
+   * - 404 if the plugin is not found
+   * - 422 if any secret-ref UUID belongs to a different company
+   */
+  router.put("/plugins/:pluginId/companies/:companyId/config-overrides", async (req, res) => {
+    assertBoardOrgAccess(req);
+    const { pluginId, companyId } = req.params;
+    assertCompanyAccess(req, companyId);
+
+    const plugin = await resolvePlugin(registry, pluginId);
+    if (!plugin) {
+      res.status(404).json({ error: "Plugin not found" });
+      return;
+    }
+
+    const body = req.body as { configJson?: Record<string, unknown> } | undefined;
+    if (!body?.configJson || typeof body.configJson !== "object" || Array.isArray(body.configJson)) {
+      res.status(400).json({ error: '"configJson" is required and must be an object' });
+      return;
+    }
+
+    // devUiUrl is an instance-admin-only knob in the global config path; a
+    // per-tenant override has no business setting it.
+    if ("devUiUrl" in body.configJson) {
+      delete body.configJson.devUiUrl;
+    }
+
+    const schema = plugin.manifestJson?.instanceConfigSchema;
+    if (schema && Object.keys(schema).length > 0) {
+      const validation = validateInstanceConfig(body.configJson, schema);
+      if (!validation.valid) {
+        res.status(400).json({
+          error: "Configuration does not match the plugin's instanceConfigSchema",
+          fieldErrors: validation.errors,
+        });
+        return;
+      }
+    }
+
+    // Reject cross-company secret refs explicitly so the caller gets a 422
+    // instead of `syncPluginSecretBindings` silently skipping the binding.
+    const secretRefPaths = extractSecretRefPathsFromConfig(body.configJson, schema ?? undefined);
+    if (secretRefPaths.size > 0) {
+      const svc = secretService(db);
+      for (const secretId of secretRefPaths.keys()) {
+        const secret = await svc.getById(secretId);
+        if (!secret || secret.status === "deleted") {
+          res.status(422).json({
+            error: "Referenced secret not found",
+            details: { configPaths: [...(secretRefPaths.get(secretId) ?? [])] },
+          });
+          return;
+        }
+        if (secret.companyId !== companyId) {
+          res.status(422).json({
+            error: "Referenced secret must belong to the target company",
+            details: { configPaths: [...(secretRefPaths.get(secretId) ?? [])] },
+          });
+          return;
+        }
+      }
+    }
+
+    try {
+      const result = await registry.upsertCompanyConfigOverride(plugin.id, companyId, body.configJson);
+      await logPluginMutationActivity(req, "plugin.company_config_override.updated", plugin.id, {
+        pluginId: plugin.id,
+        pluginKey: plugin.pluginKey,
+        companyId,
+        secretRefPathCount: secretRefPaths.size,
+        configKeyCount: Object.keys(body.configJson).length,
+      });
+      res.json({
+        pluginId: plugin.id,
+        companyId,
+        configJson: (result.settingsJson as Record<string, unknown>).configOverrides ?? {},
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(400).json({ error: message });
+    }
+  });
+
+  /**
+   * DELETE /api/plugins/:pluginId/companies/:companyId/config-overrides
+   *
+   * Clear the per-tenant plugin config override. Revokes all of this tenant's
+   * `company_secret_bindings` rows for the plugin paths previously set in the
+   * override. Other companies' bindings are not touched.
+   */
+  router.delete("/plugins/:pluginId/companies/:companyId/config-overrides", async (req, res) => {
+    assertBoardOrgAccess(req);
+    const { pluginId, companyId } = req.params;
+    assertCompanyAccess(req, companyId);
+
+    const plugin = await resolvePlugin(registry, pluginId);
+    if (!plugin) {
+      res.status(404).json({ error: "Plugin not found" });
+      return;
+    }
+
+    const result = await registry.deleteCompanyConfigOverride(plugin.id, companyId);
+    await logPluginMutationActivity(req, "plugin.company_config_override.cleared", plugin.id, {
+      pluginId: plugin.id,
+      pluginKey: plugin.pluginKey,
+      companyId,
+      hadOverride: !!result,
+    });
+    res.json({
+      pluginId: plugin.id,
+      companyId,
+      configJson: {},
+    });
   });
 
   // ===========================================================================

@@ -31,10 +31,16 @@ export default defineConfig({
   testIgnore: ["multi-user.spec.ts", "multi-user-authenticated.spec.ts"],
   timeout: 60_000,
   retries: 0,
-  // All specs share one throwaway server, and several toggle instance-level
-  // state (the `enableConferenceRoomChat` experimental flag) that changes
-  // which UI variant renders. Run files serially so a flag flip in one spec
-  // can't change the wizard/thread under another spec mid-flight.
+  // Pin to a single worker so spec files run strictly sequentially against the
+  // shared webServer. Two independent reasons require this:
+  //  - cross-file parallelism is the only path that surfaces the
+  //    heartbeat_runs / issues deadlock pair (PATCH /issues:done in one spec
+  //    contends with a heartbeat-run lifecycle update in another).
+  //  - upstream v2026.618.0: several specs toggle instance-level state (the
+  //    `enableConferenceRoomChat` experimental flag) that changes which UI
+  //    variant renders, so a flag flip in one spec must not race another.
+  // The second reason applies on developer machines too, so this is always 1
+  // (not just under CI).
   workers: 1,
   use: {
     baseURL: BASE_URL,

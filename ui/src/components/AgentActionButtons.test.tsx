@@ -122,7 +122,7 @@ describe("AgentActionButtons", () => {
     queryClient.clear();
     container.remove();
     document.body.innerHTML = "";
-    vi.clearAllMocks();
+    vi.resetAllMocks();
   });
 
   function render(agent: Agent, props: Partial<ComponentProps<typeof AgentActionButtons>> = {}) {

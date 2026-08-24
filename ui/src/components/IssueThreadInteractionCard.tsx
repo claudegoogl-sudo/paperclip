@@ -1517,6 +1517,7 @@ function RequestConfirmationResolution({
   if (interaction.status === "expired") {
     const expiredByComment = outcome === "superseded_by_comment";
     const expiredByIssueClosed = outcome === "issue_closed";
+    const expiredBySupersede = outcome === "superseded";
     const expiredByTargetChange = outcome === "stale_target";
     return (
       <div className="space-y-3 rounded-sm border border-amber-500/60 bg-amber-500/10 px-4 py-3 text-sm text-amber-900 dark:text-amber-100">
@@ -1528,15 +1529,21 @@ function RequestConfirmationResolution({
          */}
         {expiredByIssueClosed ? null : (
           <div className="text-(length:--text-micro) font-semibold uppercase tracking-(--tracking-eyebrow) text-amber-700">
-            {expiredByComment ? "Expired by comment" : "Expired by target change"}
+            {expiredByComment
+              ? "Expired by comment"
+              : expiredBySupersede
+              ? "Retracted by author"
+              : "Expired by target change"}
           </div>
         )}
         <p className="leading-6">
           {expiredByComment
             ? "A board comment superseded this confirmation before it was resolved."
             : expiredByIssueClosed
-              ? "This confirmation expired automatically when the issue reached a terminal state."
-              : "The requested target changed before this confirmation was resolved."}
+            ? "This confirmation expired automatically when the issue reached a terminal state."
+            : expiredBySupersede
+            ? "The requesting agent retracted this confirmation before it was resolved."
+            : "The requested target changed before this confirmation was resolved."}
         </p>
         {expiredByComment && interaction.result?.commentId ? (
           <Button asChild size="sm" variant="ghost" className="h-7 px-2 text-amber-950 hover:bg-amber-500/15 dark:text-amber-50">

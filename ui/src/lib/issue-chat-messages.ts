@@ -7,7 +7,7 @@ import type {
   ThreadSystemMessage,
   ThreadUserMessage,
 } from "@assistant-ui/react";
-import type { Agent, IssueComment } from "@paperclipai/shared";
+import { isSuccessfulHeartbeatRunStatus, type Agent, type IssueComment } from "@paperclipai/shared";
 import type { ActiveRunForIssue, LiveRunForIssue } from "../api/heartbeats";
 import { formatAssigneeUserLabel } from "./assignees";
 import { isOperatorInterruptedRun } from "./interrupt-handoff";
@@ -736,6 +736,7 @@ function runDurationLabel(run: {
   const stopReason = typeof run.resultJson?.stopReason === "string" ? run.resultJson.stopReason : null;
   switch (run.status) {
     case "succeeded":
+    case "succeeded_dirty":
       return durationText ? `Worked for ${durationText}` : "Finished work";
     case "failed":
     case "error":
@@ -1126,7 +1127,7 @@ export function buildIssueChatMessages(args: {
   for (const run of [...linkedRuns].sort((a, b) => toTimestamp(runTimestamp(a)) - toTimestamp(runTimestamp(b)))) {
     const transcript = transcriptsByRunId?.get(run.runId) ?? [];
     const hasRunOutput = transcript.length > 0 || (hasOutputForRun?.(run.runId) ?? false);
-    if (hasRunOutput || run.status !== "succeeded") {
+    if (hasRunOutput || !isSuccessfulHeartbeatRunStatus(run.status)) {
       // Always use the transcript message for non-succeeded runs (even before
       // transcript data loads) so the message type and fold header are stable
       // from initial render — avoids a flash when transcripts arrive later.

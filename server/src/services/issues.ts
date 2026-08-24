@@ -57,6 +57,7 @@ import type {
 } from "@paperclipai/shared";
 import {
   clampIssueRequestDepth,
+  TERMINAL_HEARTBEAT_RUN_STATUSES as SHARED_TERMINAL_HEARTBEAT_RUN_STATUSES,
   extractAgentMentionIds,
   extractProjectMentionIds,
   issueCommentAuthorTypeSchema,
@@ -89,6 +90,7 @@ import {
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { buildInitialIssueMonitorFields, normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { retryOnTransientPgError } from "./pg-retry.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
 import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallback.js";
@@ -775,7 +777,10 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
   return checkoutRunId == null;
 }
 
-export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "interrupted", "failed", "cancelled", "timed_out"]);
+export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set<string>([
+  ...SHARED_TERMINAL_HEARTBEAT_RUN_STATUSES,
+  "interrupted",
+]);
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
 
@@ -5249,6 +5254,18 @@ export function issueService(db: Db) {
   }
 
   async function clearExecutionRunIfTerminal(issueId: string): Promise<boolean> {
+    // This helper takes overlapping locks on issues + heartbeat_runs
+    // and is called pre-authorization from multiple mutation routes; on its
+    // own it can deadlock against the heartbeat-run lifecycle and 500 the
+    // request before any other code runs. Wrap in retry so transient 40P01
+    // is invisible to callers.
+    return retryOnTransientPgError(
+      () => clearExecutionRunIfTerminalOnce(issueId),
+      { label: "clear_execution_run_if_terminal" },
+    );
+  }
+
+  async function clearExecutionRunIfTerminalOnce(issueId: string): Promise<boolean> {
     return db.transaction(async (tx) => {
       await tx.execute(
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
@@ -5291,11 +5308,111 @@ export function issueService(db: Db) {
     });
   }
 
+  /**
+   * Defensive back-fill for the orphan-`checkoutRunId` lifecycle bug.
+   *
+   * When `releaseIssueExecutionAndPromote` failed to clear `checkoutRunId` (or any
+   * other code path leaves it pointing at a terminal heartbeat_runs row), mutation
+   * handlers should treat that state as "no active checkout" rather than 5xx-ing or
+   * 4xx-ing on a partial state. Call this once at the top of each mutation route
+   * (PATCH, addComment, checkout, release) before any authorization that depends on
+   * `checkoutRunId` / `executionRunId`. The helper is a no-op when both lock columns
+   * are null or point at a non-terminal run, so it is safe to call unconditionally.
+   *
+   * Returns true if any column was cleared (used by tests; callers can ignore).
+   */
+  async function clearOrphanCheckoutLocksIfTerminal(issueId: string): Promise<boolean> {
+    // See clearExecutionRunIfTerminal — same lock-ordering risk.
+    // Every mutation route calls this pre-auth, so an unwrapped deadlock
+    // here surfaces as a 500 before the route's own retry can see it.
+    return retryOnTransientPgError(
+      () => clearOrphanCheckoutLocksIfTerminalOnce(issueId),
+      { label: "clear_orphan_checkout_locks_if_terminal" },
+    );
+  }
+
+  async function clearOrphanCheckoutLocksIfTerminalOnce(issueId: string): Promise<boolean> {
+    return db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
+      );
+      const issue = await tx
+        .select({
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      if (!issue) return false;
+      if (!issue.checkoutRunId && !issue.executionRunId) return false;
+
+      const runIds = Array.from(
+        new Set([issue.checkoutRunId, issue.executionRunId].filter((id): id is string => Boolean(id))),
+      );
+      if (runIds.length === 0) return false;
+
+      // Lock the run rows in a stable order to avoid deadlocks against
+      // concurrent run-completion paths that lock the issue first then the run.
+      for (const runId of [...runIds].sort()) {
+        await tx.execute(
+          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${runId} for update`,
+        );
+      }
+      const runs = await tx
+        .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, runIds));
+      const runStatusById = new Map(runs.map((r) => [r.id, r.status]));
+
+      const isTerminal = (runId: string | null) => {
+        if (!runId) return false;
+        const status = runStatusById.get(runId);
+        // Missing run row (FK set null on delete cascade) or terminal status both qualify.
+        return status === undefined || TERMINAL_HEARTBEAT_RUN_STATUSES.has(status);
+      };
+
+      const clearCheckout = isTerminal(issue.checkoutRunId);
+      const clearExecution = isTerminal(issue.executionRunId);
+      if (!clearCheckout && !clearExecution) return false;
+
+      const patch: Partial<typeof issues.$inferInsert> = { updatedAt: new Date() };
+      if (clearCheckout) patch.checkoutRunId = null;
+      if (clearExecution) {
+        patch.executionRunId = null;
+        patch.executionAgentNameKey = null;
+        patch.executionLockedAt = null;
+      }
+
+      const conditions = [eq(issues.id, issueId)];
+      if (clearCheckout && issue.checkoutRunId) {
+        conditions.push(eq(issues.checkoutRunId, issue.checkoutRunId));
+      }
+      if (clearExecution && issue.executionRunId) {
+        conditions.push(eq(issues.executionRunId, issue.executionRunId));
+      }
+
+      const updated = await tx
+        .update(issues)
+        .set(patch)
+        .where(and(...conditions))
+        .returning({ id: issues.id })
+        .then((rows) => rows[0] ?? null);
+
+      return Boolean(updated);
+    });
+  }
+
   // Symmetric to clearExecutionRunIfTerminal. Clears checkoutRunId (and the
   // bundled execution lock cols) when the row's checkoutRunId points at a
   // heartbeat run that is terminal or no longer exists. No assignee/status
   // precondition: a terminal run holds no real claim regardless of who is
   // assigned or what status the issue is currently in.
+  //
+  // Retained alongside clearOrphanCheckoutLocksIfTerminal: this
+  // upstream (v2026.618.0) helper is the in-service self-heal invoked from
+  // `checkout`, while clearOrphanCheckoutLocksIfTerminal is the pre-auth route guard. They keep
+  // separate call sites and test suites, so both are preserved.
   async function clearCheckoutRunIfTerminal(issueId: string): Promise<boolean> {
     return db.transaction(async (tx) => {
       await tx.execute(
@@ -5452,6 +5569,7 @@ export function issueService(db: Db) {
 
   return {
     clearExecutionRunIfTerminal,
+    clearOrphanCheckoutLocksIfTerminal,
     clearCheckoutRunIfTerminal,
     addStopRelayCommentIfNeeded,
 
@@ -5499,6 +5617,24 @@ export function issueService(db: Db) {
             AND ${issueComments.deletedAt} IS NULL
             AND ${issueComments.body} ILIKE ${containsPattern} ESCAPE '\\'
         )
+      `;
+      // Scan each searchable column as its own branch so the planner can serve it
+      // from that column's trigram index. OR-ing the branches into one predicate
+      // collapses to a company-wide scan that detoasts every issue description.
+      const searchMatchIssueIds = sql`
+        SELECT ${issues.id} FROM ${issues}
+          WHERE ${issues.companyId} = ${companyId} AND ${titleContainsMatch}
+        UNION ALL
+        SELECT ${issues.id} FROM ${issues}
+          WHERE ${issues.companyId} = ${companyId} AND ${identifierContainsMatch}
+        UNION ALL
+        SELECT ${issues.id} FROM ${issues}
+          WHERE ${issues.companyId} = ${companyId} AND ${descriptionContainsMatch}
+        UNION ALL
+        SELECT ${issueComments.issueId} FROM ${issueComments}
+          WHERE ${issueComments.companyId} = ${companyId}
+            AND ${issueComments.deletedAt} IS NULL
+            AND ${issueComments.body} ILIKE ${containsPattern} ESCAPE '\\'
       `;
       if (filters?.descendantOf) {
         conditions.push(sql<boolean>`
@@ -5575,14 +5711,7 @@ export function issueService(db: Db) {
         conditions.push(inArray(issues.id, labeledIssueIds.map((row) => row.issueId)));
       }
       if (hasSearch) {
-        conditions.push(
-          or(
-            titleContainsMatch,
-            identifierContainsMatch,
-            descriptionContainsMatch,
-            commentContainsMatch,
-          )!,
-        );
+        conditions.push(sql<boolean>`${issues.id} IN (${searchMatchIssueIds})`);
       }
       if (filters?.updatedSince) {
         const since = new Date(filters.updatedSince);
@@ -8886,7 +9015,126 @@ export function issueService(db: Db) {
       });
     },
 
-    listAttachments: async (issueId: string) =>
+    /**
+     * Create a standalone `assets` row with NO `issue_attachments`
+     * binding yet. Returned by `artifacts.create`; the asset is bound to an
+     * issue+comment later via {@link attachAssetsToComment} (called from
+     * `issues.createComment` with `attachmentIds`). The split exists because
+     * `artifacts.create` has no `issueId` in its signature — the worker stores
+     * bytes first, then surfaces them on a comment.
+     */
+    createStandaloneAsset: async (input: {
+      companyId: string;
+      provider: string;
+      objectKey: string;
+      contentType: string;
+      byteSize: number;
+      sha256: string;
+      originalFilename?: string | null;
+      createdByAgentId?: string | null;
+    }): Promise<{ id: string }> => {
+      const [asset] = await db
+        .insert(assets)
+        .values({
+          companyId: input.companyId,
+          provider: input.provider,
+          objectKey: input.objectKey,
+          contentType: input.contentType,
+          byteSize: input.byteSize,
+          sha256: input.sha256,
+          originalFilename: input.originalFilename ?? null,
+          createdByAgentId: input.createdByAgentId ?? null,
+          createdByUserId: null,
+        })
+        .returning({ id: assets.id });
+      return { id: asset.id };
+    },
+
+    /**
+     * Idempotency: find an existing asset for `(companyId, sha256)` that
+     * is NOT yet bound to any `issue_attachments` row. A retried
+     * `artifacts.create` (same bytes, same company) converges onto this asset
+     * instead of storing duplicate bytes. Attached assets are excluded because
+     * `issue_attachments.asset_id` is UNIQUE — reusing an already-attached asset
+     * would make the later bind fail, so only unattached ones are reusable.
+     */
+    findReusableUnattachedAsset: async (
+      companyId: string,
+      sha256: string,
+    ): Promise<{ id: string } | null> => {
+      const attachedAssetIds = db
+        .select({ assetId: issueAttachments.assetId })
+        .from(issueAttachments);
+      const rows = await db
+        .select({ id: assets.id })
+        .from(assets)
+        .where(
+          and(
+            eq(assets.companyId, companyId),
+            eq(assets.sha256, sha256),
+            notInArray(assets.id, attachedAssetIds),
+          ),
+        )
+        .orderBy(asc(assets.createdAt))
+        .limit(1);
+      return rows[0] ?? null;
+    },
+
+    /**
+     * Bind previously-created standalone assets (by id) to an issue +
+     * comment. Each asset must belong to the issue's company or the call is
+     * rejected (`unprocessable`) — a worker cannot surface a foreign tenant's
+     * asset onto its own issue. The insert is idempotent via
+     * `onConflictDoNothing` on the UNIQUE `asset_id` index, so a retried
+     * `createComment` does not duplicate or error on already-bound assets.
+     */
+    attachAssetsToComment: async (input: {
+      issueId: string;
+      issueCommentId: string;
+      assetIds: string[];
+    }): Promise<void> => {
+      if (input.assetIds.length === 0) return;
+      const issue = await db
+        .select({ id: issues.id, companyId: issues.companyId })
+        .from(issues)
+        .where(eq(issues.id, input.issueId))
+        .then((rows) => rows[0] ?? null);
+      if (!issue) throw notFound("Issue not found");
+
+      const uniqueAssetIds = [...new Set(input.assetIds)];
+      const assetRows = await db
+        .select({ id: assets.id, companyId: assets.companyId })
+        .from(assets)
+        .where(inArray(assets.id, uniqueAssetIds));
+      const byId = new Map(assetRows.map((row) => [row.id, row]));
+      for (const assetId of uniqueAssetIds) {
+        const asset = byId.get(assetId);
+        if (!asset) throw notFound("Attachment asset not found");
+        if (asset.companyId !== issue.companyId) {
+          throw unprocessable("Attachment asset must belong to same company as issue");
+        }
+      }
+
+      await db
+        .insert(issueAttachments)
+        .values(
+          uniqueAssetIds.map((assetId) => ({
+            companyId: issue.companyId,
+            issueId: issue.id,
+            assetId,
+            issueCommentId: input.issueCommentId,
+          })),
+        )
+        .onConflictDoNothing({ target: issueAttachments.assetId });
+    },
+
+    // Tenant-scoped at the data layer: callers must pass the validated (issue)
+    // companyId. Filtering on issue_attachments.company_id here — not just via
+    // the caller's issue guard — is defense in depth: if any write path ever
+    // breaks the invariant that an attachment's company_id equals its parent
+    // issue's company_id, a foreign row can never surface (not even its
+    // companyId string in metadata).
+    listAttachments: async (issueId: string, companyId: string) =>
       db
         .select({
           id: issueAttachments.id,
@@ -8907,7 +9155,12 @@ export function issueService(db: Db) {
         })
         .from(issueAttachments)
         .innerJoin(assets, eq(issueAttachments.assetId, assets.id))
-        .where(eq(issueAttachments.issueId, issueId))
+        .where(
+          and(
+            eq(issueAttachments.issueId, issueId),
+            eq(issueAttachments.companyId, companyId),
+          ),
+        )
         .orderBy(desc(issueAttachments.createdAt)),
 
     getAttachmentById: async (id: string) =>

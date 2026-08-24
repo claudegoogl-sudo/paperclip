@@ -7,8 +7,8 @@ import type { Db } from "@paperclipai/db";
 import { derivePaperclipViteHmrPort, type DeploymentExposure, type DeploymentMode } from "@paperclipai/shared";
 import type { InspectDatabaseBackupHealthOptions } from "./services/database-backup-health.js";
 import type { StorageService } from "./storage/types.js";
-import { httpLogger, errorHandler } from "./middleware/index.js";
-import { actorMiddleware } from "./middleware/auth.js";
+import { httpLogger, errorHandler, requestQueryCancellation } from "./middleware/index.js";
+import { registerActorContext } from "./middleware/auth.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
 import { privateHostnameGuard, resolvePrivateHostnameAllowSet } from "./middleware/private-hostname-guard.js";
 import { applyTrustProxy, parseTrustProxyEnv } from "./middleware/trust-proxy.js";
@@ -56,6 +56,7 @@ import { approvalRoutes } from "./routes/approvals.js";
 import { secretRoutes } from "./routes/secrets.js";
 import { toolAccessRoutes } from "./routes/tool-access.js";
 import { smokeLabRoutes } from "./routes/smoke-lab.js";
+import { pluginConfigEgressRoutes } from "./routes/plugin-config-egress.js";
 import { costRoutes } from "./routes/costs.js";
 import { activityRoutes } from "./routes/activity.js";
 import { dashboardRoutes } from "./routes/dashboard.js";
@@ -98,6 +99,10 @@ import { createPluginJobScheduler } from "./services/plugin-job-scheduler.js";
 import { pluginJobStore } from "./services/plugin-job-store.js";
 import { createPluginToolDispatcher } from "./services/plugin-tool-dispatcher.js";
 import { createToolGatewayService } from "./services/tool-gateway.js";
+import {
+  createPluginRunContextRegistry,
+  type PluginRunContextRegistry,
+} from "./services/plugin-run-context-registry.js";
 import { pluginLifecycleManager } from "./services/plugin-lifecycle.js";
 import { createPluginJobCoordinator } from "./services/plugin-job-coordinator.js";
 import { buildHostServices, flushPluginLogBuffer } from "./services/plugin-host-services.js";
@@ -105,13 +110,24 @@ import { createPluginEventBus } from "./services/plugin-event-bus.js";
 import { setPluginEventBus } from "./services/activity-log.js";
 import { createPluginDevWatcher } from "./services/plugin-dev-watcher.js";
 import { createPluginHostServiceCleanup } from "./services/plugin-host-service-cleanup.js";
+import { createEventRelayProbe } from "./services/plugin-event-relay-probe.js";
 import { pluginRegistryService } from "./services/plugin-registry.js";
+import { approvalService } from "./services/approvals.js";
+import {
+  createApprovalsCapabilityEscalationGateway,
+  registerCapabilityEscalationResolver,
+} from "./services/plugin-capability-escalation.js";
 import { createHostClientHandlers } from "@paperclipai/plugin-sdk";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
 import { createCachedViteHtmlRenderer } from "./vite-html-renderer.js";
-import { DEFAULT_JSON_BODY_LIMIT, PORTABLE_JSON_BODY_LIMIT } from "./http/body-limits.js";
+import {
+  DEFAULT_JSON_BODY_LIMIT,
+  PORTABLE_JSON_BODY_LIMIT,
+  WEBHOOK_JSON_BODY_LIMIT,
+} from "./http/body-limits.js";
 import { COMPANY_IMPORT_API_PATH } from "./routes/company-import-paths.js";
 import { apiCompression } from "./middleware/api-compression.js";
+import { PLUGIN_WEBHOOK_INGESTION_PATH_PATTERN } from "./routes/plugin-webhook-paths.js";
 
 type UiMode = "none" | "static" | "vite-dev";
 const FEEDBACK_EXPORT_FLUSH_INTERVAL_MS = 5_000;
@@ -303,8 +319,22 @@ export async function createApp(
     hostVersion?: string;
     localPluginDir?: string;
     pluginMigrationDb?: Db;
+    /**
+     * Company the host files plugin capability-escalation board approvals
+     * against. A plugin capability escalation is instance-wide but
+     * approvals are company-scoped, so the host files against this single
+     * configured "platform" company. When omitted, no escalation gateway is
+     * wired and the loader keeps failing closed on a cap-escalating upgrade —
+     * preserving the pre-existing production default.
+     */
+    escalationApprovalCompanyId?: string;
     pluginWorkerManager?: PluginWorkerManager;
     decisionServiceOptions: DecisionServiceOptions;
+    // The run-context registry the injected pluginWorkerManager was
+    // built with. MUST be the same instance, so a worker's host-minted service
+    // run-context (registered by the manager on worker start) is visible to the
+    // secrets host-handler's Gate 1 lookup. When omitted, app creates its own.
+    pluginRunContextRegistry?: PluginRunContextRegistry;
     betterAuthHandler?: express.RequestHandler;
     resolveSession?: (req: ExpressRequest) => Promise<BetterAuthSessionResult | null>;
     /**
@@ -333,12 +363,23 @@ export async function createApp(
     limit: PORTABLE_JSON_BODY_LIMIT,
     verify: captureRawBody,
   }));
+  // Ahead of the generic parser so the anonymous webhook ingestion route gets a
+  // tighter ceiling. `verify: captureRawBody` is mandatory here: the route reads
+  // `req.rawBody` to HMAC-verify the exact bytes the provider signed.
+  app.use(PLUGIN_WEBHOOK_INGESTION_PATH_PATTERN, express.json({
+    limit: WEBHOOK_JSON_BODY_LIMIT,
+    verify: captureRawBody,
+  }));
   app.use(express.json({
     limit: DEFAULT_JSON_BODY_LIMIT,
     verify: captureRawBody,
   }));
   app.use("/api", apiCompression());
   app.use(httpLogger);
+  // Ahead of every DB-touching middleware (actor resolution included) so a
+  // client that hangs up releases the whole request's queries, not just the
+  // route handler's.
+  app.use(requestQueryCancellation);
   const privateHostnameGateEnabled = shouldEnablePrivateHostnameGuard({
     deploymentMode: opts.deploymentMode,
     deploymentExposure: opts.deploymentExposure,
@@ -354,12 +395,14 @@ export async function createApp(
       bindHost: opts.bindHost,
     }),
   );
-  app.use(
-    actorMiddleware(db, {
-      deploymentMode: opts.deploymentMode,
-      resolveSession: opts.resolveSession,
-    }),
-  );
+  // Resolve the acting credential (req.actor) and bind its provenance into
+  // AsyncLocalStorage so logActivity records it centrally. The provenance
+  // regression test drives the same registerActorContext, so removing the
+  // provenance registration turns that test red instead of silently logging NULL.
+  registerActorContext(app, db, {
+    deploymentMode: opts.deploymentMode,
+    resolveSession: opts.resolveSession,
+  });
   app.use("/api/auth", authRoutes(db));
   if (opts.betterAuthHandler) {
     app.all("/api/auth/{*authPath}", opts.betterAuthHandler);
@@ -367,7 +410,27 @@ export async function createApp(
   app.use(llmRoutes(db));
 
   const hostServicesDisposers = new Map<string, () => void>();
-  const workerManager = opts.pluginWorkerManager ?? createPluginWorkerManager();
+  // pluginId -> pluginKey, populated as each plugin's host handlers are
+  // built. Lets the event-relay probe resolve the bus key (which is the plugin
+  // key) for the running workers reported by the worker manager.
+  const pluginKeyById = new Map<string, string>();
+  // Shared run-context registry tying the dispatching agent's
+  // identity to (pluginDbId, runId) for the duration of each tool call, so the
+  // worker's `artifacts.fetch`/`secrets.resolve` callbacks can be authorized
+  // server-side. Also holds each worker's worker-lifetime service
+  // run-context (system actor) for background secret resolution — created
+  // before the worker manager so the manager can register on worker start.
+  // When the caller injects a pre-built pluginWorkerManager (index.ts
+  // does, so it can also drive heartbeat/routine services), it MUST inject the
+  // registry that manager was built with. Otherwise app would create a second,
+  // disjoint registry: the manager's registerService would write to its own
+  // registry while the secrets host-handler reads this one, so service/setup()
+  // run-contexts would never be found (Gate 1 → runcontext_invalid).
+  const pluginRunContextRegistry =
+    opts.pluginRunContextRegistry ?? createPluginRunContextRegistry();
+  const workerManager =
+    opts.pluginWorkerManager ??
+    createPluginWorkerManager({ runContextRegistry: pluginRunContextRegistry });
   const managedAutoInstallKeys = opts.managedPluginAutoInstall ?? null;
   const bundledCatalogRoot =
     opts.bundledPluginCatalogRoot ?? resolveBundledCatalogRoot(process.env);
@@ -528,6 +591,7 @@ export async function createApp(
     process.env.PAPERCLIP_TRUSTED_MCP_RUNTIME_HOST
     ?? process.env.PAPERCLIP_TOOL_RUNTIME_TRUSTED_HOST
     ?? null;
+  api.use(pluginConfigEgressRoutes(db));
   api.use(costRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(activityRoutes(db));
   api.use(dashboardRoutes(db));
@@ -548,7 +612,7 @@ export async function createApp(
   const eventBus = createPluginEventBus();
   setPluginEventBus(eventBus);
   const jobStore = pluginJobStore(db);
-  const lifecycle = pluginLifecycleManager(db, { workerManager });
+  const lifecycle = pluginLifecycleManager(db, { workerManager, eventBus });
   const scheduler = createPluginJobScheduler({
     db,
     jobStore,
@@ -558,6 +622,7 @@ export async function createApp(
     workerManager,
     lifecycleManager: lifecycle,
     db,
+    runContextRegistry: pluginRunContextRegistry,
   });
   const toolGateway = createToolGatewayService(db, {
     pluginToolDispatcher: toolDispatcher,
@@ -594,11 +659,21 @@ export async function createApp(
   let viteHtmlRenderer: ReturnType<typeof createCachedViteHtmlRenderer> | null = null;
   let viteDevServer: { close(): Promise<void> } | null = null;
   let viteHmrServer: HttpServer | null = null;
+  // Wire the capability-escalation gateway when a platform company is
+  // configured. Absent it, the loader receives no gateway and keeps failing
+  // closed on cap-escalating upgrades (pre-existing production default).
+  const escalationGateway = opts.escalationApprovalCompanyId
+    ? createApprovalsCapabilityEscalationGateway({
+        approvals: approvalService(db),
+        companyId: opts.escalationApprovalCompanyId,
+      })
+    : undefined;
   const loader = pluginLoader(
     db,
     {
       localPluginDir: opts.localPluginDir ?? DEFAULT_LOCAL_PLUGIN_DIR,
       migrationDb: opts.pluginMigrationDb,
+      escalationGateway,
     },
     {
       workerManager,
@@ -620,9 +695,12 @@ export async function createApp(
         };
         const services = buildHostServices(db, pluginId, manifest.id, eventBus, notifyWorker, {
           pluginWorkerManager: workerManager,
+          storageService: opts.storageService,
+          runContextRegistry: pluginRunContextRegistry,
           manifest,
         });
         hostServicesDisposers.set(pluginId, () => services.dispose());
+        pluginKeyById.set(pluginId, manifest.id);
         return createHostClientHandlers({
           pluginId,
           capabilities: manifest.capabilities,
@@ -635,6 +713,36 @@ export async function createApp(
   api.use(
     toolGatewayRoutes(db, toolGateway),
   );
+  // A lifecycle bound to the runtime-services + gateway loader, used
+  // only to apply board decisions to parked upgrades (complete/revert + worker
+  // re-activation). The approvals service dispatches resolved escalation
+  // approvals to this resolver via the module-level registry, breaking the
+  // approvals -> loader import cycle.
+  const upgradeLifecycle = pluginLifecycleManager(db, { loader, workerManager });
+  registerCapabilityEscalationResolver(async ({ payload, outcome }) => {
+    if (outcome === "approved") {
+      await upgradeLifecycle.completeUpgradeApproved(payload.pluginId);
+    } else {
+      await upgradeLifecycle.revertUpgradeRejected(payload.pluginId);
+    }
+  });
+  // Create the dev-watcher before the plugin routes so the routes can
+  // reconcile the local-plugin file watcher after each lifecycle mutation. The
+  // routes run against a route-local lifecycle instance whose domain events
+  // never reach this watcher's app-level subscription, so an explicit reconcile
+  // is the reliable re-arm/disarm path on install/enable/disable/uninstall.
+  // Resolve the watch target for a plugin: its local packagePath, but only
+  // while the plugin is active ('ready'). Gating on status means reconcile()
+  // disarms the watcher on disable/uninstall (status leaves 'ready') even
+  // though disable keeps packagePath in the DB.
+  const devWatcher = createPluginDevWatcher(
+    lifecycle,
+    async (pluginId) => {
+      const plugin = await pluginRegistry.getById(pluginId);
+      return plugin?.status === "ready" ? plugin.packagePath ?? null : null;
+    },
+  );
+  );
   api.use(
     pluginRoutes(
       db,
@@ -644,6 +752,7 @@ export async function createApp(
       { toolDispatcher },
       { workerManager },
       { toolGateway },
+      { reconciler: devWatcher },
     ),
   );
   api.use(adapterRoutes());
@@ -863,10 +972,6 @@ export async function createApp(
   void toolDispatcher.initialize().catch((err) => {
     logger.error({ err }, "Failed to initialize plugin tool dispatcher");
   });
-  const devWatcher = createPluginDevWatcher(
-    lifecycle,
-    async (pluginId) => (await pluginRegistry.getById(pluginId))?.packagePath ?? null,
-  );
   // Auto-provision bundled plugins so their providers are registered for
   // agent runs. Bundles are excluded from the pnpm
   // workspace and built standalone into the image (see Dockerfile), then
@@ -918,6 +1023,24 @@ export async function createApp(
   }).catch((err) => {
     logger.error({ err }, "Failed to load ready plugins on startup");
   });
+
+  // Liveness probe that warns if a running plugin's board-event relay
+  // detaches (worker up, zero event-bus subscriptions). Belt-and-suspenders to
+  // the per-restart subscription-count log in plugin-lifecycle.
+  const eventRelayProbe = createEventRelayProbe({
+    listRunningPlugins: () =>
+      workerManager
+        .diagnostics()
+        .filter((d) => d.status === "running")
+        .map((d) => ({ pluginId: d.pluginId, pluginKey: pluginKeyById.get(d.pluginId) }))
+        .filter((p): p is { pluginId: string; pluginKey: string } => Boolean(p.pluginKey)),
+    subscriptionCount: (pluginKey) => eventBus.subscriptionCount(pluginKey),
+    log: {
+      warn: (obj, msg) => logger.warn({ service: "plugin-event-relay-probe", ...obj }, msg),
+      info: (obj, msg) => logger.info({ service: "plugin-event-relay-probe", ...obj }, msg),
+    },
+  });
+  eventRelayProbe.start();
   app.locals.bundledPluginsStartup = bundledPluginsStartup;
   // The shutdown hook runs at most once. It caches the in-flight promise, so a
   // second caller (for example the `exit` handler) awaits the same completion
@@ -927,6 +1050,7 @@ export async function createApp(
     if (appServicesShutdown) return appServicesShutdown;
     appServicesShutdown = (async () => {
       disableFeedbackExportFlushes();
+      eventRelayProbe.stop();
       if (importTransferSweepTimer) {
         clearInterval(importTransferSweepTimer);
         importTransferSweepTimer = null;
@@ -937,6 +1061,7 @@ export async function createApp(
       viteHmrServer?.close();
       hostServiceCleanup.disposeAll();
       hostServiceCleanup.teardown();
+      pluginRunContextRegistry.dispose();
       // Cancel every live setup-token login session and AWAIT the cancellation,
       // so each direct child stops and the server releases each lease before the
       // caller stops the database and the provider. A lease release that

@@ -1,4 +1,6 @@
 import { redactCommandText } from "@paperclipai/adapter-utils";
+import { redactRegisteredSecretValues } from "./run-secret-registry.js";
+import { GITHUB_FINE_GRAINED_PAT_RE } from "./secret-patterns.js";
 
 const SECRET_FIELD_NAME_PATTERN =
   String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring|browser[-_]?code|login[-_]?url)[A-Za-z0-9_-]*`;
@@ -41,8 +43,24 @@ const SECRET_TEXT_HINTS = [
   "ghu_",
   "ghs_",
   "ghr_",
+  // SECURITY-CRITICAL: Fine-grained PAT prefix. The classic `gh[pousr]_` covered above does not
+  // subsume it, so without this hint a lone `github_pat_…` short-circuits the
+  // gate below unredacted.
+  "github_pat_",
 ] as const;
 export const REDACTED_EVENT_VALUE = "***REDACTED***";
+
+// Global copy of the shared fine-grained PAT matcher (secret-patterns.ts is the
+// single source of truth). The shared patterns are authored without `g`; the
+// free-form text path replaces every occurrence, so a global copy is needed
+// here.
+const GITHUB_FINE_GRAINED_PAT_TEXT_RE = new RegExp(GITHUB_FINE_GRAINED_PAT_RE.source, "g");
+/**
+ * Marker for value-exact redaction of a host-registered secret (e.g. a
+ * `vault.read` plaintext). Distinct from {@link REDACTED_EVENT_VALUE} so a
+ * value-exact hit is attributable in a persisted record.
+ */
+export const REDACTED_VAULT_VALUE = "***REDACTED:vault***";
 
 function maybeContainsSecretText(input: string) {
   const lower = input.toLowerCase();
@@ -61,6 +79,9 @@ function sanitizeValue(value: unknown): unknown {
   if (isSecretRefBinding(value)) return value;
   if (isUserSecretRefBinding(value)) return value;
   if (isPlainBinding(value)) return { type: "plain", value: sanitizeValue(value.value) };
+  // String leaves (e.g. a tool result's `data.value`) get value-exact scrubbing
+  // for any host-registered secret before being returned unchanged otherwise.
+  if (typeof value === "string") return redactRegisteredSecretValues(value, REDACTED_VAULT_VALUE);
   if (!isPlainObject(value)) return value;
   return sanitizeRecord(value);
 }
@@ -139,11 +160,18 @@ export function redactEventPayload(payload: Record<string, unknown> | null): Rec
 }
 
 export function redactSensitiveText(input: string): string {
-  if (!maybeContainsSecretText(input)) return input;
+  // SECURITY-CRITICAL: Value-exact scrub runs FIRST and unconditionally: a high-entropy registered
+  // secret may carry no secret-ish hint, so it would survive the
+  // maybeContainsSecretText short-circuit below (Control 1).
+  const valueScrubbed = redactRegisteredSecretValues(input, REDACTED_VAULT_VALUE);
+  if (!maybeContainsSecretText(valueScrubbed)) return valueScrubbed;
+  // The shared adapter-utils GitHub matcher is `\bgh[pousr]_…` and does not
+  // cover the fine-grained `github_pat_` shape, so scrub it here with the
+  // canonical secret-patterns matcher after the command-text pass.
   return redactCommandText(
-    input
+    valueScrubbed
       .replace(JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`)
       .replace(ESCAPED_JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`),
     REDACTED_EVENT_VALUE,
-  );
+  ).replace(GITHUB_FINE_GRAINED_PAT_TEXT_RE, REDACTED_EVENT_VALUE);
 }

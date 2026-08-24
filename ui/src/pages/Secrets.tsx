@@ -121,6 +121,7 @@ import {
   type SecretPathFolder,
 } from "./secrets/secret-path";
 import { SetMyUserSecretDialog } from "./secrets/SetMyUserSecretDialog";
+import { EgressTab } from "./secrets/EgressTab";
 import {
   coverageSummaryLabel,
   UserSecretChip,
@@ -2324,6 +2325,7 @@ export function Secrets() {
                       { value: "details", label: "Details" },
                       { value: "usage", label: usageQuery.data ? `Usage (${usageQuery.data.bindings.length})` : "Usage" },
                       { value: "events", label: "Access events" },
+                      { value: "egress", label: "Egress" },
                     ]}
                     align="start"
                     value={secretDetailTab}
@@ -2353,6 +2355,12 @@ export function Secrets() {
                       loading={eventsQuery.isPending}
                       events={eventsQuery.data ?? []}
                       companyId={selectedCompanyId}
+                    />
+                  </TabsContent>
+                  <TabsContent value="egress">
+                    <EgressTab
+                      companyId={selectedCompanyId}
+                      secretId={selectedSecret.id}
                     />
                   </TabsContent>
                 </div>

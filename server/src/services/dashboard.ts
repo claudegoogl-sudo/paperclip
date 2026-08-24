@@ -1,4 +1,5 @@
 import { and, eq, gte, sql } from "drizzle-orm";
+import { isSuccessfulHeartbeatRunStatus } from "@paperclipai/shared";
 import type { Db } from "@paperclipai/db";
 import { agents, approvals, companies, costEvents, heartbeatRuns, issues } from "@paperclipai/db";
 import { notFound } from "../errors.js";
@@ -160,7 +161,7 @@ export function dashboardService(db: Db) {
         const status = String(row.status);
         // Postgres booleans can arrive as JS boolean or "t"/"true" depending on driver.
         const recovered = row.recovered === true || row.recovered === "t" || row.recovered === "true";
-        if (status === "succeeded") {
+        if (isSuccessfulHeartbeatRunStatus(status)) {
           bucket.succeeded += count;
         } else if (status === "failed" || status === "timed_out") {
           if (recovered) {

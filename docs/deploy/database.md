@@ -26,23 +26,30 @@ The Docker quickstart also uses embedded PostgreSQL by default.
 
 ## 2. Local PostgreSQL (Docker)
 
-For a full PostgreSQL server locally:
+For a full PostgreSQL server locally. The compose file lives under `docker/`,
+so run the command from the repository root:
 
 ```sh
-docker compose up -d
+docker compose -f docker/docker-compose.yml up -d
 ```
 
-This starts PostgreSQL 17 on `localhost:5432`. Set the connection string:
+This starts PostgreSQL 17 on `localhost:5432`. The stack requires an explicit
+`POSTGRES_PASSWORD` and refuses to start without one; see
+[PostgreSQL password](../../doc/DOCKER.md#postgresql-password) for the recipe.
+
+Copy the example env and set `DATABASE_URL` to a connection string that uses
+the password you just generated:
 
 ```sh
 cp .env.example .env
-# DATABASE_URL=postgres://paperclip:paperclip@localhost:5432/paperclip
+# Edit .env and set DATABASE_URL, e.g.:
+# DATABASE_URL=postgres://paperclip:YOUR_PASSWORD@localhost:5432/paperclip
 ```
 
 Push the schema:
 
 ```sh
-DATABASE_URL=postgres://paperclip:paperclip@localhost:5432/paperclip \
+DATABASE_URL=postgres://paperclip:YOUR_PASSWORD@localhost:5432/paperclip \
   npx drizzle-kit push
 ```
 

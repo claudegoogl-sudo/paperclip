@@ -23,6 +23,13 @@ function resolveNativePackageName(): string | null {
   }
 }
 
+// Alias creation is a best-effort compatibility helper: the bundled postgres
+// binary boots fine without these soname symlinks. On a root-owned global
+// install run by a non-root service user the lib dir is not writable, so a
+// failed write must not be fatal. Tolerate the not-writable family the same way
+// we tolerate an already-existing alias.
+const TOLERATED_ALIAS_ERROR_CODES = new Set(["EEXIST", "EACCES", "EPERM", "EROFS"]);
+
 async function pathExists(value: string): Promise<boolean> {
   try {
     await fs.stat(value);
@@ -63,7 +70,15 @@ export async function ensureLinuxSharedLibraryAliases(libDir: string): Promise<s
       await fs.symlink(entry.name, aliasPath);
       created.push(aliasPath);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code && TOLERATED_ALIAS_ERROR_CODES.has(code)) {
+        if (code !== "EEXIST") {
+          console.warn(
+            `[embedded-postgres] could not create shared-library alias ${aliasPath} (${code}); continuing without it`,
+          );
+        }
+        continue;
+      }
       throw error;
     }
   }

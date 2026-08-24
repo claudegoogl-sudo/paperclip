@@ -3,6 +3,7 @@ import { alias } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import { activityLog, agents, companies, costEvents, heartbeatRuns, issues, projects } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
+import { randomUUID } from "node:crypto";
 import { budgetService, type BudgetServiceHooks } from "./budgets.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 
@@ -69,6 +70,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
         .values({
           ...data,
           companyId,
+          runIdentifier: data.runIdentifier ?? data.heartbeatRunId ?? randomUUID(),
           biller: data.biller ?? data.provider,
           billingType: data.billingType ?? "unknown",
           cachedInputTokens: data.cachedInputTokens ?? 0,
@@ -292,9 +294,9 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
           outputTokens: sumAsNumber(costEvents.outputTokens),
           apiRunCount:
-            sql<number>`count(distinct case when ${costEvents.billingType} = ${METERED_BILLING_TYPE} then ${costEvents.heartbeatRunId} end)::int`,
+            sql<number>`count(distinct case when ${costEvents.billingType} = ${METERED_BILLING_TYPE} then ${costEvents.runIdentifier} end)::int`,
           subscriptionRunCount:
-            sql<number>`count(distinct case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.heartbeatRunId} end)::int`,
+            sql<number>`count(distinct case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.runIdentifier} end)::int`,
           subscriptionCachedInputTokens:
             sql<number>`coalesce(sum(case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.cachedInputTokens} else 0 end), 0)::double precision`,
           subscriptionInputTokens:
@@ -325,9 +327,9 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
           outputTokens: sumAsNumber(costEvents.outputTokens),
           apiRunCount:
-            sql<number>`count(distinct case when ${costEvents.billingType} = ${METERED_BILLING_TYPE} then ${costEvents.heartbeatRunId} end)::int`,
+            sql<number>`count(distinct case when ${costEvents.billingType} = ${METERED_BILLING_TYPE} then ${costEvents.runIdentifier} end)::int`,
           subscriptionRunCount:
-            sql<number>`count(distinct case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.heartbeatRunId} end)::int`,
+            sql<number>`count(distinct case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.runIdentifier} end)::int`,
           subscriptionCachedInputTokens:
             sql<number>`coalesce(sum(case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.cachedInputTokens} else 0 end), 0)::double precision`,
           subscriptionInputTokens:
@@ -354,9 +356,9 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
           outputTokens: sumAsNumber(costEvents.outputTokens),
           apiRunCount:
-            sql<number>`count(distinct case when ${costEvents.billingType} = ${METERED_BILLING_TYPE} then ${costEvents.heartbeatRunId} end)::int`,
+            sql<number>`count(distinct case when ${costEvents.billingType} = ${METERED_BILLING_TYPE} then ${costEvents.runIdentifier} end)::int`,
           subscriptionRunCount:
-            sql<number>`count(distinct case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.heartbeatRunId} end)::int`,
+            sql<number>`count(distinct case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.runIdentifier} end)::int`,
           subscriptionCachedInputTokens:
             sql<number>`coalesce(sum(case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.cachedInputTokens} else 0 end), 0)::double precision`,
           subscriptionInputTokens:
@@ -459,32 +461,6 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
     },
 
     byProject: async (companyId: string, range?: CostDateRange) => {
-      const issueIdAsText = sql<string>`${issues.id}::text`;
-      const runProjectLinks = db
-        .selectDistinctOn([activityLog.runId, issues.projectId], {
-          runId: activityLog.runId,
-          projectId: issues.projectId,
-        })
-        .from(activityLog)
-        .innerJoin(
-          issues,
-          and(
-            eq(activityLog.entityType, "issue"),
-            eq(activityLog.entityId, issueIdAsText),
-          ),
-        )
-        .where(
-          and(
-            eq(activityLog.companyId, companyId),
-            eq(issues.companyId, companyId),
-            isNotNull(activityLog.runId),
-            isNotNull(issues.projectId),
-          ),
-        )
-        .orderBy(activityLog.runId, issues.projectId, desc(activityLog.createdAt))
-        .as("run_project_links");
-
-      const effectiveProjectId = sql<string | null>`coalesce(${costEvents.projectId}, ${runProjectLinks.projectId})`;
       const conditions: ReturnType<typeof eq>[] = [eq(costEvents.companyId, companyId)];
       if (range?.from) conditions.push(gte(costEvents.occurredAt, range.from));
       if (range?.to) conditions.push(lte(costEvents.occurredAt, range.to));
@@ -493,7 +469,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
 
       return db
         .select({
-          projectId: effectiveProjectId,
+          projectId: costEvents.projectId,
           projectName: projects.name,
           costCents: costCentsExpr,
           inputTokens: sumAsNumber(costEvents.inputTokens),
@@ -501,10 +477,9 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           outputTokens: sumAsNumber(costEvents.outputTokens),
         })
         .from(costEvents)
-        .leftJoin(runProjectLinks, eq(costEvents.heartbeatRunId, runProjectLinks.runId))
-        .innerJoin(projects, sql`${projects.id} = ${effectiveProjectId}`)
-        .where(and(...conditions, sql`${effectiveProjectId} is not null`))
-        .groupBy(effectiveProjectId, projects.name)
+        .innerJoin(projects, eq(costEvents.projectId, projects.id))
+        .where(and(...conditions, isNotNull(costEvents.projectId)))
+        .groupBy(costEvents.projectId, projects.name)
         .orderBy(desc(costCentsExpr));
     },
   };

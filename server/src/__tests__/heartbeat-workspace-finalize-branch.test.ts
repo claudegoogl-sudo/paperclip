@@ -275,6 +275,12 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
     // that is still before run registration, which a plain run table status
     // poll cannot see.
     await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+    // Quiescence period: heartbeatRunEvents may be written after run status transitions
+    // to terminal (e.g., appendRunEvent at heartbeat.ts:10288 after setRunStatus).
+    // The shared drain awaits runs and in-flight wakeups but not post-terminal event
+    // writes, so we still wait a bit for post-status-change async side effects to
+    // complete before teardown.
+    await new Promise((resolve) => setTimeout(resolve, 150));
     adapterExecute.mockReset();
     adapterExecute.mockImplementation(async () => ({
       exitCode: 0,

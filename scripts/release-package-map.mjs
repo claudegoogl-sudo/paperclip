@@ -76,6 +76,12 @@ function loadReleaseManifest() {
       );
     }
 
+    if (entry.stampVersion !== undefined && typeof entry.stampVersion !== "boolean") {
+      throw new Error(
+        `manifest entry ${index + 1} (${entry.dir}) in ${manifestPath} has a non-boolean "stampVersion".`,
+      );
+    }
+
     return entry;
   });
 }
@@ -159,10 +165,22 @@ function buildReleasePackagePlan() {
     throw new Error(`release package manifest validation failed:\n- ${problems.join("\n- ")}`);
   }
 
-  const packages = discoveredPackages.map((pkg) => ({
-    ...pkg,
-    publishFromCi: manifestByDir.get(pkg.dir).publishFromCi,
-  }));
+  const packages = discoveredPackages.map((pkg) => {
+    const entry = manifestByDir.get(pkg.dir);
+    return {
+      ...pkg,
+      publishFromCi: entry.publishFromCi,
+      // Version-stamping is broader than CI publishing: the fork-build packer
+      // (scripts/pack-public-packages.mjs) packs EVERY public package into the
+      // release-asset set, including non-published shims. Those must still be
+      // stamped to the calver release version or they ship at their literal
+      // package.json version (e.g. the deprecated adapter-hermes-gateway shim at
+      // 0.1.0). stampVersion defaults to publishFromCi so publish-enrolled
+      // packages are unaffected; a package may opt into stamping without being
+      // published by setting stampVersion:true.
+      stampVersion: entry.stampVersion ?? entry.publishFromCi,
+    };
+  });
 
   const edgeProblems = findUnpublishableWorkspaceEdges(packages);
   if (edgeProblems.length > 0) {
@@ -230,6 +248,14 @@ function getReleasePackages() {
   ];
 }
 
+// Packages whose package.json version is rewritten to the release calver. This
+// is a superset of getReleasePackages(): it also covers public packages that
+// are packed into the release-asset set but not published from CI, so they do
+// not ship at a stale literal version.
+function getStampVersionPackages() {
+  return sortTopologically(buildReleasePackagePlan().filter((pkg) => pkg.stampVersion));
+}
+
 function replaceWorkspaceDeps(deps, version) {
   if (!deps) return deps;
   const next = { ...deps };
@@ -244,7 +270,7 @@ function replaceWorkspaceDeps(deps, version) {
 }
 
 function setVersion(version) {
-  const packages = getReleasePackages();
+  const packages = getStampVersionPackages();
 
   for (const pkg of packages) {
     const nextPkg = {
@@ -342,5 +368,6 @@ export {
   discoverPublicPackages,
   findUnpublishableWorkspaceEdges,
   getReleasePackages,
+  getStampVersionPackages,
   loadReleaseManifest,
 };

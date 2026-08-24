@@ -5,8 +5,9 @@ import type { Duplex } from "node:stream";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentApiKeys, companyMemberships, instanceUserRoles } from "@paperclipai/db";
-import type { DeploymentMode } from "@paperclipai/shared";
+import { isAgentApiKeyExpired, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
+import { auditAgentKeyExpired } from "../middleware/auth.js";
 import { logger } from "../middleware/logger.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 
@@ -209,6 +210,30 @@ async function authorizeUpgrade(
     .then((rows) => rows[0] ?? null);
 
   if (!key || key.companyId !== companyId) {
+    return null;
+  }
+
+  // Fail-closed expiry backstop: reject a key past `expiresAt` on the
+  // live-events socket the same way the HTTP resolver does, independent of
+  // `revokedAt`.
+  if (isAgentApiKeyExpired(key.expiresAt)) {
+    logger.warn(
+      { keyId: key.id, agentId: key.agentId, companyId: key.companyId, expiresAt: key.expiresAt },
+      "Rejected expired agent API key on live-events socket",
+    );
+    // Detection parity with the HTTP resolver (middleware/auth.ts): emit the
+    // same `auth.agent_key_expired` activity_log row so forensics see expired-key
+    // rejections regardless of whether they arrive over HTTP or the WS upgrade.
+    // Use `url.pathname` (not `req.url`) so the token query param never lands in
+    // the audit row.
+    await auditAgentKeyExpired(db, {
+      companyId: key.companyId,
+      agentId: key.agentId,
+      keyId: key.id,
+      expiresAt: key.expiresAt ?? null,
+      method: req.method ?? "GET",
+      url: url.pathname,
+    });
     return null;
   }
 

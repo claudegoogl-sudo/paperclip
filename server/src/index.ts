@@ -18,6 +18,7 @@ import {
   formatEmbeddedPostgresError,
   getPostgresDataDirectory,
   inspectMigrations,
+  inspectMigrationPreflight,
   applyPendingMigrations,
   createEmbeddedPostgresLogBuffer,
   prepareEmbeddedPostgresNativeRuntime,
@@ -28,9 +29,24 @@ import {
   companies,
   companyMemberships,
   instanceUserRoles,
+  buildEmbeddedPostgresConnectionString,
+  buildEmbeddedPostgresConstructorOptions,
+  resolveEmbeddedPostgresPasswordForStartup,
+  rotateEmbeddedPostgresAuthIfNeeded,
+  scrubEmbeddedPostgresConnectionString,
 } from "@paperclipai/db";
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
+import {
+  RUN_HISTORY_PRUNE_BATCH_SIZE,
+  RUN_HISTORY_PRUNE_MAX_BATCHES,
+  startRunHistoryRetention,
+} from "./services/run-history-retention.js";
+import {
+  PLUGIN_WEBHOOK_DELIVERY_PRUNE_BATCH_SIZE,
+  PLUGIN_WEBHOOK_DELIVERY_PRUNE_MAX_BATCHES,
+  startPluginWebhookDeliveryRetention,
+} from "./services/plugin-webhook-delivery-retention.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
 import {
@@ -77,10 +93,16 @@ import {
   parseAdapterRegistryEnv,
   reconcileAdapterAvailability,
 } from "./services/adapter-registry-bootstrap.js";
+import { reapOrphanedMcpProcessesOnStartup } from "./services/mcp-orphan-reaper.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
+import {
+  EGRESS_POSTURE_SWEEP_INTERVAL_MS,
+  startEgressPostureSweep,
+} from "./services/egress-posture.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { isLoopbackHost, rewriteLoopbackUrlPort } from "./url-utils.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
+import { createPluginRunContextRegistry } from "./services/plugin-run-context-registry.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -124,7 +146,9 @@ type EmbeddedPostgresCtor = new (opts: {
   password: string;
   port: number;
   persistent: boolean;
+  authMethod?: "scram-sha-256" | "password" | "md5";
   initdbFlags?: string[];
+  postgresFlags?: string[];
   onLog?: (message: unknown) => void;
   onError?: (message: unknown) => void;
 }) => EmbeddedPostgresInstance;
@@ -154,25 +178,25 @@ export async function startServer(): Promise<StartedServer> {
   if (process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE === undefined) {
     process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = config.secretsMasterKeyFilePath;
   }
-  
+
   type MigrationSummary =
     | "skipped"
     | "already applied"
     | "applied (empty database)"
     | "applied (pending migrations)";
-  
+
   function formatPendingMigrationSummary(migrations: string[]): string {
     if (migrations.length === 0) return "none";
     return migrations.length > 3
       ? `${migrations.slice(0, 3).join(", ")} (+${migrations.length - 3} more)`
       : migrations.join(", ");
   }
-  
+
   async function promptApplyMigrations(migrations: string[]): Promise<boolean> {
     if (process.env.PAPERCLIP_MIGRATION_AUTO_APPLY === "true") return true;
     if (process.env.PAPERCLIP_MIGRATION_PROMPT === "never") return false;
     if (!stdin.isTTY || !stdout.isTTY) return true;
-  
+
     const prompt = createInterface({ input: stdin, output: stdout });
     try {
       const answer = (await prompt.question(
@@ -183,17 +207,51 @@ export async function startServer(): Promise<StartedServer> {
       prompt.close();
     }
   }
-  
+
   type EnsureMigrationsOptions = {
     autoApply?: boolean;
   };
-  
+
   async function ensureMigrations(
     connectionString: string,
     label: string,
     opts?: EnsureMigrationsOptions,
   ): Promise<MigrationSummary> {
     const autoApply = opts?.autoApply === true;
+
+    // Before applying anything, record what the pending set is and flag identity
+    // drift — a migration whose file contents changed after it was recorded as
+    // applied. This makes an out-of-band package/content swap loud instead of a
+    // silent boot-time re-run.
+    const preflight = await inspectMigrationPreflight(connectionString);
+    if (preflight.pending.length > 0) {
+      logger.info(
+        { label, pendingMigrations: preflight.pending },
+        `${label} has ${preflight.pending.length} pending migration(s)`,
+      );
+    }
+    for (const drift of preflight.drift) {
+      logger.warn(
+        {
+          label,
+          migrationFile: drift.migrationFile,
+          recordedHash: drift.recordedHash,
+          currentHash: drift.currentHash,
+        },
+        `${label} migration identity drift: ${drift.migrationFile} was recorded as applied under a ` +
+          `different content hash than the file now on disk. The migration file's contents changed ` +
+          `underneath an already-applied name; re-applying it may be unintended.`,
+      );
+    }
+    if (preflight.unverifiable.length > 0) {
+      logger.warn(
+        { label, unverifiableMigrations: preflight.unverifiable },
+        `${label} cannot verify migration identity for ${preflight.unverifiable.length} already-applied ` +
+          `migration(s) because this cluster has no recorded file identity for them (it predates identity ` +
+          `tracking). A content swap in these files cannot be ruled out; treat "no drift" as undecided, not clean.`,
+      );
+    }
+
     let state = await inspectMigrations(connectionString);
     if (state.status === "needsMigrations" && state.reason === "pending-migrations") {
       const repair = await reconcilePendingMigrationHistory(connectionString);
@@ -219,12 +277,12 @@ export async function startServer(): Promise<StartedServer> {
             "Refusing to start against a stale schema. Run pnpm db:migrate or set PAPERCLIP_MIGRATION_AUTO_APPLY=true.",
         );
       }
-  
+
       logger.info({ pendingMigrations: state.pendingMigrations }, `Applying ${state.pendingMigrations.length} pending migrations for ${label}`);
       await applyPendingMigrations(connectionString);
       return "applied (pending migrations)";
     }
-  
+
     const apply = autoApply ? true : await promptApplyMigrations(state.pendingMigrations);
     if (!apply) {
       throw new Error(
@@ -232,7 +290,7 @@ export async function startServer(): Promise<StartedServer> {
           "Refusing to start against a stale schema. Run pnpm db:migrate or set PAPERCLIP_MIGRATION_AUTO_APPLY=true.",
       );
     }
-  
+
     logger.info({ pendingMigrations: state.pendingMigrations }, `Applying ${state.pendingMigrations.length} pending migrations for ${label}`);
     await applyPendingMigrations(connectionString);
     return "applied (pending migrations)";
@@ -252,9 +310,18 @@ export async function startServer(): Promise<StartedServer> {
       return;
     }
     if (!config.databaseUrl) {
-      throw new Error(
-        "authenticated public deployments require DATABASE_URL or config.database.connectionString; refusing embedded PostgreSQL fallback",
+      if (!config.allowEmbeddedPostgresPublic) {
+        throw new Error(
+          "authenticated public deployment refuses embedded PostgreSQL because " +
+            "PAPERCLIP_ALLOW_EMBEDDED_POSTGRES_PUBLIC=false; set DATABASE_URL to an external " +
+            "managed Postgres connection string or unset the flag to allow embedded PostgreSQL",
+        );
+      }
+      logger.warn(
+        "public deployment running on embedded PostgreSQL; external managed Postgres " +
+          "(DATABASE_URL or config.database.connectionString) is recommended for production",
       );
+      return;
     }
     if (!isPostgresConnectionString(config.databaseUrl)) {
       throw new Error(
@@ -266,7 +333,7 @@ export async function startServer(): Promise<StartedServer> {
   const LOCAL_BOARD_USER_ID = "local-board";
   const LOCAL_BOARD_USER_EMAIL = "local@paperclip.local";
   const LOCAL_BOARD_USER_NAME = "Board";
-  
+
   async function ensureLocalTrustedBoardPrincipal(db: any): Promise<void> {
     const now = new Date();
     const existingUser = await db
@@ -274,7 +341,7 @@ export async function startServer(): Promise<StartedServer> {
       .from(authUsers)
       .where(eq(authUsers.id, LOCAL_BOARD_USER_ID))
       .then((rows: Array<{ id: string }>) => rows[0] ?? null);
-  
+
     if (!existingUser) {
       await db.insert(authUsers).values({
         id: LOCAL_BOARD_USER_ID,
@@ -286,7 +353,7 @@ export async function startServer(): Promise<StartedServer> {
         updatedAt: now,
       });
     }
-  
+
     const role = await db
       .select({ id: instanceUserRoles.id })
       .from(instanceUserRoles)
@@ -298,7 +365,7 @@ export async function startServer(): Promise<StartedServer> {
         role: "instance_admin",
       });
     }
-  
+
     const companyRows = await db.select({ id: companies.id }).from(companies);
     for (const company of companyRows) {
       const membership = await db
@@ -322,7 +389,7 @@ export async function startServer(): Promise<StartedServer> {
       });
     }
   }
-  
+
   let db;
   let pluginMigrationDb;
   let embeddedPostgres: EmbeddedPostgresInstance | null = null;
@@ -337,7 +404,7 @@ export async function startServer(): Promise<StartedServer> {
   if (config.databaseUrl) {
     const migrationUrl = config.databaseMigrationUrl ?? config.databaseUrl;
     migrationSummary = await ensureMigrations(migrationUrl, "PostgreSQL");
-  
+
     db = createDb(config.databaseUrl);
     pluginMigrationDb = config.databaseMigrationUrl ? createDb(config.databaseMigrationUrl) : db;
     logger.info("Using external PostgreSQL via DATABASE_URL/config");
@@ -361,7 +428,7 @@ export async function startServer(): Promise<StartedServer> {
       );
     }
     await prepareEmbeddedPostgresNativeRuntime();
-  
+
     const dataDir = resolve(config.embeddedPostgresDataDir);
     const configuredPort = config.embeddedPostgresPort;
     let port = configuredPort;
@@ -383,24 +450,36 @@ export async function startServer(): Promise<StartedServer> {
         logger.info({ embeddedPostgresLog: line }, "embedded-postgres");
       }
     };
-    const logEmbeddedPostgresFailure = (phase: "initialise" | "start", err: unknown) => {
+    const logEmbeddedPostgresFailure = (phase: "initialise" | "start" | "rotate", err: unknown) => {
       const recentLogs = logBuffer.getRecentLogs();
       if (recentLogs.length > 0) {
+        const safeRecentLogs = recentLogs.map((line) =>
+          scrubEmbeddedPostgresConnectionString(line),
+        );
+        const safeErr =
+          err instanceof Error
+            ? new Error(
+                scrubEmbeddedPostgresConnectionString(err.message),
+                { cause: err },
+              )
+            : typeof err === "string"
+              ? scrubEmbeddedPostgresConnectionString(err)
+              : err;
         logger.error(
           {
             phase,
-            recentLogs,
-            err,
+            recentLogs: safeRecentLogs,
+            err: safeErr,
           },
           "Embedded PostgreSQL failed; showing buffered startup logs",
         );
       }
     };
-  
+
     if (config.databaseMode === "postgres") {
       logger.warn("Database mode is postgres but no connection string was set; falling back to embedded PostgreSQL");
     }
-  
+
     const clusterVersionFile = resolve(dataDir, "PG_VERSION");
     const clusterAlreadyInitialized = existsSync(clusterVersionFile);
     const postmasterPidFile = resolve(dataDir, "postmaster.pid");
@@ -412,7 +491,7 @@ export async function startServer(): Promise<StartedServer> {
         return false;
       }
     };
-  
+
     const getRunningPid = (): number | null => {
       if (!existsSync(postmasterPidFile)) return null;
       try {
@@ -425,12 +504,17 @@ export async function startServer(): Promise<StartedServer> {
         return null;
       }
     };
-  
+
     const runningPid = getRunningPid();
+    const startupPasswordResolution = resolveEmbeddedPostgresPasswordForStartup(dataDir);
     if (runningPid) {
       logger.warn(`Embedded PostgreSQL already running; reusing existing process (pid=${runningPid}, port=${port})`);
     } else {
-      const configuredAdminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${configuredPort}/postgres`;
+      const configuredAdminConnectionString = buildEmbeddedPostgresConnectionString({
+        port: configuredPort,
+        database: "postgres",
+        password: startupPasswordResolution.password,
+      });
       try {
         const actualDataDir = await getPostgresDataDirectory(configuredAdminConnectionString);
         if (
@@ -449,17 +533,19 @@ export async function startServer(): Promise<StartedServer> {
           logger.warn(`Embedded PostgreSQL port is in use; using next free port (requestedPort=${configuredPort}, selectedPort=${detectedPort})`);
         }
         port = detectedPort;
+        // Intentionally log only dataDir and port — never the connection string.
+        // The connection string contains the per-install password and must not
+        // reach a log line.
         logger.info(`Using embedded PostgreSQL because no DATABASE_URL set (dataDir=${dataDir}, port=${port})`);
-        embeddedPostgres = new EmbeddedPostgres({
-          databaseDir: dataDir,
-          user: "paperclip",
-          password: "paperclip",
-          port,
-          persistent: true,
-          initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
-          onLog: appendEmbeddedPostgresLog,
-          onError: appendEmbeddedPostgresLog,
-        });
+        embeddedPostgres = new EmbeddedPostgres(
+          buildEmbeddedPostgresConstructorOptions({
+            dataDir,
+            port,
+            password: startupPasswordResolution.password,
+            onLog: appendEmbeddedPostgresLog,
+            onError: appendEmbeddedPostgresLog,
+          }),
+        );
 
         if (!clusterAlreadyInitialized) {
           try {
@@ -491,14 +577,62 @@ export async function startServer(): Promise<StartedServer> {
         embeddedPostgresStartedByThisProcess = true;
       }
     }
-  
-    const embeddedAdminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/postgres`;
+
+    // Converge auth on every start: rotate legacy/per-install-mismatch to the
+    // cred file, then rewrite pg_hba.conf to scram-sha-256 and reload. No-op
+    // when the cred file already matches the running role and pg_hba is
+    // already scram-only. Must run after the cluster is reachable.
+    let embeddedPassword: string = startupPasswordResolution.password;
+    try {
+      const rotation = await rotateEmbeddedPostgresAuthIfNeeded({
+        dataDir,
+        port,
+        currentPassword: startupPasswordResolution.password,
+        onEvent: (event) => {
+          if (event.kind === "no-op") {
+            logger.debug({ reason: event.reason }, "embedded PostgreSQL auth: no rotation needed");
+          } else if (event.kind === "rotate") {
+            logger.warn({ reason: event.reason }, "embedded PostgreSQL auth: rotating per-install password");
+          } else if (event.kind === "pg-hba-rewrite") {
+            logger.warn(
+              { backupPath: event.backupPath },
+              "embedded PostgreSQL auth: rewrote pg_hba.conf to scram-sha-256",
+            );
+          } else if (event.kind === "reload") {
+            logger.info("embedded PostgreSQL auth: reloaded cluster to apply scram-sha-256 pg_hba");
+          }
+        },
+      });
+      embeddedPassword = rotation.password;
+      if (rotation.rotated || rotation.pgHbaRewritten) {
+        logger.info(
+          { rotated: rotation.rotated, pgHbaRewritten: rotation.pgHbaRewritten },
+          "embedded PostgreSQL auth converged",
+        );
+      }
+    } catch (err) {
+      logEmbeddedPostgresFailure("rotate", err);
+      throw formatEmbeddedPostgresError(err, {
+        fallbackMessage: `Failed to converge embedded PostgreSQL auth in ${dataDir} on port ${port}`,
+        recentLogs: logBuffer.getRecentLogs(),
+      });
+    }
+
+    const embeddedAdminConnectionString = buildEmbeddedPostgresConnectionString({
+      port,
+      database: "postgres",
+      password: embeddedPassword,
+    });
     const dbStatus = await ensurePostgresDatabase(embeddedAdminConnectionString, "paperclip");
     if (dbStatus === "created") {
       logger.info("Created embedded PostgreSQL database: paperclip");
     }
-  
-    const embeddedConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`;
+
+    const embeddedConnectionString = buildEmbeddedPostgresConnectionString({
+      port,
+      database: "paperclip",
+      password: embeddedPassword,
+    });
     const shouldAutoApplyFirstRunMigrations = !clusterAlreadyInitialized || dbStatus === "created";
     if (shouldAutoApplyFirstRunMigrations) {
       logger.info("Detected first-run embedded PostgreSQL setup; applying pending migrations automatically");
@@ -506,7 +640,7 @@ export async function startServer(): Promise<StartedServer> {
     migrationSummary = await ensureMigrations(embeddedConnectionString, "Embedded PostgreSQL", {
       autoApply: shouldAutoApplyFirstRunMigrations,
     });
-  
+
     db = createDb(embeddedConnectionString);
     pluginMigrationDb = db;
     logger.info("Embedded PostgreSQL ready");
@@ -514,18 +648,18 @@ export async function startServer(): Promise<StartedServer> {
     resolvedEmbeddedPostgresPort = port;
     startupDbInfo = { mode: "embedded-postgres", dataDir, port };
   }
-  
+
   if (config.deploymentMode === "local_trusted" && !isLoopbackHost(config.host)) {
     throw new Error(
       `local_trusted mode requires loopback host binding (received: ${config.host}). ` +
         "Use authenticated mode for non-loopback deployments.",
     );
   }
-  
+
   if (config.deploymentMode === "local_trusted" && config.deploymentExposure !== "private") {
     throw new Error("local_trusted mode only supports private exposure");
   }
-  
+
   if (config.deploymentMode === "authenticated") {
     if (config.authBaseUrlMode === "explicit" && !config.authPublicBaseUrl) {
       throw new Error("auth.baseUrlMode=explicit requires auth.publicBaseUrl");
@@ -545,7 +679,7 @@ export async function startServer(): Promise<StartedServer> {
   if (config.authBaseUrlMode === "explicit" && config.authPublicBaseUrl) {
     config.authPublicBaseUrl = rewriteLoopbackUrlPort(config.authPublicBaseUrl, listenPort);
   }
-  
+
   let authReady = config.deploymentMode === "local_trusted";
   let betterAuthHandler: RequestHandler | undefined;
   let resolveSession:
@@ -715,7 +849,17 @@ export async function startServer(): Promise<StartedServer> {
       databaseBackupInFlight = false;
     }
   };
-  const pluginWorkerManager = createPluginWorkerManager();
+  // SECURITY-CRITICAL (fork): the worker manager and the secrets host-handler MUST share one
+  // run-context registry. The manager registers each worker's host-minted
+  // service run-context on start (so setup()-loop / background secret resolves
+  // can be authorized server-side); the secrets handler reads it on resolve.
+  // Build the registry here and thread the SAME instance into both the manager
+  // and createApp — passing the manager without its registry would leave the
+  // handler reading a disjoint, empty registry (Gate 1 -> runcontext_invalid).
+  const pluginRunContextRegistry = createPluginRunContextRegistry();
+  const pluginWorkerManager = createPluginWorkerManager({
+    runContextRegistry: pluginRunContextRegistry,
+  });
   const heartbeat = config.heartbeatSchedulerEnabled
     ? heartbeatService(db as any, { pluginWorkerManager })
     : null;
@@ -757,11 +901,16 @@ export async function startServer(): Promise<StartedServer> {
     authReady,
     companyDeletionEnabled: config.companyDeletionEnabled,
     pluginMigrationDb: pluginMigrationDb as any,
+    // Company the host files plugin capability-escalation board
+    // approvals against. Unset → no gateway wired → loader fails closed.
+    escalationApprovalCompanyId:
+      process.env.PAPERCLIP_PLUGIN_ESCALATION_COMPANY_ID?.trim() || undefined,
     betterAuthHandler,
     resolveSession,
     pluginWorkerManager,
     decisionServiceOptions,
     managedPluginAutoInstall,
+    pluginRunContextRegistry,
   });
   const server = createServer(app as unknown as Parameters<typeof createServer>[0]);
 
@@ -770,11 +919,11 @@ export async function startServer(): Promise<StartedServer> {
   // This prevents intermittent 502/ECONNRESET errors caused by Node's 5s default.
   server.keepAliveTimeout = 185000;
   server.headersTimeout = 186000;
-  
+
   if (listenPort !== requestedListenPort) {
     logger.warn(`Requested port is busy; using next free port (requestedPort=${requestedListenPort}, selectedPort=${listenPort})`);
   }
-  
+
   const runtimeListenHost = config.host;
   const runtimeApiUrl = choosePrimaryRuntimeApiUrl({
     authPublicBaseUrl: config.authPublicBaseUrl ?? null,
@@ -795,7 +944,7 @@ export async function startServer(): Promise<StartedServer> {
   process.env.PAPERCLIP_RUNTIME_API_URL = runtimeApiUrl;
   process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON = JSON.stringify(runtimeApiCandidates);
   process.env.PAPERCLIP_API_URL = configuredApiUrl;
-  
+
   setupEnvironmentCustomImageTerminalWebSocketServer(server, db as any, {
     pluginWorkerManager,
   });
@@ -1032,6 +1181,20 @@ export async function startServer(): Promise<StartedServer> {
     trackHeartbeatSchedulerWork(runEnvironmentLeaseCleanupSweep(ENVIRONMENT_LEASE_CLEANUP_SWEEP_BACKOFF_MS));
   };
 
+  // Sweep MCP child processes (e.g. Playwright MCP) that were orphaned to init
+  // by a prior crash or watchdog kill. Runs regardless of heartbeat scheduling
+  // so leaked strays never accumulate across restarts. Safe matching only:
+  // MCP command + ppid==1.
+  try {
+    const reaped = await reapOrphanedMcpProcessesOnStartup();
+    if (reaped.length > 0) {
+      logger.warn({ reapedPids: reaped }, "startup swept orphaned MCP child processes");
+    }
+  } catch (err) {
+    logger.error({ err }, "startup MCP orphan sweep failed");
+  }
+
+
   if (heartbeat) {
     const secretProposals = createSecretProposalsService(db as any);
     const decisionExecutor = decisionService(db as any, decisionServiceOptions);
@@ -1238,6 +1401,11 @@ export async function startServer(): Promise<StartedServer> {
         if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
           logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
         }
+
+        const commentAlerts = await heartbeat.reconcileHighCommentVolumeAlerts();
+        if (commentAlerts.alerted > 0 || commentAlerts.failed > 0) {
+          logger.warn({ ...commentAlerts }, "startup high-comment-volume monitor raised alerts");
+        }
       })().catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
       });
@@ -1379,6 +1547,12 @@ export async function startServer(): Promise<StartedServer> {
               logger.warn({ ...result }, "environment customImage setup cleanup changed sessions");
             }
           })
+          .then(async () => {
+            const commentAlerts = await heartbeat.reconcileHighCommentVolumeAlerts();
+            if (commentAlerts.alerted > 0 || commentAlerts.failed > 0) {
+              logger.warn({ ...commentAlerts }, "periodic high-comment-volume monitor raised alerts");
+            }
+          })
           .catch((err) => {
             logger.error({ err }, "environment customImage setup cleanup failed");
           }));
@@ -1476,7 +1650,12 @@ export async function startServer(): Promise<StartedServer> {
       scheduleEnvironmentLeaseCleanupSweep();
     });
   }
-  
+
+  // Deliberately NOT inside the `heartbeatSchedulerEnabled` block above, and not
+  // subject to heartbeat suppression: a security-posture check that silently
+  // stops running when an unrelated scheduling flag is off is failure-open.
+  startEgressPostureSweep(db as any, EGRESS_POSTURE_SWEEP_INTERVAL_MS);
+
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
 
@@ -1494,7 +1673,45 @@ export async function startServer(): Promise<StartedServer> {
       });
     }, backupIntervalMs);
   }
-  
+
+  if (config.runHistoryRetentionEnabled) {
+    logger.info(
+      {
+        retentionDays: config.runHistoryRetentionDays,
+        intervalMinutes: config.runHistoryRetentionIntervalMinutes,
+        batchSize: RUN_HISTORY_PRUNE_BATCH_SIZE,
+        maxBatchesPerTick: RUN_HISTORY_PRUNE_MAX_BATCHES,
+      },
+      "Run history retention enabled",
+    );
+    startRunHistoryRetention(
+      db,
+      config.runHistoryRetentionIntervalMinutes * 60 * 1000,
+      config.runHistoryRetentionDays,
+    );
+  }
+
+  if (config.pluginWebhookDeliveryRetentionEnabled) {
+    logger.info(
+      {
+        successRetentionDays: config.pluginWebhookDeliverySuccessRetentionDays,
+        failedRetentionDays: config.pluginWebhookDeliveryFailedRetentionDays,
+        maxRows: config.pluginWebhookDeliveryMaxRows,
+        intervalMinutes: config.pluginWebhookDeliveryRetentionIntervalMinutes,
+        batchSize: PLUGIN_WEBHOOK_DELIVERY_PRUNE_BATCH_SIZE,
+        maxBatchesPerTick: PLUGIN_WEBHOOK_DELIVERY_PRUNE_MAX_BATCHES,
+      },
+      "Plugin webhook delivery retention enabled",
+    );
+    startPluginWebhookDeliveryRetention(
+      db,
+      config.pluginWebhookDeliveryRetentionIntervalMinutes * 60 * 1000,
+      config.pluginWebhookDeliverySuccessRetentionDays,
+      config.pluginWebhookDeliveryFailedRetentionDays,
+      config.pluginWebhookDeliveryMaxRows,
+    );
+  }
+
   // Wait for external adapters to finish loading before accepting requests.
   // Without this, adapter type validation (assertKnownAdapterType) would
   // reject valid external adapter types during the startup loading window.
@@ -1576,7 +1793,7 @@ export async function startServer(): Promise<StartedServer> {
       resolveListen();
     });
   });
-  
+
   {
     const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
       await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);

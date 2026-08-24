@@ -54,6 +54,188 @@ import {
 } from "./detect-model.js";
 
 // ---------------------------------------------------------------------------
+// Environment allowlist (default-deny)
+// ---------------------------------------------------------------------------
+
+/**
+ * Non-secret process-env vars a Hermes child genuinely needs to run.
+ * Everything else in the Paperclip server env (provider keys, PATs, bot
+ * tokens, other companies' secrets) is dropped. Per-agent credentials must be
+ * supplied via adapterConfig.env, which is layered on top of this allowlist.
+ *
+ * NOTE: PYTHONPATH/PYTHONHOME are intentionally absent — the hermes shim
+ * (~/.local/bin/hermes) already unsets them before exec'ing the venv binary,
+ * so passing them through would be a no-op at best.
+ */
+const ENV_ALLOWLIST_EXACT = new Set<string>([
+  // Filesystem / process identity
+  "HOME",
+  "PATH",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "PWD",
+  "TMPDIR",
+  // Locale / time
+  "TZ",
+  "LANG",
+  "LC_ALL",
+  "TERM",
+  // Runtime mode
+  "NODE_ENV",
+  // TLS trust roots (needed for outbound HTTPS to inference providers)
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+]);
+
+/**
+ * Prefix families that are allowlisted wholesale. These namespaces hold
+ * non-secret locale (LC_*) and desktop/base-dir (XDG_*) settings.
+ */
+const ENV_ALLOWLIST_PREFIXES = ["LC_", "XDG_"];
+
+function isAllowlistedEnvKey(key: string): boolean {
+  if (ENV_ALLOWLIST_EXACT.has(key)) return true;
+  return ENV_ALLOWLIST_PREFIXES.some((p) => key.startsWith(p));
+}
+
+/**
+ * Build the base child env by filtering the server process env down to the
+ * default-deny allowlist above. Undefined values are skipped.
+ */
+export function allowlistedProcessEnv(
+  source: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (value === undefined) continue;
+    if (isAllowlistedEnvKey(key)) out[key] = value;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// PAPERCLIP_API_KEY injection (default-deny for external-logging providers)
+// ---------------------------------------------------------------------------
+
+/**
+ * INTERNAL (trusted) provider allowlist — the ONLY inference targets that may
+ * receive the broad run-scoped board key (`ctx.authToken`).
+ *
+ * "Internal" here means "trusted not to retain/leak the key into third-party
+ * readable logs" — NOT "on an internal network". These are the direct
+ * first-party Anthropic API (the same upstream `claude_local` already sends this
+ * key to, so allowlisting it is parity with the accepted baseline) and the
+ * in-process `claude_local` runtime.
+ *
+ * This is a DEFAULT-DENY allowlist, not a denylist. Any provider not in this set
+ * — including `auto`, every current external provider (openrouter, nous,
+ * copilot, zai, minimax, huggingface, kimi-coding, kilocode, …), and any
+ * provider added to Hermes in the future — is treated as untrusted and must bind
+ * a `task_bridge`-scoped key to run. A denylist would silently leak the broad
+ * key to (a) a future external-logging provider nobody remembered to add and
+ * (b) `provider=auto` routing to an external upstream under a benign model name;
+ * inverting to an allowlist closes both by construction. Adding a provider here
+ * is a deliberate, reviewed trust decision — the safe per-agent opt-in for any
+ * other provider is binding a scoped key, not widening this set.
+ */
+const INTERNAL_KEY_PROVIDERS = new Set(["anthropic", "claude_local", "claude-local"]);
+
+/**
+ * Cloaked / "stealth" model slugs (e.g. `stealth/ox-alpha`, cloaked review
+ * models) route through external-logging upstreams even when the resolved
+ * `--provider` looks benign. Defense-in-depth: even a provider on the internal
+ * allowlist is downgraded to untrusted if the model slug indicates cloaked
+ * routing, so the fail-closed guard cannot be side-stepped via the model name.
+ */
+const STEALTH_MODEL_PATTERN = /(^|\/)(stealth|cloak|ox-)/i;
+
+/**
+ * True when the broad run-scoped board key MAY be injected for this spawn
+ * target: the provider is on the explicit internal allowlist AND the model slug
+ * shows no cloaked/stealth routing. Everything else is untrusted (default-deny).
+ */
+export function isInternalKeyTarget(
+  provider: string | undefined,
+  model?: string,
+): boolean {
+  if (!provider) return false; // undefined / unresolved → untrusted
+  if (!INTERNAL_KEY_PROVIDERS.has(provider.toLowerCase())) return false;
+  if (model && STEALTH_MODEL_PATTERN.test(model)) return false; // defensive
+  return true;
+}
+
+/**
+ * True when the spawned Hermes child would talk to an inference target that must
+ * NOT receive the broad run-scoped board key — i.e. anything not on the internal
+ * allowlist. This is the fail-closed complement of {@link isInternalKeyTarget};
+ * an unknown or future external-logging provider is external by default.
+ */
+export function isExternalLoggingTarget(
+  provider: string | undefined,
+  model?: string,
+): boolean {
+  return !isInternalKeyTarget(provider, model);
+}
+
+/**
+ * Decide which value to inject as the child's `PAPERCLIP_API_KEY`.
+ *
+ * Security contract (DEFAULT-DENY):
+ *
+ *  1. An operator-bound `task_bridge`-scoped key (delivered by the server into
+ *     `adapterConfig.env.PAPERCLIP_BRIDGE_API_KEY`) always wins and is never
+ *     overwritten by the broad run-scoped `authToken`. This is the sanctioned
+ *     per-agent opt-in for ANY provider.
+ *  2. Otherwise the broad `authToken` is injected ONLY when the target is on the
+ *     internal provider allowlist ({@link isInternalKeyTarget}). For every other
+ *     provider — auto, all external providers, and any future provider — fail
+ *     closed: refuse to spawn rather than leak the broad key into a third-party
+ *     log. The dangerous path is explicit opt-in (bind a scoped key), never the
+ *     default.
+ *  3. Internal, allowlisted providers keep the `authToken` fallback, so existing
+ *     behavior for those targets is unchanged.
+ *
+ * Returns the key to inject, or `undefined` when there is nothing to inject.
+ * Throws for case 2 (fail closed).
+ */
+export function resolveSpawnApiKey(opts: {
+  /** Operator-bound key from adapterConfig.env.PAPERCLIP_BRIDGE_API_KEY. */
+  boundKey?: string;
+  /** The broad, same-company, run-scoped board key (ctx.authToken). */
+  authToken?: string;
+  /** Resolved inference provider for this spawn. */
+  provider: string | undefined;
+  /** Resolved model name for this spawn. */
+  model?: string;
+}): string | undefined {
+  const boundKey =
+    typeof opts.boundKey === "string" && opts.boundKey.length > 0
+      ? opts.boundKey
+      : undefined;
+  // 1. Operator-bound scoped key always wins.
+  if (boundKey) return boundKey;
+
+  // 2. Default-deny: the broad run key is injected only for internal allowlisted
+  //    targets. Everything else fails closed.
+  if (!isInternalKeyTarget(opts.provider, opts.model)) {
+    throw new Error(
+      `[hermes] Refusing to spawn: inference target (provider=${opts.provider ?? "auto"}` +
+        `${opts.model ? `, model=${opts.model}` : ""}) is not on the internal provider ` +
+        `allowlist, so it may retain/log the full request context upstream. No ` +
+        `task_bridge-scoped key is bound, and the broad run-scoped key is never ` +
+        `injected for non-allowlisted targets. Bind a task_bridge key via ` +
+        `adapterConfig.env (PAPERCLIP_BRIDGE_API_KEY) to authorize.`,
+    );
+  }
+
+  // 3. Internal, allowlisted provider fallback: the run-scoped board key.
+  return typeof opts.authToken === "string" && opts.authToken.length > 0
+    ? opts.authToken
+    : undefined;
+}
+
+// ---------------------------------------------------------------------------
 // Config helpers
 // ---------------------------------------------------------------------------
 
@@ -462,19 +644,57 @@ export async function execute(
   }
 
   // ── Build environment ──────────────────────────────────────────────────
+  // SECURITY (default-deny): never blanket-inherit the Paperclip server env.
+  // The server process holds every company's/agent's secrets (provider keys,
+  // GitHub PATs, telegram/bot tokens, etc.). A cloaked/logging inference model
+  // that gets a shell toolset could `printenv` and exfiltrate all of them into
+  // a third-party log. Only non-secret runtime essentials are allowlisted here;
+  // per-agent credentials must flow through adapterConfig.env (userEnv) and the
+  // explicit Paperclip injections below (buildPaperclipEnv + PAPERCLIP_API_KEY),
+  // which are the agent's own least-privilege values.
   const userEnv = config.env as Record<string, string> | undefined;
   const env: Record<string, string> = {
-    ...(process.env as Record<string, string>),
+    ...allowlistedProcessEnv(),
     ...(userEnv && typeof userEnv === "object" ? userEnv : {}),
     ...buildPaperclipEnv(ctx.agent),
   };
 
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
 
-  // PAPERCLIP_API_KEY is never accepted from config — the harness-minted run
-  // token is the only source of Paperclip API identity.
-  delete env.PAPERCLIP_API_KEY;
-  if ((ctx as any).authToken) env.PAPERCLIP_API_KEY = (ctx as any).authToken;
+  // Inject PAPERCLIP_API_KEY for the child under a DEFAULT-DENY posture: the
+  // broad run-scoped authToken is injected ONLY for providers on the internal
+  // allowlist (isInternalKeyTarget). An operator-bound task_bridge key
+  // (adapterConfig.env, already layered into `env` above) always wins; for any
+  // non-allowlisted target (auto, every external provider, and any future
+  // provider) with no scoped key bound we fail closed rather than leak the broad
+  // key into a third-party log. Internal providers (anthropic / claude_local)
+  // keep the authToken fallback.
+  // INV-6: the bound task_bridge credential is read from the distinct
+  // PAPERCLIP_BRIDGE_API_KEY slot ONLY. The PAPERCLIP_API_KEY fallback is
+  // deliberately dropped: PAPERCLIP_API_KEY is the platform-injected run-identity
+  // JWT (a broad, wrong-scope credential), so accepting it as the "bridge" key
+  // would both fail the task_bridge guard and mask the real bridge slot. The
+  // server heartbeat delivers the operator-bound task_bridge secret into
+  // PAPERCLIP_BRIDGE_API_KEY after its total PAPERCLIP_* strip.
+  const boundBridgeKey = cfgString(userEnv?.PAPERCLIP_BRIDGE_API_KEY);
+  let spawnApiKey: string | undefined;
+  try {
+    spawnApiKey = resolveSpawnApiKey({
+      boundKey: boundBridgeKey,
+      authToken: (ctx as any).authToken,
+      provider: resolvedProvider,
+      model,
+    });
+  } catch (err) {
+    await ctx.onLog("stderr", `${(err as Error).message}\n`);
+    throw err;
+  }
+  if (spawnApiKey) {
+    env.PAPERCLIP_API_KEY = spawnApiKey;
+  } else {
+    // Nothing authorized to inject — make sure no stray value survives.
+    delete env.PAPERCLIP_API_KEY;
+  }
 
   // BUG FIX: Read task context from ctx.context (wake context), not ctx.config (adapter config)
   const ctxContext = (ctx as any).context || {};
@@ -535,6 +755,14 @@ export async function execute(
   const result = await runChildProcess(ctx.runId, hermesCmd, args, {
     cwd,
     env,
+    // Do NOT inherit the server process env. `env` above is a complete
+    // least-privilege set (allowlistedProcessEnv + userEnv + buildPaperclipEnv +
+    // explicit PAPERCLIP_* injections). Inheriting process.env underneath it —
+    // as the default runChildProcess behavior does — would re-leak every
+    // non-PAPERCLIP_ server secret (MAC_PW, ZAI_API_KEY, other agents' keys, …)
+    // to the child, defeating the allowlist. A hermes agent on a prompt-logging
+    // provider could `printenv` those into a third-party-retained log.
+    inheritServerEnv: false,
     timeoutSec,
     graceSec,
     onLog: wrappedOnLog,

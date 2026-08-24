@@ -4,6 +4,13 @@ on:
   pull_request:
     branches:
       - master
+      # Stacked PRs land on long-lived upstream-sync integration branches
+      # (see .github/workflows/pr.yml's own head_ref exemption below, and the
+      # upstream-sync routine). `branches:` filters on the PR's *base*, so
+      # without this entry those PRs get zero pr.yml runs, not a skipped
+      # check — the largest, riskiest merges (sync conflict resolution)
+      # would ship with no CI signal at all.
+      - 'sync/upstream-**'
 
 concurrency:
   group: pr-${{ github.event.pull_request.number }}
@@ -22,9 +29,16 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The lockfile is CI-owned, so PRs may not hand-edit pnpm-lock.yaml. Two
+      # exemptions: `chore/refresh-lockfile` (the dedicated refresh branch) and
+      # `sync/upstream-*` branches produced by the upstream-sync routine —
+      # an upstream release merge necessarily carries upstream's
+      # pnpm-lock.yaml, and the verify/build/e2e jobs install with
+      # --frozen-lockfile, so the matching lockfile MUST travel with the sync.
       - name: Block manual lockfile edits
         if: >-
           github.head_ref != 'chore/refresh-lockfile' &&
+          !startsWith(github.head_ref, 'sync/upstream-') &&
           github.event.pull_request.user.login != 'dependabot[bot]'
         run: |
           # Diff the PR branch against its merge base so recent base-branch commits
@@ -55,6 +69,74 @@ jobs:
       - name: Test no-git-push check
         run: node --test ./scripts/check-no-git-push.test.mjs
 
+      # Published container ports bypass the INPUT chain that UFW governs, so the
+      # publish bind address is the effective control. Guard against a new
+      # service reintroducing a bare `"8080:8080"` in a shipped stack.
+      - name: Reject non-loopback port publishes in shipped container stacks
+        run: node ./scripts/check-compose-loopback-bind.mjs
+
+      - name: Test compose loopback-bind check
+        run: node --test ./scripts/check-compose-loopback-bind.test.mjs
+
+      # A credential we ship is the same credential on every install, and it is
+      # public with the repo. Shipped stacks must fail closed on `${VAR:?...}`
+      # rather than boot on a well-known default.
+      - name: Reject literal credentials in shipped container stacks
+        run: node ./scripts/check-compose-literal-secrets.mjs
+
+      - name: Test compose literal-secrets check
+        run: node --test ./scripts/check-compose-literal-secrets.test.mjs
+
+      # Same hazard as the compose stack gate above, scoped to `.env.example`:
+      # a connection string that embeds a password in URL userinfo is a
+      # credential the moment the repo is public. The rule is narrow on
+      # purpose (URLs only) so it does not couple to BETTER_AUTH_SECRET,
+      # which is a separate ticket.
+      - name: Reject literal connection-string credentials in .env.example
+        run: node ./scripts/check-env-example-connection-string.mjs
+
+      - name: Test .env.example connection-string check
+        run: node --test ./scripts/check-env-example-connection-string.test.mjs
+
+      # Regression guard for CONTRIBUTING.md's "No Internal Issue References"
+      # rule: fails if the PR diff adds an internal ticket id, an instance UI
+      # link, an agent:// link, or a localhost/private-IP deep link into the
+      # instance UI. Scoped to added lines only, base...head.
+      - name: Reject internal/instance-local references added in this diff
+        if: github.event_name == 'pull_request'
+        env:
+          # Pass GitHub context through env, never interpolated into the shell
+          # line: these two are GitHub-generated hex, but this is the canonical
+          # Actions script-injection shape and must not be templated near
+          # attacker-controlled fields (head_ref, title, body). The script reads
+          # PR_BASE_SHA/PR_HEAD_SHA.
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node ./scripts/check-no-internal-ids.mjs
+
+      - name: Test no-internal-ids check
+        run: node --test ./scripts/check-no-internal-ids.test.mjs
+
+      # Released database migrations are append-only, comments included. The
+      # runner identifies a migration by sha256 of the whole file and dedupes
+      # on that hash alone, so editing an already-released migration re-applies
+      # it on every existing database. Fail if any migration journaled at the
+      # base ref has different bytes at head. Needs git history (fetch-depth: 0
+      # above), so it lives here in policy alongside the other diff-based
+      # guards, in the same workflow as the packages/db build checks.
+      - name: Reject content changes to released (append-only) migrations
+        if: github.event_name == 'pull_request'
+        env:
+          # Pass GitHub context through env rather than interpolating into the
+          # shell line (canonical Actions script-injection shape). The script
+          # reads PR_BASE_SHA/PR_HEAD_SHA.
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node ./scripts/check-migrations-append-only.mjs
+
+      - name: Test migrations append-only check
+        run: node --test ./scripts/check-migrations-append-only.test.mjs
+
       - name: Test general-server shard partition
         run: node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs
 
@@ -66,6 +148,9 @@ jobs:
 
       - name: Test standalone package build concurrency
         run: node --test ./scripts/__tests__/build-standalone-concurrency.test.mjs
+
+      - name: Test host disk janitor
+        run: node --test ./scripts/host-disk-janitor.test.mjs
 
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
@@ -137,6 +222,12 @@ jobs:
 
       - name: Verify release registry test coverage
         run: pnpm run test:release-registry
+
+      # Unit-test the upstream-sync routine's idempotency guard (no-op when a
+      # sync PR for the latest tag is already open). Mocks the GitHub pulls
+      # query, so no network/token is required.
+      - name: Verify upstream-sync idempotency
+        run: pnpm run test:upstream-sync
 
   general_tests:
     name: General tests (${{ matrix.group_label }})
@@ -229,7 +320,7 @@ jobs:
     # Preserve the legacy required-check name while the underlying work runs in parallel.
     name: verify
     if: ${{ always() }}
-    needs: [typecheck_release_registry, general_tests, build]
+    needs: [typecheck_release_registry, general_tests, build, verify_serialized_server, e2e]
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -239,10 +330,14 @@ jobs:
           TYPECHECK_RELEASE_REGISTRY_RESULT: ${{ needs.typecheck_release_registry.result }}
           GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
           BUILD_RESULT: ${{ needs.build.result }}
+          VERIFY_SERIALIZED_SERVER_RESULT: ${{ needs.verify_serialized_server.result }}
+          E2E_RESULT: ${{ needs.e2e.result }}
         run: |
           test "$TYPECHECK_RELEASE_REGISTRY_RESULT" = "success"
           test "$GENERAL_TESTS_RESULT" = "success"
           test "$BUILD_RESULT" = "success"
+          test "$VERIFY_SERIALIZED_SERVER_RESULT" = "success"
+          test "$E2E_RESULT" = "success"
 
   build:
     name: Build
@@ -277,6 +372,13 @@ jobs:
 
       - name: Build
         run: pnpm build
+
+      # Exercise the create-paperclip-plugin scaffold's emitted release-time
+      # manifest validation gate. Uses the scaffold's `dist/` produced by the
+      # Build step above; runs the host plugin-manifest validator against a
+      # freshly-scaffolded plugin's wiring.
+      - name: Verify scaffold manifest-validation gate
+        run: pnpm run test:scaffold-create-paperclip-plugin
 
   verify_serialized_server:
     name: Verify serialized server suites (${{ matrix.shard_label }})
@@ -340,6 +442,12 @@ jobs:
   canary_dry_run:
     name: Canary Dry Run
     needs: [policy]
+    # Skip on PRs. The dry-run step does `git fetch` over unauthenticated
+    # HTTPS against the fork origin, which 403s while the fork's GitHub
+    # account is suspended. Release canary is still exercised on
+    # push-to-master by .github/workflows/release.yml's verify_canary job,
+    # so PR runs do not need this signal.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     timeout-minutes: 20
 

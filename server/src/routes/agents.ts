@@ -2820,6 +2820,15 @@ export function agentRoutes(
     res.json(items);
   });
 
+  // Instance-wide usage-limit park state — lets the dashboard/recovery
+  // sweep tell "parked on purpose until the account-wide quota resets" apart from
+  // a stall, without inferring it from an absence of active runs.
+  router.get("/instance/usage-limit-park", async (req, res) => {
+    assertInstanceAdmin(req);
+    const state = await heartbeat.getUsageLimitParkState();
+    res.json(state);
+  });
+
   router.get("/companies/:companyId/org", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
@@ -4175,6 +4184,8 @@ export function agentRoutes(
     }
     const key = await svc.createApiKey(id, req.body.name, req.body.scope, {
       responsibleUserId: req.actor.userId ?? null,
+      ttlSeconds: req.body.ttlSeconds ?? null,
+      expiresAt: req.body.expiresAt ?? null,
     });
 
     await logActivity(db, {
@@ -4189,6 +4200,9 @@ export function agentRoutes(
         name: key.name,
         scope: key.scope,
         responsibleUserId: key.responsibleUserId,
+        // Effective expiry after the cross-company ceiling is applied — records
+        // the actual lifetime granted, not the requested one.
+        expiresAt: key.expiresAt ? key.expiresAt.toISOString() : null,
       },
     });
 
@@ -4990,7 +5004,7 @@ export function agentRoutes(
     const existing = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!existing) return;
     const decision = typeof req.body?.decision === "string" ? req.body.decision : "";
-    if (!["snooze", "continue", "dismissed_false_positive"].includes(decision)) {
+    if (!["snooze", "continue", "dismissed_false_positive", "terminate"].includes(decision)) {
       res.status(400).json({ error: "Unsupported watchdog decision" });
       return;
     }
@@ -5007,7 +5021,7 @@ export function agentRoutes(
     const row = await recovery.recordWatchdogDecision({
       runId: existing.id,
       actor: req.actor,
-      decision: decision as "snooze" | "continue" | "dismissed_false_positive",
+      decision: decision as "snooze" | "continue" | "dismissed_false_positive" | "terminate",
       evaluationIssueId,
       reason,
       snoozedUntil,

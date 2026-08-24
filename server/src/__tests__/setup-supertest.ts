@@ -28,6 +28,26 @@ if (!process.env.CODEX_HOME) {
   const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-vitest-codex-home-"));
   fs.writeFileSync(path.join(codexHome, "auth.json"), '{"OPENAI_API_KEY":"sk-vitest"}\n', { mode: 0o600 });
   process.env.CODEX_HOME = codexHome;
+  // Remove only the dir this file created; a CODEX_HOME injected by the
+  // environment is left untouched. Without this, each vitest worker process
+  // leaks one /tmp/paperclip-vitest-codex-home-* dir (hundreds accumulate on a
+  // busy runner). Vitest's fork pool terminates idle workers with SIGTERM,
+  // which does not fire the "exit" event, so cover the signals too
+  // (best-effort, synchronous rm).
+  const removeCodexHome = () => {
+    try {
+      fs.rmSync(codexHome, { recursive: true, force: true });
+    } catch {
+      /* best-effort */
+    }
+  };
+  process.once("exit", removeCodexHome);
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+    process.once(signal, () => {
+      removeCodexHome();
+      process.exit(0);
+    });
+  }
 }
 
 // The automatic Tailscale HTTPS default (PAP-17158) probes for a real host

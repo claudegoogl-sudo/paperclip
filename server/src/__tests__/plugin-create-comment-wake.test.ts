@@ -1,0 +1,365 @@
+import { randomUUID } from "node:crypto";
+import { and, eq, sql } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import {
+  agentWakeupRequests,
+  agents,
+  companies,
+  createDb,
+  issueComments,
+  issues,
+} from "@paperclipai/db";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
+import { buildHostServices } from "../services/plugin-host-services.js";
+
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+function createEventBusStub() {
+  return {
+    forPlugin() {
+      return { emit: async () => {}, subscribe: () => {} };
+    },
+  } as any;
+}
+
+function issuePrefix(id: string) {
+  return `T${id.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+}
+
+if (!embeddedPostgresSupport.supported) {
+  console.warn(
+    `Skipping plugin createComment wake tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
+  );
+}
+
+describeEmbeddedPostgres("plugin issues.createComment wake + identifier resolution", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-plugin-createcomment-");
+    db = createDb(tempDb.connectionString);
+  }, 20_000);
+
+  afterEach(async () => {
+    // `wakeAssignee` spawns a real background heartbeat run whose startup
+    // asynchronously seeds company-scoped rows (bundled skills -> company_skills,
+    // plus wiki / distillation / lease tables) that can outlive the test body.
+    // Ordered DELETEs race those lagging inserts and intermittently trip a
+    // foreign-key constraint on `delete companies`. TRUNCATE ... CASCADE clears
+    // the company and every FK-dependent row atomically, and retrying lets the
+    // statement win once the (fast `true`-command) run releases its locks —
+    // covering both the FK race and a transient deadlock with the live run.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await db.execute(sql`TRUNCATE TABLE companies RESTART IDENTITY CASCADE`);
+        break;
+      } catch (err) {
+        if (attempt >= 40) throw err;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    }
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function seedCompanyAndAgent(name = "Engineer") {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: issuePrefix(companyId),
+      // A queued heartbeat run must resolve a responsible user or its seed aborts
+      // (422) and rolls back the wakeup row — so wakeAssignee would silently
+      // enqueue nothing. Real companies always carry a default; seed one here.
+      defaultResponsibleUserId: `owner-${randomUUID()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name,
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: { command: "true" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    return { companyId, agentId };
+  }
+
+  async function seedIssue(input: {
+    companyId: string;
+    identifier: string;
+    status?: string;
+    assigneeAgentId?: string | null;
+  }) {
+    const id = randomUUID();
+    await db.insert(issues).values({
+      id,
+      companyId: input.companyId,
+      title: `Issue ${input.identifier}`,
+      status: input.status ?? "todo",
+      priority: "medium",
+      identifier: input.identifier,
+      assigneeAgentId: input.assigneeAgentId ?? null,
+    });
+    return id;
+  }
+
+  it("resolves the target issue by identifier when no issueId is supplied", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const identifier = `${issuePrefix(companyId)}-7`;
+    const issueId = await seedIssue({ companyId, identifier });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.messenger", createEventBusStub());
+    const comment = await services.issues.createComment({
+      issueId: "",
+      body: "relayed from operator",
+      companyId,
+      identifier,
+    } as any);
+
+    expect(comment.issueId).toBe(issueId);
+    const [stored] = await db.select().from(issueComments).where(eq(issueComments.id, comment.id));
+    expect(stored?.issueId).toBe(issueId);
+    expect(stored?.body).toBe("relayed from operator");
+  });
+
+  it("never mints user authorship from a worker-supplied authorUserId", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const identifier = `${issuePrefix(companyId)}-8`;
+    const issueId = await seedIssue({ companyId, identifier });
+    const spoofedUserId = randomUUID();
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.messenger", createEventBusStub());
+    // A compromised/buggy worker smuggles a board user id alongside its own agent
+    // id. The host must ignore the user id entirely — no "user"-attributed comment.
+    const comment = await services.issues.createComment({
+      issueId,
+      body: "relayed from operator",
+      companyId,
+      authorAgentId: agentId,
+      authorUserId: spoofedUserId,
+    } as any);
+
+    const [stored] = await db.select().from(issueComments).where(eq(issueComments.id, comment.id));
+    expect(stored?.authorType).toBe("agent");
+    expect(stored?.authorAgentId).toBe(agentId);
+    expect(stored?.authorUserId).toBeNull();
+  });
+
+  it("ignores a bare worker-supplied authorUserId (attributes to system, never user)", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const identifier = `${issuePrefix(companyId)}-8b`;
+    const issueId = await seedIssue({ companyId, identifier });
+    const spoofedUserId = randomUUID();
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.messenger", createEventBusStub());
+    const comment = await services.issues.createComment({
+      issueId,
+      body: "no agent, just a smuggled user id",
+      companyId,
+      authorUserId: spoofedUserId,
+    } as any);
+
+    const [stored] = await db.select().from(issueComments).where(eq(issueComments.id, comment.id));
+    expect(stored?.authorType).not.toBe("user");
+    expect(stored?.authorUserId).toBeNull();
+  });
+
+  it("wakes the assignee on an open issue when wakeAssignee is set", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const identifier = `${issuePrefix(companyId)}-9`;
+    const issueId = await seedIssue({ companyId, identifier, status: "in_progress", assigneeAgentId: agentId });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.messenger", createEventBusStub());
+    await services.issues.createComment({
+      issueId,
+      body: "please take a look",
+      companyId,
+      wakeAssignee: true,
+    } as any);
+
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId)));
+    expect(wakeups.length).toBeGreaterThan(0);
+  });
+
+  it("does not wake anyone when wakeAssignee is omitted", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const identifier = `${issuePrefix(companyId)}-10`;
+    const issueId = await seedIssue({ companyId, identifier, status: "in_progress", assigneeAgentId: agentId });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.messenger", createEventBusStub());
+    await services.issues.createComment({
+      issueId,
+      body: "silent note",
+      companyId,
+    } as any);
+
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.companyId, companyId));
+    expect(wakeups.length).toBe(0);
+  });
+
+  it("consults the wake rate limiter per relay and suppresses the wake when it blocks", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const identifier = `${issuePrefix(companyId)}-10b`;
+    const issueId = await seedIssue({ companyId, identifier, status: "in_progress", assigneeAgentId: agentId });
+
+    const relayCount = 8;
+    // Block-all spy limiter: this asserts the host createComment path consults
+    // the limiter once per relay and that a blocked verdict skips the wake.
+    // It deliberately enqueues no heartbeats, so the test never spawns an async
+    // run (whose activity_log / company_skills writes would race teardown). The
+    // cap arithmetic itself — N rapid wakes within the window yield <= cap — is
+    // proven deterministically in plugin-wake-rate-limit.test.ts.
+    let consumeCalls = 0;
+    const wakeRateLimiter = {
+      consume(actor: { pluginId: string; companyId: string; agentId: string }) {
+        consumeCalls += 1;
+        return { allowed: false, limit: 0, remaining: 0, retryAfterSeconds: 1, actor };
+      },
+    };
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.messenger", createEventBusStub(), undefined, {
+      wakeRateLimiter,
+    });
+
+    for (let i = 0; i < relayCount; i++) {
+      const comment = await services.issues.createComment({
+        issueId,
+        body: `relay burst ${i}`,
+        companyId,
+        wakeAssignee: true,
+      } as any);
+      // Every relay comment must still land — only the wake is throttled.
+      expect(comment.id).toBeTruthy();
+    }
+
+    // The limiter is consulted exactly once per relay (assignee set, not self).
+    expect(consumeCalls).toBe(relayCount);
+
+    // Comments all landed; not a single wake was enqueued while the limiter blocked.
+    const landed = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(landed.length).toBe(relayCount);
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId)));
+    expect(wakeups.length).toBe(0);
+  });
+
+  it("does NOT wake a body-@mentioned agent — assignee-only wake", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent("Assignee");
+    const mentionedAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: mentionedAgentId,
+      companyId,
+      name: "Reviewer",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      adapterConfig: { command: "true" },
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const identifier = `${issuePrefix(companyId)}-11`;
+    const issueId = await seedIssue({ companyId, identifier, status: "in_progress", assigneeAgentId: agentId });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.messenger", createEventBusStub());
+    await services.issues.createComment({
+      issueId,
+      // Untrusted relay text trying to fan out a wake to an arbitrary agent.
+      body: "ping @Reviewer please review",
+      companyId,
+      wakeAssignee: true,
+    } as any);
+
+    const wokenAgentIds = new Set(
+      (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).map(
+        (row) => row.agentId,
+      ),
+    );
+    // Only the assignee is woken; the mention must never be honored from relay text.
+    expect(wokenAgentIds.has(agentId)).toBe(true);
+    expect(wokenAgentIds.has(mentionedAgentId)).toBe(false);
+    expect(wokenAgentIds.size).toBe(1);
+  });
+
+  it("defaults refuseClosed on when wakeAssignee is set", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const identifier = `${issuePrefix(companyId)}-11b`;
+    const issueId = await seedIssue({ companyId, identifier, status: "cancelled", assigneeAgentId: agentId });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.messenger", createEventBusStub());
+    // No explicit refuseClosed — the wake path must refuse a closed issue by default.
+    await expect(
+      services.issues.createComment({
+        issueId,
+        body: "operator relay to a cancelled issue",
+        companyId,
+        wakeAssignee: true,
+      } as any),
+    ).rejects.toThrow(/closed/i);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.length).toBe(0);
+    const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+    expect(wakeups.length).toBe(0);
+  });
+
+  it("refuses to land a comment on a closed issue when refuseClosed is set", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const identifier = `${issuePrefix(companyId)}-12`;
+    const issueId = await seedIssue({ companyId, identifier, status: "done", assigneeAgentId: agentId });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.messenger", createEventBusStub());
+    await expect(
+      services.issues.createComment({
+        issueId,
+        body: "this should bounce",
+        companyId,
+        refuseClosed: true,
+        wakeAssignee: true,
+      } as any),
+    ).rejects.toThrow(/closed/i);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.length).toBe(0);
+    const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+    expect(wakeups.length).toBe(0);
+  });
+
+  it("does not resolve an identifier belonging to another company", async () => {
+    const tenantA = await seedCompanyAndAgent();
+    const tenantB = await seedCompanyAndAgent();
+    const foreignIdentifier = `${issuePrefix(tenantB.companyId)}-13`;
+    await seedIssue({ companyId: tenantB.companyId, identifier: foreignIdentifier });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.messenger", createEventBusStub());
+    await expect(
+      services.issues.createComment({
+        issueId: "",
+        body: "cross-tenant attempt",
+        companyId: tenantA.companyId,
+        identifier: foreignIdentifier,
+      } as any),
+    ).rejects.toThrow(/not found/i);
+
+    const comments = await db.select().from(issueComments);
+    expect(comments.length).toBe(0);
+  });
+});
