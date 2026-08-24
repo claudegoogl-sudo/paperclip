@@ -63,12 +63,21 @@ export interface Config {
   databaseMode: DatabaseMode;
   databaseUrl: string | undefined;
   databaseMigrationUrl: string | undefined;
+  allowEmbeddedPostgresPublic: boolean;
   embeddedPostgresDataDir: string;
   embeddedPostgresPort: number;
   databaseBackupEnabled: boolean;
   databaseBackupIntervalMinutes: number;
   databaseBackupRetentionDays: number;
   databaseBackupDir: string;
+  runHistoryRetentionEnabled: boolean;
+  runHistoryRetentionDays: number;
+  runHistoryRetentionIntervalMinutes: number;
+  pluginWebhookDeliveryRetentionEnabled: boolean;
+  pluginWebhookDeliverySuccessRetentionDays: number;
+  pluginWebhookDeliveryFailedRetentionDays: number;
+  pluginWebhookDeliveryMaxRows: number;
+  pluginWebhookDeliveryRetentionIntervalMinutes: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -265,6 +274,45 @@ export function loadConfig(): Config {
       fileDatabaseBackup?.dir ??
       resolveDefaultBackupDir(),
   );
+  const runHistoryRetentionEnabled = process.env.PAPERCLIP_RUN_HISTORY_RETENTION_ENABLED !== "false";
+  // 14 days keeps roughly two weeks of run history -- long enough to debug any
+  // incident that is still being worked, short enough that the tables stop
+  // growing without bound.
+  const runHistoryRetentionDays = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_RUN_HISTORY_RETENTION_DAYS) || 14,
+  );
+  const runHistoryRetentionIntervalMinutes = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_RUN_HISTORY_RETENTION_INTERVAL_MINUTES) || 60,
+  );
+  const pluginWebhookDeliveryRetentionEnabled =
+    process.env.PAPERCLIP_PLUGIN_WEBHOOK_DELIVERY_RETENTION_ENABLED !== "false";
+  // Success rows: 3 days. A success row only proves the delivery reached the
+  // worker; once observed it has no diagnostic value. Three days covers a long
+  // weekend's "did we get it?" check without accumulating high-volume noise.
+  const pluginWebhookDeliverySuccessRetentionDays = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_PLUGIN_WEBHOOK_DELIVERY_SUCCESS_RETENTION_DAYS) || 3,
+  );
+  // Failed rows: 30 days. Failed deliveries are the incident audit trail
+  // for delivery / signature / dispatch investigations. 30 days outlives the
+  // typical on-call rotation.
+  const pluginWebhookDeliveryFailedRetentionDays = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_PLUGIN_WEBHOOK_DELIVERY_FAILED_RETENTION_DAYS) || 30,
+  );
+  // Max-rows cap. This is the load-bearing bound: age alone permits
+  // ~169 GB/day at the documented ingestion ceiling. 1,000,000 rows
+  // is roughly 1 GB on disk for the typical ~1 KB JSONB row.
+  const pluginWebhookDeliveryMaxRows = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_PLUGIN_WEBHOOK_DELIVERY_MAX_ROWS) || 1_000_000,
+  );
+  const pluginWebhookDeliveryRetentionIntervalMinutes = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_PLUGIN_WEBHOOK_DELIVERY_RETENTION_INTERVAL_MINUTES) || 60,
+  );
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -285,6 +333,14 @@ export function loadConfig(): Config {
     throw new Error(resolvedBind.errors[0]);
   }
 
+  // Emit a warning when sign-up is open on an authenticated deployment
+  if (deploymentMode === "authenticated" && authDisableSignUp === false) {
+    console.warn(
+      "[paperclip] Open sign-up is enabled on an authenticated deployment. " +
+        "Set PAPERCLIP_AUTH_DISABLE_SIGN_UP=true to close sign-up and restrict access to invited users only."
+    );
+  }
+
   return {
     deploymentMode,
     deploymentExposure,
@@ -299,6 +355,11 @@ export function loadConfig(): Config {
     databaseMode: fileDatabaseMode,
     databaseUrl: process.env.DATABASE_URL ?? fileDbUrl,
     databaseMigrationUrl: process.env.DATABASE_MIGRATION_URL,
+    // Permissive by default: authenticated+public deployments on embedded
+    // PostgreSQL warn-and-continue (preserves the live host's posture). Only an
+    // explicit PAPERCLIP_ALLOW_EMBEDDED_POSTGRES_PUBLIC=false opts into the
+    // strict refuse-to-boot contract.
+    allowEmbeddedPostgresPublic: process.env.PAPERCLIP_ALLOW_EMBEDDED_POSTGRES_PUBLIC !== "false",
     embeddedPostgresDataDir: resolveHomeAwarePath(
       fileConfig?.database.embeddedPostgresDataDir ?? resolveDefaultEmbeddedPostgresDir(),
     ),
@@ -307,6 +368,14 @@ export function loadConfig(): Config {
     databaseBackupIntervalMinutes,
     databaseBackupRetentionDays,
     databaseBackupDir,
+    runHistoryRetentionEnabled,
+    runHistoryRetentionDays,
+    runHistoryRetentionIntervalMinutes,
+    pluginWebhookDeliveryRetentionEnabled,
+    pluginWebhookDeliverySuccessRetentionDays,
+    pluginWebhookDeliveryFailedRetentionDays,
+    pluginWebhookDeliveryMaxRows,
+    pluginWebhookDeliveryRetentionIntervalMinutes,
     serveUi:
       process.env.SERVE_UI !== undefined
         ? process.env.SERVE_UI === "true"

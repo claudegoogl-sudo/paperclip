@@ -40,4 +40,28 @@ describe("embedded Postgres native runtime", () => {
     expect(second).toEqual([]);
     expect(fs.readlinkSync(path.join(tempDir, "libicuuc.so.60"))).toBe("libicuuc.so.60.2");
   });
+
+  // Reproduces the live v525 crash: a root-owned global install whose lib dir is
+  // not writable by the non-root service user. Alias creation must degrade to a
+  // warning instead of throwing and crashing startup in a restart loop.
+  it.runIf(process.platform !== "win32" && process.getuid?.() !== 0)(
+    "does not throw when the lib dir is read-only (EACCES)",
+    async () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-embedded-pg-libs-"));
+      tempDirs.push(tempDir);
+      fs.writeFileSync(path.join(tempDir, "libcrypto.so.1.1"), "");
+      fs.writeFileSync(path.join(tempDir, "libssl.so.1.1"), "");
+      // Read + execute only: symlink creation inside will fail with EACCES.
+      fs.chmodSync(tempDir, 0o555);
+
+      try {
+        const created = await ensureLinuxSharedLibraryAliases(tempDir);
+        expect(created).toEqual([]);
+        expect(fs.existsSync(path.join(tempDir, "libcrypto.so.1"))).toBe(false);
+      } finally {
+        // Restore write perms so afterEach can clean up the temp dir.
+        fs.chmodSync(tempDir, 0o755);
+      }
+    },
+  );
 });

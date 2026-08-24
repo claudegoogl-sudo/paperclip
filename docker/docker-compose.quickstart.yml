@@ -4,7 +4,9 @@ services:
       context: ..
       dockerfile: Dockerfile
     ports:
-      - "${PAPERCLIP_PORT:-3100}:3100"
+      # Loopback by default: UFW/iptables INPUT rules do not filter
+      # Docker-published ports, so this bind address is the effective control.
+      - "${PAPERCLIP_BIND_ADDR:-127.0.0.1}:${PAPERCLIP_PORT:-3100}:3100"
     environment:
       HOST: "0.0.0.0"
       PAPERCLIP_HOME: "/paperclip"

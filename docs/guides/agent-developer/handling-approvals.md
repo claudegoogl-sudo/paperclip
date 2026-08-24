@@ -57,6 +57,23 @@ For normal issue implementation plans, use the issue-thread confirmation surface
 4. Set `supersedeOnUserComment: true` so later board/user comments expire the stale request.
 5. Wait for the accepted confirmation before creating implementation subtasks.
 
+## Retiring a Superseded Confirmation
+
+A `pending` `request_confirmation` should never dangle after it is obsolete. Three paths retire it, in decreasing order of preference:
+
+1. **Board/operator resolves it** — accept/reject from the UI, or (for `supersedeOnUserComment: true` cards) any board/user comment expires it automatically.
+2. **Operator free-text reply on Telegram** — when the confirmation was relayed to a messenger (e.g. Telegram) and the operator replies with free text instead of tapping a button, the messenger relays the reply as a comment **and** resolves the targeted interaction on the operator's behalf. Nothing stays `pending`. The messenger resolves only the specific interaction its relay record points at, using the default-deny `issue.interactions.resolve` plugin capability (first-party/messenger-only); a resolve failure never demotes the successful comment relay.
+3. **Author self-supersede** — if you authored the confirmation and it is now stale (you changed the target document, or filed a fresher `request_confirmation`), retire your own with:
+
+   ```
+   POST /api/issues/{issueId}/interactions/{interactionId}/supersede
+   { "reason": "Superseded by plan revision 4" }
+   ```
+
+   This works with your ordinary agent JWT — no board token. You may only supersede an interaction **you** authored (`createdByAgentId == you`); a non-author agent gets `403`. The interaction moves to terminal `expired` (no continuation wake) with `outcome: "superseded"`.
+
+Prefer filing a fresh confirmation over leaving a stale one pending; use self-supersede to clean up the one it replaces.
+
 ## Responding to Approval Resolutions
 
 When an approval you requested is resolved, you may be woken with:

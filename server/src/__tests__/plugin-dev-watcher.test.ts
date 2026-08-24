@@ -74,6 +74,27 @@ function installMockFsWatcher() {
   return { fakeWatcher, handlers };
 }
 
+/**
+ * Return a fresh fake watcher for every chokidar.watch() call so re-arm tests
+ * can assert that the stale watcher was closed and a new one created.
+ */
+function installMockFsWatchers() {
+  const created: Array<{ close: ReturnType<typeof vi.fn>; on: ReturnType<typeof vi.fn> }> = [];
+  chokidarMock.watch.mockImplementation(() => {
+    const handlers: Record<string, (...args: unknown[]) => void> = {};
+    const fakeWatcher = {
+      close: vi.fn(),
+      on: vi.fn((event: string, listener: (...args: unknown[]) => void) => {
+        handlers[event] = listener;
+        return fakeWatcher;
+      }),
+    };
+    created.push(fakeWatcher);
+    return fakeWatcher;
+  });
+  return created;
+}
+
 describe("resolvePluginWatchTargets", () => {
   it("watches package metadata plus concrete declared runtime files", () => {
     const pluginDir = makeTempPluginDir();
@@ -124,6 +145,85 @@ describe("createPluginDevWatcher", () => {
     await vi.waitFor(() => expect(chokidarMock.watch).toHaveBeenCalledTimes(1));
     const [watchedPaths] = chokidarMock.watch.mock.calls[0] ?? [];
     expect(watchedPaths).toContain(path.join(pluginDir, "dist", "worker.js"));
+
+    devWatcher.close();
+  });
+
+  it("re-arms the watcher on the new path when reconcile sees a repoint", async () => {
+    const dirA = makeTempPluginDir();
+    writePluginPackage(dirA);
+    const dirB = makeTempPluginDir();
+    writePluginPackage(dirB);
+    const watchers = installMockFsWatchers();
+    const lifecycle = createLifecycle();
+
+    let currentPath = dirA;
+    const devWatcher = createPluginDevWatcher(
+      lifecycle as never,
+      async () => currentPath,
+    );
+
+    devWatcher.watch("plugin-1", dirA);
+    expect(chokidarMock.watch).toHaveBeenCalledTimes(1);
+    const [pathsA] = chokidarMock.watch.mock.calls[0] ?? [];
+    expect(pathsA).toContain(path.join(dirA, "dist", "worker.js"));
+
+    // Soft-uninstall + local reinstall from a new dir repoints packagePath.
+    currentPath = dirB;
+    await devWatcher.reconcile("plugin-1");
+
+    // Stale watcher on the old dir is torn down and a new one armed on dirB.
+    expect(watchers[0]?.close).toHaveBeenCalledTimes(1);
+    expect(chokidarMock.watch).toHaveBeenCalledTimes(2);
+    const [pathsB] = chokidarMock.watch.mock.calls[1] ?? [];
+    expect(pathsB).toContain(path.join(dirB, "dist", "worker.js"));
+    expect(pathsB).not.toContain(path.join(dirA, "dist", "worker.js"));
+
+    devWatcher.close();
+  });
+
+  it("disarms the watcher when reconcile finds the plugin is no longer local", async () => {
+    const pluginDir = makeTempPluginDir();
+    writePluginPackage(pluginDir);
+    const watchers = installMockFsWatchers();
+    const lifecycle = createLifecycle();
+
+    let packagePath: string | null = pluginDir;
+    const devWatcher = createPluginDevWatcher(
+      lifecycle as never,
+      async () => packagePath,
+    );
+
+    devWatcher.watch("plugin-1", pluginDir);
+    expect(chokidarMock.watch).toHaveBeenCalledTimes(1);
+
+    // Disable/uninstall clears packagePath (or the plugin is gone).
+    packagePath = null;
+    await devWatcher.reconcile("plugin-1");
+
+    expect(watchers[0]?.close).toHaveBeenCalledTimes(1);
+    // No replacement watcher is created on disarm.
+    expect(chokidarMock.watch).toHaveBeenCalledTimes(1);
+
+    devWatcher.close();
+  });
+
+  it("does not churn the watcher when reconcile resolves the same path", async () => {
+    const pluginDir = makeTempPluginDir();
+    writePluginPackage(pluginDir);
+    const watchers = installMockFsWatchers();
+    const lifecycle = createLifecycle();
+
+    const devWatcher = createPluginDevWatcher(
+      lifecycle as never,
+      async () => pluginDir,
+    );
+
+    devWatcher.watch("plugin-1", pluginDir);
+    await devWatcher.reconcile("plugin-1");
+
+    expect(chokidarMock.watch).toHaveBeenCalledTimes(1);
+    expect(watchers[0]?.close).not.toHaveBeenCalled();
 
     devWatcher.close();
   });

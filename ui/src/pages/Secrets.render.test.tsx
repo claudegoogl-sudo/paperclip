@@ -345,7 +345,7 @@ describe("Secrets page layout", () => {
   afterEach(() => {
     container.remove();
     document.body.innerHTML = "";
-    vi.clearAllMocks();
+    vi.resetAllMocks();
   });
 
   it("uses the shared search/filter/tab affordances and keeps vault sections quiet", async () => {

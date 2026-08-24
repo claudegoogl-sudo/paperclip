@@ -200,6 +200,7 @@ export const issueExecutionPolicySchema = z.object({
   commentRequired: z.boolean().optional().default(true),
   stages: z.array(issueExecutionStageSchema).default([]),
   monitor: issueExecutionMonitorPolicySchema.optional().nullable(),
+  standbyWakeTarget: z.boolean().optional().nullable().default(null),
   reviewPreset: lowTrustReviewPresetPolicySchema.optional(),
   authorizationPolicy: trustAuthorizationPolicySchema.optional(),
 });
@@ -567,6 +568,11 @@ export const addIssueCommentSchema = z.object({
   reopen: z.boolean().optional(),
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),
+  // Bind pre-uploaded standalone assets to this comment atomically at
+  // create time, so a `comment.created` subscriber (e.g. the media relay) sees
+  // them without an attach-after-post race. Mirrors the host bridge
+  // `issues.createComment` attachmentIds path.
+  attachmentIds: z.array(z.string().uuid()).max(50).optional(),
 });
 
 export type AddIssueComment = z.infer<typeof addIssueCommentSchema>;
@@ -855,7 +861,7 @@ export const requestCheckboxConfirmationPayloadSchema = z.object({
 
 export const requestConfirmationResultSchema = z.object({
   version: z.literal(1),
-  outcome: z.enum(["accepted", "rejected", "superseded_by_comment", "stale_target"]),
+  outcome: z.enum(["accepted", "rejected", "superseded_by_comment", "superseded", "stale_target"]),
   reason: z.string().trim().max(4000).nullable().optional(),
   commentId: z.string().uuid().nullable().optional(),
   staleTarget: requestConfirmationTargetSchema.nullable().optional(),

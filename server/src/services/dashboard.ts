@@ -1,4 +1,5 @@
 import { and, eq, gte, sql } from "drizzle-orm";
+import { isSuccessfulHeartbeatRunStatus } from "@paperclipai/shared";
 import type { Db } from "@paperclipai/db";
 import { agents, approvals, companies, costEvents, heartbeatRuns, issues } from "@paperclipai/db";
 import { notFound } from "../errors.js";
@@ -122,7 +123,7 @@ export function dashboardService(db: Db) {
         const bucket = runActivity.get(row.date);
         if (!bucket) continue;
         const count = Number(row.count);
-        if (row.status === "succeeded") bucket.succeeded += count;
+        if (isSuccessfulHeartbeatRunStatus(row.status)) bucket.succeeded += count;
         else if (row.status === "failed" || row.status === "timed_out") bucket.failed += count;
         else bucket.other += count;
         bucket.total += count;

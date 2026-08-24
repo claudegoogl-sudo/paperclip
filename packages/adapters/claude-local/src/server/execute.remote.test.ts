@@ -292,6 +292,10 @@ describe("claude remote execution", () => {
         sessionParams: {
           sessionId: "12345678-1234-4abc-9def-123456789012",
           cwd: managedRemoteWorkspace,
+          // Stored sessions must carry a prompt-bundle pin to be resume-eligible
+          // (see the missing-pin bust in execute.ts). This is the bundle key for
+          // an empty adapterConfig (no instructions, no skills).
+          promptBundleKey: "08bef4f10ef56ac0d71c5532f0ff338dabc4e7e078ed011e240b9e8a1df1b5fe",
           remoteExecution: {
             transport: "ssh",
             host: "127.0.0.1",

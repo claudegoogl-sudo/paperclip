@@ -58,6 +58,8 @@ import type {
 import type {
   PluginContext,
   PluginEvent,
+  PluginHttpFetchBody,
+  PluginHttpFetchInit,
   PluginJobContext,
   PluginLauncherRegistration,
   ScopeKey,
@@ -204,6 +206,62 @@ export function isWorkerEntrypoint(entry: string, moduleUrl: string): boolean {
   const entryPath = realpathOrResolvedPath(entry);
   return thisFile === entryPath;
 }
+
+// ---------------------------------------------------------------------------
+// HTTP fetch body serialization
+// ---------------------------------------------------------------------------
+
+function hasContentTypeHeader(headers: Record<string, string> | undefined): boolean {
+  if (!headers) return false;
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === "content-type") return true;
+  }
+  return false;
+}
+
+/**
+ * Convert a fetch body into the wire-format the host expects:
+ *   - string      → `{ body: <string>,   bodyEncoding: "utf8"   }`
+ *   - binary/Buf  → `{ body: <base64>,   bodyEncoding: "base64" }` (bytes preserved exactly)
+ *   - FormData    → multipart-encoded bytes (base64) + boundary content-type
+ *
+ * The host decodes based on `bodyEncoding`; a missing `bodyEncoding` is
+ * treated as `"utf8"` for backward compatibility with old worker callers.
+ */
+async function serializeFetchBody(
+  body: PluginHttpFetchBody,
+): Promise<{ body: string; bodyEncoding: "utf8" | "base64"; contentType: string | null }> {
+  if (typeof body === "string") {
+    return { body, bodyEncoding: "utf8", contentType: null };
+  }
+  // FormData → use the platform's Response Body serializer; it emits a
+  // valid multipart/form-data payload and a Content-Type with a fresh
+  // boundary, matching what `fetch()` would have produced natively.
+  if (typeof FormData !== "undefined" && body instanceof FormData) {
+    const res = new Response(body as unknown as BodyInit);
+    const buf = Buffer.from(await res.arrayBuffer());
+    return {
+      body: buf.toString("base64"),
+      bodyEncoding: "base64",
+      contentType: res.headers.get("content-type"),
+    };
+  }
+  if (Buffer.isBuffer(body)) {
+    return { body: body.toString("base64"), bodyEncoding: "base64", contentType: null };
+  }
+  if (body instanceof Uint8Array) {
+    const buf = Buffer.from(body.buffer, body.byteOffset, body.byteLength);
+    return { body: buf.toString("base64"), bodyEncoding: "base64", contentType: null };
+  }
+  if (body instanceof ArrayBuffer) {
+    const buf = Buffer.from(new Uint8Array(body));
+    return { body: buf.toString("base64"), bodyEncoding: "base64", contentType: null };
+  }
+  // Unknown body shape — fall back to string coercion to avoid throwing
+  // on exotic BodyInits we don't explicitly support. Old behaviour.
+  return { body: String(body), bodyEncoding: "utf8", contentType: null };
+}
+
 
 // ---------------------------------------------------------------------------
 // startWorkerRpcHost
@@ -533,7 +591,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       },
 
       http: {
-        async fetch(url: string, init?: RequestInit): Promise<Response> {
+        async fetch(url: string, init?: PluginHttpFetchInit): Promise<Response> {
           const serializedInit: Record<string, unknown> = {};
           if (init) {
             if (init.method) serializedInit.method = init.method;
@@ -548,23 +606,46 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
                 for (const [k, v] of init.headers) obj[k] = v;
                 serializedInit.headers = obj;
               } else {
-                serializedInit.headers = init.headers;
+                serializedInit.headers = { ...(init.headers as Record<string, string>) };
               }
             }
             if (init.body !== undefined && init.body !== null) {
-              serializedInit.body = typeof init.body === "string"
-                ? init.body
-                : String(init.body);
+              const serialized = await serializeFetchBody(init.body);
+              serializedInit.body = serialized.body;
+              serializedInit.bodyEncoding = serialized.bodyEncoding;
+              if (
+                serialized.contentType
+                && !hasContentTypeHeader(serializedInit.headers as Record<string, string> | undefined)
+              ) {
+                const headersObj =
+                  (serializedInit.headers as Record<string, string> | undefined) ?? {};
+                headersObj["Content-Type"] = serialized.contentType;
+                serializedInit.headers = headersObj;
+              }
             }
           }
 
           const result = await callHost("http.fetch", {
             url,
             init: Object.keys(serializedInit).length > 0 ? serializedInit : undefined,
+            // Opt in to base64 response bodies. This SDK decodes `bodyEncoding`
+            // below, so it is always safe to request byte-exact bytes. Old hosts
+            // ignore the flag and return utf8 (handled by the default branch);
+            // old SDKs never send it, so a new host leaves them on the legacy
+            // utf8 path — no lockstep deploy required.
+            acceptResponseBodyEncoding: "base64",
           });
 
-          // Reconstruct a Response-like object from the serialized result
-          return new Response(result.body, {
+          // Reconstruct a Response from the serialized result. When the host
+          // honored our opt-in it returns base64 of the exact response bytes;
+          // decode to a Buffer so binary bodies (images, etc.) survive
+          // `res.arrayBuffer()` byte-exact. A legacy host omits `bodyEncoding`
+          // and returns a utf8 string, which we pass through unchanged.
+          const responseBody =
+            result.bodyEncoding === "base64"
+              ? new Uint8Array(Buffer.from(result.body, "base64"))
+              : result.body;
+          return new Response(responseBody, {
             status: result.status,
             statusText: result.statusText,
             headers: result.headers,
@@ -573,8 +654,83 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       },
 
       secrets: {
-        async resolve(secretRef: string): Promise<string> {
-          return callHost("secrets.resolve", { secretRef });
+        async resolve(secretRef: string, runId: string): Promise<string> {
+          // `runId` identifies the active tool dispatch; the host re-derives the
+          // dispatching agent's company from it and never trusts the worker for
+          // company scope. Pass `runCtx.runId` from inside a tool handler.
+          return callHost("secrets.resolve", { secretRef, runId });
+        },
+        async mintHandle(value: string, runId: string, secretRef?: string): Promise<string> {
+          // Exchange resolved plaintext for an opaque borrowed handle
+          // (Control 2). Return the handle to the agent instead of the
+          // plaintext; the host substitutes the real value back in only at a
+          // downstream tool's dispatch edge. `runId` is the active dispatch's
+          // runCtx.runId, same contract as `resolve`. `secretRef` lets the host
+          // capture the binding's operator egress allowlist onto the handle;
+          // the worker never asserts the allowlist itself.
+          const { handle } = await callHost("secrets.mintHandle", { value, runId, secretRef });
+          return handle;
+        },
+      },
+
+      // Worker-level artifacts client (mirror of the tool-dispatch
+      // runCtx client, minus runId). It sends NO runId — callHost attaches the
+      // worker→host `paperclipInvocationId` and the host backfills the active
+      // service/background/dispatch run-context from it, exactly like
+      // `secrets.resolve`. `create` is host-gated on `issue.attachments.create`
+      // + company scope; `fetch` works from a tool-dispatch context
+      // today and from service/background once a follow-up host change lands
+      // (until then the host returns `runcontext_invalid` for service/background reads).
+      artifacts: {
+        async fetch(attachmentId: string) {
+          if (typeof attachmentId !== "string" || attachmentId.length === 0) {
+            throw new Error(
+              "ctx.artifacts.fetch: attachmentId must be a non-empty string",
+            );
+          }
+          // The wire type requires `runId`, but the worker client omits it: the
+          // host's `backfillDispatchRunId` populates it from the worker→host
+          // `paperclipInvocationId` before the artifacts handler runs (same path
+          // `secrets.resolve` uses). Localized cast keeps the type-lie contained.
+          const result = await callHost(
+            "artifacts.fetch",
+            { attachmentId } as WorkerToHostMethods["artifacts.fetch"][0],
+          );
+          return {
+            bytes: new Uint8Array(Buffer.from(result.contentBase64, "base64")),
+            filename: result.filename,
+            contentType: result.contentType,
+            byteSize: result.byteSize,
+          };
+        },
+        async create(input) {
+          if (!input || typeof input !== "object") {
+            throw new Error("ctx.artifacts.create: input must be an object");
+          }
+          const { companyId, filename, mimeType, bytes } = input;
+          if (typeof companyId !== "string" || companyId.length === 0) {
+            throw new Error("ctx.artifacts.create: companyId must be a non-empty string");
+          }
+          if (typeof filename !== "string" || filename.length === 0) {
+            throw new Error("ctx.artifacts.create: filename must be a non-empty string");
+          }
+          if (typeof mimeType !== "string" || mimeType.length === 0) {
+            throw new Error("ctx.artifacts.create: mimeType must be a non-empty string");
+          }
+          if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) {
+            throw new Error("ctx.artifacts.create: bytes must be a non-empty Uint8Array");
+          }
+          // `runId` is omitted on the wire — the host backfills it from the
+          // worker→host `paperclipInvocationId` (`backfillDispatchRunId`), the
+          // same path `secrets.resolve` relies on. Localized cast keeps the
+          // type-lie contained to this call.
+          const result = await callHost("artifacts.create", {
+            companyId,
+            filename,
+            mimeType,
+            contentBase64: Buffer.from(bytes).toString("base64"),
+          } as WorkerToHostMethods["artifacts.create"][0]);
+          return { attachmentId: result.attachmentId };
         },
       },
 
@@ -858,8 +1014,34 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           return callHost("issues.listComments", { issueId, companyId });
         },
 
-        async createComment(issueId: string, body: string, companyId: string, options?: { authorAgentId?: string }) {
-          return callHost("issues.createComment", { issueId, body, companyId, authorAgentId: options?.authorAgentId });
+        async listAttachments(issueId: string, companyId: string) {
+          return callHost("issues.listAttachments", { issueId, companyId });
+        },
+
+        async createComment(
+          issueId: string,
+          body: string,
+          companyId: string,
+          options?: {
+            authorAgentId?: string;
+            identifier?: string;
+            wakeAssignee?: boolean;
+            refuseClosed?: boolean;
+            // Asset ids from ctx.artifacts.create to surface on this
+            // comment. Each must belong to the comment's company.
+            attachmentIds?: string[];
+          },
+        ) {
+          return callHost("issues.createComment", {
+            issueId,
+            body,
+            companyId,
+            authorAgentId: options?.authorAgentId,
+            identifier: options?.identifier,
+            wakeAssignee: options?.wakeAssignee,
+            refuseClosed: options?.refuseClosed,
+            attachmentIds: options?.attachmentIds,
+          });
         },
 
         async createInteraction(issueId: string, interaction, companyId: string, options?: { authorAgentId?: string }) {
@@ -868,6 +1050,21 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             companyId,
             interaction,
             authorAgentId: options?.authorAgentId,
+          });
+        },
+
+        async resolveInteraction(
+          issueId: string,
+          interactionId: string,
+          companyId: string,
+          options?: { supersedingCommentId?: string | null; reason?: string | null },
+        ) {
+          return callHost("issues.resolveInteraction", {
+            issueId,
+            companyId,
+            interactionId,
+            supersedingCommentId: options?.supersedingCommentId ?? null,
+            reason: options?.reason ?? null,
           });
         },
 
@@ -1008,6 +1205,18 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           async getOrchestration(input) {
             return callHost("issues.summaries.getOrchestration", input);
           },
+        },
+      },
+
+      approvals: {
+        async list(companyId: string, status?: string) {
+          return callHost("approvals.list", { companyId, status });
+        },
+      },
+
+      interactions: {
+        async list(companyId: string, status?: string) {
+          return callHost("interactions.list", { companyId, status });
         },
       },
 
@@ -1455,7 +1664,11 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     if (plugin.definition.onEnvironmentCancelInteractiveSetup) supportedMethods.push("environmentCancelInteractiveSetup");
     if (plugin.definition.onEnvironmentDeleteTemplate) supportedMethods.push("environmentDeleteTemplate");
 
-    return { ok: true, supportedMethods };
+    // This SDK threads `paperclipInvocationId` through
+    // AsyncLocalStorage on every worker→host call made inside a dispatch, so an
+    // id-less call from this worker is definitionally a no-dispatch background
+    // call and must not inherit an unrelated tenant's in-flight scope.
+    return { ok: true, supportedMethods, echoesInvocationId: true };
   }
 
   async function handleHealth(): Promise<PluginHealthDiagnostics> {
@@ -1622,7 +1835,65 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     if (!entry) {
       throw new Error(`No tool handler registered for "${params.toolName}"`);
     }
-    return entry.fn(params.parameters, params.runContext);
+    // Inject the per-runContext artifacts client. The wire-format
+    // runContext carries identity fields only; method shims are added here so
+    // tools can do `await ctx.artifacts.fetch(attachmentId)`. The host
+    // re-derives the dispatching agent's identity from (pluginDbId, runId);
+    // we only send the opaque runId — the worker is never trusted to assert
+    // who is calling.
+    const runId = params.runContext.runId;
+    const runCtxWithMethods: ToolRunContext = {
+      ...params.runContext,
+      artifacts: {
+        async fetch(attachmentId: string) {
+          if (typeof attachmentId !== "string" || attachmentId.length === 0) {
+            throw new Error(
+              "ctx.artifacts.fetch: attachmentId must be a non-empty string",
+            );
+          }
+          const result = await callHost("artifacts.fetch", {
+            attachmentId,
+            runId,
+          });
+          return {
+            bytes: new Uint8Array(Buffer.from(result.contentBase64, "base64")),
+            filename: result.filename,
+            contentType: result.contentType,
+            byteSize: result.byteSize,
+          };
+        },
+        // Inverse of fetch — store inbound bytes as a company-scoped
+        // asset. Bytes are base64-encoded for the JSON-RPC payload; the host
+        // gates on capability, company scope, size, and MIME before storing.
+        async create(input) {
+          if (!input || typeof input !== "object") {
+            throw new Error("ctx.artifacts.create: input must be an object");
+          }
+          const { companyId, filename, mimeType, bytes } = input;
+          if (typeof companyId !== "string" || companyId.length === 0) {
+            throw new Error("ctx.artifacts.create: companyId must be a non-empty string");
+          }
+          if (typeof filename !== "string" || filename.length === 0) {
+            throw new Error("ctx.artifacts.create: filename must be a non-empty string");
+          }
+          if (typeof mimeType !== "string" || mimeType.length === 0) {
+            throw new Error("ctx.artifacts.create: mimeType must be a non-empty string");
+          }
+          if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) {
+            throw new Error("ctx.artifacts.create: bytes must be a non-empty Uint8Array");
+          }
+          const result = await callHost("artifacts.create", {
+            companyId,
+            filename,
+            mimeType,
+            contentBase64: Buffer.from(bytes).toString("base64"),
+            runId,
+          });
+          return { attachmentId: result.attachmentId };
+        },
+      },
+    };
+    return entry.fn(params.parameters, runCtxWithMethods);
   }
 
   async function handleDetectExternalObjects(params: DetectExternalObjectsParams) {

@@ -7,6 +7,7 @@ import {
   agents,
   agentRuntimeState,
   agentWakeupRequests,
+  approvals,
   budgetPolicies,
   companySecretBindings,
   companySecrets,
@@ -24,6 +25,7 @@ import {
   executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueApprovals,
   issueComments,
   issueDocuments,
   issuePlanDecompositions,
@@ -366,6 +368,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await db.delete(issueRecoveryActions);
     await db.delete(issueTreeHoldMembers);
     await db.delete(issueTreeHolds);
+    await db.delete(issueApprovals);
+    await db.delete(approvals);
+    await db.delete(issueThreadInteractions);
     for (let attempt = 0; attempt < 5; attempt += 1) {
       await db.delete(issueComments);
       await db.delete(issueDocuments);
@@ -1537,6 +1542,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
     expect(issue?.status).toBe("in_progress");
     expect(issue?.executionRunId).toBeNull();
+    // Regression: the reaped (failed) run also clears the matching checkoutRunId
+    // atomically so the orphan-checkout state never lingers; the paused-tree
+    // hold is what gates further recovery, not a stale checkout lock.
     // Terminal run cleanup releases the checkout lock even when paused-tree recovery is suppressed.
     expect(issue?.checkoutRunId).toBeNull();
 
@@ -2490,6 +2498,29 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       timeoutConfigured: false,
       timeoutFired: false,
     });
+  });
+
+  // When releaseIssueExecutionAndPromote runs against a routine_execution
+  // issue whose execution lock is already cleared but whose checkoutRunId still
+  // points at this run, the new ownsCheckoutLock branch must clear it. Without
+  // that branch the checkoutRunId stays set and wedges every subsequent mutation.
+  it("clears orphan checkoutRunId when the completing run owns it", async () => {
+    const { issueId, runId } = await seedRunFixture({ agentStatus: "running" });
+    await db
+      .update(issues)
+      .set({
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+        originKind: "routine_execution",
+      })
+      .where(eq(issues.id, issueId));
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.cancelRun(runId);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+    expect(issue?.checkoutRunId).toBeNull();
   });
 
   it("records operator interrupt cancellation metadata without changing terminal status", async () => {
@@ -4534,4 +4565,402 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     expect(runs).toHaveLength(1);
   });
+
+  it("skips a parent issue when a direct descendant has a live heartbeat run", async () => {
+    const { companyId, agentId, issueId: parentIssueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+    });
+
+    const childAgentId = randomUUID();
+    const childIssueId = randomUUID();
+    const childRunId = randomUUID();
+    const childWakeupRequestId = randomUUID();
+    const now = new Date("2026-03-19T01:00:00.000Z");
+
+    await db.insert(agents).values({
+      id: childAgentId,
+      companyId,
+      name: "ChildCoder",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await db.insert(agentWakeupRequests).values({
+      id: childWakeupRequestId,
+      companyId,
+      agentId: childAgentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: childIssueId },
+      status: "claimed",
+      runId: childRunId,
+      claimedAt: now,
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: childRunId,
+      companyId,
+      agentId: childAgentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      wakeupRequestId: childWakeupRequestId,
+      contextSnapshot: { issueId: childIssueId, taskId: childIssueId },
+      startedAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(issues).values({
+      id: childIssueId,
+      companyId,
+      parentId: parentIssueId,
+      title: "Live child of stranded parent",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: childAgentId,
+      checkoutRunId: childRunId,
+      executionRunId: childRunId,
+      issueNumber: 9001,
+      identifier: `T-CHILD-9001`,
+      startedAt: now,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(0);
+    expect(result.dispatchRequeued).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.issueIds).not.toContain(parentIssueId);
+
+    const parent = await db.select().from(issues).where(eq(issues.id, parentIssueId)).then((rows) => rows[0] ?? null);
+    expect(parent?.status).toBe("in_progress");
+
+    const recoveryIssues = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
+    expect(recoveryIssues).toHaveLength(0);
+
+    // The active descendant has its own assignee; the parent's agent must not have been re-woken either.
+    const parentAgentWakes = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId)));
+    expect(parentAgentWakes.every((row) => row.reason !== "issue_assignment_recovery")).toBe(true);
+  });
+
+  it("skips a grandparent issue when only a 2-deep descendant has a live heartbeat run (recursion)", async () => {
+    const { companyId, agentId, issueId: grandparentIssueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+    });
+
+    const middleIssueId = randomUUID();
+    const grandchildIssueId = randomUUID();
+    const grandchildAgentId = randomUUID();
+    const grandchildRunId = randomUUID();
+    const grandchildWakeupRequestId = randomUUID();
+    const now = new Date("2026-03-19T02:00:00.000Z");
+
+    // Middle issue exists in the chain but has no live run/wake of its own.
+    await db.insert(issues).values({
+      id: middleIssueId,
+      companyId,
+      parentId: grandparentIssueId,
+      title: "Inert middle of chain",
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      issueNumber: 9100,
+      identifier: `T-MID-9100`,
+    });
+
+    await db.insert(agents).values({
+      id: grandchildAgentId,
+      companyId,
+      name: "GrandchildCoder",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await db.insert(agentWakeupRequests).values({
+      id: grandchildWakeupRequestId,
+      companyId,
+      agentId: grandchildAgentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: grandchildIssueId },
+      status: "claimed",
+      runId: grandchildRunId,
+      claimedAt: now,
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: grandchildRunId,
+      companyId,
+      agentId: grandchildAgentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "running",
+      wakeupRequestId: grandchildWakeupRequestId,
+      contextSnapshot: { issueId: grandchildIssueId, taskId: grandchildIssueId },
+      startedAt: now,
+      updatedAt: now,
+    });
+
+    await db.insert(issues).values({
+      id: grandchildIssueId,
+      companyId,
+      parentId: middleIssueId,
+      title: "Live grandchild driving the chain",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: grandchildAgentId,
+      checkoutRunId: grandchildRunId,
+      executionRunId: grandchildRunId,
+      issueNumber: 9101,
+      identifier: `T-GC-9101`,
+      startedAt: now,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(0);
+    expect(result.dispatchRequeued).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.issueIds).not.toContain(grandparentIssueId);
+
+    const grandparent = await db.select().from(issues).where(eq(issues.id, grandparentIssueId)).then((rows) => rows[0] ?? null);
+    expect(grandparent?.status).toBe("in_progress");
+
+    const recoveryIssues = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
+    expect(recoveryIssues).toHaveLength(0);
+  });
+
+  it("skips an in_progress assigned standby wake target instead of escalating it", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+    });
+
+    await db
+      .update(issues)
+      .set({ executionPolicy: { mode: "normal", commentRequired: true, stages: [], standbyWakeTarget: true } })
+      .where(eq(issues.id, issueId));
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(0);
+    expect(result.dispatchRequeued).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.successfulRunHandoffEscalated).toBe(0);
+    expect(result.issueIds).not.toContain(issueId);
+
+    const parked = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(parked?.status).toBe("in_progress");
+
+    const recoveryIssues = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
+    expect(recoveryIssues).toHaveLength(0);
+
+    const recoveryWakes = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.agentId, agentId),
+          inArray(agentWakeupRequests.reason, ["issue_continuation_needed", "source_scoped_recovery_action"]),
+        ),
+      );
+    expect(recoveryWakes).toHaveLength(0);
+
+    const auditRows = await db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.recovery_skipped"),
+        ),
+      );
+    expect(auditRows).toHaveLength(1);
+    expect(auditRows[0]?.details).toMatchObject({
+      source: "recovery.reconcile_stranded_assigned_issue_skipped",
+      reason: "standby_wake_target",
+    });
+  });
+
+  it("skips an in_progress assigned issue parked on a pending board approval requested by the assignee", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+    });
+
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "request_board_approval",
+      requestedByAgentId: agentId,
+      status: "pending",
+      payload: { issueId },
+    });
+    await db.insert(issueApprovals).values({
+      companyId,
+      issueId,
+      approvalId,
+      linkedByAgentId: agentId,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(0);
+    expect(result.dispatchRequeued).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.skippedDueToPendingApproval).toBe(1);
+    expect(result.issueIds).not.toContain(issueId);
+
+    const parked = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(parked?.status).toBe("in_progress");
+
+    const recoveryIssues = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
+    expect(recoveryIssues).toHaveLength(0);
+
+    const recoveryWakes = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.agentId, agentId),
+          eq(agentWakeupRequests.reason, "issue_continuation_needed"),
+        ),
+      );
+    expect(recoveryWakes).toHaveLength(0);
+
+    const auditRows = await db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.recovery_skipped"),
+        ),
+      );
+    expect(auditRows).toHaveLength(1);
+    expect(auditRows[0]?.details).toMatchObject({
+      source: "recovery.reconcile_stranded_assigned_issue_skipped",
+      reason: "pending_board_approval",
+      approvalId,
+    });
+  });
+
+  it("skips an in_progress assigned issue parked on a pending wake_assignee interaction requested by the assignee", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+    });
+
+    const interactionId = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      createdByAgentId: agentId,
+      payload: { version: 1, prompt: "Confirm proceed?" },
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(0);
+    expect(result.dispatchRequeued).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.skippedDueToPendingWakeAssigneeInteraction).toBe(1);
+    expect(result.issueIds).not.toContain(issueId);
+
+    const parked = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(parked?.status).toBe("in_progress");
+
+    const recoveryIssues = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
+    expect(recoveryIssues).toHaveLength(0);
+
+    const recoveryWakes = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.agentId, agentId),
+          eq(agentWakeupRequests.reason, "issue_continuation_needed"),
+        ),
+      );
+    expect(recoveryWakes).toHaveLength(0);
+
+    const auditRows = await db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.recovery_skipped"),
+        ),
+      );
+    expect(auditRows).toHaveLength(1);
+    expect(auditRows[0]?.details).toMatchObject({
+      source: "recovery.reconcile_stranded_assigned_issue_skipped",
+      reason: "pending_wake_assignee_interaction",
+      interactionId,
+      kind: "request_confirmation",
+    });
+  });
+
 });

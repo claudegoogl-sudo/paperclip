@@ -74,6 +74,12 @@ export interface AdapterExecutionResult {
   errorMessage?: string | null;
   errorCode?: string | null;
   errorFamily?: AdapterExecutionErrorFamily | null;
+  /**
+   * The agent emitted a clean completion result but the process still exited
+   * non-zero. The work landed; only teardown went wrong, so the run must not be
+   * recorded as failed. `errorCode`/`errorMessage` describe the teardown fault.
+   */
+  completedDirty?: boolean;
   retryNotBefore?: string | null;
   errorMeta?: Record<string, unknown>;
   usage?: UsageSummary;
@@ -145,6 +151,13 @@ export interface AdapterExecutionContext {
 export interface AdapterModel {
   id: string;
   label: string;
+  /**
+   * Marks a model whose provider safeguards have been lifted. Such models must
+   * never be used as an automatic fallback/refusal-retry target. The flag lives
+   * with the model definition so adding a new model forces an explicit
+   * safe/unsafe decision rather than silently defaulting to allowed.
+   */
+  safeguardsLifted?: boolean;
 }
 
 export type AdapterModelProfileKey = "cheap";

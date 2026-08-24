@@ -1,0 +1,17 @@
+-- Adds a hard expiry backstop to minted agent API keys.
+--
+-- Motivation: in a prior incident a short-lived cross-company key stayed
+-- live indefinitely because the only stop was a *manual* revoke gated on a
+-- separate blocked issue. `revoked_at` alone is a denylist that depends on a
+-- human remembering to act. `expires_at` is a fail-closed backstop the auth
+-- resolver enforces on every request independent of `revoked_at`, so a missed
+-- revoke can no longer leave a key usable forever.
+--
+-- NULL = the key never auto-expires (current behaviour for same-company keys
+-- minted without an explicit TTL). Cross-company (`task_bridge`) keys are
+-- clamped to a server-side ceiling at mint time, so their rows are always
+-- populated.
+--
+-- Idempotent: re-running creates nothing new (IF NOT EXISTS). Additive and
+-- nullable, so it is safe against a populated table and needs no backfill.
+ALTER TABLE "agent_api_keys" ADD COLUMN IF NOT EXISTS "expires_at" timestamp with time zone;

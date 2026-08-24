@@ -42,8 +42,17 @@ import {
   secretProviderConfigDiscoveryPreviewSchema,
   updateSecretProviderConfigSchema,
 } from "@paperclipai/shared";
-import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+import { isValidAllowlistEntry } from "../handle-egress.js";
+import { purgeHandlesByBinding } from "../handle-vault.js";
+import { listEgressWouldDeny, type EgressWouldDenyObservationRow } from "./egress-harvest.js";
+import { egressPostureFor } from "./egress-posture.js";
+import {
+  collectSecretRefPaths,
+  isUuidSecretRef,
+  readConfigValueAtPath,
+} from "./json-schema-secret-refs.js";
 import {
   checkSecretProviders,
   getSecretProvider,
@@ -727,6 +736,21 @@ export function secretService(db: Db) {
         ),
       )
       .then((rows) => rows[0] ?? null);
+  }
+
+  async function loadOwnedBinding(companyId: string, bindingId: string) {
+    const binding = await db
+      .select()
+      .from(companySecretBindings)
+      .where(
+        and(
+          eq(companySecretBindings.id, bindingId),
+          eq(companySecretBindings.companyId, companyId),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (!binding) throw notFound(`Secret binding ${bindingId} not found in this company`);
+    return binding;
   }
 
   async function assertBindingContext(
@@ -3428,6 +3452,174 @@ export function secretService(db: Db) {
         .then((rows) => rows[0]);
     },
 
+    /**
+     * SECURITY-CRITICAL: operator-only, company-scoped review surface for the egress
+     * enforce-flip. Returns every borrowed-handle binding in the company alongside
+     * its CURRENT persisted allowlist + enforcement posture and the harvested
+     * would-deny origins as SEPARATE suggestion rows.
+     *
+     * Deliberate shape decisions, all load-bearing for the SE acceptance
+     * criteria:
+     *  - `suggestions` is a distinct field, never merged into `allowedEgress`.
+     *    The read path NEVER pre-selects or auto-applies a harvested origin
+     *    (allowlist-poisoning guard): the operator must affirmatively choose
+     *    which suggestions to seed via setBindingEgressAllowlist.
+     *  - Company-scoped (BOLA): bindings are filtered by `companyId` and the
+     *    harvest read is the company-scoped {@link listEgressWouldDeny}; a
+     *    binding in another company is never returned here.
+     *  - Origins are returned as opaque strings for the caller to contextually
+     *    encode at its sink (JSON here; the operator console must not innerHTML
+     *    them — Stored-XSS guard).
+     */
+    listEgressReview: async (companyId: string) => {
+      const bindings = await db
+        .select({
+          id: companySecretBindings.id,
+          secretId: companySecretBindings.secretId,
+          targetType: companySecretBindings.targetType,
+          targetId: companySecretBindings.targetId,
+          configPath: companySecretBindings.configPath,
+          label: companySecretBindings.label,
+          allowedEgress: companySecretBindings.allowedEgress,
+          egressAllowlistEnforced: companySecretBindings.egressAllowlistEnforced,
+          updatedAt: companySecretBindings.updatedAt,
+        })
+        .from(companySecretBindings)
+        .where(eq(companySecretBindings.companyId, companyId))
+        .orderBy(companySecretBindings.targetType, companySecretBindings.targetId, companySecretBindings.configPath);
+
+      const observations = await listEgressWouldDeny(db, { companyId });
+      const byBinding = new Map<string, EgressWouldDenyObservationRow[]>();
+      for (const obs of observations) {
+        const list = byBinding.get(obs.bindingId) ?? [];
+        list.push(obs);
+        byBinding.set(obs.bindingId, list);
+      }
+
+      return bindings.map((binding) => ({
+        ...binding,
+        // Derived, never stored. `enforced = true` with an empty allowlist is
+        // deny-all for this secret; returning the pair as two raw fields leaves
+        // that inference to the reader, and it is the inference nobody made for
+        // the bindings born enforcing with an empty allowlist.
+        posture: egressPostureFor(binding),
+        // Harvested would-deny origins as UNCHECKED suggestions. `selected` is
+        // hard-coded false: the surface presents them un-applied and the
+        // operator opts each one in. Never derived from `allowedEgress` — a
+        // suggestion already on the allowlist is still surfaced as a suggestion,
+        // not silently auto-selected.
+        suggestions: (byBinding.get(binding.id) ?? []).map((obs) => ({
+          origin: obs.origin,
+          count: obs.count,
+          firstSeen: obs.firstSeen,
+          lastSeen: obs.lastSeen,
+          selected: false as const,
+        })),
+      }));
+    },
+
+    /**
+     * SECURITY-CRITICAL: operator-only, set/replace a binding's egress allowlist.
+     *
+     * This is the only path that writes `allowedEgress`; there is no
+     * agent/worker-passable route, preserving EG1-provenance. Entries are
+     * trimmed, de-duplicated, and validated against the egress matcher so a
+     * malformed rule is rejected up front rather than stored as a dead entry
+     * that silently never matches once the binding enforces.
+     *
+     * Calling this purges in-flight handles minted under the binding (EG3) so
+     * the new allowlist takes effect immediately rather than at handle TTL.
+     * Idempotent: re-setting the same list converges (the row + purge are both
+     * safe to re-run).
+     */
+    setBindingEgressAllowlist: async (input: {
+      companyId: string;
+      bindingId: string;
+      allowedEgress: string[];
+    }) => {
+      const binding = await loadOwnedBinding(input.companyId, input.bindingId);
+      const cleaned = [
+        ...new Set(input.allowedEgress.map((e) => (typeof e === "string" ? e.trim() : "")).filter((e) => e.length > 0)),
+      ];
+      for (const entry of cleaned) {
+        if (!isValidAllowlistEntry(entry)) {
+          throw badRequest(`Invalid egress allowlist entry: ${entry}`);
+        }
+      }
+      const updated = await db
+        .update(companySecretBindings)
+        .set({ allowedEgress: cleaned, updatedAt: new Date() })
+        .where(eq(companySecretBindings.id, binding.id))
+        .returning()
+        .then((rows) => rows[0]);
+      const handlesPurged = purgeHandlesByBinding(binding.id);
+      return { binding: updated, handlesPurged };
+    },
+
+    /**
+     * SECURITY-CRITICAL: operator-only, flip ONE migrated binding's enforcement
+     * posture (enforce ←→ log_only).
+     *
+     * Deliberately per-binding, never a blanket UPDATE: operators sign off one
+     * binding at a time as they review its harvested allowlist, so a misjudged
+     * allowlist breaks a single binding rather than every migrated secret at
+     * once (no breakage cliff).
+     *
+     * Direction is controlled by `enforced` (default `true` for back-compat with
+     * callers that pre-date the operator-reachable surface). `enforced: false`
+     * turns enforcement OFF — the operator-surface "Stop enforcing" confirm is
+     * the only path that sends it. Refuses to enforce a binding whose
+     * `allowedEgress` is empty (that would deny ALL egress) unless `allowEmpty`
+     * is set for a deliberate deny-all; the empty-allowlist guard does not apply
+     * to the off direction.
+     *
+     * On either flip, purges in-flight handles minted under this binding (EG3)
+     * so the next mint captures the new posture immediately instead of at
+     * handle TTL. Idempotent: re-flipping an already-enforcing binding is a
+     * no-op flip plus an idempotent purge.
+     */
+    enforceBindingEgress: async (input: {
+      companyId: string;
+      bindingId: string;
+      enforced?: boolean;
+      allowEmpty?: boolean;
+    }) => {
+      const binding = await loadOwnedBinding(input.companyId, input.bindingId);
+      const nextEnforced = input.enforced !== false;
+      if (
+        nextEnforced &&
+        binding.allowedEgress.length === 0 &&
+        input.allowEmpty !== true
+      ) {
+        throw conflict(
+          `Refusing to enforce egress on binding ${binding.id} with an empty allowlist ` +
+            `(would deny all egress for this secret). Seed allowedEgress first, or pass ` +
+            `allowEmpty to intentionally deny all egress.`,
+        );
+      }
+      const updated = await db
+        .update(companySecretBindings)
+        .set({ egressAllowlistEnforced: nextEnforced, updatedAt: new Date() })
+        .where(eq(companySecretBindings.id, binding.id))
+        .returning()
+        .then((rows) => rows[0]);
+      const handlesPurged = purgeHandlesByBinding(binding.id);
+      logger.info(
+        {
+          companyId: input.companyId,
+          bindingId: binding.id,
+          handlesPurged,
+          action: nextEnforced
+            ? "secret.egress_allowlist_enforced"
+            : "secret.egress_allowlist_unenforced",
+        },
+        nextEnforced
+          ? "flipped secret binding egress allowlist to enforcing"
+          : "flipped secret binding egress allowlist back to log_only",
+      );
+      return { binding: updated, handlesPurged };
+    },
+
     syncSecretRefsForTarget: async (
       companyId: string,
       target: { targetType: SecretBindingTargetType; targetId: string },
@@ -3461,6 +3653,31 @@ export function secretService(db: Db) {
       const pathPrefixes = [...new Set(normalizedRefs.map((ref) => ref.configPath.split(".")[0]))];
 
       await db.transaction(async (tx) => {
+        // Capture existing egress allowlist settings before deletion
+        const existingBindings = await tx
+          .select({
+            configPath: companySecretBindings.configPath,
+            allowedEgress: companySecretBindings.allowedEgress,
+            egressAllowlistEnforced: companySecretBindings.egressAllowlistEnforced,
+          })
+          .from(companySecretBindings)
+          .where(
+            and(
+              eq(companySecretBindings.companyId, companyId),
+              eq(companySecretBindings.targetType, target.targetType),
+              eq(companySecretBindings.targetId, target.targetId),
+            ),
+          );
+        const egressSettings = new Map(
+          existingBindings.map((b) => [
+            b.configPath,
+            {
+              allowedEgress: b.allowedEgress,
+              egressAllowlistEnforced: b.egressAllowlistEnforced,
+            },
+          ])
+        );
+
         if (options?.replaceAll) {
           await tx
             .delete(companySecretBindings)
@@ -3500,19 +3717,208 @@ export function secretService(db: Db) {
         }
         if (normalizedRefs.length === 0) return;
         await tx.insert(companySecretBindings).values(
-          normalizedRefs.map((ref) => ({
-            companyId,
-            secretId: ref.secretId,
-            targetType: target.targetType,
-            targetId: target.targetId,
-            configPath: ref.configPath,
-            versionSelector: String(ref.versionSelector),
-            required: ref.required,
-            label: ref.label,
-          })),
+          normalizedRefs.map((ref) => {
+            const existing = egressSettings.get(ref.configPath);
+            return {
+              companyId,
+              secretId: ref.secretId,
+              targetType: target.targetType,
+              targetId: target.targetId,
+              configPath: ref.configPath,
+              versionSelector: String(ref.versionSelector),
+              required: ref.required,
+              label: ref.label,
+              allowedEgress: existing?.allowedEgress ?? [],
+              egressAllowlistEnforced: existing?.egressAllowlistEnforced ?? true,
+            };
+          }),
         );
       });
       return normalizedRefs;
+    },
+
+    /**
+     * Forward-path maintainer for plugin secret-ref bindings (model C).
+     *
+     * The one-time backfill (migration 0090) seeds bindings from config
+     * that predates company-scoped resolution; this is its live counterpart:
+     * every time plugin config is saved, each manifest field annotated
+     * `format: "secret-ref"` is reconciled into `company_secret_bindings` so the
+     * resolver (plugin-secrets-handler) authorizes it regardless of whether the
+     * config or the install landed first. Without it the backfill would be the
+     * sole writer and a late provision would never get a row.
+     *
+     * Key shape matches the backfill exactly:
+     * `(companyId, targetType="plugin", targetId=pluginId, configPath=<dot-path>)`.
+     *
+     * Company scoping mirrors the backfill's isolation guarantee:
+     *  - instance-wide `plugin_config` (no `companyId`): the binding's company is
+     *    the secret's TRUE owner, so it can never create an unresolvable
+     *    cross-company row.
+     *  - per-company `plugin_company_settings` (`companyId` set): a referenced
+     *    secret is bound only if it belongs to that company; cross-company or
+     *    orphan refs are skipped (no binding, no throw) — the resolver then
+     *    returns the same opaque `not_found`.
+     *
+     * Idempotent: re-saving identical config is a no-op (conflict → update to the
+     * same secretId); clearing or repointing a field removes/updates the row. A
+     * stale row that cannot be revoked (e.g. the old secret was hard-deleted so
+     * its owner is unknown) is harmless — the resolver's company-scoped resolve
+     * re-checks `secret.companyId === ctx.companyId` as defence in depth.
+     *
+     * NB: this is NOT `syncSecretRefsForTarget` — that helper deletes by config
+     * path-prefix (`env.%`), which never matches the flat, top-level config paths
+     * plugin secret-ref fields use (e.g. `githubPatSecretId`), so it would both
+     * collide on the unique index on re-save and never remove a cleared field.
+     *
+     * Never logs or returns secret values; only counts and non-secret ids.
+     */
+    syncPluginSecretBindings: async (input: {
+      /** `plugins.id` — the binding `targetId` and the resolver lookup key. */
+      pluginId: string;
+      /** The plugin manifest's `instanceConfigSchema` (or null). */
+      instanceConfigSchema: unknown;
+      /** Config as it was before this save (for revoking cleared/repointed refs). */
+      previousConfig: unknown;
+      /** Config as saved. */
+      nextConfig: unknown;
+      /** Set for per-company settings; omit for instance-wide `plugin_config`. */
+      companyId?: string;
+    }): Promise<{ bound: number; revoked: number }> => {
+      const paths = collectSecretRefPaths(asRecord(input.instanceConfigSchema));
+      if (paths.size === 0) return { bound: 0, revoked: 0 };
+
+      const refsAtPaths = (cfg: unknown): Map<string, string> => {
+        const out = new Map<string, string>();
+        const record = asRecord(cfg);
+        if (!record) return out;
+        for (const dotPath of paths) {
+          const value = readConfigValueAtPath(record, dotPath);
+          if (typeof value === "string" && isUuidSecretRef(value)) {
+            out.set(dotPath, value.toLowerCase());
+          }
+        }
+        return out;
+      };
+
+      const oldRefs = refsAtPaths(input.previousConfig);
+      const newRefs = refsAtPaths(input.nextConfig);
+
+      // Resolve the binding's owning company. For per-company settings the ref
+      // MUST belong to that company (else skip — never bind cross-company). For
+      // instance-wide config the owner is derived from the secret itself.
+      const ownerCompanyFor = async (
+        secretId: string,
+        source: Pick<Db | DbTransaction, "select">,
+      ): Promise<string | null> => {
+        const secret = await getById(secretId, source);
+        if (!secret) return null;
+        if (input.companyId && secret.companyId !== input.companyId) return null;
+        return secret.companyId;
+      };
+
+      let bound = 0;
+      let revoked = 0;
+      // Secret-ref paths whose value points at a secret that could not
+      // be bound (orphan UUID, or cross-company in per-company scope). These are
+      // exactly the refs that would later fail closed at `ctx.secrets.resolve()`
+      // as "secret not found", so we surface them loudly at config time below.
+      const unboundPaths: string[] = [];
+
+      await db.transaction(async (tx) => {
+        // 1) Revoke bindings for paths that were cleared or repointed.
+        for (const [dotPath, oldValue] of oldRefs) {
+          if (newRefs.get(dotPath) === oldValue) continue; // unchanged
+          const oldOwner = input.companyId ?? (await ownerCompanyFor(oldValue, tx));
+          if (!oldOwner) continue; // cannot locate the row to revoke (harmless)
+          // SECURITY-CRITICAL: multi-tenant safety for the instance-wide save path. When
+          // the global plugin_config is repointed from one tenant's secret to
+          // a different tenant's, the operator's intent is "default ref for
+          // the plugin is now <new>" — NOT a per-tenant revoke. Each tenant's
+          // binding row is independent (the resolver is keyed by dispatching
+          // company), so silently deleting the prior tenant's row would break
+          // them with no audit trail. Cross-tenant repoint → leave the prior
+          // tenant's row in place; the per-tenant route
+          // PUT /api/plugins/:id/companies/:cid/config-overrides is the
+          // authoritative path for revoking a specific tenant's binding.
+          if (!input.companyId) {
+            const newValue = newRefs.get(dotPath);
+            if (newValue && newValue !== oldValue) {
+              const newOwner = await ownerCompanyFor(newValue, tx);
+              if (newOwner && newOwner !== oldOwner) continue;
+            }
+          }
+          const deleted = await tx
+            .delete(companySecretBindings)
+            .where(
+              and(
+                eq(companySecretBindings.companyId, oldOwner),
+                eq(companySecretBindings.targetType, "plugin"),
+                eq(companySecretBindings.targetId, input.pluginId),
+                eq(companySecretBindings.configPath, dotPath),
+              ),
+            )
+            .returning({ id: companySecretBindings.id });
+          revoked += deleted.length;
+        }
+
+        // 2) Upsert bindings for the current refs.
+        for (const [dotPath, value] of newRefs) {
+          const owner = await ownerCompanyFor(value, tx);
+          if (!owner) {
+            unboundPaths.push(dotPath); // orphan or cross-company → no binding
+            continue;
+          }
+          const upserted = await tx
+            .insert(companySecretBindings)
+            .values({
+              companyId: owner,
+              secretId: value,
+              targetType: "plugin",
+              targetId: input.pluginId,
+              configPath: dotPath,
+              versionSelector: "latest",
+              required: true,
+              label: "plugin-config",
+            })
+            .onConflictDoUpdate({
+              target: [
+                companySecretBindings.companyId,
+                companySecretBindings.targetType,
+                companySecretBindings.targetId,
+                companySecretBindings.configPath,
+              ],
+              set: { secretId: value, updatedAt: new Date() },
+            })
+            .returning({ id: companySecretBindings.id });
+          bound += upserted.length;
+        }
+      });
+
+      const bindingsLogger = logger.child({
+        service: "plugin-secret-bindings",
+        pluginId: input.pluginId,
+      });
+      bindingsLogger.debug(
+        { companyScope: input.companyId ?? "instance", bound, revoked },
+        "synced plugin secret-ref bindings",
+      );
+      // A secret ref persisted to config but left unbound resolves as
+      // "secret not found" at call time (the messenger poll-loop failure). Warn
+      // at config time, naming the paths, so it fails loudly instead of silently.
+      if (unboundPaths.length > 0) {
+        bindingsLogger.warn(
+          {
+            companyScope: input.companyId ?? "instance",
+            unboundConfigPaths: unboundPaths,
+            reason: input.companyId
+              ? "secret missing or owned by a different company"
+              : "secret not found for any company",
+          },
+          "plugin config has secret-ref paths with no resolvable binding — ctx.secrets.resolve() will fail closed for these paths",
+        );
+      }
+      return { bound, revoked };
     },
 
     listBindingCompanyIdsForTarget: async (
@@ -3577,6 +3983,32 @@ export function secretService(db: Db) {
       }
 
       const writeBindings = async (targetDb: SecretBindingDb) => {
+        // Capture existing egress allowlist settings before deletion
+        const existingBindings = await targetDb
+          .select({
+            configPath: companySecretBindings.configPath,
+            allowedEgress: companySecretBindings.allowedEgress,
+            egressAllowlistEnforced: companySecretBindings.egressAllowlistEnforced,
+          })
+          .from(companySecretBindings)
+          .where(
+            and(
+              eq(companySecretBindings.companyId, companyId),
+              eq(companySecretBindings.targetType, target.targetType),
+              eq(companySecretBindings.targetId, target.targetId),
+              like(companySecretBindings.configPath, `${pathPrefix}.%`),
+            ),
+          );
+        const egressSettings = new Map(
+          existingBindings.map((b) => [
+            b.configPath,
+            {
+              allowedEgress: b.allowedEgress,
+              egressAllowlistEnforced: b.egressAllowlistEnforced,
+            },
+          ])
+        );
+
         await targetDb
           .delete(companySecretBindings)
           .where(
@@ -3589,15 +4021,20 @@ export function secretService(db: Db) {
           );
         if (refs.length === 0) return;
         await targetDb.insert(companySecretBindings).values(
-          refs.map((ref) => ({
-            companyId,
-            secretId: ref.secretId,
-            targetType: target.targetType,
-            targetId: target.targetId,
-            configPath: ref.configPath,
-            versionSelector: String(ref.versionSelector),
-            required: true,
-          })),
+          refs.map((ref) => {
+            const existing = egressSettings.get(ref.configPath);
+            return {
+              companyId,
+              secretId: ref.secretId,
+              targetType: target.targetType,
+              targetId: target.targetId,
+              configPath: ref.configPath,
+              versionSelector: String(ref.versionSelector),
+              required: true,
+              allowedEgress: existing?.allowedEgress ?? [],
+              egressAllowlistEnforced: existing?.egressAllowlistEnforced ?? true,
+            };
+          }),
           );
       };
 

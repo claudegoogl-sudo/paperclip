@@ -41,6 +41,7 @@ function redactedDatabaseBackupWarning(warning: DatabaseBackupHealthWarning): Da
     database_backup_last_failure: "Database backup failure marker is present.",
     database_backup_missing: "No recent database backup was found.",
     database_backup_stale: "Latest database backup is stale.",
+    database_backup_content_empty: "Latest database backup archive reports zero uncompressed bytes (empty or corrupt).",
   };
   return {
     code: warning.code,

@@ -7,6 +7,7 @@ import { publishLiveEvent } from "./live-events.js";
 import { redactCurrentUserValue } from "../log-redaction.js";
 import { sanitizeRecord } from "../redaction.js";
 import { logger } from "../middleware/logger.js";
+import { getActorProvenance } from "../middleware/actor-context.js";
 import type { PluginEventBus } from "./plugin-event-bus.js";
 import { instanceSettingsService } from "./instance-settings.js";
 
@@ -18,12 +19,23 @@ const ACTIVITY_ACTION_TO_PLUGIN_EVENT: Readonly<Record<string, PluginEventType>>
   issue_document_updated: "issue.document.updated",
   issue_document_deleted: "issue.document.deleted",
   issue_blockers_updated: "issue.relations.updated",
+  issue_thread_interaction_created: "issue.interaction.created",
+  issue_thread_interaction_accepted: "issue.interaction.responded",
+  issue_thread_interaction_rejected: "issue.interaction.responded",
+  issue_thread_interaction_answered: "issue.interaction.responded",
   approval_approved: "approval.decided",
   approval_rejected: "approval.decided",
   approval_revision_requested: "approval.decided",
   budget_soft_threshold_crossed: "budget.incident.opened",
   budget_hard_threshold_crossed: "budget.incident.opened",
   budget_incident_resolved: "budget.incident.resolved",
+};
+
+const INTERACTION_OUTCOME_FROM_ACTION: Readonly<Record<string, string>> = {
+  issue_thread_interaction_created: "created",
+  issue_thread_interaction_accepted: "accepted",
+  issue_thread_interaction_rejected: "rejected",
+  issue_thread_interaction_answered: "answered",
 };
 
 let _pluginEventBus: PluginEventBus | null = null;
@@ -36,9 +48,183 @@ export function setPluginEventBus(bus: PluginEventBus): void {
   _pluginEventBus = bus;
 }
 
-function eventTypeForActivityAction(action: string): PluginEventType | null {
+export function eventTypeForActivityAction(action: string): PluginEventType | null {
   if (PLUGIN_EVENT_SET.has(action)) return action as PluginEventType;
   return ACTIVITY_ACTION_TO_PLUGIN_EVENT[action.replaceAll(".", "_")] ?? null;
+}
+
+export function pluginPayloadExtrasForActivityAction(action: string): Record<string, unknown> {
+  const outcome = INTERACTION_OUTCOME_FROM_ACTION[action.replaceAll(".", "_")];
+  return outcome ? { outcome } : {};
+}
+
+// --- Interaction event enrichment -------------------------------------------
+// Chat-relay plugins subscribe to `issue.interaction.created`, but the
+// event historically carried only interactionId/interactionKind, so the operator
+// received a contentless ping. We attach a small, bounded projection of the
+// interaction's questions/options so a subscribed plugin can render the prompt
+// and choices without needing a new read capability. Bounds cap operator-authored
+// text and total option/question counts so the event payload stays small.
+const MAX_PROJECTED_QUESTIONS = 20;
+const MAX_PROJECTED_OPTIONS_PER_QUESTION = 30;
+const MAX_PROMPT_LENGTH = 500;
+const MAX_LABEL_LENGTH = 160;
+const MAX_OPTION_DESCRIPTION_LENGTH = 200;
+
+export interface ProjectedInteractionOption {
+  id: string;
+  label: string;
+  description?: string;
+}
+
+export interface ProjectedInteractionQuestion {
+  id: string;
+  prompt: string;
+  selectionMode: "single" | "multi";
+  options: ProjectedInteractionOption[];
+}
+
+export interface ProjectedInteraction {
+  id: string;
+  kind: string;
+  title?: string;
+  questions: ProjectedInteractionQuestion[];
+}
+
+interface InteractionForProjection {
+  id: string;
+  kind: string;
+  payload?: unknown;
+}
+
+function clip(value: unknown, max: number): string {
+  const s = typeof value === "string" ? value : String(value ?? "");
+  return s.length > max ? s.slice(0, max) : s;
+}
+
+function projectOptions(
+  rawOptions: unknown,
+  idField: string,
+  labelField: string,
+): ProjectedInteractionOption[] {
+  if (!Array.isArray(rawOptions)) return [];
+  const options: ProjectedInteractionOption[] = [];
+  for (const raw of rawOptions.slice(0, MAX_PROJECTED_OPTIONS_PER_QUESTION)) {
+    if (!raw || typeof raw !== "object") continue;
+    const o = raw as Record<string, unknown>;
+    const rawId = o[idField];
+    const rawLabel = o[labelField];
+    if (typeof rawId !== "string" || typeof rawLabel !== "string") continue;
+    const option: ProjectedInteractionOption = {
+      id: clip(rawId, MAX_LABEL_LENGTH),
+      label: clip(rawLabel, MAX_LABEL_LENGTH),
+    };
+    if (typeof o.description === "string" && o.description.length > 0) {
+      option.description = clip(o.description, MAX_OPTION_DESCRIPTION_LENGTH);
+    }
+    options.push(option);
+  }
+  return options;
+}
+
+/**
+ * Normalize a hydrated issue-thread interaction into a bounded questions/options
+ * projection for the `issue.interaction.created` plugin event. Returns `null`
+ * for a missing/malformed interaction and never throws — the caller runs this
+ * inline while building the activity-log details, so a throw would break the
+ * interaction-create request.
+ *
+ * Only questions/options (and an optional title) are projected — target/href,
+ * secret refs, and result data are deliberately omitted to minimize what a
+ * subscribed plugin sees.
+ */
+export function projectInteractionForPluginEvent(
+  interaction: InteractionForProjection | null | undefined,
+): ProjectedInteraction | null {
+  if (!interaction || typeof interaction.id !== "string" || typeof interaction.kind !== "string") {
+    return null;
+  }
+  try {
+    const payload = (interaction.payload ?? {}) as Record<string, unknown>;
+    const questions: ProjectedInteractionQuestion[] = [];
+    let title: string | undefined;
+
+    switch (interaction.kind) {
+      case "ask_user_questions": {
+        if (typeof payload.title === "string" && payload.title.length > 0) {
+          title = clip(payload.title, MAX_PROMPT_LENGTH);
+        }
+        const rawQuestions = Array.isArray(payload.questions) ? payload.questions : [];
+        for (const raw of rawQuestions.slice(0, MAX_PROJECTED_QUESTIONS)) {
+          if (!raw || typeof raw !== "object") continue;
+          const q = raw as Record<string, unknown>;
+          if (typeof q.id !== "string" || typeof q.prompt !== "string") continue;
+          questions.push({
+            id: clip(q.id, MAX_LABEL_LENGTH),
+            prompt: clip(q.prompt, MAX_PROMPT_LENGTH),
+            selectionMode: q.selectionMode === "multi" ? "multi" : "single",
+            options: projectOptions(q.options, "id", "label"),
+          });
+        }
+        break;
+      }
+      case "request_checkbox_confirmation": {
+        if (typeof payload.prompt === "string") {
+          questions.push({
+            id: interaction.id,
+            prompt: clip(payload.prompt, MAX_PROMPT_LENGTH),
+            selectionMode: "multi",
+            options: projectOptions(payload.options, "id", "label"),
+          });
+        }
+        break;
+      }
+      case "request_confirmation": {
+        if (typeof payload.prompt === "string") {
+          const accept = typeof payload.acceptLabel === "string" ? payload.acceptLabel : "Accept";
+          const reject = typeof payload.rejectLabel === "string" ? payload.rejectLabel : "Reject";
+          questions.push({
+            id: interaction.id,
+            prompt: clip(payload.prompt, MAX_PROMPT_LENGTH),
+            selectionMode: "single",
+            options: [
+              { id: "accept", label: clip(accept, MAX_LABEL_LENGTH) },
+              { id: "reject", label: clip(reject, MAX_LABEL_LENGTH) },
+            ],
+          });
+        }
+        break;
+      }
+      case "suggest_tasks": {
+        const options = projectOptions(payload.tasks, "clientKey", "title");
+        if (options.length > 0) {
+          questions.push({
+            id: interaction.id,
+            prompt: "Proposed tasks",
+            selectionMode: "multi",
+            options,
+          });
+        }
+        break;
+      }
+      default:
+        break;
+    }
+
+    const projected: ProjectedInteraction = {
+      id: interaction.id,
+      kind: interaction.kind,
+      questions,
+    };
+    if (title) projected.title = title;
+    return projected;
+  } catch (err) {
+    logger.warn(
+      { err, interactionId: interaction.id, kind: interaction.kind },
+      "failed to project interaction for plugin event",
+    );
+    return { id: interaction.id, kind: interaction.kind, questions: [] };
+  }
 }
 
 export function publishPluginDomainEvent(event: PluginEvent): void {
@@ -70,6 +256,35 @@ export async function logActivity(db: Db, input: LogActivityInput) {
   const redactedDetails = sanitizedDetails
     ? redactCurrentUserValue(sanitizedDetails, currentUserRedactionOptions)
     : null;
+
+  // Provenance of the credential that authenticated this write, captured centrally
+  // from AsyncLocalStorage rather than at each of logActivity's ~179 call sites.
+  // Null for background work (heartbeats, plugin workers) that runs outside a
+  // request — which itself is meaningful: no request-scoped credential acted.
+  const provenance = getActorProvenance();
+  const actorSource = provenance?.source ?? null;
+  const actorKeyId = provenance?.keyId ?? null;
+
+  // AC4 alert: every activity_log write is a mutation (reads are not logged here),
+  // so a board_key-sourced write is exactly a board-key-authenticated write to a
+  // board-gated route. Surface it at warn with a stable `event` discriminator.
+  // Operators grep: `event=board_key_authenticated_write` (or the JSON key). The
+  // token value is never logged — keyId (a UUID) is the only credential id emitted.
+  if (actorSource === "board_key") {
+    logger.info(
+      {
+        event: "board_key_authenticated_write",
+        actorSource,
+        actorKeyId,
+        action: input.action,
+        entityType: input.entityType,
+        entityId: input.entityId,
+        companyId: input.companyId,
+      },
+      "board_key-authenticated write to a board-gated route",
+    );
+  }
+
   await db.insert(activityLog).values({
     companyId: input.companyId,
     actorType: input.actorType,
@@ -79,6 +294,8 @@ export async function logActivity(db: Db, input: LogActivityInput) {
     entityId: input.entityId,
     agentId: input.agentId ?? null,
     runId: input.runId ?? null,
+    actorSource,
+    actorKeyId,
     details: redactedDetails,
   });
 
@@ -93,6 +310,7 @@ export async function logActivity(db: Db, input: LogActivityInput) {
       entityId: input.entityId,
       agentId: input.agentId ?? null,
       runId: input.runId ?? null,
+      actorSource,
       details: redactedDetails,
     },
   });
@@ -112,6 +330,7 @@ export async function logActivity(db: Db, input: LogActivityInput) {
         ...redactedDetails,
         agentId: input.agentId ?? null,
         runId: input.runId ?? null,
+        ...pluginPayloadExtrasForActivityAction(input.action),
       },
     };
     publishPluginDomainEvent(event);

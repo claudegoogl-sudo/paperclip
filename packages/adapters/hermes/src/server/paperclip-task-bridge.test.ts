@@ -4,6 +4,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { isExternalLoggingTarget, isInternalKeyTarget, resolveSpawnApiKey } from "./execute.js";
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const helperPath = path.resolve(__dirname, "../../skills/paperclip-task-bridge/paperclip-task.mjs");
 const apiKey = "pc_test_secret_should_not_print";
@@ -180,5 +182,140 @@ describe("paperclip-task-bridge helper", () => {
     expect(commentRequest?.body).toMatchObject({ body: "Progress from Hermes" });
     expect(patchRequest?.body).toMatchObject({ status: "in_review", comment: "Ready" });
     expect(comment.stdout + update.stdout).not.toContain(apiKey);
+  });
+});
+
+describe("resolveSpawnApiKey (external-logging key posture)", () => {
+  // Synthetic, shape-valid fixtures only — never a live key value.
+  const BOUND_BRIDGE_KEY = "pc_task_bridge_synthetic_fixture_key";
+  const BROAD_RUN_TOKEN = "pc_broad_run_scoped_authtoken_fixture";
+
+  it("keeps a bound task_bridge key for openrouter (never the broad authToken)", () => {
+    const key = resolveSpawnApiKey({
+      boundKey: BOUND_BRIDGE_KEY,
+      authToken: BROAD_RUN_TOKEN,
+      provider: "openrouter",
+      model: "stealth/ox-alpha",
+    });
+    expect(key).toBe(BOUND_BRIDGE_KEY);
+    expect(key).not.toBe(BROAD_RUN_TOKEN);
+  });
+
+  it("fails closed for openrouter when no scoped key is bound", () => {
+    expect(() =>
+      resolveSpawnApiKey({
+        boundKey: undefined,
+        authToken: BROAD_RUN_TOKEN,
+        provider: "openrouter",
+        model: "some-model",
+      }),
+    ).toThrow(/Refusing to spawn/);
+  });
+
+  it("fails closed for a cloaked stealth model even when provider is auto", () => {
+    expect(() =>
+      resolveSpawnApiKey({
+        boundKey: undefined,
+        authToken: BROAD_RUN_TOKEN,
+        provider: "auto",
+        model: "stealth/ox-alpha",
+      }),
+    ).toThrow(/Refusing to spawn/);
+  });
+
+  // Default-deny inversion — a denylist would have MISSED both of the following
+  // (they leaked the broad key on the pre-inversion code); an internal allowlist
+  // fails them closed by construction.
+  it("fails closed for an unknown/new external provider not in any denylist", () => {
+    expect(() =>
+      resolveSpawnApiKey({
+        boundKey: undefined,
+        authToken: BROAD_RUN_TOKEN,
+        provider: "some-future-logging-provider",
+        model: "brand-new-model",
+      }),
+    ).toThrow(/Refusing to spawn/);
+  });
+
+  it("fails closed for provider=auto with a benign (non-stealth) model name", () => {
+    // Threat (b): auto-routing to an external upstream under a model name that
+    // matches no stealth pattern. The provider is not on the internal allowlist,
+    // so the broad key is never injected.
+    expect(() =>
+      resolveSpawnApiKey({
+        boundKey: undefined,
+        authToken: BROAD_RUN_TOKEN,
+        provider: "auto",
+        model: "gpt-4o",
+      }),
+    ).toThrow(/Refusing to spawn/);
+  });
+
+  it("fails closed for a known external provider under a benign model name", () => {
+    // e.g. copilot / zai / minimax — external upstreams that were never in the
+    // openrouter-only denylist.
+    for (const provider of ["copilot", "zai", "minimax", "nous", "huggingface"]) {
+      expect(() =>
+        resolveSpawnApiKey({
+          boundKey: undefined,
+          authToken: BROAD_RUN_TOKEN,
+          provider,
+          model: "some-model",
+        }),
+      ).toThrow(/Refusing to spawn/);
+    }
+  });
+
+  it("keeps a bound task_bridge key for an unknown external provider", () => {
+    // The sanctioned per-agent opt-in works for ANY provider, allowlisted or not.
+    const key = resolveSpawnApiKey({
+      boundKey: BOUND_BRIDGE_KEY,
+      authToken: BROAD_RUN_TOKEN,
+      provider: "some-future-logging-provider",
+      model: "brand-new-model",
+    });
+    expect(key).toBe(BOUND_BRIDGE_KEY);
+    expect(key).not.toBe(BROAD_RUN_TOKEN);
+  });
+
+  it("keeps the authToken fallback for internal providers (no regression)", () => {
+    const key = resolveSpawnApiKey({
+      boundKey: undefined,
+      authToken: BROAD_RUN_TOKEN,
+      provider: "anthropic",
+      model: "claude-sonnet-4",
+    });
+    expect(key).toBe(BROAD_RUN_TOKEN);
+  });
+
+  it("never throws for an internal provider even without any key", () => {
+    const key = resolveSpawnApiKey({
+      boundKey: undefined,
+      authToken: undefined,
+      provider: "anthropic",
+      model: "claude-sonnet-4",
+    });
+    expect(key).toBeUndefined();
+  });
+
+  it("classifies non-allowlisted targets as external by default (default-deny)", () => {
+    expect(isExternalLoggingTarget("openrouter", "any-model")).toBe(true);
+    expect(isExternalLoggingTarget("auto", "stealth/ox-alpha")).toBe(true);
+    expect(isExternalLoggingTarget("anthropic", "claude-sonnet-4")).toBe(false);
+    // Previously `false` under the denylist (a miss). auto is not on the
+    // internal allowlist, so it is external by default now.
+    expect(isExternalLoggingTarget("auto", undefined)).toBe(true);
+    expect(isExternalLoggingTarget("some-future-logging-provider", "m")).toBe(true);
+    expect(isExternalLoggingTarget(undefined, undefined)).toBe(true);
+  });
+
+  it("treats only the internal allowlist as a trusted key target", () => {
+    expect(isInternalKeyTarget("anthropic", "claude-sonnet-4")).toBe(true);
+    expect(isInternalKeyTarget("claude_local", undefined)).toBe(true);
+    // Even an allowlisted provider is downgraded when the model slug is cloaked.
+    expect(isInternalKeyTarget("anthropic", "stealth/ox-alpha")).toBe(false);
+    expect(isInternalKeyTarget("auto", undefined)).toBe(false);
+    expect(isInternalKeyTarget("openrouter", "any-model")).toBe(false);
+    expect(isInternalKeyTarget(undefined, undefined)).toBe(false);
   });
 });

@@ -1,14 +1,15 @@
-import type { AdapterModelProfileDefinition } from "@paperclipai/adapter-utils";
+import type { AdapterModel, AdapterModelProfileDefinition } from "@paperclipai/adapter-utils";
 
 export const type = "claude_local";
 export const label = "Claude Code";
 
 export const SANDBOX_INSTALL_COMMAND = "npm install -g @anthropic-ai/claude-code";
 
-export const models = [
+export const models: AdapterModel[] = [
   { id: "claude-opus-4-8", label: "Claude Opus 4.8" },
   { id: "claude-fable-5", label: "Claude Fable 5" },
-  { id: "claude-mythos-5", label: "Claude Mythos 5" },
+  // Safeguards-lifted — must never be an automatic fallback target.
+  { id: "claude-mythos-5", label: "Claude Mythos 5", safeguardsLifted: true },
   { id: "claude-opus-4-7", label: "Claude Opus 4.7" },
   { id: "claude-opus-4-6", label: "Claude Opus 4.6" },
   { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
@@ -38,6 +39,7 @@ Core fields:
 - cwd (string, optional): default absolute working directory fallback for the agent process (created if missing when possible)
 - instructionsFilePath (string, optional): absolute path to a markdown instructions file injected at runtime
 - model (string, optional): Claude model id
+- fallbackModel (string, optional): Claude model id used for a single automatic retry when the primary model returns a policy refusal. Must be a known adapter model and is never a safeguards-lifted model (claude-mythos-5 is hard-rejected). On a refusal the run retries exactly once on a fresh session with this model and returns that result; without it, refusals surface as today. resultJson carries fallbackModelUsed/primaryRefused telemetry when it fires.
 - effort (string, optional): reasoning effort passed via --effort (low|medium|high)
 - chrome (boolean, optional): pass --chrome when running Claude
 - promptTemplate (string, optional): run prompt template

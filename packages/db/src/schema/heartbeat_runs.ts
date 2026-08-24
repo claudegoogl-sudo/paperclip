@@ -1,4 +1,5 @@
 import { type AnyPgColumn, pgTable, uuid, text, timestamp, jsonb, index, integer, bigint, boolean } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 import { agentWakeupRequests } from "./agent_wakeup_requests.js";
@@ -84,5 +85,23 @@ export const heartbeatRuns = pgTable(
       table.status,
       table.processStartedAt,
     ),
+    // Serves the `context_snapshot ->> 'issueId'` run-checkout predicate used by
+    // ~20 call sites in services/heartbeat.ts and services/recovery/service.ts.
+    // See migration 0142 for the indexed expression's cost history.
+    companyContextIssueIdx: index("heartbeat_runs_company_context_issue_idx").on(
+      table.companyId,
+      sql`(${table.contextSnapshot}->>'issueId')`,
+    ),
+    // Serves the retention prune's anti-join, which skips wakeup requests a
+    // surviving run still points at. See migration 0143.
+    wakeupRequestIdx: index("heartbeat_runs_wakeup_request_idx")
+      .on(table.wakeupRequestId)
+      .where(sql`${table.wakeupRequestId} IS NOT NULL`),
+    // Serves the retention prune scan. The partial predicate must stay in sync
+    // with TERMINAL_HEARTBEAT_RUN_STATUSES or the prune falls back to a Seq
+    // Scan; a test asserts the two match.
+    retentionIdx: index("heartbeat_runs_retention_idx")
+      .on(table.createdAt)
+      .where(sql`${table.status} IN ('succeeded', 'succeeded_dirty', 'failed', 'cancelled', 'timed_out')`),
   }),
 );

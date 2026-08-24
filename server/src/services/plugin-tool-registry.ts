@@ -25,7 +25,21 @@ import type {
 } from "@paperclipai/shared";
 import type { ToolRunContext, ToolResult, ExecuteToolParams } from "@paperclipai/plugin-sdk";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
+import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js";
 import { logger } from "../middleware/logger.js";
+import {
+  collectHandleTokens,
+  getHandleRecord,
+  substituteHandles,
+  UnresolvedHandleError,
+} from "../handle-vault.js";
+import {
+  decideEgress,
+  EgressNotAllowedError,
+  formatOrigin,
+  getHostMediatedEgress,
+  type HandleEgressCapture,
+} from "../handle-egress.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -88,6 +102,20 @@ export interface ToolExecutionResult {
   /** The result returned by the plugin's tool handler. */
   result: ToolResult;
 }
+
+/**
+ * Sink for would-deny egress observations. The chokepoint computes the
+ * NORMALIZED origin (scheme+host+port — never a raw URL) and the deduped, non-null
+ * bindings of a would-deny call and hands them off here fire-and-forget. The sink
+ * owns persistence + its own error isolation: harvesting MUST NOT affect the
+ * dispatch it rides on. In production this is backed by `recordEgressWouldDeny`;
+ * tests inject a fake to assert the chokepoint only ever emits parser output.
+ */
+export type EgressHarvestSink = (observation: {
+  companyId: string;
+  bindingIds: string[];
+  origin: string;
+}) => void;
 
 // ---------------------------------------------------------------------------
 // PluginToolRegistry interface
@@ -229,6 +257,8 @@ export interface PluginToolRegistry {
  */
 export function createPluginToolRegistry(
   workerManager?: PluginWorkerManager,
+  runContextRegistry?: PluginRunContextRegistry,
+  egressHarvestSink?: EgressHarvestSink,
 ): PluginToolRegistry {
   const log = logger.child({ service: "plugin-tool-registry" });
 
@@ -428,13 +458,170 @@ export function createPluginToolRegistry(
         "executing tool via plugin worker",
       );
 
+      // SECURITY-CRITICAL: borrowed-handle egress substitution chokepoint (Control 2).
+      //
+      // This is the STRUCTURAL chokepoint (RC5 placement): every plugin tool
+      // dispatch routes through here, including the `getRegistry()` escape
+      // hatch that bypasses the higher-level dispatcher. Before handing the
+      // parameters to the worker we replace any borrowed-handle substrings with
+      // the plaintext borrowed for THIS run (keyed by the host's own
+      // `runContext.runId`, never a handle-embedded run id — RC3), so the
+      // executing tool sees the real secret while the transcript / persisted
+      // call record keeps the opaque handle.
+      //
+      // The substitution is on a throwaway deep copy (RC4): `parameters` — the
+      // handle-bearing object the caller persists and audits — is never
+      // mutated. A handle-shaped token that does not resolve in this run's
+      // vault (foreign / expired / forged) aborts the call fail-closed (RC5);
+      // a literal `vault-handle://` must never leave the host outbound.
+      //
+      // SECURITY-CRITICAL: per-binding egress allowlist (Control-2 residual). The
+      // destination decision runs BEFORE any plaintext substitution (EG5): we
+      // enumerate the borrowed handles present in the RAW parameters and check
+      // each handle's OWN captured allowlist against the call's declared,
+      // host-mediated destination. A non-host-mediated tool (EG1), an
+      // undeterminable destination, or any enforced handle whose allowlist
+      // excludes the destination aborts the whole call fail-closed — the
+      // handle is never resolved to plaintext and the worker is never invoked.
+      let dispatchParameters: unknown;
+      try {
+        const handleTokens = collectHandleTokens(parameters);
+        if (handleTokens.length > 0) {
+          // Resolve each handle's metadata (NOT its plaintext) for the decision.
+          // A token unresolvable in this run (foreign/expired/forged) fails
+          // closed exactly as before (RC5).
+          const captures: HandleEgressCapture[] = handleTokens.map((handle) => {
+            const record = getHandleRecord(runContext.runId, handle);
+            if (!record) throw new UnresolvedHandleError(handle);
+            return {
+              handle,
+              allowedEgress: record.allowedEgress,
+              enforced: record.enforced,
+              bindingId: record.bindingId,
+              unmediatedOptInTools: record.unmediatedOptInTools,
+            };
+          });
+
+          const decision = decideEgress({
+            namespacedName,
+            descriptor: getHostMediatedEgress(namespacedName),
+            rawParameters: parameters,
+            handles: captures,
+          });
+
+          if (!decision.allow) {
+            throw new EgressNotAllowedError(decision.reason, decision.destination);
+          }
+          // Log-only migration bindings (EG4): record would-deny, do not block.
+          if (decision.wouldDeny.length > 0) {
+            log.warn(
+              {
+                pluginId,
+                toolName,
+                namespacedName,
+                runId: runContext.runId,
+                // attacker-influenced — logged as data only, never eval'd (EG6).
+                destination: decision.destination,
+                wouldDenyBindings: decision.wouldDeny.map((h) => h.bindingId),
+                action: "secret.egress_would_deny",
+              },
+              "egress would be denied under enforcement; binding is in log-only mode",
+            );
+
+            // Persist a queryable would-deny observation so
+            // operators can seed this binding's allowlist before the enforce-flip.
+            // We persist the NORMALIZED origin only (scheme+host+port, via the
+            // egress parser that already produced `decision.origin`); a non-`ok`
+            // / null origin — a non-host-mediated or undeterminable destination —
+            // is dropped, never stored, because only path/query-free parser output
+            // is safe to keep (it cannot carry tokens/PII). Fire-and-forget: a
+            // harvest failure must never break the dispatch it rides on.
+            if (egressHarvestSink) {
+              const origin = formatOrigin(decision.origin);
+              if (origin) {
+                const bindingIds = [
+                  ...new Set(
+                    decision.wouldDeny
+                      .map((h) => h.bindingId)
+                      .filter((b): b is string => b !== null),
+                  ),
+                ];
+                if (bindingIds.length > 0) {
+                  try {
+                    egressHarvestSink({ companyId: runContext.companyId, bindingIds, origin });
+                  } catch (harvestErr) {
+                    log.warn(
+                      { err: harvestErr, action: "secret.egress_would_deny_harvest_failed" },
+                      "failed to record would-deny egress observation (non-fatal)",
+                    );
+                  }
+                }
+              }
+            }
+          }
+        }
+        dispatchParameters = substituteHandles(runContext.runId, parameters);
+      } catch (err) {
+        if (err instanceof EgressNotAllowedError) {
+          log.warn(
+            {
+              pluginId,
+              toolName,
+              namespacedName,
+              runId: runContext.runId,
+              reason: err.reason,
+              // attacker-influenced — logged as data only, never eval'd (EG6).
+              destination: err.destination,
+              action: "secret.egress_denied",
+            },
+            "aborting tool dispatch: borrowed handle not allowed to egress to this destination (fail-closed)",
+          );
+          throw new Error(
+            `Cannot execute tool "${namespacedName}" — a borrowed secret handle in its ` +
+            `parameters is not permitted to egress to the call's destination. The call ` +
+            `was aborted before the handle was resolved to plaintext.`,
+          );
+        }
+        if (err instanceof UnresolvedHandleError) {
+          log.warn(
+            { pluginId, toolName, namespacedName, runId: runContext.runId, handle: err.handle },
+            "aborting tool dispatch: unresolvable borrowed handle in parameters (fail-closed)",
+          );
+          throw new Error(
+            `Cannot execute tool "${namespacedName}" — a borrowed secret handle in ` +
+            `its parameters does not belong to this run. The call was aborted so the ` +
+            `opaque handle is never sent downstream.`,
+          );
+        }
+        throw err;
+      }
+
       const rpcParams: ExecuteToolParams = {
         toolName,
-        parameters,
+        parameters: dispatchParameters,
         runContext,
       };
 
-      const result = await workerManager.call(dbId, "executeTool", rpcParams);
+      // SECURITY-CRITICAL: register the dispatching agent's runContext under
+      // (pluginDbId, runId) so the host's `artifacts.fetch` handler can
+      // authorize on the dispatching agent — not the worker JWT — when the
+      // worker calls back via the SDK helper. Always deregister to keep the
+      // in-memory registry bounded; the registry also has a TTL sweep as a
+      // belt-and-braces guard against orphans from a crashed worker.
+      runContextRegistry?.register(dbId, {
+        agentId: runContext.agentId,
+        companyId: runContext.companyId,
+        runId: runContext.runId,
+        projectId: runContext.projectId,
+        toolName,
+        registeredAt: Date.now(),
+      });
+      let result: ToolResult;
+      try {
+        result = await workerManager.call(dbId, "executeTool", rpcParams);
+      } finally {
+        runContextRegistry?.deregister(dbId, runContext.runId);
+      }
 
       log.debug(
         {

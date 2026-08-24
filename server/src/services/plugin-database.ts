@@ -120,6 +120,85 @@ function stripSqlForKeywordScan(input: string): string {
     .replace(/\/\*[\s\S]*?\*\//g, "");
 }
 
+function stripStringsAndCommentsForScan(input: string): string {
+  return input
+    .replace(/'([^']|'')*'/g, "''")
+    .replace(/--.*$/gm, "")
+    .replace(/\/\*[\s\S]*?\*\//g, "");
+}
+
+// TODO: replace this regex/state-machine pass with a real Postgres
+// SQL parser (`pgsql-ast-parser` / `libpg_query`) so we can authoritatively
+// walk the FROM/JOIN tree instead of pattern-matching trimmed text. The
+// stopgap intentionally errs conservative: unqualified relation refs are
+// rejected even when the ref is a CTE alias, because we cannot tell apart
+// CTEs from public-schema reads without proper parsing.
+function assertRuntimeQueryRefsQualified(statement: string, caller = "ctx.db.query"): void {
+  const text = stripStringsAndCommentsForScan(statement);
+  const len = text.length;
+  // Each `(` pushes whether the enclosed scope is a subquery (true) or a
+  // function/expression scope (false). FROM/JOIN inside a function scope are
+  // part of function syntax (EXTRACT, SUBSTRING, TRIM, OVERLAY, ...) and are
+  // not relation references.
+  const scopeStack: boolean[] = [];
+  let i = 0;
+  while (i < len) {
+    const ch = text[i]!;
+    if (ch === "(") {
+      let j = i + 1;
+      while (j < len && /\s/.test(text[j]!)) j += 1;
+      const isSubquery = /^(select|with)\b/i.test(text.slice(j));
+      scopeStack.push(isSubquery);
+      i += 1;
+      continue;
+    }
+    if (ch === ")") {
+      scopeStack.pop();
+      i += 1;
+      continue;
+    }
+    const prev = i > 0 ? text[i - 1]! : " ";
+    if (/[A-Za-z0-9_]/.test(prev)) {
+      i += 1;
+      continue;
+    }
+    const head = text.slice(i, i + 5).toLowerCase();
+    const kwLen = (head.startsWith("from") || head.startsWith("join"))
+      && !/[A-Za-z0-9_]/.test(text[i + 4] ?? " ")
+      ? 4
+      : 0;
+    if (kwLen === 0) {
+      i += 1;
+      continue;
+    }
+    const inFunctionScope = scopeStack.length > 0 && scopeStack[scopeStack.length - 1] === false;
+    if (inFunctionScope) {
+      i += kwLen;
+      continue;
+    }
+    let k = i + kwLen;
+    while (k < len && /\s/.test(text[k]!)) k += 1;
+    const intro = text.slice(k).match(/^(only|lateral)\b\s+/i);
+    if (intro) k += intro[0].length;
+    if (text[k] === "(") {
+      // Subquery operand — let the next loop iteration push its scope and
+      // recurse into it. The relation check inside the subquery will catch
+      // any unqualified refs.
+      i = k;
+      continue;
+    }
+    const operand = text.slice(k);
+    const qualified = /^"?[A-Za-z_][A-Za-z0-9_]*"?\s*\.\s*"?[A-Za-z_][A-Za-z0-9_]*"?/.test(operand);
+    if (!qualified) {
+      const offending = operand.match(/^[^,\s)]+/)?.[0] ?? "<expression>";
+      throw new Error(
+        `${caller} requires schema-qualified table references; "${offending}" is missing a namespace`,
+      );
+    }
+    i = k;
+  }
+}
+
 function normaliseSql(input: string): string {
   return stripSqlForKeywordScan(input).replace(/\s+/g, " ").trim().toLowerCase();
 }
@@ -261,6 +340,11 @@ export function validatePluginRuntimeQuery(
   if (/\b(insert|update|delete|alter|create|drop|truncate)\b/.test(normalized)) {
     throw new Error("ctx.db.query cannot contain mutation or DDL keywords");
   }
+  // SECURITY-CRITICAL: every FROM/JOIN must reference a schema-qualified table
+  // so the public-schema whitelist (coreReadTables) cannot be bypassed via the
+  // connection's default search_path. See also the Postgres-layer defense
+  // applied in pluginDatabaseService.query (`SET LOCAL search_path`).
+  assertRuntimeQueryRefsQualified(statement);
 
   const allowedCoreReadTables = new Set(coreReadTables);
   for (const ref of extractQualifiedRefs(statement)) {
@@ -287,6 +371,15 @@ export function validatePluginRuntimeExecute(query: string, namespace: string): 
   if (/\b(alter|create|drop|truncate)\b/.test(normalized)) {
     throw new Error("ctx.db.execute cannot contain DDL keywords");
   }
+  // SECURITY-CRITICAL: every FROM/JOIN (including those inside subqueries)
+  // must reference a schema-qualified table. Without this, writes like
+  // `UPDATE plugin_test.tbl SET x = (SELECT y FROM agents)` slip past the
+  // extractQualifiedRefs check below, which only sees the top-level target.
+  // The Postgres-layer `SET LOCAL search_path` defense above would still
+  // fail-close at runtime, but the layered-defense story documented in
+  // PLUGIN_AUTHORING_GUIDE.md and sdk/README.md requires the application
+  // layer to reject these as well.
+  assertRuntimeQueryRefsQualified(statement, "ctx.db.execute");
 
   const refs = extractQualifiedRefs(statement);
   const target = refs.find((ref) => ["into", "update", "from"].includes(ref.keyword));
@@ -558,15 +651,43 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
       const plugin = await getPluginRecord(pluginId);
       const namespace = await getRuntimeNamespace(pluginId);
       validatePluginRuntimeQuery(statement, namespace, plugin.manifestJson.database?.coreReadTables ?? []);
-      const result = await db.execute(bindSql(statement, params));
-      return Array.from(result as Iterable<T>);
+      // SECURITY-CRITICAL: pin the connection's search_path to the plugin
+      // namespace so any unqualified ref that slips past the validator resolves to the
+      // plugin's own schema, not `public`. SET LOCAL only holds inside a
+      // transaction, so open one when the client supports it; when `db` is
+      // already a transaction-scoped client (upstream v2026.525.0 made
+      // `transaction` optional on PluginDatabaseRootClient), pin on it directly
+      // since we are already inside the caller's transaction.
+      const runPinned = async (client: PluginDatabaseClient): Promise<T[]> => {
+        await client.execute(
+          sql.raw(`SET LOCAL search_path TO ${quoteIdentifier(namespace)}, pg_temp`),
+        );
+        const result = await client.execute(bindSql(statement, params));
+        return Array.from(result as Iterable<T>);
+      };
+      if (typeof db.transaction === "function") {
+        return db.transaction(async (tx) => runPinned(tx as PluginDatabaseClient));
+      }
+      return runPinned(db);
     },
 
     async execute(pluginId: string, statement: string, params?: unknown[]): Promise<{ rowCount: number }> {
       const namespace = await getRuntimeNamespace(pluginId);
       validatePluginRuntimeExecute(statement, namespace);
-      const result = await db.execute(bindSql(statement, params));
-      return { rowCount: Number((result as { count?: number | string }).count ?? 0) };
+      // SECURITY-CRITICAL: same search_path pin as query() — defense in depth. Guard the
+      // optional `transaction` (upstream v2026.525.0) and fall back to pinning
+      // on the caller's transaction-scoped client when nesting is unavailable.
+      const runPinned = async (client: PluginDatabaseClient): Promise<{ rowCount: number }> => {
+        await client.execute(
+          sql.raw(`SET LOCAL search_path TO ${quoteIdentifier(namespace)}, pg_temp`),
+        );
+        const result = await client.execute(bindSql(statement, params));
+        return { rowCount: Number((result as { count?: number | string }).count ?? 0) };
+      };
+      if (typeof db.transaction === "function") {
+        return db.transaction(async (tx) => runPinned(tx as PluginDatabaseClient));
+      }
+      return runPinned(db);
     },
   };
 }

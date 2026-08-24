@@ -232,6 +232,97 @@ export function isProcessGroupAlive(processGroupId: number | null | undefined) {
   }
 }
 
+// Absorbs clock-source skew (NTP steps, /proc/stat btime's ~1s granularity) between
+// the wall-clock captured at spawn and the kernel-reported start time. Far tighter than
+// the wedge-plus-restart interval that separates a recycled pid from the original run's
+// spawn, so a recycled pid is still reliably rejected.
+export const PROCESS_IDENTITY_START_TOLERANCE_MS = 60_000;
+
+let cachedClockTicksPerSecond: number | null = null;
+
+async function getClockTicksPerSecond(): Promise<number> {
+  if (cachedClockTicksPerSecond != null) return cachedClockTicksPerSecond;
+  try {
+    const { stdout } = await execFileAsync("getconf", ["CLK_TCK"]);
+    const parsed = Number.parseInt(stdout.trim(), 10);
+    cachedClockTicksPerSecond = Number.isInteger(parsed) && parsed > 0 ? parsed : 100;
+  } catch {
+    cachedClockTicksPerSecond = 100;
+  }
+  return cachedClockTicksPerSecond;
+}
+
+async function readSystemBootEpochMs(): Promise<number | null> {
+  try {
+    const content = await fs.readFile("/proc/stat", "utf8");
+    const line = content.split("\n").find((entry) => entry.startsWith("btime "));
+    if (!line) return null;
+    const seconds = Number.parseInt(line.slice("btime ".length).trim(), 10);
+    return Number.isInteger(seconds) && seconds > 0 ? seconds * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Kernel start time of `pid` as epoch milliseconds, derived from /proc/<pid>/stat
+ * field 22 (starttime, in clock ticks since boot) plus the system boot time.
+ * Returns null when it cannot be determined (non-Linux, dead/unreadable pid, or a
+ * missing btime) so callers can fail closed rather than trust an unverified pid.
+ */
+export async function readProcessStartEpochMs(pid: number): Promise<number | null> {
+  if (process.platform !== "linux") return null;
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  let stat: string;
+  try {
+    stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
+  } catch {
+    return null;
+  }
+  // comm (field 2) is parenthesized and may itself contain spaces and parens; the
+  // numeric fields start after the final ')'. starttime is the 22nd overall field,
+  // i.e. index 19 once counting from the field after comm (state).
+  const commEnd = stat.lastIndexOf(")");
+  if (commEnd < 0) return null;
+  const fields = stat.slice(commEnd + 1).trim().split(/\s+/);
+  const startTicks = Number.parseInt(fields[19] ?? "", 10);
+  if (!Number.isInteger(startTicks) || startTicks < 0) return null;
+  const [ticksPerSecond, bootEpochMs] = await Promise.all([
+    getClockTicksPerSecond(),
+    readSystemBootEpochMs(),
+  ]);
+  if (bootEpochMs == null) return null;
+  return bootEpochMs + (startTicks / ticksPerSecond) * 1000;
+}
+
+export type ProcessIdentityVerdict = "verified" | "mismatch" | "unsupported";
+
+/**
+ * Confirms that `pid` is still the process that was spawned at `expectedStartEpochMs`
+ * (the wall-clock recorded in heartbeat_runs.process_started_at). Used before killing
+ * a process group reconstructed from persisted metadata with no live in-memory handle,
+ * where the OS may have recycled the pid/pgid onto an unrelated process after a restart.
+ *
+ * Returns "unsupported" where /proc start times are unavailable (non-Linux) so the
+ * caller can preserve prior behavior there; on Linux any inability to positively match
+ * (dead/unreadable pid, missing expected time, start-time drift beyond tolerance) is a
+ * "mismatch" and the caller must skip the kill.
+ */
+export async function verifyProcessStartIdentity(
+  pid: number,
+  expectedStartEpochMs: number | null | undefined,
+): Promise<ProcessIdentityVerdict> {
+  if (process.platform !== "linux") return "unsupported";
+  if (typeof expectedStartEpochMs !== "number" || !Number.isFinite(expectedStartEpochMs)) {
+    return "mismatch";
+  }
+  const actual = await readProcessStartEpochMs(pid);
+  if (actual == null) return "mismatch";
+  return Math.abs(actual - expectedStartEpochMs) <= PROCESS_IDENTITY_START_TOLERANCE_MS
+    ? "verified"
+    : "mismatch";
+}
+
 async function isLikelyMatchingCommand(record: LocalServiceRegistryRecord) {
   if (process.platform === "win32") return true;
   try {

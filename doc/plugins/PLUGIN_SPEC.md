@@ -633,6 +633,124 @@ The host provides:
 
 The worker executes the tool and returns a typed result (string content, structured data, or error).
 
+### 13.11 `artifacts.fetch` (worker → host)
+
+A worker→host RPC available only from inside a tool handler via
+`runCtx.artifacts.fetch(attachmentId)`. Returns attachment bytes on behalf of
+the **dispatching agent** (the agent identified by `runCtx`), not the plugin
+worker's own tenant.
+
+Wire payload: `{ attachmentId: string, runId: string }`. The worker is never
+trusted to assert agent or company identity — the host derives both from a
+server-validated `(pluginDbId, runId)` registry entry populated when the
+`executeTool` dispatch was about to call the worker.
+
+Success result: `{ filename, contentType, byteSize, contentBase64 }`. The SDK
+decodes the base64 payload into a `Uint8Array` before returning to the tool
+handler.
+
+Authorization semantics:
+
+- The dispatching agent's `companyId` must equal the attachment's `companyId`.
+  (Agents are single-company-scoped per the actor model.)
+- Existence and access denials are collapsed to a single `not_found` shape so
+  a worker cannot probe which IDs exist in other tenants.
+
+Rate limits enforced server-side:
+
+- 60 fetches / minute per dispatching agent (global ceiling)
+- 30 fetches / minute per (dispatching agent, attachment company) sub-bucket
+
+Every call — success or denial — emits an `artifact.fetched` audit log entry
+in the dispatching agent's tenant carrying: outcome, denied reason (if any),
+dispatchingAgentId, dispatchingCompanyId, attachmentCompanyId, attachmentId,
+plugin identity, and (on success) the byte size. Bytes themselves are never
+written to logs.
+
+Capability: **none** — tool dispatch implies attachment-read authority, and
+the host's per-call authorization is what governs access.
+
+Typed errors surfaced to the worker:
+
+| code                  | meaning                                                                                  |
+| --------------------- | ---------------------------------------------------------------------------------------- |
+| `runcontext_invalid`  | No active dispatch registered for this `(pluginDbId, runId)` — likely worker forgery     |
+| `forbidden`           | Reserved — authorization failures collapse to `not_found`                                |
+| `not_found`           | Attachment missing OR dispatching agent has no access (collapsed to deny enumeration)    |
+| `rate_limited`        | Either ceiling tripped                                                                   |
+| `too_large`           | Attachment exceeds the host's per-call payload cap (default 10 MiB)                      |
+
+See the design notes above for the threat model and seven-point security checklist.
+
+### 13.12 `artifacts.create` (worker → host)
+
+The inverse of `artifacts.fetch`: a worker→host RPC that stores inbound bytes as
+a real Paperclip attachment so a plugin can relay external content (e.g. an
+inbound Telegram photo/voice note) onto a company inbox issue. Called from a
+tool handler — or from a service/background worker on the relay path — via
+`runCtx.artifacts.create({ companyId, filename, mimeType, bytes })`.
+
+Wire payload: `{ companyId, filename, mimeType, contentBase64, runId }`. The SDK
+base64-encodes the caller's `Uint8Array` and refuses to send an empty body.
+
+Success result: `{ attachmentId }` — the id of the newly created standalone
+**asset**. The asset is not yet bound to any issue; surface it on a comment by
+passing it to `issues.createComment({ ..., attachmentIds: [attachmentId] })`,
+which mints the `issue_attachments` row that `artifacts.fetch` reads.
+
+Capability: **`issue.attachments.create`** — default-deny, must be declared in
+the plugin manifest. (Unlike `artifacts.fetch`, which is gated only by per-call
+authorization, the write path is an explicit capability.)
+
+Authorization semantics:
+
+- From a **dispatch** or **background** context the registered `companyId` must
+  equal the `companyId` in params — a worker cannot write into a foreign tenant.
+  Mismatches are rejected with `forbidden` (the caller names its own company, so
+  there is no existence-enumeration concern that would warrant collapsing to
+  `not_found`).
+- From a **service** context (worker-lifetime, company-less — the inbound relay
+  path) the host trusts the params `companyId`, because there is no dispatching
+  agent to key off. Storage abuse from this path is bounded by the write rate
+  limit below.
+
+Validation gates (in order): run-context lookup → company authz → write rate
+limit → MIME allowlist → size ceiling → idempotency dedup → store.
+
+- **MIME allowlist** — a single named constant
+  `PLUGIN_ARTIFACT_ALLOWED_MIME_TYPES` (images, common documents, and
+  audio/voice types). Disallowed types are rejected with `forbidden`.
+- **Size ceiling** — `min(company.attachmentMaxBytes, 10 MiB)`, mirroring the
+  human attachment-upload route exactly (`normalizeIssueAttachmentMaxBytes`).
+  Oversize or empty bodies are rejected with `too_large`.
+- **Idempotency** — a retried create with identical bytes for the same company
+  converges onto the existing **unattached** asset (matched on the host-computed
+  `sha256`) instead of storing duplicate bytes. Already-attached assets are
+  excluded from reuse because `issue_attachments.asset_id` is UNIQUE.
+- **Storage** — reuses the existing internal storage path (`storage.putFile`,
+  namespace `plugin-artifacts`); no second storage backend is introduced.
+
+Rate limit enforced server-side:
+
+- 30 creates / minute per company (bounds storage-DoS on the relay path where
+  there is no dispatching agent to key off).
+
+Every call — success or denial — emits an `artifact.created` audit log entry in
+the target tenant carrying: outcome, denied reason (if any), companyId, context
+kind, dispatchingAgentId (if any), plugin identity, mimeType, byteSize, and a
+`deduped` flag. Bytes themselves are never written to logs.
+
+Typed errors surfaced to the worker:
+
+| code                  | meaning                                                                                  |
+| --------------------- | ---------------------------------------------------------------------------------------- |
+| `runcontext_invalid`  | No active run-context registered for this `(pluginDbId, runId)`, or malformed params     |
+| `forbidden`           | Cross-tenant `companyId`, or a MIME type outside the allowlist                           |
+| `rate_limited`        | Per-company write ceiling tripped                                                        |
+| `too_large`           | Body empty, invalid base64, or larger than `min(company cap, 10 MiB)`                    |
+
+See the design notes above for the threat model and gate-by-gate rationale.
+
 ## 14. SDK Surface
 
 Plugins do not talk to the DB directly.
@@ -816,6 +934,7 @@ The host enforces capabilities in the SDK layer and refuses calls outside the gr
 - `telemetry.track`
 - `assets.read`
 - `assets.write`
+- `issue.attachments.create`
 - `database.namespace.migrate`
 - `database.namespace.write`
 - `goals.create`
@@ -985,6 +1104,71 @@ Rules:
 3. Signature verification happens in plugin code using secret refs resolved by the host.
 4. Every delivery is recorded.
 5. Webhook handling must be idempotent.
+6. The route is anonymous, so the host bounds it. Request bodies are capped at 1 MB (tighter than the 10 MB the rest of the API allows); a larger body is rejected by the body parser with `413` before the plugin sees it. The raw signed bytes are still preserved for signature verification.
+7. The host applies a sliding-window rate limit keyed primarily on `(pluginId, endpointKey)`, with a looser additive per-IP bucket. Over-limit deliveries get `429` with a `Retry-After` header and are **not** recorded or dispatched to the worker. A `429` is data loss, not a deferral: providers have finite retry budgets, and Telegram in particular drops updates once its retry window closes. Providers expected to exceed ~120 deliveries per minute to a single endpoint need the host limits raised, or an `auth` declaration (§18.1) so their traffic is billed to the larger verified budget.
+8. Both `pluginId` and `endpointKey` are public, so anyone can spend the anonymous budget for an endpoint. Because plugins are global — one row, one worker, every tenant — that starves real deliveries instance-wide. §18.1 is the mitigation.
+
+## 18.1 Credential-Tiered Rate Limiting
+
+A webhook may declare a shared token the provider sends on every delivery. The host recognises it and bills the delivery to a separate, larger budget. This is **not** authentication: a delivery that fails the check is never rejected, it just stays on the anonymous budget.
+
+Requires the `webhooks.verify` capability. Without it, a manifest carrying `auth` fails validation at install.
+
+```jsonc
+{
+  "capabilities": ["webhooks.receive", "webhooks.verify"],
+  "webhooks": [
+    {
+      "endpointKey": "telegram",
+      "displayName": "Telegram updates",
+      "auth": {
+        "type": "header-token",
+        "header": "X-Telegram-Bot-Api-Secret-Token",
+        "tokenDigestConfigKey": "webhookTokenDigest"
+      }
+    }
+  ]
+}
+```
+
+**Generate the token — do not choose one.** The host ships a generator that is the recipe below, so operators never hand-pick a token:
+
+```
+paperclipai plugin webhook-token <pluginId> <endpointKey>
+```
+
+It mints a 128-bit token (`crypto.randomBytes(16)` → base62), mints the salt (`crypto.randomBytes(12)` → hex — the operator does not get to pick it), stores `{ salt, digest }` into instance config under the endpoint's `tokenDigestConfigKey`, and prints the token **once** for you to paste into the provider. The host never persists the token; only the digest is stored. Re-running rotates the pair.
+
+The stored value looks like this:
+
+```jsonc
+{
+  "webhookTokenDigest": {
+    "salt": "e3b0c44298fc1c14",
+    "digest": "9f2c…"   // 64 lowercase hex chars
+  }
+}
+```
+
+**Construction.** `digest = HMAC-SHA256(key = salt, message = token)`, lowercase hex. HMAC rather than `sha256(salt || token)` for two reasons. First, bare concatenation is not a canonical encoding: `salt="ab", token="cd"` and `salt="abc", token="d"` hash identically, so the salt/token boundary is not pinned and two different endpoint configurations can collide. HMAC keys the salt instead of concatenating it, which removes the ambiguity. Second, HMAC is the standard, reviewed keyed-hash construction, so no one has to re-derive which of the prefix-secret and suffix-secret SHA-256 pitfalls apply to this particular byte order — a question that is easy to get backwards. (Length extension is *not* one of them: it breaks `H(secret || message)` where the secret is the *prefix*, whereas here the salt is the public prefix and the token is the secret suffix, so it does not apply. Recovering the token from the digest still reduces to a SHA-256 preimage with a known key.) Note the orientation is inverted from conventional HMAC — the *public* salt is the key and the *secret* token is the message — which is deliberate and safe here. Derive the value with `computeWebhookTokenDigest(salt, token)` from the host rather than reimplementing it.
+
+**Requirements.**
+
+- The token is a credential and must be stored as one on the provider side; it never enters plugin config or the manifest.
+- Minimum **128 bits of entropy** in the token, enforced at **generation**: `paperclipai plugin webhook-token` mints it, so the floor is a floor and not a wish. The host cannot measure a token's entropy from a digest, so it cannot enforce the floor at verification time — an operator-chosen `paperclip-webhook-2026` (~40 bits) passes a digest check but falls offline in a fraction of a second. Bringing your own token is an explicit escape hatch (`--token`) and is refused when it is too short to possibly carry 128 bits (a length ceiling — a necessary, not sufficient, check; prefer the generator). The digest is held in **instance** config — `GET /api/plugins/:pluginId/config` is board/org-gated, so it is readable by board/org principals, the plugin's own worker, and anyone with direct DB or backup access, but **not** by anonymous callers or other tenants' agents. Any member of that reader set can brute-force a low-entropy token offline regardless of the salt (the salt only defeats precomputed tables and cross-endpoint digest reuse), and a backup outlives the credential — so the entropy floor holds even though the config is not world-readable.
+- The digest is read from **instance** config only; it is **not** merged with per-company `configOverrides` (unlike what a worker sees via `ctx.config.get()`). A tenant who can write company config-overrides therefore cannot plant a digest and promote its own traffic into the verified tier.
+- Salt: at least 16 characters, unique per endpoint. It is not secret; it exists so the stored digest resists precomputed tables and so two plugins sharing a token do not share a digest.
+- Rotation: re-run `paperclipai plugin webhook-token` (it writes a fresh `{ salt, digest }`), then update the provider. During the gap, deliveries fall back to the anonymous budget — they are not lost.
+
+**Semantics.**
+
+- Header matched case-insensitively. A header repeated in one request is treated as absent (ambiguous, and accepting any copy would let a caller staple a guess onto a legitimate request).
+- Comparison is constant-time over fixed-width digests, and happens **before** the delivery row is written and before the worker RPC.
+- Match → verified budget (600/min per endpoint, and exempt from the per-IP bucket, which an anonymous flood behind a shared tunnel IP would otherwise use to starve it). No match, no header, or no `auth` → the anonymous budget, byte-for-byte as before.
+- A missing or malformed digest config is a misconfiguration, not an outage: the host logs once per endpoint and falls through to the anonymous budget. Hard-rejecting would turn one stale digest into total ingestion failure for every tenant sharing the plugin.
+- The token, the presented header value, and the digest are never logged. The `429` warning carries only the tier (`verified` / `anonymous`).
+
+This bounds starvation; it does not authenticate the caller. Plugins that must reject forged deliveries still verify the provider's signature in worker code against a secret ref (§18 rule 3) — the host cannot do that here, because this route is anonymous and pre-company while secret refs resolve through a company binding.
 
 ## 19. UI Extension Model
 
@@ -1433,6 +1617,43 @@ Rules:
    - activity logs
    - webhook delivery rows
    - error messages
+
+### 22.1 Secret-ref binding model
+
+A secret ref in config is only a pointer. Before a worker can resolve it,
+the host must reconcile a `company_secret_bindings` row for the ref —
+resolution is authorized at call time against the **dispatching company's**
+bindings, so a bare ref in config never grants cross-company access.
+
+Both config-write paths reconcile bindings automatically. Operators do not
+manage `company_secret_bindings` directly:
+
+- **Instance-wide config** — `POST /api/plugins/:pluginId/config`. Each
+  secret ref binds to the secret's **own** company (single-tenant ownership
+  is derived from the secret itself). Repointing the global ref from one
+  tenant's secret to another's leaves the prior tenant's binding in place;
+  the per-company route below is the authoritative path for revoking a
+  specific tenant.
+- **Per-company override** — `PUT /api/plugins/:pluginId/companies/:companyId/config-overrides`.
+  Each ref must belong to `:companyId`; a cross-company ref is rejected with
+  `422` rather than silently skipped.
+
+A secret ref that points at a missing secret (orphan), or — on the
+per-company path — at another company's secret, is persisted to config but
+produces **no** binding. The host logs a `warn` at config time
+(`service: "plugin-secret-bindings"`, `unboundConfigPaths: [...]`) naming the
+affected config paths, because `ctx.secrets.resolve()` will fail closed as
+`secret not found` for those paths at call time. Treat that log line as the
+config-time signal that a ref was set through a path that cannot resolve.
+
+**Happy path (instance-wide):**
+
+1. Create the secret for the owning company (Company Settings → Secrets).
+2. Save the plugin's instance config with the secret ref at its
+   `"format": "secret-ref"` field via `POST /api/plugins/:pluginId/config`.
+3. The host writes a `company_secret_bindings` row owned by the secret's
+   company. `ctx.secrets.resolve(ref)` now succeeds for that company's
+   dispatched work.
 
 ## 23. Auditing
 

@@ -4,6 +4,8 @@ import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
+  UNSUCCESSFUL_HEARTBEAT_RUN_STATUSES,
+  isSuccessfulHeartbeatRunStatus,
   type IssueGraphLivenessAutoRecoveryPreview,
   type IssueGraphLivenessAutoRecoveryPreviewItem,
 } from "@paperclipai/shared";
@@ -28,7 +30,7 @@ import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
-import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local-service-supervisor.js";
+import { isPidAlive, isProcessGroupAlive, terminateLocalService, verifyProcessStartIdentity } from "../local-service-supervisor.js";
 import { redactCurrentUserText } from "../../log-redaction.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { logActivity } from "../activity-log.js";
@@ -50,6 +52,7 @@ import {
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
   buildSuccessfulRunHandoffExhaustedNotice,
+  isStandbyWakeTargetIssue,
   noticeMetadataReferencesRecoveryAction,
   type SuccessfulRunHandoffNotice,
 } from "./successful-run-handoff.js";
@@ -70,10 +73,42 @@ import {
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
-const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
+const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = UNSUCCESSFUL_HEARTBEAT_RUN_STATUSES;
 export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
+
+// Watchdog auto-teardown backstop. When a run holds an issue's
+// execution lock but has emitted no output past the teardown threshold, and the
+// feature is explicitly enabled, terminate its process group, mark the run
+// failed, and release the execution lock so the issue becomes re-pickable.
+//
+// Default OFF: auto-teardown is a privileged action (it kills a live process and
+// releases a JWT-bound execution lock), so it stays opt-in via
+// WATCHDOG_AUTO_TEARDOWN_ENABLED until an operator turns it on per-deployment.
+//
+// Default threshold 45m (NOT the 4h critical threshold): the 6h23m incident that
+// motivated this backstop showed 4h is far too slow to contain a wedged run. 45m
+// sits in the 30-60m band — long enough that a genuinely-busy-but-quiet run
+// (e.g. a long tool call) is unlikely to be torn down, short enough that a truly
+// wedged lock is released within one extra scan cycle after detection. The value
+// is tunable via WATCHDOG_AUTO_TEARDOWN_SILENCE_MS, floored at 30m so a
+// misconfiguration cannot tear down runs that are only briefly quiet. A live
+// snooze/continue watchdog decision always suppresses teardown.
+export const WATCHDOG_AUTO_TEARDOWN_DEFAULT_SILENCE_MS = 45 * 60 * 1000;
+export const WATCHDOG_AUTO_TEARDOWN_MIN_SILENCE_MS = 30 * 60 * 1000;
+
+export function readWatchdogAutoTeardownConfig() {
+  const enabled = /^(1|true|yes|on)$/i.test(
+    String(process.env.WATCHDOG_AUTO_TEARDOWN_ENABLED ?? "").trim(),
+  );
+  const raw = Number(process.env.WATCHDOG_AUTO_TEARDOWN_SILENCE_MS);
+  const thresholdMs =
+    Number.isFinite(raw) && raw > 0
+      ? Math.max(WATCHDOG_AUTO_TEARDOWN_MIN_SILENCE_MS, raw)
+      : WATCHDOG_AUTO_TEARDOWN_DEFAULT_SILENCE_MS;
+  return { enabled, thresholdMs };
+}
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
@@ -124,7 +159,7 @@ type LatestIssueRun = Pick<
 > & {
   resultJson?: unknown;
 } | null;
-type SuccessfulLatestIssueRun = NonNullable<LatestIssueRun> & { status: "succeeded" };
+type SuccessfulLatestIssueRun = NonNullable<LatestIssueRun> & { status: "succeeded" | "succeeded_dirty" };
 
 type StrandedRecoveryCause =
   | "stranded_assigned_issue"
@@ -410,11 +445,11 @@ function isUnsuccessfulTerminalIssueRun(latestRun: LatestIssueRun) {
 }
 
 function isSuccessfulInProgressContinuationRun(latestRun: LatestIssueRun): latestRun is SuccessfulLatestIssueRun {
-  return latestRun?.status === "succeeded";
+  return isSuccessfulHeartbeatRunStatus(latestRun?.status);
 }
 
 function isProductiveContinuationRun(latestRun: LatestIssueRun) {
-  return latestRun?.status === "succeeded" &&
+  return isSuccessfulInProgressContinuationRun(latestRun) &&
     (latestRun.livenessState === "advanced" ||
       latestRun.livenessState === "completed" ||
       latestRun.livenessState === "blocked" ||
@@ -560,6 +595,35 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => rows[0] ?? null);
   }
 
+  async function collectIssueAndDescendantIds(
+    companyId: string,
+    rootIssueId: string,
+    maxDepth = 50,
+  ): Promise<string[]> {
+    const visited = new Set<string>([rootIssueId]);
+    let frontier: string[] = [rootIssueId];
+    for (let depth = 0; depth < maxDepth && frontier.length > 0; depth += 1) {
+      const children = await db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, companyId),
+            inArray(issues.parentId, frontier),
+          ),
+        );
+      const next: string[] = [];
+      for (const child of children) {
+        if (!visited.has(child.id)) {
+          visited.add(child.id);
+          next.push(child.id);
+        }
+      }
+      frontier = next;
+    }
+    return Array.from(visited);
+  }
+
   async function getLatestIssueRunForAgent(
     companyId: string,
     issueId: string,
@@ -638,6 +702,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   async function hasActiveExecutionPath(companyId: string, issueId: string, agentId?: string | null) {
+    const issueIds = await collectIssueAndDescendantIds(companyId, issueId);
     const [run, deferredWake] = await Promise.all([
       db
         .select({ id: heartbeatRuns.id })
@@ -646,7 +711,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           and(
             eq(heartbeatRuns.companyId, companyId),
             inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
-            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+            inArray(sql<string>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`, issueIds),
             agentId ? eq(heartbeatRuns.agentId, agentId) : sql`true`,
           ),
         )
@@ -659,7 +724,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           and(
             eq(agentWakeupRequests.companyId, companyId),
             eq(agentWakeupRequests.status, "deferred_issue_execution"),
-            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+            inArray(sql<string>`${agentWakeupRequests.payload} ->> 'issueId'`, issueIds),
             agentId ? eq(agentWakeupRequests.agentId, agentId) : sql`true`,
           ),
         )
@@ -1218,6 +1283,27 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         outcome: "no_process_metadata",
         adapterType: input.runningAgent.adapterType,
       };
+    }
+
+    // With no live in-memory handle the pid/pgid come from persisted metadata, which the
+    // OS may have recycled onto an unrelated process after a server restart. Verify the
+    // survivor is the same process we spawned (kernel start time vs. the spawn timestamp)
+    // before signalling; skip on any inability to positively confirm identity.
+    if (!running) {
+      const verdict = await verifyProcessStartIdentity(
+        typeof pid === "number" ? pid : (processGroupId as number),
+        input.run.processStartedAt?.getTime(),
+      );
+      if (verdict === "mismatch") {
+        runningProcesses.delete(input.run.id);
+        return {
+          attempted: false,
+          outcome: "skipped_identity_unverified",
+          adapterType: input.runningAgent.adapterType,
+          pid,
+          processGroupId,
+        };
+      }
     }
 
     const wasAlive =
@@ -1898,9 +1984,269 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return { kind: "created" as const, evaluationIssueId: evaluation.id };
   }
 
+  // Privileged watchdog teardown. Terminates a wedged run's process
+  // group, marks the run failed, and releases the source issue's execution lock
+  // so the issue becomes re-pickable. Idempotent: the run-status transition is
+  // guarded by `WHERE status = 'running'`, so a second call (concurrent scan,
+  // retry, or a manual `terminate` decision racing the auto path) is a no-op.
+  async function performWatchdogTeardown(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    now: Date;
+    trigger: "watchdog_auto" | "manual";
+    reason?: string | null;
+    evaluationIssueId?: string | null;
+    attribution?: {
+      actorType: "system" | "agent" | "user";
+      actorId: string;
+      agentId?: string | null;
+      createdByAgentId?: string | null;
+      createdByUserId?: string | null;
+      createdByRunId?: string | null;
+    };
+  }): Promise<
+    | {
+        kind: "torn_down";
+        runId: string;
+        sourceIssueId: string | null;
+        lockCleared: boolean;
+        decisionId: string;
+        evaluationIssueId: string | null;
+      }
+    | { kind: "noop"; reason: string; runStatus?: string }
+    | { kind: "skipped"; reason: string }
+  > {
+    const attribution = input.attribution ?? { actorType: "system" as const, actorId: "system" };
+
+    // Re-read the run fresh: the candidate row may be stale by the time we act.
+    const [freshRun] = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, input.run.id))
+      .limit(1);
+    if (!freshRun) return { kind: "noop", reason: "run_missing" };
+    if (freshRun.status !== "running") {
+      return { kind: "noop", reason: "run_not_running", runStatus: freshRun.status };
+    }
+
+    const runningAgent = await getAgent(freshRun.agentId);
+    if (!runningAgent || runningAgent.companyId !== freshRun.companyId) {
+      return { kind: "skipped", reason: "running_agent_unresolved" };
+    }
+
+    const sourceIssue = await resolveStaleRunSourceIssue(freshRun);
+    const existingEvaluation = await findOpenStaleRunEvaluation(freshRun.companyId, freshRun.id);
+    const silenceStartedAt = silenceStartedAtForRun(freshRun);
+    const silenceAgeMs = silenceAgeMsForRun(freshRun, input.now);
+    const teardownReason =
+      input.reason ??
+      (input.trigger === "watchdog_auto"
+        ? `Watchdog auto-teardown: run emitted no output for ${formatDuration(silenceAgeMs)} while holding the issue execution lock.`
+        : "Watchdog teardown requested.");
+
+    // Terminate the process group first (harmless if already dead). Racing scans
+    // may both send a signal; the guarded status transition below elects one
+    // finalizer, so the observable teardown fires exactly once.
+    const cleanup = await cleanupSourceResolvedRunProcess({ run: freshRun, runningAgent });
+
+    const resultJson = {
+      ...parseObject(freshRun.resultJson),
+      watchdogAutoTeardown: {
+        trigger: input.trigger,
+        reason: teardownReason,
+        actorType: attribution.actorType,
+        actorId: attribution.actorId,
+        sourceIssueId: sourceIssue?.id ?? null,
+        sourceIssueIdentifier: sourceIssue?.identifier ?? null,
+        evaluationIssueId: input.evaluationIssueId ?? existingEvaluation?.id ?? null,
+        silenceStartedAt: silenceStartedAt?.toISOString() ?? null,
+        silenceAgeMs,
+        cleanup,
+        at: input.now.toISOString(),
+      },
+    };
+
+    const finalized = await db.transaction(async (tx) => {
+      const [updatedRun] = await tx
+        .update(heartbeatRuns)
+        .set({
+          status: "failed",
+          finishedAt: input.now,
+          error: teardownReason,
+          errorCode: "watchdog_auto_teardown",
+          resultJson,
+          updatedAt: input.now,
+        })
+        .where(
+          and(
+            eq(heartbeatRuns.id, freshRun.id),
+            eq(heartbeatRuns.companyId, freshRun.companyId),
+            eq(heartbeatRuns.status, "running"),
+          ),
+        )
+        .returning();
+      if (!updatedRun) return null;
+
+      if (freshRun.wakeupRequestId) {
+        await tx
+          .update(agentWakeupRequests)
+          .set({ status: "cancelled", finishedAt: input.now, error: teardownReason, updatedAt: input.now })
+          .where(
+            and(
+              eq(agentWakeupRequests.id, freshRun.wakeupRequestId),
+              eq(agentWakeupRequests.companyId, freshRun.companyId),
+            ),
+          );
+      }
+
+      let lockCleared = false;
+      if (sourceIssue) {
+        const [cleared] = await tx
+          .update(issues)
+          .set({
+            executionRunId: null,
+            executionAgentNameKey: null,
+            executionLockedAt: null,
+            checkoutRunId: sql`case when ${issues.checkoutRunId} = ${freshRun.id} then null else ${issues.checkoutRunId} end`,
+            updatedAt: input.now,
+          })
+          .where(
+            and(
+              eq(issues.id, sourceIssue.id),
+              eq(issues.companyId, freshRun.companyId),
+              eq(issues.executionRunId, freshRun.id),
+            ),
+          )
+          .returning({ id: issues.id });
+        lockCleared = Boolean(cleared);
+      }
+
+      const [decision] = await tx
+        .insert(heartbeatRunWatchdogDecisions)
+        .values({
+          companyId: freshRun.companyId,
+          runId: freshRun.id,
+          evaluationIssueId: input.evaluationIssueId ?? existingEvaluation?.id ?? null,
+          decision: "terminate",
+          snoozedUntil: null,
+          reason: teardownReason,
+          createdByAgentId: attribution.createdByAgentId ?? null,
+          createdByUserId: attribution.createdByUserId ?? null,
+          createdByRunId: attribution.createdByRunId ?? null,
+        })
+        .returning();
+
+      return { updatedRun, decision, lockCleared };
+    });
+
+    if (!finalized) {
+      // Lost the status-transition race — another finalizer already tore this
+      // run down. The signal we sent above is harmless; report an idempotent noop.
+      return { kind: "noop", reason: "run_no_longer_running" };
+    }
+
+    await appendRecoveryRunEvent(finalized.updatedRun, {
+      level: cleanup.outcome === "failed" ? "warn" : "info",
+      message: "Watchdog auto-teardown terminated stale active run and released execution lock",
+      payload: resultJson.watchdogAutoTeardown,
+    });
+
+    await logActivity(db, {
+      companyId: freshRun.companyId,
+      actorType: attribution.actorType,
+      actorId: attribution.actorId,
+      agentId: attribution.agentId ?? freshRun.agentId,
+      runId: freshRun.id,
+      action: "heartbeat.watchdog_torn_down",
+      entityType: "heartbeat_run",
+      entityId: freshRun.id,
+      details: {
+        source:
+          input.trigger === "watchdog_auto"
+            ? "recovery.scan_silent_active_runs"
+            : "recovery.record_watchdog_decision",
+        trigger: input.trigger,
+        reason: teardownReason,
+        sourceIssueId: sourceIssue?.id ?? null,
+        sourceIssueIdentifier: sourceIssue?.identifier ?? null,
+        evaluationIssueId: input.evaluationIssueId ?? existingEvaluation?.id ?? null,
+        watchdogDecisionId: finalized.decision.id,
+        lockCleared: finalized.lockCleared,
+        silenceAgeMs,
+        cleanup,
+      },
+    });
+
+    // Idempotent by construction: only the winner of the status transition
+    // reaches here, so the source-issue comment posts exactly once per teardown.
+    if (sourceIssue && !isTerminalIssueStatus(sourceIssue.status)) {
+      await issuesSvc.addComment(
+        sourceIssue.id,
+        [
+          "Execution watchdog auto-teardown.",
+          "",
+          `- Run \`${freshRun.id}\` was terminated after ${formatDuration(silenceAgeMs)} of output silence while holding this issue's execution lock.`,
+          `- Process cleanup outcome: \`${cleanup.outcome}\`.`,
+          finalized.lockCleared
+            ? "- Execution lock released; this issue is re-pickable and should be re-queued automatically."
+            : "- Execution lock was already released; no lock change was needed.",
+          "- If this run was doing real work, retry the task; the underlying process was unresponsive.",
+        ].join("\n"),
+        { runId: freshRun.id },
+      );
+    }
+
+    if (existingEvaluation && !isTerminalIssueStatus(existingEvaluation.status)) {
+      await issuesSvc.update(existingEvaluation.id, { status: "done" });
+      await issuesSvc.addComment(
+        existingEvaluation.id,
+        [
+          "Resolved by watchdog auto-teardown.",
+          "",
+          `- Run: \`${freshRun.id}\``,
+          `- Silent for: ${formatDuration(silenceAgeMs)}`,
+          `- Outcome: process terminated and execution lock released.`,
+        ].join("\n"),
+        { runId: freshRun.id },
+      );
+    }
+
+    const activeRecoveryAction = sourceIssue
+      ? await recoveryActionsSvc.getActiveForIssue(freshRun.companyId, sourceIssue.id)
+      : null;
+    if (activeRecoveryAction?.kind === "active_run_watchdog") {
+      await recoveryActionsSvc.resolveActiveForIssue({
+        companyId: freshRun.companyId,
+        sourceIssueId: sourceIssue!.id,
+        actionId: activeRecoveryAction.id,
+        status: "resolved",
+        outcome: "restored",
+        resolutionNote: "Watchdog auto-teardown terminated the wedged run and released the execution lock.",
+      });
+    }
+
+    await finalizeAgentAfterSourceResolvedRun(finalized.updatedRun, "cancelled");
+
+    return {
+      kind: "torn_down",
+      runId: freshRun.id,
+      sourceIssueId: sourceIssue?.id ?? null,
+      lockCleared: finalized.lockCleared,
+      decisionId: finalized.decision.id,
+      evaluationIssueId: input.evaluationIssueId ?? existingEvaluation?.id ?? null,
+    };
+  }
+
   async function scanSilentActiveRuns(opts?: { now?: Date; companyId?: string }) {
     const now = opts?.now ?? new Date();
-    const suspicionBefore = new Date(now.getTime() - ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS);
+    const teardownConfig = readWatchdogAutoTeardownConfig();
+    // When auto-teardown is enabled and its threshold is below the detection
+    // suspicion threshold, widen the candidate window so teardown can fire at its
+    // configured silence age. When disabled, keep the detection floor unchanged so
+    // review-issue creation behaviour is untouched.
+    const scanFloorMs = teardownConfig.enabled
+      ? Math.min(ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS, teardownConfig.thresholdMs)
+      : ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS;
+    const scanBefore = new Date(now.getTime() - scanFloorMs);
     const candidates = await db
       .select()
       .from(heartbeatRuns)
@@ -1908,7 +2254,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         and(
           opts?.companyId ? eq(heartbeatRuns.companyId, opts.companyId) : undefined,
           eq(heartbeatRuns.status, "running"),
-          sql`coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.processStartedAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) <= ${suspicionBefore.toISOString()}::timestamptz`,
+          sql`coalesce(${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.processStartedAt}, ${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) <= ${scanBefore.toISOString()}::timestamptz`,
         ),
       )
       .orderBy(asc(heartbeatRuns.createdAt))
@@ -1921,15 +2267,42 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       escalated: 0,
       folded: 0,
       snoozed: 0,
+      tornDown: 0,
       skipped: 0,
       evaluationIssueIds: [] as string[],
     };
 
     for (const run of candidates) {
+      // A live snooze/continue decision suppresses BOTH auto-teardown and
+      // detection — never tear down a run a reviewer explicitly asked to keep.
       if (await latestActiveOutputQuietUntilDecision(run.companyId, run.id, now)) {
         result.snoozed += 1;
         continue;
       }
+
+      const silenceAgeMs = silenceAgeMsForRun(run, now) ?? 0;
+
+      if (teardownConfig.enabled && silenceAgeMs >= teardownConfig.thresholdMs) {
+        const teardown = await performWatchdogTeardown({ run, now, trigger: "watchdog_auto" });
+        if (teardown.kind === "torn_down") {
+          result.tornDown += 1;
+          if (teardown.evaluationIssueId) result.evaluationIssueIds.push(teardown.evaluationIssueId);
+          continue;
+        }
+        if (teardown.kind === "noop") {
+          result.skipped += 1;
+          continue;
+        }
+        // teardown.kind === "skipped" (e.g. non-local adapter, unresolved agent):
+        // fall through to the detection path so the run is still surfaced.
+      }
+
+      // Below the detection floor and not torn down → nothing else to do this cycle.
+      if (silenceAgeMs < ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS) {
+        result.skipped += 1;
+        continue;
+      }
+
       const outcome = await createOrUpdateStaleRunEvaluation({ run, now });
       if (outcome.kind === "created") result.created += 1;
       else if (outcome.kind === "existing") result.existing += 1;
@@ -1947,7 +2320,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   async function recordWatchdogDecision(input: {
     runId: string;
     actor: WatchdogDecisionActor;
-    decision: "snooze" | "continue" | "dismissed_false_positive";
+    decision: "snooze" | "continue" | "dismissed_false_positive" | "terminate";
     evaluationIssueId?: string | null;
     reason?: string | null;
     snoozedUntil?: Date | null;
@@ -2031,6 +2404,87 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
 
     const decisionNow = input.now ?? new Date();
+
+    // A `terminate` decision is a privileged, authorized override of the wedged
+    // run: an operator (board) or the assigned recovery owner explicitly asks to
+    // kill the process and release the lock now, regardless of the auto-teardown
+    // feature flag or threshold. Delegate to the shared teardown path, which
+    // inserts the `terminate` decision row itself, then return that row.
+    if (input.decision === "terminate") {
+      const teardown = await performWatchdogTeardown({
+        run,
+        now: decisionNow,
+        trigger: "manual",
+        reason: input.reason ?? null,
+        evaluationIssueId: input.evaluationIssueId ?? null,
+        attribution: {
+          actorType: input.actor.type === "agent" ? "agent" : "user",
+          actorId:
+            input.actor.type === "agent"
+              ? input.actor.agentId ?? "agent"
+              : input.actor.type === "board"
+                ? input.actor.userId ?? "board"
+                : "unknown",
+          agentId: input.actor.type === "agent" ? input.actor.agentId ?? null : null,
+          createdByAgentId: input.actor.type === "agent" ? input.actor.agentId ?? null : null,
+          createdByUserId: input.actor.type === "board" ? input.actor.userId ?? null : null,
+          createdByRunId,
+        },
+      });
+      if (teardown.kind === "torn_down") {
+        const [decisionRow] = await db
+          .select()
+          .from(heartbeatRunWatchdogDecisions)
+          .where(eq(heartbeatRunWatchdogDecisions.id, teardown.decisionId))
+          .limit(1);
+        return decisionRow;
+      }
+      // Idempotent: the run already reached a terminal state (another teardown
+      // won the race, or it finished on its own). Record the authorized decision
+      // for the audit trail without re-terminating.
+      const [row] = await db
+        .insert(heartbeatRunWatchdogDecisions)
+        .values({
+          companyId: run.companyId,
+          runId: run.id,
+          evaluationIssueId: input.evaluationIssueId ?? null,
+          decision: "terminate",
+          snoozedUntil: null,
+          reason:
+            input.reason ??
+            `Terminate requested but run was already ${
+              "runStatus" in teardown && teardown.runStatus ? teardown.runStatus : "not running"
+            }; no teardown performed.`,
+          createdByAgentId: input.actor.type === "agent" ? input.actor.agentId ?? null : null,
+          createdByUserId: input.actor.type === "board" ? input.actor.userId ?? null : null,
+          createdByRunId,
+        })
+        .returning();
+      await logActivity(db, {
+        companyId: run.companyId,
+        actorType: input.actor.type === "agent" ? "agent" : "user",
+        actorId:
+          input.actor.type === "agent"
+            ? input.actor.agentId ?? "agent"
+            : input.actor.type === "board"
+              ? input.actor.userId ?? "board"
+              : "unknown",
+        agentId: input.actor.type === "agent" ? input.actor.agentId ?? null : null,
+        runId: run.id,
+        action: "heartbeat.watchdog_decision_recorded",
+        entityType: "heartbeat_run",
+        entityId: run.id,
+        details: {
+          source: "recovery.record_watchdog_decision",
+          decision: "terminate",
+          evaluationIssueId: input.evaluationIssueId ?? null,
+          teardownOutcome: teardown.kind,
+          teardownReason: teardown.reason,
+        },
+      });
+      return row;
+    }
+
     const effectiveSnoozedUntil = input.decision === "snooze"
       ? input.snoozedUntil ?? null
       : input.decision === "continue"
@@ -2844,6 +3298,48 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return updated;
   }
 
+  async function findPendingAssigneeBoardApproval(
+    companyId: string,
+    issueId: string,
+    assigneeAgentId: string,
+  ): Promise<{ approvalId: string } | null> {
+    const rows = await db
+      .select({ approvalId: approvals.id })
+      .from(issueApprovals)
+      .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+      .where(
+        and(
+          eq(issueApprovals.companyId, companyId),
+          eq(issueApprovals.issueId, issueId),
+          eq(approvals.requestedByAgentId, assigneeAgentId),
+          inArray(approvals.status, ["pending", "revision_requested"]),
+        ),
+      )
+      .limit(1);
+    return rows[0] ? { approvalId: rows[0].approvalId } : null;
+  }
+
+  async function findPendingAssigneeWakeInteraction(
+    companyId: string,
+    issueId: string,
+    assigneeAgentId: string,
+  ): Promise<{ interactionId: string; kind: string } | null> {
+    const rows = await db
+      .select({ id: issueThreadInteractions.id, kind: issueThreadInteractions.kind })
+      .from(issueThreadInteractions)
+      .where(
+        and(
+          eq(issueThreadInteractions.companyId, companyId),
+          eq(issueThreadInteractions.issueId, issueId),
+          eq(issueThreadInteractions.status, "pending"),
+          eq(issueThreadInteractions.continuationPolicy, "wake_assignee"),
+          eq(issueThreadInteractions.createdByAgentId, assigneeAgentId),
+        ),
+      )
+      .limit(1);
+    return rows[0] ? { interactionId: rows[0].id, kind: rows[0].kind } : null;
+  }
+
   async function reconcileStrandedAssignedIssues() {
     const candidates = await db
       .select()
@@ -2872,6 +3368,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       waitingOnReviewResolved: 0,
       recentProgressExempted: 0,
       skipped: 0,
+      skippedDueToPendingApproval: 0,
+      skippedDueToPendingWakeAssigneeInteraction: 0,
       issueIds: [] as string[],
     };
 
@@ -2910,9 +3408,104 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
 
-      if (await hasPendingWakeInteraction(issue.companyId, issue.id)) {
-        result.skipped += 1;
-        continue;
+      // An `in_progress` issue parked on a pending board approval
+      // (request_board_approval) or a wake_assignee interaction
+      // (ask_user_questions, request_confirmation, …) requested by the
+      // current assignee is not stranded — the assignee will resume when the
+      // CEO/board responds. Skip without escalating, without flipping status,
+      // and without enqueueing recovery wakes. This mirrors the
+      // `hasExplicitWaitingPath` logic already used by the `in_review` branch
+      // via `classifyIssueGraphLiveness`.
+      if (issue.status === "in_progress") {
+        // A standby wake target (a perpetually-open catch-all issue
+        // such as a plugin inbox) parked between externally-driven wakes is not
+        // stranded. Skip without escalating to `blocked` or enqueueing a
+        // source_scoped_recovery_action wake; it resumes when an external event
+        // posts a comment and wakes the assignee normally.
+        if (isStandbyWakeTargetIssue(issue)) {
+          await logActivity(db, {
+            companyId: issue.companyId,
+            actorType: "system",
+            actorId: "system",
+            agentId: null,
+            runId: null,
+            action: "issue.recovery_skipped",
+            entityType: "issue",
+            entityId: issue.id,
+            details: {
+              identifier: issue.identifier,
+              source: "recovery.reconcile_stranded_assigned_issue_skipped",
+              reason: "standby_wake_target",
+            },
+          });
+          result.skipped += 1;
+          continue;
+        }
+
+        const pendingApproval = await findPendingAssigneeBoardApproval(
+          issue.companyId,
+          issue.id,
+          agentId,
+        );
+        if (pendingApproval) {
+          await logActivity(db, {
+            companyId: issue.companyId,
+            actorType: "system",
+            actorId: "system",
+            agentId: null,
+            runId: null,
+            action: "issue.recovery_skipped",
+            entityType: "issue",
+            entityId: issue.id,
+            details: {
+              identifier: issue.identifier,
+              source: "recovery.reconcile_stranded_assigned_issue_skipped",
+              reason: "pending_board_approval",
+              approvalId: pendingApproval.approvalId,
+            },
+          });
+          result.skipped += 1;
+          result.skippedDueToPendingApproval += 1;
+          continue;
+        }
+
+        const pendingInteraction = await findPendingAssigneeWakeInteraction(
+          issue.companyId,
+          issue.id,
+          agentId,
+        );
+        if (pendingInteraction) {
+          await logActivity(db, {
+            companyId: issue.companyId,
+            actorType: "system",
+            actorId: "system",
+            agentId: null,
+            runId: null,
+            action: "issue.recovery_skipped",
+            entityType: "issue",
+            entityId: issue.id,
+            details: {
+              identifier: issue.identifier,
+              source: "recovery.reconcile_stranded_assigned_issue_skipped",
+              reason: "pending_wake_assignee_interaction",
+              interactionId: pendingInteraction.interactionId,
+              kind: pendingInteraction.kind,
+            },
+          });
+          result.skipped += 1;
+          result.skippedDueToPendingWakeAssigneeInteraction += 1;
+          continue;
+        }
+
+        // Catch-all (upstream v2026.618.0): any other pending wake interaction
+        // (continuationPolicy wake_assignee / wake_assignee_on_accept, including
+        // one requested by a non-assignee) also means the issue is legitimately
+        // waiting — skip without escalating. The assignee-scoped checks above add
+        // per-reason logging + counters for the common cases.
+        if (await hasPendingWakeInteraction(issue.companyId, issue.id)) {
+          result.skipped += 1;
+          continue;
+        }
       }
 
       if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) {
@@ -3060,7 +3653,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
-        if (latestRun.status === "succeeded") {
+        if (isSuccessfulHeartbeatRunStatus(latestRun.status)) {
           result.skipped += 1;
           continue;
         }

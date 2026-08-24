@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import type { AdapterExecutionContext, AdapterExecutionResult, AdapterModel } from "@paperclipai/adapter-utils";
 import type { RunProcessResult } from "@paperclipai/adapter-utils/server-utils";
 import {
   adapterExecutionTargetIsRemote,
@@ -49,12 +49,16 @@ import {
   describeClaudeFailure,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
+  isClaudeCleanCompletionResult,
   isClaudeMaxTurnsResult,
   isClaudeRefusalResult,
   isClaudeTransientUpstreamError,
   isClaudeUnknownSessionError,
   isClaudePoisonedPreviousMessageIdError,
   isClaudeImageProcessingError,
+  isClaudePreTurnRateLimitResult,
+  isClaudeUsageLimitResult,
+  isClaudeNoWorkResult,
 } from "./parse.js";
 import {
   materializeRemoteClaudeConfig,
@@ -65,10 +69,50 @@ import { claudeCommandSupportsEffortFlag } from "./cli-capabilities.js";
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
 import { isBedrockModelId } from "./models.js";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
+import { buildRuntimeContractFingerprint } from "./runtime-contract.js";
 import { buildClaudeExecutionPermissionArgs } from "./permissions.js";
-import { SANDBOX_INSTALL_COMMAND } from "../index.js";
+import { SANDBOX_INSTALL_COMMAND, models as ADAPTER_MODELS } from "../index.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
+
+// Models that must NEVER be used as an automatic fallback target, regardless of
+// per-agent config. The authoritative classification is the structured
+// `safeguardsLifted` flag on each registry entry (src/index.ts): adding a new
+// model forces an explicit safe/unsafe decision instead of defaulting to
+// allowed (fail-secure-on-omission). The name-based denylist and "mythos"
+// substring below are retained as defense in depth for ids that never reach a
+// registry entry (unknown / Bedrock-qualified) or a flag that was omitted.
+// SECURITY-CRITICAL.
+const SAFEGUARDS_LIFTED_FALLBACK_DENYLIST = new Set(["claude-mythos-5"]);
+
+export function isSafeguardsLiftedModel(
+  model: string,
+  registry: readonly AdapterModel[] = ADAPTER_MODELS,
+): boolean {
+  const id = model.trim().toLowerCase();
+  if (!id) return false;
+  // Primary: structured registry flag lives with the model definition.
+  const entry = registry.find((m) => m.id.toLowerCase() === id);
+  if (entry?.safeguardsLifted === true) return true;
+  // Defense in depth: legacy name-based denylist + "mythos" substring.
+  return SAFEGUARDS_LIFTED_FALLBACK_DENYLIST.has(id) || id.includes("mythos");
+}
+
+/**
+ * A fallback target is only allowed when it is a known adapter model AND is not
+ * a safeguards-lifted model. Unknown ids and safeguards-lifted ids are rejected
+ * so the refusal is surfaced as-is instead of silently retried on an untrusted
+ * model.
+ */
+export function isAllowedFallbackModel(
+  model: string,
+  registry: readonly AdapterModel[] = ADAPTER_MODELS,
+): boolean {
+  const id = model.trim();
+  if (!id) return false;
+  if (isSafeguardsLiftedModel(id, registry)) return false;
+  return registry.some((entry) => entry.id === id);
+}
 
 interface ClaudeExecutionInput {
   runId: string;
@@ -121,6 +165,36 @@ function buildLoginResult(input: {
 function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean {
   const raw = env[key];
   return typeof raw === "string" && raw.trim().length > 0;
+}
+
+// Claude Code leaves MCP tool calls unbounded by default (~28h), so a
+// non-returning tool (e.g. an external @playwright/mcp call) can hang a run
+// indefinitely and wedge its issue's execution lock. Apply safe per-tool-call
+// and startup ceilings unless an operator has set them explicitly.
+const DEFAULT_MCP_TOOL_TIMEOUT_MS = 300_000;
+const DEFAULT_MCP_STARTUP_TIMEOUT_MS = 30_000;
+
+function resolvePositiveIntEnv(raw: string | undefined, fallback: number): number {
+  if (typeof raw === "string" && raw.trim().length > 0) {
+    const parsed = Number.parseInt(raw.trim(), 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return fallback;
+}
+
+export function applyMcpTimeoutDefaults(env: Record<string, string>, processEnv: NodeJS.ProcessEnv): void {
+  const processHasValue = (key: string): boolean =>
+    typeof processEnv[key] === "string" && processEnv[key]!.trim().length > 0;
+  if (!hasNonEmptyEnvValue(env, "MCP_TOOL_TIMEOUT") && !processHasValue("MCP_TOOL_TIMEOUT")) {
+    env.MCP_TOOL_TIMEOUT = String(
+      resolvePositiveIntEnv(processEnv.PAPERCLIP_MCP_TOOL_TIMEOUT_MS, DEFAULT_MCP_TOOL_TIMEOUT_MS),
+    );
+  }
+  if (!hasNonEmptyEnvValue(env, "MCP_TIMEOUT") && !processHasValue("MCP_TIMEOUT")) {
+    env.MCP_TIMEOUT = String(
+      resolvePositiveIntEnv(processEnv.PAPERCLIP_MCP_STARTUP_TIMEOUT_MS, DEFAULT_MCP_STARTUP_TIMEOUT_MS),
+    );
+  }
 }
 
 function isBedrockAuth(env: Record<string, string>): boolean {
@@ -270,6 +344,7 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
   for (const [key, value] of Object.entries(shapedEnvConfig)) {
     if (typeof value === "string") env[key] = value;
   }
+  applyMcpTimeoutDefaults(env, process.env);
 
   if (!hasExplicitApiKey && authToken) {
     env.PAPERCLIP_API_KEY = authToken;
@@ -379,6 +454,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   );
   const model = asString(config.model, "");
+  const fallbackModel = asString(config.fallbackModel, "").trim();
   const effort = asString(config.effort, "");
   const chrome = asBoolean(config.chrome, false);
   const maxTurns = asNumber(config.maxTurnsPerRun, 0);
@@ -467,6 +543,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     instructionsContents: combinedInstructionsContents,
     onLog,
   });
+  // Fingerprint of host-side runtime-contract inputs (e.g. /live CONTRACT.md,
+  // macjob.py, the active MCP config). A change to any of them busts the pinned
+  // session on the next trigger even though the injected instructions are
+  // unchanged, so the prompt-bundle auto-bust alone would keep resuming stale
+  // precedent. Empty when unconfigured => no behavior change.
+  const runtimeContractFingerprintPaths = asStringArray(config.runtimeContractFingerprintPaths);
+  const runtimeContractFingerprint = await buildRuntimeContractFingerprint(runtimeContractFingerprintPaths);
   const useManagedRemoteClaudeConfig =
     executionTargetIsRemote &&
     adapterExecutionTargetUsesManagedHome(executionTarget) &&
@@ -620,13 +703,44 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const runtimeSessionCwd = asString(runtimeSessionParams.cwd, "");
   const runtimeRemoteExecution = parseObject(runtimeSessionParams.remoteExecution);
   const runtimePromptBundleKey = asString(runtimeSessionParams.promptBundleKey, "");
+  const runtimeRuntimeContractFingerprint = asString(runtimeSessionParams.runtimeContractFingerprint, "");
+  // A stored task session (its id lives in sessionParams) is expected to carry a
+  // prompt-bundle pin. Without one we cannot tell whether the agent charter /
+  // instructions changed since the session was saved, so the prompt-bundle
+  // auto-bust can never fire and the session resumes forever against a possibly
+  // stale charter. Refuse to resume such a session — a fresh session re-pins to
+  // the current bundle and converges on the next heartbeat. Sessions supplied
+  // only via runtime.sessionId (e.g. in-run poison recovery) are not stored task
+  // sessions and keep resuming as before.
+  const storedSessionId = asString(runtimeSessionParams.sessionId, "");
+  const storedSessionMissingPromptBundlePin =
+    storedSessionId.length > 0 && runtimePromptBundleKey.length === 0;
   const hasMatchingPromptBundle =
-    runtimePromptBundleKey.length === 0 || runtimePromptBundleKey === promptBundle.bundleKey;
+    runtimePromptBundleKey.length > 0
+      ? runtimePromptBundleKey === promptBundle.bundleKey
+      : !storedSessionMissingPromptBundlePin;
+  // Runtime-contract auto-bust: when the current fingerprint is configured
+  // (non-empty) and differs from the one stored with the session, refuse to
+  // resume so a fresh session re-pins to the new contract. A stored fingerprint
+  // that is empty (session predates the feature or the input was unconfigured
+  // when saved) is treated as "no opinion" and does not bust — mirrors the
+  // prompt-bundle pin's lenient handling and keeps AC4 (unconfigured => current
+  // behavior) intact.
+  const runtimeContractMismatch =
+    runtimeSessionId.length > 0 &&
+    runtimeContractFingerprint.length > 0 &&
+    runtimeRuntimeContractFingerprint.length > 0 &&
+    runtimeRuntimeContractFingerprint !== runtimeContractFingerprint;
+  const hasMatchingRuntimeContract = !runtimeContractMismatch;
   const isValidUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(runtimeSessionId);
+  const promptBundlePinMissing = storedSessionMissingPromptBundlePin && isValidUuid;
+  const promptBundlePinMismatch =
+    runtimeSessionId.length > 0 && runtimePromptBundleKey.length > 0 && runtimePromptBundleKey !== promptBundle.bundleKey;
   const canResumeSession =
     runtimeSessionId.length > 0 &&
     isValidUuid &&
     hasMatchingPromptBundle &&
+    hasMatchingRuntimeContract &&
     claudeSessionCwdMatchesExecutionTarget({
       runtimeSessionCwd,
       effectiveExecutionCwd,
@@ -660,16 +774,41 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       "stdout",
       `[paperclip] Claude session "${runtimeSessionId}" does not match the current remote execution identity and will not be resumed in "${effectiveExecutionCwd}". Starting a fresh remote session.\n`,
     );
-  } else if (runtimeSessionId && isValidUuid && !canResumeSession) {
+  } else if (
+    runtimeSessionId &&
+    isValidUuid &&
+    !canResumeSession &&
+    !promptBundlePinMismatch &&
+    !promptBundlePinMissing &&
+    !runtimeContractMismatch
+  ) {
     await onLog(
       "stdout",
       `[paperclip] Claude session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${effectiveExecutionCwd}".\n`,
     );
   }
-  if (runtimeSessionId && runtimePromptBundleKey.length > 0 && runtimePromptBundleKey !== promptBundle.bundleKey) {
+  if (promptBundlePinMismatch) {
     await onLog(
       "stdout",
       `[paperclip] Claude session "${runtimeSessionId}" was saved for prompt bundle "${runtimePromptBundleKey}" and will not be resumed with "${promptBundle.bundleKey}".\n`,
+    );
+  }
+  // Observability: surface a runtime-contract bust explicitly so a fresh-session
+  // start is diagnosable from the run log (e.g. /live flipped CONTRACT.md).
+  if (runtimeContractMismatch) {
+    await onLog(
+      "stdout",
+      `[paperclip] Claude session "${runtimeSessionId}" was saved for runtime-contract fingerprint "${runtimeRuntimeContractFingerprint}" but the host-side runtime contract now fingerprints as "${runtimeContractFingerprint}"; it will not be resumed. Starting a fresh session.\n`,
+    );
+  }
+  // Observability guard: a session id with no stored prompt-bundle pin cannot be
+  // checked against the current bundle, so the prompt-bundle auto-bust cannot
+  // fire for it. Surface it explicitly instead of silently resuming (or silently
+  // starting fresh) so a stale-session symptom is diagnosable from the run log.
+  if (promptBundlePinMissing) {
+    await onLog(
+      "stdout",
+      `[paperclip] Claude session "${runtimeSessionId}" has no stored prompt-bundle pin (sessionParams.promptBundleKey missing); it will not be resumed so instruction/charter changes take effect. Starting a fresh session pinned to prompt bundle "${promptBundle.bundleKey}".\n`,
     );
   }
   const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
@@ -710,7 +849,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const buildClaudeArgs = (
     resumeSessionId: string | null,
     attemptInstructionsFilePath: string | undefined,
+    modelOverride?: string,
   ) => {
+    const effectiveModel = modelOverride ?? model;
     const args = ["--print", "-", "--output-format", "stream-json", "--verbose"];
     if (resumeSessionId) args.push("--resume", resumeSessionId);
     args.push(...buildClaudeExecutionPermissionArgs({
@@ -721,8 +862,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // For Bedrock: only pass --model when the ID is a Bedrock-native identifier
     // (e.g. "us.anthropic.*" or ARN). Anthropic-style IDs like "claude-opus-4-6" are invalid
     // on Bedrock, so skip them and let the CLI use its own configured model.
-    if (model && (!isBedrockAuth(effectiveEnv) || isBedrockModelId(model))) {
-      args.push("--model", model);
+    if (effectiveModel && (!isBedrockAuth(effectiveEnv) || isBedrockModelId(effectiveModel))) {
+      args.push("--model", effectiveModel);
     }
     if (effectiveEffort) args.push("--effort", effectiveEffort);
     if (maxTurns > 0) args.push("--max-turns", String(maxTurns));
@@ -753,9 +894,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : `Claude exited with code ${proc.exitCode ?? -1}`;
   };
 
-  const runAttempt = async (resumeSessionId: string | null) => {
+  const runAttempt = async (resumeSessionId: string | null, modelOverride?: string) => {
     const attemptInstructionsFilePath = resumeSessionId ? undefined : effectiveInstructionsFilePath;
-    const args = buildClaudeArgs(resumeSessionId, attemptInstructionsFilePath);
+    const args = buildClaudeArgs(resumeSessionId, attemptInstructionsFilePath, modelOverride);
     const commandNotes: string[] = [];
     if (!resumeSessionId) {
       commandNotes.push(`Using stable Claude prompt bundle ${promptBundle.bundleKey}.`);
@@ -907,7 +1048,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // successful run to Paperclip and the heartbeat stalls silently. See RY-604.
     const claudeRefusal = isClaudeRefusalResult(parsed);
     const parsedIsError = asBoolean(parsed.is_error, false);
-    const failed = (proc.exitCode ?? 0) !== 0 || parsedIsError;
+    // The CLI can exit non-zero during teardown *after* it has already emitted a
+    // clean result (subtype=success, is_error=false). The work landed, so this is
+    // a success with a dirty exit, not a run failure. Every other non-zero exit
+    // — and any is_error=true result — still fails.
+    // A quota limit stops the run *before* its work is done, so it must never
+    // read as a completed run — the wake still has to be retried after the reset.
+    // `usageLimit` matches the message; `noWork` is the wording-independent
+    // backstop for a result that billed nothing and never got past turn one.
+    const usageLimit = isClaudeUsageLimitResult(parsed);
+    const noWork = isClaudeNoWorkResult(parsed);
+    const completedDirty =
+      !parsedIsError &&
+      (proc.exitCode ?? 0) !== 0 &&
+      isClaudeCleanCompletionResult(parsed) &&
+      !loginMeta.requiresLogin &&
+      !clearSessionForMaxTurns &&
+      !poisonedPreviousMessageId &&
+      !claudeRefusal &&
+      !usageLimit &&
+      !noWork;
+    const failed = parsedIsError || ((proc.exitCode ?? 0) !== 0 && !completedDirty);
     // Validate-before-persist guard: never persist a sessionId whose transcript
     // is known-poisoned. The Claude CLI keeps an on-disk JSONL keyed by the
     // session id; if the last entry contains a non-`msg_`-prefixed
@@ -922,6 +1083,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         sessionId: resolvedSessionId,
         cwd,
         promptBundleKey: promptBundle.bundleKey,
+        ...(runtimeContractFingerprint ? { runtimeContractFingerprint } : {}),
         ...(executionTargetIsRemote
           ? {
               remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
@@ -932,8 +1094,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
       } as Record<string, unknown>)
       : null;
-    const errorMessage = failed
+    const errorMessage = completedDirty
+      ? `Claude reported a successful result but the process exited with code ${proc.exitCode ?? -1}${
+          proc.signal ? ` (signal ${proc.signal})` : ""
+        }`
+      : failed
       ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
+      : null;
+    // Classify *why* teardown went wrong so the follow-up investigation can group
+    // these, but keep it out of `errorFamily`/`retryNotBefore`: the work is done,
+    // so this run must never feed the transient-retry machinery.
+    const dirtyTeardownCode = completedDirty
+      ? isClaudeTransientUpstreamError({
+          parsed,
+          stdout: proc.stdout,
+          stderr: proc.stderr,
+          errorMessage,
+        })
+        ? "claude_transient_upstream"
+        : proc.signal
+        ? `signal_${proc.signal}`
+        : `exit_${proc.exitCode ?? -1}`
       : null;
     const transientUpstream =
       failed &&
@@ -954,8 +1135,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage,
         })
       : null;
+    const preTurnRateLimit = transientUpstream && isClaudePreTurnRateLimitResult(parsed);
     const resolvedErrorCode = loginMeta.requiresLogin
       ? "claude_auth_required"
+      : completedDirty
+      ? "dirty_exit"
       : failed && clearSessionForMaxTurns
       ? "max_turns_exhausted"
       : failed && poisonedPreviousMessageId
@@ -967,12 +1151,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : null;
     const mergedResultJson: Record<string, unknown> = {
       ...parsed,
+      ...(completedDirty
+        ? {
+            dirtyExit: {
+              exitCode: proc.exitCode ?? null,
+              signal: proc.signal ?? null,
+              teardownErrorCode: dirtyTeardownCode,
+            },
+          }
+        : {}),
       ...(failed && clearSessionForMaxTurns ? { stopReason: "max_turns_exhausted" } : {}),
       ...(failed && poisonedPreviousMessageId ? { stopReason: "claude_poisoned_previous_message_id" } : {}),
       ...(claudeRefusal ? { stopReason: "refusal", errorFamily: "model_refusal" } : {}),
       ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
       ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
+      ...(preTurnRateLimit ? { noOpDispatch: true, noOpDispatchReason: "pre_turn_rate_limit" } : {}),
     };
 
     return {
@@ -981,6 +1175,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       timedOut: false,
       errorMessage,
       errorCode: resolvedErrorCode,
+      completedDirty,
       errorFamily: transientUpstream
         ? "transient_upstream"
         : claudeRefusal
@@ -1058,6 +1253,48 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
       const retry = await runAttempt(null);
       return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
+    }
+
+    // Fallback-on-refusal: a policy refusal exits cleanly (exitCode=0,
+    // is_error=false), so it is never a session error and lands here. When a
+    // distinct, allowed fallbackModel is configured, retry EXACTLY ONCE on a
+    // fresh session with that model and return its result instead of the
+    // refusal. One-shot only — the fallback attempt's own result (refusal,
+    // error, or success) is surfaced as-is, so there is no retry loop.
+    if (
+      fallbackModel &&
+      fallbackModel !== model &&
+      isClaudeRefusalResult(initial.parsed)
+    ) {
+      if (!isAllowedFallbackModel(fallbackModel)) {
+        // SECURITY-CRITICAL: never route refused work to an unknown or
+        // safeguards-lifted model (e.g. claude-mythos-5). Log and surface the
+        // original refusal unchanged.
+        await onLog(
+          "stdout",
+          `[paperclip] ${model || "primary model"} refused but fallbackModel "${fallbackModel}" is not an allowed fallback target; surfacing refusal.\n`,
+        );
+      } else {
+        await onLog(
+          "stdout",
+          `[paperclip] ${model || "primary model"} refused; falling back to ${fallbackModel}.\n`,
+        );
+        const fallbackAttempt = await runAttempt(null, fallbackModel);
+        const fallbackResult = toAdapterResult(fallbackAttempt, {
+          fallbackSessionId: null,
+          clearSessionOnMissingSession: true,
+        });
+        // Telemetry: refusal + fallback means two billed calls. Surface flags so
+        // cost/monitoring can attribute the extra call and see fallback fired.
+        fallbackResult.resultJson = {
+          ...(fallbackResult.resultJson ?? {}),
+          fallbackModelUsed: true,
+          primaryRefused: true,
+          primaryModel: model || null,
+          fallbackModel,
+        };
+        return fallbackResult;
+      }
     }
 
     return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });

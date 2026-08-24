@@ -39,6 +39,7 @@ import type {
   PluginLocalFolderEntry,
   PluginLocalFolderStatus,
   PluginAccessMember,
+  PluginIssueAttachment,
   PrincipalPermissionGrant,
   PermissionKey,
   PrincipalType,
@@ -108,6 +109,7 @@ export interface TestHarness {
     projects?: Project[];
     issues?: Issue[];
     issueComments?: IssueComment[];
+    issueAttachments?: PluginIssueAttachment[];
     agents?: Agent[];
     goals?: Goal[];
     projectWorkspaces?: PluginWorkspace[];
@@ -491,6 +493,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
   const issues = new Map<string, Issue>();
   const blockedByIssueIds = new Map<string, string[]>();
   const issueComments = new Map<string, IssueComment[]>();
+  const issueAttachments = new Map<string, PluginIssueAttachment[]>();
   const issueInteractions = new Map<string, IssueThreadInteraction[]>();
   const issueDocuments = new Map<string, IssueDocument>();
   const agents = new Map<string, Agent>();
@@ -871,13 +874,41 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
     http: {
       async fetch(url, init) {
         requireCapability(manifest, capabilitySet, "http.outbound");
-        return fetch(url, init);
+        // `PluginHttpFetchInit.body` is widened beyond native `RequestInit.body`
+        // (e.g. plain Buffer). Cast back for the global `fetch` — at runtime
+        // every value PluginHttpFetchBody accepts is also a valid BodyInit.
+        return fetch(url, init as RequestInit | undefined);
       },
     },
     secrets: {
       async resolve(secretRef) {
         requireCapability(manifest, capabilitySet, "secrets.read-ref");
         return `resolved:${secretRef}`;
+      },
+      async mintHandle(value, runId) {
+        requireCapability(manifest, capabilitySet, "secrets.read-ref");
+        // Deterministic stand-in handle for unit tests; the real host mints a
+        // 128-bit random id. The value is intentionally not echoed.
+        void value;
+        return `vault-handle://${runId}/00000000000000000000000000000000`;
+      },
+    },
+    artifacts: {
+      // Worker-ctx artifacts client. `create` is gated on
+      // `issue.attachments.create` and returns a deterministic id; `fetch`
+      // returns deterministic bytes so service/background tests have a default.
+      async create(input) {
+        requireCapability(manifest, capabilitySet, "issue.attachments.create");
+        return { attachmentId: `asset:${input.companyId}:${input.filename}` };
+      },
+      async fetch(attachmentId) {
+        const bytes = new Uint8Array(0);
+        return {
+          bytes,
+          filename: attachmentId,
+          contentType: "application/octet-stream",
+          byteSize: bytes.byteLength,
+        };
       },
     },
     activity: {
@@ -1671,11 +1702,23 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
           comment.deletedAt ? { ...comment, body: "", presentation: null, metadata: null } : comment
         );
       },
+      async listAttachments(issueId, companyId) {
+        requireCapability(manifest, capabilitySet, "issue.attachments.read");
+        if (!isInCompany(issues.get(issueId), companyId)) return [];
+        return issueAttachments.get(issueId) ?? [];
+      },
       async createComment(issueId, body, companyId, options) {
         requireCapability(manifest, capabilitySet, "issue.comments.create");
-        const parentIssue = issues.get(issueId);
+        let parentIssue = issues.get(issueId);
+        if (!parentIssue && options?.identifier) {
+          parentIssue = [...issues.values()].find((candidate) => candidate.identifier === options.identifier);
+          if (parentIssue) issueId = parentIssue.id;
+        }
         if (!isInCompany(parentIssue, companyId)) {
-          throw new Error(`Issue not found: ${issueId}`);
+          throw new Error(`Issue not found: ${options?.identifier ?? issueId}`);
+        }
+        if (options?.refuseClosed && (parentIssue.status === "done" || parentIssue.status === "cancelled")) {
+          throw new Error("Issue is closed");
         }
         const now = new Date();
         const comment: IssueComment = {
@@ -1730,6 +1773,37 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         current.push(created);
         issueInteractions.set(issueId, current);
         return created;
+      },
+      async resolveInteraction(issueId, interactionId, companyId, options) {
+        requireCapability(manifest, capabilitySet, "issue.interactions.resolve");
+        const parentIssue = issues.get(issueId);
+        if (!isInCompany(parentIssue, companyId)) {
+          throw new Error(`Issue not found: ${issueId}`);
+        }
+        const current = issueInteractions.get(issueId) ?? [];
+        const target = current.find((entry) => entry.id === interactionId);
+        if (!target || target.companyId !== parentIssue.companyId) {
+          throw new Error(`Interaction not found: ${interactionId}`);
+        }
+        if (target.status !== "pending") {
+          throw new Error("Interaction has already been resolved");
+        }
+        const commentId = options?.supersedingCommentId ?? null;
+        const reason = options?.reason?.trim() || null;
+        const now = new Date();
+        target.status = "expired";
+        target.result = {
+          version: 1,
+          outcome: commentId ? "superseded_by_comment" : "superseded",
+          commentId,
+          ...(reason ? { reason } : {}),
+        } as IssueThreadInteraction["result"];
+        // The messenger plugin actor never mints operator user authorship.
+        target.resolvedByUserId = null;
+        target.resolvedByAgentId = null;
+        target.resolvedAt = now;
+        target.updatedAt = now;
+        return target;
       },
       async suggestTasks(issueId, interaction, companyId, options) {
         return this.createInteraction(issueId, { ...interaction, kind: "suggest_tasks" }, companyId, options) as Promise<any>;
@@ -1892,6 +1966,20 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
             invocationBlocks: [],
           };
         },
+      },
+    },
+    approvals: {
+      async list(companyId) {
+        requireCapability(manifest, capabilitySet, "board.approvals.read");
+        requireCompanyId(companyId);
+        return [];
+      },
+    },
+    interactions: {
+      async list(companyId) {
+        requireCapability(manifest, capabilitySet, "issue.interactions.read");
+        requireCompanyId(companyId);
+        return [];
       },
     },
     agents: {
@@ -2378,6 +2466,11 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         list.push(row);
         issueComments.set(row.issueId, list);
       }
+      for (const row of input.issueAttachments ?? []) {
+        const list = issueAttachments.get(row.issueId) ?? [];
+        list.push(row);
+        issueAttachments.set(row.issueId, list);
+      }
       for (const row of input.agents ?? []) agents.set(row.id, row);
       for (const row of input.goals ?? []) goals.set(row.id, row);
       for (const row of input.projectWorkspaces ?? []) {
@@ -2452,6 +2545,23 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         runId: runCtx.runId ?? randomUUID(),
         companyId: runCtx.companyId ?? "company-test",
         projectId: runCtx.projectId ?? "project-test",
+        // Provide a default artifacts client for tests that don't
+        // exercise cross-tenant fetches; throws if invoked so tests that do
+        // need it must inject their own client.
+        artifacts: runCtx.artifacts ?? {
+          fetch: async () => {
+            throw new Error(
+              "ctx.artifacts.fetch is not stubbed in this test — pass `runCtx.artifacts` to inject a mock",
+            );
+          },
+          // Default create stub throws so tests that exercise the write
+          // path inject their own client (mirrors the fetch default).
+          create: async () => {
+            throw new Error(
+              "ctx.artifacts.create is not stubbed in this test — pass `runCtx.artifacts` to inject a mock",
+            );
+          },
+        },
       };
       return await handler(params, ctxToPass) as T;
     },

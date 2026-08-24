@@ -12,6 +12,7 @@ export {
   isClaudeMaxTurnsResult,
   isClaudeRefusalResult,
   isClaudeUnknownSessionError,
+  extractClaudeRetryNotBefore,
 } from "./parse.js";
 export {
   getQuotaWindows,
@@ -44,6 +45,9 @@ export const sessionCodec: AdapterSessionCodec = {
     const promptBundleKey =
       readNonEmptyString(record.promptBundleKey) ??
       readNonEmptyString(record.prompt_bundle_key);
+    const runtimeContractFingerprint =
+      readNonEmptyString(record.runtimeContractFingerprint) ??
+      readNonEmptyString(record.runtime_contract_fingerprint);
     const workspaceId = readNonEmptyString(record.workspaceId) ?? readNonEmptyString(record.workspace_id);
     const repoUrl = readNonEmptyString(record.repoUrl) ?? readNonEmptyString(record.repo_url);
     const repoRef = readNonEmptyString(record.repoRef) ?? readNonEmptyString(record.repo_ref);
@@ -51,6 +55,7 @@ export const sessionCodec: AdapterSessionCodec = {
       sessionId,
       ...(cwd ? { cwd } : {}),
       ...(promptBundleKey ? { promptBundleKey } : {}),
+      ...(runtimeContractFingerprint ? { runtimeContractFingerprint } : {}),
       ...(workspaceId ? { workspaceId } : {}),
       ...(repoUrl ? { repoUrl } : {}),
       ...(repoRef ? { repoRef } : {}),
@@ -67,6 +72,9 @@ export const sessionCodec: AdapterSessionCodec = {
     const promptBundleKey =
       readNonEmptyString(params.promptBundleKey) ??
       readNonEmptyString(params.prompt_bundle_key);
+    const runtimeContractFingerprint =
+      readNonEmptyString(params.runtimeContractFingerprint) ??
+      readNonEmptyString(params.runtime_contract_fingerprint);
     const workspaceId = readNonEmptyString(params.workspaceId) ?? readNonEmptyString(params.workspace_id);
     const repoUrl = readNonEmptyString(params.repoUrl) ?? readNonEmptyString(params.repo_url);
     const repoRef = readNonEmptyString(params.repoRef) ?? readNonEmptyString(params.repo_ref);
@@ -74,6 +82,7 @@ export const sessionCodec: AdapterSessionCodec = {
       sessionId,
       ...(cwd ? { cwd } : {}),
       ...(promptBundleKey ? { promptBundleKey } : {}),
+      ...(runtimeContractFingerprint ? { runtimeContractFingerprint } : {}),
       ...(workspaceId ? { workspaceId } : {}),
       ...(repoUrl ? { repoUrl } : {}),
       ...(repoRef ? { repoRef } : {}),

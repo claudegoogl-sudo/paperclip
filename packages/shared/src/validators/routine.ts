@@ -72,13 +72,17 @@ export const createRoutineSchema = z.object({
   catchUpPolicy: z.enum(ROUTINE_CATCH_UP_POLICIES).optional().default("skip_missed"),
   variables: z.array(routineVariableSchema).optional().default([]),
   env: envConfigSchema.optional().nullable(),
-});
+}).strict();
 
 export type CreateRoutine = z.infer<typeof createRoutineSchema>;
 
+// `.strict()` is repeated rather than inherited from createRoutineSchema: zod does
+// carry unknownKeys through .partial()/.extend() today, but that is undocumented,
+// and a silently stripped key here produces a routine that reports healthy and
+// never fires.
 export const updateRoutineSchema = createRoutineSchema.partial().extend({
   baseRevisionId: z.string().uuid().optional().nullable(),
-});
+}).strict();
 export type UpdateRoutine = z.infer<typeof updateRoutineSchema>;
 
 export const routineRevisionSnapshotRoutineV1Schema = z.object({

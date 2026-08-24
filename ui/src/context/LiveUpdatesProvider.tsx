@@ -1,6 +1,6 @@
 import { useEffect, useRef, type ReactNode } from "react";
 import { useQuery, useQueryClient, type InfiniteData, type QueryClient } from "@tanstack/react-query";
-import type { Agent, Issue, IssueComment, LiveEvent } from "@paperclipai/shared";
+import { isTerminalHeartbeatRunStatus, type Agent, type Issue, type IssueComment, type LiveEvent } from "@paperclipai/shared";
 import type { RunForIssue } from "../api/activity";
 import type { ActiveRunForIssue, LiveRunForIssue } from "../api/heartbeats";
 import type { CompanyUserDirectoryResponse } from "../api/access";
@@ -21,7 +21,6 @@ const TOAST_COOLDOWN_MAX = 3;
 const RECONNECT_SUPPRESS_MS = 2000;
 const SOCKET_CONNECTING = 0;
 const SOCKET_OPEN = 1;
-const TERMINAL_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
 
 type LiveUpdatesSocketLike = {
   readyState: number;
@@ -279,7 +278,7 @@ function invalidateVisibleIssueRunQueries(
   if (!matchesVisibleIssue) return false;
 
   const status = readString(payload.status);
-  if (runId && status && TERMINAL_RUN_STATUSES.has(status)) {
+  if (runId && status && isTerminalHeartbeatRunStatus(status)) {
     for (const issueRef of context.issueRefs) {
       queryClient.setQueryData(
         queryKeys.issues.liveRuns(issueRef),

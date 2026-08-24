@@ -1,5 +1,5 @@
 import { createHash, timingSafeEqual } from "node:crypto";
-import type { Request, RequestHandler } from "express";
+import type { Application, Request, RequestHandler } from "express";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -13,8 +13,9 @@ import {
   instanceUserRoles,
 } from "@paperclipai/db";
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
-import { isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
+import { isAgentApiKeyExpired, isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
+import { actorProvenanceMiddleware } from "./actor-context.js";
 import { logger } from "./logger.js";
 import { boardAuthService } from "../services/board-auth.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
@@ -128,6 +129,33 @@ async function auditAgentKeyMissingResponsibleUser(
     logger.warn(
       { err, companyId: input.companyId, agentId: input.agentId, keyId: input.keyId },
       "Failed to audit rejected agent key without responsible user binding",
+    );
+  }
+}
+
+export async function auditAgentKeyExpired(
+  db: Db,
+  input: { companyId: string; agentId: string; keyId: string; expiresAt: Date | null; method: string; url: string },
+) {
+  try {
+    await db.insert(activityLog).values({
+      companyId: input.companyId,
+      actorType: "agent",
+      actorId: input.agentId,
+      action: "auth.agent_key_expired",
+      entityType: "agent_api_key",
+      entityId: input.keyId,
+      ...(isUuidLike(input.agentId) ? { agentId: input.agentId } : {}),
+      details: {
+        method: input.method,
+        url: input.url,
+        expiresAt: input.expiresAt ? input.expiresAt.toISOString() : null,
+      },
+    });
+  } catch (err) {
+    logger.warn(
+      { err, companyId: input.companyId, agentId: input.agentId, keyId: input.keyId },
+      "Failed to audit rejected expired agent key",
     );
   }
 }
@@ -254,6 +282,27 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       .where(and(eq(agentApiKeys.keyHash, tokenHash), isNull(agentApiKeys.revokedAt)))
       .then((rows) => rows[0] ?? null);
 
+    // Fail-closed expiry backstop: a key past `expiresAt` is rejected
+    // even when `revokedAt` is null, so a missed manual revoke can no longer
+    // leave a key usable forever. Rejected here as unauthenticated rather than
+    // matched, so downstream sees `actor.type === "none"`.
+    if (key && isAgentApiKeyExpired(key.expiresAt)) {
+      logger.warn(
+        { keyId: key.id, agentId: key.agentId, companyId: key.companyId, expiresAt: key.expiresAt },
+        "Rejected expired agent API key",
+      );
+      await auditAgentKeyExpired(db, {
+        companyId: key.companyId,
+        agentId: key.agentId,
+        keyId: key.id,
+        expiresAt: key.expiresAt ?? null,
+        method: req.method,
+        url: req.originalUrl,
+      });
+      next();
+      return;
+    }
+
     if (!key) {
       const claims = verifyLocalAgentJwt(token);
       if (!claims) {
@@ -371,6 +420,23 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
 
     next();
   };
+}
+
+/**
+ * Registers the actor-resolution + provenance-capture middleware pair on `app`
+ * in the one order that works: `actorMiddleware` populates `req.actor`, then
+ * `actorProvenanceMiddleware` binds its credential provenance into
+ * AsyncLocalStorage so `logActivity` records it centrally.
+ *
+ * Both `createApp` (production wiring) and the provenance regression test go
+ * through this single function on purpose: dropping the provenance registration
+ * here turns that test red instead of letting production silently write NULL
+ * provenance forever — the failure mode an audit control cannot afford.
+ */
+export function registerActorContext(app: Application, db: Db, opts: ActorMiddlewareOptions): void {
+  app.use(actorMiddleware(db, opts));
+  // Must run after actorMiddleware, which is what populates req.actor.
+  app.use(actorProvenanceMiddleware());
 }
 
 export async function resolveCloudTenantActor(db: Db, req: Request): Promise<Express.Request["actor"] | null> {

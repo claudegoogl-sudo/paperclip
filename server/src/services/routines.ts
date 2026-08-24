@@ -71,6 +71,61 @@ import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
+// How long past its due time a never-started scheduled retry must sit before the routine
+// staleness guard treats it as dead. Generous enough that a briefly backed-up retry promoter
+// is never mistaken for a permanent stall.
+const STALE_EXECUTION_PIN_GRACE_MS = 30 * 60 * 1000;
+const STALE_EXECUTION_PIN_ERROR_CODE = "stale_execution_pin";
+
+// Why a pin was reaped. Carried on the release record so the issue note, the activity log and the
+// run result text can each name the arm that fired instead of collapsing to a generic "stale".
+type StalePinReason =
+  // A never-started retry whose due time passed more than the grace ago. The promoter is never
+  // coming for it.
+  | "overdue_retry"
+  // A never-started retry still in the future, but due at or after the next scheduled tick.
+  // Waiting on it buys nothing the next tick would not do sooner, so it is redundant rather than
+  // dead — and unlike an overdue retry it needs no wall-clock grace to be provably pointless.
+  | "redundant_retry"
+  // An open execution issue with no non-terminal runs at all. It never reaches the skip branch —
+  // it collides on issues_open_routine_execution_uq instead.
+  | "runless_issue";
+
+type StalePinRelease = { issueId: string; runIds: string[]; overdueMinutes: number; reason: StalePinReason };
+
+// The live heartbeat runs holding an execution issue open. Both the reap classifier and the skip
+// description read these, so they are loaded once per dispatch and shared.
+type PinningRun = {
+  id: string;
+  status: string;
+  startedAt: Date | null;
+  lastOutputAt: Date | null;
+  scheduledRetryAt: Date | null;
+  scheduledRetryAttempt: number | null;
+  scheduledRetryReason: string | null;
+};
+
+// Turns the pinning runs into one line a human can act on. `Skipped because a live execution issue
+// already exists` is true of both "the retry is late, it is due at 15:04Z" and "nothing is ever
+// coming", and telling those apart used to mean querying heartbeat_runs by hand.
+function describePinningRuns(pinningRuns: PinningRun[], now: Date) {
+  if (pinningRuns.length === 0) return "a live execution issue (no pinning run rows found)";
+
+  const parts = pinningRuns.map((run) => {
+    const attempt = run.scheduledRetryAttempt ? ` attempt ${run.scheduledRetryAttempt}` : "";
+    const cause = run.scheduledRetryReason ? ` (${run.scheduledRetryReason})` : "";
+    if (run.status !== "scheduled_retry" || !run.scheduledRetryAt) {
+      return `run ${run.id} is ${run.status}${attempt}${cause}`;
+    }
+    const dueAt = new Date(run.scheduledRetryAt);
+    const lateBy = Math.round((now.getTime() - dueAt.getTime()) / 60000);
+    const timing = lateBy > 0 ? `${lateBy} minute(s) overdue` : `due in ${Math.abs(lateBy)} minute(s)`;
+    return `run ${run.id} is a scheduled retry${attempt}${cause} due ${dueAt.toISOString()} (${timing})`;
+  });
+
+  return parts.join("; ");
+}
+
 const MAX_CATCH_UP_RUNS = 25;
 const MAX_ROUTINE_REVISIONS = 100;
 const WEEKDAY_INDEX: Record<string, number> = {
@@ -226,6 +281,9 @@ export function nextCronTickInTimeZone(expression: string, timeZone: string, aft
 }
 
 function nextResultText(status: string, issueId?: string | null) {
+  if (status === "issue_created_after_stale_pin_release" && issueId) {
+    return `Released a stale execution issue pin, then created execution issue ${issueId}`;
+  }
   if (status === "issue_created" && issueId) return `Created execution issue ${issueId}`;
   if (status === "coalesced") return "Coalesced into an existing live execution issue";
   if (status === "skipped_paused") return "Skipped because the project is paused";
@@ -1131,6 +1189,10 @@ export function routineService(
     status: string;
     issueId?: string | null;
     nextRunAt?: Date | null;
+    // Appended to the trigger's lastResult. This is the surface an operator reads first, and
+    // bare "Skipped because a live execution issue already exists" cannot distinguish a retry
+    // that is merely late from one that is never coming.
+    resultDetail?: string | null;
   }, executor: Db = db) {
     await executor
       .update(routines)
@@ -1146,7 +1208,9 @@ export function routineService(
         .update(routineTriggers)
         .set({
           lastFiredAt: input.triggeredAt,
-          lastResult: nextResultText(input.status, input.issueId),
+          lastResult: input.resultDetail
+            ? `${nextResultText(input.status, input.issueId)} — ${input.resultDetail}`
+            : nextResultText(input.status, input.issueId),
           nextRunAt: input.nextRunAt === undefined ? undefined : input.nextRunAt,
           updatedAt: new Date(),
         })
@@ -1283,6 +1347,273 @@ export function routineService(
       .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
       .limit(1)
       .then((rows) => rows[0]?.issues ?? null);
+  }
+
+  // Finds an open routine execution issue that has NO non-terminal runs behind it — the shape a
+  // killed agent run leaves behind.
+  //
+  // It never reaches the skip branch: findLiveExecutionIssue inner-joins live runs, so it returns
+  // null and the tick sails past. It does not collide on the issue insert either, because a fresh
+  // issue has a null execution_run_id and `issues_open_routine_execution_uq` only covers non-null
+  // ones. The collision surfaces later, when the assignment wakeup checks the new issue out and
+  // sets execution_run_id — which failed the whole dispatch far from its cause.
+  //
+  // Scoped to routine_execution origin so no hand-made issue can be caught by it, and to
+  // `in_progress` specifically. That status restriction is the important one: `in_review` and
+  // `blocked` are open-with-no-live-run too, but they are deliberate parks — an agent waiting on
+  // an operator answer or a sibling issue — and cancelling those destroys real state. Only
+  // `in_progress` with a terminal execution run is unambiguously a run that died mid-work with
+  // nothing left to wake it.
+  async function findRunlessExecutionIssue(
+    routine: typeof routines.$inferSelect,
+    executor: Db,
+    dispatchFingerprint: string | null | undefined,
+    origin: { kind: string; id: string | null },
+  ) {
+    const fingerprintCondition = routineExecutionFingerprintCondition(dispatchFingerprint);
+    return executor
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, routine.companyId),
+          eq(issues.originKind, origin.kind),
+          origin.id ? eq(issues.originId, origin.id) : sql`false`,
+          eq(issues.status, "in_progress"),
+          isNull(issues.hiddenAt),
+          isNotNull(issues.executionRunId),
+          ...(fingerprintCondition ? [fingerprintCondition] : []),
+          // Belt and braces against a run appearing between findLiveExecutionIssue and here: if
+          // anything non-terminal is attached, this is not a runless issue and must not be reaped.
+          sql`not exists (
+            select 1 from ${heartbeatRuns} hr
+            where hr.company_id = ${issues.companyId}
+              and hr.status in ('queued', 'running', 'scheduled_retry')
+              and (hr.id = ${issues.executionRunId}
+                or hr.context_snapshot ->> 'issueId' = cast(${issues.id} as text))
+          )`,
+        ),
+      )
+      .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  // The live heartbeat runs holding `issue` open. Loaded once per dispatch and shared, so the
+  // skip description reports the very rows the reap decision was taken on rather than re-querying
+  // and possibly disagreeing with itself.
+  //
+  // The rows are locked FOR UPDATE because promoteDueScheduledRetry flips `scheduled_retry` to
+  // `queued` outside this transaction. Without the lock, READ COMMITTED lets us decide "dead" on
+  // a snapshot that a concurrent promotion has already invalidated, and then cancel a run that
+  // is about to start.
+  async function loadPinningRuns(issue: typeof issues.$inferSelect, executor: Db) {
+    return executor
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        startedAt: heartbeatRuns.startedAt,
+        lastOutputAt: heartbeatRuns.lastOutputAt,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+        scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+        scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, issue.companyId),
+          inArray(heartbeatRuns.status, LIVE_HEARTBEAT_RUN_STATUSES),
+          or(
+            issue.executionRunId ? eq(heartbeatRuns.id, issue.executionRunId) : undefined,
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = cast(${issue.id} as text)`,
+          ),
+        ),
+      )
+      .for("update");
+  }
+
+  // Classifies the pinning runs, returning them only when EVERY one is demonstrably reapable.
+  //
+  // Deliberately narrow: a `running` (or merely queued, or not-yet-due) run is real work in
+  // flight and must keep its pin. Stalled `running` runs are already handled by the heartbeat
+  // liveness/recovery path, so this guard does not duplicate that.
+  function findDeadExecutionPinRuns(
+    pinningRuns: PinningRun[],
+    now: Date,
+    nextRunAt?: Date | null,
+  ) {
+    if (pinningRuns.length === 0) return null;
+
+    // Shared by both arms. `status` must be asserted explicitly: promotion to `queued` leaves
+    // scheduledRetryAt and startedAt untouched, so a just-promoted run is otherwise
+    // indistinguishable from a dead one on every other field.
+    const untouchedRetries = pinningRuns.every((run) =>
+      run.status === "scheduled_retry"
+      && run.startedAt === null
+      && run.lastOutputAt === null
+      && run.scheduledRetryAt !== null
+    );
+    if (!untouchedRetries) return null;
+
+    const retryDueAtMs = (run: (typeof pinningRuns)[number]) => new Date(run.scheduledRetryAt!).getTime();
+
+    const deadlineMs = now.getTime() - STALE_EXECUTION_PIN_GRACE_MS;
+    if (pinningRuns.every((run) => retryDueAtMs(run) <= deadlineMs)) {
+      return { runs: pinningRuns, reason: "overdue_retry" as const };
+    }
+
+    // A retry due at or after the next tick cannot produce work sooner than simply letting this
+    // tick through, so holding the pin for it only costs ticks. Requires a scheduled trigger:
+    // for manual/webhook dispatch there is no "next tick" to compare against and the arm is
+    // inert by construction.
+    if (nextRunAt && pinningRuns.every((run) => retryDueAtMs(run) >= nextRunAt.getTime())) {
+      return { runs: pinningRuns, reason: "redundant_retry" as const };
+    }
+
+    return null;
+  }
+
+  // Cancels the dead pin and terminalises its execution issue so the tick that follows creates
+  // exactly one new execution issue rather than racing a second one against the stale pin.
+  //
+  // Returns null — abandoning the whole reap — if any pinning run no longer matches the shape we
+  // decided on. Losing a tick to a needless skip is cheap; cancelling a run that has just started
+  // is not, so the cancel is all-or-nothing and mismatch falls through to the normal skip.
+  async function releaseDeadExecutionPin(input: {
+    routine: typeof routines.$inferSelect;
+    issue: typeof issues.$inferSelect;
+    deadRuns: NonNullable<Awaited<ReturnType<typeof findDeadExecutionPinRuns>>>;
+    now: Date;
+    executor: Db;
+  }) {
+    const { runs: deadRuns, reason } = input.deadRuns;
+    const runIds = deadRuns.map((run) => run.id);
+    const overdueBy = deadRuns
+      .map((run) => (run.scheduledRetryAt ? input.now.getTime() - new Date(run.scheduledRetryAt).getTime() : 0))
+      .reduce((max, value) => Math.max(max, value), 0);
+    const overdueMinutes = Math.round(overdueBy / 60_000);
+
+    // Subquery guard, not just a per-row predicate: a per-row `WHERE status = 'scheduled_retry'`
+    // would cancel the subset that still matches and leave the rest pinning the issue. Counting
+    // first makes the statement match all rows or none.
+    const stillDead = input.executor
+      .select({ value: sql<number>`count(*)` })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          inArray(heartbeatRuns.id, runIds),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          isNull(heartbeatRuns.startedAt),
+        ),
+      );
+
+    const cancelledRuns = await input.executor
+      .update(heartbeatRuns)
+      .set({
+        status: "cancelled",
+        finishedAt: input.now,
+        error: reason === "overdue_retry"
+          ? "Scheduled retry never started and is past due; cancelled by the routine staleness guard"
+          : "Scheduled retry never started and is not due before the next scheduled tick; cancelled by the routine staleness guard",
+        errorCode: STALE_EXECUTION_PIN_ERROR_CODE,
+        scheduledRetryAt: null,
+        updatedAt: input.now,
+      })
+      .where(
+        and(
+          inArray(heartbeatRuns.id, runIds),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          isNull(heartbeatRuns.startedAt),
+          sql`(${stillDead}) = ${runIds.length}`,
+        ),
+      )
+      .returning({ id: heartbeatRuns.id });
+
+    if (cancelledRuns.length !== runIds.length) {
+      logger.info(
+        { issueId: input.issue.id, routineId: input.routine.id, runIds, cancelled: cancelledRuns.length },
+        "abandoned stale routine execution pin release: a pinning run changed under the guard",
+      );
+      return null;
+    }
+
+    const timingLine = reason === "overdue_retry"
+      ? `- Retry was due ${overdueMinutes} minute(s) ago and was never promoted`
+      : `- Retry was not due until at or after the next scheduled tick, so waiting on it could not run this routine any sooner`;
+    const comment = [
+      "This routine execution issue was pinned by a scheduled retry that never started, so the routine could not run.",
+      "",
+      `- Stale run(s): ${runIds.length > 0 ? runIds.map((id) => `\`${id}\``).join(", ") : "_none_"}`,
+      timingLine,
+      `- Reap reason: \`${reason}\``,
+      "",
+      "The stale run has been cancelled and this issue closed so the routine can schedule a fresh execution.",
+    ].join("\n");
+
+    try {
+      await issueSvc.addComment(input.issue.id, comment, {}, undefined, input.executor);
+    } catch (err) {
+      logger.warn(
+        { err, issueId: input.issue.id, routineId: input.routine.id },
+        "failed to comment on stale routine execution issue",
+      );
+    }
+
+    await issueSvc.update(input.issue.id, { status: "cancelled" }, input.executor);
+
+    return { runIds, overdueMinutes, reason };
+  }
+
+  // Terminalises a runless open execution issue so this tick's issue can be created and checked
+  // out without colliding on issues_open_routine_execution_uq.
+  //
+  // Deliberately NOT on the dispatch transaction: issueSvc.create runs on its own connection, so
+  // an uncommitted cancel here would leave that connection blocking on our row lock while we wait
+  // on it — a self-deadlock. Committing first is also the convergent outcome: the issue has no
+  // live runs, so nothing will ever move it, and cancelling it is correct even if the surrounding
+  // dispatch later rolls back.
+  //
+  // The status guard makes it idempotent — a concurrent dispatch that reaped the same row first
+  // updates zero rows and we report no reap rather than double-commenting.
+  async function releaseRunlessExecutionIssue(input: {
+    routine: typeof routines.$inferSelect;
+    issue: typeof issues.$inferSelect;
+    now: Date;
+  }): Promise<StalePinRelease | null> {
+    const claimed = await db
+      .update(issues)
+      .set({ status: "cancelled", updatedAt: input.now })
+      .where(and(eq(issues.id, input.issue.id), eq(issues.status, "in_progress")))
+      .returning({ id: issues.id });
+
+    if (claimed.length === 0) {
+      logger.info(
+        { issueId: input.issue.id, routineId: input.routine.id },
+        "abandoned runless routine execution issue release: issue was no longer in_progress",
+      );
+      return null;
+    }
+
+    const comment = [
+      "This routine execution issue was left open with no runs still in flight, so it blocked the routine from creating a new execution issue.",
+      "",
+      `- Execution run: ${input.issue.executionRunId ? `\`${input.issue.executionRunId}\`` : "_none_"}`,
+      "- No queued, running or scheduled-retry run was attached, so nothing was ever going to advance it",
+      "- Reap reason: `runless_issue`",
+      "",
+      "This issue has been cancelled so the routine can schedule a fresh execution.",
+    ].join("\n");
+
+    try {
+      await issueSvc.addComment(input.issue.id, comment, {}, undefined, db);
+    } catch (err) {
+      logger.warn(
+        { err, issueId: input.issue.id, routineId: input.routine.id },
+        "failed to comment on runless routine execution issue",
+      );
+    }
+
+    return { issueId: input.issue.id, runIds: [], overdueMinutes: 0, reason: "runless_issue" };
   }
 
   async function finalizeRun(runId: string, patch: Partial<typeof routineRuns.$inferInsert>, executor: Db = db) {
@@ -1502,6 +1833,8 @@ export function routineService(
       title,
       description,
     });
+    // Boxed so the assignment inside the transaction callback survives control-flow narrowing.
+    const stalePinRelease: { value: StalePinRelease | null } = { value: null };
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await tx.execute(
@@ -1572,10 +1905,30 @@ export function routineService(
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
       try {
-        const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
-          kind: issueOriginKind,
-          id: issueOriginId,
-        });
+        let activeIssue: typeof issues.$inferSelect | null = await findLiveExecutionIssue(
+          input.routine,
+          txDb,
+          dispatchFingerprint,
+          { kind: issueOriginKind, id: issueOriginId },
+        );
+        let pinningRuns: PinningRun[] = [];
+        if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
+          pinningRuns = await loadPinningRuns(activeIssue, txDb);
+          const deadRuns = findDeadExecutionPinRuns(pinningRuns, triggeredAt, nextRunAt);
+          if (deadRuns) {
+            const released = await releaseDeadExecutionPin({
+              routine: input.routine,
+              issue: activeIssue,
+              deadRuns,
+              now: triggeredAt,
+              executor: txDb,
+            });
+            if (released) {
+              stalePinRelease.value = { issueId: activeIssue.id, ...released };
+              activeIssue = null;
+            }
+          }
+        }
         if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
           const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
           if (manualRunnerUserId) {
@@ -1586,10 +1939,12 @@ export function routineService(
               touchedAt: triggeredAt,
             });
           }
+          const pinDescription = describePinningRuns(pinningRuns, triggeredAt);
           const updated = await finalizeRun(createdRun.id, {
             status,
             linkedIssueId: activeIssue.id,
             coalescedIntoRunId: activeIssue.originRunId,
+            failureReason: `Pinned by issue ${activeIssue.id}: ${pinDescription}`,
             completedAt: triggeredAt,
           }, txDb);
           await updateRoutineTouchedState({
@@ -1599,34 +1954,59 @@ export function routineService(
             status,
             issueId: activeIssue.id,
             nextRunAt,
+            resultDetail: pinDescription,
           }, txDb);
           return updated ?? createdRun;
         }
 
-        try {
-          createdIssue = await issueSvc.create(input.routine.companyId, {
-            projectId,
-            projectWorkspaceId,
-            goalId: input.routine.goalId,
-            parentId: input.routine.parentIssueId,
-            title,
-            description,
-            status: "todo",
-            priority: input.routine.priority,
-            assigneeAgentId,
-            createdByAgentId: input.source === "manual" ? input.actor?.agentId ?? null : null,
-            createdByUserId: manualRunnerUserId,
-            responsibleUserId,
-            trustExplicitResponsibleUserId: true,
-            originKind: issueOriginKind,
-            originId: issueOriginId,
-            originRunId: createdRun.id,
-            originFingerprint: dispatchFingerprint,
-            billingCode: issueBillingCode,
-            executionWorkspaceId: input.executionWorkspaceId ?? null,
-            executionWorkspacePreference: input.executionWorkspacePreference ?? null,
-            executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
+        // Nothing live is pinning us, but an earlier execution issue can still be sitting open
+        // with every one of its runs terminal — the shape a killed agent leaves
+        // behind. It is invisible to findLiveExecutionIssue (which inner-joins live runs), so the
+        // tick sails past the skip branch, and it does NOT collide on this insert either: a new
+        // issue has a null execution_run_id and the unique index only covers non-null ones. The
+        // collision lands later, when the assignment wakeup checks the issue out and sets
+        // execution_run_id — far from here, and it fails the whole dispatch. So reap it up front.
+        if (input.routine.concurrencyPolicy !== "always_enqueue") {
+          const runlessIssue = await findRunlessExecutionIssue(input.routine, txDb, dispatchFingerprint, {
+            kind: issueOriginKind,
+            id: issueOriginId,
           });
+          if (runlessIssue) {
+            const released = await releaseRunlessExecutionIssue({
+              routine: input.routine,
+              issue: runlessIssue,
+              now: triggeredAt,
+            });
+            if (released) stalePinRelease.value = released;
+          }
+        }
+
+        const executionIssueInput = {
+          projectId,
+          projectWorkspaceId,
+          goalId: input.routine.goalId,
+          parentId: input.routine.parentIssueId,
+          title,
+          description,
+          status: "todo" as const,
+          priority: input.routine.priority,
+          assigneeAgentId,
+          createdByAgentId: input.source === "manual" ? input.actor?.agentId ?? null : null,
+          createdByUserId: manualRunnerUserId,
+          responsibleUserId,
+          trustExplicitResponsibleUserId: true,
+          originKind: issueOriginKind,
+          originId: issueOriginId,
+          originRunId: createdRun.id,
+          originFingerprint: dispatchFingerprint,
+          billingCode: issueBillingCode,
+          executionWorkspaceId: input.executionWorkspaceId ?? null,
+          executionWorkspacePreference: input.executionWorkspacePreference ?? null,
+          executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
+        };
+
+        try {
+          createdIssue = await issueSvc.create(input.routine.companyId, executionIssueInput);
         } catch (error) {
           const isOpenExecutionConflict =
             !!error &&
@@ -1643,31 +2023,37 @@ export function routineService(
             kind: issueOriginKind,
             id: issueOriginId,
           });
-          if (!existingIssue) throw error;
-          const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
-          if (manualRunnerUserId) {
-            await touchIssueForUserInbox(txDb, {
-              companyId: input.routine.companyId,
+          if (existingIssue) {
+            const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
+            if (manualRunnerUserId) {
+              await touchIssueForUserInbox(txDb, {
+                companyId: input.routine.companyId,
+                issueId: existingIssue.id,
+                userId: manualRunnerUserId,
+                touchedAt: triggeredAt,
+              });
+            }
+            const pinDescription = describePinningRuns(await loadPinningRuns(existingIssue, txDb), triggeredAt);
+            const updated = await finalizeRun(createdRun.id, {
+              status,
+              linkedIssueId: existingIssue.id,
+              coalescedIntoRunId: existingIssue.originRunId,
+              failureReason: `Pinned by issue ${existingIssue.id}: ${pinDescription}`,
+              completedAt: triggeredAt,
+            }, txDb);
+            await updateRoutineTouchedState({
+              routineId: input.routine.id,
+              triggerId: input.trigger?.id ?? null,
+              triggeredAt,
+              status,
               issueId: existingIssue.id,
-              userId: manualRunnerUserId,
-              touchedAt: triggeredAt,
-            });
+              nextRunAt,
+              resultDetail: pinDescription,
+            }, txDb);
+            return updated ?? createdRun;
           }
-          const updated = await finalizeRun(createdRun.id, {
-            status,
-            linkedIssueId: existingIssue.id,
-            coalescedIntoRunId: existingIssue.originRunId,
-            completedAt: triggeredAt,
-          }, txDb);
-          await updateRoutineTouchedState({
-            routineId: input.routine.id,
-            triggerId: input.trigger?.id ?? null,
-            triggeredAt,
-            status,
-            issueId: existingIssue.id,
-            nextRunAt,
-          }, txDb);
-          return updated ?? createdRun;
+
+          throw error;
         }
 
         // Keep the dispatch lock until the issue is linked to a queued heartbeat run.
@@ -1683,12 +2069,19 @@ export function routineService(
         const updated = await finalizeRun(createdRun.id, {
           status: "issue_created",
           linkedIssueId: createdIssue.id,
+          // Names the reap arm on the run row so "this tick had to break a pin first" is legible
+          // from run history alone, without correlating against the activity log.
+          failureReason: stalePinRelease.value
+            ? `Released stale execution pin on issue ${stalePinRelease.value.issueId} (${stalePinRelease.value.reason})`
+            : null,
         }, txDb);
         await updateRoutineTouchedState({
           routineId: input.routine.id,
           triggerId: input.trigger?.id ?? null,
           triggeredAt,
-          status: "issue_created",
+          // Distinct result text so a routine that had to break a stale pin stops reporting as
+          // plainly healthy on the triggers list.
+          status: stalePinRelease.value ? "issue_created_after_stale_pin_release" : "issue_created",
           issueId: createdIssue.id,
           nextRunAt,
         }, txDb);
@@ -1713,6 +2106,33 @@ export function routineService(
         return failed ?? createdRun;
       }
     });
+
+    const releasedStalePin = stalePinRelease.value;
+    if (releasedStalePin) {
+      try {
+        await logActivity(db, {
+          companyId: input.routine.companyId,
+          actorType: "system",
+          actorId: "routine-scheduler",
+          action: "routine.stale_execution_pin_released",
+          entityType: "issue",
+          entityId: releasedStalePin.issueId,
+          details: {
+            routineId: input.routine.id,
+            triggerId: input.trigger?.id ?? null,
+            runId: run.id,
+            staleRunIds: releasedStalePin.runIds,
+            overdueMinutes: releasedStalePin.overdueMinutes,
+            reason: releasedStalePin.reason,
+          },
+        });
+      } catch (err) {
+        logger.warn(
+          { err, routineId: input.routine.id, issueId: releasedStalePin.issueId },
+          "failed to log stale routine execution pin release",
+        );
+      }
+    }
 
     if (input.source === "schedule" || input.source === "webhook") {
       const actorId = input.source === "schedule" ? "routine-scheduler" : "routine-webhook";

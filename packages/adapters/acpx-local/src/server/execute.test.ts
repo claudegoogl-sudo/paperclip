@@ -482,7 +482,7 @@ describe("acpx_local runtime skill isolation", () => {
 
     expect(result.exitCode).toBe(0);
     const verboseFlags = runtimeOptions.map((options) => (options as { verbose?: boolean }).verbose);
-    // verbose is scoped to the claude agent (PAPA-388); the custom agent here
+    // verbose is scoped to the claude agent; the custom agent here
     // should not opt in to ACPX runtime verbose session-event logs.
     expect(verboseFlags.every((flag) => flag === false)).toBe(true);
 

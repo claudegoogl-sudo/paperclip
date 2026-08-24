@@ -17,6 +17,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
 }));
 
 const mockIssueService = vi.hoisted(() => ({
+  clearOrphanCheckoutLocksIfTerminal: vi.fn(async () => false),
   getById: vi.fn(),
   getByIdentifier: vi.fn(),
 }));

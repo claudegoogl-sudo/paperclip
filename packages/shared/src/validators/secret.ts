@@ -419,3 +419,54 @@ export const remoteSecretImportSchema = z.object({
 
 export type RemoteSecretImportSelection = z.infer<typeof remoteSecretImportSelectionSchema>;
 export type RemoteSecretImport = z.infer<typeof remoteSecretImportSchema>;
+
+// Operator-only egress review+flip surface for borrowed-handle
+// bindings. The request body only bounds shape/size here; per-entry semantic
+// validation (the egress matcher) and the empty-allowlist enforce guard stay
+// server-side in secretService so the rule lives in one place. The body carries
+// NO binding/company id (those come from the operator-authenticated path
+// params) and NO agent-passable fields (EG1-provenance).
+export const setBindingEgressAllowlistSchema = z.object({
+  // The full desired allowlist for the binding (replace semantics, matching
+  // setBindingEgressAllowlist). Operator-curated: the review surface presents
+  // harvested origins as UNCHECKED suggestions and the operator affirmatively
+  // selects which to include — nothing is auto-applied (allowlist-poisoning
+  // guard). Empty array is allowed (clears the allowlist); enforce-flip then
+  // refuses unless allowEmpty.
+  allowedEgress: z.array(z.string().trim().min(1).max(2048)).max(200),
+});
+
+export const enforceBindingEgressSchema = z.object({
+  // Direction of the flip. Defaults to `true` (the historical behavior) so the
+  // pre-existing callers that send `{ allowEmpty: true }` or `{}` keep working.
+  // When `false`, the binding is flipped back to `log_only` (enforcement off) —
+  // used by the operator surface's "Stop enforcing" confirm. allowEmpty is
+  // ignored in that direction.
+  enforced: z.boolean().optional(),
+  // Deliberate deny-all opt-in: flip a binding whose allowlist is empty (denies
+  // ALL egress for that secret). Defaults to false so the common path refuses
+  // an accidental empty-allowlist enforce.
+  allowEmpty: z.boolean().optional(),
+});
+
+export type SetBindingEgressAllowlistInput = z.infer<typeof setBindingEgressAllowlistSchema>;
+export type EnforceBindingEgressInput = z.infer<typeof enforceBindingEgressSchema>;
+
+// Sibling operator surface for the plugin config-key egress
+// allowlist (a plugin's own `format:"uri"` instance-config values, e.g.
+// klipper's `moonrakerBaseUrl`). Same body shape and same rationale as the
+// per-binding secret pair above: no plugin/company/config-key id in the body
+// (path params only) and no agent-passable fields.
+export const setPluginConfigEgressAllowlistSchema = z.object({
+  allowedEgress: z.array(z.string().trim().min(1).max(2048)).max(200),
+});
+
+// No body fields: unlike a secret binding's allowlist (which is entirely
+// operator-set), a config key's own declared value is unconditionally part of
+// the effective allowlist (see loadPluginEgressAllowlist in
+// plugin-config-egress.ts) — there is no "empty allowlist denies everything"
+// footgun here to gate behind an allowEmpty opt-in.
+export const enforcePluginConfigEgressAllowlistSchema = z.object({}).strict();
+
+export type SetPluginConfigEgressAllowlistInput = z.infer<typeof setPluginConfigEgressAllowlistSchema>;
+export type EnforcePluginConfigEgressAllowlistInput = z.infer<typeof enforcePluginConfigEgressAllowlistSchema>;

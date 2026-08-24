@@ -24,8 +24,9 @@
  * @see PLUGIN_SPEC.md §10 — Package Contract
  * @see PLUGIN_SPEC.md §12 — Process Model
  */
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readdir, readFile, rm, stat } from "node:fs/promises";
+import { cp, mkdir, readdir, readFile, rename, rm, stat } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -57,6 +58,45 @@ export const BUNDLED_LOCAL_PLUGIN_ROOT = path.join(REPO_ROOT, "packages", "plugi
 export const STANDALONE_BUNDLED_PLUGIN_ROOT = path.join(BUNDLED_LOCAL_PLUGIN_ROOT, "sandbox-providers");
 export const LOCAL_PLUGIN_AUTOBUILD_TIMEOUT_MS = 120_000;
 const STANDALONE_BUNDLED_PLUGIN_SDK_PACKAGE = "@paperclipai/plugin-sdk";
+
+// ---------------------------------------------------------------------------
+// Manifest dynamic-import cache-bust
+// ---------------------------------------------------------------------------
+
+/**
+ * Load a plugin manifest module via dynamic `import()`, cache-busting on the
+ * file's mtime so that rebuilds during install/upgrade are observed without a
+ * host restart.
+ *
+ * Node's ESM loader keys cached modules by absolute specifier (URL). A bare
+ * `import('/.../manifest.js')` therefore returns the originally-imported
+ * module for the lifetime of the process, even if the file on disk has been
+ * rebuilt — every install/upgrade silently uses the stale manifest.
+ *
+ * Appending `?mtime=<mtimeMs>` to a `file://` URL is an ESM-spec-compliant way
+ * to make the specifier change when (and only when) the file changes:
+ * unchanged files keep the same URL → the cached import is reused → no perf
+ * regression; changed files get a fresh URL → a fresh import → the new
+ * manifest contents win.
+ *
+ * Returns the raw module's default export (or the module itself if there is
+ * no default), unvalidated. Validation is the caller's responsibility.
+ *
+ * Exported so the regression test in `plugin-loader.test.ts` can exercise the
+ * cache-bust property directly without spinning up the full install pipeline.
+ *
+ * Host bug this fixes: plugin manifest re-import hits ESM cache
+ * and silently keeps serving the pre-rebuild manifest.
+ */
+export async function loadManifestModule(
+  manifestPath: string,
+): Promise<unknown> {
+  const fileStat = await stat(manifestPath);
+  const url = `${pathToFileURL(manifestPath).href}?mtime=${fileStat.mtimeMs}`;
+  const mod = (await import(url)) as Record<string, unknown>;
+  // The manifest may be the default export or the module namespace itself
+  return mod["default"] ?? mod;
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -158,6 +198,17 @@ export interface DiscoveredPlugin {
   source: PluginSource;
   /** The parsed and validated manifest if available, null if discovery-only. */
   manifest: PaperclipPluginManifestV1 | null;
+  /**
+   * SECURITY-CRITICAL: content digest (`sha256:<hex>`) over the resolved
+   * package's own files, the integrity anchor for a parked capability-escalating
+   * upgrade. A version string alone is forgeable for a mutable source (a
+   * `localPath` dir swapped after approval, or a re-published version/tag), so
+   * `completeUpgrade` pins the applied package to the digest captured at park.
+   *
+   * Populated by {@link fetchAndValidate} (the install/upgrade path). Left
+   * undefined by discovery scans, which do not hash every candidate package.
+   */
+  digest?: string;
 }
 
 /**
@@ -244,6 +295,121 @@ export interface PluginLoaderOptions {
    * Registry support is not yet implemented; this field is reserved.
    */
   registryUrl?: string;
+
+  /**
+   * Governance hook used when an upgrade introduces new capabilities.
+   *
+   * When provided, a cap-escalating `upgradePlugin` parks the plugin in
+   * `upgrade_pending` and files a capability-escalation approval via this
+   * gateway instead of throwing. When omitted, the loader fails closed and
+   * throws on any escalation — preserving the "no silent cap escalation"
+   * default. Injected (rather than constructed here) so the loader stays free
+   * of company/board governance policy; the host wiring decides which company
+   * the approval is filed against.
+   */
+  escalationGateway?: CapabilityEscalationGateway;
+}
+
+// ---------------------------------------------------------------------------
+// Capability-escalation governance
+// ---------------------------------------------------------------------------
+
+/**
+ * Details of a capability-escalating upgrade, handed to the escalation gateway
+ * so the board approval names exactly what is being requested.
+ */
+export interface CapabilityEscalationRequest {
+  pluginId: string;
+  pluginKey: string;
+  /** Currently-installed version (unchanged while parked). */
+  fromVersion: string;
+  /** Version the upgrade would move to once approved. */
+  toVersion: string;
+  /** Capabilities declared by the installed (old) manifest. */
+  fromCapabilities: string[];
+  /** Capabilities declared by the requested (new) manifest. */
+  toCapabilities: string[];
+  /** Capabilities present in the new manifest but not the old one. */
+  addedCapabilities: string[];
+  /**
+   * Content digest (`sha256:<hex>`) of the exact package the board is approving,
+   * captured at park. Persisted on the approval so `completeUpgrade` can pin the
+   * applied package to the approved contents and reject a swapped/re-published
+   * package that declares the same version.
+   */
+  digest: string;
+}
+
+/**
+ * Gateway the loader uses to file and look up capability-escalation approvals.
+ *
+ * Kept as an injected interface so the loader does not embed governance policy
+ * (which company/board owns the approval). The production implementation is
+ * wired by the host; tests can supply a stub.
+ */
+export interface CapabilityEscalationGateway {
+  /**
+   * Return the id of an existing *pending* capability-escalation approval for
+   * this plugin + target version, or `null` if none exists. Used for
+   * idempotency so a repeat upgrade call while already parked does not
+   * double-file the approval.
+   */
+  findPending(input: { pluginId: string; toVersion: string }): Promise<string | null>;
+
+  /** File a new pending capability-escalation approval; returns its id. */
+  file(input: CapabilityEscalationRequest): Promise<string>;
+
+  /**
+   * SECURITY-CRITICAL: return the *granted* (board-approved) capability-escalation
+   * contract for this plugin, or `null` if none is approved. `completeUpgrade` uses
+   * this as the integrity anchor: the package it applies must match the version and
+   * stay within the capabilities the board actually saw and approved. The
+   * loader self-enforces against this rather than trusting the caller's
+   * upgrade options — closing the approve-time TOCTOU where the applied
+   * package could otherwise diverge from what the board reviewed.
+   */
+  findApproved(input: { pluginId: string }): Promise<ApprovedUpgrade | null>;
+}
+
+/**
+ * SECURITY-CRITICAL: the capability-escalation contract the board approved for
+ * a parked upgrade — the integrity anchor `completeUpgrade` verifies the
+ * applied package against.
+ */
+export interface ApprovedUpgrade {
+  /** The approval record id. */
+  approvalId: string;
+  /** The exact version the board approved moving to. */
+  toVersion: string;
+  /** The capabilities the board approved adding (the upgrade must not exceed these). */
+  addedCapabilities: string[];
+  /**
+   * Content digest (`sha256:<hex>`) of the package the board approved, captured
+   * at park. When present, `completeUpgrade` rejects any fetched
+   * package whose digest differs — closing the mutable-source TOCTOU residual
+   * that the version + caps checks alone leave open. Optional so approvals filed
+   * before this anchor existed still resolve (version + caps still enforced).
+   */
+  digest?: string | null;
+}
+
+/**
+ * Result of `upgradePlugin`.
+ *
+ * - `status: "ready"` — a non-escalating upgrade was applied in place.
+ * - `status: "upgrade_pending"` — the upgrade adds capabilities and was parked
+ *   pending board approval; `approvalId` names the filed (or pre-existing)
+ *   capability-escalation approval and `addedCapabilities` the new caps.
+ */
+export interface UpgradePluginResult {
+  oldManifest: PaperclipPluginManifestV1;
+  newManifest: PaperclipPluginManifestV1;
+  discovered: DiscoveredPlugin;
+  /** Capabilities present in the new manifest but not the old one (may be empty). */
+  addedCapabilities: string[];
+  status: "ready" | "upgrade_pending";
+  /** Set only when parked; the capability-escalation approval id. */
+  approvalId: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -469,11 +635,30 @@ export interface PluginLoader {
    *
    * @see PLUGIN_SPEC.md §25.3 — Upgrade Lifecycle
    */
-  upgradePlugin(pluginId: string, options: Omit<PluginInstallOptions, "installDir">): Promise<{
-    oldManifest: PaperclipPluginManifestV1;
-    newManifest: PaperclipPluginManifestV1;
-    discovered: DiscoveredPlugin;
-  }>;
+  upgradePlugin(pluginId: string, options: Omit<PluginInstallOptions, "installDir">): Promise<UpgradePluginResult>;
+
+  /**
+   * Complete a previously parked (`upgrade_pending`) capability-escalating
+   * upgrade after its board approval was granted. Re-fetches the target
+   * package, applies the new version + manifest (and therefore the new
+   * capabilities) and returns the plugin to `ready`.
+   *
+   * Plugin-scoped data lives in separate tables (`plugin_config`,
+   * `plugin_state`, secret-ref bindings) and is left untouched. Idempotent: a
+   * call against a plugin that is not `upgrade_pending` is a no-op that returns
+   * the current row.
+   */
+  completeUpgrade(
+    pluginId: string,
+    options?: Omit<PluginInstallOptions, "installDir">,
+  ): Promise<PluginRecord>;
+
+  /**
+   * Revert a parked (`upgrade_pending`) upgrade after its board approval was
+   * rejected. Because parking never mutates the version/manifest/capabilities,
+   * this only restores the lifecycle status to `ready`. Idempotent.
+   */
+  revertPendingUpgrade(pluginId: string): Promise<PluginRecord>;
 
   /**
    * Check whether a plugin API version is supported by this host.
@@ -871,6 +1056,72 @@ export async function ensureLocalPluginBuilt(
 }
 
 /**
+ * SECURITY-CRITICAL: compute a deterministic content digest (`sha256:<hex>`)
+ * over a resolved plugin package's own files — the integrity anchor for a
+ * parked capability-escalating upgrade.
+ *
+ * The digest covers every regular file under `packageRoot`, keyed by its
+ * POSIX-normalized relative path and length so a rename, truncation, or content
+ * swap all change it. Files are hashed in sorted path order so the result is
+ * independent of filesystem enumeration order.
+ *
+ * `node_modules` and `.git` are skipped: dependency trees and VCS metadata vary
+ * by install/platform and would make the digest non-deterministic, while the
+ * threat this closes is a swap of the plugin's *own* code under an unchanged
+ * version. Symlinks are not followed (neither `isFile` nor `isDirectory`),
+ * keeping the walk inside the package tree.
+ */
+async function computePackageContentDigest(packageRoot: string): Promise<string> {
+  const files: string[] = [];
+  async function walk(dir: string): Promise<void> {
+    const entries = await readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        if (entry.name === "node_modules" || entry.name === ".git") continue;
+        await walk(path.join(dir, entry.name));
+      } else if (entry.isFile()) {
+        files.push(path.join(dir, entry.name));
+      }
+    }
+  }
+  await walk(packageRoot);
+
+  const rels = files
+    .map((abs) => ({ abs, rel: path.relative(packageRoot, abs).split(path.sep).join("/") }))
+    .sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+
+  const hash = createHash("sha256");
+  for (const { abs, rel } of rels) {
+    const bytes = await readFile(abs);
+    hash.update(rel, "utf8");
+    hash.update("\0");
+    hash.update(String(bytes.length));
+    hash.update("\0");
+    hash.update(bytes);
+  }
+  return `sha256:${hash.digest("hex")}`;
+}
+
+// ---------------------------------------------------------------------------
+// Verified-upgrade snapshotting to immutable storage
+// ---------------------------------------------------------------------------
+
+/**
+ * SECURITY-CRITICAL: subdirectory of the local plugin dir holding
+ * content-addressed snapshots of verified upgrade packages. Each parked cap-escalating upgrade from a
+ * local-path source is copied here, keyed by the content digest captured at
+ * park, so `completeUpgrade` and the worker load the board-approved bytes from a
+ * host-controlled copy instead of re-reading the mutable `localPath` source.
+ */
+const UPGRADE_SNAPSHOT_DIRNAME = ".upgrade-snapshots";
+
+/** Absolute path of the snapshot for a given `sha256:<hex>` digest. */
+function upgradeSnapshotPathFor(localPluginDir: string, digest: string): string {
+  const hex = digest.startsWith("sha256:") ? digest.slice("sha256:".length) : digest;
+  return path.join(localPluginDir, UPGRADE_SNAPSHOT_DIRNAME, hex);
+}
+
+/**
  * Resolve the manifest entrypoint from a package.json and package root.
  *
  * The spec defines a "paperclipPlugin" key in package.json with a "manifest"
@@ -1075,6 +1326,7 @@ export function pluginLoader(
     migrationDb = db,
     enableLocalFilesystem = true,
     enableNpmDiscovery = true,
+    escalationGateway,
   } = options;
 
   const registry = pluginRegistryService(db);
@@ -1252,18 +1504,83 @@ export function pluginLoader(
     // Use the version declared in the manifest (required field per the spec)
     const resolvedVersion = manifest.version;
 
+    // Content digest of the resolved package — the integrity anchor a parked
+    // upgrade is pinned to at completion.
+    const digest = await computePackageContentDigest(resolvedPackagePath);
+
     return {
       packagePath: resolvedPackagePath,
       packageName: resolvedPackageName,
       version: resolvedVersion,
       source: localPath ? "local-filesystem" : "npm",
       manifest,
+      digest,
     };
+  }
+
+  /**
+   * SECURITY-CRITICAL: snapshot a verified local-path package into
+   * content-addressed immutable storage and return the snapshot path. Copies
+   * the *entire resolved tree* — including `node_modules` and dereferencing
+   * symlinks, which {@link computePackageContentDigest} deliberately excludes —
+   * so the bytes that will be required at load time are a host-controlled
+   * copy, not the mutable (board-approved but attacker-writable) source dir.
+   *
+   * Closes the two residuals the digest-only anchor left open:
+   * - **Verify-then-load TOCTOU**: `completeUpgrade` and the worker load this
+   *   snapshot, so a swap of the source *after* approval can no longer reach the
+   *   loader — the check-time and use-time bytes are the same immutable copy.
+   * - **Unhashed deps/symlinks (OWASP A08)**: the loaded artifact is the
+   *   snapshot, whose `node_modules`/symlinked code cannot be swapped after the
+   *   copy, making the digest's `node_modules`/symlink exclusion moot for what
+   *   actually runs.
+   *
+   * Content-addressed and idempotent: a re-park at the same digest reuses an
+   * existing, still-matching snapshot; a corrupt/mismatched one is rebuilt. The
+   * tree is built under a temp name and atomically `rename`d into place, so a
+   * crash mid-copy never publishes a partial snapshot and a concurrent park to
+   * the same digest converges on byte-equivalent content.
+   */
+  async function ensureUpgradeSnapshot(packageRoot: string, digest: string): Promise<string> {
+    const dest = upgradeSnapshotPathFor(localPluginDir, digest);
+    if (existsSync(dest)) {
+      try {
+        if ((await computePackageContentDigest(dest)) === digest) return dest;
+      } catch {
+        // fall through and rebuild from the source
+      }
+      log.warn(
+        { dest, digest },
+        "plugin-loader: existing upgrade snapshot failed its digest re-check — rebuilding",
+      );
+      await rm(dest, { recursive: true, force: true });
+    }
+
+    await mkdir(path.dirname(dest), { recursive: true });
+    const tmp = `${dest}.tmp-${randomUUID()}`;
+    await rm(tmp, { recursive: true, force: true });
+    // dereference: capture the symlink *targets'* contents so a symlinked
+    // entrypoint or pnpm-style node_modules is materialized into the snapshot
+    // rather than left as a dangling link into the mutable source.
+    await cp(packageRoot, tmp, { recursive: true, dereference: true });
+    try {
+      await rename(tmp, dest);
+    } catch (err) {
+      // A concurrent park may have published the same content first. Snapshots
+      // are content-addressed, so an existing dest is byte-equivalent — drop
+      // ours and converge on theirs.
+      await rm(tmp, { recursive: true, force: true });
+      if (!existsSync(dest)) throw err;
+    }
+    return dest;
   }
 
   /**
    * Attempt to load and validate a plugin manifest from a resolved path.
    * Returns the manifest on success or throws with a descriptive error.
+   *
+   * Uses {@link loadManifestModule} so install/upgrade observe rebuilds on
+   * disk instead of a stale ESM-cached module.
    */
   async function loadManifestFromPath(
     manifestPath: string,
@@ -1271,13 +1588,7 @@ export function pluginLoader(
     let raw: unknown;
 
     try {
-      // Dynamic import works for both .js (ESM) and .cjs (CJS) manifests
-      const manifestUrl = pathToFileURL(manifestPath);
-      const manifestStat = await stat(manifestPath);
-      manifestUrl.searchParams.set("mtime", String(Math.trunc(manifestStat.mtimeMs)));
-      const mod = await import(manifestUrl.href) as Record<string, unknown>;
-      // The manifest may be the default export or the module itself
-      raw = mod["default"] ?? mod;
+      raw = await loadManifestModule(manifestPath);
     } catch (err) {
       throw new Error(
         `Failed to load manifest module at ${manifestPath}: ${String(err)}`,
@@ -1698,27 +2009,25 @@ export function pluginLoader(
      * This method:
      * 1. Fetches and validates the new plugin package using `fetchAndValidate`.
      * 2. Ensures the new manifest ID matches the existing plugin ID for safety.
-     * 3. Updates the plugin record in the registry with the new version and manifest.
+     * 3. Detects capability escalation (caps in the new manifest but not the old).
+     *    - No new caps → updates the record in place and returns `status: "ready"`.
+     *    - New caps + an escalation gateway → parks the row in `upgrade_pending`
+     *      and files a capability-escalation approval WITHOUT mutating the
+     *      version/manifest/caps, returning `status: "upgrade_pending"`.
+     *    - New caps + no gateway → throws (fail-closed default).
      *
      * @param pluginId - The UUID of the plugin to upgrade.
      * @param upgradeOptions - Options for the upgrade (packageName, localPath, version).
-     * @returns The old and new manifests, along with the discovery metadata.
-     * @throws {Error} If the plugin is not found or if the new manifest ID differs.
+     * @returns Old/new manifests, discovery metadata, the added caps, and whether
+     *   the upgrade was applied (`ready`) or parked for approval (`upgrade_pending`).
+     * @throws {Error} If the plugin is not found, the new manifest ID differs, or
+     *   the upgrade escalates capabilities and no escalation gateway is configured.
      */
     async upgradePlugin(
       pluginId: string,
       upgradeOptions: Omit<PluginInstallOptions, "installDir">,
-    ): Promise<{
-      oldManifest: PaperclipPluginManifestV1;
-      newManifest: PaperclipPluginManifestV1;
-      discovered: DiscoveredPlugin;
-    }> {
-      const plugin = (await registry.getById(pluginId)) as {
-        id: string;
-        packageName: string;
-        packagePath: string | null;
-        manifestJson: PaperclipPluginManifestV1;
-      } | null;
+    ): Promise<UpgradePluginResult> {
+      const plugin = (await registry.getById(pluginId)) as PluginRecord | null;
       if (!plugin) throw new Error(`Plugin not found: ${pluginId}`);
 
       const oldManifest = plugin.manifestJson;
@@ -1756,21 +2065,102 @@ export function pluginLoader(
       // 3. Detect capability escalation — new capabilities not in the old manifest
       const oldCaps = new Set(oldManifest.capabilities ?? []);
       const newCaps = newManifest.capabilities ?? [];
-      const escalated = newCaps.filter((c) => !oldCaps.has(c));
+      const addedCapabilities = newCaps.filter((c) => !oldCaps.has(c));
 
-      if (escalated.length > 0) {
+      if (addedCapabilities.length > 0) {
+        // Fail closed when no governance path is wired: never silently escalate.
+        if (!escalationGateway) {
+          log.warn(
+            { pluginId, addedCapabilities, oldVersion: oldManifest.version, newVersion: newManifest.version },
+            "plugin-loader: upgrade introduces new capabilities and no escalation gateway is configured — refusing",
+          );
+          throw new Error(
+            `Upgrade for "${pluginId}" introduces new capabilities that require approval: ${addedCapabilities.join(", ")}. ` +
+              `The previous version declared [${[...oldCaps].join(", ")}]. ` +
+              `Please review and approve the capability escalation before upgrading.`,
+          );
+        }
+
+        // SECURITY-CRITICAL: snapshot the verified bytes to immutable storage
+        // BEFORE filing, so the approval the board sees is backed by a stored,
+        // content-addressed copy and a later swap of the source can reach
+        // neither `completeUpgrade` nor the worker. Only local-path sources load in place; npm
+        // packages resolve hoisted deps from the shared `node_modules` and must
+        // not be copied in isolation, so they keep the digest-only anchor.
+        if (discovered.source === "local-filesystem") {
+          await ensureUpgradeSnapshot(discovered.packagePath, discovered.digest!);
+        }
+
+        // Idempotency: if we are already parked for this exact target version,
+        // converge — do NOT file a second approval (criterion 5).
+        const existingApprovalId = await escalationGateway.findPending({
+          pluginId,
+          toVersion: newManifest.version,
+        });
+        if (existingApprovalId && plugin.status === "upgrade_pending") {
+          log.info(
+            { pluginId, approvalId: existingApprovalId, toVersion: newManifest.version },
+            "plugin-loader: upgrade already parked for this target — converging without re-filing",
+          );
+          return {
+            oldManifest,
+            newManifest,
+            discovered,
+            addedCapabilities,
+            status: "upgrade_pending",
+            approvalId: existingApprovalId,
+          };
+        }
+
+        // SECURITY-CRITICAL lifecycle guard: parking is the `→ upgrade_pending`
+        // transition, which `VALID_TRANSITIONS` permits ONLY from `ready`. Refuse
+        // to park a plugin an operator has deliberately disabled or that is
+        // error-quarantined, so a (later rejected) upgrade cannot silently flip
+        // it back to `ready` via `revertPendingUpgrade`. The idempotent converge
+        // path above is the one legitimate non-`ready` entry and is handled first.
+        if (plugin.status !== "ready") {
+          throw new Error(
+            `Cannot park plugin "${pluginId}" for capability-escalation approval from status "${plugin.status}": ` +
+              `only a "ready" plugin may enter "upgrade_pending". ` +
+              `A disabled or error-quarantined plugin must be re-enabled by an operator before it can be upgraded.`,
+          );
+        }
+
+        const approvalId =
+          existingApprovalId ??
+          (await escalationGateway.file({
+            pluginId,
+            pluginKey: plugin.pluginKey,
+            fromVersion: oldManifest.version,
+            toVersion: newManifest.version,
+            fromCapabilities: [...oldCaps],
+            toCapabilities: [...newCaps],
+            addedCapabilities,
+            // Anchor the approval to the exact package contents.
+            digest: discovered.digest!,
+          }));
+
+        // Park WITHOUT touching version/manifest/caps. Because nothing else is
+        // mutated, a rejection is a pure status restore and capabilities can
+        // only ever grow through `completeUpgrade` (criteria 3 & 6).
+        await registry.updateStatus(pluginId, { status: "upgrade_pending" });
+
         log.warn(
-          { pluginId, escalated, oldVersion: oldManifest.version, newVersion: newManifest.version },
-          "plugin-loader: upgrade introduces new capabilities — requires admin approval",
+          { pluginId, approvalId, addedCapabilities, oldVersion: oldManifest.version, newVersion: newManifest.version },
+          "plugin-loader: upgrade introduces new capabilities — parked in upgrade_pending pending board approval",
         );
-        throw new Error(
-          `Upgrade for "${pluginId}" introduces new capabilities that require approval: ${escalated.join(", ")}. ` +
-            `The previous version declared [${[...oldCaps].join(", ")}]. ` +
-            `Please review and approve the capability escalation before upgrading.`,
-        );
+
+        return {
+          oldManifest,
+          newManifest,
+          discovered,
+          addedCapabilities,
+          status: "upgrade_pending",
+          approvalId,
+        };
       }
 
-      // 4. Update the existing record
+      // 4. Non-escalating upgrade — apply in place (criterion 4).
       await registry.update(pluginId, {
         packageName: discovered.packageName,
         version: discovered.version,
@@ -1781,7 +2171,212 @@ export function pluginLoader(
         oldManifest,
         newManifest,
         discovered,
+        addedCapabilities: [],
+        status: "ready",
+        approvalId: null,
       };
+    },
+
+    // -----------------------------------------------------------------------
+    // completeUpgrade / revertPendingUpgrade
+    // -----------------------------------------------------------------------
+
+    /**
+     * SECURITY-CRITICAL: complete a parked (`upgrade_pending`) upgrade after
+     * board approval. Re-fetches the target package, applies the new version +
+     * manifest (and therefore the new capabilities), and returns the plugin to
+     * `ready`. Plugin-scoped data (`plugin_config`, `plugin_state`, secret-ref
+     * bindings) lives in separate tables and is left untouched. Idempotent.
+     *
+     * The applied package is bound to the board-approved contract: the loader
+     * fetches the approval from the escalation gateway and refuses to apply a
+     * package whose version differs from the approved `toVersion` or whose
+     * capability delta exceeds the approved `addedCapabilities`. This is
+     * enforced loader-side rather than trusting the caller's `upgradeOptions`,
+     * so a swapped/re-published package cannot silently escalate capabilities
+     * the board never saw.
+     *
+     * The applied package is additionally pinned to the content digest captured
+     * at park: a package declaring the approved version and caps but carrying
+     * different code (a mutable `localPath` swapped after approval) is
+     * rejected. This closes the code-integrity residual the version + caps
+     * checks alone leave open (OWASP A08).
+     *
+     * For local-path sources the bytes are loaded from the immutable snapshot
+     * taken at park rather than re-read from the mutable source, which fully
+     * closes the verify-then-load TOCTOU and covers the `node_modules`/
+     * symlinked code the digest excludes. The completed row's `packagePath` is
+     * repointed at that snapshot so the worker requires the approved bytes.
+     */
+    async completeUpgrade(
+      pluginId: string,
+      upgradeOptions: Omit<PluginInstallOptions, "installDir"> = {},
+    ): Promise<PluginRecord> {
+      const plugin = (await registry.getById(pluginId)) as PluginRecord | null;
+      if (!plugin) throw new Error(`Plugin not found: ${pluginId}`);
+
+      // Idempotency: nothing parked → no-op (converge).
+      if (plugin.status !== "upgrade_pending") {
+        log.info(
+          { pluginId, status: plugin.status },
+          "plugin-loader: completeUpgrade called on a plugin that is not upgrade_pending — no-op",
+        );
+        return plugin;
+      }
+
+      // Bind to the board-approved contract. Without a gateway we cannot verify
+      // what was approved, so fail closed rather than apply an unbound package.
+      if (!escalationGateway) {
+        throw new Error(
+          `Cannot complete parked upgrade for "${pluginId}": no escalation gateway is configured to verify the board-approved contract.`,
+        );
+      }
+      const approved = await escalationGateway.findApproved({ pluginId });
+      if (!approved) {
+        throw new Error(
+          `Cannot complete parked upgrade for "${pluginId}": no approved capability-escalation contract was found. ` +
+            `The upgrade must be approved by the board before it can be applied.`,
+        );
+      }
+
+      const oldManifest = plugin.manifestJson as PaperclipPluginManifestV1;
+      const {
+        packageName = plugin.packageName,
+        localPath = plugin.packagePath ?? undefined,
+      } = upgradeOptions;
+
+      // Prefer the immutable snapshot captured at park over the
+      // mutable source. Loading the approved bytes from host-controlled storage
+      // closes the verify-then-load TOCTOU and covers the `node_modules`/
+      // symlinked code the digest excludes: a swap of the source after approval
+      // can no longer reach the loader. Falls back to the source only for legacy
+      // approvals with no snapshot (predating this anchor, or npm-sourced), preserving the
+      // prior digest-only behavior and never widening it.
+      let loadFromLocalPath = localPath;
+      let snapshotPath: string | null = null;
+      if (approved.digest) {
+        const candidate = upgradeSnapshotPathFor(localPluginDir, approved.digest);
+        if (existsSync(candidate)) {
+          snapshotPath = candidate;
+          loadFromLocalPath = candidate;
+        }
+      }
+
+      // Pin the fetched version to the approved target — ignore any divergent
+      // caller-supplied `version`.
+      const discovered = await fetchAndValidate({
+        packageName,
+        localPath: loadFromLocalPath,
+        version: approved.toVersion,
+        installDir: localPluginDir,
+      });
+      const newManifest = discovered.manifest!;
+
+      if (newManifest.id !== oldManifest.id) {
+        throw new Error(
+          `Upgrade completion failed: new manifest ID '${newManifest.id}' does not match existing plugin ID '${oldManifest.id}'`,
+        );
+      }
+
+      // SECURITY-CRITICAL approval-binding checks. A version string is not an
+      // integrity anchor for a mutable source, so verify BOTH the version and
+      // the capability delta against the approved contract; fail closed (no
+      // mutation, row stays parked) on any mismatch.
+      if (discovered.version !== approved.toVersion) {
+        log.warn(
+          { pluginId, discoveredVersion: discovered.version, approvedVersion: approved.toVersion },
+          "plugin-loader: completeUpgrade fetched a version that differs from the approved target — refusing",
+        );
+        throw new Error(
+          `Cannot complete parked upgrade for "${pluginId}": fetched version "${discovered.version}" ` +
+            `does not match the board-approved version "${approved.toVersion}".`,
+        );
+      }
+      const oldCaps = new Set(oldManifest.capabilities ?? []);
+      const fetchedAddedCaps = (newManifest.capabilities ?? []).filter((c) => !oldCaps.has(c));
+      const approvedAddedCaps = new Set(approved.addedCapabilities);
+      const unapprovedCaps = fetchedAddedCaps.filter((c) => !approvedAddedCaps.has(c));
+      if (unapprovedCaps.length > 0) {
+        log.warn(
+          { pluginId, unapprovedCaps, approvedAddedCapabilities: approved.addedCapabilities },
+          "plugin-loader: completeUpgrade fetched a manifest declaring capabilities the board never approved — refusing",
+        );
+        throw new Error(
+          `Cannot complete parked upgrade for "${pluginId}": fetched manifest adds capabilities that were not approved: ` +
+            `${unapprovedCaps.join(", ")}. The board approved [${approved.addedCapabilities.join(", ")}].`,
+        );
+      }
+
+      // SECURITY-CRITICAL content-integrity check. The version + caps checks above pass a
+      // package that declares the approved version and caps but carries
+      // *different code* (a mutable `localPath` swapped after approval, or a
+      // re-published version/tag). Pin to the digest captured at park: fail
+      // closed (no mutation, row stays parked) on any mismatch. When the
+      // approval predates this anchor (no stored digest) we cannot compare, so
+      // fall through on version + caps — never widening, only adding a check.
+      if (approved.digest) {
+        if (discovered.digest !== approved.digest) {
+          log.warn(
+            { pluginId, discoveredDigest: discovered.digest, approvedDigest: approved.digest },
+            "plugin-loader: completeUpgrade fetched package contents differ from the approved package — refusing",
+          );
+          throw new Error(
+            `Cannot complete parked upgrade for "${pluginId}": fetched package content digest ` +
+              `"${discovered.digest}" does not match the board-approved digest "${approved.digest}". ` +
+              `The package contents changed after approval (same version, different code).`,
+          );
+        }
+      } else {
+        log.warn(
+          { pluginId, approvalId: approved.approvalId },
+          "plugin-loader: completeUpgrade has no approved content digest to verify against (approval predates the digest anchor) — applying on version + capability checks only",
+        );
+      }
+
+      await registry.update(pluginId, {
+        packageName: discovered.packageName,
+        version: discovered.version,
+        manifest: newManifest,
+        // Repoint at the immutable snapshot so the worker requires the approved
+        // bytes, not the mutable source. Left unset for legacy/npm
+        // paths, which keep their existing packagePath.
+        ...(snapshotPath ? { packagePath: snapshotPath } : {}),
+      });
+      const updated = await registry.updateStatus(pluginId, { status: "ready" });
+
+      log.info(
+        { pluginId, fromVersion: oldManifest.version, toVersion: newManifest.version },
+        "plugin-loader: parked upgrade approved and completed",
+      );
+
+      return (updated as PluginRecord | null) ?? ((await registry.getById(pluginId)) as PluginRecord);
+    },
+
+    /**
+     * Revert a parked (`upgrade_pending`) upgrade after board rejection.
+     * Parking never mutated the version/manifest/caps, so this only restores
+     * the lifecycle status to `ready`. Idempotent.
+     */
+    async revertPendingUpgrade(pluginId: string): Promise<PluginRecord> {
+      const plugin = (await registry.getById(pluginId)) as PluginRecord | null;
+      if (!plugin) throw new Error(`Plugin not found: ${pluginId}`);
+
+      if (plugin.status !== "upgrade_pending") {
+        log.info(
+          { pluginId, status: plugin.status },
+          "plugin-loader: revertPendingUpgrade called on a plugin that is not upgrade_pending — no-op",
+        );
+        return plugin;
+      }
+
+      const updated = await registry.updateStatus(pluginId, { status: "ready" });
+
+      log.info(
+        { pluginId, version: plugin.version },
+        "plugin-loader: parked upgrade rejected and reverted to ready",
+      );
+
+      return (updated as PluginRecord | null) ?? ((await registry.getById(pluginId)) as PluginRecord);
     },
 
     // -----------------------------------------------------------------------
@@ -2201,16 +2796,25 @@ export function pluginLoader(
       // are registered by the host handler layer when the worker calls
       // events.subscribe via RPC.
       //
-      // The bus.forPlugin() call creates the scoped handle if needed;
-      // any previous subscriptions for this plugin are preserved if the
-      // worker is restarting.
+      // The bus.forPlugin() call creates the scoped handle if needed.
+      //
+      // On a restart (dev-watcher hot reload / crash auto-restart)
+      // unloadSingle() has already called eventBus.clearPlugin(), so this
+      // plugin starts with ZERO subscriptions; the new worker process must
+      // re-issue every events.subscribe RPC from its setup() for the relay to
+      // re-attach. That happens asynchronously AFTER startWorker() resolves,
+      // so the count read here is a point-in-time snapshot (typically 0 right
+      // after (re)activation) — the authoritative per-subscribe count is logged
+      // by the host events.subscribe handler as each subscription lands. A relay
+      // that stays at 0 (worker alive but no "plugin event subscription
+      // registered" lines) is the detached-subscription signature.
       // ------------------------------------------------------------------
       const _scopedBus = eventBus.forPlugin(pluginKey);
       registered.eventSubscriptions = eventBus.subscriptionCount(pluginKey);
 
       log.debug(
-        { pluginId, pluginKey },
-        "plugin-loader: event bus scoped handle ready",
+        { pluginId, pluginKey, subscriptionsAtActivation: registered.eventSubscriptions },
+        "plugin-loader: event bus scoped handle ready (worker re-subscribes asynchronously)",
       );
 
       // ------------------------------------------------------------------
@@ -2239,6 +2843,10 @@ export function pluginLoader(
       // ------------------------------------------------------------------
       const toolDeclarations = manifest.tools ?? [];
       if (toolDeclarations.length > 0) {
+        // Pass the DB UUID (`pluginId`) as the third arg so dispatch can correlate
+        // each tool to the worker manager (keyed by DB UUID, not by plugin key).
+        // Without this, `workerManager.isRunning(tool.pluginDbId)` checks the plugin
+        // KEY against a UUID-keyed map and fails closed.
         toolDispatcher.registerPluginTools(pluginKey, manifest, pluginId);
         registered.tools = toolDeclarations.length;
 

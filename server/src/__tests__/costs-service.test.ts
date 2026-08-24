@@ -1,5 +1,6 @@
 import express from "express";
 import request from "supertest";
+import { eq } from "drizzle-orm";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { afterAll, afterEach, beforeAll } from "vitest";
 import { randomUUID } from "node:crypto";
@@ -56,6 +57,7 @@ const mockAgentService = vi.hoisted(() => ({
   update: vi.fn(),
 }));
 const mockIssueService = vi.hoisted(() => ({
+  clearOrphanCheckoutLocksIfTerminal: vi.fn(async () => false),
   getById: vi.fn(),
   getByIdentifier: vi.fn(),
 }));
@@ -853,5 +855,157 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     expect(summary.estimatedDebitCents).toBe(2_000_000_000);
     expect(byKindRow?.debitCents).toBe(4_000_000_000);
     expect(byKindRow?.netCents).toBe(4_000_000_000);
+  });
+
+  it("preserves run counts and project totals after run-history prune", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const projectId = randomUUID();
+    const projectId2 = randomUUID();
+    const runId1 = randomUUID();
+    const runId2 = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Cost Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values([
+      {
+        id: projectId,
+        companyId,
+        name: "Project A",
+        status: "active",
+      },
+      {
+        id: projectId2,
+        companyId,
+        name: "Project B",
+        status: "active",
+      },
+    ]);
+
+    const runDate = new Date("2026-04-10T00:00:00.000Z");
+    await db.insert(heartbeatRuns).values([
+      {
+        id: runId1,
+        companyId,
+        agentId,
+        invocationSource: "on_demand",
+        status: "completed",
+        startedAt: runDate,
+        finishedAt: new Date(runDate.getTime() + 60_000),
+        contextSnapshot: {},
+      },
+      {
+        id: runId2,
+        companyId,
+        agentId,
+        invocationSource: "on_demand",
+        status: "completed",
+        startedAt: runDate,
+        finishedAt: new Date(runDate.getTime() + 120_000),
+        contextSnapshot: {},
+      },
+    ]);
+
+    await db.insert(costEvents).values([
+      {
+        companyId,
+        agentId,
+        projectId,
+        heartbeatRunId: runId1,
+        runIdentifier: runId1,
+        provider: "openai",
+        biller: "openai",
+        billingType: "metered_api",
+        model: "gpt-5",
+        inputTokens: 100,
+        cachedInputTokens: 0,
+        outputTokens: 20,
+        costCents: 100,
+        occurredAt: runDate,
+      },
+      {
+        companyId,
+        agentId,
+        projectId,
+        heartbeatRunId: runId1,
+        runIdentifier: runId1,
+        provider: "openai",
+        biller: "openai",
+        billingType: "metered_api",
+        model: "gpt-5",
+        inputTokens: 50,
+        cachedInputTokens: 0,
+        outputTokens: 10,
+        costCents: 50,
+        occurredAt: runDate,
+      },
+      {
+        companyId,
+        agentId,
+        projectId: projectId2,
+        heartbeatRunId: runId2,
+        runIdentifier: runId2,
+        provider: "openai",
+        biller: "openai",
+        billingType: "subscription_included",
+        model: "gpt-5",
+        inputTokens: 200,
+        cachedInputTokens: 0,
+        outputTokens: 40,
+        costCents: 200,
+        occurredAt: runDate,
+      },
+    ]);
+
+    const range = {
+      from: new Date("2026-04-01T00:00:00.000Z"),
+      to: new Date("2026-04-15T23:59:59.999Z"),
+    };
+
+    const beforeByAgent = await costs.byAgent(companyId, range);
+    const beforeByProject = await costs.byProject(companyId, range);
+
+    expect(beforeByAgent).toHaveLength(1);
+    expect(beforeByAgent[0]?.apiRunCount).toBe(1);
+    expect(beforeByAgent[0]?.subscriptionRunCount).toBe(1);
+    expect(beforeByAgent[0]?.costCents).toBe(350);
+
+    expect(beforeByProject).toHaveLength(2);
+    const projectARow = beforeByProject.find((row) => row.projectId === projectId);
+    const projectBRow = beforeByProject.find((row) => row.projectId === projectId2);
+    expect(projectARow?.costCents).toBe(150);
+    expect(projectBRow?.costCents).toBe(200);
+
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, runId1));
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, runId2));
+
+    const afterByAgent = await costs.byAgent(companyId, range);
+    const afterByProject = await costs.byProject(companyId, range);
+
+    expect(afterByAgent).toHaveLength(1);
+    expect(afterByAgent[0]?.apiRunCount).toBe(1);
+    expect(afterByAgent[0]?.subscriptionRunCount).toBe(1);
+    expect(afterByAgent[0]?.costCents).toBe(350);
+
+    expect(afterByProject).toHaveLength(2);
+    const afterProjectARow = afterByProject.find((row) => row.projectId === projectId);
+    const afterProjectBRow = afterByProject.find((row) => row.projectId === projectId2);
+    expect(afterProjectARow?.costCents).toBe(150);
+    expect(afterProjectBRow?.costCents).toBe(200);
   });
 });

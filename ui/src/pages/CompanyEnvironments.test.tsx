@@ -451,7 +451,7 @@ describe("CompanyEnvironments — test provider button", () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       delete (globalThis as any).WebSocket;
     }
-    vi.clearAllMocks();
+    vi.resetAllMocks();
   });
 
   it("shows the testing state only on the clicked environment's button", async () => {

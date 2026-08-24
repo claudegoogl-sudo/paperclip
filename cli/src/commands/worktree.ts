@@ -43,9 +43,14 @@ import {
   routineTriggers,
   runDatabaseBackup,
   runDatabaseRestore,
+  buildEmbeddedPostgresConnectionString,
+  buildEmbeddedPostgresConstructorOptions,
   createEmbeddedPostgresLogBuffer,
   formatEmbeddedPostgresError,
   prepareEmbeddedPostgresNativeRuntime,
+  readEmbeddedPostgresCredential,
+  resolveEmbeddedPostgresPasswordForStartup,
+  rotateEmbeddedPostgresAuthIfNeeded,
 } from "@paperclipai/db";
 import type { Command } from "commander";
 import { ensureAgentJwtSecret, loadPaperclipEnvFile, mergePaperclipEnvEntries, readPaperclipEnvEntries, resolvePaperclipEnvFile } from "../config/env.js";
@@ -157,7 +162,9 @@ type EmbeddedPostgresCtor = new (opts: {
   password: string;
   port: number;
   persistent: boolean;
+  authMethod?: "scram-sha-256" | "password" | "md5";
   initdbFlags?: string[];
+  postgresFlags?: string[];
   onLog?: (message: unknown) => void;
   onError?: (message: unknown) => void;
 }) => EmbeddedPostgresInstance;
@@ -165,6 +172,9 @@ type EmbeddedPostgresCtor = new (opts: {
 type EmbeddedPostgresHandle = {
   port: number;
   startedByThisProcess: boolean;
+  // Resolved password for this cluster after any rotation. Callers use this to
+  // build connection strings.
+  password: string;
   stop: () => Promise<void>;
 };
 
@@ -997,7 +1007,22 @@ function resolveSourceConnectionString(config: PaperclipConfig, envEntries: Reco
   }
 
   const port = portOverride ?? config.database.embeddedPostgresPort;
-  return `postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`;
+  // For a source instance that hasn't been opened since the per-install
+  // password fix landed, there's no cred file. The seed flow requires a
+  // running cluster, so the caller must have started the source server once
+  // after this fix to generate the cred file.
+  const cred = readEmbeddedPostgresCredential(config.database.embeddedPostgresDataDir);
+  if (!cred) {
+    throw new Error(
+      `Source embedded PostgreSQL has no per-install credential file beside ` +
+        `${config.database.embeddedPostgresDataDir}. Start the source Paperclip server once so it generates one.`,
+    );
+  }
+  return buildEmbeddedPostgresConnectionString({
+    port,
+    database: "paperclip",
+    password: cred.password,
+  });
 }
 
 export function copySeededSecretsKey(input: {
@@ -1064,26 +1089,33 @@ async function ensureEmbeddedPostgres(dataDir: string, preferredPort: number): P
 
   const postmasterPidFile = path.resolve(dataDir, "postmaster.pid");
   const runningPid = readRunningPostmasterPid(postmasterPidFile);
+  const startupPasswordResolution = resolveEmbeddedPostgresPasswordForStartup(dataDir);
   if (runningPid) {
+    const port = readPidFilePort(postmasterPidFile) ?? preferredPort;
+    const rotation = await rotateEmbeddedPostgresAuthIfNeeded({
+      dataDir,
+      port,
+      currentPassword: startupPasswordResolution.password,
+    });
     return {
-      port: readPidFilePort(postmasterPidFile) ?? preferredPort,
+      port,
       startedByThisProcess: false,
+      password: rotation.password,
       stop: async () => {},
     };
   }
 
   const port = await findAvailablePort(preferredPort);
   const logBuffer = createEmbeddedPostgresLogBuffer();
-  const instance = new EmbeddedPostgres({
-    databaseDir: dataDir,
-    user: "paperclip",
-    password: "paperclip",
-    port,
-    persistent: true,
-    initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
-    onLog: logBuffer.append,
-    onError: logBuffer.append,
-  });
+  const instance = new EmbeddedPostgres(
+    buildEmbeddedPostgresConstructorOptions({
+      dataDir,
+      port,
+      password: startupPasswordResolution.password,
+      onLog: logBuffer.append,
+      onError: logBuffer.append,
+    }),
+  );
 
   if (!existsSync(path.resolve(dataDir, "PG_VERSION"))) {
     try {
@@ -1107,9 +1139,15 @@ async function ensureEmbeddedPostgres(dataDir: string, preferredPort: number): P
     });
   }
 
+  const rotation = await rotateEmbeddedPostgresAuthIfNeeded({
+    dataDir,
+    port,
+    currentPassword: startupPasswordResolution.password,
+  });
   return {
     port,
     startedByThisProcess: true,
+    password: rotation.password,
     stop: async () => {
       await instance.stop();
     },
@@ -1300,7 +1338,11 @@ async function seedWorktreeDatabase(input: {
         input.sourceConfig.database.embeddedPostgresDataDir,
         input.sourceConfig.database.embeddedPostgresPort,
       );
-      const sourceAdminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${sourceHandle.port}/postgres`;
+      const sourceAdminConnectionString = buildEmbeddedPostgresConnectionString({
+        port: sourceHandle.port,
+        database: "postgres",
+        password: sourceHandle.password,
+      });
       await ensurePostgresDatabase(sourceAdminConnectionString, "paperclip");
     }
     const sourceConnectionString = resolveSourceConnectionString(
@@ -1324,9 +1366,17 @@ async function seedWorktreeDatabase(input: {
       input.targetConfig.database.embeddedPostgresPort,
     );
 
-    const adminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${targetHandle.port}/postgres`;
+    const adminConnectionString = buildEmbeddedPostgresConnectionString({
+      port: targetHandle.port,
+      database: "postgres",
+      password: targetHandle.password,
+    });
     await ensurePostgresDatabase(adminConnectionString, "paperclip");
-    const targetConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${targetHandle.port}/paperclip`;
+    const targetConnectionString = buildEmbeddedPostgresConnectionString({
+      port: targetHandle.port,
+      database: "paperclip",
+      password: targetHandle.password,
+    });
     await runDatabaseRestore({
       connectionString: targetConnectionString,
       backupFile: backup.backupFile,

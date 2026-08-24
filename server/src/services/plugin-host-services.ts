@@ -23,11 +23,16 @@ import type {
   PluginWorkspace,
   IssueComment,
   PluginIssueAssigneeSummary,
+  PluginIssueAttachment,
   PluginIssueOrchestrationSummary,
   PluginExecutionWorkspaceMetadata,
 } from "@paperclipai/plugin-sdk";
 import type { CreateIssueThreadInteraction, InviteJoinType, IssueDocumentSummary, PermissionKey, PrincipalType } from "@paperclipai/shared";
-import { pluginOperationIssueOriginKind } from "@paperclipai/shared";
+import {
+  pluginOperationIssueOriginKind,
+  TERMINAL_HEARTBEAT_RUN_STATUSES,
+  isSuccessfulHeartbeatRunStatus,
+} from "@paperclipai/shared";
 import { companyService } from "./companies.js";
 import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
@@ -39,6 +44,8 @@ import { documentService } from "./documents.js";
 import { heartbeatService } from "./heartbeat.js";
 import { budgetService } from "./budgets.js";
 import { issueApprovalService } from "./issue-approvals.js";
+import { approvalService } from "./approvals.js";
+import { redactEventPayload } from "../redaction.js";
 import { subscribeCompanyLiveEvents } from "./live-events.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import path from "node:path";
@@ -62,6 +69,15 @@ import {
   writePluginLocalFolderTextAtomic,
 } from "./plugin-local-folders.js";
 import { createPluginSecretsHandler } from "./plugin-secrets-handler.js";
+import { createPluginArtifactsHandler } from "./plugin-artifacts-handler.js";
+import { enforcePluginConfigEgress } from "./plugin-config-egress.js";
+import { normalizeIssueAttachmentMaxBytes } from "../attachment-types.js";
+import {
+  defaultPluginWakeRateLimiter,
+  type PluginWakeRateLimiter,
+} from "./plugin-wake-rate-limit.js";
+import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js";
+import type { StorageService } from "../storage/types.js";
 import { logActivity } from "./activity-log.js";
 import type { PluginEventBus } from "./plugin-event-bus.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
@@ -140,7 +156,7 @@ function isPrivateIP(ip: string): boolean {
  * @returns Request-routing metadata used to connect directly to the resolved IP
  *          while preserving the original hostname for HTTP Host and TLS SNI.
  */
-interface ValidatedFetchTarget {
+export interface ValidatedFetchTarget {
   parsedUrl: URL;
   resolvedAddress: string;
   hostHeader: string;
@@ -148,7 +164,10 @@ interface ValidatedFetchTarget {
   useTls: boolean;
 }
 
-async function validateAndResolveFetchUrl(urlString: string): Promise<ValidatedFetchTarget> {
+async function validateAndResolveFetchUrl(
+  urlString: string,
+  checkConfigEgress?: (urlString: string) => Promise<void>,
+): Promise<ValidatedFetchTarget> {
   let parsed: URL;
   try {
     parsed = new URL(urlString);
@@ -160,6 +179,14 @@ async function validateAndResolveFetchUrl(urlString: string): Promise<ValidatedF
     throw new Error(
       `Disallowed protocol "${parsed.protocol}" — only http: and https: are permitted`,
     );
+  }
+
+  // Plugin config-key egress allowlist. Runs AFTER protocol
+  // validation but BEFORE the DNS resolve/pin below — a denied destination
+  // must never be resolved or connected to. Fail-closed: a lookup error
+  // throws (see enforcePluginConfigEgress), it never silently allows.
+  if (checkConfigEgress) {
+    await checkConfigEgress(urlString);
   }
 
   // Resolve the hostname to an IP and check for private ranges.
@@ -215,17 +242,42 @@ async function validateAndResolveFetchUrl(urlString: string): Promise<ValidatedF
   }
 }
 
+/**
+ * Body shape that the worker→host RPC forwards.
+ *
+ * `body` is always a string on the wire (JSON-RPC). `bodyEncoding` tells us
+ * how to interpret it before writing to the upstream socket:
+ *   - "utf8" (default if missing) — text body, written as-is.
+ *   - "base64" — binary body, decoded into a Buffer before write so byte
+ *                payloads (binary blobs, multipart) round-trip exactly.
+ */
+interface PluginFetchInit {
+  method?: string;
+  headers?: Record<string, string> | Headers | Array<[string, string]>;
+  body?: string;
+  bodyEncoding?: "utf8" | "base64";
+}
+
+function decodeFetchBody(init: PluginFetchInit | undefined): string | Buffer | undefined {
+  if (!init || init.body === undefined || init.body === null) return undefined;
+  if (init.bodyEncoding === "base64") {
+    if (typeof init.body !== "string") {
+      throw new Error("http.fetch: bodyEncoding='base64' requires body to be a base64 string");
+    }
+    return Buffer.from(init.body, "base64");
+  }
+  // Default / "utf8" — pass strings through. Coerce non-strings defensively
+  // (legacy callers occasionally send buffer-like objects without bodyEncoding).
+  return typeof init.body === "string" ? init.body : String(init.body);
+}
+
 function buildPinnedRequestOptions(
   target: ValidatedFetchTarget,
-  init?: RequestInit,
-): { options: HttpRequestOptions & { servername?: string }; body: string | undefined } {
-  const headers = new Headers(init?.headers);
+  init?: PluginFetchInit,
+): { options: HttpRequestOptions & { servername?: string }; body: string | Buffer | undefined } {
+  const headers = new Headers(init?.headers as HeadersInit | undefined);
   const method = init?.method ?? "GET";
-  const body = init?.body === undefined || init?.body === null
-    ? undefined
-    : typeof init.body === "string"
-      ? init.body
-      : String(init.body);
+  const body = decodeFetchBody(init);
 
   headers.set("Host", target.hostHeader);
   if (body !== undefined && !headers.has("content-length") && !headers.has("transfer-encoding")) {
@@ -256,11 +308,18 @@ function buildPinnedRequestOptions(
   };
 }
 
-async function executePinnedHttpRequest(
+export async function executePinnedHttpRequest(
   target: ValidatedFetchTarget,
-  init: RequestInit | undefined,
+  init: PluginFetchInit | undefined,
   signal: AbortSignal,
-): Promise<{ status: number; statusText: string; headers: Record<string, string>; body: string }> {
+  responseBase64: boolean,
+): Promise<{
+  status: number;
+  statusText: string;
+  headers: Record<string, string>;
+  body: string;
+  bodyEncoding?: "utf8" | "base64";
+}> {
   const { options, body } = buildPinnedRequestOptions(target, init);
 
   const response = await new Promise<IncomingMessage>((resolve, reject) => {
@@ -302,11 +361,29 @@ async function executePinnedHttpRequest(
     }
   }
 
+  const raw = Buffer.concat(chunks);
+
+  // Opt-in callers (new SDK, which announces `acceptResponseBodyEncoding:
+  // "base64"` and decodes `result.bodyEncoding` on its end) get byte-exact
+  // base64 for text AND binary. Legacy callers keep the lossy utf8 decode
+  // (bytes >=0x80 collapse to U+FFFD) with NO `bodyEncoding` field — changing
+  // it would break old-SDK plugins that read `result.body` as a plain utf8
+  // string and ignore `bodyEncoding`.
+  if (responseBase64) {
+    return {
+      status: response.statusCode ?? 500,
+      statusText: response.statusMessage ?? "",
+      headers,
+      body: raw.toString("base64"),
+      bodyEncoding: "base64",
+    };
+  }
+
   return {
     status: response.statusCode ?? 500,
     statusText: response.statusMessage ?? "",
     headers,
-    body: Buffer.concat(chunks).toString("utf8"),
+    body: raw.toString("utf8"),
   };
 }
 
@@ -358,6 +435,14 @@ const MAX_LOG_MESSAGE_LENGTH = 10_000;
 
 /** Max serialised JSON size for plugin log meta objects. */
 const MAX_LOG_META_JSON_LENGTH = 50_000;
+
+/**
+ * Defensive upper bound on rows returned by the reconcile reads
+ * (`approvals.list` / `interactions.list`). A normal pending set is far smaller,
+ * so this is a no-op in practice; it only prevents a pathological pending count
+ * from ballooning a single response. When the cap is hit we emit one warn line.
+ */
+const RECONCILE_LIST_LIMIT = 500;
 
 /** Max length for a metric name. */
 const MAX_METRIC_NAME_LENGTH = 500;
@@ -493,12 +578,24 @@ export function buildHostServices(
   pluginKey: string,
   eventBus: PluginEventBus,
   notifyWorker?: (method: string, params: unknown) => void,
-  options: { pluginWorkerManager?: PluginWorkerManager; manifest?: import("@paperclipai/shared").PaperclipPluginManifestV1 } = {},
+  options: {
+    pluginWorkerManager?: PluginWorkerManager;
+    storageService?: StorageService;
+    runContextRegistry?: PluginRunContextRegistry;
+    manifest?: import("@paperclipai/shared").PaperclipPluginManifestV1;
+    wakeRateLimiter?: PluginWakeRateLimiter;
+  } = {},
 ): HostServices & { dispose(): void } {
+  const wakeRateLimiter = options.wakeRateLimiter ?? defaultPluginWakeRateLimiter;
   const registry = pluginRegistryService(db);
   const stateStore = pluginStateStore(db);
   const pluginDb = pluginDatabaseService(db);
-  const secretsHandler = createPluginSecretsHandler({ db, pluginId });
+  const secretsHandler = createPluginSecretsHandler({
+    db,
+    pluginDbId: pluginId,
+    pluginKey,
+    runContextRegistry: options.runContextRegistry,
+  });
   const companies = companyService(db);
   const agents = agentService(db);
   const managedAgents = pluginManagedAgentService(db, {
@@ -543,7 +640,48 @@ export function buildHostServices(
   const authorization = authorizationService(db);
   const budgets = budgetService(db);
   const issueApprovals = issueApprovalService(db);
+  const boardApprovals = approvalService(db);
+  const interactions = issueThreadInteractionService(db);
   const scopedBus = eventBus.forPlugin(pluginKey);
+
+  // artifacts.fetch handler — only available when storage + a
+  // run-context registry are wired. When absent (e.g. legacy test harnesses)
+  // the slot stays unwired and any call throws a clear error.
+  const artifactsHandler =
+    options.storageService && options.runContextRegistry
+      ? createPluginArtifactsHandler({
+          db,
+          pluginDbId: pluginId,
+          pluginKey,
+          storage: options.storageService,
+          attachments: {
+            async getAttachmentById(id: string) {
+              const row = await issues.getAttachmentById(id);
+              if (!row) return null;
+              return {
+                id: row.id,
+                companyId: row.companyId,
+                objectKey: row.objectKey,
+                contentType: row.contentType,
+                byteSize: row.byteSize,
+                originalFilename: row.originalFilename ?? null,
+              };
+            },
+          },
+          // asset-write surface + per-company size ceiling for
+          // artifacts.create (mirrors the human upload route's ceiling).
+          assetWriter: {
+            findReusableUnattachedAsset: (companyId, sha256) =>
+              issues.findReusableUnattachedAsset(companyId, sha256),
+            createStandaloneAsset: (input) => issues.createStandaloneAsset(input),
+          },
+          async resolveCompanyMaxBytes(companyId: string) {
+            const company = await companies.getById(companyId);
+            return normalizeIssueAttachmentMaxBytes(company?.attachmentMaxBytes);
+          },
+          runContextRegistry: options.runContextRegistry,
+        })
+      : null;
 
   // Track active session event subscriptions for cleanup
   const activeSubscriptions = new Set<{ unsubscribe: () => void; timer: ReturnType<typeof setTimeout> }>();
@@ -591,6 +729,48 @@ export function buildHostServices(
    * availability gate to enforce here.
    */
   const ensurePluginAvailableForCompany = async (_companyId: string) => {};
+
+  /**
+   * SECURITY-CRITICAL: real, method-scoped availability gate for the reconcile reads
+   * (`approvals.list` / `interactions.list`). Unlike the instance-wide no-op
+   * stub above, this fail-closes so a cross-tenant-sensitive enumeration can
+   * never run for a company the plugin is not genuinely provisioned for. It is
+   * deliberately NOT wired into the existing handlers (whose per-entity
+   * `requireInCompany` already supplies the cross-check) — only the new reads
+   * call it.
+   *
+   * Denial order (each step throws rather than returning an empty list — a
+   * silent empty would mask a misconfig and reopen the very downtime gap this
+   * RPC closes):
+   *   (a) companyId must be a non-empty string;
+   *   (b) the company must exist;
+   *   (c) the plugin install record must exist and be in an operational state
+   *       (not `uninstalled` / `disabled`);
+   *   (d) the company must not have explicitly disabled the plugin
+   *       (`enabled !== false`; absent settings row ⇒ default-ON, matching the
+   *       instance-wide install model).
+   */
+  const requirePluginEnabledForCompany = async (companyId: string): Promise<void> => {
+    // (a)
+    if (typeof companyId !== "string" || companyId.trim().length === 0) {
+      throw new Error("companyId is required for this operation");
+    }
+    // (b)
+    const company = await companies.getById(companyId);
+    if (!company) {
+      throw new Error("Company not found");
+    }
+    // (c)
+    const plugin = await registry.getById(pluginId);
+    if (!plugin || plugin.status === "uninstalled" || plugin.status === "disabled") {
+      throw new Error("Plugin is not available for this company");
+    }
+    // (d)
+    const settings = await registry.getCompanySettings(pluginId, companyId);
+    if (settings && settings.enabled === false) {
+      throw new Error("Plugin is disabled for this company");
+    }
+  };
 
   const getLocalFolderDeclaration = (folderKey: string) =>
     requireLocalFolderDeclaration(options.manifest?.localFolders, folderKey);
@@ -1060,13 +1240,29 @@ export function buildHostServices(
     return { resourceType, resourceId, companyId, policy: null, updatedAt: company.updatedAt };
   };
 
-  return {
-    config: {
-      async get() {
-        const configRow = await registry.getConfig(pluginId);
-        return configRow?.configJson ?? {};
-      },
+  // The runtime config service exposes `getForCompany` for per-tenant
+  // effective config. The SDK's `HostServices.config` interface adds this as an
+  // optional method; the cast keeps this file compiling against SDK versions
+  // that pre-date the extension (the gated handler duck-types `getForCompany`
+  // via `if (services.config.getForCompany)` so the absence is safe).
+  const configService = {
+    async get(): Promise<Record<string, unknown>> {
+      const configRow = await registry.getConfig(pluginId);
+      return (configRow?.configJson as Record<string, unknown> | undefined) ?? {};
     },
+    async getForCompany(companyId: string): Promise<Record<string, unknown>> {
+      const [configRow, override] = await Promise.all([
+        registry.getConfig(pluginId),
+        registry.getCompanyConfigOverride(pluginId, companyId),
+      ]);
+      const base = (configRow?.configJson as Record<string, unknown> | undefined) ?? {};
+      if (!override) return { ...base };
+      return { ...base, ...override };
+    },
+  };
+
+  return {
+    config: configService as unknown as HostServices["config"],
 
     localFolders: {
       async declarations() {
@@ -1211,11 +1407,31 @@ export function buildHostServices(
             notifyWorker("onEvent", { event });
           }
         };
-        if (params.filter) {
-          scopedBus.subscribe(params.eventPattern as any, params.filter as any, handler);
-        } else {
-          scopedBus.subscribe(params.eventPattern as any, handler);
-        }
+        const { replaced } = params.filter
+          ? scopedBus.subscribe(params.eventPattern as any, params.filter as any, handler)
+          : scopedBus.subscribe(params.eventPattern as any, handler);
+        // Observability: a plugin worker re-runs setup() (and therefore
+        // re-issues every events.subscribe RPC) on each (re)start — e.g. a
+        // dev-watcher hot reload or crash auto-restart. If the host-side
+        // subscription ever fails to re-attach, board events silently stop
+        // reaching the worker with no error. Logging the running per-plugin
+        // subscription count on every (re)subscribe makes a detached relay
+        // observable: a healthy worker logs a rising count right after restart;
+        // a detached one logs nothing (count stuck at 0).
+        //
+        // `replaced` distinguishes a first bind from a re-bind that
+        // adopted the current notify channel, which is why `subscriptionCount`
+        // now stays flat across re-binds instead of climbing.
+        logger.info(
+          {
+            pluginId,
+            pluginKey,
+            eventPattern: params.eventPattern,
+            subscriptionCount: eventBus.subscriptionCount(pluginKey),
+            replaced,
+          },
+          "plugin event subscription registered",
+        );
       },
     },
 
@@ -1223,14 +1439,29 @@ export function buildHostServices(
       async fetch(params) {
         // SSRF protection: validate protocol whitelist + block private IPs.
         // Resolve once, then connect directly to that IP to prevent DNS rebinding.
-        const target = await validateAndResolveFetchUrl(params.url);
+        // Gate on the plugin's own declared config-key egress
+        // allowlist before any DNS resolution happens.
+        const target = await validateAndResolveFetchUrl(params.url, (url) =>
+          enforcePluginConfigEgress(db, pluginId, url),
+        );
 
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), PLUGIN_FETCH_TIMEOUT_MS);
 
         try {
-          const init = params.init as RequestInit | undefined;
-          return await executePinnedHttpRequest(target, init, controller.signal);
+          const init = params.init as PluginFetchInit | undefined;
+          // The SDK worker opts in by sending `acceptResponseBodyEncoding:
+          // "base64"` as a top-level param (sibling of `url`/`init`). Old SDKs
+          // never send it, so they stay on the legacy utf8 path.
+          const responseBase64 =
+            (params as { acceptResponseBodyEncoding?: "utf8" | "base64" })
+              .acceptResponseBodyEncoding === "base64";
+          return await executePinnedHttpRequest(
+            target,
+            init,
+            controller.signal,
+            responseBase64,
+          );
         } finally {
           clearTimeout(timeout);
         }
@@ -1240,6 +1471,28 @@ export function buildHostServices(
     secrets: {
       async resolve(params) {
         return secretsHandler.resolve(params);
+      },
+      async mintHandle(params) {
+        return secretsHandler.mintHandle(params);
+      },
+    },
+
+    artifacts: {
+      async fetch(params) {
+        if (!artifactsHandler) {
+          throw new Error(
+            "artifacts.fetch is not available — host was built without a storage service or run-context registry",
+          );
+        }
+        return artifactsHandler.fetch(params);
+      },
+      async create(params) {
+        if (!artifactsHandler) {
+          throw new Error(
+            "artifacts.create is not available — host was built without a storage service or run-context registry",
+          );
+        }
+        return artifactsHandler.create(params);
       },
     },
 
@@ -2007,27 +2260,136 @@ export function buildHostServices(
         if (!inCompany(await issues.getById(params.issueId), companyId)) return [];
         return (await issues.listComments(params.issueId)) as IssueComment[];
       },
+      async listAttachments(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        if (!inCompany(await issues.getById(params.issueId), companyId)) return [];
+        // Narrow the host row to the plugin-facing projection:
+        // raw storage addressing (provider, objectKey, sha256) and creator identity
+        // are deliberately withheld so a worker cannot reach the blob store directly
+        // or infer authorship — asset bytes go through artifacts.fetch(assetId).
+        const rows = await issues.listAttachments(params.issueId, companyId);
+        return rows.map((row) => ({
+          id: row.id,
+          companyId: row.companyId,
+          issueId: row.issueId,
+          issueCommentId: row.issueCommentId,
+          assetId: row.assetId,
+          contentType: row.contentType,
+          byteSize: row.byteSize,
+          originalFilename: row.originalFilename,
+          createdAt: row.createdAt,
+        })) as PluginIssueAttachment[];
+      },
       async createComment(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
-        const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
+        // Resolve target by identifier (e.g. an issue's public id) when no issueId is supplied.
+        // requireInCompany keeps the tenant reach-check: an identifier that resolves
+        // to a foreign company throws "Issue not found".
+        const issue = params.identifier && !params.issueId
+          ? requireInCompany("Issue", await issues.getByIdentifier(params.identifier), companyId)
+          : requireInCompany("Issue", await issues.getById(params.issueId), companyId);
+        const isClosed = issue.status === "done" || issue.status === "cancelled";
+        // Secure default: on the relay/wake path, never land silently on a closed
+        // issue unless the caller explicitly opts out (refuseClosed === false).
+        const refuseClosed = params.refuseClosed ?? params.wakeAssignee === true;
+        if (refuseClosed && isClosed) {
+          throw new Error(`Issue is closed (status: ${issue.status})`);
+        }
+        // SECURITY-CRITICAL: the host must not let a plugin mint *user* authorship. A
+        // worker-supplied user id is untrusted: it would write authorType "user",
+        // indistinguishable from a real board comment, and governance leans on
+        // comment authorship (send-it-back-to-me, approvals, audit). Relays are
+        // attributed to the plugin's own agent identity; operator identity, if any,
+        // belongs in the comment body/metadata, not in host-minted authorship.
         const comment = (await issues.addComment(
-          params.issueId,
+          issue.id,
           params.body,
           { agentId: params.authorAgentId },
         )) as IssueComment;
+        // Bind any standalone assets created via artifacts.create onto
+        // this comment. attachAssetsToComment re-checks each asset's company
+        // against the (already tenant-validated) issue's company, so a worker
+        // cannot surface a foreign tenant's asset. Idempotent on the UNIQUE
+        // asset_id index, so a retried createComment does not duplicate.
+        const attachmentIds = Array.isArray(params.attachmentIds)
+          ? params.attachmentIds.filter((id): id is string => typeof id === "string" && id.length > 0)
+          : [];
+        if (attachmentIds.length > 0) {
+          await issues.attachAssetsToComment({
+            issueId: issue.id,
+            issueCommentId: comment.id,
+            assetIds: attachmentIds,
+          });
+        }
         await logPluginActivity({
           companyId,
           action: "issue.comment.created",
           entityType: "issue",
           entityId: issue.id,
+          // Record the true principal only: the plugin's agent identity. Never a
+          // worker-claimed user (would make the audit trail itself spoofable).
           actor: { actorAgentId: params.authorAgentId ?? null },
           details: {
             identifier: issue.identifier,
             commentId: comment.id,
             bodySnippet: comment.body.slice(0, 120),
+            resolvedByIdentifier: Boolean(params.identifier && !params.issueId),
+            wakeAssignee: params.wakeAssignee === true,
+            attachmentCount: attachmentIds.length,
           },
         });
+
+        if (params.wakeAssignee && !isClosed) {
+          // Assignee-only wake. Body @-mentions are deliberately NOT honored as a
+          // wake primitive here: createComment bodies on the relay path are
+          // untrusted operator/Telegram text, and mention-driven wake would let
+          // inbound content fan out heartbeat runs to arbitrary same-company agents
+          // (indirect prompt-injection / DoS). Capped, rate-limited mention-wake is
+          // tracked as a follow-up.
+          const authorAgentId = params.authorAgentId ?? null;
+          const assigneeId = issue.assigneeAgentId;
+          const selfComment = Boolean(authorAgentId && authorAgentId === assigneeId);
+          // Throttle wakes per (plugin, company, assignee). A relay storm still
+          // lands every comment, but only the first `maxWakes`/window enqueue a
+          // heartbeat — the rest are dropped so untrusted inbound volume cannot
+          // spam the assignee's runs or burn budget.
+          const wakeAllowed =
+            assigneeId && !selfComment
+              ? wakeRateLimiter.consume({ pluginId, companyId, agentId: assigneeId }).allowed
+              : true;
+          if (assigneeId && !selfComment && !wakeAllowed) {
+            logger.warn(
+              { issueId: issue.id, agentId: assigneeId, companyId, pluginId, pluginKey },
+              "plugin createComment: assignee wake rate-limited; comment landed but wakeup skipped",
+            );
+          }
+          if (assigneeId && !selfComment && wakeAllowed) {
+            await heartbeat
+              .wakeup(assigneeId, {
+                source: "automation",
+                triggerDetail: "system",
+                reason: "issue_commented",
+                payload: { issueId: issue.id, commentId: comment.id, mutation: "comment", pluginId, pluginKey },
+                requestedByActorType: "system",
+                requestedByActorId: pluginId,
+                contextSnapshot: {
+                  issueId: issue.id,
+                  taskId: issue.id,
+                  commentId: comment.id,
+                  wakeCommentId: comment.id,
+                  source: "plugin.issue.comment",
+                  wakeReason: "issue_commented",
+                  pluginId,
+                  pluginKey,
+                },
+              })
+              .catch((err) =>
+                logger.warn({ err, issueId: issue.id, agentId: assigneeId }, "plugin createComment: failed to wake assignee"),
+              );
+          }
+        }
         return comment;
       },
       async createInteraction(params) {
@@ -2052,6 +2414,107 @@ export function buildHostServices(
           },
         });
         return interaction as any;
+      },
+      // SECURITY-CRITICAL: retire (expire) a single pending interaction the plugin
+      // is relaying an operator reply to. Least-privilege authorization:
+      //  - gated by the default-deny `issue.interactions.resolve` capability
+      //    (granted only to the messenger manifest),
+      //  - `requireInCompany` binds the target issue to the plugin's own company,
+      //    and the shared service re-checks the interaction belongs to that issue
+      //    (cross-tenant interactionId -> notFound), and
+      //  - actor `userId` is ALWAYS null: the messenger acts on the operator's
+      //    behalf via free text but must NOT mint operator user authorship in the
+      //    audit trail. Terminal status is always "expired",
+      //    never "accepted", so no accept side-effect or continuation wake fires.
+      async resolveInteraction(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
+        const interaction = await issueThreadInteractionService(db).supersedeInteractionById(
+          issue,
+          params.interactionId,
+          { commentId: params.supersedingCommentId ?? null, reason: params.reason ?? null },
+          { agentId: null, userId: null },
+        );
+        await logPluginActivity({
+          companyId,
+          action: "issue.thread_interaction_superseded",
+          entityType: "issue",
+          entityId: issue.id,
+          actor: { actorAgentId: null },
+          details: {
+            identifier: issue.identifier,
+            interactionId: interaction.id,
+            interactionKind: interaction.kind,
+            interactionStatus: interaction.status,
+            supersededByActorType: "plugin",
+            supersedingCommentId: params.supersedingCommentId ?? null,
+          },
+        });
+        return interaction as any;
+      },
+    },
+
+    // SECURITY-CRITICAL: reconcile reads. Both run the real, fail-closed
+    // `requirePluginEnabledForCompany` gate before any query (Complete
+    // Mediation) and return a field-minimized projection (no requester/decider
+    // user ids, no decision notes, no result blobs). Default to pending when no
+    // status is supplied — the digest only cares about live blockers. A defensive
+    // `RECONCILE_LIST_LIMIT` bounds each response so a pathological pending count
+    // can't balloon a single read; a normal pending set is far below the cap, so
+    // this is a no-op in practice.
+    approvals: {
+      async list(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await requirePluginEnabledForCompany(companyId);
+        const rows = await boardApprovals.list(
+          companyId,
+          params.status ?? "pending",
+          RECONCILE_LIST_LIMIT,
+        );
+        if (rows.length >= RECONCILE_LIST_LIMIT) {
+          logger.warn(
+            { companyId, limit: RECONCILE_LIST_LIMIT, status: params.status ?? "pending" },
+            "plugin approvals.list reconcile read hit the defensive row cap; response truncated",
+          );
+        }
+        return rows.map((row) => ({
+          id: row.id,
+          type: row.type,
+          status: row.status,
+          payload: redactEventPayload(row.payload) ?? {},
+          createdAt: row.createdAt.toISOString(),
+        }));
+      },
+    },
+
+    interactions: {
+      async list(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await requirePluginEnabledForCompany(companyId);
+        // This reconcile read is pending-only by design (the digest tracks live
+        // blockers). Reject any other status rather than returning a silent
+        // empty list, which would mask a caller misconfig.
+        const status = params.status ?? "pending";
+        if (status !== "pending") {
+          throw new Error(`interactions.list only supports status="pending" (got "${status}")`);
+        }
+        const rows = await interactions.listPendingByCompany(companyId, RECONCILE_LIST_LIMIT);
+        if (rows.length >= RECONCILE_LIST_LIMIT) {
+          logger.warn(
+            { companyId, limit: RECONCILE_LIST_LIMIT },
+            "plugin interactions.list reconcile read hit the defensive row cap; response truncated",
+          );
+        }
+        return rows.map((row) => ({
+          id: row.id,
+          issueId: row.issueId,
+          kind: row.kind,
+          status: row.status,
+          title: row.title ?? null,
+          summary: row.summary ?? null,
+          createdAt: row.createdAt.toISOString(),
+        }));
       },
     },
 
@@ -2644,7 +3107,7 @@ export function buildHostServices(
         // Track the subscription so it can be cleaned up on dispose() if the run
         // never reaches a terminal status (hang, crash, network partition).
         if (notifyWorker) {
-          const TERMINAL_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
+          const TERMINAL_STATUSES = new Set<string>(TERMINAL_HEARTBEAT_RUN_STATUSES);
 
           const cleanup = () => {
             unsubscribe();
@@ -2673,9 +3136,9 @@ export function buildHostServices(
                   sessionId: params.sessionId,
                   runId: run.id,
                   seq: 0,
-                  eventType: status === "succeeded" ? "done" : "error",
+                  eventType: isSuccessfulHeartbeatRunStatus(status) ? "done" : "error",
                   stream: "system",
-                  message: status === "succeeded" ? "Run completed" : `Run ${status}`,
+                  message: isSuccessfulHeartbeatRunStatus(status) ? "Run completed" : `Run ${status}`,
                   payload: payload,
                 });
                 cleanup();

@@ -1011,4 +1011,282 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     });
     expect(decision.createdByRunId).toBe(managerRunId);
   });
+
+  async function withAutoTeardown<T>(
+    env: { enabled?: boolean; silenceMs?: number },
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const prevEnabled = process.env.WATCHDOG_AUTO_TEARDOWN_ENABLED;
+    const prevSilence = process.env.WATCHDOG_AUTO_TEARDOWN_SILENCE_MS;
+    if (env.enabled !== undefined) {
+      process.env.WATCHDOG_AUTO_TEARDOWN_ENABLED = env.enabled ? "true" : "false";
+    }
+    if (env.silenceMs !== undefined) {
+      process.env.WATCHDOG_AUTO_TEARDOWN_SILENCE_MS = String(env.silenceMs);
+    }
+    try {
+      return await fn();
+    } finally {
+      if (prevEnabled === undefined) delete process.env.WATCHDOG_AUTO_TEARDOWN_ENABLED;
+      else process.env.WATCHDOG_AUTO_TEARDOWN_ENABLED = prevEnabled;
+      if (prevSilence === undefined) delete process.env.WATCHDOG_AUTO_TEARDOWN_SILENCE_MS;
+      else process.env.WATCHDOG_AUTO_TEARDOWN_SILENCE_MS = prevSilence;
+    }
+  }
+
+  it("auto-tears-down a silent run past the teardown threshold and releases the lock when enabled", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, coderId, issueId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await withAutoTeardown({ enabled: true }, () =>
+      heartbeat.scanSilentActiveRuns({ now, companyId }),
+    );
+
+    expect(result).toMatchObject({ tornDown: 1, created: 0 });
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("watchdog_auto_teardown");
+    expect(run?.finishedAt?.toISOString()).toBe(now.toISOString());
+    expect(run?.resultJson).toMatchObject({
+      watchdogAutoTeardown: {
+        trigger: "watchdog_auto",
+        sourceIssueId: issueId,
+        cleanup: { outcome: "no_process_metadata" },
+      },
+    });
+
+    const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(source?.executionRunId).toBeNull();
+    expect(source?.executionAgentNameKey).toBeNull();
+    expect(source?.executionLockedAt).toBeNull();
+
+    const [agent] = await db.select().from(agents).where(eq(agents.id, coderId));
+    expect(agent?.status).toBe("idle");
+
+    const decisions = await db
+      .select()
+      .from(heartbeatRunWatchdogDecisions)
+      .where(eq(heartbeatRunWatchdogDecisions.runId, runId));
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]?.decision).toBe("terminate");
+
+    const activity = await db
+      .select()
+      .from(activityLog)
+      .where(and(eq(activityLog.runId, runId), eq(activityLog.action, "heartbeat.watchdog_torn_down")));
+    expect(activity).toHaveLength(1);
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(comments.some((c) => c.body.includes("watchdog auto-teardown"))).toBe(true);
+
+    const [event] = await db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, runId));
+    expect(event?.message).toContain("Watchdog auto-teardown");
+  });
+
+  it("does not tear down when the feature flag is disabled (detection-only default)", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, issueId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await withAutoTeardown({ enabled: false }, () =>
+      heartbeat.scanSilentActiveRuns({ now, companyId }),
+    );
+
+    expect(result).toMatchObject({ tornDown: 0, created: 1 });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("running");
+    const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(source?.executionRunId).toBe(runId);
+  });
+
+  it("never tears down a run with a live snooze decision", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, runId, issueId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    const heartbeat = heartbeatService(db);
+    await db.insert(heartbeatRunWatchdogDecisions).values({
+      companyId,
+      runId,
+      decision: "snooze",
+      snoozedUntil: new Date(now.getTime() + 60 * 60 * 1000),
+      reason: "operator asked to keep watching",
+    });
+
+    const result = await withAutoTeardown({ enabled: true }, () =>
+      heartbeat.scanSilentActiveRuns({ now, companyId }),
+    );
+
+    expect(result).toMatchObject({ tornDown: 0, snoozed: 1 });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("running");
+    const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(source?.executionRunId).toBe(runId);
+  });
+
+  it("never tears down a run with a live continue decision", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    const heartbeat = heartbeatService(db);
+    await db.insert(heartbeatRunWatchdogDecisions).values({
+      companyId,
+      runId,
+      decision: "continue",
+      snoozedUntil: new Date(now.getTime() + ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS),
+      reason: "current evidence acceptable",
+    });
+
+    const result = await withAutoTeardown({ enabled: true }, () =>
+      heartbeat.scanSilentActiveRuns({ now, companyId }),
+    );
+
+    expect(result).toMatchObject({ tornDown: 0, snoozed: 1 });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("running");
+  });
+
+  it("is idempotent across repeated scans (tears down once, no duplicate decisions or comments)", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, runId, issueId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const first = await withAutoTeardown({ enabled: true }, () =>
+      heartbeat.scanSilentActiveRuns({ now, companyId }),
+    );
+    const second = await withAutoTeardown({ enabled: true }, () =>
+      heartbeat.scanSilentActiveRuns({ now: new Date(now.getTime() + 5 * 60_000), companyId }),
+    );
+
+    expect(first.tornDown).toBe(1);
+    // The run is no longer `running`, so it is not a candidate on the second scan.
+    expect(second.scanned).toBe(0);
+    expect(second.tornDown).toBe(0);
+
+    const decisions = await db
+      .select()
+      .from(heartbeatRunWatchdogDecisions)
+      .where(eq(heartbeatRunWatchdogDecisions.runId, runId));
+    expect(decisions).toHaveLength(1);
+
+    const teardownComments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(teardownComments.filter((c) => c.body.includes("watchdog auto-teardown"))).toHaveLength(1);
+  });
+
+  it("tears down below the detection floor when a lower teardown threshold widens the window", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    // Run silent for 40m: below the 60m detection floor, above a configured 35m teardown threshold.
+    const { companyId, runId } = await seedRunningRun({ now, ageMs: 40 * 60_000 });
+    const heartbeat = heartbeatService(db);
+
+    const result = await withAutoTeardown({ enabled: true, silenceMs: 35 * 60_000 }, () =>
+      heartbeat.scanSilentActiveRuns({ now, companyId }),
+    );
+
+    expect(result).toMatchObject({ tornDown: 1, created: 0 });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("failed");
+  });
+
+  it("floors the teardown threshold at 30m so a misconfigured tiny value cannot nuke briefly-quiet runs", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    // Run silent for only 20m with a misconfigured 1m threshold: the 30m floor keeps it out of scope.
+    const { companyId, runId } = await seedRunningRun({ now, ageMs: 20 * 60_000 });
+    const heartbeat = heartbeatService(db);
+
+    const result = await withAutoTeardown({ enabled: true, silenceMs: 60_000 }, () =>
+      heartbeat.scanSilentActiveRuns({ now, companyId }),
+    );
+
+    expect(result).toMatchObject({ scanned: 0, tornDown: 0 });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("running");
+  });
+
+  it("performs an authorized manual terminate via recordWatchdogDecision regardless of the feature flag", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, coderId, issueId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
+
+    // Feature flag OFF: a manual board terminate is an explicit authorized override.
+    const decision = await withAutoTeardown({ enabled: false }, () =>
+      recovery.recordWatchdogDecision({
+        runId,
+        actor: { type: "board", userId: "operator-1" },
+        decision: "terminate",
+        reason: "operator confirmed the run is wedged",
+        now,
+      }),
+    );
+
+    expect(decision).toMatchObject({ runId, decision: "terminate", createdByUserId: "operator-1" });
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("watchdog_auto_teardown");
+    const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(source?.executionRunId).toBeNull();
+    const [agent] = await db.select().from(agents).where(eq(agents.id, coderId));
+    expect(agent?.status).toBe("idle");
+  });
+
+  it("records an audit-only terminate decision when the run already reached a terminal state", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, runId, issueId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
+
+    // Run finishes on its own before the operator's terminate lands.
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: now }).where(eq(heartbeatRuns.id, runId));
+
+    const decision = await recovery.recordWatchdogDecision({
+      runId,
+      actor: { type: "board", userId: "operator-1" },
+      decision: "terminate",
+      reason: "operator clicked terminate late",
+      now,
+    });
+
+    expect(decision).toMatchObject({ runId, decision: "terminate" });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    // Not re-terminated: still the status it reached on its own.
+    expect(run?.status).toBe("succeeded");
+    // No teardown activity-log entry, only the audit decision.
+    const teardownActivity = await db
+      .select()
+      .from(activityLog)
+      .where(and(eq(activityLog.runId, runId), eq(activityLog.action, "heartbeat.watchdog_torn_down")));
+    expect(teardownActivity).toHaveLength(0);
+    // Lock left untouched by the no-op terminate (a separate sweeper handles terminal-run locks).
+    const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(source?.executionRunId).toBe(runId);
+  });
 });

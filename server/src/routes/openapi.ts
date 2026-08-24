@@ -141,6 +141,12 @@ import {
   secretProviderConfigDiscoveryPreviewSchema,
   remoteSecretImportPreviewSchema,
   remoteSecretImportSchema,
+  // (fork) Secret egress operator surface
+  setBindingEgressAllowlistSchema,
+  enforceBindingEgressSchema,
+  // (fork) Plugin config-key egress operator surface
+  setPluginConfigEgressAllowlistSchema,
+  enforcePluginConfigEgressAllowlistSchema,
   workspaceFileListQuerySchema,
   workspaceFileResourceQuerySchema,
 } from "@paperclipai/shared";
@@ -1486,6 +1492,14 @@ registry.registerPath({
   tags: ["agents"],
   summary: "List scheduler heartbeats",
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/instance/usage-limit-park",
+  tags: ["agents"],
+  summary: "Get instance-wide usage-limit park state",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
 
 // ─── Adapters ────────────────────────────────────────────────────────────────
@@ -3186,7 +3200,7 @@ registry.registerPath({
   request: {
     params: z.object({ runId: z.string() }),
     body: jsonBody(z.object({
-      decision: z.enum(["snooze", "continue", "dismissed_false_positive"]),
+      decision: z.enum(["snooze", "continue", "dismissed_false_positive", "terminate"]),
       evaluationIssueId: z.string().optional().nullable(),
       reason: z.string().optional().nullable(),
       snoozedUntil: z.string().datetime().optional().nullable(),
@@ -4174,6 +4188,18 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "post",
+  path: "/api/plugins/{pluginId}/webhooks/{endpointKey}/token",
+  tags: ["plugins"],
+  summary: "Generate a shared token for a webhook endpoint and store its digest",
+  request: {
+    params: z.object({ pluginId: z.string(), endpointKey: z.string() }),
+    body: jsonBody(z.object({ token: z.string().optional() })),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
   method: "get",
   path: "/api/plugins/{pluginId}/dashboard",
   tags: ["plugins"],
@@ -4835,6 +4861,58 @@ registerCurrentRoute({
   body: remoteSecretImportSchema,
 });
 
+// (fork) Operator-only secret egress review + per-binding allowlist /
+// enforce-flip surface. These routes are mounted in routes/secrets.ts; document
+// them here so the openapi spec stays an exact match for the fork's hardening.
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/secret-egress-bindings",
+  tags: ["secrets"],
+  summary: "List secret egress bindings for operator review",
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/secret-egress-bindings/{bindingId}/allowlist",
+  tags: ["secrets"],
+  summary: "Set the egress allowlist for a secret binding",
+  body: setBindingEgressAllowlistSchema,
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/secret-egress-bindings/{bindingId}/enforce",
+  tags: ["secrets"],
+  summary: "Toggle egress enforcement for a secret binding",
+  body: enforceBindingEgressSchema,
+});
+
+// (fork) Operator-only plugin config-key egress review + allowlist /
+// enforce-flip surface. These routes are mounted in routes/plugin-config-egress.ts;
+// document them here so the openapi spec stays an exact match for the fork's hardening.
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/plugins/{pluginId}/config-egress",
+  tags: ["plugins"],
+  summary: "Review plugin config-key egress allowlist and would-deny suggestions",
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/plugins/{pluginId}/config-egress/{configKey}/allowlist",
+  tags: ["plugins"],
+  summary: "Set the egress allowlist for a plugin config key",
+  body: setPluginConfigEgressAllowlistSchema,
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/plugins/{pluginId}/config-egress/{configKey}/enforce",
+  tags: ["plugins"],
+  summary: "Toggle egress enforcement for a plugin config key (plugin-wide effect)",
+  body: enforcePluginConfigEgressAllowlistSchema,
+});
+
 for (const route of [
   ["get", "/api/skills/catalog", "List catalog skills"],
   ["get", "/api/skills/catalog/{catalogId}", "Get a catalog skill"],
@@ -5045,6 +5123,14 @@ registerCurrentRoute({
   body: cancelIssueThreadInteractionSchema,
 });
 
+registerCurrentRoute({
+  method: "post",
+  path: "/api/issues/{id}/interactions/{interactionId}/supersede",
+  tags: ["issues"],
+  summary: "Supersede (author-retire) an issue question interaction",
+  body: cancelIssueThreadInteractionSchema,
+});
+
 for (const route of [
   ["get", "/api/routines/{id}/revisions", "List routine revisions"],
   ["post", "/api/routines/{id}/revisions/{revisionId}/restore", "Restore a routine revision"],
@@ -5104,6 +5190,22 @@ for (const route of [
     tags: ["plugins"],
     summary: route[2],
     ...(route[0] === "post" || route[0] === "put" ? { body: pluginLocalFolderRequestSchema } : {}),
+  });
+}
+
+// (fork) Per-tenant plugin config overrides + secret-binding lifecycle.
+// Mounted in routes/plugins.ts; the PUT body is validated inline against the
+// plugin's instanceConfigSchema, so these are registered path-only.
+for (const route of [
+  ["get", "/api/plugins/{pluginId}/companies/{companyId}/config-overrides", "Get a plugin per-tenant config override"],
+  ["put", "/api/plugins/{pluginId}/companies/{companyId}/config-overrides", "Replace a plugin per-tenant config override"],
+  ["delete", "/api/plugins/{pluginId}/companies/{companyId}/config-overrides", "Clear a plugin per-tenant config override"],
+] as const) {
+  registerCurrentRoute({
+    method: route[0],
+    path: route[1],
+    tags: ["plugins"],
+    summary: route[2],
   });
 }
 

@@ -1,0 +1,373 @@
+#!/usr/bin/env node
+/**
+ * upstream-sync.mjs
+ *
+ * Sync-tick entrypoint for the upstream-sync routine
+ * (claudegoogl-sudo/paperclip ← paperclipai/paperclip). See
+ * skills/upstream-sync/SKILL.md for the wider workflow.
+ *
+ * One tick:
+ *   1. Load .paperclip/upstream-sync.json (state).
+ *   2. GET https://api.github.com/repos/paperclipai/paperclip/releases/latest
+ *      with If-None-Match: <state.etag>. On 304 → "no-op: still at <tag>".
+ *   3. On 200: if tag_name === state.lastSyncedTag, refresh ETag and exit 0.
+ *   3b. Idempotency: before any branch/push/PR work, no-op if a sync
+ *      PR for <tag> is already open on the fork. The state file only advances
+ *      when a sync PR *merges* (board-gated), so every tick between "opened"
+ *      and "merged" lands here again for the same tag — a re-run must converge,
+ *      not crash on a non-fast-forward push or a 422 "already exists". A stale
+ *      remote branch with no open PR is likewise left as-is for manual review.
+ *   4. Otherwise: git fetch upstream, branch sync/upstream-<tag> off
+ *      origin/master, merge upstream/<tag> --no-ff. On conflicts, invoke
+ *      scripts/resolve-trivial-sync-conflicts.mjs; if anything is still
+ *      unresolved, emit a JSON escalation report on stdout and exit non-zero.
+ *   5. On clean merge: rewrite state file, commit, push, open a draft PR
+ *      against claudegoogl-sudo/paperclip:master with the body produced by
+ *      scripts/format-sync-pr-body.mjs.
+ *
+ * Side-effects (network, branch creation, push, PR create) only run when
+ * --dry-run is absent. --dry-run still hits the GitHub API (read-only) and
+ * is safe to run by hand at any time.
+ */
+
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import process from "node:process";
+import { fileURLToPath } from "node:url";
+
+const UPSTREAM_OWNER = "paperclipai";
+const UPSTREAM_REPO = "paperclip";
+const FORK_OWNER = "claudegoogl-sudo";
+const FORK_REPO = "paperclip";
+const FORK_BASE_BRANCH = "master";
+const UPSTREAM_REMOTE = "upstream";
+const FORK_REMOTE = "origin";
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const stateFile = path.join(repoRoot, ".paperclip", "upstream-sync.json");
+
+const args = new Set(process.argv.slice(2));
+const dryRun = args.has("--dry-run");
+
+function readState() {
+  if (!existsSync(stateFile)) {
+    throw new Error(`missing state file: ${stateFile} (bootstrap with .paperclip/upstream-sync.json)`);
+  }
+  return JSON.parse(readFileSync(stateFile, "utf8"));
+}
+
+function writeState(next) {
+  writeFileSync(stateFile, `${JSON.stringify(next, null, 2)}\n`);
+}
+
+function git(args, opts = {}) {
+  return execFileSync("git", args, { cwd: repoRoot, encoding: "utf8", ...opts }).trim();
+}
+
+async function fetchLatestRelease(etag) {
+  const headers = {
+    "User-Agent": `${FORK_OWNER}-upstream-sync`,
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
+  if (etag) headers["If-None-Match"] = etag;
+  if (process.env.GITHUB_TOKEN) headers["Authorization"] = `Bearer ${process.env.GITHUB_TOKEN}`;
+
+  const res = await fetch(`https://api.github.com/repos/${UPSTREAM_OWNER}/${UPSTREAM_REPO}/releases/latest`, {
+    headers,
+  });
+
+  if (res.status === 304) return { status: 304, etag, release: null };
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`upstream releases/latest ${res.status}: ${body.slice(0, 400)}`);
+  }
+  const release = await res.json();
+  return { status: res.status, etag: res.headers.get("etag"), release };
+}
+
+function runConflictResolver() {
+  try {
+    execFileSync("node", [path.join("scripts", "resolve-trivial-sync-conflicts.mjs")], {
+      cwd: repoRoot,
+      stdio: "inherit",
+    });
+  } catch (err) {
+    // resolver may legitimately exit non-zero when files remain unresolved;
+    // we re-check via `git diff --name-only --diff-filter=U` below.
+    if (err && typeof err.status === "number" && err.status !== 0) {
+      // fall through; unresolved check is authoritative
+    } else {
+      throw err;
+    }
+  }
+}
+
+function unresolvedFiles() {
+  const out = git(["diff", "--name-only", "--diff-filter=U"]);
+  return out ? out.split("\n").filter(Boolean) : [];
+}
+
+function bucketFor(files) {
+  // "reviewable" = small/scoped, e.g. up to 5 files and no infra/.github changes.
+  if (files.length === 0) return "clean";
+  const touchesInfra = files.some(
+    (f) => f.startsWith(".github/") || f === "Dockerfile" || f.startsWith("docker/"),
+  );
+  if (touchesInfra || files.length > 5) return "escalation";
+  return "reviewable";
+}
+
+// Pure selection: given the array returned by the pulls list endpoint, pick the
+// open PR whose head is our sync branch on the fork. GitHub's `head` filter is
+// already scoped, but we re-check defensively (state + ref + fork owner).
+function pickOpenSyncPr(prs, branch) {
+  if (!Array.isArray(prs)) return null;
+  return (
+    prs.find(
+      (pr) =>
+        pr &&
+        pr.state === "open" &&
+        pr.head &&
+        pr.head.ref === branch &&
+        (!pr.head.repo || !pr.head.repo.owner || pr.head.repo.owner.login === FORK_OWNER),
+    ) ?? null
+  );
+}
+
+// Query the fork for an already-open sync PR for this branch. Returns the PR
+// object or null. Without a token we can't query, so we return null and let the
+// caller proceed (the PR-create step is itself token-gated). `fetchImpl` is
+// injectable for unit tests.
+async function findOpenSyncPr(branch, { token = process.env.GITHUB_TOKEN, fetchImpl = fetch } = {}) {
+  if (!token) return null;
+  const head = `${FORK_OWNER}:${branch}`;
+  const url =
+    `https://api.github.com/repos/${FORK_OWNER}/${FORK_REPO}/pulls` +
+    `?head=${encodeURIComponent(head)}&base=${FORK_BASE_BRANCH}&state=open`;
+  const res = await fetchImpl(url, {
+    headers: {
+      "User-Agent": `${FORK_OWNER}-upstream-sync`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      Authorization: `Bearer ${token}`,
+    },
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`pulls query ${res.status}: ${body.slice(0, 400)}`);
+  }
+  return pickOpenSyncPr(await res.json(), branch);
+}
+
+function remoteBranchExists(branch) {
+  return git(["ls-remote", "--heads", FORK_REMOTE, branch]).length > 0;
+}
+
+// Default runner for the post-merge activation soak. Shells out to
+// scripts/plugin-activation-soak.mjs and returns its exit code. Kept separate
+// (and injectable) so the gate's pass/fail/skip logic can be unit-tested
+// without booting a host.
+function defaultSoakRunner() {
+  const res = execFileSync("node", [path.join("scripts", "plugin-activation-soak.mjs")], {
+    cwd: repoRoot,
+    stdio: "inherit",
+    env: process.env,
+  });
+  // execFileSync throws on non-zero; reaching here means exit 0.
+  void res;
+  return 0;
+}
+
+/**
+ * Post-sync plugin-activation soak gate.
+ *
+ * An upstream-sync tick MUST NOT silently leave an installed plugin unable to
+ * activate. After a clean merge, run the activation soak (install + register +
+ * activate CAD/klipper against an isolated host, asserting `status: ready` and
+ * a non-ephemeral packagePath). If the soak fails — or cannot run because its
+ * prerequisites are missing — the tick is aborted (throws) rather than opening
+ * a PR for a build that would leave a plugin dead on the next restart.
+ *
+ * Escape hatch: set PAPERCLIP_SYNC_SKIP_SOAK=1 to skip (e.g. environments that
+ * intentionally run the soak elsewhere). Skipping is loud, never silent.
+ *
+ * @param {{ env?: NodeJS.ProcessEnv, runner?: () => number, log?: (msg: string) => void }} deps
+ * @returns {{ ran: boolean, skipped: boolean }}
+ */
+function runActivationSoakGate({ env = process.env, runner = defaultSoakRunner, log = console.log } = {}) {
+  const skip = env.PAPERCLIP_SYNC_SKIP_SOAK;
+  if (skip === "1" || skip === "true") {
+    log("soak: skipped via PAPERCLIP_SYNC_SKIP_SOAK (plugin-activation soak NOT run for this tick)");
+    return { ran: false, skipped: true };
+  }
+  let code;
+  try {
+    code = runner();
+  } catch (err) {
+    const detail = err && typeof err.status === "number" ? `exit ${err.status}` : String(err?.message ?? err);
+    throw new Error(
+      `plugin-activation soak failed (${detail}); refusing to advance the sync tick`,
+    );
+  }
+  if (code !== 0) {
+    throw new Error(
+      `plugin-activation soak failed (exit ${code}); refusing to advance the sync tick`,
+    );
+  }
+  log("soak: passed (CAD/klipper installed + activated to ready with persistent packagePath)");
+  return { ran: true, skipped: false };
+}
+
+async function main() {
+  const state = readState();
+  const { release, status, etag: newEtag } = await fetchLatestRelease(state.etag);
+
+  if (status === 304) {
+    console.log(`no-op: still at ${state.lastSyncedTag}`);
+    return 0;
+  }
+
+  const tag = release.tag_name;
+  if (tag === state.lastSyncedTag) {
+    // ETag rotated but the release is the same — just refresh the cache key.
+    if (!dryRun && newEtag && newEtag !== state.etag) {
+      writeState({ ...state, etag: newEtag, lastCheckedAt: new Date().toISOString() });
+    }
+    console.log(`no-op: still at ${state.lastSyncedTag}`);
+    return 0;
+  }
+
+  if (dryRun) {
+    console.log(
+      `dry-run: upstream is at ${tag}, fork last synced ${state.lastSyncedTag}; would create sync/upstream-${tag}`,
+    );
+    return 0;
+  }
+
+  const branch = `sync/upstream-${tag}`;
+
+  // Idempotency: a sync PR for this tag may already be open from a
+  // prior tick. The state file only advances on *merge* (board-gated), so until
+  // then upstream stays ahead and we re-enter for the same tag. Re-running the
+  // branch/push/PR steps would fail on a non-fast-forward push or a 422
+  // "A pull request already exists" and crash the soak. A re-run must converge:
+  // if the PR is already open, this tick is a no-op (no branch, push, or PR).
+  const openPr = await findOpenSyncPr(branch);
+  if (openPr) {
+    console.log(`no-op: sync PR for ${tag} already open (${openPr.html_url})`);
+    return 0;
+  }
+
+  // Remote branch exists but no open PR (e.g. PR closed unmerged, or a prior
+  // tick pushed the branch but PR creation failed). Re-pushing a freshly merged
+  // branch would either fast-forward-fail or clobber the remote branch.
+  // Simplest convergent choice: do no harm — leave the branch and no-op so a
+  // human/board decides (delete to re-sync, or reopen the PR). Exit 0 keeps the
+  // soak alive rather than crashing.
+  if (remoteBranchExists(branch)) {
+    console.log(
+      `no-op: remote branch ${branch} exists but no open PR; leaving as-is for manual review`,
+    );
+    return 0;
+  }
+
+  // Real sync path. Sibling B's cron will exercise this; the scaffold PR
+  // intentionally does not run it.
+  git(["fetch", UPSTREAM_REMOTE, "--tags"]);
+  git(["fetch", FORK_REMOTE, FORK_BASE_BRANCH]);
+
+  git(["checkout", "-B", branch, `${FORK_REMOTE}/${FORK_BASE_BRANCH}`]);
+
+  let mergeFailed = false;
+  try {
+    // `tag` is a release tag fetched into refs/tags/ by `git fetch upstream --tags`,
+    // not a branch — `${UPSTREAM_REMOTE}/${tag}` would resolve to a non-existent
+    // remote-tracking ref and abort the merge ("not something we can merge").
+    git(["merge", "--no-ff", "-m", `sync(upstream): ${tag}`, `refs/tags/${tag}`]);
+  } catch {
+    mergeFailed = true;
+  }
+
+  if (mergeFailed) {
+    runConflictResolver();
+    const remaining = unresolvedFiles();
+    if (remaining.length > 0) {
+      const report = { tag, unresolvedFiles: remaining, bucket: bucketFor(remaining) };
+      console.log(JSON.stringify(report));
+      return 2;
+    }
+    git(["commit", "--no-edit"]);
+  }
+
+  // Gate the tick on a plugin-activation soak BEFORE advancing state
+  // or pushing. A failure here aborts the tick with no state mutation and no
+  // PR — the merge commit stays local and a fixed re-run can redo it.
+  runActivationSoakGate();
+
+  const headSha = git(["rev-parse", "HEAD"]);
+  const nextState = {
+    ...state,
+    lastSyncedTag: tag,
+    lastSyncedSha: headSha,
+    lastSyncedAt: new Date().toISOString(),
+    etag: newEtag,
+    pendingPrUrl: null,
+  };
+  writeState(nextState);
+  git(["add", path.relative(repoRoot, stateFile)]);
+  git(["commit", "-m", `chore(upstream-sync): record ${tag}`]);
+
+  git(["push", "-u", FORK_REMOTE, branch]);
+
+  // PR body is computed by a sibling script so it can be unit-tested in
+  // isolation. We pass the tag and let it shell out for diff stats.
+  const body = execFileSync(
+    "node",
+    [path.join("scripts", "format-sync-pr-body.mjs"), "--tag", tag, "--base", FORK_BASE_BRANCH],
+    { cwd: repoRoot, encoding: "utf8" },
+  );
+
+  if (process.env.GITHUB_TOKEN) {
+    const prRes = await fetch(`https://api.github.com/repos/${FORK_OWNER}/${FORK_REPO}/pulls`, {
+      method: "POST",
+      headers: {
+        "User-Agent": `${FORK_OWNER}-upstream-sync`,
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+      },
+      body: JSON.stringify({
+        title: `sync(upstream): ${tag}`,
+        head: branch,
+        base: FORK_BASE_BRANCH,
+        body,
+        draft: true,
+      }),
+    });
+    if (!prRes.ok) {
+      const errBody = await prRes.text();
+      throw new Error(`PR create ${prRes.status}: ${errBody.slice(0, 400)}`);
+    }
+    const pr = await prRes.json();
+    writeState({ ...nextState, pendingPrUrl: pr.html_url });
+    console.log(`opened draft PR: ${pr.html_url}`);
+  } else {
+    console.log(`branch ${branch} pushed; GITHUB_TOKEN missing, skipped PR create`);
+  }
+  return 0;
+}
+
+const invokedDirectly =
+  process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (invokedDirectly) {
+  main()
+    .then((code) => process.exit(code ?? 0))
+    .catch((err) => {
+      console.error(err.stack || String(err));
+      process.exit(1);
+    });
+}
+
+export { findOpenSyncPr, pickOpenSyncPr, remoteBranchExists, runActivationSoakGate, main };

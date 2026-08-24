@@ -94,6 +94,16 @@ git push -u origin <descriptive-name>
 git push origin --delete <old-name>
 ```
 
+### Keep Your Branch Up to Date
+
+Before your PR can be merged, keep your branch up to date with `master` and ensure all CI checks pass. If your branch falls behind, update it:
+
+```bash
+gh pr update-branch <pr-number> -R claudegoogl-sudo/paperclip
+```
+
+The required check that must pass is `verify`.
+
 ### Model Used (Required)
 
 Every PR must include a **Model Used** section specifying which AI model produced or assisted with the change. Include the provider, exact model ID/version, context window size, and any relevant capability details (e.g., reasoning mode, tool use). If no AI was used, write "None — human-authored". This applies to all contributors — human and AI alike.
@@ -101,6 +111,29 @@ Every PR must include a **Model Used** section specifying which AI model produce
 ### Tests Must Pass
 
 All tests must pass before a PR can be merged. Run them locally first and verify CI is green after pushing.
+
+#### Rerun policy for CI flakes
+
+CI is required to be green, but the `e2e` job in particular can occasionally fail on infrastructure (Playwright apt/dpkg hangs, embedded-Postgres deadlocks, Actions runner network blips) rather than on a real regression. The policy is:
+
+1. **A single rerun is allowed** for any infra-only failure (`gh run rerun --failed <run-id>`). Note the original failure in the PR thread before rerunning so reviewers have the audit trail.
+2. **If the same step fails twice in a row, treat it as a real failure** — investigate before merging, even if the logs look "infra-shaped". File a follow-up issue rather than retrying a third time.
+3. **Never disable a check to land a PR.** If a check is genuinely useless, remove it in its own PR with justification.
+
+#### Where merged-state verification happens
+
+Pre-merge verification is the **PR** workflow ([`.github/workflows/pr.yml`](.github/workflows/pr.yml)). Post-merge verification of the merged result is the `verify_canary` job in the **Release** workflow ([`.github/workflows/release.yml`](.github/workflows/release.yml)), which runs on every push to `master` (gated `if: github.event_name == 'push'`, no repo guard).
+
+`verify_canary` runs the release package-map check, `pnpm -r typecheck`, `pnpm test:run`, and `pnpm build`. `pnpm test:run` defaults to mode `all`, which covers **both** the general groups **and** the serialized server suites — which is why there is no duplicate push-triggered test job on `master`.
+
+It does **not** run the PR-only gates, so do not assume `verify_canary` mirrors PR CI:
+
+- The PR `policy` job's diff-based static gates (hand-edited lockfile, `git push` in adapter/runtime code, non-loopback compose port publishes, internal-id scrub, released-migrations-append-only).
+- The *Verify release registry test coverage* and *Verify upstream-sync idempotency* steps.
+- The scaffold manifest-validation gate.
+- `e2e` (which is `workflow_dispatch`-only everywhere, PRs included).
+
+A red `Release` run on `master` is a **P0**: the merged result is broken, and every open PR inherits it. Fix forward or revert — do not wave it through on an unrelated PR. Attribution: the merge that broke `master` is not the PR that displays the breakage, so start bisecting from the last green `Release` run on `master`, not from whichever PR you happen to be looking at.
 
 ### Telemetry Changes
 

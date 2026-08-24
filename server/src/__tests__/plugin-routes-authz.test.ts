@@ -5,9 +5,17 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
   getByKey: vi.fn(),
+  getConfig: vi.fn(),
   upsertConfig: vi.fn(),
   getCompanySettings: vi.fn(),
   upsertCompanySettings: vi.fn(),
+  getCompanyConfigOverride: vi.fn(),
+  upsertCompanyConfigOverride: vi.fn(),
+  deleteCompanyConfigOverride: vi.fn(),
+}));
+
+const mockSecretService = vi.hoisted(() => ({
+  getById: vi.fn(),
 }));
 
 const mockLifecycle = vi.hoisted(() => ({
@@ -20,6 +28,10 @@ const mockLifecycle = vi.hoisted(() => ({
 
 vi.mock("../services/plugin-registry.js", () => ({
   pluginRegistryService: () => mockRegistry,
+}));
+
+vi.mock("../services/secrets.js", () => ({
+  secretService: () => mockSecretService,
 }));
 
 vi.mock("../services/plugin-lifecycle.js", () => ({
@@ -101,6 +113,7 @@ const companyB = "33333333-3333-4333-8333-333333333333";
 const agentA = "44444444-4444-4444-8444-444444444444";
 const runA = "55555555-5555-4555-8555-555555555555";
 const projectA = "66666666-6666-4666-8666-666666666666";
+const issueA = "88888888-8888-4888-8888-888888888888";
 const pluginId = "11111111-1111-4111-8111-111111111111";
 
 function boardActor(overrides: Record<string, unknown> = {}) {
@@ -308,8 +321,12 @@ describe.sequential("plugin install and upgrade authz", () => {
     expect(mockLifecycle.unload).toHaveBeenCalledWith(pluginId, true);
   }, 20_000);
 
-  it("rejects plugin config saves that contain secret refs even for instance admins", async () => {
+  it("permits plugin config saves that contain secret refs (resolution is company-binding-gated)", async () => {
     readyPlugin();
+    mockRegistry.upsertConfig.mockResolvedValue({
+      pluginId,
+      configJson: { apiKeyRef: "77777777-7777-4777-8777-777777777777" },
+    });
 
     const { app } = await createApp({
       type: "board",
@@ -327,9 +344,14 @@ describe.sequential("plugin install and upgrade authz", () => {
         },
       });
 
-    expect(res.status).toBe(422);
-    expect(res.body.error).toMatch(/secret references are disabled/i);
-    expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
+    // The kill-switch's config-save half is lifted: a secret-ref in config is
+    // only a pointer. Resolution is authorized at call time against the
+    // dispatching company's company_secret_bindings (plugin-secrets-handler),
+    // so storing the ref grants no cross-company access.
+    expect(res.status).toBe(200);
+    expect(mockRegistry.upsertConfig).toHaveBeenCalledWith(pluginId, {
+      configJson: { apiKeyRef: "77777777-7777-4777-8777-777777777777" },
+    });
   }, 20_000);
 
   it("allows instance admins to upgrade plugins", async () => {
@@ -425,6 +447,126 @@ describe.sequential("scoped plugin API routes", () => {
       }),
     );
   }, 20_000);
+});
+
+describe.sequential("plugin per-tenant config override routes", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockRegistry.getCompanyConfigOverride.mockResolvedValue(null);
+    mockRegistry.upsertCompanyConfigOverride.mockReset();
+    mockRegistry.deleteCompanyConfigOverride.mockResolvedValue(null);
+    mockSecretService.getById.mockReset();
+  });
+
+  function readyOverridePlugin() {
+    mockRegistry.getById.mockResolvedValue({
+      id: pluginId,
+      pluginKey: "platform.cad",
+      version: "1.0.0",
+      status: "ready",
+      manifestJson: {
+        id: "platform.cad",
+        capabilities: ["secrets.read-ref"],
+        instanceConfigSchema: {
+          type: "object",
+          properties: {
+            githubPatSecretId: { type: "string", format: "secret-ref" },
+            label: { type: "string" },
+          },
+        },
+      },
+    });
+  }
+
+  const dprSecretId = "77777777-7777-4777-8777-777777777777";
+  const otherTenantSecretId = "88888888-8888-4888-8888-888888888888";
+
+  it("rejects non-board actors", async () => {
+    readyOverridePlugin();
+    const { app } = await createApp(agentActor());
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson: { label: "ok" } });
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(mockRegistry.upsertCompanyConfigOverride).not.toHaveBeenCalled();
+  });
+
+  it("rejects board actors without companyA access", async () => {
+    readyOverridePlugin();
+    const { app } = await createApp(boardActor({ companyIds: [companyB] }));
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson: { label: "ok" } });
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(mockRegistry.upsertCompanyConfigOverride).not.toHaveBeenCalled();
+  });
+
+  it("returns 422 when a secret-ref UUID belongs to a different company", async () => {
+    readyOverridePlugin();
+    mockSecretService.getById.mockResolvedValue({
+      id: otherTenantSecretId,
+      companyId: companyB,
+      status: "active",
+    });
+    const { app } = await createApp(boardActor());
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson: { githubPatSecretId: otherTenantSecretId } });
+    expect(res.status).toBe(422);
+    expect(res.body.error).toContain("Referenced secret must belong to the target company");
+    expect(mockRegistry.upsertCompanyConfigOverride).not.toHaveBeenCalled();
+  });
+
+  it("returns 422 when a referenced secret cannot be found", async () => {
+    readyOverridePlugin();
+    mockSecretService.getById.mockResolvedValue(null);
+    const { app } = await createApp(boardActor());
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson: { githubPatSecretId: dprSecretId } });
+    expect(res.status).toBe(422);
+    expect(res.body.error).toContain("Referenced secret not found");
+    expect(mockRegistry.upsertCompanyConfigOverride).not.toHaveBeenCalled();
+  });
+
+  it("accepts an own-company secret-ref and forwards to upsertCompanyConfigOverride", async () => {
+    readyOverridePlugin();
+    mockSecretService.getById.mockResolvedValue({
+      id: dprSecretId,
+      companyId: companyA,
+      status: "active",
+    });
+    mockRegistry.upsertCompanyConfigOverride.mockResolvedValue({
+      id: "row-1",
+      pluginId,
+      companyId: companyA,
+      settingsJson: { configOverrides: { githubPatSecretId: dprSecretId } },
+    });
+    const { app } = await createApp(boardActor());
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson: { githubPatSecretId: dprSecretId } });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      pluginId,
+      companyId: companyA,
+      configJson: { githubPatSecretId: dprSecretId },
+    });
+    expect(mockRegistry.upsertCompanyConfigOverride).toHaveBeenCalledWith(
+      pluginId,
+      companyA,
+      { githubPatSecretId: dprSecretId },
+    );
+  });
+
+  it("clears the override via DELETE", async () => {
+    readyOverridePlugin();
+    const { app } = await createApp(boardActor());
+    const res = await request(app)
+      .delete(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`);
+    expect(res.status).toBe(200);
+    expect(mockRegistry.deleteCompanyConfigOverride).toHaveBeenCalledWith(pluginId, companyA);
+  });
 });
 
 describe.sequential("plugin local folder routes", () => {
@@ -1052,5 +1194,485 @@ describe.sequential("plugin tool and bridge authz", () => {
 
     expect(res.status).toBe(403);
     expect(executeTool).not.toHaveBeenCalled();
+  });
+});
+
+describe.sequential("plugin tool dispatch for agent actors", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("lets an agent JWT list plugin tools (GET /plugins/tools)", async () => {
+    const listToolsForAgent = vi.fn().mockReturnValue([{ name: "paperclip.example:search" }]);
+    const { app } = await createApp(agentActor(), {}, {
+      toolDeps: {
+        toolDispatcher: {
+          listToolsForAgent,
+          getTool: vi.fn(),
+          executeTool: vi.fn(),
+        },
+      },
+    });
+
+    const res = await request(app).get("/api/plugins/tools");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([{ name: "paperclip.example:search" }]);
+    expect(listToolsForAgent).toHaveBeenCalled();
+  });
+
+  it("executes a tool for an agent JWT using the legacy {tool, parameters, runContext} body", async () => {
+    const executeTool = vi.fn().mockResolvedValue({ content: "ok" });
+    const { app } = await createApp(agentActor(), {}, {
+      db: createSelectQueueDb([
+        [{ companyId: companyA }],
+        [{ companyId: companyA, agentId: agentA }],
+        [{ companyId: companyA }],
+      ]),
+      toolDeps: {
+        toolDispatcher: {
+          listToolsForAgent: vi.fn(),
+          getTool: vi.fn(() => ({ name: "paperclip.example:search" })),
+          executeTool,
+        },
+      },
+    });
+
+    const res = await request(app)
+      .post("/api/plugins/tools/execute")
+      .send({
+        tool: "paperclip.example:search",
+        parameters: { q: "test" },
+        runContext: {
+          agentId: agentA,
+          runId: runA,
+          companyId: companyA,
+          projectId: projectA,
+        },
+      });
+
+    expect(res.status).toBe(200);
+    expect(executeTool).toHaveBeenCalledWith(
+      "paperclip.example:search",
+      { q: "test" },
+      {
+        agentId: agentA,
+        runId: runA,
+        companyId: companyA,
+        projectId: projectA,
+      },
+    );
+  });
+
+  it("executes a tool for an agent JWT using the v0.1.6 {name, parameters, runId} body", async () => {
+    const executeTool = vi.fn().mockResolvedValue({ content: "ok" });
+    const { app } = await createApp(agentActor(), {}, {
+      db: createSelectQueueDb([
+        // run -> context issue -> project
+        [{ contextSnapshot: { issueId: issueA } }],
+        [{ projectId: projectA }],
+        // scope check: agent, run, project
+        [{ companyId: companyA }],
+        [{ companyId: companyA, agentId: agentA }],
+        [{ companyId: companyA }],
+      ]),
+      toolDeps: {
+        toolDispatcher: {
+          listToolsForAgent: vi.fn(),
+          getTool: vi.fn(() => ({ name: "paperclip.example:search" })),
+          executeTool,
+        },
+      },
+    });
+
+    const res = await request(app)
+      .post("/api/plugins/tools/execute")
+      .send({
+        name: "paperclip.example:search",
+        parameters: { q: "test" },
+        runId: runA,
+      });
+
+    expect(res.status).toBe(200);
+    expect(executeTool).toHaveBeenCalledWith(
+      "paperclip.example:search",
+      { q: "test" },
+      expect.objectContaining({
+        agentId: agentA,
+        runId: runA,
+        companyId: companyA,
+        projectId: projectA,
+      }),
+    );
+  });
+
+  it("never 500s on the short {tool, runId, parameters} agent shape", async () => {
+    const executeTool = vi.fn().mockResolvedValue({ content: "ok" });
+    const { app } = await createApp(agentActor(), {}, {
+      db: createSelectQueueDb([
+        [{ contextSnapshot: { paperclipIssue: { id: issueA } } }],
+        [{ projectId: projectA }],
+        [{ companyId: companyA }],
+        [{ companyId: companyA, agentId: agentA }],
+        [{ companyId: companyA }],
+      ]),
+      toolDeps: {
+        toolDispatcher: {
+          listToolsForAgent: vi.fn(),
+          getTool: vi.fn(() => ({ name: "paperclip.example:search" })),
+          executeTool,
+        },
+      },
+    });
+
+    const res = await request(app)
+      .post("/api/plugins/tools/execute")
+      .send({ tool: "paperclip.example:search", runId: runA, parameters: { q: "test" } });
+
+    expect(res.status).toBe(200);
+    expect(executeTool).toHaveBeenCalled();
+  });
+
+  it("omits projectId rather than faking one when the run is not project-scoped", async () => {
+    const executeTool = vi.fn().mockResolvedValue({ content: "ok" });
+    const { app } = await createApp(agentActor(), {}, {
+      db: createSelectQueueDb([
+        // run row carries no context issue -> no project to resolve
+        [{ contextSnapshot: null }],
+        [{ companyId: companyA }],
+        [{ companyId: companyA, agentId: agentA }],
+      ]),
+      toolDeps: {
+        toolDispatcher: {
+          listToolsForAgent: vi.fn(),
+          getTool: vi.fn(() => ({ name: "paperclip.example:search" })),
+          executeTool,
+        },
+      },
+    });
+
+    const res = await request(app)
+      .post("/api/plugins/tools/execute")
+      .send({ tool: "paperclip.example:search", runId: runA, parameters: {} });
+
+    expect(res.status).toBe(200);
+    const dispatched = executeTool.mock.calls[0]?.[2] as Record<string, unknown>;
+    expect(dispatched).toMatchObject({ agentId: agentA, runId: runA, companyId: companyA });
+    expect(dispatched).not.toHaveProperty("projectId");
+  });
+
+  it("denies a malformed runContext.projectId without querying the database", async () => {
+    const executeTool = vi.fn();
+    const db = createSelectQueueDb([]);
+    const { app } = await createApp(boardActor(), {}, {
+      db,
+      toolDeps: {
+        toolDispatcher: {
+          listToolsForAgent: vi.fn(),
+          getTool: vi.fn(() => ({ name: "paperclip.example:search" })),
+          executeTool,
+        },
+      },
+    });
+
+    const res = await request(app)
+      .post("/api/plugins/tools/execute")
+      .send({
+        tool: "paperclip.example:search",
+        parameters: {},
+        runContext: {
+          agentId: agentA,
+          runId: runA,
+          companyId: companyA,
+          projectId: "onboarding-fallback",
+        },
+      });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe(
+      '"runContext.projectId" does not belong to "runContext.companyId"',
+    );
+    expect(db.select).not.toHaveBeenCalled();
+    expect(executeTool).not.toHaveBeenCalled();
+  });
+
+  it("turns a scope-check database failure into a deny, not a 500", async () => {
+    const executeTool = vi.fn();
+    const { app } = await createApp(boardActor(), {}, {
+      db: {
+        select: vi.fn(() => {
+          throw new Error("connection terminated");
+        }),
+      },
+      toolDeps: {
+        toolDispatcher: {
+          listToolsForAgent: vi.fn(),
+          getTool: vi.fn(() => ({ name: "paperclip.example:search" })),
+          executeTool,
+        },
+      },
+    });
+
+    const res = await request(app)
+      .post("/api/plugins/tools/execute")
+      .send({
+        tool: "paperclip.example:search",
+        parameters: {},
+        runContext: { agentId: agentA, runId: runA, companyId: companyA, projectId: projectA },
+      });
+
+    expect(res.status).toBe(403);
+    expect(executeTool).not.toHaveBeenCalled();
+  });
+
+  it("rejects an agent JWT trying to dispatch into another company", async () => {
+    const executeTool = vi.fn();
+    const { app } = await createApp(agentActor(), {}, {
+      toolDeps: {
+        toolDispatcher: {
+          listToolsForAgent: vi.fn(),
+          getTool: vi.fn(),
+          executeTool,
+        },
+      },
+    });
+
+    const res = await request(app)
+      .post("/api/plugins/tools/execute")
+      .send({
+        tool: "paperclip.example:search",
+        parameters: {},
+        runContext: {
+          agentId: agentA,
+          runId: runA,
+          companyId: companyB,
+          projectId: projectA,
+        },
+      });
+
+    expect(res.status).toBe(403);
+    expect(executeTool).not.toHaveBeenCalled();
+  });
+
+  it("rejects an agent JWT when neither runContext nor runId is present", async () => {
+    const executeTool = vi.fn();
+    const { app } = await createApp(agentActor(), {}, {
+      toolDeps: {
+        toolDispatcher: {
+          listToolsForAgent: vi.fn(),
+          getTool: vi.fn(),
+          executeTool,
+        },
+      },
+    });
+
+    const res = await request(app)
+      .post("/api/plugins/tools/execute")
+      .send({ tool: "paperclip.example:search", parameters: {} });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/runContext\.companyId/);
+    expect(executeTool).not.toHaveBeenCalled();
+  });
+
+  it("still rejects board callers with no company access (regression)", async () => {
+    const executeTool = vi.fn();
+    const { app } = await createApp(
+      {
+        type: "board",
+        userId: "user-1",
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds: [],
+      },
+      {},
+      {
+        toolDeps: {
+          toolDispatcher: {
+            listToolsForAgent: vi.fn(),
+            getTool: vi.fn(),
+            executeTool,
+          },
+        },
+      },
+    );
+
+    const res = await request(app)
+      .post("/api/plugins/tools/execute")
+      .send({
+        tool: "paperclip.example:search",
+        parameters: {},
+        runContext: {
+          agentId: agentA,
+          runId: runA,
+          companyId: companyA,
+          projectId: projectA,
+        },
+      });
+
+    expect(res.status).toBe(403);
+    expect(executeTool).not.toHaveBeenCalled();
+  });
+});
+
+describe.sequential("webhook token mint route", () => {
+  const endpointKey = "telegram";
+  const digestKey = "webhookTokenDigest";
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function mintablePlugin(overrides: Record<string, unknown> = {}) {
+    mockRegistry.getById.mockResolvedValue({
+      id: pluginId,
+      pluginKey: "paperclip.example",
+      version: "1.0.0",
+      status: "ready",
+      manifestJson: {
+        webhooks: [
+          {
+            endpointKey,
+            displayName: "Telegram",
+            auth: {
+              type: "header-token",
+              header: "x-telegram-bot-api-secret-token",
+              tokenDigestConfigKey: digestKey,
+            },
+          },
+        ],
+      },
+      ...overrides,
+    });
+  }
+
+  function adminApp() {
+    return createApp({
+      type: "board",
+      userId: "admin-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [],
+    });
+  }
+
+  it("rejects a non-instance-admin board user with 403 and never writes config", async () => {
+    mintablePlugin();
+    const { app } = await createApp(boardActor());
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/webhooks/${endpointKey}/token`)
+      .send({});
+
+    expect(res.status).toBe(403);
+    expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
+  });
+
+  it("rejects an agent JWT with 403 and never writes config", async () => {
+    mintablePlugin();
+    const { app } = await createApp(agentActor());
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/webhooks/${endpointKey}/token`)
+      .send({});
+
+    expect(res.status).toBe(403);
+    expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
+  });
+
+  it("mints a token for an instance admin, stores only the digest, and never persists the token", async () => {
+    mintablePlugin();
+    mockRegistry.getConfig.mockResolvedValue({ configJson: {} });
+    mockRegistry.upsertConfig.mockResolvedValue(undefined);
+    const { app } = await adminApp();
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/webhooks/${endpointKey}/token`)
+      .send({});
+
+    expect(res.status).toBe(200);
+    expect(typeof res.body.token).toBe("string");
+    expect(res.body.tokenDigestConfigKey).toBe(digestKey);
+
+    expect(mockRegistry.upsertConfig).toHaveBeenCalledTimes(1);
+    const persisted = mockRegistry.upsertConfig.mock.calls[0][1].configJson;
+    const stored = persisted[digestKey];
+    expect(typeof stored.salt).toBe("string");
+    expect(typeof stored.digest).toBe("string");
+    // The plaintext token must never touch the persisted config.
+    expect(JSON.stringify(persisted)).not.toContain(res.body.token);
+  });
+
+  it("returns 404 for an unknown plugin", async () => {
+    mockRegistry.getById.mockResolvedValue(null);
+    mockRegistry.getByKey.mockResolvedValue(null);
+    const { app } = await adminApp();
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/webhooks/${endpointKey}/token`)
+      .send({});
+
+    expect(res.status).toBe(404);
+    expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 for an endpointKey the plugin does not declare", async () => {
+    mintablePlugin();
+    const { app } = await adminApp();
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/webhooks/not-declared/token`)
+      .send({});
+
+    expect(res.status).toBe(404);
+    expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 for an endpoint that declares no header-token auth", async () => {
+    mockRegistry.getById.mockResolvedValue({
+      id: pluginId,
+      pluginKey: "paperclip.example",
+      version: "1.0.0",
+      status: "ready",
+      manifestJson: { webhooks: [{ endpointKey, displayName: "Telegram" }] },
+    });
+    const { app } = await adminApp();
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/webhooks/${endpointKey}/token`)
+      .send({});
+
+    expect(res.status).toBe(400);
+    expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 for a supplied token below the entropy floor", async () => {
+    mintablePlugin();
+    mockRegistry.getConfig.mockResolvedValue({ configJson: {} });
+    const { app } = await adminApp();
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/webhooks/${endpointKey}/token`)
+      .send({ token: "short" });
+
+    expect(res.status).toBe(400);
+    expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
+  });
+
+  it("returns 409 rather than overwriting a config key that holds a non-digest value (secret-ref)", async () => {
+    mintablePlugin();
+    // The key already backs a real config value — e.g. a secret-ref. Overwriting
+    // it would tear down its binding instance-wide, so refuse.
+    mockRegistry.getConfig.mockResolvedValue({
+      configJson: { [digestKey]: { secretRef: "company-secret-123" } },
+    });
+    const { app } = await adminApp();
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/webhooks/${endpointKey}/token`)
+      .send({});
+
+    expect(res.status).toBe(409);
+    expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
   });
 });

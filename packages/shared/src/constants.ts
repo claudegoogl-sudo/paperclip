@@ -1,7 +1,13 @@
 export const COMPANY_STATUSES = ["active", "paused", "archived"] as const;
 export type CompanyStatus = (typeof COMPANY_STATUSES)[number];
 
-export const DEFAULT_COMPANY_ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
+// 25 MiB. Raised from 10 MiB so the plugin-artifact write path —
+// whose effective ceiling is Math.min(companyMaxBytes, pluginMaxBytes) — is not
+// silently pinned back to 10 MiB by an unset per-company limit. 25 MiB covers
+// everything Telegram's Bot API getFile can deliver (hard 20 MB inbound cap)
+// with margin for base64/metadata, so an inbound messenger relay can store a CAD
+// model / STL. Per-company overrides may still set anything up to the 1 GiB cap.
+export const DEFAULT_COMPANY_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
 export const MAX_COMPANY_ATTACHMENT_MAX_BYTES = 1024 * 1024 * 1024;
 
 export const DEPLOYMENT_MODES = ["local_trusted", "authenticated"] as const;
@@ -15,6 +21,15 @@ export type BindMode = (typeof BIND_MODES)[number];
 
 export const AUTH_BASE_URL_MODES = ["auto", "explicit"] as const;
 export type AuthBaseUrlMode = (typeof AUTH_BASE_URL_MODES)[number];
+
+// Leading marker on an outbound operator-delivery comment body. The messenger
+// relay keys off this prefix to forward a comment to the operator, so it is
+// load-bearing regardless of which token posted the comment. Host/board-token
+// deliveries are stored with authorType "user" and would otherwise wake the
+// issue assignee — echoing our own outbound message back as fake inbound input.
+// The comment wake fan-out suppresses the assignee `issue_commented` wake when a
+// trimmed comment body begins with this marker.
+export const OPERATOR_DELIVER_MARKER = "[[operator-deliver]]";
 
 export const AGENT_STATUSES = [
   "active",
@@ -763,16 +778,62 @@ export const WAKEUP_REQUEST_STATUSES = [
 ] as const;
 export type WakeupRequestStatus = (typeof WAKEUP_REQUEST_STATUSES)[number];
 
+/**
+ * Wakeup statuses that will never transition again.
+ *
+ * `deferred_issue_execution` is deliberately excluded: the request is parked for
+ * a later execution attempt, so it stays live no matter how old it gets.
+ */
+export const TERMINAL_WAKEUP_REQUEST_STATUSES = [
+  "coalesced",
+  "skipped",
+  "completed",
+  "failed",
+  "cancelled",
+] as const;
+export type TerminalWakeupRequestStatus = (typeof TERMINAL_WAKEUP_REQUEST_STATUSES)[number];
+
+export function isTerminalWakeupRequestStatus(status: string | null | undefined): boolean {
+  return TERMINAL_WAKEUP_REQUEST_STATUSES.includes(status as TerminalWakeupRequestStatus);
+}
+
 export const HEARTBEAT_RUN_STATUSES = [
   "queued",
   "scheduled_retry",
   "running",
   "succeeded",
+  // The adapter emitted a clean completion result but the process still exited
+  // non-zero (dirty teardown). The work landed, so this is a success for every
+  // purpose except teardown diagnostics — never treat it as a failure.
+  "succeeded_dirty",
   "failed",
   "cancelled",
   "timed_out",
 ] as const;
 export type HeartbeatRunStatus = (typeof HEARTBEAT_RUN_STATUSES)[number];
+
+/** Terminal statuses where the run actually did its work. */
+export const SUCCESSFUL_HEARTBEAT_RUN_STATUSES = ["succeeded", "succeeded_dirty"] as const;
+
+/** Terminal statuses where the run did not complete its work. */
+export const UNSUCCESSFUL_HEARTBEAT_RUN_STATUSES = ["failed", "cancelled", "timed_out"] as const;
+
+export const TERMINAL_HEARTBEAT_RUN_STATUSES = [
+  ...SUCCESSFUL_HEARTBEAT_RUN_STATUSES,
+  ...UNSUCCESSFUL_HEARTBEAT_RUN_STATUSES,
+] as const;
+
+export function isSuccessfulHeartbeatRunStatus(status: string | null | undefined): boolean {
+  return SUCCESSFUL_HEARTBEAT_RUN_STATUSES.includes(
+    status as (typeof SUCCESSFUL_HEARTBEAT_RUN_STATUSES)[number],
+  );
+}
+
+export function isTerminalHeartbeatRunStatus(status: string | null | undefined): boolean {
+  return TERMINAL_HEARTBEAT_RUN_STATUSES.includes(
+    status as (typeof TERMINAL_HEARTBEAT_RUN_STATUSES)[number],
+  );
+}
 
 export const RUN_LIVENESS_STATES = [
   "completed",
@@ -927,6 +988,11 @@ export const PLUGIN_CAPABILITIES = [
   "issue.relations.read",
   "issue.subtree.read",
   "issue.comments.read",
+  // Reading attachment metadata (asset ids on a comment) is a default-deny read,
+  // gated separately from comment text so a plugin must opt in before it can
+  // enumerate asset ids. Restored after a prior SDK reset dropped it. Asset
+  // bytes still go through artifacts.fetch.
+  "issue.attachments.read",
   "issue.documents.read",
   "agents.read",
   "goals.read",
@@ -941,6 +1007,8 @@ export const PLUGIN_CAPABILITIES = [
   "authorization.policies.read",
   "authorization.audit.read",
   "database.namespace.read",
+  "board.approvals.read",
+  "issue.interactions.read",
   // Data Write
   "issues.create",
   "issues.update",
@@ -949,7 +1017,9 @@ export const PLUGIN_CAPABILITIES = [
   "issues.wakeup",
   "issue.comments.create",
   "issue.interactions.create",
+  "issue.interactions.resolve",
   "issue.documents.write",
+  "issue.attachments.create",
   "projects.managed",
   "routines.managed",
   "skills.managed",
@@ -982,6 +1052,12 @@ export const PLUGIN_CAPABILITIES = [
   "events.emit",
   "jobs.schedule",
   "webhooks.receive",
+  // Opt-in: lets a plugin declare `webhooks[].auth` so the host can tell an
+  // authenticated delivery from an anonymous one and bill it to a separate,
+  // larger rate-limit budget. Gated rather than implicit so that adding the
+  // field is a deliberate act by the plugin author, matching how every other
+  // manifest feature block is capability-guarded.
+  "webhooks.verify",
   "api.routes.register",
   "http.outbound",
   "secrets.read-ref",
@@ -1275,6 +1351,8 @@ export const PLUGIN_EVENT_TYPES = [
   "issue.checked_out",
   "issue.released",
   "issue.assignment_wakeup_requested",
+  "issue.interaction.created",
+  "issue.interaction.responded",
   "agent.created",
   "agent.updated",
   "agent.status_changed",

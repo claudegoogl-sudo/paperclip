@@ -579,6 +579,7 @@ export type {
   JsonSchema,
   PluginJobDeclaration,
   PluginWebhookDeclaration,
+  PluginWebhookAuthDeclaration,
   PluginToolDeclaration,
   PluginEnvironmentDriverDeclaration,
   PluginEnvironmentTemplateConfigBinding,
