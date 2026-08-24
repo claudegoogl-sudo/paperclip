@@ -2499,11 +2499,25 @@ export function pluginRoutes(
    * Returns the `PluginConfig` record if one exists, or `null` if the plugin
    * has not yet been configured.
    *
+   * Requires instance-admin access. The returned `configJson` is the
+   * instance-global config — it is NOT partitioned per company and can hold
+   * cross-tenant routing/policy metadata keyed by every company UUID (e.g.
+   * paperclip-messenger's `topicMap`/`catchAllIssueMap` + `supergroupId`, or
+   * platform.vault's `companyPolicies`). Gating this on mere org membership
+   * (`assertBoardOrgAccess` = instance-admin OR member of ≥1 company) let any
+   * single-company board member read another tenant's config — a broken
+   * object-property-level authorization / excess-data-exposure disclosure
+   * (OWASP API3). The read gate now matches the write gate (POST below), which
+   * has always required instance admin: reading instance-global config is an
+   * instance-admin concern. Callers who need a single company's slice use the
+   * company-scoped `/plugins/:pluginId/companies/:companyId/config-overrides`
+   * routes, which are authorized against the caller's company access.
+   *
    * Response: `PluginConfig | null`
-   * Errors: 404 if plugin not found
+   * Errors: 403 if not instance admin; 404 if plugin not found
    */
   router.get("/plugins/:pluginId/config", async (req, res) => {
-    assertBoardOrgAccess(req);
+    assertInstanceAdmin(req);
     const { pluginId } = req.params;
     const companyId = requirePluginConfigCompanyId(req, req.query.companyId);
 

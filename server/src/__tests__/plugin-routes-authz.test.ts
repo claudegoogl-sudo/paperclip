@@ -291,6 +291,64 @@ describe.sequential("plugin install and upgrade authz", () => {
     expect(mockLifecycle.disable).not.toHaveBeenCalled();
   }, 20_000);
 
+  // The instance-global GET config read must require instance admin, matching
+  // its write sibling. Before the fix it was gated on mere org membership
+  // (assertBoardOrgAccess), so a single-company board member could read the
+  // whole instance-wide config_json — including other tenants' routing/policy
+  // metadata (messenger topicMap/supergroupId, vault companyPolicies) keyed by
+  // every company UUID. That is a broken object-property-level authorization /
+  // excess-data-exposure disclosure (OWASP API3). This test fails (200 + config
+  // body leaked) on the pre-fix code and passes (403, no read) after.
+  it("rejects instance-global plugin config reads for non-admin board org members (cross-tenant config disclosure)", async () => {
+    // Plugin is installed and ready, so the pre-fix code path reaches the
+    // config read and would return the instance-global config with 200 —
+    // demonstrating the actual leak, not just a 404.
+    readyPlugin();
+    mockRegistry.getConfig.mockResolvedValue({
+      pluginId,
+      // Cross-tenant routing metadata that must not reach a company-A member.
+      configJson: {
+        supergroupId: "-1002000000000",
+        topicMap: {
+          [companyA]: 11,
+          [companyB]: 22,
+        },
+      },
+    });
+
+    // Board org member of company A only — not an instance admin. Under the
+    // pre-fix `assertBoardOrgAccess` gate this passes (member of ≥1 company)
+    // and the caller receives company B's topic mapping.
+    const { app } = await createApp(boardActor({ companyIds: [companyA] }));
+
+    const res = await request(app).get(`/api/plugins/${pluginId}/config`);
+
+    expect(res.status).toBe(403);
+    // The handler must reject before any config read; nothing leaks.
+    expect(mockRegistry.getConfig).not.toHaveBeenCalled();
+    // Belt and suspenders: company B's UUID must never appear in the response.
+    expect(JSON.stringify(res.body ?? {})).not.toContain(companyB);
+  }, 20_000);
+
+  it("allows instance admins to read instance-global plugin config", async () => {
+    readyPlugin();
+    const configRecord = {
+      pluginId,
+      configJson: { supergroupId: "-1002000000000", topicMap: { [companyA]: 11 } },
+    };
+    mockRegistry.getConfig.mockResolvedValue(configRecord);
+
+    const { app } = await createApp(
+      boardActor({ userId: "admin-1", isInstanceAdmin: true, companyIds: [] }),
+    );
+
+    const res = await request(app).get(`/api/plugins/${pluginId}/config`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject(configRecord);
+    expect(mockRegistry.getConfig).toHaveBeenCalledWith(pluginId);
+  }, 20_000);
+
   it("resolves plugin keys without probing the UUID id column for core plugin actions", async () => {
     const pluginKey = "paperclipqa.hello-plugin";
     const plugin = {
