@@ -19,8 +19,9 @@ import {
   TERMINAL_HEARTBEAT_RUN_STATUSES,
   UNSUCCESSFUL_HEARTBEAT_RUN_STATUSES,
   isSuccessfulHeartbeatRunStatus,
-  isAgentApiKeyExpired,
-  normalizeAgentApiKeyScope,
+  formatBridgeKeyRefusalLine,
+  type BridgeKeyRefusal,
+  type BridgeKeyVerifyResult,
   type IssueExecutionMonitorClearReason,
   type IssueExecutionMonitorPolicy,
   type IssueExecutionMonitorRecoveryPolicy,
@@ -29,9 +30,9 @@ import {
   type RunLivenessState,
   type SourceTrustMetadata,
 } from "@paperclipai/shared";
+import { createTaskBridgeKeyClassifier } from "./task-bridge-keys.js";
 import {
   agents,
-  agentApiKeys,
   agentConfigRevisions,
   agentRuntimeState,
   agentTaskSessions,
@@ -718,9 +719,12 @@ export const SANCTIONED_BRIDGE_ENV_KEY = "PAPERCLIP_BRIDGE_API_KEY";
  * Resolve the operator-bound `task_bridge` credential for
  * `PAPERCLIP_BRIDGE_API_KEY` from the RAW (pre-strip) agent adapterConfig env,
  * enforcing the security invariants below (INV-2/INV-3/INV-5). Fail-closed by
- * construction: any deviation
- * returns `null` and no credential is delivered (the hermes adapter then
- * default-denies non-allowlisted providers).
+ * construction: any deviation returns a typed refusal and no credential is
+ * delivered (the hermes adapter then default-denies non-allowlisted
+ * providers). The refusal taxonomy (`BridgeKeyRefusalCode`) distinguishes the
+ * historically collapsed states — expired vs revoked vs missing vs
+ * wrong-scope key, plus binding-level faults — so a bridge outage is
+ * self-explanatory instead of a generic-refusal debug pass.
  *
  *  - INV-2: the binding MUST be an operator-set `secret_ref`, and it is read from
  *    the RAW env the caller supplies as `rawAgentEnv` — which MUST be the agent's
@@ -737,27 +741,36 @@ export const SANCTIONED_BRIDGE_ENV_KEY = "PAPERCLIP_BRIDGE_API_KEY";
  *    or a per-user `user_secret_ref` is refused.
  *  - INV-3: the resolved secret MUST be an agent API key whose scope kind is
  *    `task_bridge`; any other scope (standard / board / broad) is refused via the
- *    injected `verifyTaskBridgeScope` check. No verifier ⇒ scope unprovable ⇒
+ *    injected `verifyTaskBridgeKey` classifier. No verifier ⇒ scope unprovable ⇒
  *    refuse.
  *  - INV-5: the caller adds the returned `secretKeys` to the run-config redaction
  *    set so the live credential is masked in logs.
  */
+export type SanctionedBridgeKeyResolution =
+  | { status: "delivered"; value: string; secretKeys: Set<string> }
+  | { status: "refused"; refusal: BridgeKeyRefusal };
+
 export async function resolveSanctionedBridgeEnvBinding(input: {
   companyId: string;
   rawAgentEnv: unknown;
   secretsSvc: Pick<RuntimeConfigSecretResolver, "resolveEnvBindings">;
-  verifyTaskBridgeScope?: (resolvedKey: string) => Promise<boolean>;
+  verifyTaskBridgeKey?: (resolvedKey: string) => Promise<BridgeKeyVerifyResult>;
   context?: Parameters<RuntimeConfigSecretResolver["resolveEnvBindings"]>[2];
-}): Promise<{ value: string; secretKeys: Set<string> } | null> {
+}): Promise<SanctionedBridgeKeyResolution> {
   const rawBinding = parseObject(input.rawAgentEnv)[SANCTIONED_BRIDGE_ENV_KEY];
-  if (rawBinding === undefined) return null;
+  if (rawBinding === undefined) {
+    // No bridge binding configured at all — the common case for agents without
+    // a bridge credential, not a fault. Stay silent (no warn spam) and let the
+    // typed code speak for itself when a consumer surface renders it.
+    return { status: "refused", refusal: { code: "binding_absent" } };
+  }
   const parsed = envBindingSchema.safeParse(rawBinding);
   if (!parsed.success) {
     logger.warn(
-      { companyId: input.companyId, envKey: SANCTIONED_BRIDGE_ENV_KEY },
+      { companyId: input.companyId, envKey: SANCTIONED_BRIDGE_ENV_KEY, refusalCode: "binding_malformed" },
       "sanctioned bridge env binding is malformed; failing closed (no bridge key injected)",
     );
-    return null;
+    return { status: "refused", refusal: { code: "binding_malformed" } };
   }
   const binding = parsed.data;
   // INV-2: operator-set secret_ref only. Reject legacy inline string, `plain`
@@ -766,10 +779,10 @@ export async function resolveSanctionedBridgeEnvBinding(input: {
     typeof binding === "object" && binding !== null && binding.type === "secret_ref";
   if (!isSecretRef) {
     logger.warn(
-      { companyId: input.companyId, envKey: SANCTIONED_BRIDGE_ENV_KEY },
+      { companyId: input.companyId, envKey: SANCTIONED_BRIDGE_ENV_KEY, refusalCode: "binding_not_secret_ref" },
       "sanctioned bridge env binding is not an operator secret_ref; failing closed (no bridge key injected)",
     );
-    return null;
+    return { status: "refused", refusal: { code: "binding_not_secret_ref" } };
   }
   let value: string | undefined;
   let secretKeys = new Set<string>();
@@ -785,21 +798,36 @@ export async function resolveSanctionedBridgeEnvBinding(input: {
     // Missing backing secret / provider error ⇒ fail closed (INV-2). Never leak
     // the value or a partial secret into logs.
     logger.warn(
-      { companyId: input.companyId, envKey: SANCTIONED_BRIDGE_ENV_KEY, err: (err as Error).message },
+      { companyId: input.companyId, envKey: SANCTIONED_BRIDGE_ENV_KEY, refusalCode: "secret_unresolved", err: (err as Error).message },
       "sanctioned bridge secret failed to resolve; failing closed (no bridge key injected)",
     );
-    return null;
+    return { status: "refused", refusal: { code: "secret_unresolved" } };
   }
-  if (typeof value !== "string" || value.length === 0) return null;
-  // INV-3: fail-closed unless the resolved key is a task_bridge-scoped agent key.
-  if (!input.verifyTaskBridgeScope || !(await input.verifyTaskBridgeScope(value))) {
+  if (typeof value !== "string" || value.length === 0) {
     logger.warn(
-      { companyId: input.companyId, envKey: SANCTIONED_BRIDGE_ENV_KEY },
-      "sanctioned bridge key is not task_bridge-scoped (or unverifiable); failing closed (no bridge key injected)",
+      { companyId: input.companyId, envKey: SANCTIONED_BRIDGE_ENV_KEY, refusalCode: "secret_unresolved" },
+      "sanctioned bridge secret resolved to an empty value; failing closed (no bridge key injected)",
     );
-    return null;
+    return { status: "refused", refusal: { code: "secret_unresolved" } };
   }
-  return { value, secretKeys };
+  // INV-3: fail-closed unless the resolved key is a task_bridge-scoped agent key.
+  if (!input.verifyTaskBridgeKey) {
+    logger.warn(
+      { companyId: input.companyId, envKey: SANCTIONED_BRIDGE_ENV_KEY, refusalCode: "verifier_unavailable" },
+      "no bridge key verifier is wired; scope unprovable, failing closed (no bridge key injected)",
+    );
+    return { status: "refused", refusal: { code: "verifier_unavailable" } };
+  }
+  const verification = await input.verifyTaskBridgeKey(value);
+  if (!verification.ok) {
+    const { ok: _ok, code, ...rest } = verification;
+    logger.warn(
+      { companyId: input.companyId, envKey: SANCTIONED_BRIDGE_ENV_KEY, refusalCode: code, ...rest },
+      formatBridgeKeyRefusalLine(verification) + "; failing closed (no bridge key injected)",
+    );
+    return { status: "refused", refusal: { code, ...rest } };
+  }
+  return { status: "delivered", value, secretKeys };
 }
 
 export async function resolveExecutionRunAdapterConfig(input: {
@@ -829,12 +857,13 @@ export async function resolveExecutionRunAdapterConfig(input: {
   secretsSvc: RuntimeConfigSecretResolver;
   trustPreset?: TrustPresetResolution;
   /**
-   * Verifies that a resolved `PAPERCLIP_BRIDGE_API_KEY` value is a
-   * `task_bridge`-scoped agent API key (INV-3). When omitted, the
-   * sanctioned bridge credential is NOT delivered (fail-closed). The production
-   * caller wires this to a DB scope lookup; tests inject a stub.
+   * Classifies a resolved `PAPERCLIP_BRIDGE_API_KEY` value as a live
+   * `task_bridge`-scoped agent API key or a typed refusal (INV-3). When
+   * omitted, the sanctioned bridge credential is NOT delivered (fail-closed).
+   * The production caller wires this to the shared classifier
+   * (`createTaskBridgeKeyClassifier`); tests inject a stub.
    */
-  verifyTaskBridgeScope?: (resolvedKey: string) => Promise<boolean>;
+  verifyTaskBridgeKey?: (resolvedKey: string) => Promise<BridgeKeyVerifyResult>;
   requiredScopedEnvBinding?: {
     keys: string[];
     consumerScopes: Array<"agent" | "project">;
@@ -1104,12 +1133,13 @@ export async function resolveExecutionRunAdapterConfig(input: {
   // The value is delivered into the single sanctioned slot AFTER the strip. Run
   // identity is never touched: it lands only under PAPERCLIP_BRIDGE_API_KEY, never
   // PAPERCLIP_API_KEY (INV-1).
+  let bridgeKey: { status: "delivered" } | { status: "refused"; refusal: BridgeKeyRefusal } | null = null;
   if (input.agentId) {
     const bridgeResolution = await resolveSanctionedBridgeEnvBinding({
       companyId: input.companyId,
       rawAgentEnv: input.boardGatedAgentEnv,
       secretsSvc: input.secretsSvc,
-      verifyTaskBridgeScope: input.verifyTaskBridgeScope,
+      verifyTaskBridgeKey: input.verifyTaskBridgeKey,
       context: {
         consumerType: "agent",
         consumerId: input.agentId,
@@ -1121,7 +1151,8 @@ export async function resolveExecutionRunAdapterConfig(input: {
         ...(lowTrustAllowedBindingIds !== undefined ? { allowedBindingIds: lowTrustAllowedBindingIds } : {}),
       },
     });
-    if (bridgeResolution) {
+    if (bridgeResolution.status === "delivered") {
+      bridgeKey = { status: "delivered" };
       resolvedConfig.env = {
         ...parseObject(resolvedConfig.env),
         [SANCTIONED_BRIDGE_ENV_KEY]: bridgeResolution.value,
@@ -1130,6 +1161,8 @@ export async function resolveExecutionRunAdapterConfig(input: {
         secretKeys.add(key); // INV-5: mask the live credential in run-config logging.
       }
       secretKeys.add(SANCTIONED_BRIDGE_ENV_KEY);
+    } else {
+      bridgeKey = { status: "refused", refusal: bridgeResolution.refusal };
     }
   }
   // Pre-dispatch credential gate for codex_local: a managed Codex home with no
@@ -1174,6 +1207,10 @@ export async function resolveExecutionRunAdapterConfig(input: {
   return {
     resolvedConfig,
     secretKeys,
+    // Typed outcome of the sanctioned task_bridge credential resolution, for
+    // the run-start consumer surface (run log + wake context). `null` means
+    // bridge delivery was not attempted (no agent-scoped consumer).
+    bridgeKey,
     secretManifest: [
       ...(environmentEnvResolution.manifest ?? []),
       ...(manifest ?? []),
@@ -4495,6 +4532,10 @@ export async function buildPaperclipWakePayload(input: {
   const interactionId = readNonEmptyString(input.contextSnapshot.interactionId);
   const interactionKind = readNonEmptyString(input.contextSnapshot.interactionKind);
   const interactionStatus = readNonEmptyString(input.contextSnapshot.interactionStatus);
+  // Typed bridge-key refusal (expired / revoked / missing / scope-mismatch,
+  // or a binding-level fault). Rendered into the agent transcript so a dead
+  // task_bridge credential is self-explanatory without a server-log dig.
+  const bridgeKeyStatus = parseObject(input.contextSnapshot.paperclipBridgeKeyStatus);
   const checkboxSelection = parseObject(input.contextSnapshot.checkboxSelection);
   const planReviewContext = issueId
     ? await buildPlanReviewContext({
@@ -4540,6 +4581,7 @@ export async function buildPaperclipWakePayload(input: {
       : null,
     interactionKind,
     interactionStatus,
+    bridgeKeyStatus: Object.keys(bridgeKeyStatus).length > 0 ? bridgeKeyStatus : null,
     checkboxSelection: Object.keys(checkboxSelection).length > 0 ? checkboxSelection : null,
     checkedOutByHarness: input.contextSnapshot[PAPERCLIP_HARNESS_CHECKOUT_KEY] === true,
     dependencyBlockedInteraction: input.contextSnapshot.dependencyBlockedInteraction === true,
@@ -11339,7 +11381,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueId,
       explicitRunScopedSkillKeys: runScopedMentionedSkillKeys,
     });
-    const { resolvedConfig, secretKeys, secretManifest } = await resolveExecutionRunAdapterConfig({
+    const { resolvedConfig, secretKeys, secretManifest, bridgeKey } = await resolveExecutionRunAdapterConfig({
       companyId: agent.companyId,
       agentId: agent.id,
       adapterType: agent.adapterType,
@@ -11361,30 +11403,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       secretsSvc,
       trustPreset,
       // INV-3: only a task_bridge-scoped, non-revoked, non-expired
-      // agent API key may be delivered into PAPERCLIP_BRIDGE_API_KEY.
-      verifyTaskBridgeScope: async (resolvedKey: string) => {
-        const tokenHash = createHash("sha256").update(resolvedKey).digest("hex");
-        const [row] = await db
-          .select({
-            scopeConfig: agentApiKeys.scopeConfig,
-            expiresAt: agentApiKeys.expiresAt,
-          })
-          .from(agentApiKeys)
-          // INFO (defense-in-depth): scope the lookup to this run's company so an
-          // operator who accidentally stores a cross-company key as a company
-          // secret cannot have it pass the task_bridge scope check here. Boundary
-          // enforcement (projectId/parentIssueId/allowedAssigneeAgentIds) still
-          // belongs at the task_bridge API on use; this is a cheap extra fence.
-          .where(and(
-            eq(agentApiKeys.keyHash, tokenHash),
-            eq(agentApiKeys.companyId, agent.companyId),
-            isNull(agentApiKeys.revokedAt),
-          ))
-          .limit(1);
-        if (!row) return false;
-        if (isAgentApiKeyExpired(row.expiresAt)) return false;
-        return normalizeAgentApiKeyScope(row.scopeConfig).kind === "task_bridge";
-      },
+      // agent API key may be delivered into PAPERCLIP_BRIDGE_API_KEY. The
+      // shared classifier returns a typed refusal (expired / revoked /
+      // missing / scope-mismatch) so the failure mode is actionable.
+      verifyTaskBridgeKey: createTaskBridgeKeyClassifier(db, agent.companyId),
       requiredScopedEnvBinding: pushCapabilityPreflightRequired
         ? {
             keys: [...PUSH_CAPABILITY_ENV_KEYS],
@@ -11401,6 +11423,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     } else {
       delete context.paperclipSecrets;
+    }
+    // Consumer surface for the typed bridge-key refusal taxonomy: a refused
+    // credential surfaces as one greppable run-log/server-log line AND a
+    // structured wake-context field, so an expired/revoked/mismatched bridge
+    // key is self-explanatory in the agent transcript instead of surfacing
+    // only as the adapter's generic fail-closed spawn refusal. `binding_absent`
+    // is excluded: most agents legitimately carry no bridge binding, and that
+    // state is not a fault.
+    const bridgeKeyRefusal = bridgeKey?.status === "refused" ? bridgeKey.refusal : null;
+    if (bridgeKeyRefusal && bridgeKeyRefusal.code !== "binding_absent") {
+      const bridgeKeyLine = formatBridgeKeyRefusalLine(bridgeKeyRefusal);
+      logger.warn(
+        {
+          companyId: agent.companyId,
+          agentId: agent.id,
+          refusalCode: bridgeKeyRefusal.code,
+          ...(bridgeKeyRefusal.keyId ? { keyId: bridgeKeyRefusal.keyId } : {}),
+          ...(bridgeKeyRefusal.expiresAt ? { expiresAt: bridgeKeyRefusal.expiresAt } : {}),
+        },
+        bridgeKeyLine,
+      );
+      context.paperclipBridgeKeyStatus = {
+        ...bridgeKeyRefusal,
+        message: bridgeKeyLine,
+      };
+    } else {
+      delete context.paperclipBridgeKeyStatus;
     }
     const effectiveResolvedConfig = applyRunScopedMentionedSkillKeys(
       resolvedConfig,
