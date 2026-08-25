@@ -48,6 +48,8 @@ import {
 } from "@paperclipai/shared";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+import { logActivity } from "./activity-log.js";
+import { collectSecretRefs } from "./agent-secret-bindings.js";
 import { isValidAllowlistEntry } from "../handle-egress.js";
 import { purgeHandlesByBinding } from "../handle-vault.js";
 import { listEgressWouldDeny, type EgressWouldDenyObservationRow } from "./egress-harvest.js";
@@ -1113,13 +1115,16 @@ export function secretService(db: Db) {
     if (!context.configPath) {
       throw unprocessable("Secret resolution requires a binding config path", { code: "binding_missing" });
     }
-    const binding = await getBinding({
+    let binding: typeof companySecretBindings.$inferSelect | null = await getBinding({
       companyId,
       secretId,
       consumerType: context.consumerType,
       consumerId: context.consumerId,
       configPath: context.configPath,
     });
+    if (!binding) {
+      binding = await autoHealAgentBinding(companyId, secretId, context);
+    }
     if (!binding) {
       throw unprocessable(
         `Secret is not bound to ${context.consumerType}:${context.consumerId} at ${context.configPath}`,
@@ -1141,6 +1146,107 @@ export function secretService(db: Db) {
       projectionClass: binding.projectionClass,
       projectionAllowlistKey: binding.projectionAllowlistKey,
     });
+    return binding;
+  }
+
+  /**
+   * Re-create a missing agent binding row when the agent's PERSISTED adapter
+   * config still references this secret at exactly this config path.
+   * `company_secret_bindings` rows for agents are derived state — the healthy
+   * sync writes them FROM the config — so a config that references a secret
+   * with no binding row is drift (historically caused by a binding wipe), and
+   * healing restores what a healthy sync would have written anyway.
+   *
+   * Strictly bounded: agent consumers only, same company only, secret must be
+   * active and company-scoped, the exact (secretId, configPath) pair must
+   * appear in the persisted config, and it NEVER runs inside an explicit
+   * low-trust boundary (allowedBindingIds) — there a missing binding must fail
+   * loudly rather than self-authorize into the boundary.
+   * Returns the healed binding, or null when the heal does not apply.
+   */
+  async function autoHealAgentBinding(
+    companyId: string,
+    secretId: string,
+    context: SecretConsumerContext,
+  ): Promise<typeof companySecretBindings.$inferSelect | null> {
+    if (context.consumerType !== "agent") return null;
+    if (!context.configPath) return null;
+    if (Array.isArray(context.allowedBindingIds)) return null;
+    // Agent ids are uuids; synthetic consumer ids (tests, probes) can never
+    // have persisted config, and querying the uuid column with one errors.
+    if (!isUuidLike(context.consumerId)) return null;
+    const agentRow = await db
+      .select({ adapterConfig: agents.adapterConfig })
+      .from(agents)
+      .where(and(eq(agents.companyId, companyId), eq(agents.id, context.consumerId)))
+      .then((rows) => rows[0] ?? null);
+    if (!agentRow) return null;
+    const matchingRef = collectSecretRefs(agentRow.adapterConfig).find(
+      (ref) => ref.secretId === secretId && ref.configPath === context.configPath,
+    );
+    if (!matchingRef) return null;
+    const secret = await getById(secretId);
+    if (
+      !secret ||
+      secret.companyId !== companyId ||
+      secret.scope !== "company" ||
+      secret.status !== "active"
+    ) {
+      return null;
+    }
+    const inserted = await db
+      .insert(companySecretBindings)
+      .values({
+        companyId,
+        secretId,
+        targetType: "agent",
+        targetId: context.consumerId,
+        configPath: context.configPath,
+        versionSelector: String(matchingRef.versionSelector ?? "latest"),
+        required: true,
+        label: null,
+        allowedEgress: [],
+        egressAllowlistEnforced: true,
+      })
+      .onConflictDoNothing()
+      .returning()
+      .then((rows) => rows[0] ?? null);
+    const binding =
+      inserted ??
+      (await getBinding({
+        companyId,
+        secretId,
+        consumerType: "agent",
+        consumerId: context.consumerId,
+        configPath: context.configPath,
+      }));
+    if (!binding) return null;
+    logger.warn(
+      {
+        companyId,
+        agentId: context.consumerId,
+        secretId,
+        configPath: context.configPath,
+        bindingId: binding.id,
+        action: "secret.binding_auto_healed",
+      },
+      "agent secret binding row was missing while persisted config referenced the secret — re-created it",
+    );
+    await logActivity(db, {
+      companyId,
+      actorType: "system",
+      actorId: "secret-binding-auto-heal",
+      action: "secret.binding_auto_healed",
+      entityType: "agent",
+      entityId: context.consumerId,
+      agentId: context.consumerId,
+      details: {
+        secretId,
+        configPath: context.configPath,
+        bindingId: binding.id,
+        reason: "persisted adapter config references this secret but no binding row existed",
+      },
+    }).catch(() => undefined);
     return binding;
   }
 
@@ -4738,15 +4844,24 @@ export function secretService(db: Db) {
               );
           }
         } else {
-          await tx
-            .delete(companySecretBindings)
-            .where(
-              and(
-                eq(companySecretBindings.companyId, companyId),
-                eq(companySecretBindings.targetType, target.targetType),
-                eq(companySecretBindings.targetId, target.targetId),
-              ),
-            );
+          // An empty ref set carries no information about WHICH bindings the
+          // caller wants removed. Deleting every binding for the target here is
+          // how a config form that silently drops `env` bricks an agent (a
+          // `env: {}` PATCH once wiped every company_secret_bindings row for the
+          // target). No-op instead: stale binding rows are low harm, a silent
+          // delete-all is high harm. Explicit per-key rewrites still delete
+          // their rows via the pathPrefix branch above, and a genuine
+          // decommission can clear bindings by rewriting the keys to plain
+          // values (or via the dedicated binding delete API).
+          logger.warn(
+            {
+              companyId,
+              targetType: target.targetType,
+              targetId: target.targetId,
+              action: "secret.binding_sync_empty_refs_noop",
+            },
+            "syncSecretRefsForTarget called with zero refs (non-replaceAll) — skipping delete-all to avoid a config-form binding wipe",
+          );
         }
         if (normalizedRefs.length === 0) return;
         await tx.insert(companySecretBindings).values(
