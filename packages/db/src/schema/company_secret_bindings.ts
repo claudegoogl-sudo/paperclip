@@ -1,4 +1,5 @@
-import { boolean, index, pgTable, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
+import { boolean, index, jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
+import type { BindingAutoRenewPolicy } from "@paperclipai/shared";
 import { companies } from "./companies.js";
 import { companySecrets } from "./company_secrets.js";
 
@@ -20,6 +21,14 @@ export const companySecretBindings = pgTable(
     // rows were migrated to log-only by 0092.
     allowedEgress: text("allowed_egress").array().notNull().default([]),
     egressAllowlistEnforced: boolean("egress_allowlist_enforced").notNull().default(true),
+    // Operator opt-in for the server-internal task_bridge key auto-renewer.
+    // NULL = default-deny: the renewal sweep never touches this binding, even
+    // at expiry. Set/changed/cleared ONLY via the board-gated policy route
+    // (same provenance pattern as `allowedEgress`); the renewer itself never
+    // writes this column. The opt-in carries the exact pinned minimum scope
+    // the renewer may mint — the operator's approval and the scope snapshot
+    // are one authorization object.
+    autoRenewPolicy: jsonb("auto_renew_policy").$type<BindingAutoRenewPolicy | null>(),
     label: text("label"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

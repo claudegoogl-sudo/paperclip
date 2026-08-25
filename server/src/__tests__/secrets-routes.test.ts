@@ -34,6 +34,9 @@ const mockSecretService = vi.hoisted(() => ({
   removeCurrentUserSecretValue: vi.fn(),
   previewRemoteImport: vi.fn(),
   importRemoteSecrets: vi.fn(),
+  getBindingForBoard: vi.fn(),
+  setBindingAutoRenewPolicy: vi.fn(),
+  listRenewalEvents: vi.fn(),
 }));
 const mockLogActivity = vi.hoisted(() => vi.fn());
 
@@ -869,5 +872,86 @@ describe("secret routes", () => {
         entityId: secret.id,
       }),
     );
+  });
+
+  // task_bridge auto-renew policy routes: the operator opt-in IS the scope
+  // approval for the server-internal renewer, so an agent-reachable write path
+  // would be a self-authorization hole. All three surfaces must reject
+  // agent-scoped actors before touching the service.
+  describe("auto-renew policy routes", () => {
+    const pinnedScope = {
+      kind: "task_bridge" as const,
+      projectId: "44444444-4444-4444-8444-444444444444",
+      parentIssueIds: ["55555555-5555-4555-8555-555555555555"],
+      allowedAssigneeAgentIds: ["66666666-6666-4666-8666-666666666666"],
+    };
+    const policyBody = {
+      version: 1,
+      enabled: true,
+      scope: pinnedScope,
+      authorizedByUserId: "ignored-server-side",
+      createdAt: "ignored-server-side",
+    };
+
+    it("rejects GET auto-renew-policy for non-board actors without touching the service", async () => {
+      const res = await request(createApp({
+        type: "agent",
+        agentId: "agent-1",
+        companyId: "company-1",
+      })).get("/api/companies/company-1/secret-bindings/binding-1/auto-renew-policy");
+
+      expect(res.status).toBe(403);
+      expect(mockSecretService.getBindingForBoard).not.toHaveBeenCalled();
+    });
+
+    it("rejects POST auto-renew-policy for non-board actors without touching the service", async () => {
+      const res = await request(createApp({
+        type: "agent",
+        agentId: "agent-1",
+        companyId: "company-1",
+      }))
+        .post("/api/companies/company-1/secret-bindings/binding-1/auto-renew-policy")
+        .send({ policy: policyBody });
+
+      expect(res.status).toBe(403);
+      expect(mockSecretService.setBindingAutoRenewPolicy).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalled();
+    });
+
+    it("rejects GET renewal-events for non-board actors without touching the service", async () => {
+      const res = await request(createApp({
+        type: "agent",
+        agentId: "agent-1",
+        companyId: "company-1",
+      })).get("/api/secrets/77777777-7777-4777-8777-777777777777/renewal-events");
+
+      expect(res.status).toBe(403);
+      expect(mockSecretService.getById).not.toHaveBeenCalled();
+      expect(mockSecretService.listRenewalEvents).not.toHaveBeenCalled();
+    });
+
+    it("stores the policy for board callers, stamping provenance server-side", async () => {
+      const updatedBinding = { id: "binding-1", autoRenewPolicy: { ...policyBody, authorizedByUserId: "user-1" } };
+      mockSecretService.setBindingAutoRenewPolicy.mockResolvedValue({ binding: updatedBinding });
+
+      const res = await request(createApp())
+        .post("/api/companies/company-1/secret-bindings/binding-1/auto-renew-policy")
+        .send({ policy: policyBody });
+
+      expect(res.status).toBe(200);
+      expect(mockSecretService.setBindingAutoRenewPolicy).toHaveBeenCalledWith({
+        companyId: "company-1",
+        bindingId: "binding-1",
+        policy: expect.objectContaining({ authorizedByUserId: "user-1", enabled: true }),
+      });
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "secret.binding_auto_renew_policy_set",
+          companyId: "company-1",
+          entityId: "binding-1",
+        }),
+      );
+    });
   });
 });

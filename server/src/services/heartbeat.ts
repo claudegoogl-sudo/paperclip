@@ -30,7 +30,7 @@ import {
   type RunLivenessState,
   type SourceTrustMetadata,
 } from "@paperclipai/shared";
-import { createTaskBridgeKeyClassifier } from "./task-bridge-keys.js";
+import { createTaskBridgeKeyClassifier, SANCTIONED_BRIDGE_ENV_KEY } from "./task-bridge-keys.js";
 import {
   agents,
   agentConfigRevisions,
@@ -713,7 +713,7 @@ function assertLowTrustEnvConfigAllowed(envValue: unknown, source: string) {
  * is never treated as run identity — the hermes adapter reads it solely as the
  * task_bridge credential (INV-1, INV-6).
  */
-export const SANCTIONED_BRIDGE_ENV_KEY = "PAPERCLIP_BRIDGE_API_KEY";
+export { SANCTIONED_BRIDGE_ENV_KEY } from "./task-bridge-keys.js";
 
 /**
  * Resolve the operator-bound `task_bridge` credential for

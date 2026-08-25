@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { and, desc, eq, inArray, like, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  agentKeyRenewalEvents,
   agents,
   companySecretBindings,
   companySecretProviderConfigs,
@@ -3169,6 +3170,13 @@ export function secretService(db: Db) {
         externalRef?: string | null;
         providerVersionRef?: string | null;
         providerConfigId?: string | null;
+        /**
+         * Optional provenance marker stamped onto the new version row. Used by
+         * the server-internal task_bridge auto-renewer so every
+         * renewer-written version is attributable to its rotation job
+         * (correlates with `agent_key_renewal_events`).
+         */
+        rotationJobId?: string | null;
       },
       actor?: { userId?: string | null; agentId?: string | null },
     ) => {
@@ -3235,6 +3243,7 @@ export function secretService(db: Db) {
           fingerprintSha256: prepared.fingerprintSha256 ?? prepared.valueSha256,
           providerVersionRef: prepared.providerVersionRef ?? null,
           status: "disabled",
+          rotationJobId: input.rotationJobId ?? null,
           createdByAgentId: actor?.agentId ?? null,
           createdByUserId: actor?.userId ?? null,
         });
@@ -3554,6 +3563,77 @@ export function secretService(db: Db) {
         .then((rows) => rows[0]);
       const handlesPurged = purgeHandlesByBinding(binding.id);
       return { binding: updated, handlesPurged };
+    },
+
+    /**
+     * SECURITY-CRITICAL: operator-only opt-in for the server-internal
+     * task_bridge key auto-renewer (`company_secret_bindings.autoRenewPolicy`).
+     *
+     * The caller MUST be board-gated (`assertBoard` route, the same
+     * provenance pattern as `setBindingEgressAllowlist`): the policy's pinned
+     * scope snapshot is the exact minimum scope the renewer may mint, so an
+     * agent-reachable write path here would be a self-authorization hole.
+     * There is deliberately no agent/worker-passable path that can set,
+     * change, or clear it.
+     *
+     * Shape-gated to the one configuration the renewer understands: the
+     * binding must target an agent at `env.PAPERCLIP_BRIDGE_API_KEY`. A
+     * `null` policy clears the opt-in (back to default-deny). Idempotent:
+     * re-setting the same policy converges.
+     */
+    setBindingAutoRenewPolicy: async (input: {
+      companyId: string;
+      bindingId: string;
+      policy: unknown;
+    }) => {
+      const binding = await loadOwnedBinding(input.companyId, input.bindingId);
+      if (binding.targetType !== "agent" || binding.configPath !== "env.PAPERCLIP_BRIDGE_API_KEY") {
+        throw unprocessable(
+          "Auto-renew policy applies only to agent bindings at env.PAPERCLIP_BRIDGE_API_KEY",
+          { code: "binding_shape_unsupported" },
+        );
+      }
+      const updated = await db
+        .update(companySecretBindings)
+        .set({
+          autoRenewPolicy: input.policy === null ? null : input.policy as NonNullable<typeof binding.autoRenewPolicy>,
+          updatedAt: new Date(),
+        })
+        .where(eq(companySecretBindings.id, binding.id))
+        .returning()
+        .then((rows) => rows[0]);
+      return { binding: updated };
+    },
+
+    /**
+     * Board-facing read of one binding row by id (company-scoped). Returns
+     * `null` when the binding does not exist in this company — the caller
+     * (board-gated route) decides how to surface that.
+     */
+    getBindingForBoard: async (companyId: string, bindingId: string) =>
+      loadOwnedBinding(companyId, bindingId).catch(() => null),
+
+    /**
+     * Read the append-only renewal audit trail for every binding of one
+     * secret, newest first. Board-gated at the route. Never returns key
+     * plaintext or hashes — the rows only carry ids, timestamps, outcome,
+     * trigger, and the non-secret scope snapshot.
+     */
+    listRenewalEvents: async (companyId: string, secretId: string, limit = 50) => {
+      const secret = await getById(secretId);
+      if (!secret) throw notFound("Secret not found");
+      if (secret.companyId !== companyId) throw notFound("Secret not found");
+      return db
+        .select()
+        .from(agentKeyRenewalEvents)
+        .innerJoin(companySecretBindings, eq(agentKeyRenewalEvents.bindingId, companySecretBindings.id))
+        .where(and(
+          eq(agentKeyRenewalEvents.companyId, companyId),
+          eq(companySecretBindings.secretId, secretId),
+        ))
+        .orderBy(desc(agentKeyRenewalEvents.createdAt))
+        .limit(Math.min(Math.max(limit, 1), 200))
+        .then((rows) => rows.map((row) => row.agent_key_renewal_events));
     },
 
     /**
