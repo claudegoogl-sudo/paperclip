@@ -136,6 +136,22 @@ function collectUserSecretRefs(adapterConfig: unknown): Array<{
 }
 
 /**
+ * Whether an adapter config references at least one secret (a `secret_ref` or
+ * a `user_secret_ref`). The approval-activation path uses this to decide
+ * whether the binding reconcile can ADD anything: with zero references the
+ * replaceAll delete-and-reinsert can only delete rows — the config-form wipe
+ * shape the guards exist to prevent — while a config that still references
+ * secrets keeps the legacy activation backfill (and its fail-closed behavior
+ * on broken refs).
+ */
+export function adapterConfigReferencesSecrets(adapterConfig: unknown): boolean {
+  return (
+    collectSecretRefs(adapterConfig).length > 0 ||
+    collectUserSecretRefs(adapterConfig).length > 0
+  );
+}
+
+/**
  * Config paths of `previousRefs` that `incomingConfig` does not explicitly
  * address. A path `env.K` is addressed when the incoming config carries an env
  * object containing key K (whatever the value); a top-level path `K` is

@@ -28,7 +28,7 @@ import {
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
-import { syncAgentAdapterEnvBindings } from "./agent-secret-bindings.js";
+import { adapterConfigReferencesSecrets, syncAgentAdapterEnvBindings } from "./agent-secret-bindings.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
 import { secretService } from "./secrets.js";
@@ -708,7 +708,16 @@ export function agentService(db: Db) {
           .returning()
           .then((rows) => rows[0] ?? null);
         if (!updated) return null;
-        await syncAgentSecretBindings(updated, txDb);
+        // Activation is a status-only flip carrying no previous config, so the
+        // binding reconcile here runs unguarded: with a persisted config that
+        // references zero secrets, replaceAll can only DELETE — wiping rows
+        // the update-path guard refused to drop during the pending window
+        // (drift corner: config-form wipe + preserved bindings). Skip it.
+        // A config that still references secrets keeps the legacy activation
+        // backfill and its fail-closed behavior on broken refs.
+        if (adapterConfigReferencesSecrets(updated.adapterConfig)) {
+          await syncAgentSecretBindings(updated, txDb);
+        }
         const agent = await agentService(txDb).getById(updated.id);
         if (!agent) {
           throw notFound("Agent not found");
