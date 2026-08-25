@@ -276,6 +276,117 @@ export function isAgentApiKeyExpired(
   return d.getTime() <= now.getTime();
 }
 
+/**
+ * Typed refusal taxonomy for the sanctioned `task_bridge` credential
+ * (`PAPERCLIP_BRIDGE_API_KEY`). Replaces the historical single-boolean
+ * verifier: an expired key, a revoked key, a missing key row, and a
+ * wrong-scope key previously all collapsed into one generic "unverifiable"
+ * refusal, which made a bridge outage expensive to diagnose. Every code is
+ * distinct and actionable, and every rendered message carries ids and
+ * timestamps only — never key plaintext or `keyHash`.
+ */
+export type BridgeKeyVerifyFailureCode =
+  | "key_missing"
+  | "key_revoked"
+  | "key_expired"
+  | "key_scope_mismatch";
+
+/**
+ * Classification produced by the verifier injected into the sanctioned
+ * bridge-key resolution path. `{ ok: true }` is the only passing result;
+ * every failure names exactly why. Shared verbatim by the consumer path
+ * (heartbeat run config) and the auto-renewer's post-rotation verification,
+ * so both sides classify identically.
+ */
+export type BridgeKeyVerifyResult =
+  | { ok: true }
+  | {
+      ok: false;
+      code: BridgeKeyVerifyFailureCode;
+      keyId?: string;
+      expiresAt?: string;
+      actualScopeKind?: string;
+    };
+
+/**
+ * Binding- and verifier-level refusals raised before a key can be classified.
+ * `binding_absent` means the agent's board-gated env carries no bridge binding
+ * at all (nothing is misconfigured — the credential simply is not set up);
+ * the rest are faults. `verifier_unavailable` keeps the historical fail-closed
+ * default: no verifier wired ⇒ scope unprovable ⇒ refuse.
+ */
+export type BridgeKeyBindingRefusalCode =
+  | "binding_absent"
+  | "binding_malformed"
+  | "binding_not_secret_ref"
+  | "secret_unresolved"
+  | "verifier_unavailable";
+
+export type BridgeKeyRefusalCode = BridgeKeyVerifyFailureCode | BridgeKeyBindingRefusalCode;
+
+export interface BridgeKeyRefusal {
+  code: BridgeKeyRefusalCode;
+  keyId?: string;
+  expiresAt?: string;
+  actualScopeKind?: string;
+}
+
+const BRIDGE_KEY_REFUSAL_LINE_PREFIX: Record<BridgeKeyRefusalCode, string> = {
+  key_missing: "TASK_BRIDGE_KEY_MISSING",
+  key_revoked: "TASK_BRIDGE_KEY_REVOKED",
+  key_expired: "TASK_BRIDGE_KEY_EXPIRED",
+  key_scope_mismatch: "TASK_BRIDGE_KEY_SCOPE_MISMATCH",
+  binding_absent: "TASK_BRIDGE_BINDING_ABSENT",
+  binding_malformed: "TASK_BRIDGE_BINDING_MALFORMED",
+  binding_not_secret_ref: "TASK_BRIDGE_BINDING_NOT_SECRET_REF",
+  secret_unresolved: "TASK_BRIDGE_SECRET_UNRESOLVED",
+  verifier_unavailable: "TASK_BRIDGE_VERIFIER_UNAVAILABLE",
+};
+
+/**
+ * Render a refusal as the stable, greppable one-line message surfaced in run
+ * logs, server logs, and the agent wake context. Pure and secret-free: only
+ * the code, key id, expiry timestamp, and scope kind appear. The prefix is a
+ * fixed uppercase token so `grep TASK_BRIDGE_KEY_EXPIRED` finds every
+ * occurrence of that state on the host or in a transcript.
+ */
+export function formatBridgeKeyRefusalLine(refusal: BridgeKeyRefusal): string {
+  const prefix = BRIDGE_KEY_REFUSAL_LINE_PREFIX[refusal.code] ?? "TASK_BRIDGE_KEY_REFUSED";
+  const parts: string[] = [];
+  switch (refusal.code) {
+    case "key_expired":
+      parts.push(`bridge key ${refusal.keyId ?? "<unknown>"} expired ${refusal.expiresAt ?? "<unknown>"}`);
+      break;
+    case "key_revoked":
+      parts.push(`bridge key ${refusal.keyId ?? "<unknown>"} is revoked — re-mint required`);
+      break;
+    case "key_missing":
+      parts.push("no live agent key row matches the bound credential — re-mint required");
+      break;
+    case "key_scope_mismatch":
+      parts.push(
+        `bridge key ${refusal.keyId ?? "<unknown>"} has scope kind "${refusal.actualScopeKind ?? "unknown"}", not task_bridge`,
+      );
+      break;
+    case "binding_absent":
+      parts.push("no bridge binding is configured in the agent's board-gated env");
+      break;
+    case "binding_malformed":
+      parts.push("bridge env binding is malformed");
+      break;
+    case "binding_not_secret_ref":
+      parts.push("bridge env binding is not an operator secret_ref");
+      break;
+    case "secret_unresolved":
+      parts.push("bound bridge secret failed to resolve");
+      break;
+    case "verifier_unavailable":
+      parts.push("no bridge key verifier is wired; scope is unprovable");
+      break;
+  }
+  return `${prefix}: ${parts.join("; ")}`;
+}
+
 export const agentMineInboxQuerySchema = z.object({
   userId: z.string().trim().min(1),
   status: z.string().trim().min(1).optional().default(INBOX_MINE_ISSUE_STATUS_FILTER),
