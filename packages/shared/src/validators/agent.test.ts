@@ -4,6 +4,7 @@ import {
   agentApiKeyScopeIsCrossCompany,
   computeAgentKeyExpiresAt,
   createAgentKeySchema,
+  formatBridgeKeyRefusalLine,
   isAgentApiKeyExpired,
   type AgentApiKeyScope,
 } from "./agent.js";
@@ -111,5 +112,34 @@ describe("createAgentKeySchema", () => {
     expect(parsed.scope).toEqual({ kind: "standard" });
     expect(parsed.ttlSeconds).toBeUndefined();
     expect(parsed.expiresAt).toBeUndefined();
+  });
+});
+
+describe("formatBridgeKeyRefusalLine", () => {
+  it("renders each refusal code with a distinct, greppable prefix", () => {
+    const lines = [
+      formatBridgeKeyRefusalLine({ code: "key_expired", keyId: "k1", expiresAt: "2026-08-25T08:09:00.000Z" }),
+      formatBridgeKeyRefusalLine({ code: "key_revoked", keyId: "k2" }),
+      formatBridgeKeyRefusalLine({ code: "key_missing" }),
+      formatBridgeKeyRefusalLine({ code: "key_scope_mismatch", keyId: "k3", actualScopeKind: "standard" }),
+      formatBridgeKeyRefusalLine({ code: "binding_absent" }),
+      formatBridgeKeyRefusalLine({ code: "binding_malformed" }),
+      formatBridgeKeyRefusalLine({ code: "binding_not_secret_ref" }),
+      formatBridgeKeyRefusalLine({ code: "secret_unresolved" }),
+      formatBridgeKeyRefusalLine({ code: "verifier_unavailable" }),
+    ];
+    const prefixes = lines.map((line) => line.split(":")[0]);
+    expect(new Set(prefixes).size).toBe(prefixes.length);
+    expect(lines[0]).toContain("TASK_BRIDGE_KEY_EXPIRED: bridge key k1 expired 2026-08-25T08:09:00.000Z");
+  });
+
+  it("never renders key plaintext or hashes", () => {
+    const line = formatBridgeKeyRefusalLine({
+      code: "key_expired",
+      keyId: "key-id-only",
+      expiresAt: "2026-08-25T08:09:00.000Z",
+    });
+    expect(line).not.toContain("sha256");
+    expect(line).not.toContain("pat-");
   });
 });

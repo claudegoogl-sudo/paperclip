@@ -56,6 +56,7 @@
               "guides/board-operator/costs-and-budgets",
               "guides/board-operator/activity-log",
               "guides/board-operator/secret-egress-allowlists",
+              "guides/board-operator/task-bridge-keys",
               "guides/board-operator/importing-and-exporting"
             ]
           },

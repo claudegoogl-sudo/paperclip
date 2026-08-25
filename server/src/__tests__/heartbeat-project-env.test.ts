@@ -743,7 +743,7 @@ describe("resolveExecutionRunAdapterConfig — sanctioned task_bridge bridge key
       secretKeys: new Set([SANCTIONED_BRIDGE_ENV_KEY]),
       manifest: [],
     });
-    const verifyTaskBridgeScope = vi.fn(async () => true);
+    const verifyTaskBridgeKey = vi.fn(async () => ({ ok: true as const }));
 
     const result = await resolveExecutionRunAdapterConfig({
       companyId: "company-1",
@@ -759,7 +759,7 @@ describe("resolveExecutionRunAdapterConfig — sanctioned task_bridge bridge key
       },
       projectEnv: null,
       secretsSvc: { resolveAdapterConfigForRuntime, resolveEnvBindings } as any,
-      verifyTaskBridgeScope,
+      verifyTaskBridgeKey,
     });
 
     // The bridge value is delivered into the distinct sanctioned slot...
@@ -779,7 +779,7 @@ describe("resolveExecutionRunAdapterConfig — sanctioned task_bridge bridge key
       expect.objectContaining({ consumerType: "agent", consumerId: "agent-1" }),
     );
     // Scope was verified against the resolved value.
-    expect(verifyTaskBridgeScope).toHaveBeenCalledWith("pat-task-bridge-resolved");
+    expect(verifyTaskBridgeKey).toHaveBeenCalledWith("pat-task-bridge-resolved");
   });
 
   it("fails closed (no delivery) when the resolved key is NOT task_bridge-scoped (INV-3)", async () => {
@@ -789,7 +789,7 @@ describe("resolveExecutionRunAdapterConfig — sanctioned task_bridge bridge key
       secretKeys: new Set([SANCTIONED_BRIDGE_ENV_KEY]),
       manifest: [],
     });
-    const verifyTaskBridgeScope = vi.fn(async () => false); // wrong scope
+    const verifyTaskBridgeKey = vi.fn(async () => ({ ok: false as const, code: "key_scope_mismatch" as const, keyId: "key-1", actualScopeKind: "standard" })); // wrong scope
 
     const result = await resolveExecutionRunAdapterConfig({
       companyId: "company-1",
@@ -798,12 +798,12 @@ describe("resolveExecutionRunAdapterConfig — sanctioned task_bridge bridge key
       boardGatedAgentEnv: { [SANCTIONED_BRIDGE_ENV_KEY]: BRIDGE_SECRET_REF },
       projectEnv: null,
       secretsSvc: { resolveAdapterConfigForRuntime, resolveEnvBindings } as any,
-      verifyTaskBridgeScope,
+      verifyTaskBridgeKey,
     });
 
     expect((result.resolvedConfig.env as Record<string, unknown>)[SANCTIONED_BRIDGE_ENV_KEY]).toBeUndefined();
     expect(result.secretKeys.has(SANCTIONED_BRIDGE_ENV_KEY)).toBe(false);
-    expect(verifyTaskBridgeScope).toHaveBeenCalledTimes(1);
+    expect(verifyTaskBridgeKey).toHaveBeenCalledTimes(1);
   });
 
   it("fails closed (no delivery) when no scope verifier is wired (INV-3 fail-closed default)", async () => {
@@ -821,7 +821,7 @@ describe("resolveExecutionRunAdapterConfig — sanctioned task_bridge bridge key
       boardGatedAgentEnv: { [SANCTIONED_BRIDGE_ENV_KEY]: BRIDGE_SECRET_REF },
       projectEnv: null,
       secretsSvc: { resolveAdapterConfigForRuntime, resolveEnvBindings } as any,
-      // no verifyTaskBridgeScope
+      // no verifyTaskBridgeKey
     });
 
     expect((result.resolvedConfig.env as Record<string, unknown>)[SANCTIONED_BRIDGE_ENV_KEY]).toBeUndefined();
@@ -834,7 +834,7 @@ describe("resolveExecutionRunAdapterConfig — sanctioned task_bridge bridge key
   ])("fails closed for %s bridge binding (INV-2: operator secret_ref only)", async (_label, binding) => {
     const resolveAdapterConfigForRuntime = mockAgentConfigResolver({ AGENT_ONLY: "agent-only" });
     const resolveEnvBindings = vi.fn();
-    const verifyTaskBridgeScope = vi.fn(async () => true);
+    const verifyTaskBridgeKey = vi.fn(async () => ({ ok: true as const }));
 
     const result = await resolveExecutionRunAdapterConfig({
       companyId: "company-1",
@@ -843,13 +843,13 @@ describe("resolveExecutionRunAdapterConfig — sanctioned task_bridge bridge key
       boardGatedAgentEnv: { [SANCTIONED_BRIDGE_ENV_KEY]: binding as unknown },
       projectEnv: null,
       secretsSvc: { resolveAdapterConfigForRuntime, resolveEnvBindings } as any,
-      verifyTaskBridgeScope,
+      verifyTaskBridgeKey,
     });
 
     expect((result.resolvedConfig.env as Record<string, unknown>)[SANCTIONED_BRIDGE_ENV_KEY]).toBeUndefined();
     // A non-secret_ref binding is refused before any resolution or scope check.
     expect(resolveEnvBindings).not.toHaveBeenCalled();
-    expect(verifyTaskBridgeScope).not.toHaveBeenCalled();
+    expect(verifyTaskBridgeKey).not.toHaveBeenCalled();
   });
 
   it("keeps run-identity keys stripped even alongside a valid bridge binding (INV-1 regression, acceptance 1b)", async () => {
@@ -859,7 +859,7 @@ describe("resolveExecutionRunAdapterConfig — sanctioned task_bridge bridge key
       secretKeys: new Set([SANCTIONED_BRIDGE_ENV_KEY]),
       manifest: [],
     });
-    const verifyTaskBridgeScope = vi.fn(async () => true);
+    const verifyTaskBridgeKey = vi.fn(async () => ({ ok: true as const }));
 
     const result = await resolveExecutionRunAdapterConfig({
       companyId: "company-1",
@@ -880,7 +880,7 @@ describe("resolveExecutionRunAdapterConfig — sanctioned task_bridge bridge key
       },
       projectEnv: null,
       secretsSvc: { resolveAdapterConfigForRuntime, resolveEnvBindings } as any,
-      verifyTaskBridgeScope,
+      verifyTaskBridgeKey,
     });
 
     // The agent env handed to the resolver had every PAPERCLIP_* key stripped
@@ -909,7 +909,7 @@ describe("resolveExecutionRunAdapterConfig — sanctioned task_bridge bridge key
       secretKeys: new Set([SANCTIONED_BRIDGE_ENV_KEY]),
       manifest: [],
     });
-    const verifyTaskBridgeScope = vi.fn(async () => true);
+    const verifyTaskBridgeKey = vi.fn(async () => ({ ok: true as const }));
 
     const result = await resolveExecutionRunAdapterConfig({
       companyId: "company-1",
@@ -927,7 +927,7 @@ describe("resolveExecutionRunAdapterConfig — sanctioned task_bridge bridge key
       boardGatedAgentEnv: { AGENT_ONLY: "agent-only" },
       projectEnv: null,
       secretsSvc: { resolveAdapterConfigForRuntime, resolveEnvBindings } as any,
-      verifyTaskBridgeScope,
+      verifyTaskBridgeKey,
     });
 
     // No bridge credential is delivered...
@@ -935,6 +935,6 @@ describe("resolveExecutionRunAdapterConfig — sanctioned task_bridge bridge key
     expect(result.secretKeys.has(SANCTIONED_BRIDGE_ENV_KEY)).toBe(false);
     // ...and the issue-override binding was never even resolved or scope-checked.
     expect(resolveEnvBindings).not.toHaveBeenCalled();
-    expect(verifyTaskBridgeScope).not.toHaveBeenCalled();
+    expect(verifyTaskBridgeKey).not.toHaveBeenCalled();
   });
 });

@@ -1,0 +1,55 @@
+# Task bridge keys (`PAPERCLIP_BRIDGE_API_KEY`) — refusal codes and manual re-mint
+
+A task bridge key is a scoped agent API key (`scope.kind = "task_bridge"`) an
+operator binds to an agent's `adapterConfig.env.PAPERCLIP_BRIDGE_API_KEY` via a
+`secret_ref` + `company_secret_bindings` row. It lets an external-logging
+adapter call the board API without ever holding the broad run key.
+
+## Why bridge delivery fails: the refusal codes
+
+When the server resolves the bridge credential at run start it refuses
+fail-closed — no credential is injected — and since the typed-refusal change it
+says **which** state it hit, as a stable `TASK_BRIDGE_*` line in the run log /
+server log and a `bridgeKeyStatus` field in the agent's wake context:
+
+| Code | Meaning | Action |
+| --- | --- | --- |
+| `key_expired` | The bound key's 24h clamp elapsed (`expiresAt` passed). | Re-mint (below). |
+| `key_revoked` | The bound key row has `revokedAt` set. | Re-mint, or un-revoke deliberately. |
+| `key_missing` | No `agent_api_keys` row matches the bound credential. | Re-mint and rotate the secret to the new key. |
+| `key_scope_mismatch` | The key is live but not `task_bridge`-scoped (e.g. `standard`). | Re-mint with a `task_bridge` scope. |
+| `binding_absent` | The agent's board-gated env has no bridge binding at all. | Expected for agents without a bridge — nothing to fix. |
+| `binding_malformed` | The env binding is not a valid binding object. | Fix `adapterConfig.env.PAPERCLIP_BRIDGE_API_KEY`. |
+| `binding_not_secret_ref` | The binding is a bare string / `plain` / `user_secret_ref`. | Bind an operator `secret_ref` instead. |
+| `secret_unresolved` | The backing secret failed to resolve (deleted, inactive, provider error). | Fix the secret or its provider. |
+| `verifier_unavailable` | Server misconfiguration — no verifier wired. | Report as a server bug. |
+
+Example line (expired key, the most common state because task bridge keys are
+clamped to 24h):
+
+```
+TASK_BRIDGE_KEY_EXPIRED: bridge key 6f0c… expired 2026-08-25T08:09:00.000Z
+```
+
+## Manual re-mint (fallback when auto-renew is not enabled)
+
+Task bridge keys are clamped to 24h (`CROSS_COMPANY_AGENT_KEY_MAX_TTL_SECONDS`),
+so without an auto-renewal policy every bound key eventually hits
+`key_expired`. Manual fallback, with a board token:
+
+```bash
+# 1. Mint a fresh task_bridge-scoped key (plaintext shown exactly once):
+NEW_KEY=$(curl -s -X POST "$API/api/agents/$AGENT_ID/keys" \
+  -H "Authorization: Bearer $BOARD_TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"task_bridge manual re-mint","scope":{"kind":"task_bridge","projectId":"<project-uuid>","parentIssueIds":["<parent-issue-uuid>"],"allowedAssigneeAgentIds":["<agent-uuid>"]}}' \
+  | jq -r .token)
+# 2. Rotate the bound secret to the new key so the binding resolves to it:
+curl -s -X POST "$API/api/secrets/$SECRET_ID/rotate" \
+  -H "Authorization: Bearer $BOARD_TOKEN" -H "Content-Type: application/json" \
+  -d "{\"value\":\"$NEW_KEY\"}"
+```
+
+Keep the scope pinned to the minimum the consumer needs (project / parent
+issues / allowed assignees). The old key dies with its own 24h clamp at the
+latest; revoke it explicitly with `DELETE /api/agents/{agentId}/keys/{keyId}`
+to close the overlap window.
