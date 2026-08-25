@@ -1058,6 +1058,13 @@
       "when": 1783101600000,
       "tag": "0152_board_api_keys_scope_config",
       "breakpoints": true
+    },
+    {
+      "idx": 153,
+      "version": "7",
+      "when": 1783101700000,
+      "tag": "0153_task_bridge_auto_renew",
+      "breakpoints": true
     }
   ]
 }
