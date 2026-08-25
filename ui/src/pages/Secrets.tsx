@@ -35,7 +35,8 @@ import {
   UserRound,
   Users,
 } from "lucide-react";
-import { Link, useSearchParams } from "react-router-dom";
+import { Link } from "@/lib/router";
+import { useSearchParams } from "react-router-dom";
 import type {
   CompanySecret,
   CompanySecretUsageBinding,
