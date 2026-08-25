@@ -27,6 +27,7 @@ import {
   type AgentApiKeyScope,
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { logActivity } from "./activity-log.js";
 import { syncAgentAdapterEnvBindings } from "./agent-secret-bindings.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
@@ -381,14 +382,35 @@ export function agentService(db: Db) {
   async function syncAgentSecretBindings(
     agent: { id: string; companyId: string; adapterConfig: unknown },
     dbClient: Db = db,
+    previousAdapterConfig?: unknown,
   ) {
     const scopedSecretsSvc = dbClient === db ? secretsSvc : secretService(dbClient);
-    await syncAgentAdapterEnvBindings({
+    const { refusedConfigPaths } = await syncAgentAdapterEnvBindings({
       secretsSvc: scopedSecretsSvc,
       companyId: agent.companyId,
       agentId: agent.id,
       adapterConfig: agent.adapterConfig,
+      previousAdapterConfig,
     });
+    if (refusedConfigPaths.length > 0) {
+      // Preserve-on-ambiguity: an incoming config with zero secret refs whose
+      // previous config referenced secrets at now-absent keys is
+      // indistinguishable from a form that dropped `env`. Keep the bindings
+      // and leave an operator-visible trail (ids/paths only, no values).
+      await logActivity(dbClient, {
+        companyId: agent.companyId,
+        actorType: "system",
+        actorId: "secret-binding-guard",
+        action: "secret.binding_wipe_refused",
+        entityType: "agent",
+        entityId: agent.id,
+        agentId: agent.id,
+        details: {
+          refusedConfigPaths,
+          reason: "incoming adapter config has zero secret refs while persisted config still referenced secrets at these paths",
+        },
+      });
+    }
   }
 
   async function updateAgent(
@@ -456,7 +478,7 @@ export function agentService(db: Db) {
       if (!updated) return null;
 
       if (Object.prototype.hasOwnProperty.call(normalizedPatch, "adapterConfig")) {
-        await syncAgentSecretBindings(updated, txDb);
+        await syncAgentSecretBindings(updated, txDb, existing.adapterConfig);
       }
 
       const normalizedUpdated = await agentService(txDb).getById(updated.id);
