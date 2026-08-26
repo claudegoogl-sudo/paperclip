@@ -67,8 +67,15 @@ export interface TaskBridgeRenewalDeps {
   classify: (companyId: string, resolvedKey: string, now?: Date) => Promise<BridgeKeyVerifyResult>;
   /** Resolve the binding's current `latest` plaintext (the real env-binding path). */
   resolveLatestValue: (input: { companyId: string; agentId: string; secretId: string }) => Promise<string | null>;
-  /** Roll a botched rotation back to the previous secret version. */
-  rollbackLatestVersion: (secretId: string) => Promise<number | null>;
+  /**
+   * Roll a botched rotation back to the previous secret version — but only
+   * when the version currently at `latest` is still the one THIS rotation
+   * appended (matched by its `rotationJobId`). Returns the version rolled
+   * back to, `"superseded"` when `latest` was rewritten by someone else
+   * (operator rotation, another job) and must not be touched, or `null` when
+   * no rollback was possible at all.
+   */
+  rollbackLatestVersion: (input: { secretId: string; rotationJobId: string }) => Promise<number | "superseded" | null>;
 }
 
 function sha256Hex(value: string): string {
@@ -77,6 +84,50 @@ function sha256Hex(value: string): string {
 
 function scopeEquals(a: unknown, b: unknown): boolean {
   return JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+}
+
+/**
+ * Closed errorCode vocabulary for renewal audit rows. Raw `Error.message` is
+ * NEVER stored verbatim: a Postgres unique violation on `key_hash`, for
+ * example, embeds the hex digest in its message, and these rows are
+ * board-visible. Known error classes (pg error codes, Node system errors)
+ * map to a fixed code; anything else degrades to `unknown:<name>` plus a
+ * scrubbed, truncated fragment. Hex runs of 16+ chars — key hashes and bare
+ * uuids alike — never survive scrubbing.
+ */
+const ERROR_CODE_VOCABULARY: Record<string, string> = {
+  // Postgres SQLSTATE codes
+  "23505": "db_unique_violation",
+  "23503": "db_foreign_key_violation",
+  "23502": "db_not_null_violation",
+  "23514": "db_check_violation",
+  "22P02": "db_invalid_representation",
+  "40001": "db_serialization_failure",
+  "40P01": "db_deadlock_detected",
+  "57014": "db_query_canceled",
+  // Node system-error codes
+  ECONNREFUSED: "connection_refused",
+  ETIMEDOUT: "connection_timed_out",
+  ENOTFOUND: "dns_not_found",
+};
+
+function scrubErrorMessage(message: string): string {
+  return message
+    .replace(/[0-9a-f]{16,}/gi, "[redacted]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
+}
+
+export function renewalErrorCode(err: unknown, fallback: string, maxLength = 200): string {
+  const error = err as { code?: unknown; name?: unknown; message?: unknown } | null | undefined;
+  const code = typeof error?.code === "string" ? error.code : "";
+  const mapped = ERROR_CODE_VOCABULARY[code];
+  if (mapped) return mapped;
+  if (error === null || error === undefined) return fallback;
+  const name = typeof error.name === "string" && error.name ? error.name : "Error";
+  const message = typeof error.message === "string" ? scrubErrorMessage(error.message) : "";
+  return `unknown:${name}${message ? `:${message}` : ""}`.slice(0, maxLength);
 }
 
 /**
@@ -169,22 +220,41 @@ function defaultDeps(db: Db): TaskBridgeRenewalDeps {
         return null;
       }
     },
-    rollbackLatestVersion: async (secretId) => {
-      const [secret] = await db
-        .select({ id: companySecrets.id, latestVersion: companySecrets.latestVersion })
-        .from(companySecrets)
-        .where(eq(companySecrets.id, secretId))
-        .limit(1);
-      if (!secret || secret.latestVersion <= 1) return null;
-      const versions = await db
-        .select({ version: companySecretVersions.version, status: companySecretVersions.status })
-        .from(companySecretVersions)
-        .where(eq(companySecretVersions.secretId, secretId));
-      const previous = versions
-        .filter((v) => v.version < secret.latestVersion && v.status !== "destroyed" && v.status !== "disabled")
-        .sort((a, b) => b.version - a.version)[0];
-      if (!previous) return null;
-      await db.transaction(async (tx) => {
+    rollbackLatestVersion: async ({ secretId, rotationJobId }) => {
+      // Single transaction (secret row locked FOR UPDATE) so the ownership
+      // check and the rollback commit atomically: a concurrent `rotate` that
+      // flips `latest` between the check and the write cannot slip through.
+      return db.transaction(async (tx) => {
+        const [secret] = await tx
+          .select({ id: companySecrets.id, latestVersion: companySecrets.latestVersion })
+          .from(companySecrets)
+          .where(eq(companySecrets.id, secretId))
+          .limit(1)
+          .for("update");
+        if (!secret || secret.latestVersion <= 1) return null;
+        // Ownership guard: only roll back when the version currently at
+        // `latest` is the one this rotation appended. If an operator (or any
+        // other writer) rotated in the meantime, `latest` is theirs —
+        // destroying it would break the binding and pin the blame on a key
+        // the renewer itself revoked. Skip instead; the verify-failure path
+        // below still revokes the renewer's own stray key.
+        const [latestRow] = await tx
+          .select({ rotationJobId: companySecretVersions.rotationJobId })
+          .from(companySecretVersions)
+          .where(and(
+            eq(companySecretVersions.secretId, secretId),
+            eq(companySecretVersions.version, secret.latestVersion),
+          ))
+          .limit(1);
+        if (latestRow?.rotationJobId !== rotationJobId) return "superseded" as const;
+        const versions = await tx
+          .select({ version: companySecretVersions.version, status: companySecretVersions.status })
+          .from(companySecretVersions)
+          .where(eq(companySecretVersions.secretId, secretId));
+        const previous = versions
+          .filter((v) => v.version < secret.latestVersion && v.status !== "destroyed" && v.status !== "disabled")
+          .sort((a, b) => b.version - a.version)[0];
+        if (!previous) return null;
         await tx
           .update(companySecretVersions)
           .set({ status: "destroyed" })
@@ -203,8 +273,8 @@ function defaultDeps(db: Db): TaskBridgeRenewalDeps {
           .update(companySecrets)
           .set({ latestVersion: previous.version })
           .where(eq(companySecrets.id, secretId));
+        return previous.version;
       });
-      return previous.version;
     },
   };
 }
@@ -278,7 +348,7 @@ async function rotateBindingKey(
       companyId: binding.companyId, bindingId: binding.id, agentId,
       trigger: input.trigger, outcome: "failed:mint",
       oldKeyId: input.oldKeyId, scopeSnapshot: policy.scope,
-      errorCode: (err as Error).message?.slice(0, 200) ?? "mint_error",
+      errorCode: renewalErrorCode(err, "mint_error"),
     });
     return "failed";
   }
@@ -297,7 +367,7 @@ async function rotateBindingKey(
       trigger: input.trigger, outcome: "failed:append_version",
       oldKeyId: input.oldKeyId, newKeyId: newKey.id,
       scopeSnapshot: policy.scope,
-      errorCode: (err as Error).message?.slice(0, 200) ?? "append_version_error",
+      errorCode: renewalErrorCode(err, "append_version_error"),
     });
     return "failed";
   }
@@ -316,20 +386,30 @@ async function rotateBindingKey(
       if (!classification.ok) return `classify_${classification.code}`;
       return null;
     } catch (err) {
-      return `verify_error:${(err as Error).message?.slice(0, 120) ?? "unknown"}`;
+      // Prefix + helper output kept under the 200-char errorCode convention.
+      return `verify_error:${renewalErrorCode(err, "unknown", 180)}`;
     }
   })();
 
   if (verifyFailure !== null) {
     // Fail at 3: do NOT revoke the old key. Roll the new version back so
-    // `latest` reverts to the previous version. If the rollback itself
-    // fails, alert loudly — the binding then points at the NEW key, which is
-    // itself live and valid, so the invariant still holds.
-    const rolledBack = await deps.rollbackLatestVersion(binding.secretId).catch(() => null);
+    // `latest` reverts to the previous version — unless `latest` was already
+    // rewritten by a concurrent (operator) rotation, in which case it is
+    // theirs and must survive. If the rollback itself fails, alert loudly —
+    // the binding then points at the NEW key, which is itself live and
+    // valid, so the invariant still holds.
+    const rolledBack = await deps
+      .rollbackLatestVersion({ secretId: binding.secretId, rotationJobId })
+      .catch(() => null);
     if (rolledBack === null) {
       logger.error(
         { bindingId: binding.id, secretId: binding.secretId, rotationJobId, verifyFailure },
         "task_bridge renewal verify failed AND version rollback failed; binding points at the newly minted (live, valid) key — investigate",
+      );
+    } else if (rolledBack === "superseded") {
+      logger.warn(
+        { bindingId: binding.id, secretId: binding.secretId, rotationJobId, verifyFailure },
+        "task_bridge renewal verify failed but version rollback skipped: `latest` was superseded by a concurrent rotation (operator?) — leaving it untouched",
       );
     }
     await deps.revokeKey(agentId, newKey.id).catch(() => {});
@@ -354,7 +434,7 @@ async function rotateBindingKey(
         trigger: input.trigger, outcome: "failed:revoke_old",
         oldKeyId: input.oldKeyId, newKeyId: newKey.id,
         newExpiresAt: newKey.expiresAt, scopeSnapshot: policy.scope,
-        errorCode: (err as Error).message?.slice(0, 200) ?? "revoke_error",
+        errorCode: renewalErrorCode(err, "revoke_error"),
       });
       return "failed";
     }
@@ -457,7 +537,9 @@ async function renewOneBinding(
       trigger: "scheduled",
       outcome: "suspended:policy_invalid",
       scopeSnapshot: null,
-      errorCode: parsedPolicy.error.issues[0]?.message?.slice(0, 200) ?? "policy_invalid",
+      // Zod issue codes are a closed vocabulary and carry no received values,
+      // unlike issue messages.
+      errorCode: `policy_invalid:${parsedPolicy.error.issues[0]?.code ?? "unknown"}`.slice(0, 200),
     });
     counters.suspended += 1;
     return counters;
