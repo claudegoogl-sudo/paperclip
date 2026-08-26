@@ -199,6 +199,14 @@ export const SECURITY_POSTURE_REJECTIONS = [
     reason: "Immutable before/after snapshots of an agent config change. The live config the runtime reads is agents.adapter_config and agents.permissions, both registered; these rows are history.",
   },
   {
+    table: "agent_key_renewal_events",
+    columns: [
+      "agent_id", "binding_id", "company_id", "created_at", "error_code", "id",
+      "new_expires_at", "new_key_id", "old_key_id", "outcome", "scope_snapshot", "trigger"
+    ],
+    reason: "Append-only audit trail for task_bridge key-renewal attempts, same shape as activity_log and secret_access_events. Rows are written after the fact and read only for display and forensics; the gates they record — agent_api_keys.revoked_at/expires_at/scope_config and company_secret_bindings.auto_renew_policy — are registered.",
+  },
+  {
     table: "agent_memberships",
     columns: [
       "agent_id", "company_id", "created_at", "id", "starred_at", "state", "updated_at",
