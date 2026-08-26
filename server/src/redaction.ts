@@ -73,17 +73,31 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return proto === Object.prototype || proto === null;
 }
 
-function sanitizeValue(value: unknown): unknown {
+/**
+ * SECURITY-CRITICAL: redactor applied to plain string leaves reached via
+ * {@link sanitizeRecord}. The exported record path only value-exact scrubs
+ * leaves (preserving its long-standing semantics); the structural path used by
+ * {@link redactSensitiveText} applies the full free-form pipeline so serializing
+ * a JSON document through redaction never weakens coverage.
+ */
+type LeafTextRedactor = (text: string) => string;
+
+const valueExactLeafRedactor: LeafTextRedactor = (text) =>
+  redactRegisteredSecretValues(text, REDACTED_VAULT_VALUE);
+
+const freeFormLeafRedactor: LeafTextRedactor = (text) => redactSensitiveText(text);
+
+function sanitizeValue(value: unknown, leaf: LeafTextRedactor): unknown {
   if (value === null || value === undefined) return value;
-  if (Array.isArray(value)) return value.map(sanitizeValue);
+  if (Array.isArray(value)) return value.map((entry) => sanitizeValue(entry, leaf));
   if (isSecretRefBinding(value)) return value;
   if (isUserSecretRefBinding(value)) return value;
-  if (isPlainBinding(value)) return { type: "plain", value: sanitizeValue(value.value) };
+  if (isPlainBinding(value)) return { type: "plain", value: sanitizeValue(value.value, leaf) };
   // String leaves (e.g. a tool result's `data.value`) get value-exact scrubbing
   // for any host-registered secret before being returned unchanged otherwise.
-  if (typeof value === "string") return redactRegisteredSecretValues(value, REDACTED_VAULT_VALUE);
+  if (typeof value === "string") return leaf(value);
   if (!isPlainObject(value)) return value;
-  return sanitizeRecord(value);
+  return sanitizeRecordWithLeaf(value, leaf);
 }
 
 function isSecretRefBinding(value: unknown): value is { type: "secret_ref"; secretId: string; version?: unknown } {
@@ -101,14 +115,14 @@ function isPlainBinding(value: unknown): value is { type: "plain"; value: unknow
   return value.type === "plain" && "value" in value;
 }
 
-function sanitizeCommandArgs(args: unknown[]): unknown[] {
+function sanitizeCommandArgs(args: unknown[], leaf: LeafTextRedactor): unknown[] {
   let redactNext = false;
   return args.map((arg) => {
     if (redactNext) {
       redactNext = false;
       return REDACTED_EVENT_VALUE;
     }
-    if (typeof arg !== "string") return sanitizeValue(arg);
+    if (typeof arg !== "string") return sanitizeValue(arg, leaf);
     if (CLI_SECRET_FLAG_RE.test(arg.trim())) {
       redactNext = true;
       return arg;
@@ -117,40 +131,52 @@ function sanitizeCommandArgs(args: unknown[]): unknown[] {
   });
 }
 
-export function sanitizeRecord(record: Record<string, unknown>): Record<string, unknown> {
+function sanitizeRecordWithLeaf(
+  record: Record<string, unknown>,
+  leaf: LeafTextRedactor,
+): Record<string, unknown> {
   const redacted: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(record)) {
+    // The pre-structural text pipeline scrubbed secret bytes anywhere in the
+    // serialized line — key positions included. Apply the same leaf redactor
+    // to keys so structural redaction cannot smuggle a secret through as a
+    // key. Key-matching REs below still test the ORIGINAL key.
+    const redactedKey = leaf(key) as string;
     if (COMMAND_ARGS_PAYLOAD_KEY_RE.test(key) && Array.isArray(value)) {
-      redacted[key] = sanitizeCommandArgs(value);
+      redacted[redactedKey] = sanitizeCommandArgs(value, leaf);
       continue;
     }
     if (COMMAND_PAYLOAD_KEY_RE.test(key) && typeof value === "string") {
-      redacted[key] = redactSensitiveText(value);
+      redacted[redactedKey] = redactSensitiveText(value);
       continue;
     }
     if (SECRET_PAYLOAD_KEY_RE.test(key) && !AUDIT_REASON_PAYLOAD_KEY_RE.test(key)) {
       if (isSecretRefBinding(value)) {
-        redacted[key] = sanitizeValue(value);
+        redacted[redactedKey] = sanitizeValue(value, leaf);
         continue;
       }
       if (isUserSecretRefBinding(value)) {
-        redacted[key] = sanitizeValue(value);
+        redacted[redactedKey] = sanitizeValue(value, leaf);
         continue;
       }
       if (isPlainBinding(value)) {
-        redacted[key] = { type: "plain", value: REDACTED_EVENT_VALUE };
+        redacted[redactedKey] = { type: "plain", value: REDACTED_EVENT_VALUE };
         continue;
       }
-      redacted[key] = REDACTED_EVENT_VALUE;
+      redacted[redactedKey] = REDACTED_EVENT_VALUE;
       continue;
     }
     if (typeof value === "string" && JWT_VALUE_RE.test(value) && !AUDIT_SURFACE_PAYLOAD_KEY_RE.test(key)) {
-      redacted[key] = REDACTED_EVENT_VALUE;
+      redacted[redactedKey] = REDACTED_EVENT_VALUE;
       continue;
     }
-    redacted[key] = sanitizeValue(value);
+    redacted[redactedKey] = sanitizeValue(value, leaf);
   }
   return redacted;
+}
+
+export function sanitizeRecord(record: Record<string, unknown>): Record<string, unknown> {
+  return sanitizeRecordWithLeaf(record, valueExactLeafRedactor);
 }
 
 export function redactEventPayload(payload: Record<string, unknown> | null): Record<string, unknown> | null {
@@ -159,7 +185,69 @@ export function redactEventPayload(payload: Record<string, unknown> | null): Rec
   return sanitizeRecord(payload);
 }
 
+// ── Structural (serialized-JSON) redaction ─────────────────────────────────
+//
+// redactSensitiveText also runs over text that is itself a serialized JSON
+// document (run-log chunks are JSON.stringify'd agent events). Running the
+// free-form regexes over SERIALIZED JSON corrupts it: a secret adjacent to a
+// JSON escape (e.g. `Bearer <secret>\"`) lets a quote-adjacent value class
+// consume the backslash and re-emit a bare quote, so the persisted line no
+// longer parses and dashboard transcripts render raw JSON blobs.
+//
+// JSON-parseable input is therefore redacted STRUCTURALLY — parse, redact the
+// object graph, re-serialize — which preserves document integrity by
+// construction. String leaves still get the SAME free-form pipeline, applied to
+// their DECODED value (where quote-adjacent regexes behave correctly), so this
+// path is coverage-equivalent-or-stronger than the text pipeline it replaces
+// for JSON inputs.
+//
+// Re-entrancy budget: string leaves re-enter redactSensitiveText (a leaf may
+// itself hold serialized JSON). A module-level counter bounds the total
+// structural depth of one call tree so adversarially nested inputs cannot
+// exhaust the stack; redaction is synchronous, so the counter cannot interleave.
+// Past the budget the free-form pipeline applies unchanged.
+const MAX_STRUCTURAL_REDACTION_DEPTH = 8;
+let structuralRedactionDepth = 0;
+
+function tryParseJson(input: string): unknown {
+  // JSON.parse never returns undefined on success, so undefined reliably means
+  // "not JSON" here.
+  try {
+    return JSON.parse(input);
+  } catch {
+    return undefined;
+  }
+}
+
+function sanitizeJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sanitizeJsonValue);
+  if (isPlainObject(value)) return sanitizeRecordWithLeaf(value, freeFormLeafRedactor);
+  if (typeof value === "string") return freeFormLeafRedactor(value);
+  return value;
+}
+
 export function redactSensitiveText(input: string): string {
+  if (structuralRedactionDepth < MAX_STRUCTURAL_REDACTION_DEPTH) {
+    const parsed = tryParseJson(input);
+    if (parsed !== undefined) {
+      structuralRedactionDepth += 1;
+      try {
+        return JSON.stringify(sanitizeJsonValue(parsed));
+      } catch {
+        // SECURITY-CRITICAL: any structural-walk failure (e.g. a pathologically
+        // nested document that JSON.parse accepts but overflows the recursive
+        // walker's stack) falls back to the free-form pipeline. Redaction is
+        // never skipped — only the mode changes.
+        return redactFreeFormText(input);
+      } finally {
+        structuralRedactionDepth -= 1;
+      }
+    }
+  }
+  return redactFreeFormText(input);
+}
+
+function redactFreeFormText(input: string): string {
   // SECURITY-CRITICAL: Value-exact scrub runs FIRST and unconditionally: a high-entropy registered
   // secret may carry no secret-ish hint, so it would survive the
   // maybeContainsSecretText short-circuit below (Control 1).
