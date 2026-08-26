@@ -1,5 +1,12 @@
-import { describe, expect, it } from "vitest";
-import { REDACTED_EVENT_VALUE, redactEventPayload, redactSensitiveText, sanitizeRecord } from "../redaction.js";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  REDACTED_EVENT_VALUE,
+  REDACTED_VAULT_VALUE,
+  redactEventPayload,
+  redactSensitiveText,
+  sanitizeRecord,
+} from "../redaction.js";
+import { clearRunSecretValues, registerRunSecretValue } from "../run-secret-registry.js";
 
 describe("redaction", () => {
   it("redacts sensitive keys and nested secret values", () => {
@@ -148,5 +155,144 @@ describe("redaction", () => {
 
     expect(result?.args).toEqual(["--api-key", "not-a-command-secret"]);
     expect(result?.argv).toEqual(["--api-key", REDACTED_EVENT_VALUE]);
+  });
+});
+
+// ── Serialized-JSON integrity regression ───────────────────────────────────
+// redactSensitiveText also runs over text that IS a serialized JSON document
+// (run-log chunks are JSON.stringify'd agent events). The free-form regexes
+// used to corrupt such text: a secret adjacent to a JSON escape (e.g.
+// `Bearer <secret>\"`) let a quote-adjacent value class swallow the backslash
+// and re-emit a bare quote, so the persisted line no longer parsed. JSON input
+// is now redacted structurally (parse → redact → re-serialize), which keeps the
+// document valid by construction WITHOUT weakening coverage: every secret
+// shape below must still be fully redacted in the serialized output.
+describe("redactSensitiveText serialized-JSON integrity", () => {
+  const KEY = "pcp_agent_DEADBEEFcafe0123456789abcdef";
+  const RUN_ID = "run-redaction-json-integrity";
+
+  afterEach(() => {
+    clearRunSecretValues(RUN_ID);
+  });
+
+  it("keeps a tool_execution_end event parseable when a Bearer secret sits inside escaped quotes", () => {
+    const event = {
+      type: "tool_execution_end",
+      toolName: "ipython",
+      result: {
+        content: [
+          {
+            type: "text",
+            text: `+ curl -s -H "Authorization: Bearer ${KEY}" http://localhost:3100/api/x\n200`,
+          },
+        ],
+      },
+    };
+    const line = JSON.stringify(event);
+    expect(() => JSON.parse(line)).not.toThrow();
+
+    const redactedLine = redactSensitiveText(line);
+    const parsed = JSON.parse(redactedLine) as typeof event;
+
+    expect(redactedLine).not.toContain(KEY);
+    expect(parsed.type).toBe("tool_execution_end");
+    expect(parsed.result.content[0]?.text).toBe(
+      `+ curl -s -H "Authorization: Bearer ${REDACTED_EVENT_VALUE}" http://localhost:3100/api/x\n200`,
+    );
+  });
+
+  it("keeps a message_end event parseable when a registered secret sits adjacent to an escape", () => {
+    registerRunSecretValue(RUN_ID, KEY);
+    const event = {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: `resolved vault value "${KEY}" for the run`,
+      },
+    };
+    const redactedLine = redactSensitiveText(JSON.stringify(event));
+    const parsed = JSON.parse(redactedLine) as typeof event;
+
+    expect(redactedLine).not.toContain(KEY);
+    expect(parsed.message.content).toBe(`resolved vault value "${REDACTED_VAULT_VALUE}" for the run`);
+  });
+
+  it("keeps a plain top-level string field parseable and redacted", () => {
+    const event = {
+      type: "message_end",
+      message: `curl -H "Authorization: Bearer ${KEY}" http://localhost:3100/api/x`,
+    };
+    const redactedLine = redactSensitiveText(JSON.stringify(event));
+    const parsed = JSON.parse(redactedLine) as typeof event;
+
+    expect(redactedLine).not.toContain(KEY);
+    expect(parsed.message).toBe(`curl -H "Authorization: Bearer ${REDACTED_EVENT_VALUE}" http://localhost:3100/api/x`);
+  });
+
+  it("keeps CLI-option and env-assignment secret shapes parseable and redacted", () => {
+    // These shapes flow through quote-adjacent regexes too
+    // (COMMAND_CLI_SECRET_OPTION_RE / COMMAND_ENV_SECRET_ASSIGNMENT_RE).
+    const event = {
+      type: "tool_execution_end",
+      text: `run --api-key=sk-cli-secret-12345 done`,
+      env: `PAPERCLIP_API_KEY=sk-env-secret-67890 tail`,
+    };
+    const redactedLine = redactSensitiveText(JSON.stringify(event));
+    const parsed = JSON.parse(redactedLine) as typeof event;
+
+    expect(redactedLine).not.toContain("sk-cli-secret-12345");
+    expect(redactedLine).not.toContain("sk-env-secret-67890");
+    expect(parsed.text).toBe(`run --api-key=${REDACTED_EVENT_VALUE} done`);
+    expect(parsed.env).toBe(`PAPERCLIP_API_KEY=${REDACTED_EVENT_VALUE} tail`);
+  });
+
+  it("round-trips a benign serialized event byte-identically", () => {
+    const line = JSON.stringify({
+      type: "tool_execution_end",
+      toolName: "ipython",
+      durationMs: 1234,
+      ok: true,
+      result: { content: [{ type: "text", text: "all good\nno secrets here" }] },
+    });
+    expect(redactSensitiveText(line)).toBe(line);
+  });
+
+  it("still redacts secrets from a serialized event nested inside a string leaf", () => {
+    const event = {
+      type: "tool_execution_end",
+      payload: JSON.stringify({ note: `Authorization: Bearer ${KEY} tail` }),
+    };
+    const redactedLine = redactSensitiveText(JSON.stringify(event));
+    const parsed = JSON.parse(redactedLine) as typeof event;
+    const inner = JSON.parse(parsed.payload) as { note: string };
+
+    expect(redactedLine).not.toContain(KEY);
+    expect(inner.note).toBe(`Authorization: Bearer ${REDACTED_EVENT_VALUE} tail`);
+  });
+
+  it("redacts a registered secret used as a JSON object key (text-pipeline parity)", () => {
+    // The pre-structural text pipeline scrubbed secret bytes at ANY position
+    // in the serialized line — key positions included. Structural redaction
+    // applies the leaf redactor to keys so a secret cannot survive there.
+    registerRunSecretValue(RUN_ID, KEY);
+    const line = JSON.stringify({ [KEY]: "x", other: "y" });
+    const redactedLine = redactSensitiveText(line);
+
+    expect(redactedLine).not.toContain(KEY);
+    expect(() => JSON.parse(redactedLine)).not.toThrow();
+  });
+
+  it("redacts shape-based secrets (sk- / ghp_ / github_pat_) used as JSON keys", () => {
+    const line = JSON.stringify({
+      "sk-projabcdefghijklmnopqrstuv": "x",
+      "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345": 1,
+      "github_pat_11AAAA0123456789012345678901234567890123456": 2,
+    });
+    const redactedLine = redactSensitiveText(line);
+
+    expect(redactedLine).not.toContain("sk-projabcdefghijklmnopqrstuv");
+    expect(redactedLine).not.toContain("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345");
+    expect(redactedLine).not.toContain("github_pat_11AAAA");
+    expect(() => JSON.parse(redactedLine)).not.toThrow();
   });
 });
