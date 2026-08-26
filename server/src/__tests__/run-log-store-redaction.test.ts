@@ -196,3 +196,65 @@ describe("registerRunSecretValue short-value guard (Finding B)", () => {
     expect(parsed).toEqual({ ts, stream: "stdout", chunk });
   });
 });
+
+// ── Serialized-event chunk integrity regression ────────────────────────────
+// Chunks are serialized agent events (JSON.stringify'd before append). A
+// secret adjacent to a JSON escape — the common case is an agent echoing
+// `Authorization: Bearer $PAPERCLIP_API_KEY`, which expands to the real key
+// inside a tool result — used to make the stored chunk unparseable: a
+// quote-adjacent regex swallowed the escape's backslash and re-emitted a bare
+// quote. The persisted NDJSON line must parse AND the embedded event chunk
+// must parse, with the secret fully redacted on disk.
+describe("RunLogStore.append() serialized-event chunk integrity", () => {
+  const KEY = "pcp_agent_DEADBEEFcafe0123456789abcdef";
+  const RUN_ID = "run-serialized-chunk-integrity-1";
+
+  afterEach(() => {
+    clearRunSecretValues(RUN_ID);
+  });
+
+  it("stores a Bearer-secret event chunk that still parses after redaction", async () => {
+    registerRunSecretValue(RUN_ID, KEY);
+    const store = getRunLogStore();
+    const handle = await store.begin({
+      companyId: "company-redaction",
+      agentId: "agent-redaction",
+      runId: RUN_ID,
+    });
+
+    const event = {
+      type: "tool_execution_end",
+      toolName: "ipython",
+      result: {
+        content: [
+          {
+            type: "text",
+            text: `+ curl -s -H "Authorization: Bearer ${KEY}" http://localhost:3100/api/x\n200`,
+          },
+        ],
+      },
+    };
+    const ts = "2026-08-26T12:00:00.000Z";
+    await store.append(handle, { stream: "stdout", ts, chunk: JSON.stringify(event) });
+
+    const absPath = path.resolve(tmpDir, handle.logRef);
+    const persisted = await fs.readFile(absPath, "utf8");
+
+    // File on disk must not contain the plaintext secret.
+    expect(persisted).not.toContain(KEY);
+
+    // The NDJSON line must parse...
+    const lines = persisted.split("\n").filter((line) => line.length > 0);
+    expect(lines).toHaveLength(1);
+    const line = JSON.parse(lines[0]!) as { ts: string; stream: string; chunk: string };
+    expect(line.ts).toBe(ts);
+    expect(line.stream).toBe("stdout");
+
+    // ...and so must the embedded event chunk.
+    const chunkEvent = JSON.parse(line.chunk) as typeof event;
+    expect(chunkEvent.type).toBe("tool_execution_end");
+    expect(chunkEvent.result.content[0]?.text).toBe(
+      `+ curl -s -H "Authorization: Bearer ${REDACTED_EVENT_VALUE}" http://localhost:3100/api/x\n200`,
+    );
+  });
+});
