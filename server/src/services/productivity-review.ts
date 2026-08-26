@@ -20,6 +20,10 @@ import {
 } from "./recovery/model-profile-hint.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
 import { isStandbyWakeTargetIssue } from "./recovery/successful-run-handoff.js";
+import {
+  isProviderAdmissionFailureRun,
+  notProviderAdmissionFailureCondition,
+} from "./provider-admission-failure.js";
 
 export const PRODUCTIVITY_REVIEW_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.issueProductivityReview;
 export const HIGH_COMMENT_VOLUME_ALERT_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.highCommentVolumeAlert;
@@ -69,6 +73,7 @@ type ProductivityReviewEvidence = {
   totalRunCount: number;
   terminalRunCount: number;
   activeRunCount: number;
+  providerAdmissionFailureCount: number;
   runCountLastHour: number;
   runCountLastSixHours: number;
   commentCount: number;
@@ -385,6 +390,7 @@ export function productivityReviewService(
           eq(heartbeatRuns.agentId, agentId),
           issueRunScopeSql(issueId),
           sql`coalesce(${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) >= ${since.toISOString()}::timestamptz`,
+          notProviderAdmissionFailureCondition(),
         ),
       )
       .then((rows) => rows[0]?.count ?? 0);
@@ -455,7 +461,13 @@ export function productivityReviewService(
       }
     }
 
-    const terminalRuns = latestRuns.filter((run) =>
+    // Provider-admission failures (429-class transient upstream, zero cost)
+    // never reached the model, so they say nothing about the assignee's
+    // productivity. Exclude them from the no-comment streak and the churn
+    // windows so an account-wide outage does not read as stalled work.
+    const providerAdmissionFailureCount = latestRuns.filter(isProviderAdmissionFailureRun).length;
+    const streakEligibleRuns = latestRuns.filter((run) => !isProviderAdmissionFailureRun(run));
+    const terminalRuns = streakEligibleRuns.filter((run) =>
       TERMINAL_RUN_STATUSES.includes(run.status as (typeof TERMINAL_RUN_STATUSES)[number]),
     );
     let noCommentStreak = 0;
@@ -567,6 +579,7 @@ export function productivityReviewService(
       totalRunCount: latestRuns.length,
       terminalRunCount: terminalRuns.length,
       activeRunCount,
+      providerAdmissionFailureCount,
       runCountLastHour,
       runCountLastSixHours,
       commentCount: assigneeRunCommentCount,
@@ -650,6 +663,11 @@ export function productivityReviewService(
       `- Total sampled issue-linked runs: ${evidence.totalRunCount}`,
       `- Terminal sampled runs: ${evidence.terminalRunCount}`,
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
+      ...(evidence.providerAdmissionFailureCount > 0
+        ? [
+            `- Provider outage window: ${evidence.providerAdmissionFailureCount} sampled runs were zero-cost provider-admission failures (429-class transient upstream) and are excluded from streak/churn evidence — treat stalled-looking signals in this window as outage noise, not actionable drift`,
+          ]
+        : []),
       `- No-comment completed-run streak: ${evidence.noCommentStreak}`,
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
@@ -693,6 +711,11 @@ export function productivityReviewService(
       `- Reasons: ${evidence.triggerReasons.join("; ")}`,
       `- No-comment streak: ${evidence.noCommentStreak}`,
       `- Runs/assignee comments: ${evidence.runCountLastHour}/${evidence.commentCountLastHour} in 1h, ${evidence.runCountLastSixHours}/${evidence.commentCountLastSixHours} in 6h`,
+      ...(evidence.providerAdmissionFailureCount > 0
+        ? [
+            `- Provider outage window: ${evidence.providerAdmissionFailureCount} sampled zero-cost provider-admission failures excluded from streak/churn evidence`,
+          ]
+        : []),
       `- Next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 300) : "none recorded"}`,
     ].join("\n");
   }
