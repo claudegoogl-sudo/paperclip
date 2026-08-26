@@ -150,7 +150,10 @@ function canonicalTaskBridgeScope(scope: unknown): string | null {
     "parentIssueIds",
     "allowedAssigneeAgentIds",
   ]);
-  const rest: Record<string, string> = {};
+  // Null prototype: an own `__proto__` key (e.g. planted by JSON.parse of a
+  // corrupted row) must land in `rest` as a data property, not vanish into
+  // Object.prototype's setter — unknown fields stay verbatim, never equal.
+  const rest: Record<string, string> = Object.create(null);
   for (const key of Object.keys(record)) {
     if (!knownFields.has(key)) rest[key] = stableStringify(record[key]);
   }
@@ -163,8 +166,12 @@ function canonicalTaskBridgeScope(scope: unknown): string | null {
   });
 }
 
-function scopeEquals(a: unknown, b: unknown): boolean {
-  return canonicalTaskBridgeScope(a) === canonicalTaskBridgeScope(b);
+export function scopeEquals(a: unknown, b: unknown): boolean {
+  // Null-guard: two non-task_bridge shapes both canonicalize to null; without
+  // this guard `null === null` would alias every malformed pair to "equal".
+  const canonicalA = canonicalTaskBridgeScope(a);
+  const canonicalB = canonicalTaskBridgeScope(b);
+  return canonicalA !== null && canonicalA === canonicalB;
 }
 
 /**

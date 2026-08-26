@@ -27,6 +27,7 @@ import { createTaskBridgeKeyClassifier } from "../services/task-bridge-keys.js";
 import {
   TASK_BRIDGE_RENEWAL_LEAD_MS,
   runTaskBridgeRenewalSweep,
+  scopeEquals,
 } from "../services/task-bridge-renewal.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -505,6 +506,46 @@ describeEmbeddedPostgres("task_bridge auto-renewer sweep", () => {
       expect(live[0].id).toBe(fixture.keyId); // the bound key survived
       expect((await renewalEvents(fixture.bindingId)).some((e) => e.trigger === "reconcile" && e.oldKeyId === stray.id)).toBe(true);
     });
+
+    it("reconciliation leaves a corrupted stray whose scope carries an own __proto__ key — unknown structure is not ours to touch", async () => {
+      const pair = equivalentScopePair();
+      const fixture = await seedPolicyBinding({
+        ttlSeconds: 20 * ONE_HOUR_MS / 1000, // healthy, outside the lead window
+        policyScope: pair.singular,
+      });
+      // A stray that WOULD reconcile cleanly (plural-equivalent)…
+      const stray = await agentService(db).createApiKey(
+        fixture.agentId,
+        "stray proto-corrupted",
+        pair.plural as never,
+        { ttlSeconds: 2 * ONE_HOUR_MS / 1000 },
+      );
+      // …then corrupted in place. Writers validate with the strict schema, so
+      // an own __proto__ key can only appear via raw row corruption; plant it
+      // exactly the way a jsonb round-trip would (JSON.parse creates a real
+      // own data property, not a prototype set).
+      const planted = JSON.parse(`${JSON.stringify(pair.plural).slice(0, -1)},"__proto__":"payload"}`);
+      expect(Object.prototype.hasOwnProperty.call(planted, "__proto__")).toBe(true); // fixture guard
+      await db.update(agentApiKeys).set({ scopeConfig: planted }).where(eq(agentApiKeys.id, stray.id));
+      const [readBack] = await db
+        .select({ scopeConfig: agentApiKeys.scopeConfig })
+        .from(agentApiKeys)
+        .where(eq(agentApiKeys.id, stray.id))
+        .limit(1);
+      expect(Object.prototype.hasOwnProperty.call(readBack.scopeConfig, "__proto__")).toBe(true); // round-trip guard
+
+      const result = await sweep(new Date());
+
+      // Before the null-prototype `rest` fix, the __proto__ key was silently
+      // dropped by Object.prototype's setter, canonicalizing the corrupt stray
+      // equal to the pin ("ours to touch" -> revoked). Preserved as unknown
+      // structure, it must compare unequal and stay untouched.
+      expect(result).toMatchObject({ policies: 1, renewed: 0, reconciled: 0, suspended: 0, failed: 0 });
+      const live = await liveKeyRows(fixture.agentId);
+      expect(live).toHaveLength(2); // bound key + untouched corrupt stray
+      expect(live.map((k) => k.id).sort()).toEqual([fixture.keyId, stray.id].sort());
+      expect((await renewalEvents(fixture.bindingId)).some((e) => e.oldKeyId === stray.id)).toBe(false);
+    });
   });
 
   it("AC-6 operator revocation wins: a revoked bound key suspends the policy instead of re-minting", async () => {
@@ -762,6 +803,65 @@ describeEmbeddedPostgres("task_bridge auto-renewer sweep", () => {
     // No plaintext or key hashes anywhere in the serialized audit trail.
     const serialized = JSON.stringify(events);
     expect(serialized).not.toContain(fixture.plaintext);
+  });
+});
+
+describe("scopeEquals (canonical task_bridge scope equality)", () => {
+  // One effective scope in two shapes, mirroring the AC-4 fixtures above.
+  function unitPair() {
+    const projectId = randomUUID();
+    const parentIssueIds = [randomUUID(), randomUUID()];
+    const allowedAssigneeAgentIds = [randomUUID()];
+    return {
+      singular: { kind: "task_bridge" as const, projectId, parentIssueIds, allowedAssigneeAgentIds },
+      plural: { kind: "task_bridge" as const, projectIds: [projectId], parentIssueIds, allowedAssigneeAgentIds },
+    };
+  }
+
+  it("null never equals null: two non-task_bridge shapes must not alias to equal", () => {
+    expect(scopeEquals(null, null)).toBe(false);
+    expect(scopeEquals(undefined, undefined)).toBe(false);
+    expect(scopeEquals("task_bridge", "task_bridge")).toBe(false);
+    expect(scopeEquals({ kind: "standard" }, { kind: "standard" })).toBe(false);
+  });
+
+  it("a non-canonicalizable side never equals a real task_bridge scope (either argument order)", () => {
+    const { singular } = unitPair();
+    expect(scopeEquals(null, singular)).toBe(false);
+    expect(scopeEquals(singular, null)).toBe(false);
+    expect(scopeEquals({ kind: "standard" }, singular)).toBe(false);
+  });
+
+  it("shape-equivalent task_bridge scopes still compare equal (the fix must not overcorrect)", () => {
+    const { singular, plural } = unitPair();
+    expect(scopeEquals(singular, plural)).toBe(true);
+    expect(scopeEquals(plural, singular)).toBe(true);
+  });
+
+  it("a genuinely different effective set still compares unequal", () => {
+    const { singular } = unitPair();
+    const different = { ...singular, projectId: randomUUID() };
+    expect(scopeEquals(singular, different)).toBe(false);
+  });
+
+  it("an own __proto__ key (JSON.parse-planted) is preserved as unknown structure — never equal to the clean pin", () => {
+    const { singular } = unitPair();
+    // JSON text, not an object literal: `{"__proto__": "x"}` in literal syntax
+    // would hit the prototype setter (a no-op for strings), while JSON.parse
+    // creates a genuine own data property — the only in-process shape a
+    // corrupted jsonb row can produce.
+    const planted = JSON.parse(`${JSON.stringify(singular).slice(0, -1)},"__proto__":"payload"}`);
+    expect(Object.prototype.hasOwnProperty.call(planted, "__proto__")).toBe(true); // fixture guard
+    expect(scopeEquals(planted, singular)).toBe(false);
+    expect(scopeEquals(singular, planted)).toBe(false);
+  });
+
+  it("a preserved __proto__ key participates deterministically — identical corruptions still compare equal", () => {
+    const { singular } = unitPair();
+    const withProto = (payload: string) =>
+      JSON.parse(`${JSON.stringify(singular).slice(0, -1)},"__proto__":${JSON.stringify(payload)}}`);
+    expect(scopeEquals(withProto("payload"), withProto("payload"))).toBe(true);
+    expect(scopeEquals(withProto("payload"), withProto("other"))).toBe(false);
   });
 });
 
