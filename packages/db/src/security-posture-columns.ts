@@ -217,6 +217,11 @@ export const SECURITY_POSTURE_COLUMNS = [
     reason: "Credential material; the unique index aborts a constant flatten but not a per-row rewrite, which would invalidate or re-point every operator key.",
   },
   {
+    table: "company_secret_bindings",
+    column: "auto_renew_policy",
+    reason: "Dangerous value any non-NULL policy object: the policy is simultaneously the operator's opt-in AND the scope approval the task_bridge auto-renewer mints under, so an unqualified write that sets it enrols every binding in automatic key minting with one writer-chosen scope. NULL itself is the correct default-deny value, so this is a widen-only column.",
+  },
+  {
     table: "company_secret_versions",
     column: "revoked_at",
     reason: "Dangerous value NULL: the version lookup does not filter, so revoked_at is the sole revocation gate and clearing it re-arms every revoked secret version for resolution.",

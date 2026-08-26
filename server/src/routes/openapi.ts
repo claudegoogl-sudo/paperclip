@@ -193,6 +193,8 @@ import {
   // (fork) Secret egress operator surface
   setBindingEgressAllowlistSchema,
   enforceBindingEgressSchema,
+  // (fork) task_bridge key auto-renew operator surface
+  setBindingAutoRenewPolicySchema,
   // (fork) Plugin config-key egress operator surface
   setPluginConfigEgressAllowlistSchema,
   enforcePluginConfigEgressAllowlistSchema,
@@ -6737,6 +6739,31 @@ registerCurrentRoute({
   tags: ["secrets"],
   summary: "Toggle egress enforcement for a secret binding",
   body: enforceBindingEgressSchema,
+});
+
+// (fork) Operator-only task_bridge key auto-renew policy + renewal audit
+// trail. These routes are mounted in routes/secrets.ts; document them here so
+// the openapi spec stays an exact match for the fork's hardening.
+registerCurrentRoute({
+  method: "get",
+  path: "/api/companies/{companyId}/secret-bindings/{bindingId}/auto-renew-policy",
+  tags: ["secrets"],
+  summary: "Get the task_bridge key auto-renew policy for a secret binding",
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/companies/{companyId}/secret-bindings/{bindingId}/auto-renew-policy",
+  tags: ["secrets"],
+  summary: "Set or clear the task_bridge key auto-renew policy for a secret binding",
+  body: setBindingAutoRenewPolicySchema,
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/secrets/{id}/renewal-events",
+  tags: ["secrets"],
+  summary: "List task_bridge key renewal audit events for a secret",
 });
 
 // (fork) Operator-only plugin config-key egress review + allowlist /

@@ -99,6 +99,7 @@ import {
   EGRESS_POSTURE_SWEEP_INTERVAL_MS,
   startEgressPostureSweep,
 } from "./services/egress-posture.js";
+import { startTaskBridgeRenewalSweep } from "./services/task-bridge-renewal.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { isLoopbackHost, rewriteLoopbackUrlPort } from "./url-utils.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
@@ -1655,6 +1656,14 @@ export async function startServer(): Promise<StartedServer> {
   // subject to heartbeat suppression: a security-posture check that silently
   // stops running when an unrelated scheduling flag is off is failure-open.
   startEgressPostureSweep(db as any, EGRESS_POSTURE_SWEEP_INTERVAL_MS);
+
+  // Same reasoning as the posture sweep above: the server-internal task_bridge
+  // key auto-renewer is a continuity loop that must not silently stop when
+  // heartbeat scheduling is off. It runs unconditionally in the untokened
+  // server process, registers no route, and only ever mints for bindings an
+  // operator explicitly opted in via the board-gated policy route
+  // (default-deny: a NULL policy is never touched, even at expiry).
+  startTaskBridgeRenewalSweep(db as any);
 
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;

@@ -11,6 +11,7 @@ import {
   rotateUserSecretValueSchema,
   secretProviderConfigDiscoveryPreviewSchema,
   setBindingEgressAllowlistSchema,
+  setBindingAutoRenewPolicySchema,
   enforceBindingEgressSchema,
   updateSecretProviderConfigSchema,
   updateSecretSchema,
@@ -1248,6 +1249,94 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
       res.json(result);
     },
   );
+
+  // ---------------------------------------------------------------------------
+  // SECURITY-CRITICAL: operator-only auto-renew policy for task_bridge keys.
+  //
+  // `assertBoard` is the provenance gate (same pattern as the egress review
+  // surface above): an agent/worker JWT 403s, so there is NO agent-invokable
+  // path to opt a binding into key auto-renewal — the operator's opt-in is
+  // the scope approval. `authorizedByUserId`/`createdAt` are stamped
+  // server-side from the authenticated actor and clock, never trusted from
+  // the body, so the stored authorization names who actually opted in.
+  // ---------------------------------------------------------------------------
+
+  router.get(
+    "/companies/:companyId/secret-bindings/:bindingId/auto-renew-policy",
+    async (req, res) => {
+      assertBoard(req);
+      const companyId = req.params.companyId as string;
+      assertCompanyAccess(req, companyId);
+      const binding = await svc.getBindingForBoard(companyId, req.params.bindingId as string);
+      res.json({ policy: binding?.autoRenewPolicy ?? null });
+    },
+  );
+
+  router.post(
+    "/companies/:companyId/secret-bindings/:bindingId/auto-renew-policy",
+    validate(setBindingAutoRenewPolicySchema),
+    async (req, res) => {
+      assertBoard(req);
+      const companyId = req.params.companyId as string;
+      const bindingId = req.params.bindingId as string;
+      assertCompanyAccess(req, companyId);
+
+      // Provenance is stamped server-side; body values for these fields are
+      // validated (shape) but ignored.
+      const policy = req.body.policy === null
+        ? null
+        : {
+          ...req.body.policy,
+          authorizedByUserId: req.actor.userId ?? "board",
+          createdAt: new Date().toISOString(),
+        };
+
+      const result = await svc.setBindingAutoRenewPolicy({
+        companyId,
+        bindingId,
+        policy,
+      });
+
+      await logActivity(db, {
+        companyId,
+        actorType: "user",
+        actorId: req.actor.userId ?? "board",
+        action: policy === null
+          ? "secret.binding_auto_renew_policy_cleared"
+          : "secret.binding_auto_renew_policy_set",
+        entityType: "secret_binding",
+        entityId: bindingId,
+        details: {
+          enabled: policy?.enabled ?? false,
+          scopeKind: policy?.scope?.kind ?? null,
+        },
+      });
+
+      res.json({ policy: result.binding.autoRenewPolicy });
+    },
+  );
+
+  // Inspection surface for the append-only renewal audit trail (per design:
+  // an operator can reconstruct any rotation's complete timeline from the
+  // board without database access). Ids, timestamps, outcomes, and the
+  // non-secret scope snapshot only — never key material.
+  router.get("/secrets/:id/renewal-events", async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    const existing = await svc.getById(id);
+    if (!existing) {
+      res.status(404).json({ error: "Secret not found" });
+      return;
+    }
+    assertCompanyAccess(req, existing.companyId);
+    const limit = typeof req.query.limit === "string" ? Number.parseInt(req.query.limit, 10) : 50;
+    const events = await svc.listRenewalEvents(
+      existing.companyId,
+      id,
+      Number.isFinite(limit) ? limit : 50,
+    );
+    res.json({ events });
+  });
 
   return router;
 }
