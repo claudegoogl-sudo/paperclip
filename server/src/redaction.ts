@@ -132,35 +132,40 @@ function sanitizeRecordWithLeaf(
 ): Record<string, unknown> {
   const redacted: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(record)) {
+    // The pre-structural text pipeline scrubbed secret bytes anywhere in the
+    // serialized line — key positions included. Apply the same leaf redactor
+    // to keys so structural redaction cannot smuggle a secret through as a
+    // key. Key-matching REs below still test the ORIGINAL key.
+    const redactedKey = leaf(key) as string;
     if (COMMAND_ARGS_PAYLOAD_KEY_RE.test(key) && Array.isArray(value)) {
-      redacted[key] = sanitizeCommandArgs(value, leaf);
+      redacted[redactedKey] = sanitizeCommandArgs(value, leaf);
       continue;
     }
     if (COMMAND_PAYLOAD_KEY_RE.test(key) && typeof value === "string") {
-      redacted[key] = redactSensitiveText(value);
+      redacted[redactedKey] = redactSensitiveText(value);
       continue;
     }
     if (SECRET_PAYLOAD_KEY_RE.test(key)) {
       if (isSecretRefBinding(value)) {
-        redacted[key] = sanitizeValue(value, leaf);
+        redacted[redactedKey] = sanitizeValue(value, leaf);
         continue;
       }
       if (isUserSecretRefBinding(value)) {
-        redacted[key] = sanitizeValue(value, leaf);
+        redacted[redactedKey] = sanitizeValue(value, leaf);
         continue;
       }
       if (isPlainBinding(value)) {
-        redacted[key] = { type: "plain", value: REDACTED_EVENT_VALUE };
+        redacted[redactedKey] = { type: "plain", value: REDACTED_EVENT_VALUE };
         continue;
       }
-      redacted[key] = REDACTED_EVENT_VALUE;
+      redacted[redactedKey] = REDACTED_EVENT_VALUE;
       continue;
     }
     if (typeof value === "string" && JWT_VALUE_RE.test(value)) {
-      redacted[key] = REDACTED_EVENT_VALUE;
+      redacted[redactedKey] = REDACTED_EVENT_VALUE;
       continue;
     }
-    redacted[key] = sanitizeValue(value, leaf);
+    redacted[redactedKey] = sanitizeValue(value, leaf);
   }
   return redacted;
 }

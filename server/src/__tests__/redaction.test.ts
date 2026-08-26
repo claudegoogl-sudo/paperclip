@@ -269,4 +269,30 @@ describe("redactSensitiveText serialized-JSON integrity", () => {
     expect(redactedLine).not.toContain(KEY);
     expect(inner.note).toBe(`Authorization: Bearer ${REDACTED_EVENT_VALUE} tail`);
   });
+
+  it("redacts a registered secret used as a JSON object key (text-pipeline parity)", () => {
+    // The pre-structural text pipeline scrubbed secret bytes at ANY position
+    // in the serialized line — key positions included. Structural redaction
+    // applies the leaf redactor to keys so a secret cannot survive there.
+    registerRunSecretValue(RUN_ID, KEY);
+    const line = JSON.stringify({ [KEY]: "x", other: "y" });
+    const redactedLine = redactSensitiveText(line);
+
+    expect(redactedLine).not.toContain(KEY);
+    expect(() => JSON.parse(redactedLine)).not.toThrow();
+  });
+
+  it("redacts shape-based secrets (sk- / ghp_ / github_pat_) used as JSON keys", () => {
+    const line = JSON.stringify({
+      "sk-projabcdefghijklmnopqrstuv": "x",
+      "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345": 1,
+      "github_pat_11AAAA0123456789012345678901234567890123456": 2,
+    });
+    const redactedLine = redactSensitiveText(line);
+
+    expect(redactedLine).not.toContain("sk-projabcdefghijklmnopqrstuv");
+    expect(redactedLine).not.toContain("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345");
+    expect(redactedLine).not.toContain("github_pat_11AAAA");
+    expect(() => JSON.parse(redactedLine)).not.toThrow();
+  });
 });
