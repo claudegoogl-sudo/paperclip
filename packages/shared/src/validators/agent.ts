@@ -365,11 +365,14 @@ export const agentMineInboxQuerySchema = z.object({
  * snapshot is the exact minimum scope the renewer may mint, re-checked
  * against the live key on every sweep (drift suspends; it never propagates).
  *
- * At-least-minimum pinning is REQUIRED: `scope.projectId`,
- * `scope.parentIssueIds`, and `scope.allowedAssigneeAgentIds` must all be
- * present and non-empty. An unpinned `task_bridge` snapshot is refused, so
- * the renewer can never be opted into minting a broader key than the
- * operator explicitly enumerated.
+ * At-least-minimum pinning is REQUIRED: the project boundary must be pinned
+ * via `scope.projectId` OR a non-empty `scope.projectIds` (effective-set
+ * semantics, matching how enforcement unions the two forms — a plural-only
+ * boundary enumerates the same scope a singular one names); and
+ * `scope.parentIssueIds` and `scope.allowedAssigneeAgentIds` must be present
+ * and non-empty. An unpinned `task_bridge` snapshot is refused, so the
+ * renewer can never be opted into minting a broader key than the operator
+ * explicitly enumerated.
  */
 export const bindingAutoRenewPolicySchema = z.object({
   version: z.literal(1),
@@ -378,14 +381,16 @@ export const bindingAutoRenewPolicySchema = z.object({
   authorizedByUserId: z.string().trim().min(1),
   createdAt: z.string().trim().min(1),
 }).strict().superRefine((value, ctx) => {
-  const pinned = Boolean(value.scope.projectId)
+  const pinnedProject = Boolean(value.scope.projectId)
+    || (value.scope.projectIds?.length ?? 0) > 0;
+  const pinned = pinnedProject
     && (value.scope.parentIssueIds?.length ?? 0) > 0
     && (value.scope.allowedAssigneeAgentIds?.length ?? 0) > 0;
   if (!pinned) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message:
-        "auto-renew policy requires a pinned task_bridge scope: projectId, parentIssueIds, and allowedAssigneeAgentIds must all be present and non-empty",
+        "auto-renew policy requires a pinned task_bridge scope: a project boundary (projectId or non-empty projectIds), parentIssueIds, and allowedAssigneeAgentIds must all be present and non-empty",
       path: ["scope"],
     });
   }

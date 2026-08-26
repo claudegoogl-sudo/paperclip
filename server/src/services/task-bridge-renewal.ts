@@ -82,8 +82,96 @@ function sha256Hex(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+/**
+ * String values a boundary field contributes to the effective scope — same
+ * semantics as `scopeAllows` in authorization.ts: a bare string is one entry,
+ * an array contributes its non-empty string entries (trimmed), and anything
+ * else (absent, null, empty) enumerates nothing.
+ */
+function scopeValueList(value: unknown): string[] {
+  if (typeof value === "string" && value.trim()) return [value.trim()];
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+    .map((entry) => entry.trim());
+}
+
+function dedupeSorted(values: string[]): string[] {
+  return [...new Set(values)].sort();
+}
+
+/**
+ * Deterministic JSON for values of unknown scope fields: object keys sorted at
+ * every depth, so key-order variation inside a preserved field cannot
+ * differentiate two otherwise-equal scopes. Arrays keep their order — only the
+ * known boundary fields get set semantics.
+ */
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${stableStringify(entry)}`);
+    return `{${entries.join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+/**
+ * Canonical form of a task_bridge scope for equality comparison.
+ *
+ * Enforcement (`scopeAllows`) unions the singular and plural forms of each
+ * boundary before matching, so `{projectId: X}` and `{projectIds: [X]}` are
+ * the SAME effective scope: a key minted in one shape authorizes exactly what
+ * a policy pinned in the other shape enumerates. The renewer's comparisons —
+ * the scope-drift check and the stray-key skip — must therefore compare
+ * effective sets, not raw bytes; a byte comparison spuriously suspends on
+ * shape variation that changes nothing about what the key can do.
+ *
+ * Fail-closed by construction: `kind` must be `task_bridge`; boundary fields
+ * union, dedupe, and sort (order and duplicates carry no boundary); and any
+ * field OUTSIDE the known vocabulary is preserved verbatim (key-sorted), so a
+ * scope carrying unknown structure can never canonicalize equal to a pinned
+ * policy — unexplainable differences still suspend. Non-object shapes (null
+ * included, e.g. a standard key's null `scopeConfig`) never equal a policy
+ * scope.
+ */
+function canonicalTaskBridgeScope(scope: unknown): string | null {
+  if (scope === null || typeof scope !== "object" || Array.isArray(scope)) return null;
+  const record = scope as Record<string, unknown>;
+  if (record.kind !== "task_bridge") return null;
+  const projects = [
+    ...scopeValueList(record.projectId),
+    ...scopeValueList(record.projectIds),
+  ];
+  const parents = [
+    ...scopeValueList(record.parentIssueId),
+    ...scopeValueList(record.parentIssueIds),
+  ];
+  const assignees = scopeValueList(record.allowedAssigneeAgentIds);
+  const knownFields = new Set([
+    "kind",
+    "projectId",
+    "projectIds",
+    "parentIssueId",
+    "parentIssueIds",
+    "allowedAssigneeAgentIds",
+  ]);
+  const rest: Record<string, string> = {};
+  for (const key of Object.keys(record)) {
+    if (!knownFields.has(key)) rest[key] = stableStringify(record[key]);
+  }
+  return JSON.stringify({
+    kind: "task_bridge",
+    projectIds: dedupeSorted(projects),
+    parentIssueIds: dedupeSorted(parents),
+    allowedAssigneeAgentIds: dedupeSorted(assignees),
+    rest,
+  });
+}
+
 function scopeEquals(a: unknown, b: unknown): boolean {
-  return JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+  return canonicalTaskBridgeScope(a) === canonicalTaskBridgeScope(b);
 }
 
 /**
