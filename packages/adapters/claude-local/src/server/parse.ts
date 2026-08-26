@@ -14,9 +14,20 @@ const CLAUDE_TRANSIENT_UPSTREAM_RE =
 // The trailing `reached` is optional: upstream moved from "You're out of extra
 // usage · resets 4am (UTC)" to "You've hit your weekly limit · resets Jul 31,
 // 8am (UTC)". Requiring "reached" silently killed the usage-limit backoff for
-// every limit result after that wording change.
+// every limit result after that wording change. The bare `limit exhausted`
+// alternative covers gateway phrasings like "Weekly/Monthly Limit Exhausted"
+// where no specific limit word directly precedes "limit".
 const CLAUDE_EXTRA_USAGE_RESET_RE =
-  /(?:out\s+of\s+extra\s+usage|extra\s+usage|claude\s+usage\s+limit(?:\s+reached)?|usage\s+cap(?:\s+reached)?|(?:5[-\s]?hour|weekly|session|usage)\s+limit(?:\s+reached)?)[\s\S]{0,80}?\bresets?\s+(?:at\s+)?([^\n()]+?)(?:\s*\(([^)]+)\))?(?:[.!]|\n|$)/i;
+  /(?:out\s+of\s+extra\s+usage|extra\s+usage|claude\s+usage\s+limit(?:\s+reached)?|usage\s+cap(?:\s+reached)?|(?:5[-\s]?hour|weekly|session|usage)\s+limit(?:\s+reached)?|\blimit\s+exhausted\b)[\s\S]{0,80}?\bresets?\s+(?:at\s+)?([^\n()]+?)(?:\s*\(([^)]+)\))?(?:[.!]|\n|$)/i;
+// GLM/z.ai-style gateways state the reset as an absolute wall-clock timestamp
+// ("Weekly/Monthly Limit Exhausted ... limit will reset at 2026-08-27 12:31:10")
+// instead of Anthropic's "resets Jul 31, 8am (UTC)" clock phrasing. The
+// timestamp carries no timezone suffix; the gateway reports UTC, so it is
+// parsed as UTC. A misread timezone can only land in the past, and the server
+// treats an already-past horizon as "no horizon", so the failure mode is the
+// pre-existing backoff, never a longer one.
+const CLAUDE_ABSOLUTE_LIMIT_RESET_RE =
+  /\b(?:limit|quota|cap|usage)[\s\S]{0,120}?\b(?:will\s+)?resets?\s+(?:at\s+)?(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\s*(?:Z|UTC))?)/i;
 
 export function parseClaudeStreamJson(stdout: string) {
   let sessionId: string | null = null;
@@ -548,6 +559,32 @@ function parseClaudeResetClockTime(clockText: string, now: Date, timeZoneHint?: 
   return retryAt;
 }
 
+function parseAbsoluteResetTimestamp(text: string): Date | null {
+  const match = text.trim().match(
+    /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?(?:\s*(?:Z|UTC))?$/i,
+  );
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = match[6] === undefined ? 0 : Number(match[6]);
+  const candidate = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+  // `Date` normalizes calendar-invalid input (2026-02-31 becomes March 3), so
+  // verify the components round-trip before trusting the timestamp.
+  if (
+    candidate.getUTCFullYear() !== year ||
+    candidate.getUTCMonth() !== month - 1 ||
+    candidate.getUTCDate() !== day ||
+    candidate.getUTCHours() !== hour ||
+    candidate.getUTCMinutes() !== minute
+  ) {
+    return null;
+  }
+  return candidate;
+}
+
 export function extractClaudeRetryNotBefore(
   input: {
     parsed?: Record<string, unknown> | null;
@@ -559,8 +596,13 @@ export function extractClaudeRetryNotBefore(
 ): Date | null {
   const haystack = buildClaudeTransientHaystack(input);
   const match = haystack.match(CLAUDE_EXTRA_USAGE_RESET_RE);
-  if (!match) return null;
-  return parseClaudeResetClockTime(match[1] ?? "", now, match[2]);
+  if (match) {
+    const clockReset = parseClaudeResetClockTime(match[1] ?? "", now, match[2]);
+    if (clockReset) return clockReset;
+  }
+  const absoluteMatch = haystack.match(CLAUDE_ABSOLUTE_LIMIT_RESET_RE);
+  if (absoluteMatch) return parseAbsoluteResetTimestamp(absoluteMatch[1] ?? "");
+  return null;
 }
 
 export function isClaudeTransientUpstreamError(input: {
