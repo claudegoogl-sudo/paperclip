@@ -88,6 +88,11 @@ How it rotates, once per day per policy:
   revokes the bound key by hand, the policy **suspends** (fail-closed) and says
   so in the audit trail instead of minting. Deliberate human action always
   beats availability.
+- Do **not** hand-mint a duplicate `task_bridge` key with the pinned scope for
+  an agent under an active auto-renew policy: the sweep's reconciliation
+  revokes any live key of that agent whose scope exactly equals the pinned
+  snapshot and is not the bound value — the next sweep (within the hour) will
+  revoke your duplicate.
 
 Every attempt — success, per-stage failure, suspension, recovery — is audited
 in three places: the append-only `agent_key_renewal_events` table, the board

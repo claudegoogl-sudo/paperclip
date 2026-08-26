@@ -26,6 +26,7 @@ import { secretService } from "../services/secrets.js";
 import { createTaskBridgeKeyClassifier } from "../services/task-bridge-keys.js";
 import {
   TASK_BRIDGE_RENEWAL_LEAD_MS,
+  renewalErrorCode,
   runTaskBridgeRenewalSweep,
 } from "../services/task-bridge-renewal.js";
 
@@ -404,6 +405,9 @@ describeEmbeddedPostgres("task_bridge auto-renewer sweep", () => {
       const events = await renewalEvents(fixture.bindingId);
       expect(events).toHaveLength(1);
       expect(events[0].outcome).toBe("failed:mint");
+      // Closed errorCode vocabulary: unknown error class -> `unknown:<name>`
+      // + scrubbed message, never a verbatim Error.message.
+      expect(events[0].errorCode).toBe("unknown:Error:injected mint failure");
       const activity = await renewalActivityRows(fixture.companyId);
       expect(activity.some((row) => row.action === "agent.key_auto_renewal_failed")).toBe(true);
     });
@@ -434,6 +438,72 @@ describeEmbeddedPostgres("task_bridge auto-renewer sweep", () => {
       expect(live).toHaveLength(1);
       expect(live[0].id).not.toBe(fixture.keyId);
       expect(await resolveLatest(fixture.companyId, fixture.agentId, fixture.secretId)).not.toBe(fixture.plaintext);
+    });
+
+    it("fail at verify AFTER a concurrent operator rotation: the operator's version survives, only the renewer's own key is cleaned up", async () => {
+      const fixture = await seedPolicyBinding({ ttlSeconds: 2 * ONE_HOUR_MS / 1000 });
+      const now = new Date(Date.now() + ONE_HOUR_MS);
+      const secrets = secretService(db);
+
+      // The operator's replacement key, hand-minted with the same pinned scope
+      // (the exact F1 race: they rotate the same secret in the window between
+      // the renewer's append (step 2) and verify (step 3)).
+      const operatorKey = await agentService(db).createApiKey(
+        fixture.agentId,
+        "operator hand-rotation",
+        fixture.policy.scope as never,
+        { ttlSeconds: 20 * ONE_HOUR_MS / 1000 },
+      );
+
+      const result = await sweep(now, {
+        deps: {
+          rotateSecret: async (input: { secretId: string; value: string; rotationJobId: string }) => {
+            await secrets.rotate(input.secretId, { value: input.value, rotationJobId: input.rotationJobId });
+            // The operator's concurrent rotate: no rotationJobId — a
+            // human-driven rotation, exactly like the console/API path.
+            await secrets.rotate(input.secretId, { value: operatorKey.token });
+          },
+        },
+      });
+
+      expect(result).toMatchObject({ policies: 1, failed: 1, renewed: 0 });
+
+      // Verify failed naturally (latest_hash_mismatch) and the rollback was
+      // SKIPPED: the operator's version survived — `latest` resolves to THEIR
+      // key, not to the revoked renewer key.
+      expect(await resolveLatest(fixture.companyId, fixture.agentId, fixture.secretId)).toBe(operatorKey.token);
+
+      // The renewer's own mint was cleaned up: its key revoked. Old key and
+      // the operator's key are the only live ones.
+      const live = await liveKeyRows(fixture.agentId);
+      expect(live.map((row) => row.id).sort()).toEqual([fixture.keyId, operatorKey.id].sort());
+
+      // The renewer's appended version row is no longer current (the
+      // operator's is), and was never used to destroy the operator's version.
+      const versions = await db
+        .select({
+          version: companySecretVersions.version,
+          rotationJobId: companySecretVersions.rotationJobId,
+          status: companySecretVersions.status,
+        })
+        .from(companySecretVersions)
+        .where(eq(companySecretVersions.secretId, fixture.secretId));
+      expect(versions.filter((v) => v.status === "current")).toHaveLength(1);
+      expect(versions.find((v) => v.rotationJobId !== null)?.status).not.toBe("current");
+
+      const events = await renewalEvents(fixture.bindingId);
+      expect(events.some((e) => e.outcome === "failed:verify" && e.trigger === "rollback")).toBe(true);
+
+      // No misleading suspension afterwards: the next sweep sees the
+      // operator's healthy key bound, reconciles the now-unreferenced OLD
+      // key, and never reports suspended:key_revoked_by_operator.
+      const second = await sweep(now);
+      expect(second).toMatchObject({ policies: 1, suspended: 0, failed: 0, renewed: 0 });
+      expect(second.reconciled).toBeGreaterThanOrEqual(1);
+      expect(await resolveLatest(fixture.companyId, fixture.agentId, fixture.secretId)).toBe(operatorKey.token);
+      expect((await liveKeyRows(fixture.agentId)).map((row) => row.id)).toEqual([operatorKey.id]);
+      const eventsAfter = await renewalEvents(fixture.bindingId);
+      expect(eventsAfter.some((e) => e.outcome === "suspended:key_revoked_by_operator")).toBe(false);
     });
 
     it("fail at verify: the new version rolls back, latest resolves to the OLD key again, old key stays live", async () => {
@@ -616,6 +686,41 @@ describe("bindingAutoRenewPolicySchema (pinning gate)", () => {
       policyFixture({ ...validScope, ttlSeconds: 999_999_999 } as never),
     );
     expect(result.success).toBe(false);
+  });
+});
+
+describe("renewalErrorCode (closed errorCode vocabulary for audit rows)", () => {
+  it("maps a Postgres unique violation on key_hash to a fixed code — no hex digest leaks", () => {
+    const err = Object.assign(
+      new Error(
+        'duplicate key value violates unique constraint "agent_api_keys_key_hash_key" Key (key_hash)=(0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef) already exists.',
+      ),
+      { code: "23505" },
+    );
+    expect(renewalErrorCode(err, "mint_error")).toBe("db_unique_violation");
+  });
+
+  it("maps Node system-error codes without any message fragment", () => {
+    const err = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:5432"), { code: "ECONNREFUSED" });
+    expect(renewalErrorCode(err, "append_version_error")).toBe("connection_refused");
+  });
+
+  it("scrubs 16+ char hex runs out of unknown-class messages", () => {
+    const code = renewalErrorCode(new Error("lookup failed for deadbeef0011223344deadbeef0011 upstream"), "f");
+    expect(code).toContain("unknown:Error:");
+    expect(code).toContain("[redacted]");
+    expect(code).not.toContain("deadbeef0011");
+  });
+
+  it("degrades nullish errors to the stage fallback and truncates to the 200-char convention", () => {
+    expect(renewalErrorCode(null, "mint_error")).toBe("mint_error");
+    expect(renewalErrorCode(undefined, "revoke_error")).toBe("revoke_error");
+    expect(renewalErrorCode(new Error("x".repeat(500)), "f").length).toBeLessThanOrEqual(200);
+  });
+
+  it("keeps the verify-stage prefix within the 200-char convention", () => {
+    const code = `verify_error:${renewalErrorCode(new Error("y".repeat(400)), "unknown", 180)}`;
+    expect(code.length).toBeLessThanOrEqual(200);
   });
 });
 
