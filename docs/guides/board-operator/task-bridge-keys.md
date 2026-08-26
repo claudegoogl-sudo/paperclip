@@ -76,6 +76,16 @@ board identity — do not send them.) The binding must target an agent at
 `env.PAPERCLIP_BRIDGE_API_KEY`. Clear the opt-in any time with
 `{"policy": null}`.
 
+The project boundary may be pinned either way — `"projectId":"<uuid>"` or
+`"projectIds":["<uuid>", …]` — and the sweep compares **effective scope**, not
+raw shape: singular and plural forms that enumerate the same boundaries are
+treated as identical, on both the pinned snapshot and the live key. A key
+minted `projectIds:["X"]` matches a policy pinned `projectId:"X"` and vice
+versa, including across differently-ordered or duplicated array entries.
+What still counts as drift (and suspends fail-closed): a genuinely different
+set of projects / parent issues / allowed assignees, or any scope field the
+renewer does not know.
+
 How it rotates, once per day per policy:
 
 - The sweep renews when the bound key's remaining TTL drops to ≤ 8h — mint new

@@ -333,6 +333,180 @@ describeEmbeddedPostgres("task_bridge auto-renewer sweep", () => {
     expect(activity.some((row) => row.action === "agent.key_auto_renew_suspended")).toBe(true);
   });
 
+  describe("AC-4 canonical scope comparison: effective set, not raw shape", () => {
+    // Shared fixture builder: one effective scope expressed in two shapes.
+    // Enforcement (scopeAllows) unions singular+plural boundary fields, so the
+    // renewer must treat these as identical — a byte comparison suspends on
+    // shape variation that changes nothing about what the key can do.
+    function equivalentScopePair() {
+      const projectId = randomUUID();
+      const parentIssueIds = [randomUUID(), randomUUID()];
+      const allowedAssigneeAgentIds = [randomUUID()];
+      return {
+        projectId,
+        parentIssueIds,
+        allowedAssigneeAgentIds,
+        singular: {
+          kind: "task_bridge" as const,
+          projectId,
+          parentIssueIds,
+          allowedAssigneeAgentIds,
+        },
+        plural: {
+          kind: "task_bridge" as const,
+          projectIds: [projectId],
+          parentIssueIds,
+          allowedAssigneeAgentIds,
+        },
+      };
+    }
+
+    it("renews a plural projectIds live key against a singular pinned policy (same effective set)", async () => {
+      const pair = equivalentScopePair();
+      const fixture = await seedPolicyBinding({
+        ttlSeconds: 2 * ONE_HOUR_MS / 1000,
+        keyScope: pair.plural,
+        policyScope: pair.singular,
+      });
+
+      const result = await sweep(new Date(Date.now() + ONE_HOUR_MS));
+
+      expect(result).toMatchObject({ policies: 1, renewed: 1, suspended: 0, failed: 0 });
+      const live = await liveKeyRows(fixture.agentId);
+      expect(live).toHaveLength(1);
+      expect(live[0].id).not.toBe(fixture.keyId);
+      expect((await renewalEvents(fixture.bindingId))[0]).toMatchObject({ outcome: "success" });
+    });
+
+    it("renews a singular live key against a plural projectIds policy (same effective set)", async () => {
+      const pair = equivalentScopePair();
+      const fixture = await seedPolicyBinding({
+        ttlSeconds: 2 * ONE_HOUR_MS / 1000,
+        keyScope: pair.singular,
+        policyScope: pair.plural,
+      });
+
+      const result = await sweep(new Date(Date.now() + ONE_HOUR_MS));
+
+      expect(result).toMatchObject({ policies: 1, renewed: 1, suspended: 0, failed: 0 });
+      expect((await liveKeyRows(fixture.agentId))).toHaveLength(1);
+    });
+
+    it("array order, duplicate entries, and mixed singular+plural unions carry no boundary", async () => {
+      const projectIds = [randomUUID(), randomUUID()];
+      const parentIssueIds = [randomUUID(), randomUUID()];
+      const allowedAssigneeAgentIds = [randomUUID(), randomUUID()];
+      const fixture = await seedPolicyBinding({
+        ttlSeconds: 2 * ONE_HOUR_MS / 1000,
+        // Live key: plural, shuffled order, duplicated project + assignee.
+        keyScope: {
+          kind: "task_bridge",
+          projectIds: [projectIds[1], projectIds[0], projectIds[1]],
+          parentIssueIds: [parentIssueIds[1], parentIssueIds[0]],
+          allowedAssigneeAgentIds: [allowedAssigneeAgentIds[0], allowedAssigneeAgentIds[1], allowedAssigneeAgentIds[0]],
+        },
+        // Policy: the same effective sets, expressed as a singular+plural
+        // union in yet another order.
+        policyScope: {
+          kind: "task_bridge",
+          projectId: projectIds[0],
+          projectIds: [projectIds[1], projectIds[0]],
+          parentIssueIds: [parentIssueIds[0], parentIssueIds[1]],
+          allowedAssigneeAgentIds: [allowedAssigneeAgentIds[1], allowedAssigneeAgentIds[0]],
+        },
+      });
+
+      const result = await sweep(new Date(Date.now() + ONE_HOUR_MS));
+
+      expect(result).toMatchObject({ policies: 1, renewed: 1, suspended: 0, failed: 0 });
+    });
+
+    it("a genuinely different effective set still suspends with scope_drift (guards the canonicalization)", async () => {
+      // Same shape (both plural), different project — plain drift.
+      const parentIssueIds = [randomUUID()];
+      const allowedAssigneeAgentIds = [randomUUID()];
+      const pluralA = {
+        kind: "task_bridge" as const,
+        projectIds: [randomUUID()],
+        parentIssueIds,
+        allowedAssigneeAgentIds,
+      };
+      const pluralB = {
+        kind: "task_bridge" as const,
+        projectIds: [randomUUID()],
+        parentIssueIds,
+        allowedAssigneeAgentIds,
+      };
+      const fixture = await seedPolicyBinding({
+        ttlSeconds: 2 * ONE_HOUR_MS / 1000,
+        keyScope: pluralA,
+        policyScope: pluralB,
+      });
+
+      const result = await sweep(new Date(Date.now() + ONE_HOUR_MS));
+
+      expect(result).toMatchObject({ policies: 1, suspended: 1, renewed: 0, failed: 0 });
+      expect((await renewalEvents(fixture.bindingId))[0].outcome).toBe("suspended:scope_drift");
+      expect((await liveKeyRows(fixture.agentId))[0].id).toBe(fixture.keyId); // untouched
+    });
+
+    it("a BROADER live key (superset of the pinned projects) suspends — the pinned snapshot is exact, not minimum-only", async () => {
+      const pair = equivalentScopePair();
+      const fixture = await seedPolicyBinding({
+        ttlSeconds: 2 * ONE_HOUR_MS / 1000,
+        keyScope: { ...pair.plural, projectIds: [...pair.plural.projectIds, randomUUID()] },
+        policyScope: pair.singular,
+      });
+
+      const result = await sweep(new Date(Date.now() + ONE_HOUR_MS));
+
+      expect(result).toMatchObject({ policies: 1, suspended: 1, renewed: 0, failed: 0 });
+      expect((await renewalEvents(fixture.bindingId))[0].outcome).toBe("suspended:scope_drift");
+    });
+
+    it("an unknown extra scope field on the live key still suspends (fail-closed against unexplained structure)", async () => {
+      const pair = equivalentScopePair();
+      const fixture = await seedPolicyBinding({
+        ttlSeconds: 2 * ONE_HOUR_MS / 1000,
+        // Same effective boundaries, but carrying a field outside the
+        // task_bridge vocabulary. The strict-scope classifier refuses it
+        // BEFORE the drift check is reached (scope_mismatch); the
+        // canonicalizer additionally preserves unknown fields, so the drift
+        // path itself stays fail-closed even if classification ever loosens.
+        keyScope: { ...pair.plural, "project:sneaky": ["true"] },
+        policyScope: pair.singular,
+      });
+
+      const result = await sweep(new Date(Date.now() + ONE_HOUR_MS));
+
+      expect(result).toMatchObject({ policies: 1, suspended: 1, renewed: 0, failed: 0 });
+      expect((await renewalEvents(fixture.bindingId))[0].outcome).toBe("suspended:scope_mismatch");
+    });
+
+    it("reconciliation recognizes a stray minted in the plural-equivalent shape of the pinned singular scope", async () => {
+      const pair = equivalentScopePair();
+      const fixture = await seedPolicyBinding({
+        ttlSeconds: 20 * ONE_HOUR_MS / 1000, // healthy, outside the lead window
+        policyScope: pair.singular,
+      });
+      // A crashed rotation's stray, minted plural — same effective scope.
+      const stray = await agentService(db).createApiKey(
+        fixture.agentId,
+        "stray plural-shaped",
+        pair.plural as never,
+        { ttlSeconds: 2 * ONE_HOUR_MS / 1000 },
+      );
+
+      const result = await sweep(new Date());
+
+      expect(result).toMatchObject({ policies: 1, renewed: 0, reconciled: 1, failed: 0 });
+      const live = await liveKeyRows(fixture.agentId);
+      expect(live).toHaveLength(1);
+      expect(live[0].id).toBe(fixture.keyId); // the bound key survived
+      expect((await renewalEvents(fixture.bindingId)).some((e) => e.trigger === "reconcile" && e.oldKeyId === stray.id)).toBe(true);
+    });
+  });
+
   it("AC-6 operator revocation wins: a revoked bound key suspends the policy instead of re-minting", async () => {
     const fixture = await seedPolicyBinding({ ttlSeconds: 2 * ONE_HOUR_MS / 1000, revoked: true });
 
@@ -616,6 +790,25 @@ describe("bindingAutoRenewPolicySchema (pinning gate)", () => {
       policyFixture({ ...validScope, ttlSeconds: 999_999_999 } as never),
     );
     expect(result.success).toBe(false);
+  });
+
+  it("accepts a plural projectIds boundary with no singular projectId (effective-set pinning)", () => {
+    const plural = {
+      ...validScope,
+      projectId: undefined,
+      projectIds: [validScope.projectId as string],
+    };
+    expect(bindingAutoRenewPolicySchema.safeParse(policyFixture(plural)).success).toBe(true);
+  });
+
+  it("refuses a snapshot with neither a singular nor a plural project boundary", () => {
+    const noProject = { ...validScope, projectId: undefined };
+    expect(bindingAutoRenewPolicySchema.safeParse(policyFixture(noProject)).success).toBe(false);
+  });
+
+  it("refuses an empty projectIds array as the only project boundary", () => {
+    const empty = { ...validScope, projectId: undefined, projectIds: [] };
+    expect(bindingAutoRenewPolicySchema.safeParse(policyFixture(empty)).success).toBe(false);
   });
 });
 
