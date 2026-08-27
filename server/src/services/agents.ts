@@ -28,7 +28,7 @@ import {
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
-import { syncAgentAdapterEnvBindings } from "./agent-secret-bindings.js";
+import { adapterConfigReferencesSecrets, syncAgentAdapterEnvBindings } from "./agent-secret-bindings.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
 import {
@@ -995,7 +995,9 @@ export function agentService(db: Db) {
             environmentId: null,
           });
         }
-        await syncAgentSecretBindings(updated, txDb);
+        if (adapterConfigReferencesSecrets(updated.adapterConfig)) {
+          await syncAgentSecretBindings(updated, txDb);
+        }
         const agent = await agentService(txDb).getById(updated.id);
         if (!agent) {
           throw notFound("Agent not found");
