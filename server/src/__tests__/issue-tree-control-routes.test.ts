@@ -89,7 +89,7 @@ describe("issue tree control routes", () => {
       agentId: "22222222-2222-4222-8222-222222222222",
       companyId: "company-2",
       runId: null,
-      source: "api_key",
+      source: "agent_key",
     });
 
     const res = await request(app)
