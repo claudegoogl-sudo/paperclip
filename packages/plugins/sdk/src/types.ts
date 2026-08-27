@@ -2199,11 +2199,27 @@ export interface PluginAuthorizationPolicyRecord {
   updatedAt: Date | string | null;
 }
 
+/**
+ * Explicit actor provenance for plugin authorization previews. The host
+ * validates these at runtime and denies (403) when the source is unset,
+ * unknown, or does not match the actor type — privileged sources such as
+ * "session" are never synthesized from an omitted field. `local_implicit` is
+ * server-internal and cannot be claimed by plugins.
+ */
+export type PluginBoardActorSource = "session" | "board_key" | "cloud_tenant";
+export type PluginAgentActorSource = "agent_key" | "agent_jwt";
+
 export interface PluginAssignmentPreviewInput {
   companyId: string;
   actor:
-    | { type: "board"; userId?: string | null; companyIds?: string[]; isInstanceAdmin?: boolean }
-    | { type: "agent"; agentId: string; companyId: string };
+    | {
+        type: "board";
+        userId?: string | null;
+        companyIds?: string[];
+        isInstanceAdmin?: boolean;
+        source: PluginBoardActorSource;
+      }
+    | { type: "agent"; agentId: string; companyId: string; source: PluginAgentActorSource };
   target: {
     issueId?: string | null;
     projectId?: string | null;
