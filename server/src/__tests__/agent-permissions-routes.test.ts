@@ -755,7 +755,7 @@ describe.sequential("agent permission routes", () => {
       }));
 
     expect(res.status).toBe(403);
-    expect(res.body.error).toContain("instructions path or bundle configuration");
+    expect(res.body.error).toContain("instructions path, bundle, or context-injection configuration");
     expect(mockLogActivity).not.toHaveBeenCalled();
   }, 15_000);
 
@@ -801,7 +801,7 @@ describe.sequential("agent permission routes", () => {
       }));
 
     expect(res.status).toBe(403);
-    expect(res.body.error).toContain("instructions path or bundle configuration");
+    expect(res.body.error).toContain("instructions path, bundle, or context-injection configuration");
     expect(mockAgentService.create).not.toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
