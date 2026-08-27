@@ -33,6 +33,7 @@ import {
   MAX_TURN_CONTINUATION_RETRY_REASON,
   MAX_TURN_CONTINUATION_WAKE_REASON,
   NO_OP_DISPATCH_RETRY_MAX_ATTEMPTS,
+  TRANSIENT_RETRY_NOT_BEFORE_MAX_DELAY_MS,
   heartbeatService,
 } from "../services/heartbeat.ts";
 
@@ -2497,6 +2498,50 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect((wakeupRequest?.payload as Record<string, unknown> | null)?.transientRetryNotBefore).toBe(
       retryNotBefore.toISOString(),
     );
+  });
+
+  it("caps the transient retry-not-before horizon instead of sleeping past a pathological timestamp", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date(2026, 3, 22, 10, 0, 0);
+    const advertised = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+    const expectedDueAt = new Date(now.getTime() + TRANSIENT_RETRY_NOT_BEFORE_MAX_DELAY_MS);
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "adapter_failed",
+      errorFamily: "transient_upstream",
+      adapterType: "claude_local",
+      retryNotBefore: advertised.toISOString(),
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+    expect(scheduled.dueAt.getTime()).toBe(expectedDueAt.getTime());
+
+    const retryRun = await db
+      .select({
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+
+    expect(retryRun?.scheduledRetryAt?.getTime()).toBe(expectedDueAt.getTime());
+    // The advertised horizon stays in the context snapshot for observability,
+    // even though the effective wait was capped.
+    const contextSnapshot = (retryRun?.contextSnapshot as Record<string, unknown> | null) ?? {};
+    expect(contextSnapshot.transientRetryNotBefore).toBe(advertised.toISOString());
   });
 
   it("retries a pre-turn 429 at the advertised reset time without consuming a bounded attempt", async () => {

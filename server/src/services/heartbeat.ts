@@ -483,6 +483,13 @@ const NO_OP_DISPATCH_RETRY_MIN_DELAY_MS = 60 * 1000;
 const NO_OP_DISPATCH_RETRY_MAX_DELAY_MS = 5 * 60 * 60 * 1000;
 // The advertised reset time is a lossy wall clock; wake just past it, not exactly on it.
 export const NO_OP_DISPATCH_RETRY_SAFETY_MARGIN_MS = 60 * 1000;
+// A provider-stated reset horizon can sit arbitrarily far out (a monthly limit
+// legitimately resets weeks away; a malformed timestamp can claim years). The
+// transient ladder honors the horizon, but bounds the single wait so a
+// pathological value cannot strand the run — the longest real limit cycles are
+// weekly, so anything beyond a week re-arms on the next admission failure
+// instead of sleeping past it.
+export const TRANSIENT_RETRY_NOT_BEFORE_MAX_DELAY_MS = 7 * 24 * 60 * 60 * 1000;
 const WORKSPACE_VALIDATION_FAILURE_CODE = "workspace_validation_failed";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
 const CONFIGURATION_INCOMPLETE_FAILURE_CODE = "configuration_incomplete";
@@ -11825,14 +11832,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
+    const notBeforeCapMs = now.getTime() + TRANSIENT_RETRY_NOT_BEFORE_MAX_DELAY_MS;
+    const honoredNotBeforeMs =
+      transientRetryNotBefore !== null
+        ? Math.min(transientRetryNotBefore.getTime(), notBeforeCapMs)
+        : null;
     const schedule =
       !noOpDispatchRetry.active &&
-      transientRetryNotBefore &&
-      transientRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
+      honoredNotBeforeMs !== null &&
+      honoredNotBeforeMs > baseSchedule.dueAt.getTime()
         ? {
             ...baseSchedule,
-            dueAt: transientRetryNotBefore,
-            delayMs: Math.max(0, transientRetryNotBefore.getTime() - now.getTime()),
+            dueAt: new Date(honoredNotBeforeMs),
+            delayMs: Math.max(0, honoredNotBeforeMs - now.getTime()),
           }
         : baseSchedule;
 

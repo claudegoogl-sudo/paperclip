@@ -660,6 +660,58 @@ describe("extractClaudeRetryNotBefore", () => {
       )?.toISOString(),
     ).toBe("2026-07-31T18:50:00.000Z");
   });
+
+  // Live gateway phrasing from the 2026-08-25/26 provider outage: a 429 whose
+  // body names the limit family and states the reset as an absolute UTC
+  // timestamp. The classic `hit your X limit · resets <clock>` phrasing never
+  // appears, so the clock-time capture alone cannot see these.
+  it("parses a 'Limit Exhausted' 429 with an absolute reset timestamp", () => {
+    const now = new Date("2026-08-26T10:00:00.000Z");
+    expect(
+      extractClaudeRetryNotBefore(
+        { errorMessage: "HTTP 429: Weekly/Monthly Limit Exhausted, limit will reset at 2026-08-27 12:31:10" },
+        now,
+      )?.toISOString(),
+    ).toBe("2026-08-27T12:31:10.000Z");
+  });
+
+  it("parses an absolute reset timestamp with T separator and Z suffix", () => {
+    const now = new Date("2026-08-26T10:00:00.000Z");
+    expect(
+      extractClaudeRetryNotBefore(
+        { errorMessage: "rate limit will reset at 2026-08-27T12:31:10Z" },
+        now,
+      )?.toISOString(),
+    ).toBe("2026-08-27T12:31:10.000Z");
+  });
+
+  it("still parses clock-format resets after 'Limit Exhausted' phrasing", () => {
+    const now = new Date("2026-07-30T10:00:00.000Z");
+    expect(
+      extractClaudeRetryNotBefore(
+        { errorMessage: "Weekly/Monthly Limit Exhausted · resets Jul 31, 8am (UTC)" },
+        now,
+      )?.toISOString(),
+    ).toBe("2026-07-31T08:00:00.000Z");
+  });
+
+  it("returns null for 'Limit Exhausted' with no parseable reset", () => {
+    expect(
+      extractClaudeRetryNotBefore(
+        { errorMessage: "Weekly/Monthly Limit Exhausted" },
+        new Date("2026-08-26T10:00:00.000Z"),
+      ),
+    ).toBeNull();
+  });
+
+  it("rejects calendar-invalid absolute reset timestamps", () => {
+    expect(
+      extractClaudeRetryNotBefore(
+        { errorMessage: "limit will reset at 2026-02-31 10:00:00" },
+        new Date("2026-08-26T10:00:00.000Z"),
+      ),
+    ).toBeNull();
+  });
 });
 
 describe("isClaudePreTurnRateLimitResult", () => {

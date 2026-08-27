@@ -1089,4 +1089,150 @@ describeEmbeddedPostgres("productivity review service", () => {
       expect(result.creationCapped).toBe(1);
     });
   });
+
+  describe("provider outage awareness", () => {
+    async function insertAdmissionFailureRuns(input: {
+      companyId: string;
+      agentId: string;
+      issueId: string;
+      count: number;
+      now: Date;
+      errorCode?: string;
+      errorFamily?: string | null;
+    }) {
+      const rows = Array.from({ length: input.count }, (_unused, index) => {
+        const createdAt = new Date(input.now.getTime() - index * 60_000);
+        return {
+          id: randomUUID(),
+          companyId: input.companyId,
+          agentId: input.agentId,
+          status: "failed" as const,
+          invocationSource: "assignment" as const,
+          triggerDetail: "system",
+          startedAt: createdAt,
+          finishedAt: createdAt,
+          error: "HTTP 429: Weekly/Monthly Limit Exhausted",
+          errorCode: input.errorCode ?? "claude_transient_upstream",
+          contextSnapshot: { issueId: input.issueId, taskId: input.issueId },
+          resultJson: {
+            ...(input.errorFamily === null ? {} : { errorFamily: input.errorFamily ?? "transient_upstream" }),
+          },
+          createdAt,
+          updatedAt: createdAt,
+        };
+      });
+      await db.insert(heartbeatRuns).values(rows);
+      return rows;
+    }
+
+    it("does not open a no-comment-streak review when the streak is pure provider-admission failures", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertAdmissionFailureRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS + 2,
+        now,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(0);
+      expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+    });
+
+    it("does not open a high-churn review from an admission-failure run storm", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      // A commented real run breaks the streak so only the churn windows could
+      // fire: 40+ failed runs in 6h trips highChurnSixHours (30) without the
+      // admission-failure exclusion.
+      const [commentedRun] = (
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: 1,
+          now: new Date(now.getTime() - 7 * 60 * 60 * 1000),
+          withRunComments: true,
+        })
+      );
+      expect(commentedRun).toBeTruthy();
+      await insertAdmissionFailureRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: 40,
+        now,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(0);
+      expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+    });
+
+    it("still reviews real completed-but-silent runs and annotates the outage window", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now: new Date(now.getTime() - 3 * 60 * 60 * 1000),
+      });
+      await insertAdmissionFailureRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: 3,
+        now,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(1);
+      const reviews = await listProductivityReviews(seeded.companyId);
+      expect(reviews).toHaveLength(1);
+      expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+      expect(reviews[0]?.description).toContain("No-comment completed-run streak: 10");
+      expect(reviews[0]?.description).toContain(
+        "Provider outage window: 3 sampled runs were zero-cost provider-admission failures",
+      );
+    });
+
+    it("keeps counting non-transient failed runs toward the streak", async () => {
+      const now = new Date("2026-04-28T12:00:00.000Z");
+      const seeded = await seedAssignedIssue();
+      await insertAdmissionFailureRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+        errorCode: "claude_auth_required",
+        errorFamily: null,
+      });
+
+      const result = await productivityReviewService(db).reconcileProductivityReviews({
+        now,
+        companyId: seeded.companyId,
+      });
+
+      expect(result.created).toBe(1);
+      const reviews = await listProductivityReviews(seeded.companyId);
+      expect(reviews[0]?.description).toContain("No-comment completed-run streak: 10");
+    });
+  });
 });
