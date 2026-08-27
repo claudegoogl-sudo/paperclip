@@ -44,6 +44,7 @@ import {
   updateSecretProviderConfigSchema,
 } from "@paperclipai/shared";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { requireAgentActorSource, requireBoardActorSource } from "./actor-source.js";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { collectSecretRefs } from "./agent-secret-bindings.js";
@@ -1206,24 +1207,21 @@ export function secretService(db: Db) {
     ) {
       throw forbidden("Ephemeral secret resolution requires an authenticated actor");
     }
+    // Actor synthesis fails closed: an unset or unknown actorSource denies
+    // instead of defaulting to a privileged source ("session" can satisfy the
+    // instance-admin elevation check inside authorization.decide).
     const actor =
       context.actorType === "agent"
         ? {
             type: "agent" as const,
             agentId: context.actorId,
             companyId,
-            source: context.actorSource === "agent_jwt" ? "agent_jwt" as const : "agent_key" as const,
+            source: requireAgentActorSource(context.actorSource),
           }
         : {
             type: "board" as const,
             userId: context.actorId,
-            source: context.actorSource === "local_implicit"
-              ? "local_implicit" as const
-              : context.actorSource === "board_key"
-                ? "board_key" as const
-                : context.actorSource === "cloud_tenant"
-                  ? "cloud_tenant" as const
-                  : "session" as const,
+            source: requireBoardActorSource(context.actorSource),
           };
     const decision = await authorization.decide({
       actor,
