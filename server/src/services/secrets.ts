@@ -3836,6 +3836,10 @@ export function secretService(db: Db) {
 
       const pathPrefixes = [...new Set(normalizedRefs.map((ref) => ref.configPath.split(".")[0]))];
 
+      // Config paths whose binding rows a zero-refs (non-replaceAll) call would
+      // have deleted; surfaced as an activity event after the sync commits.
+      let refusedWipeConfigPaths: string[] = [];
+
       await db.transaction(async (tx) => {
         // Capture existing egress allowlist settings before deletion
         const existingBindings = await tx
@@ -3907,6 +3911,7 @@ export function secretService(db: Db) {
             },
             "syncSecretRefsForTarget called with zero refs (non-replaceAll) — skipping delete-all to avoid a config-form binding wipe",
           );
+          refusedWipeConfigPaths = existingBindings.map((b) => b.configPath);
         }
         if (normalizedRefs.length === 0) return;
         await tx.insert(companySecretBindings).values(
@@ -3927,6 +3932,25 @@ export function secretService(db: Db) {
           }),
         );
       });
+      if (refusedWipeConfigPaths.length > 0) {
+        // Non-agent targets (environment config forms) refuse a delete-all the
+        // same way the agent path does — leave the identical operator-visible
+        // trail (ids/paths only, never values). Best-effort: a logging failure
+        // must not fail the sync itself.
+        await logActivity(db, {
+          companyId,
+          actorType: "system",
+          actorId: "secret-binding-guard",
+          action: "secret.binding_wipe_refused",
+          entityType: target.targetType,
+          entityId: target.targetId,
+          details: {
+            refusedConfigPaths: refusedWipeConfigPaths,
+            reason:
+              "secret-ref sync received zero refs (non-replaceAll) while bindings exist — delete-all skipped",
+          },
+        }).catch(() => undefined);
+      }
       return normalizedRefs;
     },
 
