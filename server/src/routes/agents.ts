@@ -306,6 +306,17 @@ export function agentRoutes(
   ] as const;
   const KNOWN_INSTRUCTIONS_BUNDLE_KEY_SET: ReadonlySet<string> = new Set(KNOWN_INSTRUCTIONS_BUNDLE_KEYS);
 
+  // Adapter config keys that inject external file/context content into the
+  // agent prompt (adapter-side contextFiles path reads, injected context
+  // payloads). Agent-authenticated callers cannot set these on their own
+  // record — same primitive as the instructions-bundle keys above, so the
+  // agent-actor guard in assertNoAgentAdapterConfigMutation denies both
+  // lists together.
+  const KNOWN_CONTEXT_INJECTION_KEYS = [
+    "contextFiles",
+    "injectClaudeContext",
+  ] as const;
+
   const router = Router();
   const svc = agentService(db);
   const access = accessService(db);
@@ -2015,18 +2026,25 @@ export function agentRoutes(
     );
   }
 
-  function assertNoAgentInstructionsConfigMutation(
+  function agentProtectedAdapterConfigKeys(
+    adapterConfig: Record<string, unknown>,
+    path: string,
+  ): string[] {
+    return [...KNOWN_INSTRUCTIONS_BUNDLE_KEYS, ...KNOWN_CONTEXT_INJECTION_KEYS]
+      .filter((key) => adapterConfig[key] !== undefined)
+      .map((key) => `${path}.${key}`);
+  }
+
+  function assertNoAgentProtectedAdapterConfigMutation(
     req: Request,
     adapterConfig: Record<string, unknown> | null | undefined,
     path = "adapterConfig",
   ) {
     if (req.actor.type !== "agent" || !adapterConfig) return;
-    const changedSensitiveKeys = KNOWN_INSTRUCTIONS_BUNDLE_KEYS
-      .filter((key) => adapterConfig[key] !== undefined)
-      .map((key) => `${path}.${key}`);
+    const changedSensitiveKeys = agentProtectedAdapterConfigKeys(adapterConfig, path);
     if (changedSensitiveKeys.length === 0) return;
     throw forbidden(
-      `Agent-authenticated callers cannot modify instructions path or bundle configuration (${changedSensitiveKeys.join(", ")})`,
+      `Agent-authenticated callers cannot modify instructions path, bundle, or context-injection configuration (${changedSensitiveKeys.join(", ")})`,
     );
   }
 
@@ -2039,7 +2057,7 @@ export function agentRoutes(
     adapterConfig: Record<string, unknown>,
     path = "adapterConfig",
   ) {
-    assertNoAgentInstructionsConfigMutation(req, adapterConfig, path);
+    assertNoAgentProtectedAdapterConfigMutation(req, adapterConfig, path);
     assertNoAgentHostWorkspaceCommandMutation(
       req,
       collectAgentAdapterWorkspaceCommandPaths(adapterConfig, path),
