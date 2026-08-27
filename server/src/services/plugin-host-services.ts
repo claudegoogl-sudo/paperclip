@@ -87,6 +87,7 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
 import { logger } from "../middleware/logger.js";
+import { requireAgentActorSource, requirePluginBoardActorSource } from "./actor-source.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { accessService } from "./access.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
@@ -1155,26 +1156,31 @@ export function buildHostServices(
     };
   };
 
+  // Actor synthesis fails closed: the caller (plugin RPC input) must pass the
+  // source it was authenticated with. "session" is never a default — an unset
+  // or type-mismatched source denies (403) instead of synthesizing the most
+  // privileged board provenance from an unvalidated actor payload.
   const pluginAssignmentActor = (actor: {
     type: "agent" | "board";
     agentId?: string | null;
     companyId?: string | null;
     userId?: string | null;
     companyIds?: string[];
+    source?: unknown;
   }): AuthorizationActor => {
     if (actor.type === "agent") {
       return {
         type: "agent",
         agentId: actor.agentId ?? null,
         companyId: actor.companyId ?? null,
-        source: "agent_key",
+        source: requireAgentActorSource(actor.source),
       };
     }
     return {
       type: "board",
       userId: actor.userId ?? null,
       companyIds: Array.isArray(actor.companyIds) ? actor.companyIds : [],
-      source: "session",
+      source: requirePluginBoardActorSource(actor.source),
     };
   };
 

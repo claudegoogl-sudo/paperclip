@@ -243,21 +243,142 @@ describeEmbeddedPostgres("plugin access and authorization host services", () => 
     });
     expect(explanation).toMatchObject(preview);
 
+    // The operator preview historically exercised a session-sourced actor
+    // (the host used to hardcode "session" and silently drop the caller's
+    // source field); keep that effective behavior with an explicit session
+    // source now that synthesis is explicit-only.
     const injectedBoardPreview = await services.authorization.previewAssignment({
       companyId: company.id,
       actor: {
         type: "board",
         userId: "operator",
         companyIds: [company.id],
-        source: "local_implicit",
+        source: "session",
         isInstanceAdmin: true,
-      } as any,
+      },
       target: { assigneeAgentId: targetAgent!.id },
     });
     expect(injectedBoardPreview).toMatchObject({
       allowed: false,
       reason: "deny_policy_restricted",
     });
+    services.dispose();
+  });
+
+  it("denies assignment preview actor synthesis when the source is unset or mismatched", async () => {
+    const company = await createCompany(db, "PAV");
+    const targetAgent = await db
+      .insert(agents)
+      .values({
+        companyId: company.id,
+        name: "Preview target",
+        role: "engineer",
+        adapterType: "process",
+        adapterConfig: {},
+        permissions: {},
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+    const services = buildHostServices(db, pluginId, "permissions-extension", createEventBusStub());
+
+    // Board actor without an explicit source must not synthesize "session".
+    await expect(
+      services.authorization.previewAssignment({
+        companyId: company.id,
+        actor: {
+          type: "board",
+          userId: "operator",
+          companyIds: [company.id],
+        } as any,
+        target: { assigneeAgentId: targetAgent.id },
+      }),
+    ).rejects.toMatchObject({
+      status: 403,
+      message: expect.stringContaining("Plugin actor synthesis requires an explicit board actor source"),
+    });
+
+    // An agent-only source cannot authenticate a board actor.
+    await expect(
+      services.authorization.previewAssignment({
+        companyId: company.id,
+        actor: {
+          type: "board",
+          userId: "operator",
+          companyIds: [company.id],
+          source: "agent_key",
+        } as any,
+        target: { assigneeAgentId: targetAgent.id },
+      }),
+    ).rejects.toMatchObject({
+      status: 403,
+      message: expect.stringContaining("Plugin actor synthesis requires an explicit board actor source"),
+    });
+
+    // The server-internal local_implicit source cannot be claimed by a plugin:
+    // it would yield an unconditional allow_local_board decision.
+    await expect(
+      services.authorization.previewAssignment({
+        companyId: company.id,
+        actor: {
+          type: "board",
+          userId: "operator",
+          companyIds: [company.id],
+          source: "local_implicit",
+        } as any,
+        target: { assigneeAgentId: targetAgent.id },
+      }),
+    ).rejects.toMatchObject({
+      status: 403,
+      message: expect.stringContaining("cannot be claimed by plugins"),
+    });
+
+    // Agent actor without an explicit source must not synthesize "agent_key".
+    await expect(
+      services.authorization.previewAssignment({
+        companyId: company.id,
+        actor: {
+          type: "agent",
+          agentId: randomUUID(),
+          companyId: company.id,
+        } as any,
+        target: { assigneeAgentId: targetAgent.id },
+      }),
+    ).rejects.toMatchObject({
+      status: 403,
+      message: expect.stringContaining("Agent actor source is required"),
+    });
+
+    // A board-only source cannot authenticate an agent actor.
+    await expect(
+      services.authorization.explainAssignment({
+        companyId: company.id,
+        actor: {
+          type: "agent",
+          agentId: randomUUID(),
+          companyId: company.id,
+          source: "session",
+        } as any,
+        target: { assigneeAgentId: targetAgent.id },
+      }),
+    ).rejects.toMatchObject({
+      status: 403,
+      message: expect.stringContaining("Agent actor source is required"),
+    });
+
+    // Explicit sources still resolve: a session board actor produces a real
+    // decision rather than a synthesis error.
+    const explicitSessionPreview = await services.authorization.previewAssignment({
+      companyId: company.id,
+      actor: {
+        type: "board",
+        userId: "operator",
+        companyIds: [company.id],
+        source: "session",
+      },
+      target: { assigneeAgentId: targetAgent.id },
+    });
+    expect(typeof explicitSessionPreview.allowed).toBe("boolean");
+    expect(explicitSessionPreview.action).toBe("tasks:assign");
     services.dispose();
   });
 
