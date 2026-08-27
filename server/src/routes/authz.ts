@@ -1,6 +1,7 @@
 import type { Request, Response } from "express";
 import type { SecretBindingTargetType } from "@paperclipai/shared";
 import { forbidden, HttpError, unauthorized } from "../errors.js";
+import { requireAgentActorSource, requireBoardActorSource } from "../services/actor-source.js";
 import { logger } from "../middleware/logger.js";
 import { responsibleUserAuthzShadowMode } from "../services/authorization.js";
 
@@ -235,20 +236,16 @@ export function getActorInfo(req: Request): (
 ) {
   assertAuthenticated(req);
   if (req.actor.type === "agent") {
-    const actorSource = req.actor.source === "agent_jwt" ? "agent_jwt" : "agent_key";
     return {
       actorType: "agent" as const,
       actorId: req.actor.agentId ?? "unknown-agent",
       agentId: req.actor.agentId ?? null,
       runId: req.actor.runId ?? null,
       agentApiKeyId: req.actor.keyId ?? null,
-      actorSource,
+      // Unset or unknown agent provenance must deny, not coerce to agent_key.
+      actorSource: requireAgentActorSource(req.actor.source),
     };
   }
-
-  const actorSource = req.actor.source === "session"
-    ? "session"
-    : (req.actor.source ?? "local_implicit") as "local_implicit" | "session" | "board_key" | "cloud_tenant" | "mcp_oauth";
 
   return {
     actorType: "user" as const,
@@ -257,7 +254,9 @@ export function getActorInfo(req: Request): (
     agentId: null,
     runId: req.actor.runId ?? null,
     agentApiKeyId: null,
-    actorSource,
+    // Unset or unknown board provenance must deny, not default to
+    // local_implicit (the unconditional allow_local_board provenance).
+    actorSource: requireBoardActorSource(req.actor.source),
   };
 }
 
