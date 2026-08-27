@@ -90,13 +90,17 @@ describeEmbeddedPostgres("secret binding resilience", () => {
     });
   }
 
-  async function seedAgent(companyId: string, adapterConfig: Record<string, unknown>) {
+  async function seedAgent(
+    companyId: string,
+    adapterConfig: Record<string, unknown>,
+    status = "idle",
+  ) {
     const created = await agentService(db).create(companyId, {
       name: `agent-${randomUUID().slice(0, 8)}`,
       role: "engineer",
       adapterType: "codex_local",
       adapterConfig,
-      status: "idle",
+      status,
     } as Parameters<ReturnType<typeof agentService>["create"]>[1]);
     return created;
   }
@@ -296,6 +300,221 @@ describeEmbeddedPostgres("secret binding resilience", () => {
       companyId,
       secretId: secret.id,
       configPath: "env.AUTH_TOKEN",
+    });
+  });
+
+  it("(f) activating a pending-approval agent does not re-run the unguarded binding sync", async () => {
+    const companyId = await seedCompany();
+    const secret = await seedSecret(companyId);
+    const agent = await seedAgent(
+      companyId,
+      { env: { AUTH_TOKEN: { type: "secret_ref", secretId: secret.id, version: "latest" } } },
+      "pending_approval",
+    );
+    await expect(bindingsFor(agent.id)).resolves.toHaveLength(1);
+
+    // While pending, a config-form PATCH drops env: the wipe is refused and
+    // the binding preserved (scenario (a) above).
+    await agentService(db).update(agent.id, { adapterConfig: { env: {} } });
+    await expect(bindingsFor(agent.id)).resolves.toHaveLength(1);
+
+    // Activation is a status-only patch. It must NOT re-run the binding sync:
+    // the re-sync would redo the delete-and-reinsert reconcile with no
+    // previous config and silently drop the row the guard just preserved.
+    const result = await agentService(db).activatePendingApproval(agent.id);
+    expect(result?.activated).toBe(true);
+
+    const bindings = await bindingsFor(agent.id);
+    expect(bindings).toHaveLength(1);
+    expect(bindings[0]).toMatchObject({ configPath: "env.AUTH_TOKEN", secretId: secret.id });
+
+    // The refusal event comes from the PATCH only — activation adds none.
+    const events = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "secret.binding_wipe_refused"));
+    expect(events).toHaveLength(1);
+  });
+
+  it("(g) non-agent zero-refs refusal emits secret.binding_wipe_refused (ids/paths only)", async () => {
+    const companyId = await seedCompany();
+    const secret = await seedSecret(companyId, "env-secret-value");
+    const svc = secretService(db);
+    const target = { targetType: "environment" as const, targetId: "env-evt-1" };
+
+    await svc.syncSecretRefsForTarget(companyId, target, [
+      { secretId: secret.id, configPath: "env.API_KEY" },
+    ]);
+
+    // The refused wipe: a config form yields zero refs while a binding exists.
+    // Unlike the agent path (which refuses before calling into the sync), this
+    // hits the non-replaceAll empty-refs no-op inside the service itself.
+    await svc.syncSecretRefsForTarget(companyId, target, []);
+
+    const events = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "secret.binding_wipe_refused"));
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      companyId,
+      entityType: "environment",
+      entityId: "env-evt-1",
+    });
+    expect(events[0].details).toMatchObject({ refusedConfigPaths: ["env.API_KEY"] });
+    expect(JSON.stringify(events[0].details)).not.toContain("env-secret-value");
+    // The binding itself survives the refused wipe.
+    await expect(bindingsFor(target.targetId)).resolves.toHaveLength(1);
+
+    // Zero-refs sync on a target with NO existing bindings is a plain no-op —
+    // it must not produce a noise event.
+    await svc.syncSecretRefsForTarget(
+      companyId,
+      { targetType: "environment", targetId: "env-evt-empty" },
+      [],
+    );
+    const after = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "secret.binding_wipe_refused"));
+    expect(after).toHaveLength(1);
+  });
+
+  /**
+   * The auto-heal's skip boundaries: each input state must fail loudly
+   * (binding_missing or its own precondition error) without minting a
+   * company_secret_bindings row or emitting secret.binding_auto_healed.
+   */
+  describe("(h) autoHealAgentBinding skip boundaries", () => {
+    interface HealSkipCase {
+      name: string;
+      expectedError: RegExp;
+      arrange: () => Promise<{ consumerId: string; resolve: () => Promise<unknown> }>;
+    }
+
+    const secretRefConfig = (secretId: string) => ({
+      env: { AUTH_TOKEN: { type: "secret_ref" as const, secretId, version: "latest" as const } },
+    });
+
+    const agentContext = (agentId: string, extra?: Record<string, unknown>) => ({
+      consumerType: "agent" as const,
+      consumerId: agentId,
+      actorType: "agent" as const,
+      actorId: agentId,
+      ...extra,
+    });
+
+    const cases: HealSkipCase[] = [
+      {
+        name: "low-trust boundary (allowedBindingIds) never self-authorizes a heal",
+        expectedError: /not bound/i,
+        arrange: async () => {
+          const companyId = await seedCompany();
+          const secret = await seedSecret(companyId);
+          const agent = await seedAgent(companyId, secretRefConfig(secret.id));
+          const [row] = await bindingsFor(agent.id);
+          await db.delete(companySecretBindings).where(eq(companySecretBindings.targetId, agent.id));
+          return {
+            consumerId: agent.id,
+            resolve: () =>
+              secretService(db).resolveAdapterConfigForRuntime(
+                companyId,
+                secretRefConfig(secret.id),
+                agentContext(agent.id, { allowedBindingIds: [row.id] }),
+              ),
+          };
+        },
+      },
+      {
+        name: "cross-company secret never heals",
+        expectedError: /same company/i,
+        arrange: async () => {
+          const companyA = await seedCompany("Alpha");
+          const companyB = await seedCompany("Beta");
+          const secret = await seedSecret(companyB);
+          const agent = await seedAgent(companyA, { env: {} });
+          // Persisted config referencing another company's secret cannot be
+          // seeded through create (the sync writer rejects it) — write the
+          // drift directly.
+          await db
+            .update(agents)
+            .set({ adapterConfig: secretRefConfig(secret.id) })
+            .where(eq(agents.id, agent.id));
+          return {
+            consumerId: agent.id,
+            resolve: () =>
+              secretService(db).resolveAdapterConfigForRuntime(
+                companyA,
+                secretRefConfig(secret.id),
+                agentContext(agent.id),
+              ),
+          };
+        },
+      },
+      {
+        name: "inactive secret never heals",
+        expectedError: /not active/i,
+        arrange: async () => {
+          const companyId = await seedCompany();
+          const secret = await seedSecret(companyId);
+          const agent = await seedAgent(companyId, secretRefConfig(secret.id));
+          await db
+            .update(companySecrets)
+            .set({ status: "inactive" })
+            .where(eq(companySecrets.id, secret.id));
+          await db.delete(companySecretBindings).where(eq(companySecretBindings.targetId, agent.id));
+          return {
+            consumerId: agent.id,
+            resolve: () =>
+              secretService(db).resolveAdapterConfigForRuntime(
+                companyId,
+                secretRefConfig(secret.id),
+                agentContext(agent.id),
+              ),
+          };
+        },
+      },
+      {
+        name: "non-agent consumer type never heals",
+        expectedError: /not bound/i,
+        arrange: async () => {
+          const companyId = await seedCompany();
+          const secret = await seedSecret(companyId);
+          // The consumer id IS a real agent with a matching persisted ref; only
+          // the declared consumerType is non-agent. If the guard were removed
+          // the heal would find the agent row and mint a binding.
+          const agent = await seedAgent(companyId, secretRefConfig(secret.id));
+          await db.delete(companySecretBindings).where(eq(companySecretBindings.targetId, agent.id));
+          return {
+            consumerId: agent.id,
+            resolve: () =>
+              secretService(db).resolveAdapterConfigForRuntime(
+                companyId,
+                secretRefConfig(secret.id),
+                {
+                  consumerType: "environment",
+                  consumerId: agent.id,
+                  actorType: "system",
+                  actorId: "test",
+                },
+              ),
+          };
+        },
+      },
+    ];
+
+    it.each(cases)("$name", async ({ expectedError, arrange }) => {
+      const { consumerId, resolve } = await arrange();
+
+      await expect(resolve()).rejects.toThrow(expectedError);
+
+      // No binding row was minted for the consumer, and no heal was recorded.
+      await expect(bindingsFor(consumerId)).resolves.toHaveLength(0);
+      const healed = await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.action, "secret.binding_auto_healed"));
+      expect(healed).toHaveLength(0);
     });
   });
 });
