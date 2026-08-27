@@ -30,7 +30,7 @@ import {
   UserRound,
   Users,
 } from "lucide-react";
-import { Link } from "react-router-dom";
+import { Link } from "@/lib/router";
 import type {
   CompanySecret,
   CompanySecretUsageBinding,
@@ -1485,6 +1485,11 @@ export function Secrets() {
               onManageVaults={() => setActiveTab("vaults")}
               className="ml-auto"
             />
+            <Button asChild variant="outline" size="sm">
+              <Link to="/company/settings/secrets/egress">
+                <ShieldCheck className="h-3.5 w-3.5 mr-1" /> Egress bindings
+              </Link>
+            </Button>
             <Button onClick={openCreateSecret} size="sm">
               <Plus className="h-3.5 w-3.5 mr-1" /> New secret
             </Button>

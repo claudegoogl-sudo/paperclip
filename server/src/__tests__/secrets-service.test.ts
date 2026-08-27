@@ -3250,6 +3250,7 @@ describeEmbeddedPostgres("secretService", () => {
       configPath: "apiKey",
       actorType: "user",
       actorId: "user-1",
+      actorSource: "session",
     });
 
     expect(resolved).toBe("runtime-secret");
@@ -3322,6 +3323,112 @@ describeEmbeddedPostgres("secretService", () => {
     expect(resolved).toBe("runtime-secret");
   });
 
+  it("denies ephemeral board actor synthesis when actorSource is unset or unknown", async () => {
+    const companyId = await seedCompany();
+    const svc = secretService(db);
+    const secret = await svc.create(companyId, {
+      name: `ephemeral-unset-board-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "runtime-secret",
+    });
+    await seedCompanyMember(companyId, "user-1");
+
+    // Unset actorSource must never fall back to a session-sourced actor.
+    await expect(
+      svc.resolveSecretValueForEphemeralAccess(companyId, secret.id, "latest", {
+        consumerType: "system",
+        consumerId: "environment-probe-config",
+        configPath: "apiKey",
+        actorType: "user",
+        actorId: "user-1",
+      }),
+    ).rejects.toMatchObject({
+      status: 403,
+      message: expect.stringContaining("Board actor source is required"),
+    });
+
+    // Unknown string values deny rather than defaulting to "session".
+    await expect(
+      svc.resolveSecretValueForEphemeralAccess(companyId, secret.id, "latest", {
+        consumerType: "system",
+        consumerId: "environment-probe-config",
+        configPath: "apiKey",
+        actorType: "user",
+        actorId: "user-1",
+        actorSource: "definitely-not-a-source",
+      } as Parameters<typeof svc.resolveSecretValueForEphemeralAccess>[3]),
+    ).rejects.toMatchObject({
+      status: 403,
+      message: expect.stringContaining("Board actor source is required"),
+    });
+
+    // An agent-only source cannot authenticate a board actor either.
+    await expect(
+      svc.resolveSecretValueForEphemeralAccess(companyId, secret.id, "latest", {
+        consumerType: "system",
+        consumerId: "environment-probe-config",
+        configPath: "apiKey",
+        actorType: "user",
+        actorId: "user-1",
+        actorSource: "agent_key",
+      } as Parameters<typeof svc.resolveSecretValueForEphemeralAccess>[3]),
+    ).rejects.toMatchObject({
+      status: 403,
+      message: expect.stringContaining("Board actor source is required"),
+    });
+  });
+
+  it("denies ephemeral agent actor synthesis when actorSource is unset or unknown", async () => {
+    const companyId = await seedCompany();
+    const svc = secretService(db);
+    const secret = await svc.create(companyId, {
+      name: `ephemeral-unset-agent-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "runtime-secret",
+    });
+    const agentId = randomUUID();
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Unset Source Agent",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      status: "idle",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    // Unset actorSource must not fall back to "agent_key".
+    await expect(
+      svc.resolveSecretValueForEphemeralAccess(companyId, secret.id, "latest", {
+        consumerType: "system",
+        consumerId: "environment-probe-config",
+        configPath: "apiKey",
+        actorType: "agent",
+        actorId: agentId,
+      }),
+    ).rejects.toMatchObject({
+      status: 403,
+      message: expect.stringContaining("Agent actor source is required"),
+    });
+
+    // A board-only source cannot authenticate an agent actor.
+    await expect(
+      svc.resolveSecretValueForEphemeralAccess(companyId, secret.id, "latest", {
+        consumerType: "system",
+        consumerId: "environment-probe-config",
+        configPath: "apiKey",
+        actorType: "agent",
+        actorId: agentId,
+        actorSource: "session",
+      } as Parameters<typeof svc.resolveSecretValueForEphemeralAccess>[3]),
+    ).rejects.toMatchObject({
+      status: 403,
+      message: expect.stringContaining("Agent actor source is required"),
+    });
+  });
+
   it("rejects ephemeral secret access for actors without secret-read authorization", async () => {
     const companyId = await seedCompany();
     const svc = secretService(db);
@@ -3338,6 +3445,7 @@ describeEmbeddedPostgres("secretService", () => {
         configPath: "apiKey",
         actorType: "user",
         actorId: "user-without-membership",
+        actorSource: "session",
       }),
     ).rejects.toThrow(/active member|secrets:read|forbidden/i);
   });

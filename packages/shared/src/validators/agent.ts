@@ -358,6 +358,55 @@ export const agentMineInboxQuerySchema = z.object({
   status: z.string().trim().min(1).optional().default(INBOX_MINE_ISSUE_STATUS_FILTER),
 });
 
+/**
+ * Operator opt-in for the server-internal task_bridge key auto-renewer,
+ * stored on `company_secret_bindings.autoRenewPolicy`. The operator's opt-in
+ * IS the scope approval — one authorization object: the pinned `scope`
+ * snapshot is the exact minimum scope the renewer may mint, re-checked
+ * against the live key on every sweep (drift suspends; it never propagates).
+ *
+ * At-least-minimum pinning is REQUIRED: the project boundary must be pinned
+ * via `scope.projectId` OR a non-empty `scope.projectIds` (effective-set
+ * semantics, matching how enforcement unions the two forms — a plural-only
+ * boundary enumerates the same scope a singular one names); and
+ * `scope.parentIssueIds` and `scope.allowedAssigneeAgentIds` must be present
+ * and non-empty. An unpinned `task_bridge` snapshot is refused, so the
+ * renewer can never be opted into minting a broader key than the operator
+ * explicitly enumerated.
+ */
+export const bindingAutoRenewPolicySchema = z.object({
+  version: z.literal(1),
+  enabled: z.boolean(),
+  scope: taskBridgeAgentKeyScopeSchema,
+  authorizedByUserId: z.string().trim().min(1),
+  createdAt: z.string().trim().min(1),
+}).strict().superRefine((value, ctx) => {
+  const pinnedProject = Boolean(value.scope.projectId)
+    || (value.scope.projectIds?.length ?? 0) > 0;
+  const pinned = pinnedProject
+    && (value.scope.parentIssueIds?.length ?? 0) > 0
+    && (value.scope.allowedAssigneeAgentIds?.length ?? 0) > 0;
+  if (!pinned) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        "auto-renew policy requires a pinned task_bridge scope: a project boundary (projectId or non-empty projectIds), parentIssueIds, and allowedAssigneeAgentIds must all be present and non-empty",
+      path: ["scope"],
+    });
+  }
+});
+
+export type BindingAutoRenewPolicy = z.infer<typeof bindingAutoRenewPolicySchema>;
+
+/**
+ * Board-route body for setting / changing / clearing a binding's auto-renew
+ * policy. `policy: null` clears the opt-in (back to default-deny). The route
+ * is the ONLY write path — the renewer itself never writes the column.
+ */
+export const setBindingAutoRenewPolicySchema = z.object({
+  policy: bindingAutoRenewPolicySchema.nullable(),
+});
+
 export type AgentMineInboxQuery = z.infer<typeof agentMineInboxQuerySchema>;
 
 export const wakeAgentSchema = z.object({

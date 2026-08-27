@@ -1,0 +1,1050 @@
+import { randomUUID } from "node:crypto";
+import { mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { and, eq, isNull } from "drizzle-orm";
+import {
+  activityLog,
+  agentApiKeys,
+  agentKeyRenewalEvents,
+  agents,
+  companies,
+  companySecretBindings,
+  companySecretVersions,
+  companySecrets,
+  createDb,
+} from "@paperclipai/db";
+import {
+  bindingAutoRenewPolicySchema,
+  type BindingAutoRenewPolicy,
+} from "@paperclipai/shared";
+import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { agentService } from "../services/agents.js";
+import { secretService } from "../services/secrets.js";
+import { createTaskBridgeKeyClassifier } from "../services/task-bridge-keys.js";
+import {
+  TASK_BRIDGE_RENEWAL_LEAD_MS,
+  renewalErrorCode,
+  runTaskBridgeRenewalSweep,
+  scopeEquals,
+} from "../services/task-bridge-renewal.js";
+
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+if (!embeddedPostgresSupport.supported) {
+  console.warn(
+    `Skipping task_bridge renewal tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
+  );
+}
+
+/**
+ * Synthetic pinned minimum scope (shape-valid UUIDs; nothing here reaches a
+ * real instance — these fixtures are per-test random ids).
+ */
+function pinnedScope(overrides: Record<string, unknown> = {}) {
+  return {
+    kind: "task_bridge" as const,
+    projectId: randomUUID(),
+    parentIssueIds: [randomUUID()],
+    allowedAssigneeAgentIds: [randomUUID()],
+    ...overrides,
+  };
+}
+
+function policyFixture(scope: ReturnType<typeof pinnedScope>, enabled = true): BindingAutoRenewPolicy {
+  return {
+    version: 1,
+    enabled,
+    scope,
+    authorizedByUserId: randomUUID(),
+    createdAt: new Date().toISOString(),
+  };
+}
+
+/** Renewal-lead / clamp constants echoed from the service for readability. */
+const ONE_HOUR_MS = 60 * 60 * 1000;
+const TWENTY_FOUR_HOURS_MS = 24 * ONE_HOUR_MS;
+/** Slack for clamp assertions (mint vs assertion clock drift). */
+const CLOCK_SLACK_MS = 5_000;
+
+describeEmbeddedPostgres("task_bridge auto-renewer sweep", () => {
+  let stopDb: (() => Promise<void>) | null = null;
+  let db!: ReturnType<typeof createDb>;
+  const previousKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+  const secretsTmpDir = path.join(os.tmpdir(), `paperclip-task-bridge-renewal-${randomUUID()}`);
+
+  beforeAll(async () => {
+    mkdirSync(secretsTmpDir, { recursive: true });
+    process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = path.join(secretsTmpDir, "master.key");
+    const started = await startEmbeddedPostgresTestDatabase("task-bridge-renewal");
+    stopDb = started.cleanup;
+    db = createDb(started.connectionString);
+  });
+
+  afterEach(async () => {
+    // FK-safe order: audit rows reference agents/companies/secrets, so they
+    // go first; agents before companies.
+    await db.delete(activityLog);
+    await db.delete(agentKeyRenewalEvents);
+    await db.delete(agentApiKeys);
+    await db.delete(companySecretBindings);
+    await db.delete(companySecretVersions);
+    await db.delete(companySecrets);
+    await db.delete(agents);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await stopDb?.();
+    if (previousKeyFile === undefined) {
+      delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+    } else {
+      process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKeyFile;
+    }
+    rmSync(secretsTmpDir, { recursive: true, force: true });
+  });
+
+  async function seedCompany() {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: `Renewal Co ${companyId.slice(0, 6)}`,
+      issuePrefix: `R${companyId.slice(0, 6)}`.toUpperCase(),
+      status: "active",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    return companyId;
+  }
+
+  async function seedAgent(companyId: string) {
+    const agentId = randomUUID();
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: `Bridge agent ${agentId.slice(0, 6)}`,
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    return agentId;
+  }
+
+  /**
+   * The standard fixture: company + agent + a real task_bridge agent key
+   * (minted through the real service so keyHash/expiry behave exactly like
+   * production) + a local_encrypted secret whose value is that key's
+   * plaintext + an agent binding at env.PAPERCLIP_BRIDGE_API_KEY with an
+   * auto-renew policy.
+   */
+  async function seedPolicyBinding(options: {
+    ttlSeconds?: number | null;
+    keyScope?: Record<string, unknown>;
+    policyScope?: Record<string, unknown>;
+    policy?: BindingAutoRenewPolicy | null;
+    revoked?: boolean;
+    valueOverride?: string;
+  } = {}) {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId);
+    const policyScope = options.policyScope ?? pinnedScope();
+
+    let plaintext: string;
+    let keyId: string | null = null;
+    let keyExpiresAt: Date | null = null;
+    if (options.valueOverride !== undefined) {
+      plaintext = options.valueOverride;
+    } else {
+      const created = await agentService(db).createApiKey(
+        agentId,
+        "bridge fixture",
+        (options.keyScope ?? policyScope) as never,
+        { ttlSeconds: options.ttlSeconds === undefined ? 2 * ONE_HOUR_MS / 1000 : options.ttlSeconds },
+      );
+      plaintext = created.token;
+      keyId = created.id;
+      keyExpiresAt = created.expiresAt;
+      if (options.revoked) {
+        await agentService(db).revokeKey(agentId, created.id);
+      }
+    }
+
+    const secret = await secretService(db).create(companyId, {
+      name: `bridge-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: plaintext,
+    });
+    const [binding] = await db
+      .insert(companySecretBindings)
+      .values({
+        companyId,
+        secretId: secret.id,
+        targetType: "agent",
+        targetId: agentId,
+        configPath: "env.PAPERCLIP_BRIDGE_API_KEY",
+        versionSelector: "latest",
+      })
+      .returning();
+    const policy = "policy" in options ? options.policy : policyFixture(policyScope as never);
+    if (policy !== null) {
+      await db
+        .update(companySecretBindings)
+        .set({ autoRenewPolicy: policy })
+        .where(eq(companySecretBindings.id, binding.id));
+    }
+
+    return { companyId, agentId, bindingId: binding.id, secretId: secret.id, keyId, plaintext, keyExpiresAt, policy };
+  }
+
+  async function liveKeyRows(agentId: string) {
+    return db
+      .select({ id: agentApiKeys.id, expiresAt: agentApiKeys.expiresAt, scopeConfig: agentApiKeys.scopeConfig })
+      .from(agentApiKeys)
+      .where(and(eq(agentApiKeys.agentId, agentId), isNull(agentApiKeys.revokedAt)));
+  }
+
+  /** Resolve the binding's `latest` exactly the way the consumer does. */
+  async function resolveLatest(companyId: string, agentId: string, secretId: string) {
+    const resolution = await secretService(db).resolveEnvBindings(
+      companyId,
+      { PAPERCLIP_BRIDGE_API_KEY: { type: "secret_ref", secretId, version: "latest" } },
+      { consumerType: "agent", consumerId: agentId },
+    );
+    return resolution.env.PAPERCLIP_BRIDGE_API_KEY ?? null;
+  }
+
+  async function renewalEvents(bindingId: string) {
+    return db
+      .select()
+      .from(agentKeyRenewalEvents)
+      .where(eq(agentKeyRenewalEvents.bindingId, bindingId));
+  }
+
+  async function renewalActivityRows(companyId: string) {
+    return db
+      .select()
+      .from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityType, "agent")));
+  }
+
+  function sweep(now: Date, deps?: Parameters<typeof runTaskBridgeRenewalSweep>[1]) {
+    return runTaskBridgeRenewalSweep(db, { now, ...(deps ?? {}) });
+  }
+
+  it("renews a healthy key inside the lead window: clamp preserved, old key revoked, binding resolves to the new key, audit rows written", async () => {
+    const fixture = await seedPolicyBinding({ ttlSeconds: 2 * ONE_HOUR_MS / 1000 }); // expires t0+2h
+    const now = new Date(Date.now() + 1 * ONE_HOUR_MS); // 1h remaining <= 8h lead
+
+    const result = await sweep(now);
+
+    expect(result).toMatchObject({ policies: 1, renewed: 1, suspended: 0, failed: 0 });
+
+    // Exactly one live key afterwards: the new one.
+    const live = await liveKeyRows(fixture.agentId);
+    expect(live).toHaveLength(1);
+    expect(live[0].id).not.toBe(fixture.keyId);
+
+    // AC-5 clamp: renewed expiry <= now + 24h (+ clock slack), and in the future.
+    expect(live[0].expiresAt!.getTime()).toBeGreaterThan(now.getTime());
+    expect(live[0].expiresAt!.getTime()).toBeLessThanOrEqual(now.getTime() + TWENTY_FOUR_HOURS_MS + CLOCK_SLACK_MS);
+
+    // THE INVARIANT: binding `latest` resolves to a live key's plaintext.
+    const latest = await resolveLatest(fixture.companyId, fixture.agentId, fixture.secretId);
+    expect(latest).not.toBeNull();
+    expect(latest).not.toBe(fixture.plaintext);
+
+    // The old key is revoked.
+    const [oldKey] = await db
+      .select({ revokedAt: agentApiKeys.revokedAt })
+      .from(agentApiKeys)
+      .where(eq(agentApiKeys.id, fixture.keyId!));
+    expect(oldKey.revokedAt).not.toBeNull();
+
+    // AC-8 audit completeness: events row + system activity row.
+    const events = await renewalEvents(fixture.bindingId);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ trigger: "scheduled", outcome: "success", newKeyId: live[0].id, oldKeyId: fixture.keyId });
+    expect(events[0].newExpiresAt).toEqual(live[0].expiresAt);
+    const activity = await renewalActivityRows(fixture.companyId);
+    expect(activity.some((row) => row.action === "agent.key_auto_renewed")).toBe(true);
+  });
+
+  it("leaves a healthy key outside the lead window alone (no mint, no events)", async () => {
+    const fixture = await seedPolicyBinding({ ttlSeconds: 20 * ONE_HOUR_MS / 1000 }); // 20h remaining
+    const result = await sweep(new Date());
+
+    expect(result).toMatchObject({ policies: 1, renewed: 0, recovered: 0, suspended: 0, failed: 0 });
+    const live = await liveKeyRows(fixture.agentId);
+    expect(live).toHaveLength(1);
+    expect(live[0].id).toBe(fixture.keyId);
+    expect(await renewalEvents(fixture.bindingId)).toHaveLength(0);
+  });
+
+  it("AC-3 default-deny: a NULL policy binding never mints, including past expiry", async () => {
+    const fixture = await seedPolicyBinding({
+      ttlSeconds: 30_000, // expires ~30s after mint
+      policy: null, // column stays NULL — the default-deny default
+    });
+    const now = new Date(Date.now() + ONE_HOUR_MS); // key long expired by sweep time
+
+    const result = await sweep(now);
+
+    expect(result).toMatchObject({ policies: 0, renewed: 0, recovered: 0, suspended: 0, failed: 0 });
+    // Nothing minted, nothing revoked, nothing audited for this binding.
+    const live = await liveKeyRows(fixture.agentId);
+    expect(live).toHaveLength(1);
+    expect(live[0].id).toBe(fixture.keyId);
+    expect(await renewalEvents(fixture.bindingId)).toHaveLength(0);
+    expect(await renewalActivityRows(fixture.companyId)).toHaveLength(0);
+  });
+
+  it("an opted-out (enabled:false) policy never mints", async () => {
+    const fixture = await seedPolicyBinding({
+      ttlSeconds: 2 * ONE_HOUR_MS / 1000,
+      policy: policyFixture(pinnedScope(), false),
+    });
+    const result = await sweep(new Date(Date.now() + ONE_HOUR_MS));
+    expect(result).toMatchObject({ policies: 1, renewed: 0, suspended: 0, failed: 0 });
+    expect(await renewalEvents(fixture.bindingId)).toHaveLength(0);
+  });
+
+  it("AC-4 scope pinning: live-key scope drift suspends, never mints, and audits", async () => {
+    // Policy pins scope A; the live key was minted with scope B (different project).
+    const fixture = await seedPolicyBinding({
+      ttlSeconds: 2 * ONE_HOUR_MS / 1000,
+      keyScope: pinnedScope(), // B
+      policyScope: pinnedScope(), // A (fresh random -> differs from B)
+    });
+
+    const result = await sweep(new Date(Date.now() + ONE_HOUR_MS));
+
+    expect(result).toMatchObject({ policies: 1, suspended: 1, renewed: 0, failed: 0 });
+    const live = await liveKeyRows(fixture.agentId);
+    expect(live).toHaveLength(1);
+    expect(live[0].id).toBe(fixture.keyId); // untouched
+    const events = await renewalEvents(fixture.bindingId);
+    expect(events).toHaveLength(1);
+    expect(events[0].outcome).toBe("suspended:scope_drift");
+    const activity = await renewalActivityRows(fixture.companyId);
+    expect(activity.some((row) => row.action === "agent.key_auto_renew_suspended")).toBe(true);
+  });
+
+  describe("AC-4 canonical scope comparison: effective set, not raw shape", () => {
+    // Shared fixture builder: one effective scope expressed in two shapes.
+    // Enforcement (scopeAllows) unions singular+plural boundary fields, so the
+    // renewer must treat these as identical — a byte comparison suspends on
+    // shape variation that changes nothing about what the key can do.
+    function equivalentScopePair() {
+      const projectId = randomUUID();
+      const parentIssueIds = [randomUUID(), randomUUID()];
+      const allowedAssigneeAgentIds = [randomUUID()];
+      return {
+        projectId,
+        parentIssueIds,
+        allowedAssigneeAgentIds,
+        singular: {
+          kind: "task_bridge" as const,
+          projectId,
+          parentIssueIds,
+          allowedAssigneeAgentIds,
+        },
+        plural: {
+          kind: "task_bridge" as const,
+          projectIds: [projectId],
+          parentIssueIds,
+          allowedAssigneeAgentIds,
+        },
+      };
+    }
+
+    it("renews a plural projectIds live key against a singular pinned policy (same effective set)", async () => {
+      const pair = equivalentScopePair();
+      const fixture = await seedPolicyBinding({
+        ttlSeconds: 2 * ONE_HOUR_MS / 1000,
+        keyScope: pair.plural,
+        policyScope: pair.singular,
+      });
+
+      const result = await sweep(new Date(Date.now() + ONE_HOUR_MS));
+
+      expect(result).toMatchObject({ policies: 1, renewed: 1, suspended: 0, failed: 0 });
+      const live = await liveKeyRows(fixture.agentId);
+      expect(live).toHaveLength(1);
+      expect(live[0].id).not.toBe(fixture.keyId);
+      expect((await renewalEvents(fixture.bindingId))[0]).toMatchObject({ outcome: "success" });
+    });
+
+    it("renews a singular live key against a plural projectIds policy (same effective set)", async () => {
+      const pair = equivalentScopePair();
+      const fixture = await seedPolicyBinding({
+        ttlSeconds: 2 * ONE_HOUR_MS / 1000,
+        keyScope: pair.singular,
+        policyScope: pair.plural,
+      });
+
+      const result = await sweep(new Date(Date.now() + ONE_HOUR_MS));
+
+      expect(result).toMatchObject({ policies: 1, renewed: 1, suspended: 0, failed: 0 });
+      expect((await liveKeyRows(fixture.agentId))).toHaveLength(1);
+    });
+
+    it("array order, duplicate entries, and mixed singular+plural unions carry no boundary", async () => {
+      const projectIds = [randomUUID(), randomUUID()];
+      const parentIssueIds = [randomUUID(), randomUUID()];
+      const allowedAssigneeAgentIds = [randomUUID(), randomUUID()];
+      const fixture = await seedPolicyBinding({
+        ttlSeconds: 2 * ONE_HOUR_MS / 1000,
+        // Live key: plural, shuffled order, duplicated project + assignee.
+        keyScope: {
+          kind: "task_bridge",
+          projectIds: [projectIds[1], projectIds[0], projectIds[1]],
+          parentIssueIds: [parentIssueIds[1], parentIssueIds[0]],
+          allowedAssigneeAgentIds: [allowedAssigneeAgentIds[0], allowedAssigneeAgentIds[1], allowedAssigneeAgentIds[0]],
+        },
+        // Policy: the same effective sets, expressed as a singular+plural
+        // union in yet another order.
+        policyScope: {
+          kind: "task_bridge",
+          projectId: projectIds[0],
+          projectIds: [projectIds[1], projectIds[0]],
+          parentIssueIds: [parentIssueIds[0], parentIssueIds[1]],
+          allowedAssigneeAgentIds: [allowedAssigneeAgentIds[1], allowedAssigneeAgentIds[0]],
+        },
+      });
+
+      const result = await sweep(new Date(Date.now() + ONE_HOUR_MS));
+
+      expect(result).toMatchObject({ policies: 1, renewed: 1, suspended: 0, failed: 0 });
+    });
+
+    it("a genuinely different effective set still suspends with scope_drift (guards the canonicalization)", async () => {
+      // Same shape (both plural), different project — plain drift.
+      const parentIssueIds = [randomUUID()];
+      const allowedAssigneeAgentIds = [randomUUID()];
+      const pluralA = {
+        kind: "task_bridge" as const,
+        projectIds: [randomUUID()],
+        parentIssueIds,
+        allowedAssigneeAgentIds,
+      };
+      const pluralB = {
+        kind: "task_bridge" as const,
+        projectIds: [randomUUID()],
+        parentIssueIds,
+        allowedAssigneeAgentIds,
+      };
+      const fixture = await seedPolicyBinding({
+        ttlSeconds: 2 * ONE_HOUR_MS / 1000,
+        keyScope: pluralA,
+        policyScope: pluralB,
+      });
+
+      const result = await sweep(new Date(Date.now() + ONE_HOUR_MS));
+
+      expect(result).toMatchObject({ policies: 1, suspended: 1, renewed: 0, failed: 0 });
+      expect((await renewalEvents(fixture.bindingId))[0].outcome).toBe("suspended:scope_drift");
+      expect((await liveKeyRows(fixture.agentId))[0].id).toBe(fixture.keyId); // untouched
+    });
+
+    it("a BROADER live key (superset of the pinned projects) suspends — the pinned snapshot is exact, not minimum-only", async () => {
+      const pair = equivalentScopePair();
+      const fixture = await seedPolicyBinding({
+        ttlSeconds: 2 * ONE_HOUR_MS / 1000,
+        keyScope: { ...pair.plural, projectIds: [...pair.plural.projectIds, randomUUID()] },
+        policyScope: pair.singular,
+      });
+
+      const result = await sweep(new Date(Date.now() + ONE_HOUR_MS));
+
+      expect(result).toMatchObject({ policies: 1, suspended: 1, renewed: 0, failed: 0 });
+      expect((await renewalEvents(fixture.bindingId))[0].outcome).toBe("suspended:scope_drift");
+    });
+
+    it("an unknown extra scope field on the live key still suspends (fail-closed against unexplained structure)", async () => {
+      const pair = equivalentScopePair();
+      const fixture = await seedPolicyBinding({
+        ttlSeconds: 2 * ONE_HOUR_MS / 1000,
+        // Same effective boundaries, but carrying a field outside the
+        // task_bridge vocabulary. The strict-scope classifier refuses it
+        // BEFORE the drift check is reached (scope_mismatch); the
+        // canonicalizer additionally preserves unknown fields, so the drift
+        // path itself stays fail-closed even if classification ever loosens.
+        keyScope: { ...pair.plural, "project:sneaky": ["true"] },
+        policyScope: pair.singular,
+      });
+
+      const result = await sweep(new Date(Date.now() + ONE_HOUR_MS));
+
+      expect(result).toMatchObject({ policies: 1, suspended: 1, renewed: 0, failed: 0 });
+      expect((await renewalEvents(fixture.bindingId))[0].outcome).toBe("suspended:scope_mismatch");
+    });
+
+    it("reconciliation recognizes a stray minted in the plural-equivalent shape of the pinned singular scope", async () => {
+      const pair = equivalentScopePair();
+      const fixture = await seedPolicyBinding({
+        ttlSeconds: 20 * ONE_HOUR_MS / 1000, // healthy, outside the lead window
+        policyScope: pair.singular,
+      });
+      // A crashed rotation's stray, minted plural — same effective scope.
+      const stray = await agentService(db).createApiKey(
+        fixture.agentId,
+        "stray plural-shaped",
+        pair.plural as never,
+        { ttlSeconds: 2 * ONE_HOUR_MS / 1000 },
+      );
+
+      const result = await sweep(new Date());
+
+      expect(result).toMatchObject({ policies: 1, renewed: 0, reconciled: 1, failed: 0 });
+      const live = await liveKeyRows(fixture.agentId);
+      expect(live).toHaveLength(1);
+      expect(live[0].id).toBe(fixture.keyId); // the bound key survived
+      expect((await renewalEvents(fixture.bindingId)).some((e) => e.trigger === "reconcile" && e.oldKeyId === stray.id)).toBe(true);
+    });
+
+    it("reconciliation leaves a corrupted stray whose scope carries an own __proto__ key — unknown structure is not ours to touch", async () => {
+      const pair = equivalentScopePair();
+      const fixture = await seedPolicyBinding({
+        ttlSeconds: 20 * ONE_HOUR_MS / 1000, // healthy, outside the lead window
+        policyScope: pair.singular,
+      });
+      // A stray that WOULD reconcile cleanly (plural-equivalent)…
+      const stray = await agentService(db).createApiKey(
+        fixture.agentId,
+        "stray proto-corrupted",
+        pair.plural as never,
+        { ttlSeconds: 2 * ONE_HOUR_MS / 1000 },
+      );
+      // …then corrupted in place. Writers validate with the strict schema, so
+      // an own __proto__ key can only appear via raw row corruption; plant it
+      // exactly the way a jsonb round-trip would (JSON.parse creates a real
+      // own data property, not a prototype set).
+      const planted = JSON.parse(`${JSON.stringify(pair.plural).slice(0, -1)},"__proto__":"payload"}`);
+      expect(Object.prototype.hasOwnProperty.call(planted, "__proto__")).toBe(true); // fixture guard
+      await db.update(agentApiKeys).set({ scopeConfig: planted }).where(eq(agentApiKeys.id, stray.id));
+      const [readBack] = await db
+        .select({ scopeConfig: agentApiKeys.scopeConfig })
+        .from(agentApiKeys)
+        .where(eq(agentApiKeys.id, stray.id))
+        .limit(1);
+      expect(Object.prototype.hasOwnProperty.call(readBack.scopeConfig, "__proto__")).toBe(true); // round-trip guard
+
+      const result = await sweep(new Date());
+
+      // Before the null-prototype `rest` fix, the __proto__ key was silently
+      // dropped by Object.prototype's setter, canonicalizing the corrupt stray
+      // equal to the pin ("ours to touch" -> revoked). Preserved as unknown
+      // structure, it must compare unequal and stay untouched.
+      expect(result).toMatchObject({ policies: 1, renewed: 0, reconciled: 0, suspended: 0, failed: 0 });
+      const live = await liveKeyRows(fixture.agentId);
+      expect(live).toHaveLength(2); // bound key + untouched corrupt stray
+      expect(live.map((k) => k.id).sort()).toEqual([fixture.keyId, stray.id].sort());
+      expect((await renewalEvents(fixture.bindingId)).some((e) => e.oldKeyId === stray.id)).toBe(false);
+    });
+  });
+
+  it("AC-6 operator revocation wins: a revoked bound key suspends the policy instead of re-minting", async () => {
+    const fixture = await seedPolicyBinding({ ttlSeconds: 2 * ONE_HOUR_MS / 1000, revoked: true });
+
+    const result = await sweep(new Date(Date.now() + ONE_HOUR_MS));
+
+    expect(result).toMatchObject({ policies: 1, suspended: 1, renewed: 0, recovered: 0, failed: 0 });
+    const live = await liveKeyRows(fixture.agentId);
+    expect(live).toHaveLength(0); // nothing re-minted; the operator's revocation stands
+    const events = await renewalEvents(fixture.bindingId);
+    expect(events).toHaveLength(1);
+    expect(events[0].outcome).toBe("suspended:key_revoked_by_operator");
+  });
+
+  it("recovery: a naturally expired key is re-minted from the pinned snapshot", async () => {
+    const fixture = await seedPolicyBinding({ ttlSeconds: 30 }); // expires 30s after mint
+    const now = new Date(Date.now() + ONE_HOUR_MS); // long expired by sweep time
+
+    const result = await sweep(now);
+
+    expect(result).toMatchObject({ policies: 1, recovered: 1, renewed: 0, suspended: 0, failed: 0 });
+    const latest = await resolveLatest(fixture.companyId, fixture.agentId, fixture.secretId);
+    expect(latest).not.toBe(fixture.plaintext);
+    const events = await renewalEvents(fixture.bindingId);
+    expect(events[0]).toMatchObject({ trigger: "recovery", outcome: "success" });
+
+    // The expired old key is inert (auth-time expiry backstop) but still
+    // unrevoked; the invariant is satisfied by the NEW bound key. The next
+    // sweep's janitor revokes the lingering expired key — convergence to
+    // exactly one live key.
+    let live = await liveKeyRows(fixture.agentId);
+    expect(live).toHaveLength(2);
+    const newKey = live.find((row) => row.id !== fixture.keyId)!;
+    // Clamp holds on the recovery path too.
+    expect(newKey.expiresAt!.getTime()).toBeLessThanOrEqual(now.getTime() + TWENTY_FOUR_HOURS_MS + CLOCK_SLACK_MS);
+
+    const second = await sweep(now);
+    expect(second.reconciled).toBeGreaterThanOrEqual(1);
+    live = await liveKeyRows(fixture.agentId);
+    expect(live).toHaveLength(1);
+    expect(live[0].id).toBe(newKey.id);
+  });
+
+  it("recovery: a bound value with no key row (missing) re-mints", async () => {
+    const fixture = await seedPolicyBinding({ valueOverride: "pat-synthetic-value-without-any-key-row" });
+    const result = await sweep(new Date(Date.now() + ONE_HOUR_MS));
+    expect(result).toMatchObject({ policies: 1, recovered: 1, suspended: 0, failed: 0 });
+    expect(await liveKeyRows(fixture.agentId)).toHaveLength(1);
+  });
+
+  describe("AC-2 ordering/invariant: fault injection at each rotation stage", () => {
+    it("fail at mint: nothing changes, old key stays live and bound, failed:mint audited", async () => {
+      const fixture = await seedPolicyBinding({ ttlSeconds: 2 * ONE_HOUR_MS / 1000 });
+      const now = new Date(Date.now() + ONE_HOUR_MS);
+
+      const result = await sweep(now, {
+        deps: {
+          createKey: async () => {
+            throw new Error("injected mint failure");
+          },
+        },
+      });
+
+      expect(result).toMatchObject({ policies: 1, failed: 1, renewed: 0 });
+      // Old key still the only live key, still what `latest` resolves to.
+      const live = await liveKeyRows(fixture.agentId);
+      expect(live).toHaveLength(1);
+      expect(live[0].id).toBe(fixture.keyId);
+      expect(await resolveLatest(fixture.companyId, fixture.agentId, fixture.secretId)).toBe(fixture.plaintext);
+      const events = await renewalEvents(fixture.bindingId);
+      expect(events).toHaveLength(1);
+      expect(events[0].outcome).toBe("failed:mint");
+      // Closed errorCode vocabulary: unknown error class -> `unknown:<name>`
+      // + scrubbed message, never a verbatim Error.message.
+      expect(events[0].errorCode).toBe("unknown:Error:injected mint failure");
+      const activity = await renewalActivityRows(fixture.companyId);
+      expect(activity.some((row) => row.action === "agent.key_auto_renewal_failed")).toBe(true);
+    });
+
+    it("fail at append: the stray minted key is revoked, the old key stays live and bound; the next sweep converges", async () => {
+      const fixture = await seedPolicyBinding({ ttlSeconds: 2 * ONE_HOUR_MS / 1000 });
+      const now = new Date(Date.now() + ONE_HOUR_MS);
+
+      const failed = await sweep(now, {
+        deps: {
+          rotateSecret: async () => {
+            throw new Error("injected append failure");
+          },
+        },
+      });
+      expect(failed).toMatchObject({ policies: 1, failed: 1 });
+
+      // The just-minted stray was revoked by the handler; exactly one live key (the old one) remains bound.
+      expect(await liveKeyRows(fixture.agentId)).toHaveLength(1);
+      expect(await resolveLatest(fixture.companyId, fixture.agentId, fixture.secretId)).toBe(fixture.plaintext);
+      const events1 = await renewalEvents(fixture.bindingId);
+      expect(events1.some((e) => e.outcome === "failed:append_version")).toBe(true);
+
+      // Next sweep, no injection: converges to a successful renewal.
+      const converged = await sweep(now);
+      expect(converged).toMatchObject({ policies: 1, renewed: 1, failed: 0 });
+      const live = await liveKeyRows(fixture.agentId);
+      expect(live).toHaveLength(1);
+      expect(live[0].id).not.toBe(fixture.keyId);
+      expect(await resolveLatest(fixture.companyId, fixture.agentId, fixture.secretId)).not.toBe(fixture.plaintext);
+    });
+
+    it("fail at verify AFTER a concurrent operator rotation: the operator's version survives, only the renewer's own key is cleaned up", async () => {
+      const fixture = await seedPolicyBinding({ ttlSeconds: 2 * ONE_HOUR_MS / 1000 });
+      const now = new Date(Date.now() + ONE_HOUR_MS);
+      const secrets = secretService(db);
+
+      // The operator's replacement key, hand-minted with the same pinned scope
+      // (the exact F1 race: they rotate the same secret in the window between
+      // the renewer's append (step 2) and verify (step 3)).
+      const operatorKey = await agentService(db).createApiKey(
+        fixture.agentId,
+        "operator hand-rotation",
+        fixture.policy.scope as never,
+        { ttlSeconds: 20 * ONE_HOUR_MS / 1000 },
+      );
+
+      const result = await sweep(now, {
+        deps: {
+          rotateSecret: async (input: { secretId: string; value: string; rotationJobId: string }) => {
+            await secrets.rotate(input.secretId, { value: input.value, rotationJobId: input.rotationJobId });
+            // The operator's concurrent rotate: no rotationJobId — a
+            // human-driven rotation, exactly like the console/API path.
+            await secrets.rotate(input.secretId, { value: operatorKey.token });
+          },
+        },
+      });
+
+      expect(result).toMatchObject({ policies: 1, failed: 1, renewed: 0 });
+
+      // Verify failed naturally (latest_hash_mismatch) and the rollback was
+      // SKIPPED: the operator's version survived — `latest` resolves to THEIR
+      // key, not to the revoked renewer key.
+      expect(await resolveLatest(fixture.companyId, fixture.agentId, fixture.secretId)).toBe(operatorKey.token);
+
+      // The renewer's own mint was cleaned up: its key revoked. Old key and
+      // the operator's key are the only live ones.
+      const live = await liveKeyRows(fixture.agentId);
+      expect(live.map((row) => row.id).sort()).toEqual([fixture.keyId, operatorKey.id].sort());
+
+      // The renewer's appended version row is no longer current (the
+      // operator's is), and was never used to destroy the operator's version.
+      const versions = await db
+        .select({
+          version: companySecretVersions.version,
+          rotationJobId: companySecretVersions.rotationJobId,
+          status: companySecretVersions.status,
+        })
+        .from(companySecretVersions)
+        .where(eq(companySecretVersions.secretId, fixture.secretId));
+      expect(versions.filter((v) => v.status === "current")).toHaveLength(1);
+      expect(versions.find((v) => v.rotationJobId !== null)?.status).not.toBe("current");
+
+      const events = await renewalEvents(fixture.bindingId);
+      expect(events.some((e) => e.outcome === "failed:verify" && e.trigger === "rollback")).toBe(true);
+
+      // No misleading suspension afterwards: the next sweep sees the
+      // operator's healthy key bound, reconciles the now-unreferenced OLD
+      // key, and never reports suspended:key_revoked_by_operator.
+      const second = await sweep(now);
+      expect(second).toMatchObject({ policies: 1, suspended: 0, failed: 0, renewed: 0 });
+      expect(second.reconciled).toBeGreaterThanOrEqual(1);
+      expect(await resolveLatest(fixture.companyId, fixture.agentId, fixture.secretId)).toBe(operatorKey.token);
+      expect((await liveKeyRows(fixture.agentId)).map((row) => row.id)).toEqual([operatorKey.id]);
+      const eventsAfter = await renewalEvents(fixture.bindingId);
+      expect(eventsAfter.some((e) => e.outcome === "suspended:key_revoked_by_operator")).toBe(false);
+    });
+
+    it("fail at verify: the new version rolls back, latest resolves to the OLD key again, old key stays live", async () => {
+      const fixture = await seedPolicyBinding({ ttlSeconds: 2 * ONE_HOUR_MS / 1000 });
+      const now = new Date(Date.now() + ONE_HOUR_MS);
+
+      // Call 1 = the sweep's classification of the current value (must pass);
+      // call 2 = step-3 verification of the rotated value (injected to fail).
+      let classifyCalls = 0;
+      const result = await sweep(now, {
+        deps: {
+          classify: async (companyId: string, resolvedKey: string) => {
+            classifyCalls += 1;
+            if (classifyCalls >= 2) {
+              return { ok: false, code: "key_expired" as const };
+            }
+            return createTaskBridgeKeyClassifier(db, companyId)(resolvedKey);
+          },
+        },
+      });
+
+      expect(result).toMatchObject({ policies: 1, failed: 1, renewed: 0 });
+      // Rollback restored `latest` to the previous version -> OLD plaintext.
+      expect(await resolveLatest(fixture.companyId, fixture.agentId, fixture.secretId)).toBe(fixture.plaintext);
+      // Old key still live; the rolled-back new key was revoked.
+      const live = await liveKeyRows(fixture.agentId);
+      expect(live).toHaveLength(1);
+      expect(live[0].id).toBe(fixture.keyId);
+      const events = await renewalEvents(fixture.bindingId);
+      expect(events.some((e) => e.outcome === "failed:verify" && e.trigger === "rollback")).toBe(true);
+    });
+
+    it("fail at revoke-old: binding is already healthy on the new key; the next sweep reconciles the lingering old key", async () => {
+      const fixture = await seedPolicyBinding({ ttlSeconds: 2 * ONE_HOUR_MS / 1000 });
+      const now = new Date(Date.now() + ONE_HOUR_MS);
+      const agents = agentService(db);
+
+      const result = await sweep(now, {
+        deps: {
+          revokeKey: async (agentId: string, keyId: string) => {
+            if (keyId === fixture.keyId) throw new Error("injected revoke failure");
+            return agents.revokeKey(agentId, keyId);
+          },
+        },
+      });
+      expect(result).toMatchObject({ policies: 1, failed: 1 });
+
+      // The invariant held anyway: latest resolves to the NEW live key.
+      const latest = await resolveLatest(fixture.companyId, fixture.agentId, fixture.secretId);
+      expect(latest).not.toBe(fixture.plaintext);
+      let live = await liveKeyRows(fixture.agentId);
+      expect(live).toHaveLength(2); // new (bound) + old (lingering, unreferenced)
+      expect(eventsWith(await renewalEvents(fixture.bindingId), "failed:revoke_old")).toHaveLength(1);
+
+      // Next sweep: the new key is healthy and outside the lead window ->
+      // reconciliation revokes the lingering old key. Exactly one live key.
+      const converged = await sweep(now);
+      expect(converged.reconciled).toBeGreaterThanOrEqual(1);
+      live = await liveKeyRows(fixture.agentId);
+      expect(live).toHaveLength(1);
+      const events = await renewalEvents(fixture.bindingId);
+      expect(events.some((e) => e.trigger === "reconcile" && e.oldKeyId === fixture.keyId)).toBe(true);
+
+      function eventsWith(rows: { outcome: string }[], outcome: string) {
+        return rows.filter((row) => row.outcome === outcome);
+      }
+    });
+
+    it("crash between mint and append (stray live key): the next sweep reconciles it without touching the bound key", async () => {
+      const fixture = await seedPolicyBinding({ ttlSeconds: 20 * ONE_HOUR_MS / 1000 }); // healthy, outside lead
+      // Simulate a process crash right after minting: a live key with the
+      // pinned scope that no secret version references.
+      const stray = await agentService(db).createApiKey(
+        fixture.agentId,
+        "stray from crashed rotation",
+        fixture.policy.scope as never,
+        { ttlSeconds: 2 * ONE_HOUR_MS / 1000 },
+      );
+
+      const result = await sweep(new Date());
+
+      expect(result).toMatchObject({ policies: 1, renewed: 0, reconciled: 1, failed: 0 });
+      const live = await liveKeyRows(fixture.agentId);
+      expect(live).toHaveLength(1);
+      expect(live[0].id).toBe(fixture.keyId); // the bound key survived
+      expect(await resolveLatest(fixture.companyId, fixture.agentId, fixture.secretId)).toBe(fixture.plaintext);
+      const events = await renewalEvents(fixture.bindingId);
+      expect(events.some((e) => e.trigger === "reconcile" && e.oldKeyId === stray.id)).toBe(true);
+    });
+  });
+
+  it("a corrupt/drifted policy row suspends as policy_invalid (fail-closed) instead of being trusted", async () => {
+    const fixture = await seedPolicyBinding({ ttlSeconds: 2 * ONE_HOUR_MS / 1000 });
+    // Drift the stored policy into an invalid shape (hostile fat TTL field).
+    await db
+      .update(companySecretBindings)
+      .set({
+        autoRenewPolicy: {
+          ...fixture.policy,
+          scope: { ...fixture.policy.scope, ttlSeconds: 999_999_999 },
+        } as never,
+      })
+      .where(eq(companySecretBindings.id, fixture.bindingId));
+
+    const result = await sweep(new Date(Date.now() + ONE_HOUR_MS));
+
+    expect(result).toMatchObject({ policies: 1, suspended: 1, renewed: 0, failed: 0 });
+    expect(await liveKeyRows(fixture.agentId)).toHaveLength(1);
+    const events = await renewalEvents(fixture.bindingId);
+    expect(events).toHaveLength(1);
+    expect(events[0].outcome).toBe("suspended:policy_invalid");
+  });
+
+  it("secretService.setBindingAutoRenewPolicy: stores, clears, and refuses non-bridge binding shapes", async () => {
+    const fixture = await seedPolicyBinding({ policy: null });
+    const svc = secretService(db);
+    const policy = policyFixture(pinnedScope());
+
+    await svc.setBindingAutoRenewPolicy({ companyId: fixture.companyId, bindingId: fixture.bindingId, policy });
+    let [row] = await db.select().from(companySecretBindings).where(eq(companySecretBindings.id, fixture.bindingId));
+    expect(row.autoRenewPolicy).toEqual(policy);
+
+    // Clearing returns to default-deny.
+    await svc.setBindingAutoRenewPolicy({ companyId: fixture.companyId, bindingId: fixture.bindingId, policy: null });
+    [row] = await db.select().from(companySecretBindings).where(eq(companySecretBindings.id, fixture.bindingId));
+    expect(row.autoRenewPolicy).toBeNull();
+
+    // A binding at any other config path is refused.
+    const [other] = await db
+      .insert(companySecretBindings)
+      .values({
+        companyId: fixture.companyId,
+        secretId: fixture.secretId,
+        targetType: "agent",
+        targetId: fixture.agentId,
+        configPath: "env.SOME_OTHER_KEY",
+        versionSelector: "latest",
+      })
+      .returning();
+    await expect(
+      svc.setBindingAutoRenewPolicy({ companyId: fixture.companyId, bindingId: other.id, policy }),
+    ).rejects.toThrow(/env\.PAPERCLIP_BRIDGE_API_KEY/i);
+  });
+
+  it("secretService.listRenewalEvents: returns the per-secret audit trail, newest first, without key material", async () => {
+    const fixture = await seedPolicyBinding({ ttlSeconds: 30 }); // expired by sweep time -> recovery
+    await sweep(new Date(Date.now() + ONE_HOUR_MS));
+
+    const events = await secretService(db).listRenewalEvents(fixture.companyId, fixture.secretId);
+    expect(events.length).toBeGreaterThanOrEqual(1);
+    expect(events[0]).toMatchObject({ bindingId: fixture.bindingId, agentId: fixture.agentId });
+    // No plaintext or key hashes anywhere in the serialized audit trail.
+    const serialized = JSON.stringify(events);
+    expect(serialized).not.toContain(fixture.plaintext);
+  });
+});
+
+describe("scopeEquals (canonical task_bridge scope equality)", () => {
+  // One effective scope in two shapes, mirroring the AC-4 fixtures above.
+  function unitPair() {
+    const projectId = randomUUID();
+    const parentIssueIds = [randomUUID(), randomUUID()];
+    const allowedAssigneeAgentIds = [randomUUID()];
+    return {
+      singular: { kind: "task_bridge" as const, projectId, parentIssueIds, allowedAssigneeAgentIds },
+      plural: { kind: "task_bridge" as const, projectIds: [projectId], parentIssueIds, allowedAssigneeAgentIds },
+    };
+  }
+
+  it("null never equals null: two non-task_bridge shapes must not alias to equal", () => {
+    expect(scopeEquals(null, null)).toBe(false);
+    expect(scopeEquals(undefined, undefined)).toBe(false);
+    expect(scopeEquals("task_bridge", "task_bridge")).toBe(false);
+    expect(scopeEquals({ kind: "standard" }, { kind: "standard" })).toBe(false);
+  });
+
+  it("a non-canonicalizable side never equals a real task_bridge scope (either argument order)", () => {
+    const { singular } = unitPair();
+    expect(scopeEquals(null, singular)).toBe(false);
+    expect(scopeEquals(singular, null)).toBe(false);
+    expect(scopeEquals({ kind: "standard" }, singular)).toBe(false);
+  });
+
+  it("shape-equivalent task_bridge scopes still compare equal (the fix must not overcorrect)", () => {
+    const { singular, plural } = unitPair();
+    expect(scopeEquals(singular, plural)).toBe(true);
+    expect(scopeEquals(plural, singular)).toBe(true);
+  });
+
+  it("a genuinely different effective set still compares unequal", () => {
+    const { singular } = unitPair();
+    const different = { ...singular, projectId: randomUUID() };
+    expect(scopeEquals(singular, different)).toBe(false);
+  });
+
+  it("an own __proto__ key (JSON.parse-planted) is preserved as unknown structure — never equal to the clean pin", () => {
+    const { singular } = unitPair();
+    // JSON text, not an object literal: `{"__proto__": "x"}` in literal syntax
+    // would hit the prototype setter (a no-op for strings), while JSON.parse
+    // creates a genuine own data property — the only in-process shape a
+    // corrupted jsonb row can produce.
+    const planted = JSON.parse(`${JSON.stringify(singular).slice(0, -1)},"__proto__":"payload"}`);
+    expect(Object.prototype.hasOwnProperty.call(planted, "__proto__")).toBe(true); // fixture guard
+    expect(scopeEquals(planted, singular)).toBe(false);
+    expect(scopeEquals(singular, planted)).toBe(false);
+  });
+
+  it("a preserved __proto__ key participates deterministically — identical corruptions still compare equal", () => {
+    const { singular } = unitPair();
+    const withProto = (payload: string) =>
+      JSON.parse(`${JSON.stringify(singular).slice(0, -1)},"__proto__":${JSON.stringify(payload)}}`);
+    expect(scopeEquals(withProto("payload"), withProto("payload"))).toBe(true);
+    expect(scopeEquals(withProto("payload"), withProto("other"))).toBe(false);
+  });
+});
+
+describe("bindingAutoRenewPolicySchema (pinning gate)", () => {
+  const validScope = pinnedScope();
+
+  it("accepts a fully pinned task_bridge snapshot", () => {
+    expect(bindingAutoRenewPolicySchema.safeParse(policyFixture(validScope)).success).toBe(true);
+  });
+
+  it("refuses an unpinned snapshot (no parentIssueIds / allowedAssigneeAgentIds)", () => {
+    const unpinned = { ...validScope, parentIssueIds: undefined, allowedAssigneeAgentIds: undefined };
+    const result = bindingAutoRenewPolicySchema.safeParse(policyFixture(unpinned));
+    expect(result.success).toBe(false);
+  });
+
+  it("refuses a non-task_bridge scope", () => {
+    const result = bindingAutoRenewPolicySchema.safeParse(
+      policyFixture({ ...validScope, kind: "standard" } as never),
+    );
+    expect(result.success).toBe(false);
+  });
+
+  it("refuses a hostile fat-TTL field injected into the snapshot (strict schema)", () => {
+    const result = bindingAutoRenewPolicySchema.safeParse(
+      policyFixture({ ...validScope, ttlSeconds: 999_999_999 } as never),
+    );
+    expect(result.success).toBe(false);
+  });
+
+  it("accepts a plural projectIds boundary with no singular projectId (effective-set pinning)", () => {
+    const plural = {
+      ...validScope,
+      projectId: undefined,
+      projectIds: [validScope.projectId as string],
+    };
+    expect(bindingAutoRenewPolicySchema.safeParse(policyFixture(plural)).success).toBe(true);
+  });
+
+  it("refuses a snapshot with neither a singular nor a plural project boundary", () => {
+    const noProject = { ...validScope, projectId: undefined };
+    expect(bindingAutoRenewPolicySchema.safeParse(policyFixture(noProject)).success).toBe(false);
+  });
+
+  it("refuses an empty projectIds array as the only project boundary", () => {
+    const empty = { ...validScope, projectId: undefined, projectIds: [] };
+    expect(bindingAutoRenewPolicySchema.safeParse(policyFixture(empty)).success).toBe(false);
+  });
+});
+
+describe("renewalErrorCode (closed errorCode vocabulary for audit rows)", () => {
+  it("maps a Postgres unique violation on key_hash to a fixed code — no hex digest leaks", () => {
+    const err = Object.assign(
+      new Error(
+        'duplicate key value violates unique constraint "agent_api_keys_key_hash_key" Key (key_hash)=(0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef) already exists.',
+      ),
+      { code: "23505" },
+    );
+    expect(renewalErrorCode(err, "mint_error")).toBe("db_unique_violation");
+  });
+
+  it("maps Node system-error codes without any message fragment", () => {
+    const err = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:5432"), { code: "ECONNREFUSED" });
+    expect(renewalErrorCode(err, "append_version_error")).toBe("connection_refused");
+  });
+
+  it("scrubs 16+ char hex runs out of unknown-class messages", () => {
+    const code = renewalErrorCode(new Error("lookup failed for deadbeef0011223344deadbeef0011 upstream"), "f");
+    expect(code).toContain("unknown:Error:");
+    expect(code).toContain("[redacted]");
+    expect(code).not.toContain("deadbeef0011");
+  });
+
+  it("degrades nullish errors to the stage fallback and truncates to the 200-char convention", () => {
+    expect(renewalErrorCode(null, "mint_error")).toBe("mint_error");
+    expect(renewalErrorCode(undefined, "revoke_error")).toBe("revoke_error");
+    expect(renewalErrorCode(new Error("x".repeat(500)), "f").length).toBeLessThanOrEqual(200);
+  });
+
+  it("keeps the verify-stage prefix within the 200-char convention", () => {
+    const code = `verify_error:${renewalErrorCode(new Error("y".repeat(400)), "unknown", 180)}`;
+    expect(code.length).toBeLessThanOrEqual(200);
+  });
+});
+
+describe("AC-7 module boundary: the renewer registers no route and is imported only by the scheduler entry point", () => {
+  function listSourceFiles(dir: string): string[] {
+    const entries = readdirSync(dir);
+    const files: string[] = [];
+    for (const entry of entries) {
+      const full = path.join(dir, entry);
+      if (statSync(full).isDirectory()) {
+        files.push(...listSourceFiles(full));
+      } else if (entry.endsWith(".ts")) {
+        files.push(full);
+      }
+    }
+    return files;
+  }
+
+  it("no route file imports the renewal module, and server/src/index.ts is its only importer", () => {
+    const serverSrc = fileURLToPath(new URL("../", import.meta.url));
+    const importers: string[] = [];
+    for (const file of listSourceFiles(serverSrc)) {
+      const normalized = file.split(path.sep).join("/");
+      if (normalized.includes("/__tests__/")) continue;
+      const source = readFileSync(file, "utf8");
+      // Match actual import specifiers (`.../task-bridge-renewal.js`), not
+      // prose mentions of the module name in comments.
+      if (/task-bridge-renewal\.js/.test(source) && !normalized.endsWith("/services/task-bridge-renewal.ts")) {
+        importers.push(normalized);
+      }
+    }
+    expect(importers).toEqual([expect.stringMatching(/\/src\/index\.ts$/)]);
+  });
+});
