@@ -281,9 +281,16 @@ async function agentCheckoutAndPatchAttempt(
         patchData,
         runId,
       );
-      const issueRunLock = await getIssueRunLockState(board, issueId);
       trace.push(`conflictRetryPatch -> ${res.status()}: ${await res.text()}`);
-      if (res.ok() && issueRunLock.assigneeAgentId === agent.agentId) {
+      // An accepted retry PATCH is the mutation the caller asked for: the
+      // server applied patchData under the lock-holding run id. For an
+      // executor re-submit the signoff flow reassigns the issue to the
+      // reviewer in the SAME request, so the post-PATCH assignee is no longer
+      // the acting agent — requiring it here discarded a real success and
+      // routed the helper into the board-checkout fallback, which then 409s
+      // on the new status ("Board checkout failed"). Non-ok results keep
+      // flowing to the fallback below.
+      if (res.ok()) {
         return { res, trace };
       }
     }
