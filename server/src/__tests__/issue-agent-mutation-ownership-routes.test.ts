@@ -4,6 +4,14 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
 
+// The merged v2026.824.1 route graph (routes/issues.ts now transitively pulls
+// the github merge chain and the full secrets service) costs more than the
+// 5s default for the first cold module re-evaluation after this file's
+// per-test vi.resetModules(), which timed out the task-bridge deny test at
+// createApp even though the guard itself is instant. Assertions are
+// unaffected; this only widens the harness budget for this file.
+vi.setConfig({ testTimeout: 30_000 });
+
 const issueId = "11111111-1111-4111-8111-111111111111";
 const companyId = "22222222-2222-4222-8222-222222222222";
 const ownerAgentId = "33333333-3333-4333-8333-333333333333";
