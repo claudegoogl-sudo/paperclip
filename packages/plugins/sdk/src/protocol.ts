@@ -1960,7 +1960,7 @@ export interface WorkerToHostMethods {
   ];
   "issues.listAttachments": [
     params: { issueId: string; companyId: string },
-    result: IssueAttachment[],
+    result: PluginIssueAttachment[],
   ];
   "issues.getAttachmentContent": [
     params: { attachmentId: string; companyId: string; maxBytes?: number | null },

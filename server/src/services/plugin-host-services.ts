@@ -46,7 +46,6 @@ import { budgetService } from "./budgets.js";
 import { issueApprovalService } from "./issue-approvals.js";
 import { approvalService } from "./approvals.js";
 import { getStorageService } from "../storage/index.js";
-import { redactEventPayload } from "../redaction.js";
 import { subscribeCompanyLiveEvents } from "./live-events.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import path from "node:path";
@@ -1599,7 +1598,7 @@ export function buildHostServices(
     },
     async getForCompany(companyId: string): Promise<Record<string, unknown>> {
       const [configRow, override] = await Promise.all([
-        registry.getConfig(pluginId),
+        registry.getConfig(pluginId, companyId),
         registry.getCompanyConfigOverride(pluginId, companyId),
       ]);
       const base = (configRow?.configJson as Record<string, unknown> | undefined) ?? {};
@@ -2963,12 +2962,6 @@ export function buildHostServices(
           },
         });
         return interaction as any;
-      },
-      async listAttachments(params) {
-        const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
-        if (!inCompany(await issues.getById(params.issueId), companyId)) return [];
-        return (await issues.listAttachments(params.issueId)) as any;
       },
       async getAttachmentContent(params) {
         const companyId = ensureCompanyId(params.companyId);

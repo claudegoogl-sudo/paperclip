@@ -505,6 +505,7 @@ export function productivityReviewService(
         createdAt: heartbeatRuns.createdAt,
         nextAction: heartbeatRuns.nextAction,
         usageJson: heartbeatRuns.usageJson,
+        errorCode: heartbeatRuns.errorCode,
       })
       .from(heartbeatRuns)
       .where(

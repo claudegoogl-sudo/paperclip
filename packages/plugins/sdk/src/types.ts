@@ -268,9 +268,13 @@ export interface ToolRunContext {
    * behalf of the plugin worker's tenant. Use this from inside a tool
    * handler to read attachments uploaded by an agent in another company.
    *
+   * Injected by the worker RPC host when a tool handler runs; the
+   * wire-format runContext carries identity fields only, so host-side
+   * producers legitimately omit this field.
+   *
    * @see {@link ToolRunContextArtifactsClient}
    */
-  artifacts: ToolRunContextArtifactsClient;
+  artifacts?: ToolRunContextArtifactsClient;
 }
 
 /**
@@ -1926,8 +1930,6 @@ export interface PluginIssuesClient {
     input: { action: "accept" | "reject"; actorUserId?: string; reason?: string | null },
     companyId: string,
   ): Promise<{ interaction: IssueThreadInteraction; applied: boolean }>;
-  /** List attachment metadata for an issue. Requires `issue.attachments.read`. */
-  listAttachments(issueId: string, companyId: string): Promise<IssueAttachment[]>;
   /**
    * Read an attachment's content bytes (base64) through the capability-scoped
    * host bridge. Requires `issue.attachments.read`.

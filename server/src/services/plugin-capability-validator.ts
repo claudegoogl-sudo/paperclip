@@ -65,7 +65,6 @@ const OPERATION_CAPABILITIES: Record<string, readonly PluginCapability[]> = {
   "issue.interactions.read": ["issue.interactions.read"],
   "issue.attachments.list": ["issue.attachments.read"],
   "issue.attachments.get": ["issue.attachments.read"],
-  "approvals.list": ["approvals.read"],
   "approvals.get": ["approvals.read"],
   "agents.list": ["agents.read"],
   "agents.get": ["agents.read"],
