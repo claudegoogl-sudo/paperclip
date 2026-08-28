@@ -14,10 +14,6 @@ const mockRegistry = vi.hoisted(() => ({
   deleteCompanyConfigOverride: vi.fn(),
 }));
 
-const mockSecretService = vi.hoisted(() => ({
-  getById: vi.fn(),
-}));
-
 const mockLifecycle = vi.hoisted(() => ({
   load: vi.fn(),
   upgrade: vi.fn(),
@@ -45,10 +41,6 @@ vi.mock("../services/plugin-lifecycle.js", () => ({
 
 vi.mock("../services/activity-log.js", () => ({
   logActivity: vi.fn(),
-}));
-
-vi.mock("../services/secrets.js", () => ({
-  secretService: () => mockSecretService,
 }));
 
 vi.mock("../services/live-events.js", () => ({
@@ -330,7 +322,7 @@ describe.sequential("plugin install and upgrade authz", () => {
     expect(JSON.stringify(res.body ?? {})).not.toContain(companyB);
   }, 20_000);
 
-  it("allows instance admins to read instance-global plugin config", async () => {
+  it("allows instance admins to read the plugin config (company-scoped selection post-0164)", async () => {
     readyPlugin();
     const configRecord = {
       pluginId,
@@ -339,14 +331,16 @@ describe.sequential("plugin install and upgrade authz", () => {
     mockRegistry.getConfig.mockResolvedValue(configRecord);
 
     const { app } = await createApp(
-      boardActor({ userId: "admin-1", isInstanceAdmin: true, companyIds: [] }),
+      boardActor({ userId: "admin-1", isInstanceAdmin: true, companyIds: [companyA] }),
     );
 
-    const res = await request(app).get(`/api/plugins/${pluginId}/config`);
+    // Post-0164 the plugin config store is company-scoped: the caller picks the
+    // company row explicitly and the instance-admin read gate stays in front of it.
+    const res = await request(app).get(`/api/plugins/${pluginId}/config?companyId=${companyA}`);
 
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject(configRecord);
-    expect(mockRegistry.getConfig).toHaveBeenCalledWith(pluginId);
+    expect(mockRegistry.getConfig).toHaveBeenCalledWith(pluginId, companyA);
   }, 20_000);
 
   it("resolves plugin keys without probing the UUID id column for core plugin actions", async () => {
@@ -454,9 +448,12 @@ describe.sequential("plugin install and upgrade authz", () => {
 
   it("permits plugin config saves that contain secret refs (resolution is company-binding-gated)", async () => {
     readyPlugin();
+    mockSecretService.getById.mockResolvedValue({ id: secretId, companyId: companyA, status: "active" });
+    mockSecretService.syncSecretRefsForTarget.mockResolvedValue([]);
     mockRegistry.upsertConfig.mockResolvedValue({
       pluginId,
-      configJson: { apiKeyRef: "77777777-7777-4777-8777-777777777777" },
+      companyId: companyA,
+      configJson: { apiKeyRef: { type: "secret_ref", secretId, version: "latest" } },
     });
 
     const { app } = await createApp({
@@ -470,18 +467,27 @@ describe.sequential("plugin install and upgrade authz", () => {
     const res = await request(app)
       .post(`/api/plugins/${pluginId}/config`)
       .send({
+        companyId: companyA,
         configJson: {
-          apiKeyRef: "77777777-7777-4777-8777-777777777777",
+          apiKeyRef: { type: "secret_ref", secretId, version: "latest" },
         },
       });
 
-    // The kill-switch's config-save half is lifted: a secret-ref in config is
-    // only a pointer. Resolution is authorized at call time against the
-    // dispatching company's company_secret_bindings (plugin-secrets-handler),
-    // so storing the ref grants no cross-company access.
+    // A secret ref stored in config is only a pointer: the save binds it to the
+    // config-owning company (typed secret_ref shape, save-time binding sync),
+    // and resolution stays authorized at call time against that company's
+    // company_secret_bindings (plugin-secrets-handler), so storing the ref
+    // grants no cross-company access.
     expect(res.status).toBe(200);
-    expect(mockRegistry.upsertConfig).toHaveBeenCalledWith(pluginId, {
-      configJson: { apiKeyRef: "77777777-7777-4777-8777-777777777777" },
+    expect(mockSecretService.syncSecretRefsForTarget).toHaveBeenCalledWith(
+      companyA,
+      { targetType: "plugin", targetId: pluginId },
+      [expect.objectContaining({ secretId, configPath: "apiKeyRef", versionSelector: "latest" })],
+      { replaceAll: true },
+    );
+    expect(mockRegistry.upsertConfig).toHaveBeenCalledWith(pluginId, companyA, {
+      companyId: companyA,
+      configJson: { apiKeyRef: { type: "secret_ref", secretId, version: "latest" } },
     });
   }, 20_000);
 
@@ -601,7 +607,23 @@ describe.sequential("plugin per-tenant config override routes", () => {
         instanceConfigSchema: {
           type: "object",
           properties: {
-            githubPatSecretId: { type: "string", format: "secret-ref" },
+            // Post-0164 secret-ref fields carry typed { type: "secret_ref", secretId }
+            // binding objects; bare secret ids are refused at extraction time.
+            githubPatSecretId: {
+              anyOf: [
+                { type: "string", format: "secret-ref" },
+                {
+                  type: "object",
+                  properties: {
+                    type: { const: "secret_ref" },
+                    secretId: { type: "string", format: "uuid" },
+                    version: { anyOf: [{ enum: ["latest"] }, { type: "integer", minimum: 1 }] },
+                  },
+                  required: ["type", "secretId"],
+                  additionalProperties: false,
+                },
+              ],
+            },
             label: { type: "string" },
           },
         },
@@ -642,7 +664,11 @@ describe.sequential("plugin per-tenant config override routes", () => {
     const { app } = await createApp(boardActor());
     const res = await request(app)
       .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
-      .send({ configJson: { githubPatSecretId: otherTenantSecretId } });
+      .send({
+        configJson: {
+          githubPatSecretId: { type: "secret_ref", secretId: otherTenantSecretId },
+        },
+      });
     expect(res.status).toBe(422);
     expect(res.body.error).toContain("Referenced secret must belong to the target company");
     expect(mockRegistry.upsertCompanyConfigOverride).not.toHaveBeenCalled();
@@ -654,7 +680,9 @@ describe.sequential("plugin per-tenant config override routes", () => {
     const { app } = await createApp(boardActor());
     const res = await request(app)
       .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
-      .send({ configJson: { githubPatSecretId: dprSecretId } });
+      .send({
+        configJson: { githubPatSecretId: { type: "secret_ref", secretId: dprSecretId } },
+      });
     expect(res.status).toBe(422);
     expect(res.body.error).toContain("Referenced secret not found");
     expect(mockRegistry.upsertCompanyConfigOverride).not.toHaveBeenCalled();
@@ -662,6 +690,7 @@ describe.sequential("plugin per-tenant config override routes", () => {
 
   it("accepts an own-company secret-ref and forwards to upsertCompanyConfigOverride", async () => {
     readyOverridePlugin();
+    const ownCompanyRef = { type: "secret_ref", secretId: dprSecretId };
     mockSecretService.getById.mockResolvedValue({
       id: dprSecretId,
       companyId: companyA,
@@ -671,22 +700,22 @@ describe.sequential("plugin per-tenant config override routes", () => {
       id: "row-1",
       pluginId,
       companyId: companyA,
-      settingsJson: { configOverrides: { githubPatSecretId: dprSecretId } },
+      settingsJson: { configOverrides: { githubPatSecretId: ownCompanyRef } },
     });
     const { app } = await createApp(boardActor());
     const res = await request(app)
       .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
-      .send({ configJson: { githubPatSecretId: dprSecretId } });
+      .send({ configJson: { githubPatSecretId: ownCompanyRef } });
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({
       pluginId,
       companyId: companyA,
-      configJson: { githubPatSecretId: dprSecretId },
+      configJson: { githubPatSecretId: ownCompanyRef },
     });
     expect(mockRegistry.upsertCompanyConfigOverride).toHaveBeenCalledWith(
       pluginId,
       companyA,
-      { githubPatSecretId: dprSecretId },
+      { githubPatSecretId: ownCompanyRef },
     );
   });
 
@@ -1683,7 +1712,9 @@ describe.sequential("webhook token mint route", () => {
       userId: "admin-1",
       source: "session",
       isInstanceAdmin: true,
-      companyIds: [],
+      // Post-0164 config routes require an explicit companyId that the caller
+      // can access — instance admin alone no longer implies company access.
+      companyIds: [companyA],
     });
   }
 
@@ -1719,14 +1750,14 @@ describe.sequential("webhook token mint route", () => {
 
     const res = await request(app)
       .post(`/api/plugins/${pluginId}/webhooks/${endpointKey}/token`)
-      .send({});
+      .send({ companyId: companyA });
 
     expect(res.status).toBe(200);
     expect(typeof res.body.token).toBe("string");
     expect(res.body.tokenDigestConfigKey).toBe(digestKey);
 
     expect(mockRegistry.upsertConfig).toHaveBeenCalledTimes(1);
-    const persisted = mockRegistry.upsertConfig.mock.calls[0][1].configJson;
+    const persisted = mockRegistry.upsertConfig.mock.calls[0][2].configJson;
     const stored = persisted[digestKey];
     expect(typeof stored.salt).toBe("string");
     expect(typeof stored.digest).toBe("string");
@@ -1771,7 +1802,7 @@ describe.sequential("webhook token mint route", () => {
 
     const res = await request(app)
       .post(`/api/plugins/${pluginId}/webhooks/${endpointKey}/token`)
-      .send({});
+      .send({ companyId: companyA });
 
     expect(res.status).toBe(400);
     expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
@@ -1784,7 +1815,7 @@ describe.sequential("webhook token mint route", () => {
 
     const res = await request(app)
       .post(`/api/plugins/${pluginId}/webhooks/${endpointKey}/token`)
-      .send({ token: "short" });
+      .send({ companyId: companyA, token: "short" });
 
     expect(res.status).toBe(400);
     expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
@@ -1801,7 +1832,7 @@ describe.sequential("webhook token mint route", () => {
 
     const res = await request(app)
       .post(`/api/plugins/${pluginId}/webhooks/${endpointKey}/token`)
-      .send({});
+      .send({ companyId: companyA });
 
     expect(res.status).toBe(409);
     expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
