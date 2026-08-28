@@ -11177,7 +11177,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       });
 
-      await finalizeAgentStatus(run.agentId, "interrupted", message, {
+      await finalizeAgentStatus(run.agentId, "interrupted", message, undefined, {
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
       });
       interruptedRunIds.push(interrupted.id);
@@ -11923,12 +11923,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     type ScheduledRetryTransactionResult =
       | {
           outcome: "scheduled";
-          // Widened (not the full row type) because the reused-existing branch
-          // projects a trimmed column set -- see existingContinuation below.
-          run: Pick<
-            typeof heartbeatRuns.$inferSelect,
-            "id" | "status" | "agentId" | "wakeupRequestId" | "scheduledRetryAt" | "scheduledRetryAttempt"
-          >;
+          run: typeof heartbeatRuns.$inferSelect;
           reusedExisting: boolean;
         }
       | {
@@ -12012,20 +12007,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         }
 
-        // Trimmed: contextSnapshot/resultJson are never read from `existingContinuation`
-        // or its downstream aliases (retryRun / scheduleResult.run) -- both internal
-        // callers (scheduleBoundedRetryForRun's two call sites) discard the return
-        // value, and the only field consumers read are id/status/agentId/
-        // wakeupRequestId/scheduledRetry*.
         const existingContinuation = await tx
-          .select({
-            id: heartbeatRuns.id,
-            status: heartbeatRuns.status,
-            agentId: heartbeatRuns.agentId,
-            wakeupRequestId: heartbeatRuns.wakeupRequestId,
-            scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
-            scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
-          })
+          .select()
           .from(heartbeatRuns)
           .where(
             and(
@@ -12584,7 +12567,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
     }
 
-    await finalizeAgentStatus(run.agentId, "cancelled", null, {
+    await finalizeAgentStatus(run.agentId, "cancelled", null, undefined, {
       wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
     }).catch(() => undefined);
   }
@@ -14402,7 +14385,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       });
 
-      await finalizeAgentStatus(run.agentId, "failed", baseMessage, {
+      await finalizeAgentStatus(run.agentId, "failed", baseMessage, undefined, {
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
       });
       await startNextQueuedRunForAgent(run.agentId);
@@ -14594,6 +14577,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function startNextQueuedRunForAgent(agentId: string) {
     if ((await getSchedulingSuppression()).suppressed) return [];
+    const cutoff = await getWorktreeExecutionCutoff();
     // Single admission choke point for every wake source (issue-comment
     // wake, sweep, routine trigger, scheduled-retry promotion) — the account-wide
     // usage-limit quota this guards is instance-wide, so the gate must be too.
@@ -17529,7 +17513,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
 
-      await finalizeAgentStatus(agent.id, "failed", message, {
+      await finalizeAgentStatus(agent.id, "failed", message, undefined, {
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         keepIdleOnFailure: isWorkspaceSyncConflictFailure(message),
       });
@@ -17650,7 +17634,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // path owned the terminal transition. If another path already finalized
           // the run, keep that terminal outcome authoritative.
           if (setupFailureWrite.updated) {
-            await finalizeAgentStatus(run.agentId, "failed", message, {
+            await finalizeAgentStatus(run.agentId, "failed", message, undefined, {
               wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
             }).catch(() => undefined);
           }
@@ -19954,7 +19938,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await releaseIssueExecutionAndPromote(cancelled);
     }
 
-    await finalizeAgentStatus(run.agentId, "cancelled", undefined, {
+    await finalizeAgentStatus(run.agentId, "cancelled", undefined, undefined, {
       wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
     });
     await startNextQueuedRunForAgent(run.agentId);

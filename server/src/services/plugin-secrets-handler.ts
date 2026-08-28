@@ -77,6 +77,7 @@ import { envBindingSecretRefSchema } from "@paperclipai/shared";
 import { logActivity } from "./activity-log.js";
 import { logger } from "../middleware/logger.js";
 import { secretService } from "./secrets.js";
+import { unprocessable } from "../errors.js";
 import { registerRunSecretValue } from "../run-secret-registry.js";
 import { mintHandle as mintBorrowedHandle, type HandleCapture } from "../handle-vault.js";
 import type {
@@ -516,9 +517,9 @@ export function createPluginSecretsHandler(
   const serviceLimiter = createRateLimiter(globalCfg.maxAttempts, globalCfg.windowMs, now);
   const serviceRateKey = (companyId?: string) =>
     companyId ? `service:${pluginDbId}|company:${companyId}` : `service:${pluginDbId}`;
+  const log = logger.child({ service: "plugin-secrets-handler", pluginId: pluginKey });
   // Upstream company-context path rate limit (per (companyId, plugin) bucket).
   const companyContextRateLimiter = createRateLimiter(30, 60_000, now);
-
 
   const bindings: PluginSecretBindingLookup =
     options.bindings ?? {

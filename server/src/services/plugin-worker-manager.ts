@@ -1113,6 +1113,14 @@ export function createPluginWorkerHandle(
       runContextRegistry.registerBackground(pluginId, backgroundRunId, scope.companyId);
     }
 
+    // Mint a W3C `traceparent` from the active startup span, so the worker's
+    // provider span can parent to it. The host keeps the value on its own record
+    // (below) and never trusts the worker to supply the parent. Outside a
+    // measured startup step there is no active span, so this is undefined.
+    const activeStep = getActiveStepContext();
+    const traceparent = activeStep
+      ? traceparentFromContextToken(activeStep.parentContext)
+      : undefined;
     const invocation: PluginInvocationContext = {
       id: randomUUID(),
       scope: effectiveScope,

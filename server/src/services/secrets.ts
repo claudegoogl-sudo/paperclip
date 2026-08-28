@@ -76,7 +76,6 @@ import type {
 import { isSecretProviderClientError } from "../secrets/types.js";
 import { authorizationDeniedDetails, authorizationService } from "./authorization.js";
 import { findActiveServerAdapter } from "../adapters/index.js";
-import { logActivity } from "./activity-log.js";
 
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const AGENT_ACCESS_CONFIG_PATH_PREFIX = "access.";
