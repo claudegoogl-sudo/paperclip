@@ -1380,7 +1380,7 @@ describe("claude execute", () => {
           companyId: "company-1",
           name: "Claude Coder",
           adapterType: "claude_local",
-          adapterConfig: {},
+          adapterConfig: { engine: "cli" },
         },
         runtime: {
           sessionId: null,
@@ -1421,7 +1421,7 @@ describe("claude execute", () => {
           companyId: "company-1",
           name: "Claude Coder",
           adapterType: "claude_local",
-          adapterConfig: {},
+          adapterConfig: { engine: "cli" },
         },
         runtime: {
           sessionId: null,
@@ -1548,7 +1548,7 @@ describe("claude execute", () => {
             companyId: "company-1",
             name: "Claude Coder",
             adapterType: "claude_local",
-            adapterConfig: {},
+            adapterConfig: { engine: "cli" },
           },
           runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
           config: {
@@ -1749,7 +1749,7 @@ describe("claude execute", () => {
             companyId: "company-1",
             name: "Claude Coder",
             adapterType: "claude_local",
-            adapterConfig: {},
+            adapterConfig: { engine: "cli" },
           },
           runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
           config: {
@@ -1908,7 +1908,7 @@ describe("claude execute", () => {
           companyId: "company-1",
           name: "Claude Coder",
           adapterType: "claude_local",
-          adapterConfig: {},
+          adapterConfig: { engine: "cli" },
         },
         runtime: {
           sessionId: null,
