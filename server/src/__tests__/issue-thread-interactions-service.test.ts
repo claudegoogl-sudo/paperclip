@@ -2552,15 +2552,16 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       { agentId: authorAgentId },
     );
 
-    // F5: no comment involved (author self-cancel) records the dedicated
-    // "superseded" outcome, NOT "superseded_by_comment", so the audit trail never
-    // falsely claims a comment superseded it.
+    // F5: no comment involved (author self-cancel) records the "withdrawn"
+    // outcome, NOT "superseded_by_comment", so the audit trail never falsely
+    // claims a comment superseded it (upstream's union has no bare
+    // "superseded"; withdrawn is the truthful no-replacement retraction).
     expect(superseded).toMatchObject({
       id: created.id,
       status: "expired",
       result: {
         version: 1,
-        outcome: "superseded",
+        outcome: "withdrawn",
         commentId: null,
         reason: "superseded by a newer confirmation",
       },

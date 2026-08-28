@@ -3236,10 +3236,10 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
         // When a comment superseded the interaction (messenger relayed an
         // operator Telegram reply), record the comment linkage with
         // "superseded_by_comment". When no comment is involved (an authoring
-        // agent retracting its OWN ask), use the dedicated "superseded" outcome
-        // so the audit trail never falsely claims a comment superseded it
+        // agent retracting its OWN ask), record "withdrawn" so the audit trail
+        // never falsely claims a comment or a newer request superseded it
         // (truthful-audit-trail class).
-        const outcome = commentId ? "superseded_by_comment" : "superseded";
+        const outcome = commentId ? "superseded_by_comment" : "withdrawn";
         result = { version: 1, outcome, commentId, ...(reason ? { reason } : {}) };
       } else if (current.kind === "ask_user_questions") {
         result = { version: 1, answers: [], cancelled: true, cancellationReason: reason, summaryMarkdown: null };

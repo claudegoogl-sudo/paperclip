@@ -4340,7 +4340,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
       // Attachment bytes travel as content-addressed blobs/<sha256> entries,
       // deduped across the bundle; each per-task entry references its blob by
       // hash and its comment by index into the exported comments array.
-      const attachmentRows = (await issuesSvc.listAttachments(issue.id))
+      const attachmentRows = (await issuesSvc.listAttachments(issue.id, companyId))
         .slice()
         .sort((left, right) => new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime());
       const commentIndexById = new Map(comments.map((comment, index) => [comment.id, index] as const));

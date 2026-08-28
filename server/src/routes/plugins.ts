@@ -586,19 +586,21 @@ export function pluginRoutes(
   // anonymous webhook ingestion path (Step 5 of the POST handler below). Keyed
   // on the resolved plugin row id — never a URL param — so an anonymous caller
   // cannot grow the key space; the bound is the count of installed plugins.
-  // Caches the `null`/no-config case too: an endpoint that declares `auth` but
-  // has no digest configured is exactly where a presence-header flood would
-  // otherwise pay for a repeated SELECT that always fails to verify.
+  // Caches the no-config case too: an endpoint that declares `auth` but has no
+  // digest configured is exactly where a presence-header flood would otherwise
+  // pay for a repeated SELECT that always fails to verify. Plugin config rows
+  // are company-scoped, so the memo holds every configured company's row and
+  // verification accepts a digest configured for any of them.
   const webhookConfigNow = webhookDeps?.now ?? Date.now;
   const webhookConfigMemo = new Map<
     string,
-    { expiresAt: number; value: Awaited<ReturnType<typeof registry.getConfig>> }
+    { expiresAt: number; value: Awaited<ReturnType<typeof registry.listConfigs>> }
   >();
   const readWebhookConfigMemoized = async (pluginId: string) => {
     const now = webhookConfigNow();
     const hit = webhookConfigMemo.get(pluginId);
     if (hit && hit.expiresAt > now) return hit.value;
-    const value = await registry.getConfig(pluginId);
+    const value = await registry.listConfigs(pluginId);
     webhookConfigMemo.set(pluginId, {
       value,
       expiresAt: now + PLUGIN_WEBHOOK_CONFIG_MEMO_TTL_MS,
@@ -2682,10 +2684,12 @@ export function pluginRoutes(
    * is idempotent in the sense that the config always converges to a valid
    * recogniser for the token just printed.
    *
-   * Request body (optional):
-   * - `token`: bring-your-own token. Rejected below the 128-bit floor (a length
-   *   ceiling check — the explicit, discouraged escape hatch). Omit it to let
-   *   the host generate one, which is the recommended path.
+   * Request body:
+   * - `companyId`: company whose config row holds the digest (required; plugin
+   *   config is company-scoped)
+   * - `token` (optional): bring-your-own token. Rejected below the 128-bit floor
+   *   (a length ceiling check — the explicit, discouraged escape hatch). Omit it
+   *   to let the host generate one, which is the recommended path.
    *
    * Response: `{ token, endpointKey, header, tokenDigestConfigKey }`
    * Errors:
@@ -2720,7 +2724,8 @@ export function pluginRoutes(
       return;
     }
 
-    const body = req.body as { token?: unknown } | undefined;
+    const body = req.body as { token?: unknown; companyId?: unknown } | undefined;
+    const companyId = requirePluginConfigCompanyId(req, body?.companyId);
     const suppliedToken = body?.token;
     if (suppliedToken !== undefined && typeof suppliedToken !== "string") {
       res.status(400).json({ error: '"token" must be a string when provided' });
@@ -2739,7 +2744,7 @@ export function pluginRoutes(
     }
 
     // Merge into existing config so unrelated keys survive the rotation.
-    const existing = await registry.getConfig(plugin.id);
+    const existing = await registry.getConfig(plugin.id, companyId);
     // Defence in depth against a manifest that predates the install-time
     // collision guard: never blind-overwrite a config key holding anything other
     // than a prior `{salt, digest}` pair. Overwriting a secret-ref here would
@@ -2760,7 +2765,7 @@ export function pluginRoutes(
       [auth.tokenDigestConfigKey]: generated.digestConfig,
     };
 
-    await registry.upsertConfig(plugin.id, { configJson });
+    await registry.upsertConfig(plugin.id, companyId, { companyId, configJson });
     // Never log the token; the digest key is the only detail worth an audit trail.
     await logPluginMutationActivity(req, "plugin.config.updated", plugin.id, {
       pluginId: plugin.id,
@@ -3143,14 +3148,16 @@ export function pluginRoutes(
       // failing, and billing the anonymous budget anyway. Absent or empty
       // header is likewise anonymous at no cost.
       if (typeof headerValue === "string" && headerValue.length > 0) {
-        const config = await readWebhookConfigMemoized(plugin.id);
-        const verified = isVerifiedWebhookDelivery({
-          auth: webhookDecl.auth,
-          headers: req.headers,
-          config: config?.configJson,
-          pluginId: plugin.id,
-          endpointKey,
-        });
+        const configRows = await readWebhookConfigMemoized(plugin.id);
+        const verified = configRows.some((row) =>
+          isVerifiedWebhookDelivery({
+            auth: webhookDecl.auth,
+            headers: req.headers,
+            config: row.configJson,
+            pluginId: plugin.id,
+            endpointKey,
+          }),
+        );
         if (verified) tier = "verified";
       }
     }
