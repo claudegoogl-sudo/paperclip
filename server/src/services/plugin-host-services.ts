@@ -937,8 +937,9 @@ export function buildHostServices(
   const noPluginAvailabilityGate = async (_companyId: string) => {};
 
   /**
-   * SECURITY-CRITICAL: real, method-scoped availability gate for the reconcile reads
-   * (`approvals.list` / `interactions.list`). Unlike the instance-wide no-op
+   * SECURITY-CRITICAL: real, method-scoped availability gate for the fork-only
+   * reconcile/background reads (`approvals.listPending` / `interactions.list` /
+   * `config.getForServiceScope`). Unlike the instance-wide no-op
    * stub above, this fail-closes so a cross-tenant-sensitive enumeration can
    * never run for a company the plugin is not genuinely provisioned for. It is
    * deliberately NOT wired into the existing handlers (whose per-entity

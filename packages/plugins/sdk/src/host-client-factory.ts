@@ -634,8 +634,15 @@ const METHOD_CAPABILITY_MAP: Record<
  *
  * The bar for membership is that the call cannot widen which companies/entities
  * the plugin can reach beyond what a host-pinned dispatch already allows — the
- * `serviceScope` only relaxes *timing* (act while idle), never reach. A
- * distinct safety argument per entry:
+ * `serviceScope` only relaxes *timing* (act while idle), never reach.
+ *
+ * MEMBERSHIP INVARIANT: an entry is admissible only when a compensating
+ * server-side per-company reach-check backs it (`requireInCompany` or
+ * `requirePluginEnabledForCompany`). A method the host cannot reach-check
+ * server-side per company must never join this set — bridge-level guards
+ * alone are not sufficient.
+ *
+ * A distinct safety argument per entry:
  *
  *  - `state.get` / `state.set` / `state.delete`: company-scoped plugin state is
  *    the plugin's OWN data, partitioned by `(pluginId, company)`. Reading or
