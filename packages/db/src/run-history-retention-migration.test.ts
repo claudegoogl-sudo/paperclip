@@ -16,7 +16,7 @@ import {
 // agent_wakeup_requests FK strict so a bad prune fails loudly, and (c) install
 // partial indexes that keep the prune predicate off a Seq Scan.
 
-const MIGRATION_URL = new URL("./migrations/0143_run_history_retention.sql", import.meta.url);
+const MIGRATION_URL = new URL("./migrations/0230_run_history_retention.sql", import.meta.url);
 
 const cleanups: Array<() => Promise<void>> = [];
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
