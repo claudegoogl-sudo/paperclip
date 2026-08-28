@@ -81,6 +81,9 @@ const mockInstanceSettingsService = vi.hoisted(() => ({
     general: { censorUsernameInLogs: false, feedbackDataSharingPreference: "prompt" },
   })),
   listCompanyIds: vi.fn(async () => ["company-1"]),
+  // Upstream v2026.824.1: external-object service probes the experimental flag
+  // at route construction; default it off so the stub matches real behavior.
+  getExperimental: vi.fn(async () => ({ enableExternalObjects: false })),
 }));
 const mockRoutineService = vi.hoisted(() => ({
   syncRunStatusForIssue: vi.fn(async () => undefined),
@@ -150,6 +153,15 @@ vi.mock("../services/index.js", () => ({
   projectService: () => ({}),
   routineService: () => mockRoutineService,
   workProductService: () => ({}),
+  // Upstream v2026.824.1 additions pulled in by the merged routes/issues.ts.
+  companySkillService: () => ({}),
+  companySearchService: () => ({}),
+  inboxAgentPolicyService: () => ({}),
+  ISSUE_LIST_DEFAULT_LIMIT: 500,
+  ISSUE_LIST_MAX_LIMIT: 1000,
+  clampIssueListLimit: (limit: number) => limit ?? 500,
+  publishActivity: vi.fn(async () => {}),
+  projectInteractionForPluginEvent: vi.fn(() => null),
 }));
 
 // Hoist the SUT module load OUT OF the test body. The first dynamic import of
