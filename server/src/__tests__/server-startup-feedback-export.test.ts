@@ -200,21 +200,26 @@ vi.mock("detect-port", () => ({
   default: detectPortMock,
 }));
 
-vi.mock("@paperclipai/db", () => ({
-  createDb: createDbMock,
-  ensurePostgresDatabase: vi.fn(),
-  getPostgresDataDirectory: vi.fn(),
-  inspectMigrations: vi.fn(async () => ({ status: "upToDate" })),
-  inspectMigrationPreflight: vi.fn(async () => ({ pending: [], drift: [], unverifiable: [] })),
-  applyPendingMigrations: vi.fn(),
-  reconcilePendingMigrationHistory: vi.fn(async () => ({ repairedMigrations: [] })),
-  formatDatabaseBackupResult: vi.fn(() => "ok"),
-  runDatabaseBackup: vi.fn(),
-  authUsers: {},
-  companies: {},
-  companyMemberships: {},
-  instanceUserRoles: {},
-}));
+vi.mock(import("@paperclipai/db"), async (importOriginal) => {
+  // Booting the real server index pulls in nearly every service module, and
+  // service modules build sql templates from real schema tables at import time
+  // (e.g. successful-run-handoff-state.ts reads heartbeatRuns.contextSnapshot).
+  // Keep the actual schema exports and override only the side-effecting db
+  // functions index.ts calls during startup.
+  const actual = await importOriginal<typeof import("@paperclipai/db")>();
+  return {
+    ...actual,
+    createDb: createDbMock,
+    ensurePostgresDatabase: vi.fn(),
+    getPostgresDataDirectory: vi.fn(),
+    inspectMigrations: vi.fn(async () => ({ status: "upToDate" })),
+    inspectMigrationPreflight: vi.fn(async () => ({ pending: [], drift: [], unverifiable: [] })),
+    applyPendingMigrations: vi.fn(),
+    reconcilePendingMigrationHistory: vi.fn(async () => ({ repairedMigrations: [] })),
+    formatDatabaseBackupResult: vi.fn(() => "ok"),
+    runDatabaseBackup: vi.fn(),
+  };
+});
 
 vi.mock("../app.js", () => ({
   createApp: createAppMock,
@@ -520,11 +525,14 @@ describe("startServer feedback export wiring", () => {
       heartbeatSchedulerEnabled: false,
       heartbeatSchedulerIntervalMs: 30000,
     }));
-    let intervalCallback: (() => void) | null = null;
+    // Startup registers several independent intervals (egress posture, task-bridge
+    // renewal, ...), so select the scheduler tick by its interval instead of
+    // grabbing whichever callback registered last.
+    const registeredIntervals: Array<{ callback: () => void; ms: number }> = [];
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
-      .mockImplementation(((callback: () => void) => {
-        intervalCallback = callback;
+      .mockImplementation(((callback: () => void, ms?: number) => {
+        registeredIntervals.push({ callback, ms: ms ?? 0 });
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
 
@@ -536,8 +544,9 @@ describe("startServer feedback export wiring", () => {
       // reaped at startup and on the interval.
       expect(heartbeatServiceFactoryMock).toHaveBeenCalledTimes(1);
       expect(heartbeatServiceMock.sweepPendingCleanupLeases).toHaveBeenCalled();
-      expect(intervalCallback).not.toBeNull();
-      intervalCallback?.();
+      const schedulerTicks = registeredIntervals.filter((entry) => entry.ms === 30000);
+      expect(schedulerTicks).toHaveLength(1);
+      schedulerTicks[0]?.callback();
       await Promise.resolve();
       await Promise.resolve();
 
