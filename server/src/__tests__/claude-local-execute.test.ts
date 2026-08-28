@@ -1389,6 +1389,7 @@ describe("claude execute", () => {
           taskKey: null,
         },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           instructionsFilePath: instructionsPath,
@@ -1430,6 +1431,7 @@ describe("claude execute", () => {
           taskKey: null,
         },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           instructionsFilePath: instructionsPath,
@@ -1552,6 +1554,7 @@ describe("claude execute", () => {
           },
           runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
           config: {
+            engine: "cli",
             command: commandPath,
             cwd: workspace,
             promptTemplate: "Follow the paperclip heartbeat.",
@@ -1616,8 +1619,10 @@ describe("claude execute", () => {
       );
 
       expect(result.completedDirty).toBe(true);
+      // Merged contract: quota wording classifies as provider_quota, recorded as
+      // teardown diagnostics so the follow-up investigation can group it.
       expect(result.resultJson?.dirtyExit).toMatchObject({
-        teardownErrorCode: "claude_transient_upstream",
+        teardownErrorCode: "provider_quota",
       });
       // Recorded as diagnostics only; the retry contract stays unset.
       expect(result.errorFamily ?? null).toBeNull();
@@ -1728,7 +1733,9 @@ describe("claude execute", () => {
       );
 
       expect(result.completedDirty ?? false).toBe(false);
-      expect(result.errorFamily).toBe("transient_upstream");
+      // Merged contract: the upstream quota family label; the invariant under
+      // test — a session-limit result is never a completed run — is unchanged.
+      expect(result.errorFamily).toBe("provider_quota");
     });
   });
 
@@ -1753,6 +1760,7 @@ describe("claude execute", () => {
           },
           runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
           config: {
+            engine: "cli",
             command: commandPath,
             cwd: workspace,
             promptTemplate: "Follow the paperclip heartbeat.",
@@ -1818,7 +1826,7 @@ describe("claude execute", () => {
     });
   });
 
-  it("treats subtype=success results as successful even when the process exits nonzero", async () => {
+  it("records a subtype=success result whose process exits nonzero as completedDirty (fork dirty-exit contract)", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-success-subtype-"));
     const workspace = path.join(root, "workspace");
     const commandPath = path.join(root, "claude");
@@ -1866,8 +1874,15 @@ describe("claude execute", () => {
       });
 
       expect(result.exitCode).toBe(1);
-      expect(result.errorMessage).toBeNull();
-      expect(result.errorCode).toBeNull();
+      // Fork contract (supersedes upstream's success-despite-nonzero-exit): the
+      // work reported success but the process died, so the run is succeeded_dirty
+      // — retained for follow-up investigation, never a transient failure.
+      expect(result.completedDirty).toBe(true);
+      expect(result.errorMessage ?? "").toContain("exited with code 1");
+      expect(result.errorCode).toBe("dirty_exit");
+      expect(result.errorFamily ?? null).toBeNull();
+      expect(result.retryNotBefore ?? null).toBeNull();
+      // The agent's own summary still survives so the operator can see what it did.
       expect(result.summary).toBe("Implemented the requested change.");
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
@@ -1917,6 +1932,7 @@ describe("claude execute", () => {
           taskKey: null,
         },
         config: {
+          engine: "cli",
           command: commandPath,
           cwd: workspace,
           promptTemplate: "Follow the paperclip heartbeat.",
@@ -1926,8 +1942,11 @@ describe("claude execute", () => {
         onLog: async () => {},
       });
 
-      expect(result.errorCode).toBe("claude_transient_upstream");
-      expect(result.errorFamily).toBe("transient_upstream");
+      // Merged contract: the upstream quota family carries the classification,
+      // while every fork invariant is preserved — reset-time retry horizon,
+      // no-op-dispatch provenance for the bounded retry ladder.
+      expect(result.errorCode).toBe("provider_quota");
+      expect(result.errorFamily).toBe("provider_quota");
       expect(result.retryNotBefore).toBe("2026-07-26T13:50:00.000Z");
       expect(result.resultJson?.noOpDispatch).toBe(true);
       expect(result.resultJson?.noOpDispatchReason).toBe("pre_turn_rate_limit");

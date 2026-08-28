@@ -1280,7 +1280,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
     // Classify *why* teardown went wrong so the follow-up investigation can group
     // these, but keep it out of `errorFamily`/`retryNotBefore`: the work is done,
-    // so this run must never feed the transient-retry machinery.
+    // so this run must never feed the transient-retry machinery. Under the merged
+    // v2026.824.1 contract the upstream quota classifier wins over the fork's
+    // transient classifier, so quota-worded teardowns are recorded as
+    // `provider_quota` diagnostics.
     const dirtyTeardownCode = completedDirty
       ? isClaudeTransientUpstreamError({
           parsed,
@@ -1289,6 +1292,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage,
         })
         ? "claude_transient_upstream"
+        : isClaudeProviderQuotaError({
+          parsed,
+          stdout: proc.stdout,
+          stderr: proc.stderr,
+          errorMessage,
+        })
+        ? "provider_quota"
         : proc.signal
         ? `signal_${proc.signal}`
         : `exit_${proc.exitCode ?? -1}`
@@ -1313,7 +1323,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage,
         })
       : null;
-    const preTurnRateLimit = transientUpstream && isClaudePreTurnRateLimitResult(parsed);
+    // A 429 that never reached the model is a no-op dispatch regardless of which
+    // family the merged classifier assigns it (upstream quota vs fork transient).
+    const preTurnRateLimit =
+      (providerQuota || transientUpstream) && isClaudePreTurnRateLimitResult(parsed);
     const resolvedErrorCode = loginMeta.requiresLogin
       ? "claude_auth_required"
       : failed && isClaudeModelNotFoundError({

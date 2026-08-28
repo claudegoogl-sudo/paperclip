@@ -355,8 +355,16 @@ describe("isClaudeTransientUpstreamError", () => {
     ).toBe(false);
   });
 
-  it("classifies the session-limit failure as transient", () => {
-    expect(isClaudeTransientUpstreamError({ parsed: SESSION_LIMIT_RESULT })).toBe(true);
+  it("classifies the session-limit failure as provider quota (merged contract)", () => {
+    // v2026.824.1's quota classifier wins over the fork's transient classifier
+    // for subscription-limit wording; the reset horizon is still extracted for
+    // the retry backoff either way.
+    expect(isClaudeProviderQuotaError({ parsed: SESSION_LIMIT_RESULT })).toBe(true);
+    expect(isClaudeTransientUpstreamError({ parsed: SESSION_LIMIT_RESULT })).toBe(false);
+    const now = new Date("2026-07-26T12:30:00.000Z");
+    expect(extractClaudeRetryNotBefore({ parsed: SESSION_LIMIT_RESULT }, now)?.toISOString()).toBe(
+      "2026-07-26T13:50:00.000Z",
+    );
   });
 
   it("does not classify max-turns or unknown-session as transient", () => {

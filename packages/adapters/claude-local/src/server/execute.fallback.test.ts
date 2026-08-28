@@ -86,10 +86,14 @@ async function runExecute(adapterConfigModel: {
       companyId: "company-1",
       name: "Claude Coder",
       adapterType: "claude_local",
-      adapterConfig: {},
+      // These tests pin CLI-semantics (mocked runChildProcess); the merged
+      // adapter default (auto, ACP-preferred) would reroute them onto the ACP
+      // executor, which the mock never sees.
+      adapterConfig: { engine: "cli" },
     },
     runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
     config: {
+      engine: "cli",
       command: "claude",
       model: adapterConfigModel.model,
       ...(adapterConfigModel.fallbackModel ? { fallbackModel: adapterConfigModel.fallbackModel } : {}),

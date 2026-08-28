@@ -59,11 +59,17 @@ function defaultTimeoutSecForAdapter(adapterType: string) {
  * `idle` so it wakes again once `retryNotBefore` elapses. Parking it in `error`
  * takes the agent out of service for the entire limit window, which is how a
  * weekly limit removed a company's escalation path for days.
+ *
+ * Under the merged v2026.824.1 contract the same door-rejections can arrive as
+ * the upstream `provider_quota` family, and the finalize path passes upstream's
+ * `keepIdleOnFailure` flag for the same cases — all three spell "not the
+ * agent's fault, keep it schedulable".
  */
 export function resolveAgentStatusAfterRun(input: {
   outcome: HeartbeatRunOutcome;
   runningRunCount: number;
   errorFamily?: string | null;
+  keepIdleOnFailure?: boolean;
 }): "running" | "idle" | "error" {
   if (input.runningRunCount > 0) return "running";
   if (
@@ -73,7 +79,12 @@ export function resolveAgentStatusAfterRun(input: {
   ) {
     return "idle";
   }
-  if (input.outcome === "failed" && input.errorFamily === "transient_upstream") {
+  if (
+    input.outcome === "failed" &&
+    (input.errorFamily === "transient_upstream" ||
+      input.errorFamily === "provider_quota" ||
+      input.keepIdleOnFailure === true)
+  ) {
     return "idle";
   }
   return "error";
