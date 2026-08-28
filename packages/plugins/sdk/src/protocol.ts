@@ -1909,10 +1909,6 @@ export interface WorkerToHostMethods {
     params: { issueId: string; companyId: string },
     result: IssueComment[],
   ];
-  "issues.listAttachments": [
-    params: { issueId: string; companyId: string },
-    result: PluginIssueAttachment[],
-  ];
   "issues.createComment": [
     params: {
       issueId: string;

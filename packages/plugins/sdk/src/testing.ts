@@ -1736,11 +1736,6 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
           comment.deletedAt ? { ...comment, body: "", presentation: null, metadata: null } : comment
         );
       },
-      async listAttachments(issueId, companyId) {
-        requireCapability(manifest, capabilitySet, "issue.attachments.read");
-        if (!isInCompany(issues.get(issueId), companyId)) return [];
-        return issueAttachments.get(issueId) ?? [];
-      },
       async createComment(issueId, body, companyId, options) {
         requireCapability(manifest, capabilitySet, "issue.comments.create");
         if (options?.actorUserId) {

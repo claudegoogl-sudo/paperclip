@@ -66,7 +66,7 @@ export class CapabilityDeniedError extends Error {
   override readonly name = "CapabilityDeniedError";
   readonly code = PLUGIN_RPC_ERROR_CODES.CAPABILITY_DENIED;
 
-  constructor(pluginId: string, method: string, capability: PluginCapability) {
+  constructor(pluginId: string, method: string, capability: string) {
     super(
       `Plugin "${pluginId}" is missing required capability "${capability}" for method "${method}"`,
     );
@@ -541,7 +541,6 @@ const METHOD_CAPABILITY_MAP: Record<
   "issues.listInteractions": "issue.interactions.read",
   "issues.respondInteraction": "issue.interactions.respond",
   "issues.resolveInteraction": "issue.interactions.resolve",
-  "issues.listAttachments": "issue.attachments.read",
   "issues.getAttachmentContent": "issue.attachments.read",
 
   // Approvals — fork keeps the reconcile-read grant as an accepted
@@ -869,22 +868,13 @@ export function createHostClientHandlers(
       );
     }
 
-    const allowedCompanyId = readNonEmptyString(context?.invocationScope?.companyId);
-
     if (requested.kind === "all") {
       if (method === "companies.list") return;
-      if (!allowedCompanyId) {
-        throw new InvocationScopeDeniedError(pluginId, method, "company context is required");
-      }
       throw new InvocationScopeDeniedError(
         pluginId,
         method,
         `the current invocation is scoped to company "${allowedCompanyId}"`,
       );
-    }
-
-    if (!allowedCompanyId) {
-      throw new InvocationScopeDeniedError(pluginId, method, "company context is required");
     }
 
     if (requested.companyId !== allowedCompanyId) {
@@ -1003,7 +993,7 @@ export function createHostClientHandlers(
       if (scopedCompanyId) {
         return services.config.get({ ...params, companyId: scopedCompanyId }, context);
       }
-      return services.config.get();
+      return services.config.get(params, context);
     }),
 
     "localFolders.declarations": gated("localFolders.declarations", async (params) => {
@@ -1281,9 +1271,6 @@ export function createHostClientHandlers(
     "issues.resolveInteraction": gated("issues.resolveInteraction", async (params) => {
       return services.issues.resolveInteraction(params);
     }),
-    "issues.listAttachments": gated("issues.listAttachments", async (params) => {
-      return services.issues.listAttachments(params);
-    }),
     "issues.getAttachmentContent": gated("issues.getAttachmentContent", async (params) => {
       return services.issues.getAttachmentContent(params);
     }),
@@ -1451,6 +1438,6 @@ export function createHostClientHandlers(
  */
 export function getRequiredCapability(
   method: WorkerToHostMethodName,
-): PluginCapability | null {
+): PluginCapability | PluginCapability[] | null {
   return METHOD_CAPABILITY_MAP[method];
 }
