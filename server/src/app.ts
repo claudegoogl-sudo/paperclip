@@ -742,7 +742,6 @@ export async function createApp(
       return plugin?.status === "ready" ? plugin.packagePath ?? null : null;
     },
   );
-  );
   api.use(
     pluginRoutes(
       db,

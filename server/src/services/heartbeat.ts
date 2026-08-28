@@ -751,6 +751,7 @@ function isRetryableInteractionContinuationInfrastructureFailure(
     isSandboxProviderWorkerUnavailableFailureMessage(resultJson.errorMessage) ||
     isSandboxProviderWorkerUnavailableFailureMessage(resultJson.message)
   );
+}
 function isNoOpDispatchRun(run: Pick<typeof heartbeatRuns.$inferSelect, "resultJson">) {
   return parseObject(run.resultJson).noOpDispatch === true;
 }
