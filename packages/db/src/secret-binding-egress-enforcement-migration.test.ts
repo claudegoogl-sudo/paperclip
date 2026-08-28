@@ -23,7 +23,7 @@ import {
 // the log-only rollout flip.
 
 const MIGRATION_URL = new URL(
-  "./migrations/0138_secret_binding_egress_allowlist.sql",
+  "./migrations/0225_secret_binding_egress_allowlist.sql",
   import.meta.url,
 );
 
@@ -33,8 +33,8 @@ const MIGRATION_URL = new URL(
 // detach it while it recreates that shape. Replaying the file is how it goes
 // back: 0144 is idempotent by construction, so restoring this way cannot drift
 // from the trigger the migration actually defines.
-const MIGRATION_0144_URL = new URL(
-  "./migrations/0144_secret_binding_posture_audit.sql",
+const MIGRATION_0231_URL = new URL(
+  "./migrations/0231_secret_binding_posture_audit.sql",
   import.meta.url,
 );
 const POSTURE_AUDIT_TRIGGER = "company_secret_binding_posture_audit_trg";
@@ -150,7 +150,7 @@ describeEmbeddedPostgres("secret binding egress enforcement migration (0138) con
         const { bindingId } = await seedBinding(sql, "rollout");
 
         await reapplyMigration0138(sql);
-        await reapplyMigration(sql, MIGRATION_0144_URL);
+        await reapplyMigration(sql, MIGRATION_0231_URL);
 
         const [row] = await sql<{ egress_allowlist_enforced: boolean; allowed_egress: string[] }[]>`
           SELECT egress_allowlist_enforced, allowed_egress

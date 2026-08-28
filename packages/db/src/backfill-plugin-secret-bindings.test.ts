@@ -24,7 +24,7 @@ if (!embeddedPostgresSupport.supported) {
 }
 
 const BACKFILL_SQL = fs.readFileSync(
-  new URL("./migrations/0137_backfill_plugin_secret_bindings.sql", import.meta.url),
+  new URL("./migrations/0224_backfill_plugin_secret_bindings.sql", import.meta.url),
   "utf8",
 );
 
@@ -106,9 +106,11 @@ describeEmbeddedPostgres("0100 backfill company_secret_bindings", () => {
     return id;
   }
 
-  async function setInstanceConfig(pluginId: string, config: unknown): Promise<void> {
-    await sql`INSERT INTO plugin_config (plugin_id, config_json)
-      VALUES (${pluginId}, ${sql.json(config as Json)})`;
+  async function setInstanceConfig(pluginId: string, config: unknown, companyId: string = companyA): Promise<void> {
+    // plugin_config became company-scoped (NOT NULL company_id); every case in
+    // this file seeds companyA-owned secrets, so companyA is the default owner.
+    await sql`INSERT INTO plugin_config (plugin_id, company_id, config_json)
+      VALUES (${pluginId}, ${companyId}, ${sql.json(config as Json)})`;
   }
 
   async function setCompanySettings(

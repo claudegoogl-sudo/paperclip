@@ -632,10 +632,13 @@ describe("back-fill runId for legacy SDK secrets.resolve", () => {
       expect(secretsResolve).toHaveBeenCalledTimes(1);
       // The wire payload arrived from the worker without runId; the gated
       // wrapper back-filled it from the active invocation scope (which the
-      // host populated from the outer dispatcher's runContext).
+      // host populated from the outer dispatcher's runContext). The restored
+      // upstream handler also threads the scope-validated companyId
+      // (fork test adaptation for the upstream {…params, companyId} shape).
       expect(secretsResolve.mock.calls[0]?.[0]).toEqual({
         secretRef: "11111111-1111-1111-1111-111111111111",
         runId: "run-pla673",
+        companyId: "company-a",
       });
     } finally {
       await handle.stop().catch(() => undefined);
@@ -652,23 +655,22 @@ describe("back-fill runId for legacy SDK secrets.resolve", () => {
       } as unknown as HostServices,
     });
     // No active invocation: a forged worker→host call with no
-    // paperclipInvocationId arrives. requireInvocationCompanyScope guards the
-    // company-scoped methods, but `secrets.resolve` is not company-scoped at
-    // the wrapper layer — its fail-closed gate lives in the server-side
-    // secrets handler. To make this independently testable, we invoke the
-    // gated wrapper directly with no invocation scope and assert the params
-    // are forwarded *unchanged* (no runId), so the real handler still throws
-    // `runcontext_invalid`.
+    // paperclipInvocationId arrives. Upstream's proactive company-context
+    // guard is RESTORED (host-client-factory `resolveRequiredCompanyId`), so
+    // the scope-less call is denied at the SDK layer before host services run.
+    // The server-side secrets handler keeps its own fail-close
+    // (`runcontext_invalid` / company check) as defense in depth beneath it.
     await expect(
       handlers["secrets.resolve"](
         { secretRef: "11111111-1111-1111-1111-111111111111" } as never,
         {},
       ),
-    ).resolves.toEqual("should-not-be-called");
-
-    expect(secretsResolve).toHaveBeenCalledWith({
-      secretRef: "11111111-1111-1111-1111-111111111111",
+    ).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("company context is required"),
     });
+
+    expect(secretsResolve).not.toHaveBeenCalled();
   });
 });
 
@@ -727,10 +729,12 @@ describe("back-fill runId when the worker echoes no invocation id", () => {
       expect(secretsResolve).toHaveBeenCalledTimes(1);
       // No runId AND no invocation id arrived on the wire; the host resolved
       // the single in-flight executeTool dispatch and the gated wrapper
-      // back-filled runId from its host-validated scope.
+      // back-filled runId from its host-validated scope. The restored
+      // upstream handler also threads the scope-validated companyId.
       expect(secretsResolve.mock.calls[0]?.[0]).toEqual({
         secretRef: "11111111-1111-1111-1111-111111111111",
         runId: "run-pla719",
+        companyId: "company-a",
       });
     } finally {
       await handle.stop().catch(() => undefined);
@@ -748,19 +752,20 @@ describe("back-fill runId when the worker echoes no invocation id", () => {
     });
 
     // Context with invalidInvocationScope but NO singleInFlightScope models the
-    // ambiguous case (0 or 2+ dispatches in-flight). The wrapper must forward
-    // params unchanged so the server-side secrets handler still throws
-    // `runcontext_invalid`.
+    // ambiguous case (0 or 2+ dispatches in-flight). With upstream's
+    // company-context guard restored, the SDK denies before host services run
+    // — and names the unresolvable invocation scope as the reason.
     await expect(
       handlers["secrets.resolve"](
         { secretRef: "11111111-1111-1111-1111-111111111111" } as never,
         { invalidInvocationScope: true },
       ),
-    ).resolves.toEqual("should-not-be-resolved");
-
-    expect(secretsResolve).toHaveBeenCalledWith({
-      secretRef: "11111111-1111-1111-1111-111111111111",
+    ).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("missing, expired, or unknown invocation scope"),
     });
+
+    expect(secretsResolve).not.toHaveBeenCalled();
   });
 
   it("back-fills runId from singleInFlightScope while leaving company-scope enforcement to invalidInvocationScope", async () => {
@@ -775,10 +780,12 @@ describe("back-fill runId when the worker echoes no invocation id", () => {
       } as unknown as HostServices,
     });
 
-    // secrets.resolve is not company-scoped at the wrapper layer, so
-    // invalidInvocationScope does not block it; singleInFlightScope feeds the
-    // runId back-fill. The runId originates from the host scope, never the
-    // worker params.
+    // A dispatch-attributed id-less callback (singleInFlightScope — the
+    // host-observed single in-flight dispatch, never a worker-supplied field)
+    // is the fork's legacy-worker accommodation: `forkLegacyScopeContext`
+    // presents it as the invocation scope so upstream's guard authorizes the
+    // call, and the host-derived runId back-fill rides along. The restored
+    // upstream handler shape threads the scope-validated companyId too.
     await expect(
       handlers["secrets.resolve"](
         { secretRef: "11111111-1111-1111-1111-111111111111" } as never,
@@ -793,10 +800,14 @@ describe("back-fill runId when the worker echoes no invocation id", () => {
       ),
     ).resolves.toEqual("run-pla719");
 
-    expect(secretsResolve).toHaveBeenCalledWith({
-      secretRef: "11111111-1111-1111-1111-111111111111",
-      runId: "run-pla719",
-    });
+    expect(secretsResolve).toHaveBeenCalledWith(
+      {
+        secretRef: "11111111-1111-1111-1111-111111111111",
+        runId: "run-pla719",
+        companyId: "company-a",
+      },
+      expect.anything(), // the original host call context (upstream 2-arg shape)
+    );
   });
 
   it("cannot widen company scope: a worker naming company-b is denied even when singleInFlightScope is company-a", async () => {
@@ -948,11 +959,14 @@ describe("background dispatch run-context (item 1) + redaction cleanup (item 2)"
       expect(companyId).toBe("company-a");
 
       // The worker's id-less secrets.resolve callback was back-filled with the
-      // minted background runId — NOT the worker-lifetime service runId.
+      // minted background runId — NOT the worker-lifetime service runId. The
+      // restored upstream handler also threads the scope-validated companyId
+      // (here derived from the in-flight onEvent dispatch's own scope).
       expect(secretsResolve).toHaveBeenCalledTimes(1);
       expect(secretsResolve.mock.calls[0]?.[0]).toEqual({
         secretRef: SECRET_REF,
         runId: mintedRunId,
+        companyId: "company-a",
       });
       expect(mintedRunId).not.toBe(handle.serviceRunId);
 

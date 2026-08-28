@@ -229,9 +229,10 @@ describeEmbeddedPostgres("plugin capability-escalation wiring", () => {
     const newPkg = await writePackage(newManifest);
     const pluginId = await seedPlugin(oldManifest, oldPkg);
 
-    // Plugin-scoped data that must survive the upgrade untouched.
+    // Company-scoped plugin data that must survive the upgrade untouched.
     await db.insert(pluginConfig).values({
       pluginId,
+      companyId,
       configJson: { apiBase: "https://example.test" },
     });
 

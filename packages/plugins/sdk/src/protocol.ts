@@ -2043,6 +2043,35 @@ export interface WorkerToHostMethods {
     result: PluginPendingInteraction[],
   ];
 
+  // Fork-only reconcile read of PENDING board approvals (field-minimized,
+  // provisioned-gated). Upstream's general `approvals.list` surface is
+  // unchanged; the digest targets this method so the fork contract
+  // (pending-only default, no requester/decider PII, defensive row cap)
+  // survives without diverging the public surface.
+  "approvals.listPending": [
+    params: { companyId: string },
+    result: PluginPendingApproval[],
+  ];
+
+  // Fork-only background config read: per-company effective plugin config
+  // behind the fail-closed provisioning gate. Company-scoped, read-only; the
+  // host rejects kind:"all" / missing companyId.
+  "config.getForServiceScope": [
+    params: { companyId: string },
+    result: Record<string, unknown>,
+  ];
+
+  // Fork-only worker-lifetime service-context secret read: the company is
+  // derived server-side from the secret binding (never worker-supplied) and
+  // the host-minted serviceScope is mandatory at the bridge.
+  "secrets.resolveService": [
+    params: {
+      secretRef: string | EnvSecretRefBinding;
+      configPath?: string;
+    },
+    result: string,
+  ];
+
   // Agents (read)
   "agents.list": [
     params: { companyId: string; status?: string; limit?: number; offset?: number },

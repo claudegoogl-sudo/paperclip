@@ -1,7 +1,15 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { heartbeatRuns as heartbeatRunsTable } from "@paperclipai/db";
 
+// Booting the route graph pulls in nearly every server service module; since the
+// v2026.824.1 merge that cold import alone can exceed the 5s default test
+// timeout, which killed the first tests in this file (the route module is cached
+// after the first import, so later tests never saw the cost).
+vi.setConfig({ testTimeout: 30_000 });
+
+const AGENT_RUN_ID = "44444444-4444-4444-8444-444444444444";
 const ASSIGNEE_AGENT_ID = "11111111-1111-4111-8111-111111111111";
 const PREVIOUS_AGENT_ID = "22222222-2222-4222-8222-222222222222";
 const MENTIONED_AGENT_ID = "33333333-3333-4333-8333-333333333333";
@@ -200,6 +208,9 @@ function agentActor(agentId: string) {
     agentId,
     companyId: "company-1",
     source: "agent_key",
+    // Agent writes must attribute to a heartbeat run (cross-issue influence
+    // cap rejects run-less agent writes), so agent actors carry one.
+    runId: AGENT_RUN_ID,
   };
 }
 
@@ -214,8 +225,59 @@ async function createApp(actor: Record<string, unknown> = BOARD_ACTOR) {
     (req as any).actor = actor;
     next();
   });
+  // Newer route reads go through db/tx select chains: instance-settings gating
+  // for the external-object comment sync, and the cross-issue influence cap's
+  // FOR UPDATE run lookup. Serve rows per table so those gates resolve instead
+  // of crashing on a select-less fake.
+  const instanceSettingsRow = {
+    id: "instance-settings",
+    defaultEnvironmentId: null,
+    general: {},
+    experimental: {},
+    createdAt: new Date(0),
+    updatedAt: new Date(0),
+  };
+  const actingAgentId = typeof actor.agentId === "string" ? actor.agentId : null;
+  const rowsFor = (table: unknown) => {
+    // Match on the drizzle table NAME, not object identity: server modules and
+    // this test file can resolve @paperclipai/db to separate module instances.
+    const tableName = (table as Record<symbol, string | undefined> | null | undefined)?.[Symbol.for("drizzle:Name")];
+    if (tableName === "heartbeat_runs") {
+      // The acting agent's run is bound to the issue under test, so the
+      // cross-issue cap classifies agent writes as in-scope (never cross-issue)
+      // and allows them without counting against the limit.
+      return [{
+        id: AGENT_RUN_ID,
+        companyId: "company-1",
+        agentId: actingAgentId,
+        responsibleUserId: null,
+        contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+      }];
+    }
+    return [instanceSettingsRow];
+  };
+  const selectStub = () => {
+    let rows: unknown[] = [];
+    const builder = {
+      from: (table: unknown) => ({
+        where: () => {
+          rows = rowsFor(table);
+          return thenableForUpdate;
+        },
+      }),
+    };
+    const thenableForUpdate = Object.assign(Promise.resolve().then(() => rows), {
+      for: () => thenableForUpdate,
+    }) as Promise<unknown[]> & { for: () => Promise<unknown[]> };
+    return builder;
+  };
+  const insertStub = () => ({ values: async () => [] });
+  const txStub = { select: selectStub, insert: insertStub };
   app.use("/api", issueRoutes({
-    transaction: async (callback: (tx: Record<string, never>) => Promise<unknown>) => callback({}),
+    select: selectStub,
+    insert: insertStub,
+    transaction: async (callback: (tx: Record<string, unknown>) => Promise<unknown>) =>
+      callback(txStub),
   } as any, {} as any));
   app.use(errorHandler);
   return app;

@@ -10,9 +10,13 @@
  * with only the host-minted `serviceScope` present on the call context (as the
  * worker-manager surfaces it on every worker→host call). This reproduces both
  * the messenger `getUpdates` setup()-loop resolve AND the `approval.created`
- * onEvent relay resolve, which previously failed Gate 1 with
- * `runcontext_invalid`. It asserts the token now resolves and is attributed to
- * the plugin system actor.
+ * onEvent relay resolve. Those reads must target the fork-only
+ * `secrets.resolveService` surface: upstream's `secrets.resolve` guard is
+ * restored byte-compatibly and refuses a bare-serviceScope read at the SDK
+ * seam, so `secrets.resolveService` (binding-derived company, host-minted
+ * service scope mandatory) is the contract the poll loop and onEvent relay
+ * resolve against. It asserts the token resolves and is attributed to the
+ * plugin system actor.
  *
  * The bot-token secretRef is the real messenger binding from the issue; the
  * resolved value is a TEST placeholder — no real secret material is used.
@@ -77,13 +81,24 @@ function buildWorld() {
     resolver: { resolve: async () => TEST_TOKEN },
   });
 
+  // Mirror the host wiring (plugin-host-services): the fork-only
+  // `resolveService` routes to the SAME server handler — only the SDK-side
+  // gate differs (upstream-strict company context on `secrets.resolve`,
+  // binding-derived company + mandatory service scope on
+  // `secrets.resolveService`).
+  const secretsService = {
+    resolve: secretsHandler.resolve.bind(secretsHandler),
+    resolveService: secretsHandler.resolve.bind(secretsHandler),
+    mintHandle: secretsHandler.mintHandle.bind(secretsHandler),
+  };
+
   const handlers = createHostClientHandlers({
     pluginId: PLUGIN_KEY,
     capabilities: ["secrets.read-ref"],
-    services: { secrets: secretsHandler } as never,
+    services: { secrets: secretsService } as never,
   });
 
-  return { handlers, registry };
+  return { handlers, secretsHandler, registry };
 }
 
 beforeEach(() => {
@@ -99,11 +114,12 @@ describe("service-context e2e (messenger getUpdates + onEvent)", () => {
   it("resolves the bot token from a setup()-loop tick with no dispatch in flight", async () => {
     const { handlers } = buildWorld();
 
-    // Exactly what runPollLoop does: resolve with NO runId; the only scope on
-    // the call context is the host-minted service scope.
-    const value = await handlers["secrets.resolve"](
+    // Exactly what runPollLoop does on the fork-only surface: resolveService
+    // with NO runId; the only scope on the call context is the host-minted
+    // service scope, and the company comes from the operator-created binding.
+    const value = await handlers["secrets.resolveService"](
       { secretRef: BOT_TOKEN_SECRET_REF } as never,
-      { serviceScope: { runId: SERVICE_RUN_ID } },
+      { serviceScope: { runId: SERVICE_RUN_ID } } as never,
     );
 
     expect(value).toBe(TEST_TOKEN);
@@ -132,22 +148,53 @@ describe("service-context e2e (messenger getUpdates + onEvent)", () => {
     const { handlers } = buildWorld();
 
     // The onEvent handler also resolves the token to deliver outbound; it runs
-    // as a background dispatch, again carrying only the service scope.
-    const value = await handlers["secrets.resolve"](
+    // as a background dispatch, again carrying only the service scope, again
+    // on the fork-only surface.
+    const value = await handlers["secrets.resolveService"](
       { secretRef: BOT_TOKEN_SECRET_REF } as never,
-      { serviceScope: { runId: SERVICE_RUN_ID } },
+      { serviceScope: { runId: SERVICE_RUN_ID } } as never,
     );
 
     expect(value).toBe(TEST_TOKEN);
   });
 
-  it("still fails closed (runcontext_invalid) with neither dispatch nor service scope", async () => {
+  it("denies a bare-serviceScope secrets.resolve (upstream guard restored)", async () => {
     const { handlers } = buildWorld();
 
-    // A forged worker→host call outside any dispatch and without a service
-    // scope surfaces no runId, so the server handler fails closed.
+    // The fork's former fail-open behavior is gone: `secrets.resolve` carrying
+    // only the worker-lifetime service scope is refused at the SDK seam.
+    // Background reads must target `secrets.resolveService`.
+    await expect(
+      handlers["secrets.resolve"](
+        { secretRef: BOT_TOKEN_SECRET_REF } as never,
+        { serviceScope: { runId: SERVICE_RUN_ID } } as never,
+      ),
+    ).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("company context is required"),
+    });
+  });
+
+  it("still fails closed at both layers with neither dispatch nor service scope", async () => {
+    const { handlers, secretsHandler } = buildWorld();
+
+    // SDK seam: a forged worker→host call outside any dispatch and without a
+    // service scope has no company context, so the restored upstream guard
+    // denies before the server handler runs.
     await expect(
       handlers["secrets.resolve"]({ secretRef: BOT_TOKEN_SECRET_REF } as never, {}),
+    ).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("company context is required"),
+    });
+
+    // Server seam (defense in depth): past the SDK, the handler still fails
+    // closed when the registry holds no active context for the claimed run.
+    await expect(
+      secretsHandler.resolve({
+        secretRef: BOT_TOKEN_SECRET_REF,
+        runId: "00000000-0000-4000-8000-00000000dead",
+      } as never),
     ).rejects.toMatchObject({ code: "runcontext_invalid" });
   });
 });

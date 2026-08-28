@@ -103,7 +103,7 @@ jobs:
       # link, an agent:// link, or a localhost/private-IP deep link into the
       # instance UI. Scoped to added lines only, base...head.
       - name: Reject internal/instance-local references added in this diff
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && !startsWith(github.head_ref, 'sync/upstream-')
         env:
           # Pass GitHub context through env, never interpolated into the shell
           # line: these two are GitHub-generated hex, but this is the canonical
@@ -113,6 +113,21 @@ jobs:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: node ./scripts/check-no-internal-ids.mjs
+
+      # Upstream-sync superset branches re-introduce upstream's own tree as
+      # added lines against the fork's master, so the PR-diff scan above
+      # would flag upstream-authored test fixtures and docs that the superset
+      # must carry verbatim — the same wholesale-reintroduction reasoning as
+      # the lockfile exemption above. Sync branches scan the fork-authored
+      # delta against the recorded upstream re-land base instead. Bump
+      # UPSTREAM_SYNC_BASE whenever a new sync branch re-lands a newer
+      # upstream release.
+      - name: Reject internal/instance-local references in the fork delta (sync branches)
+        if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'sync/upstream-')
+        env:
+          UPSTREAM_SYNC_BASE: 8e6edcdfa911151adba26be49a41cf5017b3aade
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node ./scripts/check-no-internal-ids.mjs "$UPSTREAM_SYNC_BASE" "$PR_HEAD_SHA"
 
       - name: Test no-internal-ids check
         run: node --test ./scripts/check-no-internal-ids.test.mjs

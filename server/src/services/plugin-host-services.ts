@@ -68,7 +68,7 @@ import {
   setStoredLocalFolder,
   writePluginLocalFolderTextAtomic,
 } from "./plugin-local-folders.js";
-import { createPluginSecretsHandler } from "./plugin-secrets-handler.js";
+import { createPluginSecretsHandler, type PluginSecretsResolveParams } from "./plugin-secrets-handler.js";
 import { createPluginArtifactsHandler } from "./plugin-artifacts-handler.js";
 import { enforcePluginConfigEgress } from "./plugin-config-egress.js";
 import { normalizeIssueAttachmentMaxBytes } from "../attachment-types.js";
@@ -923,13 +923,23 @@ export function buildHostServices(
   /**
    * Plugins are instance-wide in the current runtime. Company IDs are still
    * required for company-scoped data access, but there is no per-company
-   * availability gate to enforce here.
+   * availability gate to enforce on the GENERAL surface.
+   *
+   * SECURITY-NAMING NOTE: this is deliberately NOT named like an authz gate
+   * (and not named `ensurePluginAvailableForCompany`) because it enforces
+   * NOTHING — it is upstream's structural placeholder for a per-company
+   * availability check this runtime does not have. Reading it as a security
+   * control would be the false-assurance anti-pattern. The REAL, fail-closed
+   * availability gate is `requirePluginEnabledForCompany` below, and ONLY the
+   * fork-only reconcile/background reads (`approvals.listPending`,
+   * `interactions.list`, `config.getForServiceScope`) run it.
    */
-  const ensurePluginAvailableForCompany = async (_companyId: string) => {};
+  const noPluginAvailabilityGate = async (_companyId: string) => {};
 
   /**
-   * SECURITY-CRITICAL: real, method-scoped availability gate for the reconcile reads
-   * (`approvals.list` / `interactions.list`). Unlike the instance-wide no-op
+   * SECURITY-CRITICAL: real, method-scoped availability gate for the fork-only
+   * reconcile/background reads (`approvals.listPending` / `interactions.list` /
+   * `config.getForServiceScope`). Unlike the instance-wide no-op
    * stub above, this fail-closes so a cross-tenant-sensitive enumeration can
    * never run for a company the plugin is not genuinely provisioned for. It is
    * deliberately NOT wired into the existing handlers (whose per-entity
@@ -974,7 +984,7 @@ export function buildHostServices(
 
   const getStoredLocalFolderConfig = async (companyId: string, folderKey: string) => {
     ensureCompanyId(companyId);
-    await ensurePluginAvailableForCompany(companyId);
+    await noPluginAvailabilityGate(companyId);
     const settings = await registry.getCompanySettings(pluginId, companyId);
     return getStoredLocalFolders(settings?.settingsJson)[folderKey] ?? null;
   };
@@ -1585,25 +1595,45 @@ export function buildHostServices(
     return { resourceType, resourceId, companyId, policy: null, updatedAt: company.updatedAt };
   };
 
-  // The runtime config service exposes `getForCompany` for per-tenant
-  // effective config. The SDK's `HostServices.config` interface adds this as an
-  // optional method; the gated handler duck-types `getForCompany` via
-  // `if (services.config.getForCompany)` so the absence is safe.
+  // Fork-only effective plugin config: the company's `plugin_config` row
+  // shallow-merged with the tenant's `configOverrides` subtree. ONLY the
+  // fork-only background read (`config.getForServiceScope`) serves this merged
+  // view, so a background reconcile never sees a stale base value an operator
+  // has overridden for its tenant. The upstream-named general `config.get`
+  // deliberately stays base-only — upstream (v2026.824.1) returns
+  // `configRow?.configJson ?? {}` — so the public surface remains
+  // byte-compatible and a future sync never re-litigates it.
+  const getEffectiveCompanyConfig = async (
+    companyId: string,
+  ): Promise<Record<string, unknown>> => {
+    const [configRow, override] = await Promise.all([
+      registry.getConfig(pluginId, companyId),
+      registry.getCompanyConfigOverride(pluginId, companyId),
+    ]);
+    const base = (configRow?.configJson as Record<string, unknown> | undefined) ?? {};
+    if (!override) return { ...base };
+    return { ...base, ...override };
+  };
+
   const configService = {
     async get(params: Parameters<HostServices["config"]["get"]>[0]) {
       const companyId = ensureCompanyId(params.companyId);
-      await ensurePluginAvailableForCompany(companyId);
+      await noPluginAvailabilityGate(companyId);
+      // Base-only on purpose: upstream parity for the general surface
+      // (upstream v2026.824.1 `configRow?.configJson ?? {}`). The override
+      // merge lives on the fork-only `getForServiceScope` read below.
       const configRow = await registry.getConfig(pluginId, companyId);
       return configRow?.configJson ?? {};
     },
-    async getForCompany(companyId: string): Promise<Record<string, unknown>> {
-      const [configRow, override] = await Promise.all([
-        registry.getConfig(pluginId, companyId),
-        registry.getCompanyConfigOverride(pluginId, companyId),
-      ]);
-      const base = (configRow?.configJson as Record<string, unknown> | undefined) ?? {};
-      if (!override) return { ...base };
-      return { ...base, ...override };
+    // Fork-only background read (serviceScope-reachable; see the SDK gate).
+    // Fail-closed provisioning: unknown company / uninstalled / disabled
+    // plugin → throw, never an empty config.
+    async getForServiceScope(
+      params: Parameters<HostServices["config"]["getForServiceScope"]>[0],
+    ): Promise<Record<string, unknown>> {
+      const companyId = ensureCompanyId(params.companyId);
+      await requirePluginEnabledForCompany(companyId);
+      return getEffectiveCompanyConfig(companyId);
     },
   };
 
@@ -1617,7 +1647,7 @@ export function buildHostServices(
 
       async configure(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const declaration = getLocalFolderDeclaration(params.folderKey);
         const existing = await registry.getCompanySettings(pluginId, companyId);
         const existingConfig = getStoredLocalFolders(existing?.settingsJson)[params.folderKey] ?? null;
@@ -1743,7 +1773,7 @@ export function buildHostServices(
     events: {
       async emit(params) {
         if (params.companyId) {
-          await ensurePluginAvailableForCompany(params.companyId);
+          await noPluginAvailabilityGate(params.companyId);
         }
         await scopedBus.emit(params.name, params.companyId, params.payload);
       },
@@ -1817,8 +1847,18 @@ export function buildHostServices(
     secrets: {
       async resolve(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return secretsHandler.resolve({ ...params, companyId });
+      },
+      // Fork-only worker-lifetime service-context read. NO companyId is
+      // asserted here and no availability stub runs: the secrets handler
+      // derives the company from the secret binding (ambiguous cross-company
+      // bindings collapse to not_found), rate-limits per plugin, requires the
+      // host-minted service run-context, and registers the value with the
+      // run-scoped redactor. This keeps background secret reads (the messenger
+      // poll loop's bot token) alive on the upstream-strict bridge.
+      async resolveService(params: PluginSecretsResolveParams) {
+        return secretsHandler.resolve(params);
       },
       async mintHandle(params) {
         return secretsHandler.mintHandle(params);
@@ -1847,7 +1887,7 @@ export function buildHostServices(
     activity: {
       async log(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         await logActivity(db, {
           companyId,
           actorType: "plugin",
@@ -1950,7 +1990,7 @@ export function buildHostServices(
         return applyWindow((await companies.list()) as Company[], params);
       },
       async get(params) {
-        await ensurePluginAvailableForCompany(params.companyId);
+        await noPluginAvailabilityGate(params.companyId);
         return (await companies.getById(params.companyId)) as Company;
       },
     },
@@ -1958,18 +1998,18 @@ export function buildHostServices(
     projects: {
       async list(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return applyWindow((await projects.list(companyId)) as Project[], params);
       },
       async get(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const project = await projects.getById(params.projectId);
         return (inCompany(project, companyId) ? project : null) as Project | null;
       },
       async listWorkspaces(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const project = await projects.getById(params.projectId);
         if (!inCompany(project, companyId)) return [];
         const rows = await projects.listWorkspaces(params.projectId);
@@ -1992,7 +2032,7 @@ export function buildHostServices(
       },
       async getPrimaryWorkspace(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const project = await projects.getById(params.projectId);
         if (!inCompany(project, companyId)) return null;
         const row = project.primaryWorkspace;
@@ -2014,7 +2054,7 @@ export function buildHostServices(
 
       async getWorkspaceForIssue(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const issue = await issues.getById(params.issueId);
         if (!inCompany(issue, companyId)) return null;
         const projectId = (issue as Record<string, unknown>).projectId as string | null;
@@ -2039,7 +2079,7 @@ export function buildHostServices(
       },
       async getManaged(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return projects.resolveManagedProject({
           companyId,
           pluginId,
@@ -2050,7 +2090,7 @@ export function buildHostServices(
       },
       async reconcileManaged(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return projects.resolveManagedProject({
           companyId,
           pluginId,
@@ -2060,7 +2100,7 @@ export function buildHostServices(
       },
       async resetManaged(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return projects.resolveManagedProject({
           companyId,
           pluginId,
@@ -2074,7 +2114,7 @@ export function buildHostServices(
     executionWorkspaces: {
       async get(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const workspace = await executionWorkspaces.getById(params.workspaceId);
         if (inCompany(workspace, companyId)) {
           return toPluginExecutionWorkspaceMetadata(workspace);
@@ -2086,12 +2126,12 @@ export function buildHostServices(
     routines: {
       async managedGet(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return managedRoutines.get(params.routineKey, companyId);
       },
       async managedReconcile(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return managedRoutines.reconcile(params.routineKey, companyId, {
           assigneeAgentId: params.assigneeAgentId,
           projectId: params.projectId,
@@ -2099,7 +2139,7 @@ export function buildHostServices(
       },
       async managedReset(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return managedRoutines.reset(params.routineKey, companyId, {
           assigneeAgentId: params.assigneeAgentId,
           projectId: params.projectId,
@@ -2107,14 +2147,14 @@ export function buildHostServices(
       },
       async managedUpdate(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return managedRoutines.update(params.routineKey, companyId, {
           status: params.status,
         });
       },
       async managedRun(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return managedRoutines.run(params.routineKey, companyId, {
           assigneeAgentId: params.assigneeAgentId,
           projectId: params.projectId,
@@ -2125,17 +2165,17 @@ export function buildHostServices(
     skills: {
       async managedGet(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return managedSkills.get(params.skillKey, companyId);
       },
       async managedReconcile(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return managedSkills.reconcile(params.skillKey, companyId);
       },
       async managedReset(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return managedSkills.reset(params.skillKey, companyId);
       },
     },
@@ -2143,19 +2183,19 @@ export function buildHostServices(
     issues: {
       async list(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         assertReadableOriginFilter(params.originKind);
         return applyWindow((await issues.list(companyId, params as any)) as Issue[], params);
       },
       async get(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const issue = await issues.getById(params.issueId);
         return (inCompany(issue, companyId) ? issue : null) as Issue | null;
       },
       async create(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const { actorAgentId, actorUserId, actorRunId, originKind, surfaceVisibility, ...issueInput } = params;
         const normalizedOriginKind = normalizePluginOriginKind(
           surfaceVisibility === "plugin_operation" && !originKind
@@ -2191,7 +2231,7 @@ export function buildHostServices(
       },
       async update(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const existing = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const patch = { ...(params.patch as Record<string, unknown>) };
         const actorAgentId = typeof patch.actorAgentId === "string" ? patch.actorAgentId : null;
@@ -2228,13 +2268,13 @@ export function buildHostServices(
       },
       async getRelations(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         return await issues.getRelationSummaries(params.issueId);
       },
       async setBlockedBy(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return setBlockedByWithActivity({
           companyId,
           issueId: params.issueId,
@@ -2247,7 +2287,7 @@ export function buildHostServices(
       },
       async addBlockers(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const previous = await issues.getRelationSummaries(params.issueId);
         const nextBlockedByIssueIds = [
@@ -2268,7 +2308,7 @@ export function buildHostServices(
       },
       async removeBlockers(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const previous = await issues.getRelationSummaries(params.issueId);
         const removals = new Set(params.blockerIssueIds);
@@ -2287,7 +2327,7 @@ export function buildHostServices(
       },
       async assertCheckoutOwner(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const ownership = await issues.assertCheckoutOwner(
           params.issueId,
@@ -2321,7 +2361,7 @@ export function buildHostServices(
       },
       async getSubtree(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const rootIssue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const includeRoot = params.includeRoot !== false;
         const subtreeIssueIds = await collectIssueSubtreeIds(companyId, rootIssue.id);
@@ -2404,7 +2444,7 @@ export function buildHostServices(
       },
       async requestWakeup(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         if (!issue.assigneeAgentId) {
           throw new Error("Issue has no assigned agent to wake");
@@ -2470,7 +2510,7 @@ export function buildHostServices(
       },
       async requestWakeups(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const results = [];
         for (const issueId of [...new Set(params.issueIds)]) {
           const issue = requireInCompany("Issue", await issues.getById(issueId), companyId);
@@ -2540,7 +2580,7 @@ export function buildHostServices(
       },
       async getOrchestrationSummary(params): Promise<PluginIssueOrchestrationSummary> {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const rootIssue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const subtreeIssueIds = params.includeSubtree
           ? await collectIssueSubtreeIds(companyId, rootIssue.id)
@@ -2615,13 +2655,13 @@ export function buildHostServices(
       },
       async listComments(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         if (!inCompany(await issues.getById(params.issueId), companyId)) return [];
         return (await issues.listComments(params.issueId)) as IssueComment[];
       },
       async listAttachments(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         if (!inCompany(await issues.getById(params.issueId), companyId)) return [];
         // Narrow the host row to the plugin-facing projection:
         // raw storage addressing (provider, objectKey, sha256) and creator identity
@@ -2642,7 +2682,7 @@ export function buildHostServices(
       },
       async createComment(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         // Resolve target by identifier (e.g. an issue's public id) when no issueId is supplied.
         // requireInCompany keeps the tenant reach-check: an identifier that resolves
         // to a foreign company throws "Issue not found".
@@ -2813,7 +2853,7 @@ export function buildHostServices(
       },
       async createInteraction(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const interaction = await issueThreadInteractionService(db).create(issue, params.interaction as CreateIssueThreadInteraction, {
           agentId: params.authorAgentId ?? null,
@@ -2836,13 +2876,13 @@ export function buildHostServices(
       },
       async listInteractions(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         if (!inCompany(await issues.getById(params.issueId), companyId)) return [];
         return (await interactions.listForIssue(params.issueId)) as any;
       },
       async respondInteraction(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         // Resolving an interaction is a board-user action (the web app's
         // interaction-resolve routes are board-only). The host re-verifies the
@@ -2938,7 +2978,7 @@ export function buildHostServices(
       //    never "accepted", so no accept side-effect or continuation wake fires.
       async resolveInteraction(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const interaction = await issueThreadInteractionService(db).supersedeInteractionById(
           issue,
@@ -2965,7 +3005,7 @@ export function buildHostServices(
       },
       async getAttachmentContent(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const attachment = await issues.getAttachmentById(params.attachmentId);
         // Unknown and cross-company ids are deliberately indistinguishable to
         // the plugin: both return null (no existence oracle across companies).
@@ -3057,22 +3097,53 @@ export function buildHostServices(
     approvals: {
       async list(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const rows = await approvalSvc.list(companyId, params.status ?? undefined);
         // Match the web app's approval read surface: payloads are redacted so
         // the chat bridge never receives secrets the web app itself hides.
         return rows.map((approval) => redactApprovalPayload(approval)) as any;
       },
+      // SECURITY-CRITICAL: fork-only reconcile read of PENDING board approvals
+      // for the messenger digest. Unlike the general `list` above (upstream's
+      // public surface), this runs the real, fail-closed
+      // `requirePluginEnabledForCompany` gate before any query (Complete
+      // Mediation), defaults to pending-only, projects a field-minimized row
+      // (no requester/decider user ids, no decision notes), and bounds the
+      // response with the defensive `RECONCILE_LIST_LIMIT`. A blocker created
+      // while the plugin was down is surfaced by the pending query itself —
+      // that is the missed-blocker seeding the digest depends on.
+      async listPending(params: { companyId: string }) {
+        const companyId = ensureCompanyId(params.companyId);
+        await requirePluginEnabledForCompany(companyId);
+        const rows = await approvalSvc.list(
+          companyId,
+          "pending",
+          RECONCILE_LIST_LIMIT,
+        );
+        if (rows.length >= RECONCILE_LIST_LIMIT) {
+          logger.warn(
+            { companyId, limit: RECONCILE_LIST_LIMIT, status: "pending" },
+            "plugin approvals.listPending reconcile read hit the defensive row cap; response truncated",
+          );
+        }
+        return rows.map((row) => ({
+          id: row.id,
+          type: row.type,
+          status: row.status,
+          payload: redactEventPayload(row.payload) ?? {},
+          createdAt: row.createdAt.toISOString(),
+        }));
+      },
       async get(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const approval = await approvalSvc.getById(params.approvalId);
         if (!approval || approval.companyId !== companyId) return null;
         return redactApprovalPayload(approval) as any;
       },
       async decide(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const existing = await approvalSvc.getById(params.approvalId);
         if (!existing || existing.companyId !== companyId) {
           throw new Error(`Approval "${params.approvalId}" not found`);
@@ -3136,21 +3207,21 @@ export function buildHostServices(
     issueDocuments: {
       async list(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const rows = await documents.listIssueDocuments(params.issueId);
         return rows as any;
       },
       async get(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const doc = await documents.getIssueDocumentByKey(params.issueId, params.key);
         return (doc ?? null) as any;
       },
       async upsert(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const result = await documents.upsertIssueDocument({
           issueId: params.issueId,
@@ -3176,7 +3247,7 @@ export function buildHostServices(
       },
       async delete(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         await documents.deleteIssueDocument(params.issueId, params.key);
         await logPluginActivity({
@@ -3195,7 +3266,7 @@ export function buildHostServices(
     agents: {
       async list(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const rows = await agents.list(companyId);
         return applyWindow(
           rows.filter((agent) => !params.status || agent.status === params.status) as Agent[],
@@ -3204,27 +3275,27 @@ export function buildHostServices(
       },
       async get(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const agent = await agents.getById(params.agentId);
         return (inCompany(agent, companyId) ? agent : null) as Agent | null;
       },
       async pause(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
         return (await agents.pause(params.agentId)) as Agent;
       },
       async resume(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
         return (await agents.resume(params.agentId)) as Agent;
       },
       async invoke(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
         const run = await heartbeat.wakeup(params.agentId, {
@@ -3248,17 +3319,17 @@ export function buildHostServices(
       },
       async managedGet(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return managedAgents.get(params.agentKey, companyId);
       },
       async managedReconcile(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return managedAgents.reconcile(params.agentKey, companyId);
       },
       async managedReset(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return managedAgents.reset(params.agentKey, companyId);
       },
     },
@@ -3266,7 +3337,7 @@ export function buildHostServices(
     goals: {
       async list(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const rows = await goals.list(companyId);
         return applyWindow(
           rows.filter((goal) =>
@@ -3278,13 +3349,13 @@ export function buildHostServices(
       },
       async get(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const goal = await goals.getById(params.goalId);
         return (inCompany(goal, companyId) ? goal : null) as Goal | null;
       },
       async create(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return (await goals.create(companyId, {
           title: params.title,
           description: params.description,
@@ -3296,7 +3367,7 @@ export function buildHostServices(
       },
       async update(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         requireInCompany("Goal", await goals.getById(params.goalId), companyId);
         return (await goals.update(params.goalId, params.patch as any)) as Goal;
       },
@@ -3305,7 +3376,7 @@ export function buildHostServices(
     access: {
       async listMembers(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const rows = await access.listMembers(companyId);
         const visibleRows = params.includeArchived ? rows : rows.filter((row) => row.status !== "archived");
         const grants = await db
@@ -3328,12 +3399,12 @@ export function buildHostServices(
       },
       async getMember(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return loadPluginMember(companyId, params.memberId);
       },
       async updateMember(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const updated = await access.updateMember(companyId, params.memberId, params.patch);
         if (!updated) throw new Error("Member not found");
         await logPluginActivity({
@@ -3349,7 +3420,7 @@ export function buildHostServices(
       },
       async listInvites(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const limit = Math.min(Math.max(Number(params.limit ?? 20), 1), 100);
         const offset = Math.max(Number(params.offset ?? 0), 0);
         const stateClause = inviteStateWhereClause(params.state);
@@ -3368,7 +3439,7 @@ export function buildHostServices(
       },
       async createInvite(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const normalizedAgentMessage = typeof params.agentMessage === "string"
           ? params.agentMessage.trim() || null
           : null;
@@ -3417,7 +3488,7 @@ export function buildHostServices(
       },
       async revokeInvite(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const invite = await db
           .select()
           .from(invites)
@@ -3445,7 +3516,7 @@ export function buildHostServices(
     authorization: {
       async listGrants(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const conditions = [
           eq(principalPermissionGrants.companyId, companyId),
           params.principalType ? eq(principalPermissionGrants.principalType, params.principalType) : undefined,
@@ -3460,7 +3531,7 @@ export function buildHostServices(
       },
       async setGrants(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         if (params.principalType !== "agent" && params.principalType !== "user") {
           throw new Error("principalType must be 'agent' or 'user'");
         }
@@ -3493,7 +3564,7 @@ export function buildHostServices(
       },
       async policySummary(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const [members, grants] = await Promise.all([
           access.listMembers(companyId),
           db
@@ -3512,12 +3583,12 @@ export function buildHostServices(
       },
       async getPolicy(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return readAuthorizationPolicy(companyId, params.resourceType, params.resourceId);
       },
       async updatePolicy(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const policy = params.policy ? sanitizeRecord(params.policy) : null;
         if (params.resourceType === "agent") {
           const agent = requireInCompany("Agent", await agents.getById(params.resourceId), companyId);
@@ -3570,7 +3641,7 @@ export function buildHostServices(
       },
       async previewAssignment(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return authorization.decide({
           actor: pluginAssignmentActor(params.actor),
           action: "tasks:assign",
@@ -3586,7 +3657,7 @@ export function buildHostServices(
       },
       async explainAssignment(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return authorization.decide({
           actor: pluginAssignmentActor(params.actor),
           action: "tasks:assign",
@@ -3602,7 +3673,7 @@ export function buildHostServices(
       },
       async searchAudit(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const limit = Math.min(Math.max(Number(params.limit ?? 50), 1), 100);
         const offset = Math.max(Number(params.offset ?? 0), 0);
         const decisionFilter = typeof params.decision === "string" && params.decision.trim()
@@ -3636,7 +3707,7 @@ export function buildHostServices(
     agentSessions: {
       async create(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
         const taskKey = params.taskKey ?? `plugin:${pluginKey}:session:${randomUUID()}`;
@@ -3667,7 +3738,7 @@ export function buildHostServices(
 
       async list(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const rows = await db
           .select()
           .from(agentTaskSessionsTable)
@@ -3695,7 +3766,7 @@ export function buildHostServices(
         }
 
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
 
         // Verify session exists and belongs to this plugin
         const session = await db
@@ -3807,7 +3878,7 @@ export function buildHostServices(
 
       async close(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const deleted = await db
           .delete(agentTaskSessionsTable)
           .where(

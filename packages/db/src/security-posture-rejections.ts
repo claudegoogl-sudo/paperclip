@@ -1164,7 +1164,7 @@ export const SECURITY_POSTURE_REJECTIONS = [
     reason: "Long-running dev-service bookkeeping — ports, health, lifecycle and provider handles. The command is supplied per start request rather than re-read from this row to launch a new process.",
   },
 
-  // --- sync/upstream-v2026.824.1: columns introduced by upstream 707->824 (classified during PLA-4602) ---
+  // --- sync/upstream-v2026.824.1: columns introduced by upstream 707->824 (classified during the 824.1 superset re-land) ---
   // activity_log — fork activity log (new upstream columns); the columns below are metadata-only.
 
   {

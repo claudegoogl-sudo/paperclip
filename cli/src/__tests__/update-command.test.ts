@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flipCurrentAtomic, initializeInstallStore, payloadPathFor, readInstallManifest, resolveInstallStorePaths, writeInstallManifestAtomic, type InstallManifest, type InstallRecord } from "../install-store.js";
 import type { CommandRunner } from "../commands/install.js";
 import { compareVersions, detectInstallMode, resolveUpdateRequest, rollbackManagedInstall, updateCommand } from "../commands/update.js";
+import { packageVersion } from "../version.js";
 
 let root: string;
 let previousHome: string | undefined;
@@ -116,8 +117,13 @@ describe("update command", () => {
     vi.stubEnv("NPM_CONFIG_REGISTRY", "http://attacker-registry.invalid");
     fs.mkdirSync(process.env.HOME!, { recursive: true });
     fs.writeFileSync(path.join(process.env.HOME!, ".npmrc"), "registry=http://attacker-registry.invalid\n");
+    // The mocked registry answer must compare NEWER than the shipping CLI
+    // version or the update command treats the run as a downgrade and stops at
+    // the confirmation gate before reaching the isolation assertions; the fork
+    // ships calver (2026.x.y-fork.n), so derive it instead of hard-coding.
+    const registryVersion = `${Number(packageVersion.split(".")[0]) + 1}.0.0`;
     const runCommand = vi.fn<CommandRunner>(async (_file, args, commandOptions) => {
-      if (args[0] === "view") return { stdout: '"2.0.0"\n', stderr: "" };
+      if (args[0] === "view") return { stdout: `"${registryVersion}"\n`, stderr: "" };
       expect(args).toContain("--registry=https://registry.npmjs.org");
       expect(args).toContain("--@paperclipai:registry=https://registry.npmjs.org");
       expect(commandOptions?.env?.NPM_CONFIG_REGISTRY).toBe("https://registry.npmjs.org");

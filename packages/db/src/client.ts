@@ -134,9 +134,19 @@ export function resolveDbPoolOptions(): { max: number; statementTimeoutMs: numbe
 
 export function createDb(url: string, options?: DatabaseClientOptions) {
   const resolved = options ?? databaseClientOptionsFromEnv();
+  // Pool-size precedence (fork adaptation over upstream 824.1): explicit
+  // options win, then the upstream DATABASE_POOL_MAX variable, then the fork's
+  // PAPERCLIP_DB_POOL_MAX, then the fork default. Upstream's options refactor
+  // stopped feeding resolveDbPoolOptions().max to the driver, which silently
+  // retired PAPERCLIP_DB_POOL_MAX and shrank the default pool from
+  // DEFAULT_DB_POOL_MAX to the driver default — restored here so existing
+  // deployments keep their configured sizing.
+  const maxConnections = resolved.maxConnections
+    ?? envPositiveInteger(process.env, "DATABASE_POOL_MAX")
+    ?? resolveDbPoolOptions().max;
   const { statementTimeoutMs } = resolveDbPoolOptions();
   const sql = postgres(url, {
-    ...postgresJsOptions(resolved),
+    ...postgresJsOptions({ ...resolved, maxConnections }),
     connection: { statement_timeout: statementTimeoutMs },
   });
   // Queries issued inside a cancellation scope (see query-cancellation.ts) are

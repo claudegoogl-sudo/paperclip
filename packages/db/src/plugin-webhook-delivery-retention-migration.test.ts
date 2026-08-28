@@ -7,12 +7,12 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./test-embedded-postgres.js";
 
-// Migration 0147 makes plugin_webhook_deliveries prunable on an age + max-rows
+// Migration 0234 makes plugin_webhook_deliveries prunable on an age + max-rows
 // basis by installing partial indexes that keep the prune predicates off a
 // Seq Scan. It must NOT change any schema column or constraint; only indexes.
 
 const MIGRATION_URL = new URL(
-  "./migrations/0147_plugin_webhook_deliveries_retention.sql",
+  "./migrations/0234_plugin_webhook_deliveries_retention.sql",
   import.meta.url,
 );
 
@@ -40,7 +40,7 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
-describe("0147 partial index predicates match the retention service's allowlist", () => {
+describe("0234 partial index predicates match the retention service's allowlist", () => {
   // If these drift, the partial index predicate no longer implies the prune
   // predicate and Postgres silently falls back to a Seq Scan.
   it("declares a partial index for each prunable status", async () => {
@@ -60,7 +60,7 @@ describe("0147 partial index predicates match the retention service's allowlist"
   });
 });
 
-describeEmbeddedPostgres("0147 plugin webhook deliveries retention migration", () => {
+describeEmbeddedPostgres("0234 plugin webhook deliveries retention migration", () => {
   it(
     "serves every prune predicate from an index instead of a Seq Scan",
     async () => {

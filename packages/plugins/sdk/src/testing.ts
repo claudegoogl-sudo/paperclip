@@ -741,6 +741,12 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       async get() {
         return { ...currentConfig };
       },
+      // Fork-only background read: the harness serves the same in-memory
+      // config for any company (no provisioning model to enforce here).
+      async getForServiceScope(companyId: string) {
+        void companyId;
+        return { ...currentConfig };
+      },
     },
     localFolders: {
       declarations() {
@@ -913,6 +919,13 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
     },
     secrets: {
       async resolve(secretRef) {
+        requireCapability(manifest, capabilitySet, "secrets.read-ref");
+        return `resolved:${secretRef}`;
+      },
+      async resolveService(secretRef) {
+        // Fork-only service-context resolve: same stand-in value shape as
+        // `resolve` — the harness has no binding model to derive a company
+        // from, so background tests assert plumbing, not binding authz.
         requireCapability(manifest, capabilitySet, "secrets.read-ref");
         return `resolved:${secretRef}`;
       },
@@ -2072,6 +2085,19 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
             approval.companyId === input.companyId
             && (!input.status || approval.status === input.status),
         );
+      },
+      // Fork-only reconcile read: pending-only, field-minimized stand-in.
+      async listPending(companyId: string) {
+        requireCapability(manifest, capabilitySet, "approvals.read");
+        return [...approvals.values()]
+          .filter((approval) => approval.companyId === companyId && approval.status === "pending")
+          .map((approval) => ({
+            id: approval.id,
+            type: approval.type,
+            status: approval.status,
+            payload: (approval.payload ?? {}) as Record<string, unknown>,
+            createdAt: approval.createdAt.toISOString(),
+          }));
       },
       async get(approvalId, companyId) {
         requireCapability(manifest, capabilitySet, "approvals.read");

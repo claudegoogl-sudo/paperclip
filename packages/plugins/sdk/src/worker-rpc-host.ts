@@ -67,6 +67,7 @@ import type {
   ToolResult,
   EventFilter,
   AgentSessionEvent,
+  EnvSecretRefBinding,
 } from "./types.js";
 import type {
   JsonRpcId,
@@ -521,6 +522,9 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
         async get(companyId?: string) {
           return callHost("config.get", companyId ? { companyId } : {});
         },
+        async getForServiceScope(companyId: string) {
+          return callHost("config.getForServiceScope", { companyId });
+        },
       },
 
       localFolders: {
@@ -700,6 +704,17 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             secretRef,
             runId: options.runId,
             companyId: options.companyId,
+            configPath: options.configPath,
+          });
+        },
+        async resolveService(secretRef: string | EnvSecretRefBinding, options: { configPath?: string } = {}): Promise<string> {
+          // Fork-only worker-lifetime service-context resolve: NO companyId and
+          // NO dispatch runId — the host derives the company from the secret
+          // binding and requires the host-minted service scope. This is the
+          // poll-loop path (e.g. the messenger bot token) that must not depend
+          // on a dispatch being in flight.
+          return callHost("secrets.resolveService", {
+            secretRef,
             configPath: options.configPath,
           });
         },
@@ -1295,6 +1310,12 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
 
         async get(approvalId: string, companyId: string) {
           return callHost("approvals.get", { approvalId, companyId });
+        },
+
+        async listPending(companyId: string) {
+          // Fork-only reconcile read: pending-only, field-minimized,
+          // provisioned-gated. Safe (and intended) outside any dispatch.
+          return callHost("approvals.listPending", { companyId });
         },
 
         async decide(

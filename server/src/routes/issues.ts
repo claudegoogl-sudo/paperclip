@@ -159,7 +159,7 @@ import { retryOnTransientPgError } from "../services/pg-retry.js";
 import { badRequest, conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
 import { privateJsonEtag } from "../middleware/private-json-etag.js";
 import { createRequestPromiseMemo } from "../lib/request-promise-memo.js";
-import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
+import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectIssueWorkspaceCommandPaths,
@@ -11470,7 +11470,10 @@ export function issueRoutes(
       const id = req.params.id as string;
       const interactionId = req.params.interactionId as string;
       const issue = await svc.getById(id);
-      if (!issue) {
+      // Two-step existence-oracle gate (see hasCompanyAccess in routes/authz.ts):
+      // the access check is folded into the existence check so a cross-tenant
+      // issue id returns the same 404 as a missing one — no 403-versus-404 oracle.
+      if (!issue || !hasCompanyAccess(req, issue.companyId)) {
         res.status(404).json({ error: "Issue not found" });
         return;
       }
@@ -11811,6 +11814,10 @@ export function issueRoutes(
           `Operator-delivery comments (body beginning with "${OPERATOR_DELIVER_MARKER}") must be authored by an agent token. ` +
           "The messenger relay only forwards agent-authored comments to the operator; host/board/user-token deliveries are dropped by the relay and would never reach the operator. Post this comment with an agent token instead.",
       });
+      // Reject means reject: without this return the request falls through to
+      // persistence and the wake fan-out, so a "rejected" marker comment still
+      // paged the assignee — the exact silent-echo the guard exists to prevent.
+      return;
     }
     const commentPresentation = req.body.presentation ??
       await deriveRecoveryCommentPresentation(req, issue.companyId, req.body.body);

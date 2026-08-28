@@ -148,6 +148,14 @@ describeEmbeddedPostgres("orphan checkoutRunId mutation tolerance", () => {
       originKind: "routine_execution",
     });
 
+    // Upstream v2026.824.1 attributes agent writes via the run's context
+    // snapshot source issue; production routine runs always carry it, so bind
+    // the fresh run to this issue before the PATCH.
+    await db
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, currentRunId));
+
     const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
       .patch(`/api/issues/${issueId}`)
       .send({ priority: "high" });
@@ -190,6 +198,13 @@ describeEmbeddedPostgres("orphan checkoutRunId mutation tolerance", () => {
       executionLockedAt: new Date(Date.now() - 30_000),
       originKind: "routine_execution",
     });
+
+    // Upstream v2026.824.1 attributes agent writes via the run's context
+    // snapshot source issue; bind the fresh run to this issue first.
+    await db
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, currentRunId));
 
     const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
       .post(`/api/issues/${issueId}/comments`)

@@ -1517,7 +1517,10 @@ function RequestConfirmationResolution({
   if (interaction.status === "expired") {
     const expiredByComment = outcome === "superseded_by_comment";
     const expiredByIssueClosed = outcome === "issue_closed";
-    const expiredBySupersede = outcome === "superseded";
+    // Upstream v2026.824.1 split the fork's "superseded" outcome into
+    // "withdrawn" (own card state) and "superseded_by_newer_request"; the
+    // author-retraction expiry copy now keys on the newer-request outcome.
+    const expiredBySupersede = outcome === "superseded_by_newer_request";
     const expiredByTargetChange = outcome === "stale_target";
     return (
       <div className="space-y-3 rounded-sm border border-amber-500/60 bg-amber-500/10 px-4 py-3 text-sm text-amber-900 dark:text-amber-100">
