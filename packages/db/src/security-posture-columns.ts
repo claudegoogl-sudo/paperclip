@@ -475,21 +475,6 @@ export const SECURITY_POSTURE_COLUMNS = [
     reason: "The other half of the same check: a lease is only enforced while this timestamp is in the future, so flattening it to the past disarms lease ownership without touching lease_token.",
   },
   {
-    table: "cloud_upstream_connections",
-    column: "token_status",
-    reason: "Dangerous value 'connected': the gate on using an upstream connection at all, so a flatten reactivates expired and revoked cross-instance connections.",
-  },
-  {
-    table: "cloud_upstream_connections",
-    column: "access_token",
-    reason: "Cross-instance bearer credential; an unqualified write transplants one instance's token onto every connection row, pointing other tenants' pushes at a destination the token holder controls.",
-  },
-  {
-    table: "cloud_upstream_connections",
-    column: "private_key_pem",
-    reason: "Signing key for cross-instance requests; a flatten makes one attacker-held key authenticate every connection, and unlike access_token it is not rotated on reconnect.",
-  },
-  {
     table: "session",
     column: "token",
     reason: "The session bearer value better-auth looks sessions up by. Same library-behaviour grounds as session.expires_at: enforcement is out of repo, but no migration has a legitimate reason to rewrite session credentials unqualified, and a constant flatten would give one token every user's session.",

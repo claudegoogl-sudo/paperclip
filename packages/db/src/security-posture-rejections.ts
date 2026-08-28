@@ -151,11 +151,6 @@ export const SECURITY_POSTURE_REJECTIONS = [
     reason: "Scheduling semantics for resuming an agent; not an input to any authorization decision.",
   },
   {
-    table: "cloud_upstream_connections",
-    columns: ["scopes"],
-    reason: "Outbound requested consent sent to a remote instance, which is the enforcing party. Empty falls back to defaults, and widening still requires the remote to approve.",
-  },
-  {
     table: "account",
     columns: ["scope", "access_token_expires_at"],
     reason: "Outbound OAuth provider scope and expiry for a third-party account link, with no in-repo predicate reading either.",
@@ -305,29 +300,6 @@ export const SECURITY_POSTURE_REJECTIONS = [
       "created_at", "id", "pending_key_name", "requested_company_id", "updated_at"
     ],
     reason: "Client naming, command text and lifecycle timestamps for a pending CLI login. The credential and gate columns — pending_key_hash, pending_key_scope_config, secret_hash, expires_at, requested_access — are registered.",
-  },
-  {
-    table: "cloud_upstream_connections",
-    columns: [
-      "authorized_global_user_id", "company_id", "created_at", "id", "last_run_id",
-      "pending_code_verifier", "pending_redirect_uri", "pending_state", "pending_token_url",
-      "remote_url", "source_instance_fingerprint", "source_instance_id",
-      "source_public_key", "target_company_id", "target_max_chunk_bytes", "target_origin",
-      "target_primary_host", "target_product", "target_schema_major",
-      "target_stack_display_name", "target_stack_id", "target_stack_slug",
-      "token_expires_at", "token_id", "updated_at"
-    ],
-    reason: "Remote instance discovery, capability and display metadata for an outbound cloud link. The credential and gate columns on this table are registered separately; the rest describe the remote, which is the enforcing party.",
-  },
-  {
-    table: "cloud_upstream_runs",
-    columns: [
-      "active_step", "company_id", "completed_at", "conflicts", "connection_id",
-      "created_at", "dry_run", "events", "id", "idempotency_key", "manifest_hash",
-      "progress_percent", "remote_run_id", "report", "retry_of_run_id", "status", "summary",
-      "target_url", "updated_at", "warnings"
-    ],
-    reason: "Per-run progress, conflict and report payloads for an upstream sync. Read for display and resume; the authority to run comes from the connection row.",
   },
   {
     table: "companies",
