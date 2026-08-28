@@ -313,9 +313,13 @@ describeEmbeddedPostgres("secret binding resilience", () => {
     );
     await expect(bindingsFor(agent.id)).resolves.toHaveLength(1);
 
-    // While pending, a config-form PATCH drops env: the wipe is refused and
-    // the binding preserved (scenario (a) above).
-    await agentService(db).update(agent.id, { adapterConfig: { env: {} } });
+    // While pending, a config-form PATCH drops env: the pending-approval
+    // config freeze rejects the whole update before the binding sync runs,
+    // so the binding is preserved (the wipe-refusal audit row from scenario
+    // (a) only fires for agents that are not frozen pending approval).
+    await expect(
+      agentService(db).update(agent.id, { adapterConfig: { env: {} } }),
+    ).rejects.toThrow(/Pending approval agent configuration cannot be changed before board approval/);
     await expect(bindingsFor(agent.id)).resolves.toHaveLength(1);
 
     // Activation is a status-only patch. It must NOT re-run the binding sync:
@@ -328,12 +332,13 @@ describeEmbeddedPostgres("secret binding resilience", () => {
     expect(bindings).toHaveLength(1);
     expect(bindings[0]).toMatchObject({ configPath: "env.AUTH_TOKEN", secretId: secret.id });
 
-    // The refusal event comes from the PATCH only — activation adds none.
+    // No refusal event at all: the freeze rejected the PATCH before the
+    // wipe-refusal layer, and activation is status-only and adds none.
     const events = await db
       .select()
       .from(activityLog)
       .where(eq(activityLog.action, "secret.binding_wipe_refused"));
-    expect(events).toHaveLength(1);
+    expect(events).toHaveLength(0);
   });
 
   it("(g) non-agent zero-refs refusal emits secret.binding_wipe_refused (ids/paths only)", async () => {
