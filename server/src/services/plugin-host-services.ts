@@ -1595,11 +1595,14 @@ export function buildHostServices(
     return { resourceType, resourceId, companyId, policy: null, updatedAt: company.updatedAt };
   };
 
-  // Per-company effective plugin config: the company's `plugin_config` row
-  // shallow-merged with the tenant's `configOverrides` subtree. Both the
-  // upstream `config.get` surface and the fork-only background read serve this
-  // merged view, so a plugin never sees a stale base value an operator has
-  // overridden for its tenant.
+  // Fork-only effective plugin config: the company's `plugin_config` row
+  // shallow-merged with the tenant's `configOverrides` subtree. ONLY the
+  // fork-only background read (`config.getForServiceScope`) serves this merged
+  // view, so a background reconcile never sees a stale base value an operator
+  // has overridden for its tenant. The upstream-named general `config.get`
+  // deliberately stays base-only — upstream (v2026.824.1) returns
+  // `configRow?.configJson ?? {}` — so the public surface remains
+  // byte-compatible and a future sync never re-litigates it.
   const getEffectiveCompanyConfig = async (
     companyId: string,
   ): Promise<Record<string, unknown>> => {
@@ -1616,7 +1619,11 @@ export function buildHostServices(
     async get(params: Parameters<HostServices["config"]["get"]>[0]) {
       const companyId = ensureCompanyId(params.companyId);
       await noPluginAvailabilityGate(companyId);
-      return getEffectiveCompanyConfig(companyId);
+      // Base-only on purpose: upstream parity for the general surface
+      // (upstream v2026.824.1 `configRow?.configJson ?? {}`). The override
+      // merge lives on the fork-only `getForServiceScope` read below.
+      const configRow = await registry.getConfig(pluginId, companyId);
+      return configRow?.configJson ?? {};
     },
     // Fork-only background read (serviceScope-reachable; see the SDK gate).
     // Fail-closed provisioning: unknown company / uninstalled / disabled

@@ -8,6 +8,7 @@ import {
   issueThreadInteractions,
   plugins,
   pluginCompanySettings,
+  pluginConfig,
 } from "@paperclipai/db";
 import { buildHostServices } from "../services/plugin-host-services.js";
 import {
@@ -249,6 +250,36 @@ describeEmbeddedPostgres("plugin reconcile reads host services", () => {
     await expect(
       services.config.getForServiceScope({ companyId: company.id }),
     ).resolves.toEqual({});
+    services.dispose();
+  });
+
+  it("general config.get stays base-only (upstream parity) even when a per-tenant override exists", async () => {
+    // Upstream (v2026.824.1) serves `configRow?.configJson ?? {}` on the
+    // general `config.get` surface. The override merge is a fork-only behavior
+    // and must stay on `config.getForServiceScope`, so pin the general
+    // surface to base-only here.
+    const company = await createCompany("REC");
+    const plugin = await installPlugin();
+    await db.insert(pluginConfig).values({
+      pluginId: plugin.id,
+      companyId: company.id,
+      configJson: { label: "base-value" },
+    });
+    await db.insert(pluginCompanySettings).values({
+      companyId: company.id,
+      pluginId: plugin.id,
+      enabled: true,
+      settingsJson: { configOverrides: { label: "override-value" } },
+    });
+    const services = buildHostServices(db, plugin.id, PLUGIN_KEY, createEventBusStub());
+
+    await expect(services.config.get({ companyId: company.id })).resolves.toEqual({
+      label: "base-value",
+    });
+    // The merged view remains on the fork-only background read.
+    await expect(
+      services.config.getForServiceScope({ companyId: company.id }),
+    ).resolves.toEqual({ label: "override-value" });
     services.dispose();
   });
 });
