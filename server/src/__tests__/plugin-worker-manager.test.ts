@@ -1904,6 +1904,39 @@ describe("plugin worker manager setup-token pty route gate", () => {
     }
   }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
 
+  it("delivers output that races the open reply in the same frame batch and drops a mismatch", async () => {
+    const handle = makeSetupTokenPtyHandle();
+    try {
+      await handle.start();
+      // `coalesce` makes the fixture write the open reply, the output frames,
+      // and the exit as one raw stdout write, so the host dispatches every
+      // frame before the open reply's promise continuation binds the route.
+      // The manager must buffer and replay such pre-bind frames: dropping them
+      // left `session.wait()` unsettled forever (the flaky CI timeout).
+      const session = await handle.openSetupTokenPtySession(
+        ptyOpenInput({
+          workerSessionId: "ws-A",
+          coalesce: true,
+          outputs: [
+            { chunk: "good-1" },
+            { chunk: "forged", sid: "ws-EVIL" },
+            { chunk: "good-2" },
+          ],
+          exitCode: 0,
+        }),
+      );
+      const chunks: string[] = [];
+      session.onData((chunk) => chunks.push(chunk));
+      await expect(session.wait()).resolves.toEqual({ exitCode: 0 });
+      // The replay applies the same sid check, so the forged frame is dropped
+      // and only the two bound chunks reach the listener, in order.
+      expect(chunks).toEqual(["good-1", "good-2"]);
+      await session.close();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
+
   it("routes delayed input to the worker and back to the listener", async () => {
     const handle = makeSetupTokenPtyHandle();
     try {

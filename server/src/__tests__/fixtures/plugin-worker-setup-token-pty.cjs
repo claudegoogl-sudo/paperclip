@@ -79,6 +79,41 @@ rl.on("line", (line) => {
 
     const reply = () =>
       send({ jsonrpc: "2.0", id: message.id, result: { workerSessionId } });
+
+    if (directive.coalesce) {
+      // Emit the open reply, the scripted output, and the exit as ONE raw
+      // stdout write, so the host's reader necessarily dispatches every frame
+      // in the same batch - before the open reply's promise continuation binds
+      // the route. This pins the pre-bind delivery window deterministically.
+      const frames = [
+        JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { workerSessionId } }),
+      ];
+      const outputs = Array.isArray(directive.outputs) ? directive.outputs : [];
+      for (const entry of outputs) {
+        frames.push(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            method: "setupTokenPty.output",
+            params: {
+              workerSessionId: entry.sid ?? workerSessionId,
+              chunk: entry.chunk,
+            },
+          }),
+        );
+      }
+      if (typeof directive.exitCode === "number") {
+        frames.push(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            method: "setupTokenPty.exit",
+            params: { workerSessionId, exitCode: directive.exitCode },
+          }),
+        );
+      }
+      process.stdout.write(`${frames.join("\n")}\n`);
+      return;
+    }
+
     reply();
     if (mode === "duplicate-open-reply") {
       // Send a second open reply for the same request id. The host drops it.
