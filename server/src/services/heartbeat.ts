@@ -11735,7 +11735,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         : null
       : ladderAttempt <= maxAttempts
-        ? computeBoundedTransientHeartbeatRetrySchedule(ladderAttempt, now, opts?.random)
+        ? // Upstream's splice: the caller-supplied budget (opts.maxAttempts)
+          // must win over the ladder's default length — computeBounded... hardcodes
+          // BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS. For fork-default
+          // callers (no explicit budget) this is a no-op.
+          { ...computeBoundedTransientHeartbeatRetrySchedule(ladderAttempt, now, opts?.random)!, maxAttempts }
         : null;
     const baseSchedule = noOpDispatchRetry.exhausted
       ? null
@@ -11832,10 +11836,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
+    // The fork caps transient horizons so a garbage far-future value cannot pin
+    // the ladder forever. Upstream pins provider-quota reset horizons exactly
+    // (they are the account's real reset clock, the same invariant the fork's
+    // usage-limit park honors), so the cap applies to the transient_upstream
+    // family only under the merged contract.
     const notBeforeCapMs = now.getTime() + TRANSIENT_RETRY_NOT_BEFORE_MAX_DELAY_MS;
+    const capApplies = transientRecovery?.errorFamily !== "provider_quota";
     const honoredNotBeforeMs =
       transientRetryNotBefore !== null
-        ? Math.min(transientRetryNotBefore.getTime(), notBeforeCapMs)
+        ? capApplies
+          ? Math.min(transientRetryNotBefore.getTime(), notBeforeCapMs)
+          : transientRetryNotBefore.getTime()
         : null;
     const schedule =
       !noOpDispatchRetry.active &&
