@@ -514,7 +514,7 @@ export const SECURITY_POSTURE_COLUMNS = [
     column: "execution_workspace_settings",
     reason: "Its `mode` takes precedence over execution_workspace_preference in workspace resolution, so registering the preference alone would leave the higher-precedence input unguarded.",
   },
-  // --- sync/upstream-v2026.824.1: columns introduced by upstream 707->824 (classified during PLA-4602) ---
+  // --- sync/upstream-v2026.824.1: columns introduced by upstream 707->824 (classified during the 824.1 superset re-land) ---
   {
     table: "companies",
     column: "interaction_resolver_governance",
