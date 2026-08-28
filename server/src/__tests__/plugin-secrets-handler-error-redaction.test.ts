@@ -34,6 +34,9 @@ vi.mock("../services/secrets.js", () => ({
 const { createPluginSecretsHandler, SecretsError } = await import(
   "../services/plugin-secrets-handler.js"
 );
+const { createPluginRunContextRegistry } = await import(
+  "../services/plugin-run-context-registry.js"
+);
 const { redactSensitiveText } = await import("../redaction.js");
 
 // Synthetic, shape-valid probes — never a real credential.
@@ -46,10 +49,21 @@ const JWT_PROBE =
 const BEARER_JWT_PROBE = `Bearer ${JWT_PROBE}`;
 
 function makeHandler() {
+  // The upstream-merged handler requires explicit company context when no
+  // run-context registry exists (fail-closed). These tests target the
+  // source-layer secret-ref redaction (Gate 0), reached by registering a
+  // service context so the ref-shape validation runs before the run-context
+  // lookup rejects the probe runId.
+  const registry = createPluginRunContextRegistry({
+    ttlMs: 60_000,
+    sweepIntervalMs: 60_000,
+  });
+  registry.registerService("00000000-0000-0000-0000-000000000001", "run-x");
   return createPluginSecretsHandler({
     db: {} as never,
     pluginDbId: "00000000-0000-0000-0000-000000000001",
     pluginKey: "platform.test",
+    runContextRegistry: registry,
   });
 }
 
