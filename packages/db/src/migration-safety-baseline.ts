@@ -169,4 +169,28 @@ export const MIGRATION_SAFETY_BASELINE = [
     reason:
       "Same statement as the entry above, after the in-flight rewrite that wraps it in a DO block gated on whether this run created the column. The rollout UPDATE is still textually unqualified, so the rule fires by design — it recognises a selective WHERE, not an arbitrary PL/pgSQL guard, because a guard that is subtly wrong is invisible to a static check. The guard was reviewed: it makes re-application a no-op. Entered here so the finding is covered whichever way the two changes land; the entry is inert (reported as a stale id) until the rewrite merges.",
   },
+  {
+    id: "9101cdb1c8bec88c",
+    rule: "unqualified-mutation-security-posture-column",
+    migration: "0173_inbox_policy_agent_cleanup.sql",
+    table: "user_inbox_agent_policies",
+    reason:
+      "Upstream 817 cleanup trigger: on agent deletion it removes exactly that agent's id from allowlist rows (WHERE matches the deleted id), so the mutation is row-scoped by construction.",
+  },
+  {
+    id: "eaf4a8b69debecc9",
+    rule: "unqualified-mutation-security-posture-column",
+    migration: "0182_connections_v3_schema_core.sql",
+    table: "tool_connections",
+    reason:
+      "Upstream one-time backfill executed in the same migration that introduces the column: auth_kind is derived from the connection's own config/credential refs, not from any external input.",
+  },
+  {
+    id: "7b32e0d28820baba",
+    rule: "unqualified-mutation-security-posture-column",
+    migration: "0225_secret_binding_egress_allowlist.sql",
+    table: "company_secret_bindings",
+    reason:
+      "Fork 0138 renumbered to 0223-0240 block: sets the default-on enforcement flag to false only when the column did not previously exist (guarded by column_existed), so live rows keep their applied state.",
+  },
 ] as const satisfies readonly MigrationSafetyBaselineEntry[];
