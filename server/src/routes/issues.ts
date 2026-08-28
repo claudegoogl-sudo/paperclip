@@ -11814,6 +11814,10 @@ export function issueRoutes(
           `Operator-delivery comments (body beginning with "${OPERATOR_DELIVER_MARKER}") must be authored by an agent token. ` +
           "The messenger relay only forwards agent-authored comments to the operator; host/board/user-token deliveries are dropped by the relay and would never reach the operator. Post this comment with an agent token instead.",
       });
+      // Reject means reject: without this return the request falls through to
+      // persistence and the wake fan-out, so a "rejected" marker comment still
+      // paged the assignee — the exact silent-echo the guard exists to prevent.
+      return;
     }
     const commentPresentation = req.body.presentation ??
       await deriveRecoveryCommentPresentation(req, issue.companyId, req.body.body);
