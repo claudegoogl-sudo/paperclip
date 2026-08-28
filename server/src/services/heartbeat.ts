@@ -1017,10 +1017,19 @@ const LOW_TRUST_SENSITIVE_ENV_KEY_RE =
 //    the run env like any non-prefixed binding.
 const FORBIDDEN_ENV_BINDING_KEYS = new Set(["PAPERCLIP_API_KEY"]);
 
+// Fork (INV-1): worker-supplied run identity must never survive into a
+// resolved child env — the host injects the real values after resolution.
+const RUN_IDENTITY_ENV_KEYS = new Set(["PAPERCLIP_RUN_ID", "PAPERCLIP_API_URL"]);
+
 function stripForbiddenEnvBindings(envValue: unknown): Record<string, unknown> | null {
   const record = parseObject(envValue);
+  // Upstream strips the credential binding set; the fork additionally strips
+  // run identity (INV-1). Operator-declared PAPERCLIP_-named bindings (e.g.
+  // PAPERCLIP_CLOUD_PROVIDER_TOKEN_*) keep forwarding per upstream's contract.
   const filtered = Object.fromEntries(
-    Object.entries(record).filter(([key]) => !FORBIDDEN_ENV_BINDING_KEYS.has(key)),
+    Object.entries(record).filter(
+      ([key]) => !FORBIDDEN_ENV_BINDING_KEYS.has(key) && !RUN_IDENTITY_ENV_KEYS.has(key),
+    ),
   );
   return Object.keys(filtered).length > 0 ? filtered : null;
 }
