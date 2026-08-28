@@ -584,6 +584,15 @@ export interface PluginConfigClient {
    * companyId; otherwise callers must pass it explicitly.
    */
   get(companyId?: string): Promise<Record<string, unknown>>;
+  /**
+   * Fork-only background read: the company's effective plugin config
+   * (company config row merged with the tenant `configOverrides` subtree),
+   * for use OUTSIDE any dispatch (e.g. a `setup()`-started loop). The host
+   * fail-closes unless the plugin is installed and enabled for the named
+   * company, so a worker can only ever read config for a company it is
+   * genuinely provisioned for.
+   */
+  getForServiceScope(companyId: string): Promise<Record<string, unknown>>;
 }
 
 export interface PluginLocalFolderProblem {
@@ -874,6 +883,25 @@ export interface PluginSecretsClient {
   resolve(
     secretRef: string | EnvSecretRefBinding,
     options?: { runId?: string; companyId?: string; configPath?: string },
+  ): Promise<string>;
+
+  /**
+   * Fork-only background resolve for a worker-lifetime service context
+   * (a `setup()`-started loop or background dispatch — e.g. the messenger
+   * poll loop's bot token). The company is NEVER supplied by the caller: the
+   * host derives it from the secret binding, refuses ambiguous cross-company
+   * bindings, rate-limits per plugin, and requires the host-minted service
+   * scope, so this only ever resolves a secret the plugin is genuinely bound
+   * to outside any dispatch.
+   *
+   * @param secretRef - The secret reference object from plugin config.
+   * @param options.configPath - Optional config path for binding
+   *   disambiguation, mirroring {@link resolve}.
+   * @returns The resolved secret value.
+   */
+  resolveService(
+    secretRef: string | EnvSecretRefBinding,
+    options?: { configPath?: string },
   ): Promise<string>;
 
   /**
@@ -1962,6 +1990,14 @@ export interface PluginIssuesClient {
  */
 export interface PluginApprovalsClient {
   list(input: { companyId: string; status?: string | null }): Promise<Approval[]>;
+  /**
+   * Fork-only reconcile read of PENDING board approvals for a company,
+   * field-minimized (no requester/decider user ids, no decision notes) and
+   * fail-closed on provisioning. Intended for a digest plugin's
+   * startup/poll reconcile outside any dispatch; the general {@link list}
+   * read is dispatch-scoped upstream surface.
+   */
+  listPending(companyId: string): Promise<PluginPendingApproval[]>;
   get(approvalId: string, companyId: string): Promise<Approval | null>;
   /**
    * Approve or reject an approval on behalf of a paired board user.
