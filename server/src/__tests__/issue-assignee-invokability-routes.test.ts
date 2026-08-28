@@ -30,6 +30,11 @@ const mockIssueService = vi.hoisted(() => ({
     isDependencyReady: false,
     unresolvedBlockerCount: 0,
   })),
+  // Fork orphan-checkout tolerance + upstream v2026.824.1 methods called by
+  // the merged PATCH route before the invokability guard.
+  clearOrphanCheckoutLocksIfTerminal: vi.fn(async () => false),
+  getByIdForUpdate: vi.fn(async () => null),
+  addStopRelayCommentIfNeeded: vi.fn(async () => undefined),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
@@ -129,6 +134,15 @@ vi.mock("../services/index.js", () => ({
     syncRunStatusForIssue: vi.fn(async () => undefined),
   }),
   workProductService: () => ({}),
+  // Upstream v2026.824.1 additions pulled in by the merged routes/issues.ts.
+  companySkillService: () => ({}),
+  companySearchService: () => ({}),
+  inboxAgentPolicyService: () => ({}),
+  ISSUE_LIST_DEFAULT_LIMIT: 500,
+  ISSUE_LIST_MAX_LIMIT: 1000,
+  clampIssueListLimit: (limit: number) => limit ?? 500,
+  publishActivity: vi.fn(async () => {}),
+  projectInteractionForPluginEvent: vi.fn(() => null),
 }));
 
 import { errorHandler } from "../middleware/index.js";
