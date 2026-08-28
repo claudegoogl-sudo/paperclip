@@ -631,7 +631,7 @@ async function registerActionHandlers(ctx: PluginContext): Promise<void> {
     // `runId` param for demonstration; without a valid active-dispatch runId
     // the host fails closed.
     const runId = typeof params.runId === "string" ? params.runId : "";
-    const resolved = await ctx.secrets.resolve(secretRef, runId);
+    const resolved = await ctx.secrets.resolve(secretRef, { runId });
     pushRecord({
       level: "info",
       source: "secrets",
