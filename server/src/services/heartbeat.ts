@@ -17414,7 +17414,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await finalizeAgentStatus(
         agent.id,
         outcome,
-        outcomeSucceeded ? null : (adapterResult.errorMessage ?? null),
+        // Fork: persist the same normalized failure the run records (an
+        // adapter that omits its diagnostic still yields "Adapter failed"),
+        // not the raw null errorMessage.
+        outcomeSucceeded ? null : runErrorMessage,
         adapterResult.errorFamily ?? null,
         {
           keepIdleOnFailure:
