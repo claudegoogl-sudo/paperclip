@@ -107,7 +107,9 @@ describeEmbeddedPostgres("plugin reconcile reads host services", () => {
     });
 
     const services = buildHostServices(db, plugin.id, PLUGIN_KEY, createEventBusStub());
-    const result = await services.approvals.list({ companyId: company.id });
+    // The fork reconcile contract lives on the fork-only `approvals.listPending`
+    // read; upstream's general `approvals.list` surface stays byte-compatible.
+    const result = await services.approvals.listPending({ companyId: company.id });
     services.dispose();
 
     expect(result).toHaveLength(1);
@@ -166,7 +168,7 @@ describeEmbeddedPostgres("plugin reconcile reads host services", () => {
     const plugin = await installPlugin();
     const services = buildHostServices(db, plugin.id, PLUGIN_KEY, createEventBusStub());
 
-    await expect(services.approvals.list({ companyId: "" })).rejects.toThrow();
+    await expect(services.approvals.listPending({ companyId: "" })).rejects.toThrow();
     await expect(services.interactions.list({ companyId: "   " } as any)).rejects.toThrow();
     services.dispose();
   });
@@ -176,7 +178,7 @@ describeEmbeddedPostgres("plugin reconcile reads host services", () => {
     const services = buildHostServices(db, plugin.id, PLUGIN_KEY, createEventBusStub());
 
     await expect(
-      services.approvals.list({ companyId: randomUUID() }),
+      services.approvals.listPending({ companyId: randomUUID() }),
     ).rejects.toThrow("Company not found");
     services.dispose();
   });
@@ -187,7 +189,7 @@ describeEmbeddedPostgres("plugin reconcile reads host services", () => {
     const services = buildHostServices(db, plugin.id, PLUGIN_KEY, createEventBusStub());
 
     await expect(
-      services.approvals.list({ companyId: company.id }),
+      services.approvals.listPending({ companyId: company.id }),
     ).rejects.toThrow("not available");
     services.dispose();
   });
@@ -218,7 +220,35 @@ describeEmbeddedPostgres("plugin reconcile reads host services", () => {
     });
     const services = buildHostServices(db, plugin.id, PLUGIN_KEY, createEventBusStub());
 
-    await expect(services.approvals.list({ companyId: company.id })).resolves.toEqual([]);
+    await expect(services.approvals.listPending({ companyId: company.id })).resolves.toEqual([]);
+    services.dispose();
+  });
+
+  it("config.getForServiceScope fails closed for an unprovisioned company (negative test)", async () => {
+    // The fork-only background config read runs the same real availability
+    // gate as the reconcile reads: unknown company / uninstalled / disabled
+    // plugin all deny rather than serve config.
+    const company = await createCompany("REC");
+    const uninstalled = await installPlugin("uninstalled");
+    const services = buildHostServices(db, uninstalled.id, PLUGIN_KEY, createEventBusStub());
+    await expect(
+      services.config.getForServiceScope({ companyId: company.id }),
+    ).rejects.toThrow("not available");
+    services.dispose();
+  });
+
+  it("config.getForServiceScope serves the effective (override-merged) config for a provisioned company", async () => {
+    const company = await createCompany("REC");
+    const plugin = await installPlugin();
+    const services = buildHostServices(db, plugin.id, PLUGIN_KEY, createEventBusStub());
+    await db.insert(pluginCompanySettings).values({
+      companyId: company.id,
+      pluginId: plugin.id,
+      enabled: true,
+    });
+    await expect(
+      services.config.getForServiceScope({ companyId: company.id }),
+    ).resolves.toEqual({});
     services.dispose();
   });
 });

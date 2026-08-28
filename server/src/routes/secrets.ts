@@ -19,7 +19,7 @@ import {
   updateUserSecretValueSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
-import { assertBoard, assertBoardOrAgent, assertCompanyAccess, getAccessibleResource, assertInteractiveBoard } from "./authz.js";
+import { assertBoard, assertBoardOrAgent, assertCompanyAccess, getAccessibleResource, assertInteractiveBoard, hasCompanyAccess } from "./authz.js";
 import { logActivity, secretService } from "../services/index.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
@@ -1337,7 +1337,10 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
     assertBoard(req);
     const id = req.params.id as string;
     const existing = await svc.getById(id);
-    if (!existing) {
+    // Two-step existence-oracle gate (see hasCompanyAccess in routes/authz.ts):
+    // the access check is folded into the existence check so a cross-tenant
+    // secret id returns the same 404 as a missing one — no 403-versus-404 oracle.
+    if (!existing || !hasCompanyAccess(req, existing.companyId)) {
       res.status(404).json({ error: "Secret not found" });
       return;
     }
