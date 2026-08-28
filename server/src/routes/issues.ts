@@ -12665,7 +12665,7 @@ export function issueRoutes(
     const issue = await getAccessibleResource(req, res, getIssueById(req, issueId), "Issue not found");
     if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
-    const attachments = await svc.listAttachments(issueId);
+    const attachments = await svc.listAttachments(issueId, issue.companyId);
     res.json(attachments.map(withContentPath));
   });
 

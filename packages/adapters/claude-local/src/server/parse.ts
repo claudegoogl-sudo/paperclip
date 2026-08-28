@@ -33,6 +33,24 @@ const CLAUDE_PROVIDER_QUOTA_RE =
 const CLAUDE_MODEL_NOT_FOUND_RE =
   /(?:\b404\b[\s\S]{0,120})?(?:model[\s_-]*(?:not[\s_-]*found|does not exist|unknown|invalid)|unknown[\s_-]*model)/i;
 
+export function claudeModelUsageTotals(modelUsage: unknown): UsageSummary | null {
+  const byModel = parseObject(modelUsage);
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cachedInputTokens = 0;
+  let sawEntry = false;
+  for (const value of Object.values(byModel)) {
+    const entry = parseObject(value);
+    if (Object.keys(entry).length === 0) continue;
+    sawEntry = true;
+    inputTokens += asNumber(entry.inputTokens, 0) + asNumber(entry.cacheCreationInputTokens, 0);
+    outputTokens += asNumber(entry.outputTokens, 0);
+    cachedInputTokens += asNumber(entry.cacheReadInputTokens, 0);
+  }
+  if (!sawEntry) return null;
+  return { inputTokens, outputTokens, cachedInputTokens };
+}
+
 export function parseClaudeStreamJson(stdout: string) {
   let sessionId: string | null = null;
   let model = "";

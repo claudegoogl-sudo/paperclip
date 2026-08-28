@@ -67,7 +67,6 @@ import {
   pluginLoader,
   REPO_ROOT,
 } from "../services/plugin-loader.js";
-import { extractSecretRefPathsFromConfig } from "../services/plugin-secrets-handler.js";
 import { secretService } from "../services/secrets.js";
 import { logActivity } from "../services/activity-log.js";
 import {
@@ -110,7 +109,6 @@ import {
   isWithinBundledPluginRoot,
 } from "../services/plugin-install-guard.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
-import { secretService } from "../services/secrets.js";
 import { badRequest, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
 
 /** UI slot declaration extracted from plugin manifest */
