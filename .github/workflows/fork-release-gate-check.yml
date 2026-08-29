@@ -64,7 +64,8 @@ jobs:
 
       - name: Static gates must refuse the corrupted set (dev-exports defect)
         run: |
-          bash scripts/fork-release/build.sh "$GATE_VERSION" --out dist-tarballs-corrupt --negative-test-fork34
+          cp -r dist-tarballs dist-tarballs-corrupt
+          node scripts/fork-release/negative-test-fork34.mjs --dir dist-tarballs-corrupt
           set +e
           node scripts/fork-release/preflight.mjs \
             --core-url "https://github.com/claudegoogl-sudo/paperclip/releases/download/v$GATE_VERSION/paperclipai-$GATE_VERSION.tgz" \
