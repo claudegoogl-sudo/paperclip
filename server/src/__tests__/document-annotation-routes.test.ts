@@ -56,6 +56,22 @@ const mockIssueThreadInteractionService = vi.hoisted(() => ({
   expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
 }));
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
+// routes/issues.ts builds the real external-object service straight off the
+// db handle this file passes as `{} as any`, so every document PUT fires a
+// doomed `db.transaction` call whose swallowed TypeError is logged as an
+// "external object document sync failed" warning. That warning is pure
+// harness noise from the mock environment (the real db has `.transaction`),
+// and it reads like a sync regression when scanning CI logs. Stub the service
+// so the route's fire-and-forget sync calls resolve harmlessly instead.
+const mockExternalObjectService = vi.hoisted(() => ({
+  getIssueSummaries: vi.fn(async () => new Map()),
+  getIssueSummary: vi.fn(async () => null),
+  listForIssue: vi.fn(async () => []),
+  refreshIssueObjects: vi.fn(async () => null),
+  syncCommentSafely: vi.fn(async () => undefined),
+  syncDocumentSafely: vi.fn(async () => undefined),
+  syncIssueSafely: vi.fn(async () => undefined),
+}));
 
 const documentPayload = {
   id: "document-1",
@@ -124,6 +140,9 @@ const annotationComment = {
 };
 
 function registerModuleMocks() {
+  vi.doMock("../services/external-objects.js", () => ({
+    externalObjectService: () => mockExternalObjectService,
+  }));
   vi.doMock("../services/index.js", () => ({
     accessService: () => ({
       canUser: vi.fn(),
