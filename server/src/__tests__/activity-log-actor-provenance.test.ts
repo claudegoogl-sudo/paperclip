@@ -374,8 +374,11 @@ describeEmbeddedPostgres("activity_log actor provenance via the request middlewa
     expect(sessionCalls.length).toBe(0);
   });
 
-  // Unknown/unset actor sources must not default to "session"
-  it("logs unknown/unset actor source as local_implicit (safe fallback), never as session", async () => {
+  // Unknown/unset actor sources must DENY, never synthesize provenance.
+  // Supersedes the earlier "safe fallback to local_implicit" contract:
+  // local_implicit is the unconditional allow_local_board actor, so treating
+  // an omitted source as it is fail-open (see the getActorInfo hardening).
+  it("denies unknown/unset actor source instead of defaulting it", async () => {
     const app = buildApp("correct");
 
     // Directly call getActorInfo with a request that has an unset source
@@ -392,29 +395,24 @@ describeEmbeddedPostgres("activity_log actor provenance via the request middlewa
     // Import getActorInfo
     const { getActorInfo } = await import("../routes/authz");
 
-    // Test with unset source - should fall back to "local_implicit", never "session"
-    const result1 = getActorInfo(mockReq as any);
-    expect(result1.actorSource).toBe("local_implicit");
-    expect(result1.actorSource).not.toBe("session");
+    // Unset source must throw (403), never fall back to local_implicit/session
+    expect(() => getActorInfo(mockReq as any)).toThrow(/Board actor source is required/);
 
-    // Test with an unrecognized source value
+    // An unrecognized source value must also throw, not pass through
     mockReq.actor.source = "some_future_source" as any;
-    const result2 = getActorInfo(mockReq as any);
-    expect(result2.actorSource).toBe("some_future_source");
-    expect(result2.actorSource).not.toBe("session");
+    expect(() => getActorInfo(mockReq as any)).toThrow(/Board actor source is required/);
 
-    // Test that explicit "session" source is still preserved
+    // Explicit recognized sources are preserved unchanged
+    mockReq.actor.source = "local_implicit";
+    expect(getActorInfo(mockReq as any).actorSource).toBe("local_implicit");
+
     mockReq.actor.source = "session";
-    const result3 = getActorInfo(mockReq as any);
-    expect(result3.actorSource).toBe("session");
+    expect(getActorInfo(mockReq as any).actorSource).toBe("session");
 
-    // Test other recognized sources are preserved
     mockReq.actor.source = "board_key";
-    const result4 = getActorInfo(mockReq as any);
-    expect(result4.actorSource).toBe("board_key");
+    expect(getActorInfo(mockReq as any).actorSource).toBe("board_key");
 
     mockReq.actor.source = "cloud_tenant";
-    const result5 = getActorInfo(mockReq as any);
-    expect(result5.actorSource).toBe("cloud_tenant");
+    expect(getActorInfo(mockReq as any).actorSource).toBe("cloud_tenant");
   });
 });

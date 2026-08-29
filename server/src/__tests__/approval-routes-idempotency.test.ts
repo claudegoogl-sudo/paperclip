@@ -99,7 +99,7 @@ async function createAgentApp(options: { runId?: string; contextSnapshot?: Recor
       agentId: "agent-1",
       companyId: "company-1",
       runId: options.runId ?? "run-1",
-      source: "api_key",
+      source: "agent_key",
       isInstanceAdmin: false,
     };
     next();

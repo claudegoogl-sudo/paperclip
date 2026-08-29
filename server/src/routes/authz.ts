@@ -1,5 +1,6 @@
 import type { Request } from "express";
 import { forbidden, HttpError, unauthorized } from "../errors.js";
+import { requireAgentActorSource, requireBoardActorSource } from "../services/actor-source.js";
 import { logger } from "../middleware/logger.js";
 import { responsibleUserAuthzShadowMode } from "../services/authorization.js";
 
@@ -157,25 +158,29 @@ export function getActorInfo(req: Request): (
 ) {
   assertAuthenticated(req);
   if (req.actor.type === "agent") {
-    const actorSource = req.actor.source === "agent_jwt" ? "agent_jwt" : "agent_key";
     return {
       actorType: "agent" as const,
       actorId: req.actor.agentId ?? "unknown-agent",
       agentId: req.actor.agentId ?? null,
       runId: req.actor.runId ?? null,
-      actorSource,
+      // Unset or unknown agent provenance must deny, not coerce to agent_key:
+      // agent_key is the fallback the middleware would have set explicitly, so
+      // reaching here without it means the actor was constructed without
+      // credential validation (same deny-by-default class as the service-layer
+      // actor-source validators).
+      actorSource: requireAgentActorSource(req.actor.source),
     };
   }
-
-  const actorSource = req.actor.source === "session"
-    ? "session"
-    : (req.actor.source ?? "local_implicit") as "local_implicit" | "session" | "board_key" | "cloud_tenant";
 
   return {
     actorType: "user" as const,
     actorId: req.actor.userId ?? "board",
     agentId: null,
     runId: req.actor.runId ?? null,
-    actorSource,
+    // Unset or unknown board provenance must deny, not default to
+    // local_implicit: that source is the unconditional allow_local_board
+    // actor, so synthesizing it from an omitted field would hand an
+    // unvalidated actor the most privileged provenance .
+    actorSource: requireBoardActorSource(req.actor.source),
   };
 }
