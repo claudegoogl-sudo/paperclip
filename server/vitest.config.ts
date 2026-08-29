@@ -9,14 +9,14 @@ import { resolveServerTestMaxWorkers } from "./src/config/server-test-max-worker
 export default defineConfig({
   test: {
     environment: "node",
-    // Each server suite boots + tears down its own embedded Postgres in
-    // beforeAll/afterAll. Under the loaded serial shard (maxWorkers=1) the
-    // graceful shutdown can occasionally cross vitest's default 10s hookTimeout,
-    // producing flaky "Hook timed out in 10000ms" afterAll failures on CI. Give
-    // the boot/teardown hooks generous headroom; 30s is far above the observed
-    // worst-case teardown yet still catches a genuinely hung hook. teardownTimeout
-    // mirrors it for the same reason.
-    hookTimeout: 30000,
+    // Embedded-Postgres suites boot in beforeAll and tear down in afterAll. On a
+    // loaded runner both ends can outlast vitest's 10s defaults and redden a
+    // passing suite, so the global budget is explicit: hooks run with 20s
+    // (matching the per-file `beforeAll` 20_000 that every embedded-Postgres
+    // suite already passes) and teardown keeps 30s of headroom. See
+    // packages/db/src/test-embedded-postgres.ts for the SIGKILL-escalation path
+    // that bounds cleanup() well inside this budget.
+    hookTimeout: 20_000,
     teardownTimeout: 30000,
     isolate: true,
     maxConcurrency: 1,
@@ -27,14 +27,5 @@ export default defineConfig({
       hooks: "list",
     },
     setupFiles: ["./src/__tests__/setup-supertest.ts"],
-    // Symmetric startup/teardown budget: every embedded-Postgres `beforeAll`
-    // already passes `20_000` per-file. Without this line, the matching
-    // `afterAll` cleanup hooks run on vitest's 10s default `hookTimeout`, so
-    // on a loaded runner teardown overruns the budget and reddens a passing
-    // suite. The per-file `beforeAll` 20_000 is preserved (it's a no-op once
-    // the global is 20s), but the global is what keeps the teardown side
-    // honest. See packages/db/src/test-embedded-postgres.ts for the
-    // SIGKILL-escalation path that bounds cleanup() well inside this budget.
-    hookTimeout: 20_000,
   },
 });
