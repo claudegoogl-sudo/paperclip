@@ -25,6 +25,16 @@ env:
 
 jobs:
   build-and-sign:
+    # This job publishes to ghcr.io/paperclipai/* using the runner's
+    # GITHUB_TOKEN. That token can only write packages in the repository
+    # owner's own namespace, so on a fork the push step can only ever fail
+    # with "denied: permission_denied: The requested installation does not
+    # exist" and red every matching master push. Fork deployments build
+    # their runtime images locally and consume nothing from this registry,
+    # so gate the whole job to upstream; on forks it is skipped and the
+    # run goes green without any package writes. (Same pattern as the
+    # commitperclip review job in pr.yml.)
+    if: github.repository == 'paperclipai/paperclip'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
