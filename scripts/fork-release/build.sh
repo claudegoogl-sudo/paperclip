@@ -137,7 +137,9 @@ if (violations.length > 0) {
 }
 console.log(`  -> export targets OK on the ${chain.size}-package install closure`);
 NODE
-(cd "$OUT" && sha256sum ./*.tgz > SHA256SUMS.txt)
+# Plain names (no ./ prefix), matching the basename keys the verifier and the
+# test-only injector use; verifyChecksums also normalizes either format.
+(cd "$OUT" && sha256sum *.tgz > SHA256SUMS.txt)
 echo "  -> SHA256SUMS.txt written"
 
 if [ "$NEGATIVE_TEST" = "1" ]; then

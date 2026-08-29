@@ -233,7 +233,9 @@ export function verifyChecksums({ assetsDir, sumsPath }) {
   for (const line of lines) {
     const match = line.match(/^([0-9a-f]{64})\s+\*?(.+)$/);
     if (!match) continue;
-    expected.set(match[2].trim(), match[1]);
+    // sha256sum keyed on a path-prefixed glob writes "./name.tgz"; normalize
+    // to the plain basename so sums files in either format verify.
+    expected.set(match[2].trim().replace(/^\.\//, ""), match[1]);
   }
   for (const tarballPath of listTarballs(assetsDir)) {
     const name = path.basename(tarballPath);

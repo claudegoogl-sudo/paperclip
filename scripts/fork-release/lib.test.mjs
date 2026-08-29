@@ -168,3 +168,36 @@ test("verifyChecksums detects drift and absence", () => {
     rmSync(base, { recursive: true, force: true });
   }
 });
+
+test("verifyChecksums accepts plain-name and ./-prefixed sums entries", () => {
+  const base = mkdtempSync(path.join(tmpdir(), "sums-"));
+  try {
+    const tgz = makeAsset(base, "@paperclipai/shared");
+    const name = path.basename(tgz);
+    const sha = spawnSync("sha256sum", [name], { cwd: base, encoding: "utf8" }).stdout.trim().split(/\s+/)[0];
+    for (const line of [`${sha}  ${name}`, `${sha}  ./${name}`]) {
+      writeFileSync(path.join(base, "SHA256SUMS.txt"), `${line}\n`);
+      const result = verifyChecksums({ assetsDir: base, sumsPath: path.join(base, "SHA256SUMS.txt") });
+      assert.deepEqual(result, { ok: true, violations: [] }, `line ${JSON.stringify(line)} should verify`);
+    }
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("verifyChecksums still refuses a tarball missing from a mixed-format sums file", () => {
+  const base = mkdtempSync(path.join(tmpdir(), "sums-"));
+  try {
+    const tgz = makeAsset(base, "@paperclipai/shared");
+    const sha = spawnSync("sha256sum", [path.basename(tgz)], { cwd: base, encoding: "utf8" }).stdout.trim().split(/\s+/)[0];
+    writeFileSync(path.join(base, "SHA256SUMS.txt"), `${sha}  ./${path.basename(tgz)}\n`);
+    const other = makeAsset(base, "@paperclipai/db");
+    const result = verifyChecksums({ assetsDir: base, sumsPath: path.join(base, "SHA256SUMS.txt") });
+    assert.equal(result.ok, false);
+    assert.ok(
+      result.violations.some((v) => v.asset === path.basename(other) && v.problem === "no SHA256SUMS entry"),
+    );
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
