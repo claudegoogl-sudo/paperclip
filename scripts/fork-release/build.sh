@@ -109,7 +109,10 @@ echo "  -> $TARBALL_COUNT tarballs packed"
 for T in "$OUT"/*.tgz; do gzip -t "$T" || { echo "FATAL: corrupt tarball $T" >&2; exit 1; }; done
 echo "  -> gzip -t OK on all tarballs"
 # (b) the server tarball must ship the dashboard payload
-tar -tzf "$OUT/paperclipai-server-$VERSION.tgz" | grep -q '^package/ui-dist/index.html$' \
+# grep -c reads the whole tar listing, so the pipe cannot die of SIGPIPE
+# under `set -o pipefail` the way an early-exit `grep -q` can.
+SERVER_LISTING="$(tar -tzf "$OUT/paperclipai-server-$VERSION.tgz" | grep -c '^package/ui-dist/index.html$' || true)"
+[ "$SERVER_LISTING" -ge 1 ] \
   || { echo "FATAL: server tarball does not ship ui-dist/index.html" >&2; exit 1; }
 echo "  -> server tarball ships ui-dist/index.html"
 # (c) install closure + export targets + URL pins (same code the preflight runs)
