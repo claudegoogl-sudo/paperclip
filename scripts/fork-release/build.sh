@@ -81,11 +81,22 @@ bash scripts/build-npm.sh --skip-checks --skip-typecheck 2>&1 | tail -3
 (cd cli && npm pack --pack-destination "$REPO_ROOT/$OUT" 2>&1 | tail -1)
 rm -rf packages/db/dist
 pnpm --filter @paperclipai/db build 2>&1 | tail -1
-node scripts/pack-public-packages.mjs --out "$OUT" --packer npm > pack-public.log 2>&1 || {
+# pnpm pack refuses to pack manifests that declare bundleDependencies under
+# the isolated node linker. The fork ships those deps as normal registry
+# dependencies (no tarball carries bundles), so strip the declarations for
+# the pack and restore the manifests afterwards.
+BUNDLED_MANIFESTS="$(grep -rl '"bundleDependencies"' packages server ui cli --include='package.json' 2>/dev/null | grep -v node_modules || true)"
+if [ -n "$BUNDLED_MANIFESTS" ]; then
+  echo "  -> temporarily stripping bundleDependencies from: $(echo "$BUNDLED_MANIFESTS" | tr '\n' ' ')"
+  node -e 'const fs=require("node:fs");for(const p of process.argv.slice(1)){const j=JSON.parse(fs.readFileSync(p,"utf8"));delete j.bundleDependencies;delete j.bundledDependencies;fs.writeFileSync(p,`${JSON.stringify(j,null,2)}\n`);}' $BUNDLED_MANIFESTS
+fi
+node scripts/pack-public-packages.mjs --out "$OUT" > pack-public.log 2>&1 || {
   echo "FATAL: pack-public-packages failed — last 30 lines:" >&2
   tail -30 pack-public.log >&2
+  if [ -n "$BUNDLED_MANIFESTS" ]; then git checkout -- $BUNDLED_MANIFESTS; fi
   exit 1
 }
+if [ -n "$BUNDLED_MANIFESTS" ]; then git checkout -- $BUNDLED_MANIFESTS; fi
 grep -E '^==>|^  - ' pack-public.log | tail -5
 
 echo "===== [9/10] URL-pin every internal dependency to this release ====="
