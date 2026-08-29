@@ -50,6 +50,9 @@
 #   status           print state file + port summary
 #   clear-state      MANUAL: clear backoff/alert state so the tick starts
 #                    recovering again; run ONLY after the cluster is repaired
+#   alert-desc       render the board-alert issue description from a payload
+#                    JSON on stdin (drill/debug: shows the exact body the
+#                    alert issue would carry; pure, no state, no I/O)
 #   help
 #
 # Exit codes (tick):
@@ -213,34 +216,34 @@ deliver_page() { # <json> — rc 0 delivered, 3 no transport configured, other =
   return 3
 }
 
-board_alert() { # <json> — echoes issue id on success, rc 1 otherwise
-  local json="$1" token company_id payload resp rc title desc id
+alert_description() { # <json> — echoes the board-alert issue description (pure: no I/O, no state)
+  local json="$1"
   local ahost reason detail failures maxf first detected port datadir logpath logtail runbook severity
 
-  token="$(board_token)"
-  [ -n "$token" ] || { warn "no board token in $PG_RECOVER_TOKEN_FILE — cannot file board alert"; return 1; }
+  # Field extraction: one `jq -r` per field. The former TSV roundtrip
+  # (jq to-tabbed-value, then IFS=tab read) broke the alert body twice:
+  # the tab escaping turns real newlines in the log tail into the two
+  # characters backslash-n (rendered literally in the filed description),
+  # and a whitespace IFS collapses EMPTY fields so every later field shifts
+  # left. Separate calls keep newlines real and every field in its own slot.
+  # `alert-desc` exposes this builder for drills, so the battery can render
+  # payload shapes the tick paths never produce (empty detail, null fields).
+  jfield() { printf '%s' "$json" | jq -r "$1"; }
+  ahost="$(jfield '.host // ""')"
+  reason="$(jfield '.reason // ""')"
+  detail="$(jfield '.detail // ""')"
+  failures="$(jfield '(.consecutive_failed_starts // 0) | tostring')"
+  maxf="$(jfield '(.max_consecutive_failed_starts // 0) | tostring')"
+  first="$(jfield '.first_failure_at // "(this attempt)"')"
+  detected="$(jfield '.detected_at // ""')"
+  port="$(jfield '(.port // 0) | tostring')"
+  datadir="$(jfield '.data_dir // ""')"
+  logpath="$(jfield '.log_path // ""')"
+  logtail="$(jfield '.log_tail // ""')"
+  runbook="$(jfield '.runbook_ref // ""')"
+  severity="$(jfield '.severity // "high"')"
 
-  if [ -n "${PG_RECOVER_COMPANY_ID:-}" ]; then
-    company_id="$PG_RECOVER_COMPANY_ID"
-  else
-    company_id="$(curl -sS --max-time 10 -H "Authorization: Bearer $token" "$PG_RECOVER_API_BASE/companies" 2>/dev/null \
-      | jq -r --arg n "$PG_RECOVER_COMPANY_NAME" 'map(select(.name == $n))[0].id // empty' 2>/dev/null || true)"
-  fi
-  [ -n "$company_id" ] || { warn "could not resolve board company id — cannot file board alert"; return 1; }
-
-  IFS=$'\t' read -r ahost reason detail failures maxf first detected port datadir logpath logtail runbook severity <<EOF
-$(printf '%s' "$json" | jq -r '[.host, .reason, (.detail // ""), (.consecutive_failed_starts | tostring),
-  (.max_consecutive_failed_starts | tostring), (.first_failure_at // "(this attempt)"), .detected_at,
-  (.port | tostring), .data_dir, .log_path, .log_tail, .runbook_ref, (.severity // "high")] | @tsv')
-EOF
-
-  if [ "$reason" = "panic" ]; then
-    title="[auto-alert] embedded Postgres PANIC on start (WAL corruption class)"
-  else
-    title="[auto-alert] embedded Postgres failed to start ${failures} times"
-  fi
-
-  desc="$(cat <<DESC
+  cat <<DESC
 [agent-provenance] Automated post by scripts/pg-recover.sh (host ${ahost}, host cron — no execution run id) on behalf of the Coder agent, Platform, company urlKey "PLA" — agent action — NOT an operator decision.
 
 **Automated alert: embedded Postgres is down and watchdog recovery is stopped**
@@ -262,7 +265,33 @@ ${logtail}
 
 (One alert per incident: the watchdog state file prevents re-alerting every tick; a NEW incident after clear-state files a new issue.)
 DESC
-)"
+}
+
+board_alert() { # <json> — echoes issue id on success, rc 1 otherwise
+  local json="$1" token company_id payload resp rc title desc id reason failures severity
+
+  token="$(board_token)"
+  [ -n "$token" ] || { warn "no board token in $PG_RECOVER_TOKEN_FILE — cannot file board alert"; return 1; }
+
+  if [ -n "${PG_RECOVER_COMPANY_ID:-}" ]; then
+    company_id="$PG_RECOVER_COMPANY_ID"
+  else
+    company_id="$(curl -sS --max-time 10 -H "Authorization: Bearer $token" "$PG_RECOVER_API_BASE/companies" 2>/dev/null \
+      | jq -r --arg n "$PG_RECOVER_COMPANY_NAME" 'map(select(.name == $n))[0].id // empty' 2>/dev/null || true)"
+  fi
+  [ -n "$company_id" ] || { warn "could not resolve board company id — cannot file board alert"; return 1; }
+
+  reason="$(printf '%s' "$json" | jq -r '.reason // ""')"
+  failures="$(printf '%s' "$json" | jq -r '(.consecutive_failed_starts // 0) | tostring')"
+  severity="$(printf '%s' "$json" | jq -r '.severity // "high"')"
+
+  if [ "$reason" = "panic" ]; then
+    title="[auto-alert] embedded Postgres PANIC on start (WAL corruption class)"
+  else
+    title="[auto-alert] embedded Postgres failed to start ${failures} times"
+  fi
+
+  desc="$(alert_description "$json")"
 
   payload="$(jq -n \
     --arg title "$title" --arg desc "$desc" --arg severity "$severity" \
@@ -447,6 +476,7 @@ case "${1:-tick}" in
   tick|"")      cmd_tick ;;
   status)       cmd_status ;;
   clear-state)  cmd_clear_state ;;
+  alert-desc)   alert_description "$(cat)" ;;
   help|-h)
     sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
     ;;

@@ -11,7 +11,11 @@
 # Covered: healthy no-op + stale-state reset (negative case), immediate
 # escalation on the WAL PANIC class, exactly-one-alert + no-restart backoff,
 # N-consecutive-failure escalation, recovery re-arm (healthy observation and
-# clear-state), stale/alive pidfile handling, and the alert payload shape.
+# clear-state), stale/alive pidfile handling, the alert payload shape, and the
+# board description build (a fake board API captures the POSTed issue; the
+# multi-line log tail must render with real newlines, not backslash-n text), and
+# empty/optional-field rendering via `alert-desc` (empty detail must not shift
+# positional fields; null first_failure_at falls back to its default).
 #
 #   ./scripts/pg-recover.test.sh
 #
@@ -195,6 +199,83 @@ done
 [ -n "$(printf '%s' "$LAST" | jq -r .log_tail)" ] && ok "payload carries the log tail" || bad "payload log_tail empty"
 [ -n "$(printf '%s' "$LAST" | jq -r .runbook_ref)" ] && ok "payload carries the runbook pointer" || bad "payload runbook_ref empty"
 printf '%s' "$LAST" | jq -e . >/dev/null 2>&1 && ok "payload is valid JSON" || bad "payload not valid JSON"
+
+echo "== case: board description build renders a multi-line log tail (fake board) =="
+# The description body is built only on the real board path (the drill file
+# captures the raw alert payload instead), so run one PANIC tick with the
+# drill file DISABLED against a fake board API and inspect the POSTed issue:
+# the fenced "Last log lines" block must contain REAL newlines -- the former
+# TSV field roundtrip rendered them as literal backslash-n escapes.
+unset PG_RECOVER_ALERT_FILE
+export PG_RECOVER_TOKEN="drill-board-token"
+export PG_RECOVER_COMPANY_ID="drill-company"
+BOARD_PORT=$((40000 + RANDOM % 20000))
+export PG_RECOVER_API_BASE="http://127.0.0.1:$BOARD_PORT/api"
+BOARD_CAPTURE="$TMP/board-payload.json"
+python3 -c "
+import http.server, sys
+CAP = sys.argv[2]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get('Content-Length', 0)))
+        open(CAP, 'wb').write(body)
+        self.send_response(201)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(b'{\"id\": \"fake-board-issue-id\"}')
+    def log_message(self, *a): pass
+http.server.HTTPServer(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
+" "$BOARD_PORT" "$BOARD_CAPTURE" &
+echo $! > "$TMP/listener-board.pid"   # matched by the trap's listener*.pid glob
+sleep 0.4
+printf '{}' > "$PG_RECOVER_STATE"
+export FAKE_MODE="panic"
+expect_exit 3 "board-alert tick escalates (exit 3)" "$RECOVER" tick
+[ -s "$BOARD_CAPTURE" ] && ok "board POST captured by the fake board" || bad "no board POST captured"
+[ "$(state_get alert_issue_id "$PG_RECOVER_STATE")" = "fake-board-issue-id" ] \
+  && ok "board issue id recorded" || bad "alert_issue_id not recorded"
+[ "$(jq -r '.title' "$BOARD_CAPTURE")" = "[auto-alert] embedded Postgres PANIC on start (WAL corruption class)" ] \
+  && ok "board title assembled correctly" || bad "board title wrong: $(jq -r '.title' "$BOARD_CAPTURE" 2>/dev/null)"
+jq -r '.description' "$BOARD_CAPTURE" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}.*PANIC:  could not locate a valid checkpoint record' \
+  && ok "log tail renders with real newlines (PANIC line on its own line)" \
+  || bad "PANIC log line not rendered on its own line"
+if jq -r '.description' "$BOARD_CAPTURE" | grep -qF '\n'; then
+  bad "description still contains literal backslash-n escapes"
+else
+  ok "no literal backslash-n escapes in the description"
+fi
+if grep -q '| @tsv' "$RECOVER"; then
+  bad "board_alert() still routes fields through the TSV roundtrip"
+else
+  ok "no TSV field roundtrip in pg-recover.sh"
+fi
+kill "$(cat "$TMP/listener-board.pid")" 2>/dev/null
+
+echo "== case: empty/optional fields render without positional shift (alert-desc) =="
+# `alert-desc` renders the description from an ARBITRARY payload, which lets the
+# battery exercise the empty/optional-field shapes the tick paths never produce:
+# an empty `detail` (defect #2 of the TSV roundtrip: whitespace-IFS collapsed
+# consecutive tabs and shifted every later field) and a null `first_failure_at`.
+CRAFTED="$(printf '%s' "$LAST" | jq '.detail = "" | .consecutive_failed_starts = 7 | .first_failure_at = null')"
+RENDERED="$("$RECOVER" alert-desc <<<"$CRAFTED")"
+printf '%s\n' "$RENDERED" | grep -Eq '^- Reason: panic$' \
+  && ok "empty detail leaves a clean Reason line" \
+  || bad "empty detail corrupted the Reason line: $(printf '%s\n' "$RENDERED" | grep '^- Reason' | head -1)"
+printf '%s\n' "$RENDERED" | grep -Fq 'Consecutive failed starts: 7 (max' \
+  && ok "count field stays in its own slot with empty detail" \
+  || bad "count field shifted with empty detail"
+printf '%s\n' "$RENDERED" | grep -Fq "First failure: (this attempt)" \
+  && ok "null first_failure_at renders the default" \
+  || bad "null first_failure_at rendered empty"
+printf '%s\n' "$RENDERED" | grep -Fq '**Runbook:**' \
+  && ok "Runbook line still in its own slot" \
+  || bad "Runbook line shifted with empty detail"
+printf '%s\n' "$RENDERED" | grep -Fq "Port: $PORT" \
+  && ok "Port/Data-dir line still in its own slot" \
+  || bad "Port/Data-dir line shifted with empty detail"
+printf '%s' "$RENDERED" | grep -Fq '\n' \
+  && bad "crafted render contains a literal backslash-n escape" \
+  || ok "crafted empty-detail render has no literal backslash-n escape"
 
 echo
 echo "passed: $PASS  failed: $FAIL"
