@@ -81,7 +81,12 @@ bash scripts/build-npm.sh --skip-checks --skip-typecheck 2>&1 | tail -3
 (cd cli && npm pack --pack-destination "$REPO_ROOT/$OUT" 2>&1 | tail -1)
 rm -rf packages/db/dist
 pnpm --filter @paperclipai/db build 2>&1 | tail -1
-node scripts/pack-public-packages.mjs --out "$OUT" 2>&1 | grep -E '^==>|^  - ' | tail -5
+node scripts/pack-public-packages.mjs --out "$OUT" --packer npm > pack-public.log 2>&1 || {
+  echo "FATAL: pack-public-packages failed — last 30 lines:" >&2
+  tail -30 pack-public.log >&2
+  exit 1
+}
+grep -E '^==>|^  - ' pack-public.log | tail -5
 
 echo "===== [9/10] URL-pin every internal dependency to this release ====="
 node "$SCRIPT_DIR/pin-internal-deps.mjs" --dir "$OUT" --version "$VERSION"

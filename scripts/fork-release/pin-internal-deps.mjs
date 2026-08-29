@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 /**
- * Pin every internal dependency in every packed tarball to the exact release
- * URL for this release.
+ * Normalize every packed tarball manifest for release: pin every internal
+ * dependency to the exact release URL for this release, and strip
+ * `bundleDependencies` declarations (the fork never bundles; the shipped
+ * release sets resolve those deps as normal registry dependencies).
  *
  * Fork releases are GitHub-Release tarball sets, never npm publishes, so an
  * internal dep left as `workspace:*`, `*`, `^<version>`, or a bare version is
@@ -75,6 +77,12 @@ function main() {
       const expected = expectedReleaseUrl(dep.name, args.version);
       if (dep.value !== expected) {
         manifest[dep.section][dep.name] = expected;
+        changed = true;
+      }
+    }
+    for (const key of ["bundleDependencies", "bundledDependencies"]) {
+      if (key in manifest) {
+        delete manifest[key];
         changed = true;
       }
     }
