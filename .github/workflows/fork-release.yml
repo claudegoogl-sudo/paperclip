@@ -1,0 +1,226 @@
+name: Fork Release
+
+# Release pipeline for fork core-host releases (GitHub-Release tarball sets).
+#
+# Every publish is hard-gated behind a clean-sandbox preflight:
+#   build_pack  -> build, pack, URL-pin, and statically gate the tarball set
+#   preflight   -> stage the set on a DRAFT release, then clean-sandbox
+#                  `npm install` from the exact published release URLs
+#                  (full internal dependency graph), boot the server against
+#                  a scratch data dir, and require `GET /` to answer
+#                  200 with <title>Paperclip</title>
+#   publish     -> flip the draft public (only reachable when preflight passed
+#                  and dry_run/negative_test are both off)
+#
+# Any preflight failure deletes the draft release, so a broken build leaves
+# zero published assets and a red run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, e.g. 2026.824.1-fork.35"
+        required: true
+        type: string
+      source_ref:
+        description: "Commit SHA, branch, or tag to release"
+        required: false
+        type: string
+        default: master
+      dry_run:
+        description: "Run every gate but never publish (the draft is deleted at the end)"
+        required: true
+        type: boolean
+        default: true
+      negative_test_fork34:
+        description: "Test-only: inject a broken dev-exports db tarball to prove the gate blocks it (forces dry run)"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_REPO: claudegoogl-sudo/paperclip
+
+jobs:
+  build_pack:
+    name: Build + pack + static gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Build, pack, URL-pin, and statically gate the release
+        run: |
+          args=("${{ inputs.version }}" --out dist-tarballs)
+          if [ "${{ inputs.negative_test_fork34 }}" = "true" ]; then
+            args+=(--negative-test-fork34)
+          fi
+          bash scripts/fork-release/build.sh "${args[@]}"
+
+      - name: Upload release set (workflow artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-tarballs
+          path: dist-tarballs/
+          retention-days: 7
+          if-no-files-found: error
+
+  preflight:
+    name: Preflight (clean install from release URLs -> boot -> GET /)
+    needs: build_pack
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TAG: v${{ inputs.version }}
+      CORE_URL: https://github.com/claudegoogl-sudo/paperclip/releases/download/v${{ inputs.version }}/paperclipai-${{ inputs.version }}.tgz
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Download release set
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-tarballs
+          path: dist-tarballs
+
+      - name: Stage the release set on a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          notes="Automated fork release staging for ${{ inputs.version }}."
+          notes="$notes\n\nDraft staged by the Fork Release workflow; assets are not public until the preflight passes and the release is published."
+          gh release create "$TAG" --repo "$RELEASE_REPO" --draft --prerelease \
+            --target "$GITHUB_SHA" --title "Paperclip ${{ inputs.version }}" --notes "$notes"
+          gh release upload "$TAG" --repo "$RELEASE_REPO" dist-tarballs/*.tgz dist-tarballs/SHA256SUMS.txt
+
+      - name: Download the staged assets (byte-identity check happens in the preflight)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p staged-assets
+          gh release view "$TAG" --repo "$RELEASE_REPO" --json assets \
+            --jq '.assets[] | [.databaseId, .name] | @tsv' > /tmp/assets.tsv
+          while IFS=$'\t' read -r assetId name; do
+            gh api "repos/$RELEASE_REPO/releases/assets/$assetId" \
+              -H "Accept: application/octet-stream" > "staged-assets/$name"
+          done < /tmp/assets.tsv
+          ls staged-assets | wc -l
+
+      - name: Generate the local mirror certificate for github.com
+        run: |
+          openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 2 -nodes \
+            -subj "/CN=github.com" -addext "subjectAltName=DNS:github.com"
+
+      - name: Point github.com at the local mirror for this job
+        run: |
+          sudo cp /etc/hosts /tmp/hosts.bak
+          printf "127.0.0.1 github.com\n" | sudo tee -a /etc/hosts
+          getent hosts github.com
+
+      - name: Serve the staged assets at the exact release URLs
+        run: |
+          sudo -E env PATH="$PATH" node scripts/fork-release/release-url-mirror.mjs \
+            --assets-dir "$PWD/staged-assets" \
+            --tag "$TAG" \
+            --port 443 \
+            --cert "$PWD/cert.pem" --key "$PWD/key.pem" > mirror.log 2>&1 &
+          for i in $(seq 1 20); do
+            if ss -ltn | grep -q ':443 '; then break; fi
+            sleep 0.5
+          done
+          ss -ltn | grep ':443 ' || { echo "mirror did not start" >&2; cat mirror.log >&2; exit 1; }
+
+      - name: Preflight — clean install from the exact release URLs, boot, GET /
+        env:
+          NODE_EXTRA_CA_CERTS: ${{ github.workspace }}/cert.pem
+        run: |
+          node scripts/fork-release/preflight.mjs \
+            --core-url "$CORE_URL" \
+            --assets-dir "$PWD/staged-assets" \
+            --sha256sums "$PWD/staged-assets/SHA256SUMS.txt" \
+            --http-port 3100 \
+            --pg-port 35432 \
+            --summary preflight-summary.json 2>&1 | tee preflight.log
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Fork release preflight — ${{ inputs.version }}"
+            echo
+            echo '```'
+            tail -60 preflight.log 2>/dev/null || echo "(no preflight log)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Restore hosts file
+        if: always()
+        run: |
+          sudo cp /tmp/hosts.bak /etc/hosts || true
+          pkill -f release-url-mirror.mjs || true
+
+      - name: Delete the draft release (dry run or failed preflight)
+        if: failure() || inputs.dry_run || inputs.negative_test_fork34
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete "$TAG" --repo "$RELEASE_REPO" --yes --cleanup-tag || true
+          echo "Draft release $TAG deleted (zero published assets)."
+
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preflight-diagnostics
+          path: |
+            preflight.log
+            preflight-summary.json
+            mirror.log
+            boot.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  publish:
+    name: Publish the release (gate passed)
+    needs: preflight
+    if: ${{ success() && !inputs.dry_run && !inputs.negative_test_fork34 }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Publish the staged release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ inputs.version }}
+        run: |
+          gh release edit "$TAG" --repo "$RELEASE_REPO" --draft=false
+          echo "Release $TAG published (was gated on a green preflight)."
