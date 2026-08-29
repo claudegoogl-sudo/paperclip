@@ -2,6 +2,17 @@ import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+// The route graph behind routes/issues.ts transitively pulls in nearly every
+// server service module, and every case in this file awaits createApp(), which
+// vi.importActual()s that graph after vi.resetModules(). The first case pays
+// the cold transform + evaluation of the whole graph; later cases only re-run
+// the already-transformed module code (~300ms). On a loaded runner that cold
+// first case can outlast vitest's 5s default per-test timeout even though the
+// route itself answers in milliseconds. Assertions are unaffected; this only
+// widens the harness budget for this file, matching the sibling route suites
+// that carry the same comment.
+vi.setConfig({ testTimeout: 30_000 });
+
 const issueId = "11111111-1111-4111-8111-111111111111";
 const companyId = "22222222-2222-4222-8222-222222222222";
 const otherCompanyId = "33333333-3333-4333-8333-333333333333";
