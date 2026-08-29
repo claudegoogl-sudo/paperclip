@@ -1937,6 +1937,46 @@ describe("plugin worker manager setup-token pty route gate", () => {
     }
   }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
 
+  it("drops non-string pre-bind chunks at admission and keeps them from consuming the buffer budget", async () => {
+    const handle = makeSetupTokenPtyHandle();
+    try {
+      await handle.start();
+      // `preReplyFlood` writes 302 output frames before the open reply, so
+      // the whole flood lands in the pre-bind buffer deterministically. The
+      // first 300 frames carry a non-string chunk the post-bind routing would
+      // never deliver; the last two carry a valid string chunk plus a large
+      // junk field. A frame that was buffered whole would consume one of the
+      // 256 buffer slots per junk frame and evict the valid tail; admission
+      // must drop the undeliverable frames and retain only a projected
+      // minimal copy of the deliverable ones.
+      const junkFrames = Array.from({ length: 300 }, () => ({
+        chunk: { blob: "x" },
+      }));
+      const outputs = [
+        ...junkFrames,
+        { chunk: "late-1", junkParams: "j".repeat(64 * 1024) },
+        { chunk: "late-2", junkParams: "j".repeat(64 * 1024) },
+      ];
+      const session = await handle.openSetupTokenPtySession(
+        ptyOpenInput({
+          workerSessionId: "ws-A",
+          preReplyFlood: true,
+          outputs,
+          exitCode: 0,
+        }),
+      );
+      const chunks: string[] = [];
+      session.onData((chunk) => chunks.push(chunk));
+      // The exit still settles the wait, and only the valid string chunks
+      // reach the listener, in arrival order.
+      await expect(session.wait()).resolves.toEqual({ exitCode: 0 });
+      expect(chunks).toEqual(["late-1", "late-2"]);
+      await session.close();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
+
   it("routes delayed input to the worker and back to the listener", async () => {
     const handle = makeSetupTokenPtyHandle();
     try {
@@ -1967,21 +2007,29 @@ describe("plugin worker manager setup-token pty route gate", () => {
     });
     try {
       await handle.start();
-      const session = await handle.openSetupTokenPtySession(
-        ptyOpenInput({
-          outputs: [
-            { chunk: "aaaaa" }, // total 5 → delivered
-            { chunk: "bbbbb" }, // total 10 → delivered
-            { chunk: "ccccc" }, // total 15 > 10 → terminalize
-          ],
-        }),
-      );
+      const session = await handle.openSetupTokenPtySession(ptyOpenInput({}));
+      // Drive the over-bound frame through the input-echo round trip instead
+      // of fixture-scripted outputs. Scripted outputs can coalesce with the
+      // open reply into one pipe read, in which case they are replayed before
+      // this test attaches the listener and a terminalizing last frame wipes
+      // the route's not-yet-delivered buffer (terminalized routes deliver
+      // nothing - that fail-closed behavior is intentional). An echo can only
+      // come back after the matching input round trip, so the listener below
+      // is always attached first and the bound's delivery accounting is
+      // observed deterministically.
       const chunks: string[] = [];
       session.onData((chunk) => chunks.push(chunk));
+      session.write("aaaaa"); // "echo:aaaaa" = 10 chars ≤ 10 → delivered
+      await vi.waitFor(
+        () => expect(chunks).toContain("echo:aaaaa"),
+        { timeout: 15_000 },
+      );
+      session.write("bbbbb"); // "echo:bbbbb" would exceed 10 → terminalize
       // The per-route bound terminalizes the route, so the login wait resolves
-      // with a null exit code and the third chunk never reaches the listener.
+      // with a null exit code and the over-bound echo never reaches the
+      // listener.
       await expect(session.wait()).resolves.toEqual({ exitCode: null });
-      expect(chunks).toEqual(["aaaaa", "bbbbb"]);
+      expect(chunks).toEqual(["echo:aaaaa"]);
     } finally {
       await handle.stop().catch(() => undefined);
     }

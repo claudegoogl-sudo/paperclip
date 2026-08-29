@@ -1413,18 +1413,31 @@ export function createPluginWorkerHandle(
       // replay, so a forged or oversized notification never gains delivery.
       const params = isRecord(notification.params) ? notification.params : {};
       const chunk = params.chunk;
-      const chunkChars = typeof chunk === "string" ? chunk.length : 0;
+      // Buffer a string chunk only: the post-bind routing drops a non-string
+      // chunk, so retaining one pre-bind would buy zero delivery and park
+      // host-process memory for the whole handshake window (up to a
+      // transport-frame-cap object per buffered frame).
+      if (typeof chunk !== "string") return;
       // The caps below bound memory only. They deliberately use the module
       // default total, not this route's configured `maxTotalChars`: a route may
       // configure a tiny delivery bound, and dropping a pre-bind frame against
       // it would hide the cumulative-overrun frame that must terminalize the
-      // route at replay. Delivery accounting stays in the replay path.
+      // route at replay. Delivery accounting stays in the replay path. Overflow
+      // past the caps silently truncates the buffered transcript; the exit
+      // notification is never dropped, so the login wait cannot hang here.
       if (
         route.preBindOutputs.length < SETUP_TOKEN_PTY_PRE_BIND_MAX_OUTPUTS &&
-        route.preBindChars + chunkChars <= MAX_SETUP_TOKEN_PTY_TOTAL_CHARS
+        route.preBindChars + chunk.length <= MAX_SETUP_TOKEN_PTY_TOTAL_CHARS
       ) {
-        route.preBindOutputs.push(notification);
-        route.preBindChars += chunkChars;
+        // Retain a projected minimal copy, not the parsed frame: replay reads
+        // exactly these params, so junk in other fields never parks in host
+        // memory and `preBindChars` stays byte-tight.
+        route.preBindOutputs.push({
+          jsonrpc: notification.jsonrpc,
+          method: notification.method,
+          params: { workerSessionId: params.workerSessionId, chunk },
+        });
+        route.preBindChars += chunk.length;
       }
       return;
     }
@@ -1458,8 +1471,18 @@ export function createPluginWorkerHandle(
     if (!route) return;
     if (route.state === "opening") {
       // Keep only the latest exit seen during the open handshake; an older exit
-      // is superseded. The sid check still applies at replay.
-      route.preBindExit = notification;
+      // is superseded. The sid check still applies at replay. Retain a
+      // projected minimal copy, not the parsed frame, for the same reason as
+      // the output buffer: replay reads exactly these params.
+      const params = isRecord(notification.params) ? notification.params : {};
+      route.preBindExit = {
+        jsonrpc: notification.jsonrpc,
+        method: notification.method,
+        params: {
+          workerSessionId: params.workerSessionId,
+          exitCode: params.exitCode,
+        },
+      };
       return;
     }
     if (route.state !== "open") return;
