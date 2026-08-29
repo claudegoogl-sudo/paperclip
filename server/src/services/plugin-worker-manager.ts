@@ -146,6 +146,8 @@ const MAX_SETUP_TOKEN_PTY_TOTAL_CHARS = 8 * 1024 * 1024;
 const SETUP_TOKEN_PTY_OPEN_TIMEOUT_MS = 30_000;
 /** The default close timeout for one login pseudo-terminal route, in milliseconds. */
 const SETUP_TOKEN_PTY_CLOSE_TIMEOUT_MS = 10_000;
+/** Maximum output notifications buffered while one login route is still opening. */
+const SETUP_TOKEN_PTY_PRE_BIND_MAX_OUTPUTS = 256;
 /**
  * The fixed non-secret error a disallowed login command returns. The manager
  * forwards only the compile-time `CLAUDE_SETUP_TOKEN_COMMAND` to the worker
@@ -1326,6 +1328,18 @@ export function createPluginWorkerHandle(
     deliveredChars: number;
     terminalized: boolean;
     settleWait: (value: { exitCode: number | null }) => void;
+    // Output and exit notifications that arrived after the open request was
+    // written but before the open reply bound the worker session identifier. A
+    // worker that emits them immediately after its open reply can coalesce all
+    // frames into one reader chunk, so the manager dispatches them before the
+    // reply's promise continuation flips the route to `open` - dropping them
+    // left `wait()` unsettled forever. Buffer a bounded number instead and
+    // replay through the normal sid-checked routing after the bind. The
+    // buffer is discarded unless the route actually binds, so a failed or
+    // terminalized handshake still delivers nothing.
+    preBindOutputs: JsonRpcNotification[];
+    preBindExit: JsonRpcNotification | null;
+    preBindChars: number;
   }
   // At most one active credential pseudo-terminal per worker. A non-null route
   // blocks a second open until the manager confirms the first route's close.
@@ -1367,6 +1381,8 @@ export function createPluginWorkerHandle(
     route.state = "closed";
     route.listener = null;
     route.buffered = [];
+    route.preBindOutputs = [];
+    route.preBindExit = null;
     // A terminalized route reports a null exit code, which the runner treats as a
     // failure.
     settleSetupTokenPtyWait(route, { exitCode: null });
@@ -1389,7 +1405,43 @@ export function createPluginWorkerHandle(
   // unknown, late, malformed, or mismatched notification. Never log the raw bytes.
   function routeSetupTokenPtyOutput(notification: JsonRpcNotification): void {
     const route = setupTokenPtyRoute;
-    if (!route || route.state !== "open") return;
+    if (!route) return;
+    if (route.state === "opening") {
+      // The open handshake is still in flight, so no worker session identifier
+      // is bound and nothing may be delivered yet. Buffer a bounded number of
+      // notifications for replay after the bind; the sid check still applies at
+      // replay, so a forged or oversized notification never gains delivery.
+      const params = isRecord(notification.params) ? notification.params : {};
+      const chunk = params.chunk;
+      // Buffer a string chunk only: the post-bind routing drops a non-string
+      // chunk, so retaining one pre-bind would buy zero delivery and park
+      // host-process memory for the whole handshake window (up to a
+      // transport-frame-cap object per buffered frame).
+      if (typeof chunk !== "string") return;
+      // The caps below bound memory only. They deliberately use the module
+      // default total, not this route's configured `maxTotalChars`: a route may
+      // configure a tiny delivery bound, and dropping a pre-bind frame against
+      // it would hide the cumulative-overrun frame that must terminalize the
+      // route at replay. Delivery accounting stays in the replay path. Overflow
+      // past the caps silently truncates the buffered transcript; the exit
+      // notification is never dropped, so the login wait cannot hang here.
+      if (
+        route.preBindOutputs.length < SETUP_TOKEN_PTY_PRE_BIND_MAX_OUTPUTS &&
+        route.preBindChars + chunk.length <= MAX_SETUP_TOKEN_PTY_TOTAL_CHARS
+      ) {
+        // Retain a projected minimal copy, not the parsed frame: replay reads
+        // exactly these params, so junk in other fields never parks in host
+        // memory and `preBindChars` stays byte-tight.
+        route.preBindOutputs.push({
+          jsonrpc: notification.jsonrpc,
+          method: notification.method,
+          params: { workerSessionId: params.workerSessionId, chunk },
+        });
+        route.preBindChars += chunk.length;
+      }
+      return;
+    }
+    if (route.state !== "open") return;
     const params = isRecord(notification.params) ? notification.params : {};
     const workerSessionId = readNonEmptyString(params.workerSessionId);
     if (!workerSessionId || workerSessionId !== route.workerSessionId) return;
@@ -1416,7 +1468,24 @@ export function createPluginWorkerHandle(
   // worker session identifier.
   function routeSetupTokenPtyExit(notification: JsonRpcNotification): void {
     const route = setupTokenPtyRoute;
-    if (!route || route.state !== "open") return;
+    if (!route) return;
+    if (route.state === "opening") {
+      // Keep only the latest exit seen during the open handshake; an older exit
+      // is superseded. The sid check still applies at replay. Retain a
+      // projected minimal copy, not the parsed frame, for the same reason as
+      // the output buffer: replay reads exactly these params.
+      const params = isRecord(notification.params) ? notification.params : {};
+      route.preBindExit = {
+        jsonrpc: notification.jsonrpc,
+        method: notification.method,
+        params: {
+          workerSessionId: params.workerSessionId,
+          exitCode: params.exitCode,
+        },
+      };
+      return;
+    }
+    if (route.state !== "open") return;
     const params = isRecord(notification.params) ? notification.params : {};
     const workerSessionId = readNonEmptyString(params.workerSessionId);
     if (!workerSessionId || workerSessionId !== route.workerSessionId) return;
@@ -1435,6 +1504,8 @@ export function createPluginWorkerHandle(
     route.state = "closed";
     route.listener = null;
     route.buffered = [];
+    route.preBindOutputs = [];
+    route.preBindExit = null;
     settleSetupTokenPtyWait(route, { exitCode: null });
   }
 
@@ -1471,6 +1542,9 @@ export function createPluginWorkerHandle(
       deliveredChars: 0,
       terminalized: false,
       settleWait,
+      preBindOutputs: [],
+      preBindExit: null,
+      preBindChars: 0,
     };
     setupTokenPtyRoute = route;
 
@@ -1508,6 +1582,25 @@ export function createPluginWorkerHandle(
     // Bind the worker session identifier one time and move the route to `open`.
     route.workerSessionId = workerSessionId;
     route.state = "open";
+
+    // Replay what arrived during the open handshake through the normal routing,
+    // so the sid checks and the delivery bounds apply exactly as they would
+    // have if the frames had arrived after the bind: arrival order, outputs
+    // first, then the exit. A replayed cumulative-bound overrun terminalizes the
+    // route mid-replay, and the remaining frames are then dropped by the state
+    // checks exactly as any post-close frame would be.
+    const replayOutputs = route.preBindOutputs;
+    const replayExit = route.preBindExit;
+    route.preBindOutputs = [];
+    route.preBindExit = null;
+    route.preBindChars = 0;
+    for (const notification of replayOutputs) {
+      if (route.state !== "open") break;
+      routeSetupTokenPtyOutput(notification);
+    }
+    if (route.state === "open" && replayExit) {
+      routeSetupTokenPtyExit(replayExit);
+    }
 
     return {
       onData(listener: (chunk: string) => void): void {
