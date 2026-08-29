@@ -13,7 +13,9 @@
 # N-consecutive-failure escalation, recovery re-arm (healthy observation and
 # clear-state), stale/alive pidfile handling, the alert payload shape, and the
 # board description build (a fake board API captures the POSTed issue; the
-# multi-line log tail must render with real newlines, not backslash-n text).
+# multi-line log tail must render with real newlines, not backslash-n text), and
+# empty/optional-field rendering via `alert-desc` (empty detail must not shift
+# positional fields; null first_failure_at falls back to its default).
 #
 #   ./scripts/pg-recover.test.sh
 #
@@ -248,6 +250,32 @@ else
   ok "no TSV field roundtrip in pg-recover.sh"
 fi
 kill "$(cat "$TMP/listener-board.pid")" 2>/dev/null
+
+echo "== case: empty/optional fields render without positional shift (alert-desc) =="
+# `alert-desc` renders the description from an ARBITRARY payload, which lets the
+# battery exercise the empty/optional-field shapes the tick paths never produce:
+# an empty `detail` (defect #2 of the TSV roundtrip: whitespace-IFS collapsed
+# consecutive tabs and shifted every later field) and a null `first_failure_at`.
+CRAFTED="$(printf '%s' "$LAST" | jq '.detail = "" | .consecutive_failed_starts = 7 | .first_failure_at = null')"
+RENDERED="$("$RECOVER" alert-desc <<<"$CRAFTED")"
+printf '%s\n' "$RENDERED" | grep -Eq '^- Reason: panic$' \
+  && ok "empty detail leaves a clean Reason line" \
+  || bad "empty detail corrupted the Reason line: $(printf '%s\n' "$RENDERED" | grep '^- Reason' | head -1)"
+printf '%s\n' "$RENDERED" | grep -Fq 'Consecutive failed starts: 7 (max' \
+  && ok "count field stays in its own slot with empty detail" \
+  || bad "count field shifted with empty detail"
+printf '%s\n' "$RENDERED" | grep -Fq "First failure: (this attempt)" \
+  && ok "null first_failure_at renders the default" \
+  || bad "null first_failure_at rendered empty"
+printf '%s\n' "$RENDERED" | grep -Fq '**Runbook:**' \
+  && ok "Runbook line still in its own slot" \
+  || bad "Runbook line shifted with empty detail"
+printf '%s\n' "$RENDERED" | grep -Fq "Port: $PORT" \
+  && ok "Port/Data-dir line still in its own slot" \
+  || bad "Port/Data-dir line shifted with empty detail"
+printf '%s' "$RENDERED" | grep -Fq '\n' \
+  && bad "crafted render contains a literal backslash-n escape" \
+  || ok "crafted empty-detail render has no literal backslash-n escape"
 
 echo
 echo "passed: $PASS  failed: $FAIL"
