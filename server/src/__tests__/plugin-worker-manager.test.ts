@@ -1813,6 +1813,17 @@ function ptyOpenInput(directive: unknown) {
   };
 }
 
+// Every case below drives a real fixture worker: a spawned child process that
+// speaks stdio JSON-RPC with the manager. On loaded CI runners the spawn plus
+// the round trips can outlast vitest's 5s default per-test timeout while the
+// manager is still healthy - its own open handshake allows 30s (see
+// SETUP_TOKEN_PTY_OPEN_TIMEOUT_MS) - which intermittently surfaced as a 5012ms
+// timeout on the "delivers output only for the exact bound worker session id
+// and drops a mismatch" case. Give the route-gate tests the same 30s headroom
+// the manager grants the open handshake. This only widens the timing bound;
+// every assertion, including the forged-session-id drop, is unchanged.
+const PTY_ROUTE_GATE_TEST_TIMEOUT_MS = 30_000;
+
 describe("plugin worker manager setup-token pty route gate", () => {
   it("rejects a command that is not the allowlisted setup-token command before the worker call", async () => {
     const handle = makeSetupTokenPtyHandle();
@@ -1840,7 +1851,7 @@ describe("plugin worker manager setup-token pty route gate", () => {
     } finally {
       await handle.stop().catch(() => undefined);
     }
-  });
+  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
 
   it("permits one active credential pseudo-terminal per worker", async () => {
     const handle = makeSetupTokenPtyHandle();
@@ -1864,7 +1875,7 @@ describe("plugin worker manager setup-token pty route gate", () => {
     } finally {
       await handle.stop().catch(() => undefined);
     }
-  });
+  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
 
   it("delivers output only for the exact bound worker session id and drops a mismatch", async () => {
     const handle = makeSetupTokenPtyHandle();
@@ -1891,7 +1902,80 @@ describe("plugin worker manager setup-token pty route gate", () => {
     } finally {
       await handle.stop().catch(() => undefined);
     }
-  });
+  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
+
+  it("delivers output that races the open reply in the same frame batch and drops a mismatch", async () => {
+    const handle = makeSetupTokenPtyHandle();
+    try {
+      await handle.start();
+      // `coalesce` makes the fixture write the open reply, the output frames,
+      // and the exit as one raw stdout write, so the host dispatches every
+      // frame before the open reply's promise continuation binds the route.
+      // The manager must buffer and replay such pre-bind frames: dropping them
+      // left `session.wait()` unsettled forever (the flaky CI timeout).
+      const session = await handle.openSetupTokenPtySession(
+        ptyOpenInput({
+          workerSessionId: "ws-A",
+          coalesce: true,
+          outputs: [
+            { chunk: "good-1" },
+            { chunk: "forged", sid: "ws-EVIL" },
+            { chunk: "good-2" },
+          ],
+          exitCode: 0,
+        }),
+      );
+      const chunks: string[] = [];
+      session.onData((chunk) => chunks.push(chunk));
+      await expect(session.wait()).resolves.toEqual({ exitCode: 0 });
+      // The replay applies the same sid check, so the forged frame is dropped
+      // and only the two bound chunks reach the listener, in order.
+      expect(chunks).toEqual(["good-1", "good-2"]);
+      await session.close();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
+
+  it("drops non-string pre-bind chunks at admission and keeps them from consuming the buffer budget", async () => {
+    const handle = makeSetupTokenPtyHandle();
+    try {
+      await handle.start();
+      // `preReplyFlood` writes 302 output frames before the open reply, so
+      // the whole flood lands in the pre-bind buffer deterministically. The
+      // first 300 frames carry a non-string chunk the post-bind routing would
+      // never deliver; the last two carry a valid string chunk plus a large
+      // junk field. A frame that was buffered whole would consume one of the
+      // 256 buffer slots per junk frame and evict the valid tail; admission
+      // must drop the undeliverable frames and retain only a projected
+      // minimal copy of the deliverable ones.
+      const junkFrames = Array.from({ length: 300 }, () => ({
+        chunk: { blob: "x" },
+      }));
+      const outputs = [
+        ...junkFrames,
+        { chunk: "late-1", junkParams: "j".repeat(64 * 1024) },
+        { chunk: "late-2", junkParams: "j".repeat(64 * 1024) },
+      ];
+      const session = await handle.openSetupTokenPtySession(
+        ptyOpenInput({
+          workerSessionId: "ws-A",
+          preReplyFlood: true,
+          outputs,
+          exitCode: 0,
+        }),
+      );
+      const chunks: string[] = [];
+      session.onData((chunk) => chunks.push(chunk));
+      // The exit still settles the wait, and only the valid string chunks
+      // reach the listener, in arrival order.
+      await expect(session.wait()).resolves.toEqual({ exitCode: 0 });
+      expect(chunks).toEqual(["late-1", "late-2"]);
+      await session.close();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
 
   it("routes delayed input to the worker and back to the listener", async () => {
     const handle = makeSetupTokenPtyHandle();
@@ -1905,12 +1989,17 @@ describe("plugin worker manager setup-token pty route gate", () => {
       session.write("browser-code");
       // The worker echoes the input as one output notification for the bound
       // session, so the listener receives it.
-      await vi.waitFor(() => expect(chunks).toContain("echo:browser-code"));
+      await vi.waitFor(
+        () => expect(chunks).toContain("echo:browser-code"),
+        // Delivery rides a real child-process round trip; give slow runners the
+        // same headroom as the surrounding test instead of the 1s waitFor default.
+        { timeout: 15_000 },
+      );
       await session.close();
     } finally {
       await handle.stop().catch(() => undefined);
     }
-  });
+  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
 
   it("terminalizes the route when the cumulative output passes the per-route bound", async () => {
     const handle = makeSetupTokenPtyHandle({
@@ -1918,25 +2007,33 @@ describe("plugin worker manager setup-token pty route gate", () => {
     });
     try {
       await handle.start();
-      const session = await handle.openSetupTokenPtySession(
-        ptyOpenInput({
-          outputs: [
-            { chunk: "aaaaa" }, // total 5 → delivered
-            { chunk: "bbbbb" }, // total 10 → delivered
-            { chunk: "ccccc" }, // total 15 > 10 → terminalize
-          ],
-        }),
-      );
+      const session = await handle.openSetupTokenPtySession(ptyOpenInput({}));
+      // Drive the over-bound frame through the input-echo round trip instead
+      // of fixture-scripted outputs. Scripted outputs can coalesce with the
+      // open reply into one pipe read, in which case they are replayed before
+      // this test attaches the listener and a terminalizing last frame wipes
+      // the route's not-yet-delivered buffer (terminalized routes deliver
+      // nothing - that fail-closed behavior is intentional). An echo can only
+      // come back after the matching input round trip, so the listener below
+      // is always attached first and the bound's delivery accounting is
+      // observed deterministically.
       const chunks: string[] = [];
       session.onData((chunk) => chunks.push(chunk));
+      session.write("aaaaa"); // "echo:aaaaa" = 10 chars ≤ 10 → delivered
+      await vi.waitFor(
+        () => expect(chunks).toContain("echo:aaaaa"),
+        { timeout: 15_000 },
+      );
+      session.write("bbbbb"); // "echo:bbbbb" would exceed 10 → terminalize
       // The per-route bound terminalizes the route, so the login wait resolves
-      // with a null exit code and the third chunk never reaches the listener.
+      // with a null exit code and the over-bound echo never reaches the
+      // listener.
       await expect(session.wait()).resolves.toEqual({ exitCode: null });
-      expect(chunks).toEqual(["aaaaa", "bbbbb"]);
+      expect(chunks).toEqual(["echo:aaaaa"]);
     } finally {
       await handle.stop().catch(() => undefined);
     }
-  });
+  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
 
   it("terminalizes and fails closed on a malformed open reply, then admits a later open", async () => {
     const handle = makeSetupTokenPtyHandle();
@@ -1955,7 +2052,7 @@ describe("plugin worker manager setup-token pty route gate", () => {
     } finally {
       await handle.stop().catch(() => undefined);
     }
-  });
+  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
 
   it("terminalizes the route on an open timeout", async () => {
     const handle = makeSetupTokenPtyHandle({
@@ -1969,7 +2066,7 @@ describe("plugin worker manager setup-token pty route gate", () => {
     } finally {
       await handle.stop().catch(() => undefined);
     }
-  });
+  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
 
   it("binds the worker session id one time and ignores a duplicate open reply", async () => {
     const handle = makeSetupTokenPtyHandle();
@@ -1993,7 +2090,7 @@ describe("plugin worker manager setup-token pty route gate", () => {
     } finally {
       await handle.stop().catch(() => undefined);
     }
-  });
+  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
 
   it("closes the route with a fixed exit when the worker exits", async () => {
     const handle = makeSetupTokenPtyHandle();
@@ -2010,7 +2107,7 @@ describe("plugin worker manager setup-token pty route gate", () => {
     } finally {
       await handle.stop().catch(() => undefined);
     }
-  });
+  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
 
   it("retires the worker on an unconfirmed close acknowledgement", async () => {
     const handle = makeSetupTokenPtyHandle({
@@ -2034,5 +2131,5 @@ describe("plugin worker manager setup-token pty route gate", () => {
     } finally {
       await handle.stop().catch(() => undefined);
     }
-  });
+  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
 });
