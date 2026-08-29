@@ -228,11 +228,26 @@ board_alert() { # <json> — echoes issue id on success, rc 1 otherwise
   fi
   [ -n "$company_id" ] || { warn "could not resolve board company id — cannot file board alert"; return 1; }
 
-  IFS=$'\t' read -r ahost reason detail failures maxf first detected port datadir logpath logtail runbook severity <<EOF
-$(printf '%s' "$json" | jq -r '[.host, .reason, (.detail // ""), (.consecutive_failed_starts | tostring),
-  (.max_consecutive_failed_starts | tostring), (.first_failure_at // "(this attempt)"), .detected_at,
-  (.port | tostring), .data_dir, .log_path, .log_tail, .runbook_ref, (.severity // "high")] | @tsv')
-EOF
+  # Field extraction: one `jq -r` per field. The former TSV roundtrip
+  # (jq to-tabbed-value, then IFS=tab read) broke the alert body twice:
+  # the tab escaping turns real newlines in the log tail into the two
+  # characters backslash-n (rendered literally in the filed description),
+  # and a whitespace IFS collapses EMPTY fields so every later field shifts
+  # left. Separate calls keep newlines real and every field in its own slot.
+  jfield() { printf '%s' "$json" | jq -r "$1"; }
+  ahost="$(jfield '.host // ""')"
+  reason="$(jfield '.reason // ""')"
+  detail="$(jfield '.detail // ""')"
+  failures="$(jfield '(.consecutive_failed_starts // 0) | tostring')"
+  maxf="$(jfield '(.max_consecutive_failed_starts // 0) | tostring')"
+  first="$(jfield '.first_failure_at // "(this attempt)"')"
+  detected="$(jfield '.detected_at // ""')"
+  port="$(jfield '(.port // 0) | tostring')"
+  datadir="$(jfield '.data_dir // ""')"
+  logpath="$(jfield '.log_path // ""')"
+  logtail="$(jfield '.log_tail // ""')"
+  runbook="$(jfield '.runbook_ref // ""')"
+  severity="$(jfield '.severity // "high"')"
 
   if [ "$reason" = "panic" ]; then
     title="[auto-alert] embedded Postgres PANIC on start (WAL corruption class)"
