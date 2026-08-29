@@ -115,6 +115,23 @@ echo 999999 > "$PGDATA/postmaster.pid"
 expect_exit 1 "verify: stale pidfile refused" "$GUARD" verify "$PGDATA"
 rm -f "$PGDATA/postmaster.pid"
 
+echo "== case: staged bin-dir glob discovery (no env overrides) =="
+# Regression: candidate globs once matched the bare bin DIRECTORY (dirs pass
+# -x), so discovery returned a directory instead of the binary. A staged
+# layout like /usr/local/share/paperclip-release-tools/pg-bin/<v>/bin must
+# resolve to regular executable files.
+STAGED="$TMP/staged/pg-bin/18.1/bin"
+mkdir -p "$STAGED"
+ln -s "$PGBIN/pg_controldata" "$STAGED/pg_controldata"
+ln -s "$PGBIN/pg_ctl" "$STAGED/pg_ctl"
+DISCOVERED="$(PG_GUARD_PGCONTROLDATA= PG_GUARD_EXTRA_BIN_GLOBS="$TMP/staged/pg-bin/*/bin" bash -c "source '$GUARD'; pg_guard_pgcontroldata")" && rc=$? || rc=$?
+if [ "$rc" = 0 ] && [ -f "$DISCOVERED" ] && [ -x "$DISCOVERED" ]; then
+  ok "tool discovery returns a regular executable file ($DISCOVERED)"
+else
+  bad "tool discovery failed or returned a non-file (rc=$rc, got: ${DISCOVERED:-<none>})"
+fi
+expect_exit 0 "state via staged-bin glob discovery, no env overrides" env PG_GUARD_PGCONTROLDATA= PG_GUARD_PGCTL= PG_GUARD_EXTRA_BIN_GLOBS="$TMP/staged/pg-bin/*/bin" "$GUARD" state "$PGDATA"
+
 echo "== case: missing pg_controldata maps to tooling exit 2 =="
 PG_GUARD_PGCONTROLDATA=/nonexistent/pg_controldata expect_exit 2 "verify: missing pg_controldata" env PG_GUARD_PGCONTROLDATA=/nonexistent/pg_controldata "$GUARD" verify "$PGDATA"
 

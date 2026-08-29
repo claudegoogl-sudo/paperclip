@@ -69,17 +69,18 @@ pg_guard_warn() { echo "[pg-guard] WARNING: $*" >&2; }
 pg_guard_die() { echo "[pg-guard] ERROR: $*" >&2; return 1; }
 
 # Locate a tool by explicit env, PATH, or glob candidates. Echoes the path or
-# returns 2.
+# returns 2. Candidates must be regular files: a glob can match a directory
+# (directories pass -x), and executing a directory fails confusingly later.
 pg_guard_find_tool() {
   local tool="$1" env_var="$2"
   shift 2
   local candidate="${!env_var:-}"
   if [ -n "$candidate" ]; then
-    if [ -x "$candidate" ]; then
+    if [ -f "$candidate" ] && [ -x "$candidate" ]; then
       echo "$candidate"
       return 0
     fi
-    pg_guard_warn "$env_var=$candidate is set but not executable"
+    pg_guard_warn "$env_var=$candidate is set but not an executable file"
     return 2
   fi
   candidate="$(command -v "$tool" 2>/dev/null || true)"
@@ -90,13 +91,24 @@ pg_guard_find_tool() {
   local glob
   for glob in "$@"; do
     for candidate in $glob; do
-      if [ -x "$candidate" ]; then
+      if [ -f "$candidate" ] && [ -x "$candidate" ]; then
         echo "$candidate"
         return 0
       fi
     done
   done
   return 2
+}
+
+# Append "/<tool>" to every glob line. The globs arrive as one multi-line
+# string, so plain string concatenation would decorate only the LAST line and
+# leave earlier globs matching bare directories.
+pg_guard_tool_candidates() {
+  local tool="$1" line
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    printf '%s/%s\n' "${line%/}" "$tool"
+  done
 }
 
 # Common search locations for the embedded-postgres tool distribution.
@@ -110,11 +122,11 @@ pg_guard_bin_globs() {
 }
 
 pg_guard_pgcontroldata() {
-  pg_guard_find_tool pg_controldata PG_GUARD_PGCONTROLDATA "$(pg_guard_bin_globs)/pg_controldata"
+  pg_guard_find_tool pg_controldata PG_GUARD_PGCONTROLDATA "$(pg_guard_bin_globs | pg_guard_tool_candidates pg_controldata)"
 }
 
 pg_guard_pgctl() {
-  pg_guard_find_tool pg_ctl PG_GUARD_PGCTL "$(pg_guard_bin_globs)/pg_ctl"
+  pg_guard_find_tool pg_ctl PG_GUARD_PGCTL "$(pg_guard_bin_globs | pg_guard_tool_candidates pg_ctl)"
 }
 
 # Print the "Database cluster state" string for a data dir.
