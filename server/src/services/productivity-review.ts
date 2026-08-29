@@ -1,7 +1,8 @@
-import { and, asc, desc, eq, gt, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { clampIssueRequestDepth, TERMINAL_HEARTBEAT_RUN_STATUSES } from "@paperclipai/shared";
 import {
+  activityLog,
   agents,
   companies,
   costEvents,
@@ -14,12 +15,17 @@ import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { budgetService } from "./budgets.js";
 import { issueService } from "./issues.js";
+import { visibleIssueCondition } from "./issue-visibility.js";
 import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
 } from "./recovery/model-profile-hint.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
 import { isStandbyWakeTargetIssue } from "./recovery/successful-run-handoff.js";
+import {
+  isProviderAdmissionFailureRun,
+  notProviderAdmissionFailureCondition,
+} from "./provider-admission-failure.js";
 
 export const PRODUCTIVITY_REVIEW_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.issueProductivityReview;
 export const HIGH_COMMENT_VOLUME_ALERT_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.highCommentVolumeAlert;
@@ -34,9 +40,13 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_RESOLVED_SNOOZE_MS = 6 * 60 * 60 * 1000
 export const DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS = 3;
 export const DEFAULT_PRODUCTIVITY_REVIEW_CREATION_WINDOW_MS = 24 * 60 * 60 * 1000;
-export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW = 3;
+export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW = 1;
+export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CONSECUTIVE_NO_ACTION_REVIEWS = 3;
 
-const TERMINAL_RUN_STATUSES = TERMINAL_HEARTBEAT_RUN_STATUSES;
+// Fork: derive from the shared heartbeat-run status model ("succeeded_dirty"
+// stays terminal/successful) and union upstream's "interrupted" status, which
+// is likewise terminal (non-live) for review staleness purposes.
+const TERMINAL_RUN_STATUSES = [...TERMINAL_HEARTBEAT_RUN_STATUSES, "interrupted"] as const;
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const MAX_CANDIDATE_ISSUES = 250;
 const MAX_RUNS_FOR_STREAK = 100;
@@ -46,6 +56,12 @@ export const PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX = "Productivity review e
 type IssueRow = typeof issues.$inferSelect;
 type AgentRow = typeof agents.$inferSelect;
 type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
+// Evidence only reads these run fields; selecting the full row detoasts
+// result_json/context_snapshot for up to MAX_RUNS_FOR_STREAK runs per issue.
+type ProductivityRunSample = Pick<
+  HeartbeatRunRow,
+  "id" | "agentId" | "status" | "livenessState" | "createdAt" | "nextAction" | "usageJson"
+>;
 type ProductivityReviewTrigger = "no_comment_streak" | "long_active_duration" | "high_churn";
 
 type ProductivityReviewThresholds = {
@@ -58,6 +74,7 @@ type ProductivityReviewThresholds = {
   maxRefreshComments: number;
   creationWindowMs: number;
   maxCreationsPerWindow: number;
+  maxConsecutiveNoActionReviews: number;
 };
 
 type ProductivityReviewEvidence = {
@@ -69,13 +86,14 @@ type ProductivityReviewEvidence = {
   totalRunCount: number;
   terminalRunCount: number;
   activeRunCount: number;
+  providerAdmissionFailureCount: number;
   runCountLastHour: number;
   runCountLastSixHours: number;
   commentCount: number;
   commentCountLastHour: number;
   commentCountLastSixHours: number;
   elapsedMs: number | null;
-  latestRuns: HeartbeatRunRow[];
+  latestRuns: ProductivityRunSample[];
   latestComments: Array<typeof issueComments.$inferSelect>;
   costCents: number;
   usageSamples: Array<{ runId: string; usageJson: Record<string, unknown> | null }>;
@@ -189,6 +207,10 @@ function buildThresholds(overrides?: Partial<ProductivityReviewThresholds>): Pro
       overrides?.maxCreationsPerWindow ?? DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW,
       DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW,
     ),
+    maxConsecutiveNoActionReviews: readPositiveInteger(
+      overrides?.maxConsecutiveNoActionReviews ?? DEFAULT_PRODUCTIVITY_REVIEW_MAX_CONSECUTIVE_NO_ACTION_REVIEWS,
+      DEFAULT_PRODUCTIVITY_REVIEW_MAX_CONSECUTIVE_NO_ACTION_REVIEWS,
+    ),
   };
 }
 
@@ -279,7 +301,7 @@ export function productivityReviewService(
           eq(issues.companyId, companyId),
           eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
           eq(issues.originId, sourceIssueId),
-          isNull(issues.hiddenAt),
+          visibleIssueCondition(),
           notInArray(issues.status, ["done", "cancelled"]),
         ),
       )
@@ -288,7 +310,7 @@ export function productivityReviewService(
       .then((rows) => rows[0] ?? null);
   }
 
-  async function findRecentResolvedProductivityReview(
+  async function findRecentTerminalProductivityReview(
     companyId: string,
     sourceIssueId: string,
     thresholds: ProductivityReviewThresholds,
@@ -303,7 +325,7 @@ export function productivityReviewService(
           eq(issues.companyId, companyId),
           eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
           eq(issues.originId, sourceIssueId),
-          eq(issues.status, "done"),
+          inArray(issues.status, ["done", "cancelled"]),
           gt(issues.updatedAt, cutoff),
         ),
       )
@@ -327,12 +349,61 @@ export function productivityReviewService(
           eq(issues.companyId, companyId),
           eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
           eq(issues.originId, sourceIssueId),
-          isNull(issues.hiddenAt),
+          visibleIssueCondition(),
           sql`${issues.status} <> 'cancelled'`,
           sql`${issues.createdAt} >= ${cutoff.toISOString()}::timestamptz`,
         ),
       )
       .then((rows) => Number(rows[0]?.count ?? 0));
+  }
+
+  async function countConsecutiveNoActionProductivityReviews(
+    companyId: string,
+    sourceIssueId: string,
+    thresholds: ProductivityReviewThresholds,
+  ) {
+    const completedReviews = await db
+      .select({
+        createdAt: issues.createdAt,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
+          eq(issues.originId, sourceIssueId),
+          eq(issues.status, "done"),
+          visibleIssueCondition(),
+        ),
+      )
+      .orderBy(desc(issues.createdAt), desc(issues.id))
+      .limit(thresholds.maxConsecutiveNoActionReviews);
+
+    const earliestReviewCreatedAt = completedReviews.at(-1)?.createdAt;
+    if (!earliestReviewCreatedAt) return 0;
+    const sourceActions = await db
+      .select({ createdAt: activityLog.createdAt })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, sourceIssueId),
+          gte(activityLog.createdAt, earliestReviewCreatedAt),
+        ),
+      );
+
+    let streak = 0;
+    for (const [index, review] of completedReviews.entries()) {
+      const nextNewerReviewCreatedAt = completedReviews[index - 1]?.createdAt ?? null;
+      const sourceAction = sourceActions.some((activity) => {
+        if (activity.createdAt < review.createdAt) return false;
+        return !nextNewerReviewCreatedAt || activity.createdAt < nextNewerReviewCreatedAt;
+      });
+      if (sourceAction) break;
+      streak += 1;
+    }
+    return streak;
   }
 
   async function getRefreshCommentState(companyId: string, reviewIssueId: string) {
@@ -385,6 +456,7 @@ export function productivityReviewService(
           eq(heartbeatRuns.agentId, agentId),
           issueRunScopeSql(issueId),
           sql`coalesce(${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) >= ${since.toISOString()}::timestamptz`,
+          notProviderAdmissionFailureCondition(),
         ),
       )
       .then((rows) => rows[0]?.count ?? 0);
@@ -425,7 +497,16 @@ export function productivityReviewService(
     const sixHoursAgo = new Date(now.getTime() - 6 * 60 * 60 * 1000);
 
     const latestRuns = await db
-      .select()
+      .select({
+        id: heartbeatRuns.id,
+        agentId: heartbeatRuns.agentId,
+        status: heartbeatRuns.status,
+        livenessState: heartbeatRuns.livenessState,
+        createdAt: heartbeatRuns.createdAt,
+        nextAction: heartbeatRuns.nextAction,
+        usageJson: heartbeatRuns.usageJson,
+        errorCode: heartbeatRuns.errorCode,
+      })
       .from(heartbeatRuns)
       .where(
         and(
@@ -455,7 +536,13 @@ export function productivityReviewService(
       }
     }
 
-    const terminalRuns = latestRuns.filter((run) =>
+    // Provider-admission failures (429-class transient upstream, zero cost)
+    // never reached the model, so they say nothing about the assignee's
+    // productivity. Exclude them from the no-comment streak and the churn
+    // windows so an account-wide outage does not read as stalled work.
+    const providerAdmissionFailureCount = latestRuns.filter(isProviderAdmissionFailureRun).length;
+    const streakEligibleRuns = latestRuns.filter((run) => !isProviderAdmissionFailureRun(run));
+    const terminalRuns = streakEligibleRuns.filter((run) =>
       TERMINAL_RUN_STATUSES.includes(run.status as (typeof TERMINAL_RUN_STATUSES)[number]),
     );
     let noCommentStreak = 0;
@@ -567,6 +654,7 @@ export function productivityReviewService(
       totalRunCount: latestRuns.length,
       terminalRunCount: terminalRuns.length,
       activeRunCount,
+      providerAdmissionFailureCount,
       runCountLastHour,
       runCountLastSixHours,
       commentCount: assigneeRunCommentCount,
@@ -650,6 +738,11 @@ export function productivityReviewService(
       `- Total sampled issue-linked runs: ${evidence.totalRunCount}`,
       `- Terminal sampled runs: ${evidence.terminalRunCount}`,
       `- Active queued/running/scheduled runs: ${evidence.activeRunCount}`,
+      ...(evidence.providerAdmissionFailureCount > 0
+        ? [
+            `- Provider outage window: ${evidence.providerAdmissionFailureCount} sampled runs were zero-cost provider-admission failures (429-class transient upstream) and are excluded from streak/churn evidence — treat stalled-looking signals in this window as outage noise, not actionable drift`,
+          ]
+        : []),
       `- No-comment completed-run streak: ${evidence.noCommentStreak}`,
       `- Current active elapsed time: ${msToHuman(evidence.elapsedMs)}`,
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
@@ -693,6 +786,11 @@ export function productivityReviewService(
       `- Reasons: ${evidence.triggerReasons.join("; ")}`,
       `- No-comment streak: ${evidence.noCommentStreak}`,
       `- Runs/assignee comments: ${evidence.runCountLastHour}/${evidence.commentCountLastHour} in 1h, ${evidence.runCountLastSixHours}/${evidence.commentCountLastSixHours} in 6h`,
+      ...(evidence.providerAdmissionFailureCount > 0
+        ? [
+            `- Provider outage window: ${evidence.providerAdmissionFailureCount} sampled zero-cost provider-admission failures excluded from streak/churn evidence`,
+          ]
+        : []),
       `- Next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 300) : "none recorded"}`,
     ].join("\n");
   }
@@ -740,6 +838,15 @@ export function productivityReviewService(
     );
     if (recentCreationCount >= opts.thresholds.maxCreationsPerWindow) {
       return { kind: "creation_capped" as const, reviewIssueId: null };
+    }
+
+    const consecutiveNoActionReviews = await countConsecutiveNoActionProductivityReviews(
+      evidence.sourceIssue.companyId,
+      evidence.sourceIssue.id,
+      opts.thresholds,
+    );
+    if (consecutiveNoActionReviews >= opts.thresholds.maxConsecutiveNoActionReviews) {
+      return { kind: "no_action_suppressed" as const, reviewIssueId: null };
     }
 
     const ownerAgentId = await resolveReviewOwnerAgentId(evidence.sourceIssue, evidence.sourceAgent);
@@ -842,6 +949,7 @@ export function productivityReviewService(
     now?: Date;
     companyId?: string;
     thresholds?: Partial<ProductivityReviewThresholds>;
+    issueCreatedAtGte?: Date | null;
   }) {
     // Kill-switch: short-circuit the reviewer without touching the rest of the
     // heartbeat scheduler. Default is enabled to preserve existing behaviour;
@@ -865,11 +973,12 @@ export function productivityReviewService(
       .where(
         and(
           opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
-          isNull(issues.hiddenAt),
+          visibleIssueCondition(),
           isNull(issues.assigneeUserId),
           inArray(issues.status, ["todo", "in_progress"]),
           sql`${issues.assigneeAgentId} is not null`,
           sql`${issues.originKind} <> ${PRODUCTIVITY_REVIEW_ORIGIN_KIND}`,
+          opts?.issueCreatedAtGte ? gte(issues.createdAt, opts.issueCreatedAtGte) : undefined,
         ),
       )
       .orderBy(asc(issues.updatedAt), asc(issues.id))
@@ -882,6 +991,7 @@ export function productivityReviewService(
       existing: 0,
       snoozed: 0,
       creationCapped: 0,
+      noActionSuppressed: 0,
       skipped: 0,
       failed: 0,
       reviewIssueIds: [] as string[],
@@ -899,12 +1009,17 @@ export function productivityReviewService(
         result.skipped += 1;
         continue;
       }
-      if (await findRecentResolvedProductivityReview(candidate.companyId, candidate.id, thresholds, now)) {
+      if (await findRecentTerminalProductivityReview(candidate.companyId, candidate.id, thresholds, now)) {
         result.snoozed += 1;
         continue;
       }
       const sourceAgent = await getAgent(candidate.assigneeAgentId);
       if (!sourceAgent || sourceAgent.companyId !== candidate.companyId) {
+        result.skipped += 1;
+        continue;
+      }
+      // A paused assignee cannot act on a review, so raising one only creates noise.
+      if (sourceAgent.status === "paused") {
         result.skipped += 1;
         continue;
       }
@@ -923,6 +1038,7 @@ export function productivityReviewService(
         if (outcome.kind === "created") result.created += 1;
         else if (outcome.kind === "updated") result.updated += 1;
         else if (outcome.kind === "creation_capped") result.creationCapped += 1;
+        else if (outcome.kind === "no_action_suppressed") result.noActionSuppressed += 1;
         else result.existing += 1;
         if (outcome.reviewIssueId) result.reviewIssueIds.push(outcome.reviewIssueId);
       } catch (err) {

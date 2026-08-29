@@ -475,21 +475,6 @@ export const SECURITY_POSTURE_COLUMNS = [
     reason: "The other half of the same check: a lease is only enforced while this timestamp is in the future, so flattening it to the past disarms lease ownership without touching lease_token.",
   },
   {
-    table: "cloud_upstream_connections",
-    column: "token_status",
-    reason: "Dangerous value 'connected': the gate on using an upstream connection at all, so a flatten reactivates expired and revoked cross-instance connections.",
-  },
-  {
-    table: "cloud_upstream_connections",
-    column: "access_token",
-    reason: "Cross-instance bearer credential; an unqualified write transplants one instance's token onto every connection row, pointing other tenants' pushes at a destination the token holder controls.",
-  },
-  {
-    table: "cloud_upstream_connections",
-    column: "private_key_pem",
-    reason: "Signing key for cross-instance requests; a flatten makes one attacker-held key authenticate every connection, and unlike access_token it is not rotated on reconnect.",
-  },
-  {
     table: "session",
     column: "token",
     reason: "The session bearer value better-auth looks sessions up by. Same library-behaviour grounds as session.expires_at: enforcement is out of repo, but no migration has a legitimate reason to rewrite session credentials unqualified, and a constant flatten would give one token every user's session.",
@@ -528,6 +513,157 @@ export const SECURITY_POSTURE_COLUMNS = [
     table: "issues",
     column: "execution_workspace_settings",
     reason: "Its `mode` takes precedence over execution_workspace_preference in workspace resolution, so registering the preference alone would leave the higher-precedence input unguarded.",
+  },
+  // --- sync/upstream-v2026.824.1: columns introduced by upstream 707->824 (classified during the 824.1 superset re-land) ---
+  {
+    table: "companies",
+    column: "interaction_resolver_governance",
+    reason: "Company-level governance mode for interaction resolvers; downgrading it weakens the fork's continuation gating.",
+  },
+  {
+    table: "company_secret_proposals",
+    column: "value_ciphertext",
+    reason: "Ciphertext of a proposed secret value; an unqualified write can replace the proposed credential material before approval.",
+  },
+  {
+    table: "company_skill_policies",
+    column: "default_effect",
+    reason: "Default verdict for unmatched skill tool accesses; flipping it to allow is a bulk authorization change.",
+  },
+  {
+    table: "company_skill_policies",
+    column: "rules",
+    reason: "Skill tool-access policy rules; rewriting them grants tool access outside review.",
+  },
+  {
+    table: "connection_grants",
+    column: "credential_secret_refs",
+    reason: "Secret refs backing this grant's credentials; repointing them is a credential swap.",
+  },
+  {
+    table: "connection_token_issuances",
+    column: "token_hash",
+    reason: "Hash of the issued connection token; immutable audit of what was issued, and a swap would re-target an issued credential.",
+  },
+  {
+    table: "decisions",
+    column: "signed_spec",
+    reason: "Signed decision spec authorizing effect execution; a rewrite forges an executable decision outside the approval chain.",
+  },
+  {
+    table: "external_objects",
+    column: "refresh_token",
+    reason: "Stored OAuth refresh token for the external object; an unqualified write transplants a foreign or stale credential onto the row, so writes must stay qualified.",
+  },
+  {
+    table: "tool_action_requests",
+    column: "approval_id",
+    reason: "Links a privileged action request to its board approval; repointing it attaches an unapproved action to someone else's approval.",
+  },
+  {
+    table: "tool_action_requests",
+    column: "signed_arguments",
+    reason: "Approval-bound signature over the action arguments; rewriting it detaches the approval from what actually executes.",
+  },
+  {
+    table: "tool_connections",
+    column: "auth_kind",
+    reason: "Selects how the connection authenticates; flipping it changes the interpretation of the credential columns and can bypass the intended auth path.",
+  },
+  {
+    table: "tool_connections",
+    column: "credential_refs",
+    reason: "Secret references resolving this connection's credentials; repointing them (e.g. at an attacker-owned secret) is a credential swap and must be written qualified.",
+  },
+  {
+    table: "tool_connections",
+    column: "credential_secret_refs",
+    reason: "Company-secret binding refs backing this connection; same credential-swap hazard as credential_refs.",
+  },
+  {
+    table: "tool_connections",
+    column: "ownership",
+    reason: "Records the owning principal kind of the connection; rewriting it reassigns control of the connection's credentials and grants.",
+  },
+  {
+    table: "tool_gateway_sessions",
+    column: "token_hash",
+    reason: "Hash of the gateway session token; same swap-to-known-hash hazard as gateway token hashes.",
+  },
+  {
+    table: "tool_invocations",
+    column: "approval_state",
+    reason: "Records whether the invocation passed its approval gate; forging it launders an unapproved invocation after the fact.",
+  },
+  {
+    table: "tool_invocations",
+    column: "policy_decision",
+    reason: "Recorded policy verdict (allow/deny); forging it hides denials from audit and downstream enforcement.",
+  },
+  {
+    table: "tool_mcp_gateway_tokens",
+    column: "allowed_actions",
+    reason: "Capability allowlist of the gateway token; widening it is direct privilege escalation on the gateway surface.",
+  },
+  {
+    table: "tool_mcp_gateway_tokens",
+    column: "token_hash",
+    reason: "Lookup hash of a gateway API token; swapping it for a hash the attacker knows mints them a working token without touching the secret store.",
+  },
+  {
+    table: "tool_mcp_gateways",
+    column: "auth_config",
+    reason: "Auth configuration for the MCP gateway; may carry credential material or trusted endpoints and must never be flattened by an unqualified write.",
+  },
+  {
+    table: "tool_mcp_gateways",
+    column: "header_policy",
+    reason: "Controls which headers are forwarded upstream; loosening it leaks internal headers to remote servers.",
+  },
+  {
+    table: "tool_mcp_gateways",
+    column: "metadata_policy",
+    reason: "Controls which metadata is forwarded upstream; loosening it leaks internal context to remote servers.",
+  },
+  {
+    table: "tool_oauth_states",
+    column: "code_verifier",
+    reason: "PKCE code verifier for an in-flight OAuth flow; exposure or a swap breaks the PKCE binding and enables code interception.",
+  },
+  {
+    table: "tool_policies",
+    column: "conditions",
+    reason: "Policy matching conditions; rewriting them changes which calls a policy governs.",
+  },
+  {
+    table: "tool_policies",
+    column: "config",
+    reason: "Policy effect configuration; rewriting it changes enforcement behavior.",
+  },
+  {
+    table: "tool_policies",
+    column: "enabled",
+    reason: "Policy on/off switch; disabling a guard policy via an unqualified write removes enforcement.",
+  },
+  {
+    table: "tool_policies",
+    column: "selectors",
+    reason: "Policy target selectors; rewriting them changes which calls a policy governs.",
+  },
+  {
+    table: "tool_profile_entries",
+    column: "effect",
+    reason: "Per-tool allow/deny verdict; rewriting it grants or revokes tool access directly.",
+  },
+  {
+    table: "tool_profiles",
+    column: "default_action",
+    reason: "Default verdict for unmatched tool accesses in the profile; flipping it is a bulk authorization change.",
+  },
+  {
+    table: "user_inbox_agent_policies",
+    column: "allowed_agent_ids",
+    reason: "Allowlist of agents permitted to act inside the user's inbox; widening it grants agents inbox authority on the user's behalf.",
   },
 ] as const satisfies readonly (SecurityPostureColumn & RegisteredPostureColumn)[];
 
@@ -793,6 +929,8 @@ export function assertSchemaColumnsClassified(
           ...unclassified,
         ]
       : []),
+  
+
   ];
   if (problems.length === 0) return;
 

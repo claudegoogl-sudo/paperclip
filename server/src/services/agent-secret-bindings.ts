@@ -1,4 +1,4 @@
-import { envBindingSchema, type SecretVersionSelector } from "@paperclipai/shared";
+import { envBindingSchema, type SecretProjectionClass, type SecretVersionSelector } from "@paperclipai/shared";
 
 interface AgentSecretBindingSyncService {
   syncSecretRefsForTarget?: (
@@ -10,6 +10,8 @@ interface AgentSecretBindingSyncService {
       versionSelector?: SecretVersionSelector;
       required?: boolean;
       label?: string | null;
+      projectionClass?: SecretProjectionClass;
+      projectionAllowlistKey?: string | null;
     }>,
     options?: { replaceAll?: boolean },
   ) => Promise<unknown>;
@@ -43,6 +45,8 @@ export function collectSecretRefs(adapterConfig: unknown): Array<{
   secretId: string;
   configPath: string;
   versionSelector?: SecretVersionSelector;
+  projectionClass?: SecretProjectionClass;
+  projectionAllowlistKey?: string | null;
 }> {
   const config = asRecord(adapterConfig);
   if (!config) return [];
@@ -50,6 +54,8 @@ export function collectSecretRefs(adapterConfig: unknown): Array<{
     secretId: string;
     configPath: string;
     versionSelector?: SecretVersionSelector;
+    projectionClass?: SecretProjectionClass;
+    projectionAllowlistKey?: string | null;
   }> = [];
 
   const envValue = asRecord(config.env);
@@ -62,6 +68,8 @@ export function collectSecretRefs(adapterConfig: unknown): Array<{
       secretId: binding.secretId,
       configPath: `env.${key}`,
       versionSelector: binding.version ?? "latest",
+      projectionClass: binding.projectionClass,
+      projectionAllowlistKey: binding.projectionAllowlistKey ?? null,
     });
   }
 
@@ -75,6 +83,8 @@ export function collectSecretRefs(adapterConfig: unknown): Array<{
       secretId: binding.secretId,
       configPath: key,
       versionSelector: binding.version ?? "latest",
+      projectionClass: binding.projectionClass,
+      projectionAllowlistKey: binding.projectionAllowlistKey ?? null,
     });
   }
 
@@ -133,6 +143,22 @@ function collectUserSecretRefs(adapterConfig: unknown): Array<{
   }
 
   return refs;
+}
+
+/**
+ * Whether an adapter config references at least one secret (a `secret_ref` or
+ * a `user_secret_ref`). The approval-activation path uses this to decide
+ * whether the binding reconcile can ADD anything: with zero references the
+ * replaceAll delete-and-reinsert can only delete rows — the config-form wipe
+ * shape the guards exist to prevent — while a config that still references
+ * secrets keeps the legacy activation backfill (and its fail-closed behavior
+ * on broken refs).
+ */
+export function adapterConfigReferencesSecrets(adapterConfig: unknown): boolean {
+  return (
+    collectSecretRefs(adapterConfig).length > 0 ||
+    collectUserSecretRefs(adapterConfig).length > 0
+  );
 }
 
 /**

@@ -50,19 +50,52 @@ vi.mock("../home-paths.js", () => ({
 
 describe("logger translateTime respects TZ environment variable", () => {
   beforeEach(() => {
+    vi.resetModules();
+    vi.unstubAllEnvs();
     vi.clearAllMocks();
   });
 
   it("configures pino-pretty with SYS:HH:MM:ss so timestamps honour the TZ env var", async () => {
+    vi.stubEnv("NODE_ENV", "development");
     await import("../middleware/logger.js");
 
     expect(mockTransport).toHaveBeenCalledOnce();
-    const { targets } = mockTransport.mock.calls[0][0] as {
-      targets: Array<{ options: Record<string, unknown> }>;
+    // Fork delta: the logger always uses a multi-target transport (stdout
+    // pretty + server.log file) instead of upstream's dev-only single target.
+    const transport = mockTransport.mock.calls[0][0] as {
+      target?: string;
+      options?: Record<string, unknown>;
+      targets?: Array<{ target: string; options: Record<string, unknown> }>;
     };
-    for (const target of targets) {
-      expect(target.options.translateTime).toBe("SYS:HH:MM:ss");
+    const prettyTargets = transport.targets
+      ? transport.targets.filter((t) => t.target === "pino-pretty")
+      : transport.target === "pino-pretty"
+        ? [{ target: transport.target, options: transport.options! }]
+        : [];
+    expect(prettyTargets.length).toBeGreaterThan(0);
+    for (const t of prettyTargets) {
+      expect(t.options.translateTime).toBe("SYS:HH:MM:ss");
     }
+  });
+
+  it("keeps the pretty transport and info level in production (fork file logging)", async () => {
+    // Upstream drops the pretty transport under NODE_ENV=production. The fork
+    // deliberately keeps it: operator instances always log to stdout AND the
+    // server.log file, so production must still carry the SYS:HH:MM:ss
+    // timestamps this regression is about.
+    vi.stubEnv("NODE_ENV", "production");
+    await import("../middleware/logger.js");
+
+    expect(mockTransport).toHaveBeenCalledOnce();
+    const transport = mockTransport.mock.calls[0][0] as {
+      targets?: Array<{ target: string; options: Record<string, unknown> }>;
+    };
+    const prettyTargets = (transport.targets ?? []).filter((t) => t.target === "pino-pretty");
+    expect(prettyTargets.length).toBeGreaterThan(0);
+    for (const t of prettyTargets) {
+      expect(t.options.translateTime).toBe("SYS:HH:MM:ss");
+    }
+    expect(mockPino).toHaveBeenCalledWith(expect.objectContaining({ level: "info" }), expect.anything());
   });
 
   it("SYS: prefix produces timezone-sensitive output: UTC epoch formats differently under UTC vs UTC+8", () => {

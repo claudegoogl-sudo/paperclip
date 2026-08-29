@@ -30,6 +30,8 @@ export const companySecretBindings = pgTable(
     // are one authorization object.
     autoRenewPolicy: jsonb("auto_renew_policy").$type<BindingAutoRenewPolicy | null>(),
     label: text("label"),
+    projectionClass: text("projection_class").notNull().default("unclassified"),
+    projectionAllowlistKey: text("projection_allowlist_key"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

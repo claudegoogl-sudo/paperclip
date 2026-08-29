@@ -26,6 +26,9 @@ const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
   getByKey: vi.fn(),
   getConfig: vi.fn(),
+  // Company-scoped plugin_config: the webhook path reads every configured
+  // company's row (listConfigs) instead of a single instance-wide row.
+  listConfigs: vi.fn(),
 }));
 
 vi.mock("../services/plugin-registry.js", () => ({
@@ -460,9 +463,11 @@ describe("POST /api/plugins/:pluginId/webhooks/:endpointKey resource limits", ()
     mockRegistry.getById.mockReset();
     mockRegistry.getByKey.mockReset();
     mockRegistry.getConfig.mockReset();
+    mockRegistry.listConfigs.mockReset();
     mockRegistry.getById.mockResolvedValue(READY_PLUGIN);
     mockRegistry.getByKey.mockResolvedValue(READY_PLUGIN);
     mockRegistry.getConfig.mockResolvedValue(null);
+    mockRegistry.listConfigs.mockResolvedValue([]);
   });
 
   const url = `/api/plugins/${PLUGIN_ID}/webhooks/${ENDPOINT_KEY}`;
@@ -559,7 +564,7 @@ describe("POST /api/plugins/:pluginId/webhooks/:endpointKey resource limits", ()
 
     await request(app).post(url).send({ update_id: 1 });
 
-    expect(mockRegistry.getConfig).not.toHaveBeenCalled();
+    expect(mockRegistry.listConfigs).not.toHaveBeenCalled();
   });
 
   it("leaves other /api/plugins routes on the generic 10mb parser", async () => {
@@ -581,9 +586,10 @@ describe("POST /api/plugins/:pluginId/webhooks/:endpointKey credential tiering",
     mockRegistry.getById.mockReset();
     mockRegistry.getByKey.mockReset();
     mockRegistry.getConfig.mockReset();
+    mockRegistry.listConfigs.mockReset();
     mockRegistry.getById.mockResolvedValue(READY_PLUGIN_WITH_AUTH);
     mockRegistry.getByKey.mockResolvedValue(READY_PLUGIN_WITH_AUTH);
-    mockRegistry.getConfig.mockResolvedValue(VALID_DIGEST_CONFIG);
+    mockRegistry.listConfigs.mockResolvedValue([VALID_DIGEST_CONFIG]);
     resetPluginWebhookAuthWarnings();
   });
 
@@ -671,7 +677,7 @@ describe("POST /api/plugins/:pluginId/webhooks/:endpointKey credential tiering",
     // A stale or mistyped digest must degrade to today's behaviour, never to a
     // hard rejection — a misconfiguration cannot be allowed to take ingestion
     // down for every tenant sharing the plugin.
-    mockRegistry.getConfig.mockResolvedValue({ configJson: { [TOKEN_CONFIG_KEY]: { salt: SALT } } });
+    mockRegistry.listConfigs.mockResolvedValue([{ configJson: { [TOKEN_CONFIG_KEY]: { salt: SALT } } }]);
     const rateLimiter = createPluginWebhookRateLimiter({
       maxPerEndpoint: 1,
       maxPerIp: 1_000,
@@ -737,9 +743,10 @@ describe("POST /api/plugins/:pluginId/webhooks/:endpointKey pre-limiter config r
     mockRegistry.getById.mockReset();
     mockRegistry.getByKey.mockReset();
     mockRegistry.getConfig.mockReset();
+    mockRegistry.listConfigs.mockReset();
     mockRegistry.getById.mockResolvedValue(READY_PLUGIN_WITH_AUTH);
     mockRegistry.getByKey.mockResolvedValue(READY_PLUGIN_WITH_AUTH);
-    mockRegistry.getConfig.mockResolvedValue(VALID_DIGEST_CONFIG);
+    mockRegistry.listConfigs.mockResolvedValue([VALID_DIGEST_CONFIG]);
     resetPluginWebhookAuthWarnings();
   });
 
@@ -763,7 +770,7 @@ describe("POST /api/plugins/:pluginId/webhooks/:endpointKey pre-limiter config r
       expect(res.status).toBe(200);
     }
 
-    expect(mockRegistry.getConfig).toHaveBeenCalledTimes(1);
+    expect(mockRegistry.listConfigs).toHaveBeenCalledTimes(1);
   });
 
   it("reads fresh config once the TTL lapses, so a rotation takes effect", async () => {
@@ -778,17 +785,17 @@ describe("POST /api/plugins/:pluginId/webhooks/:endpointKey pre-limiter config r
     const { app } = createWebhookApp({ rateLimiter, now: () => now });
 
     await request(app).post(url).set(TOKEN_HEADER, TOKEN).send({ n: 1 });
-    expect(mockRegistry.getConfig).toHaveBeenCalledTimes(1);
+    expect(mockRegistry.listConfigs).toHaveBeenCalledTimes(1);
 
     // Still cached one millisecond before expiry.
     now += PLUGIN_WEBHOOK_CONFIG_MEMO_TTL_MS - 1;
     await request(app).post(url).set(TOKEN_HEADER, TOKEN).send({ n: 2 });
-    expect(mockRegistry.getConfig).toHaveBeenCalledTimes(1);
+    expect(mockRegistry.listConfigs).toHaveBeenCalledTimes(1);
 
     // One millisecond past the TTL forces a fresh read.
     now += 2;
     await request(app).post(url).set(TOKEN_HEADER, TOKEN).send({ n: 3 });
-    expect(mockRegistry.getConfig).toHaveBeenCalledTimes(2);
+    expect(mockRegistry.listConfigs).toHaveBeenCalledTimes(2);
   });
 
   it("short-circuits a repeated (array) header to anonymous without a config read", async () => {
@@ -808,7 +815,7 @@ describe("POST /api/plugins/:pluginId/webhooks/:endpointKey pre-limiter config r
     const first = await request(app).post(url).send({ n: 1 });
     expect(first.status).toBe(200);
 
-    expect(mockRegistry.getConfig).not.toHaveBeenCalled();
+    expect(mockRegistry.listConfigs).not.toHaveBeenCalled();
 
     // Billed to the anonymous budget (cap 1), so the next anonymous delivery is
     // turned away — confirming the array copy never reached the verified tier.
@@ -823,6 +830,6 @@ describe("POST /api/plugins/:pluginId/webhooks/:endpointKey pre-limiter config r
 
     const res = await request(app).post(url).set(TOKEN_HEADER, "").send({ n: 1 });
     expect(res.status).toBe(200);
-    expect(mockRegistry.getConfig).not.toHaveBeenCalled();
+    expect(mockRegistry.listConfigs).not.toHaveBeenCalled();
   });
 });

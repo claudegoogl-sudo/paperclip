@@ -1,5 +1,5 @@
-import { type AnyPgColumn, pgTable, uuid, text, timestamp, jsonb, index, integer, bigint, boolean } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
+import { type AnyPgColumn, pgTable, uuid, text, timestamp, jsonb, index, integer, bigint, boolean } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 import { agentWakeupRequests } from "./agent_wakeup_requests.js";
@@ -85,15 +85,34 @@ export const heartbeatRuns = pgTable(
       table.status,
       table.processStartedAt,
     ),
+    companyCreatedAtDescIdx: index("heartbeat_runs_company_created_at_desc_idx").on(
+      table.companyId,
+      table.createdAt.desc(),
+    ),
+    companyCtxIssueCreatedIdx: index("heartbeat_runs_company_ctx_issue_created_idx").on(
+      table.companyId,
+      sql`(${table.contextSnapshot} ->> 'issueId')`,
+      table.createdAt.desc(),
+    ),
+    companyCtxTaskCreatedIdx: index("heartbeat_runs_company_ctx_task_created_idx").on(
+      table.companyId,
+      sql`(${table.contextSnapshot} ->> 'taskId')`,
+      table.createdAt.desc(),
+    ),
+    companyCtxTaskKeyCreatedIdx: index("heartbeat_runs_company_ctx_taskkey_created_idx").on(
+      table.companyId,
+      sql`(${table.contextSnapshot} ->> 'taskKey')`,
+      table.createdAt.desc(),
+    ),
     // Serves the `context_snapshot ->> 'issueId'` run-checkout predicate used by
     // ~20 call sites in services/heartbeat.ts and services/recovery/service.ts.
-    // See migration 0142 for the indexed expression's cost history.
+    // See migration 0229 for the indexed expression's cost history.
     companyContextIssueIdx: index("heartbeat_runs_company_context_issue_idx").on(
       table.companyId,
       sql`(${table.contextSnapshot}->>'issueId')`,
     ),
     // Serves the retention prune's anti-join, which skips wakeup requests a
-    // surviving run still points at. See migration 0143.
+    // surviving run still points at. See migration 0230.
     wakeupRequestIdx: index("heartbeat_runs_wakeup_request_idx")
       .on(table.wakeupRequestId)
       .where(sql`${table.wakeupRequestId} IS NOT NULL`),

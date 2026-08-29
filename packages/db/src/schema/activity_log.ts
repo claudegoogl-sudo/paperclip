@@ -14,11 +14,12 @@ export const activityLog = pgTable(
     entityType: text("entity_type").notNull(),
     entityId: text("entity_id").notNull(),
     agentId: uuid("agent_id").references(() => agents.id),
-    // fork-only divergence (migration 0090): runId FK uses ON DELETE SET NULL so
+    // fork-only divergence (migration 0223): runId FK uses ON DELETE SET NULL so
     // deleting a heartbeat_runs row doesn't violate the FK constraint;
     // re-submit upstream once the fork PR freeze lifts.
     runId: uuid("run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
-    // Provenance of the credential that authenticated the write (migration 0145).
+    responsibleUserId: text("responsible_user_id"),
+    // Provenance of the credential that authenticated the write (migration 0232).
     // actorSource is the resolved credential class from actorMiddleware
     // ("session", "board_key", "agent_key", etc.); actorKeyId is the API key id
     // qualified by actorSource: the board API key id when actor_source = 'board_key',
@@ -32,6 +33,16 @@ export const activityLog = pgTable(
   },
   (table) => ({
     companyCreatedIdx: index("activity_log_company_created_idx").on(table.companyId, table.createdAt),
+    companyAgentCreatedIdx: index("activity_log_company_agent_created_idx").on(
+      table.companyId,
+      table.agentId,
+      table.createdAt,
+    ),
+    companyResponsibleUserCreatedIdx: index("activity_log_company_responsible_user_created_idx").on(
+      table.companyId,
+      table.responsibleUserId,
+      table.createdAt,
+    ),
     runIdIdx: index("activity_log_run_id_idx").on(table.runId),
     entityIdx: index("activity_log_entity_type_id_idx").on(table.entityType, table.entityId),
     // Serves the per-issue MAX(created_at) lookup behind issue-list ordering as a single

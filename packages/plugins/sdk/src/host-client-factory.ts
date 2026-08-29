@@ -66,7 +66,7 @@ export class CapabilityDeniedError extends Error {
   override readonly name = "CapabilityDeniedError";
   readonly code = PLUGIN_RPC_ERROR_CODES.CAPABILITY_DENIED;
 
-  constructor(pluginId: string, method: string, capability: PluginCapability) {
+  constructor(pluginId: string, method: string, capability: string) {
     super(
       `Plugin "${pluginId}" is missing required capability "${capability}" for method "${method}"`,
     );
@@ -98,27 +98,23 @@ export class InvocationScopeDeniedError extends Error {
  * All methods return promises to support async I/O (database, HTTP, etc.).
  */
 export interface HostServices {
-  /** Provides `config.get`. */
+  /** Provides `config.get` and the fork-only `config.getForServiceScope`. */
   config: {
+    get(
+      params: WorkerToHostMethods["config.get"][0],
+      context?: WorkerHostCallContext,
+    ): Promise<Record<string, unknown>>;
     /**
-     * Return the instance-wide plugin configuration. Always available.
-     *
-     * For multi-tenant deployments, hosts SHOULD also implement
-     * {@link HostServices.config.getForCompany} to deliver per-tenant
-     * overrides; the gated wrapper for `config.get` consults
-     * `getForCompany` first when the invocation carries a company scope.
+     * Fork-only background read: per-company effective plugin config
+     * (company `plugin_config` row merged with the tenant `configOverrides`
+     * subtree) behind the fail-closed `requirePluginEnabledForCompany`
+     * provisioning gate. Reachable under the bare worker-lifetime
+     * `serviceScope`; rejects a missing/empty `companyId` and never accepts
+     * `kind:"all"`.
      */
-    get(): Promise<Record<string, unknown>>;
-    /**
-     * Return the effective plugin configuration for `companyId`,
-     * i.e. the instance-wide config merged with this tenant's
-     * `plugin_company_settings.settingsJson.configOverrides`.
-     *
-     * Optional — when omitted the gated wrapper falls back to {@link get},
-     * preserving single-tenant behaviour for hosts that haven't adopted
-     * per-tenant config delivery yet.
-     */
-    getForCompany?(companyId: string): Promise<Record<string, unknown>>;
+    getForServiceScope(
+      params: WorkerToHostMethods["config.getForServiceScope"][0],
+    ): Promise<WorkerToHostMethods["config.getForServiceScope"][1]>;
   };
 
   /** Provides trusted company-scoped local folder helpers. */
@@ -163,12 +159,25 @@ export interface HostServices {
     fetch(params: WorkerToHostMethods["http.fetch"][0]): Promise<WorkerToHostMethods["http.fetch"][1]>;
   };
 
-  /** Provides `secrets.resolve` and `secrets.mintHandle`. */
+  /** Provides `secrets.resolve`, `secrets.mintHandle` and the fork-only `secrets.resolveService`. */
   secrets: {
-    resolve(params: WorkerToHostMethods["secrets.resolve"][0]): Promise<string>;
+    resolve(
+      params: WorkerToHostMethods["secrets.resolve"][0],
+      context?: WorkerHostCallContext,
+    ): Promise<string>;
     mintHandle(
       params: WorkerToHostMethods["secrets.mintHandle"][0],
     ): Promise<WorkerToHostMethods["secrets.mintHandle"][1]>;
+    /**
+     * Fork-only worker-lifetime service-context read: the company is derived
+     * from the secret binding server-side (never worker-supplied), ambiguous
+     * bindings collapse to not_found, and the host-minted `serviceScope.runId`
+     * is mandatory at the bridge. This is the surface the messenger poll
+     * loop's bot-token resolve targets.
+     */
+    resolveService(
+      params: WorkerToHostMethods["secrets.resolveService"][0],
+    ): Promise<WorkerToHostMethods["secrets.resolveService"][1]>;
   };
 
   /**
@@ -230,6 +239,14 @@ export interface HostServices {
     log(params: WorkerToHostMethods["log"][0]): Promise<void>;
   };
 
+  /** Provides `span.record`. The context carries the host-minted `traceparent`. */
+  tracer: {
+    record(
+      params: WorkerToHostMethods["span.record"][0],
+      context?: WorkerHostCallContext,
+    ): Promise<void>;
+  };
+
   /** Provides `companies.list`, `companies.get`. */
   companies: {
     list(params: WorkerToHostMethods["companies.list"][0]): Promise<WorkerToHostMethods["companies.list"][1]>;
@@ -288,7 +305,21 @@ export interface HostServices {
     listAttachments(params: WorkerToHostMethods["issues.listAttachments"][0]): Promise<WorkerToHostMethods["issues.listAttachments"][1]>;
     createComment(params: WorkerToHostMethods["issues.createComment"][0]): Promise<WorkerToHostMethods["issues.createComment"][1]>;
     createInteraction(params: WorkerToHostMethods["issues.createInteraction"][0]): Promise<WorkerToHostMethods["issues.createInteraction"][1]>;
+    listInteractions(params: WorkerToHostMethods["issues.listInteractions"][0]): Promise<WorkerToHostMethods["issues.listInteractions"][1]>;
+    respondInteraction(params: WorkerToHostMethods["issues.respondInteraction"][0]): Promise<WorkerToHostMethods["issues.respondInteraction"][1]>;
+    getAttachmentContent(params: WorkerToHostMethods["issues.getAttachmentContent"][0]): Promise<WorkerToHostMethods["issues.getAttachmentContent"][1]>;
     resolveInteraction(params: WorkerToHostMethods["issues.resolveInteraction"][0]): Promise<WorkerToHostMethods["issues.resolveInteraction"][1]>;
+  };
+
+  /** Provides `approvals.list`, `approvals.get`, `approvals.decide` and the fork-only `approvals.listPending`. */
+  approvals: {
+    list(params: WorkerToHostMethods["approvals.list"][0]): Promise<WorkerToHostMethods["approvals.list"][1]>;
+    get(params: WorkerToHostMethods["approvals.get"][0]): Promise<WorkerToHostMethods["approvals.get"][1]>;
+    decide(params: WorkerToHostMethods["approvals.decide"][0]): Promise<WorkerToHostMethods["approvals.decide"][1]>;
+    /** Fork-only reconcile read: pending-only, field-minimized, provisioned-gated. */
+    listPending(
+      params: WorkerToHostMethods["approvals.listPending"][0],
+    ): Promise<WorkerToHostMethods["approvals.listPending"][1]>;
   };
 
   /** Provides `issues.documents.list`, `issues.documents.get`, `issues.documents.upsert`, `issues.documents.delete`. */
@@ -299,12 +330,7 @@ export interface HostServices {
     delete(params: WorkerToHostMethods["issues.documents.delete"][0]): Promise<WorkerToHostMethods["issues.documents.delete"][1]>;
   };
 
-  /** Provides `approvals.list` — reconcile read of pending board approvals. */
-  approvals: {
-    list(params: WorkerToHostMethods["approvals.list"][0]): Promise<WorkerToHostMethods["approvals.list"][1]>;
-  };
-
-  /** Provides `interactions.list` — reconcile read of pending issue interactions. */
+  /** Provides `interactions.list` — fork reconcile read of pending issue interactions. */
   interactions: {
     list(params: WorkerToHostMethods["interactions.list"][0]): Promise<WorkerToHostMethods["interactions.list"][1]>;
   };
@@ -417,7 +443,13 @@ export type HostClientHandlers = {
  *
  * @see PLUGIN_SPEC.md §15 — Capability Model
  */
-const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | null> = {
+// Values are a required capability, an any-of list of accepted capabilities
+// (fork: reconcile reads accept either the upstream or the fork grant), or
+// null for no capability requirement.
+const METHOD_CAPABILITY_MAP: Record<
+  WorkerToHostMethodName,
+  PluginCapability | PluginCapability[] | null
+> = {
   // Config — always allowed
   "config.get": null,
 
@@ -475,6 +507,10 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   // Logger — always allowed
   "log": null,
 
+  // Provider span sink — only a plugin that registers environment drivers may
+  // emit a provider span. The gate rejects a span from any other plugin.
+  "span.record": "environment.drivers.register",
+
   // Companies
   "companies.list": "companies.read",
   "companies.get": "companies.read",
@@ -520,11 +556,27 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
   "issues.listAttachments": "issue.attachments.read",
   "issues.createComment": "issue.comments.create",
   "issues.createInteraction": "issue.interactions.create",
+  "issues.listInteractions": "issue.interactions.read",
+  "issues.respondInteraction": "issue.interactions.respond",
   "issues.resolveInteraction": "issue.interactions.resolve",
+  "issues.getAttachmentContent": "issue.attachments.read",
+
+  // Approvals — fork keeps the reconcile-read grant as an accepted
+  // alternative capability; EITHER grant authorizes the read.
+  "approvals.list": ["approvals.read", "board.approvals.read"],
+  "approvals.get": "approvals.read",
+  "approvals.decide": "approvals.respond",
 
   // Reconcile reads
-  "approvals.list": "board.approvals.read",
   "interactions.list": "issue.interactions.read",
+  "approvals.listPending": ["approvals.read", "board.approvals.read"],
+
+  // Fork-only background reads. Config reads carry no capability upstream
+  // (`config.get`: null); the background variant keeps that parity — its
+  // entity check is the server-side provisioning gate, not a capability.
+  // The service-context resolve shares the secret-ref capability.
+  "config.getForServiceScope": null,
+  "secrets.resolveService": "secrets.read-ref",
 
   // Issue Documents
   "issues.documents.list": "issue.documents.read",
@@ -582,13 +634,16 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
  *
  * The bar for membership is that the call cannot widen which companies/entities
  * the plugin can reach beyond what a host-pinned dispatch already allows — the
- * `serviceScope` only relaxes *timing* (act while idle), never reach. Three
- * distinct safety arguments, one per entry:
+ * `serviceScope` only relaxes *timing* (act while idle), never reach.
  *
- *  - `events.subscribe`: a company filter requests a STRICT SUBSET of
- *    the unconditionally-allowed unfiltered subscribe; the host event bus only
- *    ever *removes* events that fail the filter, so a filter can only NARROW
- *    visibility, never widen it.
+ * MEMBERSHIP INVARIANT: an entry is admissible only when a compensating
+ * server-side per-company reach-check backs it (`requireInCompany` or
+ * `requirePluginEnabledForCompany`). A method the host cannot reach-check
+ * server-side per company must never join this set — bridge-level guards
+ * alone are not sufficient.
+ *
+ * A distinct safety argument per entry:
+ *
  *  - `state.get` / `state.set` / `state.delete`: company-scoped plugin state is
  *    the plugin's OWN data, partitioned by `(pluginId, company)`. Reading or
  *    writing its company-B partition leaks nothing cross-tenant and is reachable
@@ -617,8 +672,8 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
  *    no accept side-effects and no continuation wake. The reachable set equals
  *    the plugin's dispatch-lifetime reach; serviceScope only lets the inbound
  *    Telegram relay retire the pending confirmation it just answered while idle.
- *  - `approvals.list` / `interactions.list`: these reconcile reads run
- *    a real, method-scoped plugin↔company availability gate
+ *  - `approvals.listPending` / `interactions.list`: these fork-only reconcile
+ *    reads run a real, method-scoped plugin↔company availability gate
  *    (`requirePluginEnabledForCompany` in plugin-host-services) BEFORE any
  *    query and fail closed if the plugin is not installed+enabled for the
  *    claimed company. That gate is the entity cross-check that the excluded
@@ -629,21 +684,38 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
  *    constraint so the digest can reconcile on worker startup / poll with no
  *    active dispatch. Both reject `kind:"all"` and missing/empty `companyId`, so
  *    no single call can enumerate across tenants.
+ *  - `config.getForServiceScope`: per-company effective plugin config
+ *    (company `plugin_config` row merged with the tenant `configOverrides`
+ *    subtree) behind the same `requirePluginEnabledForCompany` gate as the
+ *    reconcile reads — identical reach argument (install reach only), and the
+ *    rows returned are the plugin's OWN config surface for that company, which
+ *    any dispatch for that company could read anyway. Rejects `kind:"all"` and
+ *    missing/empty `companyId`.
  *
- * Deliberately excluded: any method that trusts `companyId` as the SOLE
- * authority with no entity cross-check (e.g. `issues.list`, `companies.get`).
- * Those must not run with a worker-chosen company outside a host-pinned
- * dispatch, or a background loop could enumerate arbitrary tenants.
+ * Deliberately excluded: the upstream public reads `config.get`,
+ * `secrets.resolve` and `approvals.list`. Their guards are restored to
+ * upstream semantics (a company-scoped call with no host-issued company
+ * context is denied proactively at this layer); background/unscoped consumers
+ * must target the fork-only methods above instead. `events.subscribe` is also
+ * excluded: a setup()-time filtered subscribe for a CONFIGURED company is
+ * already authorized by the host's options-seeded proactive scope (pinned
+ * upstream), which surfaces as a real `invocationScope` — and keeping it out
+ * preserves upstream's pinned denial for companies outside the seeded set.
+ * Also excluded: any method
+ * that trusts `companyId` as the SOLE authority with no entity cross-check
+ * (e.g. `issues.list`, `companies.get`) — those must not run with a
+ * worker-chosen company outside a host-pinned dispatch, or a background loop
+ * could enumerate arbitrary tenants.
  */
 const SERVICE_SCOPE_COMPANY_METHODS: ReadonlySet<WorkerToHostMethodName> = new Set([
-  "events.subscribe",
   "state.get",
   "state.set",
   "state.delete",
   "issues.createComment",
   "issues.resolveInteraction",
   "artifacts.create",
-  "approvals.list",
+  "approvals.listPending",
+  "config.getForServiceScope",
   "interactions.list",
 ]);
 
@@ -753,6 +825,28 @@ export function createHostClientHandlers(
     return { ...params, runId: scopedRunId } as P;
   }
 
+  /**
+   * Fork-only scope feed for legacy id-less workers (platform.cad ≤0.1.7,
+   * klipper): when the host attributed an id-less callback to the single
+   * in-flight dispatch (`context.singleInFlightScope` — host-observed, never
+   * worker-supplied), present that scope AS the invocation scope so upstream's
+   * `resolveRequiredCompanyId` authorizes the call exactly as if the worker
+   * had echoed the invocation id. Upstream contexts never carry
+   * `singleInFlightScope`, so this is a provable no-op for upstream behavior.
+   * A worker that CAN echo but didn't (a `setup()` loop, `runJob`, timer) is
+   * excluded by the host's attribution latch and still fails closed.
+   */
+  function forkLegacyScopeContext(
+    context: WorkerHostCallContext | undefined,
+  ): WorkerHostCallContext | undefined {
+    if (!context || context.invocationScope || !context.singleInFlightScope) return context;
+    return {
+      ...context,
+      invocationScope: context.singleInFlightScope,
+      invalidInvocationScope: undefined,
+    };
+  }
+
   function requestedCompanyScope(
     method: WorkerToHostMethodName,
     params: unknown,
@@ -785,70 +879,53 @@ export function createHostClientHandlers(
     if (requested.kind === "none") return;
 
     const allowedCompanyId = readNonEmptyString(context?.invocationScope?.companyId);
-    if (!allowedCompanyId) {
-      // When no dispatch pins a company, authorize
-      // the narrow allowlist of company-scoped methods carrying the host-minted,
-      // worker-lifetime `serviceScope` — i.e. a background dispatch or
-      // a loop started in `setup()` (e.g. the messenger `getUpdates` poll loop /
-      // inbound `onWebhook` route) that cannot widen the plugin's reach beyond
-      // what a host-pinned dispatch already grants (see
-      // `SERVICE_SCOPE_COMPANY_METHODS` for the per-method safety argument).
-      //
-      // Guard-ordering fix: this bypass is evaluated BEFORE the
-      // `invalidInvocationScope` rejection below. The inbound relay path resolves
-      // to `invalidInvocationScope` in the host's base context (the worker→host
-      // callback carries no resolvable dispatch id — see `contextForWorkerMessage`
-      // / `baseContextForWorkerMessage` in plugin-worker-manager), so placing the
-      // throw first made this bypass dead code for the only path it exists to
-      // serve. Reaching the bypass here grants NO reach beyond the scope-less
-      // (`{}`) case already allowed below: these exact allowlist methods are
-      // server-side `requireInCompany` reach-checked, so a worker-forged
-      // `companyId` cannot reach a foreign tenant regardless of whether the
-      // worker echoed a bad id or no id. `requested.kind === "single"` ensures a
-      // concrete target company (`kind: "all"` still fails closed below), and a
-      // present `serviceScope.runId` is required. The `invalidInvocationScope`
-      // throw below retains full force for every NON-allowlisted company-scoped
-      // method, which is where its protective value actually lives.
-      if (
-        requested.kind === "single" &&
-        readNonEmptyString(context?.serviceScope?.runId) &&
-        SERVICE_SCOPE_COMPANY_METHODS.has(method)
-      ) {
-        return;
-      }
-      // The worker referenced a scope the host could not resolve to an active
-      // dispatch (missing/expired/unknown id, or a background call the host could
-      // not attribute). For non-allowlisted company-scoped methods this still
-      // fails closed — serviceScope cannot launder it into reach the method's own
-      // entity cross-check does not already grant.
-      if (context?.invalidInvocationScope) {
-        throw new InvocationScopeDeniedError(
-          pluginId,
-          method,
-          "the worker referenced a missing, expired, or unknown invocation scope",
-        );
-      }
-      // Fail closed (Complete Mediation / Fail Securely): a company-scoped
-      // worker→host call arrived with no resolvable invocation scope — e.g. an
-      // idle-window call between dispatches where the host pinned no tenant.
-      // Deny rather than silently letting the tenant pin be bypassed.
-      // companies.list legitimately enumerates every company and carries no
-      // pin, so it stays allowed.
-      if (method === "companies.list") return;
+
+    // Fork-only bypass. When no dispatch pins a company, authorize the narrow
+    // allowlist of company-scoped methods carrying the host-minted,
+    // worker-lifetime `serviceScope` — a background dispatch or a
+    // `setup()`-started loop (e.g. the messenger digest poll) that cannot
+    // widen the plugin's reach beyond what a host-pinned dispatch already
+    // grants (see `SERVICE_SCOPE_COMPANY_METHODS` for the per-method safety
+    // argument). Every allowlisted method is independently reach-checked
+    // server-side (`requireInCompany` or `requirePluginEnabledForCompany`),
+    // so a worker-forged `companyId` cannot reach a foreign tenant;
+    // `kind:"all"` and non-allowlisted methods keep failing closed below.
+    //
+    // The bypass is gated on `serviceScope.runId`, a key only the fork's host
+    // ever attaches — upstream contexts provably never carry it, so the guard
+    // below evaluates exactly as upstream wrote it and upstream's
+    // proactive-denial semantics hold byte-for-byte on the public surface.
+    if (
+      !allowedCompanyId &&
+      requested.kind === "single" &&
+      readNonEmptyString(context?.serviceScope?.runId) &&
+      SERVICE_SCOPE_COMPANY_METHODS.has(method)
+    ) {
+      return;
+    }
+
+    if (context?.invalidInvocationScope) {
       throw new InvocationScopeDeniedError(
         pluginId,
         method,
-        "no active invocation scope; company-scoped calls must run within a dispatch",
+        "the worker referenced a missing, expired, or unknown invocation scope",
       );
     }
 
     if (requested.kind === "all") {
       if (method === "companies.list") return;
+      if (!allowedCompanyId) {
+        throw new InvocationScopeDeniedError(pluginId, method, "company context is required");
+      }
       throw new InvocationScopeDeniedError(
         pluginId,
         method,
         `the current invocation is scoped to company "${allowedCompanyId}"`,
       );
+    }
+
+    if (!allowedCompanyId) {
+      throw new InvocationScopeDeniedError(pluginId, method, "company context is required");
     }
 
     if (requested.companyId !== allowedCompanyId) {
@@ -860,6 +937,40 @@ export function createHostClientHandlers(
     }
   }
 
+  function resolveRequiredCompanyId(
+    method: WorkerToHostMethodName,
+    params: unknown,
+    context?: WorkerHostCallContext,
+  ): string {
+    if (context?.invalidInvocationScope) {
+      throw new InvocationScopeDeniedError(
+        pluginId,
+        method,
+        "the worker referenced a missing, expired, or unknown invocation scope",
+      );
+    }
+
+    const requested = requestedCompanyScope(method, params);
+    const scopedCompanyId = readNonEmptyString(context?.invocationScope?.companyId);
+    if (requested.kind === "single") {
+      if (!scopedCompanyId) {
+        throw new InvocationScopeDeniedError(pluginId, method, "company context is required");
+      }
+      if (requested.companyId !== scopedCompanyId) {
+        throw new InvocationScopeDeniedError(
+          pluginId,
+          method,
+          `requested company "${requested.companyId}" but the current invocation is scoped to company "${scopedCompanyId}"`,
+        );
+      }
+      return scopedCompanyId;
+    }
+
+    if (scopedCompanyId) return scopedCompanyId;
+
+    throw new InvocationScopeDeniedError(pluginId, method, "company context is required");
+  }
+
   /**
    * Assert that the plugin has the required capability for a method.
    * Throws `CapabilityDeniedError` if the capability is missing.
@@ -869,6 +980,12 @@ export function createHostClientHandlers(
   ): void {
     const required = METHOD_CAPABILITY_MAP[method];
     if (required === null) return; // No capability required
+    if (Array.isArray(required)) {
+      // Fork: any-of list — the method is authorized when the plugin holds at
+      // least one of the accepted grants.
+      if (required.some((c) => capabilitySet.has(c))) return;
+      throw new CapabilityDeniedError(pluginId, method, required.join('" or "'));
+    }
     if (capabilitySet.has(required)) return;
     throw new CapabilityDeniedError(pluginId, method, required);
   }
@@ -897,28 +1014,33 @@ export function createHostClientHandlers(
 
   return {
     // Config
-    "config.get": gated("config.get", async (_params, context) => {
-      // When the invocation carries a company scope and the host
-      // implements per-tenant config delivery, return the company-scoped
-      // effective config; otherwise fall back to the instance-wide config.
-      //
-      // Id-less legacy workers (e.g. platform.cad ≤0.1.x) echo no
-      // `paperclipInvocationId`, so `invocationScope` is null. Consult the same
-      // host-validated `singleInFlightScope` the runId backfill uses
-      // (`backfillDispatchRunId`) so their per-tenant config — and the secret
-      // refs it carries — resolves to the in-flight dispatch's company rather
-      // than falling through to the instance-wide config. The companyId is
-      // host-derived, never worker-supplied: `config.get` takes no companyId
-      // param, so this is a scope *selection* read, not an enforcement bypass.
-      // With 0 or 2+ in-flight dispatches the host pins no `singleInFlightScope`,
-      // so behavior is unchanged (instance-wide config).
-      const companyId =
-        readNonEmptyString(context?.invocationScope?.companyId) ??
-        readNonEmptyString(context?.singleInFlightScope?.companyId);
-      if (companyId && services.config.getForCompany) {
-        return services.config.getForCompany(companyId);
+    "config.get": gated("config.get", async (params, context) => {
+      // Upstream body, byte-compatible: a company-scoped call with no
+      // host-issued company context is denied here, before host services run.
+      // The only fork delta is `forkLegacyScopeContext`, which feeds the
+      // host-attributed single-in-flight dispatch scope for legacy id-less
+      // workers and is a no-op for every upstream-constructible context.
+      const companyId = resolveRequiredCompanyId(
+        "config.get",
+        params,
+        forkLegacyScopeContext(context),
+      );
+      return services.config.get({ ...params, companyId }, context);
+    }),
+
+    // Fork-only background config read (see SERVICE_SCOPE_COMPANY_METHODS for
+    // the safety argument). Bridge-level complete mediation: the worker must
+    // name a concrete company; the server re-checks plugin↔company
+    // provisioning and never accepts `kind:"all"`.
+    "config.getForServiceScope": gated("config.getForServiceScope", async (params) => {
+      if (!readNonEmptyString((params as { companyId?: unknown } | undefined)?.companyId)) {
+        throw new InvocationScopeDeniedError(
+          pluginId,
+          "config.getForServiceScope",
+          "a concrete companyId is required; cross-tenant enumeration is not permitted",
+        );
       }
-      return services.config.get();
+      return services.config.getForServiceScope(params as { companyId: string });
     }),
 
     "localFolders.declarations": gated("localFolders.declarations", async (params) => {
@@ -987,16 +1109,49 @@ export function createHostClientHandlers(
 
     // Secrets
     "secrets.resolve": gated("secrets.resolve", async (params, context) => {
-      // Back-compat: plugins bundled against the older SDK send
-      // `{ secretRef }` with no `runId`. Back-fill from the host-validated
-      // active invocation scope (populated by the host's executeTool /
-      // performAction bracket in plugin-worker-manager.ts:deriveInvocationScope)
-      // so dispatch lookups succeed for legacy callers. The secrets handler's
-      // fail-closed throw still fires when there is no active invocation, so a
-      // forged worker→host call outside a tool dispatch keeps getting
-      // `runcontext_invalid`.
+      // Fork back-compat (host-derived, upstream-invisible): plugins bundled
+      // against an older SDK send `{ secretRef }` with no `runId`. Back-fill
+      // from the host-validated scopes so server-side dispatch lookups succeed
+      // for legacy callers; with no scope surfaced nothing is written and the
+      // upstream guard below denies before host services run.
       const enriched = backfillDispatchRunId(params, context);
-      return services.secrets.resolve(enriched);
+      // Upstream body, byte-compatible: proactive denial without host-issued
+      // company context, before host services run. The only fork delta is
+      // `forkLegacyScopeContext` (single-in-flight attribution for legacy
+      // id-less workers; no-op for upstream contexts).
+      const companyId = resolveRequiredCompanyId(
+        "secrets.resolve",
+        enriched,
+        forkLegacyScopeContext(context),
+      );
+      return services.secrets.resolve({ ...enriched, companyId }, context);
+    }),
+
+    // Fork-only background secret read (worker-lifetime service context). The
+    // company is NEVER worker-supplied here: the server derives it from the
+    // secret binding (ambiguous cross-company bindings collapse to not_found),
+    // rate-limits per plugin, and registers the value with the run-scoped
+    // redactor. The host-minted `serviceScope.runId` is mandatory — a call
+    // without it is not attributable to a worker-lifetime run-context and is
+    // denied here. This is the surface the messenger poll loop's bot-token
+    // resolve targets; `secrets.resolve` itself stays upstream-strict.
+    "secrets.resolveService": gated("secrets.resolveService", async (params, context) => {
+      if (!readNonEmptyString(context?.serviceScope?.runId)) {
+        throw new InvocationScopeDeniedError(
+          pluginId,
+          "secrets.resolveService",
+          "a host-minted service scope is required for background secret reads",
+        );
+      }
+      if (readNonEmptyString((params as { companyId?: unknown } | undefined)?.companyId)) {
+        throw new InvocationScopeDeniedError(
+          pluginId,
+          "secrets.resolveService",
+          "the company is derived from the secret binding; passing companyId is not permitted",
+        );
+      }
+      const enriched = backfillDispatchRunId(params, context);
+      return services.secrets.resolveService(enriched);
     }),
 
     // Secrets — borrowed-handle minting (Control 2). Same dispatch
@@ -1042,6 +1197,11 @@ export function createHostClientHandlers(
     // Logger
     "log": gated("log", async (params) => {
       return services.logger.log(params);
+    }),
+
+    // Provider span sink. The context carries the host-minted `traceparent`.
+    "span.record": gated("span.record", async (params, context) => {
+      return services.tracer.record(params, context);
     }),
 
     // Companies
@@ -1161,35 +1321,62 @@ export function createHostClientHandlers(
       return services.issues.listAttachments(params);
     }),
     "issues.createComment": gated("issues.createComment", async (params) => {
+      if (params.actorUserId && !capabilitySet.has("issue.comments.create_human_attributed")) {
+        throw new CapabilityDeniedError(
+          pluginId,
+          "issues.createComment",
+          "issue.comments.create_human_attributed",
+        );
+      }
       return services.issues.createComment(params);
     }),
     "issues.createInteraction": gated("issues.createInteraction", async (params) => {
       return services.issues.createInteraction(params);
     }),
+    "issues.listInteractions": gated("issues.listInteractions", async (params) => {
+      return services.issues.listInteractions(params);
+    }),
+    "issues.respondInteraction": gated("issues.respondInteraction", async (params) => {
+      return services.issues.respondInteraction(params);
+    }),
     "issues.resolveInteraction": gated("issues.resolveInteraction", async (params) => {
       return services.issues.resolveInteraction(params);
     }),
+    "issues.getAttachmentContent": gated("issues.getAttachmentContent", async (params) => {
+      return services.issues.getAttachmentContent(params);
+    }),
 
-    // Reconcile reads — pending-blocker snapshot for the messenger
-    // digest. Beyond the capability + serviceScope gates, each handler hard-
-    // rejects a missing/empty `companyId` here. `requestedCompanyScope` maps a
-    // missing companyId to `kind:"none"`, which makes `requireInvocationCompanyScope`
-    // return early WITHOUT enforcement — so a company-less call would otherwise
-    // slip the scope check entirely and let the server gate decide alone. These
-    // are cross-tenant-sensitive enumerations, so we fail closed at the bridge:
-    // no single call may run without a concrete target company (Complete
-    // Mediation / Defense in Depth; the server `requirePluginEnabledForCompany`
-    // gate is the second, authoritative layer).
+    // Approvals
     "approvals.list": gated("approvals.list", async (params) => {
+      return services.approvals.list(params);
+    }),
+
+    // Fork-only reconcile read of PENDING board approvals for the messenger
+    // digest (see SERVICE_SCOPE_COMPANY_METHODS for the safety argument).
+    // Upstream's general `approvals.list` read surface stays byte-compatible;
+    // the fail-closed provisioning gate, pending-only default, field-minimized
+    // projection and defensive row cap all live on THIS method (bridge-level
+    // complete mediation mirrors `interactions.list`).
+    "approvals.listPending": gated("approvals.listPending", async (params) => {
       if (!readNonEmptyString(params.companyId)) {
         throw new InvocationScopeDeniedError(
           pluginId,
-          "approvals.list",
+          "approvals.listPending",
           "a concrete companyId is required; cross-tenant enumeration is not permitted",
         );
       }
-      return services.approvals.list(params);
+      return services.approvals.listPending(params);
     }),
+    "approvals.get": gated("approvals.get", async (params) => {
+      return services.approvals.get(params);
+    }),
+    "approvals.decide": gated("approvals.decide", async (params) => {
+      return services.approvals.decide(params);
+    }),
+
+    // Fork reconcile reads — pending-blocker snapshot for the messenger
+    // digest. Beyond the capability + serviceScope gates, each handler hard-
+    // rejects a missing/empty `companyId` here (bridge-level complete mediation).
     "interactions.list": gated("interactions.list", async (params) => {
       if (!readNonEmptyString(params.companyId)) {
         throw new InvocationScopeDeniedError(
@@ -1332,6 +1519,6 @@ export function createHostClientHandlers(
  */
 export function getRequiredCapability(
   method: WorkerToHostMethodName,
-): PluginCapability | null {
+): PluginCapability | PluginCapability[] | null {
   return METHOD_CAPABILITY_MAP[method];
 }

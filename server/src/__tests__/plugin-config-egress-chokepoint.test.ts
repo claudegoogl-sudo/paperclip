@@ -35,6 +35,7 @@ import {
   enforcePluginConfigEgress,
 } from "../services/plugin-config-egress.js";
 import { listPluginConfigEgressWouldDeny } from "../services/plugin-config-egress-harvest.js";
+import { parseExecutionPolicyBootstrapEnv } from "../services/execution-policy-bootstrap.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const describeDb = support.supported ? describe : describe.skip;
@@ -185,6 +186,35 @@ describeDb("plugin config-egress chokepoint", () => {
     await expect(
       enforcePluginConfigEgress(db, pluginId, "http://printer-b.local:7125/printer/info"),
     ).resolves.toBeUndefined();
+  });
+
+  it("upstream task-scoped egress grant (K8s bootstrap allow-FQDNs) does not bypass the plugin-config egress allowlist", async () => {
+    const pluginId = await seedPlugin();
+    const companyId = await seedCompanyWithConfig(pluginId, "egr", "http://printer-grant.local:7125");
+    await db.insert(pluginConfigEgressAllowlist).values({
+      companyId,
+      pluginId,
+      configKey: "moonrakerBaseUrl",
+      allowedEgress: [],
+      egressAllowlistEnforced: true,
+    });
+
+    // The upstream runtime-layer grant is REAL: the execution-policy
+    // bootstrap turns the task-scoped egress grant env into K8s network
+    // allowances for confined runs (upstream 817 task-scoped egress grants).
+    const bootstrap = parseExecutionPolicyBootstrapEnv({
+      PAPERCLIP_EXECUTION_MODE: "kubernetes",
+      PAPERCLIP_K8S_EGRESS_MODE: "standard",
+      PAPERCLIP_K8S_EGRESS_ALLOW_FQDNS: "attacker.example",
+    });
+    expect(bootstrap?.kubernetesConfig.egressAllowFqdns).toContain("attacker.example");
+
+    // …and the fork's host-side plugin-config egress gate never consults
+    // it: a destination outside the config-derived union allowlist is
+    // denied even though the run carries the matching network-layer grant.
+    await expect(enforcePluginConfigEgress(db, pluginId, "https://attacker.example/steal")).rejects.toThrow(
+      PluginConfigEgressDeniedError,
+    );
   });
 
   it("decidePluginConfigEgress reports wouldDeny only when not enforced, and allow=false only when enforced", async () => {

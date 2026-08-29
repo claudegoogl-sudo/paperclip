@@ -1,7 +1,15 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { heartbeatRuns as heartbeatRunsTable } from "@paperclipai/db";
 
+// Booting the route graph pulls in nearly every server service module; since the
+// v2026.824.1 merge that cold import alone can exceed the 5s default test
+// timeout, which killed the first tests in this file (the route module is cached
+// after the first import, so later tests never saw the cost).
+vi.setConfig({ testTimeout: 30_000 });
+
+const AGENT_RUN_ID = "44444444-4444-4444-8444-444444444444";
 const ASSIGNEE_AGENT_ID = "11111111-1111-4111-8111-111111111111";
 const PREVIOUS_AGENT_ID = "22222222-2222-4222-8222-222222222222";
 const MENTIONED_AGENT_ID = "33333333-3333-4333-8333-333333333333";
@@ -9,6 +17,7 @@ const MENTIONED_AGENT_ID = "33333333-3333-4333-8333-333333333333";
 const mockIssueService = vi.hoisted(() => ({
   clearOrphanCheckoutLocksIfTerminal: vi.fn(async () => false),
   getById: vi.fn(),
+  getByIdForUpdate: vi.fn(),
   update: vi.fn(),
   addComment: vi.fn(),
   findMentionedAgents: vi.fn(),
@@ -16,6 +25,7 @@ const mockIssueService = vi.hoisted(() => ({
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
   getCurrentScheduledRetry: vi.fn(),
+  listReviewAttention: vi.fn(),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
@@ -26,6 +36,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   cancelRun: vi.fn(async () => null),
 }));
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
+  expirePendingInteractionsForTerminalIssue: vi.fn(async () => []),
   expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
   expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
 }));
@@ -50,6 +61,9 @@ vi.mock("../services/index.js", () => ({
       ambiguous: false,
       agent: { id: raw },
     })),
+  }),
+  companySkillService: () => ({
+    completeTestRunForIssue: vi.fn(async () => null),
   }),
   documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
   documentService: () => ({}),
@@ -119,6 +133,9 @@ function registerModuleMocks() {
         ambiguous: false,
         agent: { id: raw },
       })),
+    }),
+    companySkillService: () => ({
+      completeTestRunForIssue: vi.fn(async () => null),
     }),
     documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
     documentService: () => ({}),
@@ -191,6 +208,9 @@ function agentActor(agentId: string) {
     agentId,
     companyId: "company-1",
     source: "agent_key",
+    // Agent writes must attribute to a heartbeat run (cross-issue influence
+    // cap rejects run-less agent writes), so agent actors carry one.
+    runId: AGENT_RUN_ID,
   };
 }
 
@@ -205,7 +225,60 @@ async function createApp(actor: Record<string, unknown> = BOARD_ACTOR) {
     (req as any).actor = actor;
     next();
   });
-  app.use("/api", issueRoutes({} as any, {} as any));
+  // Newer route reads go through db/tx select chains: instance-settings gating
+  // for the external-object comment sync, and the cross-issue influence cap's
+  // FOR UPDATE run lookup. Serve rows per table so those gates resolve instead
+  // of crashing on a select-less fake.
+  const instanceSettingsRow = {
+    id: "instance-settings",
+    defaultEnvironmentId: null,
+    general: {},
+    experimental: {},
+    createdAt: new Date(0),
+    updatedAt: new Date(0),
+  };
+  const actingAgentId = typeof actor.agentId === "string" ? actor.agentId : null;
+  const rowsFor = (table: unknown) => {
+    // Match on the drizzle table NAME, not object identity: server modules and
+    // this test file can resolve @paperclipai/db to separate module instances.
+    const tableName = (table as Record<symbol, string | undefined> | null | undefined)?.[Symbol.for("drizzle:Name")];
+    if (tableName === "heartbeat_runs") {
+      // The acting agent's run is bound to the issue under test, so the
+      // cross-issue cap classifies agent writes as in-scope (never cross-issue)
+      // and allows them without counting against the limit.
+      return [{
+        id: AGENT_RUN_ID,
+        companyId: "company-1",
+        agentId: actingAgentId,
+        responsibleUserId: null,
+        contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+      }];
+    }
+    return [instanceSettingsRow];
+  };
+  const selectStub = () => {
+    let rows: unknown[] = [];
+    const builder = {
+      from: (table: unknown) => ({
+        where: () => {
+          rows = rowsFor(table);
+          return thenableForUpdate;
+        },
+      }),
+    };
+    const thenableForUpdate = Object.assign(Promise.resolve().then(() => rows), {
+      for: () => thenableForUpdate,
+    }) as Promise<unknown[]> & { for: () => Promise<unknown[]> };
+    return builder;
+  };
+  const insertStub = () => ({ values: async () => [] });
+  const txStub = { select: selectStub, insert: insertStub };
+  app.use("/api", issueRoutes({
+    select: selectStub,
+    insert: insertStub,
+    transaction: async (callback: (tx: Record<string, unknown>) => Promise<unknown>) =>
+      callback(txStub),
+  } as any, {} as any));
   app.use(errorHandler);
   return app;
 }
@@ -240,10 +313,12 @@ describe("issue update comment wakeups", () => {
     registerModuleMocks();
     vi.clearAllMocks();
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
+    mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
     mockIssueService.getCurrentScheduledRetry.mockResolvedValue(null);
+    mockIssueService.listReviewAttention.mockResolvedValue(new Map());
   });
 
   it("includes the new comment in assignment wakes from issue updates", async () => {
@@ -489,6 +564,41 @@ describe("issue update comment wakeups", () => {
     );
   });
 
+  it("does not wake the assignee when a closure comment marks the issue done", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    const updated = {
+      ...existing,
+      status: "done",
+      completedAt: new Date("2026-06-26T16:30:00.000Z"),
+    };
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-close-1",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "Closing this out.",
+    });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({
+        status: "done",
+        comment: "Closing this out.",
+      });
+
+    expect(res.status).toBe(200);
+    await new Promise((resolve) => setImmediate(resolve));
+    const issueCommentedWakeCalls = mockHeartbeatService.wakeup.mock.calls.filter(
+      ([, wakeup]: [string, { reason?: string }]) => wakeup?.reason === "issue_commented",
+    );
+    expect(issueCommentedWakeCalls).toEqual([]);
+  });
+
   it("wakes the assignee on top-level board issue comments", async () => {
     const existing = makeIssue({
       assigneeAgentId: ASSIGNEE_AGENT_ID,
@@ -528,6 +638,51 @@ describe("issue update comment wakeups", () => {
           wakeCommentId: "comment-3",
           wakeReason: "issue_commented",
           source: "issue.comment",
+        }),
+      }),
+    );
+  });
+
+  it("tags the wake when a board comment supersedes the last review interaction", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_review",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-review-path",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "one more review note",
+    });
+    mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockResolvedValue([{
+      id: "interaction-review-path",
+      kind: "request_confirmation",
+      status: "expired",
+    }]);
+    mockIssueService.listReviewAttention.mockResolvedValue(new Map([[
+      existing.id,
+      { state: "stalled", paths: [], reason: "review path consumed" },
+    ]]));
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${existing.id}/comments`)
+      .send({ body: "one more review note" });
+
+    expect(res.status).toBe(201);
+    await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1));
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          reviewPathLost: true,
+          reviewPathConsumedRef: "interaction-review-path",
+          reviewPathInstruction: expect.stringContaining("Restore a reviewer"),
+        }),
+        contextSnapshot: expect.objectContaining({
+          reviewPathLost: true,
+          reviewPathConsumedRef: "interaction-review-path",
         }),
       }),
     );

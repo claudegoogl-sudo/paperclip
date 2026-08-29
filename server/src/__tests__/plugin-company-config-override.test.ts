@@ -223,18 +223,19 @@ describeEmbeddedPostgres("pluginRegistryService.upsertCompanyConfigOverride", ()
     });
   });
 
-  it("instance-wide upsertConfig binds a secret ref to the secret's owning company", async () => {
+  it("company-scoped upsertConfig binds a secret ref to the secret's owning company", async () => {
     // Regression guard for the gap behind the messenger poll-loop failure: a
-    // secret ref set through the instance-wide route (POST /plugins/:id/config →
-    // registry.upsertConfig) must reconcile company_secret_bindings so
-    // ctx.secrets.resolve() can find the row. Without the sync call this row is
-    // absent and resolution fails closed as "secret not found".
+    // secret ref set through the company config route (registry.upsertConfig)
+    // must reconcile company_secret_bindings so ctx.secrets.resolve() can find
+    // the row. Without the sync call this row is absent and resolution fails
+    // closed as "secret not found". Adapted to company-scoped plugin_config:
+    // the instance-wide route no longer exists (post-0164 multi-company).
     const companyA = await seedCompany("A");
     const secretA = await seedSecret(companyA, "messenger-bot-token");
     const pluginId = await seedPlugin();
     const registry = pluginRegistryService(db);
 
-    await registry.upsertConfig(pluginId, {
+    await registry.upsertConfig(pluginId, companyA, {
       configJson: { githubPatSecretId: secretA, label: "ignore-me" },
     });
 
@@ -249,33 +250,33 @@ describeEmbeddedPostgres("pluginRegistryService.upsertCompanyConfigOverride", ()
     });
 
     // Re-running the same save is idempotent (no duplicate/zombie rows).
-    await registry.upsertConfig(pluginId, {
+    await registry.upsertConfig(pluginId, companyA, {
       configJson: { githubPatSecretId: secretA, label: "ignore-me" },
     });
     expect(await bindingsFor(pluginId)).toHaveLength(1);
   });
 
-  it("effective per-tenant config = global plugin_config merged with override", async () => {
+  it("effective per-tenant config = company plugin_config merged with override", async () => {
     // The host-services `config.getForCompany` shape (mirrored here at the
-    // registry layer): start from `plugin_config.configJson` and shallow-merge
-    // the per-tenant `configOverrides` on top.
+    // registry layer): start from the company's `plugin_config.configJson` and
+    // shallow-merge the per-tenant `configOverrides` on top.
     const companyA = await seedCompany("A");
     const secretA = await seedSecret(companyA, "pat-a");
     const pluginId = await seedPlugin();
     const registry = pluginRegistryService(db);
 
-    // Seed the instance-wide global config with Platform-shape defaults.
-    await registry.upsertConfig(pluginId, {
+    // Seed the company config with Platform-shape defaults.
+    await registry.upsertConfig(pluginId, companyA, {
       configJson: { defaultBranch: "main", githubPatSecretId: "00000000-0000-0000-0000-000000000000" },
     });
     await registry.upsertCompanyConfigOverride(pluginId, companyA, {
       githubPatSecretId: secretA,
     });
 
-    const globalConfig = await registry.getConfig(pluginId);
+    const companyConfig = await registry.getConfig(pluginId, companyA);
     const override = await registry.getCompanyConfigOverride(pluginId, companyA);
     const effective = {
-      ...((globalConfig?.configJson as Record<string, unknown> | undefined) ?? {}),
+      ...((companyConfig?.configJson as Record<string, unknown> | undefined) ?? {}),
       ...(override ?? {}),
     };
 

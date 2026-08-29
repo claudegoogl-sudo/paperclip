@@ -45,17 +45,19 @@ describe("a background call that owns no dispatch must not inherit another tenan
     echoesInvocationId: boolean,
     entrypointPath: string = BACKGROUND_CONFIG_POLL_WORKER_ENTRYPOINT,
   ) {
-    const getForCompany = vi.fn(async (companyId: string) => ({
-      tenant: companyId,
-      telegramBotTokenSecretId: `secret-ref-of-${companyId}`,
-    }));
-    const instanceWideGet = vi.fn(async () => ({ tenant: "<instance-wide>" }));
+    // Upstream handler shape: `config.get` receives `{...params, companyId}`
+    // with the host-validated company, or is denied before the service runs.
+    const configGet = vi.fn(
+      async (params: { companyId?: string }) => ({
+        tenant: params.companyId ?? "<no company served>",
+      }),
+    );
 
     const handlers = createHostClientHandlers({
       pluginId: "test.plugin",
       capabilities: [],
       services: {
-        config: { get: instanceWideGet, getForCompany },
+        config: { get: configGet },
       } as unknown as HostServices,
     });
 
@@ -71,11 +73,18 @@ describe("a background call that owns no dispatch must not inherit another tenan
         : {}),
     });
 
-    return { getForCompany, instanceWideGet, handle };
+    return { configGet, handle };
   }
 
-  it("does not resolve a setup()-loop config.get to the unrelated tenant whose dispatch is in flight", async () => {
-    const { getForCompany, instanceWideGet, handle } = buildHarness(true);
+  it("never resolves a setup()-loop config.get to the unrelated tenant whose dispatch is in flight — the scope-less read is denied outright", async () => {
+    // Upstream semantics restored (decision on the fork-guard review): with no
+    // host-issued company context, `config.get` is denied proactively at the
+    // SDK layer. A background loop that needs tenant data must target the
+    // fork-only service-scope surface (`config.getForServiceScope`), which is
+    // provisioned-gated per company. The isolation invariant is unchanged and
+    // now holds a fortiori: the loop is not pointed at a stranger's tenant —
+    // it is not served AT ALL.
+    const { configGet, handle } = buildHarness(true);
 
     try {
       await handle.start();
@@ -83,8 +92,7 @@ describe("a background call that owns no dispatch must not inherit another tenan
       // Let the background loop tick with NO dispatch in flight first. This
       // proves the loop is independent of any dispatch: it already exists.
       await new Promise((resolve) => setTimeout(resolve, 60));
-      expect(instanceWideGet.mock.calls.length).toBeGreaterThan(0);
-      expect(getForCompany).not.toHaveBeenCalled();
+      expect(configGet).not.toHaveBeenCalled();
 
       // Now company-a dispatches an event. The fixture holds it open, so it is
       // the single in-flight invocation while the background loop keeps ticking.
@@ -96,11 +104,9 @@ describe("a background call that owns no dispatch must not inherit another tenan
       } as unknown as HostToWorkerMethods["onEvent"][0]);
 
       // The background loop owns no dispatch. It must never be handed
-      // company-a's effective config.
-      expect(getForCompany).not.toHaveBeenCalled();
-      // It still gets a working, tenant-free answer — the loop is not broken,
-      // it is just no longer pointed at a stranger's tenant.
-      expect(instanceWideGet.mock.calls.length).toBeGreaterThan(1);
+      // company-a's effective config — the restored guard denies the whole
+      // read instead of falling back to an instance-wide payload.
+      expect(configGet).not.toHaveBeenCalled();
     } finally {
       await handle.stop().catch(() => undefined);
     }
@@ -109,15 +115,13 @@ describe("a background call that owns no dispatch must not inherit another tenan
   it("still attributes an id-less call to the single in-flight dispatch for a worker that cannot echo the id (preserved)", async () => {
     // The legacy population (platform.cad ≤0.1.7, klipper) never echoes
     // `paperclipInvocationId` even while servicing its own dispatch, so the
-    // attribution remains the only way to scope it. Narrowing the fix above must not
-    // take that away.
+    // host's single-in-flight attribution (`forkLegacyScopeContext` feeding
+    // upstream's `resolveRequiredCompanyId`) remains the only way to scope it.
     //
-    // This must use a DISPATCH-ONLY fixture. Originally it reused the
-    // background-poll worker, so what it actually asserted was that a
-    // background loop's id-less `config.get` resolves to the unrelated tenant
-    // whose dispatch is open — the vulnerability this suite guards against
-    // elsewhere, one method over from `secrets.resolve`, not the affordance it names.
-    const { getForCompany, handle } = buildHarness(
+    // This must use a DISPATCH-ONLY fixture. The background-poll worker would
+    // not exercise attribution: its id-less call owns no dispatch and is now
+    // denied outright.
+    const { configGet, handle } = buildHarness(
       false,
       DISPATCH_CONFIG_GET_WORKER_ENTRYPOINT,
     );
@@ -129,7 +133,10 @@ describe("a background call that owns no dispatch must not inherit another tenan
         event: { companyId: "company-a", type: "issue.created" },
       } as unknown as HostToWorkerMethods["onEvent"][0]);
 
-      expect(getForCompany).toHaveBeenCalledWith("company-a");
+      expect(configGet).toHaveBeenCalledWith(
+        { companyId: "company-a" },
+        expect.anything(),
+      );
     } finally {
       await handle.stop().catch(() => undefined);
     }

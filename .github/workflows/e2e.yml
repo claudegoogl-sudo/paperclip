@@ -25,7 +25,7 @@ jobs:
       # taken; fork-only no-version gate re-applied.)
       - uses: pnpm/action-setup@v6
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: pnpm
