@@ -100,17 +100,6 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
   }, 20_000);
 
   afterEach(async () => {
-    mockAdapterExecute.mockReset();
-    mockAdapterExecute.mockImplementation(async () => ({
-      exitCode: 0,
-      signal: null,
-      timedOut: false,
-      errorMessage: null,
-      summary: "Dependency-aware heartbeat test run.",
-      provider: "test",
-      model: "test-model",
-    }));
-    runningProcesses.clear();
     let idlePolls = 0;
     for (let attempt = 0; attempt < 100; attempt += 1) {
       const runs = await db
@@ -125,11 +114,27 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       }
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
-    // Quiescence period: heartbeatRunEvents may be written after run status transitions
-    // to terminal (e.g., appendRunEvent at heartbeat.ts:10288 after setRunStatus).
-    // The polling above only checks heartbeatRuns.status, so we wait a bit for
-    // post-status-change async side effects to complete before teardown.
-    await new Promise((resolve) => setTimeout(resolve, 150));
+        const runIds = await db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .then((runs) => runs.map((run) => run.id));
+        await Promise.all(runIds.map((runId) => heartbeat.waitForRunExecutionDrain(runId)));
+        mockAdapterExecute.mockReset();
+        mockAdapterExecute.mockImplementation(async () => ({
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary: "Dependency-aware heartbeat test run.",
+          provider: "test",
+          model: "test-model",
+        }));
+        runningProcesses.clear();
+        // Quiescence period: heartbeatRunEvents may be written after run status transitions
+        // to terminal (e.g., appendRunEvent at heartbeat.ts:10288 after setRunStatus).
+        // The drain above awaits run execution, but we still wait a bit for
+        // post-status-change async side effects to complete before teardown.
+        await new Promise((resolve) => setTimeout(resolve, 150));
     await db.delete(environmentLeases);
     await db.delete(activityLog);
     await db.delete(companySkills);

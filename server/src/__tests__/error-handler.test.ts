@@ -108,6 +108,31 @@ describe("errorHandler", () => {
     expect(res.__errorContext?.error?.message).toBe("db exploded");
   });
 
+  it("returns 400 for Zod validation errors from another module instance", () => {
+    const req = makeReq();
+    const res = makeRes() as any;
+    const next = vi.fn() as unknown as NextFunction;
+    const issue = {
+      code: "invalid_type",
+      expected: "string",
+      received: "undefined",
+      path: ["provider"],
+      message: "Required",
+    };
+    const err = Object.assign(new Error("Validation failed"), {
+      name: "ZodError",
+      issues: [issue],
+      errors: [issue],
+    });
+
+    errorHandler(err, req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith({ error: "Validation error", details: [issue] });
+    expect(res.err).toBeUndefined();
+    expect(res.__errorContext).toBeUndefined();
+  });
+
   it("surfaces body-parser PayloadTooLargeError as 413 with structured warn log", () => {
     const req = makeReq({
       method: "POST",

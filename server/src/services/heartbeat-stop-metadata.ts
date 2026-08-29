@@ -1,18 +1,21 @@
 export type HeartbeatRunOutcome =
   | "succeeded"
   | "succeeded_dirty"
+  | "interrupted"
   | "failed"
   | "cancelled"
   | "timed_out";
 
 export type HeartbeatRunStopReason =
   | "completed"
+  | "interrupted"
   | "timeout"
   | "cancelled"
   | "budget_paused"
   | "paused"
   | "max_turns_exhausted"
   | "process_lost"
+  | "unmanaged_background_task_stopped"
   | "completed_dirty_exit"
   | "adapter_failed";
 
@@ -56,11 +59,17 @@ function defaultTimeoutSecForAdapter(adapterType: string) {
  * `idle` so it wakes again once `retryNotBefore` elapses. Parking it in `error`
  * takes the agent out of service for the entire limit window, which is how a
  * weekly limit removed a company's escalation path for days.
+ *
+ * Under the merged v2026.824.1 contract the same door-rejections can arrive as
+ * the upstream `provider_quota` family, and the finalize path passes upstream's
+ * `keepIdleOnFailure` flag for the same cases — all three spell "not the
+ * agent's fault, keep it schedulable".
  */
 export function resolveAgentStatusAfterRun(input: {
   outcome: HeartbeatRunOutcome;
   runningRunCount: number;
   errorFamily?: string | null;
+  keepIdleOnFailure?: boolean;
 }): "running" | "idle" | "error" {
   if (input.runningRunCount > 0) return "running";
   if (
@@ -70,7 +79,12 @@ export function resolveAgentStatusAfterRun(input: {
   ) {
     return "idle";
   }
-  if (input.outcome === "failed" && input.errorFamily === "transient_upstream") {
+  if (
+    input.outcome === "failed" &&
+    (input.errorFamily === "transient_upstream" ||
+      input.errorFamily === "provider_quota" ||
+      input.keepIdleOnFailure === true)
+  ) {
     return "idle";
   }
   return "error";
@@ -118,11 +132,13 @@ export function inferHeartbeatRunStopReason(input: {
   errorMessage?: string | null;
 }): HeartbeatRunStopReason {
   if (input.outcome === "succeeded") return "completed";
+  if (input.outcome === "interrupted") return "interrupted";
   // The work completed; only teardown exited badly.
   if (input.outcome === "succeeded_dirty") return "completed_dirty_exit";
   const maxTurnStopReason = normalizeMaxTurnStopReason(input.errorCode);
   if (maxTurnStopReason) return maxTurnStopReason;
   if (input.outcome === "timed_out") return "timeout";
+  if (input.outcome === "failed" && input.errorCode === "unmanaged_background_task_stopped") return "unmanaged_background_task_stopped";
   if (input.outcome === "failed" && input.errorCode === "process_lost") return "process_lost";
   if (input.outcome === "cancelled") {
     const message = (input.errorMessage ?? "").toLowerCase();

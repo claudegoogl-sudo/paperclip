@@ -27,9 +27,19 @@ function makeFakeDb() {
   const insertedValues: unknown[] = [];
   const db = {
     insert: vi.fn(() => ({
-      values: vi.fn(async (value: unknown) => {
+      values: vi.fn((value: unknown) => {
         insertedValues.push(value);
+        return {
+          returning: vi.fn(async () => [{ id: "activity-1" }]),
+        };
       }),
+    })),
+    // Upstream v2026.824.1: logActivity resolves the run's responsible user
+    // before persisting; no runs exist in this suite's stub.
+    select: vi.fn(() => ({
+      from: vi.fn(() => ({
+        where: vi.fn(async () => []),
+      })),
     })),
   };
   return { db: db as unknown as Parameters<typeof logActivity>[0], insertedValues };

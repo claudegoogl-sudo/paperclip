@@ -2,6 +2,7 @@ import path from "node:path";
 import fs from "node:fs";
 import pino from "pino";
 import { pinoHttp } from "pino-http";
+import { HTTP_LOG_REDACT_PATHS } from "./http-log-redaction.js";
 import { readConfigFile } from "../config-file.js";
 import { resolveDefaultLogsDir, resolveHomeAwarePath } from "../home-paths.js";
 import { shouldSilenceHttpSuccessLog } from "./http-log-policy.js";
@@ -12,18 +13,29 @@ import { redactSensitive } from "./redact-sensitive.js";
  * Censor used by pino `redact` to scrub secret patterns from the serialised
  * request fields (`req.url`, `req.query.*`, `req.headers.*`). The matched
  * substring is replaced with its class marker via the shared module so this
- * surface cannot drift from the write-block denylist. The `authorization`
- * header is special-cased to a full `[Redacted]` because it is always a
- * credential regardless of shape.
+ * surface cannot drift from the write-block denylist. Headers that are
+ * credentials regardless of shape (`authorization`, `proxy-authorization`,
+ * `cookie`, `set-cookie`, CSRF/X-API-key headers — the upstream
+ * HTTP_LOG_REDACT_PATHS set) are special-cased to a full `[Redacted]`.
  *
  * SECURITY-CRITICAL: The log surface uses the `...ForLog` variant: the
  * Option A issuer-allowlist applies ONLY to the write-block (free-text bodies);
  * a live `iss=paperclip` run JWT must never be persisted to `server.log`, so
  * here every JWT shape is redacted regardless of issuer.
  */
+const FULLY_REDACTED_HEADER_KEYS = new Set([
+  "authorization",
+  "proxy-authorization",
+  "cookie",
+  "set-cookie",
+  "x-csrf-token",
+  "x-xsrf-token",
+  "x-api-key",
+]);
+
 function redactRequestField(value: unknown, path: string[]): unknown {
   const key = path[path.length - 1];
-  if (key === "authorization") return "[Redacted]";
+  if (FULLY_REDACTED_HEADER_KEYS.has(key)) return "[Redacted]";
   return typeof value === "string" ? redactSecretsForLog(value) : value;
 }
 
@@ -48,18 +60,25 @@ const sharedOpts = {
   singleLine: true,
 };
 
+const isProduction = process.env.NODE_ENV === "production";
+
+// Union of the upstream credential-header paths and the fork's serialised
+// request-field paths, all funnelled through the pattern-aware censor above
+// (credential headers → full `[Redacted]`, everything else → pattern redact).
+const LOG_REDACT_PATHS = [...new Set([...HTTP_LOG_REDACT_PATHS, "req.url", "req.query.*", "req.headers.*"])];
+
 export const logger = pino({
-  level: "debug",
+  level: process.env.PAPERCLIP_LOG_LEVEL?.trim() || (isProduction ? "info" : "debug"),
   // Pattern-redact the serialised request fields that pino-http logs. pino-http
   // overrides any req/res serializers we pass it, so log-time `redact` (which
   // runs after serialization) is the reliable hook for these paths:
   //   - req.url        → the `?q=<token>` URL-query case
   //   - req.query.*    → the same query parsed into fields
-  //   - req.headers.*  → header values; `authorization` → full `[Redacted]`
+  //   - req.headers.*  → header values; credential headers → full `[Redacted]`
   // reqBody.* / reqParams / reqQuery and the `msg` line are redacted at their
   // source in the pino-http callbacks below.
   redact: {
-    paths: ["req.url", "req.query.*", "req.headers.*"],
+    paths: LOG_REDACT_PATHS,
     censor: redactRequestField,
   },
 }, pino.transport({
@@ -86,7 +105,7 @@ export const httpLogger = pinoHttp({
   // source shared with the write-block denylist so the two cannot drift.
   //
   // Coverage map:
-  //  - `req.url` / `req.query` / `req.headers`  → serializers.req below
+  //  - `req.url` / `req.query` / `req.headers`  → pino `redact` on the base logger
   //  - `reqBody.*` (every leaf), reqParams, reqQuery, errorContext
   //                                            → customProps below
   //  - `msg` (embeds method + url + error msg) → custom*Message below
@@ -96,8 +115,6 @@ export const httpLogger = pinoHttp({
   //    still be censored).
   //  - `res.body`: response bodies are NOT logged anywhere in this server (the
   //    res serializer emits status only), so there is nothing to scrub there.
-  // (req/res serializers are configured on the base `logger` instance above —
-  // pino-http ignores `serializers` passed in its own options.)
   customLogLevel(_req, res, err) {
     if (shouldSilenceHttpSuccessLog(_req.method, _req.url, res.statusCode)) {
       return "silent";

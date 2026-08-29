@@ -67,6 +67,15 @@ describe("heartbeat stop metadata", () => {
     expect(
       resolveAgentStatusAfterRun({ outcome: "failed", runningRunCount: 0, errorFamily: "transient_upstream" }),
     ).toBe("idle");
+    // Merged contract: the same door-rejections classified as the upstream
+    // provider_quota family (and upstream's keepIdleOnFailure flag) keep the
+    // agent schedulable too.
+    expect(
+      resolveAgentStatusAfterRun({ outcome: "failed", runningRunCount: 0, errorFamily: "provider_quota" }),
+    ).toBe("idle");
+    expect(
+      resolveAgentStatusAfterRun({ outcome: "failed", runningRunCount: 0, keepIdleOnFailure: true }),
+    ).toBe("idle");
 
     expect(resolveAgentStatusAfterRun({ outcome: "failed", runningRunCount: 0, errorFamily: null })).toBe("error");
     expect(resolveAgentStatusAfterRun({ outcome: "failed", runningRunCount: 0 })).toBe("error");
@@ -119,6 +128,18 @@ describe("heartbeat stop metadata", () => {
         errorMessage: "Cancelled by control plane",
       }).stopReason,
     ).toBe("cancelled");
+  });
+
+  it("records graceful interruption separately from failure", () => {
+    expect(
+      buildHeartbeatRunStopMetadata({
+        adapterType: "codex_local",
+        adapterConfig: {},
+        outcome: "interrupted",
+        errorCode: "server_shutdown_interrupted",
+        errorMessage: "Interrupted by graceful server shutdown",
+      }).stopReason,
+    ).toBe("interrupted");
   });
 
   it("normalizes max-turn exhaustion stop reasons", () => {

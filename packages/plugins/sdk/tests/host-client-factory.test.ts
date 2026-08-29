@@ -9,6 +9,65 @@ import {
 import { PLUGIN_RPC_ERROR_CODES } from "../src/protocol.js";
 
 describe("createHostClientHandlers invocation company scope", () => {
+  it("rejects worker-selected config and secret company ids without a host invocation scope", async () => {
+    const configGet = vi.fn(async () => ({ apiKeyRef: "unreachable" }));
+    const secretsResolve = vi.fn(async () => "unreachable");
+    const services = {
+      config: { get: configGet },
+      secrets: { resolve: secretsResolve },
+    } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services,
+    });
+
+    await expect(
+      handlers["config.get"]({ companyId: "company-a" }),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    await expect(
+      handlers["secrets.resolve"]({
+        companyId: "company-a",
+        secretRef: { type: "secret_ref", secretId: "secret-a" },
+      }),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    expect(configGet).not.toHaveBeenCalled();
+    expect(secretsResolve).not.toHaveBeenCalled();
+  });
+
+  it("allows explicit config and secret company ids only when they match the host invocation scope", async () => {
+    const configGet = vi.fn(async () => ({ apiKeyRef: "ref" }));
+    const secretsResolve = vi.fn(async () => "resolved");
+    const services = {
+      config: { get: configGet },
+      secrets: { resolve: secretsResolve },
+    } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services,
+    });
+    const context = { invocationScope: { companyId: "company-a" } };
+
+    await expect(
+      handlers["config.get"]({ companyId: "company-a" }, context),
+    ).resolves.toEqual({ apiKeyRef: "ref" });
+    await expect(
+      handlers["secrets.resolve"]({
+        companyId: "company-a",
+        secretRef: { type: "secret_ref", secretId: "secret-a" },
+      }, context),
+    ).resolves.toBe("resolved");
+
+    expect(configGet).toHaveBeenCalledWith({ companyId: "company-a" }, context);
+    expect(secretsResolve).toHaveBeenCalledWith({
+      companyId: "company-a",
+      secretRef: { type: "secret_ref", secretId: "secret-a" },
+    }, context);
+  });
+
   it("rejects company-scoped host calls outside the current invocation company", async () => {
     const projectsList = vi.fn(async () => []);
     const services = {
@@ -173,6 +232,194 @@ describe("createHostClientHandlers invocation company scope", () => {
     expect(searchAudit).not.toHaveBeenCalled();
   });
 
+  it("rejects a human-attributed createComment call when only issue.comments.create is granted", async () => {
+    const createComment = vi.fn(async () => ({ id: "comment-1" }));
+    const services = {
+      issues: { createComment },
+    } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["issue.comments.create"],
+      services,
+    });
+    const context = { invocationScope: { companyId: "company-a" } };
+
+    await expect(
+      handlers["issues.createComment"]({
+        issueId: "issue-a",
+        body: "hello",
+        companyId: "company-a",
+        actorUserId: "user-a",
+      }, context),
+    ).rejects.toBeInstanceOf(CapabilityDeniedError);
+    expect(createComment).not.toHaveBeenCalled();
+  });
+
+  it("allows a human-attributed createComment call once issue.comments.create_human_attributed is also granted", async () => {
+    const createComment = vi.fn(async () => ({ id: "comment-1" }));
+    const services = {
+      issues: { createComment },
+    } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["issue.comments.create", "issue.comments.create_human_attributed"],
+      services,
+    });
+    const context = { invocationScope: { companyId: "company-a" } };
+
+    await expect(
+      handlers["issues.createComment"]({
+        issueId: "issue-a",
+        body: "hello",
+        companyId: "company-a",
+        actorUserId: "user-a",
+      }, context),
+    ).resolves.toEqual({ id: "comment-1" });
+    expect(createComment).toHaveBeenCalledWith({
+      issueId: "issue-a",
+      body: "hello",
+      companyId: "company-a",
+      actorUserId: "user-a",
+    });
+  });
+
+  it("still allows a plain agent-attributed createComment call without the human-attribution capability", async () => {
+    const createComment = vi.fn(async () => ({ id: "comment-2" }));
+    const services = {
+      issues: { createComment },
+    } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["issue.comments.create"],
+      services,
+    });
+    const context = { invocationScope: { companyId: "company-a" } };
+
+    await expect(
+      handlers["issues.createComment"]({
+        issueId: "issue-a",
+        body: "hello",
+        companyId: "company-a",
+        authorAgentId: "agent-a",
+      }, context),
+    ).resolves.toEqual({ id: "comment-2" });
+    expect(createComment).toHaveBeenCalled();
+  });
+});
+
+describe("createHostClientHandlers capability gating for LOOA-641 methods", () => {
+  const context = { invocationScope: { companyId: "company-a" } };
+
+  it("denies issues.respondInteraction without issue.interactions.respond", async () => {
+    const respondInteraction = vi.fn(async () => ({ interaction: { id: "i" }, applied: true }));
+    const services = { issues: { respondInteraction } } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      // A read grant must not confer the ability to respond.
+      capabilities: ["issue.interactions.read"],
+      services,
+    });
+    await expect(
+      handlers["issues.respondInteraction"]({
+        issueId: "issue-a", interactionId: "int-a", companyId: "company-a", action: "accept", actorUserId: "user-a",
+      }, context),
+    ).rejects.toBeInstanceOf(CapabilityDeniedError);
+    expect(respondInteraction).not.toHaveBeenCalled();
+  });
+
+  it("allows issues.respondInteraction with issue.interactions.respond", async () => {
+    const respondInteraction = vi.fn(async () => ({ interaction: { id: "i" }, applied: true }));
+    const services = { issues: { respondInteraction } } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["issue.interactions.respond"],
+      services,
+    });
+    await expect(
+      handlers["issues.respondInteraction"]({
+        issueId: "issue-a", interactionId: "int-a", companyId: "company-a", action: "accept", actorUserId: "user-a",
+      }, context),
+    ).resolves.toEqual({ interaction: { id: "i" }, applied: true });
+    expect(respondInteraction).toHaveBeenCalledOnce();
+  });
+
+  it("denies approvals.decide without approvals.respond", async () => {
+    const decide = vi.fn(async () => ({ approval: { id: "a" }, applied: true }));
+    const services = { approvals: { decide } } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      // A read grant must not confer the ability to decide.
+      capabilities: ["approvals.read"],
+      services,
+    });
+    await expect(
+      handlers["approvals.decide"]({
+        approvalId: "a", companyId: "company-a", action: "approve", actorUserId: "user-a",
+      }, context),
+    ).rejects.toBeInstanceOf(CapabilityDeniedError);
+    expect(decide).not.toHaveBeenCalled();
+  });
+
+  it("allows approvals.decide with approvals.respond", async () => {
+    const decide = vi.fn(async () => ({ approval: { id: "a" }, applied: true }));
+    const services = { approvals: { decide } } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["approvals.respond"],
+      services,
+    });
+    await expect(
+      handlers["approvals.decide"]({
+        approvalId: "a", companyId: "company-a", action: "approve", actorUserId: "user-a",
+      }, context),
+    ).resolves.toEqual({ approval: { id: "a" }, applied: true });
+    expect(decide).toHaveBeenCalledOnce();
+  });
+
+  it("denies read methods without their read capability", async () => {
+    const listInteractions = vi.fn(async () => []);
+    const list = vi.fn(async () => []);
+    const getAttachmentContent = vi.fn(async () => null);
+    const services = {
+      issues: { listInteractions, getAttachmentContent },
+      approvals: { list },
+    } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: [],
+      services,
+    });
+    await expect(
+      handlers["issues.listInteractions"]({ issueId: "i", companyId: "company-a" }, context),
+    ).rejects.toBeInstanceOf(CapabilityDeniedError);
+    await expect(
+      handlers["approvals.list"]({ companyId: "company-a" }, context),
+    ).rejects.toBeInstanceOf(CapabilityDeniedError);
+    await expect(
+      handlers["issues.getAttachmentContent"]({ attachmentId: "at", companyId: "company-a" }, context),
+    ).rejects.toBeInstanceOf(CapabilityDeniedError);
+    expect(listInteractions).not.toHaveBeenCalled();
+    expect(list).not.toHaveBeenCalled();
+    expect(getAttachmentContent).not.toHaveBeenCalled();
+  });
+
+  it("enforces invocation company scope on the new methods", async () => {
+    const list = vi.fn(async () => []);
+    const services = { approvals: { list } } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["approvals.read"],
+      services,
+    });
+    // Requesting company-b while scoped to company-a must be denied.
+    await expect(
+      handlers["approvals.list"]({ companyId: "company-b" }, context),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    expect(list).not.toHaveBeenCalled();
+  });
+});
+
+describe("createHostClientHandlers invocation scope fail-closed (fork serviceScope allowlist)", () => {
   it("fails closed for a company-scoped call with no resolvable invocation scope", async () => {
     const configure = vi.fn(async () => ({ ok: true }));
     const services = {
@@ -254,10 +501,16 @@ describe("createHostClientHandlers invocation company scope", () => {
       { id: "company-a", name: "Company A" },
       { id: "company-b", name: "Company B" },
     ]);
-    // A genuinely no-companyId method (kind "none") still passes with no scope.
+    // config.get is company-scoped upstream: with no host-issued company
+    // context the restored proactive guard denies it (it is NOT a
+    // "no-companyId method"). Background consumers must target the fork-only
+    // `config.getForServiceScope` read instead.
     await expect(
       handlers["config.get"](undefined as never, {}),
-    ).resolves.toEqual({ value: 1 });
+    ).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("company context is required"),
+    });
   });
 });
 
@@ -285,10 +538,16 @@ describe("createHostClientHandlers dispatch runId back-fill", () => {
       { invocationScope: { companyId: "company-a", runId: "run-xyz" } },
     );
 
-    expect(resolve).toHaveBeenCalledWith({
-      secretRef: "11111111-1111-1111-1111-111111111111",
-      runId: "run-xyz",
-    });
+    // Upstream handler shape: the scope-validated company rides on the params
+    // and the original context is passed through as the second argument.
+    expect(resolve).toHaveBeenCalledWith(
+      {
+        secretRef: "11111111-1111-1111-1111-111111111111",
+        runId: "run-xyz",
+        companyId: "company-a",
+      },
+      expect.anything(),
+    );
   });
 
   it("does NOT overwrite a runId the worker already provided", async () => {
@@ -311,10 +570,14 @@ describe("createHostClientHandlers dispatch runId back-fill", () => {
       { invocationScope: { companyId: "company-a", runId: "run-xyz" } },
     );
 
-    expect(resolve).toHaveBeenCalledWith({
-      secretRef: "11111111-1111-1111-1111-111111111111",
-      runId: "worker-supplied-run",
-    });
+    expect(resolve).toHaveBeenCalledWith(
+      {
+        secretRef: "11111111-1111-1111-1111-111111111111",
+        runId: "worker-supplied-run",
+        companyId: "company-a",
+      },
+      expect.anything(),
+    );
   });
 
   it("forwards untouched when no active invocation carries a runId", async () => {
@@ -334,18 +597,24 @@ describe("createHostClientHandlers dispatch runId back-fill", () => {
       { invocationScope: { companyId: "company-a" } },
     );
 
-    // No runId on scope → we pass through unchanged. The server-side handler
-    // will still throw `runcontext_invalid`, which is the desired fail-closed
-    // behaviour for an out-of-dispatch caller.
-    expect(resolve).toHaveBeenCalledWith({
-      secretRef: "11111111-1111-1111-1111-111111111111",
-    });
+    // No runId on scope → runId passes through unchanged (the server-side
+    // handler still fail-closes with `runcontext_invalid`). The restored
+    // upstream handler still threads the scope-validated company.
+    expect(resolve).toHaveBeenCalledWith(
+      {
+        secretRef: "11111111-1111-1111-1111-111111111111",
+        companyId: "company-a",
+      },
+      expect.anything(),
+    );
   });
 
-  it("back-fills runId on secrets.resolve from the service scope", async () => {
-    // A setup()-started loop (e.g. messenger getUpdates) or a background
-    // dispatch resolves with NO dispatch in flight, so neither invocation nor
-    // single-in-flight scope exists — only the host-minted service scope.
+  it("denies a secrets.resolve that carries only the service scope (upstream guard; use resolveService)", async () => {
+    // Upstream semantics restored: a company-scoped read with no host-issued
+    // company context (a setup()-started loop or background job — no dispatch
+    // in flight) is denied proactively at the SDK. Background secret reads
+    // must target the fork-only `secrets.resolveService`, which binds the
+    // company to the secret binding instead of accepting a worker choice.
     const resolve = vi.fn(async () => "resolved-value");
     const services = {
       secrets: { resolve },
@@ -357,15 +626,17 @@ describe("createHostClientHandlers dispatch runId back-fill", () => {
       services,
     });
 
-    await handlers["secrets.resolve"](
-      { secretRef: "11111111-1111-1111-1111-111111111111" } as never,
-      { serviceScope: { runId: "service-run-1" } },
-    );
-
-    expect(resolve).toHaveBeenCalledWith({
-      secretRef: "11111111-1111-1111-1111-111111111111",
-      runId: "service-run-1",
+    await expect(
+      handlers["secrets.resolve"](
+        { secretRef: "11111111-1111-1111-1111-111111111111" } as never,
+        { serviceScope: { runId: "service-run-1" } },
+      ),
+    ).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("company context is required"),
     });
+
+    expect(resolve).not.toHaveBeenCalled();
   });
 
   it("prefers an active dispatch runId over the service scope", async () => {
@@ -391,10 +662,14 @@ describe("createHostClientHandlers dispatch runId back-fill", () => {
       },
     );
 
-    expect(resolve).toHaveBeenCalledWith({
-      secretRef: "11111111-1111-1111-1111-111111111111",
-      runId: "dispatch-run",
-    });
+    expect(resolve).toHaveBeenCalledWith(
+      {
+        secretRef: "11111111-1111-1111-1111-111111111111",
+        runId: "dispatch-run",
+        companyId: "company-a",
+      },
+      expect.anything(),
+    );
   });
 
   it("back-fills runId on artifacts.fetch symmetrically", async () => {
@@ -496,69 +771,85 @@ describe("createHostClientHandlers artifacts.create capability gate", () => {
   });
 });
 
-describe("createHostClientHandlers config.get per-company scope selection", () => {
-  // id-less legacy workers (e.g. platform.cad ≤0.1.x) never echo a
-  // `paperclipInvocationId`, so `invocationScope` is null. The host was given
-  // a `singleInFlightScope` (the sole in-flight dispatch's company, host-derived)
-  // and wired secrets.resolve/artifacts.fetch to consult it — but config.get was
-  // left reading only `invocationScope`, so it fell through to the instance-wide
-  // config and handed DPR Platform's secret ref. These tests pin the fix.
+describe("createHostClientHandlers config.get company-context guard (upstream semantics restored)", () => {
+  // Upstream's proactive company-context guard is restored: a company-scoped
+  // `config.get` without a host-issued company context is DENIED at this layer
+  // before host services run. The single fork accommodation is
+  // `forkLegacyScopeContext`, which presents the host-attributed
+  // `singleInFlightScope` (single in-flight dispatch, never worker-supplied)
+  // as the invocation scope for legacy id-less workers — a provable no-op for
+  // every upstream-constructible context.
 
   function makeConfigHandlers() {
-    const getForCompany = vi.fn(async (companyId: string) => ({
-      githubPatSecretId: `secret-for-${companyId}`,
-    }));
-    const get = vi.fn(async () => ({ githubPatSecretId: "instance-wide-secret" }));
+    const get = vi.fn(
+      async (params: { companyId?: string }) => ({
+        githubPatSecretId: `secret-for-${params.companyId ?? "<none>"}`,
+      }),
+    );
     const services = {
-      config: { get, getForCompany },
+      config: { get },
     } as unknown as HostServices;
     const handlers = createHostClientHandlers({
       pluginId: "paperclip.test",
       capabilities: [],
       services,
     });
-    return { handlers, get, getForCompany };
+    return { handlers, get };
   }
 
-  it("delegates to getForCompany using singleInFlightScope when the worker echoed no invocation id", async () => {
-    const { handlers, get, getForCompany } = makeConfigHandlers();
+  it("serves the single-in-flight dispatch's company to an id-less legacy worker (fork accommodation)", async () => {
+    const { handlers, get } = makeConfigHandlers();
 
     await expect(
       handlers["config.get"](undefined as never, {
-        invocationScope: null,
+        invalidInvocationScope: true,
         singleInFlightScope: { companyId: "company-dpr" },
       }),
     ).resolves.toEqual({ githubPatSecretId: "secret-for-company-dpr" });
 
-    expect(getForCompany).toHaveBeenCalledWith("company-dpr");
-    expect(get).not.toHaveBeenCalled();
+    expect(get).toHaveBeenCalledWith(
+      { companyId: "company-dpr" },
+      expect.anything(),
+    );
   });
 
   it("prefers invocationScope over singleInFlightScope when both are present", async () => {
-    const { handlers, getForCompany } = makeConfigHandlers();
+    const { handlers, get } = makeConfigHandlers();
 
     await handlers["config.get"](undefined as never, {
       invocationScope: { companyId: "company-a" },
       singleInFlightScope: { companyId: "company-b" },
     });
 
-    expect(getForCompany).toHaveBeenCalledWith("company-a");
-    expect(getForCompany).not.toHaveBeenCalledWith("company-b");
+    expect(get).toHaveBeenCalledWith(
+      { companyId: "company-a" },
+      expect.anything(),
+    );
+    expect(get).not.toHaveBeenCalledWith(
+      { companyId: "company-b" },
+      expect.anything(),
+    );
   });
 
-  it("falls back to instance-wide get() with no scope (0 or 2+ in-flight dispatches → no singleInFlightScope)", async () => {
-    const { handlers, get, getForCompany } = makeConfigHandlers();
+  it("denies a scope-less config.get outright (upstream byte-compat; no instance-wide fallback)", async () => {
+    const { handlers, get } = makeConfigHandlers();
 
+    // No invocationScope and no singleInFlightScope (0 or 2+ in-flight
+    // dispatches, or a background loop that owns no dispatch) → upstream's
+    // proactive denial. Background consumers must target the fork-only
+    // `config.getForServiceScope` read instead.
     await expect(
       handlers["config.get"](undefined as never, {}),
-    ).resolves.toEqual({ githubPatSecretId: "instance-wide-secret" });
+    ).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("company context is required"),
+    });
 
-    expect(get).toHaveBeenCalledTimes(1);
-    expect(getForCompany).not.toHaveBeenCalled();
+    expect(get).not.toHaveBeenCalled();
   });
 
   it("a worker cannot name an arbitrary tenant via a forged companyId param — fails closed", async () => {
-    const { handlers, get, getForCompany } = makeConfigHandlers();
+    const { handlers, get } = makeConfigHandlers();
 
     // config.get carries no companyId in its real contract. If a worker forges
     // one, the gated `requireInvocationCompanyScope` enforcement treats it as a
@@ -572,27 +863,133 @@ describe("createHostClientHandlers config.get per-company scope selection", () =
       ),
     ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
 
-    expect(getForCompany).not.toHaveBeenCalled();
     expect(get).not.toHaveBeenCalled();
   });
+});
 
-  it("falls back to get() when the host implements no per-company delivery", async () => {
-    const get = vi.fn(async () => ({ githubPatSecretId: "instance-wide-secret" }));
+describe("createHostClientHandlers fork-only service-scope reads", () => {
+  // The fork-only background surface: provisioned reach only, concrete
+  // companyId mandatory, no kind:"all". `secrets.resolveService` additionally
+  // requires the host-minted serviceScope and rejects a worker-supplied
+  // companyId (the server derives the company from the secret binding).
+
+  function makeForkHandlers() {
+    const getForServiceScope = vi.fn(async () => ({ tier: "pro" }));
+    const listPending = vi.fn(async () => []);
+    const resolveService = vi.fn(async () => "resolved-value");
     const services = {
-      config: { get },
+      config: { get: vi.fn(), getForServiceScope },
+      approvals: { list: vi.fn(), get: vi.fn(), decide: vi.fn(), listPending },
+      secrets: { resolve: vi.fn(), mintHandle: vi.fn(), resolveService },
     } as unknown as HostServices;
     const handlers = createHostClientHandlers({
       pluginId: "paperclip.test",
-      capabilities: [],
+      capabilities: ["secrets.read-ref", "board.approvals.read"],
       services,
     });
+    return { handlers, getForServiceScope, listPending, resolveService };
+  }
+
+  it("config.getForServiceScope: authorizes a concrete company under the bare serviceScope", async () => {
+    const { handlers, getForServiceScope } = makeForkHandlers();
 
     await expect(
-      handlers["config.get"](undefined as never, {
-        singleInFlightScope: { companyId: "company-dpr" },
-      }),
-    ).resolves.toEqual({ githubPatSecretId: "instance-wide-secret" });
-    expect(get).toHaveBeenCalledTimes(1);
+      handlers["config.getForServiceScope"](
+        { companyId: "company-a" },
+        { serviceScope: { runId: "service-run-1" } } as never,
+      ),
+    ).resolves.toEqual({ tier: "pro" });
+
+    expect(getForServiceScope).toHaveBeenCalledWith({ companyId: "company-a" });
+  });
+
+  it("config.getForServiceScope: rejects a missing/empty companyId at the bridge", async () => {
+    const { handlers, getForServiceScope } = makeForkHandlers();
+
+    await expect(
+      handlers["config.getForServiceScope"]({ companyId: "" } as never, {} as never),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    await expect(
+      handlers["config.getForServiceScope"](undefined as never, {} as never),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+
+    expect(getForServiceScope).not.toHaveBeenCalled();
+  });
+
+  it("approvals.listPending: authorizes a concrete company under the bare serviceScope", async () => {
+    const { handlers, listPending } = makeForkHandlers();
+
+    await expect(
+      handlers["approvals.listPending"](
+        { companyId: "company-a" },
+        { serviceScope: { runId: "service-run-1" } } as never,
+      ),
+    ).resolves.toEqual([]);
+
+    expect(listPending).toHaveBeenCalledWith({ companyId: "company-a" });
+  });
+
+  it("approvals.listPending: rejects a missing/empty companyId at the bridge", async () => {
+    const { handlers, listPending } = makeForkHandlers();
+
+    await expect(
+      handlers["approvals.listPending"]({} as never, {} as never),
+    ).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("a concrete companyId is required"),
+    });
+
+    expect(listPending).not.toHaveBeenCalled();
+  });
+
+  it("secrets.resolveService: resolves with the host-minted serviceScope and derives nothing from the worker", async () => {
+    const { handlers, resolveService } = makeForkHandlers();
+
+    await expect(
+      handlers["secrets.resolveService"](
+        { secretRef: "11111111-1111-1111-1111-111111111111" },
+        { serviceScope: { runId: "service-run-1" } } as never,
+      ),
+    ).resolves.toBe("resolved-value");
+
+    expect(resolveService).toHaveBeenCalledWith({
+      secretRef: "11111111-1111-1111-1111-111111111111",
+      runId: "service-run-1",
+    });
+  });
+
+  it("secrets.resolveService: denies a call with no host-minted serviceScope", async () => {
+    const { handlers, resolveService } = makeForkHandlers();
+
+    await expect(
+      handlers["secrets.resolveService"](
+        { secretRef: "11111111-1111-1111-1111-111111111111" },
+        {},
+      ),
+    ).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("host-minted service scope is required"),
+    });
+
+    expect(resolveService).not.toHaveBeenCalled();
+  });
+
+  it("secrets.resolveService: rejects a worker-supplied companyId — the company comes from the binding", async () => {
+    const { handlers, resolveService } = makeForkHandlers();
+
+    // The generic invocation guard fires FIRST: a params-level companyId is a
+    // requested company scope, and a bare serviceScope grants none.
+    await expect(
+      handlers["secrets.resolveService"](
+        { secretRef: "11111111-1111-1111-1111-111111111111", companyId: "company-a" } as never,
+        { serviceScope: { runId: "service-run-1" } } as never,
+      ),
+    ).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("company context is required"),
+    });
+
+    expect(resolveService).not.toHaveBeenCalled();
   });
 });
 
@@ -617,7 +1014,14 @@ describe("createHostClientHandlers events.subscribe serviceScope", () => {
     return { handlers, subscribe };
   }
 
-  it("allows a company-filtered subscribe at setup() under serviceScope (no active dispatch)", async () => {
+  it("denies a company-filtered subscribe under serviceScope alone (upstream denial restored)", async () => {
+    // Upstream pins the denial of a proactive company-filtered subscribe with
+    // no host-issued company context. A setup()-time subscribe for a
+    // CONFIGURED company is authorized instead by the host's options-seeded
+    // proactive scope (which surfaces as a real invocationScope — see the
+    // worker-manager proactive-scope tests); the serviceScope allowance deliberately
+    // does NOT cover events.subscribe, so a company outside the seeded set
+    // still fails closed here.
     const { handlers, subscribe } = makeEventsHandlers();
     const params = {
       eventPattern: "issue.created",
@@ -628,9 +1032,11 @@ describe("createHostClientHandlers events.subscribe serviceScope", () => {
       handlers["events.subscribe"](params as never, {
         serviceScope: { runId: "service-run-1" },
       }),
-    ).resolves.toBeUndefined();
-    expect(subscribe).toHaveBeenCalledTimes(1);
-    expect(subscribe).toHaveBeenCalledWith(params);
+    ).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("company context is required"),
+    });
+    expect(subscribe).not.toHaveBeenCalled();
   });
 
   it("still allows an unfiltered subscribe under serviceScope (companyScope 'none')", async () => {
@@ -661,28 +1067,27 @@ describe("createHostClientHandlers events.subscribe serviceScope", () => {
     expect(subscribe).not.toHaveBeenCalled();
   });
 
-  it("allows a company-filtered subscribe under serviceScope even when base context reports invalidInvocationScope", async () => {
+  it("denies a company-filtered subscribe under serviceScope even when base context reports invalidInvocationScope", async () => {
+    // events.subscribe is deliberately OUTSIDE the fork-only serviceScope
+    // allowlist (upstream pins this denial; configured companies are
+    // covered by the host's options-seeded proactive scope, not by this
+    // allowance). The invalid-scope rejection therefore applies.
     const { handlers, subscribe } = makeEventsHandlers();
     const params = {
       eventPattern: "issue.created",
       filter: { companyId: "company-a" },
     };
 
-    // The inbound relay path (onWebhook / getUpdates callback with no
-    // resolvable dispatch id) resolves to `invalidInvocationScope` in the host's
-    // base context. For an allowlisted, reach-checked method carrying a valid
-    // serviceScope this must be authorized — the allowlist bypass is an
-    // exception to the invalid-scope rejection. It grants no reach beyond the
-    // scope-less `{}` case already allowed (events.subscribe is company-filtered
-    // and the filter is reach-checked server-side).
     await expect(
       handlers["events.subscribe"](params as never, {
         invalidInvocationScope: true,
         serviceScope: { runId: "service-run-1" },
       }),
-    ).resolves.toBeUndefined();
-    expect(subscribe).toHaveBeenCalledTimes(1);
-    expect(subscribe).toHaveBeenCalledWith(params);
+    ).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("missing, expired, or unknown invocation scope"),
+    });
+    expect(subscribe).not.toHaveBeenCalled();
   });
 
   it("does NOT extend the serviceScope allowance to other company-scoped methods", async () => {
@@ -975,11 +1380,11 @@ describe("createHostClientHandlers issues.resolveInteraction capability + servic
 
 describe("createHostClientHandlers reconcile reads", () => {
   // The messenger digest seeds/reconciles its pending-blocker set on worker
-  // startup by reading the authoritative live set. These reads run from a
-  // setup()-started context with no active dispatch, so they must be authorized
-  // under the bare serviceScope (SERVICE_SCOPE_COMPANY_METHODS) — but, unlike a
-  // host-pinned dispatch, the worker chooses the companyId, so the bridge hard-
-  // rejects a missing/empty companyId (the server gate is the second layer).
+  // startup via the FORK-ONLY surfaces: `approvals.listPending` (pending-only,
+  // provisioning-gated) and `interactions.list`. Upstream's general
+  // `approvals.list` read is back to its upstream shape: a plain
+  // company-scope-guarded read with NO serviceScope allowance and NO
+  // bridge-level companyId requirement — the reconcile contract moved off it.
   function makeHandlers(capabilities: string[] = ["board.approvals.read", "issue.interactions.read"]) {
     const approvalsList = vi.fn(async () => []);
     const interactionsList = vi.fn(async () => []);
@@ -1017,17 +1422,25 @@ describe("createHostClientHandlers reconcile reads", () => {
     expect(interactionsList).not.toHaveBeenCalled();
   });
 
-  it("allows both reconcile reads under serviceScope (worker-startup reconcile, no active dispatch)", async () => {
+  it("authorizes interactions.list — but NOT upstream's approvals.list — under serviceScope", async () => {
+    // Fork-only reconcile contract (decision item 2): `interactions.list`
+    // keeps its serviceScope allowance with a per-method safety argument
+    // (entity cross-checked server-side); `approvals.list` does NOT — the
+    // pending-blocker snapshot moved to `approvals.listPending`, so upstream's
+    // general read keeps upstream's strict company-context semantics.
     const { handlers, approvalsList, interactionsList } = makeHandlers();
     const ctx = { serviceScope: { runId: "service-run-1" } };
 
     await expect(
       handlers["approvals.list"]({ companyId: "company-a" }, ctx),
-    ).resolves.toEqual([]);
+    ).rejects.toMatchObject({
+      name: "InvocationScopeDeniedError",
+      message: expect.stringContaining("company context is required"),
+    });
+    expect(approvalsList).not.toHaveBeenCalled();
     await expect(
       handlers["interactions.list"]({ companyId: "company-a" }, ctx),
     ).resolves.toEqual([]);
-    expect(approvalsList).toHaveBeenCalledWith({ companyId: "company-a" });
     expect(interactionsList).toHaveBeenCalledWith({ companyId: "company-a" });
   });
 
@@ -1037,17 +1450,24 @@ describe("createHostClientHandlers reconcile reads", () => {
 
     // Missing companyId maps to scope kind "none", which would otherwise slip
     // the invocation-scope check entirely — the handler's own guard must catch
-    // it so no single call can run without a concrete target company.
+    // it so no single call can run without a concrete target company. This is
+    // the bridge contract of the FORK-ONLY reads (`approvals.listPending`,
+    // `interactions.list`). Upstream's `approvals.list` has no such
+    // requirement (kind "none" passes its generic guard untouched, exactly as
+    // upstream wrote it) — the reconcile contract no longer rides on it.
     await expect(
       handlers["approvals.list"]({} as never, ctx),
+    ).resolves.toEqual([]);
+    await expect(
+      handlers["approvals.listPending"]({} as never, ctx),
     ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
     await expect(
-      handlers["approvals.list"]({ companyId: "  " } as never, ctx),
+      handlers["approvals.listPending"]({ companyId: "  " } as never, ctx),
     ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
     await expect(
       handlers["interactions.list"]({} as never, ctx),
     ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
-    expect(approvalsList).not.toHaveBeenCalled();
+    expect(approvalsList).toHaveBeenCalledWith({});
     expect(interactionsList).not.toHaveBeenCalled();
   });
 

@@ -3,9 +3,14 @@ import { redactRegisteredSecretValues } from "./run-secret-registry.js";
 import { GITHUB_FINE_GRAINED_PAT_RE } from "./secret-patterns.js";
 
 const SECRET_FIELD_NAME_PATTERN =
-  String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)[A-Za-z0-9_-]*`;
+  String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring|browser[-_]?code|login[-_]?url)[A-Za-z0-9_-]*`;
 
 const SECRET_PAYLOAD_KEY_RE = new RegExp(SECRET_FIELD_NAME_PATTERN, "i");
+// Authorization reasons are policy decision codes, not credentials. They must
+// remain visible in audit receipts even though the field name contains
+// "authorization". JWT-shaped values are still caught by the value guard below.
+const AUDIT_REASON_PAYLOAD_KEY_RE = /^authorizationReason$/;
+const AUDIT_SURFACE_PAYLOAD_KEY_RE = /^surface$/;
 const COMMAND_PAYLOAD_KEY_RE =
   /(^command$|^cmd$|command[-_]?line|resolved[-_]?command|PAPERCLIP_RESOLVED_COMMAND)/i;
 const COMMAND_ARGS_PAYLOAD_KEY_RE = /^(commandArgs|command_?args|argv)$/i;
@@ -145,7 +150,7 @@ function sanitizeRecordWithLeaf(
       redacted[redactedKey] = redactSensitiveText(value);
       continue;
     }
-    if (SECRET_PAYLOAD_KEY_RE.test(key)) {
+    if (SECRET_PAYLOAD_KEY_RE.test(key) && !AUDIT_REASON_PAYLOAD_KEY_RE.test(key)) {
       if (isSecretRefBinding(value)) {
         redacted[redactedKey] = sanitizeValue(value, leaf);
         continue;
@@ -161,7 +166,7 @@ function sanitizeRecordWithLeaf(
       redacted[redactedKey] = REDACTED_EVENT_VALUE;
       continue;
     }
-    if (typeof value === "string" && JWT_VALUE_RE.test(value)) {
+    if (typeof value === "string" && JWT_VALUE_RE.test(value) && !AUDIT_SURFACE_PAYLOAD_KEY_RE.test(key)) {
       redacted[redactedKey] = REDACTED_EVENT_VALUE;
       continue;
     }

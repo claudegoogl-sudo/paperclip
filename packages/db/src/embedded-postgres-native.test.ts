@@ -1,8 +1,12 @@
+import childProcess from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createRequire } from "node:module";
 import { afterEach, describe, expect, it } from "vitest";
-import { ensureLinuxSharedLibraryAliases } from "./embedded-postgres-native.js";
+import { ensureLinuxSharedLibraryAliases, prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
+
+const require = createRequire(import.meta.url);
 
 describe("embedded Postgres native runtime", () => {
   const tempDirs: string[] = [];
@@ -41,6 +45,20 @@ describe("embedded Postgres native runtime", () => {
     expect(fs.readlinkSync(path.join(tempDir, "libicuuc.so.60"))).toBe("libicuuc.so.60.2");
   });
 
+  it("keeps the child process API untouched while preparing the runtime", async () => {
+    const originalSpawn = childProcess.spawn;
+
+    await prepareEmbeddedPostgresNativeRuntime();
+
+    expect(childProcess.spawn).toBe(originalSpawn);
+  });
+
+  it("uses the dependency-scoped portable locale patch", () => {
+    const source = fs.readFileSync(require.resolve("embedded-postgres"), "utf8");
+
+    expect(source).toContain("const LC_MESSAGES_LOCALE = 'C';");
+    expect(source).toContain("globalThis.process.env");
+  });
   // Reproduces the live v525 crash: a root-owned global install whose lib dir is
   // not writable by the non-root service user. Alias creation must degrade to a
   // warning instead of throwing and crashing startup in a restart loop.

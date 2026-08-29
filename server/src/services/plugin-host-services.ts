@@ -4,6 +4,7 @@ import {
   agentTaskSessions as agentTaskSessionsTable,
   agents as agentsTable,
   budgetIncidents,
+  companyMemberships,
   costEvents,
   heartbeatRuns,
   invites,
@@ -30,7 +31,6 @@ import type {
 import type { CreateIssueThreadInteraction, InviteJoinType, IssueDocumentSummary, PermissionKey, PrincipalType } from "@paperclipai/shared";
 import {
   pluginOperationIssueOriginKind,
-  TERMINAL_HEARTBEAT_RUN_STATUSES,
   isSuccessfulHeartbeatRunStatus,
 } from "@paperclipai/shared";
 import { companyService } from "./companies.js";
@@ -45,7 +45,7 @@ import { heartbeatService } from "./heartbeat.js";
 import { budgetService } from "./budgets.js";
 import { issueApprovalService } from "./issue-approvals.js";
 import { approvalService } from "./approvals.js";
-import { redactEventPayload } from "../redaction.js";
+import { getStorageService } from "../storage/index.js";
 import { subscribeCompanyLiveEvents } from "./live-events.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import path from "node:path";
@@ -68,7 +68,7 @@ import {
   setStoredLocalFolder,
   writePluginLocalFolderTextAtomic,
 } from "./plugin-local-folders.js";
-import { createPluginSecretsHandler } from "./plugin-secrets-handler.js";
+import { createPluginSecretsHandler, type PluginSecretsResolveParams } from "./plugin-secrets-handler.js";
 import { createPluginArtifactsHandler } from "./plugin-artifacts-handler.js";
 import { enforcePluginConfigEgress } from "./plugin-config-egress.js";
 import { normalizeIssueAttachmentMaxBytes } from "../attachment-types.js";
@@ -91,7 +91,13 @@ import { requireAgentActorSource, requirePluginBoardActorSource } from "./actor-
 import { getTelemetryClient } from "../telemetry.js";
 import { accessService } from "./access.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
-import { sanitizeRecord } from "../redaction.js";
+import { redactEventPayload, sanitizeRecord } from "../redaction.js";
+import type { WorkerHostCallContext } from "@paperclipai/plugin-sdk";
+import {
+  normalizeProviderFamily,
+  SANDBOX_STARTUP_SPAN_ATTRS,
+} from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
+import { recordProviderPluginSpan, type ParsedTraceparent } from "../instrumentation.js";
 
 // ---------------------------------------------------------------------------
 // SSRF protection for plugin HTTP fetch
@@ -573,6 +579,194 @@ if (_logFlushInterval.unref) _logFlushInterval.unref();
 /** Maximum time (ms) to keep a session event subscription alive before forcing cleanup. */
 const SESSION_EVENT_SUBSCRIPTION_TIMEOUT_MS = 30 * 60 * 1_000; // 30 minutes
 
+// ---------------------------------------------------------------------------
+// Provider span trust boundary (the `span.record` host handler)
+// ---------------------------------------------------------------------------
+//
+// The plugin worker runs in a separate process, so the host treats every field
+// of a worker-sent span as untrusted input. The host re-clamps the span name
+// and every attribute here, before it records the span. A worker-side or
+// plugin-side helper is not sufficient; this is the single boundary.
+
+const SPAN_ATTRS = SANDBOX_STARTUP_SPAN_ATTRS;
+
+/** The closed set of provider span leaf names a plugin may emit. `pack` and
+ * `transfer` are the host-local build and the byte upload. `ensureDirectory`,
+ * `checkSymlinkEscape`, `promote`, `extractTarball`, and `postUploadCommand`
+ * are the per-round-trip command spans in the inbound sync path. `session.open`
+ * and `session.close` are the short spans that wrap a persistent-session create
+ * and delete. */
+const KNOWN_PROVIDER_SPAN_NAMES: ReadonlySet<string> = new Set([
+  "pack",
+  "transfer",
+  "ensureDirectory",
+  "checkSymlinkEscape",
+  "promote",
+  "extractTarball",
+  "postUploadCommand",
+  "session.open",
+  "session.close",
+]);
+
+/** Clamp the span name to a closed, namespaced set. A known name maps to
+ * `sandbox.daytona.<name>`; any other value maps to `sandbox.daytona.other`, so
+ * a span name never carries free-form data. Only the daytona provider emits
+ * these spans today, so the segment is the literal `daytona`. When a second
+ * provider emits provider spans, derive the segment from the normalized
+ * `provider` family attribute on the span instead of this literal. */
+function clampProviderSpanName(raw: unknown): string {
+  const name = typeof raw === "string" && KNOWN_PROVIDER_SPAN_NAMES.has(raw) ? raw : "other";
+  return `sandbox.daytona.${name}`;
+}
+
+/** The closed allowlist of attribute keys a provider span may carry. The host
+ * drops every other key, so a command, an argument, a path, an id, a standard
+ * output, a standard error, or an `extra` field can never ride a provider span. */
+const PROVIDER_SPAN_ATTR_ALLOWLIST: ReadonlySet<string> = new Set<string>([
+  SPAN_ATTRS.provider,
+  SPAN_ATTRS.outcome,
+  SPAN_ATTRS.packWallMs,
+  SPAN_ATTRS.transferWallMs,
+  SPAN_ATTRS.transferGuardCount,
+]);
+
+/** The subset of allowed keys that carry a finite number. */
+const PROVIDER_SPAN_NUMERIC_ATTRS: ReadonlySet<string> = new Set<string>([
+  SPAN_ATTRS.packWallMs,
+  SPAN_ATTRS.transferWallMs,
+  SPAN_ATTRS.transferGuardCount,
+]);
+
+/** The closed value set for the `outcome` attribute. */
+const KNOWN_SPAN_OUTCOMES: ReadonlySet<string> = new Set(["ok", "skipped", "failed"]);
+
+/**
+ * Re-clamp the worker-sent attributes at the trust boundary. Drop every key that
+ * is not on the allowlist. Re-map `provider` through `normalizeProviderFamily`,
+ * bound `outcome` to its closed set, and keep a numeric attribute only when it
+ * is a finite number. The result holds only bounded, low-cardinality values.
+ */
+export function clampProviderSpanAttributes(
+  raw: Record<string, unknown> | undefined,
+): Record<string, string | number | boolean> {
+  const clamped: Record<string, string | number | boolean> = {};
+  if (!raw) return clamped;
+  for (const [key, value] of Object.entries(raw)) {
+    if (!PROVIDER_SPAN_ATTR_ALLOWLIST.has(key)) continue;
+    if (key === SPAN_ATTRS.provider) {
+      clamped[key] = normalizeProviderFamily(typeof value === "string" ? value : undefined);
+      continue;
+    }
+    if (key === SPAN_ATTRS.outcome) {
+      if (typeof value === "string" && KNOWN_SPAN_OUTCOMES.has(value)) clamped[key] = value;
+      continue;
+    }
+    if (PROVIDER_SPAN_NUMERIC_ATTRS.has(key)) {
+      if (typeof value === "number" && Number.isFinite(value)) clamped[key] = value;
+      continue;
+    }
+  }
+  return clamped;
+}
+
+/**
+ * Parse and validate a W3C `traceparent`. Return the parts, or `null` when the
+ * value is absent or malformed. The host mints the value, but this is the trust
+ * boundary, so it validates before use. It never logs the value.
+ */
+export function parseTraceparent(raw: string | undefined | null): ParsedTraceparent | null {
+  if (typeof raw !== "string") return null;
+  const match = /^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/.exec(raw);
+  if (!match) return null;
+  const [, version, traceId, spanId, flags] = match;
+  if (version === "ff") return null; // the W3C spec forbids version 0xff
+  if (traceId === "0".repeat(32)) return null; // an all-zero trace id is invalid
+  if (spanId === "0".repeat(16)) return null; // an all-zero span id is invalid
+  return { traceId, spanId, traceFlags: parseInt(flags, 16) };
+}
+
+/** Keep only the numeric status code. A status message could carry free-form
+ * text, so the host drops it — never a standard-stream text on a span. */
+function clampSpanStatus(
+  status: { code?: unknown; message?: unknown } | undefined,
+): { code: number } | undefined {
+  if (!status || typeof status.code !== "number" || !Number.isFinite(status.code)) return undefined;
+  return { code: status.code };
+}
+
+/** The largest span duration the host accepts as a real wall-clock width. A
+ * larger difference means a skewed or wrong clock, so the host drops the pair. */
+const MAX_PROVIDER_SPAN_DURATION_MS = 10 * 60 * 1000; // 10 minutes
+
+/** The largest age the host accepts for a span start time relative to its own
+ * clock. An older start means a stale or wrong clock, so the host drops the
+ * pair. A small negative skew (a start slightly ahead of the host clock) is
+ * allowed, because the host and the worker clocks can differ. */
+const MAX_PROVIDER_SPAN_START_AGE_MS = 60 * 60 * 1000; // 1 hour
+
+/** The largest amount by which the end time may be ahead of the host clock. A
+ * larger lead means a wrong or skewed clock, so the host drops the pair. This
+ * upper bound rejects a timestamp pair that is far in the future. It still
+ * allows a small clock skew between the host and the worker. */
+const MAX_PROVIDER_SPAN_END_SKEW_MS = 60 * 1000; // 1 minute
+
+/**
+ * Validate the worker-sent start-time and end-time pair at the trust boundary.
+ * Return the pair only when it passes the clock-safety policy:
+ * - both values are finite numbers;
+ * - the start time is less than or equal to the end time;
+ * - the duration is not larger than a bounded ceiling;
+ * - the start time is not older than a bounded age relative to the host clock;
+ * - the end time is not ahead of the host clock by more than a bounded skew.
+ * Return `undefined` when any check fails, so the host falls back to the
+ * synchronous open-and-end path.
+ */
+function validateProviderSpanTimes(
+  startTimeMs: unknown,
+  endTimeMs: unknown,
+): { startTimeMs: number; endTimeMs: number } | undefined {
+  if (typeof startTimeMs !== "number" || !Number.isFinite(startTimeMs)) return undefined;
+  if (typeof endTimeMs !== "number" || !Number.isFinite(endTimeMs)) return undefined;
+  if (startTimeMs > endTimeMs) return undefined;
+  if (endTimeMs - startTimeMs > MAX_PROVIDER_SPAN_DURATION_MS) return undefined;
+  if (Date.now() - startTimeMs > MAX_PROVIDER_SPAN_START_AGE_MS) return undefined;
+  if (endTimeMs - Date.now() > MAX_PROVIDER_SPAN_END_SKEW_MS) return undefined;
+  return { startTimeMs, endTimeMs };
+}
+
+/**
+ * Record a worker-sent provider span through the real tracer. This is the host
+ * trust boundary: it validates the host-minted `traceparent`, re-clamps the span
+ * name and every attribute, mints the parentage host-side, and drops a status
+ * message. It validates the optional start-time and end-time pair with a
+ * clock-safety policy; a valid pair gives the span its true native width, and an
+ * absent or invalid pair falls back to the synchronous open-and-end path. It
+ * rejects a span with a missing or malformed `traceparent`. It never throws —
+ * observability must not change control flow.
+ */
+export function recordWorkerProviderSpan(
+  params: {
+    name: string;
+    attributes?: Record<string, unknown>;
+    status?: { code?: unknown; message?: unknown };
+    startTimeMs?: unknown;
+    endTimeMs?: unknown;
+  },
+  context: WorkerHostCallContext | undefined,
+): void {
+  const parent = parseTraceparent(context?.traceparent);
+  if (!parent) return; // reject a missing or malformed traceparent
+  const times = validateProviderSpanTimes(params.startTimeMs, params.endTimeMs);
+  const status = clampSpanStatus(params.status);
+  recordProviderPluginSpan({
+    name: clampProviderSpanName(params.name),
+    parent,
+    attributes: clampProviderSpanAttributes(params.attributes),
+    ...(status ? { status } : {}),
+    ...(times ? { startTimeMs: times.startTimeMs, endTimeMs: times.endTimeMs } : {}),
+  });
+}
+
 export function buildHostServices(
   db: Db,
   pluginId: string,
@@ -584,6 +778,7 @@ export function buildHostServices(
     storageService?: StorageService;
     runContextRegistry?: PluginRunContextRegistry;
     manifest?: import("@paperclipai/shared").PaperclipPluginManifestV1;
+    heartbeatRuntimeEnv?: Record<string, string | undefined>;
     wakeRateLimiter?: PluginWakeRateLimiter;
   } = {},
 ): HostServices & { dispose(): void } {
@@ -631,6 +826,7 @@ export function buildHostServices(
   });
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: options.pluginWorkerManager,
+    runtimeEnv: options.heartbeatRuntimeEnv,
   });
   const projects = projectService(db);
   const executionWorkspaces = executionWorkspaceService(db);
@@ -641,7 +837,7 @@ export function buildHostServices(
   const authorization = authorizationService(db);
   const budgets = budgetService(db);
   const issueApprovals = issueApprovalService(db);
-  const boardApprovals = approvalService(db);
+  const approvalSvc = approvalService(db);
   const interactions = issueThreadInteractionService(db);
   const scopedBus = eventBus.forPlugin(pluginKey);
 
@@ -727,13 +923,23 @@ export function buildHostServices(
   /**
    * Plugins are instance-wide in the current runtime. Company IDs are still
    * required for company-scoped data access, but there is no per-company
-   * availability gate to enforce here.
+   * availability gate to enforce on the GENERAL surface.
+   *
+   * SECURITY-NAMING NOTE: this is deliberately NOT named like an authz gate
+   * (and not named `ensurePluginAvailableForCompany`) because it enforces
+   * NOTHING — it is upstream's structural placeholder for a per-company
+   * availability check this runtime does not have. Reading it as a security
+   * control would be the false-assurance anti-pattern. The REAL, fail-closed
+   * availability gate is `requirePluginEnabledForCompany` below, and ONLY the
+   * fork-only reconcile/background reads (`approvals.listPending`,
+   * `interactions.list`, `config.getForServiceScope`) run it.
    */
-  const ensurePluginAvailableForCompany = async (_companyId: string) => {};
+  const noPluginAvailabilityGate = async (_companyId: string) => {};
 
   /**
-   * SECURITY-CRITICAL: real, method-scoped availability gate for the reconcile reads
-   * (`approvals.list` / `interactions.list`). Unlike the instance-wide no-op
+   * SECURITY-CRITICAL: real, method-scoped availability gate for the fork-only
+   * reconcile/background reads (`approvals.listPending` / `interactions.list` /
+   * `config.getForServiceScope`). Unlike the instance-wide no-op
    * stub above, this fail-closes so a cross-tenant-sensitive enumeration can
    * never run for a company the plugin is not genuinely provisioned for. It is
    * deliberately NOT wired into the existing handlers (whose per-entity
@@ -778,7 +984,7 @@ export function buildHostServices(
 
   const getStoredLocalFolderConfig = async (companyId: string, folderKey: string) => {
     ensureCompanyId(companyId);
-    await ensurePluginAvailableForCompany(companyId);
+    await noPluginAvailabilityGate(companyId);
     const settings = await registry.getCompanySettings(pluginId, companyId);
     return getStoredLocalFolders(settings?.settingsJson)[folderKey] ?? null;
   };
@@ -834,6 +1040,152 @@ export function buildHostServices(
     }
     return record;
   };
+
+  /**
+   * Verify `userId` is an active human member of `companyId` before letting a
+   * plugin attribute a mutation to them. Mirrors the authorization bar the
+   * web app's own board routes apply — a plugin can only ever attribute an
+   * action to an identity that could have taken it in the web app itself.
+   * Used by any plugin capability that accepts an `actorUserId`
+   * (`createComment`'s human-attributed path, `respondInteraction`, and
+   * `approvals.decide`).
+   *
+   * All current call sites are non-safe (write) actions, so by default this
+   * also rejects a `viewer`-role member — the web app's board write-routes
+   * treat `membershipRole === "viewer"` as read-only and 403 it ("Viewer
+   * access is read-only", routes/authz.ts:115-116). Without this bar a plugin
+   * holding `approvals.respond` / `issue.interactions.respond` could attribute
+   * a decision to a viewer who is denied that same action in the web UI —
+   * strictly more authority than the paired user has (privilege escalation).
+   * A future *read-only* attribution path can opt into allowing viewers with
+   * `{ allowViewer: true }`; the default is failure-closed.
+   */
+  const requireActiveHumanMember = async (
+    companyId: string,
+    userId: string,
+    { allowViewer = false }: { allowViewer?: boolean } = {},
+  ): Promise<void> => {
+    const [membership] = await db
+      .select({ id: companyMemberships.id, membershipRole: companyMemberships.membershipRole })
+      .from(companyMemberships)
+      .where(and(
+        eq(companyMemberships.companyId, companyId),
+        eq(companyMemberships.principalType, "user"),
+        eq(companyMemberships.principalId, userId),
+        eq(companyMemberships.status, "active"),
+      ))
+      .limit(1);
+    if (!membership) {
+      throw new Error(`actorUserId "${userId}" is not an active human member of this company`);
+    }
+    if (!allowViewer && membership.membershipRole === "viewer") {
+      throw new Error(`actorUserId "${userId}" has viewer (read-only) access and cannot take this write action`);
+    }
+  };
+
+  /**
+   * Wake the assignee of a continuation issue after a plugin-relayed board-user
+   * interaction resolution, mirroring the web app's board interaction routes
+   * (routes/issues.ts's queueResolvedInteractionContinuationWakeup) so a
+   * confirmation accepted/rejected from chat resumes the agent the same way it
+   * would from the web app. Deliberately narrower than the HTTP helper: it
+   * carries the core interaction context plus the plan-review continuation
+   * payload (the confirmation kind the gateway resolves), and skips the
+   * checkbox/tool-action/item-verdict extras that the gateway's yes/no decision
+   * cards never produce. Failure-tolerant: a wake failure is logged, never
+   * thrown back to the plugin (the decision itself already applied).
+   */
+  const queuePluginInteractionContinuationWakeup = (args: {
+    issue: { id: string; assigneeAgentId: string | null; status: string };
+    interaction: {
+      id: string;
+      kind: string;
+      status: string;
+      continuationPolicy: string;
+      sourceCommentId?: string | null;
+      sourceRunId?: string | null;
+      payload?: unknown;
+    };
+    actorUserId: string;
+    source: string;
+  }): void => {
+    const { interaction, issue } = args;
+    if (
+      interaction.continuationPolicy !== "wake_assignee"
+      && interaction.continuationPolicy !== "wake_assignee_on_accept"
+    ) return;
+    if (
+      interaction.continuationPolicy === "wake_assignee_on_accept"
+      && interaction.status !== "accepted"
+    ) return;
+    if (interaction.status === "expired") return;
+    if (!issue.assigneeAgentId || issue.status === "done" || issue.status === "cancelled") return;
+
+    let planReviewInteraction: Record<string, unknown> | null = null;
+    if (interaction.kind === "request_confirmation" && isRecord(interaction.payload)) {
+      const target = isRecord(interaction.payload.target) ? interaction.payload.target : null;
+      if (
+        target
+        && target.type === "issue_document"
+        && target.key === "plan"
+        && typeof target.issueId === "string"
+        && target.issueId === issue.id
+      ) {
+        planReviewInteraction = {
+          id: interaction.id,
+          kind: interaction.kind,
+          status: interaction.status,
+          target,
+          acceptedTargetRevision: interaction.status === "accepted" ? target : null,
+        };
+      }
+    }
+
+    void heartbeat.wakeup(issue.assigneeAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: {
+        issueId: issue.id,
+        interactionId: interaction.id,
+        interactionKind: interaction.kind,
+        interactionStatus: interaction.status,
+        sourceCommentId: interaction.sourceCommentId ?? null,
+        sourceRunId: interaction.sourceRunId ?? null,
+        ...(planReviewInteraction ? { planReviewInteraction } : {}),
+        mutation: "interaction",
+      },
+      requestedByActorType: "user",
+      requestedByActorId: args.actorUserId,
+      contextSnapshot: {
+        issueId: issue.id,
+        taskId: issue.id,
+        interactionId: interaction.id,
+        interactionKind: interaction.kind,
+        interactionStatus: interaction.status,
+        ...(planReviewInteraction ? { planReviewInteraction } : {}),
+        wakeReason: "issue_commented",
+        source: `plugin:${pluginKey}`,
+      },
+    }).catch((err) => logger.warn({
+      err,
+      issueId: issue.id,
+      interactionId: interaction.id,
+      agentId: issue.assigneeAgentId,
+      source: args.source,
+    }, "failed to wake assignee on plugin-relayed interaction resolution"));
+  };
+
+  /**
+   * Redact an approval's payload before returning it through the plugin bridge,
+   * mirroring the web app's own approval read routes (routes/approvals.ts's
+   * redactApprovalPayload). Ensures the chat surface never receives secrets the
+   * web app itself hides from an approval reader.
+   */
+  const redactApprovalPayload = <T extends { payload: Record<string, unknown> }>(approval: T): T => ({
+    ...approval,
+    payload: redactEventPayload(approval.payload) ?? {},
+  });
 
   const pluginActivityDetails = (
     details: Record<string, unknown> | null | undefined,
@@ -1046,19 +1398,16 @@ export function buildHostServices(
   };
 
   const INVITE_TOKEN_PREFIX = "pcp_invite_";
-  const INVITE_TOKEN_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
-  const INVITE_TOKEN_SUFFIX_LENGTH = 8;
+  // 256 bits of entropy, base64url-encoded. Keep in sync with createInviteToken
+  // in routes/access.ts. The token is public, so it must not be brute-forceable.
+  const INVITE_TOKEN_ENTROPY_BYTES = 32;
   const INVITE_TOKEN_MAX_RETRIES = 5;
   const COMPANY_INVITE_TTL_MS = 72 * 60 * 60 * 1000;
 
   const hashToken = (token: string) => createHash("sha256").update(token).digest("hex");
 
   const createInviteToken = () => {
-    const bytes = randomBytes(INVITE_TOKEN_SUFFIX_LENGTH);
-    let suffix = "";
-    for (let idx = 0; idx < INVITE_TOKEN_SUFFIX_LENGTH; idx += 1) {
-      suffix += INVITE_TOKEN_ALPHABET[bytes[idx]! % INVITE_TOKEN_ALPHABET.length];
-    }
+    const suffix = randomBytes(INVITE_TOKEN_ENTROPY_BYTES).toString("base64url");
     return `${INVITE_TOKEN_PREFIX}${suffix}`;
   };
 
@@ -1246,24 +1595,45 @@ export function buildHostServices(
     return { resourceType, resourceId, companyId, policy: null, updatedAt: company.updatedAt };
   };
 
-  // The runtime config service exposes `getForCompany` for per-tenant
-  // effective config. The SDK's `HostServices.config` interface adds this as an
-  // optional method; the cast keeps this file compiling against SDK versions
-  // that pre-date the extension (the gated handler duck-types `getForCompany`
-  // via `if (services.config.getForCompany)` so the absence is safe).
+  // Fork-only effective plugin config: the company's `plugin_config` row
+  // shallow-merged with the tenant's `configOverrides` subtree. ONLY the
+  // fork-only background read (`config.getForServiceScope`) serves this merged
+  // view, so a background reconcile never sees a stale base value an operator
+  // has overridden for its tenant. The upstream-named general `config.get`
+  // deliberately stays base-only — upstream (v2026.824.1) returns
+  // `configRow?.configJson ?? {}` — so the public surface remains
+  // byte-compatible and a future sync never re-litigates it.
+  const getEffectiveCompanyConfig = async (
+    companyId: string,
+  ): Promise<Record<string, unknown>> => {
+    const [configRow, override] = await Promise.all([
+      registry.getConfig(pluginId, companyId),
+      registry.getCompanyConfigOverride(pluginId, companyId),
+    ]);
+    const base = (configRow?.configJson as Record<string, unknown> | undefined) ?? {};
+    if (!override) return { ...base };
+    return { ...base, ...override };
+  };
+
   const configService = {
-    async get(): Promise<Record<string, unknown>> {
-      const configRow = await registry.getConfig(pluginId);
-      return (configRow?.configJson as Record<string, unknown> | undefined) ?? {};
+    async get(params: Parameters<HostServices["config"]["get"]>[0]) {
+      const companyId = ensureCompanyId(params.companyId);
+      await noPluginAvailabilityGate(companyId);
+      // Base-only on purpose: upstream parity for the general surface
+      // (upstream v2026.824.1 `configRow?.configJson ?? {}`). The override
+      // merge lives on the fork-only `getForServiceScope` read below.
+      const configRow = await registry.getConfig(pluginId, companyId);
+      return configRow?.configJson ?? {};
     },
-    async getForCompany(companyId: string): Promise<Record<string, unknown>> {
-      const [configRow, override] = await Promise.all([
-        registry.getConfig(pluginId),
-        registry.getCompanyConfigOverride(pluginId, companyId),
-      ]);
-      const base = (configRow?.configJson as Record<string, unknown> | undefined) ?? {};
-      if (!override) return { ...base };
-      return { ...base, ...override };
+    // Fork-only background read (serviceScope-reachable; see the SDK gate).
+    // Fail-closed provisioning: unknown company / uninstalled / disabled
+    // plugin → throw, never an empty config.
+    async getForServiceScope(
+      params: Parameters<HostServices["config"]["getForServiceScope"]>[0],
+    ): Promise<Record<string, unknown>> {
+      const companyId = ensureCompanyId(params.companyId);
+      await requirePluginEnabledForCompany(companyId);
+      return getEffectiveCompanyConfig(companyId);
     },
   };
 
@@ -1277,7 +1647,7 @@ export function buildHostServices(
 
       async configure(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const declaration = getLocalFolderDeclaration(params.folderKey);
         const existing = await registry.getCompanySettings(pluginId, companyId);
         const existingConfig = getStoredLocalFolders(existing?.settingsJson)[params.folderKey] ?? null;
@@ -1403,7 +1773,7 @@ export function buildHostServices(
     events: {
       async emit(params) {
         if (params.companyId) {
-          await ensurePluginAvailableForCompany(params.companyId);
+          await noPluginAvailabilityGate(params.companyId);
         }
         await scopedBus.emit(params.name, params.companyId, params.payload);
       },
@@ -1476,6 +1846,18 @@ export function buildHostServices(
 
     secrets: {
       async resolve(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await noPluginAvailabilityGate(companyId);
+        return secretsHandler.resolve({ ...params, companyId });
+      },
+      // Fork-only worker-lifetime service-context read. NO companyId is
+      // asserted here and no availability stub runs: the secrets handler
+      // derives the company from the secret binding (ambiguous cross-company
+      // bindings collapse to not_found), rate-limits per plugin, requires the
+      // host-minted service run-context, and registers the value with the
+      // run-scoped redactor. This keeps background secret reads (the messenger
+      // poll loop's bot token) alive on the upstream-strict bridge.
+      async resolveService(params: PluginSecretsResolveParams) {
         return secretsHandler.resolve(params);
       },
       async mintHandle(params) {
@@ -1505,7 +1887,7 @@ export function buildHostServices(
     activity: {
       async log(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         await logActivity(db, {
           companyId,
           actorType: "plugin",
@@ -1592,12 +1974,23 @@ export function buildHostServices(
       },
     },
 
+    tracer: {
+      async record(params, context) {
+        // The host trust boundary: validate the host-minted `traceparent`,
+        // re-clamp the span name and every attribute, mint the parentage
+        // host-side, and record the span through the real tracer. The capability
+        // gate in `createHostClientHandlers` already rejected an ungranted
+        // plugin before this runs.
+        recordWorkerProviderSpan(params, context);
+      },
+    },
+
     companies: {
       async list(params) {
         return applyWindow((await companies.list()) as Company[], params);
       },
       async get(params) {
-        await ensurePluginAvailableForCompany(params.companyId);
+        await noPluginAvailabilityGate(params.companyId);
         return (await companies.getById(params.companyId)) as Company;
       },
     },
@@ -1605,18 +1998,18 @@ export function buildHostServices(
     projects: {
       async list(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return applyWindow((await projects.list(companyId)) as Project[], params);
       },
       async get(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const project = await projects.getById(params.projectId);
         return (inCompany(project, companyId) ? project : null) as Project | null;
       },
       async listWorkspaces(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const project = await projects.getById(params.projectId);
         if (!inCompany(project, companyId)) return [];
         const rows = await projects.listWorkspaces(params.projectId);
@@ -1639,7 +2032,7 @@ export function buildHostServices(
       },
       async getPrimaryWorkspace(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const project = await projects.getById(params.projectId);
         if (!inCompany(project, companyId)) return null;
         const row = project.primaryWorkspace;
@@ -1661,7 +2054,7 @@ export function buildHostServices(
 
       async getWorkspaceForIssue(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const issue = await issues.getById(params.issueId);
         if (!inCompany(issue, companyId)) return null;
         const projectId = (issue as Record<string, unknown>).projectId as string | null;
@@ -1686,7 +2079,7 @@ export function buildHostServices(
       },
       async getManaged(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return projects.resolveManagedProject({
           companyId,
           pluginId,
@@ -1697,7 +2090,7 @@ export function buildHostServices(
       },
       async reconcileManaged(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return projects.resolveManagedProject({
           companyId,
           pluginId,
@@ -1707,7 +2100,7 @@ export function buildHostServices(
       },
       async resetManaged(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return projects.resolveManagedProject({
           companyId,
           pluginId,
@@ -1721,7 +2114,7 @@ export function buildHostServices(
     executionWorkspaces: {
       async get(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const workspace = await executionWorkspaces.getById(params.workspaceId);
         if (inCompany(workspace, companyId)) {
           return toPluginExecutionWorkspaceMetadata(workspace);
@@ -1733,12 +2126,12 @@ export function buildHostServices(
     routines: {
       async managedGet(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return managedRoutines.get(params.routineKey, companyId);
       },
       async managedReconcile(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return managedRoutines.reconcile(params.routineKey, companyId, {
           assigneeAgentId: params.assigneeAgentId,
           projectId: params.projectId,
@@ -1746,7 +2139,7 @@ export function buildHostServices(
       },
       async managedReset(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return managedRoutines.reset(params.routineKey, companyId, {
           assigneeAgentId: params.assigneeAgentId,
           projectId: params.projectId,
@@ -1754,14 +2147,14 @@ export function buildHostServices(
       },
       async managedUpdate(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return managedRoutines.update(params.routineKey, companyId, {
           status: params.status,
         });
       },
       async managedRun(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return managedRoutines.run(params.routineKey, companyId, {
           assigneeAgentId: params.assigneeAgentId,
           projectId: params.projectId,
@@ -1772,17 +2165,17 @@ export function buildHostServices(
     skills: {
       async managedGet(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return managedSkills.get(params.skillKey, companyId);
       },
       async managedReconcile(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return managedSkills.reconcile(params.skillKey, companyId);
       },
       async managedReset(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return managedSkills.reset(params.skillKey, companyId);
       },
     },
@@ -1790,19 +2183,19 @@ export function buildHostServices(
     issues: {
       async list(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         assertReadableOriginFilter(params.originKind);
         return applyWindow((await issues.list(companyId, params as any)) as Issue[], params);
       },
       async get(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const issue = await issues.getById(params.issueId);
         return (inCompany(issue, companyId) ? issue : null) as Issue | null;
       },
       async create(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const { actorAgentId, actorUserId, actorRunId, originKind, surfaceVisibility, ...issueInput } = params;
         const normalizedOriginKind = normalizePluginOriginKind(
           surfaceVisibility === "plugin_operation" && !originKind
@@ -1838,7 +2231,7 @@ export function buildHostServices(
       },
       async update(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const existing = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const patch = { ...(params.patch as Record<string, unknown>) };
         const actorAgentId = typeof patch.actorAgentId === "string" ? patch.actorAgentId : null;
@@ -1875,13 +2268,13 @@ export function buildHostServices(
       },
       async getRelations(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         return await issues.getRelationSummaries(params.issueId);
       },
       async setBlockedBy(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return setBlockedByWithActivity({
           companyId,
           issueId: params.issueId,
@@ -1894,7 +2287,7 @@ export function buildHostServices(
       },
       async addBlockers(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const previous = await issues.getRelationSummaries(params.issueId);
         const nextBlockedByIssueIds = [
@@ -1915,7 +2308,7 @@ export function buildHostServices(
       },
       async removeBlockers(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const previous = await issues.getRelationSummaries(params.issueId);
         const removals = new Set(params.blockerIssueIds);
@@ -1934,7 +2327,7 @@ export function buildHostServices(
       },
       async assertCheckoutOwner(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const ownership = await issues.assertCheckoutOwner(
           params.issueId,
@@ -1968,7 +2361,7 @@ export function buildHostServices(
       },
       async getSubtree(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const rootIssue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const includeRoot = params.includeRoot !== false;
         const subtreeIssueIds = await collectIssueSubtreeIds(companyId, rootIssue.id);
@@ -2051,7 +2444,7 @@ export function buildHostServices(
       },
       async requestWakeup(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         if (!issue.assigneeAgentId) {
           throw new Error("Issue has no assigned agent to wake");
@@ -2117,7 +2510,7 @@ export function buildHostServices(
       },
       async requestWakeups(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const results = [];
         for (const issueId of [...new Set(params.issueIds)]) {
           const issue = requireInCompany("Issue", await issues.getById(issueId), companyId);
@@ -2187,7 +2580,7 @@ export function buildHostServices(
       },
       async getOrchestrationSummary(params): Promise<PluginIssueOrchestrationSummary> {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const rootIssue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const subtreeIssueIds = params.includeSubtree
           ? await collectIssueSubtreeIds(companyId, rootIssue.id)
@@ -2262,13 +2655,13 @@ export function buildHostServices(
       },
       async listComments(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         if (!inCompany(await issues.getById(params.issueId), companyId)) return [];
         return (await issues.listComments(params.issueId)) as IssueComment[];
       },
       async listAttachments(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         if (!inCompany(await issues.getById(params.issueId), companyId)) return [];
         // Narrow the host row to the plugin-facing projection:
         // raw storage addressing (provider, objectKey, sha256) and creator identity
@@ -2289,7 +2682,7 @@ export function buildHostServices(
       },
       async createComment(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         // Resolve target by identifier (e.g. an issue's public id) when no issueId is supplied.
         // requireInCompany keeps the tenant reach-check: an identifier that resolves
         // to a foreign company throws "Issue not found".
@@ -2306,13 +2699,16 @@ export function buildHostServices(
         // SECURITY-CRITICAL: the host must not let a plugin mint *user* authorship. A
         // worker-supplied user id is untrusted: it would write authorType "user",
         // indistinguishable from a real board comment, and governance leans on
+        if (params.actorUserId) {
+          await requireActiveHumanMember(companyId, params.actorUserId);
+        }
         // comment authorship (send-it-back-to-me, approvals, audit). Relays are
         // attributed to the plugin's own agent identity; operator identity, if any,
         // belongs in the comment body/metadata, not in host-minted authorship.
         const comment = (await issues.addComment(
           issue.id,
           params.body,
-          { agentId: params.authorAgentId },
+          { agentId: params.actorUserId ? undefined : params.authorAgentId, userId: params.actorUserId },
         )) as IssueComment;
         // Bind any standalone assets created via artifacts.create onto
         // this comment. attachAssetsToComment re-checks each asset's company
@@ -2334,9 +2730,7 @@ export function buildHostServices(
           action: "issue.comment.created",
           entityType: "issue",
           entityId: issue.id,
-          // Record the true principal only: the plugin's agent identity. Never a
-          // worker-claimed user (would make the audit trail itself spoofable).
-          actor: { actorAgentId: params.authorAgentId ?? null },
+          actor: { actorAgentId: params.actorUserId ? null : params.authorAgentId ?? null, actorUserId: params.actorUserId ?? null },
           details: {
             identifier: issue.identifier,
             commentId: comment.id,
@@ -2346,6 +2740,65 @@ export function buildHostServices(
             attachmentCount: attachmentIds.length,
           },
         });
+
+        // Human-attributed comments participate in the same "wake the
+        // assignee" behavior a board user's comment gets in the web app
+        // (routes/issues.ts's addComment route) — a plugin's own
+        // agent-attributed comments never do this. Deliberately narrower
+        // than the HTTP route: no reopen/resume/interrupt/scheduled-retry
+        // handling here, just the core wake. An assignee-less or
+        // closed-status issue is a silent no-op, matching the route's own
+        // guard.
+        //
+        // The guard re-fetches the issue instead of trusting the pre-insert
+        // `issue` snapshot: a concurrent close/unassign/reassign landing
+        // between the initial fetch and here would otherwise wake the wrong
+        // (or no-longer-relevant) agent off stale state.
+        //
+        // The comment is already committed above, so this best-effort wake
+        // must never change that outcome: a failed re-fetch is logged and
+        // falls back to the in-hand snapshot rather than rejecting
+        // createComment — a rejection would surface to the caller as a failed
+        // write and invite a retry that inserts a duplicate comment.
+        if (params.actorUserId) {
+          const postCommentIssue = (await issues.getById(issue.id).catch((err) => {
+            logger.warn(
+              { err, issueId: issue.id, commentId: comment.id },
+              "failed to re-fetch issue for plugin-relayed human comment wake; falling back to pre-insert snapshot",
+            );
+            return null;
+          })) ?? issue;
+          if (
+            postCommentIssue.assigneeAgentId
+            && postCommentIssue.status !== "done"
+            && postCommentIssue.status !== "cancelled"
+          ) {
+            await heartbeat.wakeup(postCommentIssue.assigneeAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_commented",
+              payload: {
+                issueId: issue.id,
+                commentId: comment.id,
+                mutation: "comment",
+              },
+              requestedByActorType: "user",
+              requestedByActorId: params.actorUserId,
+              contextSnapshot: {
+                issueId: issue.id,
+                taskId: issue.id,
+                sourceCommentId: comment.id,
+                wakeReason: "issue_commented",
+                source: `plugin:${pluginKey}`,
+              },
+            }).catch((err) => logger.warn({
+              err,
+              issueId: issue.id,
+              commentId: comment.id,
+              agentId: postCommentIssue.assigneeAgentId,
+            }, "failed to wake assignee on plugin-relayed human comment"));
+          }
+        }
 
         if (params.wakeAssignee && !isClosed) {
           // Assignee-only wake. Body @-mentions are deliberately NOT honored as a
@@ -2400,7 +2853,7 @@ export function buildHostServices(
       },
       async createInteraction(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const interaction = await issueThreadInteractionService(db).create(issue, params.interaction as CreateIssueThreadInteraction, {
           agentId: params.authorAgentId ?? null,
@@ -2421,6 +2874,97 @@ export function buildHostServices(
         });
         return interaction as any;
       },
+      async listInteractions(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await noPluginAvailabilityGate(companyId);
+        if (!inCompany(await issues.getById(params.issueId), companyId)) return [];
+        return (await interactions.listForIssue(params.issueId)) as any;
+      },
+      async respondInteraction(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await noPluginAvailabilityGate(companyId);
+        const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
+        // Resolving an interaction is a board-user action (the web app's
+        // interaction-resolve routes are board-only). The host re-verifies the
+        // paired user is an active human member at apply time and never trusts
+        // the plugin-supplied identity — matching the createComment bar.
+        if (!params.actorUserId) {
+          throw new Error("actorUserId is required to respond to an interaction on behalf of a board user");
+        }
+        await requireActiveHumanMember(companyId, params.actorUserId);
+
+        const current = await interactions.getById(params.interactionId);
+        if (!current || current.issueId !== issue.id || current.companyId !== companyId) {
+          throw new Error(`Interaction "${params.interactionId}" not found for this issue`);
+        }
+        // Idempotent replay: an already-resolved interaction converges without
+        // re-applying, so a duplicate button tap from chat is a safe no-op.
+        if (current.status !== "pending") {
+          return { interaction: current as any, applied: false };
+        }
+
+        const actor = { userId: params.actorUserId };
+        let resolved: typeof current;
+        let continuationTarget = {
+          id: issue.id,
+          assigneeAgentId: issue.assigneeAgentId,
+          status: issue.status,
+        };
+        if (params.action === "accept") {
+          const result = await interactions.acceptInteraction(
+            {
+              id: issue.id,
+              companyId,
+              projectId: issue.projectId ?? null,
+              goalId: issue.goalId ?? null,
+              status: issue.status,
+            },
+            params.interactionId,
+            {},
+            actor,
+          );
+          resolved = result.interaction as typeof current;
+          if (result.continuationIssue) {
+            continuationTarget = {
+              id: result.continuationIssue.id,
+              assigneeAgentId: result.continuationIssue.assigneeAgentId,
+              status: result.continuationIssue.status,
+            };
+          }
+        } else {
+          resolved = (await interactions.rejectInteraction(
+            { id: issue.id, companyId, status: issue.status },
+            params.interactionId,
+            { reason: params.reason ?? undefined },
+            actor,
+          )) as typeof current;
+        }
+
+        await logPluginActivity({
+          companyId,
+          action: params.action === "accept"
+            ? "issue.thread_interaction_accepted"
+            : "issue.thread_interaction_rejected",
+          entityType: "issue",
+          entityId: issue.id,
+          actor: { actorUserId: params.actorUserId },
+          details: {
+            identifier: issue.identifier,
+            interactionId: resolved.id,
+            interactionKind: resolved.kind,
+            interactionStatus: resolved.status,
+          },
+        });
+
+        queuePluginInteractionContinuationWakeup({
+          issue: continuationTarget,
+          interaction: resolved,
+          actorUserId: params.actorUserId,
+          source: `plugin:${pluginKey}:interaction.${params.action}`,
+        });
+
+        return { interaction: resolved as any, applied: true };
+      },
       // SECURITY-CRITICAL: retire (expire) a single pending interaction the plugin
       // is relaying an operator reply to. Least-privilege authorization:
       //  - gated by the default-deny `issue.interactions.resolve` capability
@@ -2434,7 +2978,7 @@ export function buildHostServices(
       //    never "accepted", so no accept side-effect or continuation wake fires.
       async resolveInteraction(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const interaction = await issueThreadInteractionService(db).supersedeInteractionById(
           issue,
@@ -2459,8 +3003,59 @@ export function buildHostServices(
         });
         return interaction as any;
       },
-    },
+      async getAttachmentContent(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await noPluginAvailabilityGate(companyId);
+        const attachment = await issues.getAttachmentById(params.attachmentId);
+        // Unknown and cross-company ids are deliberately indistinguishable to
+        // the plugin: both return null (no existence oracle across companies).
+        if (!attachment || attachment.companyId !== companyId) return null;
 
+        const maxBytes = typeof params.maxBytes === "number" && params.maxBytes > 0 ? params.maxBytes : null;
+        if (maxBytes !== null && attachment.byteSize > maxBytes) {
+          throw new Error(
+            `attachment ${attachment.id} is ${attachment.byteSize} bytes, over the ${maxBytes}-byte cap`,
+          );
+        }
+
+        const object = await getStorageService().getObject(attachment.companyId, attachment.objectKey);
+        const chunks: Buffer[] = [];
+        let total = 0;
+        for await (const chunk of object.stream) {
+          const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          total += buf.length;
+          // Defense in depth: enforce the cap during streaming too, so a
+          // metadata/object size mismatch can never exceed the requested cap.
+          if (maxBytes !== null && total > maxBytes) {
+            object.stream.destroy();
+            throw new Error(`attachment ${attachment.id} exceeded the ${maxBytes}-byte cap while reading`);
+          }
+          chunks.push(buf);
+        }
+        const bytes = Buffer.concat(chunks);
+
+        await logPluginActivity({
+          companyId,
+          action: "issue.attachment.read",
+          entityType: "issue",
+          entityId: attachment.issueId,
+          details: {
+            attachmentId: attachment.id,
+            byteSize: bytes.length,
+            contentType: attachment.contentType,
+          },
+        });
+
+        return {
+          attachmentId: attachment.id,
+          contentType: attachment.contentType,
+          byteSize: bytes.length,
+          sha256: attachment.sha256,
+          originalFilename: attachment.originalFilename ?? null,
+          contentBase64: bytes.toString("base64"),
+        };
+      },
+    },
     // SECURITY-CRITICAL: reconcile reads. Both run the real, fail-closed
     // `requirePluginEnabledForCompany` gate before any query (Complete
     // Mediation) and return a field-minimized projection (no requester/decider
@@ -2469,31 +3064,6 @@ export function buildHostServices(
     // `RECONCILE_LIST_LIMIT` bounds each response so a pathological pending count
     // can't balloon a single read; a normal pending set is far below the cap, so
     // this is a no-op in practice.
-    approvals: {
-      async list(params) {
-        const companyId = ensureCompanyId(params.companyId);
-        await requirePluginEnabledForCompany(companyId);
-        const rows = await boardApprovals.list(
-          companyId,
-          params.status ?? "pending",
-          RECONCILE_LIST_LIMIT,
-        );
-        if (rows.length >= RECONCILE_LIST_LIMIT) {
-          logger.warn(
-            { companyId, limit: RECONCILE_LIST_LIMIT, status: params.status ?? "pending" },
-            "plugin approvals.list reconcile read hit the defensive row cap; response truncated",
-          );
-        }
-        return rows.map((row) => ({
-          id: row.id,
-          type: row.type,
-          status: row.status,
-          payload: redactEventPayload(row.payload) ?? {},
-          createdAt: row.createdAt.toISOString(),
-        }));
-      },
-    },
-
     interactions: {
       async list(params) {
         const companyId = ensureCompanyId(params.companyId);
@@ -2524,24 +3094,134 @@ export function buildHostServices(
       },
     },
 
+    approvals: {
+      async list(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await noPluginAvailabilityGate(companyId);
+        const rows = await approvalSvc.list(companyId, params.status ?? undefined);
+        // Match the web app's approval read surface: payloads are redacted so
+        // the chat bridge never receives secrets the web app itself hides.
+        return rows.map((approval) => redactApprovalPayload(approval)) as any;
+      },
+      // SECURITY-CRITICAL: fork-only reconcile read of PENDING board approvals
+      // for the messenger digest. Unlike the general `list` above (upstream's
+      // public surface), this runs the real, fail-closed
+      // `requirePluginEnabledForCompany` gate before any query (Complete
+      // Mediation), defaults to pending-only, projects a field-minimized row
+      // (no requester/decider user ids, no decision notes), and bounds the
+      // response with the defensive `RECONCILE_LIST_LIMIT`. A blocker created
+      // while the plugin was down is surfaced by the pending query itself —
+      // that is the missed-blocker seeding the digest depends on.
+      async listPending(params: { companyId: string }) {
+        const companyId = ensureCompanyId(params.companyId);
+        await requirePluginEnabledForCompany(companyId);
+        const rows = await approvalSvc.list(
+          companyId,
+          "pending",
+          RECONCILE_LIST_LIMIT,
+        );
+        if (rows.length >= RECONCILE_LIST_LIMIT) {
+          logger.warn(
+            { companyId, limit: RECONCILE_LIST_LIMIT, status: "pending" },
+            "plugin approvals.listPending reconcile read hit the defensive row cap; response truncated",
+          );
+        }
+        return rows.map((row) => ({
+          id: row.id,
+          type: row.type,
+          status: row.status,
+          payload: redactEventPayload(row.payload) ?? {},
+          createdAt: row.createdAt.toISOString(),
+        }));
+      },
+      async get(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await noPluginAvailabilityGate(companyId);
+        const approval = await approvalSvc.getById(params.approvalId);
+        if (!approval || approval.companyId !== companyId) return null;
+        return redactApprovalPayload(approval) as any;
+      },
+      async decide(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await noPluginAvailabilityGate(companyId);
+        const existing = await approvalSvc.getById(params.approvalId);
+        if (!existing || existing.companyId !== companyId) {
+          throw new Error(`Approval "${params.approvalId}" not found`);
+        }
+        // Deciding an approval is a board-user action (the web app's approval
+        // decision routes are board-only). Re-verify active membership at apply
+        // time; never trust the plugin-supplied identity.
+        if (!params.actorUserId) {
+          throw new Error("actorUserId is required to decide an approval on behalf of a board user");
+        }
+        await requireActiveHumanMember(companyId, params.actorUserId);
+
+        const { approval, applied } = params.action === "approve"
+          ? await approvalSvc.approve(params.approvalId, params.actorUserId, params.decisionNote ?? null)
+          : await approvalSvc.reject(params.approvalId, params.actorUserId, params.decisionNote ?? null);
+
+        await logPluginActivity({
+          companyId,
+          action: params.action === "approve" ? "approval.approved" : "approval.rejected",
+          entityType: "approval",
+          entityId: approval.id,
+          actor: { actorUserId: params.actorUserId },
+          details: {
+            type: approval.type,
+            requestedByAgentId: approval.requestedByAgentId,
+            applied,
+          },
+        });
+
+        // Mirror the web app's approve/reject routes: wake the requesting agent
+        // so it resumes after a chat-driven decision. Only on a fresh decision
+        // (applied) and only when a requester agent exists.
+        if (applied && approval.requestedByAgentId) {
+          void heartbeat.wakeup(approval.requestedByAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: params.action === "approve" ? "approval_approved" : "approval_rejected",
+            payload: {
+              approvalId: approval.id,
+              approvalStatus: approval.status,
+            },
+            requestedByActorType: "user",
+            requestedByActorId: params.actorUserId,
+            contextSnapshot: {
+              source: `plugin:${pluginKey}:approval.${params.action}`,
+              approvalId: approval.id,
+              approvalStatus: approval.status,
+              wakeReason: params.action === "approve" ? "approval_approved" : "approval_rejected",
+            },
+          }).catch((err) => logger.warn({
+            err,
+            approvalId: approval.id,
+            requestedByAgentId: approval.requestedByAgentId,
+          }, "failed to wake requester on plugin-relayed approval decision"));
+        }
+
+        return { approval: redactApprovalPayload(approval) as any, applied };
+      },
+    },
+
     issueDocuments: {
       async list(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const rows = await documents.listIssueDocuments(params.issueId);
         return rows as any;
       },
       async get(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const doc = await documents.getIssueDocumentByKey(params.issueId, params.key);
         return (doc ?? null) as any;
       },
       async upsert(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const result = await documents.upsertIssueDocument({
           issueId: params.issueId,
@@ -2567,7 +3247,7 @@ export function buildHostServices(
       },
       async delete(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         await documents.deleteIssueDocument(params.issueId, params.key);
         await logPluginActivity({
@@ -2586,7 +3266,7 @@ export function buildHostServices(
     agents: {
       async list(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const rows = await agents.list(companyId);
         return applyWindow(
           rows.filter((agent) => !params.status || agent.status === params.status) as Agent[],
@@ -2595,27 +3275,27 @@ export function buildHostServices(
       },
       async get(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const agent = await agents.getById(params.agentId);
         return (inCompany(agent, companyId) ? agent : null) as Agent | null;
       },
       async pause(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
         return (await agents.pause(params.agentId)) as Agent;
       },
       async resume(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
         return (await agents.resume(params.agentId)) as Agent;
       },
       async invoke(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
         const run = await heartbeat.wakeup(params.agentId, {
@@ -2623,6 +3303,14 @@ export function buildHostServices(
           triggerDetail: "system",
           reason: params.reason ?? null,
           payload: { prompt: params.prompt },
+          contextSnapshot: {
+            wakeReason: params.reason ?? null,
+            paperclipAgentMessage: {
+              text: params.prompt,
+              source: "plugin_invoke",
+              pluginKey,
+            },
+          },
           requestedByActorType: "system",
           requestedByActorId: pluginId,
         });
@@ -2631,17 +3319,17 @@ export function buildHostServices(
       },
       async managedGet(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return managedAgents.get(params.agentKey, companyId);
       },
       async managedReconcile(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return managedAgents.reconcile(params.agentKey, companyId);
       },
       async managedReset(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return managedAgents.reset(params.agentKey, companyId);
       },
     },
@@ -2649,7 +3337,7 @@ export function buildHostServices(
     goals: {
       async list(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const rows = await goals.list(companyId);
         return applyWindow(
           rows.filter((goal) =>
@@ -2661,13 +3349,13 @@ export function buildHostServices(
       },
       async get(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const goal = await goals.getById(params.goalId);
         return (inCompany(goal, companyId) ? goal : null) as Goal | null;
       },
       async create(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return (await goals.create(companyId, {
           title: params.title,
           description: params.description,
@@ -2679,7 +3367,7 @@ export function buildHostServices(
       },
       async update(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         requireInCompany("Goal", await goals.getById(params.goalId), companyId);
         return (await goals.update(params.goalId, params.patch as any)) as Goal;
       },
@@ -2688,7 +3376,7 @@ export function buildHostServices(
     access: {
       async listMembers(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const rows = await access.listMembers(companyId);
         const visibleRows = params.includeArchived ? rows : rows.filter((row) => row.status !== "archived");
         const grants = await db
@@ -2711,12 +3399,12 @@ export function buildHostServices(
       },
       async getMember(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return loadPluginMember(companyId, params.memberId);
       },
       async updateMember(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const updated = await access.updateMember(companyId, params.memberId, params.patch);
         if (!updated) throw new Error("Member not found");
         await logPluginActivity({
@@ -2732,7 +3420,7 @@ export function buildHostServices(
       },
       async listInvites(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const limit = Math.min(Math.max(Number(params.limit ?? 20), 1), 100);
         const offset = Math.max(Number(params.offset ?? 0), 0);
         const stateClause = inviteStateWhereClause(params.state);
@@ -2751,7 +3439,7 @@ export function buildHostServices(
       },
       async createInvite(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const normalizedAgentMessage = typeof params.agentMessage === "string"
           ? params.agentMessage.trim() || null
           : null;
@@ -2800,7 +3488,7 @@ export function buildHostServices(
       },
       async revokeInvite(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const invite = await db
           .select()
           .from(invites)
@@ -2828,7 +3516,7 @@ export function buildHostServices(
     authorization: {
       async listGrants(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const conditions = [
           eq(principalPermissionGrants.companyId, companyId),
           params.principalType ? eq(principalPermissionGrants.principalType, params.principalType) : undefined,
@@ -2843,7 +3531,7 @@ export function buildHostServices(
       },
       async setGrants(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         if (params.principalType !== "agent" && params.principalType !== "user") {
           throw new Error("principalType must be 'agent' or 'user'");
         }
@@ -2876,7 +3564,7 @@ export function buildHostServices(
       },
       async policySummary(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const [members, grants] = await Promise.all([
           access.listMembers(companyId),
           db
@@ -2895,12 +3583,12 @@ export function buildHostServices(
       },
       async getPolicy(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return readAuthorizationPolicy(companyId, params.resourceType, params.resourceId);
       },
       async updatePolicy(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const policy = params.policy ? sanitizeRecord(params.policy) : null;
         if (params.resourceType === "agent") {
           const agent = requireInCompany("Agent", await agents.getById(params.resourceId), companyId);
@@ -2953,7 +3641,7 @@ export function buildHostServices(
       },
       async previewAssignment(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return authorization.decide({
           actor: pluginAssignmentActor(params.actor),
           action: "tasks:assign",
@@ -2969,7 +3657,7 @@ export function buildHostServices(
       },
       async explainAssignment(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return authorization.decide({
           actor: pluginAssignmentActor(params.actor),
           action: "tasks:assign",
@@ -2985,7 +3673,7 @@ export function buildHostServices(
       },
       async searchAudit(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const limit = Math.min(Math.max(Number(params.limit ?? 50), 1), 100);
         const offset = Math.max(Number(params.offset ?? 0), 0);
         const decisionFilter = typeof params.decision === "string" && params.decision.trim()
@@ -3019,7 +3707,7 @@ export function buildHostServices(
     agentSessions: {
       async create(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
         const taskKey = params.taskKey ?? `plugin:${pluginKey}:session:${randomUUID()}`;
@@ -3050,7 +3738,7 @@ export function buildHostServices(
 
       async list(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const rows = await db
           .select()
           .from(agentTaskSessionsTable)
@@ -3078,7 +3766,7 @@ export function buildHostServices(
         }
 
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
 
         // Verify session exists and belongs to this plugin
         const session = await db
@@ -3101,8 +3789,15 @@ export function buildHostServices(
           payload: { prompt: params.prompt },
           contextSnapshot: {
             taskKey: session.taskKey,
+            wakeReason: params.reason ?? null,
             wakeSource: "automation",
             wakeTriggerDetail: "system",
+            paperclipAgentMessage: {
+              text: params.prompt,
+              source: "plugin_session",
+              pluginKey,
+              sessionId: params.sessionId,
+            },
           },
           requestedByActorType: "system",
           requestedByActorId: pluginId,
@@ -3113,7 +3808,7 @@ export function buildHostServices(
         // Track the subscription so it can be cleaned up on dispose() if the run
         // never reaches a terminal status (hang, crash, network partition).
         if (notifyWorker) {
-          const TERMINAL_STATUSES = new Set<string>(TERMINAL_HEARTBEAT_RUN_STATUSES);
+          const TERMINAL_STATUSES = new Set(["succeeded", "interrupted", "failed", "cancelled", "timed_out"]);
 
           const cleanup = () => {
             unsubscribe();
@@ -3144,7 +3839,9 @@ export function buildHostServices(
                   seq: 0,
                   eventType: isSuccessfulHeartbeatRunStatus(status) ? "done" : "error",
                   stream: "system",
-                  message: isSuccessfulHeartbeatRunStatus(status) ? "Run completed" : `Run ${status}`,
+                  message: status === "succeeded"
+                    ? (typeof payload.finalText === "string" ? payload.finalText : null)
+                    : `Run ${status}`,
                   payload: payload,
                 });
                 cleanup();
@@ -3181,7 +3878,7 @@ export function buildHostServices(
 
       async close(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         const deleted = await db
           .delete(agentTaskSessionsTable)
           .where(

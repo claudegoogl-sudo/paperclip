@@ -36,6 +36,8 @@ import {
   isJsonRpcSuccessResponse,
   JsonRpcParseError,
   JsonRpcCallError,
+  SETUP_TOKEN_PTY_OUTPUT_NOTIFICATION,
+  SETUP_TOKEN_PTY_EXIT_NOTIFICATION,
 } from "@paperclipai/plugin-sdk";
 import type {
   JsonRpcId,
@@ -51,10 +53,13 @@ import type {
   WorkerToHostMethods,
   InitializeParams,
 } from "@paperclipai/plugin-sdk";
+import { getActiveStepContext } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
+import { CLAUDE_SETUP_TOKEN_COMMAND } from "@paperclipai/adapter-claude-local/server";
 import { logger } from "../middleware/logger.js";
 import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js";
 import { clearRunSecretValues } from "../run-secret-registry.js";
 import { redactSensitiveText } from "../redaction.js";
+import { traceparentFromContextToken } from "../instrumentation.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -63,8 +68,22 @@ import { redactSensitiveText } from "../redaction.js";
 /** Default timeout for RPC calls in milliseconds. */
 const DEFAULT_RPC_TIMEOUT_MS = 30_000;
 
-/** Hard upper bound for any RPC timeout (15 minutes). Prevents unbounded waits. */
+/**
+ * Upper bound for the *default* RPC timeout path (15 minutes). Explicit
+ * caller-supplied timeouts are not subject to this cap: execute-class RPCs such
+ * as `environmentExecute` run entire sandboxed agent sessions in one call and
+ * their callers deliberately request multi-hour budgets (see
+ * `resolvePluginExecuteRpcTimeoutMs` in plugin-environment-driver.ts).
+ * Clamping those explicit budgets here killed long sandboxed runs mid-work.
+ */
 const MAX_RPC_TIMEOUT_MS = 15 * 60 * 1_000;
+
+/**
+ * Maximum delay accepted by Node timers before Node clamps the timeout to 1ms.
+ * Keep accepted explicit RPC budgets inside this range before calling
+ * setTimeout, otherwise a huge timeout can expire almost immediately.
+ */
+const MAX_NODE_TIMER_TIMEOUT_MS = 2_147_483_647;
 
 /** Timeout for the initialize RPC call. */
 const INITIALIZE_TIMEOUT_MS = 15_000;
@@ -93,6 +112,58 @@ const CRASH_WINDOW_MS = 10 * 60 * 1_000;
 /** Maximum number of stderr characters retained for worker failure context. */
 const MAX_STDERR_EXCERPT_CHARS = 8_000;
 
+/** Maximum characters accepted for one `execute.log` chunk. A larger chunk is
+ * dropped, so a faulty or hostile worker cannot flood the host with one
+ * unbounded notification. */
+const MAX_EXECUTE_LOG_CHUNK_CHARS = 1_000_000;
+
+/**
+ * Maximum characters accepted for one incoming worker stdout line before the
+ * host parses it as JSON. The host drops a longer line without a parse, so a
+ * faulty or hostile worker cannot force the host to parse an unbounded document
+ * and exhaust memory. The bound sits far above the largest legitimate framed
+ * message, so a real large command result still passes. A worker can override
+ * it through `WorkerStartOptions.executeLogLimits`.
+ */
+const MAX_WORKER_MESSAGE_CHARS = 128 * 1024 * 1024;
+
+/**
+ * Default ceiling for the total characters one execute call may stream through
+ * `execute.log`. The host counts the delivered characters for each active
+ * execute route and drops further chunks past this bound, so one runaway or
+ * hostile execution cannot flood the host and the run-log sink without limit.
+ * The final command result still delivers the complete output through its own
+ * capture path. A worker can override it through
+ * `WorkerStartOptions.executeLogLimits`.
+ */
+const MAX_EXECUTE_LOG_TOTAL_CHARS = 128 * 1024 * 1024;
+
+/** Maximum characters for one live login pseudo-terminal output notification. */
+const MAX_SETUP_TOKEN_PTY_CHUNK_CHARS = 1_000_000;
+/** Maximum cumulative output characters for one login pseudo-terminal route. */
+const MAX_SETUP_TOKEN_PTY_TOTAL_CHARS = 8 * 1024 * 1024;
+/** The default open timeout for one login pseudo-terminal route, in milliseconds. */
+const SETUP_TOKEN_PTY_OPEN_TIMEOUT_MS = 30_000;
+/** The default close timeout for one login pseudo-terminal route, in milliseconds. */
+const SETUP_TOKEN_PTY_CLOSE_TIMEOUT_MS = 10_000;
+/** Maximum output notifications buffered while one login route is still opening. */
+const SETUP_TOKEN_PTY_PRE_BIND_MAX_OUTPUTS = 256;
+/**
+ * The fixed non-secret error a disallowed login command returns. The manager
+ * forwards only the compile-time `CLAUDE_SETUP_TOKEN_COMMAND` to the worker
+ * pseudo-terminal. It rejects any other command before the worker call, so a
+ * future caller cannot spawn an arbitrary process in the sandbox.
+ */
+const SETUP_TOKEN_PTY_COMMAND_NOT_ALLOWED = "SETUP_TOKEN_PTY_COMMAND_NOT_ALLOWED";
+/** The fixed non-secret error a rejected second credential open returns. */
+const SETUP_TOKEN_PTY_ROUTE_BUSY = "SETUP_TOKEN_PTY_ROUTE_BUSY";
+/** The fixed non-secret error a failed open returns. */
+const SETUP_TOKEN_PTY_OPEN_FAILED = "SETUP_TOKEN_PTY_OPEN_FAILED";
+
+/** Minimum time between two dropped-`execute.log` debug records. The router
+ * rate-limits the record so a flood of dropped chunks writes at most one line
+ * per window with a running count. */
+const EXECUTE_LOG_DROP_LOG_INTERVAL_MS = 1_000;
 /**
  * SECURITY-CRITICAL: hard cap on a single worker→host IPC frame (one NDJSON line) in
  * bytes. The transport is node child-process stdio and the worker controls how many
@@ -285,6 +356,30 @@ export function formatWorkerFailureMessage(message: string, stderrExcerpt: strin
 }
 
 /**
+ * Resolve the effective timeout for an RPC call.
+ *
+ * An explicit, positive, finite caller-supplied timeout bypasses the 15-minute
+ * RPC cap after normalization to Node's timer-safe integer range. Callers that
+ * pass one (e.g. the environment driver for `environmentExecute`) own their
+ * budget, and independent inactivity/safety guards bound hung runs. Only the
+ * default path (no usable explicit timeout) is clamped to MAX_RPC_TIMEOUT_MS so
+ * ordinary plugin calls stay bounded.
+ */
+export function resolveRpcCallTimeoutMs(
+  explicitTimeoutMs: number | undefined,
+  defaultTimeoutMs: number,
+): number {
+  if (
+    explicitTimeoutMs !== undefined &&
+    Number.isFinite(explicitTimeoutMs) &&
+    explicitTimeoutMs > 0
+  ) {
+    return Math.min(Math.max(Math.trunc(explicitTimeoutMs), 1), MAX_NODE_TIMER_TIMEOUT_MS);
+  }
+  return Math.min(defaultTimeoutMs, MAX_RPC_TIMEOUT_MS);
+}
+
+/**
  * SECURITY-CRITICAL: defense-in-depth redaction for host-handler errors.
  *
  * The host-handler dispatch catch-all in {@link createPluginWorkerHandle} sees
@@ -341,10 +436,50 @@ export interface WorkerStartOptions {
   /** Environment variables passed to the child process. */
   env?: Record<string, string>;
   /**
+   * Companies this worker may act on from proactive (no-invocation) worker→host
+   * calls — the plugin's configured companies. Seeded onto the handle at
+   * creation, BEFORE the child process spawns, so a proactive plugin that
+   * issues host calls during setup() (e.g. the chat gateway's one-shot
+   * `events.subscribe`, which runs while `startWorker` is still awaiting the
+   * initialize response) is already authorized when those calls arrive. The set
+   * can still be replaced at runtime via `setProactiveCompanyScopes` (e.g. on a
+   * config change). Never widens access beyond the listed companies (LOOA-695).
+   */
+  proactiveCompanyScopes?: readonly string[];
+  /**
    * Callback for stream notifications from the worker (streams.open/emit/close).
    * The host wires this to the PluginStreamBus to fan out events to SSE clients.
    */
   onStreamNotification?: (method: string, params: Record<string, unknown>) => void;
+  /**
+   * Framing and flood limits for the `execute.log` route. The defaults bound
+   * one incoming line before the JSON parse and the total streamed output for
+   * one execute call. A test overrides them to exercise the drop paths without
+   * huge inputs.
+   */
+  executeLogLimits?: {
+    /** Max characters for one incoming worker line before the JSON parse. */
+    maxIncomingMessageChars?: number;
+    /** Max total characters one execute call may stream through `execute.log`. */
+    maxTotalCharsPerExecute?: number;
+  };
+
+  /**
+   * Bounds and timeouts for the login pseudo-terminal route. The
+   * defaults bound one output notification, the cumulative output per route, and
+   * the open and the close timeouts. A test overrides them to exercise the
+   * terminalize paths without huge inputs or long waits.
+   */
+  setupTokenPtyLimits?: {
+    /** Max characters for one login pseudo-terminal output notification. */
+    maxChunkChars?: number;
+    /** Max cumulative output characters for one login pseudo-terminal route. */
+    maxTotalChars?: number;
+    /** The open timeout for one login pseudo-terminal route, in milliseconds. */
+    openTimeoutMs?: number;
+    /** The close timeout for one login pseudo-terminal route, in milliseconds. */
+    closeTimeoutMs?: number;
+  };
 }
 
 /**
@@ -375,6 +510,77 @@ interface ActiveInvocation {
    * registry stays bounded.
    */
   backgroundRunId?: string;
+  // The host-minted W3C `traceparent` for the active startup span, or undefined
+  // when no startup span is active. The span host handler reads it to mint the
+  // parentage, so a worker never supplies the parent itself.
+  traceparent?: string;
+}
+
+/**
+ * Sink for one incremental output chunk of an active `environmentExecute` call.
+ * The host runner passes it to `call` for the execute method, and the manager
+ * delivers each `execute.log` chunk to it. The sink may return a promise; the
+ * caller owns the ordering.
+ */
+export type ExecuteLogSink = (
+  stream: "stdout" | "stderr",
+  chunk: string,
+) => void | Promise<void>;
+
+/**
+ * The input the manager needs to open one live login pseudo-terminal route
+ * The manager mints the host route identifier; the caller supplies
+ * only the sandbox scope, the provider lease id, and the fixed command.
+ */
+export interface SetupTokenPtyOpenInput {
+  driverKey: string;
+  companyId: string;
+  environmentId: string;
+  providerLeaseId: string;
+  command: string;
+}
+
+/**
+ * One live login pseudo-terminal session the manager hands to the login
+ * transport. The shape matches the sandbox provider setup-token
+ * pseudo-terminal session, so the transport consumes it with no adapter.
+ */
+export interface SetupTokenPtyHostSession {
+  /** Registers the one output listener. The session streams each raw chunk in order. */
+  onData(listener: (chunk: string) => void): void;
+  /** Writes raw input bytes to the pseudo-terminal. */
+  write(data: string): void;
+  /** Resolves with the child exit code when the command ends or the route terminalizes. */
+  wait(): Promise<{ exitCode: number | null }>;
+  /** Stops the child process. Safe to call more than one time. */
+  kill(): void;
+  /** Closes the route and releases the terminal. Safe to call more than one time. */
+  close(): Promise<void>;
+}
+
+/**
+ * Host-owned route for one active execute call. The host mints the invocation
+ * id and stores the exact company id and log sink here. A worker never selects
+ * this record; the host looks it up by the host-issued invocation id on the
+ * message envelope. The company id is the single authority for the delivery
+ * target, so an `execute.log` notification never carries a company id.
+ */
+interface ExecuteLogRoute {
+  companyId: string;
+  onLog: ExecuteLogSink;
+  /**
+   * The count of characters delivered through this route. The router bounds the
+   * per-execute total and drops chunks past the configured ceiling.
+   */
+  deliveredChars: number;
+  /**
+   * Latched when the router cannot bind the shared worker pipe to a single
+   * company, because a second company's execute overlapped this one. After the
+   * latch the router drops every further chunk for this route and lets the final
+   * command result deliver the complete output. The latch keeps the delivered
+   * prefix contiguous, so the run log never shows a gap.
+   */
+  crossCompanyBlocked: boolean;
 }
 
 /**
@@ -450,12 +656,30 @@ export interface PluginWorkerHandle {
     method: M,
     params: HostToWorkerMethods[M][0],
     timeoutMs?: number,
+    executeLogSink?: ExecuteLogSink,
   ): Promise<HostToWorkerMethods[M][1]>;
 
   /**
    * Send a fire-and-forget notification to the worker (no response expected).
    */
   notify(method: string, params: unknown): void;
+
+  /**
+   * Open one live login pseudo-terminal route on this worker. The
+   * manager mints the host route identifier, reserves the route, drives the open,
+   * binds the worker session identifier one time, and returns a session the login
+   * transport drives. It permits one active credential pseudo-terminal per worker.
+   */
+  openSetupTokenPtySession(
+    input: SetupTokenPtyOpenInput,
+  ): Promise<SetupTokenPtyHostSession>;
+
+  /**
+   * Authorize the set of companies this worker may act on from proactive
+   * (non-invocation) context. Replaces any previously-authorized set. See the
+   * proactive-company-scope note in `createPluginWorkerHandle` for rationale.
+   */
+  setProactiveCompanyScopes(companyIds: readonly string[]): void;
 
   /** Subscribe to worker events. */
   on<K extends WorkerHandleEventName>(
@@ -526,6 +750,12 @@ export interface PluginWorkerManager {
   isRunning(pluginId: string): boolean;
 
   /**
+   * Authorize the companies a plugin's worker may act on from proactive
+   * (non-invocation) context. No-op if the worker is not registered.
+   */
+  setProactiveCompanyScopes(pluginId: string, companyIds: readonly string[]): void;
+
+  /**
    * Stop all managed workers. Called during server shutdown.
    */
   stopAll(): Promise<void>;
@@ -545,7 +775,19 @@ export interface PluginWorkerManager {
     method: M,
     params: HostToWorkerMethods[M][0],
     timeoutMs?: number,
+    executeLogSink?: ExecuteLogSink,
   ): Promise<HostToWorkerMethods[M][1]>;
+
+  /**
+   * Open one live login pseudo-terminal route on a specific plugin worker
+   * See {@link PluginWorkerHandle.openSetupTokenPtySession}.
+   *
+   * @throws if the worker is not registered.
+   */
+  openSetupTokenPtySession(
+    pluginId: string,
+    input: SetupTokenPtyOpenInput,
+  ): Promise<SetupTokenPtyHostSession>;
 }
 
 // ---------------------------------------------------------------------------
@@ -600,6 +842,66 @@ export function createPluginWorkerHandle(
   // lifetime. Surfaced on every worker→host call so background dispatches /
   // setup() loops can resolve secrets outside any dispatch.
   const serviceRunId = randomUUID();
+  // Host-owned execute routes, keyed by the host-issued invocation id. Only an
+  // `environmentExecute` call with a log sink registers a route here. The
+  // `execute.log` router delivers only through this map — never through the
+  // generic `activeInvocations` record — so a non-execute call can never become
+  // a log target.
+  const activeExecuteRoutes = new Map<string, ExecuteLogRoute>();
+  // Rate-limit state for dropped `execute.log` notifications. The debug record
+  // never carries chunk bytes.
+  let executeLogDropCount = 0;
+  let executeLogDropLoggedAtMs = 0;
+  // Rate-limit state for dropped oversized worker lines. The warn record carries
+  // only the length, never the line bytes.
+  let oversizedLineDropCount = 0;
+  let oversizedLineLoggedAtMs = 0;
+
+  // Framing and flood limits for the `execute.log` route. The defaults bound one
+  // incoming line before the JSON parse and the total streamed output for one
+  // execute call. A caller (a test) can lower them.
+  const maxIncomingMessageChars =
+    options.executeLogLimits?.maxIncomingMessageChars ?? MAX_WORKER_MESSAGE_CHARS;
+  const maxExecuteLogTotalChars =
+    options.executeLogLimits?.maxTotalCharsPerExecute ?? MAX_EXECUTE_LOG_TOTAL_CHARS;
+
+  // Bounds and timeouts for the login pseudo-terminal route. A caller
+  // (a test) can lower them to exercise the terminalize paths.
+  const maxSetupTokenPtyChunkChars =
+    options.setupTokenPtyLimits?.maxChunkChars ?? MAX_SETUP_TOKEN_PTY_CHUNK_CHARS;
+  const maxSetupTokenPtyTotalChars =
+    options.setupTokenPtyLimits?.maxTotalChars ?? MAX_SETUP_TOKEN_PTY_TOTAL_CHARS;
+  const setupTokenPtyOpenTimeoutMs =
+    options.setupTokenPtyLimits?.openTimeoutMs ?? SETUP_TOKEN_PTY_OPEN_TIMEOUT_MS;
+  const setupTokenPtyCloseTimeoutMs =
+    options.setupTokenPtyLimits?.closeTimeoutMs ?? SETUP_TOKEN_PTY_CLOSE_TIMEOUT_MS;
+
+  // ------------------------------------------------------------------
+  // Proactive company scopes (LOOA-629)
+  // ------------------------------------------------------------------
+  // A proactive plugin (e.g. the chat gateway) does company-scoped work from
+  // its own timers/loops — not inside a host-issued top-level invocation
+  // (onEvent/performAction/executeTool/configChanged). Those worker→host calls
+  // carry no `paperclipInvocationId`, so the governed-access gate
+  // (host-client-factory.ts) rejects any company-scoped request with
+  // "company context is required" (regression class from #9557). The host
+  // authorizes a bounded set of companies — the plugin's configured companies,
+  // set by the loader after startup config delivery — for such proactive work.
+  // A no-invocation call that references one of these companies resolves to
+  // that company's scope; a call referencing any other company stays denied,
+  // and in-invocation calls keep their strict single-company match.
+  //
+  // Seeded from options at handle creation — before the child process is
+  // spawned — so a proactive plugin's setup()-time host calls (which land while
+  // `startWorker` is still awaiting initialize) are authorized in time. The
+  // loader used to call setProactiveCompanyScopes only AFTER startWorker
+  // resolved, which was too late for the gateway's one-shot events.subscribe
+  // and left outbound push permanently dead (LOOA-695).
+  const proactiveCompanyScopes = new Set<string>();
+  for (const id of options.proactiveCompanyScopes ?? []) {
+    const trimmed = readNonEmptyString(id);
+    if (trimmed) proactiveCompanyScopes.add(trimmed);
+  }
 
   // Optional methods reported by the worker during initialization
   let supportedMethods: string[] = [];
@@ -677,6 +979,14 @@ export function createPluginWorkerHandle(
 
   function handleLine(line: string): void {
     if (!line.trim()) return;
+
+    // Enforce the framing bound BEFORE the JSON parse. A line longer than the
+    // limit is dropped without a parse, so a faulty or hostile worker cannot
+    // force the host to parse an unbounded document and exhaust memory.
+    if (line.length > maxIncomingMessageChars) {
+      dropOversizedLine(line.length);
+      return;
+    }
 
     let message: unknown;
     try {
@@ -805,11 +1115,21 @@ export function createPluginWorkerHandle(
       runContextRegistry.registerBackground(pluginId, backgroundRunId, scope.companyId);
     }
 
+    // Mint a W3C `traceparent` from the active startup span, so the worker's
+    // provider span can parent to it. The host keeps the value on its own record
+    // (below) and never trusts the worker to supply the parent. Outside a
+    // measured startup step there is no active span, so this is undefined.
+    const activeStep = getActiveStepContext();
+    const traceparent = activeStep
+      ? traceparentFromContextToken(activeStep.parentContext)
+      : undefined;
     const invocation: PluginInvocationContext = {
       id: randomUUID(),
       scope: effectiveScope,
+      ...(traceparent ? { traceparent } : {}),
+      ...(backgroundRunId ? { backgroundRunId } : {}),
     };
-    const entry: ActiveInvocation = { scope: effectiveScope, backgroundRunId };
+    const entry: ActiveInvocation = { scope: effectiveScope, traceparent, backgroundRunId };
     if (ttlMs !== undefined) {
       entry.timer = setTimeout(() => {
         activeInvocations.delete(invocation.id);
@@ -829,6 +1149,528 @@ export function createPluginWorkerHandle(
       runContextRegistry?.deregister(pluginId, entry.backgroundRunId);
     }
     activeInvocations.delete(invocation.id);
+  }
+
+  // Store the host-owned execute route for one active execute call. The host
+  // holds the exact company id and log sink; the worker never supplies them.
+  function registerExecuteRoute(
+    invocationId: string,
+    companyId: string,
+    onLog: ExecuteLogSink,
+  ): void {
+    activeExecuteRoutes.set(invocationId, {
+      companyId,
+      onLog,
+      deliveredChars: 0,
+      crossCompanyBlocked: false,
+    });
+  }
+
+  function clearExecuteRoute(invocationId: string | undefined): void {
+    if (invocationId) activeExecuteRoutes.delete(invocationId);
+  }
+
+  // Drop an oversized incoming worker line before the JSON parse. Write a
+  // rate-limited warn record with the length and a running drop count. The
+  // record never carries the line bytes.
+  function dropOversizedLine(lineLength: number): void {
+    oversizedLineDropCount += 1;
+    const nowMs = Date.now();
+    if (nowMs - oversizedLineLoggedAtMs >= EXECUTE_LOG_DROP_LOG_INTERVAL_MS) {
+      log.warn(
+        { lineLength, maxIncomingMessageChars, droppedSinceLastLog: oversizedLineDropCount },
+        "dropping oversized worker line before JSON parse",
+      );
+      oversizedLineLoggedAtMs = nowMs;
+      oversizedLineDropCount = 0;
+    }
+  }
+
+  // Drop an `execute.log` notification. Write a rate-limited debug record with
+  // the reason and a running drop count. The record never carries the chunk
+  // bytes, the company id, or command data.
+  function dropExecuteLogNotification(reason: string): void {
+    executeLogDropCount += 1;
+    const nowMs = Date.now();
+    if (nowMs - executeLogDropLoggedAtMs >= EXECUTE_LOG_DROP_LOG_INTERVAL_MS) {
+      log.debug(
+        { reason, droppedSinceLastLog: executeLogDropCount },
+        "dropping execute.log notification",
+      );
+      executeLogDropLoggedAtMs = nowMs;
+      executeLogDropCount = 0;
+    }
+  }
+
+  // Route one `execute.log` notification to its host-owned execute route. The
+  // route is the single authority for the delivery target and the company
+  // binding. This never reads a company id from the notification and never
+  // routes through the generic active-invocation record.
+  //
+  // Complete mediation: the host and the worker share one stdio pipe, and the
+  // worker process sees every active invocation id. So the host cannot prove
+  // which concurrent invocation produced a notification, and it must NOT treat
+  // the worker-supplied `paperclipInvocationId` alone as proof of origin. The
+  // host validates the exact company scope instead: it delivers only while every
+  // active execute route on this worker belongs to ONE company. When a second
+  // company's execute overlaps, the host fails closed — it latches the active
+  // routes and drops the chunk — so a worker that runs company A can never forge
+  // company B's active id and inject output into B's route. The final command
+  // result still delivers the complete output, so no byte is lost; only the live
+  // stream pauses while two companies overlap.
+  function routeExecuteLogNotification(notification: JsonRpcNotification): void {
+    const invocationId = readNonEmptyString(
+      (notification as { paperclipInvocationId?: unknown }).paperclipInvocationId,
+    );
+    const params = isRecord(notification.params) ? notification.params : {};
+    const stream = params.stream;
+    const chunk = params.chunk;
+    // Runtime-validate the payload. Drop invalid input without a throw.
+    if (stream !== "stdout" && stream !== "stderr") {
+      dropExecuteLogNotification("invalid-stream");
+      return;
+    }
+    if (
+      typeof chunk !== "string" ||
+      chunk.length === 0 ||
+      chunk.length > MAX_EXECUTE_LOG_CHUNK_CHARS
+    ) {
+      dropExecuteLogNotification("invalid-chunk");
+      return;
+    }
+    if (!invocationId) {
+      dropExecuteLogNotification("missing-invocation");
+      return;
+    }
+    const route = activeExecuteRoutes.get(invocationId);
+    if (!route) {
+      // No active execute route for this id: a late chunk after settlement or
+      // timeout, a non-execute invocation, or an unknown id. Drop it.
+      dropExecuteLogNotification("no-active-route");
+      return;
+    }
+    // The route already lost single-company attribution earlier in its life, so
+    // it stays closed for the rest of the call.
+    if (route.crossCompanyBlocked) {
+      dropExecuteLogNotification("cross-company-scope");
+      return;
+    }
+    // Validate the exact company scope. Deliver only while every active execute
+    // route on this worker belongs to one company. A second company's active
+    // route makes the shared pipe ambiguous, so the host fails closed: it
+    // latches every active route and drops the chunk.
+    let onlyCompanyId: string | null = null;
+    let crossCompany = false;
+    for (const active of activeExecuteRoutes.values()) {
+      if (onlyCompanyId === null) {
+        onlyCompanyId = active.companyId;
+      } else if (onlyCompanyId !== active.companyId) {
+        crossCompany = true;
+        break;
+      }
+    }
+    if (crossCompany) {
+      for (const active of activeExecuteRoutes.values()) {
+        active.crossCompanyBlocked = true;
+      }
+      dropExecuteLogNotification("cross-company-scope");
+      return;
+    }
+    // Bound the total characters one execute call may stream. Past the ceiling
+    // the host drops further chunks, so one runaway or hostile execution cannot
+    // flood the host and the run-log sink without limit.
+    if (route.deliveredChars + chunk.length > maxExecuteLogTotalChars) {
+      dropExecuteLogNotification("execute-output-cap");
+      return;
+    }
+    route.deliveredChars += chunk.length;
+    try {
+      const delivery = route.onLog(stream, chunk);
+      if (delivery && typeof (delivery as Promise<void>).then === "function") {
+        void (delivery as Promise<void>).catch((err) => {
+          log.error(
+            { err: err instanceof Error ? err.message : String(err) },
+            "execute.log delivery failed",
+          );
+        });
+      }
+    } catch (err) {
+      log.error(
+        { err: err instanceof Error ? err.message : String(err) },
+        "execute.log delivery threw",
+      );
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Host-owned setup-token login pseudo-terminal route gate
+  // -----------------------------------------------------------------------
+  // The manager owns one live login pseudo-terminal route per worker. It mints a
+  // host-owned opaque route identifier, carries it in the open call, and keys the
+  // close on it, so it closes a worker-created terminal even when the open reply
+  // was lost and no worker session identifier arrived. It binds the worker
+  // session identifier one time while the route is `opening`, for output only. It
+  // never trusts a worker-supplied identifier as proof of origin: it delivers
+  // output only while the route is `open` and the notification carries the exact
+  // bound identifier and valid bounded bytes, and it never logs the raw bytes. It
+  // terminalizes the route exactly once on every open failure path, closes the
+  // terminal by the host route identifier, and admits a new open only after it
+  // verifies a close acknowledgement bound to that identifier; it retires the
+  // worker on an unconfirmed close.
+
+  type SetupTokenPtyRouteState = "reserved" | "opening" | "open" | "closed";
+  interface SetupTokenPtyRoute {
+    hostRouteId: string;
+    state: SetupTokenPtyRouteState;
+    workerSessionId: string | null;
+    listener: ((chunk: string) => void) | null;
+    buffered: string[];
+    deliveredChars: number;
+    terminalized: boolean;
+    settleWait: (value: { exitCode: number | null }) => void;
+    // Output and exit notifications that arrived after the open request was
+    // written but before the open reply bound the worker session identifier. A
+    // worker that emits them immediately after its open reply can coalesce all
+    // frames into one reader chunk, so the manager dispatches them before the
+    // reply's promise continuation flips the route to `open` - dropping them
+    // left `wait()` unsettled forever. Buffer a bounded number instead and
+    // replay through the normal sid-checked routing after the bind. The
+    // buffer is discarded unless the route actually binds, so a failed or
+    // terminalized handshake still delivers nothing.
+    preBindOutputs: JsonRpcNotification[];
+    preBindExit: JsonRpcNotification | null;
+    preBindChars: number;
+  }
+  // At most one active credential pseudo-terminal per worker. A non-null route
+  // blocks a second open until the manager confirms the first route's close.
+  let setupTokenPtyRoute: SetupTokenPtyRoute | null = null;
+
+  function settleSetupTokenPtyWait(
+    route: SetupTokenPtyRoute,
+    value: { exitCode: number | null },
+  ): void {
+    const settle = route.settleWait;
+    route.settleWait = () => {};
+    settle(value);
+  }
+
+  // Close the worker terminal by the host route identifier and verify the bound
+  // acknowledgement. Return true only when the worker returns an acknowledgement
+  // that carries the exact host route identifier. An absent, malformed,
+  // mismatched, or timed-out acknowledgement returns false, so the caller fails
+  // closed.
+  async function closeSetupTokenPtyTerminal(hostRouteId: string): Promise<boolean> {
+    try {
+      const ack = await callInternal(
+        "setupTokenPtyClose",
+        { hostRouteId },
+        setupTokenPtyCloseTimeoutMs,
+      );
+      return isRecord(ack) && readNonEmptyString(ack.hostRouteId) === hostRouteId;
+    } catch {
+      return false;
+    }
+  }
+
+  // Terminalize the route exactly once. Resolve the login wait, close the worker
+  // terminal by the host route identifier, and free the per-worker slot only
+  // after the close resolves. Retire the worker when the close is unconfirmed.
+  async function terminalizeSetupTokenPtyRoute(route: SetupTokenPtyRoute): Promise<void> {
+    if (route.terminalized) return;
+    route.terminalized = true;
+    route.state = "closed";
+    route.listener = null;
+    route.buffered = [];
+    route.preBindOutputs = [];
+    route.preBindExit = null;
+    // A terminalized route reports a null exit code, which the runner treats as a
+    // failure.
+    settleSetupTokenPtyWait(route, { exitCode: null });
+    const confirmed = await closeSetupTokenPtyTerminal(route.hostRouteId);
+    if (setupTokenPtyRoute === route) setupTokenPtyRoute = null;
+    if (!confirmed) {
+      // The worker did not acknowledge the close, so the host cannot prove the
+      // terminal is gone. Fail closed: retire the worker before any reuse.
+      log.error(
+        { pluginId },
+        "setup-token login pseudo-terminal close not acknowledged; retiring worker",
+      );
+      void killProcess();
+    }
+  }
+
+  // Route one login pseudo-terminal output notification to the per-session
+  // listener. Deliver only while the route is `open` and the notification carries
+  // the exact bound worker session identifier and valid bounded bytes. Drop an
+  // unknown, late, malformed, or mismatched notification. Never log the raw bytes.
+  function routeSetupTokenPtyOutput(notification: JsonRpcNotification): void {
+    const route = setupTokenPtyRoute;
+    if (!route) return;
+    if (route.state === "opening") {
+      // The open handshake is still in flight, so no worker session identifier
+      // is bound and nothing may be delivered yet. Buffer a bounded number of
+      // notifications for replay after the bind; the sid check still applies at
+      // replay, so a forged or oversized notification never gains delivery.
+      const params = isRecord(notification.params) ? notification.params : {};
+      const chunk = params.chunk;
+      // Buffer a string chunk only: the post-bind routing drops a non-string
+      // chunk, so retaining one pre-bind would buy zero delivery and park
+      // host-process memory for the whole handshake window (up to a
+      // transport-frame-cap object per buffered frame).
+      if (typeof chunk !== "string") return;
+      // The caps below bound memory only. They deliberately use the module
+      // default total, not this route's configured `maxTotalChars`: a route may
+      // configure a tiny delivery bound, and dropping a pre-bind frame against
+      // it would hide the cumulative-overrun frame that must terminalize the
+      // route at replay. Delivery accounting stays in the replay path. Overflow
+      // past the caps silently truncates the buffered transcript; the exit
+      // notification is never dropped, so the login wait cannot hang here.
+      if (
+        route.preBindOutputs.length < SETUP_TOKEN_PTY_PRE_BIND_MAX_OUTPUTS &&
+        route.preBindChars + chunk.length <= MAX_SETUP_TOKEN_PTY_TOTAL_CHARS
+      ) {
+        // Retain a projected minimal copy, not the parsed frame: replay reads
+        // exactly these params, so junk in other fields never parks in host
+        // memory and `preBindChars` stays byte-tight.
+        route.preBindOutputs.push({
+          jsonrpc: notification.jsonrpc,
+          method: notification.method,
+          params: { workerSessionId: params.workerSessionId, chunk },
+        });
+        route.preBindChars += chunk.length;
+      }
+      return;
+    }
+    if (route.state !== "open") return;
+    const params = isRecord(notification.params) ? notification.params : {};
+    const workerSessionId = readNonEmptyString(params.workerSessionId);
+    if (!workerSessionId || workerSessionId !== route.workerSessionId) return;
+    const chunk = params.chunk;
+    if (
+      typeof chunk !== "string" ||
+      chunk.length === 0 ||
+      chunk.length > maxSetupTokenPtyChunkChars
+    ) {
+      return;
+    }
+    if (route.deliveredChars + chunk.length > maxSetupTokenPtyTotalChars) {
+      // The cumulative output passed the per-route bound. Terminalize the route.
+      void terminalizeSetupTokenPtyRoute(route);
+      return;
+    }
+    route.deliveredChars += chunk.length;
+    if (route.listener) route.listener(chunk);
+    else route.buffered.push(chunk);
+  }
+
+  // Route one login pseudo-terminal exit notification to the login wait. Resolve
+  // only while the route is `open` and the notification carries the exact bound
+  // worker session identifier.
+  function routeSetupTokenPtyExit(notification: JsonRpcNotification): void {
+    const route = setupTokenPtyRoute;
+    if (!route) return;
+    if (route.state === "opening") {
+      // Keep only the latest exit seen during the open handshake; an older exit
+      // is superseded. The sid check still applies at replay. Retain a
+      // projected minimal copy, not the parsed frame, for the same reason as
+      // the output buffer: replay reads exactly these params.
+      const params = isRecord(notification.params) ? notification.params : {};
+      route.preBindExit = {
+        jsonrpc: notification.jsonrpc,
+        method: notification.method,
+        params: {
+          workerSessionId: params.workerSessionId,
+          exitCode: params.exitCode,
+        },
+      };
+      return;
+    }
+    if (route.state !== "open") return;
+    const params = isRecord(notification.params) ? notification.params : {};
+    const workerSessionId = readNonEmptyString(params.workerSessionId);
+    if (!workerSessionId || workerSessionId !== route.workerSessionId) return;
+    const exitCode = typeof params.exitCode === "number" ? params.exitCode : null;
+    settleSetupTokenPtyWait(route, { exitCode });
+  }
+
+  // Close the one route on a worker exit. The worker is gone, so the manager
+  // resolves the login wait with the fixed non-secret exit and clears the route
+  // one time. The pending pseudo-terminal calls reject through `rejectAllPending`.
+  function closeSetupTokenPtyRouteOnWorkerExit(): void {
+    const route = setupTokenPtyRoute;
+    if (!route) return;
+    setupTokenPtyRoute = null;
+    route.terminalized = true;
+    route.state = "closed";
+    route.listener = null;
+    route.buffered = [];
+    route.preBindOutputs = [];
+    route.preBindExit = null;
+    settleSetupTokenPtyWait(route, { exitCode: null });
+  }
+
+  // Open one live login pseudo-terminal route. Reserve the route
+  // before the open call, bind the worker session identifier one time on the
+  // first successful open reply, and return a session the login transport drives.
+  // Terminalize the route on every open failure path.
+  async function openSetupTokenPtySession(
+    input: SetupTokenPtyOpenInput,
+  ): Promise<SetupTokenPtyHostSession> {
+    if (input.command !== CLAUDE_SETUP_TOKEN_COMMAND) {
+      // Allowlist the login command. Only the fixed `CLAUDE_SETUP_TOKEN_COMMAND`
+      // may run in the sandbox pseudo-terminal. Reject any other command with one
+      // fixed non-secret error before the worker call, so a caller cannot spawn
+      // an arbitrary process in the sandbox pseudo-terminal.
+      throw new Error(SETUP_TOKEN_PTY_COMMAND_NOT_ALLOWED);
+    }
+    if (setupTokenPtyRoute) {
+      // A route for this worker is not yet closed and confirmed. Reject the
+      // second open with one fixed non-secret error before it reaches the worker.
+      throw new Error(SETUP_TOKEN_PTY_ROUTE_BUSY);
+    }
+    const hostRouteId = randomUUID();
+    let settleWait: (value: { exitCode: number | null }) => void = () => {};
+    const waitPromise = new Promise<{ exitCode: number | null }>((resolve) => {
+      settleWait = resolve;
+    });
+    const route: SetupTokenPtyRoute = {
+      hostRouteId,
+      state: "reserved",
+      workerSessionId: null,
+      listener: null,
+      buffered: [],
+      deliveredChars: 0,
+      terminalized: false,
+      settleWait,
+      preBindOutputs: [],
+      preBindExit: null,
+      preBindChars: 0,
+    };
+    setupTokenPtyRoute = route;
+
+    route.state = "opening";
+    let openResult: HostToWorkerMethods["setupTokenPtyOpen"][1];
+    try {
+      openResult = await callInternal(
+        "setupTokenPtyOpen",
+        {
+          hostRouteId,
+          driverKey: input.driverKey,
+          companyId: input.companyId,
+          environmentId: input.environmentId,
+          providerLeaseId: input.providerLeaseId,
+          command: input.command,
+        },
+        setupTokenPtyOpenTimeoutMs,
+      );
+    } catch (err) {
+      // A send failure, an RPC rejection, or an open timeout. Terminalize the
+      // route exactly once and fail closed.
+      await terminalizeSetupTokenPtyRoute(route);
+      throw err instanceof Error ? err : new Error(SETUP_TOKEN_PTY_OPEN_FAILED);
+    }
+
+    const workerSessionId = readNonEmptyString(
+      isRecord(openResult) ? openResult.workerSessionId : null,
+    );
+    if (!workerSessionId || route.state !== "opening" || route.terminalized) {
+      // A malformed reply, or a route that already left `opening`. A late or a
+      // duplicate reply never binds, revives, or reopens a route.
+      await terminalizeSetupTokenPtyRoute(route);
+      throw new Error(SETUP_TOKEN_PTY_OPEN_FAILED);
+    }
+    // Bind the worker session identifier one time and move the route to `open`.
+    route.workerSessionId = workerSessionId;
+    route.state = "open";
+
+    // Replay what arrived during the open handshake through the normal routing,
+    // so the sid checks and the delivery bounds apply exactly as they would
+    // have if the frames had arrived after the bind: arrival order, outputs
+    // first, then the exit. A replayed cumulative-bound overrun terminalizes the
+    // route mid-replay, and the remaining frames are then dropped by the state
+    // checks exactly as any post-close frame would be.
+    const replayOutputs = route.preBindOutputs;
+    const replayExit = route.preBindExit;
+    route.preBindOutputs = [];
+    route.preBindExit = null;
+    route.preBindChars = 0;
+    for (const notification of replayOutputs) {
+      if (route.state !== "open") break;
+      routeSetupTokenPtyOutput(notification);
+    }
+    if (route.state === "open" && replayExit) {
+      routeSetupTokenPtyExit(replayExit);
+    }
+
+    return {
+      onData(listener: (chunk: string) => void): void {
+        route.listener = listener;
+        if (route.buffered.length > 0) {
+          const pending = route.buffered;
+          route.buffered = [];
+          for (const chunk of pending) listener(chunk);
+        }
+      },
+      write(data: string): void {
+        const sid = route.workerSessionId;
+        if (route.state !== "open" || !sid) return;
+        void callInternal(
+          "setupTokenPtyInput",
+          { workerSessionId: sid, data },
+          setupTokenPtyOpenTimeoutMs,
+        ).catch(() => {});
+      },
+      wait(): Promise<{ exitCode: number | null }> {
+        return waitPromise;
+      },
+      kill(): void {
+        const sid = route.workerSessionId;
+        if (!sid) return;
+        void callInternal(
+          "setupTokenPtyStop",
+          { workerSessionId: sid },
+          setupTokenPtyOpenTimeoutMs,
+        ).catch(() => {});
+      },
+      async close(): Promise<void> {
+        await terminalizeSetupTokenPtyRoute(route);
+      },
+    };
+  }
+
+  /**
+   * Extract the single company a worker→host call references, mirroring the SDK
+   * governed-access gate's own derivation (host-client-factory.ts
+   * `requestedCompanyScope`) so a proactive call resolves to exactly the company
+   * the gate would require:
+   *   - explicit `params.companyId`;
+   *   - a company-scoped state key (`scopeKind: "company"` + `scopeId`);
+   *   - `events.subscribe`'s `params.filter.companyId` (how the SDK's
+   *     `ctx.events.on(name, { companyId }, fn)` issues its subscribe).
+   *
+   * Returns null whenever the gate treats the call as a wildcard (`companies.list`,
+   * a `scopeKind: "company"` key with no `scopeId`) or as referencing no company
+   * (instance-scoped state, an unfiltered subscribe). A wildcard is deliberately
+   * NOT granted proactively: proactive resolution only ever admits a single,
+   * explicit company, never "all". This keeps the resolver and the gate in
+   * lockstep in the functional direction (LOOA-693 AC#4 / LOOA-695).
+   */
+  function referencedCompanyId(method: string, params: unknown): string | null {
+    // Gate returns { kind: "all" } for companies.list regardless of params —
+    // never a single company — so proactive access declines it here.
+    if (method === "companies.list") return null;
+    if (!isRecord(params)) return null;
+    const direct = readNonEmptyString(params.companyId);
+    if (direct) return direct;
+    if (params.scopeKind === "company") {
+      // scopeId present → that company; absent → wildcard ("all") in the gate,
+      // which we never grant proactively → null.
+      return readNonEmptyString(params.scopeId);
+    }
+    if (method === "events.subscribe" && isRecord(params.filter)) {
+      return readNonEmptyString(params.filter.companyId);
+    }
+    return null;
   }
 
   function contextForWorkerMessage(message: JsonRpcRequest | JsonRpcNotification): WorkerHostCallContext {
@@ -876,6 +1718,18 @@ export function createPluginWorkerHandle(
       const inFlightInvocationIds = new Set<string>();
       for (const pending of pendingRequests.values()) {
         if (pending.invocationId) inFlightInvocationIds.add(pending.invocationId);
+      // Upstream (LOOA-629/695): a proactive plugin (chat gateway) does company-scoped
+      // work from its own timers/loops. An id-less call that references one of the
+      // plugin's configured companies resolves to that company's scope. This never
+      // widens access beyond the loader-seeded allowlist; in-invocation calls keep
+      // the strict single-company match below.
+      const proactiveCompanyId = referencedCompanyId(
+        message.method,
+        (message as { params?: unknown }).params,
+      );
+      if (proactiveCompanyId && proactiveCompanyScopes.has(proactiveCompanyId)) {
+        return { invocationScope: { companyId: proactiveCompanyId } };
+      }
       }
       const hasActiveInvocation =
         activeInvocations.size > 0 || inFlightInvocationIds.size > 0;
@@ -921,7 +1775,7 @@ export function createPluginWorkerHandle(
     }
     const entry = activeInvocations.get(invocationId);
     if (!entry) return { invalidInvocationScope: true };
-    return { invocationScope: entry.scope };
+    return { invocationScope: entry.scope, traceparent: entry.traceparent };
   }
 
   /**
@@ -1028,6 +1882,25 @@ export function createPluginWorkerHandle(
       } else {
         log.info(logFields, `[plugin] ${msg}`);
       }
+      return;
+    }
+
+    // Execute-log notifications: deliver one incremental output chunk to the
+    // host-owned execute route for the active execute call.
+    if (notification.method === "execute.log") {
+      routeExecuteLogNotification(notification);
+      return;
+    }
+
+    // Setup-token login pseudo-terminal notifications: deliver output
+    // and the exit to the one host-owned login route, bound by the worker session
+    // identifier while the route is open.
+    if (notification.method === SETUP_TOKEN_PTY_OUTPUT_NOTIFICATION) {
+      routeSetupTokenPtyOutput(notification);
+      return;
+    }
+    if (notification.method === SETUP_TOKEN_PTY_EXIT_NOTIFICATION) {
+      routeSetupTokenPtyExit(notification);
       return;
     }
 
@@ -1246,6 +2119,11 @@ export function createPluginWorkerHandle(
         stderrExcerpt,
       )),
     );
+
+    // Close the one login pseudo-terminal route with a fixed non-secret exit and
+    // clear the route one time. The pending pseudo-terminal calls
+    // already rejected through `rejectAllPending`.
+    closeSetupTokenPtyRouteOnWorkerExit();
 
     // Emit synthetic close for any orphaned stream channels so SSE clients
     // are notified instead of hanging indefinitely.
@@ -1583,6 +2461,7 @@ export function createPluginWorkerHandle(
     method: M,
     params: HostToWorkerMethods[M][0],
     timeoutMs?: number,
+    executeLogSink?: ExecuteLogSink,
   ): Promise<HostToWorkerMethods[M][1]> {
     const rpcPromise = new Promise<HostToWorkerMethods[M][1]>((resolve, reject) => {
       if (!childProcess?.stdin?.writable) {
@@ -1595,9 +2474,16 @@ export function createPluginWorkerHandle(
       }
 
       const id = nextRequestId++;
-      const timeout = Math.min(timeoutMs ?? rpcTimeoutMs, MAX_RPC_TIMEOUT_MS);
+      const timeout = resolveRpcCallTimeoutMs(timeoutMs, rpcTimeoutMs);
       const invocationScope = deriveInvocationScope(method, params);
       const invocation = invocationScope ? registerInvocation(invocationScope, undefined, method) : null;
+      // Register the host-owned execute route only for an execute call that
+      // carries a log sink. The company id comes from the host-derived
+      // invocation scope, never from the worker. This binds the sink to the
+      // exact company for the life of the call.
+      if (invocation && invocationScope && executeLogSink && method === "environmentExecute") {
+        registerExecuteRoute(invocation.id, invocationScope.companyId, executeLogSink);
+      }
 
       // Guard against double-settlement. When a process exits all pending
       // requests are rejected via rejectAllPending(), but the timeout timer
@@ -1611,6 +2497,7 @@ export function createPluginWorkerHandle(
         clearTimeout(timer);
         pendingRequests.delete(id);
         clearInvocation(invocation);
+        clearExecuteRoute(invocation?.id);
         fn(value);
       };
 
@@ -1653,6 +2540,7 @@ export function createPluginWorkerHandle(
         clearTimeout(timer);
         pendingRequests.delete(id);
         clearInvocation(invocation);
+        clearExecuteRoute(invocation?.id);
         reject(
           new Error(
             `Failed to send "${method}" to worker: ${
@@ -1710,6 +2598,7 @@ export function createPluginWorkerHandle(
       method: M,
       params: HostToWorkerMethods[M][0],
       timeoutMs?: number,
+      executeLogSink?: ExecuteLogSink,
     ): Promise<HostToWorkerMethods[M][1]> {
       if (status !== "running" && status !== "starting") {
         return Promise.reject(
@@ -1718,7 +2607,18 @@ export function createPluginWorkerHandle(
           ),
         );
       }
-      return callInternal(method, params, timeoutMs);
+      return callInternal(method, params, timeoutMs, executeLogSink);
+    },
+
+    openSetupTokenPtySession(input: SetupTokenPtyOpenInput) {
+      if (status !== "running" && status !== "starting") {
+        return Promise.reject(
+          new Error(
+            `Cannot open a login pseudo-terminal — worker for "${pluginId}" is ${status}`,
+          ),
+        );
+      }
+      return openSetupTokenPtySession(input);
     },
 
     notify(method: string, params: unknown) {
@@ -1750,6 +2650,14 @@ export function createPluginWorkerHandle(
       listener: (payload: WorkerHandleEvents[K]) => void,
     ) {
       emitter.off(event, listener);
+    },
+
+    setProactiveCompanyScopes(companyIds: readonly string[]): void {
+      proactiveCompanyScopes.clear();
+      for (const id of companyIds) {
+        const trimmed = readNonEmptyString(id);
+        if (trimmed) proactiveCompanyScopes.add(trimmed);
+      }
     },
 
     diagnostics(): WorkerDiagnostics {
@@ -1943,6 +2851,10 @@ export function createPluginWorkerManager(
       return handle?.status === "running";
     },
 
+    setProactiveCompanyScopes(pluginId: string, companyIds: readonly string[]): void {
+      workers.get(pluginId)?.setProactiveCompanyScopes(companyIds);
+    },
+
     async stopAll(): Promise<void> {
       log.info({ count: workers.size }, "stopping all plugin workers");
       const promises = Array.from(workers.values()).map(async (handle) => {
@@ -1973,6 +2885,7 @@ export function createPluginWorkerManager(
       method: M,
       params: HostToWorkerMethods[M][0],
       timeoutMs?: number,
+      executeLogSink?: ExecuteLogSink,
     ): Promise<HostToWorkerMethods[M][1]> {
       const handle = workers.get(pluginId);
       if (!handle) {
@@ -1980,7 +2893,17 @@ export function createPluginWorkerManager(
           new Error(`No worker registered for plugin "${pluginId}"`),
         );
       }
-      return handle.call(method, params, timeoutMs);
+      return handle.call(method, params, timeoutMs, executeLogSink);
+    },
+
+    openSetupTokenPtySession(pluginId: string, input: SetupTokenPtyOpenInput) {
+      const handle = workers.get(pluginId);
+      if (!handle) {
+        return Promise.reject(
+          new Error(`No worker registered for plugin "${pluginId}"`),
+        );
+      }
+      return handle.openSetupTokenPtySession(input);
     },
   };
 }

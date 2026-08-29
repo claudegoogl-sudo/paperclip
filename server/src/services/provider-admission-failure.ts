@@ -3,16 +3,21 @@ import { heartbeatRuns } from "@paperclipai/db";
 
 // A provider-admission failure is a run that died at the provider's door —
 // dispatched, rejected with a transient upstream error (HTTP 429-class
-// `transient_upstream` family), and billed nothing. During an account-wide
-// outage these stack by the hundred while carrying zero information about the
-// assignee's actual productivity, so evidence consumers (the productivity
-// monitor's no-comment streak and churn windows) must not count them as
-// "completed-but-silent" work. Everything else — real successes, costed
-// transient failures, non-transient error codes — keeps its existing
-// treatment.
+// `transient_upstream` family), and billed nothing. Under the merged
+// v2026.824.1 contract the upstream quota classifier additionally reports the
+// same door-rejections (usage/session limits, out-of-extra-usage) as the
+// `provider_quota` family, so zero-cost `provider_quota` runs are admission
+// failures too. During an account-wide outage these stack by the hundred while
+// carrying zero information about the assignee's actual productivity, so
+// evidence consumers (the productivity monitor's no-comment streak and churn
+// windows) must not count them as "completed-but-silent" work. Everything
+// else — real successes, costed failures, non-transient error codes — keeps
+// its existing treatment (the zero-cost guard below still excludes any run
+// that did billable work).
 export const PROVIDER_ADMISSION_FAILURE_ERROR_CODES = [
   "claude_transient_upstream",
   "codex_transient_upstream",
+  "provider_quota",
 ] as const;
 
 export type ProviderAdmissionFailureRunShape = {
@@ -58,6 +63,7 @@ export function isProviderAdmissionFailureRun(run: ProviderAdmissionFailureRunSh
       : null;
   const transientUpstream =
     errorFamily === "transient_upstream" ||
+    errorFamily === "provider_quota" ||
     (run.errorCode !== null &&
       (PROVIDER_ADMISSION_FAILURE_ERROR_CODES as readonly string[]).includes(run.errorCode));
   if (!transientUpstream) return false;
@@ -90,8 +96,8 @@ export function notProviderAdmissionFailureCondition() {
   return sql`not (
     ${heartbeatRuns.status} = 'failed'
     and (
-      coalesce(${heartbeatRuns.resultJson} ->> 'errorFamily', '') = 'transient_upstream'
-      or ${heartbeatRuns.errorCode} in ('claude_transient_upstream', 'codex_transient_upstream')
+      coalesce(${heartbeatRuns.resultJson} ->> 'errorFamily', '') in ('transient_upstream', 'provider_quota')
+      or ${heartbeatRuns.errorCode} in ('claude_transient_upstream', 'codex_transient_upstream', 'provider_quota')
     )
     and ${providerAdmissionFailureCostIsZero()}
   )`;

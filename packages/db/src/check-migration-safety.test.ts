@@ -507,7 +507,7 @@ describe("migration safety check", () => {
 });
 
 const POSTURE_RULE = "unqualified-mutation-security-posture-column";
-const MIGRATION_0138 = "0138_secret_binding_egress_allowlist.sql";
+const MIGRATION_0225 = "0225_secret_binding_egress_allowlist.sql";
 
 function postureFindings(sql: string) {
   return analyze(sql).newFindings.filter((finding) => finding.rule === POSTURE_RULE);
@@ -517,12 +517,12 @@ describe("unqualified mutation of a security-posture column", () => {
   // The regression test that matters: the real historical statement, read off
   // disk, not a synthetic reconstruction of it.
   const migration0138 = readFileSync(
-    new URL(`./migrations/${MIGRATION_0138}`, import.meta.url),
+    new URL(`./migrations/${MIGRATION_0225}`, import.meta.url),
     "utf8",
   );
 
-  it("fires as an error on the real 0138 text that flattened every binding", () => {
-    const result = analyzeMigrationSafety([{ fileName: MIGRATION_0138, sql: migration0138 }], {
+  it("fires as an error on the real 0225 text that flattened every binding", () => {
+    const result = analyzeMigrationSafety([{ fileName: MIGRATION_0225, sql: migration0138 }], {
       baselineIds: [],
       estimates: testEstimates,
     });
@@ -536,11 +536,11 @@ describe("unqualified mutation of a security-posture column", () => {
   });
 
   it("does not lean on a migration's own claim that its write runs once", () => {
-    // 0138's header used to assert "The UPDATE runs once (drizzle journal-gated)"
+    // 0225's header used to assert "The UPDATE runs once (drizzle journal-gated)"
     // and the re-run that flattened the flag disproved it. That header has since
     // been rewritten, so the claim is pinned here as a fixture rather than read
-    // off 0138: the property under test is that the rule scores the statement,
-    // never the migration's narration of its own execution. Asserting on 0138's
+    // off 0225: the property under test is that the rule scores the statement,
+    // never the migration's narration of its own execution. Asserting on 0225's
     // prose coupled this test to a comment and broke it when the prose was fixed.
     const claimsRunOnce = `
       -- The UPDATE runs once (drizzle journal-gated); new rows are untouched.
@@ -553,20 +553,20 @@ describe("unqualified mutation of a security-posture column", () => {
     expect(postureFindings(migration0138)).toHaveLength(1);
   });
 
-  it("keeps 0138 green in CI through a baseline entry that states a reason", () => {
-    const result = analyzeMigrationSafety([{ fileName: MIGRATION_0138, sql: migration0138 }], {
+  it("keeps 0225 green in CI through a baseline entry that states a reason", () => {
+    const result = analyzeMigrationSafety([{ fileName: MIGRATION_0225, sql: migration0138 }], {
       estimates: testEstimates,
     });
     expect(result.newFindings).toEqual([]);
     expect(result.baselineFindings.map((entry) => entry.rule)).toContain(POSTURE_RULE);
 
     const entry = MIGRATION_SAFETY_BASELINE.find((candidate) => candidate.rule === POSTURE_RULE);
-    expect(entry?.migration).toBe(MIGRATION_0138);
+    expect(entry?.migration).toBe(MIGRATION_0225);
     expect(entry?.reason.trim().length).toBeGreaterThan(20);
   });
 
-  it("covers the in-flight rewrite of 0138 so either merge order stays green", () => {
-    // A separate change rewrites 0138's rollout UPDATE into a DO block gated on
+  it("covers the in-flight rewrite of 0225 so either merge order stays green", () => {
+    // A separate change rewrites 0225's rollout UPDATE into a DO block gated on
     // whether that run created the column. The finding id hashes the normalized
     // statement, so the rewrite produces a different id — whichever change lands
     // second would go red on an uncovered finding. Both texts are baselined.
@@ -597,7 +597,7 @@ describe("unqualified mutation of a security-posture column", () => {
     `;
     expect(postureFindings(rewritten)).toHaveLength(1);
 
-    const result = analyzeMigrationSafety([{ fileName: MIGRATION_0138, sql: rewritten }], {
+    const result = analyzeMigrationSafety([{ fileName: MIGRATION_0225, sql: rewritten }], {
       estimates: testEstimates,
     });
     expect(result.newFindings).toEqual([]);

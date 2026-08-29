@@ -12,6 +12,10 @@ import type {
   SecretProviderConfigHealthResponse,
   SecretProviderDescriptor,
   SecretStatus,
+  SecretProposalView,
+  SecretProposalStatus,
+  ApproveSecretProposalInput,
+  RejectSecretProposalInput,
   UserSecretCoverageSummary,
   UserSecretDefinition,
 } from "@paperclipai/shared";
@@ -276,6 +280,24 @@ export const secretsApi = {
     ),
   remoteImport: (companyId: string, data: RemoteImportInput) =>
     api.post<RemoteSecretImportResult>(`/companies/${companyId}/secrets/remote-import`, data),
+
+  // --- Secret & binding proposals (PAP-14731) -----------------------------
+  // Board-facing review surface. Agents propose credentials/bindings; humans
+  // approve or reject them here. Values are never returned by these routes.
+  listProposals: (companyId: string, status: SecretProposalStatus = "pending") =>
+    api.get<SecretProposalView[]>(
+      `/companies/${companyId}/secret-proposals?status=${encodeURIComponent(status)}`,
+    ),
+  approveProposal: (companyId: string, proposalId: string, data: ApproveSecretProposalInput = {}) =>
+    api.post<SecretProposalView>(
+      `/companies/${companyId}/secret-proposals/${proposalId}/approve`,
+      data,
+    ),
+  rejectProposal: (companyId: string, proposalId: string, data: RejectSecretProposalInput) =>
+    api.post<SecretProposalView>(
+      `/companies/${companyId}/secret-proposals/${proposalId}/reject`,
+      data,
+    ),
 
   // --- Operator-only egress review + per-binding enforce-flip surface -----
   // Bindings are returned company-wide; filter client-side on `secretId`.
