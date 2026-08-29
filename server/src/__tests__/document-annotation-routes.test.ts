@@ -2,6 +2,15 @@ import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+// Every test rebuilds the app through vi.resetModules() plus importActual of the
+// full issue-route module graph. The first test additionally pays the cold
+// load of that graph, which measured ~8s on a loaded runner while the request
+// itself completes in ~30ms; the remaining tests re-import the graph warm in
+// ~200ms. Give every test headroom so the cold first import cannot trip
+// vitest's 5s default per-test timeout (observed as an intermittent
+// serialized-shard failure on CI run 33224141020).
+const ROUTE_GRAPH_TEST_TIMEOUT_MS = 20_000;
+
 const issueId = "11111111-1111-4111-8111-111111111111";
 const companyId = "22222222-2222-4222-8222-222222222222";
 const otherCompanyId = "33333333-3333-4333-8333-333333333333";
@@ -239,7 +248,7 @@ describe("document annotation routes", () => {
       status: "open",
       includeComments: false,
     });
-  });
+  }, ROUTE_GRAPH_TEST_TIMEOUT_MS);
 
   it("includes annotation comment bodies on document reads only when explicitly requested", async () => {
     const res = await request(await createApp("agent"))
@@ -251,7 +260,7 @@ describe("document annotation routes", () => {
       status: "open",
       includeComments: true,
     });
-  });
+  }, ROUTE_GRAPH_TEST_TIMEOUT_MS);
 
   it("updates issue documents without waking the assignee through the issue-comment path", async () => {
     mockIssueService.getById.mockResolvedValue({
@@ -279,7 +288,7 @@ describe("document annotation routes", () => {
       action: "issue.document_updated",
     }));
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
-  });
+  }, ROUTE_GRAPH_TEST_TIMEOUT_MS);
 
   it("queues one bounded recovery when a board document revision expires the final review interactions", async () => {
     const assigneeAgentId = "99999999-9999-4999-8999-999999999999";
@@ -327,7 +336,7 @@ describe("document annotation routes", () => {
         wakeReason: "issue_review_path_lost",
       }),
     }));
-  });
+  }, ROUTE_GRAPH_TEST_TIMEOUT_MS);
 
   it("creates annotation threads, syncs references, logs activity, and does not wake the assignee", async () => {
     mockIssueService.getById.mockResolvedValue({
@@ -358,13 +367,13 @@ describe("document annotation routes", () => {
       }),
     }));
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
-  });
+  }, ROUTE_GRAPH_TEST_TIMEOUT_MS);
 
   it("rejects agent cross-company annotation reads with a uniform 404", async () => {
     await request(await createApp("agent", otherCompanyId))
       .get(`/api/issues/${issueId}/documents/plan/annotations`)
       .expect(404);
-  });
+  }, ROUTE_GRAPH_TEST_TIMEOUT_MS);
 
   it("adds annotation comments without waking the assignee and resolves threads", async () => {
     mockIssueService.getById.mockResolvedValue({
@@ -402,5 +411,5 @@ describe("document annotation routes", () => {
       }),
     }));
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
-  });
+  }, ROUTE_GRAPH_TEST_TIMEOUT_MS);
 });
