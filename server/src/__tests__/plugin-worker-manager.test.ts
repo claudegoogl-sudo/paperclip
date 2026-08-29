@@ -1995,6 +1995,62 @@ describe("plugin worker manager setup-token pty route gate", () => {
     }
   });
 
+  it("delivers output and exit notifications that raced ahead of the open reply", async () => {
+    // A fast worker can write its output and exit into the same pipe batch as
+    // the open reply. The host then reads the notifications before the awaited
+    // open continuation binds the session id. The route must park them during
+    // `opening` and replay them in order once the bind lands, so `wait()`
+    // resolves with the worker's exit code and no chunk is lost.
+    const handle = makeSetupTokenPtyHandle();
+    try {
+      await handle.start();
+      const session = await handle.openSetupTokenPtySession(
+        ptyOpenInput({
+          early: true,
+          workerSessionId: "ws-A",
+          outputs: [{ chunk: "hello" }],
+          exitCode: 0,
+        }),
+      );
+      const chunks: string[] = [];
+      session.onData((chunk) => chunks.push(chunk));
+      await expect(session.wait()).resolves.toEqual({ exitCode: 0 });
+      expect(chunks).toEqual(["hello"]);
+      await session.close();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("still delivers accepted chunks when the over-budget replay terminalizes before onData attaches", async () => {
+    // Same fast-worker race, over-budget variant: the parked outputs replay
+    // while the session is still inside openSetupTokenPtySession, so no
+    // listener exists yet. The budget overrun terminalizes the route, but the
+    // chunks already accepted under the budget must survive for onData.
+    const handle = makeSetupTokenPtyHandle({
+      setupTokenPtyLimits: { maxTotalChars: 10 },
+    });
+    try {
+      await handle.start();
+      const session = await handle.openSetupTokenPtySession(
+        ptyOpenInput({
+          early: true,
+          outputs: [
+            { chunk: "aaaaa" }, // total 5 → accepted
+            { chunk: "bbbbb" }, // total 10 → accepted
+            { chunk: "ccccc" }, // total 15 > 10 → terminalize
+          ],
+        }),
+      );
+      const chunks: string[] = [];
+      session.onData((chunk) => chunks.push(chunk));
+      await expect(session.wait()).resolves.toEqual({ exitCode: null });
+      expect(chunks).toEqual(["aaaaa", "bbbbb"]);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
   it("closes the route with a fixed exit when the worker exits", async () => {
     const handle = makeSetupTokenPtyHandle();
     try {

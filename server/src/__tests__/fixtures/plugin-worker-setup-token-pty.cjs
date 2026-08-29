@@ -7,6 +7,9 @@
 // test encodes a JSON directive in the forwarded `providerLeaseId`, so one fixture
 // serves every route-gate case:
 //   - `mode`: "normal" | "malformed-open" | "no-open-reply" | "duplicate-open-reply"
+//   - `early`: when true, the scripted output and exit are emitted BEFORE the
+//     open reply (same pipe batch), exercising the host's parked-notification
+//     replay for a worker that races the open reply.
 //   - `workerSessionId`: the worker session id the open reply returns (default "ws-1")
 //   - `outputs`: an array of `{ chunk, sid? }`. The fixture emits each as an output
 //     notification after the open reply. `sid` defaults to the real worker session
@@ -79,6 +82,33 @@ rl.on("line", (line) => {
 
     const reply = () =>
       send({ jsonrpc: "2.0", id: message.id, result: { workerSessionId } });
+
+    // Emit the scripted output and the exit BEFORE the open reply. A real
+    // worker can write both into the same pipe batch as the reply, and the
+    // host then reads the notifications before the awaited open continuation
+    // binds the session; the host must park and replay them.
+    const emitScriptedTraffic = () => {
+      const outputs = Array.isArray(directive.outputs) ? directive.outputs : [];
+      for (const entry of outputs) {
+        send({
+          jsonrpc: "2.0",
+          method: "setupTokenPty.output",
+          params: {
+            workerSessionId: entry.sid ?? workerSessionId,
+            chunk: entry.chunk,
+          },
+        });
+      }
+      if (typeof directive.exitCode === "number") {
+        send({
+          jsonrpc: "2.0",
+          method: "setupTokenPty.exit",
+          params: { workerSessionId, exitCode: directive.exitCode },
+        });
+      }
+    };
+    if (directive.early) emitScriptedTraffic();
+
     reply();
     if (mode === "duplicate-open-reply") {
       // Send a second open reply for the same request id. The host drops it.
@@ -87,7 +117,7 @@ rl.on("line", (line) => {
 
     // Emit the scripted output and the exit after the open reply, so the host
     // binds the route first.
-    setImmediate(() => {
+    if (!directive.early) setImmediate(() => {
       const outputs = Array.isArray(directive.outputs) ? directive.outputs : [];
       for (const entry of outputs) {
         send({

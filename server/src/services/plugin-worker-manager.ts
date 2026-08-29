@@ -1317,6 +1317,12 @@ export function createPluginWorkerHandle(
   // worker on an unconfirmed close.
 
   type SetupTokenPtyRouteState = "reserved" | "opening" | "open" | "closed";
+  // Notifications that a fast worker emits in the same pipe batch as its open
+  // reply are read before the awaited open continuation can move the route out
+  // of `opening`. They are parked here and replayed once the worker session id
+  // binds, so an eager worker never loses output or its exit.
+  const SETUP_TOKEN_PTY_PENDING_NOTIFICATION_LIMIT = 64;
+
   interface SetupTokenPtyRoute {
     hostRouteId: string;
     state: SetupTokenPtyRouteState;
@@ -1326,6 +1332,7 @@ export function createPluginWorkerHandle(
     deliveredChars: number;
     terminalized: boolean;
     settleWait: (value: { exitCode: number | null }) => void;
+    pending: JsonRpcNotification[];
   }
   // At most one active credential pseudo-terminal per worker. A non-null route
   // blocks a second open until the manager confirms the first route's close.
@@ -1366,7 +1373,12 @@ export function createPluginWorkerHandle(
     route.terminalized = true;
     route.state = "closed";
     route.listener = null;
-    route.buffered = [];
+    // `buffered` survives terminalization: those chunks were accepted under the
+    // byte budget before the terminalizing event, so a listener that attaches
+    // after the close (the fast-worker replay path attaches none yet) still
+    // receives exactly the accepted bytes. Only NEW delivery is stopped, by the
+    // `closed` state. Parked-but-unreplayed notifications are never accepted.
+    route.pending = [];
     // A terminalized route reports a null exit code, which the runner treats as a
     // failure.
     settleSetupTokenPtyWait(route, { exitCode: null });
@@ -1383,13 +1395,51 @@ export function createPluginWorkerHandle(
     }
   }
 
+  // Park one pty notification that arrived while the route was still `opening`
+  // (the worker outpaced the open reply through the pipe). Bounded: a hostile
+  // worker cannot grow the queue without bound; the drop is logged once.
+  function parkSetupTokenPtyNotification(
+    route: SetupTokenPtyRoute,
+    notification: JsonRpcNotification,
+  ): void {
+    if (route.pending.length >= SETUP_TOKEN_PTY_PENDING_NOTIFICATION_LIMIT) {
+      log.warn(
+        { pluginId },
+        "dropping setup-token pty notification parked before the open reply; queue full",
+      );
+      return;
+    }
+    route.pending.push(notification);
+  }
+
+  // Replay the notifications parked during `opening`, in arrival order, now
+  // that the worker session id is bound. Each replay re-enters the normal
+  // routing functions, so bind matching, byte bounds, and terminalization all
+  // apply exactly as they would have for an on-time notification.
+  function replaySetupTokenPtyPendingNotifications(route: SetupTokenPtyRoute): void {
+    const parked = route.pending;
+    route.pending = [];
+    for (const notification of parked) {
+      if (notification.method === SETUP_TOKEN_PTY_OUTPUT_NOTIFICATION) {
+        routeSetupTokenPtyOutput(notification);
+      } else if (notification.method === SETUP_TOKEN_PTY_EXIT_NOTIFICATION) {
+        routeSetupTokenPtyExit(notification);
+      }
+    }
+  }
+
   // Route one login pseudo-terminal output notification to the per-session
   // listener. Deliver only while the route is `open` and the notification carries
   // the exact bound worker session identifier and valid bounded bytes. Drop an
   // unknown, late, malformed, or mismatched notification. Never log the raw bytes.
   function routeSetupTokenPtyOutput(notification: JsonRpcNotification): void {
     const route = setupTokenPtyRoute;
-    if (!route || route.state !== "open") return;
+    if (!route) return;
+    if (route.state === "opening") {
+      parkSetupTokenPtyNotification(route, notification);
+      return;
+    }
+    if (route.state !== "open") return;
     const params = isRecord(notification.params) ? notification.params : {};
     const workerSessionId = readNonEmptyString(params.workerSessionId);
     if (!workerSessionId || workerSessionId !== route.workerSessionId) return;
@@ -1416,7 +1466,12 @@ export function createPluginWorkerHandle(
   // worker session identifier.
   function routeSetupTokenPtyExit(notification: JsonRpcNotification): void {
     const route = setupTokenPtyRoute;
-    if (!route || route.state !== "open") return;
+    if (!route) return;
+    if (route.state === "opening") {
+      parkSetupTokenPtyNotification(route, notification);
+      return;
+    }
+    if (route.state !== "open") return;
     const params = isRecord(notification.params) ? notification.params : {};
     const workerSessionId = readNonEmptyString(params.workerSessionId);
     if (!workerSessionId || workerSessionId !== route.workerSessionId) return;
@@ -1434,7 +1489,8 @@ export function createPluginWorkerHandle(
     route.terminalized = true;
     route.state = "closed";
     route.listener = null;
-    route.buffered = [];
+    // Accepted-but-undelivered chunks survive, mirroring the terminalize path.
+    route.pending = [];
     settleSetupTokenPtyWait(route, { exitCode: null });
   }
 
@@ -1471,6 +1527,7 @@ export function createPluginWorkerHandle(
       deliveredChars: 0,
       terminalized: false,
       settleWait,
+      pending: [],
     };
     setupTokenPtyRoute = route;
 
@@ -1505,9 +1562,12 @@ export function createPluginWorkerHandle(
       await terminalizeSetupTokenPtyRoute(route);
       throw new Error(SETUP_TOKEN_PTY_OPEN_FAILED);
     }
-    // Bind the worker session identifier one time and move the route to `open`.
+    // Bind the worker session identifier one time and move the route to `open`,
+    // then replay any pty notifications the worker raced ahead of the open
+    // reply. Replay runs after the bind so session-id matching still decides.
     route.workerSessionId = workerSessionId;
     route.state = "open";
+    replaySetupTokenPtyPendingNotifications(route);
 
     return {
       onData(listener: (chunk: string) => void): void {
