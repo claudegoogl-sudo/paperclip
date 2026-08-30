@@ -8,10 +8,12 @@
  *   2. closure     every internal dep in every tarball is the exact
  *                  `releases/download/v<version>/<asset>.tgz` URL, and every
  *                  referenced asset exists in the set (bare-version pins fail)
- *   3. exports     every manifest on the core install closure points its
- *                  main/exports/types targets at files that ship in the same
- *                  tarball (a dev manifest like `exports -> ./src/index.ts`
- *                  without `src/` fails here, and would also fail at boot)
+ *   3. exports     every manifest in the release set points its
+ *                  main/exports/types/plugin-entrypoint targets at files that
+ *                  ship in the same tarball (a dev manifest like
+ *                  `exports -> ./src/index.ts` without `src/` fails here, and
+ *                  would also fail at boot; this covers every tarball, not
+ *                  only the core install closure)
  *   4. install     clean-sandbox `npm install --prefix <sandbox> <core-url>`
  *                  resolving the full internal graph from the exact release
  *                  URLs — no `file:` and no local overrides
@@ -35,7 +37,6 @@ import path from "node:path";
 import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import {
-  coreChainClosure,
   listTarballs,
   readPackedManifest,
   scanExportTargets,
@@ -166,17 +167,20 @@ async function main() {
     } else skip("closure", "not selected");
 
     if (wants("exports")) {
-      const chain = coreChainClosure({ assetsDir: args.assetsDir, coreTarballName: coreAsset });
+      // Scan EVERY tarball in the release set, not only the core install
+      // closure: plugin tarballs are not reachable from the core URL pins,
+      // so a closure-scoped scan silently passes a plugin that ships no code.
+      const all = listTarballs(args.assetsDir);
       const violations = [];
-      for (const [assetName, { tarballPath }] of chain) {
+      for (const tarballPath of all) {
         const scan = scanExportTargets(tarballPath);
-        violations.push(...scan.violations.map((v) => ({ asset: assetName, ...v })));
+        violations.push(...scan.violations.map((v) => ({ asset: path.basename(tarballPath), ...v })));
       }
-      summary.coreChainAssets = [...chain.keys()];
+      summary.exportScanCount = all.length;
       if (violations.length > 0) {
-        fail("exports", "packed manifests on the install closure point at files that do not ship", JSON.stringify(violations, null, 2));
+        fail("exports", "packed manifests point at files that do not ship", JSON.stringify(violations, null, 2));
       }
-      pass("exports", `install closure (${chain.size} packages) ships every declared export target`);
+      pass("exports", `all ${all.length} release tarballs ship every declared export/plugin entrypoint target`);
     } else skip("exports", "not selected");
 
     if (wants("install")) {

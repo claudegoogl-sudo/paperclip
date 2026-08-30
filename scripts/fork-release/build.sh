@@ -43,28 +43,52 @@ SCRIPT_DIR="$REPO_ROOT/scripts/fork-release"
 echo "===== fork-release build $VERSION ====="
 echo "HEAD: $(git rev-parse HEAD)"
 
-echo "===== [1/9] pnpm install --frozen-lockfile ====="
+echo "===== [1/10] pnpm install --frozen-lockfile ====="
 pnpm install --frozen-lockfile 2>&1 | tail -3
 
-echo "===== [2/9] set-version $VERSION ====="
+echo "===== [2/10] set-version $VERSION ====="
 node scripts/release-package-map.mjs set-version "$VERSION"
 for P in cli/package.json server/package.json packages/db/package.json; do
   GOT="$(node -e "console.log(require('./$P').version)")"
   [ "$GOT" = "$VERSION" ] || { echo "FATAL: $P version '$GOT' != $VERSION" >&2; exit 1; }
 done
 
-echo "===== [3/9] workspace links preflight ====="
+echo "===== [3/10] workspace links preflight ====="
 pnpm run preflight:workspace-links 2>&1 | tail -2
 
-echo "===== [4/9] pre-build shared + plugin-sdk ====="
+echo "===== [4/10] pre-build shared + plugin-sdk ====="
 pnpm --filter @paperclipai/plugin-sdk ensure-build-deps >/dev/null 2>&1 || true
 pnpm --filter @paperclipai/shared build 2>&1 | tail -1
 pnpm --filter @paperclipai/plugin-sdk build 2>&1 | tail -1
 
-echo "===== [5/9] full workspace build ====="
+echo "===== [5/10] full workspace build ====="
 pnpm -r build 2>&1 | tail -2
 
-echo "===== [6/9] dashboard payload into the server package ====="
+echo "===== [6/10] build the sandbox-provider plugin dists ====="
+# The sandbox providers are deliberately NOT pnpm-workspace members (their
+# third-party SDK deps must not churn the root lockfile), so the full
+# workspace build above never visits them. Packing them unbuilt ships
+# tarballs whose manifests point at ./dist/* files that do not exist, and the
+# core-chain export scan cannot see them because nothing on the core install
+# closure depends on them. Build each provider standalone here: install its
+# registry deps, link the already-built plugin-sdk in for type resolution,
+# then run the package's own build script. Safe to re-run: npm install
+# converges, and every build starts with `rm -rf dist`.
+for D in packages/plugins/sandbox-providers/*/; do
+  [ -f "$D/package.json" ] || continue
+  echo "  -> $D"
+  # Full deps (not --omit=dev): the tsconfig needs @types/node and the
+  # devDep typescript is the compiler this package pins.
+  (cd "$D" && npm install --no-audit --no-fund --no-package-lock --loglevel=error 2>&1 | tail -1)
+  mkdir -p "$D/node_modules/@paperclipai"
+  ln -sfn "$REPO_ROOT/packages/plugins/sdk" "$D/node_modules/@paperclipai/plugin-sdk"
+  (cd "$D" && npm run build 2>&1 | tail -1)
+  for ENTRY in index.js manifest.js worker.js; do
+    test -f "$D/dist/$ENTRY"       || { echo "FATAL: $D/dist/$ENTRY missing after build" >&2; exit 1; }
+  done
+done
+
+echo "===== [7/10] dashboard payload into the server package ====="
 PAPERCLIP_RELEASE_REUSE_UI_DIST=1 bash scripts/prepare-server-ui-dist.sh 2>&1 | tail -2
 test -f server/ui-dist/index.html || { echo "FATAL: server/ui-dist/index.html missing" >&2; exit 1; }
 
@@ -117,25 +141,29 @@ SERVER_LISTING="$(tar -tzf "$OUT/paperclipai-server-$VERSION.tgz" | grep -c '^pa
 echo "  -> server tarball ships ui-dist/index.html"
 # (c) install closure + export targets + URL pins (same code the preflight runs)
 node - "$OUT" "$VERSION" <<'NODE'
-import { coreChainClosure, listTarballs, scanExportTargets, scanUrlClosure } from "./scripts/fork-release/lib.mjs";
+import path from "node:path";
+import { listTarballs, scanExportTargets, scanUrlClosure } from "./scripts/fork-release/lib.mjs";
 const [outDir, version] = process.argv.slice(2);
-const coreAsset = `paperclipai-${version}.tgz`;
 const closure = scanUrlClosure({ assetsDir: outDir, version });
 if (!closure.ok) {
   for (const v of closure.violations) console.error(JSON.stringify(v));
   process.exit(1);
 }
 console.log(`  -> URL closure OK (${closure.references.length} internal refs)`);
-const chain = coreChainClosure({ assetsDir: outDir, coreTarballName: coreAsset });
+// Scan EVERY tarball in the release set, not only the core install closure:
+// provider plugin tarballs are not reachable from the core URL pins, so a
+// closure-scoped scan silently passes a provider that ships no code.
+const all = listTarballs(outDir);
 const violations = [];
-for (const [asset, { tarballPath }] of chain) {
+for (const tarballPath of all) {
+  const asset = path.basename(tarballPath);
   violations.push(...scanExportTargets(tarballPath).violations.map((v) => ({ asset, ...v })));
 }
 if (violations.length > 0) {
   for (const v of violations) console.error(JSON.stringify(v));
   process.exit(1);
 }
-console.log(`  -> export targets OK on the ${chain.size}-package install closure`);
+console.log(`  -> export targets OK on all ${all.length} release tarballs`);
 NODE
 # Plain names (no ./ prefix), matching the basename keys the verifier and the
 # test-only injector use; verifyChecksums also normalizes either format.

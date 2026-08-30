@@ -148,9 +148,13 @@ function assetNameFor(packageName, version) {
 /**
  * Verify that every concrete export/main/types target declared by a packed
  * manifest exists inside the same tarball. Wildcard targets (`./dist/*.js`)
- * are checked by directory existence. This is the static catch for the
- * "dev manifest shipped" class: `exports -> ./src/index.ts` with no `src/`
- * in the tarball fails here before anyone installs the release.
+ * are checked by directory existence. `paperclipPlugin` entrypoints
+ * (`manifest`/`worker`/`ui`) are checked the same way — they are the paths
+ * the host's plugin loader actually imports, so a packed plugin manifest
+ * that declares them without shipping them is the same defect class as a
+ * dev manifest shipped. This is the static catch for that class:
+ * `exports -> ./src/index.ts` with no `src/` in the tarball fails here
+ * before anyone installs the release.
  */
 export function scanExportTargets(tarballPath) {
   const tarballName = path.basename(tarballPath);
@@ -162,6 +166,15 @@ export function scanExportTargets(tarballPath) {
   if (typeof manifest.main === "string") targets.push({ field: "main", value: manifest.main });
   if (typeof manifest.types === "string") targets.push({ field: "types", value: manifest.types });
   collectExportTargets(manifest.exports, "exports", targets);
+  const pluginEntry = manifest.paperclipPlugin;
+  if (pluginEntry && typeof pluginEntry === "object" && !Array.isArray(pluginEntry)) {
+    for (const key of ["manifest", "worker", "ui"]) {
+      const value = pluginEntry[key];
+      if (typeof value === "string" && value.length > 0) {
+        targets.push({ field: `paperclipPlugin.${key}`, value });
+      }
+    }
+  }
 
   for (const { field, value } of targets) {
     if (value.includes("*")) {

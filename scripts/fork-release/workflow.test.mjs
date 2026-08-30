@@ -1,4 +1,6 @@
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -111,4 +113,91 @@ test("the preflight step cannot mask a FAIL verdict behind its tee pipeline", ()
     pipefailAt !== -1 && pipefailAt < nodeAt,
     "pipefail must be enabled before the node gate runs",
   );
+});
+
+// ---------------------------------------------------------------------------
+// Export-target gate scope: every release tarball, not only the core closure
+// ---------------------------------------------------------------------------
+
+const EXPORT_GATE_VERSION = "0.0.0-export-gate-wiring";
+const preflightPath = path.join(repoRoot, "scripts", "fork-release", "preflight.mjs");
+
+function packFixtureTarball(assetsDir, assetName, { manifest, files = {} }) {
+  const work = mkdtempSync(path.join(assetsDir, "pack-"));
+  const inner = path.join(work, "package");
+  mkdirSync(inner, { recursive: true });
+  for (const [rel, content] of Object.entries(files)) {
+    const target = path.join(inner, rel);
+    mkdirSync(path.dirname(target), { recursive: true });
+    writeFileSync(target, content);
+  }
+  writeFileSync(path.join(inner, "package.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+  const out = path.join(assetsDir, assetName);
+  const result = spawnSync("tar", ["--owner=0", "--group=0", "-czf", out, "-C", work, "package"], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  rmSync(work, { recursive: true, force: true });
+  return out;
+}
+
+// A minimal two-tarball set: the core package (no export targets of its own)
+// plus one provider plugin whose packed manifest points at ./dist/* — with
+// and without the dist files actually shipped.
+function makeExportGateFixture({ withDist }) {
+  const assets = mkdtempSync(path.join(tmpdir(), "export-gate-fixture-"));
+  packFixtureTarball(assets, `paperclipai-${EXPORT_GATE_VERSION}.tgz`, {
+    manifest: { name: "paperclipai", version: EXPORT_GATE_VERSION },
+  });
+  packFixtureTarball(assets, `paperclipai-plugin-e2b-${EXPORT_GATE_VERSION}.tgz`, {
+    files: withDist ? { "dist/index.js": "export {};\n", "dist/index.d.ts": "export {};\n", "dist/manifest.js": "export default {};\n", "dist/worker.js": "export {};\n" } : {},
+    manifest: {
+      name: "@paperclipai/plugin-e2b",
+      version: EXPORT_GATE_VERSION,
+      main: "./dist/index.js",
+      exports: { ".": { types: "./dist/index.d.ts", import: "./dist/index.js" } },
+      paperclipPlugin: { manifest: "./dist/manifest.js", worker: "./dist/worker.js" },
+    },
+  });
+  return assets;
+}
+
+function runExportsGate(assetsDir) {
+  return spawnSync("node", [
+    preflightPath,
+    "--core-url", `https://github.com/claudegoogl-sudo/paperclip/releases/download/v${EXPORT_GATE_VERSION}/paperclipai-${EXPORT_GATE_VERSION}.tgz`,
+    "--assets-dir", assetsDir,
+    "--steps", "exports",
+  ], { encoding: "utf8" });
+}
+
+test("the export gate refuses a provider tarball whose manifest points at unshipped dist files", () => {
+  const assets = makeExportGateFixture({ withDist: false });
+  try {
+    const result = runExportsGate(assets);
+    assert.notEqual(
+      result.status,
+      0,
+      `the gate must FAIL a packed-but-never-built provider tarball; gate output:\n${result.stdout}\n${result.stderr}`,
+    );
+    assert.match(
+      `${result.stdout}\n${result.stderr}`,
+      /plugin-e2b/,
+      "the violation must name the offending tarball",
+    );
+  } finally {
+    rmSync(assets, { recursive: true, force: true });
+  }
+});
+
+test("the export gate passes a provider tarball that ships its dist", () => {
+  const assets = makeExportGateFixture({ withDist: true });
+  try {
+    const result = runExportsGate(assets);
+    assert.equal(
+      result.status,
+      0,
+      `the gate must pass a provider tarball that ships its dist; gate output:\n${result.stdout}\n${result.stderr}`,
+    );
+  } finally {
+    rmSync(assets, { recursive: true, force: true });
+  }
 });

@@ -19,8 +19,10 @@ passes first:
    - verifies every tarball against `SHA256SUMS.txt`;
    - verifies the URL-pin closure (every internal dep is the exact release
      URL of this release, and every referenced asset is in the set);
-   - verifies every manifest on the install closure points its
-     `main`/`exports`/`types` targets at files that ship in the same tarball;
+   - verifies every manifest in the release set (all tarballs, not only the
+     core install closure) points its `main`/`exports`/`types` and
+     `paperclipPlugin` entrypoint targets at files that ship in the same
+     tarball;
    - clean-sandbox `npm install` of the core tarball **from the exact
      published release URLs** (no `file:` overrides, no local paths), so the
      full internal graph resolves the way it will for customers;
@@ -66,6 +68,10 @@ tarballs).
   release assets at their exact published URL strings.
 - `negative-test-fork34.mjs` — test-only defect injector; never run against
   a set you intend to publish.
+- `negative-test-empty-provider.mjs` — test-only defect injector for the
+  empty-provider class (a packed plugin tarball whose manifest points at
+  `./dist/*` with no `dist/` shipped); never run against a set you intend
+  to publish.
 - `lib.mjs` — the URL-closure / export-target / checksum checks.
 - `lib.test.mjs`, `workflow.test.mjs` — unit tests for the checks and the
   workflow wiring (run in PR CI).
@@ -80,3 +86,11 @@ tarballs).
   succeeds and doctor passes; the server dies at boot with
   `Cannot find module '@paperclipai/db/src/index.ts'`. Caught statically by
   the export-target scan and dynamically by the boot step.
+- **Providers packed without ever being built** (shipped across several
+  releases): the sandbox-provider plugins sit outside the pnpm workspace,
+  so the workspace build never produced their `dist/` while their packed
+  manifests kept pointing at `./dist/*` — and being invisible to the core
+  install closure, no gate noticed. `build.sh` now builds every provider
+  before packing, and the export-target scan covers every tarball in the
+  release set, so an unbuilt (or any other target-less) tarball fails the
+  gate instead of shipping.
