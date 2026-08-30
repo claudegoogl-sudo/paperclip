@@ -41,7 +41,45 @@ test("the preflight installs from the exact release URL and asserts the dashboar
 
 test("the preflight stages assets on a draft release that is never public before the gate", () => {
   const workflow = readWorkflow("fork-release.yml");
-  assert.match(workflow, /gh release create "\$TAG".*--draft --prerelease/, "staging must be a draft");
+  const stage = workflow.slice(
+    workflow.indexOf("Stage the release set on a draft release"),
+    workflow.indexOf("Download the staged assets"),
+  );
+  // The draft is created over REST: draft=true keeps it private until the
+  // publish gate flips it, and the same call yields the numeric release id
+  // every later step resolves instead of the tag.
+  assert.match(stage, /repos\/\$RELEASE_REPO\/releases" /, "staging must create the draft over REST");
+  assert.match(stage, /-f tag_name="\$TAG"/, "the draft must carry the run's release tag");
+  assert.match(stage, /-F draft=true/, "staging must create a DRAFT release");
+  assert.match(stage, /-F prerelease=true/, "staging must mark the release prerelease");
+  assert.match(stage, /-f target_commitish="\$GITHUB_SHA"/, "the draft must pin the run's commit");
+  assert.match(stage, /--jq '\.id'/, "the create call must capture the numeric release id");
+  assert.match(stage, /DRAFT_RELEASE_ID=\$release_id" >> "\$GITHUB_ENV"/, "the id must be exported to later steps");
+  assert.doesNotMatch(stage, /gh release create/, "the gh CLI create path is replaced by the REST call");
+});
+
+test("the staged-asset lookup resolves the draft release by id, never by tag", () => {
+  const workflow = readWorkflow("fork-release.yml");
+  const download = workflow.slice(workflow.indexOf("Download the staged assets"));
+  assert.match(
+    download,
+    /repos\/\$RELEASE_REPO\/releases\/\$DRAFT_RELEASE_ID/,
+    "the asset TSV must come from the captured draft release id",
+  );
+  assert.match(download, /--jq '\.assets\[\] \| \[\.id, \.name\] \| @tsv'/, "the TSV must carry numeric REST asset ids");
+  assert.doesNotMatch(
+    download,
+    /releases\/tags\/\$TAG/,
+    "the REST by-tag endpoint resolves published releases only and 404s on drafts",
+  );
+  // The ban spans the WHOLE preflight job, not just the download step: the
+  // by-tag REST lookup 404s on drafts, which is the exact failure that ended
+  // dry run 33299563388. Prose comments may still name the retired endpoint;
+  // this matches the actual "$TAG" call shape only.
+  const preflightJob = workflow.slice(workflow.indexOf("  preflight:"), workflow.indexOf("  publish:"));
+  assert.doesNotMatch(preflightJob, /releases\/tags\/\$TAG/, "no REST by-tag lookup anywhere in the preflight job");
+  assert.match(download, /case "\$\{DRAFT_RELEASE_ID:-\}" in/, "DRAFT_RELEASE_ID must be validated before use");
+  assert.match(download, /''\|\*\[!0-9\]\*/, "the guard must refuse a missing or non-numeric id");
 });
 
 test("the negative-test injector produces a set the static gate refuses", async () => {

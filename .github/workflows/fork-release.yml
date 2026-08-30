@@ -118,8 +118,26 @@ jobs:
           set -euo pipefail
           notes="Automated fork release staging for ${{ inputs.version }}."
           notes="$notes\n\nDraft staged by the Fork Release workflow; assets are not public until the preflight passes and the release is published."
-          gh release create "$TAG" --repo "$RELEASE_REPO" --draft --prerelease \
-            --target "$GITHUB_SHA" --title "Paperclip ${{ inputs.version }}" --notes "$notes"
+          # Create the draft over REST and capture its numeric release id in the
+          # same call. REST repos/{repo}/releases/tags/{tag} resolves published
+          # releases only and 404s on drafts, so every later step that needs
+          # release identity resolves THIS id instead of the tag.
+          release_id="$(gh api "repos/$RELEASE_REPO/releases" \
+            -f tag_name="$TAG" \
+            -f target_commitish="$GITHUB_SHA" \
+            -F draft=true \
+            -F prerelease=true \
+            -f name="Paperclip ${{ inputs.version }}" \
+            -f body="$notes" \
+            --jq '.id')"
+          case "$release_id" in
+            ''|*[!0-9]*)
+              echo "draft release create returned no numeric id: '$release_id'" >&2
+              exit 1
+              ;;
+          esac
+          echo "DRAFT_RELEASE_ID=$release_id" >> "$GITHUB_ENV"
+          echo "Draft release $TAG created (id $release_id)"
           gh release upload "$TAG" --repo "$RELEASE_REPO" dist-tarballs/*.tgz dist-tarballs/SHA256SUMS.txt
 
       - name: Download the staged assets (byte-identity check happens in the preflight)
@@ -128,11 +146,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p staged-assets
-          # REST release lookup so .id is the numeric REST id the download call
-          # below needs. `gh release view --json assets` returns GraphQL asset
-          # objects: no .databaseId field, and .id is a node id that 404s on
-          # repos/*/releases/assets/{id}.
-          gh api "repos/$RELEASE_REPO/releases/tags/$TAG" \
+          # DRAFT_RELEASE_ID is exported by the staging step: the numeric REST id
+          # captured from the draft-create call. The REST release-by-tag endpoint
+          # (repos/*/releases/tags/{tag}) resolves published releases only and
+          # 404s while the release is still a draft, so the lookup goes by id.
+          case "${DRAFT_RELEASE_ID:-}" in
+            ''|*[!0-9]*)
+              echo "DRAFT_RELEASE_ID is missing or not numeric: '${DRAFT_RELEASE_ID:-}'" >&2
+              exit 1
+              ;;
+          esac
+          gh api "repos/$RELEASE_REPO/releases/$DRAFT_RELEASE_ID" \
             --jq '.assets[] | [.id, .name] | @tsv' > /tmp/assets.tsv
           expected=$(awk 'END{print NR}' /tmp/assets.tsv)
           while IFS=$'\t' read -r assetId name || [ -n "$assetId" ]; do
