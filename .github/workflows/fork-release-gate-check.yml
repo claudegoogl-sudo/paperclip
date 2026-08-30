@@ -8,6 +8,8 @@ name: Fork Release Gate Check
 #   2. the static preflight gates must PASS the clean set
 #   3. the same gates must FAIL the set after the test-only injector
 #      reproduces the historically-shipped dev-exports defect
+#   4. the same gates must FAIL the set after the second test-only injector
+#      strips a provider tarball's dist (the empty-provider defect)
 #
 # The install/boot half of the gate runs in the Fork Release workflow's
 # preflight job before anything is published.
@@ -79,6 +81,24 @@ jobs:
             exit 1
           fi
           echo "gate refused the corrupted set (exit $status) — blocking behavior confirmed"
+
+      - name: Static gates must refuse a provider tarball with no dist (empty-provider defect)
+        run: |
+          cp -r dist-tarballs dist-tarballs-empty-provider
+          node scripts/fork-release/negative-test-empty-provider.mjs --dir dist-tarballs-empty-provider
+          set +e
+          node scripts/fork-release/preflight.mjs \
+            --core-url "https://github.com/claudegoogl-sudo/paperclip/releases/download/v$GATE_VERSION/paperclipai-$GATE_VERSION.tgz" \
+            --assets-dir "$PWD/dist-tarballs-empty-provider" \
+            --sha256sums "$PWD/dist-tarballs-empty-provider/SHA256SUMS.txt" \
+            --steps checksums,closure,exports
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "GATE DEFECT: the empty-provider set passed the static gates" >&2
+            exit 1
+          fi
+          echo "gate refused the empty-provider set (exit $status) — blocking behavior confirmed"
 
       - name: Upload the built release set
         if: always()
