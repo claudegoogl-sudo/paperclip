@@ -19,7 +19,9 @@
 # pure `page-test` drill (state file untouched, transport-branch selection,
 # DRILL payload shape), and the Telegram page-transport helper against a stub
 # Bot API (rc contract 3/2/1/0, one sendMessage per attempt, one log line per
-# attempt, message label/DRILL/3800-char cap, no token or log tail anywhere).
+# attempt, message label/DRILL/3800-char cap, no token or log tail anywhere),
+# plus the hardening gates: fail-closed env-file mode (0600/0400 only) and the
+# bot-token format check, both rc 3 with one log line and no HTTP attempt.
 #
 #   ./scripts/pg-recover.test.sh
 #
@@ -331,6 +333,44 @@ chmod 600 "$TG_ENV"
 expect_exit 3 "empty bot token in env file -> rc 3" "$RECOVER" page-test
 grep -q 'pg-recover-page-telegram] no transport: bot token or chat id' "$PG_RECOVER_LOG" \
   && ok "empty-token log line names the variable problem" || bad "empty-token log line missing"
+
+echo "== case: telegram page helper — hardening: env-file mode + token format =="
+# API_BASE stays on the closed port here: any HTTP attempt against it ends
+# rc 2, so an rc 3 below proves the gate fired BEFORE any HTTP attempt.
+export PG_RECOVER_PAGE_TELEGRAM_API_BASE="http://127.0.0.1:1"
+# Mode gate: a mis-staged 0644 env file fails closed BEFORE sourcing.
+printf 'PG_RECOVER_PAGE_TELEGRAM_BOT_TOKEN=123456:drill-token-ABCDEF\nPG_RECOVER_PAGE_TELEGRAM_CHAT_ID=5145760634\n' > "$TG_ENV"
+chmod 644 "$TG_ENV"
+LINES_BEFORE="$(wc -l < "$PG_RECOVER_LOG" | tr -d ' ')"
+expect_exit 3 "env file mode 0644 -> rc 3 (fail-closed before sourcing)" "$RECOVER" page-test
+LINES_AFTER="$(wc -l < "$PG_RECOVER_LOG" | tr -d ' ')"
+[ "$LINES_AFTER" = "$((LINES_BEFORE + 1))" ] \
+  && ok "0644 env file appended exactly ONE log line" || bad "log lines $LINES_BEFORE -> $LINES_AFTER"
+tail -1 "$PG_RECOVER_LOG" | grep -qF "no transport: credentials env file not 0600: $TG_ENV" \
+  && ok "0644 log line names the mode problem and the path" || bad "0644 log line wrong: $(tail -1 "$PG_RECOVER_LOG")"
+
+# Token-format gate: correctly-staged file, malformed token fails closed
+# AFTER sourcing.
+printf 'PG_RECOVER_PAGE_TELEGRAM_BOT_TOKEN=no-colon-here\nPG_RECOVER_PAGE_TELEGRAM_CHAT_ID=5145760634\n' > "$TG_ENV"
+chmod 600 "$TG_ENV"
+LINES_BEFORE="$(wc -l < "$PG_RECOVER_LOG" | tr -d ' ')"
+expect_exit 3 "malformed bot token (no colon) -> rc 3" "$RECOVER" page-test
+LINES_AFTER="$(wc -l < "$PG_RECOVER_LOG" | tr -d ' ')"
+[ "$LINES_AFTER" = "$((LINES_BEFORE + 1))" ] \
+  && ok "malformed-token case appended exactly ONE log line" || bad "log lines $LINES_BEFORE -> $LINES_AFTER"
+tail -1 "$PG_RECOVER_LOG" | grep -q 'pg-recover-page-telegram] no transport: bot token format invalid' \
+  && ok "malformed-token log line names the format problem" || bad "format log line wrong: $(tail -1 "$PG_RECOVER_LOG")"
+
+# Accepted mode: 0400 (POSIX read-only equivalent) passes BOTH gates and
+# proceeds to the transport, which fails rc 2 on the closed port — proving
+# the mode gate does not over-block.
+printf 'PG_RECOVER_PAGE_TELEGRAM_BOT_TOKEN=123456:drill-token-ABCDEF\nPG_RECOVER_PAGE_TELEGRAM_CHAT_ID=5145760634\n' > "$TG_ENV"
+chmod 400 "$TG_ENV"
+expect_exit 2 "env file mode 0400 passes both gates -> rc 2 (transport on closed port)" "$RECOVER" page-test
+tail -1 "$PG_RECOVER_LOG" | grep -q 'pg-recover-page-telegram] sent ok=false http=none curl_rc=' \
+  && ok "0400 file got past both hardening gates (transport-failure log shape)" \
+  || bad "0400 log line wrong: $(tail -1 "$PG_RECOVER_LOG")"
+chmod 600 "$TG_ENV"
 
 echo "== case: telegram page helper — delivered (rc 0) against a stub Bot API =="
 TG_PORT=$((40000 + RANDOM % 20000))

@@ -23,8 +23,9 @@
 #   0  delivered  — HTTP 2xx AND body ok:true AND message_id parsed
 #   1  failed     — an HTTP response arrived, but non-2xx or ok:false
 #   2  transport failure — curl itself failed (DNS, timeout, refused, TLS)
-#   3  no transport configured — env file missing/unreadable, or bot
-#      token / chat id missing or empty in it
+#   3  no transport configured — env file missing/unreadable, wrong file
+#      mode (0600 required; 0400 accepted), or bot token / chat id missing,
+#      empty, or malformed in it
 #
 # Observability: every attempt appends exactly ONE line to the watchdog log
 # file ${PG_RECOVER_LOG:-~/.paperclip/instances/default/logs/pg-recover.log}:
@@ -48,12 +49,17 @@
 # substitution, so curl's argv contains only a /dev/fd/N path — never the
 # token. The token still transits the request URL toward the Bot API over
 # TLS; that part is inherent to the Telegram API and not avoidable
-# client-side.
+# client-side. Because the URL is built inside that `-K` config line with
+# the token embedded un-escaped, the token is validated on load against the
+# BotFather shape ^[0-9]+:[A-Za-z0-9_-]+$ — a value that could carry
+# curl-config metacharacters (`"`, `\`, newline) fails closed with rc 3.
 #
 # Configuration (environment):
 #   PG_RECOVER_PAGE_TELEGRAM_ENV        credentials file (default
 #                                       ~/.paperclip/secrets/pg-recover-page-telegram.env),
-#                                       chmod 0600, staged by the operator:
+#                                       chmod 0600 (0400 accepted), staged by
+#                                       the operator — any other mode fails
+#                                       closed with rc 3:
 #                                         PG_RECOVER_PAGE_TELEGRAM_BOT_TOKEN=123456:AAA...
 #                                         PG_RECOVER_PAGE_TELEGRAM_CHAT_ID=5145760634
 #   PG_RECOVER_PAGE_TELEGRAM_API_BASE   Bot API base (default
@@ -87,10 +93,31 @@ if [ ! -r "$ENV_FILE" ]; then
   log_line "no transport: credentials env file missing/unreadable: $ENV_FILE"
   exit 3
 fi
+# Fail closed on a mis-staged mode. On this single-uid host a mode bit adds
+# no actor boundary (every agent shares the uid); the check converts a silent
+# misconfiguration into a loud rc 3 and is defense-in-depth for any future
+# multi-uid deployment. 0400 is the POSIX read-only equivalent and accepted.
+env_mode="$(stat -c %a "$ENV_FILE" 2>/dev/null || true)"
+if [ "$env_mode" != "600" ] && [ "$env_mode" != "400" ]; then
+  log_line "no transport: credentials env file not 0600: $ENV_FILE"
+  exit 3
+fi
 # shellcheck disable=SC1090
 . "$ENV_FILE"
 if [ -z "${PG_RECOVER_PAGE_TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${PG_RECOVER_PAGE_TELEGRAM_CHAT_ID:-}" ]; then
   log_line "no transport: bot token or chat id missing/empty in $ENV_FILE"
+  exit 3
+fi
+# BotFather tokens match ^[0-9]+:[A-Za-z0-9_-]+$; the sendMessage URL is
+# built inside a `-K` config line with the token embedded un-escaped, so the
+# shape is validated BEFORE the token reaches that config. Anyone able to
+# write the 0600 file already has code-exec here, so this is hardening, not
+# an actor boundary — but it also fails closed on a mis-staged/wrong file.
+# The explicit newline check closes the ERE `$`-matches-before-final-newline
+# edge (a trailing newline inside the -K quoted value would corrupt the URL).
+if ! [[ "$PG_RECOVER_PAGE_TELEGRAM_BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] \
+   || [[ "$PG_RECOVER_PAGE_TELEGRAM_BOT_TOKEN" == *$'\n'* ]]; then
+  log_line "no transport: bot token format invalid"
   exit 3
 fi
 BOT_TOKEN="$PG_RECOVER_PAGE_TELEGRAM_BOT_TOKEN"
