@@ -3930,7 +3930,13 @@ describe("ensureRuntimeServicesForRun", () => {
           },
           adapterEnv: {},
         }),
-      ).rejects.toThrow(/Readiness check failed for http:\/\/127\.0\.0\.1:\d+\/api\/health: received HTTP 503/);
+      // The readiness probe runs each fetch under AbortSignal.timeout clamped to the
+      // remaining deadline, so under a loaded runner the observed failure can surface
+      // either as the stub's HTTP 503 response or as a probe timeout abort. Assert the
+      // fact of readiness failure (with its URL context), not one specific transport.
+      ).rejects.toThrow(
+        /Readiness check failed for http:\/\/127\.0\.0\.1:\d+\/api\/health: (received HTTP 503|The operation was aborted due to timeout)/,
+      );
     } finally {
       await releaseRuntimeServicesForRun(runId);
     }
