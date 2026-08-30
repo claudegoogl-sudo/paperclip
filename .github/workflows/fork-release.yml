@@ -202,6 +202,12 @@ jobs:
         env:
           NODE_EXTRA_CA_CERTS: ${{ github.workspace }}/cert.pem
         run: |
+          # Actions runs run-blocks with `bash -e`, which cannot see through a
+          # pipeline: `node ... | tee` exits with tee's status, so the gate's
+          # FAIL verdict (process.exit(1)) would be silently discarded and a
+          # broken release would publish. pipefail makes the node exit code
+          # the step's exit code.
+          set -euo pipefail
           node scripts/fork-release/preflight.mjs \
             --core-url "$CORE_URL" \
             --assets-dir "$PWD/staged-assets" \
