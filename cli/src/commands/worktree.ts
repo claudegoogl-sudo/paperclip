@@ -49,10 +49,12 @@ import {
   buildEmbeddedPostgresConstructorOptions,
   createEmbeddedPostgresLogBuffer,
   formatEmbeddedPostgresError,
+  migrateLegacyEmbeddedPostgresSocket,
   prepareEmbeddedPostgresNativeRuntime,
   readEmbeddedPostgresCredential,
   resolveEmbeddedPostgresPasswordForStartup,
   rotateEmbeddedPostgresAuthIfNeeded,
+  socketDirectoryPathFor,
 } from "@paperclipai/db";
 import type { Command } from "commander";
 import { ensureAgentJwtSecret, loadPaperclipEnvFile, mergePaperclipEnvEntries, readPaperclipEnvEntries, resolvePaperclipEnvFile } from "../config/env.js";
@@ -1057,6 +1059,7 @@ function resolveSourceConnectionString(config: PaperclipConfig, envEntries: Reco
     port,
     database: "paperclip",
     password: cred.password,
+    socketDir: socketDirectoryPathFor(config.database.embeddedPostgresDataDir),
   });
 }
 
@@ -1123,6 +1126,10 @@ async function ensureEmbeddedPostgres(dataDir: string, preferredPort: number): P
   await prepareEmbeddedPostgresNativeRuntime();
 
   const postmasterPidFile = path.resolve(dataDir, "postmaster.pid");
+  // If a legacy cluster (socket on /tmp) is running, stop it so the
+  // start path below brings it back with the new socket dir + flags. No-op
+  // when nothing is running or the running cluster already uses our dir.
+  await migrateLegacyEmbeddedPostgresSocket(dataDir);
   const runningPid = readRunningPostmasterPid(postmasterPidFile);
   const startupPasswordResolution = resolveEmbeddedPostgresPasswordForStartup(dataDir);
   if (runningPid) {
@@ -1377,6 +1384,7 @@ async function seedWorktreeDatabase(input: {
         port: sourceHandle.port,
         database: "postgres",
         password: sourceHandle.password,
+        socketDir: socketDirectoryPathFor(input.sourceConfig.database.embeddedPostgresDataDir),
       });
       await ensurePostgresDatabase(sourceAdminConnectionString, "paperclip");
     }
@@ -1405,12 +1413,14 @@ async function seedWorktreeDatabase(input: {
       port: targetHandle.port,
       database: "postgres",
       password: targetHandle.password,
+      socketDir: socketDirectoryPathFor(input.targetConfig.database.embeddedPostgresDataDir),
     });
     await resetPostgresDatabase(adminConnectionString, "paperclip");
     const targetConnectionString = buildEmbeddedPostgresConnectionString({
       port: targetHandle.port,
       database: "paperclip",
       password: targetHandle.password,
+      socketDir: socketDirectoryPathFor(input.targetConfig.database.embeddedPostgresDataDir),
     });
     await runDatabaseRestore({
       connectionString: targetConnectionString,

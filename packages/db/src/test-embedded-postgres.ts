@@ -4,10 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import { applyPendingMigrations, ensurePostgresDatabase } from "./client.js";
 import {
+  EMBEDDED_POSTGRES_HOST,
   buildEmbeddedPostgresConnectionString,
   buildEmbeddedPostgresConstructorOptions,
   resolveEmbeddedPostgresPasswordForStartup,
   rotateEmbeddedPostgresAuthIfNeeded,
+  socketDirectoryPathFor,
 } from "./embedded-postgres-auth.js";
 import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
 
@@ -126,6 +128,12 @@ async function createEmbeddedPostgresTestInstance(tempDirPrefix: string) {
       dataDir,
       port,
       password: startupPasswordResolution.password,
+      // Production kills the TCP listener (listen_addresses=""); the test
+      // harness re-enables loopback TCP so the broad DB suites can keep using
+      // bare `postgres(127.0.0.1:port)` connection strings without threading
+      // unix-socket options through every call site. The killed-TCP posture is
+      // covered directly by embedded-postgres-auth.test.ts.
+      listenAddresses: EMBEDDED_POSTGRES_HOST,
       onLog: (message) => recordStartupLogLine(recentLogs, message),
       onError: (message) => recordStartupLogLine(recentLogs, message),
     }),
@@ -137,6 +145,7 @@ async function createEmbeddedPostgresTestInstance(tempDirPrefix: string) {
 function cleanupEmbeddedPostgresTestDirs(dataDir: string) {
   fs.rmSync(dataDir, { recursive: true, force: true });
   fs.rmSync(ownerPidMarkerPath(dataDir), { force: true });
+  fs.rmSync(socketDirectoryPathFor(dataDir), { recursive: true, force: true });
 }
 
 // A killed run (SIGKILL mid-suite, the routine way a heartbeat run ends here)
@@ -407,6 +416,9 @@ export async function startEmbeddedPostgresTestDatabase(
         database: "postgres",
         password: rotation.password,
       });
+      // The harness keeps loopback TCP enabled (see listenAddresses above), so
+      // the TCP-shaped connection strings below connect directly — no socket
+      // routing needed here.
       await ensurePostgresDatabase(adminConnectionString, "paperclip");
       const connectionString = buildEmbeddedPostgresConnectionString({
         port,
