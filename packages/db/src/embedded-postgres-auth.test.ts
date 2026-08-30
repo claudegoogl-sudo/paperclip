@@ -1075,8 +1075,8 @@ describeEmbedded("embedded-postgres-auth: real-cluster rotation + fresh initdb",
     // Warm-restart migration: a pre-fix cluster has its socket at
     // /tmp. Postgres cannot move a live socket via SQL, so the migration
     // helper must stop the cluster. After stop, re-opening with the new
-    // constructor binds the socket at <dataDir>.socket and the TCP listener
-    // stays killed.
+    // constructor binds the socket at socketDirectoryPathFor(dataDir) (the
+    // hashed per-install dir) and the TCP listener stays killed.
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-legacy-migrate-"));
     cleanups.push(async () => {
       fs.rmSync(dataDir, { recursive: true, force: true });
