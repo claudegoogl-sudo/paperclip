@@ -13,9 +13,13 @@
 # N-consecutive-failure escalation, recovery re-arm (healthy observation and
 # clear-state), stale/alive pidfile handling, the alert payload shape, and the
 # board description build (a fake board API captures the POSTed issue; the
-# multi-line log tail must render with real newlines, not backslash-n text), and
+# multi-line log tail must render with real newlines, not backslash-n text),
 # empty/optional-field rendering via `alert-desc` (empty detail must not shift
-# positional fields; null first_failure_at falls back to its default).
+# positional fields; null first_failure_at falls back to its default), the
+# pure `page-test` drill (state file untouched, transport-branch selection,
+# DRILL payload shape), and the Telegram page-transport helper against a stub
+# Bot API (rc contract 3/2/1/0, one sendMessage per attempt, one log line per
+# attempt, message label/DRILL/3800-char cap, no token or log tail anywhere).
 #
 #   ./scripts/pg-recover.test.sh
 #
@@ -276,6 +280,160 @@ printf '%s\n' "$RENDERED" | grep -Fq "Port: $PORT" \
 printf '%s' "$RENDERED" | grep -Fq '\n' \
   && bad "crafted render contains a literal backslash-n escape" \
   || ok "crafted empty-detail render has no literal backslash-n escape"
+
+echo "== case: page-test drill is pure (no state reads/writes), branch selection =="
+SENTINEL='{"backoff":true,"alerted_page":"not-touched","alerted_board":true,"reason":"panic","consecutive_failures":9}'
+printf '%s' "$SENTINEL" > "$PG_RECOVER_STATE"
+unset PG_RECOVER_ALERT_FILE PG_RECOVER_PAGE_CMD
+PAGEOUT="$("$RECOVER" page-test 2>&1)"; PAGE_RC=$?
+[ "$PAGE_RC" = "3" ] && ok "page-test with no transport exits 3" || bad "page-test no-transport rc=$PAGE_RC (want 3)"
+printf '%s\n' "$PAGEOUT" | grep -q 'transport branch: none' \
+  && ok "page-test prints the 'none' transport branch" || bad "branch line missing: $PAGEOUT"
+printf '%s\n' "$PAGEOUT" | grep -q 'rc=3' \
+  && ok "page-test explains the rc meaning" || bad "rc meaning line missing"
+cmp -s "$PG_RECOVER_STATE" <(printf '%s' "$SENTINEL") \
+  && ok "no-transport drill left the state file byte-identical" || bad "state mutated by no-transport drill"
+
+export PG_RECOVER_ALERT_FILE="$TMP/drill-page.jsonl"
+: > "$PG_RECOVER_ALERT_FILE"
+expect_exit 0 "page-test via alert file exits 0" "$RECOVER" page-test
+[ "$(alert_count "$PG_RECOVER_ALERT_FILE")" = "1" ] \
+  && ok "exactly one drill payload captured" || bad "drill payload count = $(alert_count "$PG_RECOVER_ALERT_FILE")"
+cmp -s "$PG_RECOVER_STATE" <(printf '%s' "$SENTINEL") \
+  && ok "alert-file drill left the state file byte-identical" || bad "state mutated by alert-file drill"
+jq -e '(.reason == "drill")
+       and (.detail | startswith("DRILL"))
+       and (.consecutive_failed_starts == 0)
+       and (.first_failure_at == null)
+       and (.log_tail == "")
+       and (.port == '"$PORT"')' "$PG_RECOVER_ALERT_FILE" >/dev/null \
+  && ok "drill payload shape: drill reason, DRILL detail, zero counters, empty log tail" \
+  || bad "drill payload shape wrong: $(tail -1 "$PG_RECOVER_ALERT_FILE")"
+unset PG_RECOVER_ALERT_FILE
+
+echo "== case: telegram page helper — no-transport rc 3 (missing file, empty token) =="
+HELPER="$HERE/pg-recover-page-telegram.sh"
+export PG_RECOVER_PAGE_CMD="$HELPER"
+TG_ENV="$TMP/tg-page.env"
+export PG_RECOVER_PAGE_TELEGRAM_ENV="$TG_ENV"
+rm -f "$TG_ENV"
+export PG_RECOVER_PAGE_TELEGRAM_API_BASE="http://127.0.0.1:1"   # nothing listens; rc 3 must fire BEFORE any HTTP attempt
+LINES_BEFORE="$(wc -l < "$PG_RECOVER_LOG" | tr -d ' ')"
+expect_exit 3 "missing env file -> rc 3 (no transport)" "$RECOVER" page-test
+LINES_AFTER="$(wc -l < "$PG_RECOVER_LOG" | tr -d ' ')"
+[ "$LINES_AFTER" = "$((LINES_BEFORE + 1))" ] \
+  && ok "no-transport case appended exactly ONE log line" || bad "log lines $LINES_BEFORE -> $LINES_AFTER"
+grep -q 'pg-recover-page-telegram] no transport: credentials env file' "$PG_RECOVER_LOG" \
+  && ok "no-transport log line names the env-file problem" || bad "no-transport log line missing"
+
+printf 'PG_RECOVER_PAGE_TELEGRAM_BOT_TOKEN=\nPG_RECOVER_PAGE_TELEGRAM_CHAT_ID=5145760634\n' > "$TG_ENV"
+chmod 600 "$TG_ENV"
+expect_exit 3 "empty bot token in env file -> rc 3" "$RECOVER" page-test
+grep -q 'pg-recover-page-telegram] no transport: bot token or chat id' "$PG_RECOVER_LOG" \
+  && ok "empty-token log line names the variable problem" || bad "empty-token log line missing"
+
+echo "== case: telegram page helper — delivered (rc 0) against a stub Bot API =="
+TG_PORT=$((40000 + RANDOM % 20000))
+export PG_RECOVER_PAGE_TELEGRAM_API_BASE="http://127.0.0.1:$TG_PORT"
+TG_CAPTURE="$TMP/tg-captures.jsonl"
+TG_MODE="$TMP/tg-mode"
+printf 'ok' > "$TG_MODE"
+python3 -c "
+import http.server, sys, json
+from urllib.parse import parse_qs
+CAP, MODE = sys.argv[2], sys.argv[3]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get('Content-Length', 0)))
+        form = parse_qs(body.decode('utf-8'))
+        form['_path_ok'] = [self.path.startswith('/bot') and self.path.endswith('/sendMessage')]
+        with open(CAP, 'a') as f:
+            f.write(json.dumps(form) + '\n')
+        if open(MODE).read().strip() == 'ok':
+            code, resp = 200, b'{\"ok\":true,\"result\":{\"message_id\":4242}}'
+        else:
+            code, resp = 401, b'{\"ok\":false,\"error_code\":401,\"description\":\"Unauthorized\"}'
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(resp)
+    def log_message(self, *a): pass
+http.server.HTTPServer(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
+" "$TG_PORT" "$TG_CAPTURE" "$TG_MODE" &
+echo $! > "$TMP/listener-tg.pid"   # matched by the trap's listener*.pid glob
+sleep 0.4
+printf 'PG_RECOVER_PAGE_TELEGRAM_BOT_TOKEN=123456:drill-token-ABCDEF\nPG_RECOVER_PAGE_TELEGRAM_CHAT_ID=5145760634\n' > "$TG_ENV"
+chmod 600 "$TG_ENV"
+
+LINES_BEFORE="$(wc -l < "$PG_RECOVER_LOG" | tr -d ' ')"
+expect_exit 0 "page-test through the telegram helper exits 0 (delivered)" "$RECOVER" page-test
+[ -f "$TG_CAPTURE" ] && [ "$(wc -l < "$TG_CAPTURE" | tr -d ' ')" = "1" ] \
+  && ok "exactly ONE sendMessage POST for one attempt" \
+  || bad "POST count = $(wc -l < "$TG_CAPTURE" 2>/dev/null | tr -d ' ' || echo 0)"
+LAST_TG="$(tail -1 "$TG_CAPTURE")"
+[ "$(printf '%s' "$LAST_TG" | jq -r '.chat_id[0]')" = "5145760634" ] \
+  && ok "chat_id read from the env file" || bad "chat_id wrong"
+[ "$(printf '%s' "$LAST_TG" | jq -r '._path_ok[0]')" = "true" ] \
+  && ok "request path is <base>/bot<token>/sendMessage" || bad "request path shape wrong"
+TEXT="$(printf '%s' "$LAST_TG" | jq -r '.text[0]')"
+printf '%s' "$TEXT" | grep -q '^\[pg-recover\] \[DRILL\]' \
+  && ok "message starts with [pg-recover] and carries the DRILL label" \
+  || bad "message prefix wrong: $(printf '%s' "$TEXT" | head -1)"
+printf '%s' "$TEXT" | grep -qF "host=$(hostname)" \
+  && ok "message carries the host" || bad "host missing from message"
+printf '%s' "$TEXT" | grep -qF "failed_starts=0/$PG_RECOVER_MAX_FAILURES" \
+  && ok "message carries the failed-start counter" || bad "counter missing from message"
+printf '%s' "$TEXT" | grep -qF "Runbook: " \
+  && ok "message carries the runbook pointer" || bad "runbook missing from message"
+grep -qF "drill-token-ABCDEF" "$PG_RECOVER_LOG" \
+  && bad "TOKEN LEAKED into the watchdog log" || ok "token absent from the log file"
+LINES_AFTER="$(wc -l < "$PG_RECOVER_LOG" | tr -d ' ')"
+[ "$LINES_AFTER" = "$((LINES_BEFORE + 1))" ] \
+  && ok "delivered attempt appended exactly ONE log line" || bad "log lines $LINES_BEFORE -> $LINES_AFTER"
+tail -1 "$PG_RECOVER_LOG" | grep -q 'pg-recover-page-telegram] sent ok=true http=200 message_id=4242' \
+  && ok "ok=true log line shape (http + message_id)" || bad "ok=true log line wrong: $(tail -1 "$PG_RECOVER_LOG")"
+cmp -s "$PG_RECOVER_STATE" <(printf '%s' "$SENTINEL") \
+  && ok "delivered drill STILL left the state file untouched" || bad "state mutated by delivered drill"
+
+echo "== case: telegram page helper — 3800-char cap + direct stdin contract =="
+HUGE_RUNBOOK="$(python3 -c 'print("R" * 5000)')"
+CRAFTED="$(jq -n --arg rb "$HUGE_RUNBOOK" '{severity: "high", host: "cap-host",
+  detected_at: "2026-08-30T00:00:00Z", reason: "panic", detail: "d",
+  consecutive_failed_starts: 3, max_consecutive_failed_starts: 3,
+  first_failure_at: null, port: 54329, data_dir: "/d", log_path: "/l",
+  log_tail: "PAGES-MUST-NOT-CARRY-LOGS", runbook_ref: $rb}')"
+OUT="$(printf '%s' "$CRAFTED" | "$HELPER" 2>&1)"
+HELPER_RC=$?
+[ "$HELPER_RC" = "0" ] && ok "direct helper invocation (alert JSON on stdin) exits 0" || bad "direct helper rc=$HELPER_RC: $OUT"
+[ -z "$OUT" ] \
+  && ok "helper prints NOTHING to stdout/stderr (file-only logging)" || bad "helper wrote to stdout/stderr: $OUT"
+LAST_TG="$(tail -1 "$TG_CAPTURE")"
+TEXT_LEN="$(printf '%s' "$LAST_TG" | jq -r '.text[0] | length')"
+[ "$TEXT_LEN" -le 3800 ] \
+  && ok "message capped at 3800 chars (got $TEXT_LEN)" || bad "message length $TEXT_LEN exceeds the cap"
+printf '%s' "$LAST_TG" | jq -r '.text[0]' | grep -q '\[truncated\]' \
+  && ok "over-long runbook pointer is truncated, not dropped" || bad "no truncation marker"
+printf '%s' "$LAST_TG" | grep -qF "PAGES-MUST-NOT-CARRY-LOGS" \
+  && bad "log tail leaked into the message" || ok "log tail absent from the message"
+printf '%s' "$LAST_TG" | jq -r '.text[0]' | grep -q '^\[pg-recover\] WAL corruption' \
+  && ok "non-drill panic message carries the reason phrase, no DRILL label" || bad "panic phrase wrong"
+
+echo "== case: telegram page helper — HTTP 401 -> rc 1 =="
+printf 'unauth' > "$TG_MODE"
+LINES_BEFORE="$(wc -l < "$PG_RECOVER_LOG" | tr -d ' ')"
+expect_exit 1 "HTTP 401 -> rc 1" "$RECOVER" page-test
+LINES_AFTER="$(wc -l < "$PG_RECOVER_LOG" | tr -d ' ')"
+[ "$LINES_AFTER" = "$((LINES_BEFORE + 1))" ] \
+  && ok "failed attempt appended exactly ONE log line" || bad "log lines $LINES_BEFORE -> $LINES_AFTER"
+tail -1 "$PG_RECOVER_LOG" | grep -q 'pg-recover-page-telegram] sent ok=false http=401' \
+  && ok "non-2xx log line carries http=401" || bad "401 log line wrong: $(tail -1 "$PG_RECOVER_LOG")"
+
+echo "== case: telegram page helper — curl transport failure -> rc 2 =="
+export PG_RECOVER_PAGE_TELEGRAM_API_BASE="http://127.0.0.1:1"   # closed port
+expect_exit 2 "connection refused -> rc 2 (transport failure)" "$RECOVER" page-test
+tail -1 "$PG_RECOVER_LOG" | grep -q 'pg-recover-page-telegram] sent ok=false http=none' \
+  && ok "transport-failure log line carries http=none" || bad "rc-2 log line wrong: $(tail -1 "$PG_RECOVER_LOG")"
+kill "$(cat "$TMP/listener-tg.pid")" 2>/dev/null
 
 echo
 echo "passed: $PASS  failed: $FAIL"

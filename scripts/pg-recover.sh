@@ -53,6 +53,11 @@
 #   alert-desc       render the board-alert issue description from a payload
 #                    JSON on stdin (drill/debug: shows the exact body the
 #                    alert issue would carry; pure, no state, no I/O)
+#   page-test        pure drill: build a DRILL-labeled alert payload (same
+#                    shape as the escalation payload, zero counters) and feed
+#                    it through deliver_page() exactly as a real escalation
+#                    would; never reads or writes the state file. Prints
+#                    which transport branch fired and propagates its rc.
 #   help
 #
 # Exit codes (tick):
@@ -370,6 +375,45 @@ cmd_clear_state() {
   echo "state cleared" >&2
 }
 
+cmd_page_test() { # pure drill: DRILL payload through deliver_page(); NO state I/O
+  local json rc branch
+  # Same field shape as alert_json(), but no sget()/state reads: a drill must
+  # neither depend on nor disturb the incident state (fixed zero counters).
+  json="$(jq -n \
+    --arg ts "$(now)" \
+    --arg host "$(hostname 2>/dev/null || echo unknown)" \
+    --arg detail "DRILL — planned page-path verification, no outage" \
+    --arg runbook "$PG_RECOVER_RUNBOOK_REF" \
+    --arg port "$PG_RECOVER_PORT" \
+    --arg max "$PG_RECOVER_MAX_FAILURES" \
+    --arg datadir "$PG_RECOVER_DATA_DIR" \
+    --arg logpath "$PG_RECOVER_LOG" \
+    '{severity: "high", source: "pg-recover.sh page-test (manual drill)",
+      host: $host, detected_at: $ts, reason: "drill", detail: $detail,
+      consecutive_failed_starts: 0, max_consecutive_failed_starts: ($max | tonumber),
+      first_failure_at: null, port: ($port | tonumber), data_dir: $datadir,
+      log_path: $logpath, log_tail: "", runbook_ref: $runbook}')"
+
+  # Mirror deliver_page()'s precedence so the operator sees which branch fires.
+  if [ -n "${PG_RECOVER_ALERT_FILE:-}" ]; then
+    branch="alert file (PG_RECOVER_ALERT_FILE=$PG_RECOVER_ALERT_FILE)"
+  elif [ -n "${PG_RECOVER_PAGE_CMD:-}" ]; then
+    branch="page transport (PG_RECOVER_PAGE_CMD)"
+  else
+    branch="none (no PG_RECOVER_ALERT_FILE and no PG_RECOVER_PAGE_CMD)"
+  fi
+  echo "page-test: transport branch: $branch"
+
+  deliver_page "$json"
+  rc=$?
+  case "$rc" in
+    0) echo "page-test: rc=0 — page delivered" ;;
+    3) echo "page-test: rc=3 — no page transport configured (set PG_RECOVER_PAGE_CMD)" ;;
+    *) echo "page-test: rc=$rc — page transport failed (a real incident would retry on later ticks)" ;;
+  esac
+  return "$rc"
+}
+
 # --------------------------------------------------------------- main tick
 
 cmd_tick() {
@@ -477,11 +521,12 @@ case "${1:-tick}" in
   status)       cmd_status ;;
   clear-state)  cmd_clear_state ;;
   alert-desc)   alert_description "$(cat)" ;;
+  page-test)    cmd_page_test ;;
   help|-h)
     sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   *)
-    echo "unknown subcommand: $1 (use: tick | status | clear-state | help)" >&2
+    echo "unknown subcommand: $1 (use: tick | status | clear-state | alert-desc | page-test | help)" >&2
     exit 2
     ;;
 esac
