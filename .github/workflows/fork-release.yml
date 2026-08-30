@@ -128,13 +128,27 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p staged-assets
-          gh release view "$TAG" --repo "$RELEASE_REPO" --json assets \
-            --jq '.assets[] | [.databaseId, .name] | @tsv' > /tmp/assets.tsv
-          while IFS=$'\t' read -r assetId name; do
+          # REST release lookup so .id is the numeric REST id the download call
+          # below needs. `gh release view --json assets` returns GraphQL asset
+          # objects: no .databaseId field, and .id is a node id that 404s on
+          # repos/*/releases/assets/{id}.
+          gh api "repos/$RELEASE_REPO/releases/tags/$TAG" \
+            --jq '.assets[] | [.id, .name] | @tsv' > /tmp/assets.tsv
+          expected=$(awk 'END{print NR}' /tmp/assets.tsv)
+          while IFS=$'\t' read -r assetId name || [ -n "$assetId" ]; do
+            [ -n "$assetId" ] && [ -n "$name" ] || {
+              echo "bad assets.tsv line: '$assetId' / '$name'" >&2
+              exit 1
+            }
             gh api "repos/$RELEASE_REPO/releases/assets/$assetId" \
               -H "Accept: application/octet-stream" > "staged-assets/$name"
           done < /tmp/assets.tsv
-          ls staged-assets | wc -l
+          staged=$(ls -1 staged-assets | wc -l)
+          [ "$staged" -eq "$expected" ] || {
+            echo "staged $staged asset(s) but assets.tsv has $expected line(s)" >&2
+            exit 1
+          }
+          echo "staged $staged/$expected assets OK"
 
       - name: Generate the local mirror certificate for github.com
         run: |
