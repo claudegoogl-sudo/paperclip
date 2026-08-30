@@ -2,10 +2,11 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import postgres from "postgres";
 import {
   LEGACY_EMBEDDED_POSTGRES_PASSWORD,
+  assertEmbeddedPostgresSocketDirIsSafe,
   assertEmbeddedPostgresSocketPathWithinLimit,
   buildEmbeddedPostgresConnectionString,
   buildEmbeddedPostgresConstructorOptions,
@@ -34,6 +35,40 @@ import {
   getEmbeddedPostgresTestSupport,
   sweepOrphanedEmbeddedPostgresDataDirs,
 } from "./test-embedded-postgres.js";
+import type { Stats } from "node:fs";
+
+// Simulation hook for the fresh-create TOCTOU race in
+// ensureEmbeddedPostgresSocketDir: when armed, the FIRST lstatSync (the
+// existence probe) reports ENOENT so the fresh-create branch runs even though
+// an attacker-controlled entry already exists at the socket-dir path, and
+// chmodSync can be skipped (the source treats chmod as best-effort, so a lost
+// chmod must be caught by the strict post-create validation instead). Both
+// flags auto-disarm after one use and are reset in afterEach; when disarmed
+// the wrappers are pure pass-through, so the real-cluster tests below are
+// unaffected.
+const socketDirRace = vi.hoisted(() => ({ armed: false, skipChmod: false }));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  const racingLstatSync = ((...args: Parameters<typeof actual.lstatSync>) => {
+    if (socketDirRace.armed) {
+      socketDirRace.armed = false;
+      const err: NodeJS.ErrnoException = new Error(
+        `ENOENT: simulated TOCTOU race, ${String(args[0])} not there yet`,
+      );
+      err.code = "ENOENT";
+      throw err;
+    }
+    return actual.lstatSync(...args);
+  }) as typeof actual.lstatSync;
+  const racingChmodSync = ((...args: Parameters<typeof actual.chmodSync>) => {
+    if (socketDirRace.skipChmod) {
+      socketDirRace.skipChmod = false;
+      return; // simulate chmod losing the race: mode stays attacker-chosen
+    }
+    return actual.chmodSync(...args);
+  }) as typeof actual.chmodSync;
+  return { ...actual, lstatSync: racingLstatSync, chmodSync: racingChmodSync };
+});
 
 const embeddedSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbedded = embeddedSupport.supported ? describe : describe.skip;
@@ -96,6 +131,8 @@ function isLikelyPortCollision(recentLogs: string[]): boolean {
 const cleanups: Array<() => Promise<void>> = [];
 
 afterEach(async () => {
+  socketDirRace.armed = false;
+  socketDirRace.skipChmod = false;
   while (cleanups.length) {
     const cleanup = cleanups.pop()!;
     await cleanup().catch(() => undefined);
@@ -487,6 +524,119 @@ describe("embedded-postgres-auth: pure helpers", () => {
     // Pre-seed a symlink at the socket-dir path (attacker redirecting the bind).
     fs.symlinkSync(decoy, socketDir);
     expect(() => ensureEmbeddedPostgresSocketDir(dataDir)).toThrow(/symlink/);
+  });
+
+  it("ensureEmbeddedPostgresSocketDir refuses a foreign-uid dir squatting the socket-dir path", () => {
+    const dataDir = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-sock-foreign-")),
+      "db",
+    );
+    const socketDir = socketDirectoryPathFor(dataDir);
+    cleanups.push(async () => {
+      fs.rmSync(path.dirname(dataDir), { recursive: true, force: true });
+      fs.rmSync(socketDir, { recursive: true, force: true });
+    });
+
+    // No real chown needed (tests rarely run as root): pre-create the dir as
+    // this uid, then pretend the process runs as root so the dir counts as
+    // foreign to the validator. Exercises the same cross-uid refusal.
+    fs.mkdirSync(socketDir, { mode: 0o700 });
+    const getuid = vi.spyOn(process, "getuid").mockReturnValue(0);
+    try {
+      expect(() => ensureEmbeddedPostgresSocketDir(dataDir)).toThrow(
+        /owned by uid/,
+      );
+    } finally {
+      getuid.mockRestore();
+    }
+  });
+
+  it("ensureEmbeddedPostgresSocketDir fresh-create branch re-validates a symlink that won the TOCTOU race", () => {
+    const dataDir = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-sock-race-link-")),
+      "db",
+    );
+    const socketDir = socketDirectoryPathFor(dataDir);
+    const decoy = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-sock-race-decoy-"));
+    cleanups.push(async () => {
+      fs.rmSync(path.dirname(dataDir), { recursive: true, force: true });
+      fs.rmSync(socketDir, { recursive: true, force: true });
+      fs.rmSync(decoy, { recursive: true, force: true });
+    });
+
+    // Attacker pre-creates a symlink at the socket-dir path AND wins the race:
+    // our existence probe reports ENOENT, mkdir({recursive:true}) silently
+    // adopts the existing entry, and only the post-create re-validation can
+    // refuse it.
+    fs.symlinkSync(decoy, socketDir);
+    socketDirRace.armed = true;
+    expect(() => ensureEmbeddedPostgresSocketDir(dataDir)).toThrow(/symlink/);
+  });
+
+  it("ensureEmbeddedPostgresSocketDir fresh-create branch re-validates a foreign-uid dir that won the TOCTOU race", () => {
+    const dataDir = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-sock-race-foreign-")),
+      "db",
+    );
+    const socketDir = socketDirectoryPathFor(dataDir);
+    cleanups.push(async () => {
+      fs.rmSync(path.dirname(dataDir), { recursive: true, force: true });
+      fs.rmSync(socketDir, { recursive: true, force: true });
+    });
+
+    // Same race as above, but the pre-created dir is owned by someone else
+    // (simulated via getuid, since chown needs root): mkdir({recursive:true})
+    // must not silently adopt it.
+    fs.mkdirSync(socketDir, { mode: 0o700 });
+    const getuid = vi.spyOn(process, "getuid").mockReturnValue(0);
+    socketDirRace.armed = true;
+    try {
+      expect(() => ensureEmbeddedPostgresSocketDir(dataDir)).toThrow(
+        /owned by uid/,
+      );
+    } finally {
+      getuid.mockRestore();
+    }
+  });
+
+  it("ensureEmbeddedPostgresSocketDir fresh-create branch refuses an insecure dir when the best-effort chmod loses the race", () => {
+    const dataDir = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-sock-race-mode-")),
+      "db",
+    );
+    const socketDir = socketDirectoryPathFor(dataDir);
+    cleanups.push(async () => {
+      fs.rmSync(path.dirname(dataDir), { recursive: true, force: true });
+      fs.rmSync(socketDir, { recursive: true, force: true });
+    });
+
+    // chmod is best-effort in the source: if it fails (or an attacker widens
+    // the mode right after), the strict post-create mode check is the last
+    // line of defense and must refuse a group/world-accessible socket dir.
+    fs.mkdirSync(socketDir, { mode: 0o755 });
+    socketDirRace.armed = true;
+    socketDirRace.skipChmod = true;
+    expect(() => ensureEmbeddedPostgresSocketDir(dataDir)).toThrow(
+      /insecure mode/,
+    );
+  });
+
+  it("assertEmbeddedPostgresSocketDirIsSafe refuses a foreign-uid entry without touching the filesystem", () => {
+    const ownUid = typeof process.getuid === "function" ? process.getuid() : 0;
+    const foreign = {
+      isSymbolicLink: () => false,
+      isDirectory: () => true,
+      uid: ownUid + 1,
+      mode: 0o700,
+    } as unknown as Stats;
+    expect(() =>
+      assertEmbeddedPostgresSocketDirIsSafe("/run/user/1000/paperclip-pg-x", foreign),
+    ).toThrow(/owned by uid/);
+    // Self-owned equivalent passes.
+    const self = { ...foreign, uid: ownUid } as unknown as Stats;
+    expect(() =>
+      assertEmbeddedPostgresSocketDirIsSafe("/run/user/1000/paperclip-pg-x", self),
+    ).not.toThrow();
   });
 
   it("readPidFileSocketDir returns null for missing or malformed pid files", () => {
