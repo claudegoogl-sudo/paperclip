@@ -86,3 +86,29 @@ test("the negative-test injector produces a set the static gate refuses", async 
   const injector = readFileSync(path.join(repoRoot, "scripts/fork-release/negative-test-fork34.mjs"), "utf8");
   assert.match(injector, /exports.*\.\/src\/index\.ts/s, "injector must reproduce the dev-exports defect");
 });
+
+test("the preflight step cannot mask a FAIL verdict behind its tee pipeline", () => {
+  const workflow = readWorkflow("fork-release.yml");
+  const step = workflow.slice(
+    workflow.indexOf("Preflight — clean install"),
+    workflow.indexOf("Job summary"),
+  );
+  const runBody = step.slice(step.indexOf("run: |"));
+  // Actions executes run blocks with `bash -e`, whose pipeline exit status is
+  // the LAST command's — so `node preflight.mjs ... | tee preflight.log`
+  // reports tee's 0 even when the gate exits 1 on FAIL findings, and a broken
+  // release would sail past the gate into publish. The step must therefore
+  // set pipefail itself, before the node invocation.
+  assert.match(
+    runBody,
+    /set -euo pipefail/,
+    "the preflight run block must set pipefail so tee cannot swallow the gate's exit code",
+  );
+  const pipefailAt = runBody.indexOf("set -euo pipefail");
+  const nodeAt = runBody.indexOf("node scripts/fork-release/preflight.mjs");
+  assert.notEqual(nodeAt, -1, "the preflight run block must invoke the gate script");
+  assert.ok(
+    pipefailAt !== -1 && pipefailAt < nodeAt,
+    "pipefail must be enabled before the node gate runs",
+  );
+});
