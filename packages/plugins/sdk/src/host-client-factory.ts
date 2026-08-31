@@ -647,9 +647,16 @@ const METHOD_CAPABILITY_MAP: Record<
  * A distinct safety argument per entry:
  *
  *  - `state.get` / `state.set` / `state.delete`: company-scoped plugin state is
- *    the plugin's OWN data, partitioned by `(pluginId, company)`. Reading or
- *    writing its company-B partition leaks nothing cross-tenant and is reachable
- *    during any company-B dispatch anyway.
+ *    the plugin's OWN data, partitioned by `(pluginId, scopeKind, scopeId, ...)`,
+ *    and every company-scoped call is reach-checked server-side by
+ *    `requirePluginEnabledForCompany` (via `requireStateCompanyReach` in
+ *    plugin-host-services) BEFORE the store is touched — fail-closed, including
+ *    a missing/empty company `scopeId` (never served from the store's
+ *    NULL-`scopeId` partition). A worker-forged `companyId` can therefore only
+ *    reach companies the plugin is genuinely provisioned for: the reachable set
+ *    equals the plugin's install reach; serviceScope only relaxes the timing
+ *    constraint. Non-company `scopeKind`s key state by entity ids only the
+ *    plugin itself can have written, so no company reach exists to widen.
  *  - `issues.createComment`: the host service independently verifies the target
  *    issue belongs to the claimed company (`requireInCompany`), so a
  *    worker-forged `companyId` cannot reach a foreign issue. The reachable set

@@ -944,19 +944,22 @@ export function buildHostServices(
    * control would be the false-assurance anti-pattern. The REAL, fail-closed
    * availability gate is `requirePluginEnabledForCompany` below, and ONLY the
    * fork-only reconcile/background reads (`approvals.listPending`,
-   * `interactions.list`, `config.getForServiceScope`) run it.
+   * `interactions.list`, `config.getForServiceScope`) plus the company-scoped
+   * `state.get` / `state.set` / `state.delete` handlers (via
+   * `requireStateCompanyReach`) run it.
    */
   const noPluginAvailabilityGate = async (_companyId: string) => {};
 
   /**
    * SECURITY-CRITICAL: real, method-scoped availability gate for the fork-only
    * reconcile/background reads (`approvals.listPending` / `interactions.list` /
-   * `config.getForServiceScope`). Unlike the instance-wide no-op
-   * stub above, this fail-closes so a cross-tenant-sensitive enumeration can
-   * never run for a company the plugin is not genuinely provisioned for. It is
-   * deliberately NOT wired into the existing handlers (whose per-entity
-   * `requireInCompany` already supplies the cross-check) — only the new reads
-   * call it.
+   * `config.getForServiceScope`) and for company-scoped plugin state
+   * (`state.get` / `state.set` / `state.delete` via `requireStateCompanyReach`
+   * below). Unlike the instance-wide no-op stub above, this fail-closes so a
+   * cross-tenant-sensitive enumeration can never run for a company the plugin
+   * is not genuinely provisioned for. Pre-existing handlers are NOT rewired:
+   * their per-entity `requireInCompany` cross-check stays as upstream wrote
+   * it, and the company-scoped state handlers are the only added consumer.
    *
    * Denial order (each step throws rather than returning an empty list — a
    * silent empty would mask a misconfig and reopen the very downtime gap this
@@ -989,6 +992,42 @@ export function buildHostServices(
     if (settings && settings.enabled === false) {
       throw new Error("Plugin is disabled for this company");
     }
+  };
+
+  /**
+   * SECURITY-CRITICAL: per-company reach check for COMPANY-scoped plugin state
+   * (`scopeKind:"company"` — `scopeId` is a worker-chosen companyId).
+   * Company-scoped `state.get` / `state.set` / `state.delete` are admitted
+   * under the bare worker-lifetime `serviceScope` with no dispatch to pin a
+   * tenant, so this is the compensating server-side reach-check the SDK
+   * allowlist invariant requires (`SERVICE_SCOPE_COMPANY_METHODS` in the SDK
+   * host-client-factory). It bounds the reachable company set to the plugin's
+   * install reach — the identical gate the fork-only reconcile/background
+   * reads run — so an idle worker can neither pre-poison an unprovisioned
+   * company's state before adoption nor read/wipe partitions of companies it
+   * does not serve (`plugin_state` BOLA).
+   *
+   * Fail-closed shapes:
+   *   - `scopeKind:"company"` with a missing/empty `scopeId` is REJECTED
+   *     rather than falling through to the store's NULL-`scopeId` partition
+   *     (an unkeyed partition no legitimate company dispatch ever writes;
+   *     kept unreachable so it cannot become a bypass channel);
+   *   - unknown company / uninstalled or disabled install / company-disabled
+   *     plugin all deny via `requirePluginEnabledForCompany`.
+   *
+   * Every other `scopeKind` keys state by an entity id (`instance`, `issue`,
+   * `project`, `agent`, ...) that only the plugin itself can have written —
+   * no company reach exists to widen — so the gate is a no-op there.
+   */
+  const requireStateCompanyReach = async (
+    scopeKind: unknown,
+    scopeId: unknown,
+  ): Promise<void> => {
+    if (scopeKind !== "company") return;
+    if (typeof scopeId !== "string" || scopeId.trim().length === 0) {
+      throw new Error("scopeId is required for company-scoped plugin state");
+    }
+    await requirePluginEnabledForCompany(scopeId.trim());
   };
 
   const getLocalFolderDeclaration = (folderKey: string) =>
@@ -1781,14 +1820,24 @@ export function buildHostServices(
       },
     },
 
+    // SECURITY-CRITICAL: company-scoped plugin state is keyed by a
+    // worker-chosen companyId. Under the bare worker-lifetime `serviceScope`
+    // (idle worker, no dispatch pinning a tenant) the SDK allowlist admits
+    // these calls for ANY company, so the per-company reach check below is the
+    // compensating server-side gate between a worker and every company
+    // partition of its own plugin's state (`plugin_state` BOLA: pre-poison a
+    // company before it adopts the plugin, or wipe its partitions at will).
+    // Identical fail-closed gate to the fork-only reconcile reads.
     state: {
       async get(params) {
+        await requireStateCompanyReach(params.scopeKind, params.scopeId);
         return stateStore.get(pluginId, params.scopeKind as any, params.stateKey, {
           scopeId: params.scopeId,
           namespace: params.namespace,
         });
       },
       async set(params) {
+        await requireStateCompanyReach(params.scopeKind, params.scopeId);
         await stateStore.set(pluginId, {
           scopeKind: params.scopeKind as any,
           scopeId: params.scopeId,
@@ -1798,6 +1847,7 @@ export function buildHostServices(
         });
       },
       async delete(params) {
+        await requireStateCompanyReach(params.scopeKind, params.scopeId);
         await stateStore.delete(pluginId, params.scopeKind as any, params.stateKey, {
           scopeId: params.scopeId,
           namespace: params.namespace,
