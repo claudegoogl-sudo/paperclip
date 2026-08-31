@@ -1,10 +1,14 @@
 {
-  "lastSyncedTag": "v2026.707.0",
-  "lastSyncedSha": "390627b46eb333309d357004384b220ecf8a65af",
-  "lastSyncedAt": "2026-07-13T00:00:00Z",
-  "etag": "W/\"385a9c2e30ab8fe833bae7f43069f404728bf0c011d3b0ba40ab327e43b2d960\"",
-  "lastCheckedAt": "2026-07-13T00:00:00Z",
+  "lastSyncedTag": "v2026.824.1",
+  "lastSyncedSha": "8e6edcdfa911151adba26be49a41cf5017b3aade",
+  "lastSyncedAt": "2026-08-31T05:26:20Z",
+  "etag": "\"c6c0eff30f3f15a0f9afe31688b3c46333b0c3f85710f15bcac4147399e9f3ef\"",
+  "lastCheckedAt": "2026-08-31T05:26:20Z",
   "pendingPrUrl": null,
-  "lastConflictBuckets": { "clean": 0, "reviewable": 5, "escalation": 2 },
-  "_syncNote": "v2026.707.0 cursor advance. Upstream release v2026.707.0 (tag commit 390627b46eb333309d357004384b220ecf8a65af, published 2026-07-07) was merged into fork master via PR #102 (sync/upstream-v2026.707.0 -> master; fork-master merge commit d532a15c5, containing the --no-ff upstream sync commit 81160bd24160fa955231d3bffc3251231c58d2c7). Conflict resolution: 7 files, 5 reviewable keep-both (CONTRIBUTING.md, packages/db schema index, error-handler.ts+test, server-startup-feedback-export test) + 2 escalation (migration-index collision renumbered fork 0125-0128 -> 0136-0139 above upstream's 0135; recovery/service.ts SEMANTIC merge combining descendant-subtree membership AND optional agentId scope). Review gates cleared: SecurityEngineer APPROVE (error-handler redaction/denial path), QA PASS (recovery re-wake soak). CI 15/15 green on PR #102. This commit advances the durable cursor so future ticks 304/no-op instead of re-flagging the already-landed sync (mirrors 710786a10/9f3a7799f/281dbdd37 post-merge cursor advances). lastSyncedSha pins the UPSTREAM tag commit per the established marker convention (fork-master merge is d532a15c5). etag captured from paperclipai/paperclip releases/latest at 2026-07-13 (weak validator). Host release for v2026.707.0 is a SEPARATE downstream obligation (standing operator policy) tracked via the sync routine's host-release-cut follow-up; live host still at 2026.626.0-fork.8 until that lands. Supersedes v2026.626.0 (_syncNote from the previous sync cursor advance)."
+  "lastConflictBuckets": {
+    "clean": 0,
+    "reviewable": 0,
+    "escalation": 0
+  },
+  "_syncNote": "v2026.824.1 cursor reconcile. Upstream release v2026.824.1 (tag commit 8e6edcdfa911151adba26be49a41cf5017b3aade, published 2026-08-25) reached fork master out-of-band via merged PR #254 (superset re-land: upstream v2026.824.1 + 22 re-applied fork deltas incl. the 0164 multi-company plugin-config split; merged 2026-08-29T01:32Z). All upstream releases through v2026.824.1 are contained via ancestry (v2026.722.0 verified ancestor; v2026.817.0 content arrives through the 824.1 lineage). The stale v2026.707.0 cursor made every weekly tick no-op on the 'remote branch sync/upstream-v2026.824.1 exists but no open PR' guard, masking real future releases; this commit advances the durable cursor to reality so future ticks 304/no-op instead (established cursor-reconcile pattern; mirrors the v2026.618.0->v2026.626.0 and v2026.626.0->v2026.707.0 reconciles). No content change here - pure bookkeeping. lastSyncedSha pins the UPSTREAM tag commit per the established marker convention; the fork-master landing is PR #254. etag captured from releases/latest at reconcile time (strong validator). Host releases for the 824.1 line are already cut (2026.824.1-fork.34 through fork.37), so the downstream host-release obligation is satisfied. Pre-land gate tickets for the cancelled staged plan (adapter-hardening security gate, activation soak gate) are tracked on the board and predate the superset re-land. Supersedes the v2026.707.0 cursor note."
 }
