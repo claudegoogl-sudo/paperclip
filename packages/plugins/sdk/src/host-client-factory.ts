@@ -685,7 +685,12 @@ const METHOD_CAPABILITY_MAP: Record<
  *    set the digest already accumulates). serviceScope only relaxes the timing
  *    constraint so the digest can reconcile on worker startup / poll with no
  *    active dispatch. Both reject `kind:"all"` and missing/empty `companyId`, so
- *    no single call can enumerate across tenants.
+ *    no single call can enumerate across tenants. These reads deliberately keep
+ *    distinguishable company-existence failures (`Company not found` /
+ *    `not available` / `disabled`) so reconcile misconfig stays diagnosable;
+ *    the byte-equal no-existence-oracle denial collapse is a
+ *    `config.getForServiceScope`-specific contract, not a property of the
+ *    allowlist as a whole.
  *  - `config.getForServiceScope`: per-company effective plugin config
  *    (company `plugin_config` row merged with the tenant `configOverrides`
  *    subtree) behind the server-side provisioning gate — the company must
