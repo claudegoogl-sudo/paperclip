@@ -588,9 +588,11 @@ export interface PluginConfigClient {
    * Fork-only background read: the company's effective plugin config
    * (company config row merged with the tenant `configOverrides` subtree),
    * for use OUTSIDE any dispatch (e.g. a `setup()`-started loop). The host
-   * fail-closes unless the plugin is installed and enabled for the named
-   * company, so a worker can only ever read config for a company it is
-   * genuinely provisioned for.
+   * fail-closes unless the named company is genuinely provisioned for this
+   * plugin install — it must hold a `plugin_config` row for it, and the
+   * plugin must be installed and enabled for that company. Every denial
+   * collapses to one opaque error, so a worker can only ever read config
+   * for a company that configured THIS plugin.
    */
   getForServiceScope(companyId: string): Promise<Record<string, unknown>>;
 }
@@ -1018,6 +1020,13 @@ export interface PluginActivityClient {
  *
  * `plugin.state.read` capability required for `get()`.
  * `plugin.state.write` capability required for `set()` and `delete()`.
+ *
+ * SECURITY (company scope): `scopeKind: "company"` keys state by a company id.
+ * Every company-scoped `get()` / `set()` / `delete()` is reach-checked
+ * server-side — the named company must be one the plugin is genuinely
+ * provisioned for (installed, enabled, and not company-disabled) — and a
+ * missing/empty `scopeId` is rejected rather than served as the unkeyed
+ * fallback partition. Calls naming any other company fail closed.
  *
  * @see PLUGIN_SPEC.md §21.3 `plugin_state`
  */
