@@ -106,6 +106,18 @@ import { recordProviderPluginSpan, type ParsedTraceparent } from "../instrumenta
 /** Maximum time (ms) a plugin fetch request may take before being aborted. */
 const PLUGIN_FETCH_TIMEOUT_MS = 30_000;
 
+/**
+ * Opaque denial for the fork-only `config.getForServiceScope` read. Every
+ * provisioning failure on that surface collapses to this single message so a
+ * worker cannot distinguish "company unknown" from "company never configured
+ * this plugin" (no existence oracle) — the `company_secret_bindings` posture.
+ * The specific reason is logged server-side via `configGateLog`.
+ */
+const SERVICE_SCOPE_CONFIG_DENIED = "config not available for this service scope";
+
+/** Value-free server-side logger for service-scope config denials. */
+const configGateLog = logger.child({ service: "plugin-host-services.config-gate" });
+
 /** Maximum time (ms) to wait for a DNS lookup before aborting. */
 const DNS_LOOKUP_TIMEOUT_MS = 5_000;
 
@@ -1615,6 +1627,49 @@ export function buildHostServices(
     return { ...base, ...override };
   };
 
+  /**
+   * SECURITY-CRITICAL: provisioning gate for the fork-only background config
+   * read (`config.getForServiceScope`). Mirrors the `company_secret_bindings`
+   * posture of the secrets handler: the named company must hold a
+   * `plugin_config` row for THIS plugin install, and every denial shape —
+   * (a) unknown company, (b) install not operational (uninstalled/disabled),
+   * (c) company-disabled plugin, (d) missing `plugin_config` row — collapses
+   * into ONE opaque error at the worker boundary. A worker can therefore not
+   * distinguish "company does not exist" from "company exists but never
+   * configured this plugin": no company- or config-existence oracle. The
+   * specific denial reason is logged server-side only (value-free reasons).
+   *
+   * Fail closed: unknown/unprovisioned → throw, never an empty config.
+   * Deliberately scoped to the config read ONLY — the reconcile enumeration
+   * reads (`approvals.listPending` / `interactions.list`) legitimately serve
+   * companies that hold no config row, so they keep the shared
+   * `requirePluginEnabledForCompany` gate with its distinct messages.
+   */
+  const requireConfigProvisionedForCompany = async (companyId: string): Promise<void> => {
+    try {
+      await requirePluginEnabledForCompany(companyId);
+    } catch (err) {
+      configGateLog.warn(
+        { pluginId, reason: err instanceof Error ? err.message : String(err) },
+        "service-scope config read denied; collapsing to opaque provisioning error",
+      );
+      throw new Error(SERVICE_SCOPE_CONFIG_DENIED);
+    }
+    // The company must hold a `plugin_config` row for THIS plugin install —
+    // the same posture as `company_secret_bindings` for secret refs. Without
+    // this, any worker of an enabled plugin could read any company's plugin
+    // config metadata (routing ids, secret REF UUIDs — never values; values
+    // stay binding-table-gated) the moment a plugin goes multi-company.
+    const configRow = await registry.getConfig(pluginId, companyId);
+    if (!configRow) {
+      configGateLog.warn(
+        { pluginId },
+        "service-scope config read denied: company holds no plugin_config row for this install",
+      );
+      throw new Error(SERVICE_SCOPE_CONFIG_DENIED);
+    }
+  };
+
   const configService = {
     async get(params: Parameters<HostServices["config"]["get"]>[0]) {
       const companyId = ensureCompanyId(params.companyId);
@@ -1626,13 +1681,14 @@ export function buildHostServices(
       return configRow?.configJson ?? {};
     },
     // Fork-only background read (serviceScope-reachable; see the SDK gate).
-    // Fail-closed provisioning: unknown company / uninstalled / disabled
-    // plugin → throw, never an empty config.
+    // Fail-closed provisioning with an opaque, oracle-free denial:
+    // unknown company / uninstalled / disabled plugin / company without a
+    // `plugin_config` row for this install all collapse to ONE error.
     async getForServiceScope(
       params: Parameters<HostServices["config"]["getForServiceScope"]>[0],
     ): Promise<Record<string, unknown>> {
       const companyId = ensureCompanyId(params.companyId);
-      await requirePluginEnabledForCompany(companyId);
+      await requireConfigProvisionedForCompany(companyId);
       return getEffectiveCompanyConfig(companyId);
     },
   };

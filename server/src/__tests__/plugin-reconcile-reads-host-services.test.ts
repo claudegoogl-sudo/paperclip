@@ -28,6 +28,10 @@ function createEventBusStub() {
 }
 
 const PLUGIN_KEY = "paperclip.messenger";
+// Opaque denial every service-scope config provisioning failure collapses to
+// (server/src/services/plugin-host-services.ts). Assertions compare the FULL
+// message so a partially-specific error reintroduces an existence oracle.
+const SERVICE_SCOPE_CONFIG_DENIED = "config not available for this service scope";
 
 describeEmbeddedPostgres("plugin reconcile reads host services", () => {
   let db!: ReturnType<typeof createDb>;
@@ -225,31 +229,92 @@ describeEmbeddedPostgres("plugin reconcile reads host services", () => {
     services.dispose();
   });
 
-  it("config.getForServiceScope fails closed for an unprovisioned company (negative test)", async () => {
-    // The fork-only background config read runs the same real availability
-    // gate as the reconcile reads: unknown company / uninstalled / disabled
-    // plugin all deny rather than serve config.
-    const company = await createCompany("REC");
-    const uninstalled = await installPlugin("uninstalled");
-    const services = buildHostServices(db, uninstalled.id, PLUGIN_KEY, createEventBusStub());
-    await expect(
-      services.config.getForServiceScope({ companyId: company.id }),
-    ).rejects.toThrow("not available");
-    services.dispose();
-  });
-
-  it("config.getForServiceScope serves the effective (override-merged) config for a provisioned company", async () => {
+  it("config.getForServiceScope fails closed when the company holds no plugin_config row for this install", async () => {
+    // Provisioning gate (opaque denial): the company exists, the install is
+    // operational, and the company settings row explicitly enables the plugin
+    // — every pre-existing gate passes. ONLY the missing `plugin_config` row
+    // denies, so this test fails if that check is deleted (the read would
+    // otherwise resolve `{}` instead of throwing).
     const company = await createCompany("REC");
     const plugin = await installPlugin();
-    const services = buildHostServices(db, plugin.id, PLUGIN_KEY, createEventBusStub());
     await db.insert(pluginCompanySettings).values({
       companyId: company.id,
       pluginId: plugin.id,
       enabled: true,
     });
+    const services = buildHostServices(db, plugin.id, PLUGIN_KEY, createEventBusStub());
     await expect(
       services.config.getForServiceScope({ companyId: company.id }),
-    ).resolves.toEqual({});
+    ).rejects.toThrow(SERVICE_SCOPE_CONFIG_DENIED);
+    services.dispose();
+  });
+
+  it("config.getForServiceScope collapses every denial to the same opaque error (no existence oracle)", async () => {
+    // Unknown company, uninstalled install, and company-disabled plugin must
+    // be indistinguishable from each other (and from the missing-config-row
+    // denial above) at the worker boundary — the company_secret_bindings
+    // posture. A worker cannot probe whether a company exists or has
+    // configured the plugin by comparing error shapes.
+    const company = await createCompany("REC");
+    const uninstalled = await installPlugin("uninstalled");
+    const services = buildHostServices(db, uninstalled.id, PLUGIN_KEY, createEventBusStub());
+
+    const denialOf = async (promise: Promise<unknown>) => {
+      try {
+        await promise;
+        return null;
+      } catch (err) {
+        return err instanceof Error ? err.message : String(err);
+      }
+    };
+    const messages = [
+      await denialOf(services.config.getForServiceScope({ companyId: randomUUID() })),
+      await denialOf(services.config.getForServiceScope({ companyId: company.id })),
+    ];
+    services.dispose();
+
+    for (const message of messages) {
+      expect(message).toBe(SERVICE_SCOPE_CONFIG_DENIED);
+    }
+  });
+
+  it("config.getForServiceScope fails closed for an uninstalled install even when a config row exists", async () => {
+    const company = await createCompany("REC");
+    const uninstalled = await installPlugin("uninstalled");
+    await db.insert(pluginConfig).values({
+      pluginId: uninstalled.id,
+      companyId: company.id,
+      configJson: { label: "stale-config" },
+    });
+    const services = buildHostServices(db, uninstalled.id, PLUGIN_KEY, createEventBusStub());
+    await expect(
+      services.config.getForServiceScope({ companyId: company.id }),
+    ).rejects.toThrow(SERVICE_SCOPE_CONFIG_DENIED);
+    services.dispose();
+  });
+
+  it("config.getForServiceScope serves the effective (override-merged) config for a bound company holding a config row (boot-recovery shape)", async () => {
+    // The legitimate consumer shape (messenger boot self-heal): the company
+    // was bound via the host `configChanged` replay, which only ever names
+    // companies WITH a `plugin_config` row. That row must keep resolving —
+    // merged with the tenant `configOverrides` subtree.
+    const company = await createCompany("REC");
+    const plugin = await installPlugin();
+    await db.insert(pluginConfig).values({
+      pluginId: plugin.id,
+      companyId: company.id,
+      configJson: { label: "base-value" },
+    });
+    await db.insert(pluginCompanySettings).values({
+      companyId: company.id,
+      pluginId: plugin.id,
+      enabled: true,
+      settingsJson: { configOverrides: { label: "override-value" } },
+    });
+    const services = buildHostServices(db, plugin.id, PLUGIN_KEY, createEventBusStub());
+    await expect(
+      services.config.getForServiceScope({ companyId: company.id }),
+    ).resolves.toEqual({ label: "override-value" });
     services.dispose();
   });
 
