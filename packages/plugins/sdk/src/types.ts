@@ -588,9 +588,11 @@ export interface PluginConfigClient {
    * Fork-only background read: the company's effective plugin config
    * (company config row merged with the tenant `configOverrides` subtree),
    * for use OUTSIDE any dispatch (e.g. a `setup()`-started loop). The host
-   * fail-closes unless the plugin is installed and enabled for the named
-   * company, so a worker can only ever read config for a company it is
-   * genuinely provisioned for.
+   * fail-closes unless the named company is genuinely provisioned for this
+   * plugin install — it must hold a `plugin_config` row for it, and the
+   * plugin must be installed and enabled for that company. Every denial
+   * collapses to one opaque error, so a worker can only ever read config
+   * for a company that configured THIS plugin.
    */
   getForServiceScope(companyId: string): Promise<Record<string, unknown>>;
 }

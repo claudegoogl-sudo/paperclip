@@ -107,10 +107,12 @@ export interface HostServices {
     /**
      * Fork-only background read: per-company effective plugin config
      * (company `plugin_config` row merged with the tenant `configOverrides`
-     * subtree) behind the fail-closed `requirePluginEnabledForCompany`
-     * provisioning gate. Reachable under the bare worker-lifetime
-     * `serviceScope`; rejects a missing/empty `companyId` and never accepts
-     * `kind:"all"`.
+     * subtree) behind the fail-closed server-side provisioning gate: the
+     * company must hold a `plugin_config` row for THIS plugin install and
+     * the plugin must be installed and enabled for it; every denial
+     * collapses to one opaque error (no existence oracle). Reachable under
+     * the bare worker-lifetime `serviceScope`; rejects a missing/empty
+     * `companyId` and never accepts `kind:"all"`.
      */
     getForServiceScope(
       params: WorkerToHostMethods["config.getForServiceScope"][0],
@@ -690,14 +692,20 @@ const METHOD_CAPABILITY_MAP: Record<
  *    set the digest already accumulates). serviceScope only relaxes the timing
  *    constraint so the digest can reconcile on worker startup / poll with no
  *    active dispatch. Both reject `kind:"all"` and missing/empty `companyId`, so
- *    no single call can enumerate across tenants.
+ *    no single call can enumerate across tenants. These reads deliberately keep
+ *    distinguishable company-existence failures (`Company not found` /
+ *    `not available` / `disabled`) so reconcile misconfig stays diagnosable;
+ *    the byte-equal no-existence-oracle denial collapse is a
+ *    `config.getForServiceScope`-specific contract, not a property of the
+ *    allowlist as a whole.
  *  - `config.getForServiceScope`: per-company effective plugin config
  *    (company `plugin_config` row merged with the tenant `configOverrides`
- *    subtree) behind the same `requirePluginEnabledForCompany` gate as the
- *    reconcile reads — identical reach argument (install reach only), and the
- *    rows returned are the plugin's OWN config surface for that company, which
- *    any dispatch for that company could read anyway. Rejects `kind:"all"` and
- *    missing/empty `companyId`.
+ *    subtree) behind the server-side provisioning gate — the company must
+ *    hold a `plugin_config` row for THIS install (fail-closed, opaque
+ *    error), identical reach argument (configured-install reach only), and
+ *    the rows returned are the plugin's OWN config surface for that
+ *    company, which any dispatch for that company could read anyway.
+ *    Rejects `kind:"all"` and missing/empty `companyId`.
  *
  * Deliberately excluded: the upstream public reads `config.get`,
  * `secrets.resolve` and `approvals.list`. Their guards are restored to
