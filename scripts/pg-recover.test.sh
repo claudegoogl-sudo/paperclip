@@ -75,7 +75,36 @@ trap '
     [ -f "$pf" ] && kill "$(cat "$pf")" 2>/dev/null
   done
   rm -rf "$TMP"
+  default_lock_leaked quiet >/dev/null 2>&1 || true
 ' EXIT
+
+# Test isolation for the cutover-window lock. The watchdog reads its lock path
+# from PG_RECOVER_WINDOW_LOCK; the window scripts (install/rollback) read a
+# SEPARATE variable, WINDOW_LOCK, whose default resolves into the LIVE
+# instance dir. Pin BOTH to the scratch dir so nothing the battery runs can
+# create or probe a lock at the default path.
+export WINDOW_LOCK="$TMP/pg-window.lock"
+
+# Leak guard: no lock artifact may exist at the default path after the run. A
+# file that was already there before the battery started is not ours — it is
+# left untouched. A file that APPEARED during the run is a test-isolation
+# failure: removed when unheld, reported-but-NOT-removed when still
+# flock-held (a real cutover window may be live on this host; deleting it
+# could unsuppress recovery mid-window).
+DEFAULT_LOCK="/home/paperclip/.paperclip/instances/default/pg-window.lock"
+DEFAULT_LOCK_PREEXISTED=0
+[ -e "$DEFAULT_LOCK" ] && DEFAULT_LOCK_PREEXISTED=1
+default_lock_leaked() { # [quiet] -> rc 1 and a FAIL line when a leak is found
+  [ "$DEFAULT_LOCK_PREEXISTED" = "0" ] || return 0
+  [ ! -e "$DEFAULT_LOCK" ] && return 0
+  if flock -n "$DEFAULT_LOCK" true 2>/dev/null; then
+    rm -f "$DEFAULT_LOCK"
+    [ "${1:-}" = "quiet" ] || bad "LEAK: lock artifact created at the DEFAULT path during the run — removed (was unheld): $DEFAULT_LOCK"
+    return 1
+  fi
+  [ "${1:-}" = "quiet" ] || bad "LEAK: lock artifact appeared at the DEFAULT path and is STILL HELD — left in place (a real window may be running): $DEFAULT_LOCK"
+  return 1
+}
 
 PORT=$((40000 + RANDOM % 20000))
 export PG_RECOVER_PORT="$PORT"
@@ -88,6 +117,7 @@ export PG_RECOVER_MAX_FAILURES=3
 export PG_RECOVER_LOG_TAIL_LINES=50
 export PG_RECOVER_POSTGRES_BIN="$TMP/fake-postgres"
 export PG_RECOVER_ALERT_FILE="$TMP/alerts.jsonl"
+export PG_RECOVER_WINDOW_LOCK="$TMP/pg-window.lock"
 export FAKE_COUNT="$TMP/fake-postgres.calls"
 : > "$FAKE_COUNT"
 export FAKE_MODE="fail"
@@ -474,6 +504,58 @@ expect_exit 2 "connection refused -> rc 2 (transport failure)" "$RECOVER" page-t
 tail -1 "$PG_RECOVER_LOG" | grep -q 'pg-recover-page-telegram] sent ok=false http=none' \
   && ok "transport-failure log line carries http=none" || bad "rc-2 log line wrong: $(tail -1 "$PG_RECOVER_LOG")"
 kill "$(cat "$TMP/listener-tg.pid")" 2>/dev/null
+
+echo "== case: window lock held -> deferral (exit 0, no start, no failure, no state change) =="
+export PG_RECOVER_ALERT_FILE="$TMP/alerts.jsonl"   # re-arm after the telegram cases unset it
+printf '{}' > "$PG_RECOVER_STATE"
+export FAKE_MODE="fail"
+: > "$PG_RECOVER_LOG"
+STAMP_BEFORE="$(cat "$PG_RECOVER_STAMP" 2>/dev/null || true)"
+CALLS_BEFORE="$(grep -c . "$FAKE_COUNT" 2>/dev/null || echo 0)"
+ALERTS_BEFORE="$(alert_count "$PG_RECOVER_ALERT_FILE")"
+# Hold the lock the way a real cutover window does: a separate process with an
+# exclusive flock it keeps for its whole run (fd-close releases it).
+( exec 9>>"$PG_RECOVER_WINDOW_LOCK" && flock 9 && sleep 20 ) &
+WINDOW_HOLDER_PID=$!
+sleep 0.4   # let the holder win the flock
+expect_exit 0 "window-locked tick exits 0" "$RECOVER" tick
+[ "$(grep -c "window lock held — deferring recovery tick" "$PG_RECOVER_LOG")" = "1" ] \
+  && ok "exactly one deferral line in the log" || bad "deferral line count = $(grep -c "window lock held" "$PG_RECOVER_LOG" 2>/dev/null || echo 0)"
+[ "$(grep -c . "$FAKE_COUNT" 2>/dev/null || echo 0)" = "$CALLS_BEFORE" ] \
+  && ok "no start attempt under window lock" || bad "fake postgres invoked despite window lock"
+[ "$(state_get consecutive_failures "$PG_RECOVER_STATE")" = "" ] \
+  && ok "no failure counted under window lock" || bad "failure counted under window lock"
+[ "$(alert_count "$PG_RECOVER_ALERT_FILE")" = "$ALERTS_BEFORE" ] \
+  && ok "no alert under window lock" || bad "alerted during window lock"
+[ "$(cat "$PG_RECOVER_STAMP" 2>/dev/null)" = "$STAMP_BEFORE" ] \
+  && ok "stamp untouched by deferral" || bad "stamp changed on deferral ($(cat "$PG_RECOVER_STAMP" 2>/dev/null))"
+kill "$WINDOW_HOLDER_PID" 2>/dev/null
+wait "$WINDOW_HOLDER_PID" 2>/dev/null
+
+echo "== case: window lock released -> normal recovery behavior restored =="
+expect_exit 1 "tick after lock release attempts the start (exit 1)" "$RECOVER" tick
+[ "$(state_get consecutive_failures "$PG_RECOVER_STATE")" = "1" ] \
+  && ok "failure counted again after lock release" || bad "counter not incremented after lock release"
+
+echo "== case: fresh epoch line-1 WITHOUT a held flock does NOT defer (flock is authoritative) =="
+# The v2 window scripts write an epoch on line 1 of the lock file for the
+# INTERIM (pre-flock) watchdog generation. A crashed window can leave that
+# file behind with no live holder — this generation must NOT stand down on
+# file content alone, or a stale lock file could brick recovery for up to the
+# interim's 45-minute horizon.
+printf '{}\n' > "$PG_RECOVER_STATE"
+export FAKE_MODE="fail"
+: > "$PG_RECOVER_LOG"
+printf '%s\n%s\n' "$(date +%s)" "$(date -u +%Y-%m-%dT%H:%M:%SZ) leftover window lock (holder crashed)" > "$PG_RECOVER_WINDOW_LOCK"
+expect_exit 1 "epoch-only leftover does not defer (start attempted, exit 1)" "$RECOVER" tick
+[ "$(grep -c "window lock held — deferring recovery tick" "$PG_RECOVER_LOG")" = "0" ] \
+  && ok "no deferral line for an unflocked epoch-only lock file" || bad "deferred on file content alone"
+[ "$(state_get consecutive_failures "$PG_RECOVER_STATE")" = "1" ] \
+  && ok "start attempt counted (recovery not suppressed)" || bad "recovery suppressed by epoch-only file"
+rm -f "$PG_RECOVER_WINDOW_LOCK"
+
+echo "== case: leak guard — no lock artifact left at the default path =="
+default_lock_leaked || true   # rc 1 on a leak; bad() already counted it
 
 echo
 echo "passed: $PASS  failed: $FAIL"
