@@ -105,23 +105,35 @@ bash scripts/build-npm.sh --skip-checks --skip-typecheck 2>&1 | tail -3
 (cd cli && npm pack --pack-destination "$REPO_ROOT/$OUT" 2>&1 | tail -1)
 rm -rf packages/db/dist
 pnpm --filter @paperclipai/db build 2>&1 | tail -1
-# pnpm pack refuses to pack manifests that declare bundleDependencies under
-# the isolated node linker. The fork ships those deps as normal registry
-# dependencies (no tarball carries bundles), so strip the declarations for
-# the pack and restore the manifests afterwards.
-BUNDLED_MANIFESTS="$(grep -rl '"bundleDependencies"' packages server ui cli --include='package.json' 2>/dev/null | grep -v node_modules || true)"
-if [ -n "$BUNDLED_MANIFESTS" ]; then
-  echo "  -> temporarily stripping bundleDependencies from: $(echo "$BUNDLED_MANIFESTS" | tr '\n' ' ')"
-  node -e 'const fs=require("node:fs");for(const p of process.argv.slice(1)){const j=JSON.parse(fs.readFileSync(p,"utf8"));delete j.bundleDependencies;delete j.bundledDependencies;fs.writeFileSync(p,`${JSON.stringify(j,null,2)}\n`);}' $BUNDLED_MANIFESTS
-fi
-node scripts/pack-public-packages.mjs --out "$OUT" > pack-public.log 2>&1 || {
-  echo "FATAL: pack-public-packages failed — last 30 lines:" >&2
-  tail -30 pack-public.log >&2
-  if [ -n "$BUNDLED_MANIFESTS" ]; then git checkout -- $BUNDLED_MANIFESTS; fi
+# Packages that declare bundleDependencies are NOT packed here: they are
+# staged through scripts/prepare-bundled-package.mjs (npm install of the
+# bundled dep + `patch -p1` re-application of the repository pnpm patch +
+# patch-marker validation) and packed from the staged directory, so the
+# published tarballs carry the PATCHED bundled runtime. Stripping
+# bundleDependencies and packing the workspace directory instead shipped
+# pristine registry copies to hosts — the fork.37 claude_local
+# ensure_session outage (see scripts/fork-release/stage-bundled-packages.mjs).
+BUNDLED_NAMES="$(node "$SCRIPT_DIR/stage-bundled-packages.mjs" --list-names)" || {
+  echo "FATAL: could not enumerate bundled-dependency packages" >&2
   exit 1
 }
-if [ -n "$BUNDLED_MANIFESTS" ]; then git checkout -- $BUNDLED_MANIFESTS; fi
+BUNDLED_SKIP_ARGS=()
+while IFS= read -r NAME; do
+  BUNDLED_SKIP_ARGS+=(--skip "$NAME")
+done <<< "$BUNDLED_NAMES"
+node scripts/pack-public-packages.mjs --out "$OUT" "${BUNDLED_SKIP_ARGS[@]}" > pack-public.log 2>&1 || {
+  echo "FATAL: pack-public-packages failed — last 30 lines:" >&2
+  tail -30 pack-public.log >&2
+  exit 1
+}
 grep -E '^==>|^  - ' pack-public.log | tail -5
+echo "  -> staging bundled-dependency packages: $(echo "$BUNDLED_NAMES" | tr '\n' ' ')"
+node "$SCRIPT_DIR/stage-bundled-packages.mjs" --out "$REPO_ROOT/$OUT" > stage-bundled.log 2>&1 || {
+  echo "FATAL: bundled-dependency staging failed — last 30 lines:" >&2
+  tail -30 stage-bundled.log >&2
+  exit 1
+}
+cat stage-bundled.log
 
 echo "===== [9/10] URL-pin every internal dependency to this release ====="
 node "$SCRIPT_DIR/pin-internal-deps.mjs" --dir "$OUT" --version "$VERSION"
@@ -165,6 +177,11 @@ if (violations.length > 0) {
 }
 console.log(`  -> export targets OK on all ${all.length} release tarballs`);
 NODE
+# (d) bundled-dependency tarballs must ship the PATCHED bundled runtime
+node "$SCRIPT_DIR/gate-bundled-tarballs.mjs" --dir "$OUT" --version "$VERSION" || {
+  echo "FATAL: bundled-dependency tarball gate failed" >&2
+  exit 1
+}
 # Plain names (no ./ prefix), matching the basename keys the verifier and the
 # test-only injector use; verifyChecksums also normalizes either format.
 (cd "$OUT" && sha256sum *.tgz > SHA256SUMS.txt)
