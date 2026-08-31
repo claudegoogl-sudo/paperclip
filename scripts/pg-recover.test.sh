@@ -75,7 +75,36 @@ trap '
     [ -f "$pf" ] && kill "$(cat "$pf")" 2>/dev/null
   done
   rm -rf "$TMP"
+  default_lock_leaked quiet >/dev/null 2>&1 || true
 ' EXIT
+
+# Test isolation for the cutover-window lock. The watchdog reads its lock path
+# from PG_RECOVER_WINDOW_LOCK; the window scripts (install/rollback) read a
+# SEPARATE variable, WINDOW_LOCK, whose default resolves into the LIVE
+# instance dir. Pin BOTH to the scratch dir so nothing the battery runs can
+# create or probe a lock at the default path.
+export WINDOW_LOCK="$TMP/pg-window.lock"
+
+# Leak guard: no lock artifact may exist at the default path after the run. A
+# file that was already there before the battery started is not ours — it is
+# left untouched. A file that APPEARED during the run is a test-isolation
+# failure: removed when unheld, reported-but-NOT-removed when still
+# flock-held (a real cutover window may be live on this host; deleting it
+# could unsuppress recovery mid-window).
+DEFAULT_LOCK="/home/paperclip/.paperclip/instances/default/pg-window.lock"
+DEFAULT_LOCK_PREEXISTED=0
+[ -e "$DEFAULT_LOCK" ] && DEFAULT_LOCK_PREEXISTED=1
+default_lock_leaked() { # [quiet] -> rc 1 and a FAIL line when a leak is found
+  [ "$DEFAULT_LOCK_PREEXISTED" = "0" ] || return 0
+  [ ! -e "$DEFAULT_LOCK" ] && return 0
+  if flock -n "$DEFAULT_LOCK" true 2>/dev/null; then
+    rm -f "$DEFAULT_LOCK"
+    [ "${1:-}" = "quiet" ] || bad "LEAK: lock artifact created at the DEFAULT path during the run — removed (was unheld): $DEFAULT_LOCK"
+    return 1
+  fi
+  [ "${1:-}" = "quiet" ] || bad "LEAK: lock artifact appeared at the DEFAULT path and is STILL HELD — left in place (a real window may be running): $DEFAULT_LOCK"
+  return 1
+}
 
 PORT=$((40000 + RANDOM % 20000))
 export PG_RECOVER_PORT="$PORT"
@@ -524,6 +553,9 @@ expect_exit 1 "epoch-only leftover does not defer (start attempted, exit 1)" "$R
 [ "$(state_get consecutive_failures "$PG_RECOVER_STATE")" = "1" ] \
   && ok "start attempt counted (recovery not suppressed)" || bad "recovery suppressed by epoch-only file"
 rm -f "$PG_RECOVER_WINDOW_LOCK"
+
+echo "== case: leak guard — no lock artifact left at the default path =="
+default_lock_leaked || true   # rc 1 on a leak; bad() already counted it
 
 echo
 echo "passed: $PASS  failed: $FAIL"
