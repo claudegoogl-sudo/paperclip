@@ -72,9 +72,14 @@ tarballs).
   empty-provider class (a packed plugin tarball whose manifest points at
   `./dist/*` with no `dist/` shipped); never run against a set you intend
   to publish.
+- `stage-bundled-packages.mjs` — stage + pack every release package that
+  declares `bundleDependencies` (see the defect class above).
+- `gate-bundled-tarballs.mjs` — static gate: bundled tarballs must keep the
+  `bundleDependencies` manifest contract and ship the patched bundled
+  runtime (registered patch marker per dependency, fail closed on drift).
 - `lib.mjs` — the URL-closure / export-target / checksum checks.
-- `lib.test.mjs`, `workflow.test.mjs` — unit tests for the checks and the
-  workflow wiring (run in PR CI).
+- `lib.test.mjs`, `workflow.test.mjs`, `bundled-deps.test.mjs` — unit tests
+  for the checks and the workflow wiring (run in PR CI).
 
 ## Defect classes this gate exists for
 
@@ -94,3 +99,16 @@ tarballs).
   before packing, and the export-target scan covers every tarball in the
   release set, so an unbuilt (or any other target-less) tarball fails the
   gate instead of shipping.
+- **Patched bundled dependencies shipped pristine** (shipped as fork.36
+  through fork.38; caused the fork.37 `claude_local` `ensure_session`
+  outage): `build.sh` used to strip `bundleDependencies` and pack workspace
+  directories, so packages that upstream bundles — `adapter-utils` (acpx),
+  `db` (embedded-postgres) — resolved their bundled dep from the npm
+  registry on hosts, WITHOUT the repository's pnpm patches. Pristine acpx
+  rejects the SCREAMING_CASE env map adapter-utils persists as
+  `acpx.session_options.env`, killing every local agent start with
+  `Persisted key policy violation`. Bundled packages are now staged through
+  `scripts/prepare-bundled-package.mjs` (registry install + `patch -p1`
+  re-application + marker validation) and packed from the staged directory,
+  and the bundled-deps gate fails the build if any bundled tarball ships
+  without the patched runtime.

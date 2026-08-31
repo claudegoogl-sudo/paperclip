@@ -1,9 +1,14 @@
 #!/usr/bin/env node
 /**
  * Normalize every packed tarball manifest for release: pin every internal
- * dependency to the exact release URL for this release, and strip
- * `bundleDependencies` declarations (the fork never bundles; the shipped
- * release sets resolve those deps as normal registry dependencies).
+ * dependency to the exact release URL for this release. `bundleDependencies`
+ * declarations are PRESERVED: bundled packages (adapter-utils/acpx,
+ * db/embedded-postgres) are staged through prepare-bundled-package.mjs and
+ * carry the patched bundled runtime in the tarball — stripping the
+ * declaration here would desync the manifest from the shipped bundle and
+ * regress the persisted-key-policy fix (the fork.37 claude_local
+ * ensure_session outage). The bundled-deps gate fails the build if a bundled
+ * tarball ever ships without its bundle.
  *
  * Fork releases are GitHub-Release tarball sets, never npm publishes, so an
  * internal dep left as `workspace:*`, `*`, `^<version>`, or a bare version is
@@ -77,12 +82,6 @@ function main() {
       const expected = expectedReleaseUrl(dep.name, args.version);
       if (dep.value !== expected) {
         manifest[dep.section][dep.name] = expected;
-        changed = true;
-      }
-    }
-    for (const key of ["bundleDependencies", "bundledDependencies"]) {
-      if (key in manifest) {
-        delete manifest[key];
         changed = true;
       }
     }
