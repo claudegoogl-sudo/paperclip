@@ -8,7 +8,9 @@
 ///  - the manifest dropped `bundleDependencies` or the bundled dep itself;
 ///  - the bundled copy is absent from the tarball;
 ///  - a bundled dep that root `pnpm.patchedDependencies` patches ships without
-///    its registered patch marker (pristine registry copy made it through).
+///    its registered patch marker (pristine registry copy made it through);
+///  - the tarball does not ship `package/LICENSE` (every published tarball
+///    must carry the license; staging falls back to the repo-root LICENSE).
 ///
 /// Patch markers are registered per dependency name in PATCH_MARKERS. A newly
 /// patched bundled dep without a marker here is a HARD FAILURE — extend the
@@ -102,6 +104,9 @@ export function checkBundledTarballs({ outDir, version, manifestPath, repoRoot: 
     }
 
     const entries = tarEntries(tarballPath);
+    if (!entries.includes("package/LICENSE")) {
+      violations.push(`${pkg.name}: tarball does not ship package/LICENSE (every published tarball must carry the license)`);
+    }
     for (const dep of bundledDeps) {
       const prefix = `package/node_modules/${dep}/`;
       const bundledEntries = entries.filter((name) => name.startsWith(prefix));
