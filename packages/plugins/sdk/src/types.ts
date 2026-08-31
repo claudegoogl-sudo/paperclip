@@ -1019,6 +1019,13 @@ export interface PluginActivityClient {
  * `plugin.state.read` capability required for `get()`.
  * `plugin.state.write` capability required for `set()` and `delete()`.
  *
+ * SECURITY (company scope): `scopeKind: "company"` keys state by a company id.
+ * Every company-scoped `get()` / `set()` / `delete()` is reach-checked
+ * server-side — the named company must be one the plugin is genuinely
+ * provisioned for (installed, enabled, and not company-disabled) — and a
+ * missing/empty `scopeId` is rejected rather than served as the unkeyed
+ * fallback partition. Calls naming any other company fail closed.
+ *
  * @see PLUGIN_SPEC.md §21.3 `plugin_state`
  */
 export interface PluginStateClient {
