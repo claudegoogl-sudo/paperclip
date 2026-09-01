@@ -75,8 +75,9 @@ tarballs).
 - `stage-bundled-packages.mjs` — stage + pack every release package that
   declares `bundleDependencies` (see the defect class above).
 - `gate-bundled-tarballs.mjs` — static gate: bundled tarballs must keep the
-  `bundleDependencies` manifest contract and ship the patched bundled
-  runtime (registered patch marker per dependency, fail closed on drift).
+  `bundleDependencies` manifest contract, ship the patched bundled runtime
+  (registered patch marker per dependency), and carry `package/LICENSE`
+  (fail closed on drift; staging falls back to the repo-root LICENSE).
 - `lib.mjs` — the URL-closure / export-target / checksum checks.
 - `lib.test.mjs`, `workflow.test.mjs`, `bundled-deps.test.mjs` — unit tests
   for the checks and the workflow wiring (run in PR CI).
@@ -112,3 +113,10 @@ tarballs).
   re-application + marker validation) and packed from the staged directory,
   and the bundled-deps gate fails the build if any bundled tarball ships
   without the patched runtime.
+- **License dropped from restaged tarballs** (shipped as fork.39): the
+  restaged bundled packages (`adapter-utils`, `db`) are packed from a staging
+  directory, and neither package directory carries a LICENSE file — the
+  staged license copy was a silent no-op, so those tarballs published without
+  a license. Staging now falls back to the repo-root LICENSE (README is never
+  fallen back), and the bundled-deps gate rejects any bundled tarball without
+  `package/LICENSE`.

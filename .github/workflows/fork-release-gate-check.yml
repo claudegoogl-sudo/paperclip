@@ -53,6 +53,15 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      # The lockfile is CI-owned (PRs cannot commit pnpm-lock.yaml), so a
+      # manifest-changing PR leaves the committed lockfile stale and the
+      # build's `pnpm install --frozen-lockfile` would refuse it. Regenerate
+      # the lockfile in place first — the same thing the PR policy job does
+      # before its downstream jobs install. Converges to a no-op when the
+      # committed lockfile already matches the manifests.
+      - name: Regenerate the CI-owned lockfile against the checkout manifests
+        run: pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile
+
       - name: Build + pack + URL-pin the release set
         run: bash scripts/fork-release/build.sh "$GATE_VERSION" --out dist-tarballs
 

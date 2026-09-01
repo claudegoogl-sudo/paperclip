@@ -11,7 +11,7 @@
 /// fail-closed behavior against hand-built tarball fixtures.
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
@@ -19,6 +19,7 @@ import test from "node:test";
 
 import { bundledReleasePackages, tarballNameFor } from "./stage-bundled-packages.mjs";
 import { checkBundledTarballs } from "./gate-bundled-tarballs.mjs";
+import { copyPackageMetadata } from "../prepare-bundled-package.mjs";
 
 const repoRoot = join(new URL("..", import.meta.url).pathname, "..");
 
@@ -96,6 +97,7 @@ test("the gate accepts a bundled tarball that ships the patched runtime", () => 
       "node_modules/acpx/dist/live-checkpoint-ClPCSdrW.js":
         'const MAP_OBJECT_PATHS = /* @__PURE__ */ new Set(["request_token_usage", "messages.Agent.tool_results", "acpx.session_options.env"]);',
       "dist/index.js": "export {};",
+      "LICENSE": "MIT License\n",
     },
   });
 
@@ -123,6 +125,7 @@ test("the gate rejects a bundled tarball whose bundled copy is pristine", () => 
       "node_modules/acpx/dist/live-checkpoint-ClPCSdrW.js":
         'const MAP_OBJECT_PATHS = /* @__PURE__ */ new Set(["request_token_usage", "messages.Agent.tool_results"]);',
       "dist/index.js": "export {};",
+      "LICENSE": "MIT License\n",
     },
   });
 
@@ -148,7 +151,7 @@ test("the gate rejects a tarball that dropped the bundle or the manifest contrac
     version: "9.9.9-test",
     deps: { picocolors: "^1.1.1" },
     bundled: [],
-    files: { "dist/index.js": "export {};" },
+    files: { "dist/index.js": "export {};", "LICENSE": "MIT License\n" },
   });
 
   const { violations } = checkBundledTarballs({
@@ -161,4 +164,88 @@ test("the gate rejects a tarball that dropped the bundle or the manifest contrac
   assert.match(violations[0], /dropped bundleDependencies entry acpx/);
   assert.match(violations[1], /no longer declares dependency acpx/);
   assert.match(violations[2], /does not bundle node_modules\/acpx/);
+});
+
+test("the gate rejects a bundled tarball that ships without a license", () => {
+  const root = makeFakeRepo([{ dir: "packages/adapter-utils", name: "@paperclipai/adapter-utils" }]);
+  const outDir = join(root, "out");
+  mkdirSync(outDir, { recursive: true });
+  makeFakeTarball(outDir, {
+    name: "@paperclipai/adapter-utils",
+    version: "9.9.9-test",
+    deps: { acpx: "0.12.0" },
+    bundled: ["acpx"],
+    files: {
+      // Patched runtime + intact manifest contract, but no package/LICENSE:
+      // the shape fork.39's restaged bundled tarballs shipped with.
+      "node_modules/acpx/dist/live-checkpoint-ClPCSdrW.js":
+        'const MAP_OBJECT_PATHS = /* @__PURE__ */ new Set(["request_token_usage", "messages.Agent.tool_results", "acpx.session_options.env"]);',
+      "dist/index.js": "export {};",
+    },
+  });
+
+  const { violations } = checkBundledTarballs({
+    repoRoot: root,
+    outDir,
+    version: "9.9.9-test",
+    markers: MARKERS,
+  });
+  assert.ok(
+    violations.some((v) => /does not ship package\/LICENSE/.test(v)),
+    `expected a package/LICENSE violation, got: ${JSON.stringify(violations)}`,
+  );
+});
+
+test("staged package metadata copies the repo-root license when the package has none", () => {
+  const root = mkdtempSync(join(tmpdir(), "fork-release-license-"));
+  try {
+    writeFileSync(join(root, "LICENSE"), "root license\n");
+    const sourceDir = join(root, "pkg");
+    const destinationDir = join(root, "stage");
+    mkdirSync(sourceDir, { recursive: true });
+    mkdirSync(destinationDir, { recursive: true });
+    writeFileSync(join(sourceDir, "package.json"), JSON.stringify({ name: "@paperclipai/db" }));
+
+    copyPackageMetadata(sourceDir, destinationDir, root);
+
+    assert.equal(readFileSync(join(destinationDir, "LICENSE"), "utf8"), "root license\n");
+    assert.equal(existsSync(join(destinationDir, "README.md")), false, "README must not fall back to the repo root");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("staged package metadata prefers the package's own license over the root fallback", () => {
+  const root = mkdtempSync(join(tmpdir(), "fork-release-license-"));
+  try {
+    writeFileSync(join(root, "LICENSE"), "root license\n");
+    const sourceDir = join(root, "pkg");
+    const destinationDir = join(root, "stage");
+    mkdirSync(sourceDir, { recursive: true });
+    mkdirSync(destinationDir, { recursive: true });
+    writeFileSync(join(sourceDir, "LICENSE"), "package license\n");
+
+    copyPackageMetadata(sourceDir, destinationDir, root);
+
+    assert.equal(readFileSync(join(destinationDir, "LICENSE"), "utf8"), "package license\n");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("staged package metadata leaves no license behind when neither package nor root has one", () => {
+  const root = mkdtempSync(join(tmpdir(), "fork-release-license-"));
+  try {
+    const sourceDir = join(root, "pkg");
+    const destinationDir = join(root, "stage");
+    mkdirSync(sourceDir, { recursive: true });
+    mkdirSync(destinationDir, { recursive: true });
+
+    copyPackageMetadata(sourceDir, destinationDir, root);
+
+    assert.equal(existsSync(join(destinationDir, "LICENSE")), false);
+    assert.equal(existsSync(join(destinationDir, "LICENSE.md")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
