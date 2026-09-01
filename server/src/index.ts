@@ -527,7 +527,8 @@ export async function startServer(): Promise<StartedServer> {
     // sentinel (via `socketDir`). Each `postgres()` boundary
     // (`getPostgresDataDirectory`, `ensurePostgresDatabase`, `ensureMigrations`,
     // `createDb`) decodes it and connects over the unix-domain socket at
-    // `<dataDir>.socket` instead of the killed TCP listener.
+    // `socketDirectoryPathFor(dataDir)` — the short hashed `paperclip-pg-<hash>`
+    // dir under XDG_RUNTIME_DIR/tmpdir — instead of the killed TCP listener.
     if (runningPid) {
       logger.warn(`Embedded PostgreSQL already running; reusing existing process (pid=${runningPid}, socket=${embeddedSocketDir}, port=${port})`);
     } else {
