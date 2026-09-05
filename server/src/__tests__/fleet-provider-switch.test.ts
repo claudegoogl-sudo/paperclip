@@ -58,6 +58,41 @@ describe("resolveDispatchingAgentId (D1 unit)", () => {
   });
 });
 
+describe("handleFleetSwitchProvider payload trust boundary (D1 unit)", () => {
+  it("ignores a payload-supplied agentId/provider/model/companyId/env and derives target selection purely from host-resolved scope", async () => {
+    const deps = {
+      db: {} as any,
+      listFleetTargets: async (dispatchingAgentId: string) => {
+        // If the payload's spoofed agentId were honored, this would be called
+        // with "attacker-agent" instead of the host-resolved "antbot-1".
+        expect(dispatchingAgentId).toBe("antbot-1");
+        return [{ id: "antbot-1", name: "antbot", companyId: "c1", adapterConfig: {} }];
+      },
+      auditPoster: { postAudit: async () => {} },
+      featureFlag: { isEnabled: () => true },
+      firstInvocationGuard: { consumeIsFirstInvocation: async () => false },
+    };
+    const spoofedPayload = {
+      dryRun: false,
+      // None of these are part of FleetSwitchProviderParams; a worker that
+      // sends them anyway must not influence the outcome.
+      agentId: "attacker-agent",
+      provider: "attacker-provider",
+      model: "attacker-model",
+      companyId: "attacker-company",
+      env: { INJECTED: "value" },
+    } as any;
+    const result = await handleFleetSwitchProvider(
+      { invocationScope: { agentId: "antbot-1" } } as any,
+      spoofedPayload,
+      deps,
+    );
+    // The only trigger agent in the fixture is excluded as a self-switch, so
+    // this proves the RPC ran end-to-end off the host-resolved id alone.
+    expect(result.results).toEqual([{ agentId: "antbot-1", agentName: "antbot", outcome: "SKIPPED", reason: "excluded target", dryRun: false }]);
+  });
+});
+
 describe("isExcludedTarget (D3 unit)", () => {
   const triggerIds = new Set(["antbot-1", "zbot-1"]);
   it("excludes the triggering agent and its peer trigger by id/name", () => {
