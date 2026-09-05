@@ -124,6 +124,28 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Shallow, env-preserving merge of an adapterConfig patch over the agent's
+ * existing adapterConfig. Callers that only want to change a handful of keys
+ * (e.g. `provider`/`model`) MUST route through this helper instead of writing
+ * the bare patch object to `updateAgent`/`AgentsService.update` — the update
+ * path always full-replaces `adapterConfig` with whatever object it is given
+ * (`.set({ ...normalizedPatch })`), so a bare `{ provider, model }` patch
+ * silently wipes every other key, including `env` and any `secret_ref`
+ * bindings. This mirrors the merge the `PATCH /api/agents/:id` route already
+ * performs inline (server/src/routes/agents.ts) before calling `updateAgent`,
+ * extracted so any other write path (host RPCs, scripts, future routes) gets
+ * the same env-preservation guarantee by construction rather than by copying
+ * the route's inline logic.
+ */
+export function mergeAdapterConfigPatch(
+  existingAdapterConfig: unknown,
+  patch: Record<string, unknown>,
+): Record<string, unknown> {
+  const existing = isPlainRecord(existingAdapterConfig) ? existingAdapterConfig : {};
+  return { ...existing, ...patch };
+}
+
 function jsonEqual(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
