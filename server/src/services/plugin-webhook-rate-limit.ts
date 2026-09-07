@@ -26,7 +26,7 @@
 //
 // Verified deliveries consume one bucket only: `(pluginId, endpointKey)` in the
 // verified map. They deliberately skip the per-IP bucket. Behind a tunnel with
-// TRUST_PROXY unset every request shares one apparent IP, so an anonymous flood
+// TRUST_PROXY unset every request shares one apparent ip, so an anonymous flood
 // would otherwise exhaust the shared IP bucket and starve verified traffic
 // through the side door — reintroducing exactly the starvation this fixes. The
 // verified endpoint cap is the ceiling that bounds a leaked credential.
@@ -40,6 +40,19 @@
 // cap above the per-endpoint cap guarantees that when all traffic shares one
 // apparent IP the per-endpoint bucket is the binding constraint, so the per-IP
 // bucket only fires when `TRUST_PROXY` is configured and IPs are real.
+//
+// All three buckets are built on the shared sliding-window store
+// (sliding-window-rate-limit-store.ts), which deletes a key as soon as its
+// window fully ages out and caps the live-key count with oldest-first
+// eviction. The IP bucket is the unbounded-growth surface: an operator that
+// flips `TRUST_PROXY` on exposes `req.ip` to whatever an attacker sends, and
+// without the store's eviction backstop a rotating-source-IP flood would grow
+// the map without bound.
+
+import {
+  DEFAULT_SLIDING_WINDOW_MAX_KEYS,
+  createSlidingWindowRateLimitStore,
+} from "./sliding-window-rate-limit-store.js";
 
 /** Sliding window both buckets are measured over. */
 export const PLUGIN_WEBHOOK_RATE_LIMIT_WINDOW_MS = 60_000;
@@ -99,17 +112,17 @@ export type PluginWebhookRateLimiter = {
   consume(actor: PluginWebhookRateLimitActor): PluginWebhookRateLimitResult;
 };
 
-type Bucket = {
-  hits: number[];
-  blocked: boolean;
-  retryAfterSeconds: number;
-};
-
 export function createPluginWebhookRateLimiter(options: {
   windowMs?: number;
   maxPerEndpoint?: number;
   maxPerIp?: number;
   maxPerVerifiedEndpoint?: number;
+  /**
+   * Per-bucket ceiling on live keys. Defaults to the shared
+   * `DEFAULT_SLIDING_WINDOW_MAX_KEYS`; override is intended for tests that
+   * need to exercise oldest-first eviction without flooding the map.
+   */
+  maxKeys?: number;
   now?: () => number;
 } = {}): PluginWebhookRateLimiter {
   const windowMs = options.windowMs ?? PLUGIN_WEBHOOK_RATE_LIMIT_WINDOW_MS;
@@ -117,28 +130,28 @@ export function createPluginWebhookRateLimiter(options: {
   const maxPerIp = options.maxPerIp ?? PLUGIN_WEBHOOK_RATE_LIMIT_MAX_PER_IP;
   const maxPerVerifiedEndpoint = options.maxPerVerifiedEndpoint
     ?? PLUGIN_WEBHOOK_RATE_LIMIT_MAX_PER_VERIFIED_ENDPOINT;
+  const maxKeys = options.maxKeys ?? DEFAULT_SLIDING_WINDOW_MAX_KEYS;
   const now = options.now ?? Date.now;
-  const endpointHits = new Map<string, number[]>();
-  const ipHits = new Map<string, number[]>();
-  // Separate store, not a separate key prefix in `endpointHits`: an anonymous
-  // flood must not be able to reach the verified budget by any path.
-  const verifiedEndpointHits = new Map<string, number[]>();
-
-  function inspect(store: Map<string, number[]>, key: string, max: number, currentTime: number): Bucket {
-    const cutoff = currentTime - windowMs;
-    const hits = (store.get(key) ?? []).filter((hit) => hit > cutoff);
-    // Persist the pruned list so the window keeps sliding even while blocked.
-    store.set(key, hits);
-    if (hits.length < max) {
-      return { hits, blocked: false, retryAfterSeconds: 0 };
-    }
-    const oldestHit = hits[0] ?? currentTime;
-    return {
-      hits,
-      blocked: true,
-      retryAfterSeconds: Math.max(1, Math.ceil((oldestHit + windowMs - currentTime) / 1000)),
-    };
-  }
+  // Three independent stores, not three key prefixes in one store: an
+  // anonymous flood must not be able to reach the verified budget by any
+  // path, and the per-IP store must not share its eviction queue with the
+  // per-endpoint store (a cold endpoint key must not be evicted because an
+  // unrelated IP key flooded).
+  const endpointStore = createSlidingWindowRateLimitStore({
+    windowMs,
+    max: maxPerEndpoint,
+    maxKeys,
+  });
+  const ipStore = createSlidingWindowRateLimitStore({
+    windowMs,
+    max: maxPerIp,
+    maxKeys,
+  });
+  const verifiedStore = createSlidingWindowRateLimitStore({
+    windowMs,
+    max: maxPerVerifiedEndpoint,
+    maxKeys,
+  });
 
   return {
     consume(actor) {
@@ -147,7 +160,7 @@ export function createPluginWebhookRateLimiter(options: {
       const tier = actor.tier ?? "anonymous";
 
       if (tier === "verified") {
-        const verified = inspect(verifiedEndpointHits, endpointKey, maxPerVerifiedEndpoint, currentTime);
+        const verified = verifiedStore.inspect(endpointKey, currentTime);
         if (verified.blocked) {
           return {
             allowed: false,
@@ -158,18 +171,20 @@ export function createPluginWebhookRateLimiter(options: {
             retryAfterSeconds: verified.retryAfterSeconds,
           };
         }
-        verified.hits.push(currentTime);
+        verifiedStore.record(endpointKey, currentTime);
         return {
           allowed: true,
           scope: null,
           tier,
           limit: maxPerVerifiedEndpoint,
-          remaining: Math.max(0, maxPerVerifiedEndpoint - verified.hits.length),
+          // inspect reports the pre-consume remaining; the record we just
+          // committed spends one slot.
+          remaining: Math.max(0, verified.remaining - 1),
           retryAfterSeconds: 0,
         };
       }
 
-      const endpoint = inspect(endpointHits, endpointKey, maxPerEndpoint, currentTime);
+      const endpoint = endpointStore.inspect(endpointKey, currentTime);
       if (endpoint.blocked) {
         return {
           allowed: false,
@@ -182,10 +197,12 @@ export function createPluginWebhookRateLimiter(options: {
       }
 
       const ip = actor.ip?.trim();
-      const perIp = ip ? inspect(ipHits, ip, maxPerIp, currentTime) : null;
+      const perIp = ip ? ipStore.inspect(ip, currentTime) : null;
       if (perIp?.blocked) {
         // The endpoint bucket is deliberately left unconsumed: a rejected
-        // request must not spend budget that legitimate traffic needs.
+        // request must not spend budget that legitimate traffic needs. The
+        // shared store makes this trivial — `record` is a separate call, so
+        // skipping it on rejection leaves the bucket untouched.
         return {
           allowed: false,
           scope: "ip",
@@ -196,14 +213,16 @@ export function createPluginWebhookRateLimiter(options: {
         };
       }
 
-      endpoint.hits.push(currentTime);
-      perIp?.hits.push(currentTime);
+      endpointStore.record(endpointKey, currentTime);
+      if (ip) {
+        ipStore.record(ip, currentTime);
+      }
       return {
         allowed: true,
         scope: null,
         tier,
         limit: maxPerEndpoint,
-        remaining: Math.max(0, maxPerEndpoint - endpoint.hits.length),
+        remaining: Math.max(0, endpoint.remaining - 1),
         retryAfterSeconds: 0,
       };
     },
