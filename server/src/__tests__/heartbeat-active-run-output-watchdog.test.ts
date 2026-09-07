@@ -1289,4 +1289,181 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(source?.executionRunId).toBe(runId);
   });
+
+  it("auto-resolves open evaluations whose run has since terminated, idempotently", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    expect(first.created).toBe(1);
+
+    // The run finishes on its own after the alert fired — the exact false-positive
+    // shape this sweep owns: the run drops out of the scan's running-only candidate
+    // set, so nothing else would ever revisit the already-open evaluation issue.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date(now.getTime() + 60_000) })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const later = new Date(now.getTime() + 5 * 60_000);
+    const second = await heartbeat.scanSilentActiveRuns({ now: later, companyId });
+    expect(second.autoResolvedTerminated).toBe(1);
+
+    const evaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(evaluations).toHaveLength(1);
+    expect(evaluations[0]?.status).toBe("done");
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, evaluations[0]!.id));
+    const autoComment = comments.find((comment) => comment.body.startsWith("Auto-resolved: the flagged run has terminated."));
+    expect(autoComment).toBeDefined();
+    expect(autoComment?.body).toContain("`succeeded`");
+
+    // Re-running the sweep must not double-close or double-comment.
+    const third = await heartbeat.scanSilentActiveRuns({ now: later, companyId });
+    expect(third.autoResolvedTerminated).toBe(0);
+    const commentsAfter = await db.select().from(issueComments).where(eq(issueComments.issueId, evaluations[0]!.id));
+    expect(commentsAfter.filter((comment) => comment.body.startsWith("Auto-resolved:"))).toHaveLength(1);
+  });
+
+  it("auto-resolves with the failure outcome recorded when the run failed", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    const heartbeat = heartbeatService(db);
+    expect((await heartbeat.scanSilentActiveRuns({ now, companyId })).created).toBe(1);
+
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "failed",
+        finishedAt: new Date(now.getTime() + 60_000),
+        errorCode: "adapter_failed",
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const later = new Date(now.getTime() + 5 * 60_000);
+    const second = await heartbeat.scanSilentActiveRuns({ now: later, companyId });
+    expect(second.autoResolvedTerminated).toBe(1);
+    const evaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(evaluations).toHaveLength(1);
+    expect(evaluations[0]?.status).toBe("done");
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, evaluations[0]!.id));
+    const autoComment = comments.find((comment) => comment.body.startsWith("Auto-resolved:"));
+    expect(autoComment).toBeDefined();
+    expect(autoComment?.body).toContain("`failed`");
+    expect(autoComment?.body).toContain("`adapter_failed`");
+  });
+
+  it("does not auto-resolve while the run is merely queued or retried", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    const heartbeat = heartbeatService(db);
+    expect((await heartbeat.scanSilentActiveRuns({ now, companyId })).created).toBe(1);
+
+    // scheduled_retry is NOT terminal — the run has not produced its outcome yet.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "scheduled_retry" })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const later = new Date(now.getTime() + 5 * 60_000);
+    const second = await heartbeat.scanSilentActiveRuns({ now: later, companyId });
+    expect(second.autoResolvedTerminated).toBe(0);
+    const evaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(evaluations).toHaveLength(1);
+    expect(evaluations[0]?.status).not.toBe("done");
+  });
+
+  it("does not file an evaluation for a ghost run row with no live signal", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, coderId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    // Nothing is alive behind the run row: the agent went idle, no in-memory
+    // child handle exists, and no pid/process-group metadata was ever recorded.
+    // The run row still says "running", but it is a ghost, not an active run.
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, coderId));
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    expect(result.created).toBe(0);
+
+    const evaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(evaluations).toHaveLength(0);
+    const gates = await db
+      .select()
+      .from(activityLog)
+      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "heartbeat.output_stale_run_not_live")));
+    expect(gates).toHaveLength(1);
+  });
+
+  it("persists the terminal lifecycle event when a queued run executes end to end", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: `Terminal Event Co ${companyId.slice(0, 8)}`,
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: `Agent${agentId.slice(0, 8)}`,
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 20 } },
+      permissions: {},
+    });
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "queued",
+      contextSnapshot: {},
+    });
+
+    const heartbeat = heartbeatService(db);
+    const claimed = await heartbeat.startNextQueuedRunForAgent(agentId);
+    expect(claimed).toHaveLength(1);
+    await heartbeat.drainActiveRunExecutions();
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("succeeded");
+    // The terminal lifecycle event must come from the run finalization path
+    // itself. This assertion fails if the emit is removed from execution, which
+    // is exactly the silent-terminal telemetry this suite guards.
+    const events = await db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(and(eq(heartbeatRunEvents.runId, runId), eq(heartbeatRunEvents.eventType, "lifecycle")));
+    const messages = events.map((event) => event.message);
+    expect(messages).toContain("run started");
+    expect(messages).toContain("run succeeded");
+  });
 });
