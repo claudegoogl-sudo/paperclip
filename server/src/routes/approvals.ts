@@ -4,6 +4,7 @@ import { heartbeatRuns, type Db } from "@paperclipai/db";
 import {
   addApprovalCommentSchema,
   createApprovalSchema,
+  refineApprovalPayload,
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
   resubmitApprovalSchema,
@@ -40,6 +41,11 @@ function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
     context.allowDocumentUpdates === false &&
     context.resumeRequiresNormalModel === true;
 }
+
+// Authoritative boundary for approval creation: the discriminated payload
+// refinement turns schema-probe or half-built payloads into a 400 before any
+// row is written, instead of a permanently pending empty card.
+const createApprovalRequestSchema = createApprovalSchema.superRefine(refineApprovalPayload);
 
 export function approvalRoutes(
   db: Db,
@@ -221,7 +227,7 @@ export function approvalRoutes(
     res.json(redactApprovalPayload(approval));
   });
 
-  router.post("/companies/:companyId/approvals", validate(createApprovalSchema), async (req, res) => {
+  router.post("/companies/:companyId/approvals", validate(createApprovalRequestSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     if (!(await assertApprovalAccessAllowed(req, res, companyId))) return;
@@ -496,6 +502,44 @@ export function approvalRoutes(
       details: { type: approval.type },
     });
     res.json(redactApprovalPayload(approval));
+  });
+
+  router.post("/approvals/:id/withdraw", async (req, res) => {
+    const id = req.params.id as string;
+    const approval = await svc.getById(id);
+    if (!approval) {
+      res.status(404).json({ error: "Approval not found" });
+      return;
+    }
+    assertCompanyAccess(req, approval.companyId);
+    if (!(await assertApprovalMutationAllowedByRunContext(req, res, approval.companyId))) return;
+
+    if (req.actor.type !== "agent" || !req.actor.agentId || req.actor.agentId !== approval.requestedByAgentId) {
+      res.status(403).json({ error: "Only the requesting agent can withdraw this approval" });
+      return;
+    }
+
+    const actor = getActorInfo(req);
+    const { approval: updated, applied } = await svc.withdraw(id, {
+      agentId: actor.agentId as string,
+      runId: actor.runId,
+    });
+
+    if (applied) {
+      await logActivity(db, {
+        companyId: approval.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "approval.withdrawn",
+        entityType: "approval",
+        entityId: approval.id,
+        details: { type: updated.type, requestedByAgentId: updated.requestedByAgentId },
+      });
+    }
+
+    res.json(redactApprovalPayload(updated));
   });
 
   router.get("/approvals/:id/comments", async (req, res) => {

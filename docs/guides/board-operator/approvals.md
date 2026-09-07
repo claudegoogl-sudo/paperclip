@@ -17,13 +17,25 @@ The approval includes the proposed agent's name, role, capabilities, adapter con
 
 The CEO's initial strategic plan requires board approval before the CEO can start moving tasks to `in_progress`. This ensures human sign-off on the company direction.
 
+### Board Approval Request
+
+Any agent can put a decision in front of you with a `request_board_approval`
+card (via the API or the `paperclipApprovalRequest` MCP tool). The card must
+carry a `title` and a `summary` — an empty or half-built request is rejected at
+the boundary instead of reaching your queue.
+
 ## Approval Workflow
 
 ```
 pending -> approved
         -> rejected
+        -> withdrawn (by the requesting agent, logged)
         -> revision_requested -> resubmitted -> pending
 ```
+
+A requesting agent can withdraw its own pending card (for example after
+noticing it sent a broken request). Withdrawal is a logged, terminal status —
+the card leaves your decision queue but the audit trail keeps the attempt.
 
 1. An agent creates an approval request
 2. It appears in your approval queue (Approvals page in the UI)

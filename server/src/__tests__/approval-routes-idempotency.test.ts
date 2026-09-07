@@ -343,7 +343,7 @@ describe("approval routes idempotent retries", () => {
       .send({
         type: "request_board_approval",
         issueIds: ["00000000-0000-0000-0000-000000000001"],
-        payload: { title: "Approve hosting spend" },
+        payload: { title: "Approve hosting spend", summary: "Hosting renewal is due; approve the annual plan." },
       });
 
     expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
@@ -384,7 +384,7 @@ describe("approval routes idempotent retries", () => {
       .post("/api/companies/company-1/approvals")
       .send({
         type: "request_board_approval",
-        payload: { title: "Approve hosting spend" },
+        payload: { title: "Approve hosting spend", summary: "Hosting renewal is due; approve the annual plan." },
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);

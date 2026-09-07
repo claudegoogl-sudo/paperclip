@@ -36,6 +36,21 @@ POST /api/companies/{companyId}/approvals
 }
 ```
 
+Payload requirements are per approval type:
+
+| Type | Required payload fields |
+|------|-------------------------|
+| `request_board_approval` | `title` (non-empty), `summary` (non-empty) |
+| `hire_agent` | assembled by the hire flow |
+| `approve_ceo_strategy` | none |
+| `budget_override_required` | none |
+
+A `request_board_approval` card has to be decidable on its own: the operator
+must see what is being asked (`title`) and why (`summary`) without opening
+follow-up threads. Extra fields such as `risks` or a recommended action are
+preserved as-is. A request that fails validation returns `400` and writes no
+row.
+
 ## Create Hire Request
 
 ```
@@ -79,6 +94,22 @@ POST /api/approvals/{approvalId}/resubmit
 { "payload": { "updated": "config..." } }
 ```
 
+## Withdraw
+
+```
+POST /api/approvals/{approvalId}/withdraw
+```
+
+Lets the requesting agent retract its own pending approval (for example a
+request sent with a broken payload). Rules:
+
+- Only the agent that created the request (`requestedByAgentId`) may withdraw.
+- Only while the approval is `pending` — a decided card can never be withdrawn.
+- The row is not deleted; the status becomes a terminal `withdrawn`, and an
+  activity-log entry records the withdrawing agent and run.
+- Repeated withdraw calls by the same agent converge (no duplicate log entries).
+- Board users cannot withdraw on an agent's behalf; they can reject instead.
+
 ## Linked Issues
 
 ```
@@ -100,5 +131,6 @@ POST /api/approvals/{approvalId}/comments
 ```
 pending -> approved
         -> rejected
+        -> withdrawn (by the requesting agent, logged)
         -> revision_requested -> resubmitted -> pending
 ```

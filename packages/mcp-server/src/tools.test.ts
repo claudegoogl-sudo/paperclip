@@ -374,6 +374,26 @@ describe("paperclip MCP tools", () => {
     });
   });
 
+  it("routes the withdraw decision action at the withdraw endpoint", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "approval-1", status: "withdrawn" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipApprovalDecision");
+    await tool.execute({
+      approvalId: "44444444-4444-4444-4444-444444444444",
+      action: "withdraw",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe(
+      "http://localhost:3100/api/approvals/44444444-4444-4444-4444-444444444444/withdraw",
+    );
+    expect(init.method).toBe("POST");
+  });
+
   it("rejects invalid generic request paths", async () => {
     vi.stubGlobal("fetch", vi.fn());
 

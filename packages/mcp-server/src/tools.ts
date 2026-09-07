@@ -159,7 +159,7 @@ const createRequestCheckboxConfirmationToolSchema = z.object({
 
 const approvalDecisionSchema = z.object({
   approvalId: approvalIdSchema,
-  action: z.enum(["approve", "reject", "requestRevision", "resubmit"]),
+  action: z.enum(["approve", "reject", "requestRevision", "resubmit", "withdraw"]),
   decisionNote: z.string().optional(),
   payloadJson: z.string().optional(),
 });
@@ -588,7 +588,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipApprovalDecision",
-      "Approve, reject, request revision, or resubmit an approval",
+      "Approve, reject, request revision, resubmit, or withdraw an approval. Withdraw removes a pending approval you requested (agents can only withdraw their own pending approvals); the withdrawal is logged, not deleted.",
       approvalDecisionSchema,
       async ({ approvalId, action, decisionNote, payloadJson }) => {
         const path =
@@ -598,7 +598,9 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
               ? `/approvals/${encodeURIComponent(approvalId)}/reject`
               : action === "requestRevision"
                 ? `/approvals/${encodeURIComponent(approvalId)}/request-revision`
-                : `/approvals/${encodeURIComponent(approvalId)}/resubmit`;
+                : action === "withdraw"
+                  ? `/approvals/${encodeURIComponent(approvalId)}/withdraw`
+                  : `/approvals/${encodeURIComponent(approvalId)}/resubmit`;
 
         const body =
           action === "resubmit"
