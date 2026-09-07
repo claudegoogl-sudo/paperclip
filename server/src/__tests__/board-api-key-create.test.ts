@@ -12,7 +12,7 @@ import { errorHandler } from "../middleware/error-handler.ts";
 import { accessRoutes } from "../routes/access.ts";
 import { boardAuthService } from "../services/board-auth.ts";
 
-// PLA-6305: POST /api/board-api-keys must reject a create request that omits
+// POST /api/board-api-keys must reject a create request that omits
 // `expiresAt` or `scope` (the inverted secure-default that produced 11 live,
 // unscoped, never-expiring board keys), and a board key must not be able to
 // mint a successor that outlives it or is broader in scope than it.
@@ -31,7 +31,7 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
-describeEmbeddedPostgres("POST /api/board-api-keys secure defaults (PLA-6305)", () => {
+describeEmbeddedPostgres("POST /api/board-api-keys secure defaults", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   const operatorUserId = "operator-user-create";

@@ -34,7 +34,7 @@ declare global {
         boardKeyScope?: BoardApiKeyScope;
         // Expiry of the board API key currently authenticating this request.
         // Only meaningful when source === "board_key". Used to enforce the
-        // privilege ceiling on POST /api/board-api-keys (PLA-6305 AC5): a
+        // privilege ceiling on POST /api/board-api-keys: a
         // board key cannot mint a successor that outlives itself.
         boardKeyExpiresAt?: Date | null;
         runId?: string;

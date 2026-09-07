@@ -240,12 +240,12 @@ function resolveBoardKeyScope(opts: BoardTokenOptions): { kind: "plugin_ops" | "
   throw new Error(
     `--scope is required and must be one of: "plugin_ops", "standard" (got: ${opts.scope ?? "<none>"}). ` +
       'There is no flag for an unscoped, non-expiring key -- that is the exact ' +
-      "inverted default PLA-6305 removed. Use --scope standard with a short " +
+      "inverted default removed. Use --scope standard with a short " +
       "--ttl-days/--expires-at for genuine full-board authority.",
   );
 }
 
-// `--never-expires` has been removed (PLA-6305): the server now rejects a
+// `--never-expires` has been removed: the server now rejects a
 // board API key create request without `expiresAt` outright, and a
 // non-expiring key was exactly the misconfiguration that left 11 unscoped,
 // never-expiring keys live on this instance for four months. Callers must
@@ -264,6 +264,6 @@ function resolveBoardKeyExpiresAt(opts: BoardTokenOptions): Date {
   }
   throw new Error(
     "One of --expires-at or --ttl-days is required. Board API keys must have an " +
-      "expiry (PLA-6305); there is no non-expiring option.",
+      "expiry; there is no non-expiring option.",
   );
 }

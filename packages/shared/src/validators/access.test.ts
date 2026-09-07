@@ -143,7 +143,7 @@ describe("authSessionSchema", () => {
 describe("createBoardApiKeySchema", () => {
   const soon = () => new Date(Date.now() + 60 * 60 * 1000).toISOString();
 
-  it("rejects a request with only a name (PLA-6305: expiresAt and scope both required)", () => {
+  it("rejects a request with only a name (expiresAt and scope both required)", () => {
     const result = createBoardApiKeySchema.safeParse({ name: "cli-board" });
     expect(result.success).toBe(false);
   });

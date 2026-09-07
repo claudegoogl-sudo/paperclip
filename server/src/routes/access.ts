@@ -2898,7 +2898,7 @@ export function accessRoutes(
         assertCompanyAccess(req, req.body.requestedCompanyId);
       }
 
-      // Privilege ceiling (PLA-6305 AC5): a request authenticated by a board
+      // Privilege ceiling: a request authenticated by a board
       // API key must not be able to mint a successor key that is broader in
       // scope, or longer-lived, than the minting key itself. Session-authenticated
       // requests (a human/owner in the board UI/CLI login flow) are not bound by

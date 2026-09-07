@@ -120,7 +120,7 @@ export const resolveCliAuthChallengeSchema = z.object({
 export type ResolveCliAuthChallenge = z.infer<typeof resolveCliAuthChallengeSchema>;
 
 // Board API key creation is secure-default-by-construction: both `expiresAt`
-// and `scope` are REQUIRED fields (PLA-6305). Omitting either used to mean
+// and `scope` are REQUIRED fields. Omitting either used to mean
 // "never expires" / "full board authority" respectively -- the inverted
 // default that produced 11 unscoped, never-expiring live keys. A genuine
 // full-board key ({ kind: "standard" }) is still obtainable, but only with a

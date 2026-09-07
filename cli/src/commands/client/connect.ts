@@ -101,7 +101,7 @@ async function connectWizard(opts: ConnectOptions) {
     // middleware force-inherits the acting key's scope on any successor), but
     // the CLI sends the explicit scope so the request is self-describing and a
     // future server-side audit can reconstruct intent.
-    // PLA-6305: expiresAt is now required server-side. `connect` mints a
+    // expiresAt is now required server-side. `connect` mints a
     // long-lived plugin_ops-scoped key at the max allowed TTL (90 days) so a
     // developer's local profile keeps working without a change in day-to-day
     // behaviour; `paperclipai token board create` is the path for a shorter,
