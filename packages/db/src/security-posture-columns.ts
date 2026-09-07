@@ -111,7 +111,7 @@ export const SECURITY_POSTURE_COLUMNS = [
   {
     table: "board_api_key_auth_events",
     column: "key_id",
-    reason: "Per-event attribution of which credential authenticated; clearing it buries exactly which key an abuse investigation must name (the PLA-6298 evidence gap).",
+    reason: "Per-event attribution of which credential authenticated; clearing it buries exactly which key an abuse investigation must name — the evidence gap that motivated this log.",
   },
   {
     table: "board_api_key_auth_events",

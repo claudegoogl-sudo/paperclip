@@ -320,8 +320,9 @@ export function loadConfig(): Config {
   const boardApiKeyAuthEventRetentionEnabled =
     process.env.PAPERCLIP_BOARD_KEY_AUTH_EVENT_RETENTION_ENABLED !== "false";
   // Auth events: 90 days. A quarter's look-back outlives the audit cycle that
-  // motivated the log (the PLA-6298 investigation needed ~3 months of
-  // history) without letting the table drift toward activity_log's scale.
+  // motivated the log (the credential-abuse investigation that drove it needed
+  // ~3 months of history) without letting the table drift toward activity_log's
+  // scale.
   const boardApiKeyAuthEventRetentionDays = Math.max(
     1,
     Number(process.env.PAPERCLIP_BOARD_KEY_AUTH_EVENT_RETENTION_DAYS) || 90,

@@ -10,10 +10,10 @@ import { logger } from "../middleware/logger.js";
 // growth is slow -- but a security log that can grow without bound is still a
 // liability, not an asset. Mirrors plugin-webhook-delivery-retention:
 //
-//   - Age bound: 90 days. An authentication-event investigation on this
-//     instance (PLA-6298) needed roughly three months of look-back; 90 days
-//     outlives a quarter's audit cycle while keeping the table at a small
-//     fraction of activity_log's size.
+//   - Age bound: 90 days. The credential-abuse investigation that motivated
+//     this table needed roughly three months of look-back; 90 days outlives a
+//     quarter's audit cycle while keeping the table at a small fraction of
+//     activity_log's size.
 //   - Size bound: 500,000 rows (roughly tens of MB), evicting oldest-first.
 //     This is the load-bearing bound under a sustained multi-source attack
 //     that makes one row per source-minute per attacker.
