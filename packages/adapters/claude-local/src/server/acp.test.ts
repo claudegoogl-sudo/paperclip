@@ -1,12 +1,14 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AdapterExecutionContext, AdapterInvocationMeta } from "@paperclipai/adapter-utils";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import {
   buildClaudeAcpConfig,
   createClaudeAcpExecutor,
+  findIgnoredClaudeAcpCommandOverride,
+  formatIgnoredClaudeAcpCommandOverrideWarning,
   nodeVersionMeetsClaudeAcpMinimum,
   resolveClaudeAcpBillingIdentity,
   resolveClaudeExecutionEngine,
@@ -998,5 +1000,170 @@ describe("resolveClaudeAcpBillingIdentity", () => {
         executionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/work" },
       } as never).billingType,
     ).toBe("subscription");
+  });
+});
+
+describe("claude_local ACP ignored command override warning", () => {
+  // The dead-override warning must fire exactly once per run
+  // lane execution and exactly once per ACP Test surface invocation, and must
+  // stay silent whenever the ACP command is explicitly configured or the run
+  // uses the CLI lane (which still honors adapterConfig.command).
+  const WARNING_MATCH = "adapterConfig.command is set but ignored in engine=acp";
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function collectLogs(): Array<{ stream: "stdout" | "stderr"; chunk: string }> {
+    const logs: Array<{ stream: "stdout" | "stderr"; chunk: string }> = [];
+    return logs;
+  }
+
+  it("detects a dead command override only when no explicit ACP command is set", () => {
+    expect(findIgnoredClaudeAcpCommandOverride({ command: "/x/wrapper.sh" })).toBe("/x/wrapper.sh");
+    expect(
+      findIgnoredClaudeAcpCommandOverride({ command: "/x/wrapper.sh", agentCommand: "node ./fake-acp.js" }),
+    ).toBeNull();
+    expect(
+      findIgnoredClaudeAcpCommandOverride({ command: "/x/wrapper.sh", acpAgentCommand: "node ./fake-acp.js" }),
+    ).toBeNull();
+    expect(findIgnoredClaudeAcpCommandOverride({ command: "   " })).toBeNull();
+    expect(findIgnoredClaudeAcpCommandOverride({})).toBeNull();
+    expect(formatIgnoredClaudeAcpCommandOverrideWarning("/x/wrapper.sh")).toContain(WARNING_MATCH);
+    expect(formatIgnoredClaudeAcpCommandOverrideWarning("/x/wrapper.sh")).toContain("OFF the ACP spawn path");
+  });
+
+  it("warns exactly once on the run lane when engine=acp carries a command override", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-cmd-warn-");
+    const logs = collectLogs();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const execute = createClaudeAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(options) as never,
+    });
+
+    const result = await execute(buildContext(root, {
+      config: {
+        engine: "acp",
+        command: "/x/wrapper.sh",
+        cwd: root,
+        stateDir: path.join(root, "state"),
+        promptTemplate: "Do the assigned work.",
+      },
+      onLog: async (stream: "stdout" | "stderr", chunk: string) => {
+        logs.push({ stream, chunk });
+      },
+    }));
+
+    // Detection only: the run still completes through the ACPX engine, proving
+    // the warning changed no resolution precedence.
+    expect(result.exitCode).toBe(0);
+    const warnings = logs.filter((entry) => entry.chunk.includes(WARNING_MATCH));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0].stream).toBe("stderr");
+    expect(warnings[0].chunk).toContain("use agentCommand/acpAgentCommand");
+    expect(warnings[0].chunk).toContain("OFF the ACP spawn path");
+    expect(warnings[0].chunk).toContain("/x/wrapper.sh");
+    expect(
+      warnSpy.mock.calls.filter((call) => String(call[0]).includes(WARNING_MATCH)),
+    ).toHaveLength(1);
+  });
+
+  it("stays silent on the run lane when agentCommand carries the ACP command", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-cmd-quiet-");
+    const logs = collectLogs();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const execute = createClaudeAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(options) as never,
+    });
+
+    const result = await execute(buildContext(root, {
+      config: {
+        engine: "acp",
+        agentCommand: "node ./fake-acp.js",
+        cwd: root,
+        stateDir: path.join(root, "state"),
+        promptTemplate: "Do the assigned work.",
+      },
+      onLog: async (stream: "stdout" | "stderr", chunk: string) => {
+        logs.push({ stream, chunk });
+      },
+    }));
+
+    expect(result.exitCode).toBe(0);
+    expect(logs.filter((entry) => entry.chunk.includes(WARNING_MATCH))).toHaveLength(0);
+    expect(
+      warnSpy.mock.calls.filter((call) => String(call[0]).includes(WARNING_MATCH)),
+    ).toHaveLength(0);
+  });
+
+  it("stays silent for the CLI engine even when a command override is set", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-cmd-cli-");
+    const logs = collectLogs();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const execute = createClaudeAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(options) as never,
+    });
+
+    await execute(buildContext(root, {
+      config: {
+        engine: "cli",
+        command: "/x/wrapper.sh",
+        cwd: root,
+        stateDir: path.join(root, "state"),
+        promptTemplate: "Do the assigned work.",
+      },
+      onLog: async (stream: "stdout" | "stderr", chunk: string) => {
+        logs.push({ stream, chunk });
+      },
+    }));
+
+    expect(logs.filter((entry) => entry.chunk.includes(WARNING_MATCH))).toHaveLength(0);
+    expect(
+      warnSpy.mock.calls.filter((call) => String(call[0]).includes(WARNING_MATCH)),
+    ).toHaveLength(0);
+  });
+
+  it("reports the ignored override as a warn check on the ACP Test surface", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-cmd-test-");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const result = await testClaudeAcpEnvironment({
+      adapterType: "claude_local",
+      companyId: "company-1",
+      config: {
+        engine: "acp",
+        cwd: root,
+        command: "/x/wrapper.sh",
+      },
+    });
+
+    const checks = result.checks.filter((check) => check.code === "claude_acp_command_override_ignored");
+    expect(checks).toHaveLength(1);
+    expect(checks[0].level).toBe("warn");
+    expect(checks[0].detail).toContain("/x/wrapper.sh");
+    expect(
+      warnSpy.mock.calls.filter((call) => String(call[0]).includes(WARNING_MATCH)),
+    ).toHaveLength(1);
+  });
+
+  it("reports no ignored-override check when the ACP command is configured", async () => {
+    const root = await makeTempRoot("paperclip-claude-acp-cmd-test-quiet-");
+    const commandPath = path.join(root, "bin", "claude-agent-acp");
+    await fs.mkdir(path.dirname(commandPath), { recursive: true });
+    await fs.writeFile(commandPath, "#!/usr/bin/env sh\n", "utf8");
+    setNodeVersion("v22.12.0");
+
+    const result = await testClaudeAcpEnvironment({
+      adapterType: "claude_local",
+      companyId: "company-1",
+      config: {
+        engine: "acp",
+        cwd: root,
+        agentCommand: commandPath,
+      },
+    });
+
+    expect(result.checks.some((check) => check.code === "claude_acp_command_override_ignored")).toBe(false);
+    expect(result.status).toBe("pass");
   });
 });

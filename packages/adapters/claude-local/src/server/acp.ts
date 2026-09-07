@@ -351,6 +351,22 @@ export function createClaudeAcpExecutor(options: ClaudeAcpExecutorOptions = {}):
       currentExecutor = createAcpxEngineExecutor(withClaudeAcpDefaults(options));
       executor = currentExecutor;
     }
+    // Warn exactly once per run when the config carries a `command` override
+    // the ACP lane will ignore (the silent control-drop class). The warning
+    // lives at the lane
+    // boundary — not inside the command resolvers — because a single run consult
+    // the resolvers several times (engine preflight, executor, warm handle) and
+    // each of those calls must stay pure. The engine gate keeps the CLI lane
+    // (which still honors `command`) silent even if this closure is reached with
+    // an engine=cli config.
+    if (resolveClaudeExecutionEngine(ctx.config).engine === "acp") {
+      const ignoredCommand = findIgnoredClaudeAcpCommandOverride(ctx.config);
+      if (ignoredCommand) {
+        const warning = `[paperclip] ${formatIgnoredClaudeAcpCommandOverrideWarning(ignoredCommand)}\n`;
+        console.warn(warning.trimEnd());
+        await ctx.onLog("stderr", warning);
+      }
+    }
     const result = await currentExecutor({
       ...ctx,
       config: buildClaudeAcpConfig(ctx.config),
@@ -458,6 +474,40 @@ async function resolveClaudeAcpCommandForTarget(
   if (configured) return configured;
   if (target?.kind === "remote") return "claude-agent-acp";
   return resolveClaudeAcpCommand(config);
+}
+
+/**
+ * Detect the silent control-drop class: an operator-set
+ * `adapterConfig.command` is honored only by the CLI lane (see `execute.ts`,
+ * which reads it as the Claude binary). The ACP lane resolves its server
+ * command from `agentCommand`/`acpAgentCommand` alone, so a containment
+ * wrapper wired through `command` silently leaves the ACP spawn path — the
+ * runs keep starting, uncontained, with no diagnostic anywhere.
+ *
+ * Detection only: the helper never changes which command the lane runs and
+ * never mutates the config. It reports the dead value only when the operator
+ * has NOT also set an explicit ACP command (`agentCommand`/`acpAgentCommand`);
+ * once an ACP command is set the operator already controls the ACP spawn path,
+ * and the residual `command` value cannot be the silent drop of a wrapper that
+ * is expected to be there. The CLI lane keeps honoring `command` unchanged.
+ */
+export function findIgnoredClaudeAcpCommandOverride(
+  config: Record<string, unknown>,
+): string | null {
+  if (firstNonEmptyString(config.agentCommand, config.acpAgentCommand)) return null;
+  return firstNonEmptyString(config.command) ?? null;
+}
+
+/**
+ * The loud, searchable warning line for a detected dead `command` override.
+ * Shared by the run lane (server log + run log) and the Test surface so both
+ * carry the same operator-facing text.
+ */
+export function formatIgnoredClaudeAcpCommandOverrideWarning(command: string): string {
+  return (
+    "adapterConfig.command is set but ignored in engine=acp; use agentCommand/acpAgentCommand — " +
+    `if this pointed at a wrapper, that wrapper is OFF the ACP spawn path (ignored value: ${command})`
+  );
 }
 
 async function defaultClaudeAcpFallbackReason(
@@ -686,6 +736,23 @@ export async function testClaudeAcpEnvironment(
       ? undefined
       : "Install dependencies so @agentclientprotocol/claude-agent-acp is present, or set agentCommand to a valid Claude ACP server command.",
   });
+
+  // Surface the silent control-drop class on the Test surface: the
+  // same dead `command` override the run lane warns about, as a warn check the
+  // user interface renders alongside the command resolution result. The value is
+  // operator-set adapter config (not sandbox output), so echoing it back is the
+  // same trust level as the command line above.
+  const ignoredCommand = findIgnoredClaudeAcpCommandOverride(config);
+  if (ignoredCommand) {
+    console.warn(`[paperclip] ${formatIgnoredClaudeAcpCommandOverrideWarning(ignoredCommand)}`);
+    checks.push({
+      code: "claude_acp_command_override_ignored",
+      level: "warn",
+      message: "adapterConfig.command is set but ignored in engine=acp.",
+      hint: "Set agentCommand (or acpAgentCommand) instead — if the ignored value pointed at a wrapper, that wrapper is OFF the ACP spawn path.",
+      detail: `Ignored adapterConfig.command: ${ignoredCommand}`,
+    });
+  }
 
   const envConfig = parseObject(config.env);
   const considerHostEnv = !targetIsRemote;
