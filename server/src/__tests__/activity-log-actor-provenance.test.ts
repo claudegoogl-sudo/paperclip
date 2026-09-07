@@ -155,6 +155,9 @@ describeEmbeddedPostgres("activity_log actor provenance via the request middlewa
     const key = await boardAuthService(db).createNamedBoardApiKey({
       userId: operatorUserId,
       name: "operator board key",
+      // standard == the authority a legacy unscoped key had; explicit now.
+      scope: { kind: "standard" },
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
     });
 
     const boardRes = await request(app)
@@ -210,6 +213,9 @@ describeEmbeddedPostgres("activity_log actor provenance via the request middlewa
     const key = await boardAuthService(db).createNamedBoardApiKey({
       userId: operatorUserId,
       name: "operator board key",
+      // standard == the authority a legacy unscoped key had; explicit now.
+      scope: { kind: "standard" },
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
     });
 
     const res = await request(app)
@@ -231,6 +237,9 @@ describeEmbeddedPostgres("activity_log actor provenance via the request middlewa
     const key = await boardAuthService(db).createNamedBoardApiKey({
       userId: operatorUserId,
       name: "operator board key",
+      // standard == the authority a legacy unscoped key had; explicit now.
+      scope: { kind: "standard" },
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
     });
 
     const res = await request(app)
@@ -254,6 +263,8 @@ describeEmbeddedPostgres("activity_log actor provenance via the request middlewa
     const key = await boardAuthService(db).createNamedBoardApiKey({
       userId: operatorUserId,
       name: "c1 test board key",
+      scope: { kind: "standard" },
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
     });
 
     // Make a board_key-authenticated request to populate provenance context
@@ -284,6 +295,8 @@ describeEmbeddedPostgres("activity_log actor provenance via the request middlewa
     const key = await boardAuthService(db).createNamedBoardApiKey({
       userId: operatorUserId,
       name: "c2 test key",
+      scope: { kind: "standard" },
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
     });
 
     // Simulate what the route handler does: call create with provenance populated
@@ -344,6 +357,8 @@ describeEmbeddedPostgres("activity_log actor provenance via the request middlewa
     const key = await boardAuthService(db).createNamedBoardApiKey({
       userId: operatorUserId,
       name: "c3 test key",
+      scope: { kind: "standard" },
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
     });
 
     // Board-key write should fire the alert

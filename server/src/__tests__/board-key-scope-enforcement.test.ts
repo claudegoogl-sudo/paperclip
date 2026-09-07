@@ -2,14 +2,18 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { authUsers, companies, createDb } from "@paperclipai/db";
+import { authUsers, boardApiKeys, companies, createDb } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { registerActorContext } from "../middleware/auth.ts";
 import { errorHandler } from "../middleware/error-handler.ts";
-import { boardAuthService } from "../services/board-auth.ts";
+import {
+  boardAuthService,
+  createBoardApiToken,
+  hashBearerToken,
+} from "../services/board-auth.ts";
 
 // A board API key with scope { kind: "plugin_ops" } that tries to reach a
 // board route outside its scope must get 403. The test also covers the
@@ -108,12 +112,31 @@ describeEmbeddedPostgres("board API key scope enforcement", () => {
     return app;
   }
 
-  async function createKey(scope: "plugin_ops" | "standard" | null) {
+  async function createKey(scope: "plugin_ops" | "standard") {
     return boardAuthService(db).createNamedBoardApiKey({
       userId: operatorUserId,
-      name: `test-${scope ?? "null"}-${randomUUID().slice(0, 8)}`,
-      scope: scope === null ? null : { kind: scope },
+      name: `test-${scope}-${randomUUID().slice(0, 8)}`,
+      scope: { kind: scope },
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
     });
+  }
+
+  // A pre-hardening row: board API keys created before key creation required an
+  // explicit scope persist scopeConfig = NULL (full board authority). The
+  // service no longer mints those, so the legacy shape is written directly.
+  async function insertLegacyNullScopeKey() {
+    const token = createBoardApiToken();
+    const [row] = await db
+      .insert(boardApiKeys)
+      .values({
+        userId: operatorUserId,
+        name: `legacy-null-${randomUUID().slice(0, 8)}`,
+        keyHash: hashBearerToken(token),
+        scopeConfig: null,
+        expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+      })
+      .returning();
+    return { id: row.id, token };
   }
 
   beforeAll(async () => {
@@ -233,7 +256,7 @@ describeEmbeddedPostgres("board API key scope enforcement", () => {
   // becomes over-eager, this test goes red on the 200s.
   it("an unscoped board key still reaches the egress + instance-settings routes (no-behaviour-change)", async () => {
     const app = buildApp();
-    const key = await createKey(null);
+    const key = await insertLegacyNullScopeKey();
 
     const review = await request(app)
       .get(`/api/companies/${companyId}/secret-egress-bindings`)
