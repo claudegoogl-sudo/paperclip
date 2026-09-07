@@ -102,13 +102,15 @@ tarballs).
   gate instead of shipping.
 - **Patched bundled dependencies shipped pristine** (shipped as fork.36
   through fork.38; caused the fork.37 `claude_local` `ensure_session`
-  outage): `build.sh` used to strip `bundleDependencies` and pack workspace
+  outage; recurrence shipped as fork.39-fork.42 via `adapter-acpx-local`):
+  `build.sh` used to strip `bundleDependencies` and pack workspace
   directories, so packages that upstream bundles — `adapter-utils` (acpx),
-  `db` (embedded-postgres) — resolved their bundled dep from the npm
-  registry on hosts, WITHOUT the repository's pnpm patches. Pristine acpx
-  rejects the SCREAMING_CASE env map adapter-utils persists as
-  `acpx.session_options.env`, killing every local agent start with
-  `Persisted key policy violation`. Bundled packages are now staged through
+  `adapter-acpx-local` (acpx), `db` (embedded-postgres) — resolved their
+  bundled dep from the npm registry on hosts, WITHOUT the repository's pnpm
+  patches. Pristine acpx rejects the SCREAMING_CASE env map adapter-utils and
+  the acpx-local adapter persist as `acpx.session_options.env`, killing every
+  local agent start with `Persisted key policy violation`. Bundled packages
+  are now staged through
   `scripts/prepare-bundled-package.mjs` (registry install + `patch -p1`
   re-application + marker validation) and packed from the staged directory,
   and the bundled-deps gate fails the build if any bundled tarball ships
