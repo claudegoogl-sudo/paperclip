@@ -177,6 +177,11 @@ export const SECURITY_POSTURE_REJECTIONS = [
     reason: "Append-only audit trail. Rows are written after the fact and read only for display and forensics; no column is an input to an access decision.",
   },
   {
+    table: "board_api_key_auth_events",
+    columns: ["created_at", "id", "method", "route", "suppressed_count", "user_agent"],
+    reason: "Append-only authentication-event audit trail (companion to the activity_log decision). Rows are written after the fact and read only for forensics; the attribution-bearing columns key_id, outcome and source_ip are registered instead, and no column here is an input to an access decision.",
+  },
+  {
     table: "agent_api_keys",
     columns: [
       "agent_id", "company_id", "created_at", "id", "last_used_at", "name",
