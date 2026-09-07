@@ -374,6 +374,25 @@ describe("paperclip MCP tools", () => {
     });
   });
 
+  it("rejects an empty request_board_approval payload at the tool boundary without calling the API", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipCreateApproval");
+    const res = await tool.execute({
+      type: "request_board_approval",
+      payload: {},
+    });
+
+    const text = JSON.stringify(res);
+    // Missing keys surface as zod "Required" issues pointing at the payload fields.
+    expect(text).toContain("payload");
+    expect(text).toContain("title");
+    expect(text).toContain("summary");
+    expect(text).toContain("Required");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("routes the withdraw decision action at the withdraw endpoint", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       mockJsonResponse({ id: "approval-1", status: "withdrawn" }),
