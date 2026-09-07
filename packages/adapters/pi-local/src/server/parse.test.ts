@@ -237,6 +237,34 @@ describe("parsePiJsonl", () => {
     expect(parsed.errors).toEqual([]);
   });
 
+  it("clears prior transient error events once a retry succeeds", () => {
+    // Reproduces a stall-then-recover run: a mid-stream provider error is
+    // emitted, the SDK auto-retries, and the retry succeeds. The run goes on
+    // to complete cleanly (exit 0), so the earlier transient error must not
+    // linger and get treated as a fatal failure by execute.ts.
+    const stdout = [
+      JSON.stringify({
+        type: "error",
+        message: "Provider authentication failed (authentication_error, 401): OAuth access token has expired.",
+      }),
+      JSON.stringify({
+        type: "auto_retry_start",
+        attempt: 1,
+        maxAttempts: 3,
+        delayMs: 2000,
+        errorMessage: "OAuth access token has expired.",
+      }),
+      JSON.stringify({
+        type: "auto_retry_end",
+        success: true,
+        attempt: 1,
+      }),
+    ].join("\n");
+
+    const parsed = parsePiJsonl(stdout);
+    expect(parsed.errors).toEqual([]);
+  });
+
   it("surfaces standalone error events", () => {
     const stdout = [
       JSON.stringify({
