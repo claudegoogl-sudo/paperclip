@@ -73,7 +73,8 @@
     "test:release-smoke:headed": "npx playwright test --config tests/release-smoke/playwright.config.ts --headed",
     "metrics:paperclip-commits": "tsx scripts/paperclip-commit-metrics.ts",
     "perf:issue-chat-long-thread": "node scripts/measure-issue-chat-long-thread.mjs",
-    "connections:ingest-app-definitions": "node scripts/ingest-app-definitions.mjs"
+    "connections:ingest-app-definitions": "node scripts/ingest-app-definitions.mjs",
+    "test:fork-drift": "node --test scripts/fork-release/commit-stamp.test.mjs scripts/fork-release/drift-check.test.mjs scripts/fork-release/drift-sweep.test.mjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1",

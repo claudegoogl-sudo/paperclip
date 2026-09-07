@@ -17,6 +17,7 @@ import { createRequire } from "node:module";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { bundledCliNpmDependencies } from "./cli-bundled-npm-dependencies.mjs";
+import { resolveSourceCommit } from "./source-commit.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, "..");
@@ -118,9 +119,22 @@ if (Object.keys(sortedOptDeps).length > 0) {
   publishPkg.optionalDependencies = sortedOptDeps;
 }
 
+// Stamp the source commit into the publishable manifest so the packed
+// tarball (and therefore the installed tree) records exactly which commit it
+// was built from. Install-time and scheduled drift checks read this field to
+// compare the running release against the fork master without relying on the
+// version -> release-tag indirection (tags can be re-cut mid-build).
+const sourceCommit = resolveSourceCommit();
+if (sourceCommit) {
+  publishPkg.gitHead = sourceCommit.commit;
+} else {
+  console.warn("  !  No source commit resolvable (no git metadata, no RELEASE_SOURCE_COMMIT) - package.json will carry no gitHead stamp");
+}
+
 const output = JSON.stringify(publishPkg, null, 2) + "\n";
 const outPath = resolve(repoRoot, "cli/package.json");
 writeFileSync(outPath, output);
 
 console.log(`  ✓  Generated publishable package.json (${Object.keys(sortedDeps).length} deps)`);
 console.log(`     Version: ${cliPkg.version}`);
+console.log(`     Source commit: ${sourceCommit ? sourceCommit.commit : "<none>"}`);

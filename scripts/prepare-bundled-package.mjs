@@ -5,11 +5,20 @@ import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } fr
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { resolveSourceCommit } from "./source-commit.mjs";
+
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 
-export function materializePublishManifest(pkg) {
+export function materializePublishManifest(pkg, options = {}) {
   const publishConfig = pkg.publishConfig ?? {};
   const publishManifest = { ...pkg };
+
+  // Provenance stamp: these packages are packed from a STAGED COPY outside
+  // the repository, so npm/pnpm cannot auto-attach a gitHead. Resolve it
+  // here (injectable for tests) so staged tarballs carry the same stamp as
+  // the rest of the release set.
+  const sourceCommit = options.sourceCommit !== undefined ? options.sourceCommit : resolveSourceCommit();
+  if (sourceCommit) publishManifest.gitHead = sourceCommit.commit;
 
   for (const key of ["main", "types", "exports", "bin"]) {
     if (publishConfig[key] !== undefined) publishManifest[key] = publishConfig[key];
