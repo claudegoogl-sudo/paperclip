@@ -2,13 +2,17 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, gte, lte } from "drizzle-orm";
 import { authUsers, boardApiKeyAuthEvents, boardApiKeys, companies, createDb } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { registerActorContext } from "../middleware/auth.ts";
+import { registerActorContext, resetBoardKeyAuthEventThrottleForTests } from "../middleware/auth.ts";
+import {
+  pruneBoardApiKeyAuthEvents,
+  DEFAULT_BOARD_API_KEY_AUTH_EVENT_RETENTION_DAYS,
+} from "../services/board-api-key-auth-event-retention.js";
 import { errorHandler } from "../middleware/error-handler.ts";
 import { boardAuthService, hashBearerToken } from "../services/board-auth.ts";
 
@@ -32,11 +36,15 @@ describeEmbeddedPostgres("board API key auth events", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   const operatorUserId = "operator-user-auth-events";
 
-  function buildApp() {
+  function buildApp(options?: { trustedProxies?: string[] }) {
     const app = express();
     app.use(express.json());
-    registerActorContext(app, db, { deploymentMode: "authenticated" });
+    registerActorContext(app, db, {
+      deploymentMode: "authenticated",
+      authEventTrustedProxies: options?.trustedProxies,
+    });
     app.get("/api/ping", (req, res) => res.json({ ok: true, actorType: req.actor?.type ?? null }));
+    app.get("/api/ping/:pad", (req, res) => res.json({ ok: true, pad: req.params.pad.length }));
     app.use(errorHandler);
     return app;
   }
@@ -71,6 +79,7 @@ describeEmbeddedPostgres("board API key auth events", () => {
   });
 
   afterEach(async () => {
+    resetBoardKeyAuthEventThrottleForTests();
     await db.delete(boardApiKeyAuthEvents);
     await db.delete(boardApiKeys);
     await db.delete(authUsers).where(eq(authUsers.id, operatorUserId));
@@ -146,9 +155,20 @@ describeEmbeddedPostgres("board API key auth events", () => {
     await request(app).get("/api/ping").set("Authorization", `Bearer ${created.token}`);
 
     // The query documented in the PR description: "what did key X do, from
-    // where, in date range Y?"
-    const from = new Date(Date.now() - 60_000);
-    const to = new Date(Date.now() + 60_000);
+    // where, in date range Y?" The date bounds run IN the SQL (and(gte, lte)),
+    // not as a post-filter, so this test exercises the statement an
+    // investigator would actually run. A seeded out-of-range row proves the
+    // database, not JavaScript, applies the bounds.
+    const now = Date.now();
+    await db.insert(boardApiKeyAuthEvents).values({
+      keyId: created.id,
+      outcome: "success",
+      method: "GET",
+      route: "/api/ping",
+      createdAt: new Date(now - 10 * 60_000),
+    });
+    const from = new Date(now - 60_000);
+    const to = new Date(now + 60_000);
     const rows = await db
       .select({
         createdAt: boardApiKeyAuthEvents.createdAt,
@@ -160,11 +180,107 @@ describeEmbeddedPostgres("board API key auth events", () => {
       .where(
         and(
           eq(boardApiKeyAuthEvents.keyId, created.id),
-          // date range: created_at BETWEEN from AND to
+          gte(boardApiKeyAuthEvents.createdAt, from),
+          lte(boardApiKeyAuthEvents.createdAt, to),
         ),
       );
-    expect(rows.length).toBeGreaterThanOrEqual(2);
+    expect(rows.length).toBe(2);
     expect(rows.every((r) => r.createdAt >= from && r.createdAt <= to)).toBe(true);
     expect(rows.map((r) => r.outcome).sort()).toEqual(["revoked", "success"]);
+  });
+
+  it("retention prunes rows past the TTL and keeps fresh ones", async () => {
+    const now = Date.now();
+    await db.insert(boardApiKeyAuthEvents).values([
+      {
+        keyId: null,
+        outcome: "bad_key",
+        method: "GET",
+        route: "/api/ping",
+        createdAt: new Date(now - (DEFAULT_BOARD_API_KEY_AUTH_EVENT_RETENTION_DAYS + 5) * 24 * 60 * 60 * 1_000),
+      },
+      {
+        keyId: null,
+        outcome: "bad_key",
+        method: "GET",
+        route: "/api/ping",
+        createdAt: new Date(now - 60_000),
+      },
+    ]);
+
+    const result = await pruneBoardApiKeyAuthEvents(db, { now: new Date(now) });
+    expect(result.agePrune.deleted).toBe(1);
+    const remaining = await db.select().from(boardApiKeyAuthEvents);
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0].createdAt.getTime()).toBeGreaterThanOrEqual(now - 60_000);
+  });
+
+  it("caps attacker-chosen fields at insert (user agent 256, route 512)", async () => {
+    const boardAuth = boardAuthService(db);
+    const created = await boardAuth.createNamedBoardApiKey({ userId: operatorUserId, name: "truncate-key" });
+    const app = buildApp();
+
+    const longPad = "a".repeat(600);
+    const res = await request(app)
+      .get(`/api/ping/${longPad}`)
+      .set("Authorization", `Bearer ${created.token}`)
+      .set("User-Agent", "A".repeat(8_000));
+    expect(res.status).toBe(200);
+
+    const rows = await eventsFor(created.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].userAgent).toHaveLength(256);
+    expect(rows[0].route!.length).toBeLessThanOrEqual(512);
+    expect(rows[0].route).toContain("/api/ping/");
+  });
+
+  it("records the socket peer, not a spoofed X-Forwarded-For, when no allowlist is set", async () => {
+    const boardAuth = boardAuthService(db);
+    const created = await boardAuth.createNamedBoardApiKey({ userId: operatorUserId, name: "spoof-key" });
+    const app = buildApp();
+
+    const res = await request(app)
+      .get("/api/ping")
+      .set("Authorization", `Bearer ${created.token}`)
+      .set("X-Forwarded-For", "9.9.9.9, 10.10.10.10");
+    expect(res.status).toBe(200);
+
+    const rows = await eventsFor(created.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].sourceIp).toBeTruthy();
+    expect(rows[0].sourceIp).not.toContain("9.9.9.9");
+    expect(rows[0].sourceIp).not.toContain("10.10.10.10");
+  });
+
+  it("derives the client hop from XFF only when the peer is an allowlisted proxy", async () => {
+    const boardAuth = boardAuthService(db);
+    const created = await boardAuth.createNamedBoardApiKey({ userId: operatorUserId, name: "allowlist-key" });
+    // The supertest peer connects over loopback; declaring loopback allowlisted
+    // is the operator statement under test.
+    const app = buildApp({ trustedProxies: ["127.0.0.1", "::1", "::ffff:127.0.0.1"] });
+
+    const res = await request(app)
+      .get("/api/ping")
+      .set("Authorization", `Bearer ${created.token}`)
+      .set("X-Forwarded-For", "9.9.9.9, 10.10.10.10");
+    expect(res.status).toBe(200);
+
+    const rows = await eventsFor(created.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].sourceIp).toBe("10.10.10.10");
+  });
+
+  it("throttles unattributed bad_key rows to one per source per window", async () => {
+    const app = buildApp();
+    for (let i = 0; i < 5; i++) {
+      await request(app)
+        .get("/api/ping")
+        .set("Authorization", `Bearer pcp_board_${"0".repeat(48)}`);
+    }
+    const rows = await eventsFor(null);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].outcome).toBe("bad_key");
+    expect(rows[0].suppressedCount).toBe(0);
+    expect(rows[0].sourceIp).toBeTruthy();
   });
 });

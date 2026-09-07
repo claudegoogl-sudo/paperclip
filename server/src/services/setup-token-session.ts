@@ -403,7 +403,7 @@ function ipv4ToInt(address: string): number | null {
  * by an exact, case-insensitive string, because the confidential allowlist
  * expects a small set of known proxy addresses.
  */
-function addressMatchesEntry(address: string, entry: string): boolean {
+export function addressMatchesEntry(address: string, entry: string): boolean {
   const peer = address.trim().toLowerCase();
   const candidate = entry.trim().toLowerCase();
   if (candidate.length === 0) return false;
@@ -428,7 +428,7 @@ function addressMatchesEntry(address: string, entry: string): boolean {
   return candidateInt !== null && peerInt !== null && candidateInt === peerInt;
 }
 
-function peerMatchesAllowlist(address: string | undefined, allowlist: string[]): boolean {
+export function peerMatchesAllowlist(address: string | undefined, allowlist: string[]): boolean {
   if (!address) return false;
   return allowlist.some((entry) => addressMatchesEntry(address, entry));
 }

@@ -108,6 +108,22 @@ export const SECURITY_POSTURE_COLUMNS = [
     reason: "Operator-added extra destinations layered on the config key's own value; the enforcement switch evaluates it, so a blanket widen admits attacker-chosen origins plugin-wide.",
   },
 
+  {
+    table: "board_api_key_auth_events",
+    column: "key_id",
+    reason: "Per-event attribution of which credential authenticated; clearing it buries exactly which key an abuse investigation must name (the PLA-6298 evidence gap).",
+  },
+  {
+    table: "board_api_key_auth_events",
+    column: "outcome",
+    reason: "Success/expired/revoked/bad_key classification; blanking it erases the only record that a failed or brute-force authentication attempt happened.",
+  },
+  {
+    table: "board_api_key_auth_events",
+    column: "source_ip",
+    reason: "Client-derived origin of the authentication attempt (proxy-allowlist derivation); clearing it reduces the forensic answer to what but never from where.",
+  },
+
   // --- Authorization and identity ---
   {
     table: "activity_log",

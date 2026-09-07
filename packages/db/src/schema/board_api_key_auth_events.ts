@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, timestamp, index } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, integer, timestamp, index } from "drizzle-orm/pg-core";
 import { boardApiKeys } from "./board_api_keys.js";
 
 // Append-only authentication-event log for the board API key bearer path
@@ -23,6 +23,12 @@ export const boardApiKeyAuthEvents = pgTable(
     userAgent: text("user_agent"),
     method: text("method").notNull(),
     route: text("route").notNull(),
+    // How many further bad_key attempts from the same source were suppressed
+    // by the per-IP throttle since the previous row for that source. Zero on
+    // attributed events (which are never throttled) and on a source's first
+    // unattributed row. Append-only: the count is carried by the NEXT row for
+    // the source, never patched onto an existing one.
+    suppressedCount: integer("suppressed_count").notNull().default(0),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
