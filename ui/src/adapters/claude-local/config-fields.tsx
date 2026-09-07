@@ -106,7 +106,7 @@ export function ClaudeLocalAdvancedFields({
         <>
           <Field
             label="ACP server command"
-            hint="Optional override for the Claude ACP server command. Defaults to the package-local claude-agent-acp binary."
+            hint="Optional override for the Claude ACP server command. Defaults to the package-local claude-agent-acp binary. The CLI-only command field is ignored by this engine; a run warns when it is set."
           >
             <DraftInput
               value={
