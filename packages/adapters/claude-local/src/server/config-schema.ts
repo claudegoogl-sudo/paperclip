@@ -26,7 +26,7 @@ export function getConfigSchema(): AdapterConfigSchema {
         key: "agentCommand",
         label: "ACP server command",
         type: "text",
-        hint: "Optional override for the Claude ACP server command. Defaults to the package-local claude-agent-acp binary.",
+        hint: "Optional override for the Claude ACP server command. Defaults to the package-local claude-agent-acp binary. The CLI-only command field is ignored by this engine; a run warns when it is set.",
         meta: acpVisible,
       },
       {
