@@ -237,7 +237,7 @@ describe("parsePiJsonl", () => {
     expect(parsed.errors).toEqual([]);
   });
 
-  it("clears prior transient error events once a retry succeeds (PLA-6297)", () => {
+  it("clears prior transient error events once a retry succeeds", () => {
     // Reproduces a stall-then-recover run: a mid-stream provider error is
     // emitted, the SDK auto-retries, and the retry succeeds. The run goes on
     // to complete cleanly (exit 0), so the earlier transient error must not
