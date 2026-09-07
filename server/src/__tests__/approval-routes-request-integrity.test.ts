@@ -340,4 +340,16 @@ describe("approval withdraw route", () => {
 
     expect(res.status).toBe(404);
   });
+
+  it("folds a cross-tenant approval into the same 404 as a missing one", async () => {
+    mockApprovalService.getById.mockResolvedValue(pendingApproval({ companyId: "company-2" }));
+
+    const res = await request(await createAgentApp())
+      .post("/api/approvals/approval-1/withdraw")
+      .send({});
+
+    expect(res.status).toBe(404);
+    expect(mockApprovalService.withdraw).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
 });
