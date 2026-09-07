@@ -9,6 +9,7 @@ import {
   rmSync,
   statSync,
   writeFileSync,
+  type Stats,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -124,51 +125,72 @@ export function assertEmbeddedPostgresSocketPathWithinLimit(
   }
 }
 
-// Idempotent: create the per-install socket directory with mode 0700 and assert
-// it is a real, self-owned, 0700 directory. The runtime root can be shared and
-// world-writable (/tmp), so we fail closed on the ways an attacker could
-// pre-seed the path: a symlink (redirects the bind), a non-directory, a dir we
-// do not own (name squatting), or group/world-accessible mode (permission
-// drift). Mirrors the cred-file mode check. Safe to call on every start.
+// Strict validation of one lstat of the per-install socket directory, shared
+// by BOTH branches of ensureEmbeddedPostgresSocketDir so the existing-dir and
+// fresh-create paths refuse the same threat surface. `entry` MUST come from
+// lstat (never stat) so the check inspects the entry itself rather than
+// following a symlink planted at the path. Fail closed on: a symlink
+// (redirects the bind), a non-directory, a dir we do not own (name squatting),
+// or group/world-accessible mode (permission drift). Mirrors the cred-file
+// mode check. Exported so tests can cover the foreign-uid refusal without
+// needing a platform that permits chown to another uid.
+export function assertEmbeddedPostgresSocketDirIsSafe(
+  socketDir: string,
+  entry: Stats,
+): void {
+  if (entry.isSymbolicLink()) {
+    throw new Error(
+      `Embedded PostgreSQL socket directory at ${socketDir} is a symlink; ` +
+        `refusing to start (possible socket-hijack via a pre-created link).`,
+    );
+  }
+  if (!entry.isDirectory()) {
+    throw new Error(
+      `Embedded PostgreSQL socket path at ${socketDir} exists but is not a ` +
+        `directory. Remove it so a fresh 0700 socket dir can be created.`,
+    );
+  }
+  if (
+    typeof process.getuid === "function" &&
+    entry.uid !== process.getuid()
+  ) {
+    throw new Error(
+      `Embedded PostgreSQL socket directory at ${socketDir} is owned by uid ` +
+        `${entry.uid}, not this process (uid ${process.getuid()}). ` +
+        `Refusing to start (possible socket-dir squatting).`,
+    );
+  }
+  if ((entry.mode & 0o077) !== 0) {
+    throw new Error(
+      `Embedded PostgreSQL socket directory at ${socketDir} has insecure mode ` +
+        `${(entry.mode & 0o777).toString(8)}: must be 0700 ` +
+        `(no group or world access). Refusing to start.`,
+    );
+  }
+}
+
+// Idempotent: create the per-install socket directory with mode 0700 and
+// assert it is a real, self-owned, 0700 directory. The runtime root can be
+// shared and world-writable (/tmp), so we fail closed on the ways an attacker
+// could pre-seed the path: a symlink (redirects the bind), a non-directory, a
+// dir we do not own (name squatting), or group/world-accessible mode
+// (permission drift). The same strict validation runs on the existing-dir
+// branch AND again after a fresh create: mkdirSync({recursive:true}) does not
+// fail when the path appears between our probe and the create (a local
+// attacker winning the TOCTOU race), so a pre-created symlink, foreign-uid, or
+// insecure dir would otherwise be silently adopted. Safe to call on every
+// start.
 export function ensureEmbeddedPostgresSocketDir(dataDir: string): string {
   const socketDir = socketDirectoryPathFor(dataDir);
   // lstat (not stat) so we inspect the entry itself, never its symlink target.
-  let existing: ReturnType<typeof lstatSync> | null = null;
+  let existing: Stats | null = null;
   try {
     existing = lstatSync(socketDir);
   } catch {
     existing = null;
   }
   if (existing) {
-    if (existing.isSymbolicLink()) {
-      throw new Error(
-        `Embedded PostgreSQL socket directory at ${socketDir} is a symlink; ` +
-          `refusing to start (possible socket-hijack via a pre-created link).`,
-      );
-    }
-    if (!existing.isDirectory()) {
-      throw new Error(
-        `Embedded PostgreSQL socket path at ${socketDir} exists but is not a ` +
-          `directory. Remove it so a fresh 0700 socket dir can be created.`,
-      );
-    }
-    if (
-      typeof process.getuid === "function" &&
-      existing.uid !== process.getuid()
-    ) {
-      throw new Error(
-        `Embedded PostgreSQL socket directory at ${socketDir} is owned by uid ` +
-          `${existing.uid}, not this process (uid ${process.getuid()}). ` +
-          `Refusing to start (possible socket-dir squatting).`,
-      );
-    }
-    if ((existing.mode & 0o077) !== 0) {
-      throw new Error(
-        `Embedded PostgreSQL socket directory at ${socketDir} has insecure mode ` +
-          `${(existing.mode & 0o777).toString(8)}: must be 0700 ` +
-          `(no group or world access). Refusing to start.`,
-      );
-    }
+    assertEmbeddedPostgresSocketDirIsSafe(socketDir, existing);
     return socketDir;
   }
   mkdirSync(socketDir, { recursive: true, mode: SOCKET_DIRECTORY_MODE });
@@ -179,14 +201,9 @@ export function ensureEmbeddedPostgresSocketDir(dataDir: string): string {
   } catch {
     // best effort; the strict mode check below refuses insecure dirs.
   }
-  const stat = statSync(socketDir);
-  if ((stat.mode & 0o077) !== 0) {
-    throw new Error(
-      `Embedded PostgreSQL socket directory at ${socketDir} has insecure mode ` +
-        `${(stat.mode & 0o777).toString(8)}: must be 0700 ` +
-        `(no group or world access). Refusing to start.`,
-    );
-  }
+  // Re-lstat (not stat) and re-run the full validation on whatever is actually
+  // on disk now — the fresh-create counterpart of the probe above.
+  assertEmbeddedPostgresSocketDirIsSafe(socketDir, lstatSync(socketDir));
   return socketDir;
 }
 
