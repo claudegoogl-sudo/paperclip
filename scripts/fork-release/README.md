@@ -50,10 +50,41 @@ tarball into the historically-shipped dev-exports defect (`exports ->
 ./src/index.ts` with no `src/` packed) and must always fail the run — it is
 the standing proof that the gate blocks that class.
 
-After a real publish, the installer/verify/rollback scripts remain a manual
-release-asset step (they are authored per release and uploaded with
-`gh release upload <tag> <file> --clobber`, which never touches the
-tarballs).
+## Operator assets: install + rollback scripts
+
+Every train publishes two scripts as release assets: an install script and
+a rollback script. Name them `install-<base>-<train>.sh` and
+`rollback-<prev-base>-<prev-train>.sh` (for example `install-fork907.43.sh`
+and `rollback-fork824.42.sh`).
+
+This is the standing convention. The fork.38 through fork.42 trains shipped
+no scripts. The fork.43 install request went out as raw `npm install -g`
+one-liners. Both moves forced the next operator request to re-derive the
+install and rollback mechanics. Decision (2026-09-07): script assets are
+the canonical operator-facing artifact. Raw tarball one-liners are a
+degraded fallback for urgent trains only. The operator request links the
+script asset URLs.
+
+Rules for the scripts:
+
+- Author them after the publish, from the published bytes. Each script pins
+  the sha256 of the tarball it installs. The rollback script pins the
+  previous release tarball URL and its sha256. Both must resolve and verify
+  from the served bytes at authoring time. A rollback that 404s is worse
+  than none.
+- Keep them idempotent and sandbox-testable. Make `BIN`, `ROOT`,
+  `INST_DIR`, `WINDOW_LOCK`, and `API` env-overridable. Use a
+  `$INST_DIR/pg-window.lock` flock window lock with the epoch on line 1.
+  Stop the service, install, start, then gate on the service version and
+  `GET /` health before printing `RESULT OK` and the rollback one-liner.
+- Upload with `gh release upload <tag> <file> --clobber`. This never
+  touches the tarballs or other assets. Never delete published assets.
+- Sandbox-test every gate in both scripts before upload. Record the run
+  evidence on the train record.
+
+The workflow does not author or upload these scripts. They stay a manual
+post-publish step because each script pins the previous release bytes, and
+those bytes exist only after that release publishes.
 
 ## Scripts
 
