@@ -21,7 +21,7 @@ interface BoardTokenOptions extends BaseClientOptions {
   name?: string;
   expiresAt?: string;
   ttlDays?: string;
-  neverExpires?: boolean;
+  scope?: string;
 }
 
 interface CreatedAgentKey {
@@ -146,17 +146,23 @@ export function registerTokenCommands(program: Command): void {
       .description("Create a named board API key")
       .option("-C, --company-id <id>", "Company ID used for audit context")
       .option("--name <name>", "API key label", "cli-board")
-      .option("--expires-at <iso8601>", "Expiration timestamp")
-      .option("--ttl-days <days>", "Expiration in days from now")
-      .option("--never-expires", "Create a non-expiring key")
+      .option("--expires-at <iso8601>", "Expiration timestamp (required, or use --ttl-days)")
+      .option("--ttl-days <days>", "Expiration in days from now (max 90; required, or use --expires-at)")
+      .requiredOption(
+        "--scope <scope>",
+        'Board key scope: "plugin_ops" (plugin install/enable/disable/upgrade/config + issue read/comment) ' +
+          'or "standard" (full board authority -- requires a short TTL, see --ttl-days/--expires-at)',
+      )
       .action(async (opts: BoardTokenOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
+          const scope = resolveBoardKeyScope(opts);
           const expiresAt = resolveBoardKeyExpiresAt(opts);
           const payload = createBoardApiKeySchema.parse({
             name: opts.name,
             requestedCompanyId: opts.companyId ?? ctx.companyId ?? null,
             expiresAt,
+            scope,
           });
           const key = await ctx.api.post<CreatedBoardKey>("/api/board-api-keys", payload);
           if (!key) throw new Error("Failed to create board API key");
@@ -228,8 +234,24 @@ async function resolveAgent(api: { get<T>(path: string): Promise<T | null> }, co
   return agent;
 }
 
-function resolveBoardKeyExpiresAt(opts: BoardTokenOptions): Date | null | undefined {
-  if (opts.neverExpires) return null;
+function resolveBoardKeyScope(opts: BoardTokenOptions): { kind: "plugin_ops" | "standard" } {
+  const raw = opts.scope?.trim();
+  if (raw === "plugin_ops" || raw === "standard") return { kind: raw };
+  throw new Error(
+    `--scope is required and must be one of: "plugin_ops", "standard" (got: ${opts.scope ?? "<none>"}). ` +
+      'There is no flag for an unscoped, non-expiring key -- that is the exact ' +
+      "inverted default PLA-6305 removed. Use --scope standard with a short " +
+      "--ttl-days/--expires-at for genuine full-board authority.",
+  );
+}
+
+// `--never-expires` has been removed (PLA-6305): the server now rejects a
+// board API key create request without `expiresAt` outright, and a
+// non-expiring key was exactly the misconfiguration that left 11 unscoped,
+// never-expiring keys live on this instance for four months. Callers must
+// pass --expires-at or --ttl-days; the server additionally caps the TTL
+// (90 days generally, 24 hours for scope "standard").
+function resolveBoardKeyExpiresAt(opts: BoardTokenOptions): Date {
   if (opts.expiresAt?.trim()) {
     const date = new Date(opts.expiresAt.trim());
     if (!Number.isFinite(date.getTime())) throw new Error(`Invalid --expires-at value: ${opts.expiresAt}`);
@@ -240,5 +262,8 @@ function resolveBoardKeyExpiresAt(opts: BoardTokenOptions): Date | null | undefi
     if (!Number.isFinite(days) || days <= 0) throw new Error(`Invalid --ttl-days value: ${opts.ttlDays}`);
     return new Date(Date.now() + Math.floor(days * 24 * 60 * 60 * 1000));
   }
-  return undefined;
+  throw new Error(
+    "One of --expires-at or --ttl-days is required. Board API keys must have an " +
+      "expiry (PLA-6305); there is no non-expiring option.",
+  );
 }

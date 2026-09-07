@@ -32,6 +32,11 @@ declare global {
         // restricts the key to plugin ops + issue read/comment. Enforced by
         // enforceBoardKeyScopeMiddleware in server/src/middleware/auth.ts.
         boardKeyScope?: BoardApiKeyScope;
+        // Expiry of the board API key currently authenticating this request.
+        // Only meaningful when source === "board_key". Used to enforce the
+        // privilege ceiling on POST /api/board-api-keys (PLA-6305 AC5): a
+        // board key cannot mint a successor that outlives itself.
+        boardKeyExpiresAt?: Date | null;
         runId?: string;
         onBehalfOfUserId?: string | null;
         source?: "local_implicit" | "session" | "board_key" | "agent_key" | "agent_jwt" | "cloud_tenant" | "none";

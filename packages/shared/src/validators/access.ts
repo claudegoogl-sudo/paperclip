@@ -119,12 +119,55 @@ export const resolveCliAuthChallengeSchema = z.object({
 
 export type ResolveCliAuthChallenge = z.infer<typeof resolveCliAuthChallengeSchema>;
 
-export const createBoardApiKeySchema = z.object({
-  name: z.string().trim().min(1).max(120).default("paperclipai cli"),
-  expiresAt: z.coerce.date().optional().nullable(),
-  requestedCompanyId: z.string().uuid().optional().nullable(),
-  scope: boardApiKeyScopeSchema.optional().nullable(),
-});
+// Board API key creation is secure-default-by-construction: both `expiresAt`
+// and `scope` are REQUIRED fields (PLA-6305). Omitting either used to mean
+// "never expires" / "full board authority" respectively -- the inverted
+// default that produced 11 unscoped, never-expiring live keys. A genuine
+// full-board key ({ kind: "standard" }) is still obtainable, but only with a
+// short, mandatory TTL, so it is deliberate, greppable, and self-expiring.
+export const BOARD_API_KEY_MAX_TTL_DAYS = 90;
+export const BOARD_API_KEY_STANDARD_SCOPE_MAX_TTL_HOURS = 24;
+
+export const createBoardApiKeySchema = z
+  .object({
+    name: z.string().trim().min(1).max(120).default("paperclipai cli"),
+    expiresAt: z.coerce.date(),
+    requestedCompanyId: z.string().uuid().optional().nullable(),
+    scope: boardApiKeyScopeSchema,
+  })
+  .superRefine((value, ctx) => {
+    const now = Date.now();
+    const expiresAtMs = value.expiresAt.getTime();
+
+    if (expiresAtMs <= now) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["expiresAt"],
+        message: "expiresAt must be in the future",
+      });
+      return;
+    }
+
+    const maxTtlMs = BOARD_API_KEY_MAX_TTL_DAYS * 24 * 60 * 60 * 1000;
+    if (expiresAtMs - now > maxTtlMs) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["expiresAt"],
+        message: `expiresAt exceeds the maximum board API key TTL of ${BOARD_API_KEY_MAX_TTL_DAYS} days`,
+      });
+    }
+
+    if (value.scope.kind === "standard") {
+      const maxStandardTtlMs = BOARD_API_KEY_STANDARD_SCOPE_MAX_TTL_HOURS * 60 * 60 * 1000;
+      if (expiresAtMs - now > maxStandardTtlMs) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["expiresAt"],
+          message: `scope "standard" (full board authority) requires expiresAt within ${BOARD_API_KEY_STANDARD_SCOPE_MAX_TTL_HOURS} hours`,
+        });
+      }
+    }
+  });
 
 export type CreateBoardApiKey = z.infer<typeof createBoardApiKeySchema>;
 

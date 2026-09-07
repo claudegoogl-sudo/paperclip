@@ -314,6 +314,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
           isInstanceAdmin: access.isInstanceAdmin,
           keyId: boardKey.id,
           boardKeyScope: normalizeBoardApiKeyScope(boardKey.scopeConfig),
+          boardKeyExpiresAt: boardKey.expiresAt ?? null,
           runId: runIdHeader || undefined,
           source: "board_key",
         };
