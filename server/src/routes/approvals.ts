@@ -506,12 +506,14 @@ export function approvalRoutes(
 
   router.post("/approvals/:id/withdraw", async (req, res) => {
     const id = req.params.id as string;
-    const approval = await svc.getById(id);
+    // Fold existence into the access gate (missing vs cross-tenant must both be
+    // 404) so the withdraw route does not leak approval-id existence across
+    // companies — see the cross-tenant existence oracle guard test.
+    const approval = await requireApprovalAccess(req, id);
     if (!approval) {
       res.status(404).json({ error: "Approval not found" });
       return;
     }
-    assertCompanyAccess(req, approval.companyId);
     if (!(await assertApprovalMutationAllowedByRunContext(req, res, approval.companyId))) return;
 
     if (req.actor.type !== "agent" || !req.actor.agentId || req.actor.agentId !== approval.requestedByAgentId) {
