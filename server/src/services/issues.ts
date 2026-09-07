@@ -67,7 +67,7 @@ import {
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
-import { isForeignKeyViolation } from "../db-errors.js";
+import { isForeignKeyViolation, isUniqueViolation } from "../db-errors.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -4398,6 +4398,127 @@ async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?:
     ) return count;
     return count + 1;
   }, 0);
+}
+
+type IssueAttachmentBindRow = {
+  assetId: string;
+  issueId: string;
+  issueCommentId: string | null;
+};
+
+/**
+ * Classification of an existing `issue_attachments` row against a would-be
+ * bind of its asset onto `issueId` + `targetCommentId`. Shared by the
+ * pre-comment preflight ({@link validateAssetsBindableToIssue}, where
+ * `targetCommentId` is `null` because the comment does not exist yet) and the
+ * transactional bind loop in {@link attachAssetsToComment}.
+ *
+ * - `insert`  — no row yet (standalone `artifacts.create` asset): bind by INSERT.
+ * - `bind`    — row exists with `issueCommentId IS NULL` for THIS issue (the
+ *   upload-first flow): bind by UPDATE.
+ * - `skip`    — row is already bound to this exact comment (idempotent retry).
+ * - `conflict`— anything else: the asset is bound to another comment, or its
+ *   unbound row belongs to a different issue. Never silent.
+ */
+function classifyIssueAttachmentBindState(
+  existing: { issueId: string; issueCommentId: string | null } | null | undefined,
+  issueId: string,
+  targetCommentId: string | null,
+): "insert" | "bind" | "skip" | "conflict" {
+  if (!existing) return "insert";
+  if (existing.issueCommentId === null) {
+    return existing.issueId === issueId ? "bind" : "conflict";
+  }
+  return existing.issueCommentId === targetCommentId ? "skip" : "conflict";
+}
+
+function issueAttachmentConflictError(
+  assetId: string,
+  existing: { issueId: string; issueCommentId: string | null } | null | undefined,
+): HttpError {
+  if (!existing) {
+    return conflict("Attachment asset could not be bound: no issue_attachments row found", { assetId });
+  }
+  if (existing.issueCommentId === null) {
+    return conflict(
+      `Attachment asset ${assetId} is already uploaded to a different issue and cannot be attached here`,
+      { assetId, boundIssueId: existing.issueId, boundCommentId: null },
+    );
+  }
+  return conflict(
+    `Attachment asset ${assetId} is already attached to another comment`,
+    { assetId, boundIssueId: existing.issueId, boundCommentId: existing.issueCommentId },
+  );
+}
+
+/**
+ * Tenant checks shared by the attach preflight and the bind: the target issue
+ * must exist and every asset must exist and belong to the issue's company.
+ */
+async function resolveBindableAssetContext(
+  dbOrTx: any,
+  issueId: string,
+  assetIds: string[],
+): Promise<{ issue: { id: string; companyId: string }; uniqueAssetIds: string[] }> {
+  const issue = await dbOrTx
+    .select({ id: issues.id, companyId: issues.companyId })
+    .from(issues)
+    .where(eq(issues.id, issueId))
+    .then((rows: { id: string; companyId: string }[]) => rows[0] ?? null);
+  if (!issue) throw notFound("Issue not found");
+
+  const uniqueAssetIds = [...new Set(assetIds)];
+  const assetRows = await dbOrTx
+    .select({ id: assets.id, companyId: assets.companyId })
+    .from(assets)
+    .where(inArray(assets.id, uniqueAssetIds));
+  const byId = new Map<string, { id: string; companyId: string }>(
+    assetRows.map((row: { id: string; companyId: string }) => [row.id, row] as const),
+  );
+  for (const assetId of uniqueAssetIds) {
+    const asset = byId.get(assetId);
+    if (!asset) throw notFound("Attachment asset not found");
+    if (asset.companyId !== issue.companyId) {
+      throw unprocessable("Attachment asset must belong to same company as issue");
+    }
+  }
+  return { issue, uniqueAssetIds };
+}
+
+/**
+ * Read-only preflight for {@link attachAssetsToComment}: verifies every asset
+ * could be bound to a NEW comment on this issue (exists, same company, and its
+ * `issue_attachments` row is absent or unbound for this issue). Callers run it
+ * BEFORE creating the comment so a conflicting `attachmentIds` list fails the
+ * comment POST with an explicit conflict instead of leaving a comment whose
+ * attachments never bound. Returns the resolved bind context for reuse.
+ */
+async function validateAssetsBindableToNewComment(
+  dbOrTx: any,
+  input: { issueId: string; assetIds: string[] },
+): Promise<{ issue: { id: string; companyId: string }; uniqueAssetIds: string[] }> {
+  if (input.assetIds.length === 0) {
+    return { issue: { id: input.issueId, companyId: "" }, uniqueAssetIds: [] };
+  }
+  const { issue, uniqueAssetIds } = await resolveBindableAssetContext(dbOrTx, input.issueId, input.assetIds);
+  const rows: IssueAttachmentBindRow[] = await dbOrTx
+    .select({
+      assetId: issueAttachments.assetId,
+      issueId: issueAttachments.issueId,
+      issueCommentId: issueAttachments.issueCommentId,
+    })
+    .from(issueAttachments)
+    .where(inArray(issueAttachments.assetId, uniqueAssetIds));
+  const rowByAsset = new Map<string, IssueAttachmentBindRow>(
+    rows.map((row) => [row.assetId, row]),
+  );
+  for (const assetId of uniqueAssetIds) {
+    const existing = rowByAsset.get(assetId);
+    if (classifyIssueAttachmentBindState(existing, issue.id, null) === "conflict") {
+      throw issueAttachmentConflictError(assetId, existing);
+    }
+  }
+  return { issue, uniqueAssetIds };
 }
 
 export function issueService(db: Db) {
@@ -9081,12 +9202,44 @@ export function issueService(db: Db) {
     },
 
     /**
-     * Bind previously-created standalone assets (by id) to an issue +
-     * comment. Each asset must belong to the issue's company or the call is
-     * rejected (`unprocessable`) — a worker cannot surface a foreign tenant's
-     * asset onto its own issue. The insert is idempotent via
-     * `onConflictDoNothing` on the UNIQUE `asset_id` index, so a retried
-     * `createComment` does not duplicate or error on already-bound assets.
+     * Read-only preflight mirroring {@link attachAssetsToComment}'s bind
+     * semantics for a comment that does not exist yet: every asset must exist,
+     * belong to the issue's company, and carry an `issue_attachments` row that
+     * is absent or unbound (`issueCommentId IS NULL`) for this issue. Throws
+     * `notFound` / `unprocessable` / `conflict` otherwise. Comment routes call
+     * this BEFORE creating the comment so a conflicting `attachmentIds` list
+     * fails the request with an explicit error and no comment row is left
+     * behind.
+     */
+    validateAssetsBindableToIssue: async (input: {
+      issueId: string;
+      assetIds: string[];
+    }): Promise<void> => {
+      await validateAssetsBindableToNewComment(db, input);
+    },
+
+    /**
+     * Bind assets (by id) to an issue + comment before any downstream
+     * `comment.created` fan-out, so comment-scoped consumers (e.g. the media
+     * relay) see them. Per asset, exactly one of four states applies:
+     *
+     * - no `issue_attachments` row (standalone `artifacts.create` asset):
+     *   INSERT a bound row;
+     * - unbound row (`issueCommentId IS NULL`) on this issue (the
+     *   upload-first flow — the multipart attachment route creates the row at
+     *   upload time): UPDATE it onto this comment;
+     * - row already bound to this exact comment: idempotent skip, so a
+     *   retried bind (or a retried `createComment` reusing the same comment
+     *   id) converges without duplicating or erroring;
+     * - anything else (bound to a different comment, or unbound but uploaded
+     *   to a different issue): explicit `conflict` — the whole call rolls
+     *   back inside one transaction, leaving no partial binds.
+     *
+     * Each asset must belong to the issue's company or the call is rejected
+     * (`unprocessable`) — a worker cannot surface a foreign tenant's asset
+     * onto its own issue. A concurrent bind of the same asset that lost the
+     * INSERT race converges on the winning row instead of surfacing the
+     * unique-violation error.
      */
     attachAssetsToComment: async (input: {
       issueId: string;
@@ -9094,38 +9247,61 @@ export function issueService(db: Db) {
       assetIds: string[];
     }): Promise<void> => {
       if (input.assetIds.length === 0) return;
-      const issue = await db
-        .select({ id: issues.id, companyId: issues.companyId })
-        .from(issues)
-        .where(eq(issues.id, input.issueId))
-        .then((rows) => rows[0] ?? null);
-      if (!issue) throw notFound("Issue not found");
+      const { issue, uniqueAssetIds } = await resolveBindableAssetContext(db, input.issueId, input.assetIds);
 
-      const uniqueAssetIds = [...new Set(input.assetIds)];
-      const assetRows = await db
-        .select({ id: assets.id, companyId: assets.companyId })
-        .from(assets)
-        .where(inArray(assets.id, uniqueAssetIds));
-      const byId = new Map(assetRows.map((row) => [row.id, row]));
-      for (const assetId of uniqueAssetIds) {
-        const asset = byId.get(assetId);
-        if (!asset) throw notFound("Attachment asset not found");
-        if (asset.companyId !== issue.companyId) {
-          throw unprocessable("Attachment asset must belong to same company as issue");
+      await db.transaction(async (tx) => {
+        for (const assetId of uniqueAssetIds) {
+          const [existing] = await tx
+            .select({
+              id: issueAttachments.id,
+              issueId: issueAttachments.issueId,
+              issueCommentId: issueAttachments.issueCommentId,
+            })
+            .from(issueAttachments)
+            .where(eq(issueAttachments.assetId, assetId));
+          const state = classifyIssueAttachmentBindState(existing ?? null, issue.id, input.issueCommentId);
+          if (state === "skip") continue;
+          if (state === "bind") {
+            await tx
+              .update(issueAttachments)
+              .set({ issueCommentId: input.issueCommentId, updatedAt: new Date() })
+              .where(eq(issueAttachments.id, existing.id));
+            continue;
+          }
+          if (state === "insert") {
+            try {
+              await tx.insert(issueAttachments).values({
+                companyId: issue.companyId,
+                issueId: issue.id,
+                assetId,
+                issueCommentId: input.issueCommentId,
+              });
+            } catch (err) {
+              if (!isUniqueViolation(err, "issue_attachments_asset_uq")) throw err;
+              // Lost an INSERT race against a concurrent bind/upload of the
+              // same asset. Re-read the winning row inside this transaction:
+              // if it landed on this comment the retry converges (idempotent);
+              // anything else is a real conflict.
+              const [winner] = await tx
+                .select({
+                  id: issueAttachments.id,
+                  issueId: issueAttachments.issueId,
+                  issueCommentId: issueAttachments.issueCommentId,
+                })
+                .from(issueAttachments)
+                .where(eq(issueAttachments.assetId, assetId));
+              if (
+                classifyIssueAttachmentBindState(winner ?? null, issue.id, input.issueCommentId) === "skip"
+              ) {
+                continue;
+              }
+              throw issueAttachmentConflictError(assetId, winner);
+            }
+            continue;
+          }
+          throw issueAttachmentConflictError(assetId, existing);
         }
-      }
-
-      await db
-        .insert(issueAttachments)
-        .values(
-          uniqueAssetIds.map((assetId) => ({
-            companyId: issue.companyId,
-            issueId: issue.id,
-            assetId,
-            issueCommentId: input.issueCommentId,
-          })),
-        )
-        .onConflictDoNothing({ target: issueAttachments.assetId });
+      });
     },
 
     // Tenant-scoped at the data layer: callers must pass the validated (issue)

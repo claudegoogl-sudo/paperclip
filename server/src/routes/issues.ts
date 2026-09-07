@@ -11819,6 +11819,21 @@ export function issueRoutes(
       // paged the assignee — the exact silent-echo the guard exists to prevent.
       return;
     }
+    // Parse + preflight attachment binds BEFORE any comment row exists, so a
+    // conflicting attachmentIds list fails the POST with an explicit error
+    // instead of creating a comment whose attachments silently did not bind.
+    // attachAssetsToComment re-checks inside its transaction (races).
+    const commentAttachmentIds = Array.isArray(req.body.attachmentIds)
+      ? req.body.attachmentIds.filter(
+          (assetId: unknown): assetId is string => typeof assetId === "string" && assetId.length > 0,
+        )
+      : [];
+    if (commentAttachmentIds.length > 0) {
+      await svc.validateAssetsBindableToIssue({
+        issueId: issue.id,
+        assetIds: commentAttachmentIds,
+      });
+    }
     const commentPresentation = req.body.presentation ??
       await deriveRecoveryCommentPresentation(req, issue.companyId, req.body.body);
     const reopenRequested = req.body.reopen === true;
@@ -12176,15 +12191,13 @@ export function issueRoutes(
       });
     }
 
-    // Bind pre-uploaded standalone assets to this comment before any
-    // downstream `comment.created` fan-out, so a media relay reading attachments
-    // at comment-created time sees them (no attach-after-post race). Idempotent
-    // and tenant-checked in attachAssetsToComment; mirrors the host bridge path.
-    const commentAttachmentIds = Array.isArray(req.body.attachmentIds)
-      ? req.body.attachmentIds.filter(
-          (assetId: unknown): assetId is string => typeof assetId === "string" && assetId.length > 0,
-        )
-      : [];
+    // Bind pre-uploaded assets to this comment before any downstream
+    // `comment.created` fan-out, so a media relay reading attachments at
+    // comment-created time sees them (no attach-after-post race). Binding is
+    // conflict-aware: unbound rows on this issue are adopted, already-bound
+    // same-comment binds are idempotent, and genuine conflicts throw 409
+    // (pre-checked above, re-checked in-transaction here). Mirrors the host
+    // bridge path.
     if (commentAttachmentIds.length > 0) {
       await svc.attachAssetsToComment({
         issueId: currentIssue.id,
