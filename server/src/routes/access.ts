@@ -2898,11 +2898,44 @@ export function accessRoutes(
         assertCompanyAccess(req, req.body.requestedCompanyId);
       }
 
+      // Privilege ceiling: a request authenticated by a board
+      // API key must not be able to mint a successor key that is broader in
+      // scope, or longer-lived, than the minting key itself. Session-authenticated
+      // requests (a human/owner in the board UI/CLI login flow) are not bound by
+      // this -- they already carry full user authority independent of any key.
+      // `enforceBoardKeyScopeMiddleware` already force-inherits the acting
+      // scope for a plugin_ops key before this handler runs; this is the
+      // second, defense-in-depth half that also covers the expiry ceiling and
+      // remains correct even if the middleware chain changes.
+      if (req.actor.source === "board_key") {
+        // INVARIANT: the successor key's scope must be same-or-narrower than
+        // the minting key's scope. This is currently expressed by enumerating
+        // the single narrow kind (`plugin_ops`) because
+        // `boardApiKeyScopeSchema` is a two-member union (standard | plugin_ops);
+        // if a third scope kind is ever added, replace this with an explicit
+        // narrowness rank comparison (deny by default) so the ceiling cannot
+        // be bypassed by an unranked kind.
+        const actorScope = req.actor.boardKeyScope ?? { kind: "standard" as const };
+        if (actorScope.kind === "plugin_ops" && req.body.scope.kind !== "plugin_ops") {
+          throw forbidden(
+            "Board API key cannot mint a key with broader scope than itself",
+            { code: "board_key_privilege_ceiling" },
+          );
+        }
+        const actorExpiresAt = req.actor.boardKeyExpiresAt;
+        if (actorExpiresAt && req.body.expiresAt.getTime() > actorExpiresAt.getTime()) {
+          throw forbidden(
+            "Board API key cannot mint a key with a later expiry than itself",
+            { code: "board_key_privilege_ceiling" },
+          );
+        }
+      }
+
       const key = await boardAuth.createNamedBoardApiKey({
         userId: req.actor.userId,
         name: req.body.name,
-        expiresAt: req.body.expiresAt === undefined ? undefined : req.body.expiresAt,
-        scope: req.body.scope ?? null,
+        expiresAt: req.body.expiresAt,
+        scope: req.body.scope,
       });
       const companyIds = await boardAuth.resolveBoardActivityCompanyIds({
         userId: req.actor.userId,
