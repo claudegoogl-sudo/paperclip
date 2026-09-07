@@ -2811,19 +2811,28 @@ export function buildHostServices(
         // comment authorship (send-it-back-to-me, approvals, audit). Relays are
         // attributed to the plugin's own agent identity; operator identity, if any,
         // belongs in the comment body/metadata, not in host-minted authorship.
+        // Bind any standalone assets created via artifacts.create onto this
+        // comment. The preflight runs BEFORE the comment row exists, so a
+        // conflicting attachmentIds list fails createComment explicitly and
+        // leaves no comment behind; the bind itself re-checks in-transaction
+        // after addComment. Binding is idempotent for the same comment and
+        // conflict-aware: an asset already bound to a different comment/issue
+        // fails the call explicitly instead of silently dropping the
+        // attachment.
+        const attachmentIds = Array.isArray(params.attachmentIds)
+          ? params.attachmentIds.filter((id): id is string => typeof id === "string" && id.length > 0)
+          : [];
+        if (attachmentIds.length > 0) {
+          await issues.validateAssetsBindableToIssue({
+            issueId: issue.id,
+            assetIds: attachmentIds,
+          });
+        }
         const comment = (await issues.addComment(
           issue.id,
           params.body,
           { agentId: params.actorUserId ? undefined : params.authorAgentId, userId: params.actorUserId },
         )) as IssueComment;
-        // Bind any standalone assets created via artifacts.create onto
-        // this comment. attachAssetsToComment re-checks each asset's company
-        // against the (already tenant-validated) issue's company, so a worker
-        // cannot surface a foreign tenant's asset. Idempotent on the UNIQUE
-        // asset_id index, so a retried createComment does not duplicate.
-        const attachmentIds = Array.isArray(params.attachmentIds)
-          ? params.attachmentIds.filter((id): id is string => typeof id === "string" && id.length > 0)
-          : [];
         if (attachmentIds.length > 0) {
           await issues.attachAssetsToComment({
             issueId: issue.id,
