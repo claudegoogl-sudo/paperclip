@@ -1,0 +1,15 @@
+[Unit]
+Description=Paperclip fork-release drift sweep (merged-vs-running ledger)
+# One-shot service; paperclip-fork-drift.timer schedules it.
+
+[Service]
+Type=oneshot
+# %h expands to the invoking user's home directory (user units). Deploy the
+# two drift scripts to %h/work/fork-drift per scripts/fork-release/README.md.
+ExecStart=/usr/bin/env node %h/work/fork-drift/drift-sweep.mjs
+# Configuration (tracker issue key, repo, ticket regex) lives in an
+# EnvironmentFile so the unit itself stays generic; the board credential is
+# NEVER placed in this file — the sweep reads it in-process from
+# ~/.paperclip/auth.json or $PAPERCLIP_API_KEY.
+EnvironmentFile=-%h/.config/fork-drift/env
+TimeoutStartSec=300
