@@ -7,6 +7,7 @@ import {
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
   resubmitApprovalSchema,
+  APPROVAL_CREATE_PENDING_CARD_CAP_PER_AGENT,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import { logger } from "../middleware/logger.js";
@@ -22,6 +23,11 @@ import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, 
 import { redactEventPayload } from "../redaction.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { issueService } from "../services/issues.js";
+import {
+  countPendingApprovalsForAgent,
+  defaultApprovalCreateRateLimiter,
+  type ApprovalCreateRateLimiter,
+} from "../services/approval-create-rate-limit.js";
 import { REVIEW_PATH_RECOVERY_INSTRUCTION } from "../services/recovery/review-path-recovery.js";
 
 function redactApprovalPayload<T extends { payload: Record<string, unknown> }>(approval: T): T {
@@ -43,9 +49,14 @@ function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
 
 export function approvalRoutes(
   db: Db,
-  options: { pluginWorkerManager?: PluginWorkerManager } = {},
+  options: {
+    pluginWorkerManager?: PluginWorkerManager;
+    /** Override for tests; production uses the module-scope default limiter. */
+    approvalCreateRateLimiter?: ApprovalCreateRateLimiter;
+  } = {},
 ) {
   const router = Router();
+  const approvalCreateLimiter = options.approvalCreateRateLimiter ?? defaultApprovalCreateRateLimiter;
   const svc = approvalService(db);
   const access = accessService(db);
   const heartbeat = heartbeatService(db, {
@@ -72,6 +83,46 @@ export function approvalRoutes(
       reviewPathConsumedRef: approvalId,
       reviewPathInstruction: REVIEW_PATH_RECOVERY_INSTRUCTION,
     };
+  }
+
+  // Observability for a rejected create: a spoofed or policy-violating
+  // attribution attempt must be visible in the activity feed, not silently
+  // normalized or dropped. The entityId is the attribution *target* (the
+  // claimed agent, or the caller when none was claimed) because no approval
+  // row exists to point at. Details never include payload contents.
+  async function logRejectedApprovalCreate(input: {
+    companyId: string;
+    actor: ReturnType<typeof getActorInfo>;
+    reason:
+      | "requestedByAgentId_mismatch"
+      | "requestedByAgentId_not_allowed_for_user_actor";
+    claimedRequestedByAgentId: string | null;
+  }) {
+    logger.warn(
+      {
+        companyId: input.companyId,
+        agentId: input.actor.agentId,
+        runId: input.actor.runId,
+        claimedRequestedByAgentId: input.claimedRequestedByAgentId,
+        reason: input.reason,
+      },
+      "approval create rejected: requestedByAgentId attribution policy",
+    );
+    await logActivity(db, {
+      companyId: input.companyId,
+      actorType: input.actor.actorType,
+      actorId: input.actor.actorId,
+      agentId: input.actor.agentId,
+      runId: input.actor.runId,
+      action: "approval.create_denied",
+      entityType: "agent",
+      entityId: input.claimedRequestedByAgentId ?? input.actor.actorId,
+      details: {
+        outcome: "denied",
+        reason: input.reason,
+        claimedRequestedByAgentId: input.claimedRequestedByAgentId,
+      },
+    });
   }
 
   async function queueAdditionalApprovalReviewPathWakes(input: {
@@ -232,6 +283,90 @@ export function approvalRoutes(
       : [];
     const uniqueIssueIds = Array.from(new Set(issueIds));
     const { issueIds: _issueIds, ...approvalInput } = req.body;
+    const actor = getActorInfo(req);
+
+    // Attribution guard: an approval card is always attributed to its real
+    // requester. An agent caller may echo its own id (idempotent clients) but
+    // never another agent's, and user/board callers attribute via
+    // requestedByUserId only. Reject — never silently normalize — so a spoof
+    // attempt is visible (see logRejectedApprovalCreate) instead of rewritten.
+    const claimedRequestedByAgentId = approvalInput.requestedByAgentId ?? null;
+    if (actor.actorType === "agent") {
+      if (claimedRequestedByAgentId && claimedRequestedByAgentId !== actor.actorId) {
+        await logRejectedApprovalCreate({
+          companyId,
+          actor,
+          reason: "requestedByAgentId_mismatch",
+          claimedRequestedByAgentId,
+        });
+        res.status(403).json({
+          error:
+            "requestedByAgentId must be the authenticated agent; approval cards cannot be attributed to another agent",
+        });
+        return;
+      }
+    } else if (claimedRequestedByAgentId) {
+      await logRejectedApprovalCreate({
+        companyId,
+        actor,
+        reason: "requestedByAgentId_not_allowed_for_user_actor",
+        claimedRequestedByAgentId,
+      });
+      res.status(400).json({
+        error: "requestedByAgentId cannot be set on approvals created by user or board actors",
+      });
+      return;
+    }
+
+    // Per-agent creation caps (agent actors only; board/user callers are a
+    // trusted origin). The burst hit is committed only after the row is
+    // actually created, so a request rejected here or by any guard above
+    // never spends budget. This route has no idempotency/dedupe path: every
+    // successful create consumes exactly one burst hit.
+    if (actor.actorType === "agent") {
+      const burst = approvalCreateLimiter.inspect(actor.actorId);
+      if (!burst.allowed) {
+        logger.warn(
+          {
+            companyId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            limit: burst.limit,
+            retryAfterSeconds: burst.retryAfterSeconds,
+          },
+          "approval create rate-limited: per-agent burst cap reached",
+        );
+        res.setHeader("Retry-After", String(burst.retryAfterSeconds));
+        res.status(429).json({
+          error: "Too many approval cards created; retry later",
+          limit: burst.limit,
+          retryAfterSeconds: burst.retryAfterSeconds,
+        });
+        return;
+      }
+      const pendingCount = await countPendingApprovalsForAgent(db, companyId, actor.actorId);
+      if (pendingCount >= APPROVAL_CREATE_PENDING_CARD_CAP_PER_AGENT) {
+        logger.warn(
+          {
+            companyId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            pendingCount,
+            limit: APPROVAL_CREATE_PENDING_CARD_CAP_PER_AGENT,
+          },
+          "approval create blocked: per-agent pending-card cap reached",
+        );
+        // No Retry-After: the cap frees up on a human resolve/withdraw, not
+        // on a clock, so no duration is computable here.
+        res.status(429).json({
+          error: `Agent has ${pendingCount} pending approval cards (cap ${APPROVAL_CREATE_PENDING_CARD_CAP_PER_AGENT}); withdraw or resolve an existing card before creating another`,
+          limit: APPROVAL_CREATE_PENDING_CARD_CAP_PER_AGENT,
+          pending: pendingCount,
+        });
+        return;
+      }
+    }
+
     const normalizedPayload =
       approvalInput.type === "hire_agent"
         ? await secretsSvc.normalizeHireApprovalPayloadForPersistence(
@@ -241,19 +376,25 @@ export function approvalRoutes(
           )
         : approvalInput.payload;
 
-    const actor = getActorInfo(req);
     const approval = await svc.create(companyId, {
       ...approvalInput,
       payload: normalizedPayload,
       requestedByUserId: actor.actorType === "user" ? actor.actorId : null,
-      requestedByAgentId:
-        approvalInput.requestedByAgentId ?? (actor.actorType === "agent" ? actor.actorId : null),
+      // Forced from the authenticated actor: the guards above have already
+      // verified any client-supplied requestedByAgentId equals the caller
+      // (or was absent), so the body value can never influence attribution
+      // here even if a guard regresses.
+      requestedByAgentId: actor.actorType === "agent" ? actor.actorId : null,
       status: "pending",
       decisionNote: null,
       decidedByUserId: null,
       decidedAt: null,
       updatedAt: new Date(),
     });
+
+    if (actor.actorType === "agent") {
+      approvalCreateLimiter.record(actor.actorId);
+    }
 
     if (uniqueIssueIds.length > 0) {
       await issueApprovalsSvc.linkManyForApproval(approval.id, uniqueIssueIds, {
