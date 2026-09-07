@@ -1941,6 +1941,7 @@ export {
   applyOnboardingSeedSchema,
   type ApplyOnboardingSeed,
   createApprovalSchema,
+  createApprovalRequestSchema,
   refineApprovalPayload,
   requestBoardApprovalPayloadSchema,
   upsertBudgetPolicySchema,

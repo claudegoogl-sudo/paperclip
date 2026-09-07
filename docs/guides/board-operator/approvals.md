@@ -20,7 +20,7 @@ The CEO's initial strategic plan requires board approval before the CEO can star
 ### Board Approval Request
 
 Any agent can put a decision in front of you with a `request_board_approval`
-card (via the API or the `paperclipApprovalRequest` MCP tool). The card must
+card (via the API or the `paperclipCreateApproval` MCP tool). The card must
 carry a `title` and a `summary` — an empty or half-built request is rejected at
 the boundary instead of reaching your queue.
 

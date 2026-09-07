@@ -3,6 +3,7 @@ import {
   addIssueCommentSchema,
   askUserQuestionsPayloadSchema,
   checkoutIssueSchema,
+  createApprovalRequestSchema,
   createApprovalSchema,
   createIssueInputSchema,
   issueThreadInteractionContinuationPolicySchema,
@@ -429,12 +430,19 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipCreateApproval",
-      "Create a board approval request, optionally linked to one or more issues",
+      "Create a board approval request, optionally linked to one or more issues. A request_board_approval payload must carry a non-empty title and summary — weaker payloads are rejected here instead of reaching the operator queue",
       createApprovalToolSchema,
-      async ({ companyId, ...body }) =>
-        client.requestJson("POST", `/companies/${client.resolveCompanyId(companyId)}/approvals`, {
+      async ({ companyId, ...body }) => {
+        // Same discriminated payload contract as the server route: an
+        // undecidable card fails at the tool boundary with actionable
+        // feedback, instead of surfacing only as an API 400 after the fact.
+        // Parsed here (not attached to the tool schema) because the MCP server
+        // registers tools from the plain ZodObject `schema.shape`.
+        createApprovalRequestSchema.parse(body);
+        return client.requestJson("POST", `/companies/${client.resolveCompanyId(companyId)}/approvals`, {
           body,
-        }),
+        });
+      },
     ),
     makeTool(
       "paperclipGetApproval",

@@ -615,6 +615,7 @@ export {
 
 export {
   createApprovalSchema,
+  createApprovalRequestSchema,
   refineApprovalPayload,
   requestBoardApprovalPayloadSchema,
   resolveApprovalSchema,

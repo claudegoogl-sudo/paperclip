@@ -63,6 +63,15 @@ export const createApprovalSchema = z.object({
 
 export type CreateApproval = z.infer<typeof createApprovalSchema>;
 
+/**
+ * Full creation request: shape plus the discriminated payload refinement.
+ * Parsed by the server route (authoritative 4xx boundary) and by the MCP
+ * create tool's execute path (early agent-facing feedback), so an undecidable
+ * card — e.g. an empty request_board_approval payload — is rejected at
+ * whichever boundary the caller reaches first.
+ */
+export const createApprovalRequestSchema = createApprovalSchema.superRefine(refineApprovalPayload);
+
 export const resolveApprovalSchema = z.object({
   decisionNote: multilineTextSchema.optional().nullable(),
 });

@@ -3,8 +3,7 @@ import { eq } from "drizzle-orm";
 import { heartbeatRuns, type Db } from "@paperclipai/db";
 import {
   addApprovalCommentSchema,
-  createApprovalSchema,
-  refineApprovalPayload,
+  createApprovalRequestSchema,
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
   resubmitApprovalSchema,
@@ -42,10 +41,9 @@ function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
     context.resumeRequiresNormalModel === true;
 }
 
-// Authoritative boundary for approval creation: the discriminated payload
-// refinement turns schema-probe or half-built payloads into a 400 before any
-// row is written, instead of a permanently pending empty card.
-const createApprovalRequestSchema = createApprovalSchema.superRefine(refineApprovalPayload);
+// Approval creation parses through the shared createApprovalRequestSchema
+// (discriminated payload refinement): a schema probe or half-built payload is
+// a 400 before any row is written, instead of a permanently pending empty card.
 
 export function approvalRoutes(
   db: Db,
