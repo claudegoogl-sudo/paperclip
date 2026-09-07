@@ -40,8 +40,14 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
 SCRIPT_DIR="$REPO_ROOT/scripts/fork-release"
 
+# The provenance stamp every packed manifest must carry. RELEASE_SOURCE_COMMIT
+# overrides HEAD for builds where the checked-out ref is not the released
+# source; both paths are validated by scripts/source-commit.mjs.
+EXPECTED_SOURCE_COMMIT="${RELEASE_SOURCE_COMMIT:-$(git rev-parse HEAD)}"
+
 echo "===== fork-release build $VERSION ====="
 echo "HEAD: $(git rev-parse HEAD)"
+echo "Source commit stamp: $EXPECTED_SOURCE_COMMIT"
 
 echo "===== [1/10] pnpm install --frozen-lockfile ====="
 pnpm install --frozen-lockfile 2>&1 | tail -3
@@ -182,6 +188,19 @@ node "$SCRIPT_DIR/gate-bundled-tarballs.mjs" --dir "$OUT" --version "$VERSION" |
   echo "FATAL: bundled-dependency tarball gate failed" >&2
   exit 1
 }
+# (e) provenance: every packed manifest must carry a gitHead stamp equal to
+# the released source commit, so install-time and scheduled drift checks can
+# resolve what is running without the indirect version -> tag lookup.
+node - "$OUT" "$EXPECTED_SOURCE_COMMIT" <<'NODE'
+import { verifyCommitStamp } from "./scripts/fork-release/lib.mjs";
+const [outDir, expectedCommit] = process.argv.slice(2);
+const stamp = verifyCommitStamp({ assetsDir: outDir, expectedCommit });
+if (!stamp.ok) {
+  for (const v of stamp.violations) console.error(JSON.stringify(v));
+  process.exit(1);
+}
+console.log(`  -> commit stamp OK on all tarballs (${expectedCommit})`);
+NODE
 # Plain names (no ./ prefix), matching the basename keys the verifier and the
 # test-only injector use; verifyChecksums also normalizes either format.
 (cd "$OUT" && sha256sum *.tgz > SHA256SUMS.txt)

@@ -164,6 +164,9 @@ jobs:
       - name: Test fork release gate wiring + release set checks
         run: node --test ./scripts/fork-release/lib.test.mjs ./scripts/fork-release/workflow.test.mjs ./scripts/fork-release/bundled-deps.test.mjs
 
+      - name: Test commit stamp + drift check + drift sweep
+        run: pnpm run test:fork-drift
+
       - name: Test standalone package build concurrency
         run: node --test ./scripts/__tests__/build-standalone-concurrency.test.mjs
 
