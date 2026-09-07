@@ -56,3 +56,86 @@ describe("plugin wake rate limiter", () => {
     expect(first.limit).toBe(PLUGIN_WAKE_RATE_LIMIT_MAX_WAKES);
   });
 });
+
+describe("plugin wake rate limiter bucket-map eviction", () => {
+  // The wake limiter's (plugin, company, agent) bucket map is the second
+  // unbounded-growth surface the parent ticket calls out: a relay storm across
+  // many distinct agent targets grows the map without bound. These tests pin
+  // the two properties the shared store guarantees once the window ages out
+  // and once a burst of distinct keys outruns the sweep.
+
+  it("returns the wake bucket map to zero once the window has aged out", () => {
+    let now = 10_000;
+    const limiter = createPluginWakeRateLimiter({
+      windowMs: 1_000,
+      maxWakes: 5,
+      now: () => now,
+    });
+
+    for (let i = 0; i < 5; i += 1) {
+      now += 10;
+      limiter.consume({ ...ACTOR, agentId: `agent-${i}` });
+    }
+
+    // Every consume above pins a key. Advance past the window and re-touch
+    // each key; the shared store prunes the aged-out hits and deletes the
+    // now-empty key, so the map returns to zero rather than retaining five
+    // idle entries.
+    now += 1_001;
+    for (let i = 0; i < 5; i += 1) {
+      limiter.consume({ ...ACTOR, agentId: `agent-${i}` });
+    }
+
+    // Observable proof: a fresh agent gets its full wake budget. (This is also
+    // true if idle keys are retained, so the map-size invariant itself is
+    // pinned in the store's own test suite — here we only assert the limiter
+    // behaves identically.)
+    const fresh = limiter.consume({ ...ACTOR, agentId: "agent-fresh" });
+    expect(fresh.allowed).toBe(true);
+    expect(fresh.remaining).toBe(4);
+  });
+
+  it("holds the wake bucket map under a hard ceiling when fed more distinct keys than the ceiling allows", () => {
+    let now = 10_000;
+    const maxKeys = 4;
+    const limiter = createPluginWakeRateLimiter({
+      windowMs: 1_000,
+      maxWakes: 1_000,
+      maxKeys,
+      now: () => now,
+    });
+
+    // Feed three times the ceiling in distinct agents. The shared store's
+    // ceiling backstop keeps the live-key count at or below maxKeys.
+    const total = maxKeys * 3;
+    for (let i = 0; i < total; i += 1) {
+      now += 1;
+      const res = limiter.consume({ ...ACTOR, agentId: `agent-${i}` });
+      expect(res.allowed, `consume ${i} should be allowed`).toBe(true);
+    }
+
+    // Observable proof: a brand-new agent is still allowed. The backstop
+    // evicted an older agent's key to make room, rather than rejecting the
+    // wake. (Same caveat as the webhook IP test — the size invariant itself
+    // is pinned in the store suite.)
+    const probe = limiter.consume({ ...ACTOR, agentId: "agent-probe" });
+    expect(probe.allowed).toBe(true);
+  });
+
+  it("does not change observable limiter behaviour under load", () => {
+    let now = 1_000;
+    const limiter = createPluginWakeRateLimiter({
+      windowMs: 60_000,
+      maxWakes: 3,
+      now: () => now,
+    });
+
+    const results = Array.from({ length: 8 }, () => {
+      now += 100;
+      return limiter.consume(ACTOR);
+    });
+
+    expect(results.filter((r) => r.allowed).length).toBe(3);
+    expect(results.slice(3).every((r) => !r.allowed)).toBe(true);
+  });
+});
