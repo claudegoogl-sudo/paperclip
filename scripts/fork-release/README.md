@@ -171,6 +171,10 @@ source commit:
   (server, adapters, ...) as part of its publishConfig pass.
 - `scripts/prepare-bundled-package.mjs` stamps packages packed from a staged
   copy outside the repository, where npm/pnpm cannot infer provenance.
+- `scripts/generate-plugin-package-json.mjs` and
+  `scripts/generate-ui-package-json.mjs` stamp the plugin and UI manifests.
+  Their packages regenerate the manifest in a `prepack` step, which would
+  otherwise wipe the stamp written before pack ran.
 
 Resolution order lives in `scripts/source-commit.mjs`: `RELEASE_SOURCE_COMMIT`
 env (validated 40-hex) wins, then `git rev-parse HEAD`. `build.sh` gate (e)
