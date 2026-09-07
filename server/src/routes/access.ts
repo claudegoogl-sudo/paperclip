@@ -2908,6 +2908,13 @@ export function accessRoutes(
       // second, defense-in-depth half that also covers the expiry ceiling and
       // remains correct even if the middleware chain changes.
       if (req.actor.source === "board_key") {
+        // INVARIANT: the successor key's scope must be same-or-narrower than
+        // the minting key's scope. This is currently expressed by enumerating
+        // the single narrow kind (`plugin_ops`) because
+        // `boardApiKeyScopeSchema` is a two-member union (standard | plugin_ops);
+        // if a third scope kind is ever added, replace this with an explicit
+        // narrowness rank comparison (deny by default) so the ceiling cannot
+        // be bypassed by an unranked kind.
         const actorScope = req.actor.boardKeyScope ?? { kind: "standard" as const };
         if (actorScope.kind === "plugin_ops" && req.body.scope.kind !== "plugin_ops") {
           throw forbidden(

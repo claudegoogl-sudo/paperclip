@@ -103,6 +103,11 @@ export function isPluginOpsBoardKeyScope(value: unknown): boolean {
   return normalizeBoardApiKeyScope(value).kind === "plugin_ops";
 }
 
+// `requestedKeyScope` stays OPTIONAL here on purpose: already-shipped CLI
+// clients start challenges without it. Omission does NOT mean full authority --
+// the server normalizes a missing scope to the narrowest kind ({kind:
+// "plugin_ops"}) at challenge creation, so an unscoped full-board key can no
+// longer be minted by typing nothing.
 export const createCliAuthChallengeSchema = z.object({
   command: z.string().min(1).max(240),
   clientName: z.string().max(120).optional().nullable(),

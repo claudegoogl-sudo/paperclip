@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { authUsers, companies, createDb } from "@paperclipai/db";
+import { authUsers, boardApiKeys, cliAuthChallenges, companies, createDb } from "@paperclipai/db";
+import { eq } from "drizzle-orm";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -10,7 +11,11 @@ import {
 import { registerActorContext } from "../middleware/auth.ts";
 import { errorHandler } from "../middleware/error-handler.ts";
 import { accessRoutes } from "../routes/access.ts";
-import { boardAuthService } from "../services/board-auth.ts";
+import {
+  boardAuthService,
+  createBoardApiToken,
+  hashBearerToken,
+} from "../services/board-auth.ts";
 
 // POST /api/board-api-keys must reject a create request that omits
 // `expiresAt` or `scope` (the inverted secure-default that produced 11 live,
@@ -54,11 +59,11 @@ describeEmbeddedPostgres("POST /api/board-api-keys secure defaults", () => {
     return app;
   }
 
-  async function createKey(scope: "plugin_ops" | "standard" | null, expiresAt?: Date | null) {
+  async function createKey(scope: "plugin_ops" | "standard", expiresAt: Date) {
     return boardAuthService(db).createNamedBoardApiKey({
       userId: operatorUserId,
-      name: `test-${scope ?? "null"}-${randomUUID().slice(0, 8)}`,
-      scope: scope === null ? null : { kind: scope },
+      name: `test-${scope}-${randomUUID().slice(0, 8)}`,
+      scope: { kind: scope },
       expiresAt,
     });
   }
@@ -204,5 +209,86 @@ describeEmbeddedPostgres("POST /api/board-api-keys secure defaults", () => {
       .send({ name: "shorter-lived-child", scope: { kind: "plugin_ops" }, expiresAt: earlierExpiry });
 
     expect(res.status).toBe(201);
+  });
+
+  // The second mint path: CLI auth-challenge approval. A challenge started
+  // WITHOUT `requestedKeyScope` must mint a plugin_ops-scoped key, never a
+  // null-scoped (full-authority) one. Red before the fail-closed default,
+  // because the mint site wrote scopeConfig = NULL.
+  it("CLI auth challenge approval mints a plugin_ops key when requestedKeyScope was omitted", async () => {
+    const approverId = "approver-user-challenge";
+    await db.insert(authUsers).values({
+      id: approverId,
+      name: "Approver",
+      email: "approver-challenge@example.com",
+      emailVerified: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const service = boardAuthService(db);
+
+    const { challenge, challengeSecret } = await service.createCliAuthChallenge({
+      command: "paperclipai connect",
+      requestedAccess: "board",
+    });
+    // The challenge row itself is self-describing: the pending scope is the
+    // narrowest scope, not null.
+    expect(challenge.pendingKeyScopeConfig).toEqual({ kind: "plugin_ops" });
+
+    const result = await service.approveCliAuthChallenge(challenge.id, challengeSecret, approverId);
+    expect(result.status).toBe("approved");
+
+    const [minted] = await db
+      .select()
+      .from(boardApiKeys)
+      .where(eq(boardApiKeys.id, result.challenge.boardApiKeyId!));
+    expect(minted.scopeConfig).toEqual({ kind: "plugin_ops" });
+    expect(minted.expiresAt).not.toBeNull();
+  });
+
+  // Legacy pending rows persisted before challenge-creation normalization
+  // carry pendingKeyScopeConfig = NULL. Approval must still fail closed to
+  // the narrowest scope at the mint site.
+  it("CLI auth challenge approval of a legacy NULL-scope pending row mints plugin_ops, not null", async () => {
+    const approverId = "approver-user-legacy-challenge";
+    await db.insert(authUsers).values({
+      id: approverId,
+      name: "Approver",
+      email: "approver-legacy-challenge@example.com",
+      emailVerified: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const legacySecret = "legacy-challenge-secret";
+    const legacyPendingToken = createBoardApiToken();
+    const [legacyRow] = await db
+      .insert(cliAuthChallenges)
+      .values({
+        secretHash: hashBearerToken(legacySecret),
+        command: "paperclipai connect",
+        clientName: "legacy client",
+        requestedAccess: "board",
+        pendingKeyHash: hashBearerToken(legacyPendingToken),
+        pendingKeyName: "legacy client (board)",
+        pendingKeyScopeConfig: null,
+        expiresAt: new Date(Date.now() + 15 * 60 * 1000),
+      })
+      .returning();
+
+    const result = await boardAuthService(db).approveCliAuthChallenge(
+      legacyRow.id,
+      legacySecret,
+      approverId,
+    );
+    expect(result.status).toBe("approved");
+
+    const [minted] = await db
+      .select()
+      .from(boardApiKeys)
+      .where(eq(boardApiKeys.id, result.challenge.boardApiKeyId!));
+    expect(minted.scopeConfig).toEqual({ kind: "plugin_ops" });
+    expect(minted.scopeConfig).not.toBeNull();
+    expect(minted.expiresAt).not.toBeNull();
   });
 });

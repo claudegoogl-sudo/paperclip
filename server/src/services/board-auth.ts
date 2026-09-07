@@ -201,11 +201,16 @@ export function boardAuthService(db: Db) {
       .then((rows) => rows[0] ?? null);
   }
 
+  // The service layer is the chokepoint shared by every board API key mint
+  // path, so an unscoped or never-expiring key must be a compile error here,
+  // not a runtime default. Callers (the HTTP route, tests) must pass an
+  // explicit scope and expiry; the route's zod schema enforces the same at
+  // the boundary.
   async function createNamedBoardApiKey(input: {
     userId: string;
     name: string;
-    expiresAt?: Date | null;
-    scope?: BoardApiKeyScope | null;
+    expiresAt: Date;
+    scope: BoardApiKeyScope;
   }) {
     const token = createBoardApiToken();
     const created = await db
@@ -214,8 +219,8 @@ export function boardAuthService(db: Db) {
         userId: input.userId,
         name: input.name.trim(),
         keyHash: hashBearerToken(token),
-        scopeConfig: input.scope ?? null,
-        expiresAt: input.expiresAt === undefined ? boardApiKeyExpiresAt() : input.expiresAt,
+        scopeConfig: input.scope,
+        expiresAt: input.expiresAt,
       })
       .returning()
       .then((rows) => rows[0]);
@@ -305,7 +310,10 @@ export function boardAuthService(db: Db) {
         requestedCompanyId: input.requestedCompanyId?.trim() || null,
         pendingKeyHash: hashBearerToken(pendingBoardToken),
         pendingKeyName,
-        pendingKeyScopeConfig: input.requestedKeyScope ?? null,
+        // Normalize at creation so the pending row is self-describing and the
+        // approver-facing challenge record shows the scope that will actually
+        // be minted. Omission means the narrowest scope, never full authority.
+        pendingKeyScopeConfig: input.requestedKeyScope ?? { kind: "plugin_ops" },
         expiresAt,
       })
       .returning()
@@ -407,7 +415,12 @@ export function boardAuthService(db: Db) {
             userId,
             name: challenge.pendingKeyName,
             keyHash: challenge.pendingKeyHash,
-            scopeConfig: challenge.pendingKeyScopeConfig ?? null,
+            // Fail closed: a challenge that omitted `requestedKeyScope` (or a
+            // pending row persisted before scope normalization) must never
+            // mint a full-authority key by default. `normalizeBoardApiKeyScope(null)`
+            // maps null to the `standard` (full board) kind, so the narrowest
+            // scope is the only safe default here.
+            scopeConfig: challenge.pendingKeyScopeConfig ?? { kind: "plugin_ops" },
             expiresAt: boardApiKeyExpiresAt(),
           })
           .returning()
