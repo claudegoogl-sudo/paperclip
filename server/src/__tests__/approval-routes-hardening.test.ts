@@ -46,11 +46,13 @@ const rateLimitControl = vi.hoisted(() => {
     pendingCount: 0,
     inspected: 0,
     recorded: 0,
-    countCalls: 0,
+    /** Hits per agent id — the fake mirrors the real per-agent bucketing. */
+    hitsPerAgent: {} as Record<string, number[]>,
     limiter: {
-      inspect(_agentId: string) {
+      inspect(agentId: string) {
         control.inspected += 1;
-        const remaining = Math.max(0, control.maxPerAgent - control.recorded);
+        const active = (control.hitsPerAgent[agentId] ?? []).length;
+        const remaining = Math.max(0, control.maxPerAgent - active);
         return {
           allowed: remaining > 0,
           limit: control.maxPerAgent,
@@ -58,8 +60,9 @@ const rateLimitControl = vi.hoisted(() => {
           retryAfterSeconds: remaining > 0 ? 0 : 42,
         };
       },
-      record(_agentId: string) {
+      record(agentId: string) {
         control.recorded += 1;
+        (control.hitsPerAgent[agentId] ??= []).push(1);
       },
     },
     countPendingApprovalsForAgent: vi.fn(async () => control.pendingCount),
@@ -68,7 +71,7 @@ const rateLimitControl = vi.hoisted(() => {
       control.pendingCount = 0;
       control.inspected = 0;
       control.recorded = 0;
-      control.countCalls = 0;
+      control.hitsPerAgent = {};
       control.countPendingApprovalsForAgent.mockClear();
     },
   };
@@ -370,7 +373,9 @@ describe("approval create per-agent caps", () => {
     const ok = await agentPost(app, {});
     expect(ok.status, JSON.stringify(ok.body)).toBe(201);
     expect(rateLimitControl.recorded).toBe(1);
-    expect(rateLimitControl.inspected).toBe(3);
+    // the spoof short-circuits before the caps, so only the two non-spoof
+    // requests ever reached the limiter
+    expect(rateLimitControl.inspected).toBe(2);
   });
 
   it("AC10: this route has no idempotency/dedupe path — two identical creates consume two hits", async () => {
