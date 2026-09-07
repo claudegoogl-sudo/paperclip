@@ -7,6 +7,7 @@ import {
   agentApiKeys,
   agents,
   authUsers,
+  boardApiKeyAuthEvents,
   companies,
   companyMemberships,
   heartbeatRuns,
@@ -165,6 +166,35 @@ async function auditAgentJwtRunHeaderMismatch(
   }
 }
 
+// Append-only authentication-event log for the board API key bearer path.
+// Records every attempt -- success, expired, revoked, or an
+// unrecognised token -- so a future investigation of "was this key abused"
+// does not hit the same telemetry gap again: last_used_at is a single mutable
+// high-water mark, and activity_log only carries successful, attributed
+// business actions from 2026-08-07 onward. Never logs the token or key
+// hash, only the key id (nullable for an unrecognised token).
+async function recordBoardApiKeyAuthEvent(
+  db: Db,
+  input: {
+    keyId: string | null;
+    outcome: "success" | "expired" | "revoked" | "bad_key";
+    req: Request;
+  },
+) {
+  try {
+    await db.insert(boardApiKeyAuthEvents).values({
+      keyId: input.keyId,
+      outcome: input.outcome,
+      sourceIp: input.req.ip ?? null,
+      userAgent: input.req.get("user-agent") ?? null,
+      method: input.req.method,
+      route: input.req.baseUrl ? `${input.req.baseUrl}${input.req.path}` : input.req.path,
+    });
+  } catch (err) {
+    logger.warn({ err, keyId: input.keyId, outcome: input.outcome }, "Failed to log board API key auth event");
+  }
+}
+
 async function auditAgentKeyMissingResponsibleUser(
   db: Db,
   input: { companyId: string; agentId: string; keyId: string; method: string; url: string },
@@ -299,27 +329,45 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       return;
     }
 
-    const boardKey = await boardAuth.findBoardApiKeyByToken(token);
-    if (boardKey) {
-      const access = await boardAuth.resolveBoardAccess(boardKey.userId);
-      if (access.user) {
-        await boardAuth.touchBoardApiKey(boardKey.id);
-        req.actor = {
-          type: "board",
-          userId: boardKey.userId,
-          userName: access.user?.name ?? null,
-          userEmail: access.user?.email ?? null,
-          companyIds: access.companyIds,
-          memberships: access.memberships,
-          isInstanceAdmin: access.isInstanceAdmin,
+    const boardKeyLookup = await boardAuth.findBoardApiKeyForAuthEvent(token);
+    if (boardKeyLookup.key) {
+      const boardKey = boardKeyLookup.key;
+      if (boardKeyLookup.outcome === "success") {
+        const access = await boardAuth.resolveBoardAccess(boardKey.userId);
+        if (access.user) {
+          await boardAuth.touchBoardApiKey(boardKey.id);
+          await recordBoardApiKeyAuthEvent(db, { keyId: boardKey.id, outcome: "success", req });
+          req.actor = {
+            type: "board",
+            userId: boardKey.userId,
+            userName: access.user?.name ?? null,
+            userEmail: access.user?.email ?? null,
+            companyIds: access.companyIds,
+            memberships: access.memberships,
+            isInstanceAdmin: access.isInstanceAdmin,
+            keyId: boardKey.id,
+            boardKeyScope: normalizeBoardApiKeyScope(boardKey.scopeConfig),
+            runId: runIdHeader || undefined,
+            source: "board_key",
+          };
+          next();
+          return;
+        }
+        // Matched a live key hash but the owning user is gone -- treat as a
+        // bad key for logging purposes rather than silently falling through.
+        await recordBoardApiKeyAuthEvent(db, { keyId: boardKey.id, outcome: "bad_key", req });
+      } else {
+        await recordBoardApiKeyAuthEvent(db, {
           keyId: boardKey.id,
-          boardKeyScope: normalizeBoardApiKeyScope(boardKey.scopeConfig),
-          runId: runIdHeader || undefined,
-          source: "board_key",
-        };
-        next();
-        return;
+          outcome: boardKeyLookup.outcome,
+          req,
+        });
       }
+    } else if (token.startsWith("pcp_board_")) {
+      // Only log bad_key for tokens shaped like board keys -- other bearer
+      // tokens (agent keys, JWTs) fall through to their own auth paths below
+      // and should not pollute the board-key auth-event log.
+      await recordBoardApiKeyAuthEvent(db, { keyId: null, outcome: "bad_key", req });
     }
 
     const tokenHash = hashToken(token);
