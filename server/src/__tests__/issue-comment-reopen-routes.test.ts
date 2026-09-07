@@ -11,6 +11,7 @@ const mockIssueService = vi.hoisted(() => ({
   update: vi.fn(),
   addComment: vi.fn(),
   attachAssetsToComment: vi.fn(async () => undefined),
+  validateAssetsBindableToIssue: vi.fn(async () => undefined),
   getDependencyReadiness: vi.fn(),
   getCurrentScheduledRetry: vi.fn(),
   findMentionedAgents: vi.fn(),

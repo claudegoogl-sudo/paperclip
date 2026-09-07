@@ -36,6 +36,7 @@ Core fields:
 Operational fields:
 - timeoutSec (number, optional): run timeout in seconds
 - graceSec (number, optional): SIGTERM grace period in seconds
+- providerWaitGuard (object, optional): bounds silent provider waits. When the CLI produces no output at all (for example while blocked on the provider), the guard emits a one-time stderr diagnostic naming the best-effort wait class (auth, rate_limit, network, or unknown), periodic progress lines while the silence lasts, and after maxWaitSec of total silence terminates the stalled CLI process so the run fails with the distinct provider_wait_timeout error code. Fields: enabled (bool, default false), idleDiagnosticSec (number, default 900), progressSec (number, default 300), maxWaitSec (number, default 3600; 0 makes the guard observe-only: diagnostics without termination). Environment overrides: PAPERCLIP_PI_WAIT_GUARD, PAPERCLIP_PI_WAIT_IDLE_DIAGNOSTIC_SEC, PAPERCLIP_PI_WAIT_PROGRESS_SEC, PAPERCLIP_PI_WAIT_MAX_SEC (config values win over env). Not armed for sandbox execution targets, which already carry their own wall-clock backstop.
 
 Notes:
 - Pi supports multiple providers and models. Use \`pi --list-models\` to list available options.
@@ -43,4 +44,5 @@ Notes:
 - Sessions are stored in ~/.pi/paperclips/ and resumed with --session.
 - All tools (read, bash, edit, write, grep, find, ls) are enabled by default.
 - Agent instructions are appended to Pi's system prompt via --append-system-prompt, while the user task is sent via -p.
+- The providerWaitGuard watchdog is off by default. Enable it when runs may block silently on the provider; tune maxWaitSec above your longest legitimate silent stretch (a long in-agent tool run streams no output until the tool finishes).
 `;

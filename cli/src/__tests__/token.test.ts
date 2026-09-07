@@ -159,6 +159,7 @@ describe("token commands", () => {
       "--company-id", COMPANY_ID,
       "--name", "external-admin",
       "--ttl-days", "14",
+      "--scope", "plugin_ops",
       "--json",
     ], { from: "user" });
 
@@ -167,6 +168,7 @@ describe("token commands", () => {
       name: "external-admin",
       requestedCompanyId: COMPANY_ID,
       expiresAt: "2026-06-06T00:00:00.000Z",
+      scope: { kind: "plugin_ops" },
     });
     expect(JSON.parse(String(log.mock.calls[0]?.[0]))).toMatchObject({
       key: {
@@ -178,7 +180,9 @@ describe("token commands", () => {
     });
   });
 
-  it("creates a non-expiring board token when requested", async () => {
+  it("creates a standard-scope board token with a short ttl", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-23T00:00:00.000Z"));
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({
@@ -188,7 +192,7 @@ describe("token commands", () => {
         createdAt: "2026-05-23T00:00:00.000Z",
         lastUsedAt: null,
         revokedAt: null,
-        expiresAt: null,
+        expiresAt: "2026-05-23T12:00:00.000Z",
       }), { status: 201 }));
     vi.stubGlobal("fetch", fetchMock);
     vi.spyOn(console, "log").mockImplementation(() => {});
@@ -199,15 +203,54 @@ describe("token commands", () => {
       "--api-key", "board-token",
       "--company-id", COMPANY_ID,
       "--name", "external-admin",
-      "--never-expires",
+      "--expires-at", "2026-05-23T12:00:00.000Z",
+      "--scope", "standard",
       "--json",
     ], { from: "user" });
 
     expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
       name: "external-admin",
       requestedCompanyId: COMPANY_ID,
-      expiresAt: null,
+      expiresAt: "2026-05-23T12:00:00.000Z",
+      scope: { kind: "standard" },
     });
+  });
+
+  it("rejects board token create without --scope", async () => {
+    const program = createProgram();
+    await expect(
+      program.parseAsync([
+        "token", "board", "create",
+        "--api-base", "http://localhost:3100",
+        "--api-key", "board-token",
+        "--company-id", COMPANY_ID,
+        "--name", "external-admin",
+        "--ttl-days", "1",
+        "--json",
+      ], { from: "user" }),
+    ).rejects.toThrow();
+  });
+
+  it("rejects board token create without an expiry (no --never-expires escape hatch)", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    await expect(
+      createProgram().parseAsync([
+        "token", "board", "create",
+        "--api-base", "http://localhost:3100",
+        "--api-key", "board-token",
+        "--company-id", COMPANY_ID,
+        "--name", "external-admin",
+        "--scope", "plugin_ops",
+        "--json",
+      ], { from: "user" }),
+    ).rejects.toThrow();
+
+    errorSpy.mockRestore();
+    exitSpy.mockRestore();
   });
 
   it("lists and revokes board tokens", async () => {
