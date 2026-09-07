@@ -135,7 +135,7 @@ pg_guard_state() {
   local data_dir="${1:-$PG_GUARD_DATA_DIR}"
   local ctl state
   ctl="$(pg_guard_pgcontroldata)" || {
-    pg_guard_warn "pg_controldata not found; set PG_GUARD_PGCONTROLDATA (install PostgreSQL client tools matching the embedded server's major version)"
+    pg_guard_warn "pg_controldata not found; set PG_GUARD_PGCONTROLDATA, or one-time root prep: install the SERVER package postgresql-<major> (Debian/Ubuntu: pg_controldata ships in postgresql-<major>, NOT postgresql-client-<major>; if apt has no candidate for that major — e.g. noble carries PG16 only — add the PGDG apt repo first), then stage it: sudo mkdir -p /usr/local/share/paperclip-release-tools/pg-bin/<major>/bin && sudo ln -s /usr/lib/postgresql/<major>/bin/pg_controldata /usr/lib/postgresql/<major>/bin/pg_ctl /usr/local/share/paperclip-release-tools/pg-bin/<major>/bin/"
     return 2
   }
   state="$("$ctl" "$data_dir" 2>/dev/null | sed -n 's/^Database cluster state:[[:space:]]*//p' | head -1)"

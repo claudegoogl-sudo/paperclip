@@ -2145,6 +2145,61 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }) {
     const runningAgent = await getAgent(input.run.agentId);
     if (!runningAgent || runningAgent.companyId !== input.run.companyId) return { kind: "skipped" as const };
+    // Liveness gate: the candidate row was selected by the scan's
+    // status = "running" filter, but the run may have terminated between that
+    // SELECT and this point — and a row left "running" with nothing alive
+    // behind it is a ghost, not an active run. Re-read the row and require a
+    // live signal (in-memory child handle, live child pid / process group, or
+    // an agent still marked running) before opening review work. A wedged run
+    // that is still executing keeps its live signals, so genuine stalls still
+    // file. The activity records keep skipped gates observable.
+    const [freshRun] = await db
+      .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, input.run.id))
+      .limit(1);
+    if (!freshRun || freshRun.status !== "running") {
+      await logActivity(db, {
+        companyId: input.run.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: input.run.agentId,
+        runId: input.run.id,
+        action: "heartbeat.output_stale_run_already_terminal",
+        entityType: "heartbeat_run",
+        entityId: input.run.id,
+        details: {
+          source: "recovery.scan_silent_active_runs",
+          runStatusAtCheck: freshRun?.status ?? null,
+        },
+      });
+      return { kind: "skipped" as const };
+    }
+    const handleAlive = runningProcesses.has(input.run.id);
+    const pidAlive = input.run.processPid ? isPidAlive(input.run.processPid) : false;
+    const processGroupAlive = input.run.processGroupId
+      ? isProcessGroupAlive(input.run.processGroupId)
+      : false;
+    const agentExecuting = runningAgent.status === "running";
+    if (!handleAlive && !pidAlive && !processGroupAlive && !agentExecuting) {
+      await logActivity(db, {
+        companyId: input.run.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: input.run.agentId,
+        runId: input.run.id,
+        action: "heartbeat.output_stale_run_not_live",
+        entityType: "heartbeat_run",
+        entityId: input.run.id,
+        details: {
+          source: "recovery.scan_silent_active_runs",
+          processPid: input.run.processPid ?? null,
+          processGroupId: input.run.processGroupId ?? null,
+          agentStatus: runningAgent.status,
+        },
+      });
+      return { kind: "skipped" as const };
+    }
     const sourceIssue = await resolveStaleRunSourceIssue(input.run);
     const existing = await findOpenStaleRunEvaluation(input.run.companyId, input.run.id);
     if (sourceIssue && isRecoveryOriginIssue(sourceIssue)) {
@@ -2620,8 +2675,103 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     };
   }
 
+  /**
+   * Stale-active-run evaluation issues are opened while a run is still
+   * `running` and silent past the suspicion threshold, but nothing revisited
+   * them once the run finished — scanSilentActiveRuns only selects candidates
+   * with heartbeatRuns.status = "running", so a run that later reaches a
+   * terminal status (succeeded / succeeded_dirty / failed / cancelled /
+   * timed_out / interrupted) drops out of the candidate set and its
+   * already-open evaluation issue stays in the review queue forever, even
+   * though the silence it flagged has been explained by the run's outcome.
+   * Close any open evaluation issue whose run has since terminated (or whose
+   * run row is gone), before scanning for new candidates. Idempotent: only
+   * touches issues that are not already done/cancelled, so re-running the
+   * sweep never double-closes or double-comments.
+   */
+  async function closeStaleRunEvaluationsForTerminatedRuns(opts?: { now?: Date; companyId?: string }) {
+    const now = opts?.now ?? new Date();
+    const openEvaluations = await db
+      .select({
+        issueId: issues.id,
+        identifier: issues.identifier,
+        companyId: issues.companyId,
+        originId: issues.originId,
+        status: issues.status,
+      })
+      .from(issues)
+      .where(
+        and(
+          opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
+          eq(issues.originKind, STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND),
+          isNull(issues.hiddenAt),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .limit(200);
+
+    let closed = 0;
+    for (const evaluation of openEvaluations) {
+      if (!evaluation.originId) continue;
+      const [run] = await db
+        .select({
+          id: heartbeatRuns.id,
+          status: heartbeatRuns.status,
+          finishedAt: heartbeatRuns.finishedAt,
+          errorCode: heartbeatRuns.errorCode,
+        })
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.id, evaluation.originId), eq(heartbeatRuns.companyId, evaluation.companyId)))
+        .limit(1);
+      // Only a TERMINAL run (or a missing run row) resolves the alert. A queued
+      // or scheduled_retry run has not produced its outcome yet, so its
+      // evaluation issue stays open. TERMINAL_HEARTBEAT_RUN_STATUSES is the
+      // shared terminal set: succeeded, succeeded_dirty, failed, cancelled,
+      // timed_out, interrupted.
+      if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) continue;
+
+      await issuesSvc.update(evaluation.issueId, { status: "done" });
+      await issuesSvc.addComment(evaluation.issueId, [
+        "Auto-resolved: the flagged run has terminated.",
+        "",
+        `- Run: \`${evaluation.originId}\``,
+        `- Run status: \`${run?.status ?? "not found"}\``,
+        `- Finished at: ${run?.finishedAt?.toISOString() ?? "unknown"}`,
+        run?.errorCode ? `- Error code: \`${run.errorCode}\`` : null,
+        "- Outcome: the silence window this alert flagged is explained by the run outcome above; closing automatically instead of leaving it in the review queue.",
+      ].filter((line): line is string => line !== null).join("\n"), { runId: null });
+
+      await logActivity(db, {
+        companyId: evaluation.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: evaluation.originId,
+        action: "heartbeat.output_stale_evaluation_auto_closed",
+        entityType: "issue",
+        entityId: evaluation.issueId,
+        details: {
+          source: "recovery.close_stale_run_evaluations_for_terminated_runs",
+          runId: evaluation.originId,
+          runStatus: run?.status ?? null,
+          runFinishedAt: run?.finishedAt?.toISOString() ?? null,
+          runErrorCode: run?.errorCode ?? null,
+        },
+      });
+      closed += 1;
+    }
+    return { scanned: openEvaluations.length, closed };
+  }
+
   async function scanSilentActiveRuns(opts?: { now?: Date; companyId?: string; issueCreatedAtGte?: Date | null }) {
     const now = opts?.now ?? new Date();
+    const resolvedTerminated = await closeStaleRunEvaluationsForTerminatedRuns({ now, companyId: opts?.companyId });
+    if (resolvedTerminated.closed > 0) {
+      logger.info(
+        { ...resolvedTerminated },
+        "auto-resolved stale-run evaluations whose runs already terminated",
+      );
+    }
     const teardownConfig = readWatchdogAutoTeardownConfig();
     // When auto-teardown is enabled and its threshold is below the detection
     // suspicion threshold, widen the candidate window so teardown can fire at its
@@ -2673,6 +2823,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       folded: 0,
       snoozed: 0,
       tornDown: 0,
+      autoResolvedTerminated: resolvedTerminated.closed,
       skipped: 0,
       evaluationIssueIds: [] as string[],
     };

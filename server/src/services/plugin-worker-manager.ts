@@ -1682,7 +1682,8 @@ export function createPluginWorkerHandle(
     //
     // SECURITY-CRITICAL: a NARROW allowlist of company-scoped methods
     // (`SERVICE_SCOPE_COMPANY_METHODS` in the SDK gate) that are server-side
-    // `requireInCompany` reach-checked IS authorized under this serviceScope when
+    // reach-checked (`requireInCompany` or `requirePluginEnabledForCompany`) IS
+    // authorized under this serviceScope when
     // no dispatch pins a company — including when base context reports
     // `invalidInvocationScope` for the scope-less inbound relay path (the
     // `onWebhook` / `getUpdates` callback carries no resolvable dispatch id). The

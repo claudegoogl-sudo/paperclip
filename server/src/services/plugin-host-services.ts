@@ -106,6 +106,18 @@ import { recordProviderPluginSpan, type ParsedTraceparent } from "../instrumenta
 /** Maximum time (ms) a plugin fetch request may take before being aborted. */
 const PLUGIN_FETCH_TIMEOUT_MS = 30_000;
 
+/**
+ * Opaque denial for the fork-only `config.getForServiceScope` read. Every
+ * provisioning failure on that surface collapses to this single message so a
+ * worker cannot distinguish "company unknown" from "company never configured
+ * this plugin" (no existence oracle) — the `company_secret_bindings` posture.
+ * The specific reason is logged server-side via `configGateLog`.
+ */
+const SERVICE_SCOPE_CONFIG_DENIED = "config not available for this service scope";
+
+/** Value-free server-side logger for service-scope config denials. */
+const configGateLog = logger.child({ service: "plugin-host-services.config-gate" });
+
 /** Maximum time (ms) to wait for a DNS lookup before aborting. */
 const DNS_LOOKUP_TIMEOUT_MS = 5_000;
 
@@ -932,19 +944,22 @@ export function buildHostServices(
    * control would be the false-assurance anti-pattern. The REAL, fail-closed
    * availability gate is `requirePluginEnabledForCompany` below, and ONLY the
    * fork-only reconcile/background reads (`approvals.listPending`,
-   * `interactions.list`, `config.getForServiceScope`) run it.
+   * `interactions.list`, `config.getForServiceScope`) plus the company-scoped
+   * `state.get` / `state.set` / `state.delete` handlers (via
+   * `requireStateCompanyReach`) run it.
    */
   const noPluginAvailabilityGate = async (_companyId: string) => {};
 
   /**
    * SECURITY-CRITICAL: real, method-scoped availability gate for the fork-only
    * reconcile/background reads (`approvals.listPending` / `interactions.list` /
-   * `config.getForServiceScope`). Unlike the instance-wide no-op
-   * stub above, this fail-closes so a cross-tenant-sensitive enumeration can
-   * never run for a company the plugin is not genuinely provisioned for. It is
-   * deliberately NOT wired into the existing handlers (whose per-entity
-   * `requireInCompany` already supplies the cross-check) — only the new reads
-   * call it.
+   * `config.getForServiceScope`) and for company-scoped plugin state
+   * (`state.get` / `state.set` / `state.delete` via `requireStateCompanyReach`
+   * below). Unlike the instance-wide no-op stub above, this fail-closes so a
+   * cross-tenant-sensitive enumeration can never run for a company the plugin
+   * is not genuinely provisioned for. Pre-existing handlers are NOT rewired:
+   * their per-entity `requireInCompany` cross-check stays as upstream wrote
+   * it, and the company-scoped state handlers are the only added consumer.
    *
    * Denial order (each step throws rather than returning an empty list — a
    * silent empty would mask a misconfig and reopen the very downtime gap this
@@ -977,6 +992,42 @@ export function buildHostServices(
     if (settings && settings.enabled === false) {
       throw new Error("Plugin is disabled for this company");
     }
+  };
+
+  /**
+   * SECURITY-CRITICAL: per-company reach check for COMPANY-scoped plugin state
+   * (`scopeKind:"company"` — `scopeId` is a worker-chosen companyId).
+   * Company-scoped `state.get` / `state.set` / `state.delete` are admitted
+   * under the bare worker-lifetime `serviceScope` with no dispatch to pin a
+   * tenant, so this is the compensating server-side reach-check the SDK
+   * allowlist invariant requires (`SERVICE_SCOPE_COMPANY_METHODS` in the SDK
+   * host-client-factory). It bounds the reachable company set to the plugin's
+   * install reach — the identical gate the fork-only reconcile/background
+   * reads run — so an idle worker can neither pre-poison an unprovisioned
+   * company's state before adoption nor read/wipe partitions of companies it
+   * does not serve (`plugin_state` BOLA).
+   *
+   * Fail-closed shapes:
+   *   - `scopeKind:"company"` with a missing/empty `scopeId` is REJECTED
+   *     rather than falling through to the store's NULL-`scopeId` partition
+   *     (an unkeyed partition no legitimate company dispatch ever writes;
+   *     kept unreachable so it cannot become a bypass channel);
+   *   - unknown company / uninstalled or disabled install / company-disabled
+   *     plugin all deny via `requirePluginEnabledForCompany`.
+   *
+   * Every other `scopeKind` keys state by an entity id (`instance`, `issue`,
+   * `project`, `agent`, ...) that only the plugin itself can have written —
+   * no company reach exists to widen — so the gate is a no-op there.
+   */
+  const requireStateCompanyReach = async (
+    scopeKind: unknown,
+    scopeId: unknown,
+  ): Promise<void> => {
+    if (scopeKind !== "company") return;
+    if (typeof scopeId !== "string" || scopeId.trim().length === 0) {
+      throw new Error("scopeId is required for company-scoped plugin state");
+    }
+    await requirePluginEnabledForCompany(scopeId.trim());
   };
 
   const getLocalFolderDeclaration = (folderKey: string) =>
@@ -1615,6 +1666,49 @@ export function buildHostServices(
     return { ...base, ...override };
   };
 
+  /**
+   * SECURITY-CRITICAL: provisioning gate for the fork-only background config
+   * read (`config.getForServiceScope`). Mirrors the `company_secret_bindings`
+   * posture of the secrets handler: the named company must hold a
+   * `plugin_config` row for THIS plugin install, and every denial shape —
+   * (a) unknown company, (b) install not operational (uninstalled/disabled),
+   * (c) company-disabled plugin, (d) missing `plugin_config` row — collapses
+   * into ONE opaque error at the worker boundary. A worker can therefore not
+   * distinguish "company does not exist" from "company exists but never
+   * configured this plugin": no company- or config-existence oracle. The
+   * specific denial reason is logged server-side only (value-free reasons).
+   *
+   * Fail closed: unknown/unprovisioned → throw, never an empty config.
+   * Deliberately scoped to the config read ONLY — the reconcile enumeration
+   * reads (`approvals.listPending` / `interactions.list`) legitimately serve
+   * companies that hold no config row, so they keep the shared
+   * `requirePluginEnabledForCompany` gate with its distinct messages.
+   */
+  const requireConfigProvisionedForCompany = async (companyId: string): Promise<void> => {
+    try {
+      await requirePluginEnabledForCompany(companyId);
+    } catch (err) {
+      configGateLog.warn(
+        { pluginId, reason: err instanceof Error ? err.message : String(err) },
+        "service-scope config read denied; collapsing to opaque provisioning error",
+      );
+      throw new Error(SERVICE_SCOPE_CONFIG_DENIED);
+    }
+    // The company must hold a `plugin_config` row for THIS plugin install —
+    // the same posture as `company_secret_bindings` for secret refs. Without
+    // this, any worker of an enabled plugin could read any company's plugin
+    // config metadata (routing ids, secret REF UUIDs — never values; values
+    // stay binding-table-gated) the moment a plugin goes multi-company.
+    const configRow = await registry.getConfig(pluginId, companyId);
+    if (!configRow) {
+      configGateLog.warn(
+        { pluginId },
+        "service-scope config read denied: company holds no plugin_config row for this install",
+      );
+      throw new Error(SERVICE_SCOPE_CONFIG_DENIED);
+    }
+  };
+
   const configService = {
     async get(params: Parameters<HostServices["config"]["get"]>[0]) {
       const companyId = ensureCompanyId(params.companyId);
@@ -1626,13 +1720,14 @@ export function buildHostServices(
       return configRow?.configJson ?? {};
     },
     // Fork-only background read (serviceScope-reachable; see the SDK gate).
-    // Fail-closed provisioning: unknown company / uninstalled / disabled
-    // plugin → throw, never an empty config.
+    // Fail-closed provisioning with an opaque, oracle-free denial:
+    // unknown company / uninstalled / disabled plugin / company without a
+    // `plugin_config` row for this install all collapse to ONE error.
     async getForServiceScope(
       params: Parameters<HostServices["config"]["getForServiceScope"]>[0],
     ): Promise<Record<string, unknown>> {
       const companyId = ensureCompanyId(params.companyId);
-      await requirePluginEnabledForCompany(companyId);
+      await requireConfigProvisionedForCompany(companyId);
       return getEffectiveCompanyConfig(companyId);
     },
   };
@@ -1725,14 +1820,24 @@ export function buildHostServices(
       },
     },
 
+    // SECURITY-CRITICAL: company-scoped plugin state is keyed by a
+    // worker-chosen companyId. Under the bare worker-lifetime `serviceScope`
+    // (idle worker, no dispatch pinning a tenant) the SDK allowlist admits
+    // these calls for ANY company, so the per-company reach check below is the
+    // compensating server-side gate between a worker and every company
+    // partition of its own plugin's state (`plugin_state` BOLA: pre-poison a
+    // company before it adopts the plugin, or wipe its partitions at will).
+    // Identical fail-closed gate to the fork-only reconcile reads.
     state: {
       async get(params) {
+        await requireStateCompanyReach(params.scopeKind, params.scopeId);
         return stateStore.get(pluginId, params.scopeKind as any, params.stateKey, {
           scopeId: params.scopeId,
           namespace: params.namespace,
         });
       },
       async set(params) {
+        await requireStateCompanyReach(params.scopeKind, params.scopeId);
         await stateStore.set(pluginId, {
           scopeKind: params.scopeKind as any,
           scopeId: params.scopeId,
@@ -1742,6 +1847,7 @@ export function buildHostServices(
         });
       },
       async delete(params) {
+        await requireStateCompanyReach(params.scopeKind, params.scopeId);
         await stateStore.delete(pluginId, params.scopeKind as any, params.stateKey, {
           scopeId: params.scopeId,
           namespace: params.namespace,

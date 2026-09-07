@@ -1,4 +1,6 @@
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -41,10 +43,161 @@ test("the preflight installs from the exact release URL and asserts the dashboar
 
 test("the preflight stages assets on a draft release that is never public before the gate", () => {
   const workflow = readWorkflow("fork-release.yml");
-  assert.match(workflow, /gh release create "\$TAG".*--draft --prerelease/, "staging must be a draft");
+  const stage = workflow.slice(
+    workflow.indexOf("Stage the release set on a draft release"),
+    workflow.indexOf("Download the staged assets"),
+  );
+  // The draft is created over REST: draft=true keeps it private until the
+  // publish gate flips it, and the same call yields the numeric release id
+  // every later step resolves instead of the tag.
+  assert.match(stage, /repos\/\$RELEASE_REPO\/releases" /, "staging must create the draft over REST");
+  assert.match(stage, /-f tag_name="\$TAG"/, "the draft must carry the run's release tag");
+  assert.match(stage, /-F draft=true/, "staging must create a DRAFT release");
+  assert.match(stage, /-F prerelease=true/, "staging must mark the release prerelease");
+  assert.match(stage, /-f target_commitish="\$GITHUB_SHA"/, "the draft must pin the run's commit");
+  assert.match(stage, /--jq '\.id'/, "the create call must capture the numeric release id");
+  assert.match(stage, /DRAFT_RELEASE_ID=\$release_id" >> "\$GITHUB_ENV"/, "the id must be exported to later steps");
+  assert.doesNotMatch(stage, /gh release create/, "the gh CLI create path is replaced by the REST call");
+});
+
+test("the staged-asset lookup resolves the draft release by id, never by tag", () => {
+  const workflow = readWorkflow("fork-release.yml");
+  const download = workflow.slice(workflow.indexOf("Download the staged assets"));
+  assert.match(
+    download,
+    /repos\/\$RELEASE_REPO\/releases\/\$DRAFT_RELEASE_ID/,
+    "the asset TSV must come from the captured draft release id",
+  );
+  assert.match(download, /--jq '\.assets\[\] \| \[\.id, \.name\] \| @tsv'/, "the TSV must carry numeric REST asset ids");
+  assert.doesNotMatch(
+    download,
+    /releases\/tags\/\$TAG/,
+    "the REST by-tag endpoint resolves published releases only and 404s on drafts",
+  );
+  // The ban spans the WHOLE preflight job, not just the download step: the
+  // by-tag REST lookup 404s on drafts, which is the exact failure that ended
+  // dry run 33299563388. Prose comments may still name the retired endpoint;
+  // this matches the actual "$TAG" call shape only.
+  const preflightJob = workflow.slice(workflow.indexOf("  preflight:"), workflow.indexOf("  publish:"));
+  assert.doesNotMatch(preflightJob, /releases\/tags\/\$TAG/, "no REST by-tag lookup anywhere in the preflight job");
+  assert.match(download, /case "\$\{DRAFT_RELEASE_ID:-\}" in/, "DRAFT_RELEASE_ID must be validated before use");
+  assert.match(download, /''\|\*\[!0-9\]\*/, "the guard must refuse a missing or non-numeric id");
 });
 
 test("the negative-test injector produces a set the static gate refuses", async () => {
   const injector = readFileSync(path.join(repoRoot, "scripts/fork-release/negative-test-fork34.mjs"), "utf8");
   assert.match(injector, /exports.*\.\/src\/index\.ts/s, "injector must reproduce the dev-exports defect");
+});
+
+test("the preflight step cannot mask a FAIL verdict behind its tee pipeline", () => {
+  const workflow = readWorkflow("fork-release.yml");
+  const step = workflow.slice(
+    workflow.indexOf("Preflight — clean install"),
+    workflow.indexOf("Job summary"),
+  );
+  const runBody = step.slice(step.indexOf("run: |"));
+  // Actions executes run blocks with `bash -e`, whose pipeline exit status is
+  // the LAST command's — so `node preflight.mjs ... | tee preflight.log`
+  // reports tee's 0 even when the gate exits 1 on FAIL findings, and a broken
+  // release would sail past the gate into publish. The step must therefore
+  // set pipefail itself, before the node invocation.
+  assert.match(
+    runBody,
+    /set -euo pipefail/,
+    "the preflight run block must set pipefail so tee cannot swallow the gate's exit code",
+  );
+  const pipefailAt = runBody.indexOf("set -euo pipefail");
+  const nodeAt = runBody.indexOf("node scripts/fork-release/preflight.mjs");
+  assert.notEqual(nodeAt, -1, "the preflight run block must invoke the gate script");
+  assert.ok(
+    pipefailAt !== -1 && pipefailAt < nodeAt,
+    "pipefail must be enabled before the node gate runs",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Export-target gate scope: every release tarball, not only the core closure
+// ---------------------------------------------------------------------------
+
+const EXPORT_GATE_VERSION = "0.0.0-export-gate-wiring";
+const preflightPath = path.join(repoRoot, "scripts", "fork-release", "preflight.mjs");
+
+function packFixtureTarball(assetsDir, assetName, { manifest, files = {} }) {
+  const work = mkdtempSync(path.join(assetsDir, "pack-"));
+  const inner = path.join(work, "package");
+  mkdirSync(inner, { recursive: true });
+  for (const [rel, content] of Object.entries(files)) {
+    const target = path.join(inner, rel);
+    mkdirSync(path.dirname(target), { recursive: true });
+    writeFileSync(target, content);
+  }
+  writeFileSync(path.join(inner, "package.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+  const out = path.join(assetsDir, assetName);
+  const result = spawnSync("tar", ["--owner=0", "--group=0", "-czf", out, "-C", work, "package"], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  rmSync(work, { recursive: true, force: true });
+  return out;
+}
+
+// A minimal two-tarball set: the core package (no export targets of its own)
+// plus one provider plugin whose packed manifest points at ./dist/* — with
+// and without the dist files actually shipped.
+function makeExportGateFixture({ withDist }) {
+  const assets = mkdtempSync(path.join(tmpdir(), "export-gate-fixture-"));
+  packFixtureTarball(assets, `paperclipai-${EXPORT_GATE_VERSION}.tgz`, {
+    manifest: { name: "paperclipai", version: EXPORT_GATE_VERSION },
+  });
+  packFixtureTarball(assets, `paperclipai-plugin-e2b-${EXPORT_GATE_VERSION}.tgz`, {
+    files: withDist ? { "dist/index.js": "export {};\n", "dist/index.d.ts": "export {};\n", "dist/manifest.js": "export default {};\n", "dist/worker.js": "export {};\n" } : {},
+    manifest: {
+      name: "@paperclipai/plugin-e2b",
+      version: EXPORT_GATE_VERSION,
+      main: "./dist/index.js",
+      exports: { ".": { types: "./dist/index.d.ts", import: "./dist/index.js" } },
+      paperclipPlugin: { manifest: "./dist/manifest.js", worker: "./dist/worker.js" },
+    },
+  });
+  return assets;
+}
+
+function runExportsGate(assetsDir) {
+  return spawnSync("node", [
+    preflightPath,
+    "--core-url", `https://github.com/claudegoogl-sudo/paperclip/releases/download/v${EXPORT_GATE_VERSION}/paperclipai-${EXPORT_GATE_VERSION}.tgz`,
+    "--assets-dir", assetsDir,
+    "--steps", "exports",
+  ], { encoding: "utf8" });
+}
+
+test("the export gate refuses a provider tarball whose manifest points at unshipped dist files", () => {
+  const assets = makeExportGateFixture({ withDist: false });
+  try {
+    const result = runExportsGate(assets);
+    assert.notEqual(
+      result.status,
+      0,
+      `the gate must FAIL a packed-but-never-built provider tarball; gate output:\n${result.stdout}\n${result.stderr}`,
+    );
+    assert.match(
+      `${result.stdout}\n${result.stderr}`,
+      /plugin-e2b/,
+      "the violation must name the offending tarball",
+    );
+  } finally {
+    rmSync(assets, { recursive: true, force: true });
+  }
+});
+
+test("the export gate passes a provider tarball that ships its dist", () => {
+  const assets = makeExportGateFixture({ withDist: true });
+  try {
+    const result = runExportsGate(assets);
+    assert.equal(
+      result.status,
+      0,
+      `the gate must pass a provider tarball that ships its dist; gate output:\n${result.stdout}\n${result.stderr}`,
+    );
+  } finally {
+    rmSync(assets, { recursive: true, force: true });
+  }
 });

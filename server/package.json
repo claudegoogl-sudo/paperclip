@@ -69,7 +69,7 @@
     "dompurify": "^3.4.13",
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.2",
-    "embedded-postgres": "^18.1.0-beta.16",
+    "embedded-postgres": "18.1.0-beta.16",
     "express": "^5.1.0",
     "jsdom": "^28.1.0",
     "multer": "^2.2.0",

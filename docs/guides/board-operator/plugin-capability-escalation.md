@@ -47,6 +47,8 @@ Review `addedCapabilities` — that is the exact set of new powers the upgrade i
 
 The `digest` is a content hash (`sha256:<hex>`) of the exact package captured when the upgrade was parked. On approval the loader pins the applied package to this digest: a package that declares the approved version and capabilities but carries different code (a source swapped after approval) is rejected. Approvals filed before this anchor existed have no `digest` and fall back to version + capability checks only.
 
+At park time the loader also copies the package into a content-addressed snapshot store (`<local plugin dir>/.upgrade-snapshots/<digest>`). Approval applies the snapshot, not the original source directory, so the loaded bytes are host-controlled. The copy is link-safe and bounded: it dereferences only symlinks that resolve inside the approved package, refuses devices, FIFOs, and sockets, and stops the park with an error if the tree exceeds 1 GiB or 200,000 files. A symlink that points outside the package (for example into host data) is skipped, so its contents never enter the snapshot. Snapshots no longer referenced by any installed plugin are pruned on apply, revert, and uninstall.
+
 ## Configuration
 
 The escalation gateway is only wired up when the server knows which company owns the board approval queue for plugin upgrades. Set:
@@ -66,6 +68,8 @@ Each transition emits a structured log line you can grep in production:
 - `plugin-loader: upgrade already parked for this target — converging without re-filing` (idempotent re-run).
 - `capability-escalation: applying board decision to parked plugin upgrade` (on approve/reject) — includes `outcome`.
 - `plugin lifecycle: parked upgrade approved — applied and returning to ready` / `… rejected — restored to ready`.
+- `plugin-loader: snapshot skipped symlink whose target escapes the package root` (on park) — the approved source tree contained a link pointing outside the package; its target is not copied.
+- `plugin-loader: pruned unreferenced upgrade snapshot` (on apply, revert, or uninstall) — an old snapshot left the content-addressed store.
 
 ## Happy-path walkthrough
 

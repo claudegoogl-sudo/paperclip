@@ -10,6 +10,14 @@
 # failure class, pages once, and stops retrying until a human clears it.
 #
 # Behavior (one "tick"; safe to run from cron every minute or two):
+#   0. Cutover-window lock held (another process — the install/rollback
+#      window — holds an exclusive flock on PG_RECOVER_WINDOW_LOCK) ->
+#      do NOTHING: log one deferral line, update no state, count no failure,
+#      exit 0. The window intentionally stopped postgres and mid-snapshot
+#      wants it to STAY down; starting it mid-window is the race that aborted
+#      the 2026-08-31 fork.37 window (watchdog restarted the cluster during
+#      the tar). flock — not a pidfile — so a crashed window releases the
+#      lock via the kernel on fd close; no stale-lock cleanup exists.
 #   1. Port already listening -> healthy. Clears the failure counter and any
 #      active alert state. No alert, no restart. (A healthy observation is the
 #      ONLY automatic reset.)
@@ -61,7 +69,8 @@
 #   help
 #
 # Exit codes (tick):
-#   0  healthy / no-op (already up, or startup still in progress)
+#   0  healthy / no-op (already up, or startup still in progress), or a
+#      cutover window holds the window lock (deferred: nothing attempted)
 #   1  a start was attempted and failed (counter < N; retrying next tick)
 #   2  setup/config problem
 #   3  escalation active (backoff; no further start attempts until clear-state)
@@ -76,6 +85,15 @@
 #                                       (default ~/.paperclip/instances/default/pg-recover.state)
 #   PG_RECOVER_STATE                    alert/backoff state (JSON)
 #                                       (default ~/.paperclip/instances/default/pg-recover-alert.state)
+#   PG_RECOVER_WINDOW_LOCK              cutover-window lock file (default
+#                                       /home/paperclip/.paperclip/instances/default/pg-window.lock):
+#                                       while another process holds an
+#                                       exclusive flock on it, every tick
+#                                       defers (behavior 0). The default is
+#                                       ABSOLUTE on purpose, not $HOME-based:
+#                                       the root window process and the
+#                                       paperclip watchdog user must resolve
+#                                       the SAME file.
 #   PG_RECOVER_POSTGRES_BIN             postgres binary
 #   PG_RECOVER_MAX_FAILURES             N consecutive failed starts that
 #                                       escalate (default 3; a PANIC escalates
@@ -114,6 +132,9 @@ PG_RECOVER_DATA_DIR="${PG_RECOVER_DATA_DIR:-$HOME/.paperclip/instances/default/d
 PG_RECOVER_LOG="${PG_RECOVER_LOG:-$HOME/.paperclip/instances/default/logs/pg-recover.log}"
 PG_RECOVER_STAMP="${PG_RECOVER_STAMP:-$HOME/.paperclip/instances/default/pg-recover.state}"
 PG_RECOVER_STATE="${PG_RECOVER_STATE:-$HOME/.paperclip/instances/default/pg-recover-alert.state}"
+# Absolute default (not $HOME): root window + paperclip watchdog must agree on
+# one file — see the PG_RECOVER_WINDOW_LOCK doc block above.
+PG_RECOVER_WINDOW_LOCK="${PG_RECOVER_WINDOW_LOCK:-/home/paperclip/.paperclip/instances/default/pg-window.lock}"
 PG_RECOVER_POSTGRES_BIN="${PG_RECOVER_POSTGRES_BIN:-/usr/lib/node_modules/paperclipai/node_modules/@embedded-postgres/linux-x64/native/bin/postgres}"
 PG_RECOVER_MAX_FAILURES="${PG_RECOVER_MAX_FAILURES:-3}"
 PG_RECOVER_START_WAIT="${PG_RECOVER_START_WAIT:-30}"
@@ -358,6 +379,61 @@ backoff_active() {
   [ "$(sget backoff)" = "true" ]
 }
 
+# ------------------------------------------------------------- window lock
+
+# True when ANOTHER process holds an exclusive flock on PG_RECOVER_WINDOW_LOCK
+# (the cutover window). Self-competing ticks never take the lock: a tick that
+# wins the probe flock releases it immediately and proceeds normally.
+#
+# Cross-user open mode: the window runs as root, this watchdog as the
+# paperclip user, and both must open the SAME file. Whoever creates it first
+# does so 0666 (umask-defeated below; the window script does the same). The
+# probe only needs a readable fd — flock(2) accepts LOCK_EX on O_RDONLY
+# descriptors on Linux — so a restrictive-mode leftover owned by root still
+# probes correctly via the read-only fallback.
+#
+# Cross-generation interop: the v2 window scripts ALSO write the epoch
+# timestamp on line 1 of the lock file while they hold the flock. That line is
+# what the INTERIM watchdog generation deployed 2026-08-31 (pre-flock) reads
+# and stands down on; THIS generation defers on the flock itself and treats
+# the file content as opaque. A leftover file with a fresh epoch but NO flock
+# (crashed window) therefore does NOT defer a tick here — recovery stays
+# prompt, and the interim generation self-heals once the epoch goes stale.
+#
+# Fail-open by design: if the lock path cannot be opened at all we warn and
+# PROCEED. The watchdog's primary job is recovering a genuinely dead cluster;
+# an unprobeable lock file must not be able to suppress recovery forever. A
+# HELD lock, by contrast, always defers (the normal, expected case), and every
+# deferral logs a line, so a permanently-held lock is visible in the log.
+window_lock_held() {
+  local lock="$PG_RECOVER_WINDOW_LOCK"
+  # Open READ-ONLY first: probing must not CREATE protocol state. A write-mode
+  # open would materialize an empty lock file at the default path whenever a
+  # tick runs without a window (the interim watchdog generation then reads an
+  # empty line 1). flock(2) takes LOCK_EX on O_RDONLY descriptors on Linux, so
+  # the probe still detects a held lock; the write-mode fallback with the
+  # 0666 create only runs when a restrictive-mode file owned by root blocks
+  # even the read open.
+  if ! { exec 9<"$lock"; } 2>/dev/null; then
+    if [ ! -e "$lock" ]; then
+      return 1   # no lock file -> no window can hold one
+    fi
+    ( umask 000; : >>"$lock" ) 2>/dev/null || true
+    chmod 0666 "$lock" 2>/dev/null || true
+    if ! { exec 9<"$lock"; } 2>/dev/null; then
+      warn "window lock ${lock} not openable — cannot probe; proceeding (fail-open)"
+      return 1
+    fi
+  fi
+  if flock -n 9 2>/dev/null; then
+    flock -u 9 2>/dev/null || true
+    { exec 9>&-; } 2>/dev/null || true
+    return 1   # nobody holds it — window not in progress
+  fi
+  { exec 9>&-; } 2>/dev/null || true
+  return 0    # held by another process — defer
+}
+
 # ------------------------------------------------------------- subcommands
 
 cmd_status() {
@@ -417,6 +493,13 @@ cmd_page_test() { # pure drill: DRILL payload through deliver_page(); NO state I
 # --------------------------------------------------------------- main tick
 
 cmd_tick() {
+  # 0. Cutover window holding the lock? Checked before anything else —
+  #    including state_init: a deferral must update nothing at all.
+  if window_lock_held; then
+    log "window lock held — deferring recovery tick"
+    exit 0
+  fi
+
   state_init
 
   # 1. Healthy? (the only automatic reset)

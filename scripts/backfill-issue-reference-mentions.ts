@@ -3,6 +3,7 @@ import {
   companies,
   createDb,
   readEmbeddedPostgresCredential,
+  socketDirectoryPathFor,
 } from "../packages/db/src/index.js";
 import { loadConfig } from "../server/src/config.js";
 import { issueReferenceService } from "../server/src/services/issue-references.js";
@@ -31,6 +32,7 @@ async function main() {
       port: config.embeddedPostgresPort,
       database: "paperclip",
       password: cred.password,
+      socketDir: socketDirectoryPathFor(config.embeddedPostgresDataDir),
     });
   }
 

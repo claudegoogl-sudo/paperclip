@@ -1,16 +1,27 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { spawn } from "node:child_process";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
+  mkdirSync,
   readFileSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 
 import postgres from "postgres";
 
 export const EMBEDDED_POSTGRES_USER = "paperclip";
+// Host used by the connection-string builder when no unix-socket directory is
+// supplied. Today every embedded consumer passes a socketDir and the loopback
+// TCP path is never used in production — the TCP listener is killed by the
+// `listen_addresses=""` flag in `buildEmbeddedPostgresConstructorOptions`. The
+// fallback exists so unit tests of the URL builder can construct a TCP-shaped
+// string without spinning up a real cluster.
 export const EMBEDDED_POSTGRES_HOST = "127.0.0.1";
 export const LEGACY_EMBEDDED_POSTGRES_PASSWORD = "paperclip";
 
@@ -18,6 +29,20 @@ const PASSWORD_ALPHABET =
   "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 const PASSWORD_LENGTH = 32;
 const CREDENTIAL_FILE_SUFFIX = ".pg-credential";
+// Name prefix for the per-install socket directory. The full name is
+// `<prefix><hash-of-dataDir>` (see socketDirectoryPathFor) — a fixed short
+// length that does NOT grow with the data-dir depth.
+export const SOCKET_DIRECTORY_NAME_PREFIX = "paperclip-pg-";
+// Directory mode: only the data-dir owner may traverse or connect. The socket
+// file inside is also tightened via `unix_socket_permissions=0700` so the
+// cluster cannot accidentally inherit the libpq default `0777`.
+const SOCKET_DIRECTORY_MODE = 0o700;
+// AF_UNIX `sun_path` limit: 108 bytes incl. NUL on Linux (107 usable), 104 on
+// macOS/BSD (103 usable). Postgres binds `<socketDir>/.s.PGSQL.<port>` and
+// FATALs ("could not create any Unix-domain sockets") if the path overflows.
+// The hashed socket dir keeps us well under this; the guard below is a
+// fail-fast belt against a pathologically long TMPDIR/XDG_RUNTIME_DIR.
+const UNIX_SOCKET_PATH_MAX_BYTES = process.platform === "darwin" ? 103 : 107;
 
 export type EmbeddedPostgresDatabase = "postgres" | "paperclip";
 
@@ -44,6 +69,125 @@ export function generateEmbeddedPostgresPassword(): string {
 
 export function credentialFilePathFor(dataDir: string): string {
   return `${dataDir.replace(/\/+$/, "")}${CREDENTIAL_FILE_SUFFIX}`;
+}
+
+// Root directory that holds per-install socket dirs. Prefer $XDG_RUNTIME_DIR
+// (/run/user/<uid>: already 0700 and NOT world-writable) when it is set to an
+// absolute path; fall back to os.tmpdir(). Kept short and independent of the
+// data-dir path so the `<root>/paperclip-pg-<hash>/.s.PGSQL.<port>` socket path
+// stays well under the AF_UNIX sun_path limit regardless of data-dir depth.
+export function embeddedPostgresSocketRuntimeRoot(): string {
+  const xdg = process.env.XDG_RUNTIME_DIR;
+  if (xdg && path.isAbsolute(xdg)) return xdg;
+  return tmpdir();
+}
+
+// Short, stable, per-install socket directory. Derived from a hash of the data
+// dir so it is (a) unique per install, (b) identical on every start for a given
+// data dir — warm-restart detection and every `postgres()` call site agree on
+// the path — and (c) a fixed short length independent of how deep the data dir
+// is nested. The previous `<dataDir>.socket` sibling overflowed the AF_UNIX
+// 107-byte path limit for deeply nested worktree/instance data dirs, so the
+// postmaster could not create the socket and the cluster never booted.
+export function socketDirectoryPathFor(dataDir: string): string {
+  const normalized = dataDir.replace(/\/+$/, "");
+  const hash = createHash("sha256").update(normalized).digest("hex").slice(0, 16);
+  return path.join(
+    embeddedPostgresSocketRuntimeRoot(),
+    `${SOCKET_DIRECTORY_NAME_PREFIX}${hash}`,
+  );
+}
+
+// The socket file postgres binds inside the socket directory.
+export function embeddedPostgresSocketFilePath(
+  socketDir: string,
+  port: number,
+): string {
+  return path.join(socketDir, `.s.PGSQL.${port}`);
+}
+
+// Fail fast (with a clear, actionable message) if the socket path would
+// overflow the platform's AF_UNIX limit, rather than letting postgres FATAL
+// with an opaque "could not create any Unix-domain sockets".
+export function assertEmbeddedPostgresSocketPathWithinLimit(
+  socketDir: string,
+  port: number,
+): void {
+  const socketPath = embeddedPostgresSocketFilePath(socketDir, port);
+  const bytes = Buffer.byteLength(socketPath, "utf8");
+  if (bytes > UNIX_SOCKET_PATH_MAX_BYTES) {
+    throw new Error(
+      `Embedded PostgreSQL unix socket path ${socketPath} is ${bytes} bytes, ` +
+        `over the ${UNIX_SOCKET_PATH_MAX_BYTES}-byte platform limit. Set a ` +
+        `shorter XDG_RUNTIME_DIR or TMPDIR so the socket directory fits.`,
+    );
+  }
+}
+
+// Idempotent: create the per-install socket directory with mode 0700 and assert
+// it is a real, self-owned, 0700 directory. The runtime root can be shared and
+// world-writable (/tmp), so we fail closed on the ways an attacker could
+// pre-seed the path: a symlink (redirects the bind), a non-directory, a dir we
+// do not own (name squatting), or group/world-accessible mode (permission
+// drift). Mirrors the cred-file mode check. Safe to call on every start.
+export function ensureEmbeddedPostgresSocketDir(dataDir: string): string {
+  const socketDir = socketDirectoryPathFor(dataDir);
+  // lstat (not stat) so we inspect the entry itself, never its symlink target.
+  let existing: ReturnType<typeof lstatSync> | null = null;
+  try {
+    existing = lstatSync(socketDir);
+  } catch {
+    existing = null;
+  }
+  if (existing) {
+    if (existing.isSymbolicLink()) {
+      throw new Error(
+        `Embedded PostgreSQL socket directory at ${socketDir} is a symlink; ` +
+          `refusing to start (possible socket-hijack via a pre-created link).`,
+      );
+    }
+    if (!existing.isDirectory()) {
+      throw new Error(
+        `Embedded PostgreSQL socket path at ${socketDir} exists but is not a ` +
+          `directory. Remove it so a fresh 0700 socket dir can be created.`,
+      );
+    }
+    if (
+      typeof process.getuid === "function" &&
+      existing.uid !== process.getuid()
+    ) {
+      throw new Error(
+        `Embedded PostgreSQL socket directory at ${socketDir} is owned by uid ` +
+          `${existing.uid}, not this process (uid ${process.getuid()}). ` +
+          `Refusing to start (possible socket-dir squatting).`,
+      );
+    }
+    if ((existing.mode & 0o077) !== 0) {
+      throw new Error(
+        `Embedded PostgreSQL socket directory at ${socketDir} has insecure mode ` +
+          `${(existing.mode & 0o777).toString(8)}: must be 0700 ` +
+          `(no group or world access). Refusing to start.`,
+      );
+    }
+    return socketDir;
+  }
+  mkdirSync(socketDir, { recursive: true, mode: SOCKET_DIRECTORY_MODE });
+  // mkdir's mode is masked by umask; force the final mode on the freshly
+  // created dir so the assertion below cannot fail on a future start.
+  try {
+    chmodSync(socketDir, SOCKET_DIRECTORY_MODE);
+  } catch {
+    // best effort; the strict mode check below refuses insecure dirs.
+  }
+  const stat = statSync(socketDir);
+  if ((stat.mode & 0o077) !== 0) {
+    throw new Error(
+      `Embedded PostgreSQL socket directory at ${socketDir} has insecure mode ` +
+        `${(stat.mode & 0o777).toString(8)}: must be 0700 ` +
+        `(no group or world access). Refusing to start.`,
+    );
+  }
+  return socketDir;
 }
 
 export type EmbeddedPostgresCredential = { password: string };
@@ -95,18 +239,92 @@ export type BuildEmbeddedPostgresConnectionStringInput = {
   password: string;
   host?: string;
   user?: string;
+  // Unix-socket directory the cluster is bound to. When set, the builder
+  // appends the `?paperclip_socket=<dir>` sentinel so the URL can carry the
+  // socket path across boundaries that only accept a connection string (e.g.
+  // createDb / applyPendingMigrations). Decode with
+  // `resolveEmbeddedPostgresConnection` immediately before `postgres()`.
+  socketDir?: string;
 };
 
+// Query-param name carrying the unix-socket directory across URL boundaries.
+// postgres-js has no URL form for unix sockets — its URL parser keeps `host`
+// as the encoded hostname, which never contains a literal `/`, so the
+// in-library path detection never triggers from the URL alone. We smuggle the
+// socket dir as this sentinel param and strip it (returning a `{ host }`
+// options override) at every `postgres()` call site via
+// `resolveEmbeddedPostgresConnection`. The param MUST be stripped before the
+// URL reaches postgres-js: an unknown query param is forwarded as a server
+// startup parameter and would fail the connection.
+export const SOCKET_DIR_QUERY_PARAM = "paperclip_socket";
+
+// Build a libpq/postgres-js URL. The base is always TCP-shaped (host:port).
+// When `socketDir` is supplied, the `?paperclip_socket=` sentinel is appended
+// so the socket path rides along inside the URL; the loopback host/port stay
+// present so `new URL()`-based guards and postgres-js port resolution (for the
+// `.s.PGSQL.<port>` socket filename) still work. Pass the result through
+// `resolveEmbeddedPostgresConnection` right before `postgres()` to strip the
+// sentinel and obtain the `{ host: socketDir }` options override that makes
+// postgres-js connect via the unix socket instead of TCP.
 export function buildEmbeddedPostgresConnectionString(
   input: BuildEmbeddedPostgresConnectionStringInput,
 ): string {
-  const host = input.host ?? EMBEDDED_POSTGRES_HOST;
   const user = input.user ?? EMBEDDED_POSTGRES_USER;
   // Password is generated from an alphanumeric alphabet, so URL-encoding is a
   // no-op today. We still encode so a future alphabet change cannot break the
   // URL shape.
   const encodedPassword = encodeURIComponent(input.password);
-  return `postgres://${user}:${encodedPassword}@${host}:${input.port}/${input.database}`;
+  const host = input.host ?? EMBEDDED_POSTGRES_HOST;
+  const base = `postgres://${user}:${encodedPassword}@${host}:${input.port}/${input.database}`;
+  if (!input.socketDir) return base;
+  return `${base}?${SOCKET_DIR_QUERY_PARAM}=${encodeURIComponent(input.socketDir)}`;
+}
+
+export type ResolvedEmbeddedPostgresConnection = {
+  // The connection string with the `?paperclip_socket=` sentinel removed —
+  // safe to hand to postgres-js.
+  connectionString: string;
+  // Spread into the postgres-js options object. `{ host: socketDir }` when the
+  // sentinel was present (routes over the unix socket); empty otherwise.
+  sqlOptions: { host: string } | Record<string, never>;
+};
+
+// Strip the `?paperclip_socket=` sentinel from a connection string and return
+// the cleaned URL plus the postgres-js options override that routes the
+// connection over the unix socket. Call this at every `postgres()` boundary
+// that receives a bare connection string. It is a no-op fast path for external
+// postgres URLs and TCP-shaped embedded URLs (no sentinel present), so it is
+// safe to funnel every connection string through it unconditionally.
+export function resolveEmbeddedPostgresConnection(
+  connectionString: string,
+): ResolvedEmbeddedPostgresConnection {
+  // Cheap substring guard avoids constructing a URL for the common (external /
+  // TCP) case where no sentinel is present.
+  if (!connectionString.includes(`${SOCKET_DIR_QUERY_PARAM}=`)) {
+    return { connectionString, sqlOptions: {} };
+  }
+  const url = new URL(connectionString);
+  const socketDir = url.searchParams.get(SOCKET_DIR_QUERY_PARAM);
+  if (!socketDir) {
+    return { connectionString, sqlOptions: {} };
+  }
+  url.searchParams.delete(SOCKET_DIR_QUERY_PARAM);
+  return { connectionString: url.toString(), sqlOptions: { host: socketDir } };
+}
+
+// postgres-js accepts `host` as a unix socket directory when the value
+// contains a `/` — its internal path builder then constructs
+// `<host>/.s.PGSQL.<port>` and connects via `socket.connect(path)`. Return
+// the override shape so callers that already hold a socket dir can pass it
+// alongside a TCP-shaped URL without minting a sentinel. `undefined` for TCP
+// callers (no override needed). `resolveEmbeddedPostgresConnection` is the
+// preferred path when the socket dir travels inside the URL; this exists for
+// call sites that hold the socket dir directly.
+export function embeddedPostgresSqlOptions(
+  socketDir: string | undefined,
+): { host: string } | undefined {
+  if (!socketDir) return undefined;
+  return { host: socketDir };
 }
 
 export type EmbeddedPostgresConstructorOptions = {
@@ -127,6 +345,14 @@ export type BuildEmbeddedPostgresConstructorOptionsInput = {
   port: number;
   password: string;
   initdbFlags?: string[];
+  // Value for `listen_addresses`. Defaults to "" — the production posture that
+  // kills the TCP listener entirely (the socket-only hardening posture). The embedded
+  // test harness overrides this to "127.0.0.1" so its broad DB test suite can
+  // connect over loopback TCP without threading unix-socket options through
+  // every `postgres()` call site; the killed-TCP + socket-only posture is
+  // exercised directly by embedded-postgres-auth.test.ts (with a TCP-refused
+  // negative control). Production callers never pass this.
+  listenAddresses?: string;
   onLog?: (message: unknown) => void;
   onError?: (message: unknown) => void;
 };
@@ -134,6 +360,12 @@ export type BuildEmbeddedPostgresConstructorOptionsInput = {
 export function buildEmbeddedPostgresConstructorOptions(
   input: BuildEmbeddedPostgresConstructorOptionsInput,
 ): EmbeddedPostgresConstructorOptions {
+  // Ensure the socket directory exists with mode 0700 before postgres tries
+  // to bind into it. Idempotent and cheap; safe to call on every start.
+  const socketDir = ensureEmbeddedPostgresSocketDir(input.dataDir);
+  // Fail fast with a clear message if the socket path would overflow the
+  // platform's AF_UNIX limit (rather than an opaque postgres FATAL at bind).
+  assertEmbeddedPostgresSocketPathWithinLimit(socketDir, input.port);
   return {
     databaseDir: input.dataDir,
     user: EMBEDDED_POSTGRES_USER,
@@ -146,8 +378,18 @@ export function buildEmbeddedPostgresConstructorOptions(
       "--locale=C",
       "--lc-messages=C",
     ],
-    // Explicit loopback bind so a library upgrade cannot silently widen it.
-    postgresFlags: ["-c", "listen_addresses=127.0.0.1"],
+    // Kill the TCP listener entirely (listen_addresses=""), move the unix
+    // socket off /tmp into our 0700 sibling directory, and tighten the socket
+    // file mode. The pg_hba.conf host lines stay scram-sha-256 so flipping
+    // TCP back on is a one-line config change rather than a coordinated dance.
+    postgresFlags: [
+      "-c",
+      `listen_addresses=${input.listenAddresses ?? ""}`,
+      "-c",
+      `unix_socket_directories=${socketDir}`,
+      "-c",
+      "unix_socket_permissions=0700",
+    ],
     onLog: input.onLog,
     onError: input.onError,
   };
@@ -292,7 +534,7 @@ export async function rotateEmbeddedPostgresAuthIfNeeded(
       backupPath: rewrite.backupPath,
     });
     if (rewrite.changed) {
-      await reloadEmbeddedPostgres(input.port, existing.password);
+      await reloadEmbeddedPostgres(input.dataDir, input.port, existing.password);
       input.onEvent?.({ kind: "reload" });
     }
     return {
@@ -311,14 +553,19 @@ export async function rotateEmbeddedPostgresAuthIfNeeded(
   // 1. Connect with the password the cluster currently knows. For a true
   //    legacy dir that is the cleartext literal; for a mid-flight restart it
   //    is the password currently on the role.
-  const admin = postgres(
+  const resolved = resolveEmbeddedPostgresConnection(
     buildEmbeddedPostgresConnectionString({
       port: input.port,
       database: "postgres",
       password: input.currentPassword,
+      socketDir: socketDirectoryPathFor(input.dataDir),
     }),
-    { max: 1, onnotice: () => {} },
   );
+  const admin = postgres(resolved.connectionString, {
+    max: 1,
+    onnotice: () => {},
+    ...resolved.sqlOptions,
+  });
 
   let newPassword: string;
   try {
@@ -350,7 +597,7 @@ export async function rotateEmbeddedPostgresAuthIfNeeded(
 
   // 5. Reload Postgres so pg_hba takes effect.
   if (rewrite.changed) {
-    await reloadEmbeddedPostgres(input.port, newPassword);
+    await reloadEmbeddedPostgres(input.dataDir, input.port, newPassword);
     input.onEvent?.({ kind: "reload" });
   }
 
@@ -363,17 +610,23 @@ export async function rotateEmbeddedPostgresAuthIfNeeded(
 }
 
 async function reloadEmbeddedPostgres(
+  dataDir: string,
   port: number,
   password: string,
 ): Promise<void> {
-  const conn = postgres(
+  const resolved = resolveEmbeddedPostgresConnection(
     buildEmbeddedPostgresConnectionString({
       port,
       database: "postgres",
       password,
+      socketDir: socketDirectoryPathFor(dataDir),
     }),
-    { max: 1, onnotice: () => {} },
   );
+  const conn = postgres(resolved.connectionString, {
+    max: 1,
+    onnotice: () => {},
+    ...resolved.sqlOptions,
+  });
   try {
     await conn`SELECT pg_reload_conf()`;
   } finally {
@@ -389,4 +642,162 @@ const POSTGRES_URL_PASSWORD_RE =
 
 export function scrubEmbeddedPostgresConnectionString(input: string): string {
   return input.replace(POSTGRES_URL_PASSWORD_RE, "$1:[redacted]@");
+}
+
+// Read the socket directory a running cluster is bound to. Postgres writes
+// postmaster.pid in this shape (1-indexed):
+//   line 1: pid
+//   line 2: data dir
+//   line 3: nanosecond startup time
+//   line 4: port number (-p value)
+//   line 5: socket dir(s) — comma-separated unix_socket_directories
+//   line 6: listen_addresses
+//   line 7: shmem key
+// After this change, line 5 is our short per-install `paperclip-pg-<hash>`
+// socket dir (see socketDirectoryPathFor). Legacy clusters have `/tmp` (the
+// postgres default) or the earlier `<dataDir>.socket` sibling there.
+export function readPidFileSocketDir(postmasterPidFile: string): string | null {
+  if (!existsSync(postmasterPidFile)) return null;
+  try {
+    const lines = readFileSync(postmasterPidFile, "utf8").split("\n");
+    const raw = lines[4]?.trim();
+    if (!raw) return null;
+    // unix_socket_directories is comma-separated; we always pass exactly one
+    // entry, but tolerate a list by returning the first.
+    return raw.split(",")[0]!.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+// Resolve the bundled `pg_ctl` binary path. The embedded-postgres library
+// resolves binaries via the platform-specific `@embedded-postgres/<platform>`
+// package; we resolve the same way so we can shell out to `pg_ctl stop` for
+// warm-restart migration (the library's own `.stop()` only works for clusters
+// the same JS instance started; a foreign running cluster needs pg_ctl).
+//
+// The platform package is plain ESM with named exports `pg_ctl`, `initdb`,
+// `postgres`, so we use dynamic import to match the library's own loading path.
+async function resolvePgCtlBinary(): Promise<string | null> {
+  const platformPackage =
+    process.platform === "linux"
+      ? process.arch === "arm64"
+        ? "@embedded-postgres/linux-arm64"
+        : "@embedded-postgres/linux-x64"
+      : process.platform === "darwin"
+        ? process.arch === "arm64"
+          ? "@embedded-postgres/darwin-arm64"
+          : "@embedded-postgres/darwin-x64"
+        : null;
+  if (!platformPackage) return null;
+  try {
+    const mod = (await import(platformPackage)) as {
+      pg_ctl?: string;
+    };
+    return typeof mod.pg_ctl === "string" ? mod.pg_ctl : null;
+  } catch {
+    return null;
+  }
+}
+
+// Stop a running embedded cluster that was started by a previous run.
+// Required when a legacy cluster (socket at /tmp) is discovered on
+// startup: postgres cannot move a live socket dir via SQL, so the only way
+// to apply the new `unix_socket_directories` flag is a full stop+start. The
+// data dir and cred file survive, so the cluster comes back with the same
+// data, the same scram password, and the same pg_hba — only the listener
+// shape moves.
+//
+// Tries the bundled `pg_ctl stop -m fast` first; falls back to SIGTERM if the
+// binary cannot be resolved (e.g. unsupported platform). Returns true if a
+// cluster was stopped, false if there was nothing running.
+export async function stopRunningEmbeddedPostgres(
+  dataDir: string,
+  options: { timeoutMs?: number } = {},
+): Promise<boolean> {
+  const postmasterPidFile = path.resolve(dataDir, "postmaster.pid");
+  let pid: number | null = null;
+  try {
+    const raw = readFileSync(postmasterPidFile, "utf8").split("\n")[0]?.trim();
+    pid = Number(raw);
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    process.kill(pid, 0);
+  } catch {
+    // Pid file missing, malformed, or process already gone. Clean up a stale
+    // pid file if it lingers.
+    try {
+      rmSync(postmasterPidFile, { force: true });
+    } catch {
+      // best effort
+    }
+    return false;
+  }
+
+  const pgCtl = await resolvePgCtlBinary();
+  if (pgCtl) {
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const proc = spawn(
+          pgCtl,
+          ["stop", "-D", dataDir, "-m", "fast", "-w", "-t", "30"],
+          { stdio: ["ignore", "pipe", "pipe"] },
+        );
+        let stderr = "";
+        proc.stderr?.on("data", (chunk) => {
+          stderr += chunk.toString("utf8");
+        });
+        proc.on("error", reject);
+        proc.on("exit", (code) => {
+          if (code === 0) resolve();
+          else reject(new Error(`pg_ctl stop exited ${code}: ${stderr.trim()}`));
+        });
+      });
+    } catch {
+      // Fall through to SIGTERM; the pid-alive wait below is the source of truth.
+    }
+  }
+
+  if (pid != null) {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // already gone — fine
+    }
+  }
+
+  const deadline = Date.now() + (options.timeoutMs ?? 30_000);
+  while (pid != null && Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+      await new Promise((r) => setTimeout(r, 100));
+    } catch {
+      break;
+    }
+  }
+
+  try {
+    rmSync(postmasterPidFile, { force: true });
+  } catch {
+    // best effort
+  }
+  return true;
+}
+
+// Detect a legacy cluster (socket dir on postmaster.pid line 5 differs from our
+// expected per-install socket dir — i.e. the old `/tmp` default or the earlier
+// `<dataDir>.socket` sibling) and stop it so the caller can start fresh with
+// new flags. No-op when the running cluster already uses our socket dir, or when
+// no cluster is running. Idempotent: callers can invoke it on every startup
+// without checking first.
+export async function migrateLegacyEmbeddedPostgresSocket(
+  dataDir: string,
+): Promise<{ stoppedLegacyCluster: boolean; legacySocketDir: string | null }> {
+  const postmasterPidFile = path.resolve(dataDir, "postmaster.pid");
+  const expectedSocketDir = socketDirectoryPathFor(dataDir);
+  const currentSocketDir = readPidFileSocketDir(postmasterPidFile);
+  if (!currentSocketDir || currentSocketDir === expectedSocketDir) {
+    return { stoppedLegacyCluster: false, legacySocketDir: currentSocketDir };
+  }
+  await stopRunningEmbeddedPostgres(dataDir);
+  return { stoppedLegacyCluster: true, legacySocketDir: currentSocketDir };
 }

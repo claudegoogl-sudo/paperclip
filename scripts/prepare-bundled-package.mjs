@@ -71,6 +71,24 @@ export function applyBundledDependencyPatches(destinationDir, bundledDependencie
   }
 }
 
+/// Copy the package's publish metadata files into the staging directory,
+/// falling back to the repo-root license when the package ships none of its
+/// own. Every published tarball must carry a license: fork.39's restaged
+/// bundled packages (adapter-utils, db) shipped without one because neither
+/// package directory has a LICENSE file and the copy used to be a silent
+/// no-op in that case. README is deliberately not fallen back — a root
+/// README describes the monorepo, not the package.
+export function copyPackageMetadata(sourceDir, destinationDir, rootDir = repoRoot) {
+  for (const entry of ["README.md", "LICENSE", "LICENSE.md"]) {
+    let sourcePath = resolve(sourceDir, entry);
+    if (entry !== "README.md" && !existsSync(sourcePath)) {
+      const rootFallback = resolve(rootDir, entry);
+      if (existsSync(rootFallback)) sourcePath = rootFallback;
+    }
+    if (existsSync(sourcePath)) cpSync(sourcePath, resolve(destinationDir, entry));
+  }
+}
+
 export function prepareBundledPackage(sourceDir, destinationDir) {
   const sourcePackagePath = resolve(sourceDir, "package.json");
   const sourcePackage = JSON.parse(readFileSync(sourcePackagePath, "utf8"));
@@ -85,10 +103,7 @@ export function prepareBundledPackage(sourceDir, destinationDir) {
   for (const entry of sourcePackage.files ?? []) {
     cpSync(resolve(sourceDir, entry), resolve(destinationDir, entry), { recursive: true });
   }
-  for (const entry of ["README.md", "LICENSE", "LICENSE.md"]) {
-    const sourcePath = resolve(sourceDir, entry);
-    if (existsSync(sourcePath)) cpSync(sourcePath, resolve(destinationDir, entry));
-  }
+  copyPackageMetadata(sourceDir, destinationDir);
 
   const deployedPackagePath = resolve(destinationDir, "package.json");
   const publishManifest = materializePublishManifest(sourcePackage);

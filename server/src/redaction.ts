@@ -232,7 +232,16 @@ export function redactSensitiveText(input: string): string {
     if (parsed !== undefined) {
       structuralRedactionDepth += 1;
       try {
-        return JSON.stringify(sanitizeJsonValue(parsed));
+        // Preserve any leading/trailing whitespace (notably the trailing
+        // newline of an NDJSON event line) around the structural
+        // re-serialization. Run-log consumers join records on newline
+        // boundaries, so dropping it merges adjacent JSON lines into one
+        // unparseable blob. Only the surrounding
+        // whitespace is touched; the sanitized JSON body is unchanged.
+        const whitespaceMatch = input.match(/^(\s*)[\s\S]*?(\s*)$/);
+        const leading = whitespaceMatch?.[1] ?? "";
+        const trailing = whitespaceMatch?.[2] ?? "";
+        return leading + JSON.stringify(sanitizeJsonValue(parsed)) + trailing;
       } catch {
         // SECURITY-CRITICAL: any structural-walk failure (e.g. a pathologically
         // nested document that JSON.parse accepts but overflows the recursive

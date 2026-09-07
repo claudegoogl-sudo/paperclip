@@ -107,10 +107,12 @@ export interface HostServices {
     /**
      * Fork-only background read: per-company effective plugin config
      * (company `plugin_config` row merged with the tenant `configOverrides`
-     * subtree) behind the fail-closed `requirePluginEnabledForCompany`
-     * provisioning gate. Reachable under the bare worker-lifetime
-     * `serviceScope`; rejects a missing/empty `companyId` and never accepts
-     * `kind:"all"`.
+     * subtree) behind the fail-closed server-side provisioning gate: the
+     * company must hold a `plugin_config` row for THIS plugin install and
+     * the plugin must be installed and enabled for it; every denial
+     * collapses to one opaque error (no existence oracle). Reachable under
+     * the bare worker-lifetime `serviceScope`; rejects a missing/empty
+     * `companyId` and never accepts `kind:"all"`.
      */
     getForServiceScope(
       params: WorkerToHostMethods["config.getForServiceScope"][0],
@@ -645,9 +647,16 @@ const METHOD_CAPABILITY_MAP: Record<
  * A distinct safety argument per entry:
  *
  *  - `state.get` / `state.set` / `state.delete`: company-scoped plugin state is
- *    the plugin's OWN data, partitioned by `(pluginId, company)`. Reading or
- *    writing its company-B partition leaks nothing cross-tenant and is reachable
- *    during any company-B dispatch anyway.
+ *    the plugin's OWN data, partitioned by `(pluginId, scopeKind, scopeId, ...)`,
+ *    and every company-scoped call is reach-checked server-side by
+ *    `requirePluginEnabledForCompany` (via `requireStateCompanyReach` in
+ *    plugin-host-services) BEFORE the store is touched — fail-closed, including
+ *    a missing/empty company `scopeId` (never served from the store's
+ *    NULL-`scopeId` partition). A worker-forged `companyId` can therefore only
+ *    reach companies the plugin is genuinely provisioned for: the reachable set
+ *    equals the plugin's install reach; serviceScope only relaxes the timing
+ *    constraint. Non-company `scopeKind`s key state by entity ids only the
+ *    plugin itself can have written, so no company reach exists to widen.
  *  - `issues.createComment`: the host service independently verifies the target
  *    issue belongs to the claimed company (`requireInCompany`), so a
  *    worker-forged `companyId` cannot reach a foreign issue. The reachable set
@@ -683,14 +692,20 @@ const METHOD_CAPABILITY_MAP: Record<
  *    set the digest already accumulates). serviceScope only relaxes the timing
  *    constraint so the digest can reconcile on worker startup / poll with no
  *    active dispatch. Both reject `kind:"all"` and missing/empty `companyId`, so
- *    no single call can enumerate across tenants.
+ *    no single call can enumerate across tenants. These reads deliberately keep
+ *    distinguishable company-existence failures (`Company not found` /
+ *    `not available` / `disabled`) so reconcile misconfig stays diagnosable;
+ *    the byte-equal no-existence-oracle denial collapse is a
+ *    `config.getForServiceScope`-specific contract, not a property of the
+ *    allowlist as a whole.
  *  - `config.getForServiceScope`: per-company effective plugin config
  *    (company `plugin_config` row merged with the tenant `configOverrides`
- *    subtree) behind the same `requirePluginEnabledForCompany` gate as the
- *    reconcile reads — identical reach argument (install reach only), and the
- *    rows returned are the plugin's OWN config surface for that company, which
- *    any dispatch for that company could read anyway. Rejects `kind:"all"` and
- *    missing/empty `companyId`.
+ *    subtree) behind the server-side provisioning gate — the company must
+ *    hold a `plugin_config` row for THIS install (fail-closed, opaque
+ *    error), identical reach argument (configured-install reach only), and
+ *    the rows returned are the plugin's OWN config surface for that
+ *    company, which any dispatch for that company could read anyway.
+ *    Rejects `kind:"all"` and missing/empty `companyId`.
  *
  * Deliberately excluded: the upstream public reads `config.get`,
  * `secrets.resolve` and `approvals.list`. Their guards are restored to

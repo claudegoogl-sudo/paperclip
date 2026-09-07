@@ -20,6 +20,7 @@ import {
   resolveEmbeddedPostgresPasswordForStartup,
   routines,
   routineTriggers,
+  socketDirectoryPathFor,
 } from "@paperclipai/db";
 import {
   copyGitHooksToWorktreeGitDir,
@@ -941,11 +942,18 @@ describe("worktree helpers", () => {
 
         await targetPg.start();
         try {
+          // The target cluster runs the production socket-only posture (TCP
+          // listener killed), so connect over its unix socket rather than
+          // loopback TCP. createDb strips the `?paperclip_socket=` sentinel and
+          // applies the `{ host: socketDir }` override.
           const targetDb = createDb(
             buildEmbeddedPostgresConnectionString({
               port: targetConfig.database.embeddedPostgresPort,
               database: "paperclip",
               password: targetPassword,
+              socketDir: socketDirectoryPathFor(
+                targetConfig.database.embeddedPostgresDataDir,
+              ),
             }),
           );
           const seededUsers = await targetDb.select().from(authUsers);

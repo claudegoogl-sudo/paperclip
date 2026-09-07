@@ -1,5 +1,4 @@
 import { existsSync, readFileSync, rmSync } from "node:fs";
-import { createServer } from "node:net";
 import path from "node:path";
 import { ensurePostgresDatabase, getPostgresDataDirectory } from "./client.js";
 import { createEmbeddedPostgresLogBuffer, formatEmbeddedPostgresError } from "./embedded-postgres-error.js";
@@ -7,8 +6,10 @@ import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native
 import {
   buildEmbeddedPostgresConnectionString,
   buildEmbeddedPostgresConstructorOptions,
+  migrateLegacyEmbeddedPostgresSocket,
   resolveEmbeddedPostgresPasswordForStartup,
   rotateEmbeddedPostgresAuthIfNeeded,
+  socketDirectoryPathFor,
 } from "./embedded-postgres-auth.js";
 import { resolveDatabaseTarget } from "./runtime-config.js";
 
@@ -61,31 +62,6 @@ function readPidFilePort(postmasterPidFile: string): number | null {
   }
 }
 
-async function isPortInUse(port: number): Promise<boolean> {
-  return await new Promise((resolve) => {
-    const server = createServer();
-    server.unref();
-    server.once("error", (error: NodeJS.ErrnoException) => {
-      resolve(error.code === "EADDRINUSE");
-    });
-    server.listen(port, "127.0.0.1", () => {
-      server.close();
-      resolve(false);
-    });
-  });
-}
-
-async function findAvailablePort(startPort: number): Promise<number> {
-  const maxLookahead = 20;
-  let port = startPort;
-  for (let i = 0; i < maxLookahead; i += 1, port += 1) {
-    if (!(await isPortInUse(port))) return port;
-  }
-  throw new Error(
-    `Embedded PostgreSQL could not find a free port from ${startPort} to ${startPort + maxLookahead - 1}`,
-  );
-}
-
 async function loadEmbeddedPostgresCtor(): Promise<EmbeddedPostgresCtor> {
   try {
     const mod = await import("embedded-postgres");
@@ -103,9 +79,19 @@ async function ensureEmbeddedPostgresConnection(
 ): Promise<MigrationConnection> {
   const EmbeddedPostgres = await loadEmbeddedPostgresCtor();
   await prepareEmbeddedPostgresNativeRuntime();
-  const selectedPort = await findAvailablePort(preferredPort);
+  // No TCP listener is bound (listen_addresses=""), so there is nothing for a
+  // free-port probe to collide with. Each cluster lives in its own data dir
+  // and its own sibling socket dir; the port is just the `.s.PGSQL.<port>`
+  // filename suffix and a logical identifier for postmaster.pid.
+  const selectedPort = preferredPort;
   const postmasterPidFile = path.resolve(dataDir, "postmaster.pid");
   const pgVersionFile = path.resolve(dataDir, "PG_VERSION");
+  const socketDir = socketDirectoryPathFor(dataDir);
+  // If a legacy cluster (socket on /tmp) is still running, postgres
+  // cannot move its live socket via SQL — stop it now so the start path
+  // below brings it back with the new socket dir + flags. No-op when the
+  // running cluster already uses our socket dir, or when nothing is running.
+  await migrateLegacyEmbeddedPostgresSocket(dataDir);
   const runningPid = readRunningPostmasterPid(postmasterPidFile);
   const runningPort = readPidFilePort(postmasterPidFile);
   const startupPasswordResolution = resolveEmbeddedPostgresPasswordForStartup(dataDir);
@@ -113,6 +99,7 @@ async function ensureEmbeddedPostgresConnection(
     port: preferredPort,
     database: "postgres",
     password: startupPasswordResolution.password,
+    socketDir,
   });
   const logBuffer = createEmbeddedPostgresLogBuffer();
 
@@ -127,7 +114,7 @@ async function ensureEmbeddedPostgresConnection(
       }
       await ensurePostgresDatabase(preferredAdminConnectionString, "paperclip");
       process.emitWarning(
-        `Adopting an existing PostgreSQL instance on port ${preferredPort} for embedded data dir ${dataDir} because postmaster.pid is missing.`,
+        `Adopting an existing PostgreSQL instance on socket ${socketDir} (port ${preferredPort}) for embedded data dir ${dataDir} because postmaster.pid is missing.`,
       );
       const rotated = await rotateEmbeddedPostgresAuthIfNeeded({
         dataDir,
@@ -140,8 +127,9 @@ async function ensureEmbeddedPostgresConnection(
           port: preferredPort,
           database: "paperclip",
           password: rotated.password,
+          socketDir,
         }),
-        source: `embedded-postgres@${preferredPort}`,
+        source: `embedded-postgres@${socketDir}:${preferredPort}`,
         stop: async () => {},
       };
     } catch {
@@ -155,6 +143,7 @@ async function ensureEmbeddedPostgresConnection(
       port,
       database: "postgres",
       password: startupPasswordResolution.password,
+      socketDir,
     });
     await ensurePostgresDatabase(adminConnectionString, "paperclip");
     const rotated = await rotateEmbeddedPostgresAuthIfNeeded({
@@ -168,8 +157,9 @@ async function ensureEmbeddedPostgresConnection(
         port,
         database: "paperclip",
         password: rotated.password,
+        socketDir,
       }),
-      source: `embedded-postgres@${port}`,
+      source: `embedded-postgres@${socketDir}:${port}`,
       stop: async () => {},
     };
   }
@@ -190,7 +180,7 @@ async function ensureEmbeddedPostgresConnection(
     } catch (error) {
       throw formatEmbeddedPostgresError(error, {
         fallbackMessage:
-          `Failed to initialize embedded PostgreSQL cluster in ${dataDir} on port ${selectedPort}`,
+          `Failed to initialize embedded PostgreSQL cluster in ${dataDir} on socket ${socketDir} (port ${selectedPort})`,
         recentLogs: logBuffer.getRecentLogs(),
       });
     }
@@ -202,7 +192,7 @@ async function ensureEmbeddedPostgresConnection(
     await instance.start();
   } catch (error) {
     throw formatEmbeddedPostgresError(error, {
-      fallbackMessage: `Failed to start embedded PostgreSQL on port ${selectedPort}`,
+      fallbackMessage: `Failed to start embedded PostgreSQL on socket ${socketDir} (port ${selectedPort})`,
       recentLogs: logBuffer.getRecentLogs(),
     });
   }
@@ -216,6 +206,7 @@ async function ensureEmbeddedPostgresConnection(
     port: selectedPort,
     database: "postgres",
     password: rotated.password,
+    socketDir,
   });
   await ensurePostgresDatabase(adminConnectionString, "paperclip");
 
@@ -225,8 +216,9 @@ async function ensureEmbeddedPostgresConnection(
       port: selectedPort,
       database: "paperclip",
       password: rotated.password,
+      socketDir,
     }),
-    source: `embedded-postgres@${selectedPort}`,
+    source: `embedded-postgres@${socketDir}:${selectedPort}`,
     stop: async () => {
       await instance.stop();
     },

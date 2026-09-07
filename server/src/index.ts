@@ -31,9 +31,11 @@ import {
   instanceUserRoles,
   buildEmbeddedPostgresConnectionString,
   buildEmbeddedPostgresConstructorOptions,
+  migrateLegacyEmbeddedPostgresSocket,
   resolveEmbeddedPostgresPasswordForStartup,
   rotateEmbeddedPostgresAuthIfNeeded,
   scrubEmbeddedPostgresConnectionString,
+  socketDirectoryPathFor,
 } from "@paperclipai/db";
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
@@ -433,6 +435,7 @@ export async function startServer(): Promise<StartedServer> {
     const dataDir = resolve(config.embeddedPostgresDataDir);
     const configuredPort = config.embeddedPostgresPort;
     let port = configuredPort;
+    const embeddedSocketDir = socketDirectoryPathFor(dataDir);
     const logBuffer = createEmbeddedPostgresLogBuffer(120);
     const verboseEmbeddedPostgresLogs = process.env.PAPERCLIP_EMBEDDED_POSTGRES_VERBOSE === "true";
     const appendEmbeddedPostgresLog = (message: unknown) => {
@@ -506,15 +509,33 @@ export async function startServer(): Promise<StartedServer> {
       }
     };
 
+    // If a legacy cluster (socket on /tmp) is still running, postgres
+    // cannot move its live socket via SQL — stop it now so the start path
+    // below brings it back with the new socket dir + flags. No-op when the
+    // running cluster already uses our socket dir, or when nothing is running.
+    const legacyMigration = await migrateLegacyEmbeddedPostgresSocket(dataDir);
+    if (legacyMigration.stoppedLegacyCluster) {
+      logger.warn(
+        { legacySocketDir: legacyMigration.legacySocketDir, socketDir: embeddedSocketDir },
+        "Embedded PostgreSQL was running with a legacy /tmp socket; stopped it so the new socket directory takes effect on next start",
+      );
+    }
+
     const runningPid = getRunningPid();
     const startupPasswordResolution = resolveEmbeddedPostgresPasswordForStartup(dataDir);
+    // Every embedded connection string below carries the `?paperclip_socket=`
+    // sentinel (via `socketDir`). Each `postgres()` boundary
+    // (`getPostgresDataDirectory`, `ensurePostgresDatabase`, `ensureMigrations`,
+    // `createDb`) decodes it and connects over the unix-domain socket at
+    // `<dataDir>.socket` instead of the killed TCP listener.
     if (runningPid) {
-      logger.warn(`Embedded PostgreSQL already running; reusing existing process (pid=${runningPid}, port=${port})`);
+      logger.warn(`Embedded PostgreSQL already running; reusing existing process (pid=${runningPid}, socket=${embeddedSocketDir}, port=${port})`);
     } else {
       const configuredAdminConnectionString = buildEmbeddedPostgresConnectionString({
         port: configuredPort,
         database: "postgres",
         password: startupPasswordResolution.password,
+        socketDir: embeddedSocketDir,
       });
       try {
         const actualDataDir = await getPostgresDataDirectory(configuredAdminConnectionString);
@@ -526,18 +547,23 @@ export async function startServer(): Promise<StartedServer> {
         }
         await ensurePostgresDatabase(configuredAdminConnectionString, "paperclip");
         logger.warn(
-          `Embedded PostgreSQL appears to already be reachable without a pid file; reusing existing server on configured port ${configuredPort}`,
+          `Embedded PostgreSQL appears to already be reachable without a pid file; reusing existing server on socket ${embeddedSocketDir} (port ${configuredPort})`,
         );
       } catch {
+        // The TCP listener is killed by `listen_addresses=""` in the
+        // constructor options below, so the only thing the port number picks
+        // now is the `.s.PGSQL.<port>` filename suffix. detectPort is vestigial
+        // for collision avoidance but harmless and keeps the worktree-seed
+        // shape that allocates unique ports per worktree unchanged.
         const detectedPort = await detectPort(configuredPort);
         if (detectedPort !== configuredPort) {
           logger.warn(`Embedded PostgreSQL port is in use; using next free port (requestedPort=${configuredPort}, selectedPort=${detectedPort})`);
         }
         port = detectedPort;
-        // Intentionally log only dataDir and port — never the connection string.
-        // The connection string contains the per-install password and must not
-        // reach a log line.
-        logger.info(`Using embedded PostgreSQL because no DATABASE_URL set (dataDir=${dataDir}, port=${port})`);
+        // Intentionally log only dataDir, socket and port — never the
+        // connection string. The connection string contains the per-install
+        // password and must not reach a log line.
+        logger.info(`Using embedded PostgreSQL because no DATABASE_URL set (dataDir=${dataDir}, socket=${embeddedSocketDir}, port=${port})`);
         embeddedPostgres = new EmbeddedPostgres(
           buildEmbeddedPostgresConstructorOptions({
             dataDir,
@@ -554,7 +580,7 @@ export async function startServer(): Promise<StartedServer> {
           } catch (err) {
             logEmbeddedPostgresFailure("initialise", err);
             throw formatEmbeddedPostgresError(err, {
-              fallbackMessage: `Failed to initialize embedded PostgreSQL cluster in ${dataDir} on port ${port}`,
+              fallbackMessage: `Failed to initialize embedded PostgreSQL cluster in ${dataDir} on socket ${embeddedSocketDir} (port ${port})`,
               recentLogs: logBuffer.getRecentLogs(),
             });
           }
@@ -571,7 +597,7 @@ export async function startServer(): Promise<StartedServer> {
         } catch (err) {
           logEmbeddedPostgresFailure("start", err);
           throw formatEmbeddedPostgresError(err, {
-            fallbackMessage: `Failed to start embedded PostgreSQL on port ${port}`,
+            fallbackMessage: `Failed to start embedded PostgreSQL on socket ${embeddedSocketDir} (port ${port})`,
             recentLogs: logBuffer.getRecentLogs(),
           });
         }
@@ -623,6 +649,7 @@ export async function startServer(): Promise<StartedServer> {
       port,
       database: "postgres",
       password: embeddedPassword,
+      socketDir: embeddedSocketDir,
     });
     const dbStatus = await ensurePostgresDatabase(embeddedAdminConnectionString, "paperclip");
     if (dbStatus === "created") {
@@ -633,6 +660,7 @@ export async function startServer(): Promise<StartedServer> {
       port,
       database: "paperclip",
       password: embeddedPassword,
+      socketDir: embeddedSocketDir,
     });
     const shouldAutoApplyFirstRunMigrations = !clusterAlreadyInitialized || dbStatus === "created";
     if (shouldAutoApplyFirstRunMigrations) {
