@@ -24,6 +24,12 @@ const IGNORED_INSTRUCTIONS_DIRECTORY_NAMES = new Set([
   "node_modules",
   "venv",
 ]);
+// Host-managed instruction-edit backup artifacts ("AGENTS.md.bak-<suffix>" files,
+// "instructions-bak-<suffix>" directories). These are instance-local edit history
+// written outside the bundle API, never portable content, so they are excluded from
+// bundle listings and exports.
+const INSTRUCTIONS_BACKUP_FILE_PATTERN = /\.bak(?:-|$)/;
+const INSTRUCTIONS_BACKUP_DIRECTORY_PATTERN = /^instructions-bak(?:-|$)/;
 
 type BundleMode = "managed" | "external";
 
@@ -159,11 +165,13 @@ async function statIfExists(targetPath: string) {
 function shouldIgnoreInstructionsEntry(entry: { name: string; isDirectory(): boolean; isFile(): boolean }) {
   if (entry.name === "." || entry.name === "..") return true;
   if (entry.isDirectory()) {
-    return IGNORED_INSTRUCTIONS_DIRECTORY_NAMES.has(entry.name);
+    return IGNORED_INSTRUCTIONS_DIRECTORY_NAMES.has(entry.name)
+      || INSTRUCTIONS_BACKUP_DIRECTORY_PATTERN.test(entry.name);
   }
   if (!entry.isFile()) return false;
   return (
     IGNORED_INSTRUCTIONS_FILE_NAMES.has(entry.name)
+    || INSTRUCTIONS_BACKUP_FILE_PATTERN.test(entry.name)
     || entry.name.startsWith("._")
     || entry.name.endsWith(".pyc")
     || entry.name.endsWith(".pyo")
