@@ -14,7 +14,8 @@
 //   2. A hard ceiling on live keys bounds memory even when a burst of distinct
 //      keys arrives faster than once-per-window (the case where sweep-on-write
 //      alone would momentarily lag). When a new key would push the map over
-//      the ceiling, the oldest-live key is evicted first.
+//      the ceiling, the key that was inserted first is evicted — FIFO by
+//      insertion order, not LRU (see `DEFAULT_SLIDING_WINDOW_MAX_KEYS`).
 //   3. The inspect/record split lets multi-bucket limiters (e.g. webhook
 //      endpoint + IP) decide atomically: inspect every relevant bucket before
 //      committing any of them, so a request rejected by the IP bucket does
@@ -25,6 +26,8 @@
 // so the cost is O(1) amortised against the work the limiter was already
 // doing.
 
+import { logger } from "../middleware/logger.js";
+
 /**
  * Default ceiling on the number of distinct live keys a single limiter keeps
  * in memory. Sized to never bind under legitimate traffic — even a busy
@@ -32,8 +35,14 @@
  * distinct source IPs per minute — while bounding worst-case memory to a few
  * hundred kilobytes per limiter when an attacker rotates keys. Legitimate
  * working sets are never trimmed: only a flood that has already outrun the
- * sweep reaches this ceiling, and the oldest-first policy drops the coldest
- * keys, not the hottest.
+ * sweep reaches this ceiling. When it binds, eviction is FIFO by first
+ * insertion: the key that entered the map earliest is dropped first even if
+ * it is still hot, and a cold key inserted later outlives it. The ceiling is
+ * a memory bound, not a popularity-ranking cache — insertion order is the
+ * only eviction signal a `Map` gives without scanning every key. The first
+ * binding per store emits a single `logger.warn` naming the limiter and
+ * ceiling, so a working set that no longer fits is observable rather than
+ * silently trimmed.
  */
 export const DEFAULT_SLIDING_WINDOW_MAX_KEYS = 10_000;
 
@@ -66,7 +75,8 @@ export type SlidingWindowRateLimitStore = {
   /**
    * Append `currentTime` to `key`'s hit list, re-inserting the key if the
    * prior inspect pruned it to empty. Enforces the ceiling with
-   * oldest-first eviction when a *new* key would push the map over `maxKeys`.
+   * first-inserted-first (FIFO) eviction when a *new* key would push the map
+   * over `maxKeys`.
    * No-op semantics are not supported: only call this after a successful
    * inspect for the same `key` and `currentTime`.
    */
@@ -79,15 +89,28 @@ export function createSlidingWindowRateLimitStore(options: {
   windowMs: number;
   max: number;
   maxKeys?: number;
+  /**
+   * Identity reported by the once-per-instance warning emitted when the
+   * `maxKeys` ceiling first binds. Limiters pass their own name (and bucket
+   * role, when they keep several stores) so the log line says *which* map
+   * ran out of keys.
+   */
+  name?: string;
 }): SlidingWindowRateLimitStore {
   const windowMs = options.windowMs;
   const max = options.max;
   const maxKeys = options.maxKeys ?? DEFAULT_SLIDING_WINDOW_MAX_KEYS;
+  const name = options.name ?? "sliding-window-rate-limit-store";
   // Map iteration order is insertion order; setting an existing key does not
   // move it, so the first key reached by the iterator is the one first
   // inserted among the currently-live set — the closest cheap proxy for
   // "oldest live bucket" without scanning every key on every eviction.
   const hitsByKey = new Map<string, number[]>();
+  // Flips on the first ceiling eviction so the warning below fires once per
+  // store instance, not once per eviction — under a key flood the eviction
+  // branch runs on every new key and per-eviction logging would be its own
+  // flood.
+  let warnedCeilingBound = false;
 
   function evictOldest() {
     const oldest = hitsByKey.keys().next().value;
@@ -135,6 +158,13 @@ export function createSlidingWindowRateLimitStore(options: {
       // keys arriving faster than once-per-window cannot outrun the sweep
       // and grow the map past maxKeys.
       if (!hitsByKey.has(key) && hitsByKey.size >= maxKeys) {
+        if (!warnedCeilingBound) {
+          warnedCeilingBound = true;
+          logger.warn(
+            { limiter: name, maxKeys },
+            "sliding-window rate-limit key ceiling bound; evicting first-inserted (FIFO) keys",
+          );
+        }
         evictOldest();
       }
       const hits = hitsByKey.get(key);

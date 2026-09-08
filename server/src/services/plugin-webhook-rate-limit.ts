@@ -138,16 +138,19 @@ export function createPluginWebhookRateLimiter(options: {
   // per-endpoint store (a cold endpoint key must not be evicted because an
   // unrelated IP key flooded).
   const endpointStore = createSlidingWindowRateLimitStore({
+    name: "plugin-webhook:endpoint",
     windowMs,
     max: maxPerEndpoint,
     maxKeys,
   });
   const ipStore = createSlidingWindowRateLimitStore({
+    name: "plugin-webhook:ip",
     windowMs,
     max: maxPerIp,
     maxKeys,
   });
   const verifiedStore = createSlidingWindowRateLimitStore({
+    name: "plugin-webhook:verified-endpoint",
     windowMs,
     max: maxPerVerifiedEndpoint,
     maxKeys,
