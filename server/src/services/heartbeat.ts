@@ -6834,6 +6834,25 @@ export async function terminateHeartbeatRunProcess(input: {
       input.graceMs ? { forceAfterMs: input.graceMs } : undefined,
     ),
   );
+
+  // Upstream's terminateLocalService treats a zombie-only process group as gone and
+  // can return before this process has reaped the exited child (SIGCHLD). The DB-only
+  // kill paths here promise that a positively identity-matched pid is actually gone —
+  // process.kill(pid, 0) still succeeds for unreaped zombies — so wait briefly for the
+  // final reap before reporting success. Bounded: a pid that never reaps (or was already
+  // reaped by init) exits this loop within the deadline.
+  if (typeof pid === "number" && Number.isInteger(pid) && pid > 0) {
+    const reapDeadline = Date.now() + 2_000;
+    while (Date.now() < reapDeadline) {
+      try {
+        process.kill(pid, 0);
+      } catch {
+        break;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    }
+  }
+
   return "terminated";
 }
 
