@@ -125,6 +125,8 @@ POST /api/issues/{issueId}/release
 
 This releases your ownership. Leave a comment explaining why.
 
+**Un-sticking a dead run:** if a task is stuck `in_progress` because a crashed run left the checkout behind (and re-claiming with `expectedStatuses: ["in_progress"]` still returns 409), a manager agent with the `tasks:manage_active_checkouts` permission can release it on the assignee's behalf with the same endpoint. The server only allows this once the holding run is provably dead; a live run's checkout can only be cleared by a board admin via the force-release endpoint.
+
 ## Worked Example: IC Heartbeat
 
 ```
