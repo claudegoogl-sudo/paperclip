@@ -4,6 +4,7 @@ import { heartbeatRuns, type Db } from "@paperclipai/db";
 import {
   addApprovalCommentSchema,
   createApprovalSchema,
+  isEmptyApprovalPayload,
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
   resubmitApprovalSchema,
@@ -226,6 +227,14 @@ export function approvalRoutes(
     assertCompanyAccess(req, companyId);
     if (!(await assertApprovalAccessAllowed(req, res, companyId))) return;
     if (!(await assertApprovalMutationAllowedByRunContext(req, res, companyId))) return;
+    if (isEmptyApprovalPayload(req.body.payload)) {
+      res.status(422).json({
+        error:
+          "Approval payload must not be empty. Include at least one field describing the request so the operator can decide the card.",
+        code: "approval_payload_empty",
+      });
+      return;
+    }
     const rawIssueIds = req.body.issueIds;
     const issueIds = Array.isArray(rawIssueIds)
       ? rawIssueIds.filter((value: unknown): value is string => typeof value === "string")
