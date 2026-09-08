@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
+import { logger } from "../middleware/logger.js";
 import {
   DEFAULT_SLIDING_WINDOW_MAX_KEYS,
   createSlidingWindowRateLimitStore,
@@ -189,6 +190,99 @@ describe("sliding-window rate-limit store", () => {
       expect(bState.remaining).toBe(2);
       expect(cState.remaining).toBe(2);
       expect(dState.remaining).toBe(2);
+    });
+  });
+
+  describe("eviction observability", () => {
+    it("warns exactly once per store instance when the ceiling first binds", () => {
+      // Eviction used to be silent (review follow-up on the key-eviction
+      // change). The first ceiling eviction per store must emit exactly one
+      // warning — evicting again must not warn again, and a flood of
+      // evictions must not turn into a log flood.
+      const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+      try {
+        const now = 10_000;
+        const store = createSlidingWindowRateLimitStore({
+          name: "test-limiter",
+          windowMs: 1_000,
+          max: 3,
+          maxKeys: 3,
+          now: () => now,
+        });
+
+        // Fill to the ceiling. No eviction yet, so no warning yet.
+        store.record("a", now);
+        store.record("b", now);
+        store.record("c", now);
+        expect(warn).not.toHaveBeenCalled();
+
+        // Two separate ceiling evictions ("d" evicts "a", then "e" evicts
+        // "b") must produce exactly one warning line.
+        store.record("d", now);
+        store.record("e", now);
+        expect(store.size).toBe(3);
+        expect(warn).toHaveBeenCalledTimes(1);
+
+        // The warning names the limiter/store and the ceiling — and no
+        // untrusted key material.
+        const [ctx, msg] = warn.mock.calls[0];
+        expect(ctx).toEqual({ limiter: "test-limiter", maxKeys: 3 });
+        expect(String(msg)).toMatch(/ceiling/);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("does not warn when the ceiling is never reached", () => {
+      const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+      try {
+        const now = 10_000;
+        const store = createSlidingWindowRateLimitStore({
+          name: "quiet-limiter",
+          windowMs: 1_000,
+          max: 3,
+          maxKeys: 10,
+          now: () => now,
+        });
+
+        for (let i = 0; i < 5; i += 1) {
+          store.record(`k-${i}`, now);
+        }
+        expect(store.size).toBe(5);
+        expect(warn).not.toHaveBeenCalled();
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("warns again on a fresh store instance (once-per-instance, not once-per-process)", () => {
+      const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+      try {
+        const makeStore = () =>
+          createSlidingWindowRateLimitStore({
+            name: "test-limiter",
+            windowMs: 1_000,
+            max: 3,
+            maxKeys: 2,
+            now: () => 10_000,
+          });
+
+        const first = makeStore();
+        first.record("a", 10_000);
+        first.record("b", 10_000);
+        first.record("c", 10_000);
+        expect(warn).toHaveBeenCalledTimes(1);
+
+        // A second store instance (e.g. after a hot reload creating a new
+        // limiter) starts its own once-only count.
+        const second = makeStore();
+        second.record("a", 10_000);
+        second.record("b", 10_000);
+        second.record("c", 10_000);
+        expect(warn).toHaveBeenCalledTimes(2);
+      } finally {
+        warn.mockRestore();
+      }
     });
   });
 
