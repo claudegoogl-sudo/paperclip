@@ -289,8 +289,11 @@ describe("isInlineAttachmentContentType", () => {
 
 describe("formatAttachmentSize", () => {
   it("renders the default deployment cap as a round megabyte figure", () => {
-    expect(MAX_ATTACHMENT_BYTES).toBe(10 * 1024 * 1024);
-    expect(formatAttachmentSize(MAX_ATTACHMENT_BYTES)).toBe("10 MB");
+    // The fork deliberately raised the shared default 10 MiB -> 25 MiB so a
+    // fresh install accepts ~15-20 MiB STL relays without env tuning; keep
+    // upstream's shape check but assert the fork's default.
+    expect(MAX_ATTACHMENT_BYTES).toBe(25 * 1024 * 1024);
+    expect(formatAttachmentSize(MAX_ATTACHMENT_BYTES)).toBe("25 MB");
   });
 
   it("keeps one decimal place for fractional sizes and drops a trailing .0", () => {

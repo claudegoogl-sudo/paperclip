@@ -45,14 +45,22 @@ vi.mock("../services/activity-log.js", () => ({
   logActivity: mockLogActivity,
 }));
 
-vi.mock("../middleware/logger.js", () => ({
-  logger: {
+vi.mock("../middleware/logger.js", () => {
+  // The fork's egress-harvest service derives a child logger at module load;
+  // hand back the same call shape so module-import side effects stay quiet.
+  const logger = {
     info: mockLoggerInfo,
     warn: vi.fn(),
     error: vi.fn(),
     debug: vi.fn(),
-  },
-}));
+  };
+  return {
+    logger: {
+      ...logger,
+      child: vi.fn(() => logger),
+    },
+  };
+});
 
 // ---------------------------------------------------------------------------
 // Imports after mocks

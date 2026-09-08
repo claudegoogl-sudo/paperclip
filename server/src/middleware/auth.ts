@@ -75,20 +75,6 @@ function normalizeOptionalString(value: string | null | undefined) {
   return value?.trim() || null;
 }
 
-function invalidAgentTokenMessage(token: string) {
-  try {
-    const payload = JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8")) as {
-      exp?: unknown;
-    };
-    if (typeof payload.exp === "number" && payload.exp <= Math.floor(Date.now() / 1000)) {
-      return "Expired agent token; obtain fresh credentials and retry";
-    }
-  } catch {
-    // Malformed and incorrectly signed tokens share the generic failure below.
-  }
-  return "Agent token did not verify; obtain fresh credentials and retry";
-}
-
 async function resolveLegacyRunResponsibleUserId(
   db: Db,
   input: { companyId: string; agentId: string; runId: string },
@@ -531,7 +517,12 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
     if (!key) {
       const claims = verifyLocalAgentJwt(token);
       if (!claims) {
-        next(unauthorized(invalidAgentTokenMessage(token)));
+        // Fork semantic (board-key auth-event log): an unrecognized bearer
+        // falls through unauthenticated so the route's own auth decides; the
+        // board-key auth-event row above already recorded the attempt.
+        // Upstream's fail-closed 401 here would turn any stale or revoked
+        // board token into a hard rejection even on open routes.
+        next();
         return;
       }
 
