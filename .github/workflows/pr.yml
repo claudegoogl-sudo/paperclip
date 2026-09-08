@@ -400,6 +400,14 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Verify Paperclip Runner
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache the Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packages/paperclip-runner/runner
+
         run: pnpm --filter @paperclipai/paperclip-runner check:all
 
       - name: Build
