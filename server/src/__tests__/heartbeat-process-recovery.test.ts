@@ -1339,6 +1339,35 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(checkoutReleasedIssue?.checkoutRunId).toBeNull();
   });
 
+  it("inherits issueId and taskId from the retried run snapshot on a process-loss retry", async () => {
+    // Retry-family wakes keep the retried run’s issue scoping so the
+    // cross-issue influence guard still sees a source issue (the source-issue
+    // exemption applies) instead of degrading the retry to a contextless run.
+    const inheritedTaskId = randomUUID();
+    const { agentId, runId, issueId } = await seedRunFixture({
+      agentStatus: "idle",
+      processPid: 999_999_999,
+      contextSnapshot: { taskId: inheritedTaskId },
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+
+    const retryRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(retryRun).not.toBeNull();
+    expect(retryRun?.agentId).toBe(agentId);
+    expect(retryRun?.contextSnapshot).toMatchObject({
+      issueId,
+      taskId: inheritedTaskId,
+      wakeReason: "process_lost_retry",
+    });
+  });
+
   it("restores one lost monitor dispatch before escalating a second process loss", async () => {
     const { companyId, agentId, runId, issueId } = await seedRunFixture({
       adapterType: "openclaw_gateway",
@@ -2698,6 +2727,50 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(0);
+  });
+
+  it("inherits issueId and taskId from the retried run snapshot on a transient-failure retry", async () => {
+    // The scheduled retry must keep the retried run’s issue scoping (read
+    // from the run row, not re-derived from the wake payload) so the
+    // cross-issue influence guard still sees a source issue.
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: "adapter_failed",
+      errorFamily: "transient_upstream",
+      errorMessage: "Error running remote compact task: transient upstream outage.",
+      provider: "openai",
+      model: "gpt-5.4",
+      resultJson: { errorFamily: "transient_upstream" },
+    });
+
+    const { agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+    const inheritedTaskId = randomUUID();
+    await db.update(heartbeatRuns).set({
+      contextSnapshot: { issueId, taskId: inheritedTaskId, wakeReason: "issue_assigned" },
+    }).where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId);
+
+    const retryRun = await waitForValue(async () => {
+      const rows = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.retryOfRunId, runId));
+      const row = rows.find((candidate) => candidate.scheduledRetryReason === "transient_failure") ?? null;
+      return row ?? null;
+    });
+    expect(retryRun?.status).toBe("scheduled_retry");
+    expect(retryRun?.scheduledRetryReason).toBe("transient_failure");
+    expect(retryRun?.agentId).toBe(agentId);
+    expect(retryRun?.contextSnapshot).toMatchObject({
+      issueId,
+      taskId: inheritedTaskId,
+      wakeReason: "transient_failure_retry",
+    });
   });
 
   it("schedules bounded retries for failed accepted interaction continuation wakes", async () => {

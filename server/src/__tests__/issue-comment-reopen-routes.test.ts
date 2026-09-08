@@ -1187,11 +1187,15 @@ describe.sequential("issue comment reopen routes", () => {
   });
 
   it("derives compact presentation for comments from source-scoped recovery runs", async () => {
+    // Run ids are UUIDs: loadActorRunContext treats a non-UUID run header as
+    // unknown (it could never match a persisted run row), so the fixture uses
+    // a UUID-shaped run id for both the actor and the persisted row.
+    const recoveryRunId = "99999999-9999-4999-8999-999999999999";
     mockIssueService.getById.mockResolvedValue(makeIssue("in_progress"));
     mockDbSelectWhere.mockImplementation(() => ({
       then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
         Promise.resolve([{
-          id: "run-1",
+          id: recoveryRunId,
           companyId: "company-1",
           agentId: "22222222-2222-4222-8222-222222222222",
           contextSnapshot: {
@@ -1201,7 +1205,7 @@ describe.sequential("issue comment reopen routes", () => {
         }]).then(onFulfilled, onRejected),
     }));
 
-    const res = await request(await installActor(createApp(), agentActor()))
+    const res = await request(await installActor(createApp(), { ...agentActor(), runId: recoveryRunId }))
       .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
       .send({ body: "Recovered the execution path.\nHanded back to the original owner." });
 
@@ -1212,7 +1216,7 @@ describe.sequential("issue comment reopen routes", () => {
       {
         agentId: "22222222-2222-4222-8222-222222222222",
         userId: undefined,
-        runId: "run-1",
+        runId: recoveryRunId,
         onBehalfOfUserId: null,
       },
       expect.objectContaining({
