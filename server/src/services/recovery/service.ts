@@ -4255,6 +4255,25 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       return escalated ? "escalated" : "skipped";
     }
 
+    // Concurrent-reconcile dedup: the unique index on the wakeup idempotency key only
+    // catches two scanners that computed the SAME next attempt. Under scan drift the
+    // second scanner can read the first scanner's just-inserted scheduled_retry run as
+    // the latest run and advance the attempt instead, queueing two wakeups from one
+    // reconcile wave. A pending same-fingerprint retry means the next attempt is
+    // already booked for this unchanged source state — do not queue another.
+    const pendingSameFingerprintRetry = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, current.companyId),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'dispositionRepairFingerprint' = ${state.fingerprint}`,
+        eq(heartbeatRuns.status, "scheduled_retry"),
+        gt(heartbeatRuns.scheduledRetryAt, new Date()),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (pendingSameFingerprintRetry) return "covered";
+
     const nextAttempt = sameFingerprintAttempt + 1;
     const action = await ensureDispositionRepairAction({
       issue: current,
