@@ -109,7 +109,7 @@ describe("routine validators", () => {
     expect(result.success).toBe(false);
     const issue = result.error!.issues[0]!;
     expect(issue.code).toBe("unrecognized_keys");
-    expect(issue.message).toBe("Unrecognized key(s) in object: 'triggers'");
+    expect(issue.message).toBe('Unrecognized key: "triggers"');
   });
 
   // updateRoutineSchema is derived via .partial().extend(), neither of which is
@@ -123,7 +123,7 @@ describe("routine validators", () => {
     expect(result.success).toBe(false);
     const issue = result.error!.issues[0]!;
     expect(issue.code).toBe("unrecognized_keys");
-    expect(issue.message).toBe("Unrecognized key(s) in object: 'triggers'");
+    expect(issue.message).toBe('Unrecognized key: "triggers"');
   });
 
   it("still accepts every documented field on create and update", () => {

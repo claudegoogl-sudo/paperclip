@@ -560,7 +560,12 @@ describe("unqualified mutation of a security-posture column", () => {
     expect(result.newFindings).toEqual([]);
     expect(result.baselineFindings.map((entry) => entry.rule)).toContain(POSTURE_RULE);
 
-    const entry = MIGRATION_SAFETY_BASELINE.find((candidate) => candidate.rule === POSTURE_RULE);
+    // Select by migration, not just rule: the merged baseline carries older
+    // upstream entries with the same rule (e.g. 0173), and `.find` on the
+    // rule alone would return whichever lands first in the array.
+    const entry = MIGRATION_SAFETY_BASELINE.find(
+      (candidate) => candidate.rule === POSTURE_RULE && candidate.migration === MIGRATION_0233,
+    );
     expect(entry?.migration).toBe(MIGRATION_0233);
     expect(entry?.reason.trim().length).toBeGreaterThan(20);
   });
