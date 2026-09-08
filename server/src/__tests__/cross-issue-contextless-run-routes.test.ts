@@ -102,10 +102,19 @@ describeEmbeddedPostgres("cross-issue influence guard: contextless runs (routes 
 
   let issueSequence = 0;
 
-  async function seedCompanyAndAgent(prefix: string) {
+  // Issue prefixes are globally unique across companies, and best-effort
+  // teardown can leave a company row behind when a wake lands just after the
+  // deletes, so every company gets a fresh random prefix instead of a fixed
+  // per-file one.
+  function uniqueIssuePrefix() {
+    return `X${randomUUID().replace(/-/g, "").slice(0, 5).toUpperCase()}`;
+  }
+
+  async function seedCompanyAndAgent() {
+    const prefix = uniqueIssuePrefix();
     const companyId = randomUUID();
     const agentId = randomUUID();
-    const userId = `${prefix.toLowerCase()}-operator`;
+    const userId = `${randomUUID().slice(0, 8)}-operator`;
     await db.insert(companies).values({
       id: companyId,
       name: `${prefix} Company`,
@@ -130,7 +139,7 @@ describeEmbeddedPostgres("cross-issue influence guard: contextless runs (routes 
       status: "active",
       membershipRole: "operator",
     });
-    return { companyId, agentId, userId };
+    return { companyId, agentId, userId, prefix };
   }
 
   async function seedIssue(companyId: string, prefix: string, assigneeAgentId: string) {
@@ -180,8 +189,8 @@ describeEmbeddedPostgres("cross-issue influence guard: contextless runs (routes 
   }
 
   it("lets a contextless run comment on an issue it may write (201, not the context 403)", async () => {
-    const { companyId, agentId } = await seedCompanyAndAgent("CTX");
-    const issueId = await seedIssue(companyId, "CTX", agentId);
+    const { companyId, agentId, prefix } = await seedCompanyAndAgent();
+    const issueId = await seedIssue(companyId, prefix, agentId);
     const runId = await seedContextlessRun(companyId, agentId);
 
     const res = await request(app(agentActor(companyId, agentId, runId)))
@@ -197,8 +206,8 @@ describeEmbeddedPostgres("cross-issue influence guard: contextless runs (routes 
   }, 30_000);
 
   it("lets a contextless run PATCH an issue it may write (200, not the context 403)", async () => {
-    const { companyId, agentId } = await seedCompanyAndAgent("CTX");
-    const issueId = await seedIssue(companyId, "CTX", agentId);
+    const { companyId, agentId, prefix } = await seedCompanyAndAgent();
+    const issueId = await seedIssue(companyId, prefix, agentId);
     const runId = await seedContextlessRun(companyId, agentId);
 
     const res = await request(app(agentActor(companyId, agentId, runId)))
@@ -211,8 +220,8 @@ describeEmbeddedPostgres("cross-issue influence guard: contextless runs (routes 
   }, 30_000);
 
   it("lets a contextless run resolve an issue-thread interaction without the context denial", async () => {
-    const { companyId, agentId } = await seedCompanyAndAgent("CTX");
-    const issueId = await seedIssue(companyId, "CTX", agentId);
+    const { companyId, agentId, prefix } = await seedCompanyAndAgent();
+    const issueId = await seedIssue(companyId, prefix, agentId);
     const runId = await seedContextlessRun(companyId, agentId);
     const [interaction] = await db.insert(issueThreadInteractions).values({
       companyId,
@@ -239,8 +248,8 @@ describeEmbeddedPostgres("cross-issue influence guard: contextless runs (routes 
   }, 30_000);
 
   it("still fails closed for genuine attribution failures", async () => {
-    const { companyId, agentId } = await seedCompanyAndAgent("CTX");
-    const issueId = await seedIssue(companyId, "CTX", agentId);
+    const { companyId, agentId, prefix } = await seedCompanyAndAgent();
+    const issueId = await seedIssue(companyId, prefix, agentId);
 
     // (a) malformed run id, (b) run row missing, (c) run row owned by another
     // agent, (d) run row that exists only under another company: all four are
@@ -262,8 +271,8 @@ describeEmbeddedPostgres("cross-issue influence guard: contextless runs (routes 
     const foreignCompanyId = randomUUID();
     await db.insert(companies).values({
       id: foreignCompanyId,
-      name: "CTX Foreign Company",
-      issuePrefix: "CTXF",
+      name: "Foreign Company",
+      issuePrefix: uniqueIssuePrefix(),
       requireBoardApprovalForNewAgents: false,
     });
     const foreignRunId = await seedContextlessRun(foreignCompanyId, agentId);
@@ -291,8 +300,8 @@ describeEmbeddedPostgres("cross-issue influence guard: contextless runs (routes 
   }, 30_000);
 
   it("rejects the 21st contextless-run write with the cap error through the route", async () => {
-    const { companyId, agentId } = await seedCompanyAndAgent("CTX");
-    const issueId = await seedIssue(companyId, "CTX", agentId);
+    const { companyId, agentId, prefix } = await seedCompanyAndAgent();
+    const issueId = await seedIssue(companyId, prefix, agentId);
     const runId = await seedContextlessRun(companyId, agentId);
     await db.insert(activityLog).values(Array.from({ length: CROSS_ISSUE_INFLUENCE_LIMIT }, () => ({
       companyId,
@@ -322,8 +331,8 @@ describeEmbeddedPostgres("cross-issue influence guard: contextless runs (routes 
   }, 30_000);
 
   it("keeps the source-issue exemption for issue-scoped runs (no regression)", async () => {
-    const { companyId, agentId } = await seedCompanyAndAgent("CTX");
-    const issueId = await seedIssue(companyId, "CTX", agentId);
+    const { companyId, agentId, prefix } = await seedCompanyAndAgent();
+    const issueId = await seedIssue(companyId, prefix, agentId);
     const runId = await seedContextlessRun(companyId, agentId, {
       issueId,
       taskId: issueId,
