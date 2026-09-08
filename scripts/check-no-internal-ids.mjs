@@ -56,6 +56,10 @@ export const FORBIDDEN_PATTERNS = [
   {
     name: "tailnet-url",
     pattern: /\b[a-zA-Z0-9-]+\.ts\.net\b/,
+    // `example.ts.net` and hosts under it are RFC-2606-style documentation
+    // placeholders that upstream's own test fixtures use; they name no real
+    // tailnet. Anything else under .ts.net is treated as a live tailnet.
+    isAllowed: (m) => /(^|\.)example\.ts\.net$/.test(m),
     describe: (m) => `tailnet URL "${m}"`,
   },
   {
@@ -112,9 +116,9 @@ export function scanAddedLinesForForbiddenIds(addedLines, { excludedPaths = EXCL
   const findings = [];
   for (const { file, lineNumber, content } of addedLines) {
     if (excludedPaths.has(file)) continue;
-    for (const { name, pattern, describe } of FORBIDDEN_PATTERNS) {
+    for (const { name, pattern, describe, isAllowed } of FORBIDDEN_PATTERNS) {
       const match = pattern.exec(content);
-      if (match) {
+      if (match && !isAllowed?.(match[0])) {
         findings.push({
           file,
           lineNumber,

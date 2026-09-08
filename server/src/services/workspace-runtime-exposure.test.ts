@@ -295,7 +295,7 @@ function installDeps(overrides: {
     broker: overrides.broker,
     isPortAvailable: overrides.isPortAvailable ?? isLoopbackPortFree,
     isBrokerAvailable: overrides.isBrokerAvailable ?? (async () => true),
-    resolveHostname: overrides.resolveHostname ?? (async () => "runner.tail123.ts.net"),
+    resolveHostname: overrides.resolveHostname ?? (async () => "runner.tail123.example.ts.net"),
     probeHealth: overrides.probeHealth ?? (async () => true),
     now: () => "2026-08-11T00:00:00.000Z",
     // The real /proc-backed diagnosis, not a fake: the fake broker below always
@@ -372,7 +372,7 @@ describe("workspace runtime tailscale_https lifecycle", () => {
     const [runtime] = await startRuntimeServicesForWorkspaceControl(startInput());
     expect(calls.slice(0, 2)).toEqual(["reserve", "expose"]);
     expect(runtime.port).toBeGreaterThanOrEqual(42000);
-    expect(runtime.url).toBe(`https://runner.tail123.ts.net:${runtime.port}`);
+    expect(runtime.url).toBe(`https://runner.tail123.example.ts.net:${runtime.port}`);
     expect(runtime.exposure?.state).toBe("ready");
 
     await stopRuntimeServicesForExecutionWorkspace({
@@ -409,7 +409,7 @@ describe("automatic tailscale_https default for managed worktree runtimes", () =
     expect(runtime.port).toBeGreaterThanOrEqual(42_000);
     expect(runtime.port).toBeLessThanOrEqual(42_999);
     // The canonical URL is the verified HTTPS origin; HTTP is never retained.
-    expect(runtime.url).toBe(`https://runner.tail123.ts.net:${runtime.port}`);
+    expect(runtime.url).toBe(`https://runner.tail123.example.ts.net:${runtime.port}`);
     expect(runtime.url).not.toContain("http://");
     expect(runtime.exposure?.state).toBe("ready");
   }, 15_000);
@@ -433,7 +433,7 @@ describe("automatic tailscale_https default for managed worktree runtimes", () =
     }));
 
     expect(runtime.port).toBe(pinnedPort);
-    expect(runtime.url).toBe(`https://runner.tail123.ts.net:${pinnedPort}`);
+    expect(runtime.url).toBe(`https://runner.tail123.example.ts.net:${pinnedPort}`);
   }, 15_000);
 
   it("preserves a deliberate opt-out and leaves the service on plain HTTP", async () => {
@@ -522,7 +522,7 @@ describe("automatic tailscale_https default for managed worktree runtimes", () =
 
     expect(calls.slice(0, 2)).toEqual(["reserve", "expose"]);
     expect(second.port).toBe(firstPort);
-    expect(second.url).toBe(`https://runner.tail123.ts.net:${firstPort}`);
+    expect(second.url).toBe(`https://runner.tail123.example.ts.net:${firstPort}`);
   }, 25_000);
 
   it("releases the in-flight pair claim when hostname resolution fails, so a retry storm cannot exhaust the range", async () => {
@@ -597,7 +597,7 @@ describe("loopback bind is forced on the guest, not merely requested (PAP-17256)
     expect(runtime.exposure?.state).toBe("ready");
     expect(runtime.exposure?.lastError ?? null).toBeNull();
     expect(runtime.port).toBeGreaterThanOrEqual(42_000);
-    expect(runtime.url).toBe(`https://runner.tail123.ts.net:${runtime.port}`);
+    expect(runtime.url).toBe(`https://runner.tail123.example.ts.net:${runtime.port}`);
 
     // Independent confirmation on the live listeners, using the same /proc read
     // the broker's gate performs.
@@ -720,7 +720,7 @@ describe("readiness probes loopback for an exposed runtime (PAP-17256)", () => {
 
     expect(calls.slice(0, 2)).toEqual(["reserve", "expose"]);
     expect(runtime.exposure?.state).toBe("ready");
-    expect(runtime.url).toBe(`https://runner.tail123.ts.net:${runtime.port}`);
+    expect(runtime.url).toBe(`https://runner.tail123.example.ts.net:${runtime.port}`);
   }, 20_000);
 });
 
