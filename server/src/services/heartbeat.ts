@@ -13342,6 +13342,53 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return false;
   }
 
+  // Authoritative, externally visible liveness answer for a `running` row. Derived from the
+  // SAME sources `runOccupiesHostSlot` reads — the shared in-process run registry and, only
+  // for tracked local-child adapters, the pid / process-group checks — plus the
+  // reaper-consistent `occupiesHostSlot` verdict itself. An external actor under run-slot
+  // starvation pressure probes this instead of inferring death from a silent log tail:
+  // any true field means the reaper would NOT reap the row, i.e. it is live (possibly
+  // provider-stalled), not dead. `null` pid fields mean "not tracked for this adapter
+  // type" (remote/session adapters carry no child pid), never "dead".
+  function buildRunLivenessProbe(row: {
+    id: string;
+    status: string;
+    processPid: number | null;
+    processGroupId: number | null;
+    adapterType: string;
+  }) {
+    if (row.status !== "running") return null;
+    const tracksLocalChild = isTrackedLocalChildProcessAdapter(row.adapterType);
+    return {
+      hasInMemoryHandle: liveRunExecutions.has(row.id),
+      processPidAlive: tracksLocalChild && row.processPid
+        ? isProcessAlive(row.processPid)
+        : null,
+      processGroupAlive: tracksLocalChild && row.processGroupId
+        ? isProcessGroupAlive(row.processGroupId)
+        : null,
+      occupiesHostSlot: runOccupiesHostSlot(row),
+    };
+  }
+
+  // Route-facing variant: fetches the run + its agent's adapter type in one join and
+  // returns the probe block (`null` for a missing run or a non-running row).
+  async function getRunLivenessProbe(runId: string) {
+    const row = await db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        processPid: heartbeatRuns.processPid,
+        processGroupId: heartbeatRuns.processGroupId,
+        adapterType: agents.adapterType,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    return row ? buildRunLivenessProbe(row) : null;
+  }
+
   // The ceiling bounds concurrent *adapter processes*, i.e. CPU, so it counts `running` only —
   // the same status `countRunningRunsForAgent` uses. `queued` and `scheduled_retry` hold an
   // issue execution lock but no process; counting `scheduled_retry` would also be a liveness
@@ -21166,6 +21213,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reconcileTaskWatchdogs,
 
     buildRunOutputSilence,
+
+    buildRunLivenessProbe,
+    getRunLivenessProbe,
 
     tickTimers: async (now = new Date()) => {
       if ((await getSchedulingSuppression()).suppressed) {
