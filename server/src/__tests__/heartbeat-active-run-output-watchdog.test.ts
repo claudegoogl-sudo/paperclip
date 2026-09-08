@@ -19,12 +19,50 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { heartbeatService } from "../services/heartbeat.js";
 import {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
   ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
   recoveryService,
 } from "../services/recovery/service.js";
+
+const mockAdapterExecute = vi.hoisted(() =>
+  vi.fn(async () => ({
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    errorMessage: null,
+    summary: "Acknowledged stale-run evaluation.",
+    provider: "test",
+    model: "test-model",
+  })),
+);
+
+vi.mock("../telemetry.ts", () => ({
+  getTelemetryClient: () => ({ track: vi.fn() }),
+}));
+
+vi.mock("@paperclipai/shared/telemetry", async () => {
+  const actual = await vi.importActual<typeof import("@paperclipai/shared/telemetry")>(
+    "@paperclipai/shared/telemetry",
+  );
+  return {
+    ...actual,
+    trackAgentFirstHeartbeat: vi.fn(),
+  };
+});
+
+vi.mock("../adapters/index.ts", async () => {
+  const actual = await vi.importActual<typeof import("../adapters/index.ts")>("../adapters/index.ts");
+  return {
+    ...actual,
+    getServerAdapter: vi.fn(() => ({
+      supportsLocalAgentJwt: false,
+      execute: mockAdapterExecute,
+    })),
+  };
+});
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -230,10 +268,10 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       level: "critical" as const,
       ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
     },
-  ])("surfaces $level silence without creating recovery work", async ({ level, ageMs }) => {
+  ])("files $level silence review work through the watchdog scan", async ({ level, ageMs }) => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const seeded = await seedRunningRun({ now, ageMs });
-    const { enqueueWakeup, recovery } = createRecovery();
+    const { recovery } = createRecovery();
 
     await expect(recovery.buildRunOutputSilence(
       (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId)))[0]!,
@@ -248,15 +286,20 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       evaluationIssueAssigneeAgentId: null,
     });
 
+    // Fork semantics: the watchdog FILES a review issue for silent runs
+    // (upstream only surfaces the summary) — first scan creates, second is a
+    // dedup hit on the open evaluation.
     const first = await recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId });
     const second = await recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId });
-    expect(first).toMatchObject({ scanned: 1, created: 0, existing: 0, escalated: 0, skipped: 1 });
-    expect(second).toMatchObject({ scanned: 1, created: 0, existing: 0, escalated: 0, skipped: 1 });
-    expect(first.evaluationIssueIds).toEqual([]);
-    expect(second.evaluationIssueIds).toEqual([]);
-    expect(enqueueWakeup).not.toHaveBeenCalled();
-    await expectNoReviewArtifacts(seeded);
-
+    expect(first).toMatchObject({ scanned: 1, created: 1, existing: 0, skipped: 0 });
+    expect(second).toMatchObject({ scanned: 1, created: 0, existing: 1, skipped: 0 });
+    expect(first.evaluationIssueIds).toHaveLength(1);
+    const evaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, seeded.companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(evaluations).toHaveLength(1);
+    expect(evaluations[0]?.priority).toBe(level === "critical" ? "high" : "medium");
     const decisions = await db
       .select()
       .from(heartbeatRunWatchdogDecisions)
@@ -356,10 +399,14 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     });
     await expect(recovery.scanSilentActiveRuns({ now: new Date(rearmAt.getTime() - 1), companyId: seeded.companyId }))
       .resolves.toMatchObject({ snoozed: 1, created: 0 });
-    await expect(recovery.scanSilentActiveRuns({ now: new Date(rearmAt.getTime() + 1), companyId: seeded.companyId }))
-      .resolves.toMatchObject({ skipped: 1, created: 0 });
-    expect(enqueueWakeup).not.toHaveBeenCalled();
-    await expectNoReviewArtifacts(seeded);
+    // Fork semantics: after the continue decision re-arms, the next scan
+    // files the review issue (upstream would stay artifact-free).
+    const postRearm = await recovery.scanSilentActiveRuns({ now: new Date(rearmAt.getTime() + 1), companyId: seeded.companyId });
+    expect(postRearm).toMatchObject({ created: 1, skipped: 0 });
+    expect(await db.select().from(issues).where(and(
+      eq(issues.companyId, seeded.companyId),
+      eq(issues.originKind, "stale_active_run_evaluation"),
+    ))).toHaveLength(1);
   });
 
   it("permanently suppresses a run after a board false-positive decision", async () => {
@@ -429,24 +476,28 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, seeded.companyId))).toHaveLength(0);
   });
 
-  it("does not fold or create review work for a terminal source without same-run evidence", async () => {
+  it("still files review work for a terminal source without same-run evidence", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const seeded = await seedRunningRun({
       now,
       ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
       sourceStatus: "done",
     });
-    const { enqueueWakeup, recovery } = createRecovery();
+    const { recovery } = createRecovery();
 
+    // Fork semantics: a done source without same-run durable evidence still
+    // gets a review issue (the run itself never signalled completion) — this
+    // mirrors master's "still escalates terminal source issues" behavior.
     await expect(recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId }))
-      .resolves.toMatchObject({ created: 0, folded: 0, skipped: 1 });
+      .resolves.toMatchObject({ created: 1, folded: 0 });
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
     expect(run?.status).toBe("running");
-    expect(enqueueWakeup).not.toHaveBeenCalled();
-    expect(await db.select().from(issues).where(and(
+    const [evaluation] = await db.select().from(issues).where(and(
       eq(issues.companyId, seeded.companyId),
       eq(issues.originKind, "stale_active_run_evaluation"),
-    ))).toHaveLength(0);
+    ));
+    expect(evaluation?.originId).toBe(seeded.runId);
+    expect(evaluation?.parentId).toBeNull();
   });
 
   it("folds existing legacy evaluation and recovery rows idempotently", async () => {
@@ -508,14 +559,13 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, seeded.runId))).toHaveLength(1);
   });
 
-  it("keeps open legacy evaluations readable without refreshing or reprioritizing them", async () => {
+  it("escalates an open evaluation to high priority at critical silence", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const seeded = await seedRunningRun({
       now,
       ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
     });
     const evaluationIssueId = randomUUID();
-    const evaluationUpdatedAt = new Date("2026-04-20T12:00:00.000Z");
     await db.insert(issues).values({
       id: evaluationIssueId,
       companyId: seeded.companyId,
@@ -529,24 +579,14 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       originId: seeded.runId,
       originRunId: seeded.runId,
       originFingerprint: `stale_active_run:${seeded.companyId}:${seeded.runId}`,
-      updatedAt: evaluationUpdatedAt,
     });
-    const { enqueueWakeup, recovery } = createRecovery();
+    const { recovery } = createRecovery();
 
-    await expect(buildSummary(seeded.runId, now)).resolves.toMatchObject({
-      level: "critical",
-      evaluationIssueId,
-      evaluationIssueIdentifier: `${seeded.issuePrefix}-2`,
-      evaluationIssueAssigneeAgentId: seeded.managerId,
-    });
     await expect(recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId }))
-      .resolves.toMatchObject({ created: 0, existing: 1, escalated: 0 });
+      .resolves.toMatchObject({ created: 0, existing: 0, escalated: 1 });
     const [evaluation] = await db.select().from(issues).where(eq(issues.id, evaluationIssueId));
-    expect(evaluation).toMatchObject({ status: "todo", priority: "medium", assigneeAgentId: seeded.managerId });
-    expect(evaluation?.updatedAt.toISOString()).toBe(evaluationUpdatedAt.toISOString());
-    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, evaluationIssueId))).toHaveLength(0);
-    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, seeded.companyId))).toHaveLength(0);
-    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect(evaluation).toMatchObject({ status: "todo", priority: "high", assigneeAgentId: seeded.managerId });
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, evaluationIssueId))).toHaveLength(1);
 
     await expect(recovery.recordWatchdogDecision({
       runId: seeded.runId,
@@ -566,7 +606,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     })).rejects.toMatchObject({ status: 403 });
   });
 
-  it("does not recreate or auto-dismiss a closed legacy evaluation", async () => {
+  it("auto-dismisses a closed legacy evaluation without recreating it", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const seeded = await seedRunningRun({
       now,
@@ -591,11 +631,16 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
 
     await expect(recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId }))
       .resolves.toMatchObject({ created: 0, existing: 0, skipped: 1 });
+    // No recreation...
     expect(await db.select().from(issues).where(eq(issues.companyId, seeded.companyId))).toHaveLength(2);
-    expect(await db.select().from(heartbeatRunWatchdogDecisions).where(eq(
+    // ...and fork semantics auto-record the suppression so future scans skip
+    // cheaply instead of re-firing every cycle.
+    const decisions = await db.select().from(heartbeatRunWatchdogDecisions).where(eq(
       heartbeatRunWatchdogDecisions.runId,
       seeded.runId,
-    ))).toHaveLength(0);
+    ));
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]?.decision).toBe("dismissed_false_positive");
   });
 
   it("ignores healthy runs that produced recent output", async () => {
