@@ -17074,6 +17074,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   worktreePath: inspection.worktreePath,
                   expectedBranchName: inspection.expectedBranchName,
                   actualBranchName: inspection.actualBranchName,
+                  agent: { id: agent.id, name: agent.name, companyId: agent.companyId },
                   sourceIssue: issueRef
                     ? {
                         id: issueRef.id,

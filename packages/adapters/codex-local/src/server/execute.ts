@@ -795,6 +795,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           stagedCodexHomeDir = await stageCodexHomeForSync(effectiveCodexHome, { runId });
           return await prepareAdapterExecutionTargetRuntime({
             runId,
+            agent,
             target: executionTarget,
             adapterKey: "codex",
             timeoutSec,

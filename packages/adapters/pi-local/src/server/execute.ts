@@ -424,6 +424,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         );
         const preparedRemoteRuntime = await prepareAdapterExecutionTargetRuntime({
           runId,
+          agent,
           target: executionTarget,
           adapterKey: "pi",
           timeoutSec,

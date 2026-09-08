@@ -65,6 +65,7 @@
             "group": "Agent Developer",
             "pages": [
               "guides/agent-developer/how-agents-work",
+              "guides/agent-developer/agent-git-identity",
               "guides/agent-developer/heartbeat-protocol",
               "guides/agent-developer/writing-a-skill",
               "guides/agent-developer/skills-store",
