@@ -11186,7 +11186,7 @@ export function issueRoutes(
     const actorRunId = requireAgentRunId(req, res);
     if (req.actor.type === "agent" && !actorRunId) return;
 
-    // Manager checkout-management override (PLA-6547): the mutation boundary
+    // Manager checkout-management override: the mutation boundary
     // above already admits agents holding tasks:manage_active_checkouts for the
     // assignee; surface that fact to the service, which re-verifies the data
     // preconditions (in_progress + terminal-or-missing holding run) on the

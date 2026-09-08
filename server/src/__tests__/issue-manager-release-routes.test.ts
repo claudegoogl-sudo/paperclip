@@ -32,7 +32,7 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
-// PLA-6547: an agent holding tasks:manage_active_checkouts for the assignee may
+// An agent holding tasks:manage_active_checkouts for the assignee may
 // release an in_progress issue whose checkout is held by a terminal-or-missing
 // run, through the normal POST /issues/:id/release route. Route tests drive the
 // real handler (boundary ordering included) against a real database; the

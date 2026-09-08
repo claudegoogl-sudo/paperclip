@@ -8756,7 +8756,7 @@ export function issueService(db: Db) {
           .then((rows) => rows[0] ?? null);
 
         if (!existing) return null;
-        // Manager checkout-management override (PLA-6547): an agent holding
+        // Manager checkout-management override: an agent holding
         // tasks:manage_active_checkouts (route-verified via
         // hasActiveCheckoutManagementOverride and passed in as
         // options.managerOverride) may release an in_progress issue assigned to
