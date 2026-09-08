@@ -300,8 +300,11 @@ describe("claude remote execution", () => {
           cwd: managedRemoteWorkspace,
           // Stored sessions must carry a prompt-bundle pin to be resume-eligible
           // (see the missing-pin bust in execute.ts). This is the bundle key for
-          // an empty adapterConfig (no instructions, no skills).
-          promptBundleKey: "08bef4f10ef56ac0d71c5532f0ff338dabc4e7e078ed011e240b9e8a1df1b5fe",
+          // an empty adapterConfig as of the v2026.831.1 merge: no instructions,
+          // no configured skills, but the operational skill is always mounted for
+          // legacy adapters (upstream's resolveLegacyPaperclipDesiredSkillNames)
+          // and its library manifest participates in the bundle hash.
+          promptBundleKey: "af2eeaa51e64f9cad5952a326febc307226f877112ebaf73f8841b8599ebf31d",
           remoteExecution: {
             transport: "ssh",
             host: "127.0.0.1",
