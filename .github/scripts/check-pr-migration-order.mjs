@@ -51,8 +51,12 @@ export function checkMigrationOrder(baseMigrationFiles, prMigrationFiles, opts =
   // surviving means its slug (filename minus the 4-digit number) appears
   // among the added files after a renumber. Duplicate numbers and journal
   // alignment stay the job of check:migrations.
-  const syncHead = opts.syncHead ?? /^sync\/upstream-/.test(process.env.GITHUB_HEAD_REF ?? '');
-  if (syncHead) {
+  // syncHead is caller-supplied (main() derives it from GITHUB_HEAD_REF).
+  // The library function itself must not read the environment: the
+  // quality-gate tests run inside a sync-branch workflow where
+  // GITHUB_HEAD_REF is set, and ambient detection would silently flip the
+  // append-only assertions off for every test that omits opts.
+  if (opts.syncHead) {
     const addedSlugs = new Set(prMigrations.map((migration) => migrationSlug(migration.file)));
     const lost = (opts.deletedBaseFiles ?? [])
       .map(parseMigration)
@@ -135,7 +139,10 @@ function main() {
     'diff', '--name-only', '--no-renames', '--diff-filter=D', '-z', `${baseSha}...${headSha}`, '--',
     MIGRATIONS_DIRECTORY,
   ]).filter((file) => file.endsWith('.sql'));
-  const result = checkMigrationOrder(baseMigrationFiles, prMigrationFiles, { deletedBaseFiles });
+  const result = checkMigrationOrder(baseMigrationFiles, prMigrationFiles, {
+    deletedBaseFiles,
+    syncHead: /^sync\/upstream-/.test(process.env.GITHUB_HEAD_REF ?? ''),
+  });
 
   if (result.passed) {
     console.log(result.message);

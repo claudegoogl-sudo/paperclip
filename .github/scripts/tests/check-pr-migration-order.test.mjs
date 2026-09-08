@@ -95,3 +95,16 @@ test('non-sync head keeps the append-only rule even when slugs survive', () => {
   assert.equal(result.passed, false);
   assert.match(result.message, /already contains migrations through/);
 });
+
+test("ambient GITHUB_HEAD_REF does not flip a plain call into sync mode", () => {
+  process.env.GITHUB_HEAD_REF = "sync/upstream-v9999.9.9";
+  try {
+    const result = checkMigrationOrder(
+      [migration("0230_on_master")],
+      [migration("0229_from_stale_branch")],
+    );
+    assert.equal(result.passed, false);
+  } finally {
+    delete process.env.GITHUB_HEAD_REF;
+  }
+});
