@@ -51,6 +51,10 @@ These names and emails only — no secrets, no capability. Env vars set by user/
 
 3. To find the run that produced it, list runs for the agent around the commit date, or use the activity log filtered on the agent — the commit itself carries no run id (git identities are stable across runs by design), so the run is resolved from the agent's run history.
 
+## What this does not guarantee
+
+Identity injection is **default attribution, not non-repudiation**. The injected `GIT_*` variables and the host-applied identity are defaults a well-behaved process uses; a hostile agent process can still forge the author and committer on its own commits — `git commit --author=...` and its own environment overrides are ordinary git features the agent may call. A tenant separation-of-duties control keyed only on `git log --author` in an agent-writable checkout is therefore **not sound against a hostile agent**. The attribution is sound for what it targets: accidental misattribution (a commit landing under whatever identity happens to live in the checkout config) and repositories the agent reaches only via controlled paths — host-executed git operations and host-assembled process environments — rather than arbitrary process execution inside the repo.
+
 ## Workspace durability: where agent commits belong
 
 There are two kinds of agent working directories, with different guarantees:
