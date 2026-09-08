@@ -110,6 +110,7 @@ describe("paperclip MCP tools", () => {
       priority: "medium",
       assigneeAgentId: "22222222-2222-2222-2222-222222222222",
       requestDepth: 0,
+      allowDuplicate: false, // createIssueInputSchema default (upstream #9650)
     });
   });
 
@@ -372,6 +373,45 @@ describe("paperclip MCP tools", () => {
       payload: { branch: "pap-1167" },
       issueIds: ["44444444-4444-4444-4444-444444444444"],
     });
+  });
+
+  it("rejects an empty request_board_approval payload at the tool boundary without calling the API", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipCreateApproval");
+    const res = await tool.execute({
+      type: "request_board_approval",
+      payload: {},
+    });
+
+    const text = JSON.stringify(res);
+    // Missing keys surface as zod "Required" issues pointing at the payload fields.
+    expect(text).toContain("payload");
+    expect(text).toContain("title");
+    expect(text).toContain("summary");
+    expect(text).toContain("Required");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("routes the withdraw decision action at the withdraw endpoint", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "approval-1", status: "withdrawn" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipApprovalDecision");
+    await tool.execute({
+      approvalId: "44444444-4444-4444-4444-444444444444",
+      action: "withdraw",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe(
+      "http://localhost:3100/api/approvals/44444444-4444-4444-4444-444444444444/withdraw",
+    );
+    expect(init.method).toBe("POST");
   });
 
   it("rejects invalid generic request paths", async () => {

@@ -615,11 +615,15 @@ export {
 
 export {
   createApprovalSchema,
+  createApprovalRequestSchema,
+  refineApprovalPayload,
+  requestBoardApprovalPayloadSchema,
   resolveApprovalSchema,
   requestApprovalRevisionSchema,
   resubmitApprovalSchema,
   addApprovalCommentSchema,
   type CreateApproval,
+  type RequestBoardApprovalPayload,
   type ResolveApproval,
   type RequestApprovalRevision,
   type ResubmitApproval,

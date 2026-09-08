@@ -3,6 +3,7 @@ import {
   addIssueCommentSchema,
   askUserQuestionsPayloadSchema,
   checkoutIssueSchema,
+  createApprovalRequestSchema,
   createApprovalSchema,
   createIssueInputSchema,
   issueThreadInteractionContinuationPolicySchema,
@@ -159,7 +160,7 @@ const createRequestCheckboxConfirmationToolSchema = z.object({
 
 const approvalDecisionSchema = z.object({
   approvalId: approvalIdSchema,
-  action: z.enum(["approve", "reject", "requestRevision", "resubmit"]),
+  action: z.enum(["approve", "reject", "requestRevision", "resubmit", "withdraw"]),
   decisionNote: z.string().optional(),
   payloadJson: z.string().optional(),
 });
@@ -429,12 +430,19 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipCreateApproval",
-      "Create a board approval request, optionally linked to one or more issues",
+      "Create a board approval request, optionally linked to one or more issues. A request_board_approval payload must carry a non-empty title and summary — weaker payloads are rejected here instead of reaching the operator queue",
       createApprovalToolSchema,
-      async ({ companyId, ...body }) =>
-        client.requestJson("POST", `/companies/${client.resolveCompanyId(companyId)}/approvals`, {
+      async ({ companyId, ...body }) => {
+        // Same discriminated payload contract as the server route: an
+        // undecidable card fails at the tool boundary with actionable
+        // feedback, instead of surfacing only as an API 400 after the fact.
+        // Parsed here (not attached to the tool schema) because the MCP server
+        // registers tools from the plain ZodObject `schema.shape`.
+        createApprovalRequestSchema.parse(body);
+        return client.requestJson("POST", `/companies/${client.resolveCompanyId(companyId)}/approvals`, {
           body,
-        }),
+        });
+      },
     ),
     makeTool(
       "paperclipGetApproval",
@@ -588,7 +596,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipApprovalDecision",
-      "Approve, reject, request revision, or resubmit an approval",
+      "Approve, reject, request revision, resubmit, or withdraw an approval. Withdraw removes a pending approval you requested (agents can only withdraw their own pending approvals); the withdrawal is logged, not deleted.",
       approvalDecisionSchema,
       async ({ approvalId, action, decisionNote, payloadJson }) => {
         const path =
@@ -598,7 +606,9 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
               ? `/approvals/${encodeURIComponent(approvalId)}/reject`
               : action === "requestRevision"
                 ? `/approvals/${encodeURIComponent(approvalId)}/request-revision`
-                : `/approvals/${encodeURIComponent(approvalId)}/resubmit`;
+                : action === "withdraw"
+                  ? `/approvals/${encodeURIComponent(approvalId)}/withdraw`
+                  : `/approvals/${encodeURIComponent(approvalId)}/resubmit`;
 
         const body =
           action === "resubmit"

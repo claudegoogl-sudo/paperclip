@@ -167,3 +167,65 @@ describe("approvalService.findOpenHireApprovalForAgent", () => {
     expect(result).toBeNull();
   });
 });
+
+describe("approvalService.withdraw", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockAgentService.activatePendingApproval.mockResolvedValue({ agent: { id: "agent-1" }, activated: true });
+    mockAgentService.create.mockResolvedValue({ id: "agent-1" });
+    mockAgentService.terminate.mockResolvedValue(undefined);
+    mockNotifyHireApproved.mockResolvedValue(undefined);
+  });
+
+  it("withdraws a pending approval for the requesting agent", async () => {
+    const withdrawn = createApproval("withdrawn");
+    const dbStub = createDbStub([[createApproval("pending")]], [withdrawn]);
+
+    const svc = approvalService(dbStub.db as any);
+    const result = await svc.withdraw("approval-1", { agentId: "requester-1", runId: "run-1" });
+
+    expect(result.applied).toBe(true);
+    expect(result.approval.status).toBe("withdrawn");
+    expect(dbStub.returning).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses withdrawal by an agent that did not request the approval", async () => {
+    const dbStub = createDbStub([[createApproval("pending")]], []);
+
+    const svc = approvalService(dbStub.db as any);
+    await expect(svc.withdraw("approval-1", { agentId: "someone-else" })).rejects.toMatchObject({
+      status: 403,
+    });
+    expect(dbStub.returning).not.toHaveBeenCalled();
+  });
+
+  it("refuses withdrawal of an already-decided approval", async () => {
+    const dbStub = createDbStub([[createApproval("approved")]], []);
+
+    const svc = approvalService(dbStub.db as any);
+    await expect(svc.withdraw("approval-1", { agentId: "requester-1" })).rejects.toMatchObject({
+      status: 422,
+    });
+    expect(dbStub.returning).not.toHaveBeenCalled();
+  });
+
+  it("is idempotent when the approval is already withdrawn by the same agent", async () => {
+    const dbStub = createDbStub([[createApproval("withdrawn")]], []);
+
+    const svc = approvalService(dbStub.db as any);
+    const result = await svc.withdraw("approval-1", { agentId: "requester-1" });
+
+    expect(result.applied).toBe(false);
+    expect(result.approval.status).toBe("withdrawn");
+    expect(dbStub.returning).not.toHaveBeenCalled();
+  });
+
+  it("refuses withdrawal when it loses the race with a board decision", async () => {
+    const dbStub = createDbStub([[createApproval("pending")], [createApproval("approved")]], []);
+
+    const svc = approvalService(dbStub.db as any);
+    await expect(svc.withdraw("approval-1", { agentId: "requester-1" })).rejects.toMatchObject({
+      status: 422,
+    });
+  });
+});
