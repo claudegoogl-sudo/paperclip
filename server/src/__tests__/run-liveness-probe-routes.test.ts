@@ -25,7 +25,7 @@ import { agentRoutes } from "../routes/agents.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 
-// Reaper-safe run liveness (PLA-6546): the liveness probe exposed on the run GET and the
+// Reaper-safe run liveness: the liveness probe exposed on the run GET and the
 // company live-runs list must reflect the SAME in-memory registry the host-slot accounting
 // and the reaper use, so an external actor can distinguish a live (possibly provider-stalled)
 // run from an orphaned row before treating a silent log tail as death evidence. The
@@ -225,7 +225,7 @@ describeEmbeddedPostgres("run liveness probe routes", () => {
 
     // Anti-enumeration contract: an out-of-company read is a uniform 404 whose body is
     // only the not-found error — the liveness block (and every other field) stays hidden.
-    // The invariant pinned here (PLA-6546 AC2) is that the new fields do NOT widen access.
+    // The invariant pinned here is that the new fields do NOT widen access.
     const res = await request(createApp(boardActor(companyB.id)))
       .get(`/api/heartbeat-runs/${run.id}`)
       .expect(404);
