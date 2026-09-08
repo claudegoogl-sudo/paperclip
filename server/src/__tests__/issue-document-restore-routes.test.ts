@@ -155,13 +155,17 @@ function registerModuleMocks() {
 }
 
 function createRunContextDb(contextSnapshot: Record<string, unknown>) {
+  // Run ids are UUIDs in production (loadActorRunContext treats a non-UUID
+  // run header as unknown because it can never match a persisted row), so the
+  // fixture run id must be UUID-shaped.
+  const runId = "89999999-9999-4999-8999-999999999998";
   return {
     select: vi.fn(() => ({
       from: vi.fn(() => ({
         where: vi.fn(() => ({
           then: async (resolve: (rows: unknown[]) => unknown) =>
             resolve([{
-              id: "run-1",
+              id: runId,
               companyId,
               agentId: "agent-1",
               contextSnapshot,
@@ -365,7 +369,7 @@ describe("issue document revision routes", () => {
         type: "agent",
         agentId: "agent-1",
         companyId,
-        runId: "run-1",
+        runId: "89999999-9999-4999-8999-999999999998",
         source: "agent_jwt",
       },
       createRunContextDb({

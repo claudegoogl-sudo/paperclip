@@ -198,8 +198,39 @@ describe("cross-issue influence limit rollout", () => {
     expect(fake.inserted).toEqual([]);
   });
 
-  it("fails closed when the persisted run has no source issue", async () => {
-    const fake = counterDb(0, { contextSnapshot: {} });
+  it("allows and counts a contextless timer/manual run instead of failing closed", async () => {
+    // Timer, manual/on-demand, and retry wakes enrich the snapshot only when
+    // the wake payload carries the issue, so the matched run row can exist
+    // without any source issue. That is a legitimate run shape, not an
+    // attribution failure: the write proceeds and counts toward the cap, and
+    // the observation row records the absent source as null.
+    const fake = counterDb(0, { contextSnapshot: { wakeSource: "on_demand" } });
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "comment",
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    })).resolves.toMatchObject({
+      allowed: true,
+      mode: "enforce",
+      count: 1,
+      cap: CROSS_ISSUE_INFLUENCE_LIMIT,
+    });
+    expect(fake.inserted).toEqual([
+      expect.objectContaining({
+        action: "issue.cross_issue_influence_observed",
+        details: expect.objectContaining({ sourceIssueId: null }),
+      }),
+    ]);
+  });
+
+  it("gives a contextless run no same-issue exemption — every write counts", async () => {
+    // There is no source issue, so even a write to the issue the wake happens
+    // to touch cannot be exempted: the target must still consume budget.
+    const fake = counterDb(CROSS_ISSUE_INFLUENCE_LIMIT, { contextSnapshot: {} });
 
     await expect(observeCrossIssueInfluence(fake.db as never, {
       companyId: "22222222-2222-4222-8222-222222222222",
@@ -207,10 +238,17 @@ describe("cross-issue influence limit rollout", () => {
       agentId: "33333333-3333-4333-8333-333333333333",
       targetIssueId: "55555555-5555-4555-8555-555555555555",
       kind: "update",
-    })).rejects.toMatchObject({
-      status: 403,
-      details: { code: "cross_issue_influence_run_context_required" },
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    })).resolves.toMatchObject({
+      allowed: false,
+      mode: "enforce",
+      count: CROSS_ISSUE_INFLUENCE_LIMIT + 1,
     });
-    expect(fake.inserted).toEqual([]);
+    expect(fake.inserted).toEqual([
+      expect.objectContaining({
+        action: "issue.cross_issue_influence_cap_rejected",
+        details: expect.objectContaining({ sourceIssueId: null }),
+      }),
+    ]);
   });
 });

@@ -5179,6 +5179,8 @@ export function agentRoutes(
       lastOutputStream: heartbeatRuns.lastOutputStream,
       lastOutputBytes: heartbeatRuns.lastOutputBytes,
       processStartedAt: heartbeatRuns.processStartedAt,
+      processPid: heartbeatRuns.processPid,
+      processGroupId: heartbeatRuns.processGroupId,
       issueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`.as("issueId"),
     };
 
@@ -5217,6 +5219,7 @@ export function agentRoutes(
       res.json(await Promise.all(rows.map(async (run) => runRedactions.redactForRun(companyId, run.id, {
         ...heartbeat.decorateActiveRunStatus(run),
         outputSilence: await heartbeat.buildRunOutputSilence(run),
+        livenessProbe: heartbeat.buildRunLivenessProbe(run),
       }))));
       return;
     }
@@ -5224,6 +5227,7 @@ export function agentRoutes(
     res.json(await Promise.all(liveRuns.map(async (run) => runRedactions.redactForRun(companyId, run.id, {
       ...heartbeat.decorateActiveRunStatus(run),
       outputSilence: await heartbeat.buildRunOutputSilence(run),
+      livenessProbe: heartbeat.buildRunLivenessProbe(run),
     }))));
   });
 
@@ -5237,7 +5241,15 @@ export function agentRoutes(
       run.companyId,
       run.id,
       redactCurrentUserValue(
-        { ...decoratedRun, retryExhaustedReason, outputSilence: await heartbeat.buildRunOutputSilence(run) },
+        {
+          ...decoratedRun,
+          retryExhaustedReason,
+          outputSilence: await heartbeat.buildRunOutputSilence(run),
+          // Reaper-safe liveness for `running` rows (null otherwise). Lets an external
+          // actor distinguish a live (possibly provider-stalled) run from an orphaned
+          // one before treating a silent log tail as death evidence.
+          livenessProbe: await heartbeat.getRunLivenessProbe(runId),
+        },
         await getCurrentUserRedactionOptions(),
       ),
     ));
