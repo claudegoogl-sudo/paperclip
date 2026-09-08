@@ -31,12 +31,18 @@ const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
   getByIdForUpdate: vi.fn(),
   getComment: vi.fn(),
+  getAncestors: vi.fn(),
+  getCurrentScheduledRetry: vi.fn(),
   getDependencyReadiness: vi.fn(),
   getRelationSummaries: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
+  findMentionedProjectIds: vi.fn(),
   list: vi.fn(),
   listAttachments: vi.fn(),
+  listBlockerAttention: vi.fn(),
   listComments: vi.fn(),
+  listProductivityReviews: vi.fn(),
+  listReviewAttention: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
   remove: vi.fn(),
   removeAttachment: vi.fn(),
@@ -70,11 +76,17 @@ const mockProjectService = vi.hoisted(() => ({
 
 const mockDocumentService = vi.hoisted(() => ({
   upsertIssueDocument: vi.fn(),
+  getIssueDocumentPayload: vi.fn(async () => ({
+    planDocument: null,
+    documentSummaries: [],
+    legacyPlanDocument: null,
+  })),
 }));
 
 const mockWorkProductService = vi.hoisted(() => ({
   createForIssue: vi.fn(),
   getById: vi.fn(),
+  listForIssue: vi.fn(async () => []),
   remove: vi.fn(),
   update: vi.fn(),
 }));
@@ -223,7 +235,7 @@ function registerRouteMocks() {
       listIssueVotesForUser: vi.fn(async () => []),
       saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
     }),
-    goalService: () => ({}),
+    goalService: () => ({ getById: async () => null, getDefaultCompanyGoal: async () => null }),
     heartbeatService: () => mockHeartbeatService,
     instanceSettingsService: () => ({
       get: vi.fn(async () => ({
@@ -316,6 +328,9 @@ function createRunContextDb(
   const rowsForSelection = async (selection: Record<string, unknown>) => {
     const keys = Object.keys(selection);
     if (keys.includes("entityId")) return [];
+    // Issue-detail route joins (linked cases) select aliased join rows; the
+    // agent-row fallback below would crash their row mapping, so they read empty.
+    if (keys.includes("case")) return [];
     if (keys.includes("contextSnapshot")) return runRows;
     if (keys.includes("agentCompanyId")) return runRows;
     if (keys.length === 0) {
@@ -477,6 +492,16 @@ describe("agent issue mutation checkout ownership", () => {
       unresolvedBlockerCount: 0,
     });
     mockIssueService.getRelationSummaries.mockReset();
+    // Issue-detail read projections (GET /api/issues/:id) used by the
+    // creator-reassign regression tests at the bottom of this file.
+    mockIssueService.getAncestors.mockResolvedValue([]);
+    mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
+    mockIssueService.findMentionedProjectIds.mockResolvedValue([]);
+    mockIssueService.listBlockerAttention.mockResolvedValue(new Map());
+    mockIssueService.listReviewAttention.mockResolvedValue(new Map());
+    mockIssueService.listProductivityReviews.mockResolvedValue(new Map());
+    mockIssueService.getCurrentScheduledRetry.mockResolvedValue(null);
+    mockWorkProductService.listForIssue.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockReset();
     mockIssueService.list.mockReset();
     mockIssueService.listAttachments.mockReset();
@@ -2411,6 +2436,179 @@ describe("agent issue mutation checkout ownership", () => {
 
       expect(res.status, JSON.stringify(res.body)).toBe(403);
       expect(res.body.error).toBe("Task-watchdog run context is not backed by an active persisted watchdog.");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("creator reassign-to-self on idle agent-assigned issues (default-open visible write)", () => {
+    // Regression fence for the default-open visible-issue-write rule (upstream
+    // #10804, live since fork.43): an agent that creates an issue already
+    // assigned to a peer must be able to retract it (reassign to self + cancel)
+    // whenever the issue is idle and readable. The decision must not depend on
+    // creator identity, so these tests grant nothing creator-specific — the
+    // creator decides exactly like any other standard-trust agent.
+    const creatorAgentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const thirdAgentId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const assigneeRunId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+
+    function creatorActor() {
+      return {
+        type: "agent",
+        agentId: creatorAgentId,
+        companyId,
+        source: "agent_key",
+        runId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      };
+    }
+
+    function thirdActor() {
+      return {
+        type: "agent",
+        agentId: thirdAgentId,
+        companyId,
+        source: "agent_key",
+        runId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+      };
+    }
+
+    function createdIdleIssue(overrides: Record<string, unknown> = {}) {
+      return makeIssue({
+        status: "todo",
+        assigneeAgentId: peerAgentId,
+        createdByAgentId: creatorAgentId,
+        createdByUserId: null,
+        ...overrides,
+      });
+    }
+
+    function allowVisibleIssueWrites() {
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed:
+          input.action === "issue:read" ||
+          input.action === "issue:mutate" ||
+          input.action === "issue:comment" ||
+          input.action === "company_scope:read" ||
+          input.action === "tasks:assign",
+        action: input.action,
+        // tasks:assign is part of the same-company standard-trust baseline the
+        // rule ships with; only the issue:* actions carry the visible-write
+        // reason the fence asserts on.
+        reason: input.action === "tasks:assign" ? "allow_explicit_grant" : "allow_visible_issue_write",
+        explanation: "Allowed by the shared visible-issue write rule.",
+      }));
+    }
+
+    function registerCompanyAgents() {
+      const known = new Map([
+        [creatorAgentId, creatorAgentId],
+        [thirdAgentId, thirdAgentId],
+        [peerAgentId, peerAgentId],
+        [ownerAgentId, ownerAgentId],
+      ]);
+      mockAgentService.getById.mockImplementation(async (id: string) => {
+        const matched = known.get(id);
+        return matched ? makeAgent(matched, { status: "active" }) : null;
+      });
+      mockAgentService.list.mockResolvedValue([...known.keys()].map((id) => makeAgent(id, { status: "active" })));
+      mockAgentService.resolveByReference.mockImplementation(async (_companyId: string, reference: string) => {
+        const matched = known.get(reference);
+        return { ambiguous: false, agent: matched ? makeAgent(matched, { status: "active" }) : null };
+      });
+    }
+
+    it("AC1: lets the creating agent retract an idle agent-assigned issue by reassigning to itself and cancelling", async () => {
+      allowVisibleIssueWrites();
+      registerCompanyAgents();
+      let record = createdIdleIssue();
+      mockIssueService.getById.mockImplementation(async () => record);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => {
+        record = { ...record, ...patch };
+        return record;
+      });
+
+      const app = await createApp(creatorActor());
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAgentId: creatorAgentId, status: "cancelled" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const fresh = await request(app).get(`/api/issues/${issueId}`);
+      expect(fresh.status, JSON.stringify(fresh.body)).toBe(200);
+      expect(fresh.body).toEqual(expect.objectContaining({
+        assigneeAgentId: creatorAgentId,
+        status: "cancelled",
+      }));
+    });
+
+    it("AC2: denies the same creator patch with the run-lock deny copy while the assignee holds the checkout", async () => {
+      allowVisibleIssueWrites();
+      registerCompanyAgents();
+      mockIssueService.getById.mockResolvedValue(createdIdleIssue({
+        status: "in_progress",
+        checkoutRunId: assigneeRunId,
+      }));
+
+      const app = await createApp(creatorActor());
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAgentId: creatorAgentId, status: "cancelled" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      // Machine-readable contract first: assert the structured code, boundary,
+      // and that the copy names the sanctioned path (comments), not full prose.
+      expect(res.body.details.code).toBe("issue_write_assignee_run_lock");
+      expect(res.body.details.boundary).toBe("Run checkout lock");
+      expect(res.body.details.sanctionedPath).toMatch(/comment/i);
+      expect(res.body.error).toContain("Who can act:");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("AC3: lets an unrelated standard-trust agent reassign the idle agent-assigned issue to itself", async () => {
+      allowVisibleIssueWrites();
+      registerCompanyAgents();
+      mockIssueService.getById.mockResolvedValue(createdIdleIssue());
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...createdIdleIssue(),
+        ...patch,
+      }));
+
+      const app = await createApp(thirdActor());
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAgentId: thirdAgentId });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledWith(
+        issueId,
+        expect.objectContaining({ assigneeAgentId: thirdAgentId }),
+      );
+    });
+
+    it("AC4: still denies an out-of-visibility actor with the not-visible code on read and write", async () => {
+      // The default-open write rule sits downstream of visibility: an actor that
+      // cannot read the issue keeps failing reads with the boundary error and
+      // writes with the not-visible code — the visible-write tests above cannot
+      // pass through a visibility bypass.
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: input.action === "company_scope:read",
+        action: input.action,
+        reason: input.action === "company_scope:read" ? "allow_explicit_grant" : "deny_not_visible",
+        explanation: "Issue is outside this actor's visibility.",
+      }));
+      registerCompanyAgents();
+      mockIssueService.getById.mockResolvedValue(createdIdleIssue());
+
+      const app = await createApp(thirdActor());
+      const read = await request(app).get(`/api/issues/${issueId}`);
+      expect(read.status, JSON.stringify(read.body)).toBe(403);
+      expect(read.body.error).toBe("Issue is outside this actor's authorization boundary");
+
+      const res = await request(app)
+        .patch(`/api/issues/${issueId}`)
+        .send({ assigneeAgentId: thirdAgentId, status: "cancelled" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details.code).toBe("issue_write_not_visible");
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
   });
