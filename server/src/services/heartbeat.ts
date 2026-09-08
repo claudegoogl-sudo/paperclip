@@ -9543,6 +9543,106 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { run: current, updated: false as const };
   }
 
+  // Completion-wins finalization: a run row that an external path reaped to
+  // `interrupted` (graceful-shutdown drain, lease-release terminalization)
+  // while its worker was actually still alive must not permanently contradict
+  // the worker's own clean exit. When the adapter's execution path returns a
+  // positive completion after the row left `running`, this compare-and-set
+  // makes the completion the last writer of the row: it overwrites the
+  // externally-written reap marker with the true outcome and preserves the
+  // reap as append-only provenance (a `completedAfterInterrupt` note merged
+  // into resultJson plus one lifecycle event recording both writes). Nothing
+  // is deleted. The CAS only matches `status='interrupted'`, so
+  // operator-intent outcomes (`cancelled`, `timed_out`) never yield, and a
+  // re-delivered completion finds no interrupted marker and converges
+  // without duplicating provenance or side effects.
+  async function persistRunCompletionAfterExternalInterrupt(
+    runId: string,
+    completion: {
+      // Callers reach this path only when the outcome is positive
+      // (`outcomeSucceeded` guard), but TS cannot narrow the shared `status`
+      // union through that boolean, so accept the wide type here.
+      status: string;
+      exitCode: number | null;
+      signal: string | null;
+      errorCode: string | null;
+      errorMessage: string | null;
+      finishedAt: Date;
+      usageJson: Record<string, unknown> | null;
+      resultJson: Record<string, unknown> | null;
+      sessionIdAfter: string | null;
+      stdoutExcerpt: string | null;
+      stderrExcerpt: string | null;
+      logBytes: number | null;
+      logSha256?: string | null;
+      logCompressed?: boolean;
+    },
+  ) {
+    const reaped = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    if (!reaped || reaped.status !== "interrupted") {
+      return { run: reaped, updated: false as const };
+    }
+
+    const reapedAt = reaped.finishedAt ? new Date(reaped.finishedAt) : null;
+    const resultJson = {
+      ...parseObject(reaped.resultJson),
+      ...parseObject(completion.resultJson),
+      completedAfterInterrupt: {
+        reapedErrorCode: reaped.errorCode ?? null,
+        reapedAt: reapedAt ? reapedAt.toISOString() : null,
+        completedAt: completion.finishedAt.toISOString(),
+        exitCode: completion.exitCode,
+      },
+    };
+    const write = await setRunStatusFromLive(runId, completion.status, ["interrupted"], {
+      finishedAt: completion.finishedAt,
+      error: completion.errorMessage,
+      errorCode: completion.errorCode,
+      exitCode: completion.exitCode,
+      signal: completion.signal,
+      usageJson: completion.usageJson,
+      resultJson,
+      sessionIdAfter: completion.sessionIdAfter,
+      stdoutExcerpt: completion.stdoutExcerpt,
+      stderrExcerpt: completion.stderrExcerpt,
+      logBytes: completion.logBytes,
+      ...(completion.logSha256 != null ? { logSha256: completion.logSha256 } : {}),
+      ...(completion.logCompressed != null ? { logCompressed: completion.logCompressed } : {}),
+    });
+    if (!write.updated || !write.run) {
+      return write;
+    }
+
+    const seq = await nextRunEventSeq(write.run.id);
+    await appendRunEvent(write.run, seq, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message: `completed after reap: exit ${completion.exitCode} at ${completion.finishedAt.toISOString()}`,
+      payload: {
+        reapedStatus: "interrupted",
+        reapedErrorCode: reaped.errorCode ?? null,
+        reapedAt: reapedAt ? reapedAt.toISOString() : null,
+        completionStatus: completion.status,
+        exitCode: completion.exitCode,
+      },
+    });
+    logger.info(
+      {
+        runId,
+        reapedErrorCode: reaped.errorCode ?? null,
+        status: completion.status,
+        exitCode: completion.exitCode,
+      },
+      "persisted late run completion over an external interruption reap",
+    );
+    return write;
+  }
+
   // Invariant: when a run releases its environment lease, the run row must be
   // terminal. The finalizer writes the terminal status in a step that is
   // separate from the agent status=done PATCH. If the sandbox or the run
@@ -17434,7 +17534,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       let outcome: RunSessionOutcome;
       const latestRun = await getRun(run.id);
-      if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
+      // An externally-written `interrupted` marker (graceful-shutdown drain,
+      // lease-release terminalization) is a reap of a row whose worker may
+      // still be alive. It must not be adopted as the run's own outcome:
+      // when the adapter then returns a clean completion, the completion is
+      // the last writer of the row (see the late-completion handling below).
+      // Operator-intent statuses (`cancelled`, `timed_out`) still win.
+      if (isHeartbeatRunTerminalStatus(latestRun?.status) && latestRun?.status !== "interrupted") {
         outcome = latestRun.status;
       } else if (adapterResult.timedOut) {
         outcome = "timed_out";
@@ -17590,16 +17696,56 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logSha256: logSummary?.sha256,
         logCompressed: logSummary?.compressed ?? false,
       });
+      let lateCompletionAfterReap: typeof heartbeatRuns.$inferSelect | null = null;
       if (!persistedRunWrite.updated) {
-        logger.info(
-          {
-            runId: run.id,
-            attemptedStatus: status,
-            currentStatus: persistedRunWrite.run?.status ?? null,
-          },
-          "skipping late run finalization because the run already left running state",
-        );
-        return;
+        if (!outcomeSucceeded) {
+          logger.info(
+            {
+              runId: run.id,
+              attemptedStatus: status,
+              currentStatus: persistedRunWrite.run?.status ?? null,
+            },
+            "skipping late run finalization because the run already left running state",
+          );
+          return;
+        }
+        // The row left `running` before the finalization could write — e.g.
+        // the graceful-shutdown drain reaped it to `interrupted` while the
+        // worker was actually still going. A positive completion is the last
+        // writer of the row: overwrite the externally-written reap marker
+        // and keep the reap as append-only provenance. The reap path already
+        // terminalized the wakeup request and released the issue execution,
+        // so after this write we refresh liveness and the agent status only;
+        // running the normal post-completion side effects again would
+        // duplicate comments, retries and handoffs.
+        const reapCompletionWrite = await persistRunCompletionAfterExternalInterrupt(run.id, {
+          status,
+          exitCode: adapterResult.exitCode,
+          signal: adapterResult.signal,
+          errorCode: runErrorCode,
+          errorMessage: runErrorMessage,
+          finishedAt: new Date(),
+          usageJson,
+          resultJson: persistedResultJson,
+          sessionIdAfter: nextSessionState.displayId ?? nextSessionState.legacySessionId,
+          stdoutExcerpt,
+          stderrExcerpt,
+          logBytes: logSummary?.bytes ?? null,
+          logSha256: logSummary?.sha256 ?? null,
+          logCompressed: logSummary?.compressed ?? false,
+        });
+        if (!reapCompletionWrite.updated || !reapCompletionWrite.run) {
+          logger.info(
+            {
+              runId: run.id,
+              attemptedStatus: status,
+              currentStatus: reapCompletionWrite.run?.status ?? persistedRunWrite.run?.status ?? null,
+            },
+            "skipping late run finalization because the run already left running state",
+          );
+          return;
+        }
+        lateCompletionAfterReap = reapCompletionWrite.run;
       }
 
       if (runtimeResolution.kind === "native") {
@@ -17624,9 +17770,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
 
-      let persistedRun = persistedRunWrite.run;
+      let persistedRun = lateCompletionAfterReap ?? persistedRunWrite.run;
       if (persistedRun) {
         persistedRun = await classifyAndPersistRunLiveness(persistedRun, persistedResultJson) ?? persistedRun;
+      }
+
+      if (lateCompletionAfterReap) {
+        // Late completion over an external reap: the reap path already
+        // cancelled the wakeup request and released the issue execution, so
+        // skip the wakeup write and every downstream side effect (comments,
+        // retries, handoffs) — only finalize the agent status to the true
+        // outcome.
+        await finalizeAgentStatus(
+          agent.id,
+          outcome,
+          outcomeSucceeded ? null : runErrorMessage,
+          adapterResult.errorFamily ?? null,
+          {
+            keepIdleOnFailure: false,
+            wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+          },
+        );
+        return;
       }
 
       await setWakeupStatus(run.wakeupRequestId, outcomeSucceeded ? "completed" : status, {
