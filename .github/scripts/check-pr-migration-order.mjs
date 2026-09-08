@@ -14,7 +14,11 @@ function formatMigrationNumber(number) {
   return String(number).padStart(4, '0');
 }
 
-export function checkMigrationOrder(baseMigrationFiles, prMigrationFiles) {
+function migrationSlug(file) {
+  return file.split('/').pop().replace(/^\d{4}_/, '');
+}
+
+export function checkMigrationOrder(baseMigrationFiles, prMigrationFiles, opts = {}) {
   const invalidFiles = [...baseMigrationFiles, ...prMigrationFiles]
     .filter((file) => !parseMigration(file));
 
@@ -38,6 +42,40 @@ export function checkMigrationOrder(baseMigrationFiles, prMigrationFiles) {
     (latest, migration) => migration.number > latest.number ? migration : latest,
     { file: '(none)', number: -1 },
   );
+
+  // Fork-local sync patch (upstream PR #12433 has no sync concept). An
+  // upstream-sync merge interleaves upstream's new migrations with the
+  // fork's own renumbered block, so the append-only numbering rule below
+  // can never hold for a sync head. The invariant that matters instead is
+  // losslessness: every base migration survives on the head side, where
+  // surviving means its slug (filename minus the 4-digit number) appears
+  // among the added files after a renumber. Duplicate numbers and journal
+  // alignment stay the job of check:migrations.
+  const syncHead = opts.syncHead ?? /^sync\/upstream-/.test(process.env.GITHUB_HEAD_REF ?? '');
+  if (syncHead) {
+    const addedSlugs = new Set(prMigrations.map((migration) => migrationSlug(migration.file)));
+    const lost = (opts.deletedBaseFiles ?? [])
+      .map(parseMigration)
+      .filter((migration) => migration && !addedSlugs.has(migrationSlug(migration.file)));
+    if (lost.length > 0) {
+      return {
+        passed: false,
+        message: [
+          'Sync merge lost base migrations. A renumbered migration must keep its slug:',
+          ...lost.map((migration) => `- ${migration.file}`),
+        ].join('\n'),
+      };
+    }
+    const renumbered = (opts.deletedBaseFiles ?? []).length;
+    return {
+      passed: true,
+      message: [
+        `Sync merge: upstream migrations interleave with the fork block (base tip ${latestBaseMigration.file}).`,
+        `${renumbered} base migration(s) renumbered, none lost.`,
+      ].join('\n'),
+    };
+  }
+
   const outOfOrder = prMigrations.filter(
     (migration) => migration.number <= latestBaseMigration.number,
   );
@@ -90,10 +128,14 @@ function main() {
     'ls-tree', '-r', '--name-only', '-z', baseSha, '--', MIGRATIONS_DIRECTORY,
   ]).filter((file) => file.endsWith('.sql'));
   const prMigrationFiles = gitPaths([
-    'diff', '--name-only', '--diff-filter=A', '-z', `${baseSha}...${headSha}`, '--',
+    'diff', '--name-only', '--no-renames', '--diff-filter=A', '-z', `${baseSha}...${headSha}`, '--',
     MIGRATIONS_DIRECTORY,
   ]).filter((file) => file.endsWith('.sql'));
-  const result = checkMigrationOrder(baseMigrationFiles, prMigrationFiles);
+  const deletedBaseFiles = gitPaths([
+    'diff', '--name-only', '--no-renames', '--diff-filter=D', '-z', `${baseSha}...${headSha}`, '--',
+    MIGRATIONS_DIRECTORY,
+  ]).filter((file) => file.endsWith('.sql'));
+  const result = checkMigrationOrder(baseMigrationFiles, prMigrationFiles, { deletedBaseFiles });
 
   if (result.passed) {
     console.log(result.message);
