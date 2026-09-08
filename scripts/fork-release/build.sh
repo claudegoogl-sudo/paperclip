@@ -62,7 +62,14 @@ pnpm --filter @paperclipai/shared build 2>&1 | tail -1
 pnpm --filter @paperclipai/plugin-sdk build 2>&1 | tail -1
 
 echo "===== [5/10] full workspace build ====="
-pnpm -r build 2>&1 | tail -2
+# Full output goes to a log file so a mid-chain package failure can be
+# diagnosed from CI (a bare `| tail -2` discards the root-cause error).
+if ! pnpm -r build > "$REPO_ROOT/pnpm-build.log" 2>&1; then
+  echo "FATAL: pnpm -r build failed - last 40 lines:" >&2
+  tail -40 "$REPO_ROOT/pnpm-build.log" >&2
+  exit 1
+fi
+tail -2 "$REPO_ROOT/pnpm-build.log"
 
 echo "===== [6/10] build the sandbox-provider plugin dists ====="
 # The sandbox providers are deliberately NOT pnpm-workspace members (their
