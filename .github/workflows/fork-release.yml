@@ -70,6 +70,18 @@ jobs:
           node-version: 24
           cache: pnpm
 
+      - name: Setup Rust toolchain for the runner package (pin + cargo)
+        run: |
+          set -euo pipefail
+          TOOLCHAIN_FILE=packages/paperclip-runner/rust-toolchain.toml
+          if [ -f "$TOOLCHAIN_FILE" ]; then
+            CHANNEL="$(awk -F'"' '/^[[:space:]]*channel[[:space:]]*=/{print $2; exit}' "$TOOLCHAIN_FILE")"
+            echo "Installing pinned Rust toolchain ${CHANNEL} (minimal profile + cargo + rustfmt)"
+            rustup toolchain install "$CHANNEL" --profile minimal --component cargo --component rustfmt
+          else
+            echo "No rust-toolchain.toml pin found; using the image default toolchain"
+          fi
+
       - name: Build, pack, URL-pin, and statically gate the release
         run: |
           args=("${{ inputs.version }}" --out dist-tarballs)
