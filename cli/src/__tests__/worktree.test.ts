@@ -1584,21 +1584,38 @@ describe("worktree helpers", () => {
         });
 
         const { default: EmbeddedPostgres } = await import("embedded-postgres");
-        const targetPg = new EmbeddedPostgres({
-          databaseDir: targetConfig.database.embeddedPostgresDataDir,
-          user: "paperclip",
-          password: "paperclip",
-          port: targetConfig.database.embeddedPostgresPort,
-          persistent: true,
-          initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
-          onLog: () => {},
-          onError: () => {},
-        });
+        // The target cluster runs the fork's socket-only posture with a
+        // per-install credential file; read the seeded password instead of
+        // assuming the legacy literal, and connect over the unix socket.
+        const targetCred = readEmbeddedPostgresCredential(
+          targetConfig.database.embeddedPostgresDataDir,
+        );
+        const targetPassword =
+          targetCred?.password
+          ?? resolveEmbeddedPostgresPasswordForStartup(
+            targetConfig.database.embeddedPostgresDataDir,
+          ).password;
+        const targetPg = new EmbeddedPostgres(
+          buildEmbeddedPostgresConstructorOptions({
+            dataDir: targetConfig.database.embeddedPostgresDataDir,
+            port: targetConfig.database.embeddedPostgresPort,
+            password: targetPassword,
+            onLog: () => {},
+            onError: () => {},
+          }),
+        );
 
         await targetPg.start();
         try {
           const targetDb = createDb(
-            `postgres://paperclip:paperclip@127.0.0.1:${targetConfig.database.embeddedPostgresPort}/paperclip`,
+            buildEmbeddedPostgresConnectionString({
+              port: targetConfig.database.embeddedPostgresPort,
+              database: "paperclip",
+              password: targetPassword,
+              socketDir: socketDirectoryPathFor(
+                targetConfig.database.embeddedPostgresDataDir,
+              ),
+            }),
           );
           const [seededLocalBoard] = await targetDb
             .select({ id: authUsers.id })

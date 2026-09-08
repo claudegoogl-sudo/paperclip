@@ -4316,10 +4316,24 @@ async function backupWorktreeReseedTarget(input: {
     input.targetConfig.database.embeddedPostgresPort,
   );
   try {
-    const adminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${targetHandle.port}/postgres`;
+    // The target cluster runs the fork's socket-only posture with a per-install
+    // credential password; build socket connection strings from the handle
+    // instead of legacy loopback-TCP literals.
+    const socketDir = socketDirectoryPathFor(input.targetConfig.database.embeddedPostgresDataDir);
+    const adminConnectionString = buildEmbeddedPostgresConnectionString({
+      port: targetHandle.port,
+      database: "postgres",
+      password: targetHandle.password,
+      socketDir,
+    });
     await ensurePostgresDatabase(adminConnectionString, "paperclip");
     const result = await runDatabaseBackup({
-      connectionString: `postgres://paperclip:paperclip@127.0.0.1:${targetHandle.port}/paperclip`,
+      connectionString: buildEmbeddedPostgresConnectionString({
+        port: targetHandle.port,
+        database: "paperclip",
+        password: targetHandle.password,
+        socketDir,
+      }),
       backupDir: path.resolve(input.targetPaths.backupDir, "repair"),
       retention: { dailyDays: 30, weeklyWeeks: 12, monthlyMonths: 12 },
       filenamePrefix: `${input.targetPaths.instanceId}-pre-repair`,
