@@ -4853,6 +4853,10 @@ export function issueRoutes(
     if (req.actor.type !== "agent") return null;
     const runId = req.actor.runId?.trim();
     if (!runId) return null;
+    // The run header is caller-controlled; a malformed value is unknown, not
+    // an error. Treat it as missing so the untrusted string never reaches a
+    // UUID equality (PostgreSQL would cast-error into a 500).
+    if (!isUuidLike(runId)) return null;
     const run = await db
       .select({
         id: heartbeatRuns.id,
