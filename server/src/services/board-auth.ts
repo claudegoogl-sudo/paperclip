@@ -166,6 +166,30 @@ export function boardAuthService(db: Db) {
       .then((rows) => rows.find((row) => !row.expiresAt || row.expiresAt.getTime() > now.getTime()) ?? null);
   }
 
+  // Same lookup as findBoardApiKeyByToken, but never discards a match on
+  // revoked/expired -- it classifies WHY the attempt failed so the caller
+  // can log a real authentication-event outcome instead of a bare "no key
+  // found". bad_key covers both an unknown token and a token that
+  // never existed; nothing here differentiates those on purpose (doing so
+  // would let an attacker learn key-existence from failure text).
+  async function findBoardApiKeyForAuthEvent(
+    token: string,
+  ): Promise<{
+    key: typeof boardApiKeys.$inferSelect | null;
+    outcome: "success" | "expired" | "revoked" | "bad_key";
+  }> {
+    const tokenHash = hashBearerToken(token);
+    const row = await db
+      .select()
+      .from(boardApiKeys)
+      .where(eq(boardApiKeys.keyHash, tokenHash))
+      .then((rows) => rows[0] ?? null);
+    if (!row) return { key: null, outcome: "bad_key" };
+    if (row.revokedAt) return { key: row, outcome: "revoked" };
+    if (row.expiresAt && row.expiresAt.getTime() <= Date.now()) return { key: row, outcome: "expired" };
+    return { key: row, outcome: "success" };
+  }
+
   async function touchBoardApiKey(id: string) {
     const nowMs = Date.now();
     pruneTouchedBoardApiKeys(nowMs);
@@ -481,6 +505,7 @@ export function boardAuthService(db: Db) {
   return {
     resolveBoardAccess,
     findBoardApiKeyByToken,
+    findBoardApiKeyForAuthEvent,
     touchBoardApiKey,
     revokeBoardApiKey,
     createNamedBoardApiKey,

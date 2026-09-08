@@ -1714,6 +1714,13 @@
       "when": 1786985700000,
       "tag": "0248_task_bridge_auto_renew",
       "breakpoints": true
+    },
+    {
+      "idx": 249,
+      "version": "7",
+      "when": 1786985800000,
+      "tag": "0249_board_api_key_auth_events",
+      "breakpoints": true
     }
   ]
 }

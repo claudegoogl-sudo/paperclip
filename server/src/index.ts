@@ -51,6 +51,7 @@ import {
   PLUGIN_WEBHOOK_DELIVERY_PRUNE_MAX_BATCHES,
   startPluginWebhookDeliveryRetention,
 } from "./services/plugin-webhook-delivery-retention.js";
+import { startBoardApiKeyAuthEventRetention } from "./services/board-api-key-auth-event-retention.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
 import {
@@ -1929,6 +1930,23 @@ export async function startServer(): Promise<StartedServer> {
       config.pluginWebhookDeliverySuccessRetentionDays,
       config.pluginWebhookDeliveryFailedRetentionDays,
       config.pluginWebhookDeliveryMaxRows,
+    );
+  }
+
+  if (config.boardApiKeyAuthEventRetentionEnabled) {
+    logger.info(
+      {
+        retentionDays: config.boardApiKeyAuthEventRetentionDays,
+        maxRows: config.boardApiKeyAuthEventMaxRows,
+        intervalMinutes: config.boardApiKeyAuthEventRetentionIntervalMinutes,
+      },
+      "Board API key auth event retention enabled",
+    );
+    startBoardApiKeyAuthEventRetention(
+      db,
+      config.boardApiKeyAuthEventRetentionIntervalMinutes * 60 * 1000,
+      config.boardApiKeyAuthEventRetentionDays,
+      config.boardApiKeyAuthEventMaxRows,
     );
   }
 

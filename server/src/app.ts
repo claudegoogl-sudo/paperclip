@@ -397,6 +397,18 @@ export async function createApp(
       bindHost: opts.bindHost,
     }),
   );
+  // The dedicated proxy IP or CIDR allowlist for requests that arrive through
+  // a TLS-terminating proxy. The global `TRUST_PROXY` setting never satisfies
+  // anything that reads this list; an operator sets it to the real
+  // TLS-terminating proxy addresses. An empty value keeps the confidential
+  // setup-token login responses on direct TLS (or a `local_trusted` loopback
+  // peer) only, and keeps board-key auth-event rows pinned to the immediate
+  // socket peer. Declared here, before both consumers (the actor middleware
+  // and the setup-token login transport).
+  const setupTokenLoginProxyAllowlist = (process.env.CLAUDE_LOGIN_TRUSTED_PROXIES ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
   // Resolve the acting credential (req.actor) and bind its provenance into
   // AsyncLocalStorage so logActivity records it centrally. The provenance
   // regression test drives the same registerActorContext, so removing the
@@ -404,6 +416,10 @@ export async function createApp(
   registerActorContext(app, db, {
     deploymentMode: opts.deploymentMode,
     resolveSession: opts.resolveSession,
+    // Same dedicated operator allowlist the confidential-transport guard uses
+    // (SR-7); the board-key auth-event log reads it only to derive
+    // source_ip. Never derived from the global TRUST_PROXY setting.
+    authEventTrustedProxies: setupTokenLoginProxyAllowlist,
   });
   app.use("/api/auth", authRoutes(db));
   if (opts.betterAuthHandler) {
@@ -491,15 +507,6 @@ export async function createApp(
   // back through the callback below, so the shutdown hook can cancel every live
   // session (SR-4).
   let setupTokenLoginService: SetupTokenSessionService | null = null;
-  // The dedicated proxy IP or CIDR allowlist for the confidential setup-token
-  // login responses (SR-7). The global `TRUST_PROXY` setting does not satisfy
-  // the guard; an operator sets this allowlist to the real TLS-terminating
-  // proxy addresses. An empty value keeps the confidential responses on direct
-  // TLS (or a `local_trusted` loopback peer) only.
-  const setupTokenLoginProxyAllowlist = (process.env.CLAUDE_LOGIN_TRUSTED_PROXIES ?? "")
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0);
   // The explicit operator declaration that a platform edge terminates TLS for
   // every client request (SR-7). This complements the allowlist for managed
   // platforms (Railway, Render, Fly, and the like) where the app socket is
