@@ -123,3 +123,4 @@ With the current implementation:
 - Heartbeat runs auto-start the workspace's `running`-desired runtime services (via `ensureRuntimeServicesForRun`); services set to `stopped`/`manual` stay UI-controlled.
 - A configured runtime provision command runs once, lazily, before the first runtime-service start.
 - Server startup does not auto-restart workspace services.
+- Git operations that create commits or branches on behalf of a run are attributed to the run's agent, and the close path refuses to lose dirty or unpushed work. See [Agent Git Identity](/guides/agent-developer/agent-git-identity) for the identity scheme and the workspace durability contract.

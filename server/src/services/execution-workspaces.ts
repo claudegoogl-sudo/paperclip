@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import { and, asc, desc, eq, gt, inArray, isNull, lte, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  agents,
   executionWorkspaces,
   heartbeatRuns,
   issueComments,
@@ -742,6 +743,15 @@ async function quarantineRestoreDirtyWorkspaceBranch(input: {
   if (!sourceIssue) throw notFound("Source issue not found");
 
   const { ensureGitWorktreeBranchCoherent } = await import("./workspace-runtime.js");
+  // Attribute the rescue git operations to the run's agent when the
+  // reconcile actor is one. A missing/anonymous actor keeps prior behavior.
+  const rescueAgent = input.actor.agentId
+    ? await input.db
+        .select({ id: agents.id, name: agents.name, companyId: agents.companyId })
+        .from(agents)
+        .where(eq(agents.id, input.actor.agentId))
+        .then((rows) => rows[0] ?? null)
+    : null;
   try {
     const result = await ensureGitWorktreeBranchCoherent({
       db: input.db,
@@ -749,6 +759,7 @@ async function quarantineRestoreDirtyWorkspaceBranch(input: {
       worktreePath: input.inspection.worktreePath,
       expectedBranchName: input.inspection.fromBranch,
       actualBranchName: input.inspection.toBranch,
+      agent: rescueAgent,
       sourceIssue,
       executionWorkspaceId: input.workspace.id,
       heartbeatRunId: input.actor.runId,

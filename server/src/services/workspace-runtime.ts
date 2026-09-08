@@ -6,7 +6,10 @@ import os from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import type { AdapterRuntimeServiceReport } from "@paperclipai/adapter-utils";
+import {
+  buildAgentGitIdentityEnv,
+  type AdapterRuntimeServiceReport,
+} from "@paperclipai/adapter-utils";
 import type { Db } from "@paperclipai/db";
 import { executionWorkspaces, issueComments, issues, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import {
@@ -157,6 +160,23 @@ export interface ExecutionWorkspaceAgentRef {
   id: string | null;
   name: string;
   companyId: string;
+}
+
+/**
+ * Env block attributing host-executed git operations that create
+ * commits or branches on behalf of a run to the agent that owns the run (same
+ * scheme the adapter process env injects). Read-only git operations ignore
+ * GIT_* env, so only the mutating call sites thread this. Returns undefined
+ * when no agent is known, keeping those call sites behavior-identical.
+ */
+function agentGitInvocationEnv(
+  agent: ExecutionWorkspaceAgentRef | null | undefined,
+): NodeJS.ProcessEnv | undefined {
+  if (!agent?.id) return undefined;
+  return {
+    ...process.env,
+    ...buildAgentGitIdentityEnv({ id: agent.id, name: agent.name, companyId: agent.companyId }),
+  };
 }
 
 export interface RealizedExecutionWorkspace extends ExecutionWorkspaceInput {
@@ -1712,6 +1732,7 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
   repoRoot: string;
   worktreePath: string;
   expectedBranchName: string;
+  agent?: ExecutionWorkspaceAgentRef | null;
   sourceIssue: ExecutionWorkspaceIssueRef | null;
   executionWorkspaceId: string | null;
   heartbeatRunId: string | null;
@@ -1719,6 +1740,7 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
   phase?: "worktree_prepare" | "workspace_finalize";
   recorder?: WorkspaceOperationRecorder | null;
 }): Promise<DirtyQuarantineRepairResult> {
+  const identityEnv = agentGitInvocationEnv(input.agent);
   const companyId = await readIssueCompanyId(input.db, input.evidence.sourceIssueId);
   if (!companyId) {
     input.evidence.safeRepair.eligible = false;
@@ -1764,6 +1786,7 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
     await recordGitOperation(input.recorder, {
       phase: input.phase ?? "worktree_prepare",
       args: ["checkout", "-b", rescueBranch],
+      env: identityEnv,
       cwd: input.worktreePath,
       metadata: baseMetadata,
       successMessage: `Created rescue branch ${rescueBranch} for dirty git worktree state at ${input.worktreePath}\n`,
@@ -1773,6 +1796,7 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
     await recordGitOperation(input.recorder, {
       phase: input.phase ?? "worktree_prepare",
       args: ["add", "-A"],
+      env: identityEnv,
       cwd: input.worktreePath,
       metadata: baseMetadata,
       successMessage: `Staged dirty git worktree state for rescue branch ${rescueBranch}\n`,
@@ -1793,6 +1817,7 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
           `Fingerprint: ${input.evidence.fingerprint}`,
         ].join("\n"),
       ],
+      env: identityEnv,
       cwd: input.worktreePath,
       metadata: baseMetadata,
       successMessage: `Committed dirty git worktree state to rescue branch ${rescueBranch}\n`,
@@ -1802,6 +1827,7 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
     await recordGitOperation(input.recorder, {
       phase: input.phase ?? "worktree_prepare",
       args: ["checkout", input.expectedBranchName],
+      env: identityEnv,
       cwd: input.worktreePath,
       metadata: {
         ...baseMetadata,
@@ -1825,6 +1851,7 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
       await recordGitOperation(input.recorder, {
         phase: input.phase ?? "worktree_prepare",
         args: quitArgs,
+        env: identityEnv,
         cwd: input.worktreePath,
         metadata: {
           ...baseMetadata,
@@ -2076,6 +2103,7 @@ export async function ensureGitWorktreeBranchCoherent(input: {
   repoRoot: string;
   worktreePath: string;
   expectedBranchName: string | null;
+  agent?: ExecutionWorkspaceAgentRef | null;
   sourceIssue: ExecutionWorkspaceIssueRef | null;
   executionWorkspaceId?: string | null;
   actualBranchName?: string | null;
@@ -2088,6 +2116,7 @@ export async function ensureGitWorktreeBranchCoherent(input: {
 }): Promise<GitWorktreeBranchCoherenceResult> {
   const expectedBranchName = input.expectedBranchName?.trim();
   if (!expectedBranchName) return { branchName: null, reconciledForward: false, warnings: [] };
+  const identityEnv = agentGitInvocationEnv(input.agent);
 
   const currentBranch = input.actualBranchName !== undefined
     ? input.actualBranchName
@@ -2140,6 +2169,7 @@ export async function ensureGitWorktreeBranchCoherent(input: {
       sourceIssue: input.sourceIssue,
       executionWorkspaceId: input.executionWorkspaceId ?? null,
       heartbeatRunId: input.heartbeatRunId ?? null,
+      agent: input.agent ?? null,
       evidence,
       phase: input.reconcileOperationPhase,
       recorder: input.recorder ?? null,
@@ -2289,6 +2319,7 @@ export async function ensureGitWorktreeBranchCoherent(input: {
       await recordGitOperation(input.recorder, {
         phase: "worktree_prepare",
         args: ["checkout", "-B", expectedBranchName, evidence.provenance.actualHeadSha],
+        env: identityEnv,
         cwd: input.worktreePath,
         metadata: {
           repoRoot: input.repoRoot,
@@ -2333,6 +2364,7 @@ export async function ensureGitWorktreeBranchCoherent(input: {
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
       args: ["checkout", expectedBranchName],
+      env: identityEnv,
       cwd: input.worktreePath,
       metadata: {
         repoRoot: input.repoRoot,
@@ -2529,6 +2561,7 @@ async function resolveAuthoritativeBaseRef(
 // after a long planning phase without ever destroying in-progress work. Only
 // remote-tracking bases are eligible; local-only bases keep warn-only drift.
 async function refreshUnstartedWorktreeToBase(input: {
+  env?: NodeJS.ProcessEnv | null;
   repoRoot: string;
   worktreePath: string;
   branchName: string | null;
@@ -2575,6 +2608,7 @@ async function refreshUnstartedWorktreeToBase(input: {
   await recordGitOperation(input.recorder, {
     phase: "worktree_prepare",
     args: ["reset", "--hard", input.currentBaseRefSha],
+    env: input.env ?? undefined,
     cwd: input.worktreePath,
     metadata: {
       repoRoot: input.repoRoot,
@@ -2970,13 +3004,14 @@ async function recordGitOperation(
     phase: WorkspaceOperationPhase;
     args: string[];
     cwd: string;
+    env?: NodeJS.ProcessEnv | null;
     metadata?: Record<string, unknown> | null;
     successMessage?: string | null;
     failureLabel?: string | null;
   },
 ): Promise<string> {
   if (!recorder) {
-    return runGit(input.args, input.cwd);
+    return runGit(input.args, input.cwd, { env: input.env ?? undefined });
   }
 
   let stdout = "";
@@ -2992,6 +3027,7 @@ async function recordGitOperation(
         command: "git",
         args: input.args,
         cwd: input.cwd,
+        env: input.env ?? undefined,
       });
       stdout = result.stdout;
       stderr = result.stderr;
@@ -3236,6 +3272,7 @@ export async function realizeExecutionWorkspace(input: {
   }
 
   const repoRoot = await resolveGitOwnerRepoRoot(input.base.baseCwd);
+  const identityEnv = agentGitInvocationEnv(input.agent);
   let branchName: string;
   if (requestedExistingBranch) {
     // Exact-branch mode: attach the requested pre-existing branch verbatim.
@@ -3312,6 +3349,7 @@ export async function realizeExecutionWorkspace(input: {
     // the unstarted-worktree fast-forward that template-derived reuse gets.
     const refresh = currentBaseRefSha && !requestedExistingBranch
       ? await refreshUnstartedWorktreeToBase({
+          env: identityEnv,
           repoRoot,
           worktreePath: reusablePath,
           branchName: effectiveBranchName,
@@ -3400,6 +3438,7 @@ export async function realizeExecutionWorkspace(input: {
         repoRoot,
         worktreePath: reusablePath,
         expectedBranchName: branchName,
+        agent: input.agent,
         actualBranchName: validation.actualBranchName ?? null,
         sourceIssue: input.issue,
         executionWorkspaceId: null,
@@ -3481,6 +3520,7 @@ export async function realizeExecutionWorkspace(input: {
       await recordGitOperation(input.recorder, {
         phase: "worktree_prepare",
         args: ["worktree", "add", worktreePath, branchName],
+        env: identityEnv,
         cwd: repoRoot,
         metadata: {
           repoRoot,
@@ -3552,6 +3592,7 @@ export async function realizeExecutionWorkspace(input: {
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
       args: ["worktree", "add", "-b", branchName, worktreePath, baseRef],
+      env: identityEnv,
       cwd: repoRoot,
       metadata: {
         repoRoot,
@@ -3572,6 +3613,7 @@ export async function realizeExecutionWorkspace(input: {
       await recordGitOperation(input.recorder, {
         phase: "worktree_prepare",
         args: ["worktree", "add", worktreePath, branchName],
+        env: identityEnv,
         cwd: repoRoot,
         metadata: {
           repoRoot,
@@ -3655,6 +3697,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
 }): Promise<RealizedExecutionWorkspace | null> {
   const cwd = asString(input.workspace.cwd ?? input.workspace.providerRef, "").trim();
   if (!cwd) return null;
+  const identityEnv = agentGitInvocationEnv(input.agent);
 
   const strategy = input.workspace.strategyType === "git_worktree" ? "git_worktree" : "project_primary";
   const realized: RealizedExecutionWorkspace = {
@@ -3720,6 +3763,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         repoRoot,
         worktreePath: reuseWorktreePath,
         expectedBranchName: realized.branchName,
+        agent: input.agent,
         sourceIssue: input.issue,
         executionWorkspaceId: input.workspace.id ?? null,
         heartbeatRunId: input.heartbeatRunId ?? null,
@@ -3763,6 +3807,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     // Never run it for an attached operator-owned ref.
     const refresh = realized.branchCreatedByRuntime && reuseBaseRef && currentBaseRefSha
       ? await refreshUnstartedWorktreeToBase({
+          env: identityEnv,
           repoRoot,
           worktreePath: reuseWorktreePath,
           branchName: realized.branchName,
@@ -3817,6 +3862,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
       args: ["worktree", "add", worktreePath, branchName],
+      env: identityEnv,
       cwd: repoRoot,
       metadata: {
         repoRoot,
@@ -3848,6 +3894,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
       args: ["worktree", "add", "-b", branchName, worktreePath, baseRef],
+      env: identityEnv,
       cwd: repoRoot,
       metadata: {
         repoRoot,

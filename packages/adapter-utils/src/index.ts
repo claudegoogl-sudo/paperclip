@@ -67,6 +67,16 @@ export {
 } from "./command-redaction.js";
 export { buildSandboxNpmInstallCommand } from "./sandbox-install-command.js";
 export {
+  AGENT_GIT_IDENTITY_EMAIL_DOMAIN,
+  AGENT_GIT_IDENTITY_NAME_SEGMENT_MAX_CHARS,
+  buildAgentGitIdentityEnv,
+  deriveAgentGitIdentity,
+} from "./git-identity.js";
+export type {
+  AgentGitIdentity,
+  AgentGitIdentityInput,
+} from "./git-identity.js";
+export {
   buildAdapterEnvConfig,
   parseEnvBindings,
   parseEnvVars,
