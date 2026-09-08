@@ -91,7 +91,7 @@ export function collectSecretRefs(adapterConfig: unknown): Array<{
   return refs;
 }
 
-function collectUserSecretRefs(adapterConfig: unknown): Array<{
+export function collectUserSecretRefs(adapterConfig: unknown): Array<{
   definitionKey: string;
   configPath: string;
   envKey: string;

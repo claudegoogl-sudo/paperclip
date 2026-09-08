@@ -78,6 +78,7 @@ export interface Config {
   pluginWebhookDeliveryFailedRetentionDays: number;
   pluginWebhookDeliveryMaxRows: number;
   pluginWebhookDeliveryRetentionIntervalMinutes: number;
+  workspaceReaperCooldownDays: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -313,6 +314,21 @@ export function loadConfig(): Config {
     1,
     Number(process.env.PAPERCLIP_PLUGIN_WEBHOOK_DELIVERY_RETENTION_INTERVAL_MINUTES) || 60,
   );
+  // The terminal-workspace reaper waits this many days after an issue tree
+  // becomes terminal before it archives the workspace. A person can reopen the
+  // work inside this window. A value of 0 disables the cooldown and restores
+  // immediate reaping. A negative or non-numeric value falls back to the
+  // default. The day granularity and the default of 7 obey the
+  // PAPERCLIP_DB_BACKUP_RETENTION_DAYS precedent above.
+  const workspaceReaperCooldownDaysEnv =
+    process.env.PAPERCLIP_WORKSPACE_REAPER_COOLDOWN_DAYS?.trim();
+  const workspaceReaperCooldownDaysRaw = Number(workspaceReaperCooldownDaysEnv);
+  const workspaceReaperCooldownDays =
+    workspaceReaperCooldownDaysEnv
+      && Number.isFinite(workspaceReaperCooldownDaysRaw)
+      && workspaceReaperCooldownDaysRaw >= 0
+      ? workspaceReaperCooldownDaysRaw
+      : 7;
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -376,6 +392,7 @@ export function loadConfig(): Config {
     pluginWebhookDeliveryFailedRetentionDays,
     pluginWebhookDeliveryMaxRows,
     pluginWebhookDeliveryRetentionIntervalMinutes,
+    workspaceReaperCooldownDays,
     serveUi:
       process.env.SERVE_UI !== undefined
         ? process.env.SERVE_UI === "true"

@@ -507,7 +507,7 @@ describe("migration safety check", () => {
 });
 
 const POSTURE_RULE = "unqualified-mutation-security-posture-column";
-const MIGRATION_0225 = "0225_secret_binding_egress_allowlist.sql";
+const MIGRATION_0233 = "0233_secret_binding_egress_allowlist.sql";
 
 function postureFindings(sql: string) {
   return analyze(sql).newFindings.filter((finding) => finding.rule === POSTURE_RULE);
@@ -517,12 +517,12 @@ describe("unqualified mutation of a security-posture column", () => {
   // The regression test that matters: the real historical statement, read off
   // disk, not a synthetic reconstruction of it.
   const migration0138 = readFileSync(
-    new URL(`./migrations/${MIGRATION_0225}`, import.meta.url),
+    new URL(`./migrations/${MIGRATION_0233}`, import.meta.url),
     "utf8",
   );
 
   it("fires as an error on the real 0225 text that flattened every binding", () => {
-    const result = analyzeMigrationSafety([{ fileName: MIGRATION_0225, sql: migration0138 }], {
+    const result = analyzeMigrationSafety([{ fileName: MIGRATION_0233, sql: migration0138 }], {
       baselineIds: [],
       estimates: testEstimates,
     });
@@ -554,14 +554,14 @@ describe("unqualified mutation of a security-posture column", () => {
   });
 
   it("keeps 0225 green in CI through a baseline entry that states a reason", () => {
-    const result = analyzeMigrationSafety([{ fileName: MIGRATION_0225, sql: migration0138 }], {
+    const result = analyzeMigrationSafety([{ fileName: MIGRATION_0233, sql: migration0138 }], {
       estimates: testEstimates,
     });
     expect(result.newFindings).toEqual([]);
     expect(result.baselineFindings.map((entry) => entry.rule)).toContain(POSTURE_RULE);
 
     const entry = MIGRATION_SAFETY_BASELINE.find((candidate) => candidate.rule === POSTURE_RULE);
-    expect(entry?.migration).toBe(MIGRATION_0225);
+    expect(entry?.migration).toBe(MIGRATION_0233);
     expect(entry?.reason.trim().length).toBeGreaterThan(20);
   });
 
@@ -597,7 +597,7 @@ describe("unqualified mutation of a security-posture column", () => {
     `;
     expect(postureFindings(rewritten)).toHaveLength(1);
 
-    const result = analyzeMigrationSafety([{ fileName: MIGRATION_0225, sql: rewritten }], {
+    const result = analyzeMigrationSafety([{ fileName: MIGRATION_0233, sql: rewritten }], {
       estimates: testEstimates,
     });
     expect(result.newFindings).toEqual([]);
