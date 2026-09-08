@@ -695,7 +695,8 @@ describe("routine routes", () => {
     expect(res.body.details).toEqual([expect.objectContaining({
       code: "unrecognized_keys",
       keys: ["triggers"],
-      message: "Unrecognized key(s) in object: 'triggers'",
+      // Merged zod (v4, pinned by upstream v2026.831.1) wording for the same issue.
+      message: "Unrecognized key: \"triggers\"",
     })]);
     expect(mockRoutineService.create).not.toHaveBeenCalled();
   });
@@ -721,7 +722,8 @@ describe("routine routes", () => {
     expect(res.body.details).toEqual([expect.objectContaining({
       code: "unrecognized_keys",
       keys: ["triggers"],
-      message: "Unrecognized key(s) in object: 'triggers'",
+      // Merged zod (v4, pinned by upstream v2026.831.1) wording for the same issue.
+      message: "Unrecognized key: \"triggers\"",
     })]);
     expect(mockRoutineService.update).not.toHaveBeenCalled();
   });
