@@ -12,7 +12,7 @@ import {
 // Seq Scan. It must NOT change any schema column or constraint; only indexes.
 
 const MIGRATION_URL = new URL(
-  "./migrations/0234_plugin_webhook_deliveries_retention.sql",
+  "./migrations/0242_plugin_webhook_deliveries_retention.sql",
   import.meta.url,
 );
 

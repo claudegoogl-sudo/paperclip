@@ -116,11 +116,6 @@ export const SECURITY_POSTURE_REJECTIONS = [
     reason: "Read only in conjunction with board_api_key_id, so a single-column flatten cannot manufacture an approval.",
   },
   {
-    table: "companies",
-    columns: ["attachment_max_bytes"],
-    reason: "Both <= 0 and NULL normalise to the default rather than to unlimited, and every value is Math.min-ed against a process ceiling, so no flatten widens it.",
-  },
-  {
     table: "issue_tree_holds",
     columns: ["release_policy"],
     reason: "NULL normalises to {strategy:\"manual\"}, the strictest value, so a flatten fails closed.",
@@ -167,6 +162,11 @@ export const SECURITY_POSTURE_REJECTIONS = [
       "provider_id", "refresh_token", "refresh_token_expires_at", "updated_at", "user_id"
     ],
     reason: "Third-party OAuth account links owned by better-auth. Credential material here is presented to the remote provider, which is the enforcing party; no in-repo predicate reads these columns to make a local access decision.",
+  },
+  {
+    table: "account",
+    columns: ["issuer"],
+    reason: "Third-party OAuth issuer URL for a better-auth account link; it names the remote provider, which is the enforcing party. No in-repo predicate reads it.",
   },
   {
     table: "activity_log",
@@ -309,7 +309,7 @@ export const SECURITY_POSTURE_REJECTIONS = [
   {
     table: "companies",
     columns: [
-      "brand_color", "created_at", "default_responsible_user_id", "description",
+      "created_at", "default_responsible_user_id", "description",
       "feedback_data_sharing_consent_at", "feedback_data_sharing_consent_by_user_id",
       "feedback_data_sharing_terms_version", "id", "issue_counter", "issue_prefix", "name",
       "pause_reason", "paused_at", "spent_monthly_cents", "updated_at"
@@ -619,6 +619,292 @@ export const SECURITY_POSTURE_REJECTIONS = [
       "stdout_excerpt", "trigger_detail", "updated_at", "usage_json", "wakeup_request_id"
     ],
     reason: "Run lifecycle, process handles, log pointers and output excerpts. What a run is allowed to do is resolved from the agent and issue rows at launch; these columns record what happened.",
+  },
+  // completion_contracts — upstream completion contract records; the columns below are metadata-only.
+
+  {
+    table: "completion_contracts",
+    columns: [
+     "company_id",
+     "created_by_actor_id",
+     "id",
+     "issue_id",
+     "supersedes_contract_id"
+    ],
+    reason: "Identifier or foreign-key column; it points at another row and carries no authorization decision of its own.",
+  },
+  {
+    table: "completion_contracts",
+    columns: [
+     "canonical_sha256",
+     "completion_authority",
+     "contract_json",
+     "incomplete_criteria_policy",
+     "policy_version",
+     "revision",
+     "risk",
+     "schema_version"
+    ],
+    reason: "Completion contract record: policy text, versioning and content digests describing how an issue may be completed. Read by the contract engine as a record of agreed policy, never as a row-level access predicate.",
+  },
+  {
+    table: "completion_contracts",
+    columns: [
+     "created_at",
+     "created_by_actor_type"
+    ],
+    reason: "Lifecycle timestamp and actor-type label for audit display; neither is consulted by an authorization decision.",
+  },
+  // heartbeat_run_events — upstream run event-stream records; the columns below are metadata-only.
+
+  {
+    table: "heartbeat_run_events",
+    columns: [
+     "protocol_schema_version",
+     "source_event_id",
+     "source_instance_id",
+     "source_payload_sha256",
+     "source_seq"
+    ],
+    reason: "Append-only run event-stream bookkeeping: sequence numbers, emitting-instance provenance and payload digests. No column here is read as a security predicate.",
+  },
+  {
+    table: "heartbeat_runs",
+    columns: [
+     "completion_contract_id",
+     "completion_contract_sha256",
+     "driver_kind",
+     "driver_version",
+     "native_issue_id",
+     "native_phase",
+     "native_phase_updated_at",
+     "native_session_id",
+     "next_event_seq",
+     "runner_instance_id",
+     "runner_profile_json",
+     "runtime_mode",
+     "runtime_mode_reason",
+     "runtime_mode_resolved_at",
+     "runtime_mode_resolver_version"
+    ],
+    reason: "Native-run and runtime-mode bookkeeping added upstream: driver metadata, native session pointers and runtime-mode resolution state. Same claim as the lifecycle entry above — what a run may do is resolved from the agent and issue rows at launch; these columns record what happened.",
+  },
+  // issue_question_response_deliveries — upstream question-response delivery records; the columns below are metadata-only.
+
+  {
+    table: "issue_question_response_deliveries",
+    columns: [
+     "company_id",
+     "correlation_id",
+     "id",
+     "interaction_id",
+     "issue_id",
+     "source_run_id",
+     "target_run_id",
+     "target_turn_id"
+    ],
+    reason: "Identifier or foreign-key column; it points at another row and carries no authorization decision of its own.",
+  },
+  {
+    table: "issue_question_response_deliveries",
+    columns: [
+     "acknowledged_at",
+     "attempt_count",
+     "created_at",
+     "delivery_mode",
+     "error_count",
+     "last_attempt_at",
+     "last_error_code",
+     "payload_sha256",
+     "status",
+     "updated_at"
+    ],
+    reason: "At-least-once delivery bookkeeping: attempt counters, timestamps, delivery mode and payload digests. No column here is read as a security predicate.",
+  },
+  {
+    table: "issues",
+    columns: ["last_status_decision_id"],
+    reason: "FK to the status_decisions row that last transitioned the issue; the decision row is itself a record, not a grant.",
+  },
+  {
+    table: "issues",
+    columns: ["status_version"],
+    reason: "Optimistic-concurrency counter for status transitions; it orders writes and never gates access.",
+  },
+  // native_run_finalizations — upstream native run finalization records; the columns below are metadata-only.
+
+  {
+    table: "native_run_finalizations",
+    columns: [
+     "assessment_id",
+     "company_id",
+     "decision_id",
+     "issue_id",
+     "lease_owner",
+     "result_id",
+     "run_id",
+     "attempt"
+    ],
+    reason: "Identifier, foreign-key or lease-ownership column; it points at another row or claims bookkeeping work and carries no authorization decision of its own.",
+  },
+  {
+    table: "native_run_finalizations",
+    columns: [
+     "created_at",
+     "lease_expires_at",
+     "next_attempt_at",
+     "updated_at"
+    ],
+    reason: "Lifecycle and retry-lease timestamps for bookkeeping; never consulted by an authorization decision.",
+  },
+  {
+    table: "native_run_finalizations",
+    columns: [
+     "failure_code",
+     "failure_detail",
+     "phase"
+    ],
+    reason: "Finalization outcome details for diagnostics; not consulted by any authorization decision.",
+  },
+  // native_run_results — upstream native run result records; the columns below are metadata-only.
+
+  {
+    table: "native_run_results",
+    columns: [
+     "caller_result_id",
+     "company_id",
+     "completion_contract_id",
+     "id",
+     "issue_id",
+     "run_id",
+     "turn_id"
+    ],
+    reason: "Identifier or foreign-key column; it points at another row and carries no authorization decision of its own.",
+  },
+  {
+    table: "native_run_results",
+    columns: ["caller_dedupe_key"],
+    reason: "Server-scoped dedupe key for at-least-once result ingestion; matching is ingestion bookkeeping, not an access decision.",
+  },
+  {
+    table: "native_run_results",
+    columns: [
+     "canonical_sha256",
+     "rejection_code",
+     "result_json",
+     "schema_status",
+     "server_fingerprint"
+    ],
+    reason: "Recorded run results and content digests — evidence of an outcome already produced, not an input to an access decision.",
+  },
+  {
+    table: "native_run_results",
+    columns: ["created_at"],
+    reason: "Lifecycle timestamp for bookkeeping and audit display; it is never consulted by an authorization decision.",
+  },
+  // status_decision_effects — upstream decision-effect delivery records; the columns below are metadata-only.
+
+  {
+    table: "status_decision_effects",
+    columns: [
+     "company_id",
+     "decision_id",
+     "id",
+     "issue_id",
+     "target_id",
+     "target_type"
+    ],
+    reason: "Identifier or foreign-key column; it points at another row and carries no authorization decision of its own.",
+  },
+  {
+    table: "status_decision_effects",
+    columns: [
+     "attempt_count",
+     "created_at",
+     "delivered_at",
+     "delivery_state",
+     "effect_kind",
+     "idempotency_key",
+     "last_error",
+     "next_attempt_at",
+     "ordinal",
+     "payload",
+     "updated_at"
+    ],
+    reason: "Delivery bookkeeping for an effect that was already decided: idempotency keys, payload snapshots and retry state. No column here is read as a security predicate.",
+  },
+  // status_decisions — upstream recorded status-transition decisions; the columns below are metadata-only.
+
+  {
+    table: "status_decisions",
+    columns: [
+     "assessment_id",
+     "company_id",
+     "id",
+     "issue_id",
+     "run_id",
+     "supersedes_decision_id"
+    ],
+    reason: "Identifier or foreign-key column; it points at another row and carries no authorization decision of its own.",
+  },
+  {
+    table: "status_decisions",
+    columns: [
+     "application_state",
+     "decision_digest",
+     "decision_json",
+     "decision_version",
+     "from_status",
+     "policy_version",
+     "reason_code",
+     "to_status"
+    ],
+    reason: "Recorded status-transition decisions — evidence of a decision already made, not an input to one.",
+  },
+  {
+    table: "status_decisions",
+    columns: [
+     "applied_at",
+     "created_at"
+    ],
+    reason: "Lifecycle timestamp for bookkeeping and audit display; it is never consulted by an authorization decision.",
+  },
+  // work_assessments — upstream work assessment records; the columns below are metadata-only.
+
+  {
+    table: "work_assessments",
+    columns: [
+     "company_id",
+     "contract_id",
+     "id",
+     "issue_id",
+     "prior_decision_id",
+     "result_id",
+     "run_id",
+     "supersedes_assessment_id",
+     "trigger_actor_company_id",
+     "turn_id"
+    ],
+    reason: "Identifier or foreign-key column; it points at another row and carries no authorization decision of its own.",
+  },
+  {
+    table: "work_assessments",
+    columns: [
+     "assessment_json",
+     "input_digest",
+     "policy_version",
+     "prior_issue_status",
+     "prior_status_version",
+     "trigger_capability",
+     "trigger_kind",
+     "trigger_ref"
+    ],
+    reason: "Recorded work assessments — policy-versioned evidence about completed work. Evaluated by the decision engine as a record of analysis, not read as a row-level access predicate.",
+  },
+  {
+    table: "work_assessments",
+    columns: ["created_at"],
+    reason: "Lifecycle timestamp for bookkeeping and audit display; it is never consulted by an authorization decision.",
   },
   {
     table: "inbox_dismissals",
@@ -1214,6 +1500,16 @@ export const SECURITY_POSTURE_REJECTIONS = [
     ],
     reason: "Lifecycle timestamp for bookkeeping and audit display; it is never consulted by an authorization decision.",
   },
+  {
+    table: "adapter_auth_sessions",
+    columns: ["bound_at"],
+    reason: "Lifecycle timestamp for bookkeeping and audit display; it is never consulted by an authorization decision.",
+  },
+  {
+    table: "adapter_auth_sessions",
+    columns: ["public_session_id"],
+    reason: "Public, unguessable session identifier handed to the login client for polling. It identifies the session but grants nothing: completion and binding require the separately verified device flow at the API layer.",
+  },
   // built_in_managed_resources — upstream built-in managed resource catalog; the columns below are metadata-only.
 
   {
@@ -1436,50 +1732,6 @@ export const SECURITY_POSTURE_REJECTIONS = [
     ],
     reason: "Lifecycle timestamp for bookkeeping and audit display; it is never consulted by an authorization decision.",
   },
-  // claude_setup_token_sessions — upstream claude setup-token login sessions; the columns below are metadata-only.
-
-  {
-    table: "claude_setup_token_sessions",
-    columns: ["owner_user_id"],
-    reason: "FK to the owning user; the user's authority is evaluated at the API layer.",
-  },
-  {
-    table: "claude_setup_token_sessions",
-    columns: ["session_id"],
-    reason: "FK to the setup-token login session row; the token itself never persists.",
-  },
-  {
-    table: "claude_setup_token_sessions",
-    columns: [
-     "company_id",
-     "environment_id",
-     "id",
-     "lease_id"
-    ],
-    reason: "Identifier or foreign-key column; it points at another row and carries no authorization decision of its own.",
-  },
-  {
-    table: "claude_setup_token_sessions",
-    columns: ["state"],
-    reason: "Lifecycle status used for workflow bookkeeping and display; not consulted by any authorization decision.",
-  },
-  {
-    table: "claude_setup_token_sessions",
-    columns: ["adapter_type"],
-    reason: "Metadata column with no authorization semantics; the enforcing gates for this subsystem are registered as posture columns separately.",
-  },
-  {
-    table: "claude_setup_token_sessions",
-    columns: [
-     "bound_at",
-     "created_at",
-     "deadline_at",
-     "updated_at"
-    ],
-    reason: "Lifecycle timestamp for bookkeeping and audit display; it is never consulted by an authorization decision.",
-  },
-  // companies — company row (new upstream column); the columns below are metadata-only.
-
   // company_onboarding_seeds — upstream company onboarding seed spec; the columns below are metadata-only.
 
   {
@@ -1554,6 +1806,11 @@ export const SECURITY_POSTURE_REJECTIONS = [
     table: "company_secret_proposals",
     columns: ["secret_proposal_id"],
     reason: "FK within the proposals subsystem.",
+  },
+  {
+    table: "company_secret_proposals",
+    columns: ["interaction_id"],
+    reason: "FK to the interaction that surfaced the proposal; the proposal row's own gates carry the authorization.",
   },
   {
     table: "company_secret_proposals",

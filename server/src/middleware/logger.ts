@@ -8,6 +8,7 @@ import { resolveDefaultLogsDir, resolveHomeAwarePath } from "../home-paths.js";
 import { shouldSilenceHttpSuccessLog } from "./http-log-policy.js";
 import { redactSecretsForLog, redactSecretsDeepForLog } from "../secret-patterns.js";
 import { redactSensitive } from "./redact-sensitive.js";
+import { redactWorkspaceHandoffTicket } from "../auth/workspace-login-handoff.js";
 
 /**
  * Censor used by pino `redact` to scrub secret patterns from the serialised
@@ -124,12 +125,14 @@ export const httpLogger = pinoHttp({
     return "info";
   },
   customSuccessMessage(req, res) {
-    return redactSecretsForLog(`${req.method} ${req.url} ${res.statusCode}`);
+    // A workspace login handoff ticket is a bearer credential that rides in the
+    // query string, so the request line has to be redacted before it is logged.
+    return redactSecretsForLog(`${req.method} ${redactWorkspaceHandoffTicket(req.url ?? "")} ${res.statusCode}`);
   },
   customErrorMessage(req, res, err) {
     const ctx = (res as any).__errorContext;
     const errMsg = ctx?.error?.message || err?.message || (res as any).err?.message || "unknown error";
-    return redactSecretsForLog(`${req.method} ${req.url} ${res.statusCode} — ${errMsg}`);
+    return redactSecretsForLog(`${req.method} ${redactWorkspaceHandoffTicket(req.url ?? "")} ${res.statusCode} — ${errMsg}`);
   },
   customProps(req, res) {
     return redactSecretsDeepForLog(buildHttpLogProps(req, res));

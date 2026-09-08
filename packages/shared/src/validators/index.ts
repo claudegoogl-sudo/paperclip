@@ -1,4 +1,11 @@
 export {
+  nativeFinalizationResultSchema,
+  nativeFinalizationResultV1Schema,
+  nativeReportedWorkDispositionSchema,
+  type NativeFinalizationResultInput,
+} from "./native-finalization.js";
+
+export {
   decisionEffectStalenessSchema,
   decisionOptionStyleSchema,
   commentOnIssueDecisionEffectSchema,
@@ -89,6 +96,7 @@ export {
   startEnvironmentCustomImageSetupSessionSchema,
   finishEnvironmentCustomImageSetupSessionSchema,
   cancelEnvironmentCustomImageSetupSessionSchema,
+  relinkEnvironmentCustomImageTemplateSchema,
   createEnvironmentCustomImageTerminalSessionTokenSchema,
   environmentCustomImageTerminalSessionTokenSchema,
   type EnvironmentCustomImageSetupConnectionSummary,
@@ -97,6 +105,7 @@ export {
   type StartEnvironmentCustomImageSetupSession,
   type FinishEnvironmentCustomImageSetupSession,
   type CancelEnvironmentCustomImageSetupSession,
+  type RelinkEnvironmentCustomImageTemplate,
   type CreateEnvironmentCustomImageTerminalSessionToken,
   type EnvironmentCustomImageTerminalSessionToken,
 } from "./environment-custom-images.js";
@@ -460,6 +469,8 @@ export {
   requestConfirmationPayloadSchema,
   requestConfirmationResumeFailureSchema,
   requestConfirmationResultSchema,
+  requestConfirmationSecretProposalPayloadSchema,
+  requestConfirmationSecretProposalResultSchema,
   requestCheckboxConfirmationOptionSchema,
   requestCheckboxConfirmationPayloadSchema,
   requestCheckboxConfirmationResultSchema,
@@ -713,7 +724,10 @@ export {
 } from "./finance.js";
 
 export {
+  ASSET_NAMESPACE_MAX_LENGTH,
+  ASSET_NAMESPACE_RULE,
   createAssetImageMetadataSchema,
+  sanitizeAssetNamespace,
   type CreateAssetImageMetadata,
 } from "./asset.js";
 

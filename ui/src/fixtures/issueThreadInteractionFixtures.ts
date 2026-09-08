@@ -10,6 +10,7 @@ import type {
   IssueThreadInteractionBase,
   RequestCheckboxConfirmationInteraction,
   RequestConfirmationInteraction,
+  RequestConfirmationSecretProposalPayload,
   RequestConfirmationToolActionPayload,
   RequestItemVerdictsInteraction,
   SuggestTasksInteraction,
@@ -764,6 +765,125 @@ export const expiredToolActionInteraction = createToolActionConfirmationInteract
   },
 });
 
+// ---------------------------------------------------------------------------
+// Secret-binding proposal fixtures. These mirror the server-owned
+// `payload.secretProposal` block and intentionally contain display metadata
+// only: no secret ids, values, fingerprints, or version material.
+// ---------------------------------------------------------------------------
+
+const secretProposalBase: RequestConfirmationSecretProposalPayload = {
+  version: 1,
+  proposalId: "eeeeeee5-5555-4555-8555-5555555555e5",
+  sourceSecretLabel: "OpenAI API key",
+  configPath: "access.evals_openai_api_key",
+  targetAgentId: "ffffffff-6666-4666-8666-6666666666f6",
+  targetAgentName: "EvalsEngineer",
+  justification:
+    "The evaluation runner needs the existing credential under its canonical config name.",
+  expiresAt: expiresInMinutes(14 * 24 * 60),
+};
+
+function createSecretProposalConfirmationInteraction(
+  overrides: Partial<RequestConfirmationInteraction> & {
+    secretProposal?: Partial<RequestConfirmationSecretProposalPayload>;
+  },
+): RequestConfirmationInteraction {
+  const { secretProposal: secretProposalOverrides, payload, ...rest } = overrides;
+  return createRequestConfirmationInteraction({
+    id: "interaction-secret-proposal-default",
+    title: undefined,
+    summary: "Review a proposed alias for an existing secret binding.",
+    createdByAgentId: "agent-codex",
+    resolverPolicy: "human_only",
+    requestedResolverPolicy: "human_only",
+    effectiveResolverPolicy: "human_only",
+    payload: {
+      version: 1,
+      prompt: "Approve this secret binding?",
+      acceptLabel: "Approve & bind",
+      rejectLabel: "Reject",
+      allowDeclineReason: true,
+      ...payload,
+      secretProposal: { ...secretProposalBase, ...secretProposalOverrides },
+    },
+    ...rest,
+  });
+}
+
+export const pendingSecretProposalInteraction = createSecretProposalConfirmationInteraction({
+  id: "interaction-secret-proposal-pending",
+});
+
+export const executedSecretProposalInteraction = createSecretProposalConfirmationInteraction({
+  id: "interaction-secret-proposal-executed",
+  status: "accepted",
+  resolvedByUserId: issueThreadInteractionFixtureMeta.currentUserId,
+  resolvedAt: new Date("2026-04-20T15:02:00.000Z"),
+  updatedAt: new Date("2026-04-20T15:02:03.000Z"),
+  result: {
+    version: 1,
+    outcome: "accepted",
+    secretProposal: {
+      version: 1,
+      status: "executed",
+      updatedAt: "2026-04-20T15:02:03.000Z",
+    },
+  },
+});
+
+export const failedSecretProposalInteraction = createSecretProposalConfirmationInteraction({
+  id: "interaction-secret-proposal-failed",
+  status: "accepted",
+  resolvedByUserId: issueThreadInteractionFixtureMeta.currentUserId,
+  resolvedAt: new Date("2026-04-20T15:02:00.000Z"),
+  updatedAt: new Date("2026-04-20T15:02:03.000Z"),
+  result: {
+    version: 1,
+    outcome: "accepted",
+    secretProposal: {
+      version: 1,
+      status: "failed",
+      errorCode: "binding_snapshot_stale",
+      updatedAt: "2026-04-20T15:02:03.000Z",
+    },
+  },
+});
+
+export const rejectedSecretProposalInteraction = createSecretProposalConfirmationInteraction({
+  id: "interaction-secret-proposal-rejected",
+  status: "rejected",
+  resolvedByUserId: issueThreadInteractionFixtureMeta.currentUserId,
+  resolvedAt: new Date("2026-04-20T15:02:00.000Z"),
+  updatedAt: new Date("2026-04-20T15:02:00.000Z"),
+  result: {
+    version: 1,
+    outcome: "rejected",
+    reason: "Use the project-scoped credential instead.",
+    secretProposal: {
+      version: 1,
+      status: "rejected",
+      updatedAt: "2026-04-20T15:02:00.000Z",
+    },
+  },
+});
+
+export const expiredSecretProposalInteraction = createSecretProposalConfirmationInteraction({
+  id: "interaction-secret-proposal-expired",
+  status: "expired",
+  resolvedAt: new Date("2026-05-04T15:02:00.000Z"),
+  updatedAt: new Date("2026-05-04T15:02:00.000Z"),
+  secretProposal: { expiresAt: "2026-05-04T15:02:00.000Z" },
+  result: {
+    version: 1,
+    outcome: "superseded_by_newer_request",
+    secretProposal: {
+      version: 1,
+      status: "expired",
+      updatedAt: "2026-05-04T15:02:00.000Z",
+    },
+  },
+});
+
 export const commentExpiredRequestConfirmationInteraction = createRequestConfirmationInteraction({
   id: "interaction-confirmation-expired-comment",
   status: "expired",
@@ -847,7 +967,7 @@ export const humanOnlyRequestConfirmationInteraction =
   createRequestConfirmationInteraction({
     id: "interaction-confirmation-human-only",
     title: "Approve the customer-facing announcement",
-    summary: "Reserved for a human on the board because it commits the company publicly.",
+    summary: "Reserved for a human on the board because it commits the organization publicly.",
     requestedResolverPolicy: "human_only",
   });
 
@@ -856,7 +976,7 @@ export const companyCappedRequestConfirmationInteraction =
   createRequestConfirmationInteraction({
     id: "interaction-confirmation-company-capped",
     title: "Confirm the data retention change",
-    summary: "Asked for an open audience; the company caps this kind at a human decision.",
+    summary: "Asked for an open audience; the organization caps this kind at a human decision.",
     requestedResolverPolicy: "anyone",
     effectiveResolverPolicy: "human_only",
     effectiveResolverPolicySource: "company_cap",

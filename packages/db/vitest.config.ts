@@ -3,6 +3,7 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     environment: "node",
+    include: ["src/**/*.test.ts"],
     // Every suite in this package boots its own embedded Postgres; running
     // files in parallel multiplies postgres processes past what CI runners can
     // schedule, which shows up as pool/hook timeouts rather than test

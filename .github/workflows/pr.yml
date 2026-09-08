@@ -60,14 +60,25 @@ jobs:
         with:
           node-version: 24
 
+      - name: Validate migration ordering against target branch
+        run: >-
+          node .github/scripts/check-pr-migration-order.mjs
+          "${{ github.event.pull_request.base.sha }}"
+          "${{ github.event.pull_request.head.sha }}"
+
       - name: Validate Dockerfile deps stage
         run: node ./scripts/check-docker-deps-stage.mjs
+
+      - name: Validate Node version policy
+        run: pnpm check:node-version
 
       - name: Reject git push in adapter/runtime code
         run: node ./scripts/check-no-git-push.mjs
 
       - name: Test no-git-push check
         run: node --test ./scripts/check-no-git-push.test.mjs
+      - name: Test PR quality-gate scripts
+        run: node --test '.github/scripts/tests/*.test.mjs'
 
       # Published container ports bypass the INPUT chain that UFW governs, so the
       # publish bind address is the effective control. Guard against a new
@@ -387,6 +398,9 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Verify Paperclip Runner
+        run: pnpm --filter @paperclipai/paperclip-runner check:all
 
       - name: Build
         run: pnpm build

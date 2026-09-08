@@ -1,4 +1,19 @@
 export { agentAdapterTypeSchema, optionalAgentAdapterTypeSchema } from "./adapter-type.js";
+export { ADAPTER_AUTH_MISSING_CHECK_CODE } from "./adapter-auth-check-code.js";
+export {
+  nativeFinalizationResultSchema,
+  nativeFinalizationResultV1Schema,
+  nativeReportedWorkDispositionSchema,
+  type NativeFinalizationResultInput,
+} from "./validators/native-finalization.js";
+export {
+  NATIVE_FINALIZATION_SCHEMA,
+  type NativeFinalizationResult,
+  type NativeFinalizationResultV1,
+  type NativeReportedWorkDisposition,
+  type NativeRuntimeMode,
+  type NativeRunTerminalState,
+} from "./types/native-finalization.js";
 export {
   decisionEffectStalenessSchema,
   decisionOptionStyleSchema,
@@ -83,6 +98,19 @@ export {
   type ResponsibleUserSource,
   type OriginatingActor,
 } from "./issue-attribution.js";
+export {
+  ARTIFACT_REVIEW_DOCUMENT_KEY_PREFIX,
+  MARKDOWN_ATTACHMENT_CONTENT_TYPES,
+  MARKDOWN_REVIEW_DOCUMENT_MAX_BYTES,
+  artifactReviewDocumentKey,
+  getAttachmentArtifactWorkProductMetadata,
+  getMarkdownWorkProductAttachmentMetadata,
+  isArtifactReviewDocumentKey,
+  isMarkdownArtifactWorkProduct,
+  isMarkdownAttachmentContent,
+  workProductIdFromArtifactReviewDocumentKey,
+  type AttachmentArtifactWorkProductLike,
+} from "./markdown-work-products.js";
 export {
   ISSUE_WRITE_DENIAL_CODES,
   describeIssueWriteDenial,
@@ -251,8 +279,6 @@ export {
 } from "./humanize-connection.js";
 export {
   COMPANY_STATUSES,
-  DEFAULT_COMPANY_ATTACHMENT_MAX_BYTES,
-  MAX_COMPANY_ATTACHMENT_MAX_BYTES,
   DEPLOYMENT_MODES,
   DEPLOYMENT_EXPOSURES,
   BIND_MODES,
@@ -300,6 +326,7 @@ export {
   ISSUE_WATCHDOG_DISCOVERY_KINDS,
   ISSUE_SURFACE_VISIBILITIES,
   ISSUE_RECOVERY_ACTION_KINDS,
+  ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
   ISSUE_RECOVERY_ACTION_STATUSES,
   ISSUE_RECOVERY_ACTION_OWNER_TYPES,
   ISSUE_RECOVERY_ACTION_OUTCOMES,
@@ -672,6 +699,7 @@ export type {
   WriteSummarySlotResponse,
   Environment,
   EnvironmentDeleteBlastRadius,
+  EnvironmentDeleteReusableLeaseHolder,
   EnvironmentDeleteBlockedReason,
   EnvironmentLease,
   EnvironmentProbeResult,
@@ -894,6 +922,11 @@ export type {
   WorkspaceOperation,
   WorkspaceOperationPhase,
   WorkspaceOperationStatus,
+  WorkspaceLoginHandoffTicketResponse,
+  WorkspaceReadiness,
+  WorkspaceReadinessProbeResult,
+  WorkspaceReadinessState,
+  WorkspaceSeedReadinessState,
   NormalizedWorkspaceFileAvailabilityQuery,
   WorkspaceFileAvailabilityQuery,
   WorkspaceFileAvailabilityRequest,
@@ -915,8 +948,6 @@ export type {
   WorkspaceRuntimeDesiredState,
   WorkspaceRealizationRecord,
   WorkspaceRealizationRequest,
-  WorkspaceRealizationSyncStrategy,
-  WorkspaceRealizationTransport,
   ExecutionWorkspaceStrategyType,
   ExecutionWorkspaceMode,
   SharedWorkspaceConcurrency,
@@ -1052,6 +1083,9 @@ export type {
   SuggestTasksResult,
   AskUserQuestionsQuestionOption,
   AskUserQuestionsQuestion,
+  PaperclipQuestionSetOption,
+  PaperclipQuestionSetQuestion,
+  PaperclipQuestionSetPayload,
   AskUserQuestionsPayload,
   AskUserQuestionsAnswer,
   AskUserQuestionsResult,
@@ -1062,6 +1096,8 @@ export type {
   RequestConfirmationResult,
   RequestConfirmationToolActionPayload,
   RequestConfirmationToolActionResult,
+  RequestConfirmationSecretProposalPayload,
+  RequestConfirmationSecretProposalResult,
   RequestCheckboxConfirmationOption,
   RequestCheckboxConfirmationPayload,
   RequestCheckboxConfirmationResult,
@@ -1453,6 +1489,7 @@ export type {
   QuotaWindow,
   ProviderQuotaResult,
 } from "./types/index.js";
+export { WORKSPACE_READINESS_STATES } from "./types/index.js";
 export {
   COMPANY_SEARCH_EXTRACT_KINDS,
   COMPANY_SEARCH_EXTRACT_SCOPES,
@@ -2146,7 +2183,10 @@ export {
   createCostEventSchema,
   createFinanceEventSchema,
   updateBudgetSchema,
+  ASSET_NAMESPACE_MAX_LENGTH,
+  ASSET_NAMESPACE_RULE,
   createAssetImageMetadataSchema,
+  sanitizeAssetNamespace,
   createCompanyInviteSchema,
   createOpenClawInvitePromptSchema,
   acceptInviteSchema,
@@ -2484,6 +2524,7 @@ export {
   startEnvironmentCustomImageSetupSessionSchema,
   finishEnvironmentCustomImageSetupSessionSchema,
   cancelEnvironmentCustomImageSetupSessionSchema,
+  relinkEnvironmentCustomImageTemplateSchema,
   createEnvironmentCustomImageTerminalSessionTokenSchema,
   environmentCustomImageTerminalSessionTokenSchema,
   type EnvironmentCustomImageSetupConnectionSummary,
@@ -2492,6 +2533,7 @@ export {
   type StartEnvironmentCustomImageSetupSession,
   type FinishEnvironmentCustomImageSetupSession,
   type CancelEnvironmentCustomImageSetupSession,
+  type RelinkEnvironmentCustomImageTemplate,
   type CreateEnvironmentCustomImageTerminalSessionToken,
   type EnvironmentCustomImageTerminalSessionToken,
 } from "./validators/environment-custom-images.js";
@@ -2508,6 +2550,39 @@ export {
   type FeatureTier,
   type InstanceFeatureKey,
 } from "./feature-catalog.js";
+export {
+  HIDEABLE_COMPANY_PAGES,
+  HIDEABLE_COMPANY_SECTIONS,
+  HIDEABLE_GENERAL_SECTIONS,
+  HIDEABLE_INSTANCE_PAGES,
+  HIDEABLE_SETTING_KEYS,
+  SETTINGS_OPERATOR_MANAGED_ERROR_CODE,
+  UI_ONLY_GENERAL_SECTIONS,
+  experimentalSettingKey,
+  hidesCompanyPage,
+  hidesCompanySection,
+  hidesExperimentalSetting,
+  hidesGeneralSection,
+  hidesInstancePage,
+  parseHiddenSettingsList,
+  type HideableCompanyPage,
+  type HideableCompanySection,
+  type HideableExperimentalSetting,
+  type HideableGeneralSection,
+  type HideableInstancePage,
+  type HideableSettingKey,
+  type ParsedHiddenSettings,
+} from "./settings-visibility.js";
+export {
+  DEFAULTABLE_GENERAL_SETTINGS,
+  SETTING_DEFAULTS_ENV_KEY,
+  applyOperatorGeneralDefaults,
+  parseSettingDefaults,
+  stripOperatorGeneralEchoes,
+  type DefaultableGeneralSetting,
+  type OperatorSettingDefaults,
+  type ParsedSettingDefaults,
+} from "./setting-defaults.js";
 
 // --- Runtime exposure (opt-in Tailscale HTTPS for managed branch runtimes) ---
 // PAP-17049 plan, PAP-17050 threat-model verdict. Contract shared across DB,

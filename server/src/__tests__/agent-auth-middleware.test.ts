@@ -98,12 +98,12 @@ function createDbState(input: {
   return { db, activity };
 }
 
-function createApp(db: any) {
+function createApp(db: any, deploymentMode: "authenticated" | "local_trusted" = "authenticated") {
   const app = express();
   app.use(express.json());
   app.use(
     actorMiddleware(db, {
-      deploymentMode: "authenticated",
+      deploymentMode,
       resolveSession: async () => null,
     }),
   );
@@ -132,6 +132,7 @@ function craftAgentJwtWithoutResponsibleClaim(input: {
   companyId: string;
   adapterType: string;
   runId: string;
+  expiresInSeconds?: number;
 }) {
   const now = Math.floor(Date.now() / 1000);
   const header = { alg: "HS256", typ: "JWT" };
@@ -141,7 +142,7 @@ function craftAgentJwtWithoutResponsibleClaim(input: {
     adapter_type: input.adapterType,
     run_id: input.runId,
     iat: now,
-    exp: now + 3600,
+    exp: now + (input.expiresInSeconds ?? 3600),
     iss: "paperclip",
     aud: "paperclip-api",
   };
@@ -177,6 +178,112 @@ describe("agent auth middleware", () => {
     else process.env.PAPERCLIP_AGENT_JWT_TTL_SECONDS = originalTtl;
     if (originalInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
     else process.env.PAPERCLIP_INSTANCE_ID = originalInstanceId;
+  });
+
+  it("keeps header-less local requests as the implicit board actor with their run id", async () => {
+    const runId = randomUUID();
+    const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
+
+    const res = await request(createApp(db, "local_trusted"))
+      .get("/actor")
+      .set("X-Paperclip-Run-Id", runId);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ type: "board", userId: "local-board", runId });
+  });
+
+  it("rejects an empty bearer token instead of retaining the implicit local-board actor", async () => {
+    const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
+    let commentWrites = 0;
+    const app = createApp(db, "local_trusted");
+    app.post("/comments", (_req, res) => {
+      commentWrites += 1;
+      res.status(201).json({ ok: true });
+    });
+
+    const res = await request(app).post("/comments").set("Authorization", "Bearer   ").send({ body: "reply" });
+
+    expect(res.status).toBe(401);
+    expect(res.body.error).toContain("Empty bearer token");
+    expect(commentWrites).toBe(0);
+  });
+
+  // Fork divergence from upstream (PR #294 posture, kept through the v2026.831.1
+  // merge): a bearer that is neither a valid agent key nor a verifying agent JWT
+  // falls through unauthenticated so the route's own auth decides. Upstream
+  // fail-closes these with a 401; the fork must not hard-reject stale or revoked
+  // board tokens on routes that can decide for themselves.
+  it("falls an unverified bearer through to the route instead of fail-closing", async () => {
+    const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
+    let commentWrites = 0;
+    const app = createApp(db, "local_trusted");
+    app.post("/comments", (_req, res) => {
+      commentWrites += 1;
+      res.status(201).json({ ok: true });
+    });
+
+    const res = await request(app).post("/comments").set("Authorization", "Bearer not-a-token").send({ body: "reply" });
+
+    expect(res.status).toBe(201);
+    expect(commentWrites).toBe(1);
+  });
+
+  it.each([
+    ["terminated", "Agent is terminated"],
+    ["pending_approval", "Agent is pending approval"],
+  ])("rejects a %s agent JWT instead of retaining local-board", async (status, error) => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const { db } = createDbState({ agent: { id: agentId, companyId, status } });
+    const token = createLocalAgentJwt(agentId, companyId, "codex_local", runId, "user-1");
+
+    const res = await request(createApp(db, "local_trusted"))
+      .get("/actor")
+      .set("Authorization", `Bearer ${token}`);
+
+    expect(res.status).toBe(401);
+    expect(res.body.error).toContain(error);
+  });
+
+  it("rejects an agent JWT when the agent record belongs to another company", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const { db } = createDbState({ agent: { id: agentId, companyId: randomUUID() } });
+    const token = createLocalAgentJwt(agentId, companyId, "codex_local", runId, "user-1");
+
+    const res = await request(createApp(db, "local_trusted"))
+      .get("/actor")
+      .set("Authorization", `Bearer ${token}`);
+
+    expect(res.status).toBe(401);
+    expect(res.body.error).toContain("missing or belongs to another company");
+  });
+
+  it("reports an expired agent JWT specifically", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const { db } = createDbState({ agent: { id: agentId, companyId } });
+    const token = craftAgentJwtWithoutResponsibleClaim({
+      secret: process.env.PAPERCLIP_AGENT_JWT_SECRET!,
+      agentId,
+      companyId,
+      adapterType: "codex_local",
+      runId,
+      expiresInSeconds: -1,
+    });
+
+    // Fork semantics: an expired agent JWT does not verify, so it falls through
+    // like any other unknown bearer and the local-trusted app resolves the
+    // implicit local actor (upstream fail-closes with "Expired agent token").
+    const res = await request(createApp(db, "local_trusted"))
+      .get("/actor")
+      .set("Authorization", `Bearer ${token}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ type: "board", userId: "local-board" });
   });
 
   it("uses the signed responsible_user_id claim and keeps the signed run id authoritative", async () => {
