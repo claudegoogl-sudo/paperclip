@@ -1,14 +1,14 @@
 {
-  "lastSyncedTag": "v2026.824.1",
-  "lastSyncedSha": "8e6edcdfa911151adba26be49a41cf5017b3aade",
-  "lastSyncedAt": "2026-08-31T05:26:20Z",
-  "etag": "\"c6c0eff30f3f15a0f9afe31688b3c46333b0c3f85710f15bcac4147399e9f3ef\"",
-  "lastCheckedAt": "2026-08-31T05:26:20Z",
+  "lastSyncedTag": "v2026.831.1",
+  "lastSyncedSha": "65ec059bde30d98c92165b24a30a540800dd1f6f",
+  "lastSyncedAt": "2026-09-08T08:01:31Z",
+  "etag": "W/\"4d0c8c39ddb1e0aeb2cb75a51613c4be5a38ed34b22ef99c44711262f0b9f86a\"",
+  "lastCheckedAt": "2026-09-08T08:01:31Z",
   "pendingPrUrl": null,
   "lastConflictBuckets": {
     "clean": 0,
     "reviewable": 0,
     "escalation": 0
   },
-  "_syncNote": "v2026.824.1 cursor reconcile. Upstream release v2026.824.1 (tag commit 8e6edcdfa911151adba26be49a41cf5017b3aade, published 2026-08-25) reached fork master out-of-band via merged PR #254 (superset re-land: upstream v2026.824.1 + 22 re-applied fork deltas incl. the 0164 multi-company plugin-config split; merged 2026-08-29T01:32Z). All upstream releases through v2026.824.1 are contained via ancestry (v2026.722.0 verified ancestor; v2026.817.0 content arrives through the 824.1 lineage). The stale v2026.707.0 cursor made every weekly tick no-op on the 'remote branch sync/upstream-v2026.824.1 exists but no open PR' guard, masking real future releases; this commit advances the durable cursor to reality so future ticks 304/no-op instead (established cursor-reconcile pattern; mirrors the v2026.618.0->v2026.626.0 and v2026.626.0->v2026.707.0 reconciles). No content change here - pure bookkeeping. lastSyncedSha pins the UPSTREAM tag commit per the established marker convention; the fork-master landing is PR #254. etag captured from releases/latest at reconcile time (strong validator). Host releases for the 824.1 line are already cut (2026.824.1-fork.34 through fork.37), so the downstream host-release obligation is satisfied. Pre-land gate tickets for the cancelled staged plan (adapter-hardening security gate, activation soak gate) are tracked on the board and predate the superset re-land. Supersedes the v2026.707.0 cursor note."
+  "_syncNote": "v2026.831.1 cursor advance. Upstream release v2026.831.1 (tag commit 65ec059bde30d98c92165b24a30a540800dd1f6f, published 2026-09-02) reached fork master via merged PR #322 (head 81151e0e5, merge commit 62b44d5ae, 2026-09-08T06:52Z; 21/21 checks green; merged by armed auto-merge after operator approval). The weekly tick escalated this tag (35 unresolved files, bucket=escalation); conflicts were resolved out-of-band and landed through the chain PR #320 -> #321 -> #322: the GitHub updateBranch mutation suffered a server-side outage (reproduced by the repo owner via the UI) and the sync-branch ruleset blocks new-commit pushes to sync/* refs, so each fix/refile rode a fresh branch. #320/#321 were closed-by-containment when #322 landed (identical approved content; #322 adds only a one-line test-timeout budget fix for a CI-load marginal in the port-conflict test). lastSyncedSha pins the UPSTREAM tag commit per the established marker convention; the fork-master landing is PR #322. etag captured from releases/latest at advance time. Supersedes the v2026.824.1 cursor note."
 }
