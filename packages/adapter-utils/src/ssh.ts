@@ -7,10 +7,12 @@ import path from "node:path";
 import { Transform } from "node:stream";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
 import {
+  agentCommitIdentityEnv,
   createUnrelatedHistoryGraftCommit,
   GIT_SYNC_COMMIT_IDENTITY_ARGS,
   readSanitizedOriginRemoteUrl,
 } from "./git-workspace-sync.js";
+import type { AgentGitIdentityInput } from "./git-identity.js";
 import type { RunProcessResult } from "./server-utils.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
 import { mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
@@ -195,6 +197,8 @@ async function execFileText(
   options: {
     timeout?: number;
     maxBuffer?: number;
+    /** Full child environment; undefined inherits process.env (execFile default). */
+    env?: NodeJS.ProcessEnv;
   } = {},
 ): Promise<SshCommandResult> {
   return await new Promise<SshCommandResult>((resolve, reject) => {
@@ -204,6 +208,7 @@ async function execFileText(
       {
         timeout: options.timeout ?? 15_000,
         maxBuffer: options.maxBuffer ?? 1024 * 128,
+        env: options.env,
       },
       (error, stdout, stderr) => {
         if (error) {
@@ -332,6 +337,7 @@ async function runLocalGit(
   options: {
     timeout?: number;
     maxBuffer?: number;
+    env?: NodeJS.ProcessEnv;
   } = {},
 ): Promise<SshCommandResult> {
   return await execFileText("git", ["-C", localDir, ...args], options);
@@ -921,6 +927,8 @@ async function exportGitWorkspaceFromSsh(input: {
 async function integrateImportedGitHead(input: {
   localDir: string;
   importedHead: string;
+  /** Run's agent, when one is known — attributes the merge/graft commit to it. */
+  agent?: AgentGitIdentityInput | null;
 }): Promise<void> {
   const isConcurrentRefUpdateError = (error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
@@ -975,6 +983,7 @@ async function integrateImportedGitHead(input: {
         currentHead,
         importedHead: input.importedHead,
         syncLabel: "Paperclip SSH sync",
+        agent: input.agent,
       });
       try {
         await runLocalGit(input.localDir, ["update-ref", headRef, graftCommit, currentHead], {
@@ -1021,6 +1030,7 @@ async function integrateImportedGitHead(input: {
       {
         timeout: 60_000,
         maxBuffer: 64 * 1024,
+        env: agentCommitIdentityEnv(input.agent),
       },
     );
     try {
@@ -1608,6 +1618,8 @@ export async function restoreWorkspaceFromSshExecution(input: {
   remoteDir?: string;
   baselineSnapshot?: DirectorySnapshot;
   restoreGitHistory?: boolean;
+  /** Run's agent, when one is known — attributes sync-created commits to it. */
+  agent?: AgentGitIdentityInput | null;
   onProgress?: RuntimeProgressSink;
 }): Promise<void> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
@@ -1646,6 +1658,7 @@ export async function restoreWorkspaceFromSshExecution(input: {
             await integrateImportedGitHead({
               localDir: input.localDir,
               importedHead,
+              agent: input.agent,
             });
           }
           : undefined,

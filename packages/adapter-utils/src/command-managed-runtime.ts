@@ -13,6 +13,7 @@ import {
   type SandboxSyncOperation,
   type SandboxSyncResult,
 } from "./sandbox-managed-runtime.js";
+import type { AgentGitIdentityInput } from "./git-identity.js";
 import { preferredShellForSandbox, shellCommandArgs } from "./sandbox-shell.js";
 import type { RunProcessResult } from "./server-utils.js";
 import type { RuntimeProgressSink, RuntimeStatusSink } from "./runtime-progress.js";
@@ -521,6 +522,8 @@ export async function prepareCommandManagedRuntime(input: {
   assets?: CommandManagedRuntimeAsset[];
   /** Referenced (additional) projects to stage into the sandbox as plain, read-only trees. */
   additionalSources?: SandboxAdditionalSource[];
+  /** Run's agent, when one is known — attributes sync-created git commits to it. */
+  agent?: AgentGitIdentityInput | null;
   installCommand?: string | null;
   /** When provided alongside `installCommand`, skip the install if `command -v <detectCommand>` succeeds. */
   detectCommand?: string | null;
@@ -581,6 +584,7 @@ export async function prepareCommandManagedRuntime(input: {
           preserveAbsentOnRestore: input.preserveAbsentOnRestore,
           assets: input.assets,
           additionalSources: input.additionalSources,
+          agent: input.agent,
           onProgress: input.onProgress,
           onRuntimeProgress: input.onRuntimeProgress,
           runtimeSpan: input.runtimeSpan,
@@ -620,6 +624,7 @@ export async function prepareCommandManagedRuntime(input: {
     preserveAbsentOnRestore: input.preserveAbsentOnRestore,
     assets: input.assets,
     additionalSources: input.additionalSources,
+    agent: input.agent,
     onProgress: input.onProgress,
     onRuntimeProgress: input.onRuntimeProgress,
     runtimeSpan: input.runtimeSpan,

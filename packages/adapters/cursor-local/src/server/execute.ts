@@ -361,6 +361,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       );
       const preparedExecutionTargetRuntime = await prepareAdapterExecutionTargetRuntime({
         runId,
+        agent,
         target: executionTarget,
         adapterKey: "cursor",
         timeoutSec,

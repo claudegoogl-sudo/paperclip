@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { buildAgentGitIdentityEnv, type AgentGitIdentityInput } from "./git-identity.js";
 
 export interface GitCommandResult {
   stdout: string;
@@ -65,21 +66,40 @@ export function setExpensiveWorkspaceGitExecutor(executor: ExpensiveWorkspaceGit
 export const GIT_ARCHIVE_EXCLUDES = [".git", ".git/*"] as const;
 
 /**
- * Identity flags for commits the sync machinery itself creates (the merge
- * commits that reconcile concurrent histories). Execution hosts are often
- * containers with no git config and no resolvable hostname, so git cannot
- * auto-detect an identity there and `commit-tree` hard-fails with "Author
- * identity unknown" — which fails the whole run at finalize. Passing the
- * identity per invocation keeps every deployment working without host
- * configuration; `GIT_AUTHOR_*` / `GIT_COMMITTER_*` environment variables
- * still take precedence over `-c` when an operator sets them.
+ * Identity flags for commits the sync machinery itself creates (the graft and
+ * merge commits that reconcile concurrent histories). Execution hosts are
+ * often containers with no git config and no resolvable hostname, so git
+ * cannot auto-detect an identity there and `commit-tree` hard-fails with
+ * "Author identity unknown" — which fails the whole run at finalize. Passing
+ * the identity per invocation keeps every deployment working without host
+ * configuration. The fallback address lives under the reserved `.invalid`
+ * TLD (RFC 2606), so the host identity can never be confusable with a
+ * deliverable address the way `noreply@paperclip.ing` was. When the caller
+ * threads the run's agent ({@link agentCommitIdentityEnv}), the `GIT_AUTHOR_*`
+ * / `GIT_COMMITTER_*` environment variables take precedence over these `-c`
+ * flags and the commit is attributed to the agent instead.
  */
 export const GIT_SYNC_COMMIT_IDENTITY_ARGS = [
   "-c",
   "user.name=Paperclip",
   "-c",
-  "user.email=noreply@paperclip.ing",
+  "user.email=noreply@agents.paperclip.invalid",
 ] as const;
+
+/**
+ * GIT_* identity env attributing a sync-created commit (graft or merge) to
+ * the run's agent. `GIT_*` environment variables take precedence over the
+ * static `-c` flags in {@link GIT_SYNC_COMMIT_IDENTITY_ARGS}, so the call-site
+ * args stay untouched. Returns undefined when no agent context is threaded,
+ * keeping the commit on the static fallback identity (behavior-identical for
+ * non-agent callers).
+ */
+export function agentCommitIdentityEnv(
+  agent?: AgentGitIdentityInput | null,
+): NodeJS.ProcessEnv | undefined {
+  if (!agent?.id) return undefined;
+  return { ...process.env, ...buildAgentGitIdentityEnv(agent) };
+}
 
 function shellQuote(value: string) {
   return `'${value.replace(/'/g, `'\"'\"'`)}'`;
@@ -709,6 +729,8 @@ export async function createUnrelatedHistoryGraftCommit(input: {
   currentHead: string;
   importedHead: string;
   syncLabel: string;
+  /** Run's agent, when one is known — attributes the graft commit to it. */
+  agent?: AgentGitIdentityInput | null;
 }): Promise<string> {
   const importedTree = (await runLocalGit(input.localDir, ["rev-parse", `${input.importedHead}^{tree}`], {
     timeout: 10_000,
@@ -729,6 +751,7 @@ export async function createUnrelatedHistoryGraftCommit(input: {
     {
       timeout: 60_000,
       maxBuffer: 64 * 1024,
+      env: agentCommitIdentityEnv(input.agent),
     },
   );
   return graftCommit.stdout.trim();
@@ -737,6 +760,8 @@ export async function createUnrelatedHistoryGraftCommit(input: {
 export async function integrateImportedGitHead(input: {
   localDir: string;
   importedHead: string;
+  /** Run's agent, when one is known — attributes the merge/graft commit to it. */
+  agent?: AgentGitIdentityInput | null;
 }): Promise<void> {
   const isConcurrentRefUpdateError = (error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
@@ -791,6 +816,7 @@ export async function integrateImportedGitHead(input: {
         currentHead,
         importedHead: input.importedHead,
         syncLabel: "Paperclip remote git sync",
+        agent: input.agent,
       });
       try {
         await runLocalGit(input.localDir, ["update-ref", headRef, graftCommit, currentHead], {
@@ -837,6 +863,7 @@ export async function integrateImportedGitHead(input: {
       {
         timeout: 60_000,
         maxBuffer: 64 * 1024,
+        env: agentCommitIdentityEnv(input.agent),
       },
     );
     try {
