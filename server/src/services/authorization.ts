@@ -21,7 +21,7 @@ import type {
   SkillTestAgentKeyScope,
   TaskBridgeAgentKeyScope,
 } from "@paperclipai/shared";
-import { LOW_TRUST_REVIEW_PRESET, extractAgentMentionIds, type LowTrustBoundary } from "@paperclipai/shared";
+import { LOW_TRUST_REVIEW_PRESET, extractAgentMentionIds, isUuidLike, type LowTrustBoundary } from "@paperclipai/shared";
 import {
   LOW_TRUST_ISSUE_ANCESTRY_MAX_DEPTH,
   isIssueWithinLowTrustBoundary,
@@ -753,6 +753,10 @@ export function authorizationService(db: Db) {
 
   async function loadRunPolicy(runId: string | null | undefined, companyId: string, agentId: string) {
     if (!runId) return null;
+    // The run header is caller-controlled; a malformed value is unknown, not
+    // an error. Treat it as missing so the untrusted string never reaches a
+    // UUID equality (PostgreSQL would cast-error into a 500).
+    if (!isUuidLike(runId)) return null;
     const row = await db
       .select({
         id: heartbeatRuns.id,
@@ -772,6 +776,8 @@ export function authorizationService(db: Db) {
 
   async function loadRunIssueId(runId: string | null | undefined, companyId: string, agentId: string) {
     if (!runId) return null;
+    // Same caller-controlled-header rule as loadRunPolicy.
+    if (!isUuidLike(runId)) return null;
     const row = await db
       .select({
         companyId: heartbeatRuns.companyId,
