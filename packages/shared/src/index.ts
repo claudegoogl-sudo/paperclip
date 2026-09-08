@@ -1978,6 +1978,7 @@ export {
   applyOnboardingSeedSchema,
   type ApplyOnboardingSeed,
   createApprovalSchema,
+  isEmptyApprovalPayload,
   upsertBudgetPolicySchema,
   resolveBudgetIncidentSchema,
   resolveApprovalSchema,

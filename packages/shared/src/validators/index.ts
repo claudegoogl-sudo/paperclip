@@ -626,6 +626,7 @@ export {
 
 export {
   createApprovalSchema,
+  isEmptyApprovalPayload,
   resolveApprovalSchema,
   requestApprovalRevisionSchema,
   resubmitApprovalSchema,

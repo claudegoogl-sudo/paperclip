@@ -273,6 +273,7 @@ import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run
 import { taskWatchdogService } from "./task-watchdogs.js";
 import { withAgentStartLock, withHostAdmissionLock } from "./agent-start-lock.js";
 import { HOST_MAX_CONCURRENT_RUNS_ENV_VAR, resolveHostRunCeiling } from "./host-run-ceiling.js";
+import { startCgroupPidsPressureTelemetry } from "./cgroup-pids-telemetry.js";
 import {
   evaluateAgentInvokability,
   evaluateAgentInvokabilityFromDb,
@@ -15062,6 +15063,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     let run = prologueRun;
     activeRunExecutions.add(run.id);
     let runScratch: HeartbeatRunScratch | null = null;
+    // Per-run cgroup pids-pressure window: snapshot now (read resolves in the
+    // background), one structured line at teardown. Telemetry only — never
+    // throws and never blocks or alters run behavior.
+    const cgroupPidsTelemetry = startCgroupPidsPressureTelemetry({
+      logger,
+      runId,
+      agentId: run.agentId,
+    });
 
     try {
     const agent = await getAgent(run.agentId);
@@ -18037,6 +18046,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
           }
         } finally {
+          // Emit the run's single cgroup pids-pressure line (telemetry only).
+          await cgroupPidsTelemetry.finish();
           let latestRun = await getRun(run.id).catch(() => null);
           // Close the invariant "environment lease released implies the run is
           // terminal". When the teardown reaches this point with the run still

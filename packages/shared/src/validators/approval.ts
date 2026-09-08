@@ -9,6 +9,19 @@ export const createApprovalSchema = z.object({
   issueIds: z.array(z.string().guid()).optional(),
 });
 
+/**
+ * A contentless approval payload (`{}`) is not a decidable request: the
+ * operator cannot tell what is being asked, and a pending card cannot be
+ * repaired by its author (there is no cancel/withdraw route). The approval
+ * create boundary rejects these outright instead of queueing them.
+ */
+export function isEmptyApprovalPayload(payload: unknown): boolean {
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    return true;
+  }
+  return Object.keys(payload as Record<string, unknown>).length === 0;
+}
+
 export type CreateApproval = z.infer<typeof createApprovalSchema>;
 
 export const resolveApprovalSchema = z.object({
