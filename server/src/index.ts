@@ -1590,6 +1590,14 @@ export async function startServer(): Promise<StartedServer> {
           logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
         }
 
+        const strandedDeferredWakes = await heartbeat.sweepStrandedDeferredWakes();
+        if (strandedDeferredWakes.promoted > 0 || strandedDeferredWakes.resolved > 0) {
+          logger.warn(
+            { ...strandedDeferredWakes },
+            "startup stranded deferred-wake sweep promoted or resolved wakes",
+          );
+        }
+
         const reviewed = await heartbeat.reconcileProductivityReviews();
         if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
           logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
@@ -1836,6 +1844,15 @@ export async function startServer(): Promise<StartedServer> {
               const swept = await heartbeat.sweepStaleIssueLocks();
               if (swept.cleared > 0) {
                 logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
+              }
+            })
+            .then(async () => {
+              const strandedDeferredWakes = await heartbeat.sweepStrandedDeferredWakes();
+              if (strandedDeferredWakes.promoted > 0 || strandedDeferredWakes.resolved > 0) {
+                logger.warn(
+                  { ...strandedDeferredWakes },
+                  "periodic stranded deferred-wake sweep promoted or resolved wakes",
+                );
               }
             })
             .then(async () => {
