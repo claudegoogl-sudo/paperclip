@@ -8739,7 +8739,12 @@ export function issueService(db: Db) {
       });
     },
 
-    release: async (id: string, actorAgentId?: string, actorRunId?: string | null) =>
+    release: async (
+      id: string,
+      actorAgentId?: string,
+      actorRunId?: string | null,
+      options: { managerOverride?: boolean } = {},
+    ) =>
       db.transaction(async (tx) => {
         await tx.execute(
           sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`,
@@ -8751,9 +8756,44 @@ export function issueService(db: Db) {
           .then((rows) => rows[0] ?? null);
 
         if (!existing) return null;
+        // Manager checkout-management override (PLA-6547): an agent holding
+        // tasks:manage_active_checkouts (route-verified via
+        // hasActiveCheckoutManagementOverride and passed in as
+        // options.managerOverride) may release an in_progress issue assigned to
+        // another agent ONLY when the holding checkout run is terminal or
+        // missing — never to steal from a live run. The staleness re-check runs
+        // here on the locked row so the precondition cannot race the route's
+        // pre-auth orphan-clear. Board force-release (adminForceRelease) stays
+        // the only path that may clear a checkout held by a live run.
+        const managerOverride =
+          options.managerOverride === true &&
+          Boolean(actorAgentId) &&
+          existing.assigneeAgentId !== null &&
+          existing.assigneeAgentId !== actorAgentId;
         if (actorAgentId && existing.assigneeAgentId && existing.assigneeAgentId !== actorAgentId) {
-          throw conflict("Only assignee can release issue");
+          if (managerOverride && existing.status === "in_progress") {
+            if (
+              existing.checkoutRunId &&
+              !(await isTerminalOrMissingHeartbeatRun(existing.checkoutRunId, tx))
+            ) {
+              throw conflict("Checkout is held by a live run", {
+                issueId: existing.id,
+                assigneeAgentId: existing.assigneeAgentId,
+                checkoutRunId: existing.checkoutRunId,
+                actorAgentId,
+              });
+            }
+            // Terminal-or-missing holding run (or none): fall through to the
+            // regular release effects below.
+          } else {
+            throw conflict("Only assignee can release issue");
+          }
         }
+        const previous = {
+          assigneeAgentId: existing.assigneeAgentId,
+          checkoutRunId: existing.checkoutRunId,
+          executionRunId: existing.executionRunId,
+        };
         if (
           actorAgentId &&
           existing.status === "in_progress" &&
@@ -8790,7 +8830,7 @@ export function issueService(db: Db) {
           .then((rows) => rows[0] ?? null);
         if (!updated) return null;
         const [enriched] = await withIssueLabels(tx, [updated]);
-        return enriched;
+        return { issue: enriched, previous, managerOverride };
       }),
 
     adminForceRelease: async (id: string, options: { clearAssignee?: boolean } = {}) =>
