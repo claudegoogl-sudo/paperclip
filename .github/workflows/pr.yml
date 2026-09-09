@@ -80,6 +80,13 @@ jobs:
       - name: Test PR quality-gate scripts
         run: node --test '.github/scripts/tests/*.test.mjs'
 
+      # The offline mirror self-test is the standing rollback-path proof for
+      # fork releases. Pin its assignment parsing against inline comments in
+      # published scripts (e.g. TARGET="..."  # what we restore): the value
+      # ends at the closing quote, and the resolved artifact name stays clean.
+      - name: Test fork-release mirror offline-twin parsing
+        run: node --test ./scripts/mirror-fork-release.test.mjs
+
       # Published container ports bypass the INPUT chain that UFW governs, so the
       # publish bind address is the effective control. Guard against a new
       # service reintroducing a bare `"8080:8080"` in a shipped stack.
