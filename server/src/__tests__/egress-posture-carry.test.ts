@@ -7,8 +7,8 @@ import {
 
 /**
  * Unit coverage for the ONE shared helper every delete+reinsert binding sync
- * must route its re-insert egress posture through (PLA-6272). The behavioural
- * proof that each call site actually uses it lives in
+ * must route its re-insert egress posture through. The behavioural proof that
+ * each call site actually uses it lives in
  * secret-binding-egress-posture-preserve.test.ts.
  */
 describe("preservedEgressPosture", () => {

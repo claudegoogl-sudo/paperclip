@@ -153,7 +153,7 @@ rejected with reasons — a total classification of the schema. Re-running the l
 against all historical migrations surfaced **no new findings**, so nothing was
 baselined and no historical posture flatten needed escalating.
 
-## Binding egress posture across config re-saves (PLA-6272)
+## Binding egress posture across config re-saves
 
 The two registered pairs on `company_secret_bindings` — `allowed_egress` and
 `egress_allowlist_enforced` — are **operator state keyed by the binding identity
