@@ -153,6 +153,36 @@ rejected with reasons — a total classification of the schema. Re-running the l
 against all historical migrations surfaced **no new findings**, so nothing was
 baselined and no historical posture flatten needed escalating.
 
+## Binding egress posture across config re-saves (PLA-6272)
+
+The two registered pairs on `company_secret_bindings` — `allowed_egress` and
+`egress_allowlist_enforced` — are **operator state keyed by the binding identity
+`(company_id, target_type, target_id, config_path)`**, not by the row id. Binding
+rows are re-created (fresh id, fresh `created_at`) by every delete+reinsert sync
+when a config save reconciles the bindings for a target, so the write paths —
+not the schema — decide whether posture survives. The invariants, all routed
+through the single shared helper `preservedEgressPosture`
+(`server/src/services/egress-posture.ts`) and enforced by
+`server/src/__tests__/secret-binding-egress-posture-preserve.test.ts`:
+
+- **Posture is preserved across delete+reinsert.** Every sync that deletes and
+  re-inserts bindings (`syncSecretRefsForTarget`, `syncEnvBindingsForTarget`,
+  `replaceSecretRefsForInstanceTarget`, and the revoke+rebind branch of
+  `syncPluginSecretBindings`) captures the old rows' posture before the delete
+  and carries it onto the new rows. A config re-save never silently changes
+  posture in either direction — before this fix,
+  `replaceSecretRefsForInstanceTarget` wiped an operator allowlist back to `[]`
+  (deny-all while enforcing) on every instance-target save.
+- **New bindings are born enforcing** with an empty allowlist: no prior row at
+  the same binding identity resolves to the column defaults
+  (`allowed_egress = '{}'`, `egress_allowlist_enforced = true`). No write path
+  inserts `false`.
+- **A legacy log-only row stays log-only** (`egress_allowlist_enforced = false`,
+  the 0092/0138 flattening) until an operator flips it via the binding
+  egress-allowlist API; preservation carries it forward through re-saves, it
+  does not re-arm it. Reconciling the remaining legacy rows is a separate,
+  operator-gated change.
+
 Zero new findings is also what a completely broken registry produces, so it is
 not evidence on its own. The registry is proved live four ways: every pair is
 asserted to resolve against the schema and to be reachable by the rule
