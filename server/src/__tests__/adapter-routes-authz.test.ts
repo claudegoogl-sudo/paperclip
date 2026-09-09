@@ -34,6 +34,8 @@ const mocks = vi.hoisted(() => {
     reloadExternalAdapter: vi.fn(),
     getUiParserSource: vi.fn(),
     getOrExtractUiParserSource: vi.fn(),
+    logActivity: vi.fn(),
+    listCompanyIds: vi.fn(async () => ["company-1"]),
   };
 });
 
@@ -59,6 +61,14 @@ vi.mock("../adapters/plugin-loader.js", () => ({
   reloadExternalAdapter: mocks.reloadExternalAdapter,
 }));
 
+vi.mock("../services/activity-log.js", () => ({
+  logActivity: mocks.logActivity,
+}));
+
+vi.mock("../services/instance-settings.js", () => ({
+  instanceSettingsService: () => ({ listCompanyIds: mocks.listCompanyIds }),
+}));
+
 function registerRouteMocks() {
   vi.doMock("node:child_process", () => ({
     execFile: mocks.execFile,
@@ -81,6 +91,14 @@ function registerRouteMocks() {
     getOrExtractUiParserSource: mocks.getOrExtractUiParserSource,
     reloadExternalAdapter: mocks.reloadExternalAdapter,
   }));
+
+  vi.doMock("../services/activity-log.js", () => ({
+    logActivity: mocks.logActivity,
+  }));
+
+  vi.doMock("../services/instance-settings.js", () => ({
+    instanceSettingsService: () => ({ listCompanyIds: mocks.listCompanyIds }),
+  }));
 }
 
 const EXTERNAL_ADAPTER_TYPE = "external_admin_test";
@@ -90,6 +108,9 @@ let errorHandler: typeof import("../middleware/index.js").errorHandler;
 let registerServerAdapter: typeof import("../adapters/registry.js").registerServerAdapter;
 let unregisterServerAdapter: typeof import("../adapters/registry.js").unregisterServerAdapter;
 let setOverridePaused: typeof import("../adapters/registry.js").setOverridePaused;
+// Audit fan-out only needs a pass-through db handle: the audit service modules
+// are module-mocked, so the handle is never dereferenced.
+const mockDb: Parameters<typeof adapterRoutes>[0]["db"] = {} as never;
 
 function createAdapter(type = EXTERNAL_ADAPTER_TYPE): ServerAdapterModule {
   return {
@@ -130,7 +151,7 @@ function createApp(actor: Express.Request["actor"]) {
     } as Express.Request["actor"];
     next();
   });
-  app.use("/api", adapterRoutes());
+  app.use("/api", adapterRoutes({ db: mockDb }));
   app.use(errorHandler);
   return app;
 }

@@ -22,6 +22,11 @@ const mockPluginLoader = vi.hoisted(() => ({
   reloadExternalAdapter: vi.fn(),
 }));
 
+const mockLogActivity = vi.hoisted(() => vi.fn());
+const mockInstanceSettingsService = vi.hoisted(() => ({
+  listCompanyIds: vi.fn(),
+}));
+
 const overridingConfigSchemaAdapter: ServerAdapterModule = {
   type: "claude_local",
   execute: async () => ({ exitCode: 0, signal: null, timedOut: false }),
@@ -50,11 +55,18 @@ let findActiveServerAdapter: typeof import("../adapters/registry.js").findActive
 let setOverridePaused: typeof import("../adapters/registry.js").setOverridePaused;
 let adapterRoutes: typeof import("../routes/adapters.js").adapterRoutes;
 let errorHandler: typeof import("../middleware/index.js").errorHandler;
+// Audit fan-out only needs a pass-through db handle: instanceSettingsService
+// and logActivity are module-mocked, so the handle is never dereferenced.
+const mockDb: Parameters<typeof adapterRoutes>[0]["db"] = {} as never;
 
 function registerModuleMocks() {
   vi.doMock("node:child_process", async () => vi.importActual("node:child_process"));
   vi.doMock("../adapters/plugin-loader.js", () => mockPluginLoader);
   vi.doMock("../services/adapter-plugin-store.js", () => mockAdapterPluginStore);
+  vi.doMock("../services/activity-log.js", () => ({ logActivity: mockLogActivity }));
+  vi.doMock("../services/instance-settings.js", () => ({
+    instanceSettingsService: () => mockInstanceSettingsService,
+  }));
   vi.doMock("../routes/adapters.js", async () => vi.importActual("../routes/adapters.js"));
   vi.doMock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
   vi.doMock("../middleware/index.js", async () => vi.importActual("../middleware/index.js"));
@@ -62,7 +74,7 @@ function registerModuleMocks() {
 
 function createApp(
   actorOverrides: Partial<Express.Request["actor"]> = {},
-  options: Parameters<typeof adapterRoutes>[0] = {},
+  options: Parameters<typeof adapterRoutes>[0] = { db: mockDb },
 ) {
   const app = express();
   app.use(express.json());
@@ -89,10 +101,15 @@ describe("adapter routes", () => {
     vi.doUnmock("../adapters/registry.js");
     vi.doUnmock("../adapters/plugin-loader.js");
     vi.doUnmock("../services/adapter-plugin-store.js");
+    vi.doUnmock("../services/activity-log.js");
+    vi.doUnmock("../services/instance-settings.js");
     vi.doUnmock("../routes/adapters.js");
     vi.doUnmock("../routes/authz.js");
     vi.doUnmock("../middleware/index.js");
     registerModuleMocks();
+    mockInstanceSettingsService.listCompanyIds.mockResolvedValue(["company-1"]);
+    mockLogActivity.mockReset();
+    mockLogActivity.mockResolvedValue(undefined);
     mockAdapterPluginStore.listAdapterPlugins.mockReturnValue([]);
     mockAdapterPluginStore.addAdapterPlugin.mockResolvedValue(undefined);
     mockAdapterPluginStore.removeAdapterPlugin.mockReturnValue(false);
@@ -561,5 +578,97 @@ describe("adapter routes", () => {
     unregisterServerAdapter("codex_local");
     expect(findServerAdapter("codex_local")).toBe(builtin);
     setOverridePaused("codex_local", false);
+  });
+
+  it("POST /api/adapters/install writes an instance.adapter.installed activity row naming the actor", async () => {
+    const AUDIT_TYPE = "audit_install_test";
+    const externalModule: ServerAdapterModule = {
+      type: AUDIT_TYPE,
+      execute: async () => ({ exitCode: 0, signal: null, timedOut: false }),
+      testEnvironment: async () => ({
+        adapterType: AUDIT_TYPE,
+        status: "pass",
+        checks: [],
+        testedAt: new Date(0).toISOString(),
+      }),
+    };
+    mockPluginLoader.loadExternalAdapterPackage.mockResolvedValue(externalModule);
+
+    const app = createApp({ isInstanceAdmin: true });
+    const res = await request(app)
+      .post("/api/adapters/install")
+      .send({ packageName: "/tmp/fake-audit-adapter", isLocalPath: true, version: "1.2.3" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockLogActivity).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      mockDb,
+      expect.objectContaining({
+        companyId: "company-1",
+        actorType: "user",
+        actorId: "local-board",
+        action: "instance.adapter.installed",
+        entityType: "adapter",
+        entityId: AUDIT_TYPE,
+        details: {
+          packageName: "/tmp/fake-audit-adapter",
+          version: "1.2.3",
+          isLocalPath: true,
+          type: AUDIT_TYPE,
+        },
+      }),
+    );
+
+    unregisterServerAdapter(AUDIT_TYPE);
+  });
+
+  it("POST /api/adapters/install writes a failure audit row when the install throws", async () => {
+    mockPluginLoader.loadExternalAdapterPackage.mockRejectedValue(
+      new Error("boom: module blew up"),
+    );
+
+    const app = createApp({ isInstanceAdmin: true });
+    const res = await request(app)
+      .post("/api/adapters/install")
+      .send({ packageName: "/tmp/failing-audit-adapter", isLocalPath: true });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(500);
+    expect(mockLogActivity).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      mockDb,
+      expect.objectContaining({
+        action: "instance.adapter.installed",
+        entityType: "adapter",
+        entityId: "/tmp/failing-audit-adapter",
+        details: {
+          packageName: "/tmp/failing-audit-adapter",
+          isLocalPath: true,
+          outcome: "failed",
+          failureReason: "boom: module blew up",
+        },
+      }),
+    );
+  });
+
+  it("PATCH /api/adapters/:type writes an instance.adapter.disabled activity row", async () => {
+    mockAdapterPluginStore.setAdapterDisabled.mockReturnValue(true);
+
+    const app = createApp({ isInstanceAdmin: true });
+    const res = await request(app)
+      .patch("/api/adapters/claude_local")
+      .send({ disabled: true });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockLogActivity).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      mockDb,
+      expect.objectContaining({
+        companyId: "company-1",
+        action: "instance.adapter.disabled",
+        entityType: "adapter",
+        entityId: "claude_local",
+        details: { type: "claude_local", disabled: true, changed: true },
+      }),
+    );
   });
 });

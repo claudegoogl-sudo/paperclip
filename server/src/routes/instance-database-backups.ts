@@ -1,8 +1,11 @@
+import { basename } from "node:path";
 import { Router } from "express";
-import type { BackupRetentionPolicy, RunDatabaseBackupResult } from "@paperclipai/db";
+import type { BackupRetentionPolicy, Db, RunDatabaseBackupResult } from "@paperclipai/db";
 import { forbidden } from "../errors.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { assertInstanceAdmin } from "./authz.js";
+import { logInstanceActivity } from "./instance-activity.js";
+import { logger } from "../middleware/logger.js";
 
 export type InstanceDatabaseBackupTrigger = "manual" | "scheduled";
 
@@ -19,7 +22,7 @@ export type InstanceDatabaseBackupService = {
   runManualBackup(): Promise<InstanceDatabaseBackupRunResult>;
 };
 
-export function instanceDatabaseBackupRoutes(service: InstanceDatabaseBackupService) {
+export function instanceDatabaseBackupRoutes(service: InstanceDatabaseBackupService, db: Db) {
   const router = Router();
 
   router.post("/instance/database-backups", async (req, res) => {
@@ -33,7 +36,38 @@ export function instanceDatabaseBackupRoutes(service: InstanceDatabaseBackupServ
         code: "database_backups_platform_managed",
       });
     }
-    const result = await service.runManualBackup();
+    let result: InstanceDatabaseBackupRunResult;
+    try {
+      result = await service.runManualBackup();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // Audit: a failed backup attempt still names the actor — retention and
+      // durability guarantees depend on knowing who tried.
+      await logInstanceActivity(db, req, {
+        action: "instance.database_backup.created",
+        entityType: "instance_database_backup",
+        entityId: "manual",
+        details: { trigger: "manual", outcome: "failed", failureReason: message },
+      }).catch((logErr) => {
+        logger.error({ logErr }, "Failed to write database backup failure audit row");
+      });
+      throw err;
+    }
+
+    await logInstanceActivity(db, req, {
+      action: "instance.database_backup.created",
+      entityType: "instance_database_backup",
+      // The backup file is the created entity; basename keeps server
+      // directory layout out of the company-visible activity feed.
+      entityId: basename(result.backupFile),
+      details: {
+        trigger: "manual",
+        sizeBytes: result.sizeBytes,
+        prunedCount: result.prunedCount,
+        durationMs: result.durationMs,
+      },
+    });
+
     res.status(201).json(result);
   });
 
