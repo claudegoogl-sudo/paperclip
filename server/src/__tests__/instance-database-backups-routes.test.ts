@@ -8,6 +8,23 @@ import {
 } from "../routes/instance-database-backups.js";
 import { conflict } from "../errors.js";
 
+const mockLogActivity = vi.hoisted(() => vi.fn());
+const mockInstanceSettingsService = vi.hoisted(() => ({
+  listCompanyIds: vi.fn(),
+}));
+
+vi.mock("../services/activity-log.js", () => ({
+  logActivity: mockLogActivity,
+}));
+
+vi.mock("../services/instance-settings.js", () => ({
+  instanceSettingsService: () => mockInstanceSettingsService,
+}));
+
+// Audit fan-out only needs a pass-through db handle: the audit service modules
+// are module-mocked, so the handle is never dereferenced.
+const mockDb: Parameters<typeof instanceDatabaseBackupRoutes>[1] = {} as never;
+
 function createApp(actor: Record<string, unknown>, service: InstanceDatabaseBackupService) {
   const app = express();
   app.use(express.json());
@@ -15,7 +32,7 @@ function createApp(actor: Record<string, unknown>, service: InstanceDatabaseBack
     req.actor = actor as typeof req.actor;
     next();
   });
-  app.use("/api", instanceDatabaseBackupRoutes(service));
+  app.use("/api", instanceDatabaseBackupRoutes(service, mockDb));
   app.use(errorHandler);
   return app;
 }
@@ -42,6 +59,12 @@ function createBackupService(overrides: Partial<InstanceDatabaseBackupService> =
 }
 
 describe("instance database backup routes", () => {
+  beforeEach(() => {
+    mockInstanceSettingsService.listCompanyIds.mockResolvedValue(["company-1"]);
+    mockLogActivity.mockReset();
+    mockLogActivity.mockResolvedValue(undefined);
+  });
+
   it("runs a manual backup for an instance admin and returns the server result", async () => {
     const service = createBackupService();
     const app = createApp(
@@ -145,6 +168,73 @@ describe("instance database backup routes", () => {
 
     expect(res.status).toBe(409);
     expect(res.body).toEqual({ error: "Database backup already in progress" });
+  });
+
+  it("writes an instance.database_backup.created activity row on success", async () => {
+    const service = createBackupService();
+    const app = createApp(
+      {
+        type: "board",
+        userId: "admin-1",
+        source: "session",
+        isInstanceAdmin: true,
+      },
+      service,
+    );
+
+    const res = await request(app).post("/api/instance/database-backups").send({});
+
+    expect(res.status).toBe(201);
+    expect(mockLogActivity).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      mockDb,
+      expect.objectContaining({
+        companyId: "company-1",
+        actorType: "user",
+        actorId: "admin-1",
+        action: "instance.database_backup.created",
+        entityType: "instance_database_backup",
+        entityId: "paperclip-20260416.sql.gz",
+        details: {
+          trigger: "manual",
+          sizeBytes: 1234,
+          prunedCount: 2,
+          durationMs: 1000,
+        },
+      }),
+    );
+  });
+
+  it("writes a failure activity row when the backup attempt rejects", async () => {
+    const service = createBackupService({
+      runManualBackup: vi.fn().mockRejectedValue(conflict("Database backup already in progress")),
+    });
+    const app = createApp(
+      {
+        type: "board",
+        userId: "admin-1",
+        source: "session",
+        isInstanceAdmin: true,
+      },
+      service,
+    );
+
+    const res = await request(app).post("/api/instance/database-backups").send({});
+
+    expect(res.status).toBe(409);
+    expect(mockLogActivity).toHaveBeenCalledTimes(1);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      mockDb,
+      expect.objectContaining({
+        action: "instance.database_backup.created",
+        entityType: "instance_database_backup",
+        details: {
+          trigger: "manual",
+          outcome: "failed",
+          failureReason: "Database backup already in progress",
+        },
+      }),
+    );
   });
 
   describe("cloud-managed floor", () => {
