@@ -1906,6 +1906,16 @@ export function agentRoutes(
     res.json(state);
   });
 
+  // PLA-1972: in-band escape hatch — the only other way out of a park is wall-clock
+  // time reaching `parkedUntil`, which for an operator with no host SSH access makes
+  // any future park bug unrecoverable without this route.
+  router.post("/instance/usage-limit-park/clear", async (req, res) => {
+    assertInstanceAdmin(req);
+    await heartbeat.clearUsageLimitPark();
+    const state = await heartbeat.getUsageLimitParkState();
+    res.json(state);
+  });
+
   router.get("/companies/:companyId/org", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);

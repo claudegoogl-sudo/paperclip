@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
@@ -6,6 +8,7 @@ import {
   agents,
   agentWakeupRequests,
   companies,
+  companySkills,
   createDb,
   environmentLeases,
   heartbeatRunEvents,
@@ -17,7 +20,10 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { errorHandler } from "../middleware/index.js";
+import { agentRoutes } from "../routes/agents.js";
 import {
+  NO_OP_DISPATCH_RETRY_MAX_DELAY_MS,
   NO_OP_DISPATCH_RETRY_SAFETY_MARGIN_MS,
   heartbeatService,
   isZeroWorkUsageLimitResult,
@@ -98,6 +104,10 @@ describeEmbeddedPostgres("PLA-1930 usage-limit park", () => {
     await deleteAllTolerantly(agentWakeupRequests);
     await deleteAllTolerantly(agentRuntimeState);
     await deleteAllTolerantly(agents);
+    // AC3's escape-hatch test lets a real run get claimed/started, which triggers
+    // skill-sync inserting company_skills — clear it before companies so the FK
+    // (company_skills.company_id -> companies.id) doesn't block teardown.
+    await deleteAllTolerantly(companySkills);
     await deleteAllTolerantly(companies);
     await deleteAllTolerantly(usageLimitParks);
   });
@@ -319,6 +329,84 @@ describeEmbeddedPostgres("PLA-1930 usage-limit park", () => {
     });
   });
 
+  // PLA-1972: `resolveUsageLimitParkTarget` mirrored `buildNoOpDispatchRetrySchedule`'s
+  // target calc but not its clamp. `nextDatedTimeInTimeZone` (claude-local parse.ts)
+  // intentionally rolls a dated reset whose month/day already passed this year to next
+  // year, so an unclamped park driven by a genuine live string ("resets Jul 30, 8am
+  // (UTC)" parsed the day after) could park the whole fleet for ~364 days with no
+  // in-band exit. These cases drive the REAL `extractClaudeRetryNotBefore` parser
+  // (not a hand-written Date) so a regression in either the clamp or the parser's
+  // year-roll would fail this test.
+  describe("resolveUsageLimitParkTarget clamp (PLA-1972)", () => {
+    const PINNED_NOW = new Date("2026-07-31T12:00:00.000Z");
+    const CEILING = new Date(PINNED_NOW.getTime() + NO_OP_DISPATCH_RETRY_MAX_DELAY_MS);
+
+    it.each([
+      ["Jul 30 (already passed this year, rolls to 2027)", "You've hit your weekly limit · resets Jul 30, 8am (UTC)", "2027-07-30T08:00:00.000Z"],
+      ["Jan 3 (already passed this year, rolls to 2027)", "You've hit your weekly limit · resets Jan 3, 8am (UTC)", "2027-01-03T08:00:00.000Z"],
+    ])("clamps a year-rolled dated reset (%s) to the 5h ceiling instead of parking for months", (_label, result, expectedRolledIso) => {
+      const retryNotBefore = extractClaudeRetryNotBefore({ errorMessage: result }, PINNED_NOW);
+      // Sanity-check the defect this clamp guards against: the parser really did
+      // roll the reset a year out, not just a few hours.
+      expect(retryNotBefore?.toISOString()).toBe(expectedRolledIso);
+
+      const parkedUntil = resolveUsageLimitParkTarget({ now: PINNED_NOW, retryNotBefore });
+      expect(parkedUntil.getTime()).toBeLessThanOrEqual(CEILING.getTime());
+      expect(parkedUntil.toISOString()).toBe(CEILING.toISOString());
+    });
+
+    it("floors the park so a retryNotBefore already in the past cannot produce a parkedUntil before now", () => {
+      const retryNotBefore = new Date(PINNED_NOW.getTime() - 2 * 60 * 60 * 1000);
+      const parkedUntil = resolveUsageLimitParkTarget({ now: PINNED_NOW, retryNotBefore });
+      expect(parkedUntil.getTime()).toBeGreaterThanOrEqual(PINNED_NOW.getTime());
+      expect(parkedUntil.toISOString()).toBe(PINNED_NOW.toISOString());
+    });
+
+    it("leaves the no-hint fallback window unchanged (well inside the ceiling)", () => {
+      const parkedUntil = resolveUsageLimitParkTarget({ now: PINNED_NOW, retryNotBefore: null });
+      expect(parkedUntil.toISOString()).toBe("2026-07-31T12:10:00.000Z");
+    });
+
+    // Untouched cases: a target that is already inside the ceiling must come out
+    // exactly as it did before the clamp existed — the fix must not tighten
+    // legitimate near-term resets.
+    it("keeps the exact current target for an undated same-day reset (resets 8am (UTC))", () => {
+      const now = new Date("2026-07-31T05:00:00.000Z");
+      const retryNotBefore = extractClaudeRetryNotBefore(
+        { errorMessage: "You've hit your weekly limit · resets 8am (UTC)" },
+        now,
+      );
+      expect(retryNotBefore?.toISOString()).toBe("2026-07-31T08:00:00.000Z");
+      expect(resolveUsageLimitParkTarget({ now, retryNotBefore }).toISOString()).toBe(
+        "2026-07-31T08:01:00.000Z",
+      );
+    });
+
+    it("keeps the exact current target for a dated reset that has not yet passed this year (resets Aug 1, 8am (UTC))", () => {
+      const now = new Date("2026-08-01T05:00:00.000Z");
+      const retryNotBefore = extractClaudeRetryNotBefore(
+        { errorMessage: "You've hit your weekly limit · resets Aug 1, 8am (UTC)" },
+        now,
+      );
+      expect(retryNotBefore?.toISOString()).toBe("2026-08-01T08:00:00.000Z");
+      expect(resolveUsageLimitParkTarget({ now, retryNotBefore }).toISOString()).toBe(
+        "2026-08-01T08:01:00.000Z",
+      );
+    });
+
+    it("keeps the exact current target for a same-day session-limit reset (resets 6:50pm (UTC))", () => {
+      const now = new Date("2026-07-31T16:00:00.000Z");
+      const retryNotBefore = extractClaudeRetryNotBefore(
+        { errorMessage: "You've hit your session limit · resets 6:50pm (UTC)" },
+        now,
+      );
+      expect(retryNotBefore?.toISOString()).toBe("2026-07-31T18:50:00.000Z");
+      expect(resolveUsageLimitParkTarget({ now, retryNotBefore }).toISOString()).toBe(
+        "2026-07-31T18:51:00.000Z",
+      );
+    });
+  });
+
   describe("admission gate integration (AC2)", () => {
     it("blocks a wake-request dispatch (enqueueWakeup -> startNextQueuedRunForAgent) for an unrelated agent in an unrelated company while parked", async () => {
       // The park is set by a DIFFERENT agent/company's zero-work usage-limit hit —
@@ -385,6 +473,101 @@ describeEmbeddedPostgres("PLA-1930 usage-limit park", () => {
         .where(eq(heartbeatRuns.id, queuedRun!.id))
         .then((rows) => rows[0] ?? null);
       expect(["queued", "running"]).toContain(persisted?.status);
+    });
+  });
+
+  // PLA-1972 AC3: the only way out of a park was previously wall-clock time
+  // reaching `parkedUntil` — no in-band route existed to clear it, so an operator
+  // with no host SSH access had no recovery path if a park bug ever landed. This
+  // exercises the real `POST /api/instance/usage-limit-park/clear` route (mounted
+  // via the real `agentRoutes(db)`, not a mocked service) end to end: park,
+  // authenticate as an instance admin, call the route, and confirm both the park
+  // state and real admission are restored.
+  describe("usage-limit-park escape hatch route (AC3)", () => {
+    function createApp(actor: Record<string, unknown>) {
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => {
+        req.actor = actor as typeof req.actor;
+        next();
+      });
+      app.use("/api", agentRoutes(db));
+      app.use(errorHandler);
+      return app;
+    }
+
+    const instanceAdminActor = {
+      type: "board",
+      userId: "instance-admin-test",
+      source: "session",
+      isInstanceAdmin: true,
+    };
+
+    it("rejects a non-admin board caller", async () => {
+      const app = createApp({
+        type: "board",
+        userId: "non-admin-test",
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds: [],
+      });
+
+      await request(app).post("/api/instance/usage-limit-park/clear").expect(403);
+    });
+
+    it("clears an active park and re-admits a queued run through the real dispatch path", async () => {
+      await usageLimitPark.park({
+        parkedUntil: new Date(Date.now() + 60 * 60 * 1000),
+        reason: "usage_limit_zero_work",
+        rawLimitText: "You've hit your weekly limit · resets Jul 30, 8am (UTC)",
+        sourceRunId: null,
+      });
+      expect(await usageLimitPark.isParked()).toBe(true);
+
+      const app = createApp(instanceAdminActor);
+      const res = await request(app).post("/api/instance/usage-limit-park/clear");
+
+      expect(res.status).toBe(200);
+      expect(res.body.parked).toBe(false);
+      expect(await usageLimitPark.isParked()).toBe(false);
+
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      await seedAgent({ companyId, agentId });
+
+      const queuedRun = await heartbeat.wakeup(agentId, {
+        source: "on_demand",
+        reason: "manual_test_wake",
+        requestedByActorType: "system",
+        requestedByActorId: "test",
+      });
+
+      expect(queuedRun).not.toBeNull();
+
+      // Admission is now unblocked, so `wakeup`'s inline claim fires a
+      // fire-and-forget `executeRun`. Wait for that run to reach a terminal
+      // status before the test returns: leaving "queued" proves the park no
+      // longer blocks dispatch (the whole point of the escape hatch), and
+      // reaching a terminal state also means the run's start-of-execution
+      // skill-sync (which writes company_skills / agent_runtime_state) has
+      // already landed — otherwise those async writes would race this block's
+      // afterEach teardown and fail its FK-ordered deletes.
+      const readStatus = async () =>
+        db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, queuedRun!.id))
+          .then((rows) => rows[0]?.status ?? null);
+      const deadline = Date.now() + 20_000;
+      let status = await readStatus();
+      while ((status === "queued" || status === "running") && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        status = await readStatus();
+      }
+      // Not "queued": the parked outcome (queued-and-never-claimed) is no longer
+      // the result — the run was admitted through the real dispatch path.
+      expect(status).not.toBe("queued");
+      expect(status).not.toBe("running");
     });
   });
 

@@ -310,7 +310,9 @@ const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS = BOUNDED_TRANSIENT_HEARTBE
 export const NO_OP_DISPATCH_RETRY_MAX_ATTEMPTS = 8;
 const NO_OP_DISPATCH_RETRY_FALLBACK_DELAY_MS = 10 * 60 * 1000;
 const NO_OP_DISPATCH_RETRY_MIN_DELAY_MS = 60 * 1000;
-const NO_OP_DISPATCH_RETRY_MAX_DELAY_MS = 5 * 60 * 60 * 1000;
+// PLA-1972: exported so the usage-limit park's own clamp test can assert
+// against the authoritative ceiling instead of a duplicated literal.
+export const NO_OP_DISPATCH_RETRY_MAX_DELAY_MS = 5 * 60 * 60 * 1000;
 // The advertised reset time is a lossy wall clock; wake just past it, not exactly on it.
 export const NO_OP_DISPATCH_RETRY_SAFETY_MARGIN_MS = 60 * 1000;
 const WORKSPACE_VALIDATION_FAILURE_CODE = "workspace_validation_failed";
@@ -542,12 +544,26 @@ function readZeroableAmount(value: unknown): number | null {
 // parks — for a bounded fallback window — rather than silently not parking. Without
 // this fallback the exact storm this ticket exists to stop (a limit result the parser
 // can't extract a reset from) would slip straight through the new gate too.
+//
+// PLA-1972: also mirrors the sibling function's CLAMP, not just its target calc.
+// `nextDatedTimeInTimeZone` (claude-local parse.ts) intentionally rolls a dated
+// reset ("resets Jul 30, 8am (UTC)") to next year when that month/day already
+// passed this year, so an unclamped target can land up to ~365 days out — an
+// instance-wide, unrecoverable park with no other exit. Bounding it to the same
+// [now, now + NO_OP_DISPATCH_RETRY_MAX_DELAY_MS] window `buildNoOpDispatchRetrySchedule`
+// already uses for the per-agent retry ladder means a clamped park can expire
+// before the real quota reset; the fleet just re-arms the park on the next
+// limit result, the same accepted converging trade-off already recorded for the
+// undated-parse path above (and in parse.test.ts).
 // Exported alongside `isZeroWorkUsageLimitResult` for AC6 replay testing.
 export function resolveUsageLimitParkTarget(input: { now: Date; retryNotBefore: Date | null }): Date {
   const target = input.retryNotBefore
     ? input.retryNotBefore.getTime() + NO_OP_DISPATCH_RETRY_SAFETY_MARGIN_MS
     : input.now.getTime() + NO_OP_DISPATCH_RETRY_FALLBACK_DELAY_MS;
-  return new Date(target);
+  const nowMs = input.now.getTime();
+  const flooredTarget = Math.max(nowMs, target);
+  const clamped = Math.min(nowMs + NO_OP_DISPATCH_RETRY_MAX_DELAY_MS, flooredTarget);
+  return new Date(clamped);
 }
 
 function mergeAdapterRecoveryMetadata(input: {
@@ -15168,5 +15184,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // (API route, recovery sweep) distinguish "parked on purpose" from "stuck", so a
     // parked fleet isn't misreported as a stall.
     getUsageLimitParkState: (now?: Date) => usageLimitPark.getState(now),
+
+    // PLA-1972: in-band escape hatch for the instance-wide usage-limit park. The
+    // only other exit is wall-clock time reaching `parkedUntil`; without this, a
+    // future park bug is DB-surgery-only for an operator with no host SSH access.
+    clearUsageLimitPark: () => usageLimitPark.clear({ reason: "manual_unpark" }),
   };
 }
