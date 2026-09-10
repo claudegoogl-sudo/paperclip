@@ -697,6 +697,12 @@ export function registerPluginCommands(program: Command): void {
             opts.token ? { token: opts.token } : {},
           );
 
+          if (!result) {
+            throw new Error(
+              `Webhook token generation returned an empty response for endpoint "${endpointKey}".`,
+            );
+          }
+
           if (ctx.json) {
             printOutput(result, { json: true });
             return;

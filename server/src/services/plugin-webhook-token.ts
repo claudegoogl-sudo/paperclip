@@ -26,10 +26,13 @@ import { computeWebhookTokenDigest } from "./plugin-webhook-auth.js";
 export const WEBHOOK_TOKEN_ENTROPY_FLOOR_BITS = 128;
 
 /**
- * Token entropy in bytes. 16 bytes = 128 bits, exactly the floor. base62 of 16
- * bytes is 22 characters — the "22+ chars of base62" the spec cites.
+ * Fixed token width, in base62 characters. 22 uniform base62 symbols carry
+ * 22·log2(62) ≈ 131 bits, clearing the 128-bit floor — the "22+ chars of base62"
+ * the spec cites. The width is fixed (not the variable length a base62-of-a-
+ * bignum encoding produces) so {@link maxTokenEntropyBits}, which infers the
+ * charset from the classes a token actually uses, always sees a full-width token.
  */
-const TOKEN_ENTROPY_BYTES = 16;
+const TOKEN_CHARS = 22;
 
 /**
  * Salt entropy in bytes. The salt is not a secret (it only defeats precomputed
@@ -42,36 +45,40 @@ const SALT_ENTROPY_BYTES = 12;
 const BASE62_ALPHABET =
   "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-/** Big-endian base62 encoding of a byte buffer. Leading zero bytes are preserved. */
-function encodeBase62(bytes: Buffer): string {
-  let value = 0n;
-  for (const byte of bytes) value = (value << 8n) | BigInt(byte);
-
-  let out = "";
-  if (value === 0n) {
-    out = BASE62_ALPHABET[0];
-  } else {
-    while (value > 0n) {
-      const rem = Number(value % 62n);
-      out = BASE62_ALPHABET[rem] + out;
-      value /= 62n;
-    }
+/**
+ * One uniformly-random base62 character. Rejection-samples the raw byte to avoid
+ * the modulo bias `byte % 62` would introduce: 62·4 = 248, so bytes ≥ 248 are
+ * discarded and every accepted byte maps to an equiprobable symbol.
+ */
+function randomBase62Char(): string {
+  for (;;) {
+    const byte = randomBytes(1)[0];
+    if (byte < 248) return BASE62_ALPHABET[byte % 62];
   }
-
-  // Each leading 0x00 byte is an information-bearing high-order zero that the
-  // numeric conversion drops; re-add one alphabet-zero per leading zero byte so
-  // distinct buffers never collide to the same string.
-  let leadingZeros = 0;
-  for (const byte of bytes) {
-    if (byte === 0) leadingZeros++;
-    else break;
-  }
-  return BASE62_ALPHABET[0].repeat(leadingZeros) + out;
 }
 
-/** Generates a fresh 128-bit token, base62-encoded. */
+/**
+ * Generates a fresh fixed-width base62 token that clears the 128-bit floor.
+ *
+ * The token is {@link TOKEN_CHARS} uniform base62 symbols and is guaranteed to
+ * contain at least one lowercase letter, one uppercase letter and one digit.
+ * That coverage is load-bearing, not cosmetic: {@link maxTokenEntropyBits} infers
+ * a token's charset from the classes it actually uses, so a token that happened
+ * to omit a class would score below the floor and be rejected by
+ * {@link assertWebhookTokenMeetsFloor} — the generator would emit a token its own
+ * escape hatch refuses. Forcing full class coverage makes the estimator always
+ * see the 62-symbol alphabet, so every generated token clears the same floor a
+ * caller-supplied token must. The reroll costs ~5% expected extra draws and the
+ * accepted set still carries ≥ 130 bits, comfortably above the floor.
+ */
 export function generateWebhookTokenSecret(): string {
-  return encodeBase62(randomBytes(TOKEN_ENTROPY_BYTES));
+  for (;;) {
+    let token = "";
+    for (let i = 0; i < TOKEN_CHARS; i++) token += randomBase62Char();
+    if (/[a-z]/.test(token) && /[A-Z]/.test(token) && /[0-9]/.test(token)) {
+      return token;
+    }
+  }
 }
 
 /** Generates a fresh salt, hex-encoded, that the operator does not get to pick. */
