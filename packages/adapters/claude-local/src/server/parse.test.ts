@@ -8,6 +8,7 @@ import {
   isClaudeUnknownSessionError,
   isClaudeImageProcessingError,
   isClaudePreTurnRateLimitResult,
+  isClaudeUsageLimitResult,
 } from "./parse.js";
 
 const SESSION_LIMIT_RESULT = {
@@ -375,6 +376,43 @@ describe("extractClaudeRetryNotBefore", () => {
         new Date("2026-07-26T12:30:00.000Z"),
       ),
     ).toBeNull();
+  });
+});
+
+// PLA-1930: regression coverage for the exact live result strings that fed the
+// usage-limit park admission gate. These are verbatim CLI outputs (including
+// the U+00B7 `·` separator) — do not paraphrase them.
+describe("PLA-1930 live usage-limit result strings", () => {
+  it("parses the dated weekly-limit reset ('resets Jul 31, 8am (UTC)')", () => {
+    const now = new Date("2026-07-25T10:00:00.000Z");
+    const result = "You've hit your weekly limit · resets Jul 31, 8am (UTC)";
+    expect(extractClaudeRetryNotBefore({ errorMessage: result }, now)?.toISOString()).toBe(
+      "2026-07-31T08:00:00.000Z",
+    );
+    expect(isClaudeUsageLimitResult({ result })).toBe(true);
+  });
+
+  it("parses the undated weekly-limit reset ('resets 8am (UTC)') as the next occurring 8am UTC", () => {
+    // `now` is chosen so today's 8am UTC has already passed, making "next 8am"
+    // unambiguously tomorrow. Because the wording carries no date, this is a
+    // deliberate, documented behavior: an undated weekly-limit reset can resolve
+    // up to ~7 days earlier than the real reset (we only know "next 8am", not
+    // "next 8am, 7 days from now") — see extractClaudeRetryNotBefore's callers.
+    const now = new Date("2026-07-25T10:00:00.000Z");
+    const result = "You've hit your weekly limit · resets 8am (UTC)";
+    expect(extractClaudeRetryNotBefore({ errorMessage: result }, now)?.toISOString()).toBe(
+      "2026-07-26T08:00:00.000Z",
+    );
+    expect(isClaudeUsageLimitResult({ result })).toBe(true);
+  });
+
+  it("parses the session-limit reset ('resets 6:50pm (UTC)')", () => {
+    const now = new Date("2026-07-25T10:00:00.000Z");
+    const result = "You've hit your session limit · resets 6:50pm (UTC)";
+    expect(extractClaudeRetryNotBefore({ errorMessage: result }, now)?.toISOString()).toBe(
+      "2026-07-25T18:50:00.000Z",
+    );
+    expect(isClaudeUsageLimitResult({ result })).toBe(true);
   });
 });
 

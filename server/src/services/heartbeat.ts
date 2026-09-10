@@ -74,6 +74,7 @@ import type {
 } from "../adapters/index.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
+import { extractClaudeRetryNotBefore } from "@paperclipai/adapter-claude-local/server";
 import { costService } from "./costs.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
@@ -150,6 +151,7 @@ import {
   resolveExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { usageLimitParkService } from "./usage-limit-park.js";
 import {
   evaluateExecutionAllowlist,
   isExecutionForcedToKubernetes,
@@ -427,6 +429,55 @@ function readTransientRecoveryContractFromRun(
         retryNotBefore: readTransientRetryNotBeforeFromRun(run),
       }
     : null;
+}
+
+// PLA-1930: same numeric-or-numeric-string tolerance as parse.ts's
+// `readZeroableNumber` — the CLI's JSON blob isn't guaranteed to type these
+// fields consistently.
+function readZeroableNumber(value: unknown): number | null {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+/**
+ * PLA-1930: the retry-not-before instant used for the instance-wide usage-limit
+ * park. Prefers the already-parsed field the adapter attaches at dispatch time
+ * (`readTransientRetryNotBeforeFromRun`); falls back to parsing `resultJson.result`
+ * directly via `extractClaudeRetryNotBefore` when that field is absent — some
+ * live results (see PLA-1930's replay fixture) carry only the raw CLI text with
+ * no pre-parsed `retryNotBefore` key at all. This is deliberately a separate
+ * derivation from the one used by the retry ladder above: it must not change
+ * the ladder's existing (already-correct) scheduling behavior.
+ */
+function derivePlaUsageLimitParkRetryNotBefore(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "resultJson">,
+  now: Date,
+): Date | null {
+  const fromField = readTransientRetryNotBeforeFromRun(run);
+  if (fromField) return fromField;
+  const resultJson = parseObject(run.resultJson);
+  return extractClaudeRetryNotBefore({ parsed: resultJson }, now);
+}
+
+/**
+ * PLA-1930: a dispatch that billed nothing, spent no API time, and got at
+ * most one turn did no real work — whatever the wording. This is the
+ * zero-work signature used to decide whether a transient-upstream limit hit
+ * should park the whole instance (as opposed to a limit hit mid-flight after
+ * genuine work, which must be left alone per AC3).
+ */
+function isPlaUsageLimitParkZeroWorkResult(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "resultJson">,
+): boolean {
+  const resultJson = parseObject(run.resultJson);
+  const cost = readZeroableNumber(resultJson.total_cost_usd);
+  const apiMs = readZeroableNumber(resultJson.duration_api_ms);
+  const turns = readZeroableNumber(resultJson.num_turns);
+  return cost === 0 && apiMs === 0 && turns !== null && turns <= 1;
 }
 
 function isNoOpDispatchRun(run: Pick<typeof heartbeatRuns.$inferSelect, "resultJson">) {
@@ -4981,6 +5032,7 @@ export function resolveHeartbeatSchedulingSuppression(
 
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
   const instanceSettings = instanceSettingsService(db);
+  const usageLimitPark = usageLimitParkService(db);
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
   });
@@ -8342,6 +8394,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? resolveCodexTransientFallbackMode(ladderAttempt)
         : null;
     const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
+
+    // PLA-1930: a zero-work dispatch that hit a genuine transient-upstream
+    // limit with a parsed reset time means the whole account's shared quota
+    // is exhausted, not just this agent's. Park the instance so no other
+    // agent/company wastes a run against the same quota before the reset.
+    // A run that did real work before hitting the limit (non-zero cost or
+    // more than one turn) is left alone (AC3) — only the true no-op case
+    // parks.
+    if (transientRecovery) {
+      const parkRetryNotBefore = derivePlaUsageLimitParkRetryNotBefore(run, now);
+      if (parkRetryNotBefore && isPlaUsageLimitParkZeroWorkResult(run)) {
+        const resultJsonForPark = parseObject(run.resultJson);
+        const rawResultText = readNonEmptyString(resultJsonForPark.result);
+        try {
+          await usageLimitPark.setPark({
+            parkedUntil: parkRetryNotBefore,
+            reason: "claude_usage_limit",
+            rawText: rawResultText ? rawResultText.slice(0, 500) : null,
+            sourceRunId: run.id,
+            sourceAgentId: run.agentId,
+            sourceCompanyId: run.companyId,
+          });
+        } catch (err) {
+          logger.warn({ err, runId: run.id }, "failed to set PLA-1930 usage-limit park");
+        }
+      }
+    }
+
     const ladderSchedule = opts?.delayMs != null
       ? ladderAttempt <= maxAttempts
         ? {
@@ -9235,6 +9315,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect, companyAgents?: AgentOrgRow[]) {
     if (run.status !== "queued") return run;
+
+    // PLA-1930: while the instance is usage-limit parked, don't even start
+    // evaluating this run for dispatch. Unlike `invokability`/`budgetBlock`
+    // below, a park is transient and self-healing (it lifts automatically at
+    // `parkedUntil`), so this must NOT cancel the run. Callers of
+    // `claimQueuedRun` treat any non-null return as "claimed, go spawn the
+    // process" (see `startNextQueuedRunForAgent`/`executeRun`), so parking
+    // returns `null` — the same "not claimed" signal every other guard below
+    // uses — WITHOUT writing anything to the run row, so it stays `queued`
+    // untouched in the DB and the next `resumeQueuedRuns` sweep tick retries
+    // `claimQueuedRun` once the park has lifted. This is checked first
+    // because it's the cheapest way to skip every other admission check
+    // while parked.
+    const activePark = await usageLimitPark.getPark();
+    if (activePark) {
+      const seq = await nextRunEventSeq(run.id);
+      await appendRunEvent(run, seq, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "info",
+        message: "Dispatch deferred: instance is usage-limit parked",
+        payload: {
+          reason: activePark.reason,
+          parkedUntil: activePark.parkedUntil.toISOString(),
+          sourceRunId: activePark.sourceRunId,
+        },
+      });
+      return null;
+    }
+
     const agent = await getAgent(run.agentId);
     if (!agent) {
       await cancelRunInternal(run.id, "Cancelled because the agent no longer exists");
@@ -12192,6 +12302,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return;
       }
 
+      // PLA-1930: clear the instance-wide usage-limit park as soon as a run
+      // genuinely completes cleanly (status "succeeded", NOT "succeeded_dirty"
+      // — a dirty exit only proves teardown ran, not that the quota is back).
+      // Natural expiry at `parkedUntil` is handled separately by `getPark()`;
+      // this is purely an early-clear optimization, so it's gated on a park
+      // actually being active to avoid an unconditional write on every
+      // successful run instance-wide.
+      if (status === "succeeded") {
+        try {
+          if (await usageLimitPark.getPark()) {
+            await usageLimitPark.clearPark("run_succeeded");
+          }
+        } catch (err) {
+          logger.warn({ err, runId: run.id }, "failed to clear PLA-1930 usage-limit park after successful run");
+        }
+      }
+
       let persistedRun = persistedRunWrite.run;
       if (persistedRun) {
         persistedRun = await classifyAndPersistRunLiveness(persistedRun, persistedResultJson) ?? persistedRun;
@@ -13570,6 +13697,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       })();
       return queuedResponsibleUserIdPromise;
     };
+
+    // PLA-1930: the instance-wide usage-limit park is checked ahead of the
+    // per-agent/per-company `budgetBlock` below because it's a coarser,
+    // cheaper gate. Unlike `budgetBlock`, a user-initiated wake gets an
+    // informative error instead of being silently dropped, matching how
+    // `company.inactive` above branches on `requestedByActorType`.
+    const activeUsageLimitPark = await usageLimitPark.getPark();
+    if (activeUsageLimitPark) {
+      if (opts.requestedByActorType === "user") {
+        throw conflict(
+          `Instance is parked until ${activeUsageLimitPark.parkedUntil.toISOString()} because the shared Claude usage quota was exhausted (${activeUsageLimitPark.reason})`,
+          {
+            parkedUntil: activeUsageLimitPark.parkedUntil.toISOString(),
+            reason: activeUsageLimitPark.reason,
+          },
+        );
+      }
+      await writeSkippedRequest("usage_limit.parked", {
+        payload: {
+          ...(payload ?? {}),
+          usageLimitPark: {
+            parkedUntil: activeUsageLimitPark.parkedUntil.toISOString(),
+            reason: activeUsageLimitPark.reason,
+          },
+        },
+      });
+      return null;
+    }
 
     const budgetBlock = await budgets.getInvocationBlock(agent.companyId, agentId, {
       issueId,

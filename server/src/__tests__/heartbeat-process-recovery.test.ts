@@ -38,6 +38,7 @@ import {
   issues,
   projects,
   projectWorkspaces,
+  usageLimitPark,
   workspaceOperations,
 } from "@paperclipai/db";
 import {
@@ -395,6 +396,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
     await db.delete(agentWakeupRequests);
     await db.delete(budgetPolicies);
+    await db.delete(usageLimitPark);
     for (let attempt = 0; attempt < 5; attempt += 1) {
       await db.delete(agentRuntimeState);
       try {
@@ -1611,6 +1613,81 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(0);
+  });
+
+  it("PLA-1930: clears an active usage-limit park when a run completes as genuinely succeeded", async () => {
+    const { runId } = await seedQueuedIssueRunFixture();
+    const heartbeat = heartbeatService(db);
+
+    // Admission for this run has already happened by the time the adapter
+    // starts executing, so raising the park from inside the mocked adapter
+    // call — deterministically, before it resolves — models a park raised
+    // by a *different* agent's run while this one was already in flight.
+    // Dispatch admission only gates new claims, so an already-running run
+    // must be left alone (AC3) and, per this test, must clear the park on
+    // genuine success.
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.insert(usageLimitPark).values({
+        singletonKey: "default",
+        parkedUntil: new Date(Date.now() + 60_000),
+        reason: "claude_usage_limit",
+      });
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Recovered stranded heartbeat work.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("succeeded");
+
+    const park = await db.select().from(usageLimitPark).then((rows) => rows[0] ?? null);
+    expect(park?.parkedUntil).toBeNull();
+    expect(park?.reason).toBe("cleared:run_succeeded");
+  });
+
+  it("PLA-1930: does not clear an active usage-limit park when a run only completes 'succeeded_dirty'", async () => {
+    const parkedUntil = new Date(Date.now() + 60_000);
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.insert(usageLimitPark).values({
+        singletonKey: "default",
+        parkedUntil,
+        reason: "claude_usage_limit",
+      });
+      return {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        errorCode: "dirty_exit",
+        completedDirty: true,
+        summary: "Teardown exited non-zero after a clean agent completion.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    const { runId } = await seedQueuedIssueRunFixture();
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("succeeded_dirty");
+
+    // A dirty exit only proves teardown ran, not that the shared quota is
+    // back — the park must be left untouched.
+    const park = await db.select().from(usageLimitPark).then((rows) => rows[0] ?? null);
+    expect(park?.parkedUntil?.getTime()).toBe(parkedUntil.getTime());
   });
 
   it("blocks a git-sensitive local adapter before launch when a project-workspace-linked issue is missing its project id", async () => {
@@ -3348,6 +3425,53 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     if (retryRun) {
       await waitForRunToSettle(heartbeat, retryRun.id);
     }
+  });
+
+  it("PLA-1930: skips stranded-issue escalation entirely while the instance is usage-limit parked", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "failed",
+    });
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      status: "queued",
+    });
+    await db.insert(usageLimitPark).values({
+      singletonKey: "default",
+      parkedUntil: new Date(Date.now() + 60_000),
+      reason: "claude_usage_limit",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    // With an active park, the sweep must not evaluate (and therefore not
+    // re-dispatch/escalate) any candidate — the same candidate that the
+    // preceding test proves WOULD otherwise produce a dispatchRequeued.
+    expect(result.assignmentDispatched).toBe(0);
+    expect(result.dispatchRequeued).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.skipped).toBeGreaterThanOrEqual(1);
+    expect(result.issueIds).toEqual([]);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.id).toBe(runId);
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("todo");
   });
 
   it("blocks assigned todo work after the one automatic dispatch recovery was already used", async () => {

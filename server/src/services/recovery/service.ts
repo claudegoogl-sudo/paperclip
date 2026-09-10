@@ -36,6 +36,7 @@ import { redactSensitiveText } from "../../redaction.js";
 import { logActivity } from "../activity-log.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
+import { usageLimitParkService } from "../usage-limit-park.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { TERMINAL_HEARTBEAT_RUN_STATUSES, issueService } from "../issues.js";
@@ -524,6 +525,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   const treeControlSvc = issueTreeControlService(db);
   const budgets = budgetService(db);
   const instanceSettings = instanceSettingsService(db);
+  const usageLimitPark = usageLimitParkService(db);
   const runLogStore = getRunLogStore();
   let resolvedDependencyWakeBackstopCandidateCursor: string | null = null;
 
@@ -2951,6 +2953,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       skippedDueToPendingWakeAssigneeInteraction: 0,
       issueIds: [] as string[],
     };
+
+    // PLA-1930: while the instance is usage-limit parked, an assignee's
+    // silence proves nothing about liveness — every agent fleet-wide is
+    // blocked from dispatching against the same shared, exhausted quota, not
+    // just this issue's assignee. Escalating to `blocked`/re-wake here would
+    // just produce more no-op runs once the park lifts. Skip the whole sweep
+    // rather than evaluate (and mis-escalate) individual candidates.
+    if (await usageLimitPark.getPark()) {
+      result.skipped += candidates.length;
+      return result;
+    }
 
     for (const issue of candidates) {
       const executionState = issue.status === "in_review"
