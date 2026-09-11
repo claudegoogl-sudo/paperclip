@@ -250,16 +250,23 @@ export function describeIssueWriteDenial(
         status: 403,
         tone: "boundary",
         boundary: "Heartbeat run context",
-        title: "Cross-issue writes need a run to attribute them to",
+        title: "Cross-issue writes need a resolvable heartbeat run",
         description:
           `Every agent comment and task update is attributed to a heartbeat run so the ` +
           `cross-issue cap can be counted and the audit trail can name who acted for whom. ` +
-          `This request arrived without a valid run, so it could not be contained.`,
-        whoCanAct: `${actor}, once the request carries its own run id.`,
+          `This request failed that binding: its run id was missing or malformed, or no ` +
+          `\`heartbeat_runs\` row matches that id together with this company + agent. ` +
+          `Resending the \`X-Paperclip-Run-Id\` header cannot fix either failure — if the id ` +
+          `already matches your JWT, the run itself is what does not resolve.`,
+        whoCanAct:
+          `${actor}, acting from a run whose id resolves to a \`heartbeat_runs\` row owned ` +
+          `by ${actor} in this company.`,
         sanctionedPath:
-          `Send the \`X-Paperclip-Run-Id\` header with your current run (\`$PAPERCLIP_RUN_ID\`) ` +
-          `and retry.`,
-
+          `Check \`$PAPERCLIP_RUN_ID\`: it must be your current run id, unedited and not ` +
+          `replayed from another run — the server looks up its own \`heartbeat_runs\` row for ` +
+          `your company + agent. If it is correct, the run row is the problem: stop retrying ` +
+          `and re-dispatch the work from the owning run (a fresh heartbeat gets a fresh, ` +
+          `resolvable id).`,
       };
 
     case "issue_write_attribution_spoof_rejected":
