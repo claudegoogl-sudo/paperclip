@@ -1022,7 +1022,7 @@ export async function startServer(): Promise<StartedServer> {
   // document parsed fail-closed above (`plugins.autoInstall`). Absent env means
   // self-hosted: createApp falls back to its built-in kubernetes-only default.
   const managedPluginAutoInstall = managedConfig?.plugins.autoInstall ?? null;
-  const app = await createApp(db as any, {
+  const { app, pluginToolDispatcher } = await createApp(db as any, {
     uiMode,
     serverPort: listenPort,
     storageService,
@@ -1490,6 +1490,9 @@ export async function startServer(): Promise<StartedServer> {
       trustedLocalStdioRuntimeHost: process.env.PAPERCLIP_TRUSTED_MCP_RUNTIME_HOST
         ?? process.env.PAPERCLIP_TOOL_RUNTIME_TRUSTED_HOST
         ?? null,
+      // Plugin-backed connections report health via the plugin tool runtime
+      // instead of requiring a config.url their records never carry.
+      pluginToolRuntimeProbe: ({ pluginId }) => pluginToolDispatcher.toolCount(pluginId),
     });
     const worktreeRunExecutionActivation = await resolveWorktreeRunExecutionActivationState({
       getExperimental: () => instanceSettingsService(db).getExperimental(),
