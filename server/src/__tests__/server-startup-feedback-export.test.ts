@@ -33,7 +33,13 @@ const {
   routineServiceFactoryMock,
   routineServiceMock,
 } = vi.hoisted(() => {
-  const createAppMock = vi.fn(async () => ((_: unknown, __: unknown) => {}) as never);
+  const createAppMock = vi.fn(async () => ({
+    // startServer destructures the real createApp return contract
+    // ({ app, pluginToolDispatcher }); the dispatcher is only invoked lazily
+    // by the tool-health sweep probe, so a stub suffices here.
+    app: ((_: unknown, __: unknown) => {}) as never,
+    pluginToolDispatcher: { toolCount: vi.fn(() => 0) },
+  }) as never);
   const createBetterAuthInstanceMock = vi.fn(() => ({}));
   const createDbMock = vi.fn(() => ({
     select: vi.fn(() => ({
