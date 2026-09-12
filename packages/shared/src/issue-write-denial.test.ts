@@ -80,10 +80,19 @@ describe("describeIssueWriteDenial", () => {
     expect(copy.description).not.toContain("attempt");
   });
 
-  it("gives the run-context denial a copy-pasteable fix", () => {
+  it("names the real run-binding failure modes, not a header retry loop", () => {
     const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required");
-    expect(copy.sanctionedPath).toContain("X-Paperclip-Run-Id");
+    // Cause 1: the run id is missing or malformed.
+    expect(copy.description).toContain("malformed");
+    // Cause 2: no heartbeat_runs row matches the id for this company + agent.
+    expect(copy.description).toContain("heartbeat_runs");
+    expect(copy.description).toContain("company + agent");
+    // The old copy told agents to resend a header they already send correctly —
+    // the remediation must be the run binding, never a resend-and-retry.
     expect(copy.sanctionedPath).toContain("PAPERCLIP_RUN_ID");
+    expect(copy.sanctionedPath).toContain("re-dispatch");
+    expect(copy.sanctionedPath).not.toMatch(/send the .*header .*and retry/i);
+    expect(copy.whoCanAct).toContain("heartbeat_runs");
   });
 
   it("tells a spoof attempt that the write itself was fine", () => {
