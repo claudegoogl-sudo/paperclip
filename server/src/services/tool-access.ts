@@ -24,6 +24,7 @@ import {
   toolConnections,
   toolOauthStates,
   toolStdioCommandTemplates,
+  pluginConfig,
   toolCallEvents,
   toolInvocations,
   toolPolicies,
@@ -164,10 +165,20 @@ async function oauthSingleFlight<T>(
   }
 }
 
+/**
+ * Runtime probe for plugin-backed tool connections. Given a plugin's DB id it
+ * returns the number of tools the plugin runtime currently has registered for
+ * that plugin, or null when the runtime cannot answer. Health checks fail
+ * closed when the probe is not wired: an unverifiable plugin connection must
+ * not be reported healthy.
+ */
+export type PluginToolRuntimeProbe = (input: { pluginId: string }) => Promise<number | null> | number | null;
+
 type ToolAccessServiceOptions = {
   deploymentMode?: DeploymentMode;
   deploymentExposure?: DeploymentExposure;
   trustedLocalStdioRuntimeHost?: string | null;
+  pluginToolRuntimeProbe?: PluginToolRuntimeProbe;
   now?: () => Date;
 };
 
@@ -1330,6 +1341,9 @@ function sanitizeHttpFailure(error: unknown): { status: ToolConnectionHealthStat
         message: error.message,
         code,
       };
+    }
+    if (typeof code === "string" && code.startsWith("mcp_remote_plugin_")) {
+      return { status: "error", message: error.message, code };
     }
     if (code === "binding_missing" || code === "secret_deleted" || code === "secret_inactive" || code === "version_missing") {
       return {
@@ -2862,9 +2876,12 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     return headers;
   }
 
-  async function remoteTools(connection: typeof toolConnections.$inferSelect): Promise<McpToolDescriptor[]> {
+  async function remoteTools(
+    connection: typeof toolConnections.$inferSelect,
+    configOverride: Record<string, unknown> = connection.config ?? {},
+  ): Promise<McpToolDescriptor[]> {
     const headers = await resolveCredentialHeaders(connection);
-    const endpoint = await assertRemoteEndpointAllowed(connection.config);
+    const endpoint = await assertRemoteEndpointAllowed(configOverride);
     const response = await fetch(endpoint, {
       method: "POST",
       // MCP Streamable HTTP requires advertising that we accept both a JSON body
@@ -2964,18 +2981,140 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
     return updated;
   }
 
+  const PLUGIN_CONNECTION_TYPE = "paperclip_plugin";
+
+  type PluginConnectionContext = { plugin: typeof plugins.$inferSelect };
+
+  function connectionConfigPluginKey(connection: typeof toolConnections.$inferSelect): string | null {
+    const value = asRecord(connection.config)?.pluginKey;
+    return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+  }
+
+  /**
+   * Detect plugin-backed connections and resolve their plugin row.
+   *
+   * Plugin-backed connections (migration 0149 backfill) carry
+   * `{ pluginKey, type: "paperclip_plugin" }` in config and no HTTP url: their
+   * tools are served by the plugin worker, not by a remote MCP endpoint, so
+   * their health must never be evaluated against connection.config.url.
+   * Returns null when the connection is a genuine remote HTTP connection.
+   * Throws fail-closed when the connection is plugin-backed but its plugin no
+   * longer resolves — falling back to the url check would misreport these rows
+   * as `mcp_remote_url_missing` — the 100% false-positive shape this path exists to prevent.
+   */
+  async function resolvePluginConnectionContext(
+    connection: typeof toolConnections.$inferSelect,
+  ): Promise<PluginConnectionContext | null> {
+    const [application] = await db
+      .select({ pluginId: toolApplications.pluginId, type: toolApplications.type })
+      .from(toolApplications)
+      .where(eq(toolApplications.id, connection.applicationId))
+      .limit(1);
+    const pluginBacked = application?.type === PLUGIN_CONNECTION_TYPE
+      || asRecord(connection.config)?.type === PLUGIN_CONNECTION_TYPE;
+    if (!pluginBacked) return null;
+
+    let plugin: typeof plugins.$inferSelect | null = null;
+    if (application?.pluginId) {
+      plugin = await db
+        .select()
+        .from(plugins)
+        .where(eq(plugins.id, application.pluginId))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+    }
+    if (!plugin) {
+      const pluginKey = connectionConfigPluginKey(connection);
+      if (pluginKey) {
+        plugin = await db
+          .select()
+          .from(plugins)
+          .where(eq(plugins.pluginKey, pluginKey))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+      }
+    }
+    if (!plugin) {
+      throw unprocessable(
+        `Plugin-backed connection does not resolve to an installed plugin (pluginKey=${connectionConfigPluginKey(connection) ?? "unknown"})`,
+        { code: "mcp_remote_plugin_missing" },
+      );
+    }
+    return { plugin };
+  }
+
+  /**
+   * Health for a plugin-backed mcp_remote connection. The connection record
+   * carries no url, so resolution is:
+   *   1. the per-company `plugin_config` row for (plugin.id, connection.companyId).
+   *      Missing row → fail closed: the plugin is not configured for this
+   *      company, exactly like a remote connection with no config anywhere;
+   *   2. a `url` in that row's config → live HTTP probe of that endpoint;
+   *   3. otherwise the plugin runtime probe — healthy only when the plugin
+   *      currently has registered tools. An unwired or empty probe fails
+   *      closed: an unverifiable connection must not report healthy.
+   * The config lookup is keyed by BOTH pluginId and companyId, so a company's
+   * health evaluation can never resolve another company's plugin_config row.
+   */
+  async function checkPluginConnectionHealth(
+    connection: typeof toolConnections.$inferSelect,
+    context: PluginConnectionContext,
+  ): Promise<string> {
+    const { plugin } = context;
+    if (plugin.status === "uninstalled") {
+      throw unprocessable(`Plugin ${plugin.pluginKey} is uninstalled`, { code: "mcp_remote_plugin_missing" });
+    }
+    const [configRow] = await db
+      .select()
+      .from(pluginConfig)
+      .where(and(eq(pluginConfig.pluginId, plugin.id), eq(pluginConfig.companyId, connection.companyId)))
+      .limit(1);
+    const configRecord = asRecord(configRow?.configJson) ?? {};
+    const configuredUrl = typeof configRecord.url === "string" ? configRecord.url.trim() : "";
+    if (configuredUrl.length > 0) {
+      await remoteTools(connection, { ...(connection.config ?? {}), url: configuredUrl });
+      return `Plugin ${plugin.pluginKey} endpoint responded to tools/list.`;
+    }
+    if (!configRow) {
+      throw unprocessable(
+        `Plugin ${plugin.pluginKey} is not configured for this company`,
+        { code: "mcp_remote_plugin_unconfigured" },
+      );
+    }
+    const toolCount = options.pluginToolRuntimeProbe
+      ? await options.pluginToolRuntimeProbe({ pluginId: plugin.id })
+      : null;
+    if (toolCount === null || toolCount < 1) {
+      throw new HttpError(502, `Plugin ${plugin.pluginKey} runtime has no registered tools`, {
+        code: "mcp_remote_plugin_unavailable",
+      });
+    }
+    return `Plugin ${plugin.pluginKey} is running with ${toolCount} registered ${toolCount === 1 ? "tool" : "tools"}.`;
+  }
+
   async function checkConnectionHealth(connectionId: string, actor?: ActorInfo): Promise<ToolConnectionHealthCheckResult> {
     const connection = await getConnectionRow(connectionId);
     try {
+      let pluginOkMessage: string | null = null;
       if (connection.transport === "mcp_remote") {
-        await remoteTools(connection);
+        const pluginContext = await resolvePluginConnectionContext(connection);
+        if (pluginContext) {
+          pluginOkMessage = await checkPluginConnectionHealth(connection, pluginContext);
+        } else {
+          await remoteTools(connection);
+        }
       } else {
         await resolveCredentialHeaders(connection);
         await stdioTemplateId(connection.companyId, connection.config);
       }
-      const updated = await updateConnectionHealth(connection, "ok", connection.transport === "local_stdio"
-        ? "Approved stdio template is ready."
-        : "Remote MCP server responded to tools/list.");
+      const updated = await updateConnectionHealth(
+        connection,
+        "ok",
+        pluginOkMessage
+          ?? (connection.transport === "local_stdio"
+            ? "Approved stdio template is ready."
+            : "Remote MCP server responded to tools/list."),
+      );
       const runtimeSlot = await ensureRuntimeSlot(updated);
       await audit({
         companyId: connection.companyId,

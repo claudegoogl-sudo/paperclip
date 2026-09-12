@@ -650,6 +650,9 @@ export async function createApp(
     deploymentMode: opts.deploymentMode,
     deploymentExposure: opts.deploymentExposure,
     trustedLocalStdioRuntimeHost,
+    // Plugin-backed connections report health via the plugin tool runtime
+    // instead of requiring a config.url their records never carry.
+    pluginToolRuntimeProbe: ({ pluginId }) => toolDispatcher.toolCount(pluginId),
     toolGateway,
   }));
   api.use(smokeLabRoutes(db, {
@@ -1091,5 +1094,7 @@ export async function createApp(
     void flushPluginLogBuffer();
   });
 
-  return app;
+  // The plugin tool dispatcher is exposed so the standalone tool-health sweep
+  // service (index.ts) can probe plugin-backed connection health.
+  return { app, pluginToolDispatcher: toolDispatcher };
 }
