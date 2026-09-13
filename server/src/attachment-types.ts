@@ -108,6 +108,10 @@ export const PLUGIN_ARTIFACT_ALLOWED_MIME_TYPES: readonly string[] = [
   // routes force downloads for plugin-created spreadsheet-bait assets
   // (see isSpreadsheetBaitPluginArtifact).
   "text/tab-separated-values",
+  // SE ruling: inert KiCad CAD exchange formats — static board/schematic
+  // text with no executable or active-content surface.
+  "application/x-kicad-pcb",
+  "application/x-kicad-schematic",
   // Inert 3D / CAD geometry (static, non-executable).
   "model/stl",
   "application/vnd.ms-pki.stl",

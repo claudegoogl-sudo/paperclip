@@ -280,10 +280,18 @@ describe("isAllowedPluginArtifactMimeType", () => {
     }
   });
 
+  it("admits the inert KiCad exchange types per the SE ruling", () => {
+    for (const ct of ["application/x-kicad-pcb", "application/x-kicad-schematic"]) {
+      expect(isAllowedPluginArtifactMimeType(ct)).toBe(true);
+    }
+  });
+
   it("matches the newly admitted types case-insensitively", () => {
     expect(isAllowedPluginArtifactMimeType("Application/ZIP")).toBe(true);
     expect(isAllowedPluginArtifactMimeType("TEXT/CSV")).toBe(true);
     expect(isAllowedPluginArtifactMimeType("Text/Tab-Separated-Values")).toBe(true);
+    expect(isAllowedPluginArtifactMimeType("Application/X-KiCad-PCB")).toBe(true);
+    expect(isAllowedPluginArtifactMimeType("Application/X-KiCad-Schematic")).toBe(true);
   });
 });
 
