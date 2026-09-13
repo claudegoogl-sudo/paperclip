@@ -463,6 +463,80 @@ describe("issue attachment routes", () => {
     expect(mockCompanyService.getById).not.toHaveBeenCalled();
   });
 
+  it("forces plugin-created csv attachments to download (SE ruling D2)", async () => {
+    const storage = createStorageService(Buffer.from("a,b\n1,2\n"));
+    mockIssueService.getAttachmentById.mockResolvedValue({
+      ...makeAttachment("text/csv", "gerbers.csv"),
+      byteSize: 8,
+      objectKey: "company-1/plugin-artifacts/2026/09/13/uuid-gerbers.csv",
+    });
+
+    const app = await createApp(storage);
+    const res = await request(app)
+      .get("/api/attachments/attachment-1/content")
+      .buffer(true)
+      .parse(parseBinaryResponse);
+
+    expect(res.status).toBe(200);
+    expect(res.headers["content-disposition"]).toBe('attachment; filename="gerbers.csv"');
+    expect(res.headers["x-content-type-options"]).toBe("nosniff");
+  });
+
+  it("forces plugin-created tsv attachments to download even without a spreadsheet filename", async () => {
+    const storage = createStorageService(Buffer.from("a\tb\n"));
+    mockIssueService.getAttachmentById.mockResolvedValue({
+      ...makeAttachment("text/tab-separated-values", "inbound-asset"),
+      objectKey: "company-1/plugin-artifacts/2026/09/13/uuid-inbound-asset",
+    });
+
+    const app = await createApp(storage);
+    const res = await request(app)
+      .get("/api/attachments/attachment-1/content")
+      .buffer(true)
+      .parse(parseBinaryResponse);
+
+    expect(res.status).toBe(200);
+    expect(res.headers["content-disposition"]).toBe('attachment; filename="inbound-asset"');
+  });
+
+  it("forces plugin-created spreadsheet-named attachments to download under a generic content type", async () => {
+    const storage = createStorageService(Buffer.from("binary"));
+    mockIssueService.getAttachmentById.mockResolvedValue({
+      ...makeAttachment("application/octet-stream", "bom.ods"),
+      byteSize: 6,
+      objectKey: "company-1/plugin-artifacts/2026/09/13/uuid-bom.ods",
+    });
+
+    const app = await createApp(storage);
+    const res = await request(app)
+      .get("/api/attachments/attachment-1/content")
+      .buffer(true)
+      .parse(parseBinaryResponse);
+
+    expect(res.status).toBe(200);
+    expect(res.headers["content-disposition"]).toBe('attachment; filename="bom.ods"');
+  });
+
+  it("keeps human-uploaded csv attachments inline (guard is plugin-namespace-scoped)", async () => {
+    const storage = createStorageService(Buffer.from("a,b\n1,2\n"));
+    mockIssueService.getAttachmentById.mockResolvedValue({
+      ...makeAttachment("text/csv", "report.csv"),
+      byteSize: 8,
+    });
+
+    const app = await createApp(storage);
+    const res = await request(app)
+      .get("/api/attachments/attachment-1/content")
+      .buffer(true)
+      .parse(parseBinaryResponse);
+
+    expect(res.status).toBe(200);
+    expect([
+      undefined,
+      'inline; filename="report.csv"',
+    ]).toContain(res.headers["content-disposition"]);
+  });
+
   it("serves html attachments as downloads with nosniff", async () => {
     const storage = createStorageService();
     mockIssueService.getAttachmentById.mockResolvedValue(makeAttachment("text/html", "report.html"));

@@ -175,6 +175,7 @@ import {
   formatAttachmentSize,
   GENERIC_ATTACHMENT_CONTENT_TYPES,
   isInlineAttachmentContentType,
+  isSpreadsheetBaitPluginArtifact,
   MAX_ATTACHMENT_BYTES,
   normalizeContentType,
   normalizeUploadAttachmentContentType,
@@ -13363,9 +13364,21 @@ export function issueRoutes(
       res.setHeader("Content-Security-Policy", "sandbox; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'");
     }
     const filename = attachment.originalFilename ?? "attachment";
-    const disposition = parseBooleanQuery(req.query.download)
-      ? "attachment"
-      : isInlineAttachmentContentType(responseContentType) ? "inline" : "attachment";
+    // SE ruling (D2): plugin-created spreadsheet-bait assets (csv/tsv content
+    // type or spreadsheet filename under the plugin-artifacts namespace) are
+    // pinned to download — a browser must never render them inline.
+    const disposition =
+      parseBooleanQuery(req.query.download) ||
+      isSpreadsheetBaitPluginArtifact({
+        companyId: attachment.companyId,
+        objectKey: attachment.objectKey,
+        contentType: responseContentType,
+        originalFilename: attachment.originalFilename,
+      })
+        ? "attachment"
+        : isInlineAttachmentContentType(responseContentType)
+          ? "inline"
+          : "attachment";
     res.setHeader("Content-Disposition", `${disposition}; filename=\"${filename.replaceAll("\"", "")}\"`);
 
     object.stream.on("error", (err) => {
