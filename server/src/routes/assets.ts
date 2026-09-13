@@ -9,6 +9,7 @@ import { assetService, logActivity } from "../services/index.js";
 import {
   formatAttachmentSize,
   isAllowedContentType,
+  isSpreadsheetBaitPluginArtifact,
   MAX_ATTACHMENT_BYTES,
 } from "../attachment-types.js";
 import { assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
@@ -337,7 +338,17 @@ export function assetRoutes(db: Db, storage: StorageService) {
       res.setHeader("Content-Security-Policy", "sandbox; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'");
     }
     const filename = asset.originalFilename ?? "asset";
-    res.setHeader("Content-Disposition", `inline; filename=\"${filename.replaceAll("\"", "")}\"`);
+    // SE ruling (D2): spreadsheet-bait plugin-created assets are pinned to
+    // download; every other asset keeps the historical inline default.
+    const disposition = isSpreadsheetBaitPluginArtifact({
+      companyId: asset.companyId,
+      objectKey: asset.objectKey,
+      contentType: responseContentType,
+      originalFilename: asset.originalFilename,
+    })
+      ? "attachment"
+      : "inline";
+    res.setHeader("Content-Disposition", `${disposition}; filename=\"${filename.replaceAll("\"", "")}\"`);
 
     object.stream.on("error", (err) => {
       next(err);

@@ -1,3 +1,5 @@
+import { Readable } from "node:stream";
+import type { IncomingMessage } from "node:http";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import express from "express";
 import request from "supertest";
@@ -405,5 +407,111 @@ describe("POST /api/companies/:companyId/logo", () => {
     expect(res.status).toBe(422);
     expect(res.body.error).toBe("SVG could not be sanitized");
     expect(createAssetMock).not.toHaveBeenCalled();
+  });
+});
+
+function parseBinaryResponse(res: IncomingMessage, callback: (error: Error | null, body?: Buffer) => void) {
+  const chunks: Buffer[] = [];
+  res.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+  res.on("end", () => callback(null, Buffer.concat(chunks)));
+  res.on("error", callback);
+}
+
+describe("GET /api/assets/:assetId/content — spreadsheet-bait disposition guard", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.doUnmock("../services/activity-log.js");
+    vi.doUnmock("../services/assets.js");
+    vi.doUnmock("../services/index.js");
+    vi.doUnmock("../routes/assets.js");
+    vi.doUnmock("../routes/authz.js");
+    vi.doUnmock("../middleware/index.js");
+    registerModuleMocks();
+    vi.clearAllMocks();
+    createAssetMock.mockReset();
+    getAssetByIdMock.mockReset();
+    logActivityMock.mockReset();
+  });
+
+  it("forces plugin-created csv assets to download", async () => {
+    const storage = createStorageService();
+    storage.getObject.mockResolvedValue({
+      stream: Readable.from(Buffer.from("a,b\n1,2\n")),
+      contentType: "text/csv",
+      contentLength: 8,
+    });
+    getAssetByIdMock.mockResolvedValue({
+      ...createAsset(),
+      contentType: "text/csv",
+      byteSize: 8,
+      originalFilename: "gerbers.csv",
+      objectKey: "company-1/plugin-artifacts/2026/09/13/uuid-gerbers.csv",
+    });
+
+    const app = await createApp(storage);
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .get("/api/assets/asset-1/content")
+        .buffer(true)
+        .parse(parseBinaryResponse),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers["content-disposition"]).toBe('attachment; filename="gerbers.csv"');
+    expect(res.headers["x-content-type-options"]).toBe("nosniff");
+  });
+
+  it("forces plugin-created spreadsheet-named assets to download even under a generic content type", async () => {
+    const storage = createStorageService();
+    storage.getObject.mockResolvedValue({
+      stream: Readable.from(Buffer.from("binary")),
+      contentType: "application/octet-stream",
+      contentLength: 6,
+    });
+    getAssetByIdMock.mockResolvedValue({
+      ...createAsset(),
+      contentType: "application/octet-stream",
+      byteSize: 6,
+      originalFilename: "bom.xlsx",
+      objectKey: "company-1/plugin-artifacts/2026/09/13/uuid-bom.xlsx",
+    });
+
+    const app = await createApp(storage);
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .get("/api/assets/asset-1/content")
+        .buffer(true)
+        .parse(parseBinaryResponse),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers["content-disposition"]).toBe('attachment; filename="bom.xlsx"');
+  });
+
+  it("keeps human-uploaded csv assets inline (guard is scoped to the plugin-artifacts namespace)", async () => {
+    const storage = createStorageService();
+    storage.getObject.mockResolvedValue({
+      stream: Readable.from(Buffer.from("a,b\n1,2\n")),
+      contentType: "text/csv",
+      contentLength: 8,
+    });
+    getAssetByIdMock.mockResolvedValue({
+      ...createAsset(),
+      contentType: "text/csv",
+      byteSize: 8,
+      originalFilename: "report.csv",
+      objectKey: "assets/general/report.csv",
+    });
+
+    const app = await createApp(storage);
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .get("/api/assets/asset-1/content")
+        .buffer(true)
+        .parse(parseBinaryResponse),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers["content-disposition"]).toBe('inline; filename="report.csv"');
   });
 });
