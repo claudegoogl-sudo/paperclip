@@ -6,6 +6,7 @@ import {
   inferOfficeAttachmentContentTypeFromFilename,
   isAllowedPluginArtifactMimeType,
   isInlineAttachmentContentType,
+  isSpreadsheetBaitPluginArtifact,
   matchesContentType,
   MAX_ATTACHMENT_BYTES,
   normalizeContentType,
@@ -244,9 +245,8 @@ describe("isAllowedPluginArtifactMimeType", () => {
     expect(isAllowedPluginArtifactMimeType("Application/VND.MS-PKI.STL")).toBe(true);
   });
 
-  it("keeps the F2 exclusions (text/html, text/csv) rejected", () => {
+  it("keeps text/html rejected on the plugin path", () => {
     expect(isAllowedPluginArtifactMimeType("text/html")).toBe(false);
-    expect(isAllowedPluginArtifactMimeType("text/csv")).toBe(false);
   });
 
   it("never allows executables", () => {
@@ -260,16 +260,119 @@ describe("isAllowedPluginArtifactMimeType", () => {
     }
   });
 
-  it("leaves SVG and archive types gated until SecurityEngineer rules", () => {
+  it("leaves SVG and the remaining archive types gated (the SE ruling admitted zip only)", () => {
     for (const ct of [
       "image/svg+xml",
-      "application/zip",
+      "application/x-zip-compressed",
+      "application/x-zip",
       "application/gzip",
       "application/x-7z-compressed",
       "application/x-tar",
+      "application/octet-stream",
     ]) {
       expect(isAllowedPluginArtifactMimeType(ct)).toBe(false);
     }
+  });
+
+  it("admits zip, csv and tsv for opaque storage per the SE ruling", () => {
+    for (const ct of ["application/zip", "text/csv", "text/tab-separated-values"]) {
+      expect(isAllowedPluginArtifactMimeType(ct)).toBe(true);
+    }
+  });
+
+  it("admits the inert KiCad exchange types per the SE ruling", () => {
+    for (const ct of ["application/x-kicad-pcb", "application/x-kicad-schematic"]) {
+      expect(isAllowedPluginArtifactMimeType(ct)).toBe(true);
+    }
+  });
+
+  it("matches the newly admitted types case-insensitively", () => {
+    expect(isAllowedPluginArtifactMimeType("Application/ZIP")).toBe(true);
+    expect(isAllowedPluginArtifactMimeType("TEXT/CSV")).toBe(true);
+    expect(isAllowedPluginArtifactMimeType("Text/Tab-Separated-Values")).toBe(true);
+    expect(isAllowedPluginArtifactMimeType("Application/X-KiCad-PCB")).toBe(true);
+    expect(isAllowedPluginArtifactMimeType("Application/X-KiCad-Schematic")).toBe(true);
+  });
+});
+
+describe("isSpreadsheetBaitPluginArtifact", () => {
+  const base = {
+    companyId: "company-1",
+    objectKey: "company-1/plugin-artifacts/2026/09/13/uuid-gerbers.csv",
+    contentType: "text/csv",
+    originalFilename: "gerbers.csv",
+  };
+
+  it("forces attachment for plugin-created csv/tsv assets (by type)", () => {
+    expect(isSpreadsheetBaitPluginArtifact(base)).toBe(true);
+    expect(
+      isSpreadsheetBaitPluginArtifact({
+        ...base,
+        contentType: "text/tab-separated-values",
+        originalFilename: "bom.tsv",
+        objectKey: "company-1/plugin-artifacts/2026/09/13/uuid-bom.tsv",
+      }),
+    ).toBe(true);
+    // Alias x-zip-compressed style case variance on the type is normalized.
+    expect(
+      isSpreadsheetBaitPluginArtifact({ ...base, contentType: "TEXT/CSV" }),
+    ).toBe(true);
+  });
+
+  it("forces attachment for plugin-created spreadsheet-named assets even under a generic type", () => {
+    for (const filename of ["bom.ods", "bom.xls", "bom.xlsx", "bom.xlsm", "data.tsv"]) {
+      expect(
+        isSpreadsheetBaitPluginArtifact({
+          ...base,
+          contentType: "application/octet-stream",
+          originalFilename: filename,
+          objectKey: `company-1/plugin-artifacts/2026/09/13/uuid-${filename}`,
+        }),
+      ).toBe(true);
+    }
+  });
+
+  it("leaves human-uploaded spreadsheet-bait serving unchanged (namespace-scoped)", () => {
+    expect(
+      isSpreadsheetBaitPluginArtifact({
+        ...base,
+        objectKey: "issues/issue-1/gerbers.csv",
+      }),
+    ).toBe(false);
+    expect(
+      isSpreadsheetBaitPluginArtifact({
+        ...base,
+        objectKey: "assets/general/gerbers.csv",
+      }),
+    ).toBe(false);
+  });
+
+  it("leaves non-spreadsheet plugin assets alone", () => {
+    expect(
+      isSpreadsheetBaitPluginArtifact({
+        ...base,
+        contentType: "image/png",
+        originalFilename: "preview.png",
+        objectKey: "company-1/plugin-artifacts/2026/09/13/uuid-preview.png",
+      }),
+    ).toBe(false);
+    expect(
+      isSpreadsheetBaitPluginArtifact({
+        ...base,
+        contentType: "image/png",
+        originalFilename: null,
+        objectKey: "company-1/plugin-artifacts/2026/09/13/uuid-noname",
+      }),
+    ).toBe(false);
+  });
+
+  it("does not match a different company's plugin-artifacts namespace", () => {
+    expect(
+      isSpreadsheetBaitPluginArtifact({
+        ...base,
+        objectKey: "company-2/plugin-artifacts/2026/09/13/uuid-gerbers.csv",
+      }),
+    ).toBe(false);
   });
 });
 
