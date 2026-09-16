@@ -652,7 +652,7 @@ export async function createApp(
     trustedLocalStdioRuntimeHost,
     // Plugin-backed connections report health via the plugin tool runtime
     // instead of requiring a config.url their records never carry.
-    pluginToolRuntimeProbe: ({ pluginId }) => toolDispatcher.toolCount(pluginId),
+    pluginToolRuntimeProbe: ({ pluginKey }) => toolDispatcher.toolCount(pluginKey),
     toolGateway,
   }));
   api.use(smokeLabRoutes(db, {
