@@ -1492,7 +1492,7 @@ export async function startServer(): Promise<StartedServer> {
         ?? null,
       // Plugin-backed connections report health via the plugin tool runtime
       // instead of requiring a config.url their records never carry.
-      pluginToolRuntimeProbe: ({ pluginId }) => pluginToolDispatcher.toolCount(pluginId),
+      pluginToolRuntimeProbe: ({ pluginKey }) => pluginToolDispatcher.toolCount(pluginKey),
     });
     const worktreeRunExecutionActivation = await resolveWorktreeRunExecutionActivationState({
       getExperimental: () => instanceSettingsService(db).getExperimental(),

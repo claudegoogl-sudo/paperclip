@@ -166,13 +166,16 @@ async function oauthSingleFlight<T>(
 }
 
 /**
- * Runtime probe for plugin-backed tool connections. Given a plugin's DB id it
- * returns the number of tools the plugin runtime currently has registered for
- * that plugin, or null when the runtime cannot answer. Health checks fail
- * closed when the probe is not wired: an unverifiable plugin connection must
- * not be reported healthy.
+ * Runtime probe for plugin-backed tool connections. Given a plugin's
+ * pluginKey — the key the plugin tool runtime registers its tools under
+ * (`registry.registerPlugin(plugin.pluginKey, ...)`) — it returns the number
+ * of tools the runtime currently has registered for that plugin, or null when
+ * the runtime cannot answer. Passing the DB uuid here always misses (the
+ * registry's byPlugin map is keyed by pluginKey) and fails every connection
+ * closed. Health checks fail closed when the probe is not wired: an
+ * unverifiable plugin connection must not be reported healthy.
  */
-export type PluginToolRuntimeProbe = (input: { pluginId: string }) => Promise<number | null> | number | null;
+export type PluginToolRuntimeProbe = (input: { pluginKey: string }) => Promise<number | null> | number | null;
 
 type ToolAccessServiceOptions = {
   deploymentMode?: DeploymentMode;
@@ -3082,7 +3085,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       );
     }
     const toolCount = options.pluginToolRuntimeProbe
-      ? await options.pluginToolRuntimeProbe({ pluginId: plugin.id })
+      ? await options.pluginToolRuntimeProbe({ pluginKey: plugin.pluginKey })
       : null;
     if (toolCount === null || toolCount < 1) {
       throw new HttpError(502, `Plugin ${plugin.pluginKey} runtime has no registered tools`, {

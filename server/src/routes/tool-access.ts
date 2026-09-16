@@ -85,7 +85,7 @@ export function toolAccessRoutes(
     deploymentExposure?: DeploymentExposure;
     trustedLocalStdioRuntimeHost?: string | null;
     /** Runtime probe for plugin-backed connection health (see tool-access service). */
-    pluginToolRuntimeProbe?: (input: { pluginId: string }) => Promise<number | null> | number | null;
+    pluginToolRuntimeProbe?: (input: { pluginKey: string }) => Promise<number | null> | number | null;
     toolGateway?: ToolGatewayService;
   } = {},
 ) {

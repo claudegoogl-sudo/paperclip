@@ -50,6 +50,7 @@ import { secretService } from "../services/secrets.js";
 import { canonicalToolArguments, signToolArguments } from "../services/tool-content-guards.js";
 import { createToolGatewayService, type ToolGatewayService } from "../services/tool-gateway.js";
 import { toolAccessRoutes } from "../routes/tool-access.js";
+import { createPluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
 import { errorHandler } from "../middleware/index.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -7086,7 +7087,7 @@ describeEmbeddedPostgres("tool access service", () => {
 
     it("reports a configured plugin-backed connection healthy through the real sweep, and red once the per-company config row is gone", async () => {
       const probe = vi.fn(() => 2);
-      const { connection } = await seedPluginConnection({ withConfigRow: true });
+      const { plugin, connection } = await seedPluginConnection({ withConfigRow: true });
       const service = toolAccessService(db, { pluginToolRuntimeProbe: probe });
 
       const sweep = await service.sweepConnectionHealth({ staleAfterMs: 0 });
@@ -7095,13 +7096,66 @@ describeEmbeddedPostgres("tool access service", () => {
       expect(healthy.healthStatus).toBe("ok");
       expect(healthy.healthMessage).not.toContain("config.url");
       expect(healthy.healthMessage).toContain("registered tools");
-      expect(probe).toHaveBeenCalledWith({ pluginId: expect.any(String) });
+      // The probe must be keyed by pluginKey (the registry's registration
+      // key), never the DB uuid — see the uuid regression test below.
+      expect(probe).toHaveBeenCalledWith({ pluginKey: plugin.pluginKey });
 
       // Negative control: removing the per-company config row — the thing
       // the resolution must read — turns the same sweep back to failure.
       await db.delete(pluginConfig);
       const after = await service.sweepConnectionHealth({ staleAfterMs: 0 });
       expect(after).toMatchObject({ checked: 1, healthy: 0, failed: 1 });
+    });
+
+    it("probes the runtime by pluginKey, the key tools are registered under — not the DB uuid", async () => {
+      const { plugin, connection } = await seedPluginConnection({ withConfigRow: true });
+
+      // Real registration chain, exactly as the loader drives it
+      // (plugin-tool-dispatcher registerFromDb →
+      // registry.registerPlugin(plugin.pluginKey, manifest, plugin.id)):
+      // tools are registered under the pluginKey; the DB uuid only rides
+      // along as pluginDbId.
+      const dispatcher = createPluginToolDispatcher({});
+      dispatcher.registerPluginTools(
+        plugin.pluginKey,
+        {
+          ...(plugin.manifestJson as PaperclipPluginManifestV1),
+          tools: [{
+            name: "ping",
+            displayName: "Ping",
+            description: "probe fixture",
+            parametersSchema: { type: "object", properties: {} },
+          }],
+        },
+        plugin.id,
+      );
+      // Registration-key shape: the pluginKey sees the tool; the DB uuid
+      // does not — that asymmetry is what makes this test discriminating.
+      expect(dispatcher.toolCount(plugin.pluginKey)).toBe(1);
+      expect(dispatcher.toolCount(plugin.id)).toBe(0);
+
+      // Wiring mirrors app.ts (probe → dispatcher.toolCount), with one guard:
+      // a key of the wrong shape (e.g. a regression handing back the DB uuid,
+      // or the uuid under a differently-named field) must yield 0 tools, not
+      // accidentally fall through to toolCount()=total. If the service passed
+      // plugin.id the lookup would miss, toolCount would be 0, and health
+      // would fail closed with mcp_remote_plugin_unavailable — the
+      // 0/14-configured-connections symptom this pins down.
+      const probeInputs: unknown[] = [];
+      const service = toolAccessService(db, {
+        pluginToolRuntimeProbe: (input) => {
+          probeInputs.push(input);
+          return typeof input.pluginKey === "string" ? dispatcher.toolCount(input.pluginKey) : 0;
+        },
+      });
+
+      await expect(
+        service.checkHealth(connection.id, { actorType: "user", actorId: "board" }),
+      ).resolves.toBeDefined();
+      expect(probeInputs).toEqual([{ pluginKey: plugin.pluginKey }]);
+      const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, connection.id));
+      expect(row.healthStatus).toBe("ok");
+      expect(row.healthMessage).toBe(`Plugin ${plugin.pluginKey} is running with 1 registered tool.`);
     });
 
     it("fails closed when no plugin_config row exists anywhere for the connection's company", async () => {
