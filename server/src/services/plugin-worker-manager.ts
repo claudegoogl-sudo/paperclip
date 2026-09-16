@@ -2085,10 +2085,13 @@ export function createPluginWorkerHandle(
     chunk: Uint8Array;
     token: ReservationToken | null;
   }
-  // One pre-bind exit event, normalized to the narrow duplex-event schema.
+  // One pre-bind exit event, normalized to the narrow duplex-event schema. The
+  // record keeps the transport-close discriminator, so a replayed exit settles
+  // the wait with the same mark a post-bind exit would carry.
   interface HeldDuplexExitEvent {
     workerSessionId: string;
     exitCode: number | null;
+    transportClosed: boolean;
     token: ReservationToken | null;
   }
 
@@ -2619,6 +2622,7 @@ export function createPluginWorkerHandle(
       route.preBindExit = {
         workerSessionId,
         exitCode,
+        transportClosed: params.transportClosed === true,
         token: reserved === "no-ledger" ? null : reserved,
       };
       return;
@@ -2699,6 +2703,10 @@ export function createPluginWorkerHandle(
             hostRouteId: route.hostRouteId,
             workerSessionId: heldExit.workerSessionId,
             exitCode: heldExit.exitCode,
+            // Carry the held discriminator through the replay, so a transport
+            // close held before the bind still settles the wait with the mark a
+            // post-bind exit would carry.
+            ...(heldExit.transportClosed ? { transportClosed: true } : {}),
           },
         });
       }
