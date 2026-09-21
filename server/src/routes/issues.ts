@@ -18664,15 +18664,6 @@ export function issueRoutes(
         "sandbox; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'",
       );
     }
-    const disposition = parseBooleanQuery(req.query.download)
-      ? "attachment"
-      : isInlineAttachmentContentType(responseContentType)
-        ? "inline"
-        : "attachment";
-    res.setHeader(
-      "Content-Disposition",
-      String(res.getHeader("Content-Disposition")).replace(/^attachment;/, `${disposition};`),
-    );
     const filename = attachment.originalFilename ?? "attachment";
     // SE ruling (D2): plugin-created spreadsheet-bait assets (csv/tsv content
     // type or spreadsheet filename under the plugin-artifacts namespace) are
@@ -19117,15 +19108,6 @@ export function issueRoutes(
         "sandbox; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'",
       );
     }
-    const disposition = parseBooleanQuery(req.query.download)
-      ? "attachment"
-      : isInlineAttachmentContentType(responseContentType)
-        ? "inline"
-        : "attachment";
-    res.setHeader(
-      "Content-Disposition",
-      String(res.getHeader("Content-Disposition")).replace(/^attachment;/, `${disposition};`),
-    );
     const filename = attachment.originalFilename ?? "attachment";
     // SE ruling (D2): plugin-created spreadsheet-bait assets (csv/tsv content
     // type or spreadsheet filename under the plugin-artifacts namespace) are

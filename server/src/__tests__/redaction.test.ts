@@ -1,6 +1,5 @@
-import { afterEach } from "vitest";
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   PRP_V1_EVENT_TYPES,
   REDACTED_EVENT_VALUE,
@@ -367,6 +366,20 @@ describe("redaction", () => {
     expect(result).not.toContain(jwt);
   });
 
+  it("redacts a lone fine-grained github_pat_ with no other secret hint", () => {
+    // Synthetic, shape-valid probe — never a real credential.
+    const finePat = `github_pat_11${"B".repeat(80)}`;
+    const result = redactSensitiveText(`rejected input ${finePat} at gate`);
+
+    expect(result).not.toContain(finePat);
+    expect(result).toContain(REDACTED_EVENT_VALUE);
+  });
+
+  it("does not over-redact a benign github_pat_ mention below the length floor", () => {
+    const benign = "see github_pat_docs for setup";
+    expect(redactSensitiveText(benign)).toBe(benign);
+  });
+
   it("redacts authorization variants and standalone bearer credentials from diagnostic text", () => {
     const input = [
       "Authorization: Basic dXNlcjpwYXNz",
@@ -393,15 +406,186 @@ describe("redaction", () => {
     expect(redactSensitiveText(result)).toBe(result);
   });
 
-  it("redacts a lone fine-grained github_pat_ with no other secret hint", () => {
-    // Synthetic, shape-valid probe — never a real credential.
-    const finePat = `github_pat_11${"B".repeat(80)}`;
-    const result = redactSensitiveText(`rejected input ${finePat} at gate`);
+  it("redacts raw and escaped quote-delimited authorization values without leaking nested content", () => {
+    const cases = [
+      {
+        input: 'prefix Authorization: Bearer "two word secret" suffix',
+        expected: `prefix Authorization: ${REDACTED_EVENT_VALUE} suffix`,
+      },
+      {
+        input: "prefix Authorization: Basic 'two word secret' suffix",
+        expected: `prefix Authorization: ${REDACTED_EVENT_VALUE} suffix`,
+      },
+      {
+        input: String.raw`prefix {\"Authorization\":\"Basic dXNlcjpwYXNz\"} suffix`,
+        expected: String.raw`prefix {\"Authorization\":\"***REDACTED***\"} suffix`,
+      },
+      {
+        input: String.raw`prefix Authorization: \"Bearer \\\"nested two word secret\\\"\" suffix`,
+        expected: String.raw`prefix Authorization: \"***REDACTED***\" suffix`,
+      },
+    ];
 
-    expect(result).not.toContain(finePat);
-    expect(result).toContain(REDACTED_EVENT_VALUE);
+    for (const { input, expected } of cases) {
+      const result = redactSensitiveText(input);
+      expect(result).toBe(expected);
+      expect(result).not.toContain("two word secret");
+      expect(result).not.toContain("dXNlcjpwYXNz");
+      expect(redactSensitiveText(result)).toBe(result);
+    }
   });
 
+  it("redacts raw and serialized standalone bearer values without leaking quoted content", () => {
+    const cases = [
+      {
+        input: 'prefix Bearer "two word secret" suffix',
+        expected: `prefix Bearer "${REDACTED_EVENT_VALUE}" suffix`,
+      },
+      {
+        input: "prefix Bearer 'two word secret' suffix",
+        expected: `prefix Bearer '${REDACTED_EVENT_VALUE}' suffix`,
+      },
+      {
+        input: String.raw`prefix Bearer \"two word secret\" suffix`,
+        expected: String.raw`prefix Bearer \"***REDACTED***\" suffix`,
+      },
+      {
+        input: String.raw`prefix Bearer \"outer \\\"nested secret\\\" value\" suffix`,
+        expected: String.raw`prefix Bearer \"***REDACTED***\" suffix`,
+      },
+    ];
+
+    for (const { input, expected } of cases) {
+      const result = redactSensitiveText(input);
+      expect(result).toBe(expected);
+      expect(result).not.toContain("two word secret");
+      expect(result).not.toContain("nested secret");
+      expect(redactSensitiveText(result)).toBe(result);
+    }
+  });
+
+  it("redacts token tails attached to raw and escaped closing credential quotes", () => {
+    const cases = [
+      {
+        input: 'Authorization: Basic "abc"defg retry',
+        expected: `Authorization: ${REDACTED_EVENT_VALUE}`,
+      },
+      {
+        input: String.raw`Authorization: Basic \"abc\"defg retry`,
+        expected: `Authorization: ${REDACTED_EVENT_VALUE}`,
+      },
+      {
+        input: 'Bearer "abc"defg retry',
+        expected: `Bearer "${REDACTED_EVENT_VALUE}"`,
+      },
+      {
+        input: String.raw`Bearer \"abc\"defg retry`,
+        expected: String.raw`Bearer \"***REDACTED***\"`,
+      },
+      {
+        input: 'Authorization: Basic "abc"defg retry\nsafe context',
+        expected: `Authorization: ${REDACTED_EVENT_VALUE}`,
+      },
+      {
+        input:
+          String.raw`Authorization: Basic \"abc\"defg retry` + "\nsafe context",
+        expected: `Authorization: ${REDACTED_EVENT_VALUE}`,
+      },
+      {
+        input: 'authorization="Bearer abc\ndef" status=401',
+        expected: `authorization="${REDACTED_EVENT_VALUE}" status=401`,
+      },
+      {
+        input: String.raw`authorization=\"Bearer abc
+def\" status=401`,
+        expected: String.raw`authorization=\"***REDACTED***\" status=401`,
+      },
+      {
+        input: 'authorization="Bearer abc"\ndef" status=401',
+        expected: `authorization="${REDACTED_EVENT_VALUE}" status=401`,
+      },
+      {
+        input: String.raw`authorization=\"Bearer abc\"
+def\" status=401`,
+        expected: String.raw`authorization=\"***REDACTED***\" status=401`,
+      },
+      {
+        input: 'authorization="Bearer abc"\ndef status=401',
+        expected: `authorization="${REDACTED_EVENT_VALUE}"`,
+      },
+      {
+        input: String.raw`authorization=\"Bearer abc\"
+def status=401`,
+        expected: String.raw`authorization=\"***REDACTED***\"`,
+      },
+      {
+        input:
+          'authorization="Bearer first-line"\nrequest failed with Bearer standalone"embedded-tail',
+        expected: `authorization="${REDACTED_EVENT_VALUE}"\nrequest failed with Bearer ${REDACTED_EVENT_VALUE}`,
+      },
+      {
+        input: String.raw`authorization=\"Bearer first-line\"
+request failed with Bearer standalone\"embedded-tail`,
+        expected: String.raw`authorization=\"***REDACTED***\"
+request failed with Bearer ***REDACTED***`,
+      },
+      {
+        input: String.raw`{\"authorization\":\"Bearer a\"b c\"} suffix`,
+        expected: String.raw`{\"authorization\":\"***REDACTED***\"} suffix`,
+      },
+      {
+        input: `{"authorization":"Bearer a"b c"} suffix`,
+        expected: `{"authorization":"${REDACTED_EVENT_VALUE}"} suffix`,
+      },
+      {
+        input: String.raw`{\"authorization\":\"Bearer a\" b c\"} suffix`,
+        expected: String.raw`{\"authorization\":\"***REDACTED***\"} suffix`,
+      },
+      {
+        input: `{"authorization":"Bearer a" b c"} suffix`,
+        expected: `{"authorization":"${REDACTED_EVENT_VALUE}"} suffix`,
+      },
+    ];
+
+    for (const { input, expected } of cases) {
+      const result = redactSensitiveText(input);
+      expect(result).toBe(expected);
+      expect(result).not.toContain("abc");
+      expect(result).not.toContain("defg");
+      expect(result).not.toContain('a"b c');
+      expect(result).not.toContain('a" b c');
+      expect(redactSensitiveText(result)).toBe(result);
+    }
+
+    const sanitized = redactEventPayload({
+      message: 'Authorization: Basic "abc"defg retry',
+      malformedProviderText: '{"authorization":"Bearer a" b c"} suffix',
+      authorization: 'Bearer a"b c"',
+      nested: {
+        diagnostics: [
+          String.raw`Bearer \"abc\"defg retry`,
+          String.raw`{\"authorization\":\"Bearer a\"b c\"} suffix`,
+          String.raw`authorization=\"Bearer first-line
+second-line\" status=401`,
+          String.raw`authorization=\"Bearer first-line\"
+second-line\" status=401`,
+        ],
+      },
+    });
+    expect(sanitized).toEqual({
+      message: `Authorization: ${REDACTED_EVENT_VALUE}`,
+      malformedProviderText: `{"authorization":"${REDACTED_EVENT_VALUE}"} suffix`,
+      authorization: REDACTED_EVENT_VALUE,
+      nested: {
+        diagnostics: [
+          String.raw`Bearer \"***REDACTED***\"`,
+          String.raw`{\"authorization\":\"***REDACTED***\"} suffix`,
+          String.raw`authorization=\"***REDACTED***\" status=401`,
+          String.raw`authorization=\"***REDACTED***\" status=401`,
+        ],
+      },
+    });
+    expect(redactEventPayload(sanitized)).toEqual(sanitized);
   });
 
   it("redacts inline secrets from command metadata without hiding safe command text", () => {

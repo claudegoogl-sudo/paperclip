@@ -211,6 +211,26 @@ describe("agent auth middleware", () => {
     expect(commentWrites).toBe(0);
   });
 
+  // Fork divergence from upstream (PR #294 posture, kept through the v2026.831.1
+  // merge): a bearer that is neither a valid agent key nor a verifying agent JWT
+  // falls through unauthenticated so the route's own auth decides. Upstream
+  // fail-closes these with a 401; the fork must not hard-reject stale or revoked
+  // board tokens on routes that can decide for themselves.
+  it("falls an unverified bearer through to the route instead of fail-closing", async () => {
+    const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
+    let commentWrites = 0;
+    const app = createApp(db, "local_trusted");
+    app.post("/comments", (_req, res) => {
+      commentWrites += 1;
+      res.status(201).json({ ok: true });
+    });
+
+    const res = await request(app).post("/comments").set("Authorization", "Bearer not-a-token").send({ body: "reply" });
+
+    expect(res.status).toBe(201);
+    expect(commentWrites).toBe(1);
+  });
+
   it("leaves public MCP gateway bearers for the gateway protocol to validate", async () => {
     const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
     const publicId = `gw_${"a".repeat(32)}`;
@@ -234,24 +254,6 @@ describe("agent auth middleware", () => {
 
     expect(res.status).toBe(401);
     expect(res.body.error).toContain("Agent token did not verify");
-  // Fork divergence from upstream (PR #294 posture, kept through the v2026.831.1
-  // merge): a bearer that is neither a valid agent key nor a verifying agent JWT
-  // falls through unauthenticated so the route's own auth decides. Upstream
-  // fail-closes these with a 401; the fork must not hard-reject stale or revoked
-  // board tokens on routes that can decide for themselves.
-  it("falls an unverified bearer through to the route instead of fail-closing", async () => {
-    const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
-    let commentWrites = 0;
-    const app = createApp(db, "local_trusted");
-    app.post("/comments", (_req, res) => {
-      commentWrites += 1;
-      res.status(201).json({ ok: true });
-    });
-
-    const res = await request(app).post("/comments").set("Authorization", "Bearer not-a-token").send({ body: "reply" });
-
-    expect(res.status).toBe(201);
-    expect(commentWrites).toBe(1);
   });
 
   it.each([

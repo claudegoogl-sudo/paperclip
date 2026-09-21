@@ -161,6 +161,8 @@ describeEmbeddedPostgres("productivity review service", () => {
   
   
 
+});
+
 describe("high comment volume alerts (fork monitor, standalone module)", () => {
   it("raises exactly one deduplicated high-comment-volume alert per offending issue", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
@@ -191,6 +193,7 @@ describe("high comment volume alerts (fork monitor, standalone module)", () => {
     expect(alerts[0]?.originFingerprint).toBe(`high-comment-volume-alert:${seeded.issueId}`);
     expect(alerts[0]?.description).toContain("Comment count: 4");
     expect(alerts[0]?.description).toContain("Alert threshold: 3");
+  });
 
   it("does not raise a high-comment-volume alert below the threshold", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
@@ -212,4 +215,24 @@ describe("high comment volume alerts (fork monitor, standalone module)", () => {
     expect(result.scanned).toBe(0);
     expect(result.alerted).toBe(0);
     expect(await listHighCommentVolumeAlerts(seeded.companyId)).toHaveLength(0);
+  });
 });
+
+async function listHighCommentVolumeAlerts(companyId: string) {
+  const rows = await db
+    .select({ id: issues.id, parentId: issues.parentId, assigneeAgentId: issues.assigneeAgentId })
+    .from(issues)
+    .where(
+      and(
+        eq(issues.companyId, companyId),
+        sql`${issues.originKind} = ${HIGH_COMMENT_VOLUME_ALERT_ORIGIN_KIND}`,
+      ),
+    );
+  const detailed = await Promise.all(
+    rows.map(async (row) => {
+      const [full] = await db.select().from(issues).where(eq(issues.id, row.id)).limit(1);
+      return full;
+    }),
+  );
+  return detailed.filter(Boolean);
+}
