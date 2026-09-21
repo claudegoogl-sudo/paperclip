@@ -350,8 +350,6 @@ export function useLiveRunTranscripts({
             return next;
           });
         }
-
-        }
       } finally {
         inFlightRunIds.delete(run.id);
         if (!cancelled) {

@@ -55,6 +55,7 @@ export function serviceWorkerBuildIdPlugin(
 ): Plugin {
   const serviceWorkerFileName = options.serviceWorkerFileName ?? "sw.js";
   let buildId: string | null = null;
+  let sawMainBundle = false;
   let outDir = "dist";
 
   return {
@@ -68,11 +69,24 @@ export function serviceWorkerBuildIdPlugin(
         (chunk) => chunk.type === "chunk" && chunk.isEntry,
       );
       if (entry) {
+        sawMainBundle = true;
         buildId = deriveBuildIdFromEntryFileName(entry.fileName);
       }
     },
     closeBundle() {
       const swPath = path.resolve(outDir, serviceWorkerFileName);
+      // Rolldown-based Vite runs closeBundle once per emitted bundle, and
+      // sub-builds (web-worker chunks, lib passes) close before the main
+      // bundle's assets land in the outDir. Those passes saw no entry chunk,
+      // so skip them silently; the main pass stamps after its emit. A missing
+      // sw.js on the main pass is still a hard failure — the worker would
+      // never rotate.
+      if (!fs.existsSync(swPath)) {
+        if (!sawMainBundle) return;
+        throw new Error(
+          `${swPath} was not emitted with the main bundle; the build cannot stamp the service-worker build id`,
+        );
+      }
       const source = fs.readFileSync(swPath, "utf8");
       const stamped = stampServiceWorkerBuildId(source, buildId ?? "build");
       fs.writeFileSync(swPath, stamped);

@@ -50183,6 +50183,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         await expect(authority()).resolves.toBe("allow_chat_run_presentation");
         const [attachment] = await issueService(db).listAttachments(
           conversation.issueId,
+          fixture.companyId,
         );
         expect(attachment).toBeDefined();
         const selection = {
