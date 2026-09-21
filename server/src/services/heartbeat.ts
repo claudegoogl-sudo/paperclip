@@ -777,6 +777,16 @@ export const NO_OP_DISPATCH_RETRY_SAFETY_MARGIN_MS = 60 * 1000;
 // weekly, so anything beyond a week re-arms on the next admission failure
 // instead of sleeping past it.
 export const TRANSIENT_RETRY_NOT_BEFORE_MAX_DELAY_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Routine executions only release issues that still have actionable work
+// (fork routine-execution release guard).
+const ROUTINE_EXECUTION_RELEASABLE_ISSUE_STATUSES = [
+  "backlog",
+  "todo",
+  "in_progress",
+  "in_review",
+  "blocked",
+] as const;
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
 export {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
@@ -13964,18 +13974,37 @@ export function heartbeatService(
     });
   }
 
+  // Fork: monotonic per-run event sequence, allocated inside the caller's flow
+  // so event ordering is stable even when several writers race.
+  async function nextRunEventSeq(runId: string) {
+    const [row] = await db
+      .select({ maxSeq: sql<number | null>`max(${heartbeatRunEvents.seq})` })
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, runId));
+    return Number(row?.maxSeq ?? 0) + 1;
+  }
+
   async function appendRunEvent(
     run: typeof heartbeatRuns.$inferSelect,
-    event: {
-      eventType: string;
-      stream?: "system" | "stdout" | "stderr";
-      level?: "info" | "warn" | "error";
-      color?: string;
-      message?: string;
-      payload?: Record<string, unknown>;
-      retryExhaustion?: AppendHeartbeatRunEventInput["retryExhaustion"];
-    },
+    seqOrEvent:
+      | number
+      | {
+          eventType: string;
+          stream?: "system" | "stdout" | "stderr";
+          level?: "info" | "warn" | "error";
+          color?: string;
+          message?: string;
+          payload?: Record<string, unknown>;
+          retryExhaustion?: AppendHeartbeatRunEventInput["retryExhaustion"];
+        },
+    seq?: number,
   ) {
+    // Fork call shape: appendRunEvent(run, seq, event); upstream shape:
+    // appendRunEvent(run, event). Normalize both onto (event, seq).
+    const event =
+      typeof seqOrEvent === "number" ? (arguments[2] as typeof seqOrEvent & object) : seqOrEvent;
+    const eventSeq =
+      typeof seqOrEvent === "number" ? seqOrEvent : (seq ?? (await nextRunEventSeq(run.id)));
     const eventAt = new Date();
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
     const sanitizedMessage = event.message
@@ -14015,7 +14044,7 @@ export function heartbeatService(
       retryExhaustion: event.retryExhaustion,
     });
     if (persistedEvent.disposition === "duplicate") return;
-    const seq = persistedEvent.row.seq;
+    const persistedSeq = persistedEvent.row.seq;
 
     publishLiveEvent({
       companyId: run.companyId,
@@ -14024,7 +14053,7 @@ export function heartbeatService(
         runId: run.id,
         agentId: run.agentId,
         issueId,
-        seq,
+        seq: persistedSeq,
         eventType: event.eventType,
         stream: event.stream ?? null,
         level: event.level ?? null,
@@ -15603,12 +15632,16 @@ export function heartbeatService(
         opts?.maxAttempts ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
       ),
     );
+    const noOpDispatchRetry = resolveNoOpDispatchRetry({ run, retryReason });
+    // A dispatch that never reached the model did not happen, so it must not
+    // advance the ladder (fork no-op dispatch retry budget).
+    const noOpAdvance = noOpDispatchRetry.active ? 0 : 1;
     const nextAttempt =
       (retryReason === WORKSPACE_BUSY_RETRY_REASON ||
       retryReason === AI_CONNECTION_BUSY_RETRY_REASON ||
       retryReason === MAX_TURN_CONTINUATION_RETRY_REASON
         ? (run.scheduledRetryAttempt ?? 0)
-        : executionFailureRetryCount(run)) + 1;
+        : executionFailureRetryCount(run)) + noOpAdvance;
     const computedBaseSchedule =
       opts?.delayMs != null
         ? nextAttempt <= maxAttempts
@@ -21086,14 +21119,6 @@ export function heartbeatService(
       } else {
         delete context.paperclipSkillTest;
       }
-    // System/heartbeat sessions (no taskKey) have no agent_task_sessions row, so
-    // their resume params live on agent_runtime_state.session_params_json. Reading
-    // them here lets the persisted promptBundleKey flow into runtime.sessionParams
-    // so the adapter's resume guard busts a pinned session when the charter
-    // changes. Honour a requested reset so we don't resume when a fresh session is
-    // intended, and never source these for per-issue runs (taskKey present).
-    const systemSessionParamsJson =
-      !taskKey && !resetTaskSession ? (runtime.sessionParamsJson ?? null) : null;
       const executionContinuation =
         issueRef && !isConversation(issueContext) && issueContext?.assigneeAgentId === agent.id
           ? await buildExecutionContinuation({
@@ -21841,6 +21866,14 @@ export function heartbeatService(
       const sessionResetReason =
         sessionConfigFreshness.reasons.join("; ") || null;
       const taskSessionForRun = resetTaskSession ? null : taskSession;
+      // System/heartbeat sessions (no taskKey) have no agent_task_sessions row, so
+      // their resume params live on agent_runtime_state.session_params_json. Reading
+      // them here lets the persisted promptBundleKey flow into runtime.sessionParams
+      // so the adapter's resume guard busts a pinned session when the charter
+      // changes. Honour a requested reset so we don't resume when a fresh session is
+      // intended, and never source these for per-issue runs (taskKey present).
+      const systemSessionParamsJson =
+        !taskKey && !resetTaskSession ? (runtime.sessionParamsJson ?? null) : null;
       const previousSessionParams =
         explicitResumeSessionParams ??
         (isCanonicalSessionIdForAdapter(
@@ -30104,6 +30137,53 @@ export function heartbeatService(
       );
     }
     return result;
+  }
+
+  async function countAgentsWithQueuedRuns() {
+    const [{ count }] = await db
+      .select({ count: sql<number>`count(distinct ${heartbeatRuns.agentId})` })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "queued"));
+    return Number(count ?? 0);
+  }
+
+  /**
+   * Atomically decides whether one more run may start host-wide. The DB count and the
+   * reservation increment happen inside `withHostAdmissionLock`, so two agents dispatching
+   * concurrently cannot both read the same pre-claim count. Deliberately does *not* wrap the
+   * claim itself — see the note on `withHostAdmissionLock`.
+   */
+  async function reserveHostRunSlot() {
+    return withHostAdmissionLock(async () => {
+      const hostRunningCount = await countRunningRunsHostWide();
+      const hostInUse = hostRunningCount + inFlightHostRunReservations;
+      if (hostInUse >= hostRunCeiling.value) {
+        return { granted: false as const, hostRunningCount, hostInUse };
+      }
+      inFlightHostRunReservations += 1;
+      return { granted: true as const, hostRunningCount, hostInUse };
+    });
+  }
+
+  function releaseHostRunSlot() {
+    inFlightHostRunReservations = Math.max(0, inFlightHostRunReservations - 1);
+  }
+
+  function recordHostCeilingDeferral(agentId: string, details: Record<string, unknown>) {
+    hostCeilingDeferralCount += 1;
+    hostCeilingDeferredAgentIds.add(agentId);
+    logger.warn(
+      {
+        agentId,
+        hostMaxConcurrentRuns: hostRunCeiling.value,
+        hostCeilingSource: hostRunCeiling.source,
+        inFlightHostRunReservations,
+        hostCeilingDeferralCount,
+        deferredAgentCount: hostCeilingDeferredAgentIds.size,
+        ...details,
+      },
+      "heartbeat dispatch deferred by host concurrent-run ceiling",
+    );
   }
 
   return {
