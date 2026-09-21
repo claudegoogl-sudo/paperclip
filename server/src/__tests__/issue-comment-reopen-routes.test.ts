@@ -1474,14 +1474,19 @@ describe.sequential("issue comment reopen routes", () => {
     const recoveryRunId = "99999999-9999-4999-8999-999999999999";
     mockIssueService.getById.mockResolvedValue(makeIssue("in_progress"));
     mockDbSelectWhere.mockImplementation(() => ({
-      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-        Promise.resolve([{
-          id: recoveryRunId,
-          companyId: "company-1",
-          agentId: "22222222-2222-4222-8222-222222222222",
-          contextSnapshot: {
-            wakeReason: "source_scoped_recovery_action",
-            recoveryCause: "process_lost",
+      then: (
+        onFulfilled: (rows: unknown[]) => unknown,
+        onRejected?: (reason: unknown) => unknown,
+      ) =>
+        Promise.resolve([
+          {
+            id: recoveryRunId,
+            companyId: "company-1",
+            agentId: "22222222-2222-4222-8222-222222222222",
+            contextSnapshot: {
+              wakeReason: "source_scoped_recovery_action",
+              recoveryCause: "process_lost",
+            },
           },
         ]).then(onFulfilled, onRejected),
     }));

@@ -162,27 +162,6 @@ describe("agent instructions service", () => {
     ]);
   });
 
-  it.skipIf(process.platform === "win32")("rejects instruction symlinks for immutable runner snapshots without changing legacy exports", async () => {
-    const externalRoot = await makeTempDir("paperclip-agent-instructions-symlink-");
-    const outsideRoot = await makeTempDir("paperclip-agent-instructions-outside-");
-    cleanupDirs.add(externalRoot);
-    cleanupDirs.add(outsideRoot);
-    await fs.writeFile(path.join(externalRoot, "AGENTS.md"), "Read sibling.md\n", "utf8");
-    await fs.writeFile(path.join(outsideRoot, "secret.md"), "must not enter the bundle\n", "utf8");
-    await fs.symlink(path.join(outsideRoot, "secret.md"), path.join(externalRoot, "sibling.md"));
-    const agent = makeAgent({
-      instructionsBundleMode: "external",
-      instructionsRootPath: externalRoot,
-      instructionsEntryFile: "AGENTS.md",
-      instructionsFilePath: path.join(externalRoot, "AGENTS.md"),
-    });
-    const svc = agentInstructionsService();
-
-    await expect(svc.exportFiles(agent)).resolves.toMatchObject({
-      files: { "AGENTS.md": "Read sibling.md\n" },
-    });
-    await expect(svc.exportFiles(agent, { rejectSymlinks: true }))
-      .rejects.toThrow("Instructions bundle may not contain symlinks: sibling.md");
   it("skips instruction-edit backup artifacts from bundle listings and exports", async () => {
     const externalRoot = await makeTempDir("paperclip-agent-instructions-backups-");
     cleanupDirs.add(externalRoot);
@@ -200,12 +179,6 @@ describe("agent instructions service", () => {
     await fs.writeFile(path.join(externalRoot, "docs", "TOOLS.md"), "## Tools\n", "utf8");
 
     const svc = agentInstructionsService();
-    const agent = makeAgent({
-      instructionsBundleMode: "external",
-      instructionsRootPath: externalRoot,
-      instructionsEntryFile: "AGENTS.md",
-      instructionsFilePath: path.join(externalRoot, "AGENTS.md"),
-    });
 
     const bundle = await svc.getBundle(agent);
     const exported = await svc.exportFiles(agent);
@@ -216,6 +189,31 @@ describe("agent instructions service", () => {
       "docs/TOOLS.md",
     ]);
     expect(exported.files["AGENTS.md"]).toBe("# Current Agent\n");
+  });
+
+  it.skipIf(process.platform === "win32")("rejects instruction symlinks for immutable runner snapshots without changing legacy exports", async () => {
+    const agent = makeAgent({
+      instructionsBundleMode: "external",
+      instructionsRootPath: externalRoot,
+      instructionsEntryFile: "AGENTS.md",
+      instructionsFilePath: path.join(externalRoot, "AGENTS.md"),
+    });
+  it.skipIf(process.platform === "win32")("rejects instruction symlinks for immutable runner snapshots without changing legacy exports", async () => {
+    const externalRoot = await makeTempDir("paperclip-agent-instructions-symlink-");
+    const outsideRoot = await makeTempDir("paperclip-agent-instructions-outside-");
+    cleanupDirs.add(externalRoot);
+    cleanupDirs.add(outsideRoot);
+    await fs.writeFile(path.join(externalRoot, "AGENTS.md"), "Read sibling.md\n", "utf8");
+    await fs.writeFile(path.join(outsideRoot, "secret.md"), "must not enter the bundle\n", "utf8");
+    await fs.symlink(path.join(outsideRoot, "secret.md"), path.join(externalRoot, "sibling.md"));
+    const svc = agentInstructionsService();
+
+    await expect(svc.exportFiles(agent)).resolves.toMatchObject({
+      files: { "AGENTS.md": "Read sibling.md\n" },
+    });
+    await expect(svc.exportFiles(agent, { rejectSymlinks: true }))
+      .rejects.toThrow("Instructions bundle may not contain symlinks: sibling.md");
+  });
   });
 
   it("recovers a managed bundle from disk when bundle config metadata is missing", async () => {
