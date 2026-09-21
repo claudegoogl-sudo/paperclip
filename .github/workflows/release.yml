@@ -337,7 +337,7 @@ jobs:
         run: node scripts/cloud-source-verification.mjs "$SOURCE_SHA"
 
   publish_canary:
-    if: github.event_name == 'push' && github.repository == 'paperclipai/paperclip'
+    if: github.event_name == 'push'
     needs: verify_canary
     runs-on: ubuntu-latest
     timeout-minutes: 150
@@ -1282,7 +1282,7 @@ jobs:
           ./scripts/release.sh "${args[@]}"
 
   publish_stable:
-    if: github.event_name == 'workflow_dispatch' && !inputs.dry_run && github.repository == 'paperclipai/paperclip'
+    if: github.event_name == 'workflow_dispatch' && inputs.channel == 'stable' && !inputs.dry_run
     needs: [preflight_stable, verify_stable]
     runs-on: ubuntu-latest
     timeout-minutes: 150

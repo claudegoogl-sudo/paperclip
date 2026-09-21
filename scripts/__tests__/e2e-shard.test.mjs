@@ -13,7 +13,6 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 const script = path.join(repoRoot, "scripts", "e2e-shard.mjs");
 const durationsManifest = path.join(repoRoot, "scripts", "e2e-shard-durations.json");
 const playwrightConfig = path.join(repoRoot, "tests", "e2e", "playwright.config.ts");
-const prCallerWorkflow = path.join(repoRoot, ".github", "workflows", "pr.yml");
 const trustedPrWorkflowPath = ".github/workflows/pr-trusted.yml";
 const trustedPrWorkflow = path.join(repoRoot, trustedPrWorkflowPath);
 
@@ -26,13 +25,13 @@ function runShard(args) {
 }
 
 function readTrustedPrWorkflow() {
-  const caller = readFileSync(prCallerWorkflow, "utf8");
-  assert.match(
-    caller,
-    /^\s+uses: paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@master\s*$/m,
-    "pr.yml must call the trusted workflow from CODEOWNERS-protected master",
-  );
-  // Validate proposed workflow changes locally; CI executes the merged master version.
+  // Fork carve-out: upstream's pr.yml is a thin caller delegating to
+  // paperclipai/paperclip's CODEOWNERS-protected pr-trusted.yml@master. The
+  // fork keeps its own pr.yml with the fork CI jobs (policy, internal-id sync
+  // scan, lockfile and runner carve-outs), so the caller assertion does not
+  // apply here; the fork's pr-trusted.yml travels in-tree from upstream and
+  // its jobs are still validated below. Validate proposed workflow changes
+  // locally; CI executes the merged master version.
   return readFileSync(trustedPrWorkflow, "utf8");
 }
 
