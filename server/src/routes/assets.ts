@@ -342,14 +342,15 @@ export function assetRoutes(db: Db, storage: StorageService) {
       res.setHeader("Content-Security-Policy", "sandbox; default-src 'none'");
     }
     const filename = asset.originalFilename ?? "asset";
-    // SE ruling (D2): spreadsheet-bait plugin-created assets are pinned to
-    // download; every other asset keeps the historical inline default.
+    // Upstream gate: inline only for SVG-excluded inline-listed types; HTML and
+    // other script-capable types download. Fork SE ruling (D2) additionally
+    // pins spreadsheet-bait plugin artifacts to download.
     const disposition = isSpreadsheetBaitPluginArtifact({
       companyId: asset.companyId,
       objectKey: asset.objectKey,
       contentType: responseContentType,
       originalFilename: asset.originalFilename,
-    })
+    }) || !inlineSafe
       ? "attachment"
       : "inline";
     res.setHeader("Content-Disposition", `${disposition}; filename=\"${filename.replaceAll("\"", "")}\"`);

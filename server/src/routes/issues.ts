@@ -6497,6 +6497,8 @@ export function issueRoutes(
       details: { issueId: issue.id, holdId: hold.holdId, rootIssueId: hold.rootIssueId },
     });
     return false;
+  }
+
   /**
    * SECURITY-CRITICAL: Pre-submit secret-pattern denylist (locked spec). Scans
    * the named write-side fields against the shared pattern set
@@ -7814,96 +7816,6 @@ export function issueRoutes(
     });
   });
 
-  router.get("/companies/:companyId/search/extract", async (req, res) => {
-    const companyId = req.params.companyId as string;
-    assertCompanyAccess(req, companyId);
-    const companyScopeDecision = await access.decide({
-      actor: req.actor,
-      action: "company_scope:read",
-      resource: { type: "company", companyId },
-    });
-    if (!companyScopeDecision.allowed) {
-      res.status(403).json({
-        error: "Company search is outside this actor's authorization boundary",
-      });
-      return;
-    }
-    const parsedQuery = companySearchExtractQuerySchema.safeParse(req.query);
-    if (!parsedQuery.success) {
-      res.status(400).json({
-        error:
-          parsedQuery.error.issues[0]?.message ??
-          "Invalid extract search query",
-      });
-      return;
-    }
-    const rateLimit = searchRateLimiter.consume(
-      companySearchRateLimitActor(req, companyId),
-    );
-    res.setHeader("X-RateLimit-Limit", String(rateLimit.limit));
-    res.setHeader("X-RateLimit-Remaining", String(rateLimit.remaining));
-    if (!rateLimit.allowed) {
-      res.setHeader("Retry-After", String(rateLimit.retryAfterSeconds));
-      res.status(429).json({
-        error: "Search rate limit exceeded",
-        retryAfterSeconds: rateLimit.retryAfterSeconds,
-      });
-      return;
-    }
-    const result = await getSearchService().extract(
-      companyId,
-      parsedQuery.data,
-    );
-    res.json(result);
-  });
-
-  router.get("/companies/:companyId/search", async (req, res) => {
-    const companyId = req.params.companyId as string;
-    assertCompanyAccess(req, companyId);
-    const companyScopeDecision = await access.decide({
-      actor: req.actor,
-      action: "company_scope:read",
-      resource: { type: "company", companyId },
-    });
-    if (!companyScopeDecision.allowed) {
-      res.status(403).json({
-        error: "Company search is outside this actor's authorization boundary",
-      });
-      return;
-    }
-    const parsedQuery = companySearchQuerySchema.safeParse(req.query);
-    if (!parsedQuery.success) {
-      res.status(400).json({
-        error: parsedQuery.error.issues[0]?.message ?? "Invalid search query",
-      });
-      return;
-    }
-    let query = parsedQuery.data;
-    if (query.assigneeUserId === "me") {
-      if (req.actor.type !== "board" || !req.actor.userId) {
-        res
-          .status(403)
-          .json({ error: "assigneeUserId=me requires board authentication" });
-        return;
-      }
-      query = { ...query, assigneeUserId: req.actor.userId };
-    }
-    const rateLimit = searchRateLimiter.consume(
-      companySearchRateLimitActor(req, companyId),
-    );
-    res.setHeader("X-RateLimit-Limit", String(rateLimit.limit));
-    res.setHeader("X-RateLimit-Remaining", String(rateLimit.remaining));
-    if (!rateLimit.allowed) {
-      res.setHeader("Retry-After", String(rateLimit.retryAfterSeconds));
-      res.status(429).json({
-        error: "Search rate limit exceeded",
-        retryAfterSeconds: rateLimit.retryAfterSeconds,
-      });
-      return;
-    }
-    const result = await getSearchService().search(companyId, query);
-    res.json(result);
-  });
 
   router.get("/companies/:companyId/issues", async (req, res) => {
     const startedAt = Date.now();
@@ -17281,6 +17193,97 @@ export function issueRoutes(
     });
   }
 
+  router.get("/companies/:companyId/search/extract", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const companyScopeDecision = await access.decide({
+      actor: req.actor,
+      action: "company_scope:read",
+      resource: { type: "company", companyId },
+    });
+    if (!companyScopeDecision.allowed) {
+      res.status(403).json({
+        error: "Company search is outside this actor's authorization boundary",
+      });
+      return;
+    }
+    const parsedQuery = companySearchExtractQuerySchema.safeParse(req.query);
+    if (!parsedQuery.success) {
+      res.status(400).json({
+        error:
+          parsedQuery.error.issues[0]?.message ??
+          "Invalid extract search query",
+      });
+      return;
+    }
+    const rateLimit = searchRateLimiter.consume(
+      companySearchRateLimitActor(req, companyId),
+    );
+    res.setHeader("X-RateLimit-Limit", String(rateLimit.limit));
+    res.setHeader("X-RateLimit-Remaining", String(rateLimit.remaining));
+    if (!rateLimit.allowed) {
+      res.setHeader("Retry-After", String(rateLimit.retryAfterSeconds));
+      res.status(429).json({
+        error: "Search rate limit exceeded",
+        retryAfterSeconds: rateLimit.retryAfterSeconds,
+      });
+      return;
+    }
+    const result = await getSearchService().extract(
+      companyId,
+      parsedQuery.data,
+    );
+    res.json(result);
+  });
+
+  router.get("/companies/:companyId/search", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const companyScopeDecision = await access.decide({
+      actor: req.actor,
+      action: "company_scope:read",
+      resource: { type: "company", companyId },
+    });
+    if (!companyScopeDecision.allowed) {
+      res.status(403).json({
+        error: "Company search is outside this actor's authorization boundary",
+      });
+      return;
+    }
+    const parsedQuery = companySearchQuerySchema.safeParse(req.query);
+    if (!parsedQuery.success) {
+      res.status(400).json({
+        error: parsedQuery.error.issues[0]?.message ?? "Invalid search query",
+      });
+      return;
+    }
+    let query = parsedQuery.data;
+    if (query.assigneeUserId === "me") {
+      if (req.actor.type !== "board" || !req.actor.userId) {
+        res
+          .status(403)
+          .json({ error: "assigneeUserId=me requires board authentication" });
+        return;
+      }
+      query = { ...query, assigneeUserId: req.actor.userId };
+    }
+    const rateLimit = searchRateLimiter.consume(
+      companySearchRateLimitActor(req, companyId),
+    );
+    res.setHeader("X-RateLimit-Limit", String(rateLimit.limit));
+    res.setHeader("X-RateLimit-Remaining", String(rateLimit.remaining));
+    if (!rateLimit.allowed) {
+      res.setHeader("Retry-After", String(rateLimit.retryAfterSeconds));
+      res.status(429).json({
+        error: "Search rate limit exceeded",
+        retryAfterSeconds: rateLimit.retryAfterSeconds,
+      });
+      return;
+    }
+    const result = await getSearchService().search(companyId, query);
+    res.json(result);
+  });
+
   router.post(
     "/issues/:id/comments",
     validate(addIssueCommentSchema),
@@ -18756,8 +18759,6 @@ export function issueRoutes(
     res.json({ ok: true });
   });
 
-  return router;
-}
 
   router.post(
     "/issues/:id/feedback-votes",
@@ -18870,335 +18871,6 @@ export function issueRoutes(
       res.status(201).json(result.vote);
     },
   );
-
-  router.get("/issues/:id/attachments", async (req, res) => {
-    const issueId = req.params.id as string;
-    const issue = await getAccessibleResource(
-      req,
-      res,
-      getIssueById(req, issueId),
-      "Issue not found",
-    );
-    if (!issue) return;
-    if (!(await assertIssueReadAllowed(req, res, issue))) return;
-    const attachments = await svc.listAttachments(issueId, issue.companyId);
-    res.json(attachments.map(withContentPath));
-  });
-
-  router.post(
-    "/companies/:companyId/issues/:issueId/attachments",
-    async (req, res) => {
-      const companyId = req.params.companyId as string;
-      const issueId = req.params.issueId as string;
-      assertCompanyAccess(req, companyId);
-      const issue = await svc.getById(issueId);
-      if (!issue) {
-        res.status(404).json({ error: "Issue not found" });
-        return;
-      }
-      if (issue.companyId !== companyId) {
-        res.status(422).json({ error: "Issue does not belong to company" });
-        return;
-      }
-      if (issue.conversationAgentId && req.actor.type === "board" && !(await instanceSettings.getExperimental()).enableAgentChat) {
-        throw notFound("Agent Chat is disabled");
-      }
-      if (issue.conversationAgentId && req.actor.type === "board" && req.actor.userId !== issue.conversationUserId) {
-        throw forbidden("Only the conversation owner can upload attachments");
-      }
-      if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
-      if (
-        !(await assertDeliverableMutationAllowedByRunContext(req, res, issue))
-      )
-        return;
-
-      try {
-        await runSingleFileUpload(req, res, MAX_ATTACHMENT_BYTES);
-      } catch (err) {
-        if (err instanceof multer.MulterError) {
-          if (err.code === "LIMIT_FILE_SIZE") {
-            res.status(422).json({
-              error: `Attachment is larger than the ${formatAttachmentSize(MAX_ATTACHMENT_BYTES)} limit`,
-            });
-            return;
-          }
-          res.status(400).json({ error: err.message });
-          return;
-        }
-        throw err;
-      }
-
-      const file = (
-        req as Request & {
-          file?: { mimetype: string; buffer: Buffer; originalname: string };
-        }
-      ).file;
-      if (!file) {
-        res.status(400).json({ error: "Missing file field 'file'" });
-        return;
-      }
-      const contentType = normalizeUploadAttachmentContentType({
-        contentType: file.mimetype,
-        originalFilename: file.originalname,
-      });
-      if (file.buffer.length <= 0) {
-        res.status(422).json({ error: "Attachment is empty" });
-        return;
-      }
-
-      const parsedMeta = createIssueAttachmentMetadataSchema.safeParse(
-        req.body ?? {},
-      );
-      if (!parsedMeta.success) {
-        res.status(400).json({
-          error: "Invalid attachment metadata",
-          details: parsedMeta.error.issues,
-        });
-        return;
-      }
-
-      const actor = getActorInfo(req);
-      const stored = await storage.putFile({
-        companyId,
-        namespace: `issues/${issueId}`,
-        originalFilename: file.originalname || null,
-        contentType,
-        body: file.buffer,
-      });
-
-      let attachment: Awaited<ReturnType<typeof svc.createAttachment>>;
-      try {
-        attachment = await svc.createAttachment({
-          issueId,
-          issueCommentId: parsedMeta.data.issueCommentId ?? null,
-          provider: stored.provider,
-          objectKey: stored.objectKey,
-          contentType: stored.contentType,
-          byteSize: stored.byteSize,
-          sha256: stored.sha256,
-          originalFilename: stored.originalFilename,
-          createdByAgentId: actor.agentId,
-          createdByUserId: actor.actorType === "user" ? actor.actorId : null,
-          createdByRunId: actor.runId,
-        });
-      } catch (err) {
-        // A known 4xx means the registration transaction definitely rejected
-        // the request, so the just-written object is orphaned and safe to
-        // remove. An unexpected/database error is ambiguous: COMMIT may have
-        // succeeded even if the response was lost, and deleting the object in
-        // that case would corrupt a durable attachment row.
-        if (err instanceof HttpError && err.status >= 400 && err.status < 500) {
-          try {
-            await storage.deleteObject(companyId, stored.objectKey);
-          } catch (cleanupErr) {
-            logger.warn(
-              { cleanupErr, companyId, issueId },
-              "failed to remove stored object after attachment registration was rejected",
-            );
-          }
-        }
-        throw err;
-      }
-
-      await logActivity(db, {
-        companyId,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        agentId: actor.agentId,
-        runId: actor.runId,
-        agentApiKeyId: actor.agentApiKeyId,
-        action: "issue.attachment_added",
-        entityType: "issue",
-        entityId: issueId,
-        details: {
-          attachmentId: attachment.id,
-          originalFilename: attachment.originalFilename,
-          contentType: attachment.contentType,
-          byteSize: attachment.byteSize,
-        },
-      });
-
-      if (attachment.artifactWorkProductId) {
-        await logActivity(db, {
-          companyId,
-          actorType: actor.actorType,
-          actorId: actor.actorId,
-          agentId: actor.agentId,
-          runId: actor.runId,
-          agentApiKeyId: actor.agentApiKeyId,
-          action: "issue.work_product_created",
-          entityType: "issue",
-          entityId: issueId,
-          details: {
-            workProductId: attachment.artifactWorkProductId,
-            type: "artifact",
-            provider: "paperclip",
-            source: "run_attachment_upload",
-          },
-        });
-      }
-
-      const {
-        artifactWorkProductId: _artifactWorkProductId,
-        ...attachmentResponse
-      } = attachment;
-      res.status(201).json(withContentPath(attachmentResponse));
-    },
-  );
-
-  router.get("/attachments/:attachmentId/content", async (req, res, next) => {
-    const attachmentId = req.params.attachmentId as string;
-    const attachment = await getAccessibleResource(
-      req,
-      res,
-      svc.getAttachmentById(attachmentId),
-      "Attachment not found",
-    );
-    if (!attachment) return;
-    const issue = await svc.getById(attachment.issueId);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    if (!(await assertIssueReadAllowed(req, res, issue))) return;
-
-    const contentLength = attachment.byteSize;
-    const range = parseAttachmentRangeHeader(
-      typeof req.headers.range === "string" ? req.headers.range : undefined,
-      contentLength,
-    );
-    res.setHeader("Accept-Ranges", "bytes");
-    if (range.kind === "invalid") {
-      res.setHeader("Content-Range", `bytes */${contentLength}`);
-      res.status(416).end();
-      return;
-    }
-
-    const object = await storage.getObject(
-      attachment.companyId,
-      attachment.objectKey,
-      range.kind === "range"
-        ? { range: { start: range.start, end: range.end } }
-        : undefined,
-    );
-    const responseContentType = resolveAttachmentResponseContentType({
-      storedContentType: attachment.contentType,
-      objectContentType: object.contentType,
-      originalFilename: attachment.originalFilename,
-    });
-    // Markdown bodies are stored as UTF-8; declare the charset so inline
-    // (raw) views do not mojibake. SVG/inline checks below stay on the bare type.
-    const isMarkdownResponse = isMarkdownAttachmentContent({
-      contentType: responseContentType,
-      originalFilename: attachment.originalFilename,
-    });
-    // Express formats filenames with an encoded Unicode parameter when needed.
-    res.attachment(attachment.originalFilename ?? "attachment");
-    res.setHeader(
-      "Content-Type",
-      isMarkdownResponse
-        ? `${responseContentType}; charset=utf-8`
-        : responseContentType,
-    );
-    res.setHeader("Cache-Control", "private, max-age=60");
-    res.setHeader("X-Content-Type-Options", "nosniff");
-    if (responseContentType === SVG_CONTENT_TYPE) {
-      res.setHeader(
-        "Content-Security-Policy",
-        "sandbox; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'",
-      );
-    }
-    const filename = attachment.originalFilename ?? "attachment";
-    // SE ruling (D2): plugin-created spreadsheet-bait assets (csv/tsv content
-    // type or spreadsheet filename under the plugin-artifacts namespace) are
-    // pinned to download — a browser must never render them inline.
-    const disposition =
-      parseBooleanQuery(req.query.download) ||
-      isSpreadsheetBaitPluginArtifact({
-        companyId: attachment.companyId,
-        objectKey: attachment.objectKey,
-        contentType: responseContentType,
-        originalFilename: attachment.originalFilename,
-      })
-        ? "attachment"
-        : isInlineAttachmentContentType(responseContentType)
-          ? "inline"
-          : "attachment";
-    res.setHeader("Content-Disposition", `${disposition}; filename=\"${filename.replaceAll("\"", "")}\"`);
-
-    object.stream.on("error", (err) => {
-      next(err);
-    });
-    if (range.kind === "range") {
-      const rangeLength = range.end - range.start + 1;
-      res.status(206);
-      res.setHeader("Content-Length", String(rangeLength));
-      res.setHeader(
-        "Content-Range",
-        `bytes ${range.start}-${range.end}/${contentLength}`,
-      );
-      object.stream.pipe(res);
-      return;
-    }
-
-    res.setHeader(
-      "Content-Length",
-      String(contentLength || object.contentLength || 0),
-    );
-    object.stream.pipe(res);
-  });
-
-  router.delete("/attachments/:attachmentId", async (req, res) => {
-    const attachmentId = req.params.attachmentId as string;
-    const attachment = await getAccessibleResource(
-      req,
-      res,
-      svc.getAttachmentById(attachmentId),
-      "Attachment not found",
-    );
-    if (!attachment) return;
-    const issue = await svc.getById(attachment.issueId);
-    if (!issue) {
-      res.status(404).json({ error: "Issue not found" });
-      return;
-    }
-    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
-    if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue)))
-      return;
-
-    try {
-      await storage.deleteObject(attachment.companyId, attachment.objectKey);
-    } catch (err) {
-      logger.warn(
-        { err, attachmentId },
-        "storage delete failed while removing attachment",
-      );
-    }
-
-    const removed = await svc.removeAttachment(attachmentId);
-    if (!removed) {
-      res.status(404).json({ error: "Attachment not found" });
-      return;
-    }
-
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: removed.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      agentApiKeyId: actor.agentApiKeyId,
-      action: "issue.attachment_removed",
-      entityType: "issue",
-      entityId: removed.issueId,
-      details: {
-        attachmentId: removed.id,
-      },
-    });
-
-    res.json({ ok: true });
-  });
 
   return router;
 }
