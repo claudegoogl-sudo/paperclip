@@ -468,6 +468,7 @@ import {
   resolveWorktreeRunExecutionActivation,
 } from "./instance-settings.js";
 import { usageLimitParkService } from "./usage-limit-park.js";
+import { highCommentVolumeAlertService as highCommentVolumeAlertMonitor } from "./high-comment-volume-alert.js";
 import {
   evaluateExecutionAllowlist,
   isExecutionForcedToKubernetes,
@@ -30184,6 +30185,18 @@ export function heartbeatService(
       },
       "heartbeat dispatch deferred by host concurrent-run ceiling",
     );
+  }
+
+  // Fork carryover: the high-comment-volume alert monitor now lives in its own
+  // module (upstream removed the productivity-review service it used to ride
+  // on); expose it through the heartbeat surface the startup/periodic wiring
+  // already calls.
+  async function reconcileHighCommentVolumeAlerts(opts?: {
+    now?: Date;
+    companyId?: string;
+    threshold?: number;
+  }) {
+    return highCommentVolumeAlertMonitor.reconcileHighCommentVolumeAlerts(opts);
   }
 
   return {
