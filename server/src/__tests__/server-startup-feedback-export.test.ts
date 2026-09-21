@@ -33,18 +33,13 @@ const {
   routineServiceFactoryMock,
   routineServiceMock,
 } = vi.hoisted(() => {
-  const createAppMock = vi.fn(async () => ({
-    // startServer destructures the real createApp return contract
-    // ({ app, pluginToolDispatcher }); the dispatcher is only invoked lazily
-    // by the tool-health sweep probe, so a stub suffices here.
-    // The app stub carries the `locals` surfaces startServer sweeps at startup
-    // (tool review + delivery sweeps read app.locals directly).
-    app: Object.assign((_: unknown, __: unknown) => {}, {
-      locals: {
-        toolGateway: { sweepActionReviews: vi.fn(async () => ({ scanned: 0 })) },
-        toolActionDeliveries: { sweepPending: vi.fn(async () => ({ scanned: 0, delivered: 0 })) },
-      },
-    }) as never,
+  const createAppMock = vi.fn(async () => Object.assign((_: unknown, __: unknown) => {}, {
+    locals: {
+      toolGateway: { sweepActionReviews: vi.fn(async () => ({ scanned: 0 })) },
+      toolActionDeliveries: { sweepPending: vi.fn(async () => ({ scanned: 0, delivered: 0 })) },
+    },
+    // Fork createApp returns { app, pluginToolDispatcher }; the dispatcher is
+    // only invoked lazily by the tool-health sweep probe, so a stub suffices.
     pluginToolDispatcher: { toolCount: vi.fn(() => 0) },
   }) as never);
   const createBetterAuthInstanceMock = vi.fn(() => ({}));
@@ -428,7 +423,6 @@ import { startServer } from "../index.ts";
 import { logger } from "../middleware/logger.js";
 import { reconcileSafeNativeReplacements } from "../services/native-runtime/native-safe-replacement.js";
 import { EXECUTION_RECONCILIATION_INTERVAL_MS } from "../services/execution-control-deadline.js";
-
 describe("startServer feedback export wiring", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -714,7 +708,7 @@ describe("startServer feedback export wiring", () => {
     expect(fakeServer.close).toHaveBeenCalledTimes(1);
   });
 
-  it("warns but does not refuse authenticated public startup on embedded PostgreSQL", async () => {
+  it("refuses authenticated public startup without an external database URL", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       deploymentExposure: "public",
       authBaseUrlMode: "explicit",
@@ -723,24 +717,13 @@ describe("startServer feedback export wiring", () => {
       databaseUrl: undefined,
     }));
 
-    // The cloud-DB contract guard must no longer reject embedded PostgreSQL for
-    // authenticated+public deployments; it warns and falls through to the
-    // embedded-postgres branch (restores pre-525 posture). The embedded boot
-    // itself is out of scope for this unit, so swallow whatever happens after
-    // the guard and assert only that it warned instead of throwing the contract.
-    let thrown: unknown;
-    await startServer().catch((err) => {
-      thrown = err;
-    });
-
-    expect(vi.mocked(logger.warn)).toHaveBeenCalledWith(
-      expect.stringContaining("public deployment running on embedded PostgreSQL"),
+    await expect(startServer()).rejects.toThrow(
+      "authenticated public deployments require DATABASE_URL or config.database.connectionString",
     );
-    expect(String((thrown as Error | undefined)?.message ?? "")).not.toContain(
-      "refusing embedded PostgreSQL fallback",
-    );
+    expect(createDbMock).not.toHaveBeenCalled();
   });
 
+  it("warns but does not refuse authenticated public startup on embedded PostgreSQL", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       deploymentExposure: "public",
       authBaseUrlMode: "explicit",

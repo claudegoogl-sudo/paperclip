@@ -569,7 +569,7 @@ describe.sequential("issue thread interaction routes", () => {
       createdAt: "2026-04-20T12:00:00.000Z",
       updatedAt: "2026-04-20T12:05:00.000Z",
       resolvedAt: "2026-04-20T12:05:00.000Z",
-    });
+    }));
     mockInteractionService.getById.mockResolvedValue({
       id: "interaction-3",
       companyId: "company-1",
@@ -1147,28 +1147,6 @@ describe.sequential("issue thread interaction routes", () => {
     );
   });
 
-  it("durably marks a board-cancelled native question before cancelling its run", async () => {
-    mockRequestNativeQuestionRunCancellation.mockResolvedValueOnce(RUN_2);
-
-    const res = await request(await createApp())
-      .post(`/api/issues/${ISSUE_ID}/interactions/interaction-2/cancel`)
-      .send({});
-
-    expect(res.status).toBe(200);
-    expect(mockRequestNativeQuestionRunCancellation).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({ id: "interaction-2", sourceRunId: RUN_2 }),
-      { kind: "interaction_cancelled", interactionId: "interaction-2" },
-    );
-    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
-      RUN_2,
-      "Cancelled while waiting for operator input",
-      expect.objectContaining({
-        resultJson: expect.objectContaining({ cancelledInteractionId: "interaction-2" }),
-      }),
-    );
-  });
-
   it("lets a board actor supersede an interaction and records it as expired without a continuation wake", async () => {
     const app = await createApp();
 
@@ -1232,7 +1210,27 @@ describe.sequential("issue thread interaction routes", () => {
     expect(mockInteractionService.supersedeInteractionById).not.toHaveBeenCalled();
   });
 
-  it("accepts request confirmations and wakes the current assignee when configured for accept-only wakeups", async () => {
+  it("durably marks a board-cancelled native question before cancelling its run", async () => {
+    mockRequestNativeQuestionRunCancellation.mockResolvedValueOnce(RUN_2);
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${ISSUE_ID}/interactions/interaction-2/cancel`)
+      .send({});
+
+    expect(res.status).toBe(200);
+    expect(mockRequestNativeQuestionRunCancellation).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ id: "interaction-2", sourceRunId: RUN_2 }),
+      { kind: "interaction_cancelled", interactionId: "interaction-2" },
+    );
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+      RUN_2,
+      "Cancelled while waiting for operator input",
+      expect.objectContaining({
+        resultJson: expect.objectContaining({ cancelledInteractionId: "interaction-2" }),
+      }),
+    );
+  });  it("accepts request confirmations and wakes the current assignee when configured for accept-only wakeups", async () => {
     mockInteractionService.acceptInteraction.mockResolvedValueOnce({
       interaction: {
         id: "interaction-3",
