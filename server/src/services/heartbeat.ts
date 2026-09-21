@@ -468,7 +468,7 @@ import {
   resolveWorktreeRunExecutionActivation,
 } from "./instance-settings.js";
 import { usageLimitParkService } from "./usage-limit-park.js";
-import { highCommentVolumeAlertService as highCommentVolumeAlertMonitor } from "./high-comment-volume-alert.js";
+import { highCommentVolumeAlertService } from "./high-comment-volume-alert.js";
 import {
   evaluateExecutionAllowlist,
   isExecutionForcedToKubernetes,
@@ -797,9 +797,12 @@ export {
 export const ACTIVE_RUN_OUTPUT_PROGRESS_FLUSH_INTERVAL_MS = 60 * 1000;
 export const ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS = 5 * 1000;
 export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
-  30_000, 30_000,
+  2 * 60 * 1000,
+  10 * 60 * 1000,
+  30 * 60 * 1000,
+  2 * 60 * 60 * 1000,
 ] as const;
-const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0;
+const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0.25;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
 function isTransientWorkspaceGitScanCode(code: string | null | undefined): boolean {
@@ -9291,7 +9294,7 @@ export function normalizeSessionParams(
 }
 
 type RunSessionOutcome =
-  "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out";
+  "succeeded" | "succeeded_dirty" | "interrupted" | "failed" | "cancelled" | "timed_out";
 
 type SkillTestHeartbeatCompletion = {
   outcome: "failed" | "cancelled";
@@ -13998,14 +14001,38 @@ export function heartbeatService(
           payload?: Record<string, unknown>;
           retryExhaustion?: AppendHeartbeatRunEventInput["retryExhaustion"];
         },
-    seq?: number,
+    eventOrSeq?:
+      | {
+          eventType: string;
+          stream?: "system" | "stdout" | "stderr";
+          level?: "info" | "warn" | "error";
+          color?: string;
+          message?: string;
+          payload?: Record<string, unknown>;
+          retryExhaustion?: AppendHeartbeatRunEventInput["retryExhaustion"];
+        }
+      | number,
   ) {
     // Fork call shape: appendRunEvent(run, seq, event); upstream shape:
     // appendRunEvent(run, event). Normalize both onto (event, seq).
     const event =
-      typeof seqOrEvent === "number" ? (arguments[2] as typeof seqOrEvent & object) : seqOrEvent;
+      typeof seqOrEvent === "number"
+        ? (eventOrSeq as {
+            eventType: string;
+            stream?: "system" | "stdout" | "stderr";
+            level?: "info" | "warn" | "error";
+            color?: string;
+            message?: string;
+            payload?: Record<string, unknown>;
+            retryExhaustion?: AppendHeartbeatRunEventInput["retryExhaustion"];
+          })
+        : seqOrEvent;
     const eventSeq =
-      typeof seqOrEvent === "number" ? seqOrEvent : (seq ?? (await nextRunEventSeq(run.id)));
+      typeof seqOrEvent === "number"
+        ? seqOrEvent
+        : typeof eventOrSeq === "number"
+          ? eventOrSeq
+          : (await nextRunEventSeq(run.id));
     const eventAt = new Date();
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
     const sanitizedMessage = event.message
@@ -15663,9 +15690,6 @@ export function heartbeatService(
               opts?.random,
             )
           : null;
-    const baseSchedule = computedBaseSchedule
-      ? { ...computedBaseSchedule, maxAttempts }
-      : null;
     const transientRecovery =
       retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON
         ? readTransientRecoveryContractFromRun(run)
@@ -15676,22 +15700,52 @@ export function heartbeatService(
         ? resolveCodexTransientFallbackMode(nextAttempt)
         : null;
     const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
+    // Fork no-op dispatch retry ladder: a dispatch that never reached the
+    // model retries on its own short budget and never advances the bounded
+    // ladder; exhausting it gives up without consuming a bounded attempt.
+    const baseSchedule = noOpDispatchRetry.exhausted
+      ? null
+      : noOpDispatchRetry.active
+        ? buildNoOpDispatchRetrySchedule({
+            now,
+            attempt: nextAttempt,
+            maxAttempts,
+            retryNotBefore: transientRetryNotBefore,
+          })
+        : computedBaseSchedule
+          ? { ...computedBaseSchedule, maxAttempts }
+          : null;
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
 
     if (!baseSchedule) {
+      const giveUpReason = noOpDispatchRetry.exhausted
+        ? `No-op dispatch retries exhausted after ${noOpDispatchRetry.maxAttempts} attempts that never reached the model`
+        : `Bounded retry exhausted after ${run.scheduledRetryAttempt ?? 0} scheduled attempts`;
       const exhaustion = {
         retryReason,
         scheduledRetryAttempt: run.scheduledRetryAttempt ?? 0,
         maxAttempts,
+        ...(noOpDispatchRetry.exhausted
+          ? {
+              noOpDispatchRetryAttempt: noOpDispatchRetry.attempt,
+              noOpDispatchMaxAttempts: noOpDispatchRetry.maxAttempts,
+            }
+          : {}),
       };
       await appendRunEvent(run, {
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
-        message: `Bounded retry exhausted after ${run.scheduledRetryAttempt ?? 0} scheduled attempts; no further automatic retry will be queued`,
+        message: `${giveUpReason}; no further automatic retry will be queued`,
         payload: exhaustion,
         retryExhaustion: exhaustion,
+      });
+      await releaseRoutineExecutionIssueAfterRetryGiveUp(run, {
+        retryReason,
+        attempt: nextAttempt,
+        maxAttempts,
+        giveUpReason,
       });
       if (retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON) {
         await escalatePlanApprovalResumeFailureNeedsAttention({
@@ -15762,16 +15816,27 @@ export function heartbeatService(
       }
     }
 
+    // The fork caps transient horizons so a garbage far-future value cannot pin
+    // the ladder forever. Upstream pins provider-quota reset horizons exactly
+    // (they are the account's real reset clock, the same invariant the fork's
+    // usage-limit park honors), so the cap applies to the transient_upstream
+    // family only under the merged contract.
+    const notBeforeCapMs = now.getTime() + TRANSIENT_RETRY_NOT_BEFORE_MAX_DELAY_MS;
+    const capApplies = transientRecovery?.errorFamily !== "provider_quota";
+    const honoredNotBeforeMs =
+      transientRetryNotBefore !== null
+        ? capApplies
+          ? Math.min(transientRetryNotBefore.getTime(), notBeforeCapMs)
+          : transientRetryNotBefore.getTime()
+        : null;
     const schedule =
-      transientRetryNotBefore &&
-      transientRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
+      !noOpDispatchRetry.active &&
+      honoredNotBeforeMs !== null &&
+      honoredNotBeforeMs > baseSchedule.dueAt.getTime()
         ? {
             ...baseSchedule,
-            dueAt: transientRetryNotBefore,
-            delayMs: Math.max(
-              0,
-              transientRetryNotBefore.getTime() - now.getTime(),
-            ),
+            dueAt: new Date(honoredNotBeforeMs),
+            delayMs: Math.max(0, honoredNotBeforeMs - now.getTime()),
           }
         : baseSchedule;
 
@@ -15875,6 +15940,8 @@ export function heartbeatService(
         ...(transientRetryNotBefore
           ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() }
           : {}),
+        noOpDispatchRetryAttempt: noOpDispatchRetry.attempt,
+        ...(noOpDispatchRetry.active ? { noOpDispatchRetry: true } : {}),
         ...(transientRecovery?.errorFamily === "provider_quota" &&
         transientRetryNotBefore
           ? {
@@ -16623,7 +16690,7 @@ export function heartbeatService(
       try {
         if (cancelledRun && !scheduled) await releaseIssueExecutionAndPromote(cancelledRun);
       } finally {
-        await finalizeAgentStatus(run.agentId, "cancelled", null, { wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run) });
+        await finalizeAgentStatus(run.agentId, "cancelled", null, undefined, { wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run) });
       }
     }
   }
@@ -16831,7 +16898,18 @@ export function heartbeatService(
   }
 
   function summarizeIssueScheduledRetryRun(row: {
-    run: typeof heartbeatRuns.$inferSelect;
+    run: Pick<
+      typeof heartbeatRuns.$inferSelect,
+      | "id"
+      | "status"
+      | "agentId"
+      | "retryOfRunId"
+      | "scheduledRetryAt"
+      | "scheduledRetryAttempt"
+      | "scheduledRetryReason"
+      | "error"
+      | "errorCode"
+    >;
     agentName: string | null;
   }) {
     return {
@@ -18312,6 +18390,7 @@ export function heartbeatService(
       runningCount > 0
         ? "running"
         : outcome === "succeeded" ||
+            outcome === "succeeded_dirty" ||
             outcome === "interrupted" ||
             outcome === "cancelled" ||
             (outcome === "failed" && options?.keepIdleOnFailure)
@@ -19011,6 +19090,7 @@ export function heartbeatService(
       input.succeeded
         ? null
         : (settledRun?.error ?? "native_workspace_sync_out_failed"),
+      undefined,
       {
         wasFirstHeartbeat: settledRun
           ? timerClaimWasFirstHeartbeat(settledRun)
@@ -20269,123 +20349,148 @@ export function heartbeatService(
     runOptions: {
       nativeLeaseOwner?: string;
       nativeRestartRecovery?: NativeRestartRecoveryClaim;
+      hostReservationHeld?: boolean;
     } = {},
   ) {
     const attemptStartedAtMs = Date.now();
     let attestedQuestionResponseAtMs: number | null = null;
-    if ((await getSchedulingSuppression()).suppressed) {
-      try {
-        await releaseRunClaimedJustBeforeSuppression(runId);
-      } catch (err) {
-        logger.error(
-          { err, runId },
-          "failed to release run claimed just before task-drain suppression; the run row stays running, and the orphan reaper finalizes it and releases the issue lock on its next cycle",
-        );
-      }
-      return;
-    }
-
+    // A run claimed by `startNextQueuedRunForAgent` arrives here still holding the host
+    // admission reservation that reserved its slot during claim. That reservation is handed
+    // back the instant the run registers in-process below (where it starts counting toward
+    // `countRunningRunsHostWide` on its own), or on any early return/throw before registration
+    // so the slot is never leaked.
+    let heldHostReservation = runOptions.hostReservationHeld ?? false;
+    const releaseHeldHostReservation = () => {
+      if (!heldHostReservation) return;
+      heldHostReservation = false;
+      releaseHostRunSlot();
+    };
+    // Hoisted so the execution body below (and its closures) can see them;
+    // the try/finally only guards the reservation-sensitive prologue.
     let legacyAdapterEntered = false;
-    let run = await getRun(runId);
-    if (!run) return;
-    if (run.status !== "queued" && run.status !== "running") return;
-
-    if (run.status === "queued") {
-      const claimed = await claimQueuedRun(run);
-      if (!claimed) {
-        // claimQueuedRun can also leave the run queued when dependencies are unresolved.
+    let prologueRun: typeof heartbeatRuns.$inferSelect;
+    try {
+      if ((await getSchedulingSuppression()).suppressed) {
+        try {
+          await releaseRunClaimedJustBeforeSuppression(runId);
+        } catch (err) {
+          logger.error(
+            { err, runId },
+            "failed to release prologueRun claimed just before task-drain suppression; the prologueRun row stays running, and the orphan reaper finalizes it and releases the issue lock on its next cycle",
+          );
+        }
         return;
       }
-      run = claimed;
-    }
 
-    if (
-      runOptions.nativeLeaseOwner &&
-      run.runtimeMode === "native" &&
-      runOptions.nativeRestartRecovery?.kind !== "reattach_existing_runner"
-    ) {
-      // A numeric PID or process-group ID is a liveness signal, never an
-      // ownership capability: the OS may have recycled it after the service
-      // restart. A still-active in-memory child handle is also insufficient to
-      // authorize recovery to kill it. Any live or active-looking process
-      // therefore blocks replacement recovery without receiving a signal.
-      const tracked = runningProcesses.get(run.id);
-      const trackedChildIsActive =
-        !!tracked &&
-        tracked.child.exitCode === null &&
-        tracked.child.signalCode === null;
-      const trackedPid = tracked?.child.pid ?? null;
-      const trackedProcessGroupId = tracked?.processGroupId ?? null;
-      const trackedPidAlive = trackedPid ? isProcessAlive(trackedPid) : false;
-      const trackedProcessGroupAlive = trackedProcessGroupId
-        ? isProcessGroupAlive(trackedProcessGroupId)
-        : false;
-      const persistedPidAlive =
-        !!run.processPid && isProcessAlive(run.processPid);
-      const persistedProcessGroupAlive =
-        !!run.processGroupId && isProcessGroupAlive(run.processGroupId);
-      if (
-        trackedChildIsActive ||
-        trackedPidAlive ||
-        trackedProcessGroupAlive ||
-        persistedPidAlive ||
-        persistedProcessGroupAlive
-      ) {
-        await markNativeOwnershipUnverified(run, {
-          reason: "live_process_identifier",
-          processPidAlive: trackedPidAlive || persistedPidAlive,
-          processGroupAlive:
-            trackedProcessGroupAlive || persistedProcessGroupAlive,
-        });
-        throw new Error(NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE);
+      const fetchedRun = await getRun(runId);
+      if (!fetchedRun) return;
+      prologueRun = fetchedRun;
+      if (prologueRun.status !== "queued" && prologueRun.status !== "running") return;
+
+      if (prologueRun.status === "queued") {
+        const claimed = await claimQueuedRun(prologueRun);
+        if (!claimed) {
+          // claimQueuedRun can also leave the prologueRun queued when dependencies are unresolved.
+          return;
+        }
+        prologueRun = claimed;
       }
-      runningProcesses.delete(run.id);
-      if (run.processPid || run.processGroupId || run.processStartedAt) {
-        const cleared = await db.transaction(async tx => {
-          const cleared = await tx
-            .update(heartbeatRuns)
-            .set({
-              processPid: null,
-              processGroupId: null,
-              processStartedAt: null,
-              updatedAt: new Date(),
-            })
-            .where(
-              and(
-                eq(heartbeatRuns.id, run.id),
-                eq(heartbeatRuns.runtimeMode, "native"),
-                run.processPid === null
-                  ? isNull(heartbeatRuns.processPid)
-                  : eq(heartbeatRuns.processPid, run.processPid),
-                run.processGroupId === null
-                  ? isNull(heartbeatRuns.processGroupId)
-                  : eq(heartbeatRuns.processGroupId, run.processGroupId),
-                run.processStartedAt === null
-                  ? isNull(heartbeatRuns.processStartedAt)
-                  : eq(heartbeatRuns.processStartedAt, run.processStartedAt),
-              ),
-            )
-            .returning()
-            .then((rows) => rows[0] ?? null);
-          if (cleared) await recordNativeLocalProcessStop(tx as unknown as Db, run);
-          return cleared;
-        });
-        if (!cleared) {
-          const current = await getRun(run.id);
-          if (current) {
-            await markNativeOwnershipUnverified(current, {
-              reason: "live_process_identifier",
-            });
-          }
+
+      if (
+        runOptions.nativeLeaseOwner &&
+        prologueRun.runtimeMode === "native" &&
+        runOptions.nativeRestartRecovery?.kind !== "reattach_existing_runner"
+      ) {
+        // A numeric PID or process-group ID is a liveness signal, never an
+        // ownership capability: the OS may have recycled it after the service
+        // restart. A still-active in-memory child handle is also insufficient to
+        // authorize recovery to kill it. Any live or active-looking process
+        // therefore blocks replacement recovery without receiving a signal.
+        const tracked = runningProcesses.get(prologueRun.id);
+        const trackedChildIsActive =
+          !!tracked &&
+          tracked.child.exitCode === null &&
+          tracked.child.signalCode === null;
+        const trackedPid = tracked?.child.pid ?? null;
+        const trackedProcessGroupId = tracked?.processGroupId ?? null;
+        const trackedPidAlive = trackedPid ? isProcessAlive(trackedPid) : false;
+        const trackedProcessGroupAlive = trackedProcessGroupId
+          ? isProcessGroupAlive(trackedProcessGroupId)
+          : false;
+        const persistedPidAlive =
+          !!prologueRun.processPid && isProcessAlive(prologueRun.processPid);
+        const persistedProcessGroupAlive =
+          !!prologueRun.processGroupId && isProcessGroupAlive(prologueRun.processGroupId);
+        if (
+          trackedChildIsActive ||
+          trackedPidAlive ||
+          trackedProcessGroupAlive ||
+          persistedPidAlive ||
+          persistedProcessGroupAlive
+        ) {
+          await markNativeOwnershipUnverified(prologueRun, {
+            reason: "live_process_identifier",
+            processPidAlive: trackedPidAlive || persistedPidAlive,
+            processGroupAlive:
+              trackedProcessGroupAlive || persistedProcessGroupAlive,
+          });
           throw new Error(NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE);
         }
-        run = cleared;
+        runningProcesses.delete(prologueRun.id);
+        if (prologueRun.processPid || prologueRun.processGroupId || prologueRun.processStartedAt) {
+          const cleared = await db.transaction(async tx => {
+            const cleared = await tx
+              .update(heartbeatRuns)
+              .set({
+                processPid: null,
+                processGroupId: null,
+                processStartedAt: null,
+                updatedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(heartbeatRuns.id, prologueRun.id),
+                  eq(heartbeatRuns.runtimeMode, "native"),
+                  prologueRun.processPid === null
+                    ? isNull(heartbeatRuns.processPid)
+                    : eq(heartbeatRuns.processPid, prologueRun.processPid),
+                  prologueRun.processGroupId === null
+                    ? isNull(heartbeatRuns.processGroupId)
+                    : eq(heartbeatRuns.processGroupId, prologueRun.processGroupId),
+                  prologueRun.processStartedAt === null
+                    ? isNull(heartbeatRuns.processStartedAt)
+                    : eq(heartbeatRuns.processStartedAt, prologueRun.processStartedAt),
+                ),
+              )
+              .returning()
+              .then((rows) => rows[0] ?? null);
+            if (cleared) await recordNativeLocalProcessStop(tx as unknown as Db, prologueRun);
+            return cleared;
+          });
+          if (!cleared) {
+            const current = await getRun(prologueRun.id);
+            if (current) {
+              await markNativeOwnershipUnverified(current, {
+                reason: "live_process_identifier",
+              });
+            }
+            throw new Error(NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE);
+          }
+          prologueRun = cleared;
+        }
       }
-    }
 
-    if (run.runtimeMode === "legacy" && run.controllerBootId &&
-        run.controllerBootId !== legacyControllerBootId) return;
-    activeRunExecutions.add(run.id);
+      if (prologueRun.runtimeMode === "legacy" && prologueRun.controllerBootId &&
+          prologueRun.controllerBootId !== legacyControllerBootId) return;
+      activeRunExecutions.add(prologueRun.id);
+      releaseHeldHostReservation();
+    } finally {
+      releaseHeldHostReservation();
+    }
+    // Unreachable unless the prologue returned early (which never falls
+    // through to here). Rebind to a non-null `run` so the execution body and
+    // its closures see a non-nullable type.
+    let run: typeof heartbeatRuns.$inferSelect = prologueRun;
     const executionControl = createAdapterExecutionControl();
     const controllerLease = watchLegacyControllerLease(db, run, executionControl.controller);
     let runScratch: HeartbeatRunScratch | null = null;
@@ -21484,7 +21589,7 @@ export function heartbeatService(
           selectedEnvironmentForConfig?.driver ?? "local",
         );
       const aiBinding = agent.runtimeConfig?.aiConnection ? aiConnectionBindingSchema.parse(agent.runtimeConfig.aiConnection) : undefined;
-      const { resolvedConfig, secretKeys, secretManifest } =
+      const { resolvedConfig, secretKeys, secretManifest, bridgeKey } =
         await resolveExecutionRunAdapterConfig({
           managedAiCredentials: Boolean(aiBinding),
           managedGitHubCredentials: !useHostGitHub,
@@ -22255,9 +22360,7 @@ export function heartbeatService(
                   openedAt: new Date(),
                   metadata: nextExecutionWorkspaceMetadata,
                 })
-              : outcome === "succeeded_dirty"
-                ? (adapterResult.errorCode ?? "dirty_exit")
-                : null;
+              : null;
       } catch (error) {
         if (executionWorkspace.created) {
           try {
@@ -23503,7 +23606,6 @@ export function heartbeatService(
                   mode: "warm" as const,
                   idleTimeoutMs: resolvePaperclipRunnerIdleTimeoutMs(
                     parseObject(agent.adapterConfig).idleTimeoutMs,
-          promotedRecords,
                   ),
                 }
               : { mode: "per_turn" as const, idleTimeoutMs: null };
@@ -23533,7 +23635,6 @@ export function heartbeatService(
               nativeExecution.binding.executionWorkspaceId !==
                 nativeExecutionWorkspaceId ||
               nativeExecution.completionContract.id !==
-          promotedRecords,
                 completionContract.row.id ||
               nativeExecution.completionContract.sha256 !==
                 completionContract.row.canonicalSha256
@@ -23630,7 +23731,6 @@ export function heartbeatService(
                     agent.companyId,
                     readNonEmptyString(runnerAdapterConfig.managedProfileId) ??
                       "",
-        promotedRecords,
                   )
                 : null;
             const agentCoreProfile =
@@ -23649,7 +23749,6 @@ export function heartbeatService(
                 runnerAdapterConfig.env,
               ).ANTHROPIC_API_KEY;
               const boundSecretId =
-      await publishQueuedRunsAndKickAgents((promotionResult.promotedRecords ?? []).map((record) => record.run));
                 typeof rawApiKeyBinding === "object" &&
                 rawApiKeyBinding !== null
                   ? readNonEmptyString(
@@ -24967,6 +25066,11 @@ export function heartbeatService(
           !processCancellation?.failed
         ) {
           outcome = "succeeded";
+        } else if (adapterResult.completedDirty) {
+          // The agent emitted a clean completion result and only teardown exited
+          // non-zero. Recording this as `failed` used to park the agent in `error`
+          // on the back of a run that had done its work.
+          outcome = "succeeded_dirty";
         } else {
           outcome = "failed";
         }
@@ -25042,11 +25146,19 @@ export function heartbeatService(
         const status =
           outcome === "succeeded"
             ? "succeeded"
-            : outcome === "cancelled"
-              ? "cancelled"
-              : outcome === "timed_out"
-                ? "timed_out"
-                : "failed";
+            : outcome === "succeeded_dirty"
+              ? "succeeded_dirty"
+              : outcome === "cancelled"
+                ? "cancelled"
+                : outcome === "timed_out"
+                  ? "timed_out"
+                  : "failed";
+        // Clear early on the first successful dispatch so a stale park set
+        // from an earlier (possibly mis-parsed) reset time can never outlive a
+        // quota that has, in fact, already recovered.
+        if (outcome === "succeeded" || outcome === "succeeded_dirty") {
+          await usageLimitPark.clear({ reason: "run_succeeded" });
+        }
 
         const cacheAdjustedCostUsd = resolveCacheAdjustedCostUsd(adapterResult);
         const usageJson =
@@ -25575,7 +25687,7 @@ export function heartbeatService(
             }
           }
         }
-        await finalizeAgentStatus(agent.id, outcome, runErrorMessage, {
+        await finalizeAgentStatus(agent.id, outcome, runErrorMessage, undefined, {
           keepIdleOnFailure:
             outcome === "failed" &&
             ((finalizedRun
@@ -25688,6 +25800,7 @@ export function heartbeatService(
               run.agentId,
               "failed",
               "native_workspace_sync_out_unrecoverable",
+              undefined,
               { wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run) },
             ).catch(() => undefined);
           }
@@ -25907,7 +26020,7 @@ export function heartbeatService(
           }
         }
 
-        await finalizeAgentStatus(agent.id, "failed", message, {
+        await finalizeAgentStatus(agent.id, "failed", message, undefined, {
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
           keepIdleOnFailure:
             Boolean(nonRetryablePreflightFailureCode(err)) ||
@@ -26147,7 +26260,7 @@ export function heartbeatService(
         // path owned the terminal transition. If another path already finalized
         // the run, keep that terminal outcome authoritative.
         if (setupFailureWrite.updated) {
-          await finalizeAgentStatus(run.agentId, "failed", message, {
+          await finalizeAgentStatus(run.agentId, "failed", message, undefined, {
             wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
             // Low-trust admission failures are task/principal preconditions,
             // not evidence that the immutable endpoint agent is unhealthy.
@@ -29230,7 +29343,7 @@ export function heartbeatService(
         await releaseIssueExecutionAndPromote(cancelled, {
           suppressImmediateRecovery: options.suppressImmediateRecovery,
         });
-        await finalizeAgentStatus(run.agentId, "cancelled", undefined, {
+        await finalizeAgentStatus(run.agentId, "cancelled", undefined, undefined, {
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         });
         await startNextQueuedRunForAgent(run.agentId);
@@ -29990,6 +30103,24 @@ export function heartbeatService(
     return Number(count ?? 0);
   }
 
+  async function countRunningRunsHostWide() {
+    const rows = await db
+      .select({
+        id: heartbeatRuns.id,
+        processPid: heartbeatRuns.processPid,
+        processGroupId: heartbeatRuns.processGroupId,
+        adapterType: agents.adapterType,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(eq(heartbeatRuns.status, "running"));
+    let count = 0;
+    for (const row of rows) {
+      if (runOccupiesHostSlot(row)) count += 1;
+    }
+    return count;
+  }
+
   /**
    * Atomically decides whether one more run may start host-wide. The DB count and the
    * reservation increment happen inside `withHostAdmissionLock`, so two agents dispatching
@@ -30033,12 +30164,13 @@ export function heartbeatService(
   // module (upstream removed the productivity-review service it used to ride
   // on); expose it through the heartbeat surface the startup/periodic wiring
   // already calls.
+  const highCommentVolumeAlertMonitorInstance = highCommentVolumeAlertService(db);
   async function reconcileHighCommentVolumeAlerts(opts?: {
     now?: Date;
     companyId?: string;
     threshold?: number;
   }) {
-    return highCommentVolumeAlertMonitor.reconcileHighCommentVolumeAlerts(opts);
+    return highCommentVolumeAlertMonitorInstance.reconcileHighCommentVolumeAlerts(opts);
   }
 
 

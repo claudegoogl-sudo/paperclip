@@ -6974,7 +6974,7 @@ export function agentRoutes(
     const existing = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!existing) return;
     const decision = typeof req.body?.decision === "string" ? req.body.decision : "";
-    if (!["snooze", "continue", "dismissed_false_positive", "terminate"].includes(decision)) {
+    if (!["snooze", "continue", "dismissed_false_positive"].includes(decision)) {
       res.status(400).json({ error: "Unsupported watchdog decision" });
       return;
     }
@@ -6991,7 +6991,7 @@ export function agentRoutes(
     const row = await recovery.recordWatchdogDecision({
       runId: existing.id,
       actor: req.actor,
-      decision: decision as "snooze" | "continue" | "dismissed_false_positive" | "terminate",
+      decision: decision as "snooze" | "continue" | "dismissed_false_positive",
       evaluationIssueId,
       reason,
       snoozedUntil,

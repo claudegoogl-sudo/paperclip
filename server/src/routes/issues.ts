@@ -8498,7 +8498,7 @@ export function issueRoutes(
         .listReviewAttention(issue.companyId, [issue])
         .then((map) => map.get(issue.id) ?? null),
       svc.getCurrentScheduledRetry(issue.id),
-      svc.listAttachments(issue.id),
+      svc.listAttachments(issue.id, issue.companyId),
       documentsSvc.getIssueDocumentByKey(
         issue.id,
         ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,

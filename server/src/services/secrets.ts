@@ -1282,7 +1282,7 @@ export function secretService(db: Db | DbTransaction) {
       },
       "agent secret binding row was missing while persisted config referenced the secret — re-created it",
     );
-    await logActivity(db, {
+    await logActivity(db as Db, {
       companyId,
       actorType: "system",
       actorId: "secret-binding-auto-heal",
@@ -4859,7 +4859,7 @@ export function secretService(db: Db | DbTransaction) {
         .where(eq(companySecretBindings.companyId, companyId))
         .orderBy(companySecretBindings.targetType, companySecretBindings.targetId, companySecretBindings.configPath);
 
-      const observations = await listEgressWouldDeny(db, { companyId });
+      const observations = await listEgressWouldDeny(db as Db, { companyId });
       const byBinding = new Map<string, EgressWouldDenyObservationRow[]>();
       for (const obs of observations) {
         const list = byBinding.get(obs.bindingId) ?? [];
@@ -5214,7 +5214,7 @@ export function secretService(db: Db | DbTransaction) {
         // same way the agent path does — leave the identical operator-visible
         // trail (ids/paths only, never values). Best-effort: a logging failure
         // must not fail the sync itself.
-        await logActivity(db, {
+        await logActivity(db as Db, {
           companyId,
           actorType: "system",
           actorId: "secret-binding-guard",

@@ -42,10 +42,17 @@ export function legacyExecutionNeedsReconciliation(
   // that the bootstrap evidence proves never started. Keep unknown outcomes held.
   if ((run.errorCode === "workspace_git_scan_timeout" || run.errorCode === "workspace_git_scan_saturated") &&
       evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false) return false;
+  // A no-op dispatch (pre-turn rate limit) never reached the model, so there is
+  // no provider work to reconcile however many times it retried. Its retry
+  // counter can sit at the ladder top without ever having executed a turn.
+  if ((run.resultJson as Record<string, unknown> | null | undefined)?.noOpDispatch === true) return false;
+  // Bootstrap evidence that the provider never started is authoritative no
+  // matter how many pre-provider attempts stacked up: there is no provider
+  // work to reconcile, so the retry ladder (which may run longer than the
+  // historical two-attempt default) owns the budget.
+  if (evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false) return false;
   if (executionFailureRetryCount(run) >= 2) return true;
-  return !(
-    evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false
-  );
+  return true;
 }
 
 /** Persist the failed legacy run, owned lock release and operator decision together. */

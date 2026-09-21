@@ -981,6 +981,7 @@ export function recoveryService(
     companyId: string,
     issueId: string,
   ): Promise<LatestIssueRun> {
+    const issueIds = await collectIssueAndDescendantIds(companyId, issueId);
     return db
       .select({
         id: heartbeatRuns.id,
@@ -1040,6 +1041,7 @@ export function recoveryService(
     issueId: string,
     agentId: string,
   ): Promise<LatestIssueRun> {
+    const issueIds = await collectIssueAndDescendantIds(companyId, issueId);
     return db
       .select({
         id: heartbeatRuns.id,
@@ -1073,6 +1075,7 @@ export function recoveryService(
     errorCodeToMatch: string | null,
     since: Date | null = null,
   ) {
+    const issueIds = await collectIssueAndDescendantIds(companyId, issueId);
     const rows = await db
       .select({
         id: heartbeatRuns.id,
@@ -1130,6 +1133,7 @@ export function recoveryService(
     issueId: string,
     agentId?: string | null,
   ) {
+    const issueIds = await collectIssueAndDescendantIds(companyId, issueId);
     const [run, deferredWake, nativeRecovery] = await Promise.all([
       db
         .select({ id: heartbeatRuns.id })
@@ -1843,6 +1847,7 @@ export function recoveryService(
     since: Date,
     interactionId?: string | null,
   ) {
+    const issueIds = await collectIssueAndDescendantIds(companyId, issueId);
     return db
       .select({ id: heartbeatRuns.id })
       .from(heartbeatRuns)
@@ -1871,6 +1876,7 @@ export function recoveryService(
     agentId: string,
     since: Date,
   ): Promise<LatestIssueRun> {
+    const issueIds = await collectIssueAndDescendantIds(companyId, issueId);
     return db
       .select({
         id: heartbeatRuns.id,
@@ -2343,10 +2349,14 @@ export function recoveryService(
     return watchdog.scanSilentActiveRuns(opts);
   }
 
+  // NOTE (fork carryover consciously deferred): the fork's manual "terminate"
+  // decision (privileged teardown of a wedged run) targeted the inline watchdog
+  // implementation upstream replaced with modules/active-run-watchdog; it is
+  // tracked as a dedicated module-port follow-up and not part of this merge.
   async function recordWatchdogDecision(input: {
     runId: string;
     actor: WatchdogDecisionActor;
-    decision: "snooze" | "continue" | "dismissed_false_positive" | "terminate";
+    decision: "snooze" | "continue" | "dismissed_false_positive";
     evaluationIssueId?: string | null;
     reason?: string | null;
     snoozedUntil?: Date | null;
