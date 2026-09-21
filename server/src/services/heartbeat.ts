@@ -501,7 +501,6 @@ import {
   ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS as RECOVERY_ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
   recoveryService,
 } from "./recovery/service.js";
-import { highCommentVolumeAlertService } from "./high-comment-volume-alert.js";
 import {
   createRunDispatch,
   type PostCommitEffect,
@@ -762,16 +761,23 @@ const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = [
   "cancelled",
   "timed_out",
 ] as const;
+// A dispatch the adapter reports as never having reached the model (session-limit 429)
+// gets its own budget: it must not eat the bounded ladder, but it also must not loop
+// forever, so it is capped and then falls through to the ordinary exhaustion path.
+export const NO_OP_DISPATCH_RETRY_MAX_ATTEMPTS = 8;
+const NO_OP_DISPATCH_RETRY_FALLBACK_DELAY_MS = 10 * 60 * 1000;
+const NO_OP_DISPATCH_RETRY_MIN_DELAY_MS = 60 * 1000;
+const NO_OP_DISPATCH_RETRY_MAX_DELAY_MS = 5 * 60 * 60 * 1000;
+// The advertised reset time is a lossy wall clock; wake just past it, not exactly on it.
+export const NO_OP_DISPATCH_RETRY_SAFETY_MARGIN_MS = 60 * 1000;
+// A provider-stated reset horizon can sit arbitrarily far out (a monthly limit
+// legitimately resets weeks away; a malformed timestamp can claim years). The
+// transient ladder honors the horizon, but bounds the single wait so a
+// pathological value cannot strand the run — the longest real limit cycles are
+// weekly, so anything beyond a week re-arms on the next admission failure
+// instead of sleeping past it.
+export const TRANSIENT_RETRY_NOT_BEFORE_MAX_DELAY_MS = 7 * 24 * 60 * 60 * 1000;
 const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
-// Mirrors OPEN_ISSUE_STATUSES in services/routines.ts — the statuses that still pin a routine
-// via findLiveExecutionIssue, and therefore the ones a retry give-up must clear.
-const ROUTINE_EXECUTION_RELEASABLE_ISSUE_STATUSES = [
-  "backlog",
-  "todo",
-  "in_progress",
-  "in_review",
-  "blocked",
-] as const;
 export {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
@@ -795,15 +801,6 @@ export {
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
 };
 const INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS = 2;
-// A dispatch the adapter reports as never having reached the model (session-limit 429)
-// gets its own budget: it must not eat the bounded ladder, but it also must not loop
-// forever, so it is capped and then falls through to the ordinary exhaustion path.
-export const NO_OP_DISPATCH_RETRY_MAX_ATTEMPTS = 8;
-const NO_OP_DISPATCH_RETRY_FALLBACK_DELAY_MS = 10 * 60 * 1000;
-const NO_OP_DISPATCH_RETRY_MIN_DELAY_MS = 60 * 1000;
-const NO_OP_DISPATCH_RETRY_MAX_DELAY_MS = 5 * 60 * 60 * 1000;
-// The advertised reset time is a lossy wall clock; wake just past it, not exactly on it.
-export const NO_OP_DISPATCH_RETRY_SAFETY_MARGIN_MS = 60 * 1000;
 const WORKSPACE_VALIDATION_FAILURE_CODE = "workspace_validation_failed";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
 const CONFIGURATION_INCOMPLETE_FAILURE_CODE = "configuration_incomplete";
@@ -1602,9 +1599,6 @@ function stripForbiddenEnvBindings(
   managedGitHubCredentials = false,
 ): Record<string, unknown> | null {
   const record = parseObject(envValue);
-  // Upstream strips the credential binding set; the fork additionally strips
-  // run identity (INV-1). Operator-declared PAPERCLIP_-named bindings (e.g.
-  // PAPERCLIP_CLOUD_PROVIDER_TOKEN_*) keep forwarding per upstream's contract.
   const filtered = Object.fromEntries(
     Object.entries(record).filter(
       ([key]) =>
@@ -2128,6 +2122,49 @@ export async function resolveExecutionRunAdapterConfig(input: {
       ...input.trustedEnvProjection,
     };
     for (const key of input.trustedEnvSecretKeys ?? []) secretKeys.add(key);
+  }
+  // Sanctioned task_bridge credential delivery (separated-identity design). The total
+  // PAPERCLIP_* strip above removed any PAPERCLIP_BRIDGE_API_KEY binding along with
+  // run identity; re-resolve it here from the agent's BOARD-GATED adapterConfig env
+  // (`boardGatedAgentEnv`, the raw pre-strip `agents.adapterConfig.env`), NOT from
+  // the issue-override-merged `executionRunConfig.env`. Issue-assignee adapterConfig
+  // overrides are agent-settable and shallow-merged into the run config, so reading
+  // the bridge binding from the board-gated revision closes any self-authorization
+  // path a future override/secret-binding refactor might otherwise open (INV-2).
+  // The value is delivered into the single sanctioned slot AFTER the strip. Run
+  // identity is never touched: it lands only under PAPERCLIP_BRIDGE_API_KEY, never
+  // PAPERCLIP_API_KEY (INV-1).
+  let bridgeKey: { status: "delivered" } | { status: "refused"; refusal: BridgeKeyRefusal } | null = null;
+  if (input.agentId) {
+    const bridgeResolution = await resolveSanctionedBridgeEnvBinding({
+      companyId: input.companyId,
+      rawAgentEnv: input.boardGatedAgentEnv,
+      secretsSvc: input.secretsSvc,
+      verifyTaskBridgeKey: input.verifyTaskBridgeKey,
+      context: {
+        consumerType: "agent",
+        consumerId: input.agentId,
+        actorType: "agent",
+        actorId: input.agentId,
+        responsibleUserId: input.responsibleUserId ?? null,
+        issueId: input.issueId ?? null,
+        heartbeatRunId: input.heartbeatRunId ?? null,
+        ...(lowTrustAllowedBindingIds !== undefined ? { allowedBindingIds: lowTrustAllowedBindingIds } : {}),
+      },
+    });
+    if (bridgeResolution.status === "delivered") {
+      bridgeKey = { status: "delivered" };
+      resolvedConfig.env = {
+        ...parseObject(resolvedConfig.env),
+        [SANCTIONED_BRIDGE_ENV_KEY]: bridgeResolution.value,
+      };
+      for (const key of bridgeResolution.secretKeys) {
+        secretKeys.add(key); // INV-5: mask the live credential in run-config logging.
+      }
+      secretKeys.add(SANCTIONED_BRIDGE_ENV_KEY);
+    } else {
+      bridgeKey = { status: "refused", refusal: bridgeResolution.refusal };
+    }
   }
   // Pre-dispatch credential gate for codex_local: a managed Codex home with no
   // usable auth.json and an empty OPENAI_API_KEY would dispatch a run that
@@ -8188,6 +8225,12 @@ export async function buildPaperclipWakePayload(input: {
   const interactionContinuationSource = readNonEmptyString(
     input.contextSnapshot.source,
   );
+  // Typed bridge-key refusal (expired / revoked / missing / scope-mismatch,
+  // or a binding-level fault). Rendered into the agent transcript so a dead
+  // task_bridge credential is self-explanatory without a server-log dig.
+  const bridgeKeyStatus = parseObject(
+    input.contextSnapshot.paperclipBridgeKeyStatus,
+  );
   const externalInteractionContinuation =
     (interactionStatus === "answered" || interactionStatus === "accepted") &&
     (input.contextSnapshot.externalChatContinuation === true ||
@@ -8382,6 +8425,7 @@ export async function buildPaperclipWakePayload(input: {
         : null,
     interactionKind,
     interactionStatus,
+    bridgeKeyStatus: Object.keys(bridgeKeyStatus).length > 0 ? bridgeKeyStatus : null,
     interactionId,
     sourceRunId: readNonEmptyString(input.contextSnapshot.sourceRunId),
     externalChatQuestionResponse: externalChatProvider
@@ -9115,35 +9159,7 @@ async function terminateHeartbeatRunProcess(input: {
 }) {
   const pid = input.pid ?? null;
   const processGroupId = input.processGroupId ?? null;
-  if (typeof pid !== "number" && typeof processGroupId !== "number") return "no_process";
-
-  if (!input.trustedHandle) {
-    const identityMode = input.identityMode ?? "process";
-    // Anchor identity on the group leader (pid === pgid) for descendant-group reaps, and on
-    // the persisted pid for the cancel paths.
-    const target =
-      identityMode === "descendant-group"
-        ? (typeof processGroupId === "number" ? processGroupId : (pid as number))
-        : (typeof pid === "number" ? pid : (processGroupId as number));
-    // In descendant-group mode a dead leader is not a live recycled process, so only a live
-    // leader is worth verifying; verifying a dead leader would always mismatch and wrongly
-    // block reaping the legitimate orphaned descendants.
-    const shouldVerify = identityMode === "process" || isProcessAlive(target);
-    if (shouldVerify) {
-      const expectedStartEpochMs =
-        input.expectedProcessStartedAt instanceof Date
-          ? input.expectedProcessStartedAt.getTime()
-          : input.expectedProcessStartedAt;
-      const verdict = await verifyProcessStartIdentity(target, expectedStartEpochMs);
-      if (verdict === "mismatch") {
-        logger.warn(
-          { runId: input.runId, targetPid: pid, targetProcessGroupId: processGroupId, identityMode },
-          "skipped heartbeat run process termination: recycled pid/pgid could not be identity-verified",
-        );
-        return "skipped_identity_unverified";
-      }
-    }
-  }
+  if (typeof pid !== "number" && typeof processGroupId !== "number") return;
 
   await terminateLocalService(
     {
@@ -9160,26 +9176,6 @@ async function terminateHeartbeatRunProcess(input: {
     },
     { forceAfterMs: input.graceMs, signal: input.signal },
   );
-
-  // Upstream's terminateLocalService treats a zombie-only process group as gone and
-  // can return before this process has reaped the exited child (SIGCHLD). The DB-only
-  // kill paths here promise that a positively identity-matched pid is actually gone —
-  // process.kill(pid, 0) still succeeds for unreaped zombies — so wait briefly for the
-  // final reap before reporting success. Bounded: a pid that never reaps (or was already
-  // reaped by init) exits this loop within the deadline.
-  if (typeof pid === "number" && Number.isInteger(pid) && pid > 0) {
-    const reapDeadline = Date.now() + 2_000;
-    while (Date.now() < reapDeadline) {
-      try {
-        process.kill(pid, 0);
-      } catch {
-        break;
-      }
-      await new Promise<void>((resolve) => setTimeout(resolve, 50));
-    }
-  }
-
-  return "terminated";
 }
 
 function buildProcessLossMessage(
@@ -9734,79 +9730,6 @@ export function heartbeatService(
     return override.allowed ? override.cutoff : null;
   };
 
-  }
-
-  // A `running` row occupies a host slot only if a process is actually behind it. This mirrors
-  // `reapOrphanedRuns`' liveness test exactly: a run counts iff the reaper would NOT reap it —
-  // it is tracked in-process (mid-dispatch or executing) or its child pid / process group is
-  // still alive (a detached run whose in-memory handle was lost). A bare `running` row with no
-  // live process is an orphan the reaper cleans up on its ~5-minute tick; counting it would let
-  // a handful of orphans permanently occupy the whole host budget and stall every agent, which
-  // on a ceiling of 4 needs only four dead rows. Fresh claims stay covered by the in-flight
-  // reservation, which is only released once the run is registered in-process — see
-  // `reserveHostRunSlot` and the reservation transfer in `executeRun`.
-  function runOccupiesHostSlot(row: {
-    id: string;
-    processPid: number | null;
-    processGroupId: number | null;
-    adapterType: string;
-  }) {
-    if (liveRunExecutions.has(row.id)) return true;
-    if (isTrackedLocalChildProcessAdapter(row.adapterType)) {
-      if (row.processPid && isProcessAlive(row.processPid)) return true;
-      if (row.processGroupId && isProcessGroupAlive(row.processGroupId)) return true;
-    }
-    return false;
-  }
-
-  // Authoritative, externally visible liveness answer for a `running` row. Derived from the
-  // SAME sources `runOccupiesHostSlot` reads — the shared in-process run registry and, only
-  // for tracked local-child adapters, the pid / process-group checks — plus the
-  // reaper-consistent `occupiesHostSlot` verdict itself. An external actor under run-slot
-  // starvation pressure probes this instead of inferring death from a silent log tail:
-  // any true field means the reaper would NOT reap the row, i.e. it is live (possibly
-  // provider-stalled), not dead. `null` pid fields mean "not tracked for this adapter
-  // type" (remote/session adapters carry no child pid), never "dead".
-  function buildRunLivenessProbe(row: {
-    id: string;
-    status: string;
-    processPid: number | null;
-    processGroupId: number | null;
-    adapterType: string;
-  }) {
-    if (row.status !== "running") return null;
-    const tracksLocalChild = isTrackedLocalChildProcessAdapter(row.adapterType);
-    return {
-      hasInMemoryHandle: liveRunExecutions.has(row.id),
-      processPidAlive: tracksLocalChild && row.processPid
-        ? isProcessAlive(row.processPid)
-        : null,
-      processGroupAlive: tracksLocalChild && row.processGroupId
-        ? isProcessGroupAlive(row.processGroupId)
-        : null,
-      occupiesHostSlot: runOccupiesHostSlot(row),
-    };
-  }
-
-  // Route-facing variant: fetches the run + its agent's adapter type in one join and
-  // returns the probe block (`null` for a missing run or a non-running row).
-  async function getRunLivenessProbe(runId: string) {
-    const row = await db
-      .select({
-        id: heartbeatRuns.id,
-        status: heartbeatRuns.status,
-        processPid: heartbeatRuns.processPid,
-        processGroupId: heartbeatRuns.processGroupId,
-        adapterType: agents.adapterType,
-      })
-      .from(heartbeatRuns)
-      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
-      .where(eq(heartbeatRuns.id, runId))
-      .then((rows) => rows[0] ?? null);
-    return row ? buildRunLivenessProbe(row) : null;
-  }
-
-
   const hostRunCeiling = resolveHostRunCeiling(runtimeEnv[HOST_MAX_CONCURRENT_RUNS_ENV_VAR]);
   logger.info(
     {
@@ -9864,7 +9787,6 @@ export function heartbeatService(
         .select()
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, runId));
-  const highCommentVolumeAlerts = highCommentVolumeAlertService(db, { enqueueWakeup });
       if (!run) return null;
       const agent = await getAgent(run.agentId);
       if (!agent || agent.companyId !== run.companyId) return null;
@@ -13624,7 +13546,7 @@ export function heartbeatService(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
   ) {
-    if (run.status !== "succeeded") return;
+    if (!isSuccessfulHeartbeatRunStatus(run.status)) return;
     const context = parseObject(run.contextSnapshot);
     const issueId =
       readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
@@ -15544,6 +15466,120 @@ export function heartbeatService(
     };
   }
 
+  // A routine execution issue is only reachable through its run: it has no human owner and no
+  // independent waker. Once the bounded retry ladder gives up, nothing will ever touch the issue
+  // again, yet it stays open and keeps pinning the routine via findLiveExecutionIssue. Terminalise
+  // it here — with a visible comment — so the next tick can start a fresh run.
+  async function releaseRoutineExecutionIssueAfterRetryGiveUp(
+    run: typeof heartbeatRuns.$inferSelect,
+    details: {
+      retryReason: string;
+      attempt: number;
+      maxAttempts: number;
+      giveUpReason: string;
+    },
+  ) {
+    const contextSnapshot = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(contextSnapshot.issueId);
+    if (!issueId) return { released: false as const, reason: "no_issue" as const };
+
+    const issue = await db
+      .select({
+        id: issues.id,
+        status: issues.status,
+        originKind: issues.originKind,
+      })
+      .from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!issue) return { released: false as const, reason: "issue_not_found" as const };
+    if (issue.originKind !== "routine_execution") {
+      return { released: false as const, reason: "not_routine_execution" as const };
+    }
+    if (!ROUTINE_EXECUTION_RELEASABLE_ISSUE_STATUSES.includes(issue.status as never)) {
+      return { released: false as const, reason: "issue_already_terminal" as const };
+    }
+
+    // Never release an issue another live run is still driving; that run is the waker.
+    const otherLiveRun = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, run.companyId),
+          ne(heartbeatRuns.id, run.id),
+          inArray(heartbeatRuns.status, EXECUTION_PATH_HEARTBEAT_RUN_STATUSES),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (otherLiveRun) return { released: false as const, reason: "another_live_run" as const };
+
+    const lastError = readNonEmptyString(run.error);
+    const lastErrorCode = readNonEmptyString(run.errorCode);
+    const comment = [
+      "Automatic retries for this routine execution have been exhausted, so the control plane is closing this issue.",
+      "",
+      `- Retry ladder: \`${details.retryReason}\`, ${details.maxAttempts} scheduled attempt(s); attempt ${details.attempt} was not queued`,
+      `- Give-up reason: ${details.giveUpReason}`,
+      `- Last error code: ${lastErrorCode ? `\`${lastErrorCode}\`` : "_none recorded_"}`,
+      `- Last error: ${lastError ? lastError.slice(0, 500) : "_none recorded_"}`,
+      `- Last run: \`${run.id}\``,
+      "",
+      "No further automatic wake will be queued for this issue. The routine's next scheduled tick will create a fresh execution issue.",
+    ].join("\n");
+
+    try {
+      await issuesSvc.addComment(issueId, comment, { agentId: run.agentId, runId: run.id });
+    } catch (err) {
+      logger.warn(
+        { err, issueId, runId: run.id },
+        "failed to post retry-exhaustion comment on routine execution issue",
+      );
+    }
+
+    await issuesSvc.update(issueId, { status: "cancelled", actorAgentId: run.agentId });
+
+    await appendRunEvent(run, await nextRunEventSeq(run.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: "Released routine execution issue after bounded retry give-up",
+      payload: {
+        issueId,
+        retryReason: details.retryReason,
+        attempt: details.attempt,
+        maxAttempts: details.maxAttempts,
+        giveUpReason: details.giveUpReason,
+        errorCode: lastErrorCode,
+      },
+    });
+
+    try {
+      await logActivity(db, {
+        companyId: run.companyId,
+        actorType: "system",
+        actorId: "heartbeat-retry",
+        action: "routine.execution_issue_released",
+        entityType: "issue",
+        entityId: issueId,
+        details: {
+          runId: run.id,
+          retryReason: details.retryReason,
+          attempt: details.attempt,
+          maxAttempts: details.maxAttempts,
+          giveUpReason: details.giveUpReason,
+          errorCode: lastErrorCode,
+        },
+      });
+    } catch (err) {
+      logger.warn({ err, issueId, runId: run.id }, "failed to log routine execution issue release");
+    }
+
+    return { released: true as const, issueId };
+  }
+
   async function scheduleBoundedRetryForRun(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -15672,6 +15708,15 @@ export function heartbeatService(
             invalidOrgChain: invokability.invalidOrgChain,
             ...invokability.details,
           },
+        });
+        // Same stranding hazard as exhaustion: no retry is queued and nothing else will wake
+        // the execution issue. The transaction-level `not_scheduled` codes below are excluded
+        // because they already mean the issue is terminal or owned by a different run.
+        await releaseRoutineExecutionIssueAfterRetryGiveUp(run, {
+          retryReason,
+          attempt: nextAttempt,
+          maxAttempts,
+          giveUpReason: "Scheduled retry suppressed because the agent is not invokable",
         });
         return {
           outcome: "not_scheduled" as const,
@@ -15997,6 +16042,9 @@ export function heartbeatService(
             }
 
             return {
+            ...(noOpDispatchRetry.active
+              ? { noOpDispatchRetry: true, noOpDispatchRetryAttempt: noOpDispatchRetry.attempt }
+              : {}),
               outcome: "scheduled",
               run: existingContinuation,
               reusedExisting: true,
@@ -17152,6 +17200,163 @@ export function heartbeatService(
     intervalSec: number,
   ) {
     const dueBefore = new Date(now.getTime() - intervalSec * 1000);
+  // A `running` row occupies a host slot only if a process is actually behind it. This mirrors
+  // `reapOrphanedRuns`' liveness test exactly: a run counts iff the reaper would NOT reap it —
+  // it is tracked in-process (mid-dispatch or executing) or its child pid / process group is
+  // still alive (a detached run whose in-memory handle was lost). A bare `running` row with no
+  // live process is an orphan the reaper cleans up on its ~5-minute tick; counting it would let
+  // a handful of orphans permanently occupy the whole host budget and stall every agent, which
+  // on a ceiling of 4 needs only four dead rows. Fresh claims stay covered by the in-flight
+  // reservation, which is only released once the run is registered in-process — see
+  // `reserveHostRunSlot` and the reservation transfer in `executeRun`.
+  function runOccupiesHostSlot(row: {
+    id: string;
+    processPid: number | null;
+    processGroupId: number | null;
+    adapterType: string;
+  }) {
+    if (liveRunExecutions.has(row.id)) return true;
+    if (isTrackedLocalChildProcessAdapter(row.adapterType)) {
+      if (row.processPid && isProcessAlive(row.processPid)) return true;
+      if (row.processGroupId && isProcessGroupAlive(row.processGroupId)) return true;
+    }
+    return false;
+  }
+
+  // Authoritative, externally visible liveness answer for a `running` row. Derived from the
+  // SAME sources `runOccupiesHostSlot` reads — the shared in-process run registry and, only
+  // for tracked local-child adapters, the pid / process-group checks — plus the
+  // reaper-consistent `occupiesHostSlot` verdict itself. An external actor under run-slot
+  // starvation pressure probes this instead of inferring death from a silent log tail:
+  // any true field means the reaper would NOT reap the row, i.e. it is live (possibly
+  // provider-stalled), not dead. `null` pid fields mean "not tracked for this adapter
+  // type" (remote/session adapters carry no child pid), never "dead".
+  function buildRunLivenessProbe(row: {
+    id: string;
+    status: string;
+    processPid: number | null;
+    processGroupId: number | null;
+    adapterType: string;
+  }) {
+    if (row.status !== "running") return null;
+    const tracksLocalChild = isTrackedLocalChildProcessAdapter(row.adapterType);
+    return {
+      hasInMemoryHandle: liveRunExecutions.has(row.id),
+      processPidAlive: tracksLocalChild && row.processPid
+        ? isProcessAlive(row.processPid)
+        : null,
+      processGroupAlive: tracksLocalChild && row.processGroupId
+        ? isProcessGroupAlive(row.processGroupId)
+        : null,
+      occupiesHostSlot: runOccupiesHostSlot(row),
+    };
+  }
+
+  // Route-facing variant: fetches the run + its agent's adapter type in one join and
+  // returns the probe block (`null` for a missing run or a non-running row).
+  async function getRunLivenessProbe(runId: string) {
+    const row = await db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        processPid: heartbeatRuns.processPid,
+        processGroupId: heartbeatRuns.processGroupId,
+        adapterType: agents.adapterType,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    return row ? buildRunLivenessProbe(row) : null;
+  }
+
+  // The ceiling bounds concurrent *adapter processes*, i.e. CPU, so it counts `running` only —
+  // the same status `countRunningRunsForAgent` uses. `queued` and `scheduled_retry` hold an
+  // issue execution lock but no process; counting `scheduled_retry` would also be a liveness
+  // trap, because a scheduled-retry run can only leave that status by being promoted, and
+  // promotion goes back through this same admission gate.
+  async function countRunningRunsHostWide() {
+    const rows = await db
+      .select({
+        id: heartbeatRuns.id,
+        processPid: heartbeatRuns.processPid,
+        processGroupId: heartbeatRuns.processGroupId,
+        adapterType: agents.adapterType,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(eq(heartbeatRuns.status, "running"));
+    let count = 0;
+    for (const row of rows) {
+      if (runOccupiesHostSlot(row)) count += 1;
+    }
+    return count;
+  }
+
+  async function countAgentsWithQueuedRuns() {
+    const [{ count }] = await db
+      .select({ count: sql<number>`count(distinct ${heartbeatRuns.agentId})` })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "queued"));
+    return Number(count ?? 0);
+  }
+
+  /**
+   * Atomically decides whether one more run may start host-wide. The DB count and the
+   * reservation increment happen inside `withHostAdmissionLock`, so two agents dispatching
+   * concurrently cannot both read the same pre-claim count. Deliberately does *not* wrap the
+   * claim itself — see the note on `withHostAdmissionLock`.
+   */
+  async function reserveHostRunSlot() {
+    return withHostAdmissionLock(async () => {
+      const hostRunningCount = await countRunningRunsHostWide();
+      const hostInUse = hostRunningCount + inFlightHostRunReservations;
+      if (hostInUse >= hostRunCeiling.value) {
+        return { granted: false as const, hostRunningCount, hostInUse };
+      }
+      inFlightHostRunReservations += 1;
+      return { granted: true as const, hostRunningCount, hostInUse };
+    });
+  }
+
+  function releaseHostRunSlot() {
+    inFlightHostRunReservations = Math.max(0, inFlightHostRunReservations - 1);
+  }
+
+  function recordHostCeilingDeferral(agentId: string, details: Record<string, unknown>) {
+    hostCeilingDeferralCount += 1;
+    hostCeilingDeferredAgentIds.add(agentId);
+    logger.warn(
+      {
+        agentId,
+        hostMaxConcurrentRuns: hostRunCeiling.value,
+        hostCeilingSource: hostRunCeiling.source,
+        inFlightHostRunReservations,
+        hostCeilingDeferralCount,
+        deferredAgentCount: hostCeilingDeferredAgentIds.size,
+        ...details,
+      },
+      "heartbeat dispatch deferred by host concurrent-run ceiling",
+    );
+  }
+
+  /**
+   * Called when a run leaves the `running` status and frees a host slot. Agents deferred by the
+   * ceiling are otherwise only re-driven by their own next wake, which is what would turn a
+   * bounded queue into a stalled one.
+   */
+  async function drainHostCeilingDeferrals(alreadyDrivenAgentId: string | null) {
+    if (hostCeilingDeferredAgentIds.size === 0) return;
+    const deferredAgentIds = [...hostCeilingDeferredAgentIds];
+    hostCeilingDeferredAgentIds.clear();
+    for (const deferredAgentId of deferredAgentIds) {
+      if (deferredAgentId === alreadyDrivenAgentId) continue;
+      await startNextQueuedRunForAgent(deferredAgentId).catch((err) => {
+        logger.error({ err, agentId: deferredAgentId }, "host ceiling deferral re-dispatch failed");
+      });
+    }
+  }
+
     const claimed = await db
       .update(agents)
       .set({
@@ -19777,215 +19982,6 @@ export function heartbeatService(
     );
   }
 
-  const STRANDED_DEFERRED_WAKE_SWEEP_BATCH_LIMIT = 50;
-
-  // Heal stranded `deferred_issue_execution` wakes: wakes whose issue has no
-  // execution/checkout lock and no live execution path can never be promoted by
-  // a finalizing run (that finalization already happened without considering
-  // them — or predates sibling promotion), so a periodic pass promotes or
-  // consciously resolves them instead. Bounded per pass and idempotent: a
-  // promoted/resolved wake leaves the deferred status, so re-runs converge and
-  // never double-queue.
-  async function sweepStrandedDeferredWakes() {
-    const result = {
-      scanned: 0,
-      promoted: 0,
-      resolved: 0,
-      skippedLocked: 0,
-      skippedLiveExecutionPath: 0,
-      skippedStale: 0,
-      failed: 0,
-      wakeIds: [] as string[],
-      issueIds: [] as string[],
-    };
-
-    const deferredWakes = await db
-      .select({
-        id: agentWakeupRequests.id,
-        companyId: agentWakeupRequests.companyId,
-        agentId: agentWakeupRequests.agentId,
-        payload: agentWakeupRequests.payload,
-        requestedByActorType: agentWakeupRequests.requestedByActorType,
-        requestedAt: agentWakeupRequests.requestedAt,
-      })
-      .from(agentWakeupRequests)
-      .where(eq(agentWakeupRequests.status, "deferred_issue_execution"))
-      .orderBy(asc(agentWakeupRequests.requestedAt))
-      .limit(STRANDED_DEFERRED_WAKE_SWEEP_BATCH_LIMIT);
-
-    for (const deferredWake of deferredWakes) {
-      result.scanned += 1;
-      const wakePayload = parseObject(deferredWake.payload);
-      const wakeIssueId = readNonEmptyString(wakePayload.issueId);
-      if (!wakeIssueId) {
-        await db
-          .update(agentWakeupRequests)
-          .set({
-            status: "failed",
-            finishedAt: new Date(),
-            error: "Stranded deferred wake resolved by sweep: payload has no issueId",
-            updatedAt: new Date(),
-          })
-          .where(eq(agentWakeupRequests.id, deferredWake.id));
-        result.resolved += 1;
-        result.wakeIds.push(deferredWake.id);
-        continue;
-      }
-
-      const issue = await db
-        .select()
-        .from(issues)
-        .where(and(eq(issues.id, wakeIssueId), eq(issues.companyId, deferredWake.companyId)))
-        .then((rows) => rows[0] ?? null);
-      if (!issue) {
-        await db
-          .update(agentWakeupRequests)
-          .set({
-            status: "failed",
-            finishedAt: new Date(),
-            error: "Stranded deferred wake resolved by sweep: issue not found",
-            updatedAt: new Date(),
-          })
-          .where(eq(agentWakeupRequests.id, deferredWake.id));
-        result.resolved += 1;
-        result.wakeIds.push(deferredWake.id);
-        continue;
-      }
-
-      // Still locked: the lock holder's finalization owns the promotion.
-      if (issue.executionRunId || issue.checkoutRunId) {
-        result.skippedLocked += 1;
-        continue;
-      }
-
-      // A live queued/running run is bound to this issue: its finalization
-      // promotes the wake; treating it as stranded could double-queue work.
-      const liveExecutionPath = await db
-        .select({ id: heartbeatRuns.id })
-        .from(heartbeatRuns)
-        .where(
-          and(
-            eq(heartbeatRuns.companyId, issue.companyId),
-            inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
-            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
-          ),
-        )
-        .limit(1)
-        .then((rows) => rows[0] ?? null);
-      if (liveExecutionPath) {
-        result.skippedLiveExecutionPath += 1;
-        continue;
-      }
-
-      // Terminal issue: only a comment wake that may reopen the issue is worth
-      // promoting (the promotion path owns the reopen rules); every other wake
-      // resolves without burning a doomed queued run.
-      const issueIsTerminal = issue.status === "done" || issue.status === "cancelled";
-      const wakeContextSeed = parseObject(wakePayload[DEFERRED_WAKE_CONTEXT_KEY]);
-      const wakeCommentIds = extractWakeCommentIds(wakeContextSeed);
-      const wakeReason = readNonEmptyString(wakeContextSeed.wakeReason);
-      const mayReopenTerminalIssue =
-        wakeCommentIds.length > 0 &&
-        (deferredWake.requestedByActorType === "user" || wakeReason === "issue_reopened_via_comment");
-      if (issueIsTerminal && !mayReopenTerminalIssue) {
-        await db
-          .update(agentWakeupRequests)
-          .set({
-            status: "cancelled",
-            finishedAt: new Date(),
-            error: "Stranded deferred wake resolved by sweep: issue is in a terminal status",
-            updatedAt: new Date(),
-          })
-          .where(eq(agentWakeupRequests.id, deferredWake.id));
-        result.resolved += 1;
-        result.wakeIds.push(deferredWake.id);
-        result.issueIds.push(issue.id);
-        logger.info(
-          {
-            companyId: issue.companyId,
-            issueId: issue.id,
-            wakeId: deferredWake.id,
-            reason: "issue_terminal_status",
-            context: "deferred_wake_sweep",
-          },
-          "Stranded deferred wake cancelled (issue in terminal status)",
-        );
-        continue;
-      }
-
-      try {
-        type StrandedSweepOutcome =
-          | { kind: "promoted"; record: PromotedDeferredWakeRecord }
-          | { kind: "none"; resolvedDeferredWakeCount: number }
-          | { kind: "skipped_stale" };
-        const sweepOutcome = await db.transaction(async (tx): Promise<StrandedSweepOutcome> => {
-          // Re-check under the row lock: the unlocked pre-checks above can race
-          // with a concurrent checkout or finalization.
-          await tx.execute(sql`select id from issues where id = ${issue.id} for update`);
-          const freshIssue = await tx
-            .select()
-            .from(issues)
-            .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId)))
-            .then((rows) => rows[0] ?? null);
-          if (!freshIssue || freshIssue.executionRunId || freshIssue.checkoutRunId) {
-            return { kind: "skipped_stale" };
-          }
-          return promoteDeferredWakeForIssueInTx(tx as unknown as Db, freshIssue, null);
-        });
-        if (sweepOutcome.kind === "promoted") {
-          result.promoted += 1;
-          result.wakeIds.push(sweepOutcome.record.wakeId);
-          result.issueIds.push(sweepOutcome.record.issueId);
-          if (sweepOutcome.record.reopenedActivity) {
-            await logActivity(db, sweepOutcome.record.reopenedActivity);
-          }
-          await publishQueuedRunsAndKickAgents([sweepOutcome.record.run]);
-        } else if (sweepOutcome.kind === "none" && sweepOutcome.resolvedDeferredWakeCount > 0) {
-          result.resolved += sweepOutcome.resolvedDeferredWakeCount;
-          result.wakeIds.push(deferredWake.id);
-          result.issueIds.push(issue.id);
-        } else if (sweepOutcome.kind === "skipped_stale") {
-          result.skippedStale += 1;
-        }
-      } catch (error) {
-        result.failed += 1;
-        logger.warn(
-          {
-            companyId: deferredWake.companyId,
-            wakeId: deferredWake.id,
-            issueId: issue.id,
-            context: "deferred_wake_sweep",
-            err: error,
-          },
-          "Stranded deferred-wake sweep failed to promote a wake",
-        );
-      }
-    }
-
-    // Observability: the stranded count and every promote/resolve are visible
-    // here and in the promotion path's structured logs.
-    if (result.promoted > 0 || result.resolved > 0 || result.failed > 0) {
-      logger.warn(
-        { ...result, context: "deferred_wake_sweep" },
-        "Stranded deferred-wake sweep promoted or resolved wakes",
-      );
-    } else if (result.scanned > 0) {
-      logger.info(
-        { ...result, context: "deferred_wake_sweep" },
-        "Stranded deferred-wake sweep found no promotable strands",
-      );
-    }
-    return result;
-  }
-
-  async function reconcileHighCommentVolumeAlerts(opts?: {
-    now?: Date;
-    companyId?: string;
-    threshold?: number;
-  }) {
-    return highCommentVolumeAlerts.reconcileHighCommentVolumeAlerts(opts);
-  }
-
   async function scanSilentActiveRuns(opts?: {
     now?: Date;
     companyId?: string;
@@ -20282,7 +20278,7 @@ export function heartbeatService(
       if (claimedRuns.length === 0) return [];
 
       for (const claimedRun of claimedRuns) {
-        const execution = executeRun(claimedRun.id).catch((err) => {
+        const execution = executeRun(claimedRun.id, { hostReservationHeld: true }).catch((err) => {
           logger.error(
             { err, runId: claimedRun.id },
             "queued heartbeat execution failed",
@@ -20391,18 +20387,6 @@ export function heartbeatService(
       });
     return promise;
   }
-  async function executeRun(runId: string, opts?: { hostReservationHeld?: boolean }) {
-    // A run claimed by `startNextQueuedRunForAgent` arrives here still holding the host
-    // admission reservation that reserved its slot during claim. That reservation is handed
-    // back the instant the run registers in-process below (where it starts counting toward
-    // `countRunningRunsHostWide` on its own), or on any early return/throw before registration
-    // so the slot is never leaked (AC5).
-    let heldHostReservation = opts?.hostReservationHeld ?? false;
-    const releaseHeldHostReservation = () => {
-      if (!heldHostReservation) return;
-      heldHostReservation = false;
-      releaseHostRunSlot();
-    };
 
   async function executeRun(
     runId: string,
@@ -21102,6 +21086,14 @@ export function heartbeatService(
       } else {
         delete context.paperclipSkillTest;
       }
+    // System/heartbeat sessions (no taskKey) have no agent_task_sessions row, so
+    // their resume params live on agent_runtime_state.session_params_json. Reading
+    // them here lets the persisted promptBundleKey flow into runtime.sessionParams
+    // so the adapter's resume guard busts a pinned session when the charter
+    // changes. Honour a requested reset so we don't resume when a fresh session is
+    // intended, and never source these for per-issue runs (taskKey present).
+    const systemSessionParamsJson =
+      !taskKey && !resetTaskSession ? (runtime.sessionParamsJson ?? null) : null;
       const executionContinuation =
         issueRef && !isConversation(issueContext) && issueContext?.assigneeAgentId === agent.id
           ? await buildExecutionContinuation({
@@ -21687,6 +21679,33 @@ export function heartbeatService(
       } else {
         delete context.paperclipSecrets;
       }
+    // Consumer surface for the typed bridge-key refusal taxonomy: a refused
+    // credential surfaces as one greppable run-log/server-log line AND a
+    // structured wake-context field, so an expired/revoked/mismatched bridge
+    // key is self-explanatory in the agent transcript instead of surfacing
+    // only as the adapter's generic fail-closed spawn refusal. `binding_absent`
+    // is excluded: most agents legitimately carry no bridge binding, and that
+    // state is not a fault.
+    const bridgeKeyRefusal = bridgeKey?.status === "refused" ? bridgeKey.refusal : null;
+    if (bridgeKeyRefusal && bridgeKeyRefusal.code !== "binding_absent") {
+      const bridgeKeyLine = formatBridgeKeyRefusalLine(bridgeKeyRefusal);
+      logger.warn(
+        {
+          companyId: agent.companyId,
+          agentId: agent.id,
+          refusalCode: bridgeKeyRefusal.code,
+          ...(bridgeKeyRefusal.keyId ? { keyId: bridgeKeyRefusal.keyId } : {}),
+          ...(bridgeKeyRefusal.expiresAt ? { expiresAt: bridgeKeyRefusal.expiresAt } : {}),
+        },
+        bridgeKeyLine,
+      );
+      context.paperclipBridgeKeyStatus = {
+        ...bridgeKeyRefusal,
+        message: bridgeKeyLine,
+      };
+    } else {
+      delete context.paperclipBridgeKeyStatus;
+    }
       const effectiveResolvedConfig = applyRunScopedMentionedSkillKeys(
         resolvedConfig,
         runScopedSkillKeys,
@@ -22360,7 +22379,9 @@ export function heartbeatService(
                   openedAt: new Date(),
                   metadata: nextExecutionWorkspaceMetadata,
                 })
-              : null;
+              : outcome === "succeeded_dirty"
+                ? (adapterResult.errorCode ?? "dirty_exit")
+                : null;
       } catch (error) {
         if (executionWorkspace.created) {
           try {
@@ -22947,6 +22968,14 @@ export function heartbeatService(
       let runtimeSessionParamsForAdapter = normalizeSessionParams(
         stripPaperclipSessionMetadataFromSessionParams(runtimeSessionParams),
       );
+          // SECURITY-CRITICAL: Drop any value-exact secret values registered during this run so a
+          // rotated secret's stale plaintext is never retained across runs
+          // (Control 1).
+          clearRunSecretValues(run.id);
+          // SECURITY-CRITICAL: Drop any borrowed-handle plaintext minted during this run so a
+          // run-A handle can never resolve under a later run and rotated
+          // secrets are not retained (Control 2).
+          clearRunHandles(run.id);
 
       const sessionCompaction = await evaluateSessionCompaction({
         agent,
@@ -23598,6 +23627,7 @@ export function heartbeatService(
                   mode: "warm" as const,
                   idleTimeoutMs: resolvePaperclipRunnerIdleTimeoutMs(
                     parseObject(agent.adapterConfig).idleTimeoutMs,
+          promotedRecords,
                   ),
                 }
               : { mode: "per_turn" as const, idleTimeoutMs: null };
@@ -23627,6 +23657,7 @@ export function heartbeatService(
               nativeExecution.binding.executionWorkspaceId !==
                 nativeExecutionWorkspaceId ||
               nativeExecution.completionContract.id !==
+          promotedRecords,
                 completionContract.row.id ||
               nativeExecution.completionContract.sha256 !==
                 completionContract.row.canonicalSha256
@@ -23723,6 +23754,7 @@ export function heartbeatService(
                     agent.companyId,
                     readNonEmptyString(runnerAdapterConfig.managedProfileId) ??
                       "",
+        promotedRecords,
                   )
                 : null;
             const agentCoreProfile =
@@ -23741,6 +23773,7 @@ export function heartbeatService(
                 runnerAdapterConfig.env,
               ).ANTHROPIC_API_KEY;
               const boundSecretId =
+      await publishQueuedRunsAndKickAgents((promotionResult.promotedRecords ?? []).map((record) => record.run));
                 typeof rawApiKeyBinding === "object" &&
                 rawApiKeyBinding !== null
                   ? readNonEmptyString(
@@ -25509,6 +25542,29 @@ export function heartbeatService(
               agent,
             );
           }
+          // A genuinely zero-work usage-limit hit (never billed,
+          // never reached the model, and carrying a limit-signal string) parks every
+          // agent in every company until the advertised reset, instead of relying on
+          // this one agent's own retry ladder to eventually stop hammering a quota the
+          // whole account is out of. A mid-flight limit (non-zero cost/turns) and a
+          // zero-work failure with no limit wording (expired auth, bad model id,
+          // transient upstream error) are both deliberately excluded — see
+          // `shouldParkForUsageLimit` / `isZeroWorkUsageLimitResult`.
+          {
+            const failedResultJson = parseObject(livenessRun.resultJson);
+            if (shouldParkForUsageLimit(outcome, failedResultJson)) {
+              const parkedUntil = resolveUsageLimitParkTarget({
+                now: new Date(),
+                retryNotBefore: readTransientRetryNotBeforeFromRun(livenessRun),
+              });
+              await usageLimitPark.park({
+                parkedUntil,
+                reason: readNonEmptyString(livenessRun.errorCode) ?? "usage_limit_zero_work",
+                rawLimitText: readNonEmptyString(failedResultJson.result),
+                sourceRunId: livenessRun.id,
+              });
+            }
+          }
           const issueCommentPolicyResult = await finalizeIssueCommentPolicy(
             livenessRun,
             agent,
@@ -25606,6 +25662,11 @@ export function heartbeatService(
             adapterResult,
             {
               legacySessionId: nextSessionState.legacySessionId,
+              // Per-issue sessions store their params in agent_task_sessions
+              // (below); only the system/heartbeat session (no taskKey) records its
+              // resume params on agent_runtime_state so the prompt-bundle guard can
+              // bust it when the charter changes. `null` clears them on session drop.
+              sessionParams: taskKey ? undefined : (nextSessionState.params ?? null),
             },
             normalizedUsage,
           );
@@ -29836,6 +29897,8 @@ export function heartbeatService(
 
     releaseEnvironmentLeasesForRun,
     resumeRemoteStopComments,
+    sweepStrandedDeferredWakes,
+
     resumeQueuedCommentInterrupt,
     resumeExecutionWaitComments,
 
@@ -29844,8 +29907,6 @@ export function heartbeatService(
     reconcileResolvedDependencyWakes,
 
     scanSilentActiveRuns,
-
-    sweepStrandedDeferredWakes,
 
     reconcileHighCommentVolumeAlerts,
 
