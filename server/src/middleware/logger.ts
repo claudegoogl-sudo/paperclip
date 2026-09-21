@@ -1,14 +1,23 @@
 import path from "node:path";
 import fs from "node:fs";
 import pino from "pino";
+import type { Logger } from "pino";
 import { pinoHttp } from "pino-http";
 import { HTTP_LOG_REDACT_PATHS } from "./http-log-redaction.js";
 import { readConfigFile } from "../config-file.js";
 import { resolveDefaultLogsDir, resolveHomeAwarePath } from "../home-paths.js";
-import { shouldSilenceHttpSuccessLog } from "./http-log-policy.js";
+import {
+  isPrivateChatWebhookHttpRequest,
+  isSecretSensitiveHttpRequest,
+  shouldSilenceHttpSuccessLog,
+} from "./http-log-policy.js";
 import { redactSecretsForLog, redactSecretsDeepForLog } from "../secret-patterns.js";
-import { redactSensitive } from "./redact-sensitive.js";
+import {
+  redactSensitive,
+  stripSecretBearingUrlParts,
+} from "./redact-sensitive.js";
 import { redactWorkspaceHandoffTicket } from "../auth/workspace-login-handoff.js";
+
 
 /**
  * Censor used by pino `redact` to scrub secret patterns from the serialised

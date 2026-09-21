@@ -12,9 +12,10 @@ on:
       # would ship with no CI signal at all.
       - 'sync/upstream-**'
 
-concurrency:
-  group: pr-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
 
 jobs:
   policy:

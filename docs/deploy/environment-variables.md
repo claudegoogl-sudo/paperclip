@@ -14,73 +14,64 @@ All environment variables that Paperclip uses for server configuration.
 | `PAPERCLIP_BIND_HOST` | (unset) | Required when `PAPERCLIP_BIND=custom` |
 | `HOST` | `127.0.0.1` | Legacy host override; prefer `PAPERCLIP_BIND` for new setups |
 | `DATABASE_URL` | (embedded) | PostgreSQL connection string |
-| `PAPERCLIP_ALLOW_EMBEDDED_POSTGRES_PUBLIC` | `true` | When `false`, an `authenticated` + `public` deployment with no `DATABASE_URL` refuses to boot instead of falling back to embedded PostgreSQL. Default (`true`, or unset) warns and continues on embedded PostgreSQL. Set `false` to require an external managed Postgres in production. |
-| `PAPERCLIP_DB_POOL_MAX` | `20` | Maximum connections in the application's PostgreSQL pool. Raise it for busier instances, but keep the total across all processes under the server's `max_connections` (commonly `100`). Values below `1` or non-integers fall back to the default. |
-| `PAPERCLIP_DB_STATEMENT_TIMEOUT_MS` | `60000` | Per-query `statement_timeout` for the application pool, in milliseconds. A query exceeding it is cancelled and its pool connection released, so one slow query cannot starve the pool. Set `0` to disable (not recommended). Non-integers and negative values fall back to the default. Database migrations run on a separate connection and are not affected. This is a backstop: a read request whose client disconnects has its queries cancelled right away rather than at this timeout — see [Connection pool behavior](../../doc/DATABASE.md#connection-pool-behavior). |
 | `PAPERCLIP_HOME` | `~/.paperclip` | Base directory for all Paperclip data |
 | `PAPERCLIP_INSTANCE_ID` | `default` | Instance identifier (for multiple local instances) |
 | `PAPERCLIP_DEPLOYMENT_MODE` | `local_trusted` | Runtime mode override |
 | `PAPERCLIP_DEPLOYMENT_EXPOSURE` | `private` | Exposure policy when deployment mode is `authenticated` |
 | `PAPERCLIP_API_URL` | (auto-derived) | Paperclip API base URL. When set externally (e.g., via Kubernetes ConfigMap, load balancer, or reverse proxy), the server preserves the value instead of deriving it from the listen host and port. Useful for deployments where the public-facing URL differs from the local bind address. |
-| `PAPERCLIP_MAX_CONCURRENT_RUNS_HOST` | `ceil(vCPU / 2)` | Host-wide ceiling on concurrently executing agent runs — see [Host-wide run concurrency](#host-wide-run-concurrency). |
-
-## Host-wide run concurrency
-
-An agent's `heartbeat.maxConcurrentRuns` is a **per-agent** limit. Because every
-agent has its own, the sum across an instance can be far larger than the host can
-actually execute — 38 agents at the default of 20 each is 760 theoretical
-concurrent runs regardless of how many cores the box has.
-
-`PAPERCLIP_MAX_CONCURRENT_RUNS_HOST` is a second, **host-wide** ceiling checked
-before every dispatch, across all agents and all companies:
-
-- **Default:** `ceil(vCPU / 2)`, where vCPU is Node's `availableParallelism()`.
-  That is quota-aware, so on a host whose cgroup limits it to 4 cores of an
-  8-core machine the default resolves to `2`, not `4`. Set the variable
-  explicitly to pin a value.
-- **Range:** clamped to `1`–`50`. A value below `1`, a non-number, or an empty
-  string is ignored and the default is used.
-- **Counted statuses:** only runs in the `running` status count. `queued` and
-  `scheduled_retry` runs hold an issue execution lock but no adapter process, and
-  counting `scheduled_retry` would deadlock the scheduler, because such a run can
-  only leave that status by being promoted through this same gate.
-- **Liveness:** a `running` run only counts if a process is actually behind it —
-  it is executing in-process or its child pid / process group is still alive. A
-  `running` row left behind by a crashed or restarted process (an orphan the
-  reaper cleans up on its next tick) does not consume the budget, so a few orphans
-  cannot stall every agent. Freshly claimed runs, which are `running` before their
-  process registers, are held by an in-flight admission reservation in the
-  meantime, so they are never double-counted or missed.
-
-The resolved value is logged once at startup as `resolved host-wide concurrent
-run ceiling`, with `source` (`env` or `default`) and the detected `vcpuCount`.
-
-Runs refused by the ceiling **stay queued** — they are never cancelled or failed —
-and are re-offered a slot as soon as a running run finishes. Each refusal logs
-`heartbeat dispatch deferred by host concurrent-run ceiling` at `warn` with the
-current host count and ceiling, so throttling is distinguishable from idleness.
-
-When the ceiling is the scarce resource, a single agent may claim at most
-`ceil / (agents with queued work)` runs per dispatch pass, so one busy agent
-cannot take the whole host budget. The per-agent `maxConcurrentRuns` still
-applies as a secondary gate.
-
-## Run-path Integrity
-
-Optional boot-time self-checks for `paperclipai run`. They guard against a
-service unit silently launching the wrong binary — e.g. `ExecStart=/usr/bin/npx
-paperclipai run` resolving an upstream release from the public npm registry
-instead of the locally installed build. On every boot `paperclipai run` logs the
-detected build channel (`fork`/`upstream`) and version; these variables let an
-operator turn a mismatch into a fast, loud abort instead of a silent crash loop.
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PAPERCLIP_REQUIRE_FORK_BUILD` | (unset) | When truthy (`1`/`true`/`yes`/`on`), abort at boot unless the running build carries a `-fork.<n>` version marker |
-| `PAPERCLIP_EXPECTED_VERSION` | (unset) | When set, abort at boot unless the running CLI version matches this value exactly |
-
+| `PAPERCLIP_CHAT_WEBHOOK_PUBLIC_URL` | (board public origin) | Optional HTTPS origin for native chat provider webhooks when ingress and the board use different hosts. Must have no credentials, path, query, or fragment; invalid configuration refuses startup. Used only for provider callback URLs, not board links, authentication, trusted hosts, or identity confirmation. |
+| `PAPERCLIP_RUNNER_PUBLIC_URL` | (unset) | Explicit `wss://` base URL used only when a remote `paperclip_runner` target dials Paperclip directly. Paperclip appends `/api/runner/v1/connect/<runId>`; the reverse proxy must forward WebSocket upgrades for that route. This value is never inferred from request headers. Daytona ignores it and uses provider ingress. |
+| `PAPERCLIP_RUNNER_CA_BUNDLE_PATH` | (unset) | Optional PEM CA bundle for direct runner WSS. Platform roots remain enabled. There is no insecure TLS bypass. |
+| `PAPERCLIP_RUNNER_REMOTE_BINARY_PATH` | (host build) | Host-local path to a `paperclip-runnerd` artifact built for the remote target OS and architecture. Required when Paperclip and the remote sandbox do not share a compatible platform; build metadata and the required transport mode are verified before launch. |
+| `PAPERCLIP_RUNNER_REMOTE_CODEX_PATH` | (unset) | Optional host-local path to a Codex executable built for the remote target OS and architecture. For remote Codex-backed runners, Paperclip stages and verifies this executable beside `paperclip-runnerd`. |
+| `PAPERCLIP_RUNNER_REMOTE_CODEX_NPM_SPEC` | (unset) | Optional pinned npm package spec (for example, `@openai/codex@0.153.4`) installed inside each fresh remote lease when its Codex harness is not baked into the sandbox image. Mutually exclusive with `PAPERCLIP_RUNNER_REMOTE_CODEX_PATH`; Paperclip verifies the installed executable before starting `runnerd`. |
+| `PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH` | (unset) | Host-local path to the immutable provider pack built by `pnpm --filter @paperclipai/paperclip-runner build:provider-pack`. The pack includes its target-built Node 24.11 runtime, locked production dependencies, OpenCode proxy/executable, and ACPX sidecar. Remote OpenCode and ACPX fail closed without it. A preinstalled pack is accepted only when its complete digested manifest matches this build-owned pack; otherwise Paperclip stages this pack into the sandbox. |
 | `PAPERCLIP_HIDDEN_SETTINGS` | (unset) | Comma-separated settings surfaces to hide from the UI and floor at the API, for operators hosting Paperclip for others (managed cloud, internal shared server). See [Hiding settings surfaces](#hiding-settings-surfaces). |
 | `PAPERCLIP_SETTING_DEFAULTS` | (unset) | JSON object replacing the schema default of selected instance settings, for hosting operators. See [Operator setting defaults](#operator-setting-defaults). |
+
+Daytona connectivity for `paperclip_runner` uses authenticated provider
+WebSocket ingress and follows the instance experimental setting
+`enableNativeRunner` (default `false`). There is no separate ingress opt-in.
+Disabling Paperclip Runner blocks fresh native starts while persisted native
+runs retain their recovery path. The deprecated `enableRunnerPreviewIngress`
+key remains accepted in stored and managed configuration for version-skew
+compatibility, but it has no runtime effect. The setting has no effect on
+legacy adapters or callback bridges.
+
+### Webhook-only chat ingress
+
+Keep `PAPERCLIP_PUBLIC_URL` (or the explicit authentication public URL) pointed
+at the actual board. If the board is private, set
+`PAPERCLIP_CHAT_WEBHOOK_PUBLIC_URL=https://chat-ingress.example.com` and forward
+only `POST /api/chat-webhooks/*` from that host. Provider signatures still gate
+ingress; this variable does not expose routes or grant provider access.
+Never forward the private `local_trusted` board through a public tunnel.
+
+Task links in external messages require an externally safe HTTPS board URL.
+Local/private board URLs are omitted with instructions to open the task in
+Paperclip; the public webhook host is never substituted for the board. Identity
+confirmation stays on the board and requires the user to be able to reach it.
+
+### Preinstalled remote runner images
+
+Remote sandbox images may preinstall `paperclip-runnerd`, `codex`, and the
+provider pack at `/opt/paperclip-runner/provider-pack` instead of
+paying the upload and npm-install cost on every fresh lease. Put both executable
+names on the sandbox user's `PATH`; `$HOME/.local/bin` is checked explicitly
+before `PATH`. Paperclip verifies runner build metadata, the selected PRP
+transport capability, Codex startup, the provider-pack digest, exact harness
+pins, Node compatibility, and packaged bridge digests before linking artifacts
+into the run-specific runtime directory. A missing or incompatible executable falls back
+to `PAPERCLIP_RUNNER_REMOTE_BINARY_PATH` and
+`PAPERCLIP_RUNNER_REMOTE_CODEX_NPM_SPEC` (or
+`PAPERCLIP_RUNNER_REMOTE_CODEX_PATH`) without changing the selected transport.
+OpenCode and ACPX instead fall back only to
+`PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH`; they never start a provider
+process on the Paperclip host for a remote target.
+The Daytona environment editor's **Configure image** action can create this
+image without a separate container registry: install the executables in its
+setup sandbox, finish setup, and Paperclip captures and promotes the resulting
+Daytona snapshot for future leases.
 
 ### Hiding settings surfaces
 
@@ -178,18 +169,3 @@ These are set automatically by the server when invoking agents:
 |----------|-------------|
 | `ANTHROPIC_API_KEY` | Anthropic API key (for Claude Code adapter) |
 | `OPENAI_API_KEY` | OpenAI API key (for Codex adapter) |
-
-## MCP Tool-Call Timeouts (Claude Code adapter)
-
-Claude Code leaves MCP tool calls effectively unbounded by default (~28h), so a
-non-returning tool (including external MCP servers such as `@playwright/mcp`) can
-hang a run indefinitely and wedge its issue's execution lock. The adapter injects
-safe ceilings into the Claude CLI environment unless an operator sets them
-explicitly (via `config.env` or the host process env).
-
-| Variable | Description |
-|----------|-------------|
-| `MCP_TOOL_TIMEOUT` | Per-tool-call wall-clock ceiling in ms passed to the Claude CLI. Injected default `300000` (5 min) when unset. |
-| `MCP_TIMEOUT` | MCP server startup timeout in ms passed to the Claude CLI. Injected default `30000` (30s) when unset. |
-| `PAPERCLIP_MCP_TOOL_TIMEOUT_MS` | Tunes the injected `MCP_TOOL_TIMEOUT` default. |
-| `PAPERCLIP_MCP_STARTUP_TIMEOUT_MS` | Tunes the injected `MCP_TIMEOUT` default. |

@@ -681,6 +681,112 @@ export const SECURITY_POSTURE_COLUMNS = [
     column: "allowed_agent_ids",
     reason: "Allowlist of agents permitted to act inside the user's inbox; widening it grants agents inbox authority on the user's behalf.",
   },
+  // --- sync/upstream-v2026.916.0: columns introduced by upstream 824->916 (classified during the 916.0 sync merge; every registration names its in-repo predicate consumer) ---
+  {
+    table: "adapter_auth_sessions",
+    column: "connection_id",
+    reason: "Resolved session→connection binding returned by local-ai-login as the authenticated session's connection; rewriting it re-binds an auth session to a different connection.",
+  },
+  {
+    table: "adapter_auth_sessions",
+    column: "connection_grant_id",
+    reason: "Grant half of the same resolved binding; rewriting it swaps which grant's credentials the authenticated session draws on.",
+  },
+  {
+    table: "chat_endpoint_leases",
+    column: "token",
+    reason: "Bearer lease token; endpoint ownership is resolved by exact-token lookup in chat-channels, so an unqualified rewrite transfers endpoint control.",
+  },
+  {
+    table: "chat_identity_links",
+    column: "confirmation_token_hash",
+    reason: "Proof-of-control secret for identity linking, matched by exact hash; rewriting it lets a different claimant complete the link.",
+  },
+  {
+    table: "chat_identity_links",
+    column: "paperclip_user_id",
+    reason: "The external-principal→user binding; membership resolution reads it, so rewriting it re-binds a chat identity to a different user.",
+  },
+  {
+    table: "chat_identity_links",
+    column: "status",
+    reason: "'linked' is the gate membership resolution checks before trusting the binding, so a flatten to it trusts unconfirmed links.",
+  },
+  {
+    table: "chat_endpoints",
+    column: "allow_direct_messages",
+    reason: "Per-endpoint gate on whether direct-message conversations are admitted at all (!endpoint.allowDirectMessages refuses processing), so a flatten re-opens DM intake for endpoints that turned it off.",
+  },
+  {
+    table: "chat_endpoints",
+    column: "allow_group_chats",
+    reason: "Per-endpoint gate on group-chat admission (endpoint.allowGroupChats is the return predicate), so a flatten re-opens group intake for endpoints that turned it off.",
+  },
+  {
+    table: "chat_endpoints",
+    column: "allow_unlinked_people",
+    reason: "Per-endpoint gate on whether principals without a confirmed identity link may interact; widening it lets unlinked outsiders into the endpoint.",
+  },
+  {
+    table: "connection_grant_members",
+    column: "subject_id",
+    reason: "Who an organization-kind grant covers; grant applicability resolves through these membership rows, so an unqualified rewrite changes whose traffic the grant's credentials may serve.",
+  },
+  {
+    table: "connection_grant_members",
+    column: "subject_type",
+    reason: "Subject kind half of the same membership binding; rewriting it reinterprets every member row's subject_id.",
+  },
+  {
+    table: "connection_grants",
+    column: "external_credential",
+    reason: "External credential material for vercel-connect grants; feeds credential header resolution and is redacted on read, so it must never be rewritten unqualified.",
+  },
+  {
+    table: "connection_grants",
+    column: "subject_agent_id",
+    reason: "Agent-kind grant subject, constrained by connection_grants_subject_check and read to scope agent-kind grants; rewriting it re-points a grant at a different agent.",
+  },
+  {
+    table: "email_endpoints",
+    column: "owned_api_key_id",
+    reason: "Names the credential that owns the inbox; email-channels changes scope handling when it is absent, so clearing it widens which credentials may drive the endpoint.",
+  },
+  {
+    table: "email_endpoints",
+    column: "receive_mode",
+    reason: "Selects the inbound delivery path (signature-verified webhook vs websocket); rewriting it changes which trust check guards inbound mail.",
+  },
+  {
+    table: "managed_agent_profiles",
+    column: "api_key_secret_id",
+    reason: "Bound-secret pin; heartbeat and the native runtime compare the bound secret id against it before using the profile's credentials, so rewriting it swaps the profile's credential.",
+  },
+  {
+    table: "run_identity_contexts",
+    column: "responsible_user_id",
+    reason: "Actor-provenance predicate captured at agent-auth JWT issuance and read back by auth middleware to attribute run actions to a user; clearing or rewriting it corrupts that attribution.",
+  },
+  {
+    table: "tool_connections",
+    column: "connection_purpose",
+    reason: "'ai' vs tool purpose gates route visibility and intent admission (connection-intents rejects ai-purpose connections for tool use), so a flatten re-exposes AI auth sessions as tool connections.",
+  },
+  {
+    table: "tool_connections",
+    column: "credential_policy",
+    reason: "Read alongside credential resolution in tool-access; rewriting it changes which credential path a tool call may use.",
+  },
+  {
+    table: "tool_connections",
+    column: "credential_source",
+    reason: "'vercel_connect' gates the vercel credential header resolution path in tool-access; flipping it changes how the connection's credentials resolve.",
+  },
+  {
+    table: "tool_connections",
+    column: "external_credential",
+    reason: "Credential reference material fed to resolveVercelCredentialHeaders; an unqualified write transplants one connection's external credential onto every row.",
+  },
 ] as const satisfies readonly (SecurityPostureColumn & RegisteredPostureColumn)[];
 
 const POSTURE_COLUMNS_BY_TABLE = new Map<string, Set<string>>();
