@@ -433,7 +433,9 @@ import {
 import {
   isProcessGroupAlive,
   terminateLocalService,
+  verifyProcessStartIdentity,
 } from "./local-service-supervisor.js";
+import { reapRunMcpDescendants } from "./mcp-orphan-reaper.js";
 import {
   GIT_BRANCH_OWNERSHIP_METADATA_KEY,
   GIT_BRANCH_OWNERSHIP_METADATA_VERSION,
@@ -9165,31 +9167,108 @@ export async function persistHeartbeatRunProcessMetadata(
   });
 }
 
-async function terminateHeartbeatRunProcess(input: {
+type TerminateHeartbeatRunOutcome = "terminated" | "skipped_identity_unverified" | "no_process";
+
+export async function terminateHeartbeatRunProcess(input: {
   pid: number | null | undefined;
   processGroupId: number | null | undefined;
   graceMs?: number;
   signal?: NodeJS.Signals;
-}) {
+  // When there is no live in-memory child handle, the pid/pgid come from persisted
+  // metadata that the OS may have recycled onto an unrelated process after a server
+  // restart. Callers without a trusted handle pass the recorded spawn time so we can
+  // confirm the survivor is the process we spawned before signalling.
+  //
+  // identityMode selects how a non-matching identity is treated:
+  //  - "process" (default): the persisted pid is expected to still be alive; any inability
+  //    to positively match (dead/unreadable pid, missing/skewed start time) means the pid
+  //    was recycled onto — or is now — an unrelated live process, so the kill is skipped
+  //    (fail-closed). Used by the cancel / wakeup-cancel no-handle branches, which signal a
+  //    persisted pid that, if recycled, may be an unrelated *live* process.
+  //  - "descendant-group": reached only after the parent pid was confirmed dead, so the
+  //    only thing alive is an orphaned descendant group whose leader (pid === pgid) is gone.
+  //    A dead leader cannot be a live recycled process, so we proceed and reap the orphans;
+  //    we skip only when the group leader is *still alive* with a start time that does not
+  //    match — the one shape in which this branch could signal a live recycled group.
+  //
+  // Trusted-handle callers pass trustedHandle:true to bypass the gate entirely.
+  trustedHandle?: boolean;
+  identityMode?: "process" | "descendant-group";
+  expectedProcessStartedAt?: Date | number | null;
+  runId?: string;
+}): Promise<TerminateHeartbeatRunOutcome> {
   const pid = input.pid ?? null;
   const processGroupId = input.processGroupId ?? null;
-  if (typeof pid !== "number" && typeof processGroupId !== "number") return;
+  if (typeof pid !== "number" && typeof processGroupId !== "number") return "no_process";
 
-  await terminateLocalService(
-    {
-      pid:
-        typeof pid === "number" && Number.isInteger(pid) && pid > 0
-          ? pid
-          : (processGroupId ?? 0),
-      processGroupId:
-        typeof processGroupId === "number" &&
-        Number.isInteger(processGroupId) &&
-        processGroupId > 0
-          ? processGroupId
-          : null,
-    },
-    { forceAfterMs: input.graceMs, signal: input.signal },
+  if (!input.trustedHandle) {
+    const identityMode = input.identityMode ?? "process";
+    // Anchor identity on the group leader (pid === pgid) for descendant-group reaps, and on
+    // the persisted pid for the cancel paths.
+    const target =
+      identityMode === "descendant-group"
+        ? (typeof processGroupId === "number" ? processGroupId : (pid as number))
+        : (typeof pid === "number" ? pid : (processGroupId as number));
+    // In descendant-group mode a dead leader is not a live recycled process, so only a live
+    // leader is worth verifying; verifying a dead leader would always mismatch and wrongly
+    // block reaping the legitimate orphaned descendants.
+    const shouldVerify = identityMode === "process" || isProcessAlive(target);
+    if (shouldVerify) {
+      const expectedStartEpochMs =
+        input.expectedProcessStartedAt instanceof Date
+          ? input.expectedProcessStartedAt.getTime()
+          : input.expectedProcessStartedAt;
+      const verdict = await verifyProcessStartIdentity(target, expectedStartEpochMs);
+      if (verdict === "mismatch") {
+        logger.warn(
+          { runId: input.runId, targetPid: pid, targetProcessGroupId: processGroupId, identityMode },
+          "skipped heartbeat run process termination: recycled pid/pgid could not be identity-verified",
+        );
+        return "skipped_identity_unverified";
+      }
+    }
+  }
+
+  // Snapshot MCP descendants before the group is torn down (ppid links intact),
+  // kill the group, then reap any MCP that escaped the group into its own
+  // session. Covers both normal exit and watchdog/cancel teardown.
+  await reapRunMcpDescendants({ pid, processGroupId }, () =>
+    terminateLocalService(
+      {
+        pid:
+          typeof pid === "number" && Number.isInteger(pid) && pid > 0
+            ? pid
+            : (processGroupId ?? 0),
+        processGroupId:
+          typeof processGroupId === "number" && Number.isInteger(processGroupId) && processGroupId > 0
+            ? processGroupId
+            : null,
+      },
+      input.graceMs != null || input.signal
+        ? { forceAfterMs: input.graceMs, signal: input.signal }
+        : undefined,
+    ),
   );
+
+  // Upstream's terminateLocalService treats a zombie-only process group as gone and
+  // can return before this process has reaped the exited child (SIGCHLD). The DB-only
+  // kill paths here promise that a positively identity-matched pid is actually gone —
+  // process.kill(pid, 0) still succeeds for unreaped zombies — so wait briefly for the
+  // final reap before reporting success. Bounded: a pid that never reaps (or was already
+  // reaped by init) exits this loop within the deadline.
+  if (typeof pid === "number" && Number.isInteger(pid) && pid > 0) {
+    const reapDeadline = Date.now() + 2_000;
+    while (Date.now() < reapDeadline) {
+      try {
+        process.kill(pid, 0);
+      } catch {
+        break;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    }
+  }
+
+  return "terminated";
 }
 
 function buildProcessLossMessage(
@@ -21834,7 +21913,7 @@ export function heartbeatService(
           agent.adapterType,
           stripPaperclipSessionMetadataFromSessionParams(
             sessionCodec.deserialize(
-              taskSessionForRun?.sessionParamsJson ?? null,
+              taskSessionForRun?.sessionParamsJson ?? systemSessionParamsJson,
             ),
           ),
         );

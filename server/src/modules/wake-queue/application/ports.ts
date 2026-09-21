@@ -15,6 +15,15 @@ export type LockedIssueExecution = {
   /** Plan bounded recovery without draining messages while the finishing owner cleans up. */
   recoveryOnly?: boolean;
   primaryIssue: IssueSnapshot;
+  /**
+   * Sibling issues (other than the primary) that still referenced the
+   * finishing run and were lock-cleared in this same transaction. A single
+   * run can hold execution locks on several issues — its context issue plus
+   * any additional issues stamped by the legacy run fallback — so a deferred
+   * wake parked on any of them must be promoted in this same finalization
+   * instead of stranding until the periodic sweep.
+   */
+  siblingIssues?: IssueSnapshot[];
   run: RunSnapshot;
 };
 

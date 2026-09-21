@@ -1753,8 +1753,13 @@ describe("claude execute", () => {
         // only checks is_error/subtype, so without the noWork/usageLimit guards this
         // result reads as a clean completion and gets marked completedDirty.
         expect(result.completedDirty ?? false).toBe(false);
-        expect(result.errorCode).toBe("claude_transient_upstream");
-        expect(result.errorFamily).toBe("transient_upstream");
+        // Upstream widened the provider-quota regex to "you've hit your
+        // <any> limit", so a weekly account limit now classifies as
+        // provider_quota (exact reset-horizon pinning) instead of the
+        // fork's transient family. The guards under test — never
+        // completedDirty, retry after the reset — are family-agnostic.
+        expect(result.errorCode).toBe("provider_quota");
+        expect(result.errorFamily).toBe("provider_quota");
         // The backoff must survive: the wake is retried after the reset,
         // not treated as done.
         expect(result.retryNotBefore).toBe("2026-07-31T08:00:00.000Z");
@@ -1857,8 +1862,8 @@ describe("claude execute", () => {
       const result = await replay(liveUsageLimitRow, 1);
 
       expect(result.completedDirty ?? false).toBe(false);
-      expect(result.errorCode).toBe("claude_transient_upstream");
-      expect(result.errorFamily).toBe("transient_upstream");
+      expect(result.errorCode).toBe("provider_quota");
+      expect(result.errorFamily).toBe("provider_quota");
     });
 
     it("classifies the live genuine-dirty-exit row as completedDirty (exit 143, matches the live shape)", async () => {

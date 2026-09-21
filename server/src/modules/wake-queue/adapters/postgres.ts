@@ -1188,7 +1188,23 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
         }
 
-        const locked: LockedIssueExecution = { primaryIssue: toIssueSnapshot(issueRow), run: runSnapshot, recoveryOnly };
+        const locked: LockedIssueExecution = {
+          primaryIssue: toIssueSnapshot(issueRow),
+          // Sibling issues lock-cleared in this same transaction (context-issue
+          // selection above only picks the drain primary; the fork's
+          // sibling-promotion fix drains deferred wakes on these too).
+          siblingIssues: candidateIssues
+            .filter((candidate) => candidate.id !== issueRow?.id)
+            // A sibling whose execution lock already moved to a different
+            // (live retry) run is executing under that run; draining its
+            // deferred wakes here would steal the issue from under it. The
+            // split-UPDATE retry contract leaves executionRunId on the retry
+            // while this finishing run only stays pinned in checkoutRunId.
+            .filter((candidate) => !candidate.executionRunId || candidate.executionRunId === run.id)
+            .map(toIssueSnapshot),
+          run: runSnapshot,
+          recoveryOnly,
+        };
         const result = await fn(locked, { host: buildHost(tx, deps), transaction: buildTransaction(tx, deps, db, run) });
         return { ...result, run: runSnapshot };
       });

@@ -177,6 +177,11 @@ describeEmbeddedPostgres("deferred issue-execution wake promotion", () => {
       agentId,
       invocationSource: "assignment",
       status,
+      // Upstream's legacy-execution reconciliation gate holds a release that
+      // cannot prove the provider never started; the seeded run never
+      // dispatched, so bootstrap evidence is literally true and lets the
+      // finalization drain deferred wakes (the behavior under test).
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
       contextSnapshot: contextIssueId ? { issueId: contextIssueId, taskId: contextIssueId } : {},
     });
     return runId;
