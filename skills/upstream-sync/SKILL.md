@@ -68,6 +68,11 @@ When `git merge upstream/<tag>` reports conflicts,
    to regenerate a lockfile genuinely owned by the sync branch.
    The fork's `pr.yml` lockfile-block carves out only `chore/refresh-lockfile`,
    not sync branches, so the lockfile change must look authored by this branch.
+   The regen is skipped (with a `LOCKFILE-REGEN-SKIPPED` line, resolver exit 2)
+   when a manifest pnpm parses at install time (`package.json`,
+   `pnpm-workspace.yaml`) is still conflicted — installing then would crash
+   with `ERR_PNPM_JSON_PARSE` instead of escalating. The lockfile stays
+   staged-as-theirs for the conflict train to re-resolve explicitly.
 2. **`CHANGELOG*`** — concatenate upstream + fork sides with a divider; never
    prefer one.
 3. **`docs/**.md`, `README*`** — take theirs when both sides only added prose

@@ -12,6 +12,11 @@
  *                        The fork's pr.yml lockfile-block carve-out covers
  *                        chore/refresh-lockfile only, so sync branches must
  *                        explicitly own a lockfile-only change set.
+ *                        The regen is SKIPPED (LOCKFILE-REGEN-SKIPPED line,
+ *                        exit 2) when a manifest pnpm parses at install time
+ *                        (package.json, pnpm-workspace.yaml) is still
+ *                        conflicted — running it then crashes with
+ *                        ERR_PNPM_JSON_PARSE instead of escalating.
  *   - CHANGELOG*       → concatenate both sides with a divider.
  *   - docs/**.md, README*
  *                      → take theirs (upstream is canonical for docs) when
@@ -66,6 +71,12 @@ function isPnpmLock(file) {
   return file === "pnpm-lock.yaml";
 }
 
+function isPnpmParsedManifest(file) {
+  // Files `pnpm install` parses while resolving the workspace; conflict
+  // markers inside one abort the install with ERR_PNPM_JSON_PARSE.
+  return file === "pnpm-workspace.yaml" || /(^|\/)package\.json$/.test(file);
+}
+
 function isChangelog(file) {
   return /(^|\/)CHANGELOG[^/]*$/.test(file);
 }
@@ -103,7 +114,20 @@ async function main() {
   }
 
   if (needsPnpmRegen) {
-    await regeneratePnpmLock();
+    // `pnpm install` parses every manifest it can see at install time. If a
+    // manifest (package.json, pnpm-workspace.yaml) is still conflicted, the
+    // regen would crash on ERR_PNPM_JSON_PARSE — skip it and fall through to
+    // the remaining-files exit below so the caller keeps its structured
+    // escalation report. The lockfile stays staged-as-theirs; the human
+    // conflict train re-resolves it explicitly.
+    const pnpmInputs = unresolvedFiles().filter(isPnpmParsedManifest);
+    if (pnpmInputs.length > 0) {
+      console.error(
+        `LOCKFILE-REGEN-SKIPPED: ${pnpmInputs.length} pnpm-parsed file(s) still conflicted: ${pnpmInputs.join(", ")}`,
+      );
+    } else {
+      await regeneratePnpmLock();
+    }
   }
 
   const remaining = unresolvedFiles();
