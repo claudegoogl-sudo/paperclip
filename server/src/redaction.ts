@@ -985,7 +985,10 @@ export function redactEventPayload(payload: Record<string, unknown> | null): Rec
 
 function redactAgentEnvBinding(value: unknown): unknown {
   if (isSecretRefBinding(value) || isUserSecretRefBinding(value)) {
-    return sanitizeValue(value);
+    // Fork redaction set: sanitizeValue walks bindings with a leaf text
+    // redactor; env binding values are vault material, so use the exact-value
+    // leaf (same as the env redaction path below).
+    return sanitizeValue(value, valueExactLeafRedactor);
   }
   if (typeof value === "string" || isPlainBinding(value)) {
     return { type: "plain", value: REDACTED_EVENT_VALUE };

@@ -130,6 +130,7 @@ import { startTaskBridgeRenewalSweep } from "./services/task-bridge-renewal.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { isLoopbackHost, rewriteLoopbackUrlPort } from "./url-utils.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
+import { createPluginRunContextRegistry } from "./services/plugin-run-context-registry.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -1031,7 +1032,10 @@ async function startServerWithDatabaseTeardown(
       databaseBackupInFlight = false;
     }
   };
-  const pluginWorkerManager = createPluginWorkerManager();
+  const pluginRunContextRegistry = createPluginRunContextRegistry();
+  const pluginWorkerManager = createPluginWorkerManager({
+    runContextRegistry: pluginRunContextRegistry,
+  });
   const heartbeat = config.heartbeatSchedulerEnabled
     ? heartbeatService(db as any, { pluginWorkerManager })
     : null;

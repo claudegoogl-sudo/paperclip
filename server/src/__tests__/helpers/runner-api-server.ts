@@ -24,7 +24,7 @@ export async function startRunnerApiTestServer() {
   const temporary = await startEmbeddedPostgresTestDatabase("paperclip-api-eval-db-");
   const db = createDb(temporary.connectionString);
   const storage = createStorageService(createLocalDiskStorageProvider(join(root, "storage")));
-  const app = await createApp(db, {
+  const created = await createApp(db, {
     uiMode: "none", serverPort: 0, storageService: storage,
     deploymentMode: "authenticated", deploymentExposure: "private",
     allowedHostnames: ["127.0.0.1"], bindHost: "127.0.0.1", authReady: true,
@@ -32,6 +32,9 @@ export async function startRunnerApiTestServer() {
     localPluginDir: join(root, "plugins"), managedPluginAutoInstall: [],
     decisionServiceOptions: { wakeOriginAgent: async () => undefined },
   });
+  // Fork createApp returns { app, pluginToolDispatcher } so the standalone
+  // tool-health sweep can probe plugin-backed connections; unwrap the app.
+  const app = created.app;
   const http = createServer(app);
   const sockets = new Set<import("node:net").Socket>();
   http.on("connection", socket => { sockets.add(socket); socket.on("close", () => sockets.delete(socket)); });

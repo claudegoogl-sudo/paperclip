@@ -77,7 +77,6 @@ import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
 import { budgetService } from "../budgets.js";
 import { unadmittedChatWakeupCondition } from "../durable-chat-wakeup.js";
-import { instanceSettingsService } from "../instance-settings.js";
 import { getRunLogStore } from "../run-log-store.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import {

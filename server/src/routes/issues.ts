@@ -221,23 +221,6 @@ import { privateJsonEtag } from "../middleware/private-json-etag.js";
 import { createRequestPromiseMemo } from "../lib/request-promise-memo.js";
 import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import {
-  badRequest,
-  conflict,
-  forbidden,
-  HttpError,
-  notFound,
-  unauthorized,
-  unprocessable,
-} from "../errors.js";
-import { privateJsonEtag } from "../middleware/private-json-etag.js";
-import { createRequestPromiseMemo } from "../lib/request-promise-memo.js";
-import {
-  assertBoard,
-  assertCompanyAccess,
-  getAccessibleResource,
-  getActorInfo,
-} from "./authz.js";
-import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectIssueWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
