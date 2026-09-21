@@ -30094,6 +30094,21 @@ export function heartbeatService(
     };
   }
 
+  async function getRunLivenessProbe(runId: string) {
+    const row = await db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        processPid: heartbeatRuns.processPid,
+        processGroupId: heartbeatRuns.processGroupId,
+        adapterType: agents.adapterType,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    return row ? buildRunLivenessProbe(row) : null;
+  }
   return {
     waitForRunExecutionDrain: async (
       runId: string,
