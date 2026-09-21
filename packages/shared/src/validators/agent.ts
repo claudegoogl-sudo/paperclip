@@ -60,20 +60,26 @@ export const createAgentInstructionsBundleSchema = z.object({
   }),
 });
 
+const agentModelProfileConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  label: z.string().trim().min(1).optional(),
+  adapterConfig: adapterConfigSchema,
+}).strict();
+
+// Fork carryover: modelProfiles.cheap.adapterConfig is the fork's second home
+// for adapterConfig (guarded by the same runtime_config mutation assertion as
+// agents.adapter_config). Upstream removed modelProfiles; the fork's
+// context-injection guard and runtime-config handling still read it, so the
+// schema keeps accepting it.
 export const agentRuntimeConfigSchema = z.object({
   aiConnection: aiConnectionBindingSchema.optional(),
   debug: z.object({
     providerTrace: z.literal("raw").optional(),
   }).strict().optional(),
-}).catchall(z.unknown()).superRefine((value, ctx) => {
-  if (Object.prototype.hasOwnProperty.call(value, "modelProfiles")) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ["modelProfiles"],
-      message: "runtimeConfig.modelProfiles is no longer supported",
-    });
-  }
-});
+  modelProfiles: z.object({
+    cheap: agentModelProfileConfigSchema.optional(),
+  }).strict().optional(),
+}).catchall(z.unknown());
 
 export const createAgentSchema = z.object({
   name: z.string().min(1),
