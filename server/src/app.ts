@@ -20,7 +20,7 @@ import {
 import type { InspectDatabaseBackupHealthOptions } from "./services/database-backup-health.js";
 import type { StorageService } from "./storage/types.js";
 import { httpLogger, errorHandler, requestQueryCancellation } from "./middleware/index.js";
-import { registerActorContext } from "./middleware/auth.js";
+import { actorMiddleware, registerActorContext } from "./middleware/auth.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
 import {
   privateHostnameGuard,
@@ -186,11 +186,8 @@ import {
 import { COMPANY_IMPORT_API_PATH } from "./routes/company-import-paths.js";
 import { apiCompression } from "./middleware/api-compression.js";
 import { PLUGIN_WEBHOOK_INGESTION_PATH_PATTERN } from "./routes/plugin-webhook-paths.js";
-import { COMPANY_IMPORT_API_PATH } from "./routes/company-import-paths.js";
-import { apiCompression } from "./middleware/api-compression.js";
 import { chatWebhookBodyParser } from "./middleware/chat-webhook-body.js";
 import { createChatWebhookDiagnostics } from "./services/chat-webhook-diagnostics.js";
-
 
 type UiMode = "none" | "static" | "vite-dev";
 const FEEDBACK_EXPORT_FLUSH_INTERVAL_MS = 5_000;
@@ -550,6 +547,17 @@ export async function createApp(
       verify: captureRawBody,
     }),
   );
+  // Ahead of the generic parser so the anonymous plugin webhook ingestion
+  // route gets a tighter ceiling. `verify: captureRawBody` is mandatory here:
+  // the route reads `req.rawBody` to HMAC-verify the exact bytes the provider
+  // signed.
+  app.use(
+    PLUGIN_WEBHOOK_INGESTION_PATH_PATTERN,
+    express.json({
+      limit: WEBHOOK_JSON_BODY_LIMIT,
+      verify: captureRawBody,
+    }),
+  );
   // Chat providers sign the exact request bytes. Capture every webhook media
   // type before the global JSON parser so JSON events and form-encoded action
   // callbacks are verified against the provider's original body.
@@ -631,25 +639,6 @@ export async function createApp(
   app.use(llmRoutes(db));
 
   const hostServicesDisposers = new Map<string, () => void>();
-  const workerManager = opts.pluginWorkerManager ?? createPluginWorkerManager();
-  const connectionIntentHeartbeat = heartbeatService(db, {
-    pluginWorkerManager: workerManager,
-  });
-  const chatChannels = chatChannelService(db, {
-    deferWebhookProcessing: true,
-    heartbeat: connectionIntentHeartbeat,
-    publicBaseUrl: opts.authPublicBaseUrl,
-    webhookPublicBaseUrl: opts.chatWebhookPublicBaseUrl,
-    resolveNativeQuestion: (interaction) =>
-      deliverNativeQuestionResponse(db, interaction),
-    storage: opts.storageService,
-  });
-  // Provider-authenticated ingress is intentionally outside the board
-  // mutation guard. The Chat SDK adapter verifies the provider signature
-  // before Paperclip persists or acts on any event.
-  const emailChannels = emailChannelService(db, { heartbeat: connectionIntentHeartbeat, storage: opts.storageService, publicBaseUrl: opts.chatWebhookPublicBaseUrl ?? opts.authPublicBaseUrl });
-  app.use(emailWebhookRoutes(emailChannels));
-  app.use(chatWebhookRoutes(chatChannels));
   // pluginId -> pluginKey, populated as each plugin's host handlers are
   // built. Lets the event-relay probe resolve the bus key (which is the plugin
   // key) for the running workers reported by the worker manager.
@@ -671,6 +660,24 @@ export async function createApp(
   const workerManager =
     opts.pluginWorkerManager ??
     createPluginWorkerManager({ runContextRegistry: pluginRunContextRegistry });
+  const connectionIntentHeartbeat = heartbeatService(db, {
+    pluginWorkerManager: workerManager,
+  });
+  const chatChannels = chatChannelService(db, {
+    deferWebhookProcessing: true,
+    heartbeat: connectionIntentHeartbeat,
+    publicBaseUrl: opts.authPublicBaseUrl,
+    webhookPublicBaseUrl: opts.chatWebhookPublicBaseUrl,
+    resolveNativeQuestion: (interaction) =>
+      deliverNativeQuestionResponse(db, interaction),
+    storage: opts.storageService,
+  });
+  // Provider-authenticated ingress is intentionally outside the board
+  // mutation guard. The Chat SDK adapter verifies the provider signature
+  // before Paperclip persists or acts on any event.
+  const emailChannels = emailChannelService(db, { heartbeat: connectionIntentHeartbeat, storage: opts.storageService, publicBaseUrl: opts.chatWebhookPublicBaseUrl ?? opts.authPublicBaseUrl });
+  app.use(emailWebhookRoutes(emailChannels));
+  app.use(chatWebhookRoutes(chatChannels));
   const managedAutoInstallKeys = opts.managedPluginAutoInstall ?? null;
   const bundledCatalogRoot =
     opts.bundledPluginCatalogRoot ?? resolveBundledCatalogRoot(process.env);
@@ -729,17 +736,6 @@ export async function createApp(
   // back through the callback below, so the shutdown hook can cancel every live
   // session (SR-4).
   let setupTokenLoginService: SetupTokenSessionService | null = null;
-  // The dedicated proxy IP or CIDR allowlist for the confidential setup-token
-  // login responses (SR-7). The global `TRUST_PROXY` setting does not satisfy
-  // the guard; an operator sets this allowlist to the real TLS-terminating
-  // proxy addresses. An empty value keeps the confidential responses on direct
-  // TLS (or a `local_trusted` loopback peer) only.
-  const setupTokenLoginProxyAllowlist = (
-    process.env.CLAUDE_LOGIN_TRUSTED_PROXIES ?? ""
-  )
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0);
   // The explicit operator declaration that a platform edge terminates TLS for
   // every client request (SR-7). This complements the allowlist for managed
   // platforms (Railway, Render, Fly, and the like) where the app socket is
@@ -845,9 +841,10 @@ export async function createApp(
     }),
   );
   const trustedLocalStdioRuntimeHost =
-    process.env.PAPERCLIP_TRUSTED_MCP_RUNTIME_HOST ??
-    process.env.PAPERCLIP_TOOL_RUNTIME_TRUSTED_HOST ??
-    null;
+    process.env.PAPERCLIP_TRUSTED_MCP_RUNTIME_HOST
+    ?? process.env.PAPERCLIP_TOOL_RUNTIME_TRUSTED_HOST
+    ?? null;
+  api.use(pluginConfigEgressRoutes(db));
   api.use(costRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(activityRoutes(db));
   api.use(dashboardRoutes(db));
@@ -916,8 +913,8 @@ export async function createApp(
       deploymentExposure: opts.deploymentExposure,
       authPublicBaseUrl: opts.authPublicBaseUrl,
       trustedLocalStdioRuntimeHost,
-      // Fork carryover: plugin-backed connections report health via the plugin
-      // tool runtime instead of requiring a config.url their records never carry.
+      // Plugin-backed connections report health via the plugin tool runtime
+      // instead of requiring a config.url their records never carry.
       pluginToolRuntimeProbe: ({ pluginKey }) => toolDispatcher.toolCount(pluginKey),
       toolGateway,
       connectionIntentHeartbeat,
@@ -930,10 +927,6 @@ export async function createApp(
       deploymentExposure: opts.deploymentExposure,
     }),
   );
-  api.use(smokeLabRoutes(db, {
-    deploymentMode: opts.deploymentMode,
-    deploymentExposure: opts.deploymentExposure,
-  }));
   const jobCoordinator = createPluginJobCoordinator({
     db,
     lifecycle,
@@ -990,6 +983,8 @@ export async function createApp(
           notifyWorker,
           {
             pluginWorkerManager: workerManager,
+            storageService: opts.storageService,
+            runContextRegistry: pluginRunContextRegistry,
             manifest,
           },
         );
@@ -1004,7 +999,6 @@ export async function createApp(
     },
   );
   runtimePluginLoader = loader;
-  api.use(toolGatewayRoutes(db, toolGateway));
   api.use(
     toolGatewayRoutes(db, toolGateway),
   );
@@ -1353,11 +1347,6 @@ export async function createApp(
   void toolDispatcher.initialize().catch((err) => {
     logger.error({ err }, "Failed to initialize plugin tool dispatcher");
   });
-  const devWatcher = createPluginDevWatcher(
-    lifecycle,
-    async (pluginId) =>
-      (await pluginRegistry.getById(pluginId))?.packagePath ?? null,
-  );
   // Auto-provision bundled plugins so their providers are registered for
   // agent runs. Bundles are excluded from the pnpm
   // workspace and built standalone into the image (see Dockerfile), then
@@ -1410,6 +1399,24 @@ export async function createApp(
     .catch((err) => {
       logger.error({ err }, "Failed to load ready plugins on startup");
     });
+
+  // Liveness probe that warns if a running plugin's board-event relay
+  // detaches (worker up, zero event-bus subscriptions). Belt-and-suspenders to
+  // the per-restart subscription-count log in plugin-lifecycle.
+  const eventRelayProbe = createEventRelayProbe({
+    listRunningPlugins: () =>
+      workerManager
+        .diagnostics()
+        .filter((d) => d.status === "running")
+        .map((d) => ({ pluginId: d.pluginId, pluginKey: pluginKeyById.get(d.pluginId) }))
+        .filter((p): p is { pluginId: string; pluginKey: string } => Boolean(p.pluginKey)),
+    subscriptionCount: (pluginKey) => eventBus.subscriptionCount(pluginKey),
+    log: {
+      warn: (obj, msg) => logger.warn({ service: "plugin-event-relay-probe", ...obj }, msg),
+      info: (obj, msg) => logger.info({ service: "plugin-event-relay-probe", ...obj }, msg),
+    },
+  });
+  eventRelayProbe.start();
   app.locals.bundledPluginsStartup = bundledPluginsStartup;
   // The shutdown hook runs at most once. It caches the in-flight promise, so a
   // second caller (for example the `exit` handler) awaits the same completion
@@ -1423,6 +1430,7 @@ export async function createApp(
       scheduler.stop();
       jobCoordinator.stop();
       disableFeedbackExportFlushes();
+      eventRelayProbe.stop();
       unsubscribeChatPublicationSignals();
       chatReconciliation.stop();
       if (chatPublicationTimer) {
@@ -1430,7 +1438,6 @@ export async function createApp(
         chatPublicationTimer = null;
       }
       await chatReconciliation.drain();
-      eventRelayProbe.stop();
       if (importTransferSweepTimer) {
         clearInterval(importTransferSweepTimer);
         importTransferSweepTimer = null;
@@ -1441,9 +1448,9 @@ export async function createApp(
       viteHmrServer?.close();
       hostServiceCleanup.disposeAll();
       hostServiceCleanup.teardown();
+      pluginRunContextRegistry.dispose();
       await emailChannels.shutdown();
       await chatChannels.shutdown();
-      pluginRunContextRegistry.dispose();
       // Cancel every live setup-token login session and AWAIT the cancellation,
       // so each direct child stops and the server releases each lease before the
       // caller stops the database and the provider. A lease release that
