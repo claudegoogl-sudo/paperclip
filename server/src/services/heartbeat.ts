@@ -129,6 +129,16 @@ import {
   resolveAgentStatusAfterRun,
 } from "./heartbeat-stop-metadata.js";
 import {
+  SERVER_SHUTDOWN_INTERRUPTED_ERROR_CODE,
+  clearLastServerShutdownBoundary,
+  currentShutdownSignal,
+  isRunKilledByServerShutdown,
+  isServerShutdownInProgress,
+  readLastServerShutdownBoundary,
+  type ServerShutdownBoundary,
+  type ServerShutdownSignal,
+} from "./server-shutdown-state.js";
+import {
   classifyRunLiveness,
   type RunLivenessClassificationInput,
 } from "./run-liveness.js";
@@ -11285,6 +11295,94 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
+
+  /**
+   * Shared finalize for a run killed by a server shutdown.
+   *
+   * Used by the paths that close a run WITHOUT their own terminal write — the
+   * graceful drain and the process-lost sweep. It keeps the `interrupted` +
+   * `server_shutdown_interrupted` + restart-retry shape identical between
+   * them. The adapter-error close path, which has its own rich terminal write
+   * (usage, sessions, cost events), instead reclassifies in place through the
+   * shared `isRunKilledByServerShutdown` predicate before that write.
+   *
+   * Returns null when the run already left the running state (another close
+   * path won the race); callers must then not write a failure class either.
+   */
+  async function finalizeRunInterruptedByServerShutdown(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    agent: typeof agents.$inferSelect | null;
+    signal: ServerShutdownSignal;
+    now: Date;
+    cause: "graceful_drain" | "adapter_error_close" | "process_lost_sweep";
+    message: string;
+    extras?: {
+      stdoutExcerpt?: string | null;
+      stderrExcerpt?: string | null;
+      logBytes?: number | null;
+      logSha256?: string | null;
+      logCompressed?: boolean;
+      exitCode?: number | null;
+    };
+  }): Promise<{ run: typeof heartbeatRuns.$inferSelect; retryRunId: string | null } | null> {
+    const { run, signal, now, cause, message } = input;
+    const interruptedStatus = await setRunStatusIfRunning(run.id, "interrupted", {
+      finishedAt: now,
+      error: message,
+      errorCode: SERVER_SHUTDOWN_INTERRUPTED_ERROR_CODE,
+      signal,
+      ...(input.extras ?? {}),
+      resultJson: mergeRunStopMetadataForAgent(
+        input.agent ?? { adapterType: "unknown", adapterConfig: {} },
+        "interrupted",
+        {
+          resultJson: parseObject(run.resultJson),
+          errorCode: SERVER_SHUTDOWN_INTERRUPTED_ERROR_CODE,
+          errorMessage: message,
+        },
+      ),
+    });
+    if (!interruptedStatus.updated || !interruptedStatus.run) return null;
+    let interrupted = interruptedStatus.run;
+    await setWakeupStatus(run.wakeupRequestId, "cancelled", {
+      finishedAt: now,
+      error: null,
+    });
+    interrupted = await classifyAndPersistRunLiveness(interrupted, parseObject(interrupted.resultJson)) ?? interrupted;
+
+    await releaseEnvironmentLeasesForRun({
+      runId: interrupted.id,
+      companyId: interrupted.companyId,
+      agentId: interrupted.agentId,
+      status: interrupted.status,
+      failureReason: interrupted.error ?? undefined,
+    });
+
+    const retry = input.agent ? await enqueueProcessLossRetry(interrupted, input.agent, now) : null;
+    if (!retry) {
+      await releaseIssueExecutionAndPromote(interrupted);
+    }
+
+    await appendRunEvent(interrupted, await nextRunEventSeq(interrupted.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message,
+      payload: {
+        signal,
+        cause,
+        ...(run.processPid ? { processPid: run.processPid } : {}),
+        ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
+        ...(retry ? { retryRunId: retry.id } : {}),
+      },
+    });
+
+    await finalizeAgentStatus(run.agentId, "interrupted", message, undefined, {
+      wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+    });
+    return { run: interrupted, retryRunId: retry?.id ?? null };
+  }
+
   async function drainRunningRunsForShutdown(
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
@@ -11333,57 +11431,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const message = `Interrupted by graceful server shutdown (${signal}); retry queued for restart recovery`;
-      const interruptedStatus = await setRunStatusIfRunning(run.id, "interrupted", {
-        finishedAt: now,
-        error: message,
-        errorCode: "server_shutdown_interrupted",
+      const interruptedFinalize = await finalizeRunInterruptedByServerShutdown({
+        run,
+        agent,
         signal,
-        resultJson: mergeRunStopMetadataForAgent(agent, "interrupted", {
-          resultJson: parseObject(run.resultJson),
-          errorCode: "server_shutdown_interrupted",
-          errorMessage: message,
-        }),
-      });
-      if (!interruptedStatus.updated || !interruptedStatus.run) continue;
-      let interrupted = interruptedStatus.run;
-      await setWakeupStatus(run.wakeupRequestId, "cancelled", {
-        finishedAt: now,
-        error: null,
-      });
-      interrupted = await classifyAndPersistRunLiveness(interrupted, parseObject(interrupted.resultJson)) ?? interrupted;
-
-      await releaseEnvironmentLeasesForRun({
-        runId: interrupted.id,
-        companyId: interrupted.companyId,
-        agentId: interrupted.agentId,
-        status: interrupted.status,
-        failureReason: interrupted.error ?? undefined,
-      });
-
-      const retry = await enqueueProcessLossRetry(interrupted, agent, now);
-      if (!retry) {
-        await releaseIssueExecutionAndPromote(interrupted);
-      } else {
-        retryRunIds.push(retry.id);
-      }
-
-      await appendRunEvent(interrupted, await nextRunEventSeq(interrupted.id), {
-        eventType: "lifecycle",
-        stream: "system",
-        level: "warn",
+        now,
+        cause: "graceful_drain",
         message,
-        payload: {
-          signal,
-          ...(run.processPid ? { processPid: run.processPid } : {}),
-          ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
-          ...(retry ? { retryRunId: retry.id } : {}),
-        },
       });
-
-      await finalizeAgentStatus(run.agentId, "interrupted", message, undefined, {
-        wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
-      });
-      interruptedRunIds.push(interrupted.id);
+      if (interruptedFinalize) {
+        if (interruptedFinalize.retryRunId) retryRunIds.push(interruptedFinalize.retryRunId);
+        interruptedRunIds.push(interruptedFinalize.run.id);
+      }
     }
 
     if (interruptedRunIds.length > 0) {
@@ -14574,6 +14633,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
 
+    // Shutdown-boundary evidence for classifying orphaned runs. A
+    // marker left behind by the previous process means these stale "running"
+    // rows died with that shutdown (the periodic scheduler is stopped during
+    // shutdown, so the startup reap is where those kills surface). A missing
+    // marker keeps the genuine `process_lost` classification.
+    let lastShutdownBoundary: ServerShutdownBoundary | null = null;
+    try {
+      lastShutdownBoundary = await readLastServerShutdownBoundary();
+    } catch (err) {
+      logger.warn(
+        { err },
+        "failed to read server shutdown boundary marker; orphan reap cannot reclassify shutdown kills",
+      );
+    }
+
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
     const activeRuns = await db
       .select({
@@ -14693,6 +14767,46 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         : null;
 
+      // A run that was already running when a shutdown began (in
+      // this process, or in the previous process whose boundary marker
+      // survived the restart) died because of that shutdown — record the
+      // shutdown class through the shared predicate, never `process_lost`.
+      // Runs started after the boundary are untouched and keep the genuine
+      // process-loss classification below.
+      if (isRunKilledByServerShutdown({
+        inProgress: isServerShutdownInProgress(),
+        boundary: lastShutdownBoundary,
+        runStartedAt: run.startedAt ?? null,
+      })) {
+        const boundarySignal = lastShutdownBoundary?.signal ?? currentShutdownSignal("SIGTERM");
+        const shutdownMessage =
+          `Interrupted by server shutdown (${boundarySignal}); process lost across the shutdown boundary; retry queued for restart recovery`;
+        const shutdownAgent = await getAgent(run.agentId);
+        const shutdownFinalize = await finalizeRunInterruptedByServerShutdown({
+          run,
+          agent: shutdownAgent,
+          signal: boundarySignal,
+          now,
+          cause: "process_lost_sweep",
+          message: shutdownMessage,
+          extras: {
+            exitCode: null,
+            stdoutExcerpt: null,
+            stderrExcerpt: null,
+          },
+        });
+        if (shutdownFinalize) {
+          // No startNextQueuedRunForAgent here, matching the graceful drain:
+          // during a shutdown nothing new dispatches, and on the startup path
+          // the caller chain resumes queued retries right after the reap.
+          runningProcesses.delete(run.id);
+          reaped.push(run.id);
+        }
+        // A null result means another close path already terminalized the run;
+        // either way the `process_lost` write below must not run.
+        continue;
+      }
+
       let finalizedRun = await setRunStatus(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
         errorCode: "process_lost",
@@ -14791,6 +14905,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         { errorKind: PENDING_CLEANUP_SWEEP_ERROR_KIND },
         "pending_cleanup lease sweep failed",
       );
+    }
+
+    if (lastShutdownBoundary) {
+      // Boundary consumed by this reap. Later periodic reaps on this live
+      // process must see no boundary, so fresh orphans (started after the
+      // boundary) keep the genuine `process_lost` classification. A reap that
+      // crashed before this point leaves the marker in place; the next reap
+      // re-reads it and the startedAt comparison still holds.
+      try {
+        await clearLastServerShutdownBoundary();
+      } catch (err) {
+        logger.warn({ err }, "failed to clear server shutdown boundary marker");
+      }
     }
 
     return { reaped: reaped.length, runIds: reaped };
@@ -17592,7 +17719,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         usageBasis: adapterResult.usageBasis ?? null,
       });
       const normalizedUsage = sessionUsageResolution.normalizedUsage;
-      const runErrorMessage =
+      let runErrorMessage =
         outcome === "cancelled"
           ? (latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
           : outcome === "succeeded"
@@ -17603,7 +17730,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               );
       const recordedResponsibleUserDenialCode =
         normalizeResponsibleUserDenialCode(latestRun?.errorCode);
-      const runErrorCode =
+      let runErrorCode =
         outcome === "timed_out"
           ? "timeout"
           : outcome === "cancelled"
@@ -17613,6 +17740,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               : outcome === "succeeded_dirty"
                 ? (adapterResult.errorCode ?? "dirty_exit")
                 : null;
+
+      // A failure that lands while the server process is shutting
+      // down is a shutdown kill, not an adapter defect. During a shutdown wave
+      // the plugin workers are SIGTERMed and adapter streams die with non-zero
+      // exits (143) or stream errors, which this close path would otherwise
+      // record as `adapter_failed`. Reclassify through the shared shutdown
+      // predicate before any terminal write so status, errorCode, stop
+      // metadata, agent status, and the failure retry ladders all see the
+      // shutdown class instead. A genuine adapter error (no shutdown in
+      // progress) is untouched.
+      if (outcome === "failed" && isRunKilledByServerShutdown({
+        // In-process signal only: this close path runs in the same process
+        // that dispatched the run, so a persisted boundary from an earlier
+        // process is never evidence about it.
+        inProgress: isServerShutdownInProgress(),
+      })) {
+        const shutdownSignal = currentShutdownSignal("SIGTERM");
+        outcome = "interrupted";
+        runErrorMessage =
+          `Interrupted by server shutdown (${shutdownSignal}) during adapter close; retry queued for restart recovery`;
+        runErrorCode = SERVER_SHUTDOWN_INTERRUPTED_ERROR_CODE;
+      }
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
       if (handle) {
@@ -17631,9 +17780,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ? "succeeded_dirty"
             : outcome === "cancelled"
               ? "cancelled"
-              : outcome === "timed_out"
-                ? "timed_out"
-                : "failed";
+              : outcome === "interrupted"
+                ? "interrupted"
+                : outcome === "timed_out"
+                  ? "timed_out"
+                  : "failed";
 
       const cacheAdjustedCostUsd = resolveCacheAdjustedCostUsd(adapterResult);
       const usageJson =
@@ -17747,10 +17898,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         persistedRun = await classifyAndPersistRunLiveness(persistedRun, persistedResultJson) ?? persistedRun;
       }
 
-      await setWakeupStatus(run.wakeupRequestId, outcomeSucceeded ? "completed" : status, {
-        finishedAt: new Date(),
-        error: runErrorMessage,
-      });
+      await setWakeupStatus(
+        run.wakeupRequestId,
+        outcomeSucceeded ? "completed" : (outcome === "interrupted" ? "cancelled" : status),
+        {
+          finishedAt: new Date(),
+          error: runErrorMessage,
+        },
+      );
 
       const finalizedRun = persistedRun ?? (await getRun(run.id));
       if (finalizedRun) {
@@ -17824,6 +17979,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         } else if (outcome === "failed" && readTransientRecoveryContractFromRun(livenessRun)) {
           await scheduleBoundedRetryForRun(livenessRun, agent);
+        } else if (
+          outcome === "interrupted" &&
+          runErrorCode === SERVER_SHUTDOWN_INTERRUPTED_ERROR_CODE
+        ) {
+          // Mirror the graceful-drain semantics for a run the close
+          // path reclassified as shutdown-interrupted — queue restart recovery
+          // instead of a failure ladder, so the run resumes after the server
+          // comes back exactly like a drain-interrupted run.
+          await enqueueProcessLossRetry(livenessRun, agent, new Date());
         }
         // A genuinely zero-work usage-limit hit (never billed,
         // never reached the model, and carrying a limit-signal string) parks every

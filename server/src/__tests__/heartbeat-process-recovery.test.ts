@@ -109,6 +109,12 @@ import {
   redactSuccessfulRunHandoffEvidence,
 } from "../services/heartbeat.ts";
 import {
+  markServerShutdownStarted,
+  readLastServerShutdownBoundary,
+  resetServerShutdownMemoryForTests,
+  resolveServerShutdownBoundaryPath,
+} from "../services/server-shutdown-state.js";
+import {
   readHotRestartIntent,
   resolveLegacyHotRestartIntentPath,
   resolveHotRestartReportPath,
@@ -327,6 +333,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   }, 20_000);
 
   afterEach(async () => {
+    // A leaked in-process shutdown flag would reclassify every
+    // later run in this suite as shutdown-interrupted. Memory only — never
+    // touch the persisted marker, which may belong to a live instance.
+    resetServerShutdownMemoryForTests();
     vi.clearAllMocks();
     const localServiceSupervisor = await vi.importActual<typeof import("../services/local-service-supervisor.js")>(
       "../services/local-service-supervisor.js",
@@ -2383,6 +2393,242 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0] ?? null);
     expect(issue?.checkoutRunId).toBeNull();
     expect(issue?.executionRunId).toBe(secondRetry?.id);
+  });
+
+  // Shutdown-boundary run classification. The 2026-09-22 restart
+  // churn recorded runs killed BY the shutdown as `adapter_failed` (×3) and
+  // `process_lost` (×2); only the runs the graceful drain reached got
+  // `server_shutdown_interrupted`. The gap: the adapter-error close and the
+  // startup orphan reap never consulted shutdown state.
+  async function seedShutdownBoundaryMarker(home: string, input: {
+    signal?: "SIGINT" | "SIGTERM";
+    startedAt: Date;
+    pid?: number;
+  }) {
+    await fs.mkdir(path.dirname(resolveServerShutdownBoundaryPath(home)), { recursive: true });
+    await fs.writeFile(
+      resolveServerShutdownBoundaryPath(home),
+      JSON.stringify({
+        signal: input.signal ?? "SIGTERM",
+        startedAt: input.startedAt.toISOString(),
+        pid: input.pid ?? 4242,
+      }),
+      "utf8",
+    );
+  }
+
+  async function spawnDeadPid(): Promise<number> {
+    const child = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
+    const pid = child.pid!;
+    await waitForPidExit(pid);
+    expect(isPidAlive(pid)).toBe(false);
+    return pid;
+  }
+
+  it("records the shutdown terminal state, not process_lost, when the startup reap replays the 2026-09-22 boundary timeline", async () => {
+    await withTempPaperclipHome(async (home) => {
+      // Fixture: run 2df60c6f shape — running since 17:18, plugin-worker
+      // SIGTERM wave at 17:26:15 kills the server mid-shutdown, systemd
+      // restarts immediately, startup reap observes the orphan at 17:26:15.921.
+      const deadPid = await spawnDeadPid();
+      const { agentId, runId, wakeupRequestId } = await seedRunFixture({
+        agentStatus: "running",
+        processPid: deadPid,
+      });
+      await db
+        .update(heartbeatRuns)
+        .set({ startedAt: new Date("2026-09-22T17:18:02.000Z") })
+        .where(eq(heartbeatRuns.id, runId));
+      await seedShutdownBoundaryMarker(home, {
+        signal: "SIGTERM",
+        startedAt: new Date("2026-09-22T17:26:15.000Z"),
+      });
+      expect(await readLastServerShutdownBoundary(home)).toMatchObject({
+        signal: "SIGTERM",
+        pid: 4242,
+      });
+
+      const heartbeat = heartbeatService(db);
+      const result = await heartbeat.reapOrphanedRuns();
+
+      expect(result).toEqual({ reaped: 1, runIds: [runId] });
+      const run = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0]);
+      expect(run).toMatchObject({
+        status: "interrupted",
+        errorCode: "server_shutdown_interrupted",
+        signal: "SIGTERM",
+      });
+      expect(run?.error).toContain("Interrupted by server shutdown (SIGTERM)");
+
+      // Restart recovery is queued, mirroring the graceful-drain semantics.
+      const retry = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.retryOfRunId, runId))
+        .then((rows) => rows[0] ?? null);
+      expect(retry).toMatchObject({ status: "queued", processLossRetryCount: 1 });
+
+      const wakeup = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeupRequestId))
+        .then((rows) => rows[0] ?? null);
+      expect(wakeup?.status).toBe("cancelled");
+
+      // Agent status matches today's graceful-drain handling for
+      // server_shutdown_interrupted runs exactly (resolveAgentStatusAfterRun
+      // has no "interrupted" agent status; the drain parks the agent in
+      // error with the shutdown message as the reason).
+      const agent = await db
+        .select({ status: agents.status, errorReason: agents.errorReason })
+        .from(agents)
+        .where(eq(agents.id, agentId))
+        .then((rows) => rows[0] ?? null);
+      expect(agent?.status).toBe("error");
+      expect(agent?.errorReason).toContain("Interrupted by server shutdown (SIGTERM)");
+
+      // The boundary marker is consumed by the reap.
+      expect(await readLastServerShutdownBoundary(home)).toBeNull();
+    });
+  });
+
+  it("still records process_lost when no shutdown boundary exists (negative control)", async () => {
+    await withTempPaperclipHome(async () => {
+      const deadPid = await spawnDeadPid();
+      const { runId } = await seedRunFixture({
+        agentStatus: "running",
+        processPid: deadPid,
+      });
+
+      const heartbeat = heartbeatService(db);
+      const result = await heartbeat.reapOrphanedRuns();
+
+      expect(result).toEqual({ reaped: 1, runIds: [runId] });
+      const run = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0]);
+      expect(run).toMatchObject({ status: "failed", errorCode: "process_lost" });
+    });
+  });
+
+  it("does not classify a run started after the shutdown boundary as a shutdown kill", async () => {
+    await withTempPaperclipHome(async (home) => {
+      const deadPid = await spawnDeadPid();
+      const { runId } = await seedRunFixture({
+        agentStatus: "running",
+        processPid: deadPid,
+      });
+      // Boundary from 30 minutes ago; the orphaned run started after it, so
+      // its loss is genuine — exactly the post-restart run that must never be
+      // swept into the shutdown class.
+      await db
+        .update(heartbeatRuns)
+        .set({ startedAt: new Date("2026-09-22T17:26:15.001Z") })
+        .where(eq(heartbeatRuns.id, runId));
+      await seedShutdownBoundaryMarker(home, {
+        startedAt: new Date("2026-09-22T17:26:15.000Z"),
+      });
+
+      const heartbeat = heartbeatService(db);
+      await heartbeat.reapOrphanedRuns();
+
+      const run = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0]);
+      expect(run).toMatchObject({ status: "failed", errorCode: "process_lost" });
+      // Stale boundary is still consumed once the reap runs.
+      expect(await readLastServerShutdownBoundary(home)).toBeNull();
+    });
+  });
+
+  it("classifies an adapter SIGTERM-wave failure as shutdown-interrupted when the server is shutting down", async () => {
+    await withTempPaperclipHome(async (home) => {
+      // The 09-22 adapter_failed shape: the plugin-worker SIGTERM wave kills
+      // the adapter stream mid-run; the close path sees exit 143 + an error.
+      mockAdapterExecute.mockResolvedValueOnce({
+        exitCode: 143,
+        signal: "SIGTERM",
+        timedOut: false,
+        errorMessage: "process terminated by signal SIGTERM",
+        provider: "test",
+        model: "test-model",
+      });
+      const { agentId, runId } = await seedQueuedIssueRunFixture();
+      const heartbeat = heartbeatService(db);
+
+      // The shutdown signal arrives while the run is live; the adapter stream
+      // dies in the SIGTERM wave and the close path must consult the flag.
+      // Marking before dispatch keeps the test deterministic.
+      markServerShutdownStarted("SIGTERM", new Date("2026-09-22T17:26:15.000Z"));
+      await heartbeat.resumeQueuedRuns();
+      await waitForRunToSettle(heartbeat, runId);
+      await heartbeat.waitForRunExecutionDrain(runId);
+
+      const run = await heartbeat.getRun(runId);
+      expect(run).toMatchObject({
+        status: "interrupted",
+        errorCode: "server_shutdown_interrupted",
+        signal: "SIGTERM",
+      });
+      expect(run?.error).toContain("Interrupted by server shutdown (SIGTERM)");
+
+      const retry = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.retryOfRunId, runId))
+        .then((rows) => rows[0] ?? null);
+      expect(retry).toMatchObject({ status: "queued" });
+
+      const agent = await db
+        .select({ status: agents.status, errorReason: agents.errorReason })
+        .from(agents)
+        .where(eq(agents.id, agentId))
+        .then((rows) => rows[0] ?? null);
+      // Same agent-status shape as a drain-interrupted run: parked in error
+      // with the shutdown message, so operators see why (parity with today's
+      // server_shutdown_interrupted handling).
+      expect(agent?.status).toBe("error");
+      expect(agent?.errorReason).toContain("Interrupted by server shutdown (SIGTERM)");
+    });
+  });
+
+  it("still records adapter_failed for a real adapter error when no shutdown is in progress (negative control)", async () => {
+    await withTempPaperclipHome(async () => {
+      mockAdapterExecute.mockResolvedValueOnce({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage: "model_error: upstream provider rejected the request",
+        provider: "test",
+        model: "test-model",
+      });
+      const { agentId, runId } = await seedQueuedIssueRunFixture();
+      const heartbeat = heartbeatService(db);
+
+      await heartbeat.resumeQueuedRuns();
+      await waitForRunToSettle(heartbeat, runId);
+      await heartbeat.waitForRunExecutionDrain(runId);
+
+      // A genuine mid-run model error must keep the adapter failure class.
+      // This assertion goes red if real adapter failures ever collapse into
+      // the shutdown class.
+      const run = await heartbeat.getRun(runId);
+      expect(run).toMatchObject({ status: "failed", errorCode: "adapter_failed" });
+      const agent = await db
+        .select({ status: agents.status })
+        .from(agents)
+        .where(eq(agents.id, agentId))
+        .then((rows) => rows[0] ?? null);
+      expect(agent?.status).toBe("error");
+    });
   });
 
   it("releases active environment leases when an orphaned run is reaped", async () => {
