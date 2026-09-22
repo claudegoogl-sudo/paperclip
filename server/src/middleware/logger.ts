@@ -1,14 +1,23 @@
 import path from "node:path";
 import fs from "node:fs";
 import pino from "pino";
+import type { Logger } from "pino";
 import { pinoHttp } from "pino-http";
 import { HTTP_LOG_REDACT_PATHS } from "./http-log-redaction.js";
 import { readConfigFile } from "../config-file.js";
 import { resolveDefaultLogsDir, resolveHomeAwarePath } from "../home-paths.js";
-import { shouldSilenceHttpSuccessLog } from "./http-log-policy.js";
+import {
+  isPrivateChatWebhookHttpRequest,
+  isSecretSensitiveHttpRequest,
+  shouldSilenceHttpSuccessLog,
+} from "./http-log-policy.js";
 import { redactSecretsForLog, redactSecretsDeepForLog } from "../secret-patterns.js";
-import { redactSensitive } from "./redact-sensitive.js";
+import {
+  redactSensitive,
+  stripSecretBearingUrlParts,
+} from "./redact-sensitive.js";
 import { redactWorkspaceHandoffTicket } from "../auth/workspace-login-handoff.js";
+
 
 /**
  * Censor used by pino `redact` to scrub secret patterns from the serialised
@@ -97,8 +106,37 @@ export const logger = pino({
   ],
 }));
 
-export const httpLogger = pinoHttp({
-  logger,
+function requestClassificationUrl(req: {
+  originalUrl?: unknown;
+  url?: unknown;
+}): string | undefined {
+  return typeof req.originalUrl === "string"
+    ? req.originalUrl
+    : typeof req.url === "string"
+      ? req.url
+      : undefined;
+}
+
+function isPrivateWebhook(req: { method?: string; originalUrl?: unknown; url?: unknown }) {
+  return isPrivateChatWebhookHttpRequest(req.method, requestClassificationUrl(req));
+}
+
+function requestLogUrl(req: { method?: string; originalUrl?: unknown; url?: unknown }) {
+  return isPrivateWebhook(req)
+    ? "/api/chat-webhooks/:publicId/:provider"
+    : stripSecretBearingUrlParts(typeof req.url === "string" ? req.url : "");
+}
+
+/**
+ * Factory form of the HTTP logger (upstream contract): mount the fork's
+ * redacting middleware against a caller-supplied base logger, so tests and
+ * embedders can observe exactly what would be written. The singletons below
+ * use the shared `logger`. Combines upstream's private-webhook closed
+ * projections with the fork's secret-pattern redaction.
+ */
+export function createHttpLogger(baseLogger: pino.Logger) {
+  return pinoHttp({
+    logger: baseLogger,
   // SECURITY-CRITICAL: Log-time secret-pattern redaction (§1–§2). The matched substring
   // in any logged value is replaced with its class marker (e.g.
   // `<redacted github_pat>`) before the line is serialised — never a partial
@@ -116,6 +154,39 @@ export const httpLogger = pinoHttp({
   //    still be censored).
   //  - `res.body`: response bodies are NOT logged anywhere in this server (the
   //    res serializer emits status only), so there is nothing to scrub there.
+    serializers: {
+      req(req: Record<string, unknown> & { url?: unknown; method?: unknown; id?: unknown }) {
+        if (
+          isPrivateWebhook({
+            method: typeof req.method === "string" ? req.method : undefined,
+            url: req.url,
+          })
+        ) {
+          // Closed projection: no params, arbitrary headers, or parser/SDK
+          // body copies (including Buffer numeric byte keys) may leak a
+          // provider payload.
+          return {
+            id: req.id,
+            method: req.method,
+            url: "/api/chat-webhooks/:publicId/:provider",
+          };
+        }
+        return {
+          ...req,
+          url: typeof req.url === "string" ? stripSecretBearingUrlParts(req.url) : req.url,
+          query: undefined,
+        };
+      },
+      res(
+        res: Record<string, unknown> & {
+          raw?: { req?: { method?: string; originalUrl?: unknown; url?: unknown } };
+        },
+      ) {
+        return res.raw?.req && isPrivateWebhook(res.raw.req)
+          ? { statusCode: res.statusCode }
+          : res;
+      },
+    },
   customLogLevel(_req, res, err) {
     if (shouldSilenceHttpSuccessLog(_req.method, _req.url, res.statusCode)) {
       return "silent";
@@ -125,19 +196,45 @@ export const httpLogger = pinoHttp({
     return "info";
   },
   customSuccessMessage(req, res) {
-    // A workspace login handoff ticket is a bearer credential that rides in the
-    // query string, so the request line has to be redacted before it is logged.
-    return redactSecretsForLog(`${req.method} ${redactWorkspaceHandoffTicket(req.url ?? "")} ${res.statusCode}`);
+    // The request line keeps the webhook placeholder for private webhook
+    // routes and drops secret-bearing URL parts otherwise; the fork's
+    // pattern redaction wraps both (a workspace login handoff ticket is a
+    // bearer credential that rides in the query string).
+    return redactSecretsForLog(`${req.method} ${requestLogUrl(req)} ${res.statusCode}`);
   },
   customErrorMessage(req, res, err) {
+    if (isSecretSensitiveHttpRequest(req.method, requestClassificationUrl(req))) {
+      return redactSecretsForLog(`${req.method} ${requestLogUrl(req)} ${res.statusCode} — request failed`);
+    }
     const ctx = (res as any).__errorContext;
     const errMsg = ctx?.error?.message || err?.message || (res as any).err?.message || "unknown error";
-    return redactSecretsForLog(`${req.method} ${redactWorkspaceHandoffTicket(req.url ?? "")} ${res.statusCode} — ${errMsg}`);
+    return redactSecretsForLog(`${req.method} ${requestLogUrl(req)} ${res.statusCode} — ${errMsg}`);
+  },
+  customErrorObject(req, _res, _err, value) {
+    // pino-http serializes res.err independently of customProps/errorContext.
+    // Do not rely on a particular error handler having sanitized an SDK Error.
+    return isPrivateWebhook(req)
+      ? {
+          ...value,
+          err: { type: "Error", message: "Chat webhook request failed" },
+        }
+      : value;
   },
   customProps(req, res) {
+    if (res.statusCode >= 400 && isPrivateWebhook(req)) {
+      // Omit, rather than recursively redact, the entire provider payload —
+      // before/after parsing, with or without error context.
+      return {
+        reqBody: "[REDACTED]",
+        ...((res as any).__errorContext || (res as any).err ? { errorContext: { name: "Error" } } : {}),
+      };
+    }
     return redactSecretsDeepForLog(buildHttpLogProps(req, res));
   },
-});
+  });
+}
+
+export const httpLogger = createHttpLogger(logger);
 
 // Two redaction layers apply to the request fields below (defense in depth):
 //  1. `redactSensitive` here scrubs values by *key name* (password, *_token,
@@ -149,23 +246,37 @@ function buildHttpLogProps(req: any, res: any): Record<string, unknown> {
   if (res.statusCode >= 400) {
     const ctx = (res as any).__errorContext;
     if (ctx) {
+      const secretSensitiveRoute = isSecretSensitiveHttpRequest(
+        req.method,
+        requestClassificationUrl(req),
+      );
       return {
-        errorContext: ctx.error,
+        // Provider SDK and validation errors sometimes echo the supplied
+        // credential in their prose. Keep only a non-sensitive type marker for
+        // secret-sensitive routes; the status, route, and redacted body remain.
+        errorContext: secretSensitiveRoute
+          ? { name: "Error" }
+          : ctx.error,
         reqBody: redactSensitive(ctx.reqBody),
         reqParams: redactSensitive(ctx.reqParams),
-        reqQuery: redactSensitive(ctx.reqQuery),
+        // Query strings stay out entirely on secret-sensitive routes (one-shot
+        // OAuth codes and handoff tickets ride there); elsewhere they are
+        // key-redacted like the body.
+        ...(secretSensitiveRoute
+          ? {}
+          : { reqQuery: redactSensitive(ctx.reqQuery) }),
       };
     }
     const props: Record<string, unknown> = {};
-    const { body, params, query } = req as any;
+    // Query strings are never copied into the structured request log: OAuth
+    // callback codes and handoff tickets ride there, and key/pattern redaction
+    // cannot vouch for an opaque one-time value.
+    const { body, params } = req as any;
     if (body && typeof body === "object" && Object.keys(body).length > 0) {
       props.reqBody = redactSensitive(body);
     }
     if (params && typeof params === "object" && Object.keys(params).length > 0) {
       props.reqParams = redactSensitive(params);
-    }
-    if (query && typeof query === "object" && Object.keys(query).length > 0) {
-      props.reqQuery = redactSensitive(query);
     }
     if ((req as any).route?.path) {
       props.routePath = (req as any).route.path;

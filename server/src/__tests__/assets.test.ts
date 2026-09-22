@@ -417,6 +417,93 @@ function parseBinaryResponse(res: IncomingMessage, callback: (error: Error | nul
   res.on("error", callback);
 }
 
+
+describe("GET /api/assets/:assetId/content", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.doUnmock("../services/index.js");
+    vi.doUnmock("../routes/assets.js");
+    vi.doUnmock("../routes/authz.js");
+    vi.doUnmock("../middleware/index.js");
+    registerModuleMocks();
+    vi.clearAllMocks();
+    getAssetByIdMock.mockReset();
+  });
+
+  it("downloads script-capable HTML with nosniff and a sandbox CSP", async () => {
+    const html = Buffer.from("<script>globalThis.__assetXss = true</script>");
+    const storage = createStorageService("text/html");
+    getAssetByIdMock.mockResolvedValue({
+      ...createAsset(),
+      contentType: "text/html",
+      byteSize: html.byteLength,
+      originalFilename: "proof.html",
+    });
+    vi.mocked(storage.getObject).mockResolvedValue({
+      stream: Readable.from(html),
+      contentType: "text/html",
+      contentLength: html.byteLength,
+    });
+
+    const res = await requestApp(await createApp(storage), (baseUrl) =>
+      request(baseUrl).get("/api/assets/asset-1/content"),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers["content-disposition"]).toBe('attachment; filename="proof.html"');
+    expect(res.headers["x-content-type-options"]).toBe("nosniff");
+    expect(res.headers["content-security-policy"]).toBe("sandbox; default-src 'none'");
+  });
+
+  it("downloads SVG instead of rendering it on the application origin", async () => {
+    const svg = Buffer.from("<svg xmlns='http://www.w3.org/2000/svg'><circle r='4'/></svg>");
+    const storage = createStorageService("image/svg+xml; charset=utf-8");
+    getAssetByIdMock.mockResolvedValue({
+      ...createAsset(),
+      contentType: "image/svg+xml; charset=utf-8",
+      byteSize: svg.byteLength,
+      originalFilename: "logo.svg",
+    });
+    vi.mocked(storage.getObject).mockResolvedValue({
+      stream: Readable.from(svg),
+      contentType: "image/svg+xml; charset=utf-8",
+      contentLength: svg.byteLength,
+    });
+
+    const res = await requestApp(await createApp(storage), (baseUrl) =>
+      request(baseUrl).get("/api/assets/asset-1/content"),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers["content-disposition"]).toBe('attachment; filename="logo.svg"');
+    expect(res.headers["x-content-type-options"]).toBe("nosniff");
+    expect(res.headers["content-security-policy"]).toBe("sandbox; default-src 'none'");
+  });
+
+  it("keeps curated image types inline", async () => {
+    const image = Buffer.from("png-bytes");
+    const storage = createStorageService("image/png");
+    getAssetByIdMock.mockResolvedValue({
+      ...createAsset(),
+      byteSize: image.byteLength,
+    });
+    vi.mocked(storage.getObject).mockResolvedValue({
+      stream: Readable.from(image),
+      contentType: "image/png",
+      contentLength: image.byteLength,
+    });
+
+    const res = await requestApp(await createApp(storage), (baseUrl) =>
+      request(baseUrl).get("/api/assets/asset-1/content"),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers["content-disposition"]).toBe('inline; filename="logo.png"');
+    expect(res.headers["x-content-type-options"]).toBe("nosniff");
+    expect(res.headers).not.toHaveProperty("content-security-policy");
+  });
+});
+
 describe("GET /api/assets/:assetId/content — spreadsheet-bait disposition guard", () => {
   beforeEach(() => {
     vi.resetModules();

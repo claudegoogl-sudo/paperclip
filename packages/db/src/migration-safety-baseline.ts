@@ -171,22 +171,27 @@ export const MIGRATION_SAFETY_BASELINE = [
       "Upstream one-time backfill executed in the same migration that introduces the column: auth_kind is derived from the connection's own config/credential refs, not from any external input.",
   },
   {
-    id: "7b32e0d28820baba",
+    // id recomputed for the 2026.916.0 sync: the fork-migration renumber
+    // 0233_* -> 0282_* feeds findingId (rule + migration filename + table +
+    // normalized statement). Prior ids: 7b32e0d28820baba (0138_* name),
+    // 8d8eaa2bca851a5f (0233_* name).
+    id: "13833088093ef6c5",
     rule: "unqualified-mutation-security-posture-column",
-    migration: "0233_secret_binding_egress_allowlist.sql",
+    migration: "0282_secret_binding_egress_allowlist.sql",
     table: "company_secret_bindings",
     reason:
-      "Fork 0138 renumbered to 0223-0240 block: sets the default-on enforcement flag to false only when the column did not previously exist (guarded by column_existed), so live rows keep their applied state.",
+      "Rollout UPDATE for the EG4 egress-enforcement flag, wrapped in a DO block gated on whether this run created the column, so re-application is a no-op and live rows keep their applied state (fork 0138, renumbered 0233 then 0282). The UPDATE is still textually unqualified, so the rule fires by design — it recognises a selective WHERE, not an arbitrary PL/pgSQL guard, because a guard that is subtly wrong is invisible to a static check. This guard was reviewed on those terms. Baselined for this migration only — any NEW unqualified write to a posture column must fail CI.",
   },
   {
-    // id recomputed for the 2026.831.1 sync: the fork-migration renumber
-    // 0138_* -> 0233_* and the guarded DO-block rollout text both feed
-    // findingId (rule + migration filename + table + normalized statement).
-    id: "8d8eaa2bca851a5f",
+    // Upstream v2026.916.0 migration, baselined during the 916.0 sync merge:
+    // registering adapter_auth_sessions.connection_id/connection_grant_id as
+    // posture columns (they are the resolved session->connection binding
+    // local-ai-login returns) made upstream's row-clearing DELETE a finding.
+    id: "4bad7538284b878c",
     rule: "unqualified-mutation-security-posture-column",
-    migration: "0233_secret_binding_egress_allowlist.sql",
-    table: "company_secret_bindings",
+    migration: "0224_unified_adapter_auth_sessions.sql",
+    table: "adapter_auth_sessions",
     reason:
-      "Rollout UPDATE for the EG4 egress-enforcement flag, wrapped in a DO block gated on whether this run created the column, so re-application is a no-op and live rows keep their applied state. The UPDATE is still textually unqualified, so the rule fires by design — it recognises a selective WHERE, not an arbitrary PL/pgSQL guard, because a guard that is subtly wrong is invisible to a static check. This guard was reviewed on those terms. Baselined for this migration only — any NEW unqualified write to a posture column must fail CI.",
+      "Upstream's deliberate deploy-window decision, documented in the migration's own header: adapter_auth_sessions rows are short-lived login sessions, and rather than backfilling the new NOT NULL public_session_id the migration deletes existing rows so a dropped login session re-starts. No persisted authorization state is downgraded — the table only ever held in-flight logins — and the delete ships in the same migration that reshapes the table, so it cannot run twice.",
   },
 ] as const satisfies readonly MigrationSafetyBaselineEntry[];

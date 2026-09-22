@@ -12,9 +12,10 @@ on:
       # would ship with no CI signal at all.
       - 'sync/upstream-**'
 
-concurrency:
-  group: pr-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
 
 jobs:
   policy:
@@ -143,7 +144,7 @@ jobs:
       - name: Reject internal/instance-local references in the fork delta (sync branches)
         if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'sync/upstream-')
         env:
-          UPSTREAM_SYNC_BASE: 8e6edcdfa911151adba26be49a41cf5017b3aade
+          UPSTREAM_SYNC_BASE: dffc2b3ca1b9e88fa21cb17493083e682dffd1ca
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: node ./scripts/check-no-internal-ids.mjs "$UPSTREAM_SYNC_BASE" "$PR_HEAD_SHA"
 

@@ -4308,4 +4308,719 @@ export const SECURITY_POSTURE_REJECTIONS = [
     ],
     reason: "Metadata column with no authorization semantics; the enforcing gates for this subsystem are registered as posture columns separately.",
   },
+  // --- sync/upstream-v2026.916.0: upstream-new tables/columns classified during the 916.0 sync merge ---
+  // adapter_auth_sessions — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "adapter_auth_sessions",
+    columns: [
+     "ai_connection",
+     "connection_method",
+     "result_claim",
+    ],
+    reason: "Echo fields of a completed adapter auth session: the transport method used, the resolved AI connection payload echo, and the provider's final claim. Read for session-completion bookkeeping and display (device-login commit), not as authorization predicates; the binding that matters (connection_id, connection_grant_id) is registered above.",
+  },
+
+  // agent_session_goal_actions — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "agent_session_goal_actions",
+    columns: [
+     "action",
+     "company_id",
+     "completed_at",
+     "created_at",
+     "delivered_at",
+     "error",
+     "id",
+     "payload_json",
+     "request_id",
+     "result_json",
+     "session_id",
+     "status",
+     "updated_at",
+    ],
+    reason: "Goal-action delivery bookkeeping (ids, timestamps, status, request/result payloads). Sequences the goal subsystem's own messages; no consumer reads any of these as an authorization predicate.",
+  },
+
+  // agent_task_sessions — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "agent_task_sessions",
+    columns: [
+     "goal_capability_json",
+     "goal_desired_state",
+     "goal_json",
+     "goal_observed_at",
+     "goal_revision",
+     "goal_source_cursor",
+     "goal_source_id",
+     "goal_status",
+    ],
+    reason: "Goal-state snapshot columns (desired state, observed state, revision, cursor, source ids). Drive goal evaluation and resumability, not authorization.",
+  },
+
+  // ai_connection_defaults — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "ai_connection_defaults",
+    columns: [
+     "company_id",
+     "grant_id",
+     "id",
+     "method",
+     "provider",
+     "updated_at",
+     "user_id",
+    ],
+    reason: "Per-company/user default connection preferences. grant_id selects among grants the company already holds; authority lives in connection_grants (registered) and the resolver's company scoping, so rewriting a default changes preference, not authority.",
+  },
+
+  // ai_provider_defaults — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "ai_provider_defaults",
+    columns: [
+     "company_id",
+     "grant_id",
+     "id",
+     "provider",
+     "updated_at",
+     "user_id",
+    ],
+    reason: "Per-company/user default provider preferences; same grounds as ai_connection_defaults — authority lives in the grant and the resolver, not in which grant a preference points at.",
+  },
+
+  // announcement_dismissals — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "announcement_dismissals",
+    columns: [
+     "announcement_id",
+     "dismissed_at",
+     "user_id",
+    ],
+    reason: "Announcement dismissal bookkeeping (who dismissed what, when); display state only.",
+  },
+
+  // announcement_publications — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "announcement_publications",
+    columns: [
+     "announcement_id",
+    ],
+    reason: "Which announcement a publication row refers to; display bookkeeping.",
+  },
+
+  // chat_actions — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "chat_actions",
+    columns: [
+     "company_id",
+     "conversation_id",
+     "created_at",
+     "delivery_id",
+     "endpoint_id",
+     "id",
+     "kind",
+     "payload",
+     "principal_id",
+     "provider_action_id",
+     "result",
+     "status",
+     "updated_at",
+    ],
+    reason: "Chat action delivery records (kind, payload, result, provider action ids, status); delivery machinery and audit, not authorization predicates.",
+  },
+
+  // chat_agent_routes — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "chat_agent_routes",
+    columns: [
+     "company_id",
+     "created_at",
+     "created_by_user_id",
+     "destination_endpoint_id",
+     "enabled",
+     "id",
+     "max_hops",
+     "source_endpoint_id",
+     "trigger_mode",
+     "updated_at",
+    ],
+    reason: "Routing rules (source/destination endpoints, trigger mode, hop limits). enabled gates whether a route fires — an availability switch; inbound trust is enforced at the endpoint gates and identity-link layers, which are registered.",
+  },
+
+  // chat_conversations — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "chat_conversations",
+    columns: [
+     "company_id",
+     "created_at",
+     "endpoint_id",
+     "external_conversation_id",
+     "external_label",
+     "external_thread_id",
+     "id",
+     "is_direct_message",
+     "issue_id",
+     "last_activity_at",
+     "provider_url",
+     "resource_id",
+     "session_generation",
+     "state",
+     "updated_at",
+    ],
+    reason: "Conversation metadata and provider identifiers (external ids, labels, state, timestamps); no consumer reads any as an authorization predicate.",
+  },
+
+  // chat_deliveries — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "chat_deliveries",
+    columns: [
+     "attempts",
+     "company_id",
+     "conversation_id",
+     "created_at",
+     "deduplication_key",
+     "endpoint_id",
+     "event_kind",
+     "id",
+     "next_attempt_at",
+     "normalized_event",
+     "principal_id",
+     "processed_at",
+     "provider_event_id",
+     "received_at",
+     "redacted_error",
+     "state",
+     "updated_at",
+    ],
+    reason: "Inbound event delivery queue state (attempts, dedup keys, normalized events, errors); queue machinery, not authorization.",
+  },
+
+  // chat_discord_command_owners — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "chat_discord_command_owners",
+    columns: [
+     "action_id",
+     "application_id",
+     "company_id",
+     "created_at",
+     "endpoint_id",
+    ],
+    reason: "Discord command ownership registry used to route commands to their owning action/endpoint; routing metadata, not an authorization gate.",
+  },
+
+  // chat_endpoint_leases — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "chat_endpoint_leases",
+    columns: [
+     "company_id",
+     "created_at",
+     "endpoint_id",
+     "expires_at",
+     "id",
+     "lease_key",
+     "updated_at",
+    ],
+    reason: "Lease bookkeeping around the registered token column; expires_at bounds lease validity for renewal/cleanup reads, and ownership itself is the exact-token match on the registered chat_endpoint_leases.token.",
+  },
+
+  // chat_endpoint_resources — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "chat_endpoint_resources",
+    columns: [
+     "availability",
+     "company_id",
+     "created_at",
+     "detail",
+     "enabled",
+     "endpoint_id",
+     "id",
+     "label",
+     "metadata",
+     "parent_provider_resource_id",
+     "provider_resource_id",
+     "provider_url",
+     "type",
+     "updated_at",
+    ],
+    reason: "Provider resource inventory (labels, metadata, availability, provider urls); display and availability data.",
+  },
+
+  // chat_endpoints — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "chat_endpoints",
+    columns: [
+     "activated_at",
+     "archived_at",
+     "assigned_agent_id",
+     "bot_avatar_url",
+     "bot_display_name",
+     "bot_external_id",
+     "bot_username",
+     "capabilities",
+     "company_id",
+     "concurrency_policy",
+     "connection_id",
+     "created_at",
+     "deployment_mode",
+     "external_execution_policy",
+     "health_message",
+     "id",
+     "last_error",
+     "last_event_at",
+     "last_publication_at",
+     "provider",
+     "provider_account_id",
+     "provider_account_label",
+     "public_id",
+     "publication_mode",
+     "setup",
+     "sponsor_user_id",
+     "status",
+     "updated_at",
+    ],
+    reason: "Endpoint configuration and health telemetry. The admission gates that are read as predicates (allow_direct_messages, allow_group_chats, allow_unlinked_people) are registered above; the rest is display config, provider account labels, and liveness telemetry, and execution/publication policy is enforced per-event through those registered gates and the identity-link layer.",
+  },
+
+  // chat_external_principals — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "chat_external_principals",
+    columns: [
+     "avatar_url",
+     "company_id",
+     "created_at",
+     "display_name",
+     "external_id",
+     "handle",
+     "id",
+     "is_bot",
+     "kind",
+     "last_seen_at",
+     "provider",
+     "provider_account_id",
+     "updated_at",
+    ],
+    reason: "External principal directory (handles, avatars, kinds, last-seen); identity resolution goes through the registered chat_identity_links binding, not through these profile fields.",
+  },
+
+  // chat_identity_links — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "chat_identity_links",
+    columns: [
+     "company_id",
+     "confirmed_at",
+     "created_at",
+     "endpoint_id",
+     "expires_at",
+     "id",
+     "principal_id",
+     "revoked_at",
+     "updated_at",
+    ],
+    reason: "Link bookkeeping around the registered gates: lifecycle timestamps, endpoint scoping, and the principal side of the pairing. revoked_at has no reader (revocation is observed through the registered status column), and principal_id names the external identity being bound, not a decision input.",
+  },
+
+  // chat_message_links — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "chat_message_links",
+    columns: [
+     "comment_id",
+     "company_id",
+     "conversation_id",
+     "created_at",
+     "delivery_id",
+     "direction",
+     "endpoint_id",
+     "id",
+     "provider_message_id",
+     "publication_id",
+    ],
+    reason: "Message linkage bookkeeping (comment ↔ provider message ids, direction); mapping data, not authorization.",
+  },
+
+  // chat_publications — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "chat_publications",
+    columns: [
+     "attempts",
+     "comment_id",
+     "company_id",
+     "conversation_id",
+     "created_at",
+     "endpoint_id",
+     "id",
+     "idempotency_key",
+     "issue_id",
+     "next_attempt_at",
+     "payload",
+     "provider_message_id",
+     "provider_url",
+     "published_at",
+     "redacted_error",
+     "state",
+     "updated_at",
+    ],
+    reason: "Outbound publication queue state (attempts, idempotency keys, payloads, errors); queue machinery.",
+  },
+
+  // chat_sdk_state — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "chat_sdk_state",
+    columns: [
+     "company_id",
+     "created_at",
+     "endpoint_id",
+     "expires_at",
+     "id",
+     "state_key",
+     "updated_at",
+     "value",
+     "version",
+    ],
+    reason: "Provider SDK handshake scratch state with expiry, matched by state_key; transient protocol state, not authorization.",
+  },
+
+  // chat_teams_file_transfers — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "chat_teams_file_transfers",
+    columns: [
+     "aad_object_id",
+     "attachment_id",
+     "attempt_expires_at",
+     "attempt_id",
+     "authority_digest",
+     "authorized_user_id",
+     "bot_app_id",
+     "byte_size",
+     "comment_id",
+     "company_id",
+     "consent_message_id",
+     "conversation_generation",
+     "conversation_id",
+     "created_at",
+     "credential_fingerprint",
+     "endpoint_id",
+     "expires_at",
+     "file_info_message_id",
+     "filename",
+     "id",
+     "issue_id",
+     "phase",
+     "principal_id",
+     "private_state",
+     "provider_conversation_id",
+     "provider_user_id",
+     "publication_id",
+     "reason",
+     "response_activity_id",
+     "response_digest",
+     "runtime_generation",
+     "sha256",
+     "source_digest",
+     "tenant_id",
+     "token_sha256",
+     "updated_at",
+     "version",
+    ],
+    reason: "Teams file-transfer consent and transfer records. authorized_user_id and the digests record WHO consented and to WHAT bytes for audit; enforcement happens in the consent-message flow before the row is trusted, and no consumer reads these columns as a row-level authorization predicate.",
+  },
+
+  // connection_event_deliveries — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "connection_event_deliveries",
+    columns: [
+     "action",
+     "attempts",
+     "company_id",
+     "created_at",
+     "event",
+     "id",
+     "installation_id",
+     "last_error",
+     "normalized_payload",
+     "processed_at",
+     "provider",
+     "provider_created_at",
+     "provider_delivery_id",
+     "repository_id",
+     "status",
+     "updated_at",
+    ],
+    reason: "GitHub connection webhook delivery queue (events, attempts, errors); queue machinery.",
+  },
+
+  // connection_grant_delegations — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "connection_grant_delegations",
+    columns: [
+     "agent_id",
+     "company_id",
+     "created_at",
+     "created_by_user_id",
+     "grant_id",
+     "id",
+    ],
+    reason: "Audit of who created or delegated a grant; the grant's authority is the registered grant and member columns, not this provenance record.",
+  },
+
+  // connection_grant_members — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "connection_grant_members",
+    columns: [
+     "company_id",
+     "created_at",
+     "grant_id",
+     "id",
+    ],
+    reason: "Membership-row bookkeeping (company, grant, timestamps); the binding that authorization resolves through (subject_id, subject_type) is registered above.",
+  },
+
+  // connection_intent_deliveries — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "connection_intent_deliveries",
+    columns: [
+     "company_id",
+     "created_at",
+     "delivered_at",
+     "interaction_id",
+     "next_attempt_at",
+    ],
+    reason: "Connection-intent delivery queue (interactions, timestamps); queue machinery.",
+  },
+
+  // email_endpoints — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "email_endpoints",
+    columns: [
+     "activation_at",
+     "company_id",
+     "endpoint_id",
+     "last_sync_at",
+     "sync_checkpoint",
+     "webhook_id",
+    ],
+    reason: "Endpoint bookkeeping around the registered receive_mode/owned_api_key_id gates: activation/sync timestamps, webhook linkage, and the endpoint pointer.",
+  },
+
+  // email_messages — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "email_messages",
+    columns: [
+     "attachment_ids",
+     "automatic",
+     "company_id",
+     "conversation_id",
+     "direction",
+     "endpoint_id",
+     "envelope",
+     "full_text",
+     "id",
+     "provider_message_id",
+     "text",
+     "timestamp",
+    ],
+    reason: "Inbound email content records (envelopes, texts, attachment ids); content storage, with trust enforced upstream of storage.",
+  },
+
+  // email_sends — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "email_sends",
+    columns: [
+     "actor",
+     "company_id",
+     "digest",
+     "endpoint_id",
+     "first_attempt_at",
+     "outcome",
+     "publication_id",
+     "request",
+    ],
+    reason: "Outbound send records (actor, digest, outcome, request); audit of sends, not a gate.",
+  },
+
+  // heartbeat_runs — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "heartbeat_runs",
+    columns: [
+     "active_identity_context_id",
+     "controller_boot_id",
+     "controller_lease_expires_at",
+     "execution_control_deadline_at",
+     "execution_stage",
+     "execution_status_delivery_id",
+    ],
+    reason: "Controller bookkeeping for run execution (boot ids, controller lease expiry, control deadlines, stage, delivery linkage). controller_lease_expires_at is a process-liveness lease over which controller process is active, not a row-mutation gate like pipeline_cases.lease_expires_at (registered); run authorization is enforced at check-in and by the registered run columns.",
+  },
+
+  // issue_attachments — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "issue_attachments",
+    columns: [
+     "originating_run_id",
+    ],
+    reason: "originating_run_id is a provenance pointer recorded for audit; run authority is enforced at run check-in, not by reading this column.",
+  },
+
+  // issue_comments — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "issue_comments",
+    columns: [
+     "client_request_id",
+     "conversation_session_generation",
+    ],
+    reason: "Idempotency key (client_request_id) and conversation-session bookkeeping; the trust control on this table (source_trust) is registered.",
+  },
+
+  // issue_thread_interactions — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "issue_thread_interactions",
+    columns: [
+     "addressee_user_id",
+     "origin_comment_ids",
+     "source_identity_context_id",
+    ],
+    reason: "Interaction addressing and origin bookkeeping (addressee, origin comments, source identity context); delivery targeting, not authorization.",
+  },
+
+  // issues — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "issues",
+    columns: [
+     "continuation_identity_context_id",
+     "conversation_agent_id",
+     "conversation_boundary_comment_id",
+     "conversation_session_generation",
+     "conversation_state",
+     "conversation_user_id",
+     "origin_identity_context_id",
+    ],
+    reason: "Conversation state machine and identity-context pointers for the thread feature; the execution and trust controls on this table (source_trust, execution_policy, workspace columns) are registered.",
+  },
+
+  // managed_agent_profiles — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "managed_agent_profiles",
+    columns: [
+     "agent_version",
+     "anthropic_agent_id",
+     "beta_version",
+     "company_id",
+     "created_at",
+     "default_max_list_cost_cents",
+     "default_model",
+     "display_name",
+     "enabled",
+     "environment_id",
+     "id",
+     "profile_key",
+     "qualification",
+     "qualified_at",
+     "qualified_revision",
+     "retention_acknowledged",
+     "service",
+     "updated_at",
+    ],
+    reason: "Profile inventory, qualification state, and billing defaults; the credential pin (api_key_secret_id) is registered. enabled gates whether a profile may be selected — an availability switch enforced at selection, not a row-level authorization predicate.",
+  },
+
+  // native_run_finalizations — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "native_run_finalizations",
+    columns: [
+     "control_deadline_at",
+     "controller_boot_id",
+     "controller_generation",
+     "controller_pid",
+     "controller_process_started_at",
+     "recovery_history",
+     "recovery_request_id",
+     "recovery_state",
+    ],
+    reason: "Native runtime finalization bookkeeping (controller generation, pid, recovery state); recovery authority is enforced in the recovery service state machine, not by these telemetry columns.",
+  },
+
+  // provider_trace_records — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "provider_trace_records",
+    columns: [
+     "byte_count",
+     "company_id",
+     "created_at",
+     "deleted_at",
+     "digest",
+     "expires_at",
+     "frame_count",
+     "id",
+     "provider",
+     "reason",
+     "requested_by",
+     "run_id",
+     "status",
+     "trace_ref",
+     "updated_at",
+    ],
+    reason: "Provider trace storage with retention sweeps (expires_at drives cleanup); content is addressed by digest for debugging.",
+  },
+
+  // remote_agent_profiles — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "remote_agent_profiles",
+    columns: [
+     "company_id",
+     "configuration",
+     "created_at",
+     "display_name",
+     "enabled",
+     "id",
+     "profile_key",
+     "qualification",
+     "qualified_at",
+     "qualified_revision",
+     "retention_acknowledged",
+     "service",
+     "updated_at",
+    ],
+    reason: "Remote profile inventory and qualification state; same grounds as managed_agent_profiles minus the credential pin.",
+  },
+
+  // run_identity_contexts — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "run_identity_contexts",
+    columns: [
+     "accepted_at",
+     "cause",
+     "company_id",
+     "correlation_id",
+     "created_at",
+     "github",
+     "id",
+     "message_id",
+     "parent_context_id",
+     "revision",
+     "run_id",
+     "status",
+    ],
+    reason: "Identity-context chain bookkeeping (revisions, correlation ids, message linkage, cause); the attribution predicate (responsible_user_id) is registered above.",
+  },
+
+  // tool_action_deliveries — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "tool_action_deliveries",
+    columns: [
+     "action_request_id",
+     "company_id",
+     "created_at",
+     "delivered_at",
+     "interaction_id",
+     "issue_id",
+    ],
+    reason: "Delivery bookkeeping for tool action requests; the approval binding lives on tool_action_requests (registered).",
+  },
+
+  // tool_oauth_states — upstream v2026.916.0 additions (classified during the 916.0 sync merge)
+  {
+    table: "tool_oauth_states",
+    columns: [
+     "subject_agent_id",
+    ],
+    reason: "subject_agent_id is indexed for admin lookup of in-flight flows; rows are matched by the state token and swept by expiry, and no consumer reads it as an authorization predicate (code_verifier on this table is registered).",
+  },
+
 ];
