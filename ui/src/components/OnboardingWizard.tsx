@@ -5,6 +5,11 @@ import { aiConnectionsApi } from "@/api/ai-connections";
 import { aiProviderForAdapter } from "./ai-connections/AiConnectionField";
 import type { AiConnectionBinding } from "@paperclipai/shared";
 import { storeProviderApiKey } from "../lib/provider-credential";
+import { parseOnboardingGoalInput } from "../lib/onboarding-goal";
+import {
+  isExistingCompanyMissionUnresolved,
+  planMissionPersistence,
+} from "../lib/onboarding-mission";
 import { SavedProviderKeySelect, useSavedProviderKeys } from "./onboarding/SavedProviderKeySelect";
 import { useEffect, useState, useMemo, useRef } from "react";
 import type { ComponentType, CSSProperties } from "react";
@@ -550,6 +555,9 @@ function OnboardingWizardInner({
 
   // Step 1
   const [companyName, setCompanyName] = useState((saved?.companyName as string) ?? "");
+  // Fork carryover: the mission flow parses the free-text goal into a titled
+  // company goal on both the create-company and existing-company paths.
+  const [companyGoal, setCompanyGoal] = useState((saved?.companyGoal as string) ?? "");
 
   // Step 2
   // The name is not defaulted: a pre-filled "Chief of staff" is a choice made
