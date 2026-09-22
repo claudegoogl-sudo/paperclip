@@ -23,6 +23,8 @@ All environment variables that Paperclip uses for server configuration.
 | `PAPERCLIP_DEPLOYMENT_EXPOSURE` | `private` | Exposure policy when deployment mode is `authenticated` |
 | `PAPERCLIP_API_URL` | (auto-derived) | Paperclip API base URL. When set externally (e.g., via Kubernetes ConfigMap, load balancer, or reverse proxy), the server preserves the value instead of deriving it from the listen host and port. Useful for deployments where the public-facing URL differs from the local bind address. |
 | `PAPERCLIP_MAX_CONCURRENT_RUNS_HOST` | `ceil(vCPU / 2)` | Host-wide ceiling on concurrently executing agent runs — see [Host-wide run concurrency](#host-wide-run-concurrency). |
+| `PAPERCLIP_RUN_ADMISSION_MEMORY_PCT` | `90` | Defer new run admission once the service cgroup's memory usage reaches this percentage of its effective soft limit (`memory.high`, or `memory.max` when no soft limit is set) — see [Memory-pressure run admission](#memory-pressure-run-admission). |
+| `PAPERCLIP_RECOVERY_REPLAY_MAX_CONCURRENT` | `ceil(PAPERCLIP_MAX_CONCURRENT_RUNS_HOST / 2)` | Cap on concurrently in-flight boot/recovery replay dispatches, with a jittered `>= 2s` spacing between dispatch starts — see [Staggered boot recovery replay](#staggered-boot-recovery-replay). |
 
 ## Host-wide run concurrency
 
@@ -64,6 +66,85 @@ When the ceiling is the scarce resource, a single agent may claim at most
 `ceil / (agents with queued work)` runs per dispatch pass, so one busy agent
 cannot take the whole host budget. The per-agent `maxConcurrentRuns` still
 applies as a secondary gate.
+
+## Memory-pressure run admission
+
+`PAPERCLIP_MAX_CONCURRENT_RUNS_HOST` bounds how many agent runs execute at
+once, but it cannot see the cgroup memory budget those runs fill. After a
+crash-loop restart, boot recovery replays continuations for every stranded
+`in_progress` issue, and the ceiling happily admits a full house of heavy
+adapter processes — refilling the service cgroup to `memory.high`/`memory.max`
+and converting a recoverable restart into another OOM.
+
+`PAPERCLIP_RUN_ADMISSION_MEMORY_PCT` adds a memory-pressure backoff to the same
+admission gate:
+
+- **What is read:** the server's own cgroup v2 memory files (`memory.current`,
+  `memory.high`, `memory.max`, `memory.events`), discovered via
+  `/proc/self/cgroup` and `/proc/self/mountinfo`.
+- **Threshold:** the variable is a percentage of the *effective soft limit* —
+  `memory.high` when set, `memory.max` otherwise, and the smaller of the two
+  when both are set (so a unit with inverted limits — `MemoryHigh` ≥
+  `MemoryMax` — defers before the hard limit, not after the OOM killer has
+  fired). Range `1`–`100`, default `90`. Unusable values are ignored and the
+  default is used.
+- **Behavior:** a run whose admission would start at or above the threshold is
+  deferred through the exact same deferral/drain machinery a ceiling refusal
+  uses — one more deferral reason, not a new queue. Deferred runs stay queued
+  and are re-offered a slot as running work finishes and memory drains.
+- **No-op off Linux:** on hosts without cgroup v2 memory files (macOS, Windows,
+  minimal CI containers) or with no limit set, the check detects this and
+  changes nothing.
+- **Observability:** each refusal logs
+  `heartbeat dispatch deferred by cgroup memory pressure` at `warn` with the
+  pressure percentage, threshold, current bytes, effective limit, and the
+  cumulative `memory.events` `high` counter; the run-ceiling state surface
+  reports `memoryPressurePct` and `deferralsByMemory`.
+
+Happy path — a host whose service unit sets `MemoryHigh=10G` and
+`MemoryMax=12G` wants admission to back off once anonymous memory passes
+~8.5G:
+
+```bash
+# systemd override
+[Service]
+Environment=PAPERCLIP_RUN_ADMISSION_MEMORY_PCT=85
+```
+
+On restart, boot replay still queues every stranded continuation, but
+admission defers while the cgroup is hot and drains the backlog as memory
+falls back under the threshold.
+
+## Staggered boot recovery replay
+
+The recovery sweep requeues continuations for stranded `in_progress` issues in
+one pass, and the queued-run drain dispatches a queued run per agent — together
+they can spawn a full house of adapter processes seconds after a restart.
+Replay dispatches (recovery-driven wakes and the boot queued-run drain) are
+therefore paced:
+
+- **Cap:** at most `PAPERCLIP_RECOVERY_REPLAY_MAX_CONCURRENT` replay dispatches
+  in flight at once. Default `ceil(hostCeiling / 2)`, clamped to the host
+  ceiling; values below `1` or non-numbers fall back to the default.
+- **Spacing:** a jittered delay of at least 2s (plus up to 4s of jitter)
+  between dispatch starts, so processes respawn spread out instead of in one
+  burst. An isolated dispatch (nothing else replaying) still starts
+  immediately — the spacing only binds during bursts.
+- **Not a queue:** every paced wake still runs, still goes through the normal
+  admission gate (`reserveHostRunSlot`), and a failed dispatch releases its
+  slot immediately.
+- **Observability:** each genuinely delayed replay dispatch logs
+  `recovery replay dispatch staggered` at `info` with the wait, cap, and
+  in-flight counts.
+
+Happy path — a host with a ceiling of 8 wants boot replay to admit at most 2
+continuations at a time:
+
+```bash
+# systemd override
+[Service]
+Environment=PAPERCLIP_RECOVERY_REPLAY_MAX_CONCURRENT=2
+```
 
 ## Run-path Integrity
 
