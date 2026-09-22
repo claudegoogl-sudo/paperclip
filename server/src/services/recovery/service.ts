@@ -90,6 +90,15 @@ import {
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import {
+  HOST_MAX_CONCURRENT_RUNS_ENV_VAR,
+  resolveHostRunCeiling,
+} from "../host-run-ceiling.js";
+import {
+  RECOVERY_REPLAY_MAX_CONCURRENT_ENV_VAR,
+  createRecoveryReplayPacer,
+  resolveRecoveryReplayCap,
+} from "./replay-pacing.js";
+import {
   collectDispositionRepairSourceState,
   dispositionRepairDelayMs,
   DISPOSITION_REPAIR_MAX_ATTEMPTS,
@@ -798,7 +807,54 @@ function buildLivenessOriginalIssueComment(finding: IssueLivenessFinding, escala
   ].join("\n");
 }
 
-export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup }) {
+export function recoveryService(
+  db: Db,
+  deps: {
+    enqueueWakeup: RecoveryWakeup;
+    /**
+     * Resolved host run ceiling (from the heartbeat service). When absent, the
+     * replay cap derives from the env ceiling the same way the heartbeat does.
+     */
+    hostCeilingValue?: number;
+    /** Raw `PAPERCLIP_RECOVERY_REPLAY_MAX_CONCURRENT` value; falls back to process env. */
+    replayMaxConcurrentEnvValue?: unknown;
+    /** Timing overrides for tests; production uses the >= 2s jittered defaults. */
+    replayPacing?: {
+      minDelayMs?: number;
+      jitterSpanMs?: number;
+      random?: () => number;
+      now?: () => number;
+      setTimeoutImpl?: (ms: number) => Promise<void>;
+    };
+  },
+) {
+  // Staggered boot/recovery replay (see ./replay-pacing.ts): the wakes this service
+  // drives during a recovery drain — stranded-issue continuation replays, assignment
+  // dispatch, disposition repair, dependency-wake heals — dispatch through the normal
+  // admission gate, so an unpaced drain can spawn a full house of adapter processes
+  // seconds after a restart. Every wake still runs and still goes through
+  // `reserveHostRunSlot`; the pacer only bounds how many start at once.
+  const replayCap = resolveRecoveryReplayCap(
+    deps.replayMaxConcurrentEnvValue ?? process.env[RECOVERY_REPLAY_MAX_CONCURRENT_ENV_VAR],
+    deps.hostCeilingValue
+      ?? resolveHostRunCeiling(process.env[HOST_MAX_CONCURRENT_RUNS_ENV_VAR]).value,
+  );
+  const replayPacer = createRecoveryReplayPacer({
+    cap: replayCap.value,
+    logger,
+    ...deps.replayPacing,
+  });
+  logger.info(
+    {
+      event: "recovery_replay_pacing_resolved",
+      recoveryReplayMaxConcurrent: replayCap.value,
+      source: replayCap.source,
+      envVar: RECOVERY_REPLAY_MAX_CONCURRENT_ENV_VAR,
+      ...(replayCap.invalidEnvValue ? { ignoredEnvValue: replayCap.invalidEnvValue } : {}),
+    },
+    "resolved recovery replay pacing cap",
+  );
+  const enqueueWakeup = replayPacer.wrapWake(deps.enqueueWakeup);
   const issuesSvc = issueService(db);
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -1195,7 +1251,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     retryOfRunId?: string | null;
     extraContext?: Record<string, unknown>;
   }) {
-    const queued = await deps.enqueueWakeup(input.agentId, {
+    const queued = await enqueueWakeup(input.agentId, {
       source: "automation",
       triggerDetail: "system",
       reason: input.reason,
@@ -1233,7 +1289,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   async function enqueueInitialAssignedTodoDispatch(issue: typeof issues.$inferSelect, agentId: string) {
-    return deps.enqueueWakeup(agentId, {
+    return enqueueWakeup(agentId, {
       source: "assignment",
       triggerDetail: "system",
       reason: "issue_assigned",
@@ -1348,7 +1404,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         },
       });
 
-      const queued = await deps.enqueueWakeup(creatorAgent.id, {
+      const queued = await enqueueWakeup(creatorAgent.id, {
         source: "automation",
         triggerDetail: "system",
         reason: "issue_assigned",
@@ -2365,7 +2421,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       });
     }
     if (ownerAgentId) {
-      await deps.enqueueWakeup(ownerAgentId, {
+      await enqueueWakeup(ownerAgentId, {
         source: "assignment",
         triggerDetail: "system",
         reason: "issue_assigned",
@@ -3761,7 +3817,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     if (!scheduledRun) {
       try {
         if (timing.delayMs === 0) {
-          const enqueuedRun = await deps.enqueueWakeup(agentId, {
+          const enqueuedRun = await enqueueWakeup(agentId, {
             source: "automation",
             triggerDetail: "system",
             reason: ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
@@ -6346,7 +6402,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       },
     });
 
-    const wake = await deps.enqueueWakeup(ownerSelection.agentId, {
+    const wake = await enqueueWakeup(ownerSelection.agentId, {
       source: "assignment",
       triggerDetail: "system",
       reason: "issue_assigned",
@@ -6551,7 +6607,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
 
         try {
-          const wake = await deps.enqueueWakeup(agentId, {
+          const wake = await enqueueWakeup(agentId, {
             source: "automation",
             triggerDetail: "system",
             reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,

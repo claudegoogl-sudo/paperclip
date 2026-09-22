@@ -275,6 +275,18 @@ import { withAgentStartLock, withHostAdmissionLock } from "./agent-start-lock.js
 import { HOST_MAX_CONCURRENT_RUNS_ENV_VAR, resolveHostRunCeiling } from "./host-run-ceiling.js";
 import { startCgroupPidsPressureTelemetry } from "./cgroup-pids-telemetry.js";
 import {
+  RUN_ADMISSION_MEMORY_CGROUP_DIR_ENV_VAR,
+  RUN_ADMISSION_MEMORY_PCT_ENV_VAR,
+  RUN_ADMISSION_MEMORY_SAMPLE_TTL_MS_DEFAULT,
+  createRunAdmissionMemoryPressureReader,
+  resolveRunAdmissionMemoryPct,
+} from "./run-admission-memory-pressure.js";
+import {
+  RECOVERY_REPLAY_MAX_CONCURRENT_ENV_VAR,
+  createRecoveryReplayPacer,
+  resolveRecoveryReplayCap,
+} from "./recovery/replay-pacing.js";
+import {
   evaluateAgentInvokability,
   evaluateAgentInvokabilityFromDb,
   shouldCancelRunsForNonInvokableAgent,
@@ -7288,6 +7300,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // instead of always re-offering the slot to whoever asked most recently.
   const hostCeilingDeferredAgentIds = new Set<string>();
 
+  // Memory-pressure guardrail for run admission: when the service's own cgroup is at or
+  // above the threshold fraction of its effective soft memory limit, admission defers
+  // through the same deferral/drain machinery a ceiling refusal uses (one more deferral
+  // reason, not a new queue). Off cgroup-v2 hosts (and under Vitest without an explicit
+  // cgroup-dir override) the reading reports unavailable and admission is unchanged.
+  const runAdmissionMemoryPct = resolveRunAdmissionMemoryPct(
+    runtimeEnv[RUN_ADMISSION_MEMORY_PCT_ENV_VAR],
+  );
+  const runAdmissionMemoryPressure = createRunAdmissionMemoryPressureReader({ env: runtimeEnv });
+  let runAdmissionMemoryDeferralCount = 0;
+  logger.info(
+    {
+      runAdmissionMemoryPct: runAdmissionMemoryPct.value,
+      source: runAdmissionMemoryPct.source,
+      envVar: RUN_ADMISSION_MEMORY_PCT_ENV_VAR,
+      sampleTtlMs: RUN_ADMISSION_MEMORY_SAMPLE_TTL_MS_DEFAULT,
+      cgroupDirOverrideEnvVar: RUN_ADMISSION_MEMORY_CGROUP_DIR_ENV_VAR,
+      ...(runAdmissionMemoryPct.invalidEnvValue
+        ? { ignoredEnvValue: runAdmissionMemoryPct.invalidEnvValue }
+        : {}),
+    },
+    "resolved run admission memory-pressure threshold",
+  );
+
   const runLogStore = getRunLogStore();
   const secretsSvc = secretService(db);
   const companySkills = companySkillService(db);
@@ -7313,7 +7349,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     cancelWorkForScope: cancelBudgetScopeWork,
   };
   const budgets = budgetService(db, budgetHooks);
-  const recovery = recoveryService(db, { enqueueWakeup });
+  const recovery = recoveryService(db, {
+    enqueueWakeup,
+    hostCeilingValue: hostRunCeiling.value,
+    replayMaxConcurrentEnvValue: runtimeEnv[RECOVERY_REPLAY_MAX_CONCURRENT_ENV_VAR],
+  });
 
   function isPlanApprovalConfirmationPayload(payload: unknown) {
     const target = parseObject(parseObject(payload).target);
@@ -13431,18 +13471,65 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const hostRunningCount = await countRunningRunsHostWide();
       const hostInUse = hostRunningCount + inFlightHostRunReservations;
       if (hostInUse >= hostRunCeiling.value) {
-        return { granted: false as const, hostRunningCount, hostInUse };
+        return { granted: false as const, reason: "host_ceiling" as const, hostRunningCount, hostInUse };
+      }
+      // Memory-pressure admission backoff: sampled from the service's own cgroup v2
+      // (TTL-cached), and only when a usable reading exists — on hosts without the
+      // files this is a strict no-op. Deferred runs stay queued and re-enter this
+      // gate through the existing deferral/drain machinery, exactly like a ceiling
+      // refusal.
+      const memoryPressure = await runAdmissionMemoryPressure.read();
+      if (
+        memoryPressure.available &&
+        memoryPressure.memoryPressurePct !== null &&
+        memoryPressure.memoryPressurePct >= runAdmissionMemoryPct.value
+      ) {
+        runAdmissionMemoryDeferralCount += 1;
+        return {
+          granted: false as const,
+          reason: "memory_pressure" as const,
+          hostRunningCount,
+          hostInUse,
+          memoryPressurePct: memoryPressure.memoryPressurePct,
+          memoryPressureThresholdPct: runAdmissionMemoryPct.value,
+          memoryCurrentBytes: memoryPressure.memoryCurrentBytes,
+          effectiveMemoryLimitBytes: memoryPressure.effectiveLimitBytes,
+          memoryEventsHigh: memoryPressure.memoryEventsHigh,
+          cgroupDir: memoryPressure.cgroupDir,
+        };
       }
       inFlightHostRunReservations += 1;
-      return { granted: true as const, hostRunningCount, hostInUse };
+      return { granted: true as const, reason: "granted" as const, hostRunningCount, hostInUse };
     });
+  }
+
+  // Details the deferral logger emits for a memory-pressure refusal so the one
+  // `logger.warn` per deferral carries the numbers an operator needs to tell
+  // memory backoff apart from ceiling throttling.
+  function memoryPressureDeferralDetails(
+    reservation: Awaited<ReturnType<typeof reserveHostRunSlot>>,
+  ): Record<string, unknown> {
+    if (reservation.reason !== "memory_pressure") return { deferralReason: reservation.reason };
+    return {
+      deferralReason: reservation.reason,
+      memoryPressurePct: reservation.memoryPressurePct,
+      memoryPressureThresholdPct: reservation.memoryPressureThresholdPct,
+      memoryCurrentBytes: reservation.memoryCurrentBytes,
+      effectiveMemoryLimitBytes: reservation.effectiveMemoryLimitBytes,
+      memoryEventsHigh: reservation.memoryEventsHigh,
+      cgroupDir: reservation.cgroupDir,
+    };
   }
 
   function releaseHostRunSlot() {
     inFlightHostRunReservations = Math.max(0, inFlightHostRunReservations - 1);
   }
 
-  function recordHostCeilingDeferral(agentId: string, details: Record<string, unknown>) {
+  function recordHostCeilingDeferral(
+    agentId: string,
+    details: Record<string, unknown>,
+    opts?: { message?: string },
+  ) {
     hostCeilingDeferralCount += 1;
     hostCeilingDeferredAgentIds.add(agentId);
     logger.warn(
@@ -13455,7 +13542,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         deferredAgentCount: hostCeilingDeferredAgentIds.size,
         ...details,
       },
-      "heartbeat dispatch deferred by host concurrent-run ceiling",
+      opts?.message ?? "heartbeat dispatch deferred by host concurrent-run ceiling",
     );
   }
 
@@ -14724,8 +14811,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ));
 
     const agentIds = [...new Set(queuedRuns.map((r) => r.agentId))];
+
+    // Staggered boot/recovery replay: a restart can find a queued run for many agents
+    // at once, and admitting them back-to-back refills the cgroup before anything can
+    // react. Each dispatch pass through this drain runs at most
+    // ceil(hostCeiling / 2) concurrently (env-tunable) with a jittered >= 2s spacing
+    // between pass starts, so processes respawn spread out. An isolated resume (one
+    // agent) starts immediately — the spacing only binds during bursts.
+    const replayPacer = createRecoveryReplayPacer({
+      cap: resolveRecoveryReplayCap(
+        runtimeEnv[RECOVERY_REPLAY_MAX_CONCURRENT_ENV_VAR],
+        hostRunCeiling.value,
+      ).value,
+      logger,
+    });
+    const pacedStartNextQueuedRunForAgent = replayPacer.wrapWake(
+      (agentId: string) => startNextQueuedRunForAgent(agentId),
+    );
     for (const agentId of agentIds) {
-      await startNextQueuedRunForAgent(agentId);
+      await pacedStartNextQueuedRunForAgent(agentId);
     }
   }
 
@@ -14952,14 +15056,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const reservation = await reserveHostRunSlot();
         if (!reservation.granted) {
           hostCeilingDeferred = true;
-          recordHostCeilingDeferral(agentId, {
-            companyId: agent.companyId,
-            hostRunningCount: reservation.hostRunningCount,
-            queuedRunCount: prioritizedRuns.length,
-            claimedRunCount: claimedRuns.length,
-            contendingAgentCount,
-            fairShareSlots,
-          });
+          recordHostCeilingDeferral(
+            agentId,
+            {
+              companyId: agent.companyId,
+              hostRunningCount: reservation.hostRunningCount,
+              queuedRunCount: prioritizedRuns.length,
+              claimedRunCount: claimedRuns.length,
+              contendingAgentCount,
+              fairShareSlots,
+              ...memoryPressureDeferralDetails(reservation),
+            },
+            reservation.reason === "memory_pressure"
+              ? { message: "heartbeat dispatch deferred by cgroup memory pressure" }
+              : undefined,
+          );
           break;
         }
         visitedRunCount += 1;
@@ -15077,12 +15188,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // path into a claim, so the host ceiling has to hold here too. The run stays queued.
         const reservation = await reserveHostRunSlot();
         if (!reservation.granted) {
-          recordHostCeilingDeferral(prologueRun.agentId, {
-            companyId: prologueRun.companyId,
-            runId: prologueRun.id,
-            hostRunningCount: reservation.hostRunningCount,
-            path: "execute_run",
-          });
+          recordHostCeilingDeferral(
+            prologueRun.agentId,
+            {
+              companyId: prologueRun.companyId,
+              runId: prologueRun.id,
+              hostRunningCount: reservation.hostRunningCount,
+              path: "execute_run",
+              ...memoryPressureDeferralDetails(reservation),
+            },
+            reservation.reason === "memory_pressure"
+              ? { message: "heartbeat dispatch deferred by cgroup memory pressure" }
+              : undefined,
+          );
           return;
         }
         let claimed: Awaited<ReturnType<typeof claimQueuedRun>>;
@@ -21349,14 +21467,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // parked fleet isn't misreported as a stall.
     getUsageLimitParkState: (now?: Date) => usageLimitPark.getState(now),
 
-    getHostRunCeilingState: async () => ({
-      maxConcurrentRuns: hostRunCeiling.value,
-      source: hostRunCeiling.source,
-      vcpuCount: hostRunCeiling.vcpuCount,
-      hostRunningCount: await countRunningRunsHostWide(),
-      inFlightReservations: inFlightHostRunReservations,
-      deferralCount: hostCeilingDeferralCount,
-      deferredAgentIds: [...hostCeilingDeferredAgentIds],
-    }),
+    getHostRunCeilingState: async () => {
+      const memoryPressure = runAdmissionMemoryPressure.lastReading();
+      return {
+        maxConcurrentRuns: hostRunCeiling.value,
+        source: hostRunCeiling.source,
+        vcpuCount: hostRunCeiling.vcpuCount,
+        hostRunningCount: await countRunningRunsHostWide(),
+        inFlightReservations: inFlightHostRunReservations,
+        deferralCount: hostCeilingDeferralCount,
+        deferredAgentIds: [...hostCeilingDeferredAgentIds],
+        // Memory-pressure admission backoff observability: the last sampled cgroup
+        // reading plus the count of admissions deferred by it, so a restart that is
+        // shedding load is distinguishable from one that is merely ceiling-throttled.
+        memoryPressurePct: memoryPressure?.memoryPressurePct ?? null,
+        memoryPressureAvailable: memoryPressure?.available ?? false,
+        runAdmissionMemoryPct: runAdmissionMemoryPct.value,
+        deferralsByMemory: runAdmissionMemoryDeferralCount,
+      };
+    },
   };
 }
