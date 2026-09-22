@@ -87,6 +87,7 @@ import {
   toolAccessService,
   workspaceOperationService,
 } from "./services/index.js";
+import { markServerShutdownStarted } from "./services/server-shutdown-state.js";
 import { questionResponseDeliveryService } from "./services/question-response-delivery.js";
 import { queueIssueAssignmentWakeup } from "./services/issue-assignment-wakeup.js";
 import { createSecretProposalsService } from "./services/secret-proposals.js";
@@ -2054,6 +2055,10 @@ export async function startServer(): Promise<StartedServer> {
 
   {
     const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
+      // Mark the shutdown BEFORE the first await: every heartbeat terminal-state
+      // path that fires while the drain is still walking runs must observe the
+      // flag no later than the drain itself.
+      markServerShutdownStarted(signal);
       await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
       heartbeatSchedulerStopped = true;
       if (heartbeatSchedulerInterval) {
