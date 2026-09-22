@@ -615,6 +615,15 @@ function authorizationCredentialRange(
 
   const scheme = /^(?:Bearer|Basic)\b/i.exec(input.slice(valueStart));
   if (!scheme) return null;
+  // An earlier scheme-preserving pass (the command-text Authorization shape)
+  // may already have replaced the credential with the redaction marker; do not
+  // re-match the marker and consume the scheme a second time.
+  {
+    const afterScheme = input.slice(
+      inlineWhitespaceEnd(input, valueStart + scheme[0].length),
+    );
+    if (afterScheme.startsWith(REDACTED_EVENT_VALUE)) return null;
+  }
   let credentialStart = inlineWhitespaceEnd(
     input,
     valueStart + scheme[0].length,
@@ -647,6 +656,28 @@ function authorizationCredentialRange(
       // consume them through the next structural or whitespace boundary.
       while (end < input.length && !/[\s,;}\]]/.test(input[end])) end += 1;
     }
+    // A quote that lands exactly ON the boundary is a closing delimiter
+    // (e.g. the JSON string quote around a diagnostic message), not part of
+    // the credential. Keep both the quote and the scheme word so the
+    // surrounding serialized document stays parseable; a bare unquoted
+    // credential (no boundary quote) consumes the scheme like the command
+    // text shape does not.
+    const boundaryQuote =
+      end > credentialStart &&
+      (input[end - 1] === '"' || input[end - 1] === "'") &&
+      (end >= input.length || /[\s,;}\]]/.test(input[end]));
+    if (boundaryQuote) end -= 1;
+    // `Bearer` keeps its scheme word (the command-text Authorization shape
+    // preserves it, and re-scrubbing a replaced marker must not eat the
+    // scheme twice); `Basic` consumes it, matching the diagnostic contract
+    // for bare Basic credentials.
+    const preserveScheme =
+      boundaryQuote || scheme[0].toLowerCase() === "bearer";
+    return {
+      start: preserveScheme ? credentialStart : valueStart,
+      end,
+      replacement: REDACTED_EVENT_VALUE,
+    };
   }
   return { start: valueStart, end, replacement: REDACTED_EVENT_VALUE };
 }
@@ -691,6 +722,8 @@ function redactStandaloneBearerCredentials(input: string): string {
     ) {
       continue;
     }
+
+    if (input.startsWith(REDACTED_EVENT_VALUE, credentialStart)) continue;
 
     let end: number;
     let replacement = REDACTED_EVENT_VALUE;
@@ -959,7 +992,13 @@ function sanitizeRecordWithLeaf(
 }
 
 export function sanitizeRecord(record: Record<string, unknown>): Record<string, unknown> {
-  return sanitizeRecordWithLeaf(record, valueExactLeafRedactor);
+  // Upstream v2026.916.0 semantics: adapter diagnostics are provider-controlled
+  // text, so every string leaf goes through the free-form text scanner (a
+  // secret-bearing header fragment under `message`/`reason`/array entries is
+  // redacted, not just host-registered secret values). The fork's exact-value
+  // leaf remains available for vault binding surfaces that already guarantee
+  // their values.
+  return sanitizeRecordWithLeaf(record, freeFormLeafRedactor);
 }
 
 export function redactEventPayload(payload: Record<string, unknown> | null): Record<string, unknown> | null {
@@ -1095,9 +1134,14 @@ function redactFreeFormText(input: string): string {
   // The shared adapter-utils GitHub matcher is `\bgh[pousr]_…` and does not
   // cover the fine-grained `github_pat_` shape, so scrub it here with the
   // canonical secret-patterns matcher after the command-text pass.
+  // Order matters for the two Authorization/Bearer scrubbers: the
+  // scheme-preserving command-text shapes (`Authorization: Bearer <value>`
+  // with the value running to a quote or whitespace) run FIRST so a JSON
+  // closing quote after the credential survives intact; the quote-tail
+  // scrubbers then consume the malformed shapes the command regex cannot
+  // express (credentials glued to raw or escaped closing quotes).
   return redactCommandText(
     redactStandaloneBearerCredentials(redactAuthorizationCredentials(valueScrubbed))
-
       .replace(JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`)
       .replace(
         ESCAPED_JSON_SECRET_FIELD_TEXT_RE,
