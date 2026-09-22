@@ -55,7 +55,6 @@ import {
   heartbeatRuns,
   issueApprovals,
   issueComments,
-  issueApprovals,
   issueDocuments,
   issuePlanDecompositions,
   issueRecoveryActions,
