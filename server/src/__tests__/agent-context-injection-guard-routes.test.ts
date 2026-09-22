@@ -101,6 +101,7 @@ function registerModuleMocks() {
   vi.doMock("../services/agent-instructions.js", () => ({
     agentInstructionsService: () => mockAgentInstructionsService,
     syncInstructionsBundleConfigFromFilePath: mockSyncInstructionsBundleConfigFromFilePath,
+    agentInstructionsBundleMode: () => null as ReturnType<typeof import("../services/agent-instructions.js").agentInstructionsBundleMode>,
   }));
 
   vi.doMock("../services/activity-log.js", () => ({

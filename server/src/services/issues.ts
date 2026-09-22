@@ -12513,9 +12513,14 @@ export function issueService(db: Db) {
         originalFilename: string | null;
       }> = [];
       if (attachmentIds.length > 0) {
+        // Comment attachments are referenced by ASSET id (the upload and
+        // artifacts.create surfaces both hand out the asset id, and the
+        // route-level preflight validates the same key), so resolve rows
+        // through the asset join rather than by attachment-row id.
         const attachmentRows = await dbOrTx
           .select({
             id: issueAttachments.id,
+            assetId: issueAttachments.assetId,
             issueCommentId: issueAttachments.issueCommentId,
             originatingRunId: issueAttachments.originatingRunId,
             createdByAgentId: assets.createdByAgentId,
@@ -12527,12 +12532,13 @@ export function issueService(db: Db) {
             and(
               eq(issueAttachments.companyId, issue.companyId),
               eq(issueAttachments.issueId, issueId),
-              inArray(issueAttachments.id, attachmentIds),
+              inArray(issueAttachments.assetId, attachmentIds),
             ),
           )
           .for("update");
         type CommentAttachmentRow = {
           id: string;
+          assetId: string;
           issueCommentId: string | null;
           originatingRunId: string | null;
           createdByAgentId: string | null;
@@ -12542,13 +12548,32 @@ export function issueService(db: Db) {
           attachmentRows.map(
             (
               attachment: CommentAttachmentRow,
-            ): [string, CommentAttachmentRow] => [attachment.id, attachment],
+            ): [string, CommentAttachmentRow] => [attachment.assetId, attachment],
           ),
         );
-        if (attachmentById.size !== attachmentIds.length) {
-          throw unprocessable(
-            "Comment attachments must belong to the same task and company",
-          );
+        // Standalone `artifacts.create` assets have no issue_attachments row
+        // yet — validate them against the assets table (same company) and let
+        // attachAssetsToComment insert the bound row; only assets that are
+        // neither present as rows nor as same-company assets are rejected.
+        const missingAssetIds = attachmentIds.filter(
+          (attachmentId: string) => !attachmentById.has(attachmentId),
+        );
+        if (missingAssetIds.length > 0) {
+          const standaloneRows = await dbOrTx
+            .select({ id: assets.id })
+            .from(assets)
+            .where(
+              and(
+                eq(assets.companyId, issue.companyId),
+                inArray(assets.id, missingAssetIds),
+              ),
+            )
+            .for("update");
+          if (standaloneRows.length !== missingAssetIds.length) {
+            throw unprocessable(
+              "Comment attachments must belong to the same task and company",
+            );
+          }
         }
         if (
           attachmentRows.some(
@@ -12642,7 +12667,11 @@ export function issueService(db: Db) {
           );
         }
         for (const attachmentId of attachmentIds) {
-          const attachment = attachmentById.get(attachmentId)!;
+          const attachment = attachmentById.get(attachmentId);
+          // Standalone assets (no row yet) are bound — with their row
+          // inserted — by attachAssetsToComment after this call; they carry
+          // no existing-row metadata to report here.
+          if (!attachment) continue;
           boundAttachments.push({
             id: attachment.id,
             commentId: comment.id,

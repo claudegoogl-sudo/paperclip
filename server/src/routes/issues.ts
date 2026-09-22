@@ -18667,7 +18667,6 @@ export function issueRoutes(
         "sandbox; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'",
       );
     }
-    const filename = attachment.originalFilename ?? "attachment";
     // SE ruling (D2): plugin-created spreadsheet-bait assets (csv/tsv content
     // type or spreadsheet filename under the plugin-artifacts namespace) are
     // pinned to download — a browser must never render them inline.
@@ -18683,7 +18682,14 @@ export function issueRoutes(
         : isInlineAttachmentContentType(responseContentType)
           ? "inline"
           : "attachment";
-    res.setHeader("Content-Disposition", `${disposition}; filename=\"${filename.replaceAll("\"", "")}\"`);
+    // res.attachment above already set an escaped, standards-correct
+    // Content-Disposition (upstream shape: keep it, swap only the disposition
+    // token) so quoted/Unicode filenames survive byte-for-byte instead of
+    // having their quote characters stripped.
+    res.setHeader(
+      "Content-Disposition",
+      String(res.getHeader("Content-Disposition")).replace(/^attachment;/, `${disposition};`),
+    );
 
     object.stream.on("error", (err) => {
       next(err);
