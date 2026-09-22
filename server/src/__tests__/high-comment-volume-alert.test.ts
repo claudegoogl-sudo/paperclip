@@ -29,7 +29,10 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
-describeEmbeddedPostgres("productivity review service", () => {
+// Upstream removed the productivity-review service; the fork's high-comment-
+// volume alert monitor survived as its own module, and its tests moved here.
+// The fixtures and seed helpers below are shared by the monitor suite.
+describeEmbeddedPostgres("high comment volume alerts (fork monitor, standalone module)", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let db: ReturnType<typeof createDb>;
 
@@ -111,6 +114,28 @@ describeEmbeddedPostgres("productivity review service", () => {
     return { companyId, managerId, coderId, issueId, issuePrefix, createdAt };
   }
 
+  async function insertPlainComments(input: {
+    companyId: string;
+    issueId: string;
+    authorAgentId: string;
+    count: number;
+    now: Date;
+  }) {
+    await db.insert(issueComments).values(
+      Array.from({ length: input.count }, (_unused, index) => {
+        const createdAt = new Date(input.now.getTime() - index * 1000);
+        return {
+          companyId: input.companyId,
+          issueId: input.issueId,
+          authorAgentId: input.authorAgentId,
+          body: `Chatter ${index}`,
+          createdAt,
+          updatedAt: createdAt,
+        };
+      }),
+    );
+  }
+
   async function insertRuns(input: {
     companyId: string;
     agentId: string;
@@ -159,11 +184,6 @@ describeEmbeddedPostgres("productivity review service", () => {
   }
 
   
-  
-
-});
-
-describe("high comment volume alerts (fork monitor, standalone module)", () => {
   it("raises exactly one deduplicated high-comment-volume alert per offending issue", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();
@@ -191,8 +211,8 @@ describe("high comment volume alerts (fork monitor, standalone module)", () => {
     expect(alerts[0]?.assigneeAgentId).toBe(seeded.managerId);
     expect(alerts[0]?.originId).toBe(seeded.issueId);
     expect(alerts[0]?.originFingerprint).toBe(`high-comment-volume-alert:${seeded.issueId}`);
-    expect(alerts[0]?.description).toContain("Comment count: 4");
-    expect(alerts[0]?.description).toContain("Alert threshold: 3");
+    expect(alerts[0]?.description).toContain("**Comment count**: 4");
+    expect(alerts[0]?.description).toContain("threshold: 3");
   });
 
   it("does not raise a high-comment-volume alert below the threshold", async () => {
@@ -216,9 +236,8 @@ describe("high comment volume alerts (fork monitor, standalone module)", () => {
     expect(result.alerted).toBe(0);
     expect(await listHighCommentVolumeAlerts(seeded.companyId)).toHaveLength(0);
   });
-});
 
-async function listHighCommentVolumeAlerts(companyId: string) {
+  async function listHighCommentVolumeAlerts(companyId: string) {
   const rows = await db
     .select({ id: issues.id, parentId: issues.parentId, assigneeAgentId: issues.assigneeAgentId })
     .from(issues)
@@ -236,3 +255,4 @@ async function listHighCommentVolumeAlerts(companyId: string) {
   );
   return detailed.filter(Boolean);
 }
+});
