@@ -12,26 +12,32 @@ const { createAssetMock, getAssetByIdMock, logActivityMock } = vi.hoisted(() => 
   logActivityMock: vi.fn(),
 }));
 
-function registerModuleMocks() {
-  vi.doMock("../services/activity-log.js", () => ({
-    logActivity: logActivityMock,
-  }));
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("../services/activity-log.js", () => ({
+  logActivity: logActivityMock,
+}));
 
-  vi.doMock("../services/assets.js", () => ({
-    assetService: vi.fn(() => ({
-      create: createAssetMock,
-      getById: getAssetByIdMock,
-    })),
-  }));
+vi.mock("../services/assets.js", () => ({
+  assetService: vi.fn(() => ({
+    create: createAssetMock,
+    getById: getAssetByIdMock,
+  })),
+}));
 
-  vi.doMock("../services/index.js", () => ({
-    assetService: vi.fn(() => ({
-      create: createAssetMock,
-      getById: getAssetByIdMock,
-    })),
-    logActivity: logActivityMock,
-  }));
-}
+vi.mock("../services/index.js", () => ({
+  assetService: vi.fn(() => ({
+    create: createAssetMock,
+    getById: getAssetByIdMock,
+  })),
+  logActivity: logActivityMock,
+}));
 
 function createAsset() {
   const now = new Date("2026-01-01T00:00:00.000Z");
@@ -137,14 +143,6 @@ async function requestApp(
 
 describe("POST /api/companies/:companyId/assets/images", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../services/activity-log.js");
-    vi.doUnmock("../services/assets.js");
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../routes/assets.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
     createAssetMock.mockReset();
     getAssetByIdMock.mockReset();
@@ -278,12 +276,6 @@ describe("POST /api/companies/:companyId/assets/images", () => {
 
 describe("POST /api/companies/:companyId/logo", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../routes/assets.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
     createAssetMock.mockReset();
     getAssetByIdMock.mockReset();
@@ -419,14 +411,6 @@ function parseBinaryResponse(res: IncomingMessage, callback: (error: Error | nul
 
 describe("GET /api/assets/:assetId/content — spreadsheet-bait disposition guard", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../services/activity-log.js");
-    vi.doUnmock("../services/assets.js");
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../routes/assets.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
     createAssetMock.mockReset();
     getAssetByIdMock.mockReset();

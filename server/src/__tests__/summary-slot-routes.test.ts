@@ -28,6 +28,24 @@ const mockSummarySlotService = vi.hoisted(() => ({
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockHeartbeatWakeup = vi.hoisted(() => vi.fn());
 
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("../services/index.js", () => ({
+  accessService: () => mockAccessService,
+  heartbeatService: () => ({ wakeup: mockHeartbeatWakeup }),
+  instanceSettingsService: () => mockInstanceSettingsService,
+  logActivity: mockLogActivity,
+}));
+vi.mock("../services/summary-slots.js", () => ({
+  summarySlotService: () => mockSummarySlotService,
+}));
+
 function slot(overrides: Record<string, unknown> = {}) {
   return {
     id: slotId,
@@ -57,18 +75,6 @@ function generatingIssue(overrides: Record<string, unknown> = {}) {
     assigneeAgentId: agentId,
     ...overrides,
   };
-}
-
-function registerModuleMocks() {
-  vi.doMock("../services/index.js", () => ({
-    accessService: () => mockAccessService,
-    heartbeatService: () => ({ wakeup: mockHeartbeatWakeup }),
-    instanceSettingsService: () => mockInstanceSettingsService,
-    logActivity: mockLogActivity,
-  }));
-  vi.doMock("../services/summary-slots.js", () => ({
-    summarySlotService: () => mockSummarySlotService,
-  }));
 }
 
 async function createApp(actor: Record<string, unknown>) {
@@ -107,8 +113,6 @@ const slotPath = `/api/companies/${companyId}/summary-slots/project/header?scope
 
 describe("summary slot routes", () => {
   beforeEach(() => {
-    vi.resetModules();
-    registerModuleMocks();
     vi.clearAllMocks();
     mockAccessService.decide.mockResolvedValue({ allowed: true, explanation: "Allowed." });
     mockAccessService.canUser.mockResolvedValue(true);

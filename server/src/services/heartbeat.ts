@@ -18460,8 +18460,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
           }
           activeRunExecutions.delete(run.id);
-          await startNextQueuedRunForAgent(run.agentId);
-          await drainHostCeilingDeferrals(run.agentId);
+          // "During a shutdown nothing new dispatches" — same invariant the
+          // graceful drain and the startup reap already honor. A run that
+          // closes while the server is shutting down (including one
+          // reclassified as server_shutdown_interrupted, whose
+          // restart-recovery retry was just queued) must not kick the next
+          // queued run for the agent: the dispatch would race the drain and
+          // spawn a run that is killed seconds later. The retry waits for the
+          // next boot's resumeQueuedRuns, exactly like a drain-interrupted
+          // run's does.
+          if (isServerShutdownInProgress()) {
+            logger.info(
+              { runId: run.id, agentId: run.agentId },
+              "suppressing post-run queued-run dispatch because a server shutdown is in progress",
+            );
+          } else {
+            await startNextQueuedRunForAgent(run.agentId);
+            await drainHostCeilingDeferrals(run.agentId);
+          }
         }
   }
 

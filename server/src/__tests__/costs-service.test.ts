@@ -23,6 +23,30 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
 
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("../services/index.js", () => ({
+  accessService: () => mockAccessService,
+  budgetService: () => mockBudgetService,
+  costService: () => mockCostService,
+  financeService: () => mockFinanceService,
+  companyService: () => mockCompanyService,
+  agentService: () => mockAgentService,
+  issueService: () => mockIssueService,
+  heartbeatService: () => mockHeartbeatService,
+  logActivity: mockLogActivity,
+}));
+
+vi.mock("../services/quota-windows.js", () => ({
+  fetchAllQuotaWindows: mockFetchAllQuotaWindows,
+}));
+
 function makeDb(overrides: Record<string, unknown> = {}) {
   const selectChain = {
     from: vi.fn().mockReturnThis(),
@@ -111,26 +135,10 @@ const mockAccessService = vi.hoisted(() => ({
   decide: vi.fn(),
 }));
 
-function registerModuleMocks() {
-  vi.doMock("../services/index.js", () => ({
-    accessService: () => mockAccessService,
-    budgetService: () => mockBudgetService,
-    costService: () => mockCostService,
-    financeService: () => mockFinanceService,
-    companyService: () => mockCompanyService,
-    agentService: () => mockAgentService,
-    issueService: () => mockIssueService,
-    heartbeatService: () => mockHeartbeatService,
-    logActivity: mockLogActivity,
-  }));
-
-  vi.doMock("../services/quota-windows.js", () => ({
-    fetchAllQuotaWindows: mockFetchAllQuotaWindows,
-  }));
-}
-
 describe("cost routes", () => {
-  const routeModules = hoistModuleGraph(registerModuleMocks, async () => {
+  // Module mocks are hoisted vi.mock at the file top (race-safe under load);
+  // hoistModuleGraph now only loads the route graph once per describe block.
+  const routeModules = hoistModuleGraph(() => {}, async () => {
     const [costsRouteModule, middlewareModule] = await Promise.all([
       vi.importActual<typeof import("../routes/costs.js")>("../routes/costs.js"),
       vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
