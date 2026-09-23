@@ -345,7 +345,7 @@ describe("sandbox adapter execution targets", () => {
     expect(result.stdout).toBe("ok\n");
     // The host injects the run-clock env (ISO-8601 UTC stamps) on top of the
     // caller env; assert the exact key set so no stray identity key leaks.
-    const call = runner.execute.mock.calls[0][0] as {
+    const call = (runner.execute.mock.calls as unknown[][])[0][0] as {
       env: Record<string, string>;
     };
     expect(call.env).toEqual({
@@ -1917,7 +1917,7 @@ describe("sandbox adapter execution targets", () => {
 
     // Exact key set: the caller env minus inherited identity keys, plus the
     // host-injected run-clock stamps. No stray identity key may leak.
-    const strippedCall = runner.execute.mock.calls[0][0] as {
+    const strippedCall = (runner.execute.mock.calls as unknown[][])[0][0] as {
       env: Record<string, string>;
     };
     expect(strippedCall.env).toEqual({
@@ -1965,7 +1965,7 @@ describe("sandbox adapter execution targets", () => {
 
     // Exact key set: explicit remote identity overrides are preserved (not
     // stripped), plus the host-injected run-clock stamps.
-    const overrideCall = runner.execute.mock.calls[0][0] as {
+    const overrideCall = (runner.execute.mock.calls as unknown[][])[0][0] as {
       env: Record<string, string>;
     };
     expect(overrideCall.env).toEqual({
