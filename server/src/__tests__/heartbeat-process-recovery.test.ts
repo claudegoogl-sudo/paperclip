@@ -2585,7 +2585,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.retryOfRunId, runId))
         .then((rows) => rows[0] ?? null);
-      expect(retry).toMatchObject({ status: "queued" });
+      // The retry can already be picked up for dispatch by the time this read
+      // happens (timing/load dependent — observed as "running" on CI). The
+      // invariant under test is that a retry run EXISTS for the interrupted
+      // run and is progressing, not parked or failed.
+      expect(retry?.retryOfRunId).toBe(runId);
+      expect(["queued", "running"]).toContain(retry?.status);
 
       const agent = await db
         .select({ status: agents.status, errorReason: agents.errorReason })
