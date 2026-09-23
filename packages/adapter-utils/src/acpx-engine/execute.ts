@@ -147,6 +147,7 @@ import {
   type StartupStepMeasureOptions,
   type StartupTraceContext,
 } from "./startup-timing.js";
+import { buildPersistedSessionEnv } from "./session-persist-env.js";
 
 const defaultModuleDir = path.dirname(fileURLToPath(import.meta.url));
 const PAPERCLIP_MANAGED_CODEX_SKILLS_MANIFEST = ".paperclip-managed-skills.json";
@@ -399,6 +400,11 @@ interface AcpxPreparedRuntime {
   workspaceRepoUrl: string;
   workspaceRepoRef: string;
   env: Record<string, string>;
+  // Value-free mirror of `env` persisted on the acpx session record (refs
+  // only — see session-persist-env.ts). Handed to acpx as
+  // `sessionOptions.persistedEnv` so the record never carries resolved
+  // secrets; the real `env` above stays memory-only spawn input.
+  persistedEnv: Record<string, string>;
   loggedEnv: Record<string, string>;
   stateDir: string;
   permissionMode: "approve-all" | "approve-reads" | "deny-all";
@@ -2251,6 +2257,7 @@ async function buildRuntime(input: {
     workspaceRepoUrl,
     workspaceRepoRef,
     env,
+    persistedEnv: buildPersistedSessionEnv(env),
     loggedEnv,
     stateDir,
     permissionMode,
@@ -3726,7 +3733,13 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                   mode: prepared.mode,
                   cwd: prepared.cwd,
                   resumeSessionId,
-                  sessionOptions: { env: prepared.env },
+                  sessionOptions: {
+                    env: prepared.env,
+                    // Persist refs only — the record is plaintext on
+                    // disk and must never carry resolved secret values. Real
+                    // values reach the spawn via `env` above (memory only).
+                    persistedEnv: prepared.persistedEnv,
+                  },
                 });
                 ensureSessionMs = now() - ensureSessionStart;
                 return established;
@@ -3757,7 +3770,12 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                   agent: prepared.acpxAgent,
                   mode: prepared.mode,
                   cwd: prepared.cwd,
-                  sessionOptions: { env: prepared.env },
+                  sessionOptions: {
+                    env: prepared.env,
+                    // Refs, not values, on the record (see the
+                    // resume call site above for the full rationale).
+                    persistedEnv: prepared.persistedEnv,
+                  },
                 });
                 retryEnsureSessionMs = now() - ensureSessionStart;
                 return established;
@@ -3866,6 +3884,14 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         }
         sessionHandle = handle;
         startupFailed = false;
+        // Observability: one line per session establishment naming
+        // HOW MANY env keys were persisted as secret refs — never the keys'
+        // values (or the values themselves), so the run log proves the
+        // redaction applied without leaking anything.
+        await ctx.onLog(
+          "stdout",
+          `[paperclip] Session "${prepared.sessionKey}" record persists ${Object.keys(prepared.persistedEnv).length} env keys as secret refs (no values on disk).\n`,
+        );
         await emitPhase("ensure_session", ensureSessionPhaseStart, "ok");
       } catch (err) {
         if (!buildRuntimeSettled) {
