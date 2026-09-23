@@ -114,16 +114,22 @@ const annotationComment = {
   updatedAt: new Date("2026-06-16T12:01:00.000Z"),
 };
 
-function registerModuleMocks() {
-  vi.doMock("../services/index.js", () => ({
-    accessService: () => ({
-      canUser: vi.fn(async () => true),
-    }),
-    documentAnnotationService: () => mockAnnotationService,
-    logActivity: mockLogActivity,
-    routineService: () => mockRoutineService,
-  }));
-}
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("../services/index.js", () => ({
+  accessService: () => ({
+    canUser: vi.fn(async () => true),
+  }),
+  documentAnnotationService: () => mockAnnotationService,
+  logActivity: mockLogActivity,
+  routineService: () => mockRoutineService,
+}));
 
 async function createApp(actor: "board" | "agent" = "board", actorCompanyId = companyId) {
   const [{ routineRoutes }, { errorHandler }] = await Promise.all([
@@ -156,10 +162,6 @@ async function createApp(actor: "board" | "agent" = "board", actorCompanyId = co
 
 describe("routine description annotation routes", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../routes/routines.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
 
     mockRoutineService.get.mockResolvedValue(routine);

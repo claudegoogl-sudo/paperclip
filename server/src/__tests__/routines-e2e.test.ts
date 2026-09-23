@@ -34,54 +34,6 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { accessService } from "../services/access.js";
 
-function registerRoutineServiceMock() {
-  vi.doMock("../services/routines.js", async () => {
-    const actual = await vi.importActual<typeof import("../services/routines.js")>("../services/routines.js");
-
-    return {
-      ...actual,
-      routineService: (db: any) =>
-        actual.routineService(db, {
-          heartbeat: {
-            wakeup: async (agentId: string, wakeupOpts: any) => {
-              const issueId =
-                (typeof wakeupOpts?.payload?.issueId === "string" && wakeupOpts.payload.issueId) ||
-                (typeof wakeupOpts?.contextSnapshot?.issueId === "string" && wakeupOpts.contextSnapshot.issueId) ||
-                null;
-              if (!issueId) return null;
-
-              const issue = await db
-                .select({ companyId: issues.companyId })
-                .from(issues)
-                .where(eq(issues.id, issueId))
-                .then((rows: Array<{ companyId: string }>) => rows[0] ?? null);
-              if (!issue) return null;
-
-              const queuedRunId = randomUUID();
-              await db.insert(heartbeatRuns).values({
-                id: queuedRunId,
-                companyId: issue.companyId,
-                agentId,
-                invocationSource: wakeupOpts?.source ?? "assignment",
-                triggerDetail: wakeupOpts?.triggerDetail ?? null,
-                status: "queued",
-                contextSnapshot: { ...(wakeupOpts?.contextSnapshot ?? {}), issueId },
-              });
-              await db
-                .update(issues)
-                .set({
-                  executionRunId: queuedRunId,
-                  executionLockedAt: new Date(),
-                })
-                .where(eq(issues.id, issueId));
-              return { id: queuedRunId };
-            },
-          },
-        }),
-    };
-  });
-}
-
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe.sequential : describe.skip;
 
@@ -130,24 +82,6 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
   });
 
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("@paperclipai/shared/telemetry");
-    vi.doUnmock("../telemetry.js");
-    vi.doUnmock("../services/access.js");
-    vi.doUnmock("../services/issues.js");
-    vi.doUnmock("../services/companies.js");
-    vi.doUnmock("../services/projects.js");
-    vi.doUnmock("../services/company-skills.js");
-    vi.doUnmock("../services/assets.js");
-    vi.doUnmock("../services/agent-instructions.js");
-    vi.doUnmock("../services/workspace-runtime.js");
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../services/routines.js");
-    vi.doUnmock("../routes/routines.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerRoutineServiceMock();
-    vi.doMock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
     vi.clearAllMocks();
   });
 
@@ -571,3 +505,57 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     });
   });
 });
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("../services/routines.js", async () => {
+  const actual = await vi.importActual<typeof import("../services/routines.js")>("../services/routines.js");
+
+  return {
+    ...actual,
+    routineService: (db: any) =>
+      actual.routineService(db, {
+        heartbeat: {
+          wakeup: async (agentId: string, wakeupOpts: any) => {
+            const issueId =
+              (typeof wakeupOpts?.payload?.issueId === "string" && wakeupOpts.payload.issueId) ||
+              (typeof wakeupOpts?.contextSnapshot?.issueId === "string" && wakeupOpts.contextSnapshot.issueId) ||
+              null;
+            if (!issueId) return null;
+
+            const issue = await db
+              .select({ companyId: issues.companyId })
+              .from(issues)
+              .where(eq(issues.id, issueId))
+              .then((rows: Array<{ companyId: string }>) => rows[0] ?? null);
+            if (!issue) return null;
+
+            const queuedRunId = randomUUID();
+            await db.insert(heartbeatRuns).values({
+              id: queuedRunId,
+              companyId: issue.companyId,
+              agentId,
+              invocationSource: wakeupOpts?.source ?? "assignment",
+              triggerDetail: wakeupOpts?.triggerDetail ?? null,
+              status: "queued",
+              contextSnapshot: { ...(wakeupOpts?.contextSnapshot ?? {}), issueId },
+            });
+            await db
+              .update(issues)
+              .set({
+                executionRunId: queuedRunId,
+                executionLockedAt: new Date(),
+              })
+              .where(eq(issues.id, issueId));
+            return { id: queuedRunId };
+          },
+        },
+      }),
+  };
+});
+
