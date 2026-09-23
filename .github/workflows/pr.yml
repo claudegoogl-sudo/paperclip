@@ -19,7 +19,10 @@ concurrency:
 jobs:
   policy:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # The drift-detection step regenerates the lockfile on every PR (not just
+    # manifest-touching ones), so give the registry-resolution round trip
+    # headroom beyond the old manifest-gated budget.
+    timeout-minutes: 8
     outputs:
       lockfile_regenerated: ${{ steps.regen_lockfile.outputs.regenerated }}
 
@@ -179,6 +182,12 @@ jobs:
       - name: Test release verify workflow wiring
         run: node --test ./scripts/__tests__/release-verify-workflow.test.mjs
 
+      # Guards this workflow's own lockfile contract: unconditional regen +
+      # content-based drift detection in policy, and a hard-gated artifact
+      # restore in every job that installs with --frozen-lockfile.
+      - name: Test PR lockfile policy workflow wiring
+        run: node --test ./scripts/__tests__/pr-lockfile-policy.test.mjs
+
       - name: Test fork release gate wiring + release set checks
         run: node --test ./scripts/fork-release/lib.test.mjs ./scripts/fork-release/workflow.test.mjs ./scripts/fork-release/bundled-deps.test.mjs
 
@@ -200,16 +209,40 @@ jobs:
           PAPERCLIP_RELEASE_BOOTSTRAP_BASE_SHA="${{ github.event.pull_request.base.sha }}" \
             node ./scripts/check-release-package-bootstrap.mjs "${changed_paths[@]}"
 
-      - name: Validate dependency resolution when manifests change
+      # Lockfile drift between the checked-out tree and pnpm-lock.yaml comes
+      # from two places: this PR's own diff (manifests, patches, .npmrc,
+      # pnpmfile) or a base-branch merge that landed lock-relevant changes
+      # without a lockfile refresh (for example a patchedDependencies
+      # patch-hash change). The refresh-lockfile workflow repairs master
+      # asynchronously on every push, but until its PR lands, every PR branch
+      # carries the stale lockfile and every --frozen-lockfile install fails
+      # with ERR_PNPM_LOCKFILE_CONFIG_MISMATCH. Path-matching only the PR diff
+      # misses the base-drift case entirely, so regenerate unconditionally and
+      # decide on the actual lockfile diff — the ground truth — instead of a
+      # path guess. Downstream jobs install with the regenerated artifact when
+      # it exists, so a drifted base keeps PRs green instead of red-flagging
+      # every open PR until the refresh PR merges.
+      - name: Detect lockfile drift by regenerating
         id: regen_lockfile
         run: |
           changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")"
           manifest_pattern='(^|/)package\.json$|^pnpm-workspace\.yaml$|^\.npmrc$|^pnpmfile\.(cjs|js|mjs)$|^patches/'
+          pr_lock_inputs=0
           if printf '%s\n' "$changed" | grep -Eq "$manifest_pattern"; then
-            pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile
-            echo "regenerated=1" >> "$GITHUB_OUTPUT"
-          else
+            echo "PR diff touches lock-relevant manifests/patches."
+            pr_lock_inputs=1
+          fi
+          pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile
+          if git diff --quiet -- pnpm-lock.yaml; then
             echo "regenerated=0" >> "$GITHUB_OUTPUT"
+            echo "pnpm-lock.yaml is in sync with manifests and patches (PR touches lock inputs: $pr_lock_inputs)."
+          else
+            echo "regenerated=1" >> "$GITHUB_OUTPUT"
+            if [ "$pr_lock_inputs" -eq 1 ]; then
+              echo "Lockfile drift from this PR's own manifest/patch changes; uploading regenerated lockfile."
+            else
+              echo "Lockfile drift inherited from the base branch (a merged commit changed lock inputs without refreshing pnpm-lock.yaml); uploading regenerated lockfile so downstream jobs install cleanly."
+            fi
           fi
 
       # Manifest-only PRs (where pnpm-lock.yaml stays at base because the policy
@@ -240,9 +273,13 @@ jobs:
         with:
           version: 9.15.4
 
+      # Hard requirement when policy flagged a regen: without the artifact the
+      # committed lockfile is stale and the --frozen-lockfile install below
+      # fails with a confusing mismatch. A missing artifact must fail HERE,
+      # at the named restore step, not six jobs deep at install time.
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: pr-lockfile
           path: .
@@ -330,9 +367,11 @@ jobs:
         with:
           version: 9.15.4
 
+      # Fail here, not at install time, if policy required the artifact and it
+      # is missing (full rationale at the first restore step in this workflow).
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: pr-lockfile
           path: .
@@ -393,9 +432,11 @@ jobs:
         with:
           version: 9.15.4
 
+      # Fail here, not at install time, if policy required the artifact and it
+      # is missing (full rationale at the first restore step in this workflow).
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: pr-lockfile
           path: .
@@ -462,9 +503,11 @@ jobs:
         with:
           version: 9.15.4
 
+      # Fail here, not at install time, if policy required the artifact and it
+      # is missing (full rationale at the first restore step in this workflow).
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: pr-lockfile
           path: .
@@ -502,9 +545,11 @@ jobs:
         with:
           version: 9.15.4
 
+      # Fail here, not at install time, if policy required the artifact and it
+      # is missing (full rationale at the first restore step in this workflow).
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: pr-lockfile
           path: .
@@ -577,9 +622,11 @@ jobs:
         with:
           version: 9.15.4
 
+      # Fail here, not at install time, if policy required the artifact and it
+      # is missing (full rationale at the first restore step in this workflow).
       - name: Restore regenerated PR lockfile (if policy uploaded one)
+        if: needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: pr-lockfile
           path: .

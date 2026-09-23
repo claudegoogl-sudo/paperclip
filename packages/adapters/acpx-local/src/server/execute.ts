@@ -29,6 +29,7 @@ import {
   type PaperclipSkillEntry,
 } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
+import { buildPersistedSessionEnv } from "@paperclipai/adapter-utils/acpx-engine/session-persist-env";
 import {
   createAcpRuntime,
   createAgentRegistry,
@@ -79,6 +80,12 @@ interface AcpxPreparedRuntime {
   workspaceRepoUrl: string;
   workspaceRepoRef: string;
   env: Record<string, string>;
+  // Value-free mirror of `env` (every key -> `__paperclip_secret_ref:<KEY>`).
+  // Anything persisted at rest (session record, wrapper artifacts) carries
+  // this marker manifest instead of resolved values; the real `env` stays
+  // memory-only spawn input. Same contract the acpx-engine adapter applies
+  // to its session records.
+  persistedEnv: Record<string, string>;
   loggedEnv: Record<string, string>;
   stateDir: string;
   permissionMode: "approve-all" | "approve-reads" | "deny-all";
@@ -659,36 +666,42 @@ async function writePaperclipClaudeSettings(input: {
   };
 }
 
-async function writeAgentWrapper(input: {
+// Writes the value-free agent wrapper script. Historically this also wrote a
+// sibling `.env` file containing every spawn env entry (including
+// server-resolved secret values) which the wrapper sourced at exec time — a
+// plaintext-secret-at-rest sink under the instance state dir. The wrapper no
+// longer touches any env file: real env values reach the spawned agent as
+// process env supplied by the acpx runtime at spawn time (memory-only; see
+// the `sessionOptions.env` call sites in `createAcpxLocalExecutor`), and the
+// wrapper's cache identity is derived from a value-free marker manifest so
+// wrapper dedup never depends on (or persists) secret material.
+export async function writeAgentWrapper(input: {
   stateDir: string;
   acpxAgent: string;
   agentCommandShell: string;
   env: Record<string, string>;
   childStderrDir: string;
-}): Promise<{ wrapperPath: string; envFilePath: string }> {
+}): Promise<{ wrapperPath: string }> {
   const wrappersDir = path.join(input.stateDir, "wrappers");
   await fs.mkdir(wrappersDir, { recursive: true });
-  const envLines = Object.entries(input.env)
+  const persistedEnv = buildPersistedSessionEnv(input.env);
+  const manifestLines = Object.entries(persistedEnv)
     .filter(([key]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key))
     .sort(([left], [right]) => left.localeCompare(right))
-    .map(([key, value]) => `${key}=${shellQuote(value)}`);
+    .map(([key, value]) => `${key}=${value}`);
   const wrapperHash = shortHash({
     agent: input.acpxAgent,
     command: input.agentCommandShell,
-    env: envLines,
+    envManifest: manifestLines,
     childStderrDir: input.childStderrDir,
   });
   const wrapperPath = path.join(wrappersDir, `${input.acpxAgent}-${wrapperHash}.sh`);
-  const envFilePath = path.join(wrappersDir, `${input.acpxAgent}-${wrapperHash}.env`);
   const script = [
     "#!/usr/bin/env bash",
     "set -euo pipefail",
-    `env_file=${shellQuote(envFilePath)}`,
-    "if [[ -f \"$env_file\" ]]; then",
-    "  set -a",
-    "  source \"$env_file\"",
-    "  set +a",
-    "fi",
+    // Env values are NOT sourced from disk. They arrive as process env on
+    // the wrapper's own spawn (acpx sessionOptions.env), so they are simply
+    // inherited by the exec'd agent command below.
     `stderr_dir=${shellQuote(input.childStderrDir)}`,
     "if [[ -n \"${PAPERCLIP_RUN_ID:-}\" ]]; then",
     "  mkdir -p \"$stderr_dir\"",
@@ -698,20 +711,19 @@ async function writeAgentWrapper(input: {
     "",
   ].join("\n");
   await writeFileAtomically({
-    target: envFilePath,
-    contents: `${envLines.join("\n")}\n`,
-    mode: 0o600,
-  });
-  await writeFileAtomically({
     target: wrapperPath,
     contents: script,
     mode: 0o700,
   });
   await cleanupStaleAgentWrappers({
     wrappersDir,
-    currentFileNames: new Set([path.basename(wrapperPath), path.basename(envFilePath)]),
+    // Legacy installs may still carry value-bearing `<agent>-<hash>.env`
+    // files from the pre-fix writer; they are not current anymore, so the
+    // retention-based sweep below removes them like any other stale
+    // artifact.
+    currentFileNames: new Set([path.basename(wrapperPath)]),
   });
-  return { wrapperPath, envFilePath };
+  return { wrapperPath };
 }
 
 async function cleanupStaleAgentWrappers(input: { wrappersDir: string; currentFileNames: Set<string> }) {
@@ -882,6 +894,11 @@ async function buildRuntime(input: {
   const agentCommandShell = configuredCommand || (builtInCommand ? shellQuote(builtInCommand) : "");
   const childStderrDir = path.join(stateDir, "run-stderr");
   const childStderrLogPath = agentCommand ? path.join(childStderrDir, `${runId}.log`) : null;
+  // Value-free mirror of the spawn env: persisted artifacts (session record,
+  // wrapper identity) reference keys as markers and never carry resolved
+  // values. Computed once from the finalized env (after config.env merge,
+  // auth token, and model overrides).
+  const persistedEnv = buildPersistedSessionEnv(env);
   const wrapper = agentCommand
     ? await writeAgentWrapper({
         stateDir,
@@ -932,6 +949,7 @@ async function buildRuntime(input: {
     workspaceRepoUrl,
     workspaceRepoRef,
     env,
+    persistedEnv,
     loggedEnv,
     stateDir,
     permissionMode,
@@ -1425,6 +1443,10 @@ export function createAcpxLocalExecutor(deps: ExecuteDeps = {}) {
             mode: prepared.mode,
             cwd: prepared.cwd,
             resumeSessionId,
+            // Real env values are supplied to the spawned agent process as
+            // child process env (memory-only); `persistedEnv` is the
+            // value-free marker manifest the session record persists instead.
+            sessionOptions: { env: prepared.env, persistedEnv: prepared.persistedEnv },
           });
         } catch (err) {
           if (!resumeSessionId || !isResumeFailure(err)) throw err;
@@ -1439,6 +1461,9 @@ export function createAcpxLocalExecutor(deps: ExecuteDeps = {}) {
             agent: prepared.acpxAgent,
             mode: prepared.mode,
             cwd: prepared.cwd,
+            // Same contract as the resume call site above: values in memory
+            // only, markers on the record.
+            sessionOptions: { env: prepared.env, persistedEnv: prepared.persistedEnv },
           });
         }
       }
@@ -1477,6 +1502,13 @@ export function createAcpxLocalExecutor(deps: ExecuteDeps = {}) {
       };
     }
     const sessionHandle = handle;
+    // Observability: one value-free line proving the redaction applied —
+    // how many env keys the spawn carries in memory vs how many are
+    // persisted as reference markers on disk. Never names keys or values.
+    await ctx.onLog(
+      "stdout",
+      `[paperclip] ACPX session "${prepared.sessionKey}" spawn env: ${Object.keys(prepared.env).length} key(s) in memory, ${Object.keys(prepared.persistedEnv).length} persisted as secret-ref markers (no values on disk).\n`,
+    );
     try {
       await applySessionConfigOptions({
         runtime,
