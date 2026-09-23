@@ -343,11 +343,22 @@ describe("sandbox adapter execution targets", () => {
     });
 
     expect(result.stdout).toBe("ok\n");
+    // The host injects the run-clock env (ISO-8601 UTC stamps) on top of the
+    // caller env; assert the exact key set so no stray identity key leaks.
+    const call = (runner.execute.mock.calls as unknown[][])[0][0] as {
+      env: Record<string, string>;
+    };
+    expect(call.env).toEqual({
+      TOKEN: "token",
+      PAPERCLIP_NOW: expect.any(String),
+      PAPERCLIP_RUN_STARTED_AT: expect.any(String),
+    });
+    expect(Number.isNaN(Date.parse(call.env.PAPERCLIP_NOW))).toBe(false);
+    expect(Number.isNaN(Date.parse(call.env.PAPERCLIP_RUN_STARTED_AT))).toBe(false);
     expect(runner.execute).toHaveBeenCalledWith(expect.objectContaining({
       command: "agent-cli",
       args: ["--json"],
       cwd: "/workspace",
-      env: { TOKEN: "token" },
       stdin: "prompt",
       timeoutMs: 5000,
     }));
@@ -1904,11 +1915,18 @@ describe("sandbox adapter execution targets", () => {
       onLog: async () => {},
     });
 
-    expect(runner.execute).toHaveBeenCalledWith(expect.objectContaining({
-      env: {
-        SAFE_VALUE: "visible",
-      },
-    }));
+    // Exact key set: the caller env minus inherited identity keys, plus the
+    // host-injected run-clock stamps. No stray identity key may leak.
+    const strippedCall = (runner.execute.mock.calls as unknown[][])[0][0] as {
+      env: Record<string, string>;
+    };
+    expect(strippedCall.env).toEqual({
+      SAFE_VALUE: "visible",
+      PAPERCLIP_NOW: expect.any(String),
+      PAPERCLIP_RUN_STARTED_AT: expect.any(String),
+    });
+    expect(Number.isNaN(Date.parse(strippedCall.env.PAPERCLIP_NOW))).toBe(false);
+    expect(Number.isNaN(Date.parse(strippedCall.env.PAPERCLIP_RUN_STARTED_AT))).toBe(false);
   });
 
   it("preserves explicit remote identity env overrides for sandbox execution", async () => {
@@ -1945,13 +1963,18 @@ describe("sandbox adapter execution targets", () => {
       onLog: async () => {},
     });
 
-    expect(runner.execute).toHaveBeenCalledWith(expect.objectContaining({
-      env: {
-        PATH: "/custom/remote/bin:/usr/bin",
-        HOME: "/home/sandbox",
-        SAFE_VALUE: "visible",
-      },
-    }));
+    // Exact key set: explicit remote identity overrides are preserved (not
+    // stripped), plus the host-injected run-clock stamps.
+    const overrideCall = (runner.execute.mock.calls as unknown[][])[0][0] as {
+      env: Record<string, string>;
+    };
+    expect(overrideCall.env).toEqual({
+      PATH: "/custom/remote/bin:/usr/bin",
+      HOME: "/home/sandbox",
+      SAFE_VALUE: "visible",
+      PAPERCLIP_NOW: expect.any(String),
+      PAPERCLIP_RUN_STARTED_AT: expect.any(String),
+    });
   });
 
   it("treats SSH targets as bridge-only", () => {

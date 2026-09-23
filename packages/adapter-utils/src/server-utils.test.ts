@@ -453,6 +453,62 @@ describe("runChildProcess", () => {
     expect(result.stdout).toBe("done");
   });
 
+  it("injects PAPERCLIP_NOW and PAPERCLIP_RUN_STARTED_AT clock env into the child", async () => {
+    const before = Date.now() - 1_000;
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      [
+        "-e",
+        "process.stdout.write(JSON.stringify({ now: process.env.PAPERCLIP_NOW, started: process.env.PAPERCLIP_RUN_STARTED_AT }));",
+      ],
+      {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    const childEnv = JSON.parse(result.stdout) as { now: string; started: string };
+    expect(Number.isNaN(Date.parse(childEnv.now))).toBe(false);
+    expect(Number.isNaN(Date.parse(childEnv.started))).toBe(false);
+    expect(Date.parse(childEnv.now)).toBeGreaterThanOrEqual(before);
+    // The spawn stamp never precedes the preparation stamp, and it is the same
+    // instant the run metadata records as the process start.
+    expect(Date.parse(childEnv.started)).toBeGreaterThanOrEqual(Date.parse(childEnv.now));
+    expect(childEnv.started).toBe(result.startedAt);
+  });
+
+  it("keeps host clock env authoritative over adapter-provided PAPERCLIP_* values", async () => {
+    const result = await runChildProcess(
+      randomUUID(),
+      process.execPath,
+      [
+        "-e",
+        "process.stdout.write(JSON.stringify({ now: process.env.PAPERCLIP_NOW, started: process.env.PAPERCLIP_RUN_STARTED_AT }));",
+      ],
+      {
+        cwd: process.cwd(),
+        env: {
+          PAPERCLIP_NOW: "2000-01-01T00:00:00.000Z",
+          PAPERCLIP_RUN_STARTED_AT: "2000-01-01T00:00:00.000Z",
+        },
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    const childEnv = JSON.parse(result.stdout) as { now: string; started: string };
+    expect(childEnv.now).not.toBe("2000-01-01T00:00:00.000Z");
+    expect(childEnv.started).not.toBe("2000-01-01T00:00:00.000Z");
+    expect(Number.isNaN(Date.parse(childEnv.now))).toBe(false);
+  });
+
   it("waits for onSpawn before sending stdin to the child", async () => {
     const spawnDelayMs = 150;
     const startedAt = Date.now();
@@ -2728,5 +2784,93 @@ describe("buildPaperclipEnv", () => {
       const env = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" });
       expect(env.PAPERCLIP_API_URL).toBe("http://localhost:3200");
     });
+  });
+});
+
+describe("wake payload run clock context", () => {
+  const basePayload = {
+    reason: "issue_assigned",
+    issue: {
+      id: "issue-1",
+      identifier: "PAP-1",
+      title: "Run clock context",
+      description: null,
+      descriptionTruncated: false,
+      status: "in_progress",
+    },
+    commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+    comments: [],
+    fallbackFetchNeeded: false,
+  };
+
+  it("stamps now and run started at render time when the server sent neither", () => {
+    const prompt = renderPaperclipWakePrompt(basePayload);
+    const nowLine = prompt.split("\n").find((line) => line.startsWith("- now: "));
+    const startedLine = prompt.split("\n").find((line) => line.startsWith("- run started: "));
+    expect(nowLine).toBeDefined();
+    expect(startedLine).toBeDefined();
+    const nowValue = (nowLine ?? "").slice("- now: ".length);
+    const startedValue = (startedLine ?? "").slice("- run started: ".length);
+    expect(Number.isNaN(Date.parse(nowValue))).toBe(false);
+    expect(startedValue).toBe(nowValue);
+    expect(prompt).toContain("- sibling runs on this issue: none active");
+  });
+
+  it("renders the server-recorded run start and sibling run metadata", () => {
+    const payload = {
+      ...basePayload,
+      runStartedAt: "2026-09-24T08:00:00.000Z",
+      siblingRuns: [
+        {
+          runId: "11111111-1111-4111-8111-111111111111",
+          agentName: "QA",
+          startedAt: "2026-09-24T08:01:00.000Z",
+        },
+        { runId: "22222222-2222-4222-8222-222222222222", agentName: "Coder", startedAt: null },
+      ],
+    };
+    const prompt = renderPaperclipWakePrompt(payload);
+    expect(prompt).toContain("- run started: 2026-09-24T08:00:00.000Z");
+    expect(prompt).toContain("- sibling runs on this issue (active, this run excluded): 2");
+    expect(prompt).toContain(
+      "  - QA run 11111111-1111-4111-8111-111111111111 started 2026-09-24T08:01:00.000Z",
+    );
+    expect(prompt).toContain(
+      "  - Coder run 22222222-2222-4222-8222-222222222222 not started yet",
+    );
+    const parsed = JSON.parse(stringifyPaperclipWakePayload(payload) ?? "{}");
+    expect(parsed.runStartedAt).toBe("2026-09-24T08:00:00.000Z");
+    expect(parsed.siblingRuns).toHaveLength(2);
+  });
+
+  it("caps sibling runs at five entries", () => {
+    const payload = {
+      ...basePayload,
+      siblingRuns: Array.from({ length: 9 }, (_, index) => ({
+        runId: `run-${index}`,
+        agentName: `Agent ${index}`,
+        startedAt: "2026-09-24T08:00:00.000Z",
+      })),
+    };
+    const prompt = renderPaperclipWakePrompt(payload);
+    expect(prompt).toContain("- sibling runs on this issue (active, this run excluded): 5");
+    expect(prompt.match(/run-\d/g)).toHaveLength(5);
+  });
+
+  it("keeps the run clock lines in resume deltas", () => {
+    const prompt = renderPaperclipWakePrompt(
+      { ...basePayload, runStartedAt: "2026-09-24T08:00:00.000Z" },
+      { resumedSession: true },
+    );
+    expect(prompt).toContain("## Paperclip Resume Delta");
+    expect(prompt).toContain("- now:");
+    expect(prompt).toContain("- run started: 2026-09-24T08:00:00.000Z");
+    expect(prompt).toContain("- sibling runs on this issue: none active");
+  });
+
+  it("degrades cleanly when sibling data is garbage", () => {
+    const prompt = renderPaperclipWakePrompt({ ...basePayload, siblingRuns: [{}, "junk", 42] });
+    expect(prompt).toContain("- sibling runs on this issue: none active");
+    expect(prompt).not.toContain("unknown agent");
   });
 });
