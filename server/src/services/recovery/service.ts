@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -113,6 +113,19 @@ const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = [
 ] as const;
 export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
+// Cross-run correlation windows (fleet-stall umbrella): a single shared upstream
+// stall silences many runs within seconds of each other. A run may join an existing
+// evaluation of a sibling run only while that evaluation is fresh and the sibling
+// went silent within an absolute window of this run. Absolute ±window rather than
+// floor(time/60s) bucket equality so two events 1s apart across a bucket edge still
+// correlate.
+export const ACTIVE_RUN_CORRELATION_WINDOW_MS = 60 * 1000;
+export const ACTIVE_RUN_CORRELATION_MAX_EVALUATION_AGE_MS = 10 * 60 * 1000;
+// Watchdog decision value recorded on each correlated run so per-run decisions
+// (dismiss/snooze/terminate) keep working against the shared evaluation issue.
+// Not a human signal: excluded from the closed-evaluation auto-dismiss
+// "hasAnyDecision" guard and inert in the snooze/dismiss readers.
+export const WATCHDOG_DECISION_CORRELATED = "correlated";
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
 
@@ -2169,6 +2182,187 @@ export function recoveryService(
     return true;
   }
 
+  // Anchor for a previously correlated run: the run has no evaluation issue of its
+  // own (findOpenStaleRunEvaluation never anchors it), so the decision row is the
+  // durable per-run bookkeeping that keeps later scan cycles from re-correlating
+  // and re-commenting on the shared evaluation.
+  async function findOpenCorrelatedEvaluation(companyId: string, runId: string) {
+    const [row] = await db
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        priority: issues.priority,
+      })
+      .from(heartbeatRunWatchdogDecisions)
+      .innerJoin(issues, eq(issues.id, heartbeatRunWatchdogDecisions.evaluationIssueId))
+      .where(
+        and(
+          eq(heartbeatRunWatchdogDecisions.companyId, companyId),
+          eq(heartbeatRunWatchdogDecisions.runId, runId),
+          eq(heartbeatRunWatchdogDecisions.decision, WATCHDOG_DECISION_CORRELATED),
+          eq(issues.companyId, companyId),
+          visibleIssueCondition(),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .orderBy(desc(heartbeatRunWatchdogDecisions.createdAt))
+      .limit(1);
+    return row ?? null;
+  }
+
+  // Oldest fresh open evaluation whose source run went silent within the correlation
+  // window of this run — the shared-upstream-stall candidate to join. Company-scoped:
+  // issues, agents and run data are company data, and a cross-company merge would leak
+  // one company's run ids/agent names into another company's thread.
+  async function findCorrelatableStaleRunEvaluation(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    now: Date;
+  }) {
+    const silenceStartedAt = silenceStartedAtForRun(input.run);
+    if (!silenceStartedAt) return null;
+    const candidates = await db
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        priority: issues.priority,
+        originId: issues.originId,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, input.run.companyId),
+          eq(issues.originKind, STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND),
+          ne(issues.originId, input.run.id),
+          gte(
+            issues.createdAt,
+            new Date(input.now.getTime() - ACTIVE_RUN_CORRELATION_MAX_EVALUATION_AGE_MS),
+          ),
+          visibleIssueCondition(),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .orderBy(asc(issues.createdAt))
+      .limit(25);
+    for (const candidate of candidates) {
+      if (!candidate.originId) continue;
+      const [siblingRun] = await db
+        .select({
+          lastOutputAt: heartbeatRuns.lastOutputAt,
+          processStartedAt: heartbeatRuns.processStartedAt,
+          startedAt: heartbeatRuns.startedAt,
+          createdAt: heartbeatRuns.createdAt,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, candidate.originId))
+        .limit(1);
+      if (!siblingRun) continue;
+      const siblingSilenceStartedAt = silenceStartedAtForRun(siblingRun);
+      if (
+        siblingSilenceStartedAt &&
+        Math.abs(siblingSilenceStartedAt.getTime() - silenceStartedAt.getTime()) <=
+          ACTIVE_RUN_CORRELATION_WINDOW_MS
+      ) {
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  // One correlation comment per (evaluation issue, correlated run) pair. The
+  // activity-log row is the persistence record that suppresses repeats across scan
+  // cycles and process restarts (same pattern as ensureSourceIssueCommentedForStaleEvaluation).
+  async function appendCorrelatedRunComment(input: {
+    evaluationIssue: { id: string; identifier: string | null };
+    run: typeof heartbeatRuns.$inferSelect;
+    runningAgent: { name: string };
+    evidence: Awaited<ReturnType<typeof collectStaleRunEvidence>>;
+    level: string;
+  }) {
+    const [priorCorrelation] = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, input.run.companyId),
+          eq(activityLog.action, "heartbeat.output_stale_run_correlated"),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, input.evaluationIssue.id),
+          eq(activityLog.runId, input.run.id),
+        ),
+      )
+      .limit(1);
+    if (priorCorrelation) return false;
+    await issuesSvc.addComment(
+      input.evaluationIssue.id,
+      [
+        "Correlated silent run — shared-upstream stall candidate. Watchdog tied this run to this evaluation instead of filing a duplicate ticket.",
+        "",
+        `- Agent: ${input.runningAgent.name}`,
+        `- Run: \`${input.run.id}\``,
+        `- Silent for: ${formatDuration(input.evidence.silenceAgeMs)} (${input.level})`,
+        `- Last output at: ${input.run.lastOutputAt?.toISOString() ?? "none recorded"}`,
+        "",
+        "Per-run dismiss/terminate still works via watchdog decisions against this issue.",
+      ].join("\n"),
+      { runId: input.run.id },
+    );
+    await logActivity(db, {
+      companyId: input.run.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: input.run.id,
+      action: "heartbeat.output_stale_run_correlated",
+      entityType: "issue",
+      entityId: input.evaluationIssue.id,
+      details: {
+        source: "recovery.scan_silent_active_runs",
+        level: input.level,
+        silenceAgeMs: input.evidence.silenceAgeMs,
+        lastOutputAt: input.run.lastOutputAt?.toISOString() ?? null,
+      },
+    });
+    return true;
+  }
+
+  // Durable per-run bookkeeping for a correlated run (idempotent per
+  // (company, run, evaluation) triple). Points the run's watchdog decision history at
+  // the shared evaluation so per-run dismiss/resolve operates on the right issue.
+  async function recordCorrelatedWatchdogDecision(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    evaluationIssue: { id: string };
+  }) {
+    const [existingRow] = await db
+      .select({ id: heartbeatRunWatchdogDecisions.id })
+      .from(heartbeatRunWatchdogDecisions)
+      .where(
+        and(
+          eq(heartbeatRunWatchdogDecisions.companyId, input.run.companyId),
+          eq(heartbeatRunWatchdogDecisions.runId, input.run.id),
+          eq(heartbeatRunWatchdogDecisions.evaluationIssueId, input.evaluationIssue.id),
+          eq(heartbeatRunWatchdogDecisions.decision, WATCHDOG_DECISION_CORRELATED),
+        ),
+      )
+      .limit(1);
+    if (existingRow) return existingRow;
+    const [row] = await db
+      .insert(heartbeatRunWatchdogDecisions)
+      .values({
+        companyId: input.run.companyId,
+        runId: input.run.id,
+        evaluationIssueId: input.evaluationIssue.id,
+        decision: WATCHDOG_DECISION_CORRELATED,
+        snoozedUntil: null,
+        reason:
+          "Auto-correlated by the silent-run watchdog: sibling evaluation went silent within the correlation window (single shared-upstream stall).",
+        createdByAgentId: null,
+        createdByUserId: null,
+        createdByRunId: null,
+      })
+      .returning({ id: heartbeatRunWatchdogDecisions.id });
+    return row ?? null;
+  }
+
   async function inspectSilentActiveRun(input: {
     run: typeof heartbeatRuns.$inferSelect;
     now: Date;
@@ -2300,6 +2494,9 @@ export function recoveryService(
             and(
               eq(heartbeatRunWatchdogDecisions.companyId, input.run.companyId),
               eq(heartbeatRunWatchdogDecisions.runId, input.run.id),
+              // System correlation rows are not the "a human explicitly opted in to
+              // the watchdog lifecycle" signal this guard exists for.
+              ne(heartbeatRunWatchdogDecisions.decision, WATCHDOG_DECISION_CORRELATED),
             ),
           )
           .limit(1)
@@ -2359,6 +2556,32 @@ export function recoveryService(
         });
       }
       return { kind: "existing" as const, evaluationIssueId: existing.id };
+    }
+
+    // Cross-run correlation (fleet-stall umbrella): a shared upstream stall silences
+    // many runs within seconds of each other. Tie this run into a fresh sibling
+    // evaluation instead of manufacturing one more ticket in a cluster. Order matters:
+    // own evaluation > correlated anchor > fresh correlate > create.
+    const correlatedAnchor = await findOpenCorrelatedEvaluation(input.run.companyId, input.run.id);
+    if (correlatedAnchor) {
+      return { kind: "correlated" as const, evaluationIssueId: correlatedAnchor.id };
+    }
+    const correlatable = await findCorrelatableStaleRunEvaluation({ run: input.run, now: input.now });
+    if (correlatable) {
+      await appendCorrelatedRunComment({
+        evaluationIssue: correlatable,
+        run: input.run,
+        runningAgent,
+        evidence,
+        level,
+      });
+      await recordCorrelatedWatchdogDecision({ run: input.run, evaluationIssue: correlatable });
+      if (level === "critical" && correlatable.priority !== "high") {
+        await issuesSvc.update(correlatable.id, {
+          priority: "high",
+        });
+      }
+      return { kind: "correlated" as const, evaluationIssueId: correlatable.id };
     }
 
     const ownerAgentId = await resolveStaleRunOwnerAgentId({ run: input.run, runningAgent, sourceIssue });
@@ -2841,6 +3064,7 @@ export function recoveryService(
     const result = {
       scanned: candidates.length,
       created: 0,
+      correlated: 0,
       existing: 0,
       escalated: 0,
       folded: 0,
@@ -2886,6 +3110,7 @@ export function recoveryService(
           dismissedFalsePositive: decisionState.dismissedFalsePositive,
         });
         if (outcome.kind === "created") result.created += 1;
+      else if (outcome.kind === "correlated") result.correlated += 1;
       else if (outcome.kind === "existing") result.existing += 1;
       else if (outcome.kind === "escalated") result.escalated += 1;
       else if (outcome.kind === "folded") result.folded += 1;
@@ -2942,23 +3167,42 @@ export function recoveryService(
     }
 
     const boardActor = input.actor.type === "board";
+    // Correlated binding: a run tied into a sibling run's evaluation by the watchdog's
+    // cross-run correlation has no evaluation issue of its own (originId of the shared
+    // issue is the sibling run). A prior `correlated` decision row is the durable
+    // run→evaluation binding that keeps per-run dismiss/snooze/terminate working
+    // against the shared evaluation issue.
+    const correlatedBinding = evaluationIssue
+      ? await db
+          .select({ id: heartbeatRunWatchdogDecisions.id })
+          .from(heartbeatRunWatchdogDecisions)
+          .where(
+            and(
+              eq(heartbeatRunWatchdogDecisions.companyId, run.companyId),
+              eq(heartbeatRunWatchdogDecisions.runId, run.id),
+              eq(heartbeatRunWatchdogDecisions.evaluationIssueId, evaluationIssue.id),
+              eq(heartbeatRunWatchdogDecisions.decision, WATCHDOG_DECISION_CORRELATED),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null)
+      : null;
+    const evaluationBoundToRun =
+      evaluationIssue !== null &&
+      evaluationIssue.originKind === STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND &&
+      (evaluationIssue.originId === run.id || correlatedBinding !== null);
     const assignedRecoveryOwner =
       input.actor.type === "agent" &&
       Boolean(input.actor.agentId) &&
-      evaluationIssue !== null &&
-      evaluationIssue.originKind === STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND &&
-      evaluationIssue.originId === run.id &&
-      evaluationIssue.hiddenAt === null &&
-      !["done", "cancelled"].includes(evaluationIssue.status) &&
+      evaluationBoundToRun &&
+      evaluationIssue?.hiddenAt === null &&
+      !["done", "cancelled"].includes(evaluationIssue?.status ?? "") &&
       evaluationIssue?.assigneeAgentId === input.actor.agentId;
     if (!boardActor && !assignedRecoveryOwner) {
       throw forbidden("Only the board or the assigned recovery owner can record watchdog decisions");
     }
 
-    if (evaluationIssue && (
-      evaluationIssue.originKind !== STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND ||
-      evaluationIssue.originId !== run.id
-    )) {
+    if (evaluationIssue && !evaluationBoundToRun) {
       throw forbidden("Watchdog decision evaluation issue is not bound to the target run");
     }
 
