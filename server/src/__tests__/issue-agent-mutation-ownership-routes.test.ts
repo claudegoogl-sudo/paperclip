@@ -156,56 +156,62 @@ const mockExternalObjectService = vi.hoisted(() => ({
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 const mockObserveCrossIssueInfluence = vi.hoisted(() => vi.fn(async () => null));
 
-function registerRouteMocks() {
-  vi.doMock("@paperclipai/shared/telemetry", () => ({
+// Hoisted module mocks (not per-test vi.doMock + vi.resetModules): the mock
+// registry must be in place before ANY import of the route module, in every
+// test. createApp concurrently importActual()s middleware and route modules
+// whose graphs share the mocked services, so a load-dependent registry race
+// could bind the REAL services module and 500 the request under test
+// (master Release runs 35877211616 / 35888840397). A hoisted vi.mock applies
+// to every import graph deterministically.
+  vi.mock("@paperclipai/shared/telemetry", () => ({
     trackAgentTaskCompleted: vi.fn(),
     trackErrorHandlerCrash: vi.fn(),
   }));
 
-  vi.doMock("../telemetry.js", () => ({
+  vi.mock("../telemetry.js", () => ({
     getTelemetryClient: vi.fn(() => ({ track: vi.fn() })),
   }));
 
-  vi.doMock("../services/access.js", () => ({
+  vi.mock("../services/access.js", () => ({
     accessService: () => mockAccessService,
   }));
 
-  vi.doMock("../services/agents.js", () => ({
+  vi.mock("../services/agents.js", () => ({
     agentService: () => mockAgentService,
   }));
 
-  vi.doMock("../services/documents.js", () => ({
+  vi.mock("../services/documents.js", () => ({
     documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
     documentService: () => mockDocumentService,
   }));
 
-  vi.doMock("../services/issues.js", () => ({
+  vi.mock("../services/issues.js", () => ({
     issueService: () => mockIssueService,
   }));
 
-  vi.doMock("../services/work-products.js", () => ({
+  vi.mock("../services/work-products.js", () => ({
     workProductService: () => mockWorkProductService,
   }));
 
-  vi.doMock("../services/external-objects.js", () => ({
+  vi.mock("../services/external-objects.js", () => ({
     externalObjectService: () => mockExternalObjectService,
   }));
 
-  vi.doMock("../services/activity-log.js", () => ({
+  vi.mock("../services/activity-log.js", () => ({
     logActivity: mockLogActivity,
   }));
 
-  vi.doMock("../services/cross-issue-influence-limit.js", () => ({
+  vi.mock("../services/cross-issue-influence-limit.js", () => ({
     observeCrossIssueInfluence: mockObserveCrossIssueInfluence,
     crossIssueInfluenceLimitError: vi.fn(),
     crossIssueInfluenceRunContextError: () => new HttpError(
-      403,
-      "Agent issue comments and updates require a valid heartbeat run so cross-issue influence can be contained",
-      { code: "cross_issue_influence_run_context_required" },
+  403,
+  "Agent issue comments and updates require a valid heartbeat run so cross-issue influence can be contained",
+  { code: "cross_issue_influence_run_context_required" },
     ),
   }));
 
-  vi.doMock("../services/index.js", () => ({
+  vi.mock("../services/index.js", () => ({
     ISSUE_LIST_DEFAULT_LIMIT: 100,
     ISSUE_LIST_MAX_LIMIT: 500,
     accessService: () => mockAccessService,
@@ -213,42 +219,42 @@ function registerRouteMocks() {
     budgetService: () => mockBudgetService,
     clampIssueListLimit: (value: number) => Math.min(Math.max(value, 1), 500),
     companySkillService: () => ({
-      completeTestRunForIssue: vi.fn(async () => null),
+  completeTestRunForIssue: vi.fn(async () => null),
     }),
     companyService: () => mockCompanyService,
     documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
     documentService: () => mockDocumentService,
     executionWorkspaceService: () => ({}),
     feedbackService: () => ({
-      listIssueVotesForUser: vi.fn(async () => []),
-      saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
+  listIssueVotesForUser: vi.fn(async () => []),
+  saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
     }),
     goalService: () => ({}),
     heartbeatService: () => mockHeartbeatService,
     instanceSettingsService: () => ({
-      get: vi.fn(async () => ({
-        id: "instance-settings-1",
-        general: {
-          censorUsernameInLogs: false,
-          feedbackDataSharingPreference: "prompt",
-        },
-      })),
-      listCompanyIds: vi.fn(async () => [companyId]),
+  get: vi.fn(async () => ({
+    id: "instance-settings-1",
+    general: {
+      censorUsernameInLogs: false,
+      feedbackDataSharingPreference: "prompt",
+    },
+  })),
+  listCompanyIds: vi.fn(async () => [companyId]),
     }),
     issueApprovalService: () => mockIssueApprovalService,
     issueRecoveryActionService: () => mockIssueRecoveryActionService,
     issueReferenceService: () => ({
-      deleteDocumentSource: async () => undefined,
-      diffIssueReferenceSummary: () => ({
-        addedReferencedIssues: [],
-        removedReferencedIssues: [],
-        currentReferencedIssues: [],
-      }),
-      emptySummary: () => ({ outbound: [], inbound: [] }),
-      listIssueReferenceSummary: async () => ({ outbound: [], inbound: [] }),
-      syncComment: async () => undefined,
-      syncDocument: async () => undefined,
-      syncIssue: async () => undefined,
+  deleteDocumentSource: async () => undefined,
+  diffIssueReferenceSummary: () => ({
+    addedReferencedIssues: [],
+    removedReferencedIssues: [],
+    currentReferencedIssues: [],
+  }),
+  emptySummary: () => ({ outbound: [], inbound: [] }),
+  listIssueReferenceSummary: async () => ({ outbound: [], inbound: [] }),
+  syncComment: async () => undefined,
+  syncDocument: async () => undefined,
+  syncIssue: async () => undefined,
     }),
     issueService: () => mockIssueService,
     issueThreadInteractionService: () => mockIssueThreadInteractionService,
@@ -256,11 +262,11 @@ function registerRouteMocks() {
     logActivity: mockLogActivity,
     projectService: () => mockProjectService,
     routineService: () => ({
-      syncRunStatusForIssue: vi.fn(async () => undefined),
+  syncRunStatusForIssue: vi.fn(async () => undefined),
     }),
     workProductService: () => mockWorkProductService,
   }));
-}
+
 
 function makeIssue(overrides: Record<string, unknown> = {}) {
   return {
@@ -405,22 +411,6 @@ function boardActor() {
 
 describe("agent issue mutation checkout ownership", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("@paperclipai/shared/telemetry");
-    vi.doUnmock("../telemetry.js");
-    vi.doUnmock("../services/access.js");
-    vi.doUnmock("../services/activity-log.js");
-    vi.doUnmock("../services/cross-issue-influence-limit.js");
-    vi.doUnmock("../services/agents.js");
-    vi.doUnmock("../services/documents.js");
-    vi.doUnmock("../services/external-objects.js");
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../services/issues.js");
-    vi.doUnmock("../services/work-products.js");
-    vi.doUnmock("../routes/issues.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerRouteMocks();
     vi.clearAllMocks();
     mockAccessService.canUser.mockReset();
     mockAccessService.decide.mockReset();
