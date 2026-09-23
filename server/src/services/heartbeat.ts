@@ -21301,7 +21301,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return {
         ...ensured,
         sessionDisplayId: latestTaskSession?.sessionDisplayId ?? ensured.sessionId,
-        sessionParamsJson: latestTaskSession?.sessionParamsJson ?? null,
+        // Internal __paperclip* session-reset bookkeeping (configured-model
+        // snapshot, config fingerprints) never leaves the service: it is
+        // per-task run-finalize state, not agent-level truth, and has
+        // misinformed model audits when surfaced here. DB rows keep it.
+        sessionParamsJson: stripPaperclipSessionMetadataFromSessionParams(
+          latestTaskSession?.sessionParamsJson ?? null,
+        ),
       };
     },
 
@@ -21309,11 +21315,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const agent = await getAgent(agentId);
       if (!agent) throw notFound("Agent not found");
 
-      return db
+      const sessions = await db
         .select()
         .from(agentTaskSessions)
         .where(and(eq(agentTaskSessions.companyId, agent.companyId), eq(agentTaskSessions.agentId, agentId)))
         .orderBy(desc(agentTaskSessions.updatedAt), desc(agentTaskSessions.createdAt));
+      // Same egress rule as getRuntimeState: internal __paperclip* session-reset
+      // metadata stays in the DB for shouldResetTaskSessionForModelChange and
+      // friends, but API consumers must not see it as agent-level state.
+      return sessions.map((session) => ({
+        ...session,
+        sessionParamsJson: stripPaperclipSessionMetadataFromSessionParams(session.sessionParamsJson ?? null),
+      }));
     },
 
     resetRuntimeSession: async (agentId: string, opts?: { taskKey?: string | null }) => {
