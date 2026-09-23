@@ -24,6 +24,7 @@ import {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
   ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
+  STALE_RUN_CORRELATION_EVALUATION_MAX_AGE_MS,
   recoveryService,
 } from "../services/recovery/service.js";
 
@@ -1110,5 +1111,327 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     const messages = events.map((event) => event.message);
     expect(messages).toContain("run started");
     expect(messages).toContain("run succeeded");
+  });
+
+  // Seed a fleet of N silent runs in ONE company — each run gets its own
+  // engineer agent and in_progress source issue, and every run is silent from
+  // (about) the same instant. This is the shared-upstream-stall shape: several
+  // agents stall together on one provider outage, and the per-run watchdog
+  // would otherwise file one ticket per run.
+  async function seedSilentFleet(opts: {
+    now: Date;
+    runCount: number;
+    ageMs: number;
+    offsetMs?: (index: number) => number;
+  }) {
+    const companyId = randomUUID();
+    const managerId = randomUUID();
+    const issuePrefix = `F${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: `Silent Fleet Co ${companyId.slice(0, 8)}`,
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    const agentRows: (typeof agents.$inferInsert)[] = [{
+      id: managerId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    }];
+    const issueRows: (typeof issues.$inferInsert)[] = [];
+    const runRows: (typeof heartbeatRuns.$inferInsert)[] = [];
+    const runs: { runId: string; coderId: string; issueId: string }[] = [];
+    for (let index = 0; index < opts.runCount; index += 1) {
+      const coderId = randomUUID();
+      const issueId = randomUUID();
+      const runId = randomUUID();
+      const startedAt = new Date(opts.now.getTime() - opts.ageMs - (opts.offsetMs?.(index) ?? 0));
+      agentRows.push({
+        id: coderId,
+        companyId,
+        name: `Coder${index}`,
+        role: "engineer",
+        status: "running",
+        reportsTo: managerId,
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      issueRows.push({
+        id: issueId,
+        companyId,
+        title: `Silent fleet issue ${index}`,
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: coderId,
+        issueNumber: index + 1,
+        identifier: `${issuePrefix}-${index + 1}`,
+        originKind: "manual",
+        createdAt: startedAt,
+        updatedAt: startedAt,
+      });
+      runRows.push({
+        id: runId,
+        companyId,
+        agentId: coderId,
+        status: "running",
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        startedAt,
+        processStartedAt: startedAt,
+        lastOutputAt: null,
+        lastOutputSeq: 0,
+        lastOutputStream: null,
+        contextSnapshot: { issueId },
+        logBytes: 0,
+      });
+      runs.push({ runId, coderId, issueId });
+    }
+    await db.insert(agents).values(agentRows);
+    await db.insert(issues).values(issueRows);
+    await db.insert(heartbeatRuns).values(runRows);
+    for (const run of runs) {
+      await db.update(issues).set({ executionRunId: run.runId }).where(eq(issues.id, run.issueId));
+    }
+    return { companyId, managerId, runs };
+  }
+
+  async function listStaleRunEvaluations(companyId: string) {
+    return db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+  }
+
+  it("correlates fleet-synchronized silences into one shared evaluation", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const seeded = await seedSilentFleet({
+      now,
+      runCount: 3,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    const { recovery } = createRecovery();
+
+    const first = await recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId });
+    expect(first).toMatchObject({ scanned: 3, created: 1, correlated: 2, existing: 0 });
+
+    const evaluations = await listStaleRunEvaluations(seeded.companyId);
+    expect(evaluations).toHaveLength(1);
+    const evaluation = evaluations[0]!;
+
+    const correlatedRows = await db
+      .select()
+      .from(heartbeatRunWatchdogDecisions)
+      .where(and(
+        eq(heartbeatRunWatchdogDecisions.companyId, seeded.companyId),
+        eq(heartbeatRunWatchdogDecisions.decision, "correlated"),
+      ));
+    expect(correlatedRows).toHaveLength(2);
+    const correlatedRunIds = new Set(correlatedRows.map((row) => row.runId));
+    const creatorRunIds = seeded.runs.map((r) => r.runId).filter((id) => !correlatedRunIds.has(id));
+    expect(creatorRunIds).toHaveLength(1);
+    // The shared evaluation belongs to the creator run, and every correlated
+    // row points at it with the per-run bookkeeping intact.
+    expect(evaluation.originId).toBe(creatorRunIds[0]);
+    for (const row of correlatedRows) {
+      expect(row.evaluationIssueId).toBe(evaluation.id);
+    }
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, evaluation.id));
+    const correlationComments = comments.filter((comment) => comment.body.includes("Correlated silent run joined"));
+    expect(correlationComments).toHaveLength(2);
+    const correlationText = correlationComments.map((comment) => comment.body).join("\n");
+    for (const runId of correlatedRunIds) {
+      expect(correlationText).toContain(runId);
+    }
+    expect(correlationText).not.toContain(creatorRunIds[0]);
+
+    // Re-scan: the correlated anchor keeps the still-silent runs on the
+    // existing-evaluation path — no duplicate comments, no new issues.
+    const second = await recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId });
+    expect(second).toMatchObject({ scanned: 3, created: 0, correlated: 0, existing: 3 });
+    expect(await listStaleRunEvaluations(seeded.companyId)).toHaveLength(1);
+    const commentsAfter = await db.select().from(issueComments).where(eq(issueComments.issueId, evaluation.id));
+    expect(commentsAfter.filter((comment) => comment.body.includes("Correlated silent run joined"))).toHaveLength(2);
+  });
+
+  it("keeps far-apart silences in separate evaluations", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const seeded = await seedSilentFleet({
+      now,
+      runCount: 2,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      offsetMs: (index) => index * 3 * 60 * 60 * 1000,
+    });
+    const { recovery } = createRecovery();
+
+    const scan = await recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId });
+    expect(scan).toMatchObject({ scanned: 2, created: 2, correlated: 0 });
+
+    const evaluations = await listStaleRunEvaluations(seeded.companyId);
+    expect(evaluations).toHaveLength(2);
+    expect(new Set(evaluations.map((issue) => issue.originId))).toEqual(
+      new Set(seeded.runs.map((run) => run.runId)),
+    );
+    const correlatedRows = await db
+      .select()
+      .from(heartbeatRunWatchdogDecisions)
+      .where(and(
+        eq(heartbeatRunWatchdogDecisions.companyId, seeded.companyId),
+        eq(heartbeatRunWatchdogDecisions.decision, "correlated"),
+      ));
+    expect(correlatedRows).toHaveLength(0);
+  });
+
+  it("does not correlate into an evaluation older than the freshness window", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const seeded = await seedSilentFleet({
+      now,
+      runCount: 2,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    // The second run is a ghost during the first scan (agent idle), so it
+    // neither creates nor correlates — only the first run's evaluation exists.
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, seeded.runs[1]!.coderId));
+    const { recovery } = createRecovery();
+    const first = await recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId });
+    expect(first).toMatchObject({ scanned: 2, created: 1, correlated: 0, skipped: 1 });
+    expect(await listStaleRunEvaluations(seeded.companyId)).toHaveLength(1);
+    const [evaluation] = await listStaleRunEvaluations(seeded.companyId);
+
+    // Age the evaluation past the correlation freshness window. The second
+    // run's silence still started within the silence window of the source
+    // run, so ONLY the freshness guard can keep the evaluations separate.
+    await db.update(issues).set({
+      createdAt: new Date(now.getTime() - STALE_RUN_CORRELATION_EVALUATION_MAX_AGE_MS - 60_000),
+    }).where(eq(issues.id, evaluation!.id));
+    await db.update(agents).set({ status: "running" }).where(eq(agents.id, seeded.runs[1]!.coderId));
+
+    const second = await recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId });
+    expect(second).toMatchObject({ scanned: 2, created: 1, correlated: 0, existing: 1 });
+    const evaluations = await listStaleRunEvaluations(seeded.companyId);
+    expect(evaluations).toHaveLength(2);
+  });
+
+  it("records per-run decisions through the shared evaluation for a correlated run", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const seeded = await seedSilentFleet({
+      now,
+      runCount: 3,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    // Third run stays a ghost through the scan so it ends up with NO binding
+    // to the shared evaluation — the sharp negative for the binding check.
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, seeded.runs[2]!.coderId));
+    const { recovery } = createRecovery();
+    await recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId });
+    const [evaluation] = await listStaleRunEvaluations(seeded.companyId);
+    const [correlatedRow] = await db
+      .select()
+      .from(heartbeatRunWatchdogDecisions)
+      .where(and(
+        eq(heartbeatRunWatchdogDecisions.companyId, seeded.companyId),
+        eq(heartbeatRunWatchdogDecisions.decision, "correlated"),
+      ));
+    const correlatedRunId = correlatedRow!.runId;
+
+    // The shared evaluation's assigned recovery owner can snooze the
+    // correlated run through the shared issue — per-run bookkeeping survives
+    // the correlation.
+    const snoozed = await recovery.recordWatchdogDecision({
+      runId: correlatedRunId,
+      actor: { type: "agent", agentId: evaluation!.assigneeAgentId },
+      decision: "snooze",
+      evaluationIssueId: evaluation!.id,
+      snoozedUntil: new Date(now.getTime() + 30 * 60 * 1000),
+      reason: "shared upstream stall; waiting it out",
+    });
+    expect(snoozed.decision).toBe("snooze");
+    expect(snoozed.evaluationIssueId).toBe(evaluation!.id);
+
+    // The board is equally accepted through the shared issue.
+    await expect(recovery.recordWatchdogDecision({
+      runId: correlatedRunId,
+      actor: { type: "board", userId: "responsible-user" },
+      decision: "continue",
+      evaluationIssueId: evaluation!.id,
+    })).resolves.toMatchObject({ decision: "continue" });
+
+    // A non-assignee agent stays forbidden even with a valid binding.
+    await expect(recovery.recordWatchdogDecision({
+      runId: correlatedRunId,
+      actor: { type: "agent", agentId: seeded.runs[2]!.coderId },
+      decision: "snooze",
+      evaluationIssueId: evaluation!.id,
+    })).rejects.toMatchObject({ status: 403 });
+
+    // An unbound run is rejected against the shared evaluation even for the
+    // assigned owner — correlation does not widen the binding to every run.
+    await expect(recovery.recordWatchdogDecision({
+      runId: seeded.runs[2]!.runId,
+      actor: { type: "agent", agentId: evaluation!.assigneeAgentId },
+      decision: "snooze",
+      evaluationIssueId: evaluation!.id,
+    })).rejects.toMatchObject({ status: 403 });
+
+    // The snooze suppresses only the correlated run's next scan pass.
+    const rescan = await recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId });
+    expect(rescan).toMatchObject({ scanned: 3, snoozed: 1, existing: 1, skipped: 1, created: 0 });
+  });
+
+  it("auto-dismisses a correlated run's own later evaluation despite the correlation row", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const seeded = await seedSilentFleet({
+      now,
+      runCount: 2,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    const { recovery } = createRecovery();
+    await recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId });
+    const [shared] = await listStaleRunEvaluations(seeded.companyId);
+    const [correlatedRow] = await db
+      .select()
+      .from(heartbeatRunWatchdogDecisions)
+      .where(and(
+        eq(heartbeatRunWatchdogDecisions.companyId, seeded.companyId),
+        eq(heartbeatRunWatchdogDecisions.decision, "correlated"),
+      ));
+    const correlatedRunId = correlatedRow!.runId;
+
+    // The shared evaluation is closed done on the board without a decision.
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, shared!.id));
+
+    // Next scan: the creator run auto-dismisses its closed evaluation; the
+    // still-silent correlated run finds no open shared evaluation and files
+    // its own.
+    const second = await recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId });
+    expect(second).toMatchObject({ scanned: 2, created: 1, skipped: 1 });
+    const evaluations = await listStaleRunEvaluations(seeded.companyId);
+    expect(evaluations).toHaveLength(2);
+
+    // That own evaluation is also closed done. The auto-dismiss guard must
+    // NOT treat the system-written correlation row as a human opt-in — the
+    // run still gets its suppression row instead of re-firing forever.
+    const [ownEvaluation] = evaluations.filter((issue) => issue.id !== shared!.id);
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, ownEvaluation!.id));
+    const third = await recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId });
+    expect(third).toMatchObject({ scanned: 2, created: 0 });
+    expect(await listStaleRunEvaluations(seeded.companyId)).toHaveLength(2);
+    const correlatedRunDecisions = await db
+      .select()
+      .from(heartbeatRunWatchdogDecisions)
+      .where(eq(heartbeatRunWatchdogDecisions.runId, correlatedRunId));
+    expect(correlatedRunDecisions.map((row) => row.decision).sort()).toEqual([
+      "correlated",
+      "dismissed_false_positive",
+    ]);
   });
 });
