@@ -2031,6 +2031,11 @@ registry.registerPath({
   path: "/api/agents/{id}/runtime-state",
   tags: ["agents"],
   summary: "Get agent runtime state",
+  description:
+    "Internal `__paperclip*` session metadata (configured-model snapshot, config fingerprints) is " +
+    "session-reset bookkeeping and is stripped from `sessionParamsJson` on egress; it is not an audit " +
+    "surface. For model audits read the pin from the agent's `adapterConfig.model` and the served model " +
+    "from the latest run's `resultJson.servedModel`.",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
 });
@@ -2052,6 +2057,11 @@ registry.registerPath({
   path: "/api/agents/{id}/task-sessions",
   tags: ["agents"],
   summary: "List agent task sessions",
+  description:
+    "Internal `__paperclip*` session metadata (configured-model snapshot, config fingerprints) is " +
+    "session-reset bookkeeping and is stripped from each row's `sessionParamsJson` on egress; it is not " +
+    "an audit surface. For model audits read the pin from the agent's `adapterConfig.model` and the " +
+    "served model from the latest run's `resultJson.servedModel`.",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
 });

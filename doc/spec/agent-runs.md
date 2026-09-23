@@ -692,8 +692,12 @@ On server startup:
    - backward-compatible alias to wakeup API
 3. `GET /agents/:agentId/runtime-state`
    - board-only debug view
+   - `sessionParamsJson` excludes internal `__paperclip*` session metadata (configured-model snapshot, config fingerprints): that is session-reset bookkeeping, not an audit surface
 4. `GET /agents/:agentId/task-sessions`
    - board-only list of task-scoped adapter sessions
+   - each row's `sessionParamsJson` excludes internal `__paperclip*` session metadata (see runtime-state above)
+
+Model audit method: configured pin -> `agent.adapterConfig.model`; served model -> latest run `resultJson.servedModel` (prime_local 0.8.6+); deep truth -> session transcripts. Never `__paperclipConfiguredModel`.
 5. `POST /agents/:agentId/runtime-state/reset-session`
    - clears all task sessions for the agent, or one when `taskKey` is provided
 6. `GET /heartbeat-runs/:runId/events?afterSeq=:n`
