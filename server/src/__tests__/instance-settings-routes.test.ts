@@ -22,16 +22,26 @@ const mockEnvironmentService = vi.hoisted(() => ({
 }));
 const mockLogActivity = vi.hoisted(() => vi.fn());
 
-function registerModuleMocks() {
-  vi.doMock("../services/index.js", () => ({
-    heartbeatService: () => mockHeartbeatService,
-    instanceSettingsService: () => mockInstanceSettingsService,
-    logActivity: mockLogActivity,
-  }));
-  vi.doMock("../services/environments.js", () => ({
-    environmentService: () => mockEnvironmentService,
-  }));
-}
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently importActual()s middleware/index.js and
+// routes/instance-settings.js, and both graphs contain services/index.js (the
+// error handler reaches it too). With doMock-registered mocks that first
+// evaluation could race the registry under load and bind the REAL services
+// module, constructing the real heartbeatService (the tell is the one-shot
+// "resolved host-wide concurrent run ceiling" INFO log) and rejecting the
+// request under test with a 500 — observed on CI in the serialized shard
+// (run 35877211616, 2026-09-23) and reproduced locally under CPU pressure.
+// A hoisted vi.mock applies to every import graph deterministically, so the
+// real services module can never leak into a request.
+vi.mock("../services/index.js", () => ({
+  heartbeatService: () => mockHeartbeatService,
+  instanceSettingsService: () => mockInstanceSettingsService,
+  logActivity: mockLogActivity,
+}));
+vi.mock("../services/environments.js", () => ({
+  environmentService: () => mockEnvironmentService,
+}));
 
 // Identity object the mocked db.transaction hands to writers; tests assert
 // both the marker clear and the settings update receive THIS same tx.
@@ -61,12 +71,6 @@ async function createApp(actor: any) {
 
 describe("instance settings routes", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../routes/instance-settings.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
     mockInstanceSettingsService.get.mockReset();
     mockInstanceSettingsService.getGeneral.mockReset();
