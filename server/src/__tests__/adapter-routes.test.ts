@@ -51,14 +51,20 @@ let setOverridePaused: typeof import("../adapters/registry.js").setOverridePause
 let adapterRoutes: typeof import("../routes/adapters.js").adapterRoutes;
 let errorHandler: typeof import("../middleware/index.js").errorHandler;
 
-function registerModuleMocks() {
-  vi.doMock("node:child_process", async () => vi.importActual("node:child_process"));
-  vi.doMock("../adapters/plugin-loader.js", () => mockPluginLoader);
-  vi.doMock("../services/adapter-plugin-store.js", () => mockAdapterPluginStore);
-  vi.doMock("../routes/adapters.js", async () => vi.importActual("../routes/adapters.js"));
-  vi.doMock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
-  vi.doMock("../middleware/index.js", async () => vi.importActual("../middleware/index.js"));
-}
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("node:child_process", async () => vi.importActual("node:child_process"));
+vi.mock("../adapters/plugin-loader.js", () => mockPluginLoader);
+vi.mock("../services/adapter-plugin-store.js", () => mockAdapterPluginStore);
+vi.mock("../routes/adapters.js", async () => vi.importActual("../routes/adapters.js"));
+vi.mock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
+vi.mock("../middleware/index.js", async () => vi.importActual("../middleware/index.js"));
 
 function createApp(
   actorOverrides: Partial<Express.Request["actor"]> = {},
@@ -84,15 +90,6 @@ function createApp(
 
 describe("adapter routes", () => {
   beforeEach(async () => {
-    vi.resetModules();
-    vi.doUnmock("node:child_process");
-    vi.doUnmock("../adapters/registry.js");
-    vi.doUnmock("../adapters/plugin-loader.js");
-    vi.doUnmock("../services/adapter-plugin-store.js");
-    vi.doUnmock("../routes/adapters.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     mockAdapterPluginStore.listAdapterPlugins.mockReturnValue([]);
     mockAdapterPluginStore.addAdapterPlugin.mockResolvedValue(undefined);
     mockAdapterPluginStore.removeAdapterPlugin.mockReturnValue(false);
