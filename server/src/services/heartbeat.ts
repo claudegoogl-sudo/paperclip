@@ -6038,6 +6038,13 @@ export async function buildPaperclipWakePayload(input: {
   // Experimental: agents write user-interaction content in ASD-STE100
   // Simplified Technical English (rendered as a prompt directive downstream).
   simplifiedEnglishInteractions?: boolean;
+  // The run that will receive this payload. Enables the run-start stamp and
+  // the same-issue sibling-run list (metadata only: agent name, run id,
+  // startedAt) rendered into the wake prompt for parallel-run orientation.
+  currentRun?: {
+    id: string;
+    startedAt?: Date | string | null;
+  } | null;
 }) {
   const executionStage = parseObject(input.contextSnapshot.executionStage);
   const commentIds = extractWakeCommentIds(input.contextSnapshot);
@@ -6268,6 +6275,44 @@ export async function buildPaperclipWakePayload(input: {
       .then((rows) => rows[0] ?? null)
     : null;
 
+  // Sibling-run visibility: other active runs on the same issue, metadata
+  // only (agent name, run id, startedAt), newest first, capped to match the
+  // renderer cap. Excludes the current run.
+  const currentRun = input.currentRun ?? null;
+  const runStartedAt = (() => {
+    if (!currentRun?.startedAt) return null;
+    const parsed = currentRun.startedAt instanceof Date ? currentRun.startedAt : new Date(currentRun.startedAt);
+    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+  })();
+  const siblingRuns =
+    issueId && currentRun
+      ? await input.db
+          .select({
+            runId: heartbeatRuns.id,
+            agentName: agents.name,
+            startedAt: heartbeatRuns.startedAt,
+          })
+          .from(heartbeatRuns)
+          .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, input.companyId),
+              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+              ne(heartbeatRuns.id, currentRun.id),
+              inArray(heartbeatRuns.status, ["queued", "running"]),
+            ),
+          )
+          .orderBy(desc(heartbeatRuns.createdAt))
+          .limit(5)
+          .then((rows) =>
+            rows.map((row) => ({
+              runId: row.runId,
+              agentName: row.agentName,
+              startedAt: row.startedAt ? row.startedAt.toISOString() : null,
+            })),
+          )
+      : [];
+
   const payload = {
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
     recovery: recoveryAction || recoveryCause
@@ -6366,6 +6411,8 @@ export async function buildPaperclipWakePayload(input: {
     },
     truncated: payloadTruncated,
     fallbackFetchNeeded: payloadTruncated || missingCommentCount > 0,
+    runStartedAt,
+    siblingRuns,
   };
   return issueId
     ? createRunSecretRedactionRegistry(input.db).redactForIssue(input.companyId, issueId, payload)
@@ -15659,6 +15706,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null,
       exposeLowTrustRaw,
       simplifiedEnglishInteractions: experimentalInstanceSettings.enableSimplifiedEnglishInteractions === true,
+      currentRun: { id: run.id, startedAt: run.startedAt ?? run.createdAt ?? null },
     });
     if (paperclipWakePayload) {
       context[PAPERCLIP_WAKE_PAYLOAD_KEY] = paperclipWakePayload;

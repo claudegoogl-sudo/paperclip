@@ -816,7 +816,12 @@ export async function runAdapterExecutionTargetProcess(
 ): Promise<RunProcessResult> {
   if (target?.kind === "remote" && target.transport === "sandbox") {
     const runner = requireSandboxRunner(target);
-    const env = sanitizeRemoteExecutionEnv(options.env);
+    // Run clock context for the sandboxed agent process (mirrors the local
+    // spawn injection): both stamps are ISO-8601 UTC and host-controlled.
+    const env: Record<string, string> = {
+      ...sanitizeRemoteExecutionEnv(options.env),
+      PAPERCLIP_NOW: new Date().toISOString(),
+    };
     await options.onRuntimeProgress?.({
       phase: "adapter_startup",
       message: "Starting adapter in environment",
@@ -829,6 +834,7 @@ export async function runAdapterExecutionTargetProcess(
       runLogTail.start(options.onLog);
     }
     try {
+      env.PAPERCLIP_RUN_STARTED_AT = new Date().toISOString();
       const result = await runner.execute({
         command: execCommand,
         args: execArgs,
