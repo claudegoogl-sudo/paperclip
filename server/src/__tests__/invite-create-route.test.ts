@@ -4,27 +4,33 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const logActivityMock = vi.fn();
 
-function registerModuleMocks() {
-  vi.doMock("../services/index.js", () => ({
-    accessService: () => ({
-      isInstanceAdmin: vi.fn(),
-      canUser: vi.fn(),
-      hasPermission: vi.fn(),
-    }),
-    agentService: () => ({
-      getById: vi.fn(),
-    }),
-    boardAuthService: () => ({
-      createChallenge: vi.fn(),
-      resolveBoardAccess: vi.fn(),
-      assertCurrentBoardKey: vi.fn(),
-      revokeBoardApiKey: vi.fn(),
-    }),
-    deduplicateAgentName: vi.fn(),
-    logActivity: (...args: unknown[]) => logActivityMock(...args),
-    notifyHireApproved: vi.fn(),
-  }));
-}
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("../services/index.js", () => ({
+  accessService: () => ({
+    isInstanceAdmin: vi.fn(),
+    canUser: vi.fn(),
+    hasPermission: vi.fn(),
+  }),
+  agentService: () => ({
+    getById: vi.fn(),
+  }),
+  boardAuthService: () => ({
+    createChallenge: vi.fn(),
+    resolveBoardAccess: vi.fn(),
+    assertCurrentBoardKey: vi.fn(),
+    revokeBoardApiKey: vi.fn(),
+  }),
+  deduplicateAgentName: vi.fn(),
+  logActivity: (...args: unknown[]) => logActivityMock(...args),
+  notifyHireApproved: vi.fn(),
+}));
 
 function createDbStub() {
   const createdInvite = {
@@ -106,12 +112,6 @@ async function createApp() {
 
 describe("POST /companies/:companyId/invites", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../routes/access.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
     logActivityMock.mockReset();
   });

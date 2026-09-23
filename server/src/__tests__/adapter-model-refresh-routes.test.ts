@@ -66,42 +66,48 @@ const mockInstanceSettingsService = vi.hoisted(() => ({
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
 
-function registerModuleMocks() {
-  vi.doMock("@paperclipai/adapter-opencode-local/server", async () => {
-    const actual = await vi.importActual<typeof import("@paperclipai/adapter-opencode-local/server")>("@paperclipai/adapter-opencode-local/server");
-    return {
-      ...actual,
-      listOpenCodeModels: mockListOpenCodeModels,
-    };
-  });
-
-  vi.doMock("../services/index.js", () => ({
-    agentService: () => ({}),
-    agentInstructionsService: () => mockAgentInstructionsService,
-    accessService: () => mockAccessService,
-    approvalService: () => mockApprovalService,
-    builtInAgentService: () => ({ ensureCompanyDefaultAgentGrants: vi.fn() }),
-    companySkillService: () => mockCompanySkillService,
-    budgetService: () => mockBudgetService,
-    heartbeatService: () => mockHeartbeatService,
-    issueApprovalService: () => mockIssueApprovalService,
-    issueService: () => ({}),
-    logActivity: mockLogActivity,
-    secretService: () => mockSecretService,
-    syncInstructionsBundleConfigFromFilePath: vi.fn((_agent, config) => config),
-    workspaceOperationService: () => ({}),
-  }));
-
-  vi.doMock("../services/instance-settings.js", () => ({
-    instanceSettingsService: () => mockInstanceSettingsService,
-  }));
-
-  vi.doMock("../services/environments.js", () => ({
-    environmentService: () => mockEnvironmentService,
-  }));
-}
-
 const refreshableAdapterType = "refreshable_adapter_route_test";
+
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("@paperclipai/adapter-opencode-local/server", async () => {
+  const actual = await vi.importActual<typeof import("@paperclipai/adapter-opencode-local/server")>("@paperclipai/adapter-opencode-local/server");
+  return {
+    ...actual,
+    listOpenCodeModels: mockListOpenCodeModels,
+  };
+});
+
+vi.mock("../services/index.js", () => ({
+  agentService: () => ({}),
+  agentInstructionsService: () => mockAgentInstructionsService,
+  accessService: () => mockAccessService,
+  approvalService: () => mockApprovalService,
+  builtInAgentService: () => ({ ensureCompanyDefaultAgentGrants: vi.fn() }),
+  companySkillService: () => mockCompanySkillService,
+  budgetService: () => mockBudgetService,
+  heartbeatService: () => mockHeartbeatService,
+  issueApprovalService: () => mockIssueApprovalService,
+  issueService: () => ({}),
+  logActivity: mockLogActivity,
+  secretService: () => mockSecretService,
+  syncInstructionsBundleConfigFromFilePath: vi.fn((_agent, config) => config),
+  workspaceOperationService: () => ({}),
+}));
+
+vi.mock("../services/instance-settings.js", () => ({
+  instanceSettingsService: () => mockInstanceSettingsService,
+}));
+
+vi.mock("../services/environments.js", () => ({
+  environmentService: () => mockEnvironmentService,
+}));
 
 async function createApp() {
   const [{ agentRoutes }, { errorHandler }] = await Promise.all([
@@ -159,11 +165,6 @@ async function unregisterTestAdapter(type: string) {
 
 describe("adapter model refresh route", () => {
   beforeEach(async () => {
-    vi.resetModules();
-    vi.doUnmock("../routes/agents.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
     mockCompanySkillService.listRuntimeSkillEntries.mockResolvedValue([]);
     mockCompanySkillService.resolveRequestedSkillKeys.mockResolvedValue([]);

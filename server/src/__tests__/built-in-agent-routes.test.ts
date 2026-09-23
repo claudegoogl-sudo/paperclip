@@ -27,6 +27,23 @@ const mockBuiltInAgentService = vi.hoisted(() => ({
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
 
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("../services/index.js", () => ({
+  accessService: () => mockAccessService,
+  instanceSettingsService: () => mockInstanceSettingsService,
+  logActivity: mockLogActivity,
+}));
+vi.mock("../services/built-in-agents.js", () => ({
+  builtInAgentService: () => mockBuiltInAgentService,
+}));
+
 function allowDecision() {
   return {
     allowed: true,
@@ -72,17 +89,6 @@ function builtInState(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function registerModuleMocks() {
-  vi.doMock("../services/index.js", () => ({
-    accessService: () => mockAccessService,
-    instanceSettingsService: () => mockInstanceSettingsService,
-    logActivity: mockLogActivity,
-  }));
-  vi.doMock("../services/built-in-agents.js", () => ({
-    builtInAgentService: () => mockBuiltInAgentService,
-  }));
-}
-
 async function createApp(actor: Record<string, unknown>) {
   const [{ builtInAgentRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/built-in-agents.js")>("../routes/built-in-agents.js"),
@@ -101,8 +107,6 @@ async function createApp(actor: Record<string, unknown>) {
 
 describe("built-in agent routes", () => {
   beforeEach(() => {
-    vi.resetModules();
-    registerModuleMocks();
     vi.clearAllMocks();
     mockAccessService.decide.mockResolvedValue(allowDecision());
     mockAccessService.canUser.mockResolvedValue(true);

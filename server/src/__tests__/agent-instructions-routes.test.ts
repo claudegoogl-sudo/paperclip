@@ -72,37 +72,43 @@ vi.mock("../adapters/index.js", () => ({
   listAdapterModels: vi.fn(),
 }));
 
-function registerModuleMocks() {
-  vi.doMock("../services/index.js", () => ({
-    agentService: () => mockAgentService,
-    agentInstructionsService: () => mockAgentInstructionsService,
-    accessService: () => mockAccessService,
-    approvalService: () => ({}),
-    builtInAgentService: () => mockBuiltInAgentService,
-    companySkillService: () => ({ listRuntimeSkillEntries: vi.fn() }),
-    budgetService: () => ({}),
-    heartbeatService: () => ({}),
-    issueApprovalService: () => ({}),
-    issueService: () => ({}),
-    logActivity: mockLogActivity,
-    secretService: () => mockSecretService,
-    syncInstructionsBundleConfigFromFilePath: mockSyncInstructionsBundleConfigFromFilePath,
-    workspaceOperationService: () => ({}),
-  }));
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("../services/index.js", () => ({
+  agentService: () => mockAgentService,
+  agentInstructionsService: () => mockAgentInstructionsService,
+  accessService: () => mockAccessService,
+  approvalService: () => ({}),
+  builtInAgentService: () => mockBuiltInAgentService,
+  companySkillService: () => ({ listRuntimeSkillEntries: vi.fn() }),
+  budgetService: () => ({}),
+  heartbeatService: () => ({}),
+  issueApprovalService: () => ({}),
+  issueService: () => ({}),
+  logActivity: mockLogActivity,
+  secretService: () => mockSecretService,
+  syncInstructionsBundleConfigFromFilePath: mockSyncInstructionsBundleConfigFromFilePath,
+  workspaceOperationService: () => ({}),
+}));
 
-  vi.doMock("../services/secrets.js", () => ({
-    secretService: () => mockSecretService,
-  }));
+vi.mock("../services/secrets.js", () => ({
+  secretService: () => mockSecretService,
+}));
 
-  vi.doMock("../services/environments.js", () => ({
-    environmentService: () => mockEnvironmentService,
-  }));
+vi.mock("../services/environments.js", () => ({
+  environmentService: () => mockEnvironmentService,
+}));
 
-  vi.doMock("../adapters/index.js", () => ({
-    findServerAdapter: mockFindServerAdapter,
-    listAdapterModels: vi.fn(),
-  }));
-}
+vi.mock("../adapters/index.js", () => ({
+  findServerAdapter: mockFindServerAdapter,
+  listAdapterModels: vi.fn(),
+}));
 
 function boardActor() {
   return {
@@ -193,11 +199,6 @@ function makeReflectionCoachAgent(overrides: Record<string, unknown> = {}) {
 
 describe("agent instructions bundle routes", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../routes/agents.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
     mockBuiltInAgentService.ensureCompanyDefaultAgentGrants.mockResolvedValue(0);
     mockSyncInstructionsBundleConfigFromFilePath.mockImplementation((_agent, config) => config);
