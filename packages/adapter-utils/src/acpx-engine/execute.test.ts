@@ -2010,6 +2010,54 @@ describe("shared ACPX engine runtime behavior", () => {
     }
   });
 
+  it("hands ACPX a value-free persistedEnv alongside the real spawn env", async () => {
+    let observedSessionOptions: { env?: Record<string, string>; persistedEnv?: Record<string, string> } | undefined;
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => ({
+        ensureSession: async (input: {
+          sessionOptions?: { env?: Record<string, string>; persistedEnv?: Record<string, string> };
+        }) => {
+          observedSessionOptions = input.sessionOptions;
+          return { backendSessionId: "backend-session", agentSessionId: "agent-session", runtimeSessionName: "runtime-session" };
+        },
+        startTurn: () => ({
+          events: (async function* () { yield { type: "done", stopReason: "end_turn" }; })(),
+          result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+          cancel: async () => {},
+        }),
+        close: async () => {},
+      }) as never,
+    });
+    const previousApiKey = process.env.PAPERCLIP_API_KEY;
+    try {
+      delete process.env.PAPERCLIP_API_KEY;
+      const result = await execute({
+        runId: "run-7718",
+        agent: { id: "agent-7718", companyId: "company-7718" },
+        runtime: {},
+        config: { agent: "custom", agentCommand: "node ./fake-acp.js", env: { ANTHROPIC_AUTH_TOKEN: "dummy-zai-not-a-secret" } },
+        context: {},
+        authToken: "runtime-key-7718",
+        onLog: async () => {},
+        onMeta: async () => {},
+      } as never);
+      expect(result.exitCode).toBe(0);
+      // Real spawn env still carries the resolved values...
+      expect(observedSessionOptions?.env?.PAPERCLIP_API_KEY).toBe("runtime-key-7718");
+      expect(observedSessionOptions?.env?.ANTHROPIC_AUTH_TOKEN).toBe("dummy-zai-not-a-secret");
+      // ...while the persisted map carries refs only, for the same key set.
+      const persisted = observedSessionOptions?.persistedEnv ?? {};
+      expect(Object.keys(persisted).sort()).toEqual(Object.keys(observedSessionOptions?.env ?? {}).sort());
+      expect(persisted.PAPERCLIP_API_KEY).toBe("__paperclip_secret_ref:PAPERCLIP_API_KEY");
+      expect(persisted.ANTHROPIC_AUTH_TOKEN).toBe("__paperclip_secret_ref:ANTHROPIC_AUTH_TOKEN");
+      expect(JSON.stringify(persisted)).not.toContain("runtime-key-7718");
+      expect(JSON.stringify(persisted)).not.toContain("dummy-zai-not-a-secret");
+    } finally {
+      if (previousApiKey === undefined) delete process.env.PAPERCLIP_API_KEY;
+      else process.env.PAPERCLIP_API_KEY = previousApiKey;
+    }
+  });
+
   it("writes a Paperclip-managed .claude/settings.local.json for the claude agent so it can reach the Paperclip API", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
