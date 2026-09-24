@@ -113,6 +113,7 @@ import { startTaskBridgeRenewalSweep } from "./services/task-bridge-renewal.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { isLoopbackHost, rewriteLoopbackUrlPort } from "./url-utils.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
+import { bufferPluginLogEntry } from "./services/plugin-host-services.js";
 import { createPluginRunContextRegistry } from "./services/plugin-run-context-registry.js";
 import {
   createDuplexAggregateByteLedgerTelemetry,
@@ -1012,6 +1013,10 @@ export async function startServer(): Promise<StartedServer> {
   const pluginWorkerManager = createPluginWorkerManager({
     runContextRegistry: pluginRunContextRegistry,
     duplexAggregateByteLedger,
+    // Worker ctx.logger notifications persist to plugin_logs on the same
+    // buffered path as the logger.log host service (§26.1), so the operator
+    // logs panel can show plugin errors.
+    workerLogPersist: (entry) => bufferPluginLogEntry({ db, ...entry }),
   });
   const heartbeat = config.heartbeatSchedulerEnabled
     ? heartbeatService(db as any, { pluginWorkerManager, duplexAggregateByteLedger })

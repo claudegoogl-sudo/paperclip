@@ -565,6 +565,41 @@ export async function flushPluginLogBuffer(): Promise<void> {
   }
 }
 
+/**
+ * Append one plugin log entry to the shared batch buffer, applying the exact
+ * persist semantics of the `logger.log` host service: message truncation and
+ * meta sanitisation (reserved pino keys stripped, serialised size cap), then a
+ * size-triggered flush.
+ *
+ * Exported so the plugin worker manager can persist worker `ctx.logger`
+ * notifications (the `log` JSON-RPC notification) on the SAME buffered path —
+ * every worker logger call must land in `plugin_logs` (§26.1), and the
+ * operator logs panel reads only that table. Fire-and-forget: never throws
+ * into the caller's notification path.
+ */
+export function bufferPluginLogEntry(entry: {
+  db: Db;
+  pluginId: string;
+  companyId: string | null;
+  level?: string;
+  message?: unknown;
+  meta?: Record<string, unknown> | null;
+}): void {
+  _logBuffer.push({
+    db: entry.db,
+    pluginId: entry.pluginId,
+    companyId: entry.companyId ?? null,
+    level: entry.level ?? "info",
+    message: truncStr(String(entry.message ?? ""), MAX_LOG_MESSAGE_LENGTH),
+    meta: sanitiseMeta(entry.meta ?? null),
+  });
+  if (_logBuffer.length >= LOG_BUFFER_FLUSH_SIZE) {
+    flushPluginLogBuffer().catch((err) => {
+      console.error("[plugin-host-services] Triggered log flush failed:", err);
+    });
+  }
+}
+
 /** Interval handle for the periodic log flush. */
 const _logFlushInterval = setInterval(() => {
   flushPluginLogBuffer().catch((err) => {
@@ -2026,19 +2061,14 @@ export function buildHostServices(
         // logger.log) so they benefit from batched writes and are flushed
         // reliably on shutdown. Using level "metric" makes them queryable
         // alongside regular logs via the same API (§26).
-        _logBuffer.push({
+        bufferPluginLogEntry({
           db,
           pluginId,
           companyId: params.companyId ?? null,
           level: "metric",
           message: safeName,
-          meta: sanitiseMeta({ value: params.value, tags: params.tags ?? null }),
+          meta: { value: params.value, tags: params.tags ?? null },
         });
-        if (_logBuffer.length >= LOG_BUFFER_FLUSH_SIZE) {
-          flushPluginLogBuffer().catch((err) => {
-            console.error("[plugin-host-services] Triggered metric flush failed:", err);
-          });
-        }
       },
     },
 
@@ -2074,20 +2104,16 @@ export function buildHostServices(
         else pluginLogger.info(logFields, `[plugin] ${safeMessage}`);
 
         // Persist to plugin_logs table via the module-level batch buffer (§26.1).
-        // Fire-and-forget — logging should never block the worker.
-        _logBuffer.push({
+        // Fire-and-forget — logging should never block the worker. The shared
+        // helper applies the same truncation/sanitisation semantics as above.
+        bufferPluginLogEntry({
           db,
           pluginId,
           companyId: params.companyId ?? null,
-          level: level ?? "info",
-          message: safeMessage,
-          meta: safeMeta,
+          level,
+          message: params.message,
+          meta,
         });
-        if (_logBuffer.length >= LOG_BUFFER_FLUSH_SIZE) {
-          flushPluginLogBuffer().catch((err) => {
-            console.error("[plugin-host-services] Triggered log flush failed:", err);
-          });
-        }
       },
     },
 
