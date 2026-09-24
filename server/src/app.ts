@@ -97,6 +97,11 @@ import {
   resolveBundledPluginInstalls,
 } from "./services/bundled-plugins.js";
 import { createPluginWorkerManager, type PluginWorkerManager } from "./services/plugin-worker-manager.js";
+import {
+  createPluginStreamBus,
+  publishWorkerStreamNotification,
+  type PluginStreamBus,
+} from "./services/plugin-stream-bus.js";
 import { createPluginJobScheduler } from "./services/plugin-job-scheduler.js";
 import { pluginJobStore } from "./services/plugin-job-store.js";
 import { createPluginToolDispatcher } from "./services/plugin-tool-dispatcher.js";
@@ -335,6 +340,12 @@ export async function createApp(
      */
     escalationApprovalCompanyId?: string;
     pluginWorkerManager?: PluginWorkerManager;
+    // Stream bus wired to the SAME worker manager instance passed above: the
+    // manager publishes verified worker stream notifications here and the
+    // plugin SSE bridge subscribes on it. When app builds its own manager it
+    // also builds the bus and wires the two; an injected manager must come
+    // with its bus (index.ts wires both) or the SSE bridge has no publisher.
+    pluginStreamBus?: PluginStreamBus;
     decisionServiceOptions: DecisionServiceOptions;
     // The run-context registry the injected pluginWorkerManager was
     // built with. MUST be the same instance, so a worker's host-minted service
@@ -450,6 +461,11 @@ export async function createApp(
   // run-contexts would never be found (Gate 1 → runcontext_invalid).
   const pluginRunContextRegistry =
     opts.pluginRunContextRegistry ?? createPluginRunContextRegistry();
+  // The SSE bridge needs BOTH halves wired to the same manager — a
+  // publisher (manager onStreamNotification → bus) and the bus itself
+  // (bridgeDeps.streamBus). Build the bus here and wire the internal-manager
+  // path; an injected manager must pair with the bus it publishes to.
+  const pluginStreamBus = opts.pluginStreamBus ?? createPluginStreamBus();
   const workerManager =
     opts.pluginWorkerManager ??
     createPluginWorkerManager({
@@ -458,6 +474,9 @@ export async function createApp(
       // buffered path as the logger.log host service (§26.1), so the operator
       // logs panel can show plugin errors.
       workerLogPersist: (entry) => bufferPluginLogEntry({ db, ...entry }),
+      onStreamNotification: ({ pluginId, method, params }) => {
+        publishWorkerStreamNotification(pluginStreamBus, pluginId, method, params);
+      },
     });
   const managedAutoInstallKeys = opts.managedPluginAutoInstall ?? null;
   const bundledCatalogRoot =
@@ -769,7 +788,7 @@ export async function createApp(
       { scheduler, jobStore },
       { workerManager },
       { toolDispatcher },
-      { workerManager },
+      { workerManager, streamBus: pluginStreamBus },
       { toolGateway },
       { reconciler: devWatcher },
     ),

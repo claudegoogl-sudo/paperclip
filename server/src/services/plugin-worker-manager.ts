@@ -1232,9 +1232,18 @@ export function createPluginWorkerHandle(
   let backoffTimer: ReturnType<typeof setTimeout> | null = null;
   let nextRestartAt: number | null = null;
 
-  // Track open stream channels so we can emit synthetic close on crash.
-  // Maps channel → companyId.
-  const openStreamChannels = new Map<string, string>();
+  // SECURITY-CRITICAL: tenant pin for stream channels. Maps channel → companyId.
+  // A pin is captured ONLY from a host-validated invocation scope: either a
+  // `streams.open` (or an in-dispatch `streams.emit`) whose echoed
+  // `paperclipInvocationId` resolves to an active host-minted invocation, with
+  // the notification's claimed companyId equal to that scope's companyId. Once
+  // pinned, out-of-dispatch `streams.emit`/`streams.close` notifications for
+  // the channel are tenant-verified against the pin per emit — the
+  // worker can never attribute a channel to a company it was not dispatched
+  // by, because the pin's value comes from the dispatch scope, never from the
+  // worker's claim. Pins live until `streams.close` or worker exit (crash
+  // emits a synthetic close and clears them below).
+  const pinnedStreamChannels = new Map<string, string>();
 
   // Shutdown coordination
   let intentionalStop = false;
@@ -3073,22 +3082,35 @@ export function createPluginWorkerHandle(
       const inFlightInvocationIds = new Set<string>();
       for (const pending of pendingRequests.values()) {
         if (pending.invocationId) inFlightInvocationIds.add(pending.invocationId);
+      }
+      const method = readNonEmptyString((message as { method?: unknown }).method);
       // Upstream (LOOA-629/695): a proactive plugin (chat gateway) does company-scoped
       // work from its own timers/loops. An id-less call that references one of the
       // plugin's configured companies resolves to that company's scope. This never
       // widens access beyond the loader-seeded allowlist; in-invocation calls keep
-      // the strict single-company match below.
-      const proactiveCompanyId = referencedCompanyId(
-        message.method,
-        (message as { params?: unknown }).params,
-      );
-      if (proactiveCompanyId && proactiveCompanyScopes.has(proactiveCompanyId)) {
-        return { invocationScope: { companyId: proactiveCompanyId } };
-      }
+      // the strict single-company match below. Resolved at statement level, NOT per
+      // pending request: scope resolution must be deterministic and independent of
+      // unrelated in-flight host→worker traffic (inside the loop above it only ever
+      // evaluated while some request happened to be outstanding).
+      //
+      // SECURITY (stream channel pins): `streams.*` NEVER resolves a scope from the
+      // proactive allowlist. A channel pin is capturable only from an echoed,
+      // host-minted invocation id (or an in-dispatch emit seeded by one); otherwise
+      // a worker could open a channel naming any configured company with no
+      // dispatch at all and hold a permanently attributed stream for it. Id-less
+      // stream traffic fails closed in the stream notification handler instead
+      // (invalid_invocation_scope / no_invocation_scope / unpinned_channel).
+      if (!method?.startsWith("streams.")) {
+        const proactiveCompanyId = referencedCompanyId(
+          message.method,
+          (message as { params?: unknown }).params,
+        );
+        if (proactiveCompanyId && proactiveCompanyScopes.has(proactiveCompanyId)) {
+          return { invocationScope: { companyId: proactiveCompanyId } };
+        }
       }
       const hasActiveInvocation =
         activeInvocations.size > 0 || inFlightInvocationIds.size > 0;
-      const method = readNonEmptyString((message as { method?: unknown }).method);
       if (!hasActiveInvocation) {
         // SECURITY-CRITICAL: an id-less call with nothing in flight is unambiguous —
         // this worker makes this call outside any dispatch. Record it so the
@@ -3196,6 +3218,64 @@ export function createPluginWorkerHandle(
       } catch {
         // Worker may have exited, ignore send error
       }
+    }
+  }
+
+  /**
+   * Forward a verified stream notification to the stream-bus callback.
+   */
+  function forwardStreamNotification(method: string, params: Record<string, unknown>): void {
+    if (!options.onStreamNotification) return;
+    try {
+      options.onStreamNotification(method, params);
+    } catch (err) {
+      log.error(
+        {
+          method,
+          err: err instanceof Error ? err.message : String(err),
+        },
+        "stream notification handler failed",
+      );
+    }
+  }
+
+  /**
+   * Drop an unverifiable stream notification — loudly. Besides the host log
+   * warn (queryable per §26.1 with pluginId), tell the WORKER its notification
+   * was dropped so out-of-dispatch emitters are not silently dead.
+   * The `streams.dropped` notification is fire-and-forget: current bundled
+   * SDKs ignore unknown notifications; SDKs bundled after this change surface
+   * it on the plugin log. Best-effort — the worker may already be gone.
+   */
+  function dropStreamNotification(
+    method: string,
+    channel: string,
+    companyId: string,
+    reason: string,
+    message: string,
+  ): void {
+    log.warn(
+      {
+        method,
+        channel: channel || undefined,
+        companyId: companyId || undefined,
+        reason,
+      },
+      message,
+    );
+    try {
+      sendMessage({
+        jsonrpc: JSONRPC_VERSION,
+        method: "streams.dropped",
+        params: {
+          method,
+          channel: channel || undefined,
+          companyId: companyId || undefined,
+          reason,
+        },
+      });
+    } catch {
+      // Worker may have exited; the warn above is the durable record.
     }
   }
 
@@ -3314,56 +3394,107 @@ export function createPluginWorkerHandle(
     ) {
       const params = (notification.params ?? {}) as Record<string, unknown>;
       const companyId = String(params.companyId ?? "");
+      const channel = String(params.channel ?? "");
       const context = contextForWorkerMessage(notification);
       if (context.invalidInvocationScope) {
-        log.warn(
-          { method: notification.method, companyId },
+        dropStreamNotification(
+          notification.method,
+          channel,
+          companyId,
+          "invalid_invocation_scope",
           "dropping plugin stream notification with invalid invocation scope",
         );
         return;
       }
       const allowedCompanyId = readNonEmptyString(context.invocationScope?.companyId);
       if (companyId) {
-        // Fail closed (matches requireInvocationCompanyScope): a company-scoped
-        // stream notification with no resolvable invocation scope cannot be
-        // tenant-verified — drop it rather than forwarding it under no pin.
         if (!allowedCompanyId) {
-          log.warn(
-            { method: notification.method, companyId },
-            "dropping company-scoped plugin stream notification with no resolvable invocation scope",
+          // No resolvable invocation scope: the notification is out-of-dispatch
+          // (async loop, reconnect callback — e.g. a status snapshot loop
+          // seeded by an earlier dispatch). Fail closed UNLESS the channel
+          // carries a pin captured at `streams.open` from a host-validated
+          // dispatch, in which case the pin tenant-verifies the emit per
+          // notification. The pin's companyId comes from the
+          // dispatch scope, never from the worker's claim, so a worker can
+          // still never attribute a channel to a company it was not
+          // dispatched by. Opens are never pinned here: an id-less open is
+          // unattributable even under the single-in-flight heuristic.
+          if (notification.method !== "streams.open") {
+            const pin = readNonEmptyString(pinnedStreamChannels.get(channel));
+            if (pin && pin === companyId) {
+              // A pinned close tears the pin down with the channel, so later
+              // emits for it fail closed again.
+              if (notification.method === "streams.close") {
+                pinnedStreamChannels.delete(channel);
+              }
+              forwardStreamNotification(notification.method, params);
+              return;
+            }
+            dropStreamNotification(
+              notification.method,
+              channel,
+              companyId,
+              pin ? "pin_mismatch" : "unpinned_channel",
+              pin
+                ? "dropping plugin stream notification outside pinned channel company"
+                : "dropping company-scoped plugin stream notification with no pinned channel",
+            );
+            return;
+          }
+          dropStreamNotification(
+            notification.method,
+            channel,
+            companyId,
+            "no_invocation_scope",
+            "dropping company-scoped plugin stream open with no resolvable invocation scope",
           );
           return;
         }
         if (companyId !== allowedCompanyId) {
-          log.warn(
-            { method: notification.method, companyId, allowedCompanyId },
+          dropStreamNotification(
+            notification.method,
+            channel,
+            companyId,
+            "company_mismatch",
             "dropping plugin stream notification outside invocation company scope",
           );
           return;
         }
       }
 
-      // Track open channels so we can emit synthetic close on crash
-      if (notification.method === "streams.open") {
-        const ch = String(params.channel ?? "");
-        if (ch) openStreamChannels.set(ch, companyId);
-      } else if (notification.method === "streams.close") {
-        openStreamChannels.delete(String(params.channel ?? ""));
+      // SECURITY: the pin checks above live inside `if (companyId)`, so a
+      // notification that omits the company claim entirely would skip them.
+      // On a pinned channel the pin IS the attribution: an empty claim is a
+      // mismatch with it, and an unclaimed close must not tear down a verified
+      // pin. (An empty-company stream would fail closed at the SSE bridge
+      // anyway, but the attribution decision belongs to this layer, not
+      // downstream.) Company-agnostic channels are never pinned, so this
+      // guard cannot affect them.
+      if (!companyId && channel && pinnedStreamChannels.has(channel)) {
+        dropStreamNotification(
+          notification.method,
+          channel,
+          companyId,
+          "pin_mismatch",
+          "dropping plugin stream notification with no company claim on a pinned channel",
+        );
+        return;
       }
 
-      if (options.onStreamNotification) {
-        try {
-          options.onStreamNotification(notification.method, params);
-        } catch (err) {
-          log.error(
-            {
-              method: notification.method,
-              err: err instanceof Error ? err.message : String(err),
-            },
-            "stream notification handler failed",
-          );
-        }
+      // Host-verified (in-dispatch with matching company, or company-agnostic).
+      // Track channel pins so out-of-dispatch emits for the channel can be
+      // attributed later, and so we can emit synthetic close on crash.
+      if (notification.method === "streams.open") {
+        if (channel && companyId) pinnedStreamChannels.set(channel, companyId);
+      } else if (notification.method === "streams.close") {
+        pinnedStreamChannels.delete(channel);
+      } else if (notification.method === "streams.emit" && channel && allowedCompanyId) {
+        // An in-dispatch emit on a never-opened channel still pins it: async
+        // loops seeded by a dispatch keep emitting after the dispatch settles.
+        pinnedStreamChannels.set(channel, allowedCompanyId);
       }
+
+      forwardStreamNotification(notification.method, params);
       return;
     }
 
@@ -3551,15 +3682,15 @@ export function createPluginWorkerHandle(
 
     // Emit synthetic close for any orphaned stream channels so SSE clients
     // are notified instead of hanging indefinitely.
-    if (openStreamChannels.size > 0 && options.onStreamNotification) {
-      for (const [channel, companyId] of openStreamChannels) {
+    if (pinnedStreamChannels.size > 0 && options.onStreamNotification) {
+      for (const [channel, companyId] of pinnedStreamChannels) {
         try {
           options.onStreamNotification("streams.close", { channel, companyId });
         } catch {
           // Best-effort cleanup — don't let it interfere with exit handling
         }
       }
-      openStreamChannels.clear();
+      pinnedStreamChannels.clear();
     }
 
     emitter.emit("exit", { pluginId, code, signal });
@@ -4191,6 +4322,18 @@ export interface PluginWorkerManagerOptions {
    * duplex bytes unbounded. The manager never makes a fresh default ledger.
    */
   duplexAggregateByteLedger?: DuplexAggregateByteLedger | null;
+  /**
+   * Callback invoked with verified stream notifications from any plugin worker
+   * (`streams.open`/`emit`/`close`). The manager stamps `pluginId` so one bus
+   * can fan out for every plugin. The server wires this to the
+   * {@link PluginStreamBus}; without it, per-worker `WorkerStartOptions.onStreamNotification`
+   * callbacks still work but no manager-level fan-out happens.
+   */
+  onStreamNotification?: (event: {
+    pluginId: string;
+    method: string;
+    params: Record<string, unknown>;
+  }) => void;
 }
 
 /**
@@ -4294,6 +4437,16 @@ export function createPluginWorkerManager(
         duplexRouteSlots,
         duplexAggregateByteLedger,
         ...options,
+        // Stamp the emitting pluginId on stream notifications fanned out at the
+        // manager level, unless the caller supplied its own per-worker callback.
+        onStreamNotification:
+          options.onStreamNotification ??
+          (managerOptions?.onStreamNotification
+            ? (method, params) => {
+                const notify = managerOptions.onStreamNotification;
+                if (notify) notify({ pluginId, method, params });
+              }
+            : undefined),
       }, {
         runContextRegistry: managerOptions?.runContextRegistry,
         workerLogPersist: managerOptions?.workerLogPersist,

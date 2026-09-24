@@ -79,3 +79,37 @@ export function createPluginStreamBus(): PluginStreamBus {
     },
   };
 }
+
+/**
+ * Translate a verified worker stream notification into a bus publish
+ * (SSE bridge wiring). `open` becomes the SSE `open` event type, `close`
+ * the `close` event type, and `emit` a `message` carrying the event payload.
+ * The SDK emits `{ channel, companyId, event }`; the bare-`params` fallback
+ * keeps custom or legacy payloads intact.
+ *
+ * Returns `true` when the notification was a recognized stream method with a
+ * channel, `false` otherwise (caller may log).
+ */
+export function publishWorkerStreamNotification(
+  bus: PluginStreamBus,
+  pluginId: string,
+  method: string,
+  params: Record<string, unknown>,
+): boolean {
+  const channel = typeof params.channel === "string" && params.channel ? params.channel : null;
+  if (!channel) return false;
+  const companyId = typeof params.companyId === "string" ? params.companyId : "";
+  const eventType: StreamEventType | null =
+    method === "streams.open"
+      ? "open"
+      : method === "streams.close"
+        ? "close"
+        : method === "streams.emit"
+          ? "message"
+          : null;
+  if (!eventType) return false;
+  const event =
+    params.event !== undefined ? params.event : params.payload !== undefined ? params.payload : params;
+  bus.publish(pluginId, channel, companyId, event, eventType);
+  return true;
+}
