@@ -61,6 +61,20 @@ rl.on("line", (line) => {
       return;
     }
 
+    if (scenario === "pin-proactive-trap") {
+      // Id-less stream notifications naming a proactively configured company,
+      // sent while THIS host→worker request is still pending. The request
+      // derives no invocation scope, so the host's proactive-scope path is
+      // the only resolver that could attribute these notifications — and
+      // stream notifications must never resolve through it (no pin, no
+      // delivery, every notification dropped loudly).
+      send({ jsonrpc: "2.0", method: "streams.open", params: { channel: params.channel, companyId: params.companyId } });
+      send({ jsonrpc: "2.0", method: "streams.emit", params: { channel: params.channel, companyId: params.companyId, event: { n: 1 } } });
+      send({ jsonrpc: "2.0", method: "streams.close", params: { channel: params.channel, companyId: params.companyId } });
+      send({ jsonrpc: "2.0", id: message.id, result: { ok: true } });
+      return;
+    }
+
     if (scenario === "open-in-dispatch" || scenario === "open-idless") {
       // open-idless deliberately omits the echo even when a dispatch is in
       // flight (legacy worker shape): the host must not pin from an
@@ -71,6 +85,20 @@ rl.on("line", (line) => {
         method: "streams.open",
         params: { channel: params.channel, companyId: params.companyId },
         ...withEcho,
+      });
+    } else if (scenario === "open-emit-idless") {
+      // Both notifications id-less while the dispatch is still in flight (the
+      // "ride concurrent traffic" shape). The host must never pin from either,
+      // even when the claimed company is proactively allowlisted.
+      send({
+        jsonrpc: "2.0",
+        method: "streams.open",
+        params: { channel: params.channel, companyId: params.companyId },
+      });
+      send({
+        jsonrpc: "2.0",
+        method: "streams.emit",
+        params: { channel: params.channel, companyId: params.companyId, event: { n: 0 } },
       });
     } else if (scenario === "emit") {
       send({

@@ -2964,6 +2964,95 @@ describe("plugin stream attribution: pinned out-of-dispatch emits", () => {
     }
   });
 
+  it("never pins or delivers via proactive scope: id-less streams.* naming a proactively configured company drop with a signal", async () => {
+    const onStreamNotification = vi.fn();
+    // The proactive allowlist is the second would-be attribution source the
+    // pin design must not trust: a proactive scope is a timer/loop
+    // authorization, not a host-validated dispatch.
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: STREAM_PIN_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: {},
+      proactiveCompanyScopes: ["proactive-co"],
+      onStreamNotification: onStreamNotification as unknown as (
+        method: string,
+        params: Record<string, unknown>,
+      ) => void,
+    });
+    try {
+      await handle.start();
+
+      // The trap dispatch derives no invocation scope (empty actorContext
+      // companyId), so its host→worker request pends WITHOUT an invocation
+      // while the fixture sends id-less streams.* naming the proactively
+      // configured company. Proactive resolution must not apply to
+      // streams.*: no pin, no publish, every notification dropped loudly.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "pin-proactive-trap", channel: "trap-ch", companyId: "proactive-co" },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(onStreamNotification).not.toHaveBeenCalled();
+
+      const drops = await handle.call("performAction", companyAction({ scenario: "report-drops" }, ""));
+      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
+        { method: "streams.open", channel: "trap-ch", companyId: "proactive-co", reason: "no_invocation_scope" },
+        { method: "streams.emit", channel: "trap-ch", companyId: "proactive-co", reason: "unpinned_channel" },
+        { method: "streams.close", channel: "trap-ch", companyId: "proactive-co", reason: "unpinned_channel" },
+      ]);
+
+      // Nothing was pinned, so a later out-of-dispatch emit stays dropped.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "emit", channel: "trap-ch", companyId: "proactive-co" },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(onStreamNotification).not.toHaveBeenCalled();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("drops a company-agnostic notification on a pinned channel with a signal", async () => {
+    const onStreamNotification = vi.fn();
+    const handle = makePinHandle(onStreamNotification);
+    try {
+      await handle.start();
+
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "open-in-dispatch", channel: "printer-status", companyId: "company-1" },
+          "company-1",
+        )),
+      ).resolves.toEqual({ ok: true });
+
+      // A pinned channel has a host-validated tenant, so a notification that
+      // claims NO company is an unattributable write to a known tenant's
+      // channel — not a wildcard broadcast. Fail closed at the attribution
+      // layer instead of relying on the SSE bridge's empty-companyId assert
+      // downstream.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "emit", channel: "printer-status", companyId: "" },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(streamChannels(onStreamNotification)).toEqual(["streams.open:printer-status:company-1"]);
+
+      const drops = await handle.call("performAction", companyAction({ scenario: "report-drops" }, ""));
+      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
+        { method: "streams.emit", channel: "printer-status", reason: "pin_mismatch" },
+      ]);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
   it("pins from an in-dispatch emit so a seeded loop keeps landing", async () => {
     const onStreamNotification = vi.fn();
     const handle = makePinHandle(onStreamNotification);
@@ -3024,6 +3113,99 @@ describe("plugin stream attribution: pinned out-of-dispatch emits", () => {
       });
     } finally {
       await manager.stopAll().catch(() => undefined);
+    }
+  });
+
+  it("never pins from an id-less open/emit naming a proactive-allowlisted company", async () => {
+    const onStreamNotification = vi.fn();
+    const handle = makePinHandle(onStreamNotification);
+    try {
+      await handle.start();
+      // The worker is configured (proactive allowlist) for company-2, so an
+      // id-less stream call naming company-2 must still never resolve a scope:
+      // pin capture requires an echoed, host-minted invocation id. While a
+      // company-2 dispatch is in flight, the id-less open+emit ride its pending
+      // request — exactly the traffic the proactive resolver used to see.
+      handle.setProactiveCompanyScopes(["company-2"]);
+
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "open-emit-idless", channel: "allowlist-ch", companyId: "company-2" },
+          "company-2",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(onStreamNotification).not.toHaveBeenCalled();
+
+      // After the dispatch settled there is still nothing pinned to leak
+      // through: the follow-up emit fails closed too.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "emit", channel: "allowlist-ch", companyId: "company-2" },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(onStreamNotification).not.toHaveBeenCalled();
+
+      const drops = await handle.call("performAction", companyAction({ scenario: "report-drops" }, ""));
+      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
+        { method: "streams.open", channel: "allowlist-ch", companyId: "company-2", reason: "invalid_invocation_scope" },
+        { method: "streams.emit", channel: "allowlist-ch", companyId: "company-2", reason: "invalid_invocation_scope" },
+        { method: "streams.emit", channel: "allowlist-ch", companyId: "company-2", reason: "unpinned_channel" },
+      ]);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("fails closed on a pinned channel when a notification carries no company claim", async () => {
+    const onStreamNotification = vi.fn();
+    const handle = makePinHandle(onStreamNotification);
+    try {
+      await handle.start();
+
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "open-in-dispatch", channel: "printer-status", companyId: "company-1" },
+          "company-1",
+        )),
+      ).resolves.toEqual({ ok: true });
+
+      // No companyId claim at all on a pinned channel: the pin checks live in
+      // the companyId branch, so an unclaimed notification must not slip
+      // through unverified — and an unclaimed close must not tear the pin down.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "emit", channel: "printer-status", event: { type: "status" } },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "close", channel: "printer-status" },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+
+      // The pin survived both unclaimed attempts: the claimed emit still lands.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "emit", channel: "printer-status", companyId: "company-1", event: { n: 2 } },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+
+      expect(streamChannels(onStreamNotification)).toEqual([
+        "streams.open:printer-status:company-1",
+        "streams.emit:printer-status:company-1",
+      ]);
+
+      const drops = await handle.call("performAction", companyAction({ scenario: "report-drops" }, ""));
+      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
+        { method: "streams.emit", channel: "printer-status", reason: "pin_mismatch" },
+        { method: "streams.close", channel: "printer-status", reason: "pin_mismatch" },
+      ]);
+    } finally {
+      await handle.stop().catch(() => undefined);
     }
   });
 });

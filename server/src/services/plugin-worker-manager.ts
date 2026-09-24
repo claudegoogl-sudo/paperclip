@@ -3082,22 +3082,35 @@ export function createPluginWorkerHandle(
       const inFlightInvocationIds = new Set<string>();
       for (const pending of pendingRequests.values()) {
         if (pending.invocationId) inFlightInvocationIds.add(pending.invocationId);
+      }
+      const method = readNonEmptyString((message as { method?: unknown }).method);
       // Upstream (LOOA-629/695): a proactive plugin (chat gateway) does company-scoped
       // work from its own timers/loops. An id-less call that references one of the
       // plugin's configured companies resolves to that company's scope. This never
       // widens access beyond the loader-seeded allowlist; in-invocation calls keep
-      // the strict single-company match below.
-      const proactiveCompanyId = referencedCompanyId(
-        message.method,
-        (message as { params?: unknown }).params,
-      );
-      if (proactiveCompanyId && proactiveCompanyScopes.has(proactiveCompanyId)) {
-        return { invocationScope: { companyId: proactiveCompanyId } };
-      }
+      // the strict single-company match below. Resolved at statement level, NOT per
+      // pending request: scope resolution must be deterministic and independent of
+      // unrelated in-flight host→worker traffic (inside the loop above it only ever
+      // evaluated while some request happened to be outstanding).
+      //
+      // SECURITY (stream channel pins): `streams.*` NEVER resolves a scope from the
+      // proactive allowlist. A channel pin is capturable only from an echoed,
+      // host-minted invocation id (or an in-dispatch emit seeded by one); otherwise
+      // a worker could open a channel naming any configured company with no
+      // dispatch at all and hold a permanently attributed stream for it. Id-less
+      // stream traffic fails closed in the stream notification handler instead
+      // (invalid_invocation_scope / no_invocation_scope / unpinned_channel).
+      if (!method?.startsWith("streams.")) {
+        const proactiveCompanyId = referencedCompanyId(
+          message.method,
+          (message as { params?: unknown }).params,
+        );
+        if (proactiveCompanyId && proactiveCompanyScopes.has(proactiveCompanyId)) {
+          return { invocationScope: { companyId: proactiveCompanyId } };
+        }
       }
       const hasActiveInvocation =
         activeInvocations.size > 0 || inFlightInvocationIds.size > 0;
-      const method = readNonEmptyString((message as { method?: unknown }).method);
       if (!hasActiveInvocation) {
         // SECURITY-CRITICAL: an id-less call with nothing in flight is unambiguous —
         // this worker makes this call outside any dispatch. Record it so the
@@ -3447,6 +3460,25 @@ export function createPluginWorkerHandle(
           );
           return;
         }
+      }
+
+      // SECURITY: the pin checks above live inside `if (companyId)`, so a
+      // notification that omits the company claim entirely would skip them.
+      // On a pinned channel the pin IS the attribution: an empty claim is a
+      // mismatch with it, and an unclaimed close must not tear down a verified
+      // pin. (An empty-company stream would fail closed at the SSE bridge
+      // anyway, but the attribution decision belongs to this layer, not
+      // downstream.) Company-agnostic channels are never pinned, so this
+      // guard cannot affect them.
+      if (!companyId && channel && pinnedStreamChannels.has(channel)) {
+        dropStreamNotification(
+          notification.method,
+          channel,
+          companyId,
+          "pin_mismatch",
+          "dropping plugin stream notification with no company claim on a pinned channel",
+        );
+        return;
       }
 
       // Host-verified (in-dispatch with matching company, or company-agnostic).
