@@ -70,34 +70,47 @@ const moduleLog = logger.child({ service: "plugin-loader" });
 
 /**
  * Load a plugin manifest module via dynamic `import()`, cache-busting on the
- * file's mtime so that rebuilds during install/upgrade are observed without a
- * host restart.
+ * file's content digest so that rebuilds during install/upgrade are observed
+ * without a host restart.
  *
  * Node's ESM loader keys cached modules by absolute specifier (URL). A bare
  * `import('/.../manifest.js')` therefore returns the originally-imported
  * module for the lifetime of the process, even if the file on disk has been
  * rebuilt — every install/upgrade silently uses the stale manifest.
  *
- * Appending `?mtime=<mtimeMs>` to a `file://` URL is an ESM-spec-compliant way
- * to make the specifier change when (and only when) the file changes:
- * unchanged files keep the same URL → the cached import is reused → no perf
- * regression; changed files get a fresh URL → a fresh import → the new
- * manifest contents win.
+ * Appending `?digest=<sha256>` to a `file://` URL is an ESM-spec-compliant
+ * way to make the specifier change when (and only when) the file's bytes
+ * change: unchanged files keep the same URL → the cached import is reused →
+ * no perf regression; changed files get a fresh URL → a fresh import → the
+ * new manifest contents win.
+ *
+ * The key must be content-derived, not mtime-derived. `npm pack` normalizes
+ * every tar entry mtime to a fixed epoch, so an upgrade stage can replace a
+ * module with different bytes that carry the SAME mtime as the file they
+ * replace. An mtime-keyed URL is then identical, Node serves the cached OLD
+ * module, and the upgrade reports the old version as installed. A digest key
+ * makes the cache-bust independent of filesystem timestamp behavior.
  *
  * Returns the raw module's default export (or the module itself if there is
  * no default), unvalidated. Validation is the caller's responsibility.
  *
- * Exported so the regression test in `plugin-loader.test.ts` can exercise the
- * cache-bust property directly without spinning up the full install pipeline.
+ * Exported so the regression tests in `plugin-loader.test.ts` can exercise
+ * the cache-bust properties directly without spinning up the full install
+ * pipeline.
  *
- * Host bug this fixes: plugin manifest re-import hits ESM cache
- * and silently keeps serving the pre-rebuild manifest.
+ * Host bugs this fixes: (1) plugin manifest re-import hits ESM cache and
+ * silently keeps serving the pre-rebuild manifest; (2) an mtime-keyed URL
+ * served the OLD module after an upgrade whose staged files kept the same
+ * (normalized) mtime.
  */
 export async function loadManifestModule(
   manifestPath: string,
 ): Promise<unknown> {
-  const fileStat = await stat(manifestPath);
-  const url = `${pathToFileURL(manifestPath).href}?mtime=${fileStat.mtimeMs}`;
+  // Content digest of the module bytes — see the npm-pack mtime-normalization
+  // note above for why the cache key must not be the mtime.
+  const bytes = await readFile(manifestPath);
+  const digest = createHash("sha256").update(bytes).digest("hex");
+  const url = `${pathToFileURL(manifestPath).href}?digest=${digest}`;
   const mod = (await import(url)) as Record<string, unknown>;
   // The manifest may be the default export or the module namespace itself
   return mod["default"] ?? mod;
