@@ -73,6 +73,8 @@ import { logger } from "../middleware/logger.js";
 import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js";
 import { clearRunSecretValues } from "../run-secret-registry.js";
 import { redactSensitiveText } from "../redaction.js";
+import { redactSecretsForLog } from "../secret-patterns.js";
+import { sanitiseMeta } from "./plugin-host-services.js";
 import { traceparentFromContextToken } from "../instrumentation.js";
 
 /**
@@ -3220,20 +3222,26 @@ export function createPluginWorkerHandle(
       // The child logger already carries `pluginId` in its bindings, but we
       // add explicit `pluginLogLevel` and `pluginTimestamp` so downstream
       // consumers (log storage, UI queries) can filter without parsing.
+      // SECURITY: the meta spread and the message go through the same
+      // sanitiser/redactor the persist sink applies, so the host pino line can
+      // never carry a shape-valid secret from worker-authored content. The
+      // values handed to `workerLogPersist` below stay raw — the persist side
+      // owns truncation + sanitisation (single semantics, sink contract).
       const logFields: Record<string, unknown> = {
-        ...meta,
+        ...(sanitiseMeta(meta) ?? {}),
         pluginLogLevel: level,
         pluginTimestamp: new Date().toISOString(),
       };
+      const safeLine = redactSecretsForLog(msg);
 
       if (level === "error") {
-        log.error(logFields, `[plugin] ${msg}`);
+        log.error(logFields, `[plugin] ${safeLine}`);
       } else if (level === "warn") {
-        log.warn(logFields, `[plugin] ${msg}`);
+        log.warn(logFields, `[plugin] ${safeLine}`);
       } else if (level === "debug") {
-        log.debug(logFields, `[plugin] ${msg}`);
+        log.debug(logFields, `[plugin] ${safeLine}`);
       } else {
-        log.info(logFields, `[plugin] ${msg}`);
+        log.info(logFields, `[plugin] ${safeLine}`);
       }
 
       // §26.1: persist the worker logger call to plugin_logs — the host log

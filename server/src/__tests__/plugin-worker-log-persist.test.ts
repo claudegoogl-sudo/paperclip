@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, like } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import type { HostToWorkerMethods } from "@paperclipai/plugin-sdk";
@@ -21,6 +21,14 @@ import {
 
 const FIXTURES_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 const LOGGER_EMIT_WORKER_ENTRYPOINT = path.join(FIXTURES_DIR, "plugin-worker-logger-emit.cjs");
+
+// Synthetic, shape-valid credential fixtures for the persist-sink redaction
+// regression (§26.1). These are NOT live values — they only exercise the
+// shared secret-pattern recognisers (same set the pino host-log path uses).
+const SYNTH_GITHUB_PAT = `github_pat_${"A".repeat(36)}`;
+const SYNTH_GITHUB_PAT_MARKER = "<redacted github_pat>";
+const SYNTH_AWS_KEY = `AKIA${"2".repeat(16)}`;
+const SYNTH_AWS_KEY_MARKER = "<redacted aws_access_key>";
 
 const TEST_MANIFEST: PaperclipPluginManifestV1 = {
   id: "test.plugin",
@@ -307,5 +315,83 @@ describeEmbeddedPostgres("worker log notification → plugin_logs persist (§26.
     } finally {
       await manager.stopAll().catch(() => undefined);
     }
+  });
+
+  it("pattern-redacts shape-valid secrets in meta and message before persisting (persist-sink redaction)", async () => {
+    const { pluginId, companyId } = await seedPluginAndCompany();
+    const manager = createPluginWorkerManager({ workerLogPersist: managerPersistingTo(db) });
+
+    const handle = await manager.startWorker(pluginId, {
+      entrypointPath: LOGGER_EMIT_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: {},
+    });
+
+    try {
+      // A worker logs a message and meta that embed shape-valid credential
+      // values (synthetic fixtures — the same recognisers the pino host-log
+      // path uses). The persisted row must carry only the class markers; no
+      // substring of either synthetic value may survive anywhere in the row.
+      await handle.call("getData", {
+        companyId,
+        mode: "dispatch-log",
+        message: `evt.leaky_message token=${SYNTH_GITHUB_PAT}`,
+        meta: {
+          plugin: "test.plugin",
+          note: `aws=${SYNTH_AWS_KEY}`,
+          nested: { deep: SYNTH_GITHUB_PAT },
+        },
+      } as unknown as HostToWorkerMethods["getData"][0]);
+      await flushPluginLogBuffer();
+
+      const rows = await db
+        .select()
+        .from(pluginLogs)
+        .where(and(eq(pluginLogs.pluginId, pluginId), like(pluginLogs.message, "evt.leaky_message%")));
+      expect(rows.length).toBe(1);
+      const row = rows[0]!;
+      expect(row.message).toBe(`evt.leaky_message token=${SYNTH_GITHUB_PAT_MARKER}`);
+      expect(row.meta).toEqual({
+        plugin: "test.plugin",
+        note: `aws=${SYNTH_AWS_KEY_MARKER}`,
+        nested: { deep: SYNTH_GITHUB_PAT_MARKER },
+      });
+      // Defense in depth: neither raw synthetic value survives anywhere.
+      const serialised = JSON.stringify(row);
+      expect(serialised).not.toContain(SYNTH_GITHUB_PAT);
+      expect(serialised).not.toContain(SYNTH_AWS_KEY);
+    } finally {
+      await manager.stopAll().catch(() => undefined);
+    }
+  });
+
+  it("normalises the worker-controlled level to the known set before persisting", async () => {
+    const { pluginId, companyId } = await seedPluginAndCompany();
+
+    // The sink receives plugin-controlled level strings that are used as a
+    // read filter (`GET /api/plugins/:id/logs?level=`), so only the known set
+    // may persist; anything else collapses to "info". "metric" stays: it is
+    // host-minted by `metrics.write` (§26: queryable alongside logs).
+    bufferPluginLogEntry({ db, pluginId, companyId, level: "VERBOSE", message: "evt.level_uppercase" });
+    bufferPluginLogEntry({ db, pluginId, companyId, level: "totally-bogus", message: "evt.level_bogus" });
+    bufferPluginLogEntry({ db, pluginId, companyId, level: undefined, message: "evt.level_missing" });
+    bufferPluginLogEntry({ db, pluginId, companyId, level: "metric", message: "evt.level_metric" });
+    bufferPluginLogEntry({ db, pluginId, companyId, level: "debug", message: "evt.level_debug" });
+    await flushPluginLogBuffer();
+
+    async function levelFor(message: string) {
+      const rows = await db.select().from(pluginLogs).where(eq(pluginLogs.message, message));
+      expect(rows.length).toBe(1);
+      return rows[0]!.level;
+    }
+
+    expect(await levelFor("evt.level_uppercase")).toBe("info");
+    expect(await levelFor("evt.level_bogus")).toBe("info");
+    expect(await levelFor("evt.level_missing")).toBe("info");
+    expect(await levelFor("evt.level_metric")).toBe("metric");
+    expect(await levelFor("evt.level_debug")).toBe("debug");
   });
 });

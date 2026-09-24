@@ -1833,6 +1833,8 @@ Log storage rules:
 
 - Plugin logs are stored in a `plugin_logs` table or appended to a log file under the plugin's data directory.
 - Each log entry includes: plugin ID, timestamp, level, message, and optional structured metadata.
+- The host redacts secret-shaped content (credential and token patterns) from the persisted message and metadata before storage.
+- The host stores a normalised level: `debug`, `info`, `warn`, `error`, or `metric` (metrics written through `ctx.metrics.write`). Any other value is stored as `info`.
 - Logs are queryable from the plugin settings page in the UI.
 - Logs have a configurable retention period (default: 7 days).
 - The host captures `stdout` and `stderr` from the worker process as fallback logs even if the worker does not use `ctx.logger`.
