@@ -107,7 +107,11 @@ import {
 } from "./services/plugin-run-context-registry.js";
 import { pluginLifecycleManager } from "./services/plugin-lifecycle.js";
 import { createPluginJobCoordinator } from "./services/plugin-job-coordinator.js";
-import { buildHostServices, flushPluginLogBuffer } from "./services/plugin-host-services.js";
+import {
+  bufferPluginLogEntry,
+  buildHostServices,
+  flushPluginLogBuffer,
+} from "./services/plugin-host-services.js";
 import { createPluginEventBus } from "./services/plugin-event-bus.js";
 import { setPluginEventBus } from "./services/activity-log.js";
 import { createPluginDevWatcher } from "./services/plugin-dev-watcher.js";
@@ -448,7 +452,13 @@ export async function createApp(
     opts.pluginRunContextRegistry ?? createPluginRunContextRegistry();
   const workerManager =
     opts.pluginWorkerManager ??
-    createPluginWorkerManager({ runContextRegistry: pluginRunContextRegistry });
+    createPluginWorkerManager({
+      runContextRegistry: pluginRunContextRegistry,
+      // Worker ctx.logger notifications persist to plugin_logs on the same
+      // buffered path as the logger.log host service (§26.1), so the operator
+      // logs panel can show plugin errors.
+      workerLogPersist: (entry) => bufferPluginLogEntry({ db, ...entry }),
+    });
   const managedAutoInstallKeys = opts.managedPluginAutoInstall ?? null;
   const bundledCatalogRoot =
     opts.bundledPluginCatalogRoot ?? resolveBundledCatalogRoot(process.env);

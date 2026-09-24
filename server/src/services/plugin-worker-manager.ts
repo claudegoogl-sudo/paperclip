@@ -1060,6 +1060,12 @@ export interface PluginWorkerHandleDeps {
    * worker-lifetime service path.
    */
   runContextRegistry?: PluginRunContextRegistry;
+  /**
+   * Persist sink for worker `log` notifications; see
+   * {@link PluginWorkerLogPersistSink}. Injected by the manager from
+   * {@link PluginWorkerManagerOptions.workerLogPersist}.
+   */
+  workerLogPersist?: PluginWorkerLogPersistSink;
 }
 
 /**
@@ -1074,6 +1080,7 @@ export function createPluginWorkerHandle(
 ): PluginWorkerHandle {
   const log = logger.child({ service: "plugin-worker", pluginId });
   const runContextRegistry = deps.runContextRegistry;
+  const workerLogPersist = deps.workerLogPersist;
   const emitter = new EventEmitter();
   /**
    * Higher than default (10) to accommodate multiple subscribers to
@@ -3228,6 +3235,35 @@ export function createPluginWorkerHandle(
       } else {
         log.info(logFields, `[plugin] ${msg}`);
       }
+
+      // §26.1: persist the worker logger call to plugin_logs — the host log
+      // line above never reaches the operator logs panel, so plugin errors
+      // were invisible there. Company attribution mirrors the other
+      // worker→host notifications: a dispatch-scoped log (the worker echoed
+      // the invocation id, or a legacy worker owns the single in-flight
+      // dispatch) pins that dispatch's host-validated company; a proactive or
+      // setup()-loop log has no claim to any company and persists as
+      // instance-scope (companyId null). Raw values go to the sink — the
+      // persist side applies the shared truncation + sanitiseMeta semantics.
+      // Fire-and-forget: a sink failure must never break the notification path.
+      if (workerLogPersist) {
+        try {
+          const logContext = baseContextForWorkerMessage(notification);
+          const scopedCompanyId =
+            readNonEmptyString(logContext.invocationScope?.companyId) ??
+            readNonEmptyString(logContext.singleInFlightScope?.companyId) ??
+            null;
+          workerLogPersist({
+            pluginId,
+            companyId: scopedCompanyId,
+            level,
+            message: msg,
+            meta: meta ?? null,
+          });
+        } catch (err) {
+          log.warn({ err, pluginId }, "worker log persist sink failed");
+        }
+      }
       return;
     }
 
@@ -4087,6 +4123,23 @@ export function createPluginWorkerHandle(
 /**
  * Options for creating a PluginWorkerManager.
  */
+/**
+ * Persist sink for worker `ctx.logger` notifications (the `log` JSON-RPC
+ * notification). The server wires it to the plugin-host-services log buffer
+ * (`bufferPluginLogEntry`) so every worker logger call lands in `plugin_logs`
+ * (§26.1) and the operator logs panel can show plugin errors. The sink receives
+ * RAW values — the persist side applies the same truncation/sanitisation
+ * semantics as the `logger.log` host service. When absent (unit tests), worker
+ * log notifications only hit the host log.
+ */
+export type PluginWorkerLogPersistSink = (entry: {
+  pluginId: string;
+  companyId: string | null;
+  level: string;
+  message: string;
+  meta: Record<string, unknown> | null;
+}) => void;
+
 export interface PluginWorkerManagerOptions {
   /**
    * Optional callback invoked when a worker emits a lifecycle event
@@ -4106,6 +4159,12 @@ export interface PluginWorkerManagerOptions {
    * `setup()`-started loops can resolve secrets. Deregistered on stop.
    */
   runContextRegistry?: PluginRunContextRegistry;
+  /**
+   * Persist sink for worker `ctx.logger` notifications; see
+   * {@link PluginWorkerLogPersistSink}. Injected by the server so worker logger
+   * calls persist to `plugin_logs` on the shared buffered path.
+   */
+  workerLogPersist?: PluginWorkerLogPersistSink;
   /**
    * The process-scoped aggregate ceiling for concurrent duplex channel routes,
    * across every worker in the process. The manager builds one shared slot
@@ -4229,6 +4288,7 @@ export function createPluginWorkerManager(
         ...options,
       }, {
         runContextRegistry: managerOptions?.runContextRegistry,
+        workerLogPersist: managerOptions?.workerLogPersist,
       });
       workers.set(pluginId, handle);
 
