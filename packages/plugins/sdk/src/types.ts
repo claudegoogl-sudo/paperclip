@@ -2360,6 +2360,14 @@ export interface PluginAuthorizationClient {
  * reconnect callbacks) are delivered against the pin. Emits that cannot be
  * attributed are dropped with a plugin-visible `streams.dropped` signal.
  *
+ * Pins are bounded per worker: once the host's per-worker cap is reached,
+ * capturing a new pin evicts the least-recently pinned channel, and the
+ * eviction is reported with a `streams.dropped` signal
+ * (`reason: "pin_cap_exceeded"`) naming the evicted channel. Close channels
+ * you are done with (`ctx.streams.close`) to stay under the cap; an evicted
+ * channel keeps working inside dispatches but loses its out-of-dispatch
+ * attribution until it is re-opened.
+ *
  * @example
  * ```ts
  * // Worker: stream chat tokens to the UI
