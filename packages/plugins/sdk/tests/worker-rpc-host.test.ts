@@ -1098,3 +1098,95 @@ describe("worker duplex channel dispatch", () => {
     }
   });
 });
+
+
+describe("worker streams.dropped feedback", () => {
+  it("forwards a host streams.dropped notification to the plugin log as a warning", async () => {
+    const hostToWorker = new PassThrough();
+    const workerToHost = new PassThrough();
+    const hostReadline = createInterface({ input: workerToHost });
+    const pending = new Map<string, (response: JsonRpcResponse) => void>();
+    const logNotifications: Array<Record<string, unknown>> = [];
+    let nextRequestId = 1;
+    const plugin = definePlugin({
+      async setup(ctx) {
+        ctx.actions.register("noop", async () => ({ ok: true }));
+      },
+    });
+    const worker = startWorkerRpcHost({
+      plugin,
+      stdin: hostToWorker,
+      stdout: workerToHost,
+    });
+
+    function callWorker(method: string, params: unknown) {
+      const id = `host-${nextRequestId++}`;
+      const result = new Promise<unknown>((resolve, reject) => {
+        pending.set(id, (response) => {
+          if ("error" in response && response.error) {
+            reject(new Error(response.error.message));
+            return;
+          }
+          resolve((response as { result?: unknown }).result);
+        });
+      });
+      hostToWorker.write(serializeMessage(createRequest(method, params, id)));
+      return result;
+    }
+
+    hostReadline.on("line", (line) => {
+      const message = parseMessage(line);
+      if (isJsonRpcNotification(message) && message.method === "log") {
+        logNotifications.push((message as JsonRpcNotification).params as Record<string, unknown>);
+        return;
+      }
+      if (!isJsonRpcResponse(message)) return;
+      pending.get(String(message.id))?.(message);
+      pending.delete(String(message.id));
+    });
+
+    try {
+      await expect(callWorker("initialize", {
+        manifest: {
+          id: "paperclip.test-stream-drop",
+          apiVersion: 1,
+          version: "1.0.0",
+          displayName: "Stream Drop Test",
+          description: "Test plugin",
+          author: "Paperclip",
+          categories: ["automation"],
+          capabilities: [],
+          entrypoints: {},
+        },
+        config: {},
+        databaseNamespace: null,
+      })).resolves.toMatchObject({ ok: true });
+
+      // Host → worker drop signal (fire-and-forget, no id).
+      hostToWorker.write(serializeMessage({
+        jsonrpc: "2.0" as const,
+        method: "streams.dropped",
+        params: {
+          method: "streams.emit",
+          channel: "printer-status",
+          companyId: "company-1",
+          reason: "unpinned_channel",
+        },
+      }));
+      // Let the readline loop settle.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(logNotifications).toHaveLength(1);
+      expect(logNotifications[0]).toMatchObject({
+        level: "warn",
+        message: expect.stringContaining("unpinned_channel"),
+      });
+      expect(String(logNotifications[0].message)).toContain('channel="printer-status"');
+    } finally {
+      worker.stop();
+      hostReadline.close();
+      hostToWorker.destroy();
+      workerToHost.destroy();
+    }
+  });
+});

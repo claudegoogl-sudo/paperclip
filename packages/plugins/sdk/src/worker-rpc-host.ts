@@ -2533,6 +2533,19 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             message: `Failed to handle event notification: ${err instanceof Error ? err.message : String(err)}`,
           });
         });
+      } else if (notif.method === "streams.dropped" && notif.params) {
+        // Host feedback: a `streams.*` notification was dropped because it
+        // could not be tenant-verified. Surface it on the plugin
+        // log so out-of-dispatch emitters are diagnosable instead of silently
+        // dead. Fire-and-forget — never throw into the readline loop.
+        const drop = notif.params as { method?: string; channel?: string; reason?: string };
+        notifyHost("log", {
+          level: "warn",
+          message: `host dropped streams ${drop.method ?? "notification"} (${
+            drop.reason ?? "unknown"
+          })${drop.channel ? ` channel="${drop.channel}"` : ""}`,
+          meta: { streamDropReason: drop.reason ?? "unknown", channel: drop.channel },
+        });
       }
     }
   }

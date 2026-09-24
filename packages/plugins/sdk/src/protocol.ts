@@ -2523,6 +2523,29 @@ export interface WorkerToHostNotifications {
   };
 
   /**
+   * Host→worker feedback: the host DROPPED a `streams.*`
+   * notification because it could not be tenant-verified — no resolvable
+   * invocation scope, no channel pin captured at `streams.open` inside an
+   * attributed dispatch, or a companyId that mismatches the pin.
+   *
+   * This notification is fire-and-forget in both directions: the worker RPC
+   * host forwards it to the plugin log (`level: "warn"`) so out-of-dispatch
+   * emitters are diagnosable instead of silently dead. Reason codes:
+   * `invalid_invocation_scope`, `no_invocation_scope`, `company_mismatch`,
+   * `unpinned_channel`, `pin_mismatch`.
+   */
+  "streams.dropped": {
+    /** The dropped worker→host notification method (`streams.emit`, …). */
+    method: string;
+    /** Channel of the dropped notification, when one was named. */
+    channel?: string;
+    /** Claimed companyId of the dropped notification, when one was sent. */
+    companyId?: string;
+    /** Why the host dropped it. */
+    reason: string;
+  };
+
+  /**
    * Deliver one incremental output chunk of the active `environmentExecute`
    * call to the host runner log sink.
    *

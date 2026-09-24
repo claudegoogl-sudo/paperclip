@@ -2354,6 +2354,12 @@ export interface PluginAuthorizationClient {
  * Streams are scoped to `(pluginId, channel, companyId)`. Multiple UI clients
  * can subscribe to the same channel concurrently.
  *
+ * Attribution: the host tenant-verifies every notification. Open
+ * the channel inside a dispatch for the target company — the host pins the
+ * channel to that company, so later out-of-dispatch emits (status loops,
+ * reconnect callbacks) are delivered against the pin. Emits that cannot be
+ * attributed are dropped with a plugin-visible `streams.dropped` signal.
+ *
  * @example
  * ```ts
  * // Worker: stream chat tokens to the UI

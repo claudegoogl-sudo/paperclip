@@ -179,6 +179,12 @@ export function useHostLocation(): HostLocation {
  * and accumulates events as they arrive. The worker pushes events using
  * `ctx.streams.emit(channel, event)`.
  *
+ * The worker side must open the channel inside a dispatch for the target
+ * company (or emit in-dispatch once) so the host can pin and attribute the
+ * stream; out-of-dispatch emitters without a pin are dropped with a
+ * `streams.dropped` signal (see the SDK README, "Attribution"). For pure
+ * background data with no attributable emitter, prefer `usePluginData` polling.
+ *
  * @template T The expected shape of each streamed event
  * @param channel - The stream channel name (must match what the worker uses in `ctx.streams.emit`)
  * @param options - Optional configuration for the stream

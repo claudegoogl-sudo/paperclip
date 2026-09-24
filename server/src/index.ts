@@ -114,6 +114,10 @@ import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runt
 import { isLoopbackHost, rewriteLoopbackUrlPort } from "./url-utils.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { bufferPluginLogEntry } from "./services/plugin-host-services.js";
+import {
+  createPluginStreamBus,
+  publishWorkerStreamNotification,
+} from "./services/plugin-stream-bus.js";
 import { createPluginRunContextRegistry } from "./services/plugin-run-context-registry.js";
 import {
   createDuplexAggregateByteLedgerTelemetry,
@@ -1010,6 +1014,12 @@ export async function startServer(): Promise<StartedServer> {
   // and createApp — passing the manager without its registry would leave the
   // handler reading a disjoint, empty registry (Gate 1 -> runcontext_invalid).
   const pluginRunContextRegistry = createPluginRunContextRegistry();
+  // One process-wide stream bus. Verified worker stream notifications publish
+  // here and the plugin SSE bridge (`GET /api/plugins/:pluginId/bridge/stream/:channel`)
+  // fans them out to subscribed UIs. Without this wiring the SSE
+  // bridge was a silently-dead surface — the endpoint 501'd and no worker
+  // notification ever reached a subscriber.
+  const pluginStreamBus = createPluginStreamBus();
   const pluginWorkerManager = createPluginWorkerManager({
     runContextRegistry: pluginRunContextRegistry,
     duplexAggregateByteLedger,
@@ -1017,6 +1027,15 @@ export async function startServer(): Promise<StartedServer> {
     // buffered path as the logger.log host service (§26.1), so the operator
     // logs panel can show plugin errors.
     workerLogPersist: (entry) => bufferPluginLogEntry({ db, ...entry }),
+    onStreamNotification: ({ pluginId, method, params }) => {
+      const published = publishWorkerStreamNotification(pluginStreamBus, pluginId, method, params);
+      if (!published) {
+        logger.warn(
+          { pluginId, method },
+          "unrecognized plugin stream notification could not be published",
+        );
+      }
+    },
   });
   const heartbeat = config.heartbeatSchedulerEnabled
     ? heartbeatService(db as any, { pluginWorkerManager, duplexAggregateByteLedger })
@@ -1066,6 +1085,7 @@ export async function startServer(): Promise<StartedServer> {
     betterAuthHandler,
     resolveSession,
     pluginWorkerManager,
+    pluginStreamBus,
     decisionServiceOptions,
     managedPluginAutoInstall,
     pluginRunContextRegistry,
