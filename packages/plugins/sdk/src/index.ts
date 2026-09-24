@@ -295,6 +295,7 @@ export type {
   PluginDataClient,
   PluginActionsClient,
   PluginStreamsClient,
+  StreamDropNotice,
   PluginToolsClient,
   PluginMetricsClient,
   PluginTelemetryClient,
