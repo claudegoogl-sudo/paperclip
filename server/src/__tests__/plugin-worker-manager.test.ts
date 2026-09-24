@@ -3208,4 +3208,116 @@ describe("plugin stream attribution: pinned out-of-dispatch emits", () => {
       await handle.stop().catch(() => undefined);
     }
   });
+
+  it("caps pins per worker: oldest pin evicted, reported via streams.dropped, and no longer attributed", async () => {
+    const onStreamNotification = vi.fn();
+    const handle = makePinHandle(onStreamNotification);
+    try {
+      await handle.start();
+
+      // One dispatch opens 130 host-verified channels: the first 128 pin, and
+      // capturing pins 129/130 evicts the two oldest pins (cap-ch-0/1).
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "open-burst", prefix: "cap-ch-", count: 130, companyId: "company-1" },
+          "company-1",
+        )),
+      ).resolves.toEqual({ ok: true });
+
+      // Every open was verified in-dispatch and forwarded to the bus — the
+      // cap limits attribution memory, it does not silently swallow traffic.
+      expect(streamChannels(onStreamNotification)).toHaveLength(130);
+      expect(streamChannels(onStreamNotification)[0]).toBe("streams.open:cap-ch-0:company-1");
+      expect(streamChannels(onStreamNotification)[129]).toBe("streams.open:cap-ch-129:company-1");
+
+      // Both evictions are plugin-visible with the cap reason, oldest first.
+      const drops = await handle.call("performAction", companyAction({ scenario: "report-drops" }, ""));
+      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
+        { method: "streams.open", channel: "cap-ch-0", companyId: "company-1", reason: "pin_cap_exceeded" },
+        { method: "streams.open", channel: "cap-ch-1", companyId: "company-1", reason: "pin_cap_exceeded" },
+      ]);
+
+      // An evicted channel lost out-of-dispatch attribution: fail closed with
+      // the unpinned signal (which the plugin also sees as a drop).
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "emit", channel: "cap-ch-0", companyId: "company-1" },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(streamChannels(onStreamNotification)).toHaveLength(130);
+
+      // A channel still under the cap keeps its pin: the emit lands.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "emit", channel: "cap-ch-129", companyId: "company-1" },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(streamChannels(onStreamNotification)).toHaveLength(131);
+      expect(streamChannels(onStreamNotification)[130]).toBe("streams.emit:cap-ch-129:company-1");
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("refreshes pin recency on re-open so the oldest untouched pin evicts first", async () => {
+    const onStreamNotification = vi.fn();
+    const handle = makePinHandle(onStreamNotification);
+    try {
+      await handle.start();
+
+      // Fill the cap exactly: 128 pinned channels.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "open-burst", prefix: "rec-ch-", count: 128, companyId: "company-1" },
+          "company-1",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(streamChannels(onStreamNotification)).toHaveLength(128);
+
+      // Re-open rec-ch-0 — the re-capture refreshes its recency, so it is no
+      // longer the eviction candidate.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "open-in-dispatch", channel: "rec-ch-0", companyId: "company-1" },
+          "company-1",
+        )),
+      ).resolves.toEqual({ ok: true });
+
+      // One more channel pushes the map over the cap: the oldest UNtouched
+      // pin (rec-ch-1) evicts, not the refreshed rec-ch-0.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "open-in-dispatch", channel: "rec-ch-128", companyId: "company-1" },
+          "company-1",
+        )),
+      ).resolves.toEqual({ ok: true });
+
+      const drops = await handle.call("performAction", companyAction({ scenario: "report-drops" }, ""));
+      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
+        { method: "streams.open", channel: "rec-ch-1", companyId: "company-1", reason: "pin_cap_exceeded" },
+      ]);
+
+      // The refreshed channel kept its pin: the out-of-dispatch emit lands.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "emit", channel: "rec-ch-0", companyId: "company-1" },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(streamChannels(onStreamNotification)).toContain("streams.emit:rec-ch-0:company-1");
+
+      // The evicted channel fails closed.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "emit", channel: "rec-ch-1", companyId: "company-1" },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(streamChannels(onStreamNotification)).not.toContain("streams.emit:rec-ch-1:company-1");
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
 });

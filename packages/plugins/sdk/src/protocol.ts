@@ -2532,7 +2532,16 @@ export interface WorkerToHostNotifications {
    * host forwards it to the plugin log (`level: "warn"`) so out-of-dispatch
    * emitters are diagnosable instead of silently dead. Reason codes:
    * `invalid_invocation_scope`, `no_invocation_scope`, `company_mismatch`,
-   * `unpinned_channel`, `pin_mismatch`.
+   * `unpinned_channel`, `pin_mismatch`, `pin_cap_exceeded`.
+   *
+   * `pin_cap_exceeded` is the eviction report: the host bounds the pins it
+   * keeps per worker, so capturing a new pin once the cap is reached evicts
+   * the least-recently captured pin. On eviction `channel`/`companyId` name
+   * the EVICTED pin (not the notification being processed) and `method` is
+   * the capture that triggered the eviction. The channel itself keeps
+   * working in-dispatch; only its out-of-dispatch attribution and exit-time
+   * cleanup are given up. Close channels you are done with to stay under
+   * the cap.
    */
   "streams.dropped": {
     /** The dropped worker→host notification method (`streams.emit`, …). */

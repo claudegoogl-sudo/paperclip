@@ -148,6 +148,15 @@ const MAX_STDERR_EXCERPT_CHARS = 8_000;
  * unbounded notification. */
 const MAX_EXECUTE_LOG_CHUNK_CHARS = 1_000_000;
 
+/** SECURITY: per-worker bound on concurrently pinned stream channels. A
+ * worker that never closes its channels would otherwise grow the pin map
+ * without bound (memory) and fan out one synthetic close per pin on worker
+ * exit (notification flood). Once a worker pins this many channels, capturing
+ * a new pin evicts the least-recently captured pin; each eviction is reported
+ * to the plugin via a `streams.dropped` notification with reason
+ * `pin_cap_exceeded`, so the cap is never silent. */
+const MAX_PINNED_STREAM_CHANNELS = 128;
+
 /**
  * Maximum characters accepted for one incoming worker stdout line before the
  * host parses it as JSON. The host drops a longer line without a parse, so a
@@ -1241,9 +1250,42 @@ export function createPluginWorkerHandle(
   // the channel are tenant-verified against the pin per emit — the
   // worker can never attribute a channel to a company it was not dispatched
   // by, because the pin's value comes from the dispatch scope, never from the
-  // worker's claim. Pins live until `streams.close` or worker exit (crash
-  // emits a synthetic close and clears them below).
+  // worker's claim. Pins live until `streams.close`, eviction under the
+  // per-worker cap (`MAX_PINNED_STREAM_CHANNELS`, least-recently captured
+  // first), or worker exit (crash emits a synthetic close and clears them
+  // below). An evicted channel keeps streaming in-dispatch — only its
+  // out-of-dispatch attribution and exit cleanup are given up.
   const pinnedStreamChannels = new Map<string, string>();
+
+  /**
+   * Capture a host-verified channel pin, evicting the least-recently captured
+   * pin when the worker is over `MAX_PINNED_STREAM_CHANNELS`.
+   *
+   * Recency: re-capturing an already-pinned channel moves it to newest, so a
+   * channel the worker is actively (re-)opening is never the eviction
+   * candidate. Every eviction is reported twice — never silently: a
+   * `streams.dropped` notification tells the PLUGIN its pin was evicted (so
+   * it knows out-of-dispatch emits for that channel will now fail closed),
+   * and the host warn log records it for querying.
+   */
+  function captureStreamPin(channel: string, companyId: string, sourceMethod: string): void {
+    pinnedStreamChannels.delete(channel);
+    pinnedStreamChannels.set(channel, companyId);
+    while (pinnedStreamChannels.size > MAX_PINNED_STREAM_CHANNELS) {
+      const oldest = pinnedStreamChannels.keys().next();
+      if (oldest.done) break;
+      const evictedChannel = oldest.value;
+      const evictedCompanyId = pinnedStreamChannels.get(evictedChannel) ?? "";
+      pinnedStreamChannels.delete(evictedChannel);
+      dropStreamNotification(
+        sourceMethod,
+        evictedChannel,
+        evictedCompanyId,
+        "pin_cap_exceeded",
+        "evicted plugin stream channel pin: worker exceeded the per-worker pinned-channel cap",
+      );
+    }
+  }
 
   // Shutdown coordination
   let intentionalStop = false;
@@ -3485,13 +3527,13 @@ export function createPluginWorkerHandle(
       // Track channel pins so out-of-dispatch emits for the channel can be
       // attributed later, and so we can emit synthetic close on crash.
       if (notification.method === "streams.open") {
-        if (channel && companyId) pinnedStreamChannels.set(channel, companyId);
+        if (channel && companyId) captureStreamPin(channel, companyId, notification.method);
       } else if (notification.method === "streams.close") {
         pinnedStreamChannels.delete(channel);
       } else if (notification.method === "streams.emit" && channel && allowedCompanyId) {
         // An in-dispatch emit on a never-opened channel still pins it: async
         // loops seeded by a dispatch keep emitting after the dispatch settles.
-        pinnedStreamChannels.set(channel, allowedCompanyId);
+        captureStreamPin(channel, allowedCompanyId, notification.method);
       }
 
       forwardStreamNotification(notification.method, params);
