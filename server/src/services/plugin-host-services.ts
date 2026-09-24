@@ -92,6 +92,7 @@ import { getTelemetryClient } from "../telemetry.js";
 import { accessService } from "./access.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { redactEventPayload, sanitizeRecord } from "../redaction.js";
+import { redactSecretsDeepForLog, redactSecretsForLog } from "../secret-patterns.js";
 import type { WorkerHostCallContext } from "@paperclipai/plugin-sdk";
 import {
   normalizeProviderFamily,
@@ -482,8 +483,14 @@ function truncStr(s: string, max: number): string {
   return s.slice(0, max) + "...[truncated]";
 }
 
-/** Sanitise a plugin-supplied meta object: enforce size limit and strip reserved keys. */
-function sanitiseMeta(meta: Record<string, unknown> | null | undefined): Record<string, unknown> | null {
+/**
+ * Sanitise a plugin-supplied meta object: strip reserved pino keys,
+ * pattern-redact secret-shaped string leaves, and enforce the serialised size
+ * limit. Exported so the plugin worker manager can apply the SAME semantics to
+ * the meta it spreads into the host pino log line — one sanitiser, every
+ * surface that persists or logs plugin-authored meta.
+ */
+export function sanitiseMeta(meta: Record<string, unknown> | null | undefined): Record<string, unknown> | null {
   if (meta == null) return null;
   // Strip pino reserved keys
   const cleaned: Record<string, unknown> = {};
@@ -492,17 +499,54 @@ function sanitiseMeta(meta: Record<string, unknown> | null | undefined): Record<
       cleaned[k] = v;
     }
   }
+  // SECURITY: pattern-redact every string leaf BEFORE the size check, so the
+  // enforced size is the persisted size. Same shared pattern set the pino
+  // host-log path uses (secret-patterns.ts) in its log-surface posture: every
+  // credential shape is scrubbed regardless of issuer. `plugin_logs` is read
+  // back raw by `GET /api/plugins/:pluginId/logs`, so a shape-valid secret in
+  // worker-authored meta must never persist unredacted. A self-referential or
+  // otherwise non-serialisable meta fails closed to the `_sanitised` marker.
+  let redacted: Record<string, unknown>;
+  try {
+    redacted = redactSecretsDeepForLog(cleaned);
+  } catch {
+    return { _sanitised: true, _error: "meta was not JSON-serialisable" };
+  }
   // Enforce total serialised size
   let json: string;
   try {
-    json = JSON.stringify(cleaned);
+    json = JSON.stringify(redacted);
   } catch {
     return { _sanitised: true, _error: "meta was not JSON-serialisable" };
   }
   if (json.length > MAX_LOG_META_JSON_LENGTH) {
     return { _sanitised: true, _error: `meta exceeded ${MAX_LOG_META_JSON_LENGTH} chars` };
   }
-  return cleaned;
+  return redacted;
+}
+
+/** Levels the persist sink accepts verbatim; anything else normalises to "info". */
+const KNOWN_PLUGIN_LOG_LEVELS: ReadonlySet<string> = new Set([
+  "debug",
+  "info",
+  "warn",
+  "error",
+  // Host-minted by `metrics.write` (§26): metrics persist to `plugin_logs` so
+  // they are queryable alongside regular logs. A worker cannot mint it — the
+  // host service hard-codes it — but the allowlist must keep it working.
+  "metric",
+]);
+
+/**
+ * Normalise a plugin-controlled log level before persist: trim, lowercase,
+ * known set passes through, everything else collapses to "info". The value
+ * lands in `plugin_logs.level` and is used as a read filter
+ * (`GET /api/plugins/:pluginId/logs?level=`), so a worker must never be able
+ * to persist an unbounded string there.
+ */
+function normaliseLogLevel(level: string | null | undefined): string {
+  const candidate = typeof level === "string" ? level.trim().toLowerCase() : "";
+  return KNOWN_PLUGIN_LOG_LEVELS.has(candidate) ? candidate : "info";
 }
 
 interface BufferedLogEntry {
@@ -567,8 +611,10 @@ export async function flushPluginLogBuffer(): Promise<void> {
 
 /**
  * Append one plugin log entry to the shared batch buffer, applying the exact
- * persist semantics of the `logger.log` host service: message truncation and
- * meta sanitisation (reserved pino keys stripped, serialised size cap), then a
+ * persist semantics of the `logger.log` host service: secret-pattern
+ * redaction and truncation of the message, level normalisation to the known
+ * set, and meta sanitisation (reserved pino keys stripped, secret-pattern
+ * redaction of every string leaf, serialised size cap), then a
  * size-triggered flush.
  *
  * Exported so the plugin worker manager can persist worker `ctx.logger`
@@ -589,8 +635,11 @@ export function bufferPluginLogEntry(entry: {
     db: entry.db,
     pluginId: entry.pluginId,
     companyId: entry.companyId ?? null,
-    level: entry.level ?? "info",
-    message: truncStr(String(entry.message ?? ""), MAX_LOG_MESSAGE_LENGTH),
+    level: normaliseLogLevel(entry.level),
+    // SECURITY: `message` is worker-authored free text and `plugin_logs` is
+    // read back raw, so it goes through the same text redactor the pino
+    // host-log path uses (log-surface posture) after truncation.
+    message: redactSecretsForLog(truncStr(String(entry.message ?? ""), MAX_LOG_MESSAGE_LENGTH)),
     meta: sanitiseMeta(entry.meta ?? null),
   });
   if (_logBuffer.length >= LOG_BUFFER_FLUSH_SIZE) {
@@ -2055,7 +2104,10 @@ export function buildHostServices(
     metrics: {
       async write(params) {
         const safeName = truncStr(String(params.name ?? ""), MAX_METRIC_NAME_LENGTH);
-        logger.debug({ pluginId, name: safeName, value: params.value, tags: params.tags }, "Plugin metric write");
+        logger.debug(
+          redactSecretsDeepForLog({ pluginId, name: safeName, value: params.value, tags: params.tags }),
+          "Plugin metric write",
+        );
 
         // Persist metrics to plugin_logs via the batch buffer (same path as
         // logger.log) so they benefit from batched writes and are flushed
@@ -2089,7 +2141,10 @@ export function buildHostServices(
     logger: {
       async log(params) {
         const { level, meta } = params;
-        const safeMessage = truncStr(String(params.message ?? ""), MAX_LOG_MESSAGE_LENGTH);
+        // The host log line must meet the same secret-pattern bar as the
+        // persisted row; the persist side re-applies truncation + redaction
+        // on the raw value in `bufferPluginLogEntry` below.
+        const safeMessage = redactSecretsForLog(truncStr(String(params.message ?? ""), MAX_LOG_MESSAGE_LENGTH));
         const safeMeta = sanitiseMeta(meta);
         const pluginLogger = logger.child({ service: "plugin-worker", pluginId });
         const logFields = {
