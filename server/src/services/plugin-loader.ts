@@ -1534,6 +1534,63 @@ export function getPluginUiContributionMetadata(
  * @see PLUGIN_SPEC.md §8.3 — Install Process
  * @see PLUGIN_SPEC.md §12 — Process Model
  */
+
+/**
+ * Deliver each configured company's stored config to a (re)started worker via
+ * the same `configChanged` path an operator config-save uses. Shared by the
+ * loader's activation path (step 5b) and the lifecycle manager's bare worker
+ * restart fallback, so every worker start — activation or bounce — receives
+ * its stored config. Best-effort per company; never throws.
+ */
+export async function deliverStoredPluginConfig(input: {
+  workerManager: Pick<PluginWorkerManager, "call">;
+  pluginId: string;
+  pluginKey: string;
+  configRows: ReadonlyArray<{ companyId: string; configJson: unknown }>;
+  log: { warn: (obj: object, msg: string) => void; debug: (obj: object, msg: string) => void; info: (obj: object, msg: string) => void };
+}): Promise<{ delivered: number; failed: number }> {
+  const { workerManager, pluginId, pluginKey, configRows, log } = input;
+  let delivered = 0;
+  let failed = 0;
+  for (const row of configRows) {
+    try {
+      await workerManager.call(pluginId, "configChanged", {
+        config: (row.configJson ?? {}) as Record<string, unknown>,
+        companyId: row.companyId,
+      });
+      delivered += 1;
+    } catch (configErr) {
+      // A single-tenant worker fails closed (CROSS_TENANT_CONFIG) rather
+      // than collapse onto a second company's config — surface that at
+      // warn so the misconfiguration (multiple distinct companies
+      // configured for a single-tenant plugin) is visible, instead of
+      // being lost in the best-effort debug stream.
+      failed += 1;
+      const code = (configErr as { code?: number } | null)?.code;
+      const details = {
+        pluginId,
+        pluginKey,
+        companyId: row.companyId,
+        code,
+        err: configErr instanceof Error ? configErr.message : String(configErr),
+      };
+      if (code === PLUGIN_RPC_ERROR_CODES.CROSS_TENANT_CONFIG) {
+        log.warn(
+          details,
+          "plugin-loader: startup config delivery rejected — single-tenant plugin configured for multiple companies",
+        );
+      } else {
+        log.debug(details, "plugin-loader: startup config delivery skipped for company");
+      }
+    }
+  }
+  log.info(
+    { pluginId, pluginKey, configuredCompanies: configRows.length, delivered, failed },
+    "plugin-loader: startup config delivery complete",
+  );
+  return { delivered, failed };
+}
+
 export function pluginLoader(
   db: Db,
   options: PluginLoaderOptions = {},
@@ -3173,36 +3230,7 @@ export function pluginLoader(
       // Reuses the `configRows` loaded in step 4b (which also seeded the
       // worker's proactive company scopes before startup); no second listConfigs
       // round-trip is needed here.
-      for (const row of configRows) {
-        try {
-          await workerManager.call(pluginId, "configChanged", {
-            config: (row.configJson ?? {}) as Record<string, unknown>,
-            companyId: row.companyId,
-          });
-        } catch (configErr) {
-          // A single-tenant worker fails closed (CROSS_TENANT_CONFIG) rather
-          // than collapse onto a second company's config — surface that at
-          // warn so the misconfiguration (multiple distinct companies
-          // configured for a single-tenant plugin) is visible, instead of
-          // being lost in the best-effort debug stream.
-          const code = (configErr as { code?: number } | null)?.code;
-          const details = {
-            pluginId,
-            pluginKey,
-            companyId: row.companyId,
-            code,
-            err: configErr instanceof Error ? configErr.message : String(configErr),
-          };
-          if (code === PLUGIN_RPC_ERROR_CODES.CROSS_TENANT_CONFIG) {
-            log.warn(
-              details,
-              "plugin-loader: startup config delivery rejected — single-tenant plugin configured for multiple companies",
-            );
-          } else {
-            log.debug(details, "plugin-loader: startup config delivery skipped for company");
-          }
-        }
-      }
+      await deliverStoredPluginConfig({ workerManager, pluginId, pluginKey, configRows, log });
 
       // ------------------------------------------------------------------
       // 6. Sync job declarations and register with scheduler
