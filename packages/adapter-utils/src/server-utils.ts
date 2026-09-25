@@ -2397,9 +2397,28 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
   return shapedWorkspaceEnv;
 }
 
+/**
+ * Signing-capable server secrets that must never reach any child process.
+ * Holding either one lets a process mint agent JWTs for any agent. This list is
+ * explicit on purpose: it does not depend on the PAPERCLIP_* prefix rule, so a
+ * later allowlist change to that rule cannot re-admit these names.
+ * `BETTER_AUTH_SECRET` is the server's JWT-secret fallback.
+ */
+export const CHILD_ENV_SIGNING_KEY_DENYLIST = [
+  "PAPERCLIP_AGENT_JWT_SECRET",
+  "BETTER_AUTH_SECRET",
+] as const;
+
+function deleteSigningKeys(env: NodeJS.ProcessEnv): void {
+  for (const key of CHILD_ENV_SIGNING_KEY_DENYLIST) {
+    delete env[key];
+  }
+}
+
 export function sanitizeInheritedPaperclipEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.PAPERCLIPAI_CMD;
+  deleteSigningKeys(env);
   for (const key of Object.keys(env)) {
     if (!key.startsWith("PAPERCLIP_")) continue;
     if (key === "PAPERCLIP_RUNTIME_API_URL") continue;
@@ -2596,6 +2615,9 @@ export const CLAUDE_CODE_NESTING_VARS = [
  *   adapter uses this because its child may run on a prompt-logging provider.
  *
  * The CLAUDE_CODE_* nesting-var strip and `ensurePathInEnv` apply either way.
+ * The signing-key denylist (`CHILD_ENV_SIGNING_KEY_DENYLIST`) is also removed
+ * either way, and AFTER `env` is layered: a caller (adapterConfig.env, a secret
+ * binding) must not be able to re-inject a signing key.
  */
 export function buildChildEnv(
   env: Record<string, string>,
@@ -2609,6 +2631,7 @@ export function buildChildEnv(
   for (const key of CLAUDE_CODE_NESTING_VARS) {
     delete rawMerged[key];
   }
+  deleteSigningKeys(rawMerged);
   return ensurePathInEnv(rawMerged);
 }
 
