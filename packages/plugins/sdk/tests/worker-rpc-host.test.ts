@@ -1190,3 +1190,160 @@ describe("worker streams.dropped feedback", () => {
     }
   });
 });
+
+
+describe("worker streams.dropped onDropped subscribers", () => {
+  function startDropTestHost(onSetup: (ctx: import("../src/types.js").PluginContext) => void) {
+    const hostToWorker = new PassThrough();
+    const workerToHost = new PassThrough();
+    const hostReadline = createInterface({ input: workerToHost });
+    const workerMessages: Array<{ method?: string; id?: unknown; params?: unknown; result?: unknown }> = [];
+    const plugin = definePlugin({
+      async setup(ctx) {
+        onSetup(ctx);
+      },
+    });
+    const worker = startWorkerRpcHost({
+      plugin,
+      stdin: hostToWorker,
+      stdout: workerToHost,
+    });
+    const logNotifications: Array<Record<string, unknown>> = [];
+    hostReadline.on("line", (line) => {
+      const message = parseMessage(line);
+      if (!message) return;
+      const record = message as { method?: string; id?: unknown; params?: unknown; result?: unknown };
+      workerMessages.push(record);
+      if (record.method === "log") {
+        logNotifications.push(record.params as Record<string, unknown>);
+      }
+    });
+    const stop = () => {
+      worker.stop();
+      hostReadline.close();
+      hostToWorker.destroy();
+      workerToHost.destroy();
+    };
+    return { hostToWorker, workerMessages, logNotifications, stop };
+  }
+
+  function writeDrop(hostToWorker: PassThrough, params: Record<string, unknown>): void {
+    hostToWorker.write(
+      serializeMessage({
+        jsonrpc: "2.0" as const,
+        method: "streams.dropped",
+        params,
+      }),
+    );
+  }
+
+  // `setup()` (and therefore any `ctx.streams.onDropped` registration) runs
+  // on the `initialize` request — send it before simulating host drops.
+  async function initialize(
+    hostToWorker: PassThrough,
+    workerMessages: Array<{ id?: unknown }>,
+  ): Promise<void> {
+    hostToWorker.write(
+      serializeMessage(
+        createRequest(
+          "initialize",
+          {
+            manifest: {
+              id: "paperclip.stream-drop-subscribers",
+              apiVersion: 1,
+              version: "1.0.0",
+              displayName: "Stream Drop Subscribers",
+              description: "Test plugin",
+              author: "Paperclip",
+              categories: ["automation"],
+              capabilities: [],
+              entrypoints: {},
+            },
+            config: {},
+            databaseNamespace: null,
+          },
+          "init-1",
+        ),
+      ),
+    );
+    const deadline = Date.now() + 2000;
+    while (!workerMessages.some((m) => m.id === "init-1")) {
+      if (Date.now() > deadline) throw new Error("initialize timed out");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+
+  it("hands a streams.dropped notice to ctx.streams.onDropped subscribers", async () => {
+    const seen: import("../src/types.js").StreamDropNotice[] = [];
+    const { hostToWorker, workerMessages, logNotifications, stop } = startDropTestHost((ctx) => {
+      ctx.streams.onDropped((notice) => {
+        seen.push(notice);
+      });
+    });
+    await initialize(hostToWorker, workerMessages);
+
+    try {
+      writeDrop(hostToWorker, {
+        method: "streams.open",
+        channel: "klipper",
+        companyId: "company-1",
+        reason: "invalid_invocation_scope",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(seen).toEqual([
+        { method: "streams.open", channel: "klipper", companyId: "company-1", reason: "invalid_invocation_scope" },
+      ]);
+      // The plugin-log warn diagnostic stays in place alongside the dispatch.
+      expect(logNotifications.some((l) => l.level === "warn" && String(l.message).includes("invalid_invocation_scope"))).toBe(true);
+    } finally {
+      stop();
+    }
+  });
+
+  it("stops delivery after the unsubscribe function is called", async () => {
+    const seen: import("../src/types.js").StreamDropNotice[] = [];
+    const { hostToWorker, workerMessages, stop } = startDropTestHost((ctx) => {
+      const unsubscribe = ctx.streams.onDropped((notice) => {
+        seen.push(notice);
+      });
+      unsubscribe();
+    });
+    await initialize(hostToWorker, workerMessages);
+
+    try {
+      writeDrop(hostToWorker, { method: "streams.emit", channel: "klipper", reason: "pin_mismatch" });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(seen).toEqual([]);
+    } finally {
+      stop();
+    }
+  });
+
+  it("contains a throwing handler: logs the failure and later handlers still run", async () => {
+    const seen: import("../src/types.js").StreamDropNotice[] = [];
+    const { hostToWorker, workerMessages, logNotifications, stop } = startDropTestHost((ctx) => {
+      ctx.streams.onDropped(() => {
+        throw new Error("handler boom");
+      });
+      ctx.streams.onDropped((notice) => {
+        seen.push(notice);
+      });
+    });
+    await initialize(hostToWorker, workerMessages);
+
+    try {
+      writeDrop(hostToWorker, { method: "streams.open", channel: "ch", reason: "unpinned_channel" });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(seen).toEqual([{ method: "streams.open", channel: "ch", reason: "unpinned_channel" }]);
+      expect(
+        logNotifications.some(
+          (l) => l.level === "error" && String(l.message).includes("streams.dropped handler failed") && String(l.message).includes("handler boom"),
+        ),
+      ).toBe(true);
+    } finally {
+      stop();
+    }
+  });
+});

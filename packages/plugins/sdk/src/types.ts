@@ -2400,6 +2400,42 @@ export interface PluginStreamsClient {
    * clients so they know no more events will arrive.
    */
   close(channel: string): void;
+
+  /**
+   * Subscribe to host `streams.dropped` feedback for this worker.
+   *
+   * The host tenant-verifies every worker→host `streams.*` notification and
+   * sends a `streams.dropped` notification when it drops one (unknown
+   * invocation scope, pin mismatch, unpinned channel, …). The SDK always
+   * surfaces the drop on the plugin log; this subscription hands the same
+   * notice to plugin code so a worker can repair local bookkeeping that
+   * assumed delivery — e.g. clear a cached "channel is open" mirror so the
+   * next dispatch re-opens the channel instead of deduping against a pin
+   * the host never recorded.
+   *
+   * The handler is fire-and-forget: it runs synchronously off the host
+   * notification loop, and a throw is contained (logged, never propagated
+   * into the readline loop). Returns an unsubscribe function.
+   */
+  onDropped(handler: (notice: StreamDropNotice) => void): () => void;
+}
+
+/**
+ * Host feedback that a worker→host `streams.*` notification was dropped.
+ *
+ * Mirrors the `streams.dropped` notification params the host sends (see
+ * `PLUGIN_SPEC.md` §14 — SDK Surface): every field is optional because the
+ * host omits what the dropped notification did not carry.
+ */
+export interface StreamDropNotice {
+  /** The dropped worker→host notification method (`streams.open`, …). */
+  method?: string;
+  /** Channel of the dropped notification, when one was named. */
+  channel?: string;
+  /** Claimed companyId of the dropped notification, when one was sent. */
+  companyId?: string;
+  /** Why the host dropped it (`invalid_invocation_scope`, `pin_mismatch`, …). */
+  reason?: string;
 }
 
 /**
