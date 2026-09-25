@@ -139,6 +139,21 @@ describe("invite URL: authPublicBaseUrl precedence", () => {
     expect(res.body.inviteUrl).not.toContain("127.0.0.1");
   });
 
+  it("keeps the public invite URL when an agent-run loopback base is configured", async () => {
+    vi.stubEnv("PAPERCLIP_AGENT_API_URL", "http://127.0.0.1:3100");
+    try {
+      const app = await createApp("https://paperclip.example.com");
+      const res = await request(app)
+        .post("/api/companies/company-1/invites")
+        .set("host", "127.0.0.1:3100")
+        .send({ allowedJoinTypes: "human", humanRole: "viewer" });
+      expect(res.status).toBe(201);
+      expect(res.body.inviteUrl).toMatch(/^https:\/\/paperclip\.example\.com\/invite\/pcp_invite_/);
+      expect(res.body.inviteUrl).not.toContain("127.0.0.1");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
   it("falls back to request-derived host when authPublicBaseUrl is not configured", async () => {
     const app = await createApp(undefined);
 
