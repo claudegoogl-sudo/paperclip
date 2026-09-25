@@ -8458,6 +8458,35 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       source: "recovery.reconcile_stranded_assigned_issue_skipped",
       reason: "standby_wake_target",
     });
+
+    // Repeated sweeps over the unchanged parked issue keep skipping it but do
+    // not write another skip row.
+    await heartbeat.reconcileStrandedAssignedIssues();
+    const again = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(again.issueIds).not.toContain(issueId);
+    const countSkipRows = () =>
+      db
+        .select()
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.entityId, issueId),
+            eq(activityLog.action, "issue.recovery_skipped"),
+          ),
+        )
+        .then((rows) => rows.length);
+    expect(await countSkipRows()).toBe(1);
+
+    // A change to the issue (comments/status/policy bump updatedAt) opens a
+    // new quiet period: exactly one more row, then deduped again.
+    await db
+      .update(issues)
+      .set({ updatedAt: new Date(Date.now() + 1000) })
+      .where(eq(issues.id, issueId));
+    await heartbeat.reconcileStrandedAssignedIssues();
+    expect(await countSkipRows()).toBe(2);
+    await heartbeat.reconcileStrandedAssignedIssues();
+    expect(await countSkipRows()).toBe(2);
   });
 
   it("skips an in_progress assigned issue parked on a pending board approval requested by the assignee", async () => {
