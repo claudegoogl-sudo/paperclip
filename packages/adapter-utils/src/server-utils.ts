@@ -2399,15 +2399,32 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
 
 /**
  * Signing-capable server secrets that must never reach any child process.
- * Holding either one lets a process mint agent JWTs for any agent. This list is
- * explicit on purpose: it does not depend on the PAPERCLIP_* prefix rule, so a
- * later allowlist change to that rule cannot re-admit these names.
- * `BETTER_AUTH_SECRET` is the server's JWT-secret fallback.
+ * Holding one of these lets a process mint agent JWTs, decrypt stored secrets,
+ * or sign privileged server artifacts. The list is explicit on purpose: it does
+ * not depend on the PAPERCLIP_* prefix rule, so a later allowlist change to
+ * that rule cannot re-admit these names. `BETTER_AUTH_SECRET` is the server's
+ * JWT-secret fallback. These names are removed from the inherited server env
+ * AND from caller-supplied env (adapterConfig.env, secret bindings).
  */
 export const CHILD_ENV_SIGNING_KEY_DENYLIST = [
   "PAPERCLIP_AGENT_JWT_SECRET",
   "BETTER_AUTH_SECRET",
+  "PAPERCLIP_SECRETS_MASTER_KEY",
+  "PAPERCLIP_SECRETS_MASTER_KEY_FILE",
+  "PAPERCLIP_DECISION_SIGNING_SECRET",
+  "PAPERCLIP_WORKSPACE_HANDOFF_SECRET",
+  "PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN",
+  "PAPERCLIP_DEV_SERVER_STATUS_TOKEN",
+  "PAPERCLIP_TOOL_OAUTH_CLIENT_SECRET",
+  "PAPERCLIP_TELEMETRY_BACKEND_TOKEN",
 ] as const;
+
+/**
+ * Server credentials removed from the INHERITED server env only. A caller may
+ * still pass its own value (e.g. a project agent's own `DATABASE_URL` via
+ * adapterConfig.env); the server's own credential must not leak through.
+ */
+export const CHILD_ENV_INHERITED_ONLY_DENYLIST = ["DATABASE_URL"] as const;
 
 function deleteSigningKeys(env: NodeJS.ProcessEnv): void {
   for (const key of CHILD_ENV_SIGNING_KEY_DENYLIST) {
@@ -2419,6 +2436,7 @@ export function sanitizeInheritedPaperclipEnv(baseEnv: NodeJS.ProcessEnv): NodeJ
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.PAPERCLIPAI_CMD;
   deleteSigningKeys(env);
+  for (const key of CHILD_ENV_INHERITED_ONLY_DENYLIST) delete env[key];
   for (const key of Object.keys(env)) {
     if (!key.startsWith("PAPERCLIP_")) continue;
     if (key === "PAPERCLIP_RUNTIME_API_URL") continue;
@@ -2618,6 +2636,8 @@ export const CLAUDE_CODE_NESTING_VARS = [
  * The signing-key denylist (`CHILD_ENV_SIGNING_KEY_DENYLIST`) is also removed
  * either way, and AFTER `env` is layered: a caller (adapterConfig.env, a secret
  * binding) must not be able to re-inject a signing key.
+ * `CHILD_ENV_INHERITED_ONLY_DENYLIST` (`DATABASE_URL`) is removed from the
+ * inherited env only; a caller-supplied value is kept.
  */
 export function buildChildEnv(
   env: Record<string, string>,
