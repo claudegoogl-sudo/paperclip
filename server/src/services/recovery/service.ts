@@ -111,6 +111,66 @@ const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = [
   ...UNSUCCESSFUL_HEARTBEAT_RUN_STATUSES,
   "interrupted",
 ] as const;
+
+/**
+ * Write an `issue.recovery_skipped` activity row at most once per quiet period.
+ *
+ * The stranded-issue sweep re-evaluates parked issues every tick and the skip
+ * decision is (correctly) repeated each time. Logging it each time wrote one
+ * identical row per sweep (~every 30 s) for every parked issue. Suppress the
+ * write when the latest skip row for this issue carries the same details and
+ * is not older than the issue's `updatedAt` (which comments, status, assignee
+ * and execution-policy changes all bump).
+ */
+async function logRecoverySkippedOnceWithDb(
+  db: Db,
+  issue: { id: string; companyId: string; updatedAt: Date | string | null },
+  details: Record<string, unknown>,
+) {
+  // Stamp the issue version this skip was decided against; an unchanged
+  // stamp + unchanged reason means nothing new to record.
+  const stamped: Record<string, unknown> = {
+    ...details,
+    issueUpdatedAt: issue.updatedAt ? new Date(issue.updatedAt).toISOString() : null,
+  };
+  const [latest] = await db
+    .select({ details: activityLog.details })
+    .from(activityLog)
+    .where(
+      and(
+        eq(activityLog.companyId, issue.companyId),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, issue.id),
+        eq(activityLog.action, "issue.recovery_skipped"),
+      ),
+    )
+    .orderBy(desc(activityLog.createdAt))
+    .limit(1);
+  if (latest) {
+    const prev = (latest.details ?? {}) as Record<string, unknown>;
+    const same = Object.keys(stamped).every((k) => prev[k] === stamped[k]);
+    if (same) {
+      logger.debug(
+        { issueId: issue.id, reason: details.reason },
+        "recovery skip row deduped (issue unchanged since last skip row)",
+      );
+      return false;
+    }
+  }
+  await logActivity(db, {
+    companyId: issue.companyId,
+    actorType: "system",
+    actorId: "system",
+    agentId: null,
+    runId: null,
+    action: "issue.recovery_skipped",
+    entityType: "issue",
+    entityId: issue.id,
+    details: stamped,
+  });
+  return true;
+}
+
 export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 // Cross-run correlation windows (fleet-stall umbrella): a single shared upstream
@@ -5081,20 +5141,10 @@ export function recoveryService(
         // source_scoped_recovery_action wake; it resumes when an external event
         // posts a comment and wakes the assignee normally.
         if (isStandbyWakeTargetIssue(issue)) {
-          await logActivity(db, {
-            companyId: issue.companyId,
-            actorType: "system",
-            actorId: "system",
-            agentId: null,
-            runId: null,
-            action: "issue.recovery_skipped",
-            entityType: "issue",
-            entityId: issue.id,
-            details: {
-              identifier: issue.identifier,
-              source: "recovery.reconcile_stranded_assigned_issue_skipped",
-              reason: "standby_wake_target",
-            },
+          await logRecoverySkippedOnceWithDb(db, issue, {
+            identifier: issue.identifier,
+            source: "recovery.reconcile_stranded_assigned_issue_skipped",
+            reason: "standby_wake_target",
           });
           result.skipped += 1;
           continue;
@@ -5106,21 +5156,11 @@ export function recoveryService(
           agentId,
         );
         if (pendingApproval) {
-          await logActivity(db, {
-            companyId: issue.companyId,
-            actorType: "system",
-            actorId: "system",
-            agentId: null,
-            runId: null,
-            action: "issue.recovery_skipped",
-            entityType: "issue",
-            entityId: issue.id,
-            details: {
-              identifier: issue.identifier,
-              source: "recovery.reconcile_stranded_assigned_issue_skipped",
-              reason: "pending_board_approval",
-              approvalId: pendingApproval.approvalId,
-            },
+          await logRecoverySkippedOnceWithDb(db, issue, {
+            identifier: issue.identifier,
+            source: "recovery.reconcile_stranded_assigned_issue_skipped",
+            reason: "pending_board_approval",
+            approvalId: pendingApproval.approvalId,
           });
           result.skipped += 1;
           result.skippedDueToPendingApproval += 1;
@@ -5133,22 +5173,12 @@ export function recoveryService(
           agentId,
         );
         if (pendingInteraction) {
-          await logActivity(db, {
-            companyId: issue.companyId,
-            actorType: "system",
-            actorId: "system",
-            agentId: null,
-            runId: null,
-            action: "issue.recovery_skipped",
-            entityType: "issue",
-            entityId: issue.id,
-            details: {
-              identifier: issue.identifier,
-              source: "recovery.reconcile_stranded_assigned_issue_skipped",
-              reason: "pending_wake_assignee_interaction",
-              interactionId: pendingInteraction.interactionId,
-              kind: pendingInteraction.kind,
-            },
+          await logRecoverySkippedOnceWithDb(db, issue, {
+            identifier: issue.identifier,
+            source: "recovery.reconcile_stranded_assigned_issue_skipped",
+            reason: "pending_wake_assignee_interaction",
+            interactionId: pendingInteraction.interactionId,
+            kind: pendingInteraction.kind,
           });
           result.skipped += 1;
           result.skippedDueToPendingWakeAssigneeInteraction += 1;
