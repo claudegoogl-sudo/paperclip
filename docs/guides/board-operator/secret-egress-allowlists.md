@@ -191,3 +191,74 @@ binding.
 Shipping this mechanism does not itself flip any instance to enforcing —
 every existing plugin config-key row starts (and stays) log-only until an
 operator explicitly reviews suggestions and calls the enforce route.
+
+## Plugin private-origin opt-in (`ctx.http.fetch` to one LAN device)
+
+The plugin `ctx.http.fetch` guard denies every non-public address: RFC1918,
+IPv6 ULA, loopback, link-local (including `169.254.169.254`), the host's own
+interface addresses, and (when `PAPERCLIP_PLUGIN_FETCH_CGNAT=deny`) CGNAT
+`100.64.0.0/10`. Some plugins must reach one device on a routed LAN, for
+example a printer at `http://192.168.2.86:8898`. An **instance admin** can
+opt exact origins in for **one plugin**.
+
+What it allows, and nothing more:
+
+- Only the exact origin `scheme://IP:port`. A different port, a different
+  scheme, or a hostname that resolves to the same IP is still denied with the
+  usual `All resolved IPs for … are in private/reserved ranges` error.
+- Ports compare as the effective port: `http://10.0.0.5:80` matches
+  `http://10.0.0.5/`.
+- The connection is pinned to that IP (no second DNS lookup). Redirects are
+  not followed; a `30x` goes back to the plugin as a normal response.
+- The plugin's config-key egress allowlist (above) still runs first and can
+  still deny.
+
+What is refused at write time (`400`, with the reason):
+
+- Hostnames, a missing port, any path/query/fragment/userinfo, and
+  non-canonical IPv4 such as `0xc0.168.2.86` or `3232236118`.
+- Any address that is not RFC1918, IPv6 ULA (`fc00::/7`) or CGNAT
+  (`100.64.0.0/10`): loopback, link-local, metadata, `0.0.0.0`, multicast,
+  public addresses.
+- IPv6 forms that embed IPv4 (`::ffff:…`, `::a.b.c.d`, `64:ff9b::…`).
+- Any address bound to an interface of this host (docker bridges, the host's
+  own tailscale IP). The same check runs again on every fetch, against the
+  current interface list.
+
+**Scope.** `http.fetch` carries no company id, so the opt-in is plugin-wide:
+every company that runs the plugin gets the same LAN reach. That is why the
+list lives on the plugin, and only an instance admin can change it. Company
+boards and agents get `403`.
+
+**Audit.** Each change that adds or removes an origin writes a
+`plugin.private_egress_updated` activity event (actor, `added`, `removed`)
+into every company that has the plugin configured, and logs
+`plugin.private_egress.updated` at instance level. Each fetch that uses the
+opt-in path logs `plugin.http_fetch.private_egress` with
+`decision: "allow" | "deny"`, `pluginId`, `origin` and `matchedEntry`. The
+log never contains the path, query or headers.
+
+### HTTP API
+
+`:pluginId` is the plugin UUID or its plugin key (for example
+`platform.klipper`). `PUT` replaces the whole list and is idempotent.
+
+```bash
+# Read
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  "$PAPERCLIP_URL/api/plugins/platform.klipper/private-egress"
+
+# Add (the list is replaced; include every entry you want to keep)
+curl -sS -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"origins":["http://192.168.2.86:8898"]}' \
+  "$PAPERCLIP_URL/api/plugins/platform.klipper/private-egress"
+
+# Remove one entry: PUT the list without it. Rollback: empty the list.
+curl -sS -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"origins":[]}' \
+  "$PAPERCLIP_URL/api/plugins/platform.klipper/private-egress"
+```
+
+The response is `{ pluginId, origins, added, removed }`. At most 20 entries.
+The column defaults to an empty list, so without an opt-in the guard behaves
+exactly as before.

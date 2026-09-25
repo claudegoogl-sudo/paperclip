@@ -35,6 +35,12 @@ export const plugins = pgTable(
     /** Resolved package path for local-path installs; used to find worker entrypoint. */
     packagePath: text("package_path"),
     lastError: text("last_error"),
+    /**
+     * Instance-admin opt-in: exact private origins (`http(s)://<ip>:<port>`)
+     * this plugin's `ctx.http.fetch` may reach despite the private-range guard.
+     * Plugin-wide by design (http.fetch has no company scope). Default empty.
+     */
+    privateEgressOrigins: text("private_egress_origins").array().notNull().default([]),
     installedAt: timestamp("installed_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
