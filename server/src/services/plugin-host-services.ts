@@ -87,11 +87,18 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
 import {
+  canonicalizeIp,
   classifyEgressIp,
   isEgressAllowed,
   resolveCgnatMode,
   type ClassifyOptions,
 } from "./plugin-egress-ip-classifier.js";
+import {
+  isPrivateEgressEligible,
+  loadPluginPrivateEgressOrigins,
+  normalizeStoredPrivateEgressOrigins,
+  privateEgressRequestOrigin,
+} from "./plugin-private-egress.js";
 import { logger } from "../middleware/logger.js";
 import { requireAgentActorSource, requirePluginBoardActorSource } from "./actor-source.js";
 import { getTelemetryClient } from "../telemetry.js";
@@ -162,7 +169,70 @@ export interface FetchUrlValidationOptions {
   dnsLookup?: (hostname: string, options: { all: true }) => Promise<Array<{ address: string; family: number }>>;
   interfaces?: ClassifyOptions["interfaces"];
   env?: NodeJS.ProcessEnv;
-  log?: Pick<typeof logger, "warn">;
+  log?: Pick<typeof logger, "warn" | "info">;
+  /**
+   * Instance-admin private-origin opt-in for THIS plugin (see
+   * `plugin-private-egress.ts`). Consulted only when every resolved address
+   * is denied. Absent = today's behaviour, byte-identical.
+   */
+  loadPrivateEgressOrigins?: () => Promise<readonly string[]>;
+}
+
+type ClassifiedFetchAddress = {
+  entry: { address: string; family: number };
+  cls: ReturnType<typeof classifyEgressIp>;
+};
+
+/**
+ * Private-origin opt-in decision. Returns the address to pin (the same
+ * `ValidatedFetchTarget` path as any public target — no second resolve), or
+ * null so the caller throws today's error text unchanged. Fails closed.
+ */
+async function resolvePrivateEgressOptIn(
+  parsed: URL,
+  originalHostname: string,
+  classified: ClassifiedFetchAddress[],
+  options: FetchUrlValidationOptions,
+): Promise<ClassifiedFetchAddress | null> {
+  const log = options.log ?? logger;
+  // IP literals only: a hostname never matches, so DNS (rebinding or not)
+  // can never select an opted-in address. An IP literal resolves to exactly
+  // itself, so there is exactly one candidate.
+  if (isIP(originalHostname) === 0 || classified.length !== 1) return null;
+  const origin = privateEgressRequestOrigin(parsed);
+  if (!origin) return null;
+  const candidate = classified[0]!;
+  // The pinned address must be the literal itself (classifier-canonical).
+  const literal = canonicalizeIp(originalHostname);
+  if (!literal || candidate.cls.canonical === null || literal.canonical !== candidate.cls.canonical) return null;
+  let stored: readonly string[];
+  try {
+    stored = await options.loadPrivateEgressOrigins!();
+  } catch (err) {
+    log.warn(
+      { err, event: "plugin.http_fetch.private_egress", decision: "deny", reason: "lookup_failed", pluginId: options.pluginId ?? null },
+      "plugin.http_fetch.private_egress lookup failed; failing closed",
+    );
+    return null;
+  }
+  if (stored.length === 0) return null;
+  // Re-validate on read against the CURRENT host interfaces. own_host and
+  // loopback/link-local/metadata are never eligible, whatever is stored.
+  const origins = normalizeStoredPrivateEgressOrigins(stored, { interfaces: options.interfaces });
+  const matched = origins.includes(origin) && isPrivateEgressEligible(candidate.cls);
+  // Value-free: scheme/IP/port origin only, never path, query or headers.
+  log.info(
+    {
+      event: "plugin.http_fetch.private_egress",
+      decision: matched ? "allow" : "deny",
+      pluginId: options.pluginId ?? null,
+      origin,
+      matchedEntry: matched ? origin : null,
+      category: candidate.cls.category,
+    },
+    matched ? "plugin.http_fetch.private_allowed" : "plugin.http_fetch.private_denied",
+  );
+  return matched ? candidate : null;
 }
 
 export async function validateAndResolveFetchUrl(
@@ -226,6 +296,10 @@ export async function validateAndResolveFetchUrl(
       cls: classifyEgressIp(entry.address, { interfaces: options.interfaces }),
     }));
     const safe = classified.filter(({ cls }) => isEgressAllowed(cls, cgnatMode));
+    if (safe.length === 0 && options.loadPrivateEgressOrigins) {
+      const optedIn = await resolvePrivateEgressOptIn(parsed, originalHostname, classified, options);
+      if (optedIn) safe.push(optedIn);
+    }
     const safeResults = safe.map(({ entry }) => entry);
     if (safeResults.length === 0) {
       throw new Error(
@@ -2026,7 +2100,7 @@ export function buildHostServices(
         // allowlist before any DNS resolution happens.
         const target = await validateAndResolveFetchUrl(params.url, (url) =>
           enforcePluginConfigEgress(db, pluginId, url),
-          { pluginId },
+          { pluginId, loadPrivateEgressOrigins: () => loadPluginPrivateEgressOrigins(db, pluginId) },
         );
 
         const controller = new AbortController();

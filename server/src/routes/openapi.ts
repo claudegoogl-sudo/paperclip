@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { setPrivateEgressSchema } from "./plugin-private-egress.js";
 import { z } from "zod";
 import {
   // Agent
@@ -6934,6 +6935,23 @@ registerCurrentRoute({
   tags: ["plugins"],
   summary: "Toggle egress enforcement for a plugin config key (plugin-wide effect)",
   body: enforcePluginConfigEgressAllowlistSchema,
+});
+
+// (fork) Instance-admin plugin http.fetch private-origin opt-in. Mounted in
+// routes/plugin-private-egress.ts. `{"origins": []}` is the rollback.
+registerCurrentRoute({
+  method: "get",
+  path: "/api/plugins/{pluginId}/private-egress",
+  tags: ["plugins"],
+  summary: "List the operator-set private origins a plugin's http.fetch may reach (instance admin)",
+});
+
+registerCurrentRoute({
+  method: "put",
+  path: "/api/plugins/{pluginId}/private-egress",
+  tags: ["plugins"],
+  summary: "Replace the private-origin http.fetch opt-in list for a plugin (instance admin; 400 on invalid entry)",
+  body: setPrivateEgressSchema,
 });
 
 for (const route of [
