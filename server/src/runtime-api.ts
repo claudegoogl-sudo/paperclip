@@ -80,6 +80,42 @@ export function choosePrimaryRuntimeApiUrl(input: {
   return formatOrigin("http:", "localhost", input.port);
 }
 
+/**
+ * Base URL handed to agent runs as PAPERCLIP_API_URL.
+ *
+ * Separate from the runtime/public base on purpose: the public base
+ * (authPublicBaseUrl) is for browsers and off-host clients and may sit behind
+ * an interactive access proxy that answers API calls with an HTML login page.
+ * Local agent runs execute on the same host as the server, so they default to
+ * the loopback listen origin whenever the server binds loopback or a wildcard.
+ *
+ * Precedence: explicit PAPERCLIP_AGENT_API_URL > loopback listen origin (bind
+ * host loopback or wildcard) > fallbackApiUrl (the runtime/public base).
+ */
+export function chooseAgentApiUrl(input: {
+  explicitAgentApiUrl?: string | null;
+  bindHost: string;
+  port: number;
+  fallbackApiUrl: string;
+}): string {
+  const explicit = input.explicitAgentApiUrl?.trim();
+  if (explicit) {
+    try {
+      return new URL(explicit).origin;
+    } catch {
+      // Malformed override: fall through to the derived default.
+    }
+  }
+  const bindHost = normalizeHost(input.bindHost).toLowerCase();
+  if (!bindHost || bindHost === "0.0.0.0" || bindHost === "localhost" || bindHost === "127.0.0.1") {
+    return formatOrigin("http:", "127.0.0.1", input.port);
+  }
+  if (bindHost === "::" || bindHost === "::1") {
+    return formatOrigin("http:", "::1", input.port);
+  }
+  return input.fallbackApiUrl;
+}
+
 export function collectReachableInterfaceHosts(input: {
   networkInterfacesMap?: NodeJS.Dict<os.NetworkInterfaceInfo[]>;
 } = {}): string[] {

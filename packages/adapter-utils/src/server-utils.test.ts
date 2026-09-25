@@ -2734,6 +2734,7 @@ describe("appendWithByteCap", () => {
 
 describe("buildPaperclipEnv", () => {
   const ENV_KEYS = [
+    "PAPERCLIP_AGENT_API_URL",
     "PAPERCLIP_API_URL",
     "PAPERCLIP_RUNTIME_API_URL",
     "PAPERCLIP_LISTEN_HOST",
@@ -2756,6 +2757,20 @@ describe("buildPaperclipEnv", () => {
       }
     }
   }
+
+  it("gives agent runs PAPERCLIP_AGENT_API_URL over the public runtime base", () => {
+    withEnv(
+      {
+        PAPERCLIP_AGENT_API_URL: "http://127.0.0.1:3100",
+        PAPERCLIP_API_URL: "https://paperclip.example.com",
+        PAPERCLIP_RUNTIME_API_URL: "https://paperclip.example.com",
+      },
+      () => {
+        const env = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" });
+        expect(env.PAPERCLIP_API_URL).toBe("http://127.0.0.1:3100");
+      },
+    );
+  });
 
   it("prefers an explicit PAPERCLIP_API_URL override over the derived runtime URL", () => {
     withEnv(
