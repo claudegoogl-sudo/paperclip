@@ -14,6 +14,11 @@ import type {
   AdapterSkillEntry,
   AdapterSkillSnapshot,
 } from "./types.js";
+import {
+  CHILD_ENV_SIGNING_KEY_DENYLIST,
+  deleteSigningKeys,
+  scrubSigningKeys,
+} from "./child-env-scrub.js";
 
 export interface RunProcessResult {
   exitCode: number | null;
@@ -2130,7 +2135,24 @@ export function buildInvocationEnvForLogs(
   return redactEnvForLogs(merged);
 }
 
-export function buildPaperclipEnv(agent: { id: string; companyId: string }): Record<string, string> {
+export interface BuildPaperclipEnvOptions {
+  /**
+   * Which API base the run receives as PAPERCLIP_API_URL.
+   * - "runtime" (default): the runtime/public base. Use for adapters whose
+   *   agent runs OFF the server host (openclaw-gateway, cursor-cloud): a
+   *   loopback URL there would point at the remote host's own loopback and
+   *   send the run credential to whatever listens on that port.
+   * - "agent": PAPERCLIP_AGENT_API_URL when set (server boot defaults it to
+   *   the loopback listen origin). Only for adapters that spawn the agent on
+   *   the server host.
+   */
+  apiBase?: "agent" | "runtime";
+}
+
+export function buildPaperclipEnv(
+  agent: { id: string; companyId: string },
+  options: BuildPaperclipEnvOptions = {},
+): Record<string, string> {
   const resolveHostForUrl = (rawHost: string): string => {
     const host = rawHost.trim();
     if (!host || host === "0.0.0.0" || host === "::") return "localhost";
@@ -2148,10 +2170,16 @@ export function buildPaperclipEnv(agent: { id: string; companyId: string }): Rec
   // An explicit PAPERCLIP_API_URL override must win over the URL derived from
   // authPublicBaseUrl: the derived URL can be unreachable from inside the
   // runtime container (e.g. when the public base URL is VPN/tailnet-only).
+  // PAPERCLIP_AGENT_API_URL is the dedicated agent-run base (server boot
+  // defaults it to the loopback listen origin); it wins over the
+  // runtime/public base, which may be behind an interactive access proxy.
+  const agentApiUrl =
+    options.apiBase === "agent" ? process.env.PAPERCLIP_AGENT_API_URL?.trim() : undefined;
   const apiUrl =
-    process.env.PAPERCLIP_API_URL ??
-    process.env.PAPERCLIP_RUNTIME_API_URL ??
-    `http://${runtimeHost}:${runtimePort}`;
+    agentApiUrl ||
+    (process.env.PAPERCLIP_API_URL ??
+      process.env.PAPERCLIP_RUNTIME_API_URL ??
+      `http://${runtimeHost}:${runtimePort}`);
   vars.PAPERCLIP_API_URL = apiUrl;
   return vars;
 }
@@ -2397,9 +2425,19 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
   return shapedWorkspaceEnv;
 }
 
+export {
+  CHILD_ENV_SIGNING_KEY_DENYLIST,
+  scrubSigningKeys,
+  scrubbedProcessEnv,
+} from "./child-env-scrub.js";
+
+export const CHILD_ENV_INHERITED_ONLY_DENYLIST = ["DATABASE_URL"] as const;
+
 export function sanitizeInheritedPaperclipEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.PAPERCLIPAI_CMD;
+  deleteSigningKeys(env);
+  for (const key of CHILD_ENV_INHERITED_ONLY_DENYLIST) delete env[key];
   for (const key of Object.keys(env)) {
     if (!key.startsWith("PAPERCLIP_")) continue;
     if (key === "PAPERCLIP_RUNTIME_API_URL") continue;
@@ -2596,6 +2634,11 @@ export const CLAUDE_CODE_NESTING_VARS = [
  *   adapter uses this because its child may run on a prompt-logging provider.
  *
  * The CLAUDE_CODE_* nesting-var strip and `ensurePathInEnv` apply either way.
+ * The signing-key denylist (`CHILD_ENV_SIGNING_KEY_DENYLIST`) is also removed
+ * either way, and AFTER `env` is layered: a caller (adapterConfig.env, a secret
+ * binding) must not be able to re-inject a signing key.
+ * `CHILD_ENV_INHERITED_ONLY_DENYLIST` (`DATABASE_URL`) is removed from the
+ * inherited env only; a caller-supplied value is kept.
  */
 export function buildChildEnv(
   env: Record<string, string>,
@@ -2609,6 +2652,7 @@ export function buildChildEnv(
   for (const key of CLAUDE_CODE_NESTING_VARS) {
     delete rawMerged[key];
   }
+  deleteSigningKeys(rawMerged);
   return ensurePathInEnv(rawMerged);
 }
 
@@ -3465,7 +3509,7 @@ export async function runChildProcess(
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
       remoteExecution: opts.remoteExecution ?? null,
       remoteEnv: opts.remoteExecution
-        ? { ...opts.env, PAPERCLIP_NOW: paperclipNow, PAPERCLIP_RUN_STARTED_AT: paperclipNow }
+        ? scrubSigningKeys({ ...opts.env, PAPERCLIP_NOW: paperclipNow, PAPERCLIP_RUN_STARTED_AT: paperclipNow })
         : null,
       localProcessSandbox: opts.localProcessSandbox ?? null,
     })
@@ -3477,6 +3521,9 @@ export async function runChildProcess(
           PAPERCLIP_NOW: paperclipNow,
           PAPERCLIP_RUN_STARTED_AT: startedAt,
         };
+        // target.env is layered after the scrub in buildChildEnv; re-apply the
+        // signing-key denylist so no spawn target can re-inject a signing key.
+        deleteSigningKeys(childEnv);
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
         }

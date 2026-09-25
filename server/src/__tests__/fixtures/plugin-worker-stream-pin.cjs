@@ -75,7 +75,21 @@ rl.on("line", (line) => {
       return;
     }
 
-    if (scenario === "open-in-dispatch" || scenario === "open-idless") {
+    if (scenario === "open-burst") {
+      // Open `count` distinct channels inside THIS dispatch (each echoing the
+      // host-minted invocation id), so every open is host-verified and
+      // pinned — the burst shape that drives the pin map over its cap.
+      const count = Number(params.count) || 0;
+      const prefix = typeof params.prefix === "string" ? params.prefix : "burst-";
+      for (let i = 0; i < count; i++) {
+        send({
+          jsonrpc: "2.0",
+          method: "streams.open",
+          params: { channel: `${prefix}${i}`, companyId: params.companyId },
+          ...echo,
+        });
+      }
+    } else if (scenario === "open-in-dispatch" || scenario === "open-idless") {
       // open-idless deliberately omits the echo even when a dispatch is in
       // flight (legacy worker shape): the host must not pin from an
       // unattributable open.

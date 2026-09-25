@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { buildAgentParams, resolveClaimedApiKeyPath, resolveSessionKey } from "./execute.js";
+import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
+import { buildAgentParams, buildPaperclipEnvForWake, resolveClaimedApiKeyPath, resolveSessionKey } from "./execute.js";
 
 describe("resolveSessionKey", () => {
   it("prefixes run-scoped session keys with the configured agent", () => {
@@ -121,5 +122,29 @@ describe("resolveClaimedApiKeyPath", () => {
   it("falls back to the shared default when value is not a string", () => {
     expect(resolveClaimedApiKeyPath(42)).toBe(DEFAULT_PATH);
     expect(resolveClaimedApiKeyPath({})).toBe(DEFAULT_PATH);
+  });
+});
+
+describe("buildPaperclipEnvForWake", () => {
+  it("never hands the remote gateway agent the server's loopback agent base", () => {
+    const saved = { agent: process.env.PAPERCLIP_AGENT_API_URL, api: process.env.PAPERCLIP_API_URL };
+    process.env.PAPERCLIP_AGENT_API_URL = "http://127.0.0.1:3100";
+    process.env.PAPERCLIP_API_URL = "https://paperclip.example.com";
+    try {
+      const ctx = {
+        agent: { id: "agent-1", companyId: "company-1" },
+        runId: "run-1",
+        config: {},
+        context: {},
+      } as unknown as AdapterExecutionContext;
+      const env = buildPaperclipEnvForWake(ctx, { issueIds: [] } as unknown as Parameters<typeof buildPaperclipEnvForWake>[1]);
+      expect(env.PAPERCLIP_API_URL).toBe("https://paperclip.example.com");
+      expect(JSON.stringify(env)).not.toContain("127.0.0.1");
+    } finally {
+      if (saved.agent === undefined) delete process.env.PAPERCLIP_AGENT_API_URL;
+      else process.env.PAPERCLIP_AGENT_API_URL = saved.agent;
+      if (saved.api === undefined) delete process.env.PAPERCLIP_API_URL;
+      else process.env.PAPERCLIP_API_URL = saved.api;
+    }
   });
 });

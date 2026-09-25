@@ -85,6 +85,7 @@ import {
 } from "./acpx-engine/startup-timing.js";
 import type { RuntimeProgressSink, RuntimeStatusSink } from "./runtime-progress.js";
 import type { LocalProcessSandboxOptions } from "./local-process-sandbox.js";
+import { signingKeyScrubSource } from "./child-env-scrub.js";
 
 export type { RuntimeProgressSink } from "./runtime-progress.js";
 
@@ -2848,6 +2849,8 @@ if ((await isSymbolicLink(sessionDir)) || (await isSymbolicLink(stdinDir))) {
 const childEnv = { ...process.env, ...(config.env || {}) };
 delete childEnv.PAPERCLIP_PROCESS_SESSION_DIR;
 delete childEnv.PAPERCLIP_PROCESS_SESSION_COMMAND_B64;
+// Never pass a signing-capable server secret to the session child.
+${signingKeyScrubSource("childEnv")}
 
 // I1: exactly one child process per emitted wrapper. Do not add a second
 // tracked child handle.
@@ -2939,6 +2942,8 @@ if ((await isSymbolicLink(sessionDir)) || (await isSymbolicLink(stdinDir))) {
 const childEnv = { ...process.env, ...(config.env || {}) };
 delete childEnv.PAPERCLIP_PROCESS_SESSION_DIR;
 delete childEnv.PAPERCLIP_PROCESS_SESSION_COMMAND_B64;
+// Never pass a signing-capable server secret to the session child.
+${signingKeyScrubSource("childEnv")}
 
 // I1: exactly one child process per emitted wrapper. Do not add a second
 // tracked child handle.

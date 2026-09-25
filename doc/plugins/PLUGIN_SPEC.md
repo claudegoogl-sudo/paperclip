@@ -978,6 +978,19 @@ The host enforces capabilities in the SDK layer and refuses calls outside the gr
 - `secrets.read-ref`
 - `environment.drivers.register`
 
+#### `http.outbound` destination rules
+
+`ctx.http.fetch` resolves the host once, then connects to the pinned IP. The host parses every resolved address and denies by default:
+
+- Loopback, unspecified, link-local (includes `169.254.169.254`), RFC 1918, ULA, multicast, documentation, benchmarking, discard and other reserved ranges are denied.
+- IPv6 forms that embed an IPv4 address (`::ffff:7f00:1`, `::127.0.0.1`, `64:ff9b::7f00:1`) are unwrapped. The inner IPv4 is classified.
+- 6to4 (`2002::/16`), Teredo (`2001::/32`) and local-use NAT64 (`64:ff9b:1::/48`) are denied.
+- Addresses of the host's own network interfaces are always denied.
+- CGNAT (`100.64.0.0/10`) is controlled by `PAPERCLIP_PLUGIN_FETCH_CGNAT`: `allow-legacy` (default) allows it and logs `plugin.http_fetch.cgnat_legacy_allowed` (plugin id, scheme, IP, port only); `deny` blocks it.
+- Redirects are not followed. The worker receives the 30x response.
+
+Example: `http://[::ffff:127.0.0.1]:3100/` fails with `All resolved IPs for ... are in private/reserved ranges`.
+
 ### Agent Tools
 
 - `agent.tools.register`
