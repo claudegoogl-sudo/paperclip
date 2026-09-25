@@ -776,12 +776,22 @@ export async function createApp(
   // while the plugin is active ('ready'). Gating on status means reconcile()
   // disarms the watcher on disable/uninstall (status leaves 'ready') even
   // though disable keeps packagePath in the DB.
+  // File-change restarts go through a lifecycle bound to the runtime-services
+  // loader so they take the full deactivate + activateReadyPlugin path
+  // (manifest re-read, migrations, fresh host handlers, startup config
+  // delivery). The shared `lifecycle` above is built without a loader (the
+  // loader needs it as a runtime service), so its restartWorker() would fall
+  // back to a bare process bounce. Lifecycle-event subscriptions stay on the
+  // shared `lifecycle`, which is where the loader emits them.
+  const devWatcherRestartLifecycle = pluginLifecycleManager(db, { loader, workerManager, eventBus });
   const devWatcher = createPluginDevWatcher(
     lifecycle,
     async (pluginId) => {
       const plugin = await pluginRegistry.getById(pluginId);
       return plugin?.status === "ready" ? plugin.packagePath ?? null : null;
     },
+    undefined,
+    { restartWorker: (pluginId) => devWatcherRestartLifecycle.restartWorker(pluginId) },
   );
   api.use(
     pluginRoutes(
