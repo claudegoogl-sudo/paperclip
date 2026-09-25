@@ -2432,6 +2432,13 @@ function deleteSigningKeys(env: NodeJS.ProcessEnv): void {
   }
 }
 
+/** Returns a copy of `env` with every signing-capable name removed. */
+export function scrubSigningKeys<T extends Record<string, string | undefined>>(env: T): T {
+  const out = { ...env };
+  for (const key of CHILD_ENV_SIGNING_KEY_DENYLIST) delete (out as Record<string, unknown>)[key];
+  return out;
+}
+
 export function sanitizeInheritedPaperclipEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.PAPERCLIPAI_CMD;
@@ -3508,7 +3515,7 @@ export async function runChildProcess(
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
       remoteExecution: opts.remoteExecution ?? null,
       remoteEnv: opts.remoteExecution
-        ? { ...opts.env, PAPERCLIP_NOW: paperclipNow, PAPERCLIP_RUN_STARTED_AT: paperclipNow }
+        ? scrubSigningKeys({ ...opts.env, PAPERCLIP_NOW: paperclipNow, PAPERCLIP_RUN_STARTED_AT: paperclipNow })
         : null,
       localProcessSandbox: opts.localProcessSandbox ?? null,
     })
@@ -3520,6 +3527,9 @@ export async function runChildProcess(
           PAPERCLIP_NOW: paperclipNow,
           PAPERCLIP_RUN_STARTED_AT: startedAt,
         };
+        // target.env is layered after the scrub in buildChildEnv; re-apply the
+        // signing-key denylist so no spawn target can re-inject a signing key.
+        deleteSigningKeys(childEnv);
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
         }

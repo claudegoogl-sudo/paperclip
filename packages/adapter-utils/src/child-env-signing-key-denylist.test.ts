@@ -1,3 +1,6 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
@@ -6,6 +9,7 @@ import {
   buildChildEnv,
   runChildProcess,
   sanitizeInheritedPaperclipEnv,
+  scrubSigningKeys,
 } from "./server-utils.js";
 
 // Regression: signing-capable secrets must never reach a child process, whether
@@ -94,5 +98,49 @@ describe("child env signing-key denylist", () => {
     });
     expect(result.exitCode).toBe(0);
     expect(JSON.parse(result.stdout.trim())).toEqual(names.map(() => false));
+  });
+
+  it("scrubSigningKeys removes every denylisted name and keeps the rest", () => {
+    const out = scrubSigningKeys({ ...allFake(), KEEP: "1" });
+    for (const key of ALWAYS) expect(key in out).toBe(false);
+    expect(out.KEEP).toBe("1");
+  });
+
+  it("runChildProcess remote path forwards no signing key from opts.env to ssh", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "signing-denylist-ssh-"));
+    const savedPath = process.env.PATH;
+    try {
+      // Fake ssh: report which denylisted names appear in its argv (names only),
+      // and whether any reached its own env.
+      const names = JSON.stringify(ALWAYS);
+      await writeFile(
+        path.join(dir, "ssh"),
+        `#!/usr/bin/env node\nconst n=${names};const a=process.argv.slice(2).join(" ");` +
+          `process.stdout.write(JSON.stringify({argv:n.filter((k)=>a.includes(k+"=")),env:n.filter((k)=>k in process.env),keep:a.includes("KEEP=")}));\n`,
+        { mode: 0o755 },
+      );
+      process.env.PATH = `${dir}${path.delimiter}${savedPath ?? ""}`;
+      const result = await runChildProcess("signing-denylist-remote", "node", ["-e", "0"], {
+        cwd: process.cwd(),
+        env: { ...allFake(), KEEP: "1" },
+        timeoutSec: 20,
+        graceSec: 1,
+        onLog: async () => {},
+        remoteExecution: {
+          host: "ssh.example.test",
+          port: 22,
+          username: "ssh-user",
+          remoteCwd: "/srv/paperclip/workspace",
+          remoteWorkspacePath: "/srv/paperclip/workspace",
+          privateKey: null,
+          knownHosts: null,
+          strictHostKeyChecking: true,
+        },
+      });
+      expect(JSON.parse(result.stdout)).toEqual({ argv: [], env: [], keep: true });
+    } finally {
+      process.env.PATH = savedPath;
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
