@@ -86,6 +86,12 @@ import type { IncomingMessage, RequestOptions as HttpRequestOptions } from "node
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
+import {
+  classifyEgressIp,
+  isEgressAllowed,
+  resolveCgnatMode,
+  type ClassifyOptions,
+} from "./plugin-egress-ip-classifier.js";
 import { logger } from "../middleware/logger.js";
 import { requireAgentActorSource, requirePluginBoardActorSource } from "./actor-source.js";
 import { getTelemetryClient } from "../telemetry.js";
@@ -127,40 +133,6 @@ const ALLOWED_PROTOCOLS = new Set(["http:", "https:"]);
 const TELEMETRY_EVENT_NAME_REGEX = /^[a-z0-9][a-z0-9_-]*$/;
 
 /**
- * Check if an IP address is in a private/reserved range (RFC 1918, loopback,
- * link-local, etc.) that plugins should never be able to reach.
- *
- * Handles IPv4-mapped IPv6 addresses (e.g. ::ffff:127.0.0.1) which Node's
- * dns.lookup may return depending on OS configuration.
- */
-function isPrivateIP(ip: string): boolean {
-  const lower = ip.toLowerCase();
-
-  // Unwrap IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) and re-check as IPv4
-  const v4MappedMatch = lower.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
-  if (v4MappedMatch && v4MappedMatch[1]) return isPrivateIP(v4MappedMatch[1]);
-
-  // IPv4 patterns
-  if (ip.startsWith("10.")) return true;
-  if (ip.startsWith("172.")) {
-    const second = parseInt(ip.split(".")[1]!, 10);
-    if (second >= 16 && second <= 31) return true;
-  }
-  if (ip.startsWith("192.168.")) return true;
-  if (ip.startsWith("127.")) return true;                   // loopback
-  if (ip.startsWith("169.254.")) return true;               // link-local
-  if (ip === "0.0.0.0") return true;
-
-  // IPv6 patterns
-  if (lower === "::1") return true;                          // loopback
-  if (lower.startsWith("fc") || lower.startsWith("fd")) return true; // ULA
-  if (lower.startsWith("fe80")) return true;                 // link-local
-  if (lower === "::") return true;
-
-  return false;
-}
-
-/**
  * Validate a URL for plugin fetch: protocol whitelist + private IP blocking.
  *
  * SSRF Prevention Strategy:
@@ -184,9 +156,19 @@ export interface ValidatedFetchTarget {
   useTls: boolean;
 }
 
-async function validateAndResolveFetchUrl(
+/** Injectable dependencies for {@link validateAndResolveFetchUrl} (tests). */
+export interface FetchUrlValidationOptions {
+  pluginId?: string;
+  dnsLookup?: (hostname: string, options: { all: true }) => Promise<Array<{ address: string; family: number }>>;
+  interfaces?: ClassifyOptions["interfaces"];
+  env?: NodeJS.ProcessEnv;
+  log?: Pick<typeof logger, "warn">;
+}
+
+export async function validateAndResolveFetchUrl(
   urlString: string,
   checkConfigEgress?: (urlString: string) => Promise<void>,
+  options: FetchUrlValidationOptions = {},
 ): Promise<ValidatedFetchTarget> {
   let parsed: URL;
   try {
@@ -217,7 +199,8 @@ async function validateAndResolveFetchUrl(
 
   // Race the DNS lookup against a timeout to prevent indefinite hangs
   // when DNS is misconfigured or unresponsive.
-  const dnsPromise = dnsLookup(originalHostname, { all: true });
+  const lookup = options.dnsLookup ?? dnsLookup;
+  const dnsPromise = lookup(originalHostname, { all: true });
   const timeoutPromise = new Promise<never>((_, reject) => {
     setTimeout(
       () => reject(new Error(`DNS lookup timed out after ${DNS_LOOKUP_TIMEOUT_MS}ms for ${originalHostname}`)),
@@ -234,7 +217,16 @@ async function validateAndResolveFetchUrl(
     // Filter to only non-private IPs instead of rejecting the entire request
     // when some IPs are private. This handles multi-homed hosts that resolve
     // to both private and public addresses.
-    const safeResults = results.filter((entry) => !isPrivateIP(entry.address));
+    // Parsed, deny-by-default classification (plugin-egress-ip-classifier):
+    // embedded-IPv4 IPv6 forms are unwrapped, own-host addresses are always
+    // denied, CGNAT follows the PAPERCLIP_PLUGIN_FETCH_CGNAT switch.
+    const cgnatMode = resolveCgnatMode(options.env);
+    const classified = results.map((entry) => ({
+      entry,
+      cls: classifyEgressIp(entry.address, { interfaces: options.interfaces }),
+    }));
+    const safe = classified.filter(({ cls }) => isEgressAllowed(cls, cgnatMode));
+    const safeResults = safe.map(({ entry }) => entry);
     if (safeResults.length === 0) {
       throw new Error(
         `All resolved IPs for ${originalHostname} are in private/reserved ranges`,
@@ -242,6 +234,20 @@ async function validateAndResolveFetchUrl(
     }
 
     const resolved = safeResults[0]!;
+    if (safe[0]!.cls.category === "cgnat") {
+      // Legacy CGNAT allowance must be visible. Scheme/IP/port only —
+      // never path, query or headers.
+      (options.log ?? logger).warn(
+        {
+          event: "plugin.http_fetch.cgnat_legacy_allowed",
+          pluginId: options.pluginId ?? null,
+          scheme: parsed.protocol.replace(/:$/, ""),
+          ip: resolved.address,
+          port: parsed.port ? Number(parsed.port) : parsed.protocol === "https:" ? 443 : 80,
+        },
+        "plugin.http_fetch.cgnat_legacy_allowed",
+      );
+    }
     return {
       parsedUrl: parsed,
       resolvedAddress: resolved.address,
@@ -2020,6 +2026,7 @@ export function buildHostServices(
         // allowlist before any DNS resolution happens.
         const target = await validateAndResolveFetchUrl(params.url, (url) =>
           enforcePluginConfigEgress(db, pluginId, url),
+          { pluginId },
         );
 
         const controller = new AbortController();
