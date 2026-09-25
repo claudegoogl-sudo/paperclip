@@ -2766,8 +2766,23 @@ describe("buildPaperclipEnv", () => {
         PAPERCLIP_RUNTIME_API_URL: "https://paperclip.example.com",
       },
       () => {
-        const env = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" });
+        const env = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" }, { apiBase: "agent" });
         expect(env.PAPERCLIP_API_URL).toBe("http://127.0.0.1:3100");
+      },
+    );
+  });
+
+  it("keeps the runtime/public base by default so off-host adapters never get loopback", () => {
+    withEnv(
+      {
+        PAPERCLIP_AGENT_API_URL: "http://127.0.0.1:3100",
+        PAPERCLIP_API_URL: "https://paperclip.example.com",
+      },
+      () => {
+        const env = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" });
+        expect(env.PAPERCLIP_API_URL).toBe("https://paperclip.example.com");
+        const explicit = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" }, { apiBase: "runtime" });
+        expect(explicit.PAPERCLIP_API_URL).toBe("https://paperclip.example.com");
       },
     );
   });

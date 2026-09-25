@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildRuntimeApiCandidateUrls,
   chooseAgentApiUrl,
+  isInsecureNonLoopbackApiUrl,
   choosePrimaryRuntimeApiUrl,
   collectReachableInterfaceHosts,
 } from "../runtime-api.js";
@@ -178,5 +179,18 @@ describe("chooseAgentApiUrl", () => {
     expect(
       chooseAgentApiUrl({ explicitAgentApiUrl: "not a url", bindHost: "0.0.0.0", port: 3100, fallbackApiUrl: publicBase }),
     ).toBe("http://127.0.0.1:3100");
+    expect(
+      chooseAgentApiUrl({ explicitAgentApiUrl: "file:///x", bindHost: "0.0.0.0", port: 3100, fallbackApiUrl: publicBase }),
+    ).toBe("http://127.0.0.1:3100");
+  });
+});
+
+describe("isInsecureNonLoopbackApiUrl", () => {
+  it("flags cleartext http to non-loopback hosts only", () => {
+    expect(isInsecureNonLoopbackApiUrl("http://10.0.0.5:3100")).toBe(true);
+    expect(isInsecureNonLoopbackApiUrl("http://127.0.0.1:3100")).toBe(false);
+    expect(isInsecureNonLoopbackApiUrl("http://[::1]:3100")).toBe(false);
+    expect(isInsecureNonLoopbackApiUrl("http://localhost:3100")).toBe(false);
+    expect(isInsecureNonLoopbackApiUrl("https://paperclip.example.com")).toBe(false);
   });
 });

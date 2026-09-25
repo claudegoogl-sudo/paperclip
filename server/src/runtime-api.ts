@@ -101,7 +101,9 @@ export function chooseAgentApiUrl(input: {
   const explicit = input.explicitAgentApiUrl?.trim();
   if (explicit) {
     try {
-      return new URL(explicit).origin;
+      const parsed = new URL(explicit);
+      // Only http(s) origins are usable API bases ("file:" etc. yield "null").
+      if (parsed.protocol === "http:" || parsed.protocol === "https:") return parsed.origin;
     } catch {
       // Malformed override: fall through to the derived default.
     }
@@ -114,6 +116,18 @@ export function chooseAgentApiUrl(input: {
     return formatOrigin("http:", "::1", input.port);
   }
   return input.fallbackApiUrl;
+}
+
+/** True when an agent API base is cleartext http to a non-loopback host. */
+export function isInsecureNonLoopbackApiUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:") return false;
+    const host = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    return !(host === "localhost" || host === "::1" || /^127\./.test(host));
+  } catch {
+    return false;
+  }
 }
 
 export function collectReachableInterfaceHosts(input: {
