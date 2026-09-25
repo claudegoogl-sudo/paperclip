@@ -28,7 +28,7 @@ import {
 // plus an instance-level structured log line.
 // ---------------------------------------------------------------------------
 
-const setPrivateEgressSchema = z
+export const setPrivateEgressSchema = z
   .object({
     origins: z.array(z.string().max(80)).max(MAX_PRIVATE_EGRESS_ORIGINS),
   })
