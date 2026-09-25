@@ -14,6 +14,11 @@ import type {
   AdapterSkillEntry,
   AdapterSkillSnapshot,
 } from "./types.js";
+import {
+  CHILD_ENV_SIGNING_KEY_DENYLIST,
+  deleteSigningKeys,
+  scrubSigningKeys,
+} from "./child-env-scrub.js";
 
 export interface RunProcessResult {
   exitCode: number | null;
@@ -2397,47 +2402,13 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
   return shapedWorkspaceEnv;
 }
 
-/**
- * Signing-capable server secrets that must never reach any child process.
- * Holding one of these lets a process mint agent JWTs, decrypt stored secrets,
- * or sign privileged server artifacts. The list is explicit on purpose: it does
- * not depend on the PAPERCLIP_* prefix rule, so a later allowlist change to
- * that rule cannot re-admit these names. `BETTER_AUTH_SECRET` is the server's
- * JWT-secret fallback. These names are removed from the inherited server env
- * AND from caller-supplied env (adapterConfig.env, secret bindings).
- */
-export const CHILD_ENV_SIGNING_KEY_DENYLIST = [
-  "PAPERCLIP_AGENT_JWT_SECRET",
-  "BETTER_AUTH_SECRET",
-  "PAPERCLIP_SECRETS_MASTER_KEY",
-  "PAPERCLIP_SECRETS_MASTER_KEY_FILE",
-  "PAPERCLIP_DECISION_SIGNING_SECRET",
-  "PAPERCLIP_WORKSPACE_HANDOFF_SECRET",
-  "PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN",
-  "PAPERCLIP_DEV_SERVER_STATUS_TOKEN",
-  "PAPERCLIP_TOOL_OAUTH_CLIENT_SECRET",
-  "PAPERCLIP_TELEMETRY_BACKEND_TOKEN",
-] as const;
+export {
+  CHILD_ENV_SIGNING_KEY_DENYLIST,
+  scrubSigningKeys,
+  scrubbedProcessEnv,
+} from "./child-env-scrub.js";
 
-/**
- * Server credentials removed from the INHERITED server env only. A caller may
- * still pass its own value (e.g. a project agent's own `DATABASE_URL` via
- * adapterConfig.env); the server's own credential must not leak through.
- */
 export const CHILD_ENV_INHERITED_ONLY_DENYLIST = ["DATABASE_URL"] as const;
-
-function deleteSigningKeys(env: NodeJS.ProcessEnv): void {
-  for (const key of CHILD_ENV_SIGNING_KEY_DENYLIST) {
-    delete env[key];
-  }
-}
-
-/** Returns a copy of `env` with every signing-capable name removed. */
-export function scrubSigningKeys<T extends Record<string, string | undefined>>(env: T): T {
-  const out = { ...env };
-  for (const key of CHILD_ENV_SIGNING_KEY_DENYLIST) delete (out as Record<string, unknown>)[key];
-  return out;
-}
 
 export function sanitizeInheritedPaperclipEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
