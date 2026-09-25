@@ -148,6 +148,7 @@ import {
   type StartupTraceContext,
 } from "./startup-timing.js";
 import { buildPersistedSessionEnv } from "./session-persist-env.js";
+import { scrubSigningKeys } from "../child-env-scrub.js";
 
 const defaultModuleDir = path.dirname(fileURLToPath(import.meta.url));
 const PAPERCLIP_MANAGED_CODEX_SKILLS_MANIFEST = ".paperclip-managed-skills.json";
@@ -745,7 +746,7 @@ async function normalizeGeminiAcpCommandShell(commandShell: string, env: NodeJS.
     const { stdout } = await execFileAsync(tokens[0], ["--version"], {
       timeout: GEMINI_VERSION_PROBE_TIMEOUT_MS,
       encoding: "utf8",
-      env,
+      env: scrubSigningKeys(env),
     });
     versionParts = parseGeminiVersionParts(stdout);
   } catch {

@@ -36,6 +36,7 @@ import {
   type SyncOperationTask,
 } from "./sync-operation-schedule.js";
 import type { RuntimeSpanRunner } from "./acpx-engine/startup-timing.js";
+import { scrubbedProcessEnv } from "./child-env-scrub.js";
 
 const execFile = promisify(execFileCallback);
 const SANDBOX_WORKSPACE_HEAVY_DIR_NAMES = [
@@ -721,10 +722,7 @@ async function withTempDir<T>(prefix: string, fn: (dir: string) => Promise<T>): 
 
 async function execTar(args: string[]): Promise<void> {
   await execFile("tar", args, {
-    env: {
-      ...process.env,
-      COPYFILE_DISABLE: "1",
-    },
+    env: scrubbedProcessEnv({ COPYFILE_DISABLE: "1" }),
     maxBuffer: 32 * 1024 * 1024,
   });
 }
