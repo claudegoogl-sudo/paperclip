@@ -110,7 +110,12 @@ import {
   startEgressPostureSweep,
 } from "./services/egress-posture.js";
 import { startTaskBridgeRenewalSweep } from "./services/task-bridge-renewal.js";
-import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
+import {
+  buildRuntimeApiCandidateUrls,
+  chooseAgentApiUrl,
+  choosePrimaryRuntimeApiUrl,
+  isInsecureNonLoopbackApiUrl,
+} from "./runtime-api.js";
 import { isLoopbackHost, rewriteLoopbackUrlPort } from "./url-utils.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { bufferPluginLogEntry } from "./services/plugin-host-services.js";
@@ -1122,6 +1127,20 @@ export async function startServer(): Promise<StartedServer> {
   process.env.PAPERCLIP_RUNTIME_API_URL = runtimeApiUrl;
   process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON = JSON.stringify(runtimeApiCandidates);
   process.env.PAPERCLIP_API_URL = configuredApiUrl;
+  const agentApiUrl = chooseAgentApiUrl({
+    explicitAgentApiUrl: process.env.PAPERCLIP_AGENT_API_URL ?? null,
+    bindHost: runtimeListenHost,
+    port: listenPort,
+    fallbackApiUrl: configuredApiUrl,
+  });
+  process.env.PAPERCLIP_AGENT_API_URL = agentApiUrl;
+  logger.info({ agentApiUrl, runtimeApiUrl: configuredApiUrl }, "agent run API base selected");
+  if (isInsecureNonLoopbackApiUrl(agentApiUrl)) {
+    logger.warn(
+      { agentApiUrl },
+      "agent run API base is cleartext http to a non-loopback host; run credentials cross the network unencrypted",
+    );
+  }
 
   
   setupRunnerPrpWebSocketServer(server, { apiUrl: configuredApiUrl });

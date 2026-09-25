@@ -676,7 +676,7 @@ export async function execute(
   const env: Record<string, string> = {
     ...allowlistedProcessEnv(),
     ...(userEnv && typeof userEnv === "object" ? userEnv : {}),
-    ...buildPaperclipEnv(ctx.agent),
+    ...buildPaperclipEnv(ctx.agent, { apiBase: "agent" }),
   };
 
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;

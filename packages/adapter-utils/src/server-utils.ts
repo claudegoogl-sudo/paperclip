@@ -2135,7 +2135,24 @@ export function buildInvocationEnvForLogs(
   return redactEnvForLogs(merged);
 }
 
-export function buildPaperclipEnv(agent: { id: string; companyId: string }): Record<string, string> {
+export interface BuildPaperclipEnvOptions {
+  /**
+   * Which API base the run receives as PAPERCLIP_API_URL.
+   * - "runtime" (default): the runtime/public base. Use for adapters whose
+   *   agent runs OFF the server host (openclaw-gateway, cursor-cloud): a
+   *   loopback URL there would point at the remote host's own loopback and
+   *   send the run credential to whatever listens on that port.
+   * - "agent": PAPERCLIP_AGENT_API_URL when set (server boot defaults it to
+   *   the loopback listen origin). Only for adapters that spawn the agent on
+   *   the server host.
+   */
+  apiBase?: "agent" | "runtime";
+}
+
+export function buildPaperclipEnv(
+  agent: { id: string; companyId: string },
+  options: BuildPaperclipEnvOptions = {},
+): Record<string, string> {
   const resolveHostForUrl = (rawHost: string): string => {
     const host = rawHost.trim();
     if (!host || host === "0.0.0.0" || host === "::") return "localhost";
@@ -2153,10 +2170,16 @@ export function buildPaperclipEnv(agent: { id: string; companyId: string }): Rec
   // An explicit PAPERCLIP_API_URL override must win over the URL derived from
   // authPublicBaseUrl: the derived URL can be unreachable from inside the
   // runtime container (e.g. when the public base URL is VPN/tailnet-only).
+  // PAPERCLIP_AGENT_API_URL is the dedicated agent-run base (server boot
+  // defaults it to the loopback listen origin); it wins over the
+  // runtime/public base, which may be behind an interactive access proxy.
+  const agentApiUrl =
+    options.apiBase === "agent" ? process.env.PAPERCLIP_AGENT_API_URL?.trim() : undefined;
   const apiUrl =
-    process.env.PAPERCLIP_API_URL ??
-    process.env.PAPERCLIP_RUNTIME_API_URL ??
-    `http://${runtimeHost}:${runtimePort}`;
+    agentApiUrl ||
+    (process.env.PAPERCLIP_API_URL ??
+      process.env.PAPERCLIP_RUNTIME_API_URL ??
+      `http://${runtimeHost}:${runtimePort}`);
   vars.PAPERCLIP_API_URL = apiUrl;
   return vars;
 }
