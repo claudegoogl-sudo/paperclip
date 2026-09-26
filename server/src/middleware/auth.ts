@@ -778,6 +778,73 @@ export function enforceBoardKeyScopeMiddleware(): RequestHandler {
 }
 
 /**
+ * Routes a `{ kind: "notify_only" }` agent API key may reach. Each pattern
+ * captures the issue id, which must be one of the key's `issueIds` (UUIDs,
+ * compared case-insensitively; identifiers such as `ABC-1` are not accepted,
+ * so the allow-list check needs no DB lookup). Fail-closed: anything else is
+ * 403 `agent_key_scope_violation`.
+ */
+const NOTIFY_ONLY_ALLOWED_ROUTES: ReadonlyArray<{
+  readonly method: string;
+  readonly pathPattern: RegExp;
+}> = [
+  { method: "GET", pathPattern: /^\/api\/issues\/([^/]+)$/ },
+  { method: "POST", pathPattern: /^\/api\/issues\/([^/]+)\/interactions$/ },
+];
+
+/**
+ * Agent-key scope enforcement for `notify_only` keys. Runs after
+ * actorMiddleware. Every other actor (including every other agent-key scope)
+ * falls through unchanged. A notify_only key never carries a run id: any
+ * `X-Paperclip-Run-Id` header is dropped so run attribution cannot be forged.
+ */
+export function enforceAgentKeyScopeMiddleware(): RequestHandler {
+  return (req, _res, next) => {
+    const actor = req.actor;
+    if (
+      !actor ||
+      actor.type !== "agent" ||
+      actor.keyScope?.kind !== "notify_only"
+    ) {
+      next();
+      return;
+    }
+
+    actor.runId = undefined;
+    const allowed = new Set((actor.keyScope.issueIds ?? []).map((id) => id.toLowerCase()));
+    const method = req.method.toUpperCase();
+    const matched = NOTIFY_ONLY_ALLOWED_ROUTES.some((entry) => {
+      if (method !== entry.method) return false;
+      const m = entry.pathPattern.exec(req.path);
+      if (!m) return false;
+      let issueId: string;
+      try {
+        issueId = decodeURIComponent(m[1] ?? "").toLowerCase();
+      } catch {
+        return false;
+      }
+      return allowed.has(issueId);
+    });
+    if (!matched) {
+      logger.warn(
+        { agentId: actor.agentId, keyId: actor.keyId, method, path: req.path },
+        "agent key scope violation (notify_only)",
+      );
+      next(
+        forbidden("Agent API key scope does not permit this route", {
+          code: "agent_key_scope_violation",
+          scope: "notify_only",
+          method,
+          path: req.path,
+        }),
+      );
+      return;
+    }
+    next();
+  };
+}
+
+/**
  * Registers the actor-resolution + provenance-capture middleware pair on `app`
  * in the one order that works: `actorMiddleware` populates `req.actor`, then
  * `enforceBoardKeyScopeMiddleware` narrows a scoped board key's reachable
@@ -795,6 +862,7 @@ export function registerActorContext(app: Application, db: Db, opts: ActorMiddle
   // run before route handlers so scoped-key requests never reach a route the
   // scope does not permit.
   app.use(enforceBoardKeyScopeMiddleware());
+  app.use(enforceAgentKeyScopeMiddleware());
   app.use(actorProvenanceMiddleware());
 }
 

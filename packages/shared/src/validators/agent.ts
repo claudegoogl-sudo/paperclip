@@ -171,19 +171,42 @@ export const skillTestAgentKeyScopeSchema = z.object({
   issueId: z.string().guid(),
 }).strict();
 
+/**
+ * `notify_only`: a run-less, fail-closed key for out-of-band pagers (systemd
+ * timers, cron) that must file interaction cards on a fixed set of issues.
+ * The key may only `GET /api/issues/:id` and `POST /api/issues/:id/interactions`
+ * for the listed issue UUIDs; every other route is 403
+ * (`agent_key_scope_violation`). It is the only agent-key kind exempt from the
+ * "Agent run id required" rule on interaction create, and any run-id header it
+ * sends is ignored, so no run attribution can be invented or forged.
+ */
+export const notifyOnlyAgentKeyScopeSchema = z.object({
+  kind: z.literal("notify_only"),
+  issueIds: z.array(z.string().guid()).min(1).max(10),
+}).strict();
+
 export const agentApiKeyScopeSchema = z.union([
   standardAgentKeyScopeSchema,
   taskBridgeAgentKeyScopeSchema,
   skillTestAgentKeyScopeSchema,
+  notifyOnlyAgentKeyScopeSchema,
 ]);
 
 export type AgentApiKeyScope = z.infer<typeof agentApiKeyScopeSchema>;
 export type TaskBridgeAgentKeyScope = z.infer<typeof taskBridgeAgentKeyScopeSchema>;
 export type SkillTestAgentKeyScope = z.infer<typeof skillTestAgentKeyScopeSchema>;
+export type NotifyOnlyAgentKeyScope = z.infer<typeof notifyOnlyAgentKeyScopeSchema>;
 
 export function normalizeAgentApiKeyScope(value: unknown): AgentApiKeyScope {
   const parsed = agentApiKeyScopeSchema.safeParse(value);
-  return parsed.success ? parsed.data : { kind: "standard" };
+  if (parsed.success) return parsed.data;
+  // Fail closed: a stored notify_only scope that no longer parses must never
+  // degrade to `standard`. An empty allow-list matches no issue, so the
+  // notify_only enforcement denies every route.
+  if (value && typeof value === "object" && (value as { kind?: unknown }).kind === "notify_only") {
+    return { kind: "notify_only", issueIds: [] } as unknown as AgentApiKeyScope;
+  }
+  return { kind: "standard" };
 }
 
 /**
@@ -202,6 +225,33 @@ export function agentApiKeyScopeIsCrossCompany(scope: AgentApiKeyScope | null | 
  * clamp to this ceiling. 24h.
  */
 export const CROSS_COMPANY_AGENT_KEY_MAX_TTL_SECONDS = 24 * 60 * 60;
+
+/** Maximum lifetime of a `notify_only` key (durable-credential lifetime cap). 90d. */
+export const NOTIFY_ONLY_AGENT_KEY_MAX_TTL_SECONDS = 90 * 24 * 60 * 60;
+
+/**
+ * `notify_only` keys must carry an explicit expiry no more than
+ * {@link NOTIFY_ONLY_AGENT_KEY_MAX_TTL_SECONDS} in the future. Returns an error
+ * message, or null when the requested lifetime is acceptable.
+ */
+export function notifyOnlyAgentKeyExpiryError(
+  input: { ttlSeconds?: number | null; expiresAt?: Date | string | null; now?: Date },
+): string | null {
+  const nowMs = (input.now ?? new Date()).getTime();
+  let expiresMs: number | null = null;
+  if (input.expiresAt != null) {
+    const d = input.expiresAt instanceof Date ? input.expiresAt : new Date(input.expiresAt);
+    expiresMs = Number.isNaN(d.getTime()) ? NaN : d.getTime();
+  } else if (input.ttlSeconds != null) {
+    expiresMs = nowMs + Math.floor(input.ttlSeconds) * 1000;
+  }
+  if (expiresMs == null) return "notify_only keys require ttlSeconds or expiresAt";
+  if (!Number.isFinite(expiresMs) || expiresMs <= nowMs) return "notify_only key expiry must be in the future";
+  if (expiresMs > nowMs + NOTIFY_ONLY_AGENT_KEY_MAX_TTL_SECONDS * 1000) {
+    return "notify_only key expiry must be at most 90 days from now";
+  }
+  return null;
+}
 
 export const createAgentKeySchema = z.object({
   name: z.string().min(1).default("default"),
