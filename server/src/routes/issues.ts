@@ -261,6 +261,37 @@ import {
 } from "../services/cross-issue-influence-limit.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
+
+/**
+ * Per-key create cap for run-less `notify_only` agent keys: a leaked pager key
+ * must not be able to flood an operator with cards. Sliding one-hour window,
+ * in-process (a restart resets it, which only ever loosens by one window).
+ */
+export const NOTIFY_ONLY_CREATE_LIMIT_PER_HOUR = 10;
+const NOTIFY_ONLY_CREATE_WINDOW_MS = 60 * 60 * 1000;
+const notifyOnlyCreateLog = new Map<string, number[]>();
+
+export function consumeNotifyOnlyCreateQuota(keyId: string, now: number = Date.now()): boolean {
+  const cutoff = now - NOTIFY_ONLY_CREATE_WINDOW_MS;
+  const recent = (notifyOnlyCreateLog.get(keyId) ?? []).filter((t) => t > cutoff);
+  if (recent.length >= NOTIFY_ONLY_CREATE_LIMIT_PER_HOUR) {
+    notifyOnlyCreateLog.set(keyId, recent);
+    return false;
+  }
+  recent.push(now);
+  notifyOnlyCreateLog.set(keyId, recent);
+  // Bound memory: drop keys whose window is empty.
+  if (notifyOnlyCreateLog.size > 1000) {
+    for (const [k, ts] of notifyOnlyCreateLog) {
+      if (!ts.some((t) => t > cutoff)) notifyOnlyCreateLog.delete(k);
+    }
+  }
+  return true;
+}
+
+export function resetNotifyOnlyCreateQuotaForTests(): void {
+  notifyOnlyCreateLog.clear();
+}
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
@@ -11313,6 +11344,25 @@ export function issueRoutes(
     if (notifyOnlyScope) {
       if (!notifyOnlyScope.issueIds.some((allowedId) => allowedId.toLowerCase() === issue.id.toLowerCase())) {
         res.status(403).json({ error: "Agent API key scope does not permit this issue", code: "agent_key_scope_violation" });
+        return;
+      }
+      // A pager only asks for acknowledgement: no task suggestions or questions.
+      if (req.body.kind !== "request_confirmation") {
+        res.status(403).json({
+          error: "notify_only keys may only create request_confirmation interactions",
+          code: "agent_key_scope_violation",
+        });
+        return;
+      }
+      if (!consumeNotifyOnlyCreateQuota(req.actor.keyId ?? `agent:${req.actor.agentId}`)) {
+        logger.warn(
+          { agentId: req.actor.agentId, keyId: req.actor.keyId, issueId: issue.id },
+          "notify_only interaction create rate limit exceeded",
+        );
+        res.status(429).json({
+          error: "notify_only interaction create rate limit exceeded",
+          code: "agent_key_rate_limited",
+        });
         return;
       }
       if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;

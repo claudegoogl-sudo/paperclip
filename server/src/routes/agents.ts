@@ -10,6 +10,7 @@ import {
   ADAPTER_AGNOSTIC_KEYS,
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
   createAgentKeySchema,
+  notifyOnlyAgentKeyExpiryError,
   createAgentHireSchema,
   createAgentSchema,
   deriveAgentUrlKey,
@@ -4432,6 +4433,13 @@ export function agentRoutes(
       return;
     }
     if (req.body.scope?.kind === "notify_only") {
+      // Board-only mint (assertBoard above): an agent credential must never be
+      // able to mint itself a durable run-less key. The key must also expire.
+      const expiryError = notifyOnlyAgentKeyExpiryError({
+        ttlSeconds: req.body.ttlSeconds ?? null,
+        expiresAt: req.body.expiresAt ?? null,
+      });
+      if (expiryError) throw unprocessable(expiryError);
       // Every allow-listed issue must exist in the agent's own company.
       const requestedIds = [...new Set((req.body.scope.issueIds as string[]).map((v) => v.toLowerCase()))];
       const found = await db

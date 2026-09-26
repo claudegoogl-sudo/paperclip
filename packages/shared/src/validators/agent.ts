@@ -226,6 +226,33 @@ export function agentApiKeyScopeIsCrossCompany(scope: AgentApiKeyScope | null | 
  */
 export const CROSS_COMPANY_AGENT_KEY_MAX_TTL_SECONDS = 24 * 60 * 60;
 
+/** Maximum lifetime of a `notify_only` key (PLA-6305 durable-credential cap). 90d. */
+export const NOTIFY_ONLY_AGENT_KEY_MAX_TTL_SECONDS = 90 * 24 * 60 * 60;
+
+/**
+ * `notify_only` keys must carry an explicit expiry no more than
+ * {@link NOTIFY_ONLY_AGENT_KEY_MAX_TTL_SECONDS} in the future. Returns an error
+ * message, or null when the requested lifetime is acceptable.
+ */
+export function notifyOnlyAgentKeyExpiryError(
+  input: { ttlSeconds?: number | null; expiresAt?: Date | string | null; now?: Date },
+): string | null {
+  const nowMs = (input.now ?? new Date()).getTime();
+  let expiresMs: number | null = null;
+  if (input.expiresAt != null) {
+    const d = input.expiresAt instanceof Date ? input.expiresAt : new Date(input.expiresAt);
+    expiresMs = Number.isNaN(d.getTime()) ? NaN : d.getTime();
+  } else if (input.ttlSeconds != null) {
+    expiresMs = nowMs + Math.floor(input.ttlSeconds) * 1000;
+  }
+  if (expiresMs == null) return "notify_only keys require ttlSeconds or expiresAt";
+  if (!Number.isFinite(expiresMs) || expiresMs <= nowMs) return "notify_only key expiry must be in the future";
+  if (expiresMs > nowMs + NOTIFY_ONLY_AGENT_KEY_MAX_TTL_SECONDS * 1000) {
+    return "notify_only key expiry must be at most 90 days from now";
+  }
+  return null;
+}
+
 export const createAgentKeySchema = z.object({
   name: z.string().min(1).default("default"),
   scope: agentApiKeyScopeSchema.optional().default({ kind: "standard" }),

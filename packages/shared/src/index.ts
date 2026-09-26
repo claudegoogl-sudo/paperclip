@@ -1753,6 +1753,8 @@ export {
   taskBridgeAgentKeyScopeSchema,
   skillTestAgentKeyScopeSchema,
   notifyOnlyAgentKeyScopeSchema,
+  notifyOnlyAgentKeyExpiryError,
+  NOTIFY_ONLY_AGENT_KEY_MAX_TTL_SECONDS,
   createAgentKeySchema,
   agentApiKeyScopeIsCrossCompany,
   CROSS_COMPANY_AGENT_KEY_MAX_TTL_SECONDS,

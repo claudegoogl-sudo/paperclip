@@ -2471,6 +2471,33 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueThreadInteractionService.create).not.toHaveBeenCalled();
     });
 
+    it.each(["suggest_tasks", "ask_user_questions"])("returns 403 for a %s card (request_confirmation only)", async (kind) => {
+      const res = await request(await createApp(notifyOnlyActor([issueId])))
+        .post(`/api/issues/${issueId}/interactions`)
+        .send({ kind, payload: {} });
+
+      // Either the kind gate (403) or body validation (400) must refuse; never create.
+      expect([400, 403], JSON.stringify(res.body)).toContain(res.status);
+      if (res.status === 403) expect(res.body.code).toBe("agent_key_scope_violation");
+      expect(mockIssueThreadInteractionService.create).not.toHaveBeenCalled();
+    });
+
+    it("rate-limits card creation per key to 10 per hour (429)", async () => {
+      const issuesModule = await import("../routes/issues.js");
+      issuesModule.resetNotifyOnlyCreateQuotaForTests();
+      const app = await createApp(notifyOnlyActor([issueId]));
+      for (let i = 0; i < issuesModule.NOTIFY_ONLY_CREATE_LIMIT_PER_HOUR; i += 1) {
+        const ok = await request(app).post(`/api/issues/${issueId}/interactions`).send(cardBody);
+        expect(ok.status, JSON.stringify(ok.body)).toBe(201);
+      }
+      const res = await request(app).post(`/api/issues/${issueId}/interactions`).send(cardBody);
+      expect(res.status, JSON.stringify(res.body)).toBe(429);
+      expect(res.body.code).toBe("agent_key_rate_limited");
+      expect(mockIssueThreadInteractionService.create).toHaveBeenCalledTimes(
+        issuesModule.NOTIFY_ONLY_CREATE_LIMIT_PER_HOUR,
+      );
+    });
+
     it("keeps the run-id rule for a standard agent key without a run id (401)", async () => {
       mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: peerAgentId, checkoutRunId: null, executionRunId: null }));
       const res = await request(await createApp({

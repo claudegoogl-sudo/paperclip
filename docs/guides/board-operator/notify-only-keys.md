@@ -10,7 +10,8 @@ issues. It can do nothing else.
 | Request | Result |
 | --- | --- |
 | `GET /api/issues/:id` for a listed issue | Allowed. |
-| `POST /api/issues/:id/interactions` for a listed issue | Allowed. No run id is needed. |
+| `POST /api/issues/:id/interactions` (`kind = request_confirmation`) for a listed issue | Allowed. No run id is needed. At most 10 per key per hour, then `429 agent_key_rate_limited`. |
+| `POST /api/issues/:id/interactions` with any other kind (`suggest_tasks`, `ask_user_questions`) | `403 agent_key_scope_violation`. |
 | Any route for an issue that is not listed | `403 agent_key_scope_violation`. |
 | Every other route (comments, issue PATCH/create, issue lists, secrets, agents, board keys, interaction accept/resolve, ...) | `403 agent_key_scope_violation`. |
 
@@ -29,18 +30,22 @@ Rules:
 
 ## Mint a key
 
-Only a board actor can mint a key. Every agent key (including `notify_only`,
-`task_bridge`, and `skill_test`) gets 403 on the mint route.
+Only a board actor can mint a key. Every agent credential (agent JWT, and
+agent keys of any scope) gets 403 on the mint route. A stolen agent credential
+therefore cannot mint itself a durable run-less key.
 
 ```bash
 curl -sS -X POST "$PAPERCLIP_API_URL/agents/$AGENT_ID/keys" \
   -H "Authorization: Bearer <board credential>" \
   -H "Content-Type: application/json" \
-  -d '{"name":"token-watch pager","scope":{"kind":"notify_only","issueIds":["<issue-uuid>"]}}'
+  -d '{"name":"token-watch pager","ttlSeconds":7776000,"scope":{"kind":"notify_only","issueIds":["<issue-uuid>"]}}'
 ```
 
 - `issueIds` holds 1 to 10 issue UUIDs. An empty list is `400`.
 - Every listed issue must be in the agent's company, else `422`.
+- An expiry is required: `ttlSeconds` or `expiresAt`, in the future and at
+  most 90 days away. A missing or longer expiry is `422`. Re-mint before it
+  runs out.
 
 ## Use the key
 
