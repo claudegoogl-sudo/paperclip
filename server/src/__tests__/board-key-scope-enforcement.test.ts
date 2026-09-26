@@ -72,6 +72,12 @@ describeEmbeddedPostgres("board API key scope enforcement", () => {
       return res.json({ ok: true, route: `plugins.${action}` });
     });
 
+    // CLI self identity (and a neighbour that must stay blocked) — the CLI's
+    // login/whoami/connect flows read /cli-auth/me with the fresh key.
+    app.get("/api/cli-auth/me", (_req, res) => res.json({ ok: true, route: "cli-auth.me" }));
+    app.get("/api/cli-auth/me/extra", (_req, res) => res.json({ ok: true, route: "cli-auth.me.extra" }));
+    app.post("/api/cli-auth/me", (_req, res) => res.json({ ok: true, route: "cli-auth.me.post" }));
+
     // Issue comment — the only mutation plugin_ops allows on issues.
     app.post("/api/issues/:issueId/comments", (_req, res) =>
       res.json({ ok: true, route: "issue.comment" }),
@@ -199,6 +205,20 @@ describeEmbeddedPostgres("board API key scope enforcement", () => {
       expect(res.status).toBe(200);
       expect(res.body).toMatchObject({ route: `plugins.${action}` });
     }
+  });
+
+  it("a plugin_ops-scoped key reaches GET /api/cli-auth/me (CLI login/whoami self identity) and nothing wider", async () => {
+    const app = buildApp();
+    const key = await createKey("plugin_ops");
+    const me = await request(app).get("/api/cli-auth/me").set("authorization", `Bearer ${key.token}`);
+    expect(me.status).toBe(200);
+    expect(me.body).toMatchObject({ route: "cli-auth.me" });
+
+    const extra = await request(app).get("/api/cli-auth/me/extra").set("authorization", `Bearer ${key.token}`);
+    expect(extra.status).toBe(403);
+    expect(extra.body).toMatchObject({ code: "board_key_scope_violation" });
+    const post = await request(app).post("/api/cli-auth/me").set("authorization", `Bearer ${key.token}`).send({});
+    expect(post.status).toBe(403);
   });
 
   it("a plugin_ops-scoped key reaches issue comment", async () => {
