@@ -692,6 +692,10 @@ const PLUGIN_OPS_ALLOWED_ROUTES: ReadonlyArray<{
   { method: "GET", pathPattern: /^\/api\/board-api-keys$/ },
   { method: "DELETE", pathPattern: /^\/api\/board-api-keys\/[^/]+$/ },
   { method: "POST", pathPattern: /^\/api\/cli-auth\/revoke-current$/ },
+  // Read-only self identity. The CLI's own login/whoami/connect flows call
+  // this with the key they just received; without it the CLI's default
+  // plugin_ops scope cannot complete its own login.
+  { method: "GET", pathPattern: /^\/api\/cli-auth\/me$/ },
 
   // --- Issue read/comment (operator-readable activity surface) ---
   // Allows GETs on issue detail/list/comments/documents and posting a comment.
