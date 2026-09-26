@@ -92,6 +92,7 @@ const mockIssueThreadInteractionService = vi.hoisted(() => ({
   expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
   expireRequestConfirmationsSupersededByHistoricalComments: vi.fn(async () => []),
   listForIssue: vi.fn(async () => []),
+  create: vi.fn(),
 }));
 const mockIssueApprovalService = vi.hoisted(() => ({
   link: vi.fn(),
@@ -2402,6 +2403,131 @@ describe("agent issue mutation checkout ownership", () => {
       expect(res.status, JSON.stringify(res.body)).toBe(403);
       expect(res.body.error).toBe("Task-watchdog run context is not backed by an active persisted watchdog.");
       expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("notify_only agent key on interaction create", () => {
+    const keyId = "88888888-8888-4888-8888-888888888888";
+    const otherIssueId = "99999999-9999-4999-8999-999999999990";
+    const cardBody = {
+      kind: "request_confirmation",
+      payload: { version: 1, prompt: "Token watch fired. Acknowledge?" },
+    };
+
+    function notifyOnlyActor(issueIds: string[]) {
+      return {
+        type: "agent",
+        agentId: peerAgentId,
+        companyId,
+        source: "agent_key",
+        keyId,
+        keyScope: { kind: "notify_only", issueIds },
+        // intentionally no runId: the pager is not a heartbeat run
+      };
+    }
+
+    beforeEach(() => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId }));
+      mockIssueThreadInteractionService.create.mockReset();
+      mockIssueThreadInteractionService.create.mockImplementation(async (_issue: unknown, input: Record<string, unknown>) => ({
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        kind: input.kind,
+        status: "pending",
+        sourceRunId: input.sourceRunId ?? null,
+        addresseeAgentId: null,
+      }));
+    });
+
+    it("creates a run-less card on an allow-listed issue with key provenance and no run id", async () => {
+      const res = await request(await createApp(notifyOnlyActor([issueId])))
+        .post(`/api/issues/${issueId}/interactions`)
+        .send(cardBody);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueThreadInteractionService.create).toHaveBeenCalledWith(
+        expect.objectContaining({ id: issueId }),
+        expect.objectContaining({ sourceRunId: null }),
+        expect.objectContaining({ agentId: peerAgentId }),
+      );
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.thread_interaction_created",
+          actorType: "agent",
+          agentId: peerAgentId,
+          agentApiKeyId: keyId,
+          runId: null,
+        }),
+      );
+    });
+
+    it("returns 403 for an issue that is not on the key allow-list", async () => {
+      const res = await request(await createApp(notifyOnlyActor([otherIssueId])))
+        .post(`/api/issues/${issueId}/interactions`)
+        .send(cardBody);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.code).toBe("agent_key_scope_violation");
+      expect(mockIssueThreadInteractionService.create).not.toHaveBeenCalled();
+    });
+
+    it.each(["suggest_tasks", "ask_user_questions"])("returns 403 for a %s card (request_confirmation only)", async (kind) => {
+      const res = await request(await createApp(notifyOnlyActor([issueId])))
+        .post(`/api/issues/${issueId}/interactions`)
+        .send({ kind, payload: {} });
+
+      // Either the kind gate (403) or body validation (400) must refuse; never create.
+      expect([400, 403], JSON.stringify(res.body)).toContain(res.status);
+      if (res.status === 403) expect(res.body.code).toBe("agent_key_scope_violation");
+      expect(mockIssueThreadInteractionService.create).not.toHaveBeenCalled();
+    });
+
+    it("rate-limits card creation per key to 10 per hour (429)", async () => {
+      const issuesModule = await import("../routes/issues.js");
+      issuesModule.resetNotifyOnlyCreateQuotaForTests();
+      const app = await createApp(notifyOnlyActor([issueId]));
+      for (let i = 0; i < issuesModule.NOTIFY_ONLY_CREATE_LIMIT_PER_HOUR; i += 1) {
+        const ok = await request(app).post(`/api/issues/${issueId}/interactions`).send(cardBody);
+        expect(ok.status, JSON.stringify(ok.body)).toBe(201);
+      }
+      const res = await request(app).post(`/api/issues/${issueId}/interactions`).send(cardBody);
+      expect(res.status, JSON.stringify(res.body)).toBe(429);
+      expect(res.body.code).toBe("agent_key_rate_limited");
+      expect(mockIssueThreadInteractionService.create).toHaveBeenCalledTimes(
+        issuesModule.NOTIFY_ONLY_CREATE_LIMIT_PER_HOUR,
+      );
+    });
+
+    it("keeps the run-id rule for a standard agent key without a run id (401)", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: peerAgentId, checkoutRunId: null, executionRunId: null }));
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: peerAgentId,
+        companyId,
+        source: "agent_key",
+        keyId,
+        keyScope: { kind: "standard" },
+      }))
+        .post(`/api/issues/${issueId}/interactions`)
+        .send(cardBody);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(401);
+      expect(res.body.error).toBe("Agent run id required");
+      expect(mockIssueThreadInteractionService.create).not.toHaveBeenCalled();
+    });
+
+    it("still accepts an agent_jwt with a run id and records that run", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: peerAgentId, checkoutRunId: null, executionRunId: null }));
+      const res = await request(await createApp(peerActor({ source: "agent_jwt" })))
+        .post(`/api/issues/${issueId}/interactions`)
+        .send(cardBody);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueThreadInteractionService.create).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ sourceRunId: "66666666-6666-4666-8666-666666666666" }),
+        expect.anything(),
+      );
     });
   });
 });
