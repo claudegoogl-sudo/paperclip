@@ -523,6 +523,44 @@ describe.sequential("agent permission routes", () => {
     expect(res.status).toBe(403);
   });
 
+  it.each([
+    ["standard", { kind: "standard" }],
+    ["task_bridge", { kind: "task_bridge", projectId: "11111111-1111-4111-8111-111111111111" }],
+    ["skill_test", { kind: "skill_test", issueId: "11111111-1111-4111-8111-111111111111" }],
+    ["notify_only", { kind: "notify_only", issueIds: ["11111111-1111-4111-8111-111111111111"] }],
+  ])("refuses to mint a notify_only key from a %s agent key", async (_label, keyScope) => {
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+      keyScope,
+      runId: "run-1",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/agents/${agentId}/keys`)
+      .send({ name: "pager", scope: { kind: "notify_only", issueIds: ["11111111-1111-4111-8111-111111111111"] } }));
+
+    expect(res.status).toBe(403);
+  });
+
+  it("rejects a notify_only mint with an empty issue allow-list (400)", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/agents/${agentId}/keys`)
+      .send({ name: "pager", scope: { kind: "notify_only", issueIds: [] } }));
+
+    expect(res.status).toBe(400);
+  });
+
   it("blocks wakeups for authenticated company members without agent admin permission", async () => {
     mockAccessService.canUser.mockResolvedValue(false);
 

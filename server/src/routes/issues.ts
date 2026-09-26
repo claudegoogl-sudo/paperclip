@@ -11304,7 +11304,19 @@ export function issueRoutes(
     const id = req.params.id as string;
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!issue) return;
-    if (req.actor.type === "agent") {
+    // notify_only agent keys are run-less by design: the issue allow-list (also
+    // enforced by enforceAgentKeyScopeMiddleware) is their whole authorization,
+    // and the card is stored with sourceRunId = null.
+    const notifyOnlyScope = req.actor.type === "agent" && req.actor.keyScope?.kind === "notify_only"
+      ? req.actor.keyScope
+      : null;
+    if (notifyOnlyScope) {
+      if (!notifyOnlyScope.issueIds.some((allowedId) => allowedId.toLowerCase() === issue.id.toLowerCase())) {
+        res.status(403).json({ error: "Agent API key scope does not permit this issue", code: "agent_key_scope_violation" });
+        return;
+      }
+      if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
+    } else if (req.actor.type === "agent") {
       if (!(await assertAgentIssueMutationAllowed(req, res, issue, { allowVisibleIssueWrite: true }))) return;
       if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
     } else {
@@ -11312,8 +11324,8 @@ export function issueRoutes(
     }
 
     const actor = getActorInfo(req);
-    const agentSourceRunId = req.actor.type === "agent" ? requireAgentRunId(req, res) : null;
-    if (req.actor.type === "agent" && !agentSourceRunId) return;
+    const agentSourceRunId = req.actor.type === "agent" && !notifyOnlyScope ? requireAgentRunId(req, res) : null;
+    if (req.actor.type === "agent" && !notifyOnlyScope && !agentSourceRunId) return;
     if (
       req.body.kind === "request_confirmation"
       && req.body.addresseeAgentId

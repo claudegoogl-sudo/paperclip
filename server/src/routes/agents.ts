@@ -4431,6 +4431,17 @@ export function agentRoutes(
     if (!agent) {
       return;
     }
+    if (req.body.scope?.kind === "notify_only") {
+      // Every allow-listed issue must exist in the agent's own company.
+      const requestedIds = [...new Set((req.body.scope.issueIds as string[]).map((v) => v.toLowerCase()))];
+      const found = await db
+        .select({ id: issuesTable.id })
+        .from(issuesTable)
+        .where(and(eq(issuesTable.companyId, agent.companyId), inArray(issuesTable.id, requestedIds)));
+      if (found.length !== requestedIds.length) {
+        throw unprocessable("notify_only issueIds must all be issues in the agent's company");
+      }
+    }
     const key = await svc.createApiKey(id, req.body.name, req.body.scope, {
       responsibleUserId: req.actor.userId ?? null,
       ttlSeconds: req.body.ttlSeconds ?? null,

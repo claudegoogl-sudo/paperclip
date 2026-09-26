@@ -171,19 +171,42 @@ export const skillTestAgentKeyScopeSchema = z.object({
   issueId: z.string().guid(),
 }).strict();
 
+/**
+ * `notify_only`: a run-less, fail-closed key for out-of-band pagers (systemd
+ * timers, cron) that must file interaction cards on a fixed set of issues.
+ * The key may only `GET /api/issues/:id` and `POST /api/issues/:id/interactions`
+ * for the listed issue UUIDs; every other route is 403
+ * (`agent_key_scope_violation`). It is the only agent-key kind exempt from the
+ * "Agent run id required" rule on interaction create, and any run-id header it
+ * sends is ignored, so no run attribution can be invented or forged.
+ */
+export const notifyOnlyAgentKeyScopeSchema = z.object({
+  kind: z.literal("notify_only"),
+  issueIds: z.array(z.string().guid()).min(1).max(10),
+}).strict();
+
 export const agentApiKeyScopeSchema = z.union([
   standardAgentKeyScopeSchema,
   taskBridgeAgentKeyScopeSchema,
   skillTestAgentKeyScopeSchema,
+  notifyOnlyAgentKeyScopeSchema,
 ]);
 
 export type AgentApiKeyScope = z.infer<typeof agentApiKeyScopeSchema>;
 export type TaskBridgeAgentKeyScope = z.infer<typeof taskBridgeAgentKeyScopeSchema>;
 export type SkillTestAgentKeyScope = z.infer<typeof skillTestAgentKeyScopeSchema>;
+export type NotifyOnlyAgentKeyScope = z.infer<typeof notifyOnlyAgentKeyScopeSchema>;
 
 export function normalizeAgentApiKeyScope(value: unknown): AgentApiKeyScope {
   const parsed = agentApiKeyScopeSchema.safeParse(value);
-  return parsed.success ? parsed.data : { kind: "standard" };
+  if (parsed.success) return parsed.data;
+  // Fail closed: a stored notify_only scope that no longer parses must never
+  // degrade to `standard`. An empty allow-list matches no issue, so the
+  // notify_only enforcement denies every route.
+  if (value && typeof value === "object" && (value as { kind?: unknown }).kind === "notify_only") {
+    return { kind: "notify_only", issueIds: [] } as unknown as AgentApiKeyScope;
+  }
+  return { kind: "standard" };
 }
 
 /**
