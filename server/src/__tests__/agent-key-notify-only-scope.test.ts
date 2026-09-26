@@ -69,7 +69,7 @@ describe("notify_only agent key scope schema", () => {
         issueIds: Array.from({ length: 11 }, () => randomUUID()),
       }).success,
     ).toBe(false);
-    expect(notifyOnlyAgentKeyScopeSchema.safeParse({ kind: "notify_only", issueIds: ["PLA-1"] }).success).toBe(false);
+    expect(notifyOnlyAgentKeyScopeSchema.safeParse({ kind: "notify_only", issueIds: ["ABC-1"] }).success).toBe(false);
     expect(
       notifyOnlyAgentKeyScopeSchema.safeParse({ kind: "notify_only", issueIds: [listedIssueId], extra: 1 }).success,
     ).toBe(false);
@@ -96,7 +96,7 @@ describe("notify_only agent key route allow-list", () => {
   it.each([
     ["GET", () => `/api/issues/${otherIssueId}`],
     ["POST", () => `/api/issues/${otherIssueId}/interactions`],
-    ["GET", () => "/api/issues/PLA-1"],
+    ["GET", () => "/api/issues/ABC-1"],
     ["POST", () => `/api/issues/${listedIssueId}/comments`],
     ["GET", () => `/api/issues/${listedIssueId}/comments`],
     ["PATCH", () => `/api/issues/${listedIssueId}`],

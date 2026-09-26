@@ -780,7 +780,7 @@ export function enforceBoardKeyScopeMiddleware(): RequestHandler {
 /**
  * Routes a `{ kind: "notify_only" }` agent API key may reach. Each pattern
  * captures the issue id, which must be one of the key's `issueIds` (UUIDs,
- * compared case-insensitively; identifiers such as `PLA-1` are not accepted,
+ * compared case-insensitively; identifiers such as `ABC-1` are not accepted,
  * so the allow-list check needs no DB lookup). Fail-closed: anything else is
  * 403 `agent_key_scope_violation`.
  */
