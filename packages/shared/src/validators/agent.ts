@@ -226,7 +226,7 @@ export function agentApiKeyScopeIsCrossCompany(scope: AgentApiKeyScope | null | 
  */
 export const CROSS_COMPANY_AGENT_KEY_MAX_TTL_SECONDS = 24 * 60 * 60;
 
-/** Maximum lifetime of a `notify_only` key (PLA-6305 durable-credential cap). 90d. */
+/** Maximum lifetime of a `notify_only` key (durable-credential lifetime cap). 90d. */
 export const NOTIFY_ONLY_AGENT_KEY_MAX_TTL_SECONDS = 90 * 24 * 60 * 60;
 
 /**
