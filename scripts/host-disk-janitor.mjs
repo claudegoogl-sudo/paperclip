@@ -27,6 +27,14 @@
  *     Fully untracked (never `git add`ed) files are NOT protected by this
  *     check -- see README notes in the PR description.
  *
+ *   - A directory at, inside, or containing a path registered as a live
+ *     plugin install (`plugins.package_path` in the embedded Postgres) is
+ *     NEVER deletion-eligible, regardless of age or git state. A plain-copy
+ *     install has no .git and mtimes as old as its source tag, which otherwise
+ *     classifies exactly like an abandoned worktree -- that is how a live
+ *     deploy tree was reaped on 2026-09-09. If the registry
+ *     lookup fails, the worktree and /tmp categories fail closed for that
+ *     run (nothing deleted) and the failure is printed loudly.
  * All retention values live in one place: CONFIG below. Every path is also
  * overridable via environment variable so this script can be pointed at an
  * isolated sandbox directory tree for testing without touching production
@@ -34,6 +42,7 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
 import {
   closeSync,
   existsSync,
@@ -42,6 +51,7 @@ import {
   readdirSync,
   readFileSync,
   lstatSync,
+  statSync,
   rmSync,
   unlinkSync,
   mkdirSync,
@@ -107,6 +117,31 @@ export const CONFIG = {
   // the disk alarm from that point on. Never rely on a crontab comment
   // alone for this -- the guard belongs in code.
   SELF_SCRIPT_PATH: process.env.PLA_JANITOR_SELF_PATH || fileURLToPath(import.meta.url),
+
+  // -- DB-registered plugin package paths (the 2026-09-09 live-deploy reap fix) --
+  // The plugins table's package_path column is the authority on "this
+  // directory is a deployed plugin install". Registered roots -- and any
+  // directory at, inside, or containing one -- are never deletion-eligible.
+  REGISTERED_PATHS_JSON_OVERRIDE:
+    process.env.PLA_JANITOR_REGISTERED_PATHS_JSON || "", // test/ops override: JSON array of paths
+  PG_DATA_DIR: process.env.PLA_JANITOR_PG_DATA_DIR || "",
+  PG_PORT: Number(process.env.PLA_JANITOR_PG_PORT || 54329),
+  PG_USER: process.env.PLA_JANITOR_PG_USER || "paperclip",
+  PG_DATABASE: process.env.PLA_JANITOR_PG_DATABASE || "paperclip",
+  PG_CREDENTIAL_SUFFIX: ".pg-credential",
+  // Where to find the `pg` driver, tried in order. The embedded-postgres
+  // client library ships inside the paperclipai global module on this host;
+  // the bare "pg" fallback only resolves when run from a tree that has it.
+  PG_MODULE_PATHS: (
+    process.env.PLA_JANITOR_PG_MODULE_PATHS ||
+    [
+      "/usr/lib/node_modules/paperclipai/node_modules/pg",
+      path.join(HOME, "upstream-paperclip/node_modules/pg"),
+      "pg",
+    ].join(":")
+  )
+    .split(":")
+    .filter(Boolean),
 
   // -- /tmp agent scratch --
   // Patterns, not bare prefixes: a bare `startsWith("pla")` also captures
@@ -502,13 +537,15 @@ export function isPathAncestorOf(candidateDir, targetPath) {
   return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
 }
 
-export function evaluateWorktree(dirPath, nowMs, config = CONFIG) {
+export function evaluateWorktree(dirPath, nowMs, config = CONFIG, registeredPaths = []) {
   const classification = classifyWorktree(dirPath);
   const cutoffMs = nowMs - config.WORKTREE_MAX_AGE_DAYS * DAY_MS;
   const isOldEnough = !directoryHasFileNewerThan(dirPath, cutoffMs, [".git"]);
   const isSelf = isPathAncestorOf(dirPath, config.SELF_SCRIPT_PATH);
-  const eligible = (classification === "not-a-repo" || classification === "safe") && isOldEnough && !isSelf;
-  return { path: dirPath, classification, isOldEnough, isSelf, eligible };
+  const registeredRoot = findRegisteredOverlap(dirPath, registeredPaths);
+  const eligible =
+    (classification === "not-a-repo" || classification === "safe") && isOldEnough && !isSelf && registeredRoot === null;
+  return { path: dirPath, classification, isOldEnough, isSelf, registeredRoot, eligible };
 }
 
 /**
@@ -539,6 +576,189 @@ function pruneWorktreeRegistrations(storeDir) {
 }
 
 // ---------------------------------------------------------------------------
+// DB-registered plugin package paths (the 2026-09-09 live-deploy reap fix)
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract the embedded-Postgres data directory from a `ps ax -o command`
+ * snapshot. Unlike the messenger drift-check (which takes the first
+ * `postgres -D` line and can be fooled by an unrelated staging cluster),
+ * this prefers the data dir under the Paperclip instance directory and only
+ * falls back to the first match when no instance dir is present.
+ */
+export function parseEmbeddedPostgresDataDir(psText) {
+  const matches = [];
+  for (const line of String(psText).split("\n")) {
+    const m = line.match(/(?:^|\/)postgres\b.*?\s-D\s+(\S+)/);
+    if (m) matches.push(m[1]);
+  }
+  if (matches.length === 0) return null;
+  return (
+    matches.find((d) => d.includes(`${path.sep}.paperclip${path.sep}instances${path.sep}default${path.sep}db`)) ||
+    matches[0]
+  );
+}
+
+/**
+ * Parse `-p <port>` and `unix_socket_directories=<dir>` out of a
+ * postmaster.opts file. The file quotes each argument (`"-p" "54329"`), so
+ * both patterns tolerate quote characters in either position. The live
+ * cluster on this host is UNIX-socket-only (listen_addresses is empty), so
+ * the socket dir -- not a TCP host -- is the connection path.
+ */
+export function parsePostmasterOpts(optsText) {
+  const port = optsText.match(/-p"?\s*"?(\d+)/);
+  const sock = optsText.match(/unix_socket_directories="?([^"\s]+)/);
+  return {
+    port: port ? Number(port[1]) : null,
+    socketDir: sock ? sock[1] : null,
+  };
+}
+
+/**
+ * Resolve the embedded-Postgres password without ever logging it:
+ *   (a) PGPASSWORD from the environment, when set and non-empty;
+ *   (b) the host credential file `<dataDir>.pg-credential`, read only when it
+ *       is mode 0600 (any looser mode is refused, not silently trusted -- same
+ *       policy as the messenger drift check).
+ * The value must never appear in logs, output, or error messages.
+ */
+export function resolveDbCredential({ env = {}, dataDir, io } = {}) {
+  const _io = io ?? {
+    exists: (p) => existsSync(p),
+    mode: (p) => statSync(p).mode & 0o777,
+    read: (p) => readFileSync(p, "utf8"),
+  };
+  if (env.PGPASSWORD) return { password: env.PGPASSWORD, source: "env" };
+  if (!dataDir) throw new Error("no embedded-postgres data dir; cannot locate credential file");
+  const credPath = `${dataDir}${CONFIG.PG_CREDENTIAL_SUFFIX}`;
+  if (!_io.exists(credPath)) throw new Error(`credential file ${credPath} not found`);
+  const mode = _io.mode(credPath);
+  if (mode !== 0o600) {
+    throw new Error(`credential file ${credPath} has mode ${mode.toString(8)}, expected 600 -- refusing`);
+  }
+  const password = _io.read(credPath).trim();
+  if (!password) throw new Error(`credential file ${credPath} is empty`);
+  return { password, source: "credfile" };
+}
+
+function importPgModule(config) {
+  // `pg` is a CommonJS package; ES-module import() cannot resolve a package
+  // by directory path, so load it through createRequire, which can.
+  const errors = [];
+  const require = createRequire(import.meta.url);
+  for (const candidate of config.PG_MODULE_PATHS) {
+    try {
+      const mod = require(candidate);
+      return { mod: mod.default ?? mod, via: candidate };
+    } catch (err) {
+      errors.push(`${candidate}: ${err.message.split("\n")[0]}`);
+    }
+  }
+  throw new Error(
+    `no usable pg module (tried ${config.PG_MODULE_PATHS.length} location(s)): ${errors.join("; ")}`,
+  );
+}
+
+/**
+ * Load the set of registered plugin install roots (`plugins.package_path`)
+ * from the embedded Postgres over its UNIX socket. Never throws: any failure
+ * returns { status: "unavailable", error } and every caller must fail CLOSED
+ * (treat every scanned directory as potentially registered -- delete nothing
+ * in the directory categories) until the lookup works again. Under-deleting
+ * is recoverable; deleting a live install is not.
+ */
+export async function loadRegisteredPackagePaths({ config = CONFIG } = {}) {
+  if (config.REGISTERED_PATHS_JSON_OVERRIDE) {
+    try {
+      const parsed = JSON.parse(config.REGISTERED_PATHS_JSON_OVERRIDE);
+      if (!Array.isArray(parsed)) throw new Error("override is not a JSON array");
+      return {
+        status: "ok",
+        paths: [...new Set(parsed.map((p) => path.resolve(String(p))))].sort(),
+        source: "json-override",
+      };
+    } catch (err) {
+      return {
+        status: "unavailable",
+        paths: [],
+        source: "json-override",
+        error: `bad PLA_JANITOR_REGISTERED_PATHS_JSON: ${err.message}`,
+      };
+    }
+  }
+  try {
+    let psText = "";
+    try {
+      psText = execFileSync("ps", ["ax", "-o", "command"], { encoding: "utf8" });
+    } catch (err) {
+      throw new Error(`ps failed: ${err.message}`);
+    }
+    const dataDir = config.PG_DATA_DIR || parseEmbeddedPostgresDataDir(psText);
+    if (!dataDir) throw new Error("no embedded-postgres `postgres -D <dataDir>` process found");
+    let optsText = "";
+    try {
+      optsText = readFileSync(path.join(dataDir, "postmaster.opts"), "utf8");
+    } catch {
+      // postmaster.opts missing: socket/port must come from somewhere else
+    }
+    const { port, socketDir } = parsePostmasterOpts(optsText);
+    if (!socketDir) throw new Error(`could not read unix_socket_directories from ${path.join(dataDir, "postmaster.opts")}`);
+    const { password, source: credSource } = resolveDbCredential({ env: process.env, dataDir });
+    const { mod: pg, via: pgVia } = importPgModule(config);
+    const client = new pg.Client({
+      host: socketDir,
+      port: port || config.PG_PORT,
+      user: config.PG_USER,
+      password,
+      database: config.PG_DATABASE,
+    });
+    try {
+      await client.connect();
+    } catch (err) {
+      throw new Error(
+        `connect to embedded Postgres over socket ${socketDir} port ${port || config.PG_PORT} ` +
+          `(credential from ${credSource}, pg from ${pgVia}) failed: ${err.message}`,
+      );
+    }
+    let rows;
+    try {
+      const result = await client.query("SELECT package_path FROM plugins WHERE package_path IS NOT NULL");
+      rows = result.rows;
+    } finally {
+      try {
+        await client.end();
+      } catch {
+        // already closed
+      }
+    }
+    const paths = [...new Set(rows.map((r) => path.resolve(String(r.package_path))))].sort();
+    return { status: "ok", paths, source: "db", socketDir, port: port || config.PG_PORT, rowCount: rows.length };
+  } catch (err) {
+    return { status: "unavailable", paths: [], source: "db", error: err.message };
+  }
+}
+
+/**
+ * Return the registered path that overlaps `dirPath`, or null. Overlap means
+ * either side is equal to or an ancestor of the other: a candidate AT or
+ * INSIDE a registered root must never be deleted, and a candidate that
+ * CONTAINS a registered root must never be deleted either (deleting the
+ * parent would destroy the registered install inside it).
+ */
+export function findRegisteredOverlap(dirPath, registeredPaths) {
+  if (!registeredPaths || registeredPaths.length === 0) return null;
+  const resolved = path.resolve(dirPath);
+  for (const registered of registeredPaths) {
+    const regResolved = path.resolve(registered);
+    if (regResolved === resolved) return regResolved;
+    if (isPathAncestorOf(regResolved, resolved)) return regResolved; // candidate inside registered root
+    if (isPathAncestorOf(resolved, regResolved)) return regResolved; // registered root inside candidate
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // /tmp agent scratch
 // ---------------------------------------------------------------------------
 
@@ -549,10 +769,11 @@ export function scanTmpCandidates(config = CONFIG) {
     .map((e) => path.join(config.TMP_DIR, e.name));
 }
 
-export function evaluateTmpEntry(entryPath, nowMs, config = CONFIG) {
+export function evaluateTmpEntry(entryPath, nowMs, config = CONFIG, registeredPaths = []) {
   const cutoffMs = nowMs - config.TMP_MAX_AGE_DAYS * DAY_MS;
-  const eligible = !directoryHasFileNewerThan(entryPath, cutoffMs);
-  return { path: entryPath, eligible };
+  const registeredRoot = findRegisteredOverlap(entryPath, registeredPaths);
+  const eligible = !directoryHasFileNewerThan(entryPath, cutoffMs) && registeredRoot === null;
+  return { path: entryPath, eligible, registeredRoot };
 }
 
 // ---------------------------------------------------------------------------
@@ -682,8 +903,27 @@ function dirSizeBytes(p) {
   return collectFiles(p).reduce((sum, f) => sum + f.sizeBytes, 0) + statSize(p);
 }
 
-export async function run({ apply = false, nowMs = Date.now(), config = CONFIG } = {}) {
+export async function run({
+  apply = false,
+  nowMs = Date.now(),
+  config = CONFIG,
+  loadRegistered = loadRegisteredPackagePaths,
+} = {}) {
   const summary = { mode: apply ? "apply" : "dry-run", timestamp: new Date(nowMs).toISOString(), categories: {} };
+
+  // -- DB-registered plugin install roots (the 2026-09-09 live-deploy reap fix) --
+  // Loaded once, up front: the worktree AND /tmp categories both consult it.
+  // On lookup failure both categories fail closed for the whole run.
+  const registeredLookup = await loadRegistered({ config });
+  const registeredPaths = registeredLookup.status === "ok" ? registeredLookup.paths : [];
+  const registeredGuardActive = registeredLookup.status === "ok";
+  summary.registeredPackagePaths = {
+    status: registeredLookup.status,
+    source: registeredLookup.source || "unknown",
+    count: registeredPaths.length,
+    paths: registeredPaths,
+  };
+  if (registeredLookup.error) summary.registeredPackagePaths.error = registeredLookup.error;
 
   // -- backups --
   {
@@ -724,6 +964,9 @@ export async function run({ apply = false, nowMs = Date.now(), config = CONFIG }
       reclaimedBytes: [...unverified, ...prune].reduce((sum, e) => sum + e.sizeBytes, 0),
       prunedNames: prune.map((e) => e.name),
       unverifiedNames: unverified.map((e) => e.name),
+      // Full paths, so the log alone attributes every deletion (so the log alone attributes every deletion).
+      prunedPaths: [...unverified, ...prune].map((e) => e.fullPath || path.join(config.BACKUPS_DIR, e.name)),
+      unverifiedPaths: unverified.map((e) => e.fullPath || path.join(config.BACKUPS_DIR, e.name)),
     };
   }
 
@@ -746,14 +989,19 @@ export async function run({ apply = false, nowMs = Date.now(), config = CONFIG }
       keptFiles: keep.length,
       prunedFiles: prune.length,
       reclaimedBytes: prune.reduce((sum, f) => sum + f.sizeBytes, 0),
+      prunedPaths: prune.map((f) => f.path),
     };
   }
 
   // -- worktrees / clones --
   {
     const candidates = scanWorktreeCandidates(config);
-    const evaluations = candidates.map((p) => evaluateWorktree(p, nowMs, config));
-    const eligible = evaluations.filter((e) => e.eligible);
+    const evaluations = candidates.map((p) => evaluateWorktree(p, nowMs, config, registeredPaths));
+    const ageEligible = evaluations.filter((e) => e.eligible);
+    // Fail closed when the registered-path lookup did not answer: any
+    // candidate could be a live install root the DB would have excluded, so
+    // nothing in this category is deleted until the lookup works again.
+    const eligible = registeredGuardActive ? ageEligible : [];
     // Size is measured before deletion in both modes -- measuring only in
     // dry-run (the previous behavior) made every --apply run report
     // reclaimedBytes: 0, the only observability this job gets.
@@ -772,10 +1020,15 @@ export async function run({ apply = false, nowMs = Date.now(), config = CONFIG }
     summary.categories.worktrees = {
       totalScanned: candidates.length,
       eligible: eligible.length,
+      eligibleBeforeRegisteredGuard: ageEligible.length,
       reclaimedBytes: eligibleSizedBytes,
       eligiblePaths: eligible.map((e) => e.path),
       excludedReview: evaluations.filter((e) => e.classification === "review").map((e) => e.path),
       excludedSelf: evaluations.filter((e) => e.isSelf).map((e) => e.path),
+      excludedRegistered: evaluations
+        .filter((e) => e.registeredRoot)
+        .map((e) => ({ path: e.path, registeredRoot: e.registeredRoot })),
+      guardFailureExcludedPaths: registeredGuardActive ? [] : ageEligible.map((e) => e.path),
       registrationPrune,
     };
   }
@@ -783,8 +1036,10 @@ export async function run({ apply = false, nowMs = Date.now(), config = CONFIG }
   // -- /tmp scratch --
   {
     const candidates = scanTmpCandidates(config);
-    const evaluations = candidates.map((p) => evaluateTmpEntry(p, nowMs, config));
-    const eligible = evaluations.filter((e) => e.eligible);
+    const evaluations = candidates.map((p) => evaluateTmpEntry(p, nowMs, config, registeredPaths));
+    const ageEligible = evaluations.filter((e) => e.eligible);
+    // Same fail-closed rule as the worktree category above.
+    const eligible = registeredGuardActive ? ageEligible : [];
     const eligibleSizedBytes = eligible.reduce((sum, e) => sum + dirSizeBytes(e.path), 0);
     if (apply) {
       for (const e of eligible) {
@@ -798,8 +1053,13 @@ export async function run({ apply = false, nowMs = Date.now(), config = CONFIG }
     summary.categories.tmpScratch = {
       totalScanned: candidates.length,
       eligible: eligible.length,
+      eligibleBeforeRegisteredGuard: ageEligible.length,
       reclaimedBytes: eligibleSizedBytes,
       eligiblePaths: eligible.map((e) => e.path),
+      excludedRegistered: evaluations
+        .filter((e) => e.registeredRoot)
+        .map((e) => ({ path: e.path, registeredRoot: e.registeredRoot })),
+      guardFailureExcludedPaths: registeredGuardActive ? [] : ageEligible.map((e) => e.path),
     };
   }
 
@@ -840,21 +1100,46 @@ export async function run({ apply = false, nowMs = Date.now(), config = CONFIG }
 
 function printSummary(summary) {
   const c = summary.categories;
+  const reg = summary.registeredPackagePaths || { status: "unknown", paths: [], count: 0 };
+  const verb = summary.mode === "apply" ? "deleted" : "would delete";
   console.log(`host-disk-janitor: mode=${summary.mode} at ${summary.timestamp}`);
+  console.log("");
+  // Registered install roots first: they are the reason this run's exclusions
+  // look the way they do, and the 2026-09-09 reap was invisible without them.
+  if (reg.status === "ok") {
+    console.log(`registered plugin package paths (DB): ${reg.count} -- never deletion-eligible`);
+    for (const p of reg.paths) console.log(`  registered: ${p}`);
+  } else if (reg.status === "unavailable") {
+    console.log(`registered plugin package paths: LOOKUP FAILED -- worktree + /tmp pruning DISABLED this run (fail-closed)`);
+    if (reg.error) console.log(`  reason: ${reg.error}`);
+  } else {
+    console.log(`registered plugin package paths: no data (status ${reg.status}) -- worktree + /tmp pruning DISABLED this run (fail-closed)`);
+  }
   console.log("");
   console.log(
     `backups:     ${c.backups.prunedFiles}/${c.backups.totalFiles} files ${summary.mode === "apply" ? "deleted" : "would delete"}, ` +
       `${bytesToHuman(c.backups.reclaimedBytes)} ${summary.mode === "apply" ? "freed" : "reclaimable"} (kept ${c.backups.keptFiles}, unrecognized ${c.backups.unrecognizedFiles}, unverified ${c.backups.unverifiedFiles})`,
   );
+  for (const p of c.backups.prunedPaths || []) console.log(`  ${verb}: ${p}`);
+  for (const p of c.backups.unverifiedPaths || []) console.log(`  ${verb} (failed content verification): ${p}`);
   console.log(
     `run-logs:    ${c.runLogs.prunedFiles}/${c.runLogs.totalFiles} files ${summary.mode === "apply" ? "deleted" : "would delete"}, ` +
       `${bytesToHuman(c.runLogs.reclaimedBytes)} ${summary.mode === "apply" ? "freed" : "reclaimable"} (kept ${c.runLogs.keptFiles})`,
   );
+  for (const p of c.runLogs.prunedPaths || []) console.log(`  ${verb}: ${p}`);
   console.log(
     `worktrees:   ${c.worktrees.eligible}/${c.worktrees.totalScanned} dirs ${summary.mode === "apply" ? "deleted" : "would delete"}, ` +
       `${bytesToHuman(c.worktrees.reclaimedBytes)} ${summary.mode === "apply" ? "freed" : "reclaimable"} ` +
-      `(excluded as review: ${c.worktrees.excludedReview.length}, excluded as self: ${c.worktrees.excludedSelf.length})`,
+      `(excluded as review: ${c.worktrees.excludedReview.length}, excluded as self: ${c.worktrees.excludedSelf.length}, ` +
+      `excluded as DB-registered: ${(c.worktrees.excludedRegistered || []).length})`,
   );
+  for (const p of c.worktrees.eligiblePaths) console.log(`  ${verb}: ${p}`);
+  for (const e of c.worktrees.excludedRegistered || []) {
+    console.log(`  excluded (registered package path root: ${e.registeredRoot}): ${e.path}`);
+  }
+  for (const p of c.worktrees.guardFailureExcludedPaths || []) {
+    console.log(`  excluded (registered-path lookup failed): ${p}`);
+  }
   if (c.worktrees.registrationPrune) {
     const rp = c.worktrees.registrationPrune;
     console.log(`             git worktree prune: ${rp.pruned} stale registration(s) cleared (${rp.before} -> ${rp.after})`);
@@ -863,6 +1148,13 @@ function printSummary(summary) {
     `tmp scratch: ${c.tmpScratch.eligible}/${c.tmpScratch.totalScanned} entries ${summary.mode === "apply" ? "deleted" : "would delete"}, ` +
       `${bytesToHuman(c.tmpScratch.reclaimedBytes)} ${summary.mode === "apply" ? "freed" : "reclaimable"}`,
   );
+  for (const p of c.tmpScratch.eligiblePaths) console.log(`  ${verb}: ${p}`);
+  for (const e of c.tmpScratch.excludedRegistered || []) {
+    console.log(`  excluded (registered package path root: ${e.registeredRoot}): ${e.path}`);
+  }
+  for (const p of c.tmpScratch.guardFailureExcludedPaths || []) {
+    console.log(`  excluded (registered-path lookup failed): ${p}`);
+  }
   console.log("");
   const d = summary.diskAlarm;
   if (d.usePercent === null) {
