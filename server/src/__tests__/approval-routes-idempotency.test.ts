@@ -50,6 +50,9 @@ vi.mock("../services/index.js", () => ({
   secretService: () => mockSecretService,
 }));
 
+// The services mock is hoisted above; hoistModuleGraph needs no extra doMock.
+function registerModuleMocks() {}
+
 const routeModules = hoistModuleGraph(registerModuleMocks, async () => {
   const { errorHandler } = await import("../middleware/index.js");
   const { approvalRoutes } = await import("../routes/approvals.js");
