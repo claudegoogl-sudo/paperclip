@@ -164,7 +164,7 @@ export const CONFIG = {
   TMP_UNMATCHED_DELETE: process.env.PLA_JANITOR_TMP_UNMATCHED_DELETE === "1",
   TMP_OWNER_UID: typeof process.getuid === "function" ? process.getuid() : -1,
   // Never touched by the unmatched category, whatever the owner or age.
-  TMP_UNMATCHED_EXCLUDE_PATTERNS: [/^\./, /^paperclip-pg-/, /^systemd-private-/, /^tmux-/, /^snap-private-tmp$/],
+  TMP_UNMATCHED_EXCLUDE_PATTERNS: [/^\./, /^paperclip-pg-/, /^systemd-private-/, /^tmux-/, /^snap-private-tmp$/, /^claude-/, /^claude$/, /^prime-/, /^prime$/],
   PROC_DIR: process.env.PLA_JANITOR_PROC_DIR || "/proc",
   // Report-only: large paths outside janitor roots that need an owner call.
   OWNER_DECISION_GLOBS: [
@@ -853,6 +853,15 @@ export function collectLiveProcessPaths(procDir = CONFIG.PROC_DIR) {
         // exited or not ours
       }
     }
+    // mmap'd files (shared libs, node addons, sqlite -shm) of a live process.
+    try {
+      for (const line of readFileSync(path.join(base, "maps"), "utf8").split("\n")) {
+        const i = line.indexOf("/");
+        if (i >= 0) paths.add(line.slice(i).replace(/ \(deleted\)$/, ""));
+      }
+    } catch {
+      // exited or not ours
+    }
     let fds = [];
     try {
       fds = readdirSync(path.join(base, "fd"));
@@ -911,7 +920,12 @@ export function evaluateTmpUnmatched(nowMs, config = CONFIG, { live, registeredP
       out.excluded.push({ path: p, reason: "registered-package-path" });
       continue;
     }
-    if (directoryHasFileNewerThan(p, cutoffMs)) continue; // fresh -- not a candidate
+    const age = strictNewestLeafMtime(p);
+    if (!age.ok) {
+      out.excluded.push({ path: p, reason: "age-walk-error" });
+      continue;
+    }
+    if (age.newestMtimeMs > cutoffMs) continue; // fresh -- not a candidate
     if (!live || !live.ok) {
       out.excluded.push({ path: p, reason: "live-process-scan-failed" });
       continue;
@@ -920,9 +934,47 @@ export function evaluateTmpUnmatched(nowMs, config = CONFIG, { live, registeredP
       out.excluded.push({ path: p, reason: "in-use-by-live-process" });
       continue;
     }
-    out.candidates.push({ path: p, newestMtimeMs: newestLeafMtimeMs(p) });
+    out.candidates.push({ path: p, newestMtimeMs: age.newestMtimeMs });
   }
   return out;
+}
+
+/**
+ * Fail-closed newest-inside mtime for the unmatched /tmp category: full walk,
+ * leaf mtimes only; ANY readdir/lstat error => { ok: false } (caller keeps the
+ * entry). Empty tree falls back to root ctime (absence of evidence = fresh).
+ */
+export function strictNewestLeafMtime(rootPath) {
+  let rootStat;
+  try {
+    rootStat = lstatSync(rootPath);
+  } catch {
+    return { ok: false };
+  }
+  if (!rootStat.isDirectory()) return { ok: true, newestMtimeMs: rootStat.mtimeMs };
+  let newest = 0;
+  const stack = [rootPath];
+  while (stack.length) {
+    const dir = stack.pop();
+    let children;
+    try {
+      children = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return { ok: false };
+    }
+    for (const c of children) {
+      const cp = path.join(dir, c.name);
+      let st;
+      try {
+        st = lstatSync(cp);
+      } catch {
+        return { ok: false };
+      }
+      if (st.isDirectory()) stack.push(cp);
+      else newest = Math.max(newest, st.mtimeMs);
+    }
+  }
+  return { ok: true, newestMtimeMs: Math.max(newest, newest ? 0 : rootStat.ctimeMs) };
 }
 
 /** Newest leaf mtime under a path (for reporting age only). */
