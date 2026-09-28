@@ -17806,7 +17806,7 @@ describeEmbeddedPostgres("tool access service", () => {
     it("reports a configured plugin-backed connection healthy through the real sweep, and red once the per-company config row is gone", async () => {
       const probe = vi.fn(() => 2);
       const { plugin, connection } = await seedPluginConnection({ withConfigRow: true });
-      const service = toolAccessService(db, { pluginToolRuntimeProbe: probe });
+      const service = createTestToolAccessService(db, { pluginToolRuntimeProbe: probe });
 
       const sweep = await service.sweepConnectionHealth({ staleAfterMs: 0 });
       expect(sweep).toMatchObject({ checked: 1, healthy: 1, failed: 0, failedConnectionIds: [] });
@@ -17860,7 +17860,7 @@ describeEmbeddedPostgres("tool access service", () => {
       // would fail closed with mcp_remote_plugin_unavailable — the
       // 0/14-configured-connections symptom this pins down.
       const probeInputs: unknown[] = [];
-      const service = toolAccessService(db, {
+      const service = createTestToolAccessService(db, {
         pluginToolRuntimeProbe: (input) => {
           probeInputs.push(input);
           return typeof input.pluginKey === "string" ? dispatcher.toolCount(input.pluginKey) : 0;
@@ -17878,7 +17878,7 @@ describeEmbeddedPostgres("tool access service", () => {
 
     it("fails closed when no plugin_config row exists anywhere for the connection's company", async () => {
       const { connection } = await seedPluginConnection();
-      const service = toolAccessService(db, { pluginToolRuntimeProbe: () => 3 });
+      const service = createTestToolAccessService(db, { pluginToolRuntimeProbe: () => 3 });
 
       await expect(service.checkHealth(connection.id, { actorType: "user", actorId: "board" })).rejects.toMatchObject({
         status: 502,
@@ -17899,7 +17899,7 @@ describeEmbeddedPostgres("tool access service", () => {
       // Only company B is configured; A must not resolve B's row.
       await db.insert(pluginConfig).values({ pluginId: plugin.id, companyId: companyB.id, configJson: {} });
 
-      const service = toolAccessService(db, { pluginToolRuntimeProbe: probe });
+      const service = createTestToolAccessService(db, { pluginToolRuntimeProbe: probe });
       await expect(service.checkHealth(connectionA.id, { actorType: "user", actorId: "board" })).rejects.toMatchObject({
         details: expect.objectContaining({ code: "mcp_remote_plugin_unconfigured" }),
       });
@@ -17919,7 +17919,7 @@ describeEmbeddedPostgres("tool access service", () => {
         withConfigRow: true,
         configJson: { url: "https://plugin-fixture.example/mcp" },
       });
-      const service = toolAccessService(db, { pluginToolRuntimeProbe: probe });
+      const service = createTestToolAccessService(db, { pluginToolRuntimeProbe: probe });
 
       await service.checkHealth(connection.id, { actorType: "user", actorId: "board" });
       expect(String(fetchMock.mock.calls[0]?.[0])).toBe("https://plugin-fixture.example/mcp");
@@ -17928,13 +17928,13 @@ describeEmbeddedPostgres("tool access service", () => {
 
     it("fails closed when the plugin runtime probe is unwired or reports no registered tools", async () => {
       const { connection: unwired } = await seedPluginConnection({ withConfigRow: true });
-      const withoutProbe = toolAccessService(db);
+      const withoutProbe = createTestToolAccessService(db);
       await expect(withoutProbe.checkHealth(unwired.id, { actorType: "user", actorId: "board" })).rejects.toMatchObject({
         details: expect.objectContaining({ code: "mcp_remote_plugin_unavailable" }),
       });
 
       const { connection: empty } = await seedPluginConnection({ withConfigRow: true });
-      const emptyRuntime = toolAccessService(db, { pluginToolRuntimeProbe: () => 0 });
+      const emptyRuntime = createTestToolAccessService(db, { pluginToolRuntimeProbe: () => 0 });
       await expect(emptyRuntime.checkHealth(empty.id, { actorType: "user", actorId: "board" })).rejects.toMatchObject({
         details: expect.objectContaining({ code: "mcp_remote_plugin_unavailable" }),
       });
@@ -17948,7 +17948,7 @@ describeEmbeddedPostgres("tool access service", () => {
         mcpHttpResponse({ jsonrpc: "2.0", id: "paperclip-catalog-refresh", result: { tools: [] } }),
       );
       const company = await createCompany(db);
-      const service = toolAccessService(db, { pluginToolRuntimeProbe: () => 2 });
+      const service = createTestToolAccessService(db, { pluginToolRuntimeProbe: () => 2 });
       await service.createConnection(company.id, {
         name: "Plain remote",
         transport: "mcp_remote",

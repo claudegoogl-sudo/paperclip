@@ -7744,6 +7744,7 @@ export function toolAccessService(
     try {
       const config = asRecord(connection.config);
       const oauth = asRecord(config.oauth);
+      let pluginOkMessage: string | null = null;
       if (
         config.sourceTemplateKey === "github" &&
         oauth.connectorProfile === "github.code"
@@ -7789,7 +7790,7 @@ export function toolAccessService(
         // the remote-endpoint probe below.
         const pluginContext = await resolvePluginConnectionContext(connection);
         if (pluginContext) {
-          await checkPluginConnectionHealth(connection, pluginContext);
+          pluginOkMessage = await checkPluginConnectionHealth(connection, pluginContext);
         } else {
         await assertComposioConnectedAccountActive(connection);
         const canProbeWithoutAuthorization =
@@ -7820,7 +7821,7 @@ export function toolAccessService(
       const updated = await updateConnectionHealth(
         connection,
         "ok",
-        config.sourceTemplateKey === "github" &&
+        pluginOkMessage ?? (config.sourceTemplateKey === "github" &&
           oauth.connectorProfile === "github.code"
           ? "GitHub account, installation, and repository access are available."
           : isAgentMailConnection(connection)
@@ -7829,7 +7830,7 @@ export function toolAccessService(
               ? "Composio accepted the API key and returned its toolkits."
               : connection.transport === "local_stdio"
                 ? "Approved stdio template is ready."
-                : "Remote MCP server responded to tools/list.",
+                : "Remote MCP server responded to tools/list."),
       );
       const runtimeSlot = await ensureRuntimeSlot(updated);
       await audit({
@@ -8346,7 +8347,14 @@ export function toolAccessService(
           eq(toolConnections.status, "active"),
           ne(toolConnections.transport, "chat_sdk"),
           ne(toolConnections.transport, "runtime_auth"),
-          ne(toolApplications.type, "paperclip_plugin"),
+          // Legacy plugin backfills (no pluginKey) stay excluded. Fork carryover:
+          // plugin-backed connections that carry a pluginKey ARE swept — their
+          // health is evaluated against the per-company plugin config / runtime
+          // probe (checkPluginConnectionHealth), not a remote endpoint.
+          or(
+            ne(toolApplications.type, "paperclip_plugin"),
+            sql`${toolConnections.config} ->> 'pluginKey' is not null`,
+          ),
           or(isNull(toolConnections.healthCheckedAt), lte(toolConnections.healthCheckedAt, cutoff)),
         ),
       )

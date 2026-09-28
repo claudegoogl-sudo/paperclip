@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_OPENCODE_LOCAL_MODEL } from "@paperclipai/adapter-opencode-local";
 import { LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
 
@@ -286,6 +286,11 @@ async function requestApp(
 }
 
 describe.sequential("agent permission routes", () => {
+  // Warm the route module graph once; the cold import exceeds the per-test timeout.
+  beforeAll(async () => {
+    await Promise.all([import("../middleware/index.js"), import("../routes/agents.js")]);
+  }, 120_000);
+
   beforeEach(() => {
     vi.resetAllMocks();
     mockAgentService.getById.mockReset();
@@ -486,6 +491,4 @@ describe.sequential("agent permission routes", () => {
   for (const adapterCase of sshCapableAdapterCases) {
   }
 
-  describe("agent configuration read gate", () => {
-  });
 });
