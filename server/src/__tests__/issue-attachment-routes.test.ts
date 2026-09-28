@@ -292,7 +292,9 @@ describe("issue attachment routes", () => {
       }),
     );
     expect(res.body.contentType).toBe("application/zip");
-  });
+    // First test in the describe pays the cold transform/import of the large
+    // issues route module after vi.resetModules(); give it headroom.
+  }, 60_000);
 
   it("removes a newly stored object when attachment registration is rejected", async () => {
     const storage = createStorageService();

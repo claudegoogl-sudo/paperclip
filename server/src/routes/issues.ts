@@ -42,6 +42,7 @@ import {
   executionWorkspaces,
   heartbeatRuns,
   issueApprovals,
+  issueAttachments,
   issueComments,
   issueDocuments,
   issueExecutionDecisions,
@@ -17401,15 +17402,40 @@ export function issueRoutes(
       // conflicting attachmentIds list fails the POST with an explicit error
       // instead of creating a comment whose attachments silently did not bind.
       // attachAssetsToComment re-checks inside its transaction (races).
-      const commentAttachmentIds = Array.isArray(req.body.attachmentIds)
+      // Callers may reference attachments by ASSET id (upload route,
+      // artifacts.create) or by attachment ROW id (native runner handoff,
+      // which re-references the row createAttachment returned); normalize
+      // row ids onto their asset id before the asset-keyed pipeline.
+      const requestedAttachmentIds = Array.isArray(req.body.attachmentIds)
         ? req.body.attachmentIds.filter(
-            (assetId: unknown): assetId is string => typeof assetId === "string" && assetId.length > 0,
+            (attachmentId: unknown): attachmentId is string =>
+              typeof attachmentId === "string" && attachmentId.length > 0,
           )
         : [];
+      const rowReferencedAssetIds = requestedAttachmentIds.length
+        ? await db
+            .select({
+              rowId: issueAttachments.id,
+              assetId: issueAttachments.assetId,
+            })
+            .from(issueAttachments)
+            .where(
+              and(
+                eq(issueAttachments.companyId, issue.companyId),
+                eq(issueAttachments.issueId, issue.id),
+                inArray(issueAttachments.id, requestedAttachmentIds),
+              ),
+            )
+            .then((rows) => new Map(rows.map((row) => [row.rowId, row.assetId])))
+        : new Map<string, string>();
+      const commentAttachmentIds: string[] = (requestedAttachmentIds as string[]).map(
+        (attachmentId: string) => rowReferencedAssetIds.get(attachmentId) ?? attachmentId,
+      );
       if (commentAttachmentIds.length > 0) {
         await svc.validateAssetsBindableToIssue({
           issueId: issue.id,
           assetIds: commentAttachmentIds,
+          replayRunId: actor.runId ?? null,
         });
       }
       const commentPresentation =
@@ -17744,7 +17770,7 @@ export function issueRoutes(
             (actor.actorType === "agent" ? "agent" : "user"),
           presentation: commentPresentation,
           metadata: req.body.metadata ?? null,
-          attachmentIds: req.body.attachmentIds,
+          attachmentIds: commentAttachmentIds.length > 0 ? commentAttachmentIds : req.body.attachmentIds,
           clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
           sourceTrust,
         };
@@ -17856,7 +17882,7 @@ export function issueRoutes(
             (actor.actorType === "agent" ? "agent" : "user"),
           presentation: commentPresentation,
           metadata: req.body.metadata ?? null,
-          attachmentIds: req.body.attachmentIds,
+          attachmentIds: commentAttachmentIds.length > 0 ? commentAttachmentIds : req.body.attachmentIds,
           clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
           authorizationReason: commentAuthorizationReason,
           sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),

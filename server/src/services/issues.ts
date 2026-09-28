@@ -6548,7 +6548,32 @@ async function resolveBindableAssetContext(
     .then((rows: { id: string; companyId: string }[]) => rows[0] ?? null);
   if (!issue) throw notFound("Issue not found");
 
-  const uniqueAssetIds = [...new Set(assetIds)];
+  // Accept either key: callers hand out the ASSET id (upload route,
+  // artifacts.create) or the attachment ROW id (native runner handoff). Map
+  // row ids onto their asset before the company check.
+  const uniqueInputIds = [...new Set(assetIds)];
+  const attachmentMappedRows = await dbOrTx
+    .select({
+      inputId: issueAttachments.id,
+      assetId: issueAttachments.assetId,
+      companyId: issueAttachments.companyId,
+    })
+    .from(issueAttachments)
+    .where(
+      and(
+        eq(issueAttachments.companyId, issue.companyId),
+        eq(issueAttachments.issueId, issueId),
+        inArray(issueAttachments.id, uniqueInputIds),
+      ),
+    );
+  const assetIdByRowId = new Map<string, string>(
+    (attachmentMappedRows as { inputId: string; assetId: string }[]).map(
+      (row) => [row.inputId, row.assetId] as const,
+    ),
+  );
+  const uniqueAssetIds: string[] = [
+    ...new Set(uniqueInputIds.map((id) => assetIdByRowId.get(id) ?? id)),
+  ];
   const assetRows = await dbOrTx
     .select({ id: assets.id, companyId: assets.companyId })
     .from(assets)
@@ -6576,7 +6601,7 @@ async function resolveBindableAssetContext(
  */
 async function validateAssetsBindableToNewComment(
   dbOrTx: any,
-  input: { issueId: string; assetIds: string[] },
+  input: { issueId: string; assetIds: string[]; replayRunId?: string | null },
 ): Promise<{ issue: { id: string; companyId: string }; uniqueAssetIds: string[] }> {
   if (input.assetIds.length === 0) {
     return { issue: { id: input.issueId, companyId: "" }, uniqueAssetIds: [] };
@@ -6596,6 +6621,27 @@ async function validateAssetsBindableToNewComment(
   for (const assetId of uniqueAssetIds) {
     const existing = rowByAsset.get(assetId);
     if (classifyIssueAttachmentBindState(existing, issue.id, null) === "conflict") {
+      // Idempotent replay: the same run re-posting its comment (helper
+      // retries) targets an asset already bound to that run's own comment on
+      // this issue. Let it through; addComment dedupes by run + body and the
+      // bind step re-checks inside its transaction.
+      if (
+        input.replayRunId &&
+        existing?.issueId === issue.id &&
+        existing.issueCommentId
+      ) {
+        const [boundComment] = await dbOrTx
+          .select({ createdByRunId: issueComments.createdByRunId })
+          .from(issueComments)
+          .where(
+            and(
+              eq(issueComments.id, existing.issueCommentId),
+              eq(issueComments.issueId, issue.id),
+              isNull(issueComments.deletedAt),
+            ),
+          );
+        if (boundComment?.createdByRunId === input.replayRunId) continue;
+      }
       throw issueAttachmentConflictError(assetId, existing);
     }
   }
@@ -12532,7 +12578,14 @@ export function issueService(db: Db) {
             and(
               eq(issueAttachments.companyId, issue.companyId),
               eq(issueAttachments.issueId, issueId),
-              inArray(issueAttachments.assetId, attachmentIds),
+              // Two in-tree contracts reference attachments on comments:
+              // the HTTP route and upload/artifacts surfaces key by ASSET id,
+              // while the native runner file handoff passes the attachment
+              // ROW id returned by createAttachment. Match either.
+              or(
+                inArray(issueAttachments.assetId, attachmentIds),
+                inArray(issueAttachments.id, attachmentIds),
+              ),
             ),
           )
           .for("update");
@@ -12544,13 +12597,11 @@ export function issueService(db: Db) {
           createdByAgentId: string | null;
           originalFilename: string | null;
         };
-        const attachmentById = new Map<string, CommentAttachmentRow>(
-          attachmentRows.map(
-            (
-              attachment: CommentAttachmentRow,
-            ): [string, CommentAttachmentRow] => [attachment.assetId, attachment],
-          ),
-        );
+        const attachmentById = new Map<string, CommentAttachmentRow>();
+        for (const attachment of attachmentRows) {
+          attachmentById.set(attachment.assetId, attachment);
+          attachmentById.set(attachment.id, attachment);
+        }
         // Standalone `artifacts.create` assets have no issue_attachments row
         // yet — validate them against the assets table (same company) and let
         // attachAssetsToComment insert the bound row; only assets that are
@@ -13179,6 +13230,7 @@ export function issueService(db: Db) {
     validateAssetsBindableToIssue: async (input: {
       issueId: string;
       assetIds: string[];
+      replayRunId?: string | null;
     }): Promise<void> => {
       await validateAssetsBindableToNewComment(db, input);
     },
