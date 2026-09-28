@@ -8,16 +8,26 @@ const mocks = vi.hoisted(() => {
 
   return {
     externalRecords,
-    execFile: vi.fn((_file: string, _args: string[], optionsOrCallback: unknown, maybeCallback?: unknown) => {
-      const callback = typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback;
-      if (typeof callback === "function") {
-        callback(null, "", "");
-      }
-      return {
-        kill: vi.fn(),
-        on: vi.fn(),
-      };
-    }),
+    execFile: vi.fn(
+      (
+        _file: string,
+        _args: string[],
+        optionsOrCallback: unknown,
+        maybeCallback?: unknown,
+      ) => {
+        const callback =
+          typeof optionsOrCallback === "function"
+            ? optionsOrCallback
+            : maybeCallback;
+        if (typeof callback === "function") {
+          callback(null, "", "");
+        }
+        return {
+          kill: vi.fn(),
+          on: vi.fn(),
+        };
+      },
+    ),
     listAdapterPlugins: vi.fn(),
     addAdapterPlugin: vi.fn((record: any) => {
       externalRecords.set(record.type, record);
@@ -59,6 +69,30 @@ vi.mock("../adapters/plugin-loader.js", () => ({
   reloadExternalAdapter: mocks.reloadExternalAdapter,
 }));
 
+function registerRouteMocks() {
+  vi.doMock("node:child_process", () => ({
+    execFile: mocks.execFile,
+  }));
+
+  vi.doMock("../services/adapter-plugin-store.js", () => ({
+    listAdapterPlugins: mocks.listAdapterPlugins,
+    addAdapterPlugin: mocks.addAdapterPlugin,
+    removeAdapterPlugin: mocks.removeAdapterPlugin,
+    getAdapterPluginByType: mocks.getAdapterPluginByType,
+    getAdapterPluginsDir: mocks.getAdapterPluginsDir,
+    getDisabledAdapterTypes: mocks.getDisabledAdapterTypes,
+    setAdapterDisabled: mocks.setAdapterDisabled,
+  }));
+
+  vi.doMock("../adapters/plugin-loader.js", () => ({
+    buildExternalAdapters: mocks.buildExternalAdapters,
+    loadExternalAdapterPackage: mocks.loadExternalAdapterPackage,
+    getUiParserSource: mocks.getUiParserSource,
+    getOrExtractUiParserSource: mocks.getOrExtractUiParserSource,
+    reloadExternalAdapter: mocks.reloadExternalAdapter,
+  }));
+}
+
 const EXTERNAL_ADAPTER_TYPE = "external_admin_test";
 const EXTERNAL_PACKAGE_NAME = "paperclip-external-adapter";
 let adapterRoutes: typeof import("../routes/adapters.js").adapterRoutes;
@@ -66,36 +100,6 @@ let errorHandler: typeof import("../middleware/index.js").errorHandler;
 let registerServerAdapter: typeof import("../adapters/registry.js").registerServerAdapter;
 let unregisterServerAdapter: typeof import("../adapters/registry.js").unregisterServerAdapter;
 let setOverridePaused: typeof import("../adapters/registry.js").setOverridePaused;
-
-// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
-// registry must be in place before ANY import of the routes module, in every
-// test. createApp concurrently imports middleware and route modules whose
-// graphs both contain services/index.js. With doMock-registered mocks that
-// first evaluation could race the registry under load and bind the REAL
-// services module, rejecting the request under test with a 500 (observed on
-// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
-// to every import graph deterministically.
-vi.mock("node:child_process", () => ({
-  execFile: mocks.execFile,
-}));
-
-vi.mock("../services/adapter-plugin-store.js", () => ({
-  listAdapterPlugins: mocks.listAdapterPlugins,
-  addAdapterPlugin: mocks.addAdapterPlugin,
-  removeAdapterPlugin: mocks.removeAdapterPlugin,
-  getAdapterPluginByType: mocks.getAdapterPluginByType,
-  getAdapterPluginsDir: mocks.getAdapterPluginsDir,
-  getDisabledAdapterTypes: mocks.getDisabledAdapterTypes,
-  setAdapterDisabled: mocks.setAdapterDisabled,
-}));
-
-vi.mock("../adapters/plugin-loader.js", () => ({
-  buildExternalAdapters: mocks.buildExternalAdapters,
-  loadExternalAdapterPackage: mocks.loadExternalAdapterPackage,
-  getUiParserSource: mocks.getUiParserSource,
-  getOrExtractUiParserSource: mocks.getOrExtractUiParserSource,
-  reloadExternalAdapter: mocks.reloadExternalAdapter,
-}));
 
 function createAdapter(type = EXTERNAL_ADAPTER_TYPE): ServerAdapterModule {
   return {
@@ -129,7 +133,9 @@ function createApp(actor: Express.Request["actor"]) {
   app.use((req, _res, next) => {
     req.actor = {
       ...actor,
-      companyIds: Array.isArray(actor.companyIds) ? [...actor.companyIds] : actor.companyIds,
+      companyIds: Array.isArray(actor.companyIds)
+        ? [...actor.companyIds]
+        : actor.companyIds,
       memberships: Array.isArray(actor.memberships)
         ? actor.memberships.map((membership) => ({ ...membership }))
         : actor.memberships,
@@ -145,7 +151,8 @@ async function requestApp(
   app: express.Express,
   buildRequest: (baseUrl: string) => request.Test,
 ) {
-  const { createServer } = await vi.importActual<typeof import("node:http")>("node:http");
+  const { createServer } =
+    await vi.importActual<typeof import("node:http")>("node:http");
   const server = createServer(app);
   try {
     await new Promise<void>((resolve) => {
@@ -168,7 +175,9 @@ async function requestApp(
   }
 }
 
-function boardMember(membershipRole: "admin" | "operator" | "viewer"): Express.Request["actor"] {
+function boardMember(
+  membershipRole: "admin" | "operator" | "viewer",
+): Express.Request["actor"] {
   return {
     type: "board",
     userId: `${membershipRole}-user`,
@@ -219,11 +228,19 @@ function sendMutatingRequest(app: express.Express, name: string) {
           .send({ paused: true }),
       );
     case "delete":
-      return requestApp(app, (baseUrl) => request(baseUrl).delete(`/api/adapters/${EXTERNAL_ADAPTER_TYPE}`));
+      return requestApp(app, (baseUrl) =>
+        request(baseUrl).delete(`/api/adapters/${EXTERNAL_ADAPTER_TYPE}`),
+      );
     case "reload":
-      return requestApp(app, (baseUrl) => request(baseUrl).post(`/api/adapters/${EXTERNAL_ADAPTER_TYPE}/reload`));
+      return requestApp(app, (baseUrl) =>
+        request(baseUrl).post(`/api/adapters/${EXTERNAL_ADAPTER_TYPE}/reload`),
+      );
     case "reinstall":
-      return requestApp(app, (baseUrl) => request(baseUrl).post(`/api/adapters/${EXTERNAL_ADAPTER_TYPE}/reinstall`));
+      return requestApp(app, (baseUrl) =>
+        request(baseUrl).post(
+          `/api/adapters/${EXTERNAL_ADAPTER_TYPE}/reinstall`,
+        ),
+      );
     default:
       throw new Error(`Unknown mutating adapter route: ${name}`);
   }
@@ -243,11 +260,22 @@ function resetInstalledExternalAdapterState() {
 
 describe.sequential("adapter management route authorization", () => {
   beforeEach(async () => {
+    vi.resetModules();
+    vi.doUnmock("../services/adapter-plugin-store.js");
+    vi.doUnmock("../adapters/plugin-loader.js");
+    vi.doUnmock("../routes/adapters.js");
+    vi.doUnmock("../routes/authz.js");
+    vi.doUnmock("../middleware/index.js");
+    vi.doUnmock("../adapters/registry.js");
+    registerRouteMocks();
+    vi.doMock("../routes/authz.js", async () =>
+      vi.importActual("../routes/authz.js"),
+    );
 
     const [routes, middleware, registry] = await Promise.all([
-      vi.importActual<typeof import("../routes/adapters.js")>("../routes/adapters.js"),
-      vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-      vi.importActual<typeof import("../adapters/registry.js")>("../adapters/registry.js"),
+      import("../routes/adapters.js"),
+      import("../middleware/index.js"),
+      import("../adapters/registry.js"),
     ]);
     adapterRoutes = routes.adapterRoutes;
     errorHandler = middleware.errorHandler;
@@ -259,13 +287,19 @@ describe.sequential("adapter management route authorization", () => {
 
     unregisterServerAdapter(EXTERNAL_ADAPTER_TYPE);
     setOverridePaused("claude_local", false);
-    mocks.listAdapterPlugins.mockImplementation(() => [...mocks.externalRecords.values()]);
-    mocks.getAdapterPluginsDir.mockReturnValue("/tmp/paperclip-adapter-route-authz-test");
+    mocks.listAdapterPlugins.mockImplementation(() => [
+      ...mocks.externalRecords.values(),
+    ]);
+    mocks.getAdapterPluginsDir.mockReturnValue(
+      "/tmp/paperclip-adapter-route-authz-test",
+    );
     mocks.getDisabledAdapterTypes.mockReturnValue([]);
     mocks.setAdapterDisabled.mockReturnValue(true);
     mocks.buildExternalAdapters.mockResolvedValue([]);
     mocks.loadExternalAdapterPackage.mockResolvedValue(createAdapter());
-    mocks.reloadExternalAdapter.mockImplementation(async (type: string) => createAdapter(type));
+    mocks.reloadExternalAdapter.mockImplementation(async (type: string) =>
+      createAdapter(type),
+    );
   }, 20_000);
 
   afterEach(() => {
@@ -309,7 +343,9 @@ describe.sequential("adapter management route authorization", () => {
 
       const res = await sendMutatingRequest(app, routeName);
 
-      expect(res.status, `${routeName}: ${JSON.stringify(res.body)}`).toBe(expectedStatus);
+      expect(res.status, `${routeName}: ${JSON.stringify(res.body)}`).toBe(
+        expectedStatus,
+      );
     }
   });
 
@@ -356,8 +392,12 @@ describe.sequential("adapter management route authorization", () => {
 
         const res = await sendMutatingRequest(app, routeName);
 
-        expect(res.status, `${routeName}: ${JSON.stringify(res.body)}`).toBe(403);
-        expect(res.body.details).toMatchObject({ code: "adapter_install_platform_managed" });
+        expect(res.status, `${routeName}: ${JSON.stringify(res.body)}`).toBe(
+          403,
+        );
+        expect(res.body.details).toMatchObject({
+          code: "adapter_install_platform_managed",
+        });
         expect(mocks.execFile).not.toHaveBeenCalled();
         expect(mocks.loadExternalAdapterPackage).not.toHaveBeenCalled();
       },
@@ -372,7 +412,14 @@ describe.sequential("adapter management route authorization", () => {
       delete process.env.PAPERCLIP_HIDDEN_SETTINGS;
     });
 
-    it.each(["install", "disable", "override", "delete", "reload", "reinstall"] as const)(
+    it.each([
+      "install",
+      "disable",
+      "override",
+      "delete",
+      "reload",
+      "reinstall",
+    ] as const)(
       "floors adapter %s for instance admins when the operator hides the Adapters surface",
       async (routeName) => {
         resetInstalledExternalAdapterState();
@@ -383,8 +430,12 @@ describe.sequential("adapter management route authorization", () => {
 
         const res = await sendMutatingRequest(app, routeName);
 
-        expect(res.status, `${routeName}: ${JSON.stringify(res.body)}`).toBe(403);
-        expect(res.body.details).toMatchObject({ code: "settings_operator_managed" });
+        expect(res.status, `${routeName}: ${JSON.stringify(res.body)}`).toBe(
+          403,
+        );
+        expect(res.body.details).toMatchObject({
+          code: "settings_operator_managed",
+        });
         expect(mocks.execFile).not.toHaveBeenCalled();
         expect(mocks.loadExternalAdapterPackage).not.toHaveBeenCalled();
         expect(mocks.reloadExternalAdapter).not.toHaveBeenCalled();
@@ -395,7 +446,9 @@ describe.sequential("adapter management route authorization", () => {
       seedInstalledExternalAdapter();
       const app = createApp(boardMember("admin"));
 
-      const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/adapters"));
+      const res = await requestApp(app, (baseUrl) =>
+        request(baseUrl).get("/api/adapters"),
+      );
 
       expect(res.status, JSON.stringify(res.body)).toBe(200);
     });

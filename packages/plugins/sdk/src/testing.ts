@@ -56,6 +56,7 @@ import type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentResumeLeaseParams,
   PluginEnvironmentReleaseLeaseParams,
+  PluginEnvironmentTerminationReceipt,
   PluginEnvironmentDestroyLeaseParams,
   PluginEnvironmentRealizeWorkspaceParams,
   PluginEnvironmentRealizeWorkspaceResult,
@@ -186,8 +187,8 @@ export interface EnvironmentTestHarnessOptions extends TestHarnessOptions {
     onProbe?: (params: PluginEnvironmentProbeParams) => Promise<PluginEnvironmentProbeResult>;
     onAcquireLease?: (params: PluginEnvironmentAcquireLeaseParams) => Promise<PluginEnvironmentLease>;
     onResumeLease?: (params: PluginEnvironmentResumeLeaseParams) => Promise<PluginEnvironmentLease>;
-    onReleaseLease?: (params: PluginEnvironmentReleaseLeaseParams) => Promise<void>;
-    onDestroyLease?: (params: PluginEnvironmentDestroyLeaseParams) => Promise<void>;
+    onReleaseLease?: (params: PluginEnvironmentReleaseLeaseParams) => Promise<PluginEnvironmentTerminationReceipt | void>;
+    onDestroyLease?: (params: PluginEnvironmentDestroyLeaseParams) => Promise<PluginEnvironmentTerminationReceipt | void>;
     onRealizeWorkspace?: (params: PluginEnvironmentRealizeWorkspaceParams) => Promise<PluginEnvironmentRealizeWorkspaceResult>;
     onExecute?: (params: PluginEnvironmentExecuteParams) => Promise<PluginEnvironmentExecuteResult>;
     onStartInteractiveSetup?: (params: PluginEnvironmentStartInteractiveSetupParams) => Promise<PluginEnvironmentInteractiveSetupSession>;
@@ -211,9 +212,9 @@ export interface EnvironmentTestHarness extends TestHarness {
   /** Invoke the environment driver's resumeLease hook. */
   resumeLease(params: PluginEnvironmentResumeLeaseParams): Promise<PluginEnvironmentLease>;
   /** Invoke the environment driver's releaseLease hook. */
-  releaseLease(params: PluginEnvironmentReleaseLeaseParams): Promise<void>;
+  releaseLease(params: PluginEnvironmentReleaseLeaseParams): Promise<PluginEnvironmentTerminationReceipt | void>;
   /** Invoke the environment driver's destroyLease hook. */
-  destroyLease(params: PluginEnvironmentDestroyLeaseParams): Promise<void>;
+  destroyLease(params: PluginEnvironmentDestroyLeaseParams): Promise<PluginEnvironmentTerminationReceipt | void>;
   /** Invoke the environment driver's realizeWorkspace hook. */
   realizeWorkspace(params: PluginEnvironmentRealizeWorkspaceParams): Promise<PluginEnvironmentRealizeWorkspaceResult>;
   /** Invoke the environment driver's execute hook. */
@@ -2592,10 +2593,10 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       },
     },
     loginPty: {
-      output(_workerSessionId: string, _chunk: string) {
+      output(_hostRouteId: string, _workerSessionId: string, _chunk: string) {
         // No-op in test harness — the host login route is not wired here.
       },
-      exit(_workerSessionId: string, _exitCode: number | null) {
+      exit(_hostRouteId: string, _workerSessionId: string, _exitCode: number | null) {
         // No-op in test harness — the host login route is not wired here.
       },
     },

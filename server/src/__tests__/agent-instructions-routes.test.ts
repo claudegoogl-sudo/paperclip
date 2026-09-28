@@ -3,6 +3,7 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockAgentService = vi.hoisted(() => ({
+  create: vi.fn(),
   getById: vi.fn(),
   update: vi.fn(),
   resolveByReference: vi.fn(),
@@ -69,46 +70,42 @@ vi.mock("../services/environments.js", () => ({
 
 vi.mock("../adapters/index.js", () => ({
   findServerAdapter: mockFindServerAdapter,
+  findActiveServerAdapter: mockFindServerAdapter,
   listAdapterModels: vi.fn(),
 }));
 
-// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
-// registry must be in place before ANY import of the routes module, in every
-// test. createApp concurrently imports middleware and route modules whose
-// graphs both contain services/index.js. With doMock-registered mocks that
-// first evaluation could race the registry under load and bind the REAL
-// services module, rejecting the request under test with a 500 (observed on
-// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
-// to every import graph deterministically.
-vi.mock("../services/index.js", () => ({
-  agentService: () => mockAgentService,
-  agentInstructionsService: () => mockAgentInstructionsService,
-  accessService: () => mockAccessService,
-  approvalService: () => ({}),
-  builtInAgentService: () => mockBuiltInAgentService,
-  companySkillService: () => ({ listRuntimeSkillEntries: vi.fn() }),
-  budgetService: () => ({}),
-  heartbeatService: () => ({}),
-  issueApprovalService: () => ({}),
-  issueService: () => ({}),
-  logActivity: mockLogActivity,
-  secretService: () => mockSecretService,
-  syncInstructionsBundleConfigFromFilePath: mockSyncInstructionsBundleConfigFromFilePath,
-  workspaceOperationService: () => ({}),
-}));
+function registerModuleMocks() {
+  vi.doMock("../services/index.js", () => ({
+    agentService: () => mockAgentService,
+    agentInstructionsService: () => mockAgentInstructionsService,
+    accessService: () => mockAccessService,
+    approvalService: () => ({}),
+    builtInAgentService: () => mockBuiltInAgentService,
+    companySkillService: () => ({ listRuntimeSkillEntries: vi.fn() }),
+    budgetService: () => ({}),
+    heartbeatService: () => ({}),
+    issueApprovalService: () => ({}),
+    issueService: () => ({}),
+    logActivity: mockLogActivity,
+    secretService: () => mockSecretService,
+    syncInstructionsBundleConfigFromFilePath: mockSyncInstructionsBundleConfigFromFilePath,
+    workspaceOperationService: () => ({}),
+  }));
 
-vi.mock("../services/secrets.js", () => ({
-  secretService: () => mockSecretService,
-}));
+  vi.doMock("../services/secrets.js", () => ({
+    secretService: () => mockSecretService,
+  }));
 
-vi.mock("../services/environments.js", () => ({
-  environmentService: () => mockEnvironmentService,
-}));
+  vi.doMock("../services/environments.js", () => ({
+    environmentService: () => mockEnvironmentService,
+  }));
 
-vi.mock("../adapters/index.js", () => ({
-  findServerAdapter: mockFindServerAdapter,
-  listAdapterModels: vi.fn(),
-}));
+  vi.doMock("../adapters/index.js", () => ({
+    findServerAdapter: mockFindServerAdapter,
+    findActiveServerAdapter: mockFindServerAdapter,
+    listAdapterModels: vi.fn(),
+  }));
+}
 
 function boardActor() {
   return {
@@ -120,7 +117,7 @@ function boardActor() {
   };
 }
 
-async function createApp(actor: Record<string, unknown> = boardActor()) {
+async function createApp(actor: Record<string, unknown> = boardActor(), db: Record<string, unknown> = {}) {
   const [{ agentRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
@@ -131,7 +128,7 @@ async function createApp(actor: Record<string, unknown> = boardActor()) {
     (req as any).actor = actor;
     next();
   });
-  app.use("/api", agentRoutes({} as any));
+  app.use("/api", agentRoutes(db as any));
   app.use(errorHandler);
   return app;
 }
@@ -199,6 +196,11 @@ function makeReflectionCoachAgent(overrides: Record<string, unknown> = {}) {
 
 describe("agent instructions bundle routes", () => {
   beforeEach(() => {
+    vi.resetModules();
+    vi.doUnmock("../routes/agents.js");
+    vi.doUnmock("../routes/authz.js");
+    vi.doUnmock("../middleware/index.js");
+    registerModuleMocks();
     vi.clearAllMocks();
     mockBuiltInAgentService.ensureCompanyDefaultAgentGrants.mockResolvedValue(0);
     mockSyncInstructionsBundleConfigFromFilePath.mockImplementation((_agent, config) => config);
@@ -284,6 +286,202 @@ describe("agent instructions bundle routes", () => {
       entryFile: "AGENTS.md",
     });
     expect(mockAgentInstructionsService.getBundle).toHaveBeenCalled();
+  });
+
+  it("requires instance-admin access for every external instruction entry point", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent(),
+      adapterConfig: {
+        instructionsBundleMode: "external",
+        instructionsRootPath: "/srv/paperclip/external-agent",
+        instructionsEntryFile: "AGENTS.md",
+      },
+    });
+    const app = await createApp({
+      type: "board",
+      userId: "company-admin",
+      companyIds: ["company-1"],
+      memberships: [{ companyId: "company-1", status: "active", membershipRole: "admin" }],
+      source: "session",
+      isInstanceAdmin: false,
+    });
+    const requests = [
+      () => request(app).get("/api/agents/11111111-1111-4111-8111-111111111111/instructions-bundle"),
+      () => request(app)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111/instructions-bundle")
+        .send({ entryFile: "AGENTS.md" }),
+      () => request(app)
+        .get("/api/agents/11111111-1111-4111-8111-111111111111/instructions-bundle/file")
+        .query({ path: "AGENTS.md" }),
+      () => request(app)
+        .put("/api/agents/11111111-1111-4111-8111-111111111111/instructions-bundle/file")
+        .send({ path: "AGENTS.md", content: "# changed" }),
+      () => request(app)
+        .delete("/api/agents/11111111-1111-4111-8111-111111111111/instructions-bundle/file")
+        .query({ path: "AGENTS.md" }),
+    ];
+
+    for (const perform of requests) {
+      const res = await perform();
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.error).toContain("Instance admin");
+    }
+    expect(mockAgentInstructionsService.getBundle).not.toHaveBeenCalled();
+    expect(mockAgentInstructionsService.readFile).not.toHaveBeenCalled();
+    expect(mockAgentInstructionsService.updateBundle).not.toHaveBeenCalled();
+    expect(mockAgentInstructionsService.writeFile).not.toHaveBeenCalled();
+    expect(mockAgentInstructionsService.deleteFile).not.toHaveBeenCalled();
+  });
+
+  it("treats a host root mislabeled as managed as external", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent(),
+      adapterConfig: {
+        instructionsBundleMode: "managed",
+        instructionsRootPath: "/private/host/instructions",
+        instructionsEntryFile: "AGENTS.md",
+      },
+    });
+    const app = await createApp({
+      type: "board",
+      userId: "company-admin",
+      companyIds: ["company-1"],
+      memberships: [{ companyId: "company-1", status: "active", membershipRole: "admin" }],
+      source: "session",
+      isInstanceAdmin: false,
+    });
+
+    const res = await request(app)
+      .get("/api/agents/11111111-1111-4111-8111-111111111111/instructions-bundle");
+
+    expect(res.status).toBe(403);
+    expect(mockAgentInstructionsService.getBundle).not.toHaveBeenCalled();
+  });
+
+  it("allows an instance admin to read an external instruction bundle", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent(),
+      adapterConfig: {
+        instructionsBundleMode: "external",
+        instructionsRootPath: "/srv/paperclip/external-agent",
+        instructionsEntryFile: "AGENTS.md",
+      },
+    });
+
+    const res = await requestApp(
+      await createApp({
+        type: "board",
+        userId: "instance-admin",
+        companyIds: ["company-1"],
+        memberships: [{ companyId: "company-1", status: "active", membershipRole: "admin" }],
+        source: "session",
+        isInstanceAdmin: true,
+      }),
+      (baseUrl) => request(baseUrl)
+        .get("/api/agents/11111111-1111-4111-8111-111111111111/instructions-bundle"),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentInstructionsService.getBundle).toHaveBeenCalled();
+  });
+
+  it("rejects a company admin that requests a new external instruction root", async () => {
+    mockSyncInstructionsBundleConfigFromFilePath.mockImplementation((_agent, config) => ({
+      ...config,
+      instructionsBundleMode: "external",
+      instructionsRootPath: "/srv/paperclip/external-agent",
+      instructionsEntryFile: "AGENTS.md",
+    }));
+    const app = await createApp({
+      type: "board",
+      userId: "company-admin",
+      companyIds: ["company-1"],
+      memberships: [{ companyId: "company-1", status: "active", membershipRole: "admin" }],
+      source: "session",
+      isInstanceAdmin: false,
+    });
+
+    const compatibilityRes = await request(app)
+      .patch("/api/agents/11111111-1111-4111-8111-111111111111/instructions-path")
+      .send({ path: "/srv/paperclip/external-agent/AGENTS.md" });
+    expect(compatibilityRes.status, JSON.stringify(compatibilityRes.body)).toBe(403);
+
+    const bundleRes = await request(app)
+      .patch("/api/agents/11111111-1111-4111-8111-111111111111/instructions-bundle")
+      .send({ mode: "external", rootPath: "/srv/paperclip/external-agent" });
+    expect(bundleRes.status, JSON.stringify(bundleRes.body)).toBe(403);
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+    expect(mockAgentInstructionsService.updateBundle).not.toHaveBeenCalled();
+  });
+
+  it("rejects external instruction roots through the generic agent patch", async () => {
+    mockSyncInstructionsBundleConfigFromFilePath.mockImplementation((_agent, config) => config);
+    const app = await createApp({
+      type: "board",
+      userId: "company-admin",
+      companyIds: ["company-1"],
+      memberships: [{ companyId: "company-1", status: "active", membershipRole: "admin" }],
+      source: "session",
+      isInstanceAdmin: false,
+    });
+
+    const res = await request(app)
+      .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+      .send({
+        adapterConfig: {
+          instructionsBundleMode: "external",
+          instructionsRootPath: "/srv/paperclip/external-agent",
+          instructionsEntryFile: "AGENTS.md",
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("Instance admin");
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  it("rejects external instruction roots during both hire and direct creation", async () => {
+    const actor = {
+      type: "board",
+      userId: "company-admin",
+      companyIds: ["company-1"],
+      memberships: [{ companyId: "company-1", status: "active", membershipRole: "admin" }],
+      source: "session",
+      isInstanceAdmin: false,
+    };
+    const db = {
+      select: vi.fn(() => ({
+        from: vi.fn(() => ({
+          where: vi.fn(async () => [{
+            id: "company-1",
+            requireBoardApprovalForNewAgents: false,
+          }]),
+        })),
+      })),
+    };
+    const app = await createApp(actor, db);
+    const body = {
+      name: "External agent",
+      adapterType: "codex_local",
+      adapterConfig: {
+        instructionsBundleMode: "external",
+        instructionsRootPath: "/srv/paperclip/external-agent",
+        instructionsEntryFile: "AGENTS.md",
+      },
+    };
+
+    const hireRes = await request(app)
+      .post("/api/companies/company-1/agent-hires")
+      .send(body);
+    expect(hireRes.status, JSON.stringify(hireRes.body)).toBe(403);
+    expect(hireRes.body.error).toContain("Instance admin");
+
+    const createRes = await request(app)
+      .post("/api/companies/company-1/agents")
+      .send(body);
+    expect(createRes.status, JSON.stringify(createRes.body)).toBe(403);
+    expect(createRes.body.error).toContain("Instance admin");
+    expect(mockAgentService.create).not.toHaveBeenCalled();
   });
 
   it("denies non-privileged agents from reading peer instructions bundles", async () => {

@@ -83,6 +83,7 @@ export const sessionCodec: AdapterSessionCodec = {
     const promptBundleKey =
       readNonEmptyString(record.promptBundleKey) ??
       readNonEmptyString(record.prompt_bundle_key);
+    const mcpServerIdentity = readNonEmptyString(record.mcpServerIdentity);
     const runtimeContractFingerprint =
       readNonEmptyString(record.runtimeContractFingerprint) ??
       readNonEmptyString(record.runtime_contract_fingerprint);
@@ -93,6 +94,7 @@ export const sessionCodec: AdapterSessionCodec = {
       sessionId,
       ...(cwd ? { cwd } : {}),
       ...(promptBundleKey ? { promptBundleKey } : {}),
+      ...(mcpServerIdentity ? { mcpServerIdentity } : {}),
       ...(runtimeContractFingerprint ? { runtimeContractFingerprint } : {}),
       ...(workspaceId ? { workspaceId } : {}),
       ...(repoUrl ? { repoUrl } : {}),
@@ -110,6 +112,7 @@ export const sessionCodec: AdapterSessionCodec = {
     const promptBundleKey =
       readNonEmptyString(params.promptBundleKey) ??
       readNonEmptyString(params.prompt_bundle_key);
+    const mcpServerIdentity = readNonEmptyString(params.mcpServerIdentity);
     const runtimeContractFingerprint =
       readNonEmptyString(params.runtimeContractFingerprint) ??
       readNonEmptyString(params.runtime_contract_fingerprint);
@@ -120,6 +123,7 @@ export const sessionCodec: AdapterSessionCodec = {
       sessionId,
       ...(cwd ? { cwd } : {}),
       ...(promptBundleKey ? { promptBundleKey } : {}),
+      ...(mcpServerIdentity ? { mcpServerIdentity } : {}),
       ...(runtimeContractFingerprint ? { runtimeContractFingerprint } : {}),
       ...(workspaceId ? { workspaceId } : {}),
       ...(repoUrl ? { repoUrl } : {}),

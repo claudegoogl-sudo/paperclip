@@ -3,6 +3,7 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_OPENCODE_LOCAL_MODEL } from "@paperclipai/adapter-opencode-local";
 import { LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
+import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
 
 vi.mock("acpx/runtime", () => ({
   createAcpRuntime: vi.fn(),
@@ -41,11 +42,14 @@ const baseAgent = {
 
 const mockAgentService = vi.hoisted(() => ({
   getById: vi.fn(),
+  getConfigRevision: vi.fn(),
+  listConfigRevisions: vi.fn(),
   list: vi.fn(),
   create: vi.fn(),
   activatePendingApproval: vi.fn(),
   terminate: vi.fn(),
   update: vi.fn(),
+  rollbackConfigRevision: vi.fn(),
   updatePermissions: vi.fn(),
   getChainOfCommand: vi.fn(),
   resolveByReference: vi.fn(),
@@ -120,106 +124,104 @@ const mockInstanceSettingsService = vi.hoisted(() => ({
   getGeneral: vi.fn(),
 }));
 
-// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
-// registry must be in place before ANY import of the routes module, in every
-// test. createApp concurrently imports middleware and route modules whose
-// graphs both contain services/index.js. With doMock-registered mocks that
-// first evaluation could race the registry under load and bind the REAL
-// services module, rejecting the request under test with a 500 (observed on
-// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
-// to every import graph deterministically.
-vi.mock("@paperclipai/adapter-opencode-local/server", async () => {
-  const actual = await vi.importActual<typeof import("@paperclipai/adapter-opencode-local/server")>("@paperclipai/adapter-opencode-local/server");
-  return {
-    ...actual,
-    ensureOpenCodeModelConfiguredAndAvailable: mockEnsureOpenCodeModelConfiguredAndAvailable,
-  };
-});
+function registerModuleMocks() {
+  vi.doMock("@paperclipai/adapter-opencode-local/server", async () => {
+    const actual = await vi.importActual<typeof import("@paperclipai/adapter-opencode-local/server")>("@paperclipai/adapter-opencode-local/server");
+    return {
+      ...actual,
+      ensureOpenCodeModelConfiguredAndAvailable: mockEnsureOpenCodeModelConfiguredAndAvailable,
+    };
+  });
 
-vi.mock("@paperclipai/shared/telemetry", () => ({
-  trackAgentCreated: mockTrackAgentCreated,
-  trackErrorHandlerCrash: vi.fn(),
-}));
+  vi.doMock("@paperclipai/shared/telemetry", () => ({
+    trackAgentCreated: mockTrackAgentCreated,
+    trackErrorHandlerCrash: vi.fn(),
+  }));
 
-vi.mock("../telemetry.js", () => ({
-  getTelemetryClient: mockGetTelemetryClient,
-}));
+  vi.doMock("../telemetry.js", () => ({
+    getTelemetryClient: mockGetTelemetryClient,
+  }));
 
-vi.mock("../services/agents.js", () => ({
-  agentService: () => mockAgentService,
-}));
+  vi.doMock("../services/agents.js", () => ({
+    agentService: () => mockAgentService,
+  }));
 
-vi.mock("../services/access.js", () => ({
-  accessService: () => mockAccessService,
-}));
+  vi.doMock("../services/access.js", () => ({
+    accessService: () => mockAccessService,
+  }));
 
-vi.mock("../services/approvals.js", () => ({
-  approvalService: () => mockApprovalService,
-}));
+  vi.doMock("../services/approvals.js", () => ({
+    approvalService: () => mockApprovalService,
+  }));
 
-vi.mock("../services/company-skills.js", () => ({
-  companySkillService: () => mockCompanySkillService,
-}));
+  vi.doMock("../services/company-skills.js", () => ({
+    companySkillService: () => mockCompanySkillService,
+  }));
 
-vi.mock("../services/budgets.js", () => ({
-  budgetService: () => mockBudgetService,
-}));
+  vi.doMock("../services/budgets.js", () => ({
+    budgetService: () => mockBudgetService,
+  }));
 
-vi.mock("../services/heartbeat.js", () => ({
-  heartbeatService: () => mockHeartbeatService,
-}));
+  vi.doMock("../services/heartbeat.js", () => ({
+    heartbeatService: () => mockHeartbeatService,
+  }));
 
-vi.mock("../services/issue-approvals.js", () => ({
-  issueApprovalService: () => mockIssueApprovalService,
-}));
+  vi.doMock("../services/issue-approvals.js", () => ({
+    issueApprovalService: () => mockIssueApprovalService,
+  }));
 
-vi.mock("../services/issues.js", () => ({
-  issueService: () => mockIssueService,
-}));
+  vi.doMock("../services/issues.js", () => ({
+    issueService: () => mockIssueService,
+  }));
 
-vi.mock("../services/secrets.js", () => ({
-  secretService: () => mockSecretService,
-}));
+  vi.doMock("../services/secrets.js", () => ({
+    secretService: () => mockSecretService,
+  }));
 
-vi.mock("../services/environments.js", () => ({
-  environmentService: () => mockEnvironmentService,
-}));
+  vi.doMock("../services/environments.js", () => ({
+    environmentService: () => mockEnvironmentService,
+  }));
 
-vi.mock("../services/agent-instructions.js", () => ({
-  agentInstructionsService: () => mockAgentInstructionsService,
-  syncInstructionsBundleConfigFromFilePath: mockSyncInstructionsBundleConfigFromFilePath,
-}));
+  vi.doMock("../services/agent-instructions.js", () => ({
+    agentInstructionsService: () => mockAgentInstructionsService,
+    agentInstructionsBundleMode: (agent: { adapterConfig?: unknown }) => {
+      const config = agent.adapterConfig as Record<string, unknown> | undefined;
+      return config?.instructionsBundleMode === "external" ? "external" : "managed";
+    },
+    syncInstructionsBundleConfigFromFilePath: mockSyncInstructionsBundleConfigFromFilePath,
+  }));
 
-vi.mock("../services/workspace-operations.js", () => ({
-  workspaceOperationService: () => mockWorkspaceOperationService,
-}));
+  vi.doMock("../services/workspace-operations.js", () => ({
+    workspaceOperationService: () => mockWorkspaceOperationService,
+  }));
 
-vi.mock("../services/activity-log.js", () => ({
-  logActivity: mockLogActivity,
-}));
+  vi.doMock("../services/activity-log.js", () => ({
+    logActivity: mockLogActivity,
+  }));
 
-vi.mock("../services/instance-settings.js", () => ({
-  instanceSettingsService: () => mockInstanceSettingsService,
-}));
+  vi.doMock("../services/instance-settings.js", () => ({
+    instanceSettingsService: () => mockInstanceSettingsService,
+  }));
 
-vi.mock("../services/index.js", () => ({
-  agentService: () => mockAgentService,
-  agentInstructionsService: () => mockAgentInstructionsService,
-  accessService: () => mockAccessService,
-  approvalService: () => mockApprovalService,
-  builtInAgentService: () => mockBuiltInAgentService,
-  companySkillService: () => mockCompanySkillService,
-  budgetService: () => mockBudgetService,
-  heartbeatService: () => mockHeartbeatService,
-  ISSUE_LIST_DEFAULT_LIMIT: 500,
-  issueApprovalService: () => mockIssueApprovalService,
-  issueService: () => mockIssueService,
-  logActivity: mockLogActivity,
-  secretService: () => mockSecretService,
-  syncInstructionsBundleConfigFromFilePath: mockSyncInstructionsBundleConfigFromFilePath,
-  workspaceOperationService: () => mockWorkspaceOperationService,
-  environmentService: () => mockEnvironmentService,
-}));
+  vi.doMock("../services/index.js", () => ({
+    agentService: () => mockAgentService,
+    agentInstructionsService: () => mockAgentInstructionsService,
+    accessService: () => mockAccessService,
+    approvalService: () => mockApprovalService,
+    builtInAgentService: () => mockBuiltInAgentService,
+    companySkillService: () => mockCompanySkillService,
+    budgetService: () => mockBudgetService,
+    heartbeatService: () => mockHeartbeatService,
+    ISSUE_LIST_DEFAULT_LIMIT: 500,
+    issueApprovalService: () => mockIssueApprovalService,
+    issueService: () => mockIssueService,
+    logActivity: mockLogActivity,
+    secretService: () => mockSecretService,
+    syncInstructionsBundleConfigFromFilePath: mockSyncInstructionsBundleConfigFromFilePath,
+    workspaceOperationService: () => mockWorkspaceOperationService,
+    environmentService: () => mockEnvironmentService,
+  }));
+}
 
 function createDbStub(options: { requireBoardApprovalForNewAgents?: boolean } = {}) {
   return {
@@ -237,25 +239,6 @@ function createDbStub(options: { requireBoardApprovalForNewAgents?: boolean } = 
       }),
     }),
   };
-}
-
-async function createApp(actor: Record<string, unknown>, dbOptions: { requireBoardApprovalForNewAgents?: boolean } = {}) {
-  const [{ errorHandler }, { agentRoutes }] = await Promise.all([
-    import("../middleware/index.js") as Promise<typeof import("../middleware/index.js")>,
-    import("../routes/agents.js") as Promise<typeof import("../routes/agents.js")>,
-  ]);
-  const app = express();
-  app.use(express.json());
-  app.use((req, _res, next) => {
-    (req as any).actor = {
-      ...actor,
-      companyIds: Array.isArray(actor.companyIds) ? [...actor.companyIds] : actor.companyIds,
-    };
-    next();
-  });
-  app.use("/api", agentRoutes(createDbStub(dbOptions) as any));
-  app.use(errorHandler);
-  return app;
 }
 
 async function requestApp(
@@ -286,14 +269,41 @@ async function requestApp(
 }
 
 describe.sequential("agent permission routes", () => {
+  const routeModules = hoistModuleGraph(registerModuleMocks, async () => {
+    const [{ errorHandler }, { agentRoutes }] = await Promise.all([
+      vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+      vi.importActual<typeof import("../routes/agents.js")>("../routes/agents.js"),
+    ]);
+    return { errorHandler, agentRoutes };
+  });
+
+  function createApp(actor: Record<string, unknown>, dbOptions: { requireBoardApprovalForNewAgents?: boolean } = {}) {
+    const { errorHandler, agentRoutes } = routeModules.value;
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      (req as any).actor = {
+        ...actor,
+        companyIds: Array.isArray(actor.companyIds) ? [...actor.companyIds] : actor.companyIds,
+      };
+      next();
+    });
+    app.use("/api", agentRoutes(createDbStub(dbOptions) as any));
+    app.use(errorHandler);
+    return app;
+  }
+
   beforeEach(() => {
     vi.resetAllMocks();
     mockAgentService.getById.mockReset();
+    mockAgentService.getConfigRevision.mockReset();
+    mockAgentService.listConfigRevisions.mockReset();
     mockAgentService.list.mockReset();
     mockAgentService.create.mockReset();
     mockAgentService.activatePendingApproval.mockReset();
     mockAgentService.terminate.mockReset();
     mockAgentService.update.mockReset();
+    mockAgentService.rollbackConfigRevision.mockReset();
     mockAgentService.updatePermissions.mockReset();
     mockAgentService.getChainOfCommand.mockReset();
     mockAgentService.resolveByReference.mockReset();
@@ -333,6 +343,8 @@ describe.sequential("agent permission routes", () => {
     mockSyncInstructionsBundleConfigFromFilePath.mockImplementation((_agent, config) => config);
     mockGetTelemetryClient.mockReturnValue({ track: vi.fn() });
     mockAgentService.getById.mockResolvedValue(baseAgent);
+    mockAgentService.getConfigRevision.mockResolvedValue(null);
+    mockAgentService.listConfigRevisions.mockResolvedValue([]);
     mockAgentService.list.mockResolvedValue([baseAgent]);
     mockAgentService.getChainOfCommand.mockResolvedValue([]);
     mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: baseAgent });
@@ -418,7 +430,8 @@ describe.sequential("agent permission routes", () => {
     expect(res.body.runtimeConfig).toEqual({});
   }, 20_000);
 
-  it("keeps board agent detail unredacted for low-trust agents", async () => {
+  it("redacts env values in board agent detail responses", async () => {
+    const plaintextValue = "plain-value-must-not-leak";
     mockAgentService.getById.mockResolvedValue({
       ...baseAgent,
       permissions: {
@@ -427,12 +440,18 @@ describe.sequential("agent permission routes", () => {
       },
       adapterConfig: {
         command: "pnpm agent:run",
-        env: { PAPERCLIP_API_KEY: "secret-test-key" },
+        env: {
+          LEGACY_VALUE: plaintextValue,
+          PLAIN_VALUE: { type: "plain", value: plaintextValue },
+          SECRET_REFERENCE: {
+            type: "secret_ref",
+            secretId: "33333333-3333-4333-8333-333333333333",
+            version: "latest",
+          },
+        },
       },
       runtimeConfig: {
-        modelProfiles: {
-          default: { enabled: true, adapterConfig: { model: "openai/gpt-5.4-mini" } },
-        },
+        heartbeat: { enabled: false },
       },
     });
 
@@ -449,14 +468,188 @@ describe.sequential("agent permission routes", () => {
     expect(res.status).toBe(200);
     expect(res.body.adapterConfig).toMatchObject({
       command: "pnpm agent:run",
-      env: { PAPERCLIP_API_KEY: "secret-test-key" },
-    });
-    expect(res.body.runtimeConfig).toMatchObject({
-      modelProfiles: {
-        default: { enabled: true, adapterConfig: { model: "openai/gpt-5.4-mini" } },
+      env: {
+        LEGACY_VALUE: { type: "plain", value: "***REDACTED***" },
+        PLAIN_VALUE: { type: "plain", value: "***REDACTED***" },
+        SECRET_REFERENCE: {
+          type: "secret_ref",
+          secretId: "33333333-3333-4333-8333-333333333333",
+          version: "latest",
+        },
       },
     });
+    expect(JSON.stringify(res.body)).not.toContain(plaintextValue);
+    expect(res.body.runtimeConfig).toMatchObject({
+      heartbeat: { enabled: false },
+    });
     expect(res.body.permissions).toMatchObject({ trustPreset: LOW_TRUST_REVIEW_PRESET });
+  }, 20_000);
+
+  // TEC-7032 reported the leak against the company agent-list endpoint, which
+  // serialises rows directly instead of going through buildAgentDetail.
+  it("redacts env values in board GET /api/companies/:companyId/agents responses", async () => {
+    const plaintextValue = "listed-value-must-not-leak";
+    mockAgentService.list.mockResolvedValue([
+      {
+        ...baseAgent,
+        adapterConfig: {
+          command: "pnpm agent:run",
+          env: {
+            LEGACY_VALUE: plaintextValue,
+            PLAIN_VALUE: { type: "plain", value: plaintextValue },
+            SECRET_REFERENCE: {
+              type: "secret_ref",
+              secretId: "55555555-5555-4555-8555-555555555555",
+              version: "latest",
+            },
+          },
+        },
+      },
+    ]);
+
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get(`/api/companies/${companyId}/agents`),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveLength(1);
+    expect(res.body[0].adapterConfig).toMatchObject({
+      command: "pnpm agent:run",
+      env: {
+        LEGACY_VALUE: { type: "plain", value: "***REDACTED***" },
+        PLAIN_VALUE: { type: "plain", value: "***REDACTED***" },
+        SECRET_REFERENCE: {
+          type: "secret_ref",
+          secretId: "55555555-5555-4555-8555-555555555555",
+          version: "latest",
+        },
+      },
+    });
+    expect(JSON.stringify(res.body)).not.toContain(plaintextValue);
+  }, 20_000);
+
+  // Mutation routes echo the stored row back, so they leak the same values the
+  // GET paths redact.
+  it("redacts env values in agent mutation responses", async () => {
+    const plaintextValue = "mutation-value-must-not-leak";
+    const storedAgent = {
+      ...baseAgent,
+      adapterConfig: {
+        env: { PLAIN_VALUE: { type: "plain", value: plaintextValue } },
+      },
+    };
+    mockAgentService.getById.mockResolvedValue(storedAgent);
+    mockAgentService.update.mockResolvedValue(storedAgent);
+
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).patch(`/api/agents/${agentId}`).send({ title: "Renamed" }),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body.adapterConfig.env).toEqual({
+      PLAIN_VALUE: { type: "plain", value: "***REDACTED***" },
+    });
+    expect(JSON.stringify(res.body)).not.toContain(plaintextValue);
+  }, 20_000);
+
+  it("redacts env values in GET /api/agents/me responses", async () => {
+    const plaintextValue = "self-value-must-not-leak";
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: {
+        env: {
+          EXISTING_VALUE: plaintextValue,
+          NEW_VALUE: { type: "plain", value: plaintextValue },
+          SECRET_REFERENCE: {
+            type: "secret_ref",
+            secretId: "44444444-4444-4444-8444-444444444444",
+            version: 2,
+          },
+        },
+      },
+    });
+
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      runId: null,
+      source: "agent_key",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/agents/me"));
+
+    expect(res.status).toBe(200);
+    expect(res.body.adapterConfig.env).toEqual({
+      EXISTING_VALUE: { type: "plain", value: "***REDACTED***" },
+      NEW_VALUE: { type: "plain", value: "***REDACTED***" },
+      SECRET_REFERENCE: {
+        type: "secret_ref",
+        secretId: "44444444-4444-4444-8444-444444444444",
+        version: 2,
+      },
+    });
+    expect(JSON.stringify(res.body)).not.toContain(plaintextValue);
+  }, 20_000);
+
+  it("preserves stored env values when a redacted detail response is submitted unchanged", async () => {
+    const plaintextValue = "stored-value-must-be-preserved";
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: {
+        env: {
+          EXISTING_VALUE: { type: "plain", value: plaintextValue },
+        },
+      },
+    });
+    mockAgentService.update.mockResolvedValue(baseAgent);
+
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const redactedResponse = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get(`/api/agents/${agentId}`),
+    );
+    expect(redactedResponse.status).toBe(200);
+    const redactedEnv = redactedResponse.body.adapterConfig.env as Record<string, unknown>;
+    expect(redactedEnv.EXISTING_VALUE).toEqual({ type: "plain", value: "***REDACTED***" });
+
+    const patchRes = await requestApp(app, (baseUrl) =>
+      request(baseUrl).patch(`/api/agents/${agentId}`).send({
+        title: "Renamed while redacted env round-trips",
+        adapterConfig: redactedResponse.body.adapterConfig,
+      }),
+    );
+
+    expect(patchRes.status).toBe(200);
+    const updateCallArgs = mockAgentService.update.mock.calls[0]?.[1] as
+      | { adapterConfig?: Record<string, unknown> }
+      | undefined;
+    expect(updateCallArgs?.adapterConfig?.env).toEqual({
+      EXISTING_VALUE: { type: "plain", value: plaintextValue },
+    });
+    expect(JSON.stringify(updateCallArgs?.adapterConfig ?? {})).not.toContain("***REDACTED***");
   }, 20_000);
 
   it("redacts company agent list for authenticated company members without agent admin permission", async () => {
@@ -505,6 +698,166 @@ describe.sequential("agent permission routes", () => {
     expect(res.status).toBe(403);
   });
 
+  it("requires instance administration to enable agent-scoped raw provider traces", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "agent-admin-user",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}`)
+      .send({ runtimeConfig: { debug: { providerTrace: "raw" } } }));
+
+    expect(res.status).toBe(403);
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  it("allows instance administrators to enable agent-scoped raw provider traces", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "instance-admin-user",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${agentId}`)
+      .send({ runtimeConfig: { debug: { providerTrace: "raw" } } }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalledWith(
+      agentId,
+      expect.objectContaining({
+        runtimeConfig: { debug: { providerTrace: "raw" } },
+      }),
+      expect.anything(),
+    );
+  });
+
+  it.each([
+    ["direct creation", `/api/companies/${companyId}/agents`],
+    ["hire creation", `/api/companies/${companyId}/agent-hires`],
+  ])("requires instance administration for raw provider traces during %s", async (_label, path) => {
+    const app = await createApp({
+      type: "board",
+      userId: "agent-admin-user",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(path)
+      .send({
+        name: "Trace attempt",
+        role: "engineer",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: { debug: { providerTrace: "raw" } },
+      }));
+
+    expect(res.status).toBe(403);
+    expect(mockAgentService.create).not.toHaveBeenCalled();
+  });
+
+  it("allows instance administrators to create and hire with raw provider traces", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "instance-admin-user",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+    const body = {
+      name: "Trace capture agent",
+      adapterType: "process",
+      runtimeConfig: { debug: { providerTrace: "raw" } },
+    };
+
+    const createResponse = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .post(`/api/companies/${companyId}/agents`)
+        .send(body),
+    );
+    const hireResponse = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .post(`/api/companies/${companyId}/agent-hires`)
+        .send(body),
+    );
+
+    expect(createResponse.status, JSON.stringify(createResponse.body)).toBe(201);
+    expect(hireResponse.status, JSON.stringify(hireResponse.body)).toBe(201);
+    expect(mockAgentService.create).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects non-admin rollback into raw provider trace capture", async () => {
+    mockAgentService.getConfigRevision.mockResolvedValue({
+      id: "33333333-3333-4333-8333-333333333333",
+      afterConfig: {
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: { debug: { providerTrace: "raw" } },
+      },
+    });
+    const app = await createApp({
+      type: "board",
+      userId: "agent-admin-user",
+      source: "session",
+      isInstanceAdmin: false,
+      companyIds: [companyId],
+    });
+
+    const response = await requestApp(app, (baseUrl) =>
+      request(baseUrl).post(
+        `/api/agents/${agentId}/config-revisions/33333333-3333-4333-8333-333333333333/rollback`,
+      ),
+    );
+
+    expect(response.status).toBe(403);
+    expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
+  });
+
+  it("redacts plaintext env values in configuration rollback responses", async () => {
+    const revisionId = "33333333-3333-4333-8333-333333333333";
+    const plaintextValue = "rollback-value-must-not-leak";
+    mockAgentService.getConfigRevision.mockResolvedValue({
+      id: revisionId,
+      afterConfig: {
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+      },
+    });
+    mockAgentService.rollbackConfigRevision.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: {
+        env: { GENERIC_NAME: { type: "plain", value: plaintextValue } },
+      },
+    });
+
+    const app = await createApp({
+      type: "board",
+      userId: "instance-admin-user",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).post(`/api/agents/${agentId}/config-revisions/${revisionId}/rollback`),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body.adapterConfig.env).toEqual({
+      GENERIC_NAME: { type: "plain", value: "***REDACTED***" },
+    });
+    expect(JSON.stringify(res.body)).not.toContain(plaintextValue);
+  });
+
   it("blocks api key creation for authenticated company members without agent admin permission", async () => {
     mockAccessService.canUser.mockResolvedValue(false);
 
@@ -521,105 +874,6 @@ describe.sequential("agent permission routes", () => {
       .send({ name: "backdoor" }));
 
     expect(res.status).toBe(403);
-  });
-
-  it.each([
-    ["standard", { kind: "standard" }],
-    ["task_bridge", { kind: "task_bridge", projectId: "11111111-1111-4111-8111-111111111111" }],
-    ["skill_test", { kind: "skill_test", issueId: "11111111-1111-4111-8111-111111111111" }],
-    ["notify_only", { kind: "notify_only", issueIds: ["11111111-1111-4111-8111-111111111111"] }],
-  ])("refuses to mint a notify_only key from a %s agent key", async (_label, keyScope) => {
-    const app = await createApp({
-      type: "agent",
-      agentId,
-      companyId,
-      source: "agent_key",
-      keyScope,
-      runId: "run-1",
-    });
-
-    const res = await requestApp(app, (baseUrl) => request(baseUrl)
-      .post(`/api/agents/${agentId}/keys`)
-      .send({ name: "pager", scope: { kind: "notify_only", issueIds: ["11111111-1111-4111-8111-111111111111"] } }));
-
-    expect(res.status).toBe(403);
-  });
-
-  it("refuses to mint a notify_only key from the owning agent's own JWT (board only)", async () => {
-    const app = await createApp({
-      type: "agent",
-      agentId,
-      companyId,
-      source: "agent_jwt",
-      runId: "run-1",
-    });
-
-    const res = await requestApp(app, (baseUrl) => request(baseUrl)
-      .post(`/api/agents/${agentId}/keys`)
-      .send({ name: "pager", ttlSeconds: 3600, scope: { kind: "notify_only", issueIds: ["11111111-1111-4111-8111-111111111111"] } }));
-
-    expect(res.status).toBe(403);
-  });
-
-  it.each([
-    ["no expiry", {}],
-    ["expiry over 90 days", { ttlSeconds: 91 * 24 * 60 * 60 }],
-    ["expiry in the past", { expiresAt: "2000-01-01T00:00:00Z" }],
-  ])("rejects a board notify_only mint with %s (422)", async (_label, lifetime) => {
-    const app = await createApp({
-      type: "board",
-      userId: "board-user",
-      source: "local_implicit",
-      isInstanceAdmin: true,
-      companyIds: [companyId],
-    });
-
-    const res = await requestApp(app, (baseUrl) => request(baseUrl)
-      .post(`/api/agents/${agentId}/keys`)
-      .send({ name: "pager", ...lifetime, scope: { kind: "notify_only", issueIds: ["11111111-1111-4111-8111-111111111111"] } }));
-
-    expect(res.status).toBe(422);
-  });
-
-  it("rejects a board notify_only mint naming an issue outside the agent's company (422)", async () => {
-    const app = await createApp({
-      type: "board",
-      userId: "board-user",
-      source: "local_implicit",
-      isInstanceAdmin: true,
-      companyIds: [companyId],
-    });
-
-    // DB stub resolves one in-company row; the second id is foreign.
-    const res = await requestApp(app, (baseUrl) => request(baseUrl)
-      .post(`/api/agents/${agentId}/keys`)
-      .send({
-        name: "pager",
-        ttlSeconds: 3600,
-        scope: {
-          kind: "notify_only",
-          issueIds: ["11111111-1111-4111-8111-111111111111", "33333333-3333-4333-8333-333333333333"],
-        },
-      }));
-
-    expect(res.status).toBe(422);
-    expect(JSON.stringify(res.body)).toContain("company");
-  });
-
-  it("rejects a notify_only mint with an empty issue allow-list (400)", async () => {
-    const app = await createApp({
-      type: "board",
-      userId: "board-user",
-      source: "local_implicit",
-      isInstanceAdmin: true,
-      companyIds: [companyId],
-    });
-
-    const res = await requestApp(app, (baseUrl) => request(baseUrl)
-      .post(`/api/agents/${agentId}/keys`)
-      .send({ name: "pager", scope: { kind: "notify_only", issueIds: [] } }));
-
-    expect(res.status).toBe(400);
   });
 
   it("blocks wakeups for authenticated company members without agent admin permission", async () => {
@@ -663,165 +917,6 @@ describe.sequential("agent permission routes", () => {
     expect(res.status).toBe(403);
     expect(res.body.error).toContain("host-executed workspace commands");
     expect(mockLogActivity).not.toHaveBeenCalled();
-  });
-
-  it("blocks agent-authenticated self-updates that set cheap-profile host-executed workspace commands", async () => {
-    mockAgentService.getById.mockResolvedValue({
-      ...baseAgent,
-      adapterType: "codex_local",
-    });
-
-    const app = await createApp({
-      type: "agent",
-      agentId,
-      companyId,
-      source: "agent_key",
-      runId: "run-1",
-    });
-
-    const res = await requestApp(app, (baseUrl) => request(baseUrl)
-      .patch(`/api/agents/${agentId}`)
-      .send({
-        runtimeConfig: {
-          modelProfiles: {
-            cheap: {
-              adapterConfig: {
-                workspaceStrategy: {
-                  type: "git_worktree",
-                  provisionCommand: "touch /tmp/paperclip-rce",
-                },
-              },
-            },
-          },
-        },
-      }));
-
-    expect(res.status).toBe(403);
-    expect(res.body.error).toContain("host-executed workspace commands");
-    expect(res.body.error).toContain(
-      "runtimeConfig.modelProfiles.cheap.adapterConfig.workspaceStrategy.provisionCommand",
-    );
-    expect(mockLogActivity).not.toHaveBeenCalled();
-  });
-
-  it("allows board updates that set cheap-profile workspace commands", async () => {
-    mockAgentService.getById.mockResolvedValue({
-      ...baseAgent,
-      adapterType: "codex_local",
-    });
-
-    const app = await createApp({
-      type: "board",
-      userId: "board-user",
-      source: "local_implicit",
-      isInstanceAdmin: true,
-      companyIds: [companyId],
-    });
-
-    const runtimeConfig = {
-      modelProfiles: {
-        cheap: {
-          adapterConfig: {
-            workspaceStrategy: {
-              type: "git_worktree",
-              provisionCommand: "bash ./scripts/provision-worktree.sh",
-            },
-          },
-        },
-      },
-    };
-
-    const res = await requestApp(app, (baseUrl) => request(baseUrl)
-      .patch(`/api/agents/${agentId}`)
-      .send({ runtimeConfig }));
-
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(mockAgentService.update).toHaveBeenCalledWith(
-      agentId,
-      expect.objectContaining({ runtimeConfig }),
-      expect.anything(),
-    );
-    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
-      action: "agent.updated",
-    }));
-  });
-
-  it("normalizes cheap-profile env bindings through the adapter config secret pipeline", async () => {
-    mockAgentService.getById.mockResolvedValue({
-      ...baseAgent,
-      adapterType: "codex_local",
-    });
-    mockSecretService.normalizeAdapterConfigForPersistence.mockImplementation(async (_companyId, config) => ({
-      ...config,
-      env: {
-        API_TOKEN: {
-          type: "secret_ref",
-          secretId: "33333333-3333-4333-8333-333333333333",
-          version: "latest",
-        },
-      },
-    }));
-
-    const app = await createApp({
-      type: "board",
-      userId: "board-user",
-      source: "local_implicit",
-      isInstanceAdmin: true,
-      companyIds: [companyId],
-    });
-
-    const res = await requestApp(app, (baseUrl) => request(baseUrl)
-      .patch(`/api/agents/${agentId}`)
-      .send({
-        runtimeConfig: {
-          modelProfiles: {
-            cheap: {
-              adapterConfig: {
-                model: "gpt-5.3-codex-spark",
-                env: {
-                  API_TOKEN: {
-                    type: "secret_ref",
-                    secretId: "33333333-3333-4333-8333-333333333333",
-                    version: "latest",
-                  },
-                },
-              },
-            },
-          },
-        },
-      }));
-
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(mockSecretService.normalizeAdapterConfigForPersistence).toHaveBeenCalledWith(
-      companyId,
-      expect.objectContaining({
-        model: "gpt-5.3-codex-spark",
-        env: expect.any(Object),
-      }),
-      { strictMode: false, adapterType: "codex_local" },
-    );
-    expect(mockAgentService.update).toHaveBeenCalledWith(
-      agentId,
-      expect.objectContaining({
-        runtimeConfig: {
-          modelProfiles: {
-            cheap: {
-              adapterConfig: {
-                model: "gpt-5.3-codex-spark",
-                env: {
-                  API_TOKEN: {
-                    type: "secret_ref",
-                    secretId: "33333333-3333-4333-8333-333333333333",
-                    version: "latest",
-                  },
-                },
-              },
-            },
-          },
-        },
-      }),
-      expect.anything(),
-    );
   });
 
   it("blocks agent-authenticated self-updates that set instructions bundle roots", async () => {
@@ -1074,79 +1169,10 @@ describe.sequential("agent permission routes", () => {
             intervalSec: 3600,
             maxConcurrentRuns: 20,
           },
-          modelProfiles: {
-            cheap: { enabled: false },
-          },
         },
       }),
       { claudeLogin: { storedSessionId: null, ownerUserId: "board-user", applyExistingWithoutClaim: false } },
     );
-  });
-
-  it("creates agents when optional adapter model profile discovery fails", async () => {
-    const { registerServerAdapter, unregisterServerAdapter } = await import("../adapters/index.js");
-    registerServerAdapter({
-      type: "failing_profile_discovery",
-      execute: async () => ({ exitCode: 0, signal: null, timedOut: false }),
-      testEnvironment: async () => ({
-        adapterType: "failing_profile_discovery",
-        status: "pass",
-        checks: [],
-        testedAt: new Date(0).toISOString(),
-      }),
-      listModelProfiles: async () => {
-        throw new Error("profile discovery unavailable");
-      },
-    });
-
-    try {
-      const app = await createApp({
-        type: "board",
-        userId: "board-user",
-        source: "local_implicit",
-        isInstanceAdmin: true,
-        companyIds: [companyId],
-      });
-
-      const res = await requestApp(app, (baseUrl) => request(baseUrl)
-        .post(`/api/companies/${companyId}/agents`)
-        .send({
-          name: "Builder",
-          role: "engineer",
-          adapterType: "failing_profile_discovery",
-          adapterConfig: {},
-          runtimeConfig: {
-            modelProfiles: {
-              cheap: {
-                enabled: true,
-                adapterConfig: {},
-              },
-            },
-          },
-        }));
-
-      expect(res.status, JSON.stringify(res.body)).toBe(201);
-      expect(mockAgentService.create).toHaveBeenCalledWith(
-        companyId,
-        expect.objectContaining({
-          runtimeConfig: {
-            heartbeat: {
-              enabled: false,
-              maxConcurrentRuns: 20,
-            },
-            modelProfiles: {
-              cheap: {
-                enabled: true,
-                adapterConfig: {},
-              },
-            },
-          },
-        }),
-        { claudeLogin: { storedSessionId: null, ownerUserId: "board-user", applyExistingWithoutClaim: false } },
-      );
-    } finally {
-      unregisterServerAdapter("failing_profile_discovery");
-    }
   });
 
   it("seeds opencode agent creation with the static default model without live discovery", async () => {
@@ -1256,12 +1282,16 @@ describe.sequential("agent permission routes", () => {
             intervalSec: 3600,
             maxConcurrentRuns: 20,
           },
-          modelProfiles: {
-            cheap: { enabled: false },
-          },
         },
       }),
-      { claudeLogin: { storedSessionId: null, ownerUserId: "board-user", applyExistingWithoutClaim: false } },
+      {
+        claudeLogin: {
+          storedSessionId: null,
+          ownerUserId: "board-user",
+          applyExistingWithoutClaim: false,
+          inheritedFromAgentId: null,
+        },
+      },
     );
   });
 
@@ -1856,6 +1886,13 @@ describe.sequential("agent permission routes", () => {
       // the read-only permission loosening introduced by this PR.
       mockAccessService.canUser.mockResolvedValue(false);
       mockAccessService.hasPermission.mockResolvedValue(false);
+      const plaintextValue = "configuration-value-must-not-leak";
+      mockAgentService.getById.mockResolvedValue({
+        ...baseAgent,
+        adapterConfig: {
+          env: { GENERIC_NAME: { type: "plain", value: plaintextValue } },
+        },
+      });
 
       const app = await createApp({
         type: "board",
@@ -1868,6 +1905,78 @@ describe.sequential("agent permission routes", () => {
       const res = await request(app).get(`/api/agents/${agentId}/configuration`);
 
       expect(res.status).toBe(200);
+      expect(res.body.adapterConfig.env).toEqual({
+        GENERIC_NAME: { type: "plain", value: "***REDACTED***" },
+      });
+      expect(JSON.stringify(res.body)).not.toContain(plaintextValue);
+    });
+
+    it("redacts plaintext env values in company configuration-list responses", async () => {
+      const plaintextValue = "configuration-list-value-must-not-leak";
+      mockAgentService.list.mockResolvedValue([
+        {
+          ...baseAgent,
+          adapterConfig: {
+            env: { GENERIC_NAME: { type: "plain", value: plaintextValue } },
+          },
+        },
+      ]);
+
+      const app = await createApp({
+        type: "board",
+        userId: "board-user",
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds: [companyId],
+      });
+
+      const res = await request(app).get(`/api/companies/${companyId}/agent-configurations`);
+
+      expect(res.status).toBe(200);
+      expect(res.body[0].adapterConfig.env).toEqual({
+        GENERIC_NAME: { type: "plain", value: "***REDACTED***" },
+      });
+      expect(JSON.stringify(res.body)).not.toContain(plaintextValue);
+    });
+
+    it("redacts plaintext env values in configuration revisions", async () => {
+      const plaintextValue = "revision-value-must-not-leak";
+      mockAgentService.listConfigRevisions.mockResolvedValue([
+        {
+          id: "33333333-3333-4333-8333-333333333333",
+          beforeConfig: {
+            adapterConfig: {
+              env: { GENERIC_NAME: { type: "plain", value: plaintextValue } },
+            },
+          },
+          afterConfig: {
+            adapterConfig: {
+              env: { GENERIC_NAME: plaintextValue },
+            },
+          },
+        },
+      ]);
+
+      const app = await createApp({
+        type: "board",
+        userId: "board-user",
+        source: "session",
+        isInstanceAdmin: false,
+        companyIds: [companyId],
+      });
+
+      const res = await request(app).get(`/api/agents/${agentId}/config-revisions`);
+
+      expect(res.status).toBe(200);
+      expect(res.body[0].beforeConfig.adapterConfig.env.GENERIC_NAME).toEqual({
+        type: "plain",
+        value: "***REDACTED***",
+      });
+      expect(res.body[0].afterConfig.adapterConfig.env.GENERIC_NAME).toEqual({
+        type: "plain",
+        value: "***REDACTED***",
+      });
+      expect(JSON.stringify(res.body)).not.toContain(plaintextValue);
     });
 
     it("denies an agent actor without configure or suggest grants when reading peer config", async () => {
