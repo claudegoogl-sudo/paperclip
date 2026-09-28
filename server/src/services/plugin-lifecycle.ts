@@ -43,7 +43,7 @@ import type {
   PaperclipPluginManifestV1,
 } from "@paperclipai/shared";
 import { pluginRegistryService } from "./plugin-registry.js";
-import { pluginLoader, type PluginLoader } from "./plugin-loader.js";
+import { deliverStoredPluginConfig, pluginLoader, type PluginLoader } from "./plugin-loader.js";
 import type { PluginEventBus } from "./plugin-event-bus.js";
 import type { PluginWorkerManager, WorkerStartOptions } from "./plugin-worker-manager.js";
 import { badRequest, notFound } from "../errors.js";
@@ -920,6 +920,31 @@ export function pluginLifecycleManager(
         eventBus?.clearPlugin(plugin.pluginKey);
         await handle.restart();
         emitDomain("plugin.worker_started", { pluginId, pluginKey: plugin.pluginKey });
+
+        // The restarted worker boots with the empty bootstrap config, exactly
+        // like a fresh activation. Replay stored company configs through the
+        // loader's shared delivery helper so a bare bounce (e.g. a dev-watcher
+        // file-change restart) never leaves the worker unconfigured.
+        let configRows: Awaited<ReturnType<typeof registry.listConfigs>> = [];
+        try {
+          configRows = await registry.listConfigs(pluginId);
+        } catch (listErr) {
+          log.warn(
+            {
+              pluginId,
+              pluginKey: plugin.pluginKey,
+              err: listErr instanceof Error ? listErr.message : String(listErr),
+            },
+            "plugin lifecycle: could not list stored configs after worker restart; worker keeps empty config",
+          );
+        }
+        await deliverStoredPluginConfig({
+          workerManager,
+          pluginId,
+          pluginKey: plugin.pluginKey,
+          configRows,
+          log,
+        });
 
         if (eventBus) {
           const eventSubscriptions = eventBus.subscriptionCount(plugin.pluginKey);

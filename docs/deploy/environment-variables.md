@@ -26,6 +26,10 @@ All environment variables that Paperclip uses for server configuration.
 | `PAPERCLIP_RUNNER_REMOTE_CODEX_PATH` | (unset) | Optional host-local path to a Codex executable built for the remote target OS and architecture. For remote Codex-backed runners, Paperclip stages and verifies this executable beside `paperclip-runnerd`. |
 | `PAPERCLIP_RUNNER_REMOTE_CODEX_NPM_SPEC` | (unset) | Optional pinned npm package spec (for example, `@openai/codex@0.153.4`) installed inside each fresh remote lease when its Codex harness is not baked into the sandbox image. Mutually exclusive with `PAPERCLIP_RUNNER_REMOTE_CODEX_PATH`; Paperclip verifies the installed executable before starting `runnerd`. |
 | `PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH` | (unset) | Host-local path to the immutable provider pack built by `pnpm --filter @paperclipai/paperclip-runner build:provider-pack`. The pack includes its target-built Node 24.11 runtime, locked production dependencies, OpenCode proxy/executable, and ACPX sidecar. Remote OpenCode and ACPX fail closed without it. A preinstalled pack is accepted only when its complete digested manifest matches this build-owned pack; otherwise Paperclip stages this pack into the sandbox. |
+| `PAPERCLIP_AGENT_API_URL` | loopback listen origin (`http://127.0.0.1:<port>`, or `http://[::1]:<port>` for IPv6) when the server binds loopback or a wildcard; otherwise `PAPERCLIP_API_URL` | Base URL injected into local agent runs as their `PAPERCLIP_API_URL`. Kept separate from the public base so agents on the server host never send API calls (and their credentials) through a public access proxy that may answer with an HTML login page. Set it to override, e.g. `http://host.docker.internal:3100` for containerised agents. Invite/join links, board UI links and routine webhook URLs keep using the public base. Sandbox callback bridges are unaffected. |
+| `PAPERCLIP_MAX_CONCURRENT_RUNS_HOST` | `ceil(vCPU / 2)` | Host-wide ceiling on concurrently executing agent runs — see [Host-wide run concurrency](#host-wide-run-concurrency). |
+| `PAPERCLIP_RUN_ADMISSION_MEMORY_PCT` | `90` | Defer new run admission once the service cgroup's memory usage reaches this percentage of its effective soft limit (`memory.high`, or `memory.max` when no soft limit is set) — see [Memory-pressure run admission](#memory-pressure-run-admission). |
+| `PAPERCLIP_RECOVERY_REPLAY_MAX_CONCURRENT` | `ceil(PAPERCLIP_MAX_CONCURRENT_RUNS_HOST / 2)` | Cap on concurrently in-flight boot/recovery replay dispatches, with a jittered `>= 2s` spacing between dispatch starts — see [Staggered boot recovery replay](#staggered-boot-recovery-replay). |
 | `PAPERCLIP_HIDDEN_SETTINGS` | (unset) | Comma-separated settings surfaces to hide from the UI and floor at the API, for operators hosting Paperclip for others (managed cloud, internal shared server). See [Hiding settings surfaces](#hiding-settings-surfaces). |
 | `PAPERCLIP_SETTING_DEFAULTS` | (unset) | JSON object replacing the schema default of selected instance settings, for hosting operators. See [Operator setting defaults](#operator-setting-defaults). |
 
@@ -169,3 +173,139 @@ These are set automatically by the server when invoking agents:
 |----------|-------------|
 | `ANTHROPIC_API_KEY` | Anthropic API key (for Claude Code adapter) |
 | `OPENAI_API_KEY` | OpenAI API key (for Codex adapter) |
+
+
+
+## Host-wide run concurrency
+
+An agent's `heartbeat.maxConcurrentRuns` is a **per-agent** limit. Because every
+agent has its own, the sum across an instance can be far larger than the host can
+actually execute — 38 agents at the default of 20 each is 760 theoretical
+concurrent runs regardless of how many cores the box has.
+
+`PAPERCLIP_MAX_CONCURRENT_RUNS_HOST` is a second, **host-wide** ceiling checked
+before every dispatch, across all agents and all companies:
+
+- **Default:** `ceil(vCPU / 2)`, where vCPU is Node's `availableParallelism()`.
+  That is quota-aware, so on a host whose cgroup limits it to 4 cores of an
+  8-core machine the default resolves to `2`, not `4`. Set the variable
+  explicitly to pin a value.
+- **Range:** clamped to `1`–`50`. A value below `1`, a non-number, or an empty
+  string is ignored and the default is used.
+- **Counted statuses:** only runs in the `running` status count. `queued` and
+  `scheduled_retry` runs hold an issue execution lock but no adapter process, and
+  counting `scheduled_retry` would deadlock the scheduler, because such a run can
+  only leave that status by being promoted through this same gate.
+- **Liveness:** a `running` run only counts if a process is actually behind it —
+  it is executing in-process or its child pid / process group is still alive. A
+  `running` row left behind by a crashed or restarted process (an orphan the
+  reaper cleans up on its next tick) does not consume the budget, so a few orphans
+  cannot stall every agent. Freshly claimed runs, which are `running` before their
+  process registers, are held by an in-flight admission reservation in the
+  meantime, so they are never double-counted or missed.
+
+The resolved value is logged once at startup as `resolved host-wide concurrent
+run ceiling`, with `source` (`env` or `default`) and the detected `vcpuCount`.
+
+Runs refused by the ceiling **stay queued** — they are never cancelled or failed —
+and are re-offered a slot as soon as a running run finishes. Each refusal logs
+`heartbeat dispatch deferred by host concurrent-run ceiling` at `warn` with the
+current host count and ceiling, so throttling is distinguishable from idleness.
+
+When the ceiling is the scarce resource, a single agent may claim at most
+`ceil / (agents with queued work)` runs per dispatch pass, so one busy agent
+cannot take the whole host budget. The per-agent `maxConcurrentRuns` still
+applies as a secondary gate.
+
+## Memory-pressure run admission
+
+`PAPERCLIP_MAX_CONCURRENT_RUNS_HOST` bounds how many agent runs execute at
+once, but it cannot see the cgroup memory budget those runs fill. After a
+crash-loop restart, boot recovery replays continuations for every stranded
+`in_progress` issue, and the ceiling happily admits a full house of heavy
+adapter processes — refilling the service cgroup to `memory.high`/`memory.max`
+and converting a recoverable restart into another OOM.
+
+`PAPERCLIP_RUN_ADMISSION_MEMORY_PCT` adds a memory-pressure backoff to the same
+admission gate:
+
+- **What is read:** the server's own cgroup v2 memory files (`memory.current`,
+  `memory.high`, `memory.max`, `memory.events`), discovered via
+  `/proc/self/cgroup` and `/proc/self/mountinfo`.
+- **Threshold:** the variable is a percentage of the *effective soft limit* —
+  `memory.high` when set, `memory.max` otherwise, and the smaller of the two
+  when both are set (so a unit with inverted limits — `MemoryHigh` ≥
+  `MemoryMax` — defers before the hard limit, not after the OOM killer has
+  fired). Range `1`–`100`, default `90`. Unusable values are ignored and the
+  default is used.
+- **Behavior:** a run whose admission would start at or above the threshold is
+  deferred through the exact same deferral/drain machinery a ceiling refusal
+  uses — one more deferral reason, not a new queue. Deferred runs stay queued
+  and are re-offered a slot as running work finishes and memory drains.
+- **No-op off Linux:** on hosts without cgroup v2 memory files (macOS, Windows,
+  minimal CI containers) or with no limit set, the check detects this and
+  changes nothing.
+- **Observability:** each refusal logs
+  `heartbeat dispatch deferred by cgroup memory pressure` at `warn` with the
+  pressure percentage, threshold, current bytes, effective limit, and the
+  cumulative `memory.events` `high` counter; the run-ceiling state surface
+  reports `memoryPressurePct` and `deferralsByMemory`.
+
+Happy path — a host whose service unit sets `MemoryHigh=10G` and
+`MemoryMax=12G` wants admission to back off once anonymous memory passes
+~8.5G:
+
+```bash
+# systemd override
+[Service]
+Environment=PAPERCLIP_RUN_ADMISSION_MEMORY_PCT=85
+```
+
+On restart, boot replay still queues every stranded continuation, but
+admission defers while the cgroup is hot and drains the backlog as memory
+falls back under the threshold.
+
+## Staggered boot recovery replay
+
+The recovery sweep requeues continuations for stranded `in_progress` issues in
+one pass, and the queued-run drain dispatches a queued run per agent — together
+they can spawn a full house of adapter processes seconds after a restart.
+Replay dispatches (recovery-driven wakes and the boot queued-run drain) are
+therefore paced:
+
+- **Cap:** at most `PAPERCLIP_RECOVERY_REPLAY_MAX_CONCURRENT` replay dispatches
+  in flight at once. Default `ceil(hostCeiling / 2)`, clamped to the host
+  ceiling; values below `1` or non-numbers fall back to the default.
+- **Spacing:** a jittered delay of at least 2s (plus up to 4s of jitter)
+  between dispatch starts, so processes respawn spread out instead of in one
+  burst. An isolated dispatch (nothing else replaying) still starts
+  immediately — the spacing only binds during bursts.
+- **Not a queue:** every paced wake still runs, still goes through the normal
+  admission gate (`reserveHostRunSlot`), and a failed dispatch releases its
+  slot immediately.
+- **Observability:** each genuinely delayed replay dispatch logs
+  `recovery replay dispatch staggered` at `info` with the wait, cap, and
+  in-flight counts.
+
+Happy path — a host with a ceiling of 8 wants boot replay to admit at most 2
+continuations at a time:
+
+```bash
+# systemd override
+[Service]
+Environment=PAPERCLIP_RECOVERY_REPLAY_MAX_CONCURRENT=2
+```
+
+## Run-path Integrity
+
+Optional boot-time self-checks for `paperclipai run`. They guard against a
+service unit silently launching the wrong binary — e.g. `ExecStart=/usr/bin/npx
+paperclipai run` resolving an upstream release from the public npm registry
+instead of the locally installed build. On every boot `paperclipai run` logs the
+detected build channel (`fork`/`upstream`) and version; these variables let an
+operator turn a mismatch into a fast, loud abort instead of a silent crash loop.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PAPERCLIP_REQUIRE_FORK_BUILD` | (unset) | When truthy (`1`/`true`/`yes`/`on`), abort at boot unless the running build carries a `-fork.<n>` version marker |
+| `PAPERCLIP_EXPECTED_VERSION` | (unset) | When set, abort at boot unless the running CLI version matches this value exactly |

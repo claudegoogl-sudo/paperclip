@@ -344,6 +344,16 @@ import {
   readChatControlRecoveryStop,
 } from "./chat-control-recovery-stop.js";
 import {
+  SERVER_SHUTDOWN_INTERRUPTED_ERROR_CODE,
+  clearLastServerShutdownBoundary,
+  currentShutdownSignal,
+  isRunKilledByServerShutdown,
+  isServerShutdownInProgress,
+  readLastServerShutdownBoundary,
+  type ServerShutdownBoundary,
+  type ServerShutdownSignal,
+} from "./server-shutdown-state.js";
+import {
   classifyRunLiveness,
   type RunLivenessClassificationInput,
 } from "./run-liveness.js";
@@ -540,6 +550,18 @@ import { taskWatchdogService } from "./task-watchdogs.js";
 import { withAgentStartLock, withHostAdmissionLock } from "./agent-start-lock.js";
 import { HOST_MAX_CONCURRENT_RUNS_ENV_VAR, resolveHostRunCeiling } from "./host-run-ceiling.js";
 import { startCgroupPidsPressureTelemetry } from "./cgroup-pids-telemetry.js";
+import {
+  RUN_ADMISSION_MEMORY_CGROUP_DIR_ENV_VAR,
+  RUN_ADMISSION_MEMORY_PCT_ENV_VAR,
+  RUN_ADMISSION_MEMORY_SAMPLE_TTL_MS_DEFAULT,
+  createRunAdmissionMemoryPressureReader,
+  resolveRunAdmissionMemoryPct,
+} from "./run-admission-memory-pressure.js";
+import {
+  RECOVERY_REPLAY_MAX_CONCURRENT_ENV_VAR,
+  createRecoveryReplayPacer,
+  resolveRecoveryReplayCap,
+} from "./recovery/replay-pacing.js";
 import {
   evaluateAgentInvokability,
   evaluateAgentInvokabilityFromDb,
@@ -7946,6 +7968,13 @@ export async function buildPaperclipWakePayload(input: {
   // Experimental: agents write user-interaction content in ASD-STE100
   // Simplified Technical English (rendered as a prompt directive downstream).
   simplifiedEnglishInteractions?: boolean;
+  // The run that will receive this payload. Enables the run-start stamp and
+  // the same-issue sibling-run list (metadata only: agent name, run id,
+  // startedAt) rendered into the wake prompt for parallel-run orientation.
+  currentRun?: {
+    id: string;
+    startedAt?: Date | string | null;
+  } | null;
 }) {
   const executionStage = parseObject(input.contextSnapshot.executionStage);
   const commentIds = extractWakeCommentIds(input.contextSnapshot);
@@ -8339,6 +8368,44 @@ export async function buildPaperclipWakePayload(input: {
           notice: externalAttachmentOmissionNotice(omission),
         }))
     : [];
+  // Sibling-run visibility: other active runs on the same issue, metadata
+  // only (agent name, run id, startedAt), newest first, capped to match the
+  // renderer cap. Excludes the current run.
+  const currentRun = input.currentRun ?? null;
+  const runStartedAt = (() => {
+    if (!currentRun?.startedAt) return null;
+    const parsed = currentRun.startedAt instanceof Date ? currentRun.startedAt : new Date(currentRun.startedAt);
+    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+  })();
+  const siblingRuns =
+    issueId && currentRun
+      ? await input.db
+          .select({
+            runId: heartbeatRuns.id,
+            agentName: agents.name,
+            startedAt: heartbeatRuns.startedAt,
+          })
+          .from(heartbeatRuns)
+          .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, input.companyId),
+              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+              ne(heartbeatRuns.id, currentRun.id),
+              inArray(heartbeatRuns.status, ["queued", "running"]),
+            ),
+          )
+          .orderBy(desc(heartbeatRuns.createdAt))
+          .limit(5)
+          .then((rows) =>
+            rows.map((row) => ({
+              runId: row.runId,
+              agentName: row.agentName,
+              startedAt: row.startedAt ? row.startedAt.toISOString() : null,
+            })),
+          )
+      : [];
+
   const payload = {
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
     executionContinuation: input.contextSnapshot.executionContinuation ?? null,
@@ -8503,6 +8570,8 @@ export async function buildPaperclipWakePayload(input: {
     },
     truncated: payloadTruncated,
     fallbackFetchNeeded: payloadTruncated || missingCommentCount > 0,
+    runStartedAt,
+    siblingRuns,
   };
   return issueId
     ? createRunSecretRedactionRegistry(input.db).redactForIssue(
@@ -9845,6 +9914,30 @@ export function heartbeatService(
   // instead of always re-offering the slot to whoever asked most recently.
   const hostCeilingDeferredAgentIds = new Set<string>();
 
+  // Memory-pressure guardrail for run admission: when the service's own cgroup is at or
+  // above the threshold fraction of its effective soft memory limit, admission defers
+  // through the same deferral/drain machinery a ceiling refusal uses (one more deferral
+  // reason, not a new queue). Off cgroup-v2 hosts (and under Vitest without an explicit
+  // cgroup-dir override) the reading reports unavailable and admission is unchanged.
+  const runAdmissionMemoryPct = resolveRunAdmissionMemoryPct(
+    runtimeEnv[RUN_ADMISSION_MEMORY_PCT_ENV_VAR],
+  );
+  const runAdmissionMemoryPressure = createRunAdmissionMemoryPressureReader({ env: runtimeEnv });
+  let runAdmissionMemoryDeferralCount = 0;
+  logger.info(
+    {
+      runAdmissionMemoryPct: runAdmissionMemoryPct.value,
+      source: runAdmissionMemoryPct.source,
+      envVar: RUN_ADMISSION_MEMORY_PCT_ENV_VAR,
+      sampleTtlMs: RUN_ADMISSION_MEMORY_SAMPLE_TTL_MS_DEFAULT,
+      cgroupDirOverrideEnvVar: RUN_ADMISSION_MEMORY_CGROUP_DIR_ENV_VAR,
+      ...(runAdmissionMemoryPct.invalidEnvValue
+        ? { ignoredEnvValue: runAdmissionMemoryPct.invalidEnvValue }
+        : {}),
+    },
+    "resolved run admission memory-pressure threshold",
+  );
+
   const runLogStore = getRunLogStore();
   const traceStore = providerTraceStore(db);
   const secretsSvc = secretService(db);
@@ -9886,6 +9979,8 @@ export function heartbeatService(
       const result = await scheduleBoundedRetryForRun(run, agent);
       return result.outcome === "scheduled" ? result.run : null;
     },
+    hostCeilingValue: hostRunCeiling.value,
+    replayMaxConcurrentEnvValue: runtimeEnv[RECOVERY_REPLAY_MAX_CONCURRENT_ENV_VAR],
   });
   const runDispatch = createRunDispatch(db);
 
@@ -15400,6 +15495,93 @@ export function heartbeatService(
     };
   }
 
+  /**
+   * Shared finalize for a run killed by a server shutdown.
+   *
+   * Used by the paths that close a run WITHOUT their own terminal write — the
+   * graceful drain and the process-lost sweep. It keeps the `interrupted` +
+   * `server_shutdown_interrupted` + restart-retry shape identical between
+   * them. The adapter-error close path, which has its own rich terminal write
+   * (usage, sessions, cost events), instead reclassifies in place through the
+   * shared `isRunKilledByServerShutdown` predicate before that write.
+   *
+   * Returns null when the run already left the running state (another close
+   * path won the race); callers must then not write a failure class either.
+   */
+  async function finalizeRunInterruptedByServerShutdown(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    agent: typeof agents.$inferSelect | null;
+    signal: ServerShutdownSignal;
+    now: Date;
+    cause: "graceful_drain" | "adapter_error_close" | "process_lost_sweep";
+    message: string;
+    extras?: {
+      stdoutExcerpt?: string | null;
+      stderrExcerpt?: string | null;
+      logBytes?: number | null;
+      logSha256?: string | null;
+      logCompressed?: boolean;
+      exitCode?: number | null;
+    };
+  }): Promise<{ run: typeof heartbeatRuns.$inferSelect; retryRunId: string | null } | null> {
+    const { run, signal, now, cause, message } = input;
+    const interruptedStatus = await setRunStatusIfRunning(run.id, "interrupted", {
+      finishedAt: now,
+      error: message,
+      errorCode: SERVER_SHUTDOWN_INTERRUPTED_ERROR_CODE,
+      signal,
+      ...(input.extras ?? {}),
+      resultJson: mergeRunStopMetadataForAgent(
+        input.agent ?? { adapterType: "unknown", adapterConfig: {} },
+        "interrupted",
+        {
+          resultJson: parseObject(run.resultJson),
+          errorCode: SERVER_SHUTDOWN_INTERRUPTED_ERROR_CODE,
+          errorMessage: message,
+        },
+      ),
+    });
+    if (!interruptedStatus.updated || !interruptedStatus.run) return null;
+    let interrupted = interruptedStatus.run;
+    await setWakeupStatus(run.wakeupRequestId, "cancelled", {
+      finishedAt: now,
+      error: null,
+    });
+    interrupted = await classifyAndPersistRunLiveness(interrupted, parseObject(interrupted.resultJson)) ?? interrupted;
+
+    await releaseEnvironmentLeasesForRun({
+      runId: interrupted.id,
+      companyId: interrupted.companyId,
+      agentId: interrupted.agentId,
+      status: interrupted.status,
+      failureReason: interrupted.error ?? undefined,
+    });
+
+    const retry = input.agent ? await enqueueProcessLossRetry(interrupted, input.agent, now) : null;
+    if (!retry) {
+      await releaseIssueExecutionAndPromote(interrupted);
+    }
+
+    await appendRunEvent(interrupted, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message,
+      payload: {
+        signal,
+        cause,
+        ...(run.processPid ? { processPid: run.processPid } : {}),
+        ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
+        ...(retry ? { retryRunId: retry.id } : {}),
+      },
+    });
+
+    await finalizeAgentStatus(run.agentId, "interrupted", message, undefined, {
+      wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+    });
+    return { run: interrupted, retryRunId: retry?.id ?? null };
+  }
+
   async function drainRunningRunsForShutdown(
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
@@ -15592,6 +15774,7 @@ export function heartbeatService(
       });
       interruptedRunIds.push(interrupted.id);
     }
+
 
     if (interruptedRunIds.length > 0) {
       logger.warn(
@@ -19404,6 +19587,21 @@ export function heartbeatService(
       }
     }
 
+    // Shutdown-boundary evidence for classifying orphaned runs. A
+    // marker left behind by the previous process means these stale "running"
+    // rows died with that shutdown (the periodic scheduler is stopped during
+    // shutdown, so the startup reap is where those kills surface). A missing
+    // marker keeps the genuine `process_lost` classification.
+    let lastShutdownBoundary: ServerShutdownBoundary | null = null;
+    try {
+      lastShutdownBoundary = await readLastServerShutdownBoundary();
+    } catch (err) {
+      logger.warn(
+        { err },
+        "failed to read server shutdown boundary marker; orphan reap cannot reclassify shutdown kills",
+      );
+    }
+
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
     const activeRuns = await db
       .select({
@@ -19611,6 +19809,46 @@ export function heartbeatService(
       const baseMessage = buildProcessLossMessage(run);
       const conversationContinuationEligible = await runUsedConversationAdapter(db, run);
 
+      // A run that was already running when a shutdown began (in
+      // this process, or in the previous process whose boundary marker
+      // survived the restart) died because of that shutdown — record the
+      // shutdown class through the shared predicate, never `process_lost`.
+      // Runs started after the boundary are untouched and keep the genuine
+      // process-loss classification below.
+      if (isRunKilledByServerShutdown({
+        inProgress: isServerShutdownInProgress(),
+        boundary: lastShutdownBoundary,
+        runStartedAt: run.startedAt ?? null,
+      })) {
+        const boundarySignal = lastShutdownBoundary?.signal ?? currentShutdownSignal("SIGTERM");
+        const shutdownMessage =
+          `Interrupted by server shutdown (${boundarySignal}); process lost across the shutdown boundary; retry queued for restart recovery`;
+        const shutdownAgent = await getAgent(run.agentId);
+        const shutdownFinalize = await finalizeRunInterruptedByServerShutdown({
+          run,
+          agent: shutdownAgent,
+          signal: boundarySignal,
+          now,
+          cause: "process_lost_sweep",
+          message: shutdownMessage,
+          extras: {
+            exitCode: null,
+            stdoutExcerpt: null,
+            stderrExcerpt: null,
+          },
+        });
+        if (shutdownFinalize) {
+          // No startNextQueuedRunForAgent here, matching the graceful drain:
+          // during a shutdown nothing new dispatches, and on the startup path
+          // the caller chain resumes queued retries right after the reap.
+          runningProcesses.delete(run.id);
+          reaped.push(run.id);
+        }
+        // A null result means another close path already terminalized the run;
+        // either way the `process_lost` write below must not run.
+        continue;
+      }
+
       const failureWrite = await setRunStatusFromLive(
         run.id,
         "failed",
@@ -19736,6 +19974,19 @@ export function heartbeatService(
       );
     }
 
+    if (lastShutdownBoundary) {
+      // Boundary consumed by this reap. Later periodic reaps on this live
+      // process must see no boundary, so fresh orphans (started after the
+      // boundary) keep the genuine `process_lost` classification. A reap that
+      // crashed before this point leaves the marker in place; the next reap
+      // re-reads it and the startedAt comparison still holds.
+      try {
+        await clearLastServerShutdownBoundary();
+      } catch (err) {
+        logger.warn({ err }, "failed to clear server shutdown boundary marker");
+      }
+    }
+
     return { reaped: reaped.length, runIds: reaped };
   }
 
@@ -19835,8 +20086,25 @@ export function heartbeatService(
       );
 
     const agentIds = [...new Set(queuedRuns.map((r) => r.agentId))];
+
+    // Staggered boot/recovery replay: a restart can find a queued run for many agents
+    // at once, and admitting them back-to-back refills the cgroup before anything can
+    // react. Each dispatch pass through this drain runs at most
+    // ceil(hostCeiling / 2) concurrently (env-tunable) with a jittered >= 2s spacing
+    // between pass starts, so processes respawn spread out. An isolated resume (one
+    // agent) starts immediately — the spacing only binds during bursts.
+    const replayPacer = createRecoveryReplayPacer({
+      cap: resolveRecoveryReplayCap(
+        runtimeEnv[RECOVERY_REPLAY_MAX_CONCURRENT_ENV_VAR],
+        hostRunCeiling.value,
+      ).value,
+      logger,
+    });
+    const pacedStartNextQueuedRunForAgent = replayPacer.wrapWake(
+      (agentId: string) => startNextQueuedRunForAgent(agentId),
+    );
     for (const agentId of agentIds) {
-      await startNextQueuedRunForAgent(agentId);
+      await pacedStartNextQueuedRunForAgent(agentId);
     }
   }
 
@@ -20282,14 +20550,21 @@ export function heartbeatService(
         const reservation = await reserveHostRunSlot();
         if (!reservation.granted) {
           hostCeilingDeferred = true;
-          recordHostCeilingDeferral(agentId, {
-            companyId: agent.companyId,
-            hostRunningCount: reservation.hostRunningCount,
-            queuedRunCount: prioritizedRuns.length,
-            claimedRunCount: claimedRuns.length,
-            contendingAgentCount,
-            fairShareSlots,
-          });
+          recordHostCeilingDeferral(
+            agentId,
+            {
+              companyId: agent.companyId,
+              hostRunningCount: reservation.hostRunningCount,
+              queuedRunCount: prioritizedRuns.length,
+              claimedRunCount: claimedRuns.length,
+              contendingAgentCount,
+              fairShareSlots,
+              ...memoryPressureDeferralDetails(reservation),
+            },
+            reservation.reason === "memory_pressure"
+              ? { message: "heartbeat dispatch deferred by cgroup memory pressure" }
+              : undefined,
+          );
           break;
         }
         visitedRunCount += 1;
@@ -20478,7 +20753,36 @@ export function heartbeatService(
       if (prologueRun.status !== "queued" && prologueRun.status !== "running") return;
 
       if (prologueRun.status === "queued") {
-        const claimed = await claimQueuedRun(prologueRun);
+        // Defense-in-depth against `startNextQueuedRunForAgent`'s gate —
+        // this function is a second, independently reachable path into a claim, and
+        // an already-running run above must never be stopped mid-flight by a park
+        // that started after it was dispatched.
+        if (await usageLimitPark.isParked()) return;
+        // Same defense-in-depth as the park above: this is a second, independently reachable
+        // path into a claim, so the host ceiling has to hold here too. The run stays queued.
+        const reservation = await reserveHostRunSlot();
+        if (!reservation.granted) {
+          recordHostCeilingDeferral(
+            prologueRun.agentId,
+            {
+              companyId: prologueRun.companyId,
+              runId: prologueRun.id,
+              hostRunningCount: reservation.hostRunningCount,
+              path: "execute_run",
+              ...memoryPressureDeferralDetails(reservation),
+            },
+            reservation.reason === "memory_pressure"
+              ? { message: "heartbeat dispatch deferred by cgroup memory pressure" }
+              : undefined,
+          );
+          return;
+        }
+        let claimed: Awaited<ReturnType<typeof claimQueuedRun>>;
+        try {
+          claimed = await claimQueuedRun(prologueRun);
+        } finally {
+          releaseHostRunSlot();
+        }
         if (!claimed) {
           // claimQueuedRun can also leave the prologueRun queued when dependencies are unresolved.
           return;
@@ -21196,6 +21500,7 @@ export function heartbeatService(
         simplifiedEnglishInteractions:
           experimentalInstanceSettings.enableSimplifiedEnglishInteractions ===
           true,
+        currentRun: { id: run.id, startedAt: run.startedAt ?? run.createdAt ?? null },
       });
       if (paperclipWakePayload) {
         context[PAPERCLIP_WAKE_PAYLOAD_KEY] = paperclipWakePayload;
@@ -30222,18 +30527,65 @@ export function heartbeatService(
       const hostRunningCount = await countRunningRunsHostWide();
       const hostInUse = hostRunningCount + inFlightHostRunReservations;
       if (hostInUse >= hostRunCeiling.value) {
-        return { granted: false as const, hostRunningCount, hostInUse };
+        return { granted: false as const, reason: "host_ceiling" as const, hostRunningCount, hostInUse };
+      }
+      // Memory-pressure admission backoff: sampled from the service's own cgroup v2
+      // (TTL-cached), and only when a usable reading exists — on hosts without the
+      // files this is a strict no-op. Deferred runs stay queued and re-enter this
+      // gate through the existing deferral/drain machinery, exactly like a ceiling
+      // refusal.
+      const memoryPressure = await runAdmissionMemoryPressure.read();
+      if (
+        memoryPressure.available &&
+        memoryPressure.memoryPressurePct !== null &&
+        memoryPressure.memoryPressurePct >= runAdmissionMemoryPct.value
+      ) {
+        runAdmissionMemoryDeferralCount += 1;
+        return {
+          granted: false as const,
+          reason: "memory_pressure" as const,
+          hostRunningCount,
+          hostInUse,
+          memoryPressurePct: memoryPressure.memoryPressurePct,
+          memoryPressureThresholdPct: runAdmissionMemoryPct.value,
+          memoryCurrentBytes: memoryPressure.memoryCurrentBytes,
+          effectiveMemoryLimitBytes: memoryPressure.effectiveLimitBytes,
+          memoryEventsHigh: memoryPressure.memoryEventsHigh,
+          cgroupDir: memoryPressure.cgroupDir,
+        };
       }
       inFlightHostRunReservations += 1;
-      return { granted: true as const, hostRunningCount, hostInUse };
+      return { granted: true as const, reason: "granted" as const, hostRunningCount, hostInUse };
     });
+  }
+
+  // Details the deferral logger emits for a memory-pressure refusal so the one
+  // `logger.warn` per deferral carries the numbers an operator needs to tell
+  // memory backoff apart from ceiling throttling.
+  function memoryPressureDeferralDetails(
+    reservation: Awaited<ReturnType<typeof reserveHostRunSlot>>,
+  ): Record<string, unknown> {
+    if (reservation.reason !== "memory_pressure") return { deferralReason: reservation.reason };
+    return {
+      deferralReason: reservation.reason,
+      memoryPressurePct: reservation.memoryPressurePct,
+      memoryPressureThresholdPct: reservation.memoryPressureThresholdPct,
+      memoryCurrentBytes: reservation.memoryCurrentBytes,
+      effectiveMemoryLimitBytes: reservation.effectiveMemoryLimitBytes,
+      memoryEventsHigh: reservation.memoryEventsHigh,
+      cgroupDir: reservation.cgroupDir,
+    };
   }
 
   function releaseHostRunSlot() {
     inFlightHostRunReservations = Math.max(0, inFlightHostRunReservations - 1);
   }
 
-  function recordHostCeilingDeferral(agentId: string, details: Record<string, unknown>) {
+    function recordHostCeilingDeferral(
+    agentId: string,
+    details: Record<string, unknown>,
+    opts?: { message?: string },
+  ) {
     hostCeilingDeferralCount += 1;
     hostCeilingDeferredAgentIds.add(agentId);
     logger.warn(
@@ -30246,7 +30598,7 @@ export function heartbeatService(
         deferredAgentCount: hostCeilingDeferredAgentIds.size,
         ...details,
       },
-      "heartbeat dispatch deferred by host concurrent-run ceiling",
+      opts?.message ?? "heartbeat dispatch deferred by host concurrent-run ceiling",
     );
   }
 
@@ -30471,9 +30823,14 @@ export function heartbeatService(
         .then((rows) => rows[0] ?? null);
       return {
         ...ensured,
-        sessionDisplayId:
-          latestTaskSession?.sessionDisplayId ?? ensured.sessionId,
-        sessionParamsJson: latestTaskSession?.sessionParamsJson ?? null,
+        sessionDisplayId: latestTaskSession?.sessionDisplayId ?? ensured.sessionId,
+        // Internal __paperclip* session-reset bookkeeping (configured-model
+        // snapshot, config fingerprints) never leaves the service: it is
+        // per-task run-finalize state, not agent-level truth, and has
+        // misinformed model audits when surfaced here. DB rows keep it.
+        sessionParamsJson: stripPaperclipSessionMetadataFromSessionParams(
+          latestTaskSession?.sessionParamsJson ?? null,
+        ),
       };
     },
 
@@ -30481,19 +30838,18 @@ export function heartbeatService(
       const agent = await getAgent(agentId);
       if (!agent) throw notFound("Agent not found");
 
-      return db
+      const sessions = await db
         .select()
         .from(agentTaskSessions)
-        .where(
-          and(
-            eq(agentTaskSessions.companyId, agent.companyId),
-            eq(agentTaskSessions.agentId, agentId),
-          ),
-        )
-        .orderBy(
-          desc(agentTaskSessions.updatedAt),
-          desc(agentTaskSessions.createdAt),
-        );
+        .where(and(eq(agentTaskSessions.companyId, agent.companyId), eq(agentTaskSessions.agentId, agentId)))
+        .orderBy(desc(agentTaskSessions.updatedAt), desc(agentTaskSessions.createdAt));
+      // Same egress rule as getRuntimeState: internal __paperclip* session-reset
+      // metadata stays in the DB for shouldResetTaskSessionForModelChange and
+      // friends, but API consumers must not see it as agent-level state.
+      return sessions.map((session) => ({
+        ...session,
+        sessionParamsJson: stripPaperclipSessionMetadataFromSessionParams(session.sessionParamsJson ?? null),
+      }));
     },
 
     resetRuntimeSession: async (
@@ -30857,14 +31213,24 @@ export function heartbeatService(
     // parked fleet isn't misreported as a stall.
     getUsageLimitParkState: (now?: Date) => usageLimitPark.getState(now),
 
-    getHostRunCeilingState: async () => ({
-      maxConcurrentRuns: hostRunCeiling.value,
-      source: hostRunCeiling.source,
-      vcpuCount: hostRunCeiling.vcpuCount,
-      hostRunningCount: await countRunningRunsHostWide(),
-      inFlightReservations: inFlightHostRunReservations,
-      deferralCount: hostCeilingDeferralCount,
-      deferredAgentIds: [...hostCeilingDeferredAgentIds],
-    }),
+    getHostRunCeilingState: async () => {
+      const memoryPressure = runAdmissionMemoryPressure.lastReading();
+      return {
+        maxConcurrentRuns: hostRunCeiling.value,
+        source: hostRunCeiling.source,
+        vcpuCount: hostRunCeiling.vcpuCount,
+        hostRunningCount: await countRunningRunsHostWide(),
+        inFlightReservations: inFlightHostRunReservations,
+        deferralCount: hostCeilingDeferralCount,
+        deferredAgentIds: [...hostCeilingDeferredAgentIds],
+        // Memory-pressure admission backoff observability: the last sampled cgroup
+        // reading plus the count of admissions deferred by it, so a restart that is
+        // shedding load is distinguishable from one that is merely ceiling-throttled.
+        memoryPressurePct: memoryPressure?.memoryPressurePct ?? null,
+        memoryPressureAvailable: memoryPressure?.available ?? false,
+        runAdmissionMemoryPct: runAdmissionMemoryPct.value,
+        deferralsByMemory: runAdmissionMemoryDeferralCount,
+      };
+    },
   };
 }

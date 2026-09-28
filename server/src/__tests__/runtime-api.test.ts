@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   buildRuntimeApiCandidateUrls,
+  chooseAgentApiUrl,
+  isInsecureNonLoopbackApiUrl,
   choosePrimaryRuntimeApiUrl,
   collectReachableInterfaceHosts,
 } from "../runtime-api.js";
@@ -154,5 +156,41 @@ describe("runtime API discovery", () => {
       "192.168.6.178",
       "fd7a:115c:a1e0::8a3a:a11d",
     ]);
+  });
+});
+
+describe("chooseAgentApiUrl", () => {
+  const publicBase = "https://paperclip.example.com";
+  it("defaults to the loopback listen origin for wildcard and loopback binds, not the public base", () => {
+    for (const bindHost of ["0.0.0.0", "127.0.0.1", "localhost", ""]) {
+      expect(chooseAgentApiUrl({ bindHost, port: 3100, fallbackApiUrl: publicBase })).toBe("http://127.0.0.1:3100");
+    }
+    for (const bindHost of ["::", "::1"]) {
+      expect(chooseAgentApiUrl({ bindHost, port: 3101, fallbackApiUrl: publicBase })).toBe("http://[::1]:3101");
+    }
+  });
+  it("keeps the runtime base when bound to a specific non-loopback host", () => {
+    expect(chooseAgentApiUrl({ bindHost: "10.0.0.5", port: 3100, fallbackApiUrl: publicBase })).toBe(publicBase);
+  });
+  it("honours an explicit PAPERCLIP_AGENT_API_URL override (origin only) and ignores malformed values", () => {
+    expect(
+      chooseAgentApiUrl({ explicitAgentApiUrl: "http://host.docker.internal:3100/api", bindHost: "0.0.0.0", port: 3100, fallbackApiUrl: publicBase }),
+    ).toBe("http://host.docker.internal:3100");
+    expect(
+      chooseAgentApiUrl({ explicitAgentApiUrl: "not a url", bindHost: "0.0.0.0", port: 3100, fallbackApiUrl: publicBase }),
+    ).toBe("http://127.0.0.1:3100");
+    expect(
+      chooseAgentApiUrl({ explicitAgentApiUrl: "file:///x", bindHost: "0.0.0.0", port: 3100, fallbackApiUrl: publicBase }),
+    ).toBe("http://127.0.0.1:3100");
+  });
+});
+
+describe("isInsecureNonLoopbackApiUrl", () => {
+  it("flags cleartext http to non-loopback hosts only", () => {
+    expect(isInsecureNonLoopbackApiUrl("http://10.0.0.5:3100")).toBe(true);
+    expect(isInsecureNonLoopbackApiUrl("http://127.0.0.1:3100")).toBe(false);
+    expect(isInsecureNonLoopbackApiUrl("http://[::1]:3100")).toBe(false);
+    expect(isInsecureNonLoopbackApiUrl("http://localhost:3100")).toBe(false);
+    expect(isInsecureNonLoopbackApiUrl("https://paperclip.example.com")).toBe(false);
   });
 });

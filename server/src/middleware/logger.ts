@@ -17,6 +17,7 @@ import {
   stripSecretBearingUrlParts,
 } from "./redact-sensitive.js";
 import { redactWorkspaceHandoffTicket } from "../auth/workspace-login-handoff.js";
+import { prettySharedOptions } from "./pretty-log-options.js";
 
 
 /**
@@ -64,11 +65,7 @@ fs.mkdirSync(logDir, { recursive: true });
 
 const logFile = path.join(logDir, "server.log");
 
-const sharedOpts = {
-  translateTime: "SYS:HH:MM:ss",
-  ignore: "pid,hostname",
-  singleLine: true,
-};
+const sharedOpts = prettySharedOptions;
 
 const isProduction = process.env.NODE_ENV === "production";
 

@@ -4,6 +4,7 @@ import {
   experimentalApiQueries,
 } from "./experimental-api-paths.js";
 import { Router } from "express";
+import { setPrivateEgressSchema } from "./plugin-private-egress.js";
 import { z } from "zod";
 import {
   createAiConnectionSchema,
@@ -3307,6 +3308,11 @@ registry.registerPath({
   path: "/api/agents/{id}/runtime-state",
   tags: ["agents"],
   summary: "Get agent runtime state",
+  description:
+    "Internal `__paperclip*` session metadata (configured-model snapshot, config fingerprints) is " +
+    "session-reset bookkeeping and is stripped from `sessionParamsJson` on egress; it is not an audit " +
+    "surface. For model audits read the pin from the agent's `adapterConfig.model` and the served model " +
+    "from the latest run's `resultJson.servedModel`.",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
 });
@@ -3328,6 +3334,11 @@ registry.registerPath({
   path: "/api/agents/{id}/task-sessions",
   tags: ["agents"],
   summary: "List agent task sessions",
+  description:
+    "Internal `__paperclip*` session metadata (configured-model snapshot, config fingerprints) is " +
+    "session-reset bookkeeping and is stripped from each row's `sessionParamsJson` on egress; it is not " +
+    "an audit surface. For model audits read the pin from the agent's `adapterConfig.model` and the " +
+    "served model from the latest run's `resultJson.servedModel`.",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
@@ -9535,6 +9546,23 @@ registerCurrentRoute({
   tags: ["plugins"],
   summary: "Toggle egress enforcement for a plugin config key (plugin-wide effect)",
   body: enforcePluginConfigEgressAllowlistSchema,
+});
+
+// (fork) Instance-admin plugin http.fetch private-origin opt-in. Mounted in
+// routes/plugin-private-egress.ts. `{"origins": []}` is the rollback.
+registerCurrentRoute({
+  method: "get",
+  path: "/api/plugins/{pluginId}/private-egress",
+  tags: ["plugins"],
+  summary: "List the operator-set private origins a plugin's http.fetch may reach (instance admin)",
+});
+
+registerCurrentRoute({
+  method: "put",
+  path: "/api/plugins/{pluginId}/private-egress",
+  tags: ["plugins"],
+  summary: "Replace the private-origin http.fetch opt-in list for a plugin (instance admin; 400 on invalid entry)",
+  body: setPrivateEgressSchema,
 });
 
 for (const route of [

@@ -33,16 +33,22 @@ const mockAccessService = vi.hoisted(() => ({
   decide: vi.fn(),
 }));
 
-function registerModuleMocks() {
-  vi.doMock("../services/index.js", () => ({
-    accessService: () => mockAccessService,
-    approvalService: () => mockApprovalService,
-    heartbeatService: () => mockHeartbeatService,
-    issueApprovalService: () => mockIssueApprovalService,
-    logActivity: mockLogActivity,
-    secretService: () => mockSecretService,
-  }));
-}
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("../services/index.js", () => ({
+  accessService: () => mockAccessService,
+  approvalService: () => mockApprovalService,
+  heartbeatService: () => mockHeartbeatService,
+  issueApprovalService: () => mockIssueApprovalService,
+  logActivity: mockLogActivity,
+  secretService: () => mockSecretService,
+}));
 
 const routeModules = hoistModuleGraph(registerModuleMocks, async () => {
   const { errorHandler } = await import("../middleware/index.js");

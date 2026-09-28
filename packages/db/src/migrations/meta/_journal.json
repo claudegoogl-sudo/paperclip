@@ -2080,6 +2080,13 @@
       "when": 1786985800000,
       "tag": "0298_board_api_key_auth_events",
       "checksum": null
+    },
+    {
+      "idx": 299,
+      "version": "7",
+      "when": 1786985900000,
+      "tag": "0299_plugin_private_egress_optin",
+      "breakpoints": true
     }
   ]
 }

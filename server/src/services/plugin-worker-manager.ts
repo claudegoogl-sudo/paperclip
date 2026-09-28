@@ -67,6 +67,8 @@ import { logger } from "../middleware/logger.js";
 import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js";
 import { clearRunSecretValues } from "../run-secret-registry.js";
 import { redactSensitiveText } from "../redaction.js";
+import { redactSecretsForLog } from "../secret-patterns.js";
+import { sanitiseMeta } from "./plugin-host-services.js";
 import { traceparentFromContextToken } from "../instrumentation.js";
 
 // ---------------------------------------------------------------------------
@@ -124,6 +126,15 @@ const MAX_STDERR_EXCERPT_CHARS = 8_000;
  * dropped, so a faulty or hostile worker cannot flood the host with one
  * unbounded notification. */
 const MAX_EXECUTE_LOG_CHUNK_CHARS = 1_000_000;
+
+/** SECURITY: per-worker bound on concurrently pinned stream channels. A
+ * worker that never closes its channels would otherwise grow the pin map
+ * without bound (memory) and fan out one synthetic close per pin on worker
+ * exit (notification flood). Once a worker pins this many channels, capturing
+ * a new pin evicts the least-recently captured pin; each eviction is reported
+ * to the plugin via a `streams.dropped` notification with reason
+ * `pin_cap_exceeded`, so the cap is never silent. */
+const MAX_PINNED_STREAM_CHANNELS = 128;
 
 /**
  * Maximum characters accepted for one incoming worker stdout line before the
@@ -1062,6 +1073,12 @@ export interface PluginWorkerHandleDeps {
    * worker-lifetime service path.
    */
   runContextRegistry?: PluginRunContextRegistry;
+  /**
+   * Persist sink for worker `log` notifications; see
+   * {@link PluginWorkerLogPersistSink}. Injected by the manager from
+   * {@link PluginWorkerManagerOptions.workerLogPersist}.
+   */
+  workerLogPersist?: PluginWorkerLogPersistSink;
 }
 
 /**
@@ -1076,6 +1093,7 @@ export function createPluginWorkerHandle(
 ): PluginWorkerHandle {
   const log = logger.child({ service: "plugin-worker", pluginId });
   const runContextRegistry = deps.runContextRegistry;
+  const workerLogPersist = deps.workerLogPersist;
   const emitter = new EventEmitter();
   /**
    * Higher than default (10) to accommodate multiple subscribers to
@@ -1227,9 +1245,51 @@ export function createPluginWorkerHandle(
   let backoffTimer: ReturnType<typeof setTimeout> | null = null;
   let nextRestartAt: number | null = null;
 
-  // Track open stream channels so we can emit synthetic close on crash.
-  // Maps channel → companyId.
-  const openStreamChannels = new Map<string, string>();
+  // SECURITY-CRITICAL: tenant pin for stream channels. Maps channel → companyId.
+  // A pin is captured ONLY from a host-validated invocation scope: either a
+  // `streams.open` (or an in-dispatch `streams.emit`) whose echoed
+  // `paperclipInvocationId` resolves to an active host-minted invocation, with
+  // the notification's claimed companyId equal to that scope's companyId. Once
+  // pinned, out-of-dispatch `streams.emit`/`streams.close` notifications for
+  // the channel are tenant-verified against the pin per emit — the
+  // worker can never attribute a channel to a company it was not dispatched
+  // by, because the pin's value comes from the dispatch scope, never from the
+  // worker's claim. Pins live until `streams.close`, eviction under the
+  // per-worker cap (`MAX_PINNED_STREAM_CHANNELS`, least-recently captured
+  // first), or worker exit (crash emits a synthetic close and clears them
+  // below). An evicted channel keeps streaming in-dispatch — only its
+  // out-of-dispatch attribution and exit cleanup are given up.
+  const pinnedStreamChannels = new Map<string, string>();
+
+  /**
+   * Capture a host-verified channel pin, evicting the least-recently captured
+   * pin when the worker is over `MAX_PINNED_STREAM_CHANNELS`.
+   *
+   * Recency: re-capturing an already-pinned channel moves it to newest, so a
+   * channel the worker is actively (re-)opening is never the eviction
+   * candidate. Every eviction is reported twice — never silently: a
+   * `streams.dropped` notification tells the PLUGIN its pin was evicted (so
+   * it knows out-of-dispatch emits for that channel will now fail closed),
+   * and the host warn log records it for querying.
+   */
+  function captureStreamPin(channel: string, companyId: string, sourceMethod: string): void {
+    pinnedStreamChannels.delete(channel);
+    pinnedStreamChannels.set(channel, companyId);
+    while (pinnedStreamChannels.size > MAX_PINNED_STREAM_CHANNELS) {
+      const oldest = pinnedStreamChannels.keys().next();
+      if (oldest.done) break;
+      const evictedChannel = oldest.value;
+      const evictedCompanyId = pinnedStreamChannels.get(evictedChannel) ?? "";
+      pinnedStreamChannels.delete(evictedChannel);
+      dropStreamNotification(
+        sourceMethod,
+        evictedChannel,
+        evictedCompanyId,
+        "pin_cap_exceeded",
+        "evicted plugin stream channel pin: worker exceeded the per-worker pinned-channel cap",
+      );
+    }
+  }
 
   // Shutdown coordination
   let intentionalStop = false;
@@ -2999,22 +3059,35 @@ export function createPluginWorkerHandle(
       const inFlightInvocationIds = new Set<string>();
       for (const pending of pendingRequests.values()) {
         if (pending.invocationId) inFlightInvocationIds.add(pending.invocationId);
+      }
+      const method = readNonEmptyString((message as { method?: unknown }).method);
       // Upstream (LOOA-629/695): a proactive plugin (chat gateway) does company-scoped
       // work from its own timers/loops. An id-less call that references one of the
       // plugin's configured companies resolves to that company's scope. This never
       // widens access beyond the loader-seeded allowlist; in-invocation calls keep
-      // the strict single-company match below.
-      const proactiveCompanyId = referencedCompanyId(
-        message.method,
-        (message as { params?: unknown }).params,
-      );
-      if (proactiveCompanyId && proactiveCompanyScopes.has(proactiveCompanyId)) {
-        return { invocationScope: { companyId: proactiveCompanyId } };
-      }
+      // the strict single-company match below. Resolved at statement level, NOT per
+      // pending request: scope resolution must be deterministic and independent of
+      // unrelated in-flight host→worker traffic (inside the loop above it only ever
+      // evaluated while some request happened to be outstanding).
+      //
+      // SECURITY (stream channel pins): `streams.*` NEVER resolves a scope from the
+      // proactive allowlist. A channel pin is capturable only from an echoed,
+      // host-minted invocation id (or an in-dispatch emit seeded by one); otherwise
+      // a worker could open a channel naming any configured company with no
+      // dispatch at all and hold a permanently attributed stream for it. Id-less
+      // stream traffic fails closed in the stream notification handler instead
+      // (invalid_invocation_scope / no_invocation_scope / unpinned_channel).
+      if (!method?.startsWith("streams.")) {
+        const proactiveCompanyId = referencedCompanyId(
+          message.method,
+          (message as { params?: unknown }).params,
+        );
+        if (proactiveCompanyId && proactiveCompanyScopes.has(proactiveCompanyId)) {
+          return { invocationScope: { companyId: proactiveCompanyId } };
+        }
       }
       const hasActiveInvocation =
         activeInvocations.size > 0 || inFlightInvocationIds.size > 0;
-      const method = readNonEmptyString((message as { method?: unknown }).method);
       if (!hasActiveInvocation) {
         // SECURITY-CRITICAL: an id-less call with nothing in flight is unambiguous —
         // this worker makes this call outside any dispatch. Record it so the
@@ -3126,6 +3199,64 @@ export function createPluginWorkerHandle(
   }
 
   /**
+   * Forward a verified stream notification to the stream-bus callback.
+   */
+  function forwardStreamNotification(method: string, params: Record<string, unknown>): void {
+    if (!options.onStreamNotification) return;
+    try {
+      options.onStreamNotification(method, params);
+    } catch (err) {
+      log.error(
+        {
+          method,
+          err: err instanceof Error ? err.message : String(err),
+        },
+        "stream notification handler failed",
+      );
+    }
+  }
+
+  /**
+   * Drop an unverifiable stream notification — loudly. Besides the host log
+   * warn (queryable per §26.1 with pluginId), tell the WORKER its notification
+   * was dropped so out-of-dispatch emitters are not silently dead.
+   * The `streams.dropped` notification is fire-and-forget: current bundled
+   * SDKs ignore unknown notifications; SDKs bundled after this change surface
+   * it on the plugin log. Best-effort — the worker may already be gone.
+   */
+  function dropStreamNotification(
+    method: string,
+    channel: string,
+    companyId: string,
+    reason: string,
+    message: string,
+  ): void {
+    log.warn(
+      {
+        method,
+        channel: channel || undefined,
+        companyId: companyId || undefined,
+        reason,
+      },
+      message,
+    );
+    try {
+      sendMessage({
+        jsonrpc: JSONRPC_VERSION,
+        method: "streams.dropped",
+        params: {
+          method,
+          channel: channel || undefined,
+          companyId: companyId || undefined,
+          reason,
+        },
+      });
+    } catch {
+      // Worker may have exited; the warn above is the durable record.
+    }
+  }
+
+  /**
    * Handle a JSON-RPC notification from the worker (fire-and-forget).
    *
    * The `log` notification is the primary case — worker `ctx.logger` calls
@@ -3148,20 +3279,55 @@ export function createPluginWorkerHandle(
       // The child logger already carries `pluginId` in its bindings, but we
       // add explicit `pluginLogLevel` and `pluginTimestamp` so downstream
       // consumers (log storage, UI queries) can filter without parsing.
+      // SECURITY: the meta spread and the message go through the same
+      // sanitiser/redactor the persist sink applies, so the host pino line can
+      // never carry a shape-valid secret from worker-authored content. The
+      // values handed to `workerLogPersist` below stay raw — the persist side
+      // owns truncation + sanitisation (single semantics, sink contract).
       const logFields: Record<string, unknown> = {
-        ...meta,
+        ...(sanitiseMeta(meta) ?? {}),
         pluginLogLevel: level,
         pluginTimestamp: new Date().toISOString(),
       };
+      const safeLine = redactSecretsForLog(msg);
 
       if (level === "error") {
-        log.error(logFields, `[plugin] ${msg}`);
+        log.error(logFields, `[plugin] ${safeLine}`);
       } else if (level === "warn") {
-        log.warn(logFields, `[plugin] ${msg}`);
+        log.warn(logFields, `[plugin] ${safeLine}`);
       } else if (level === "debug") {
-        log.debug(logFields, `[plugin] ${msg}`);
+        log.debug(logFields, `[plugin] ${safeLine}`);
       } else {
-        log.info(logFields, `[plugin] ${msg}`);
+        log.info(logFields, `[plugin] ${safeLine}`);
+      }
+
+      // §26.1: persist the worker logger call to plugin_logs — the host log
+      // line above never reaches the operator logs panel, so plugin errors
+      // were invisible there. Company attribution mirrors the other
+      // worker→host notifications: a dispatch-scoped log (the worker echoed
+      // the invocation id, or a legacy worker owns the single in-flight
+      // dispatch) pins that dispatch's host-validated company; a proactive or
+      // setup()-loop log has no claim to any company and persists as
+      // instance-scope (companyId null). Raw values go to the sink — the
+      // persist side applies the shared truncation + sanitiseMeta semantics.
+      // Fire-and-forget: a sink failure must never break the notification path.
+      if (workerLogPersist) {
+        try {
+          const logContext = baseContextForWorkerMessage(notification);
+          const scopedCompanyId =
+            readNonEmptyString(logContext.invocationScope?.companyId) ??
+            readNonEmptyString(logContext.singleInFlightScope?.companyId) ??
+            null;
+          workerLogPersist({
+            pluginId,
+            companyId: scopedCompanyId,
+            level,
+            message: msg,
+            meta: meta ?? null,
+          });
+        } catch (err) {
+          log.warn({ err, pluginId }, "worker log persist sink failed");
+        }
       }
       return;
     }
@@ -3205,56 +3371,107 @@ export function createPluginWorkerHandle(
     ) {
       const params = (notification.params ?? {}) as Record<string, unknown>;
       const companyId = String(params.companyId ?? "");
+      const channel = String(params.channel ?? "");
       const context = contextForWorkerMessage(notification);
       if (context.invalidInvocationScope) {
-        log.warn(
-          { method: notification.method, companyId },
+        dropStreamNotification(
+          notification.method,
+          channel,
+          companyId,
+          "invalid_invocation_scope",
           "dropping plugin stream notification with invalid invocation scope",
         );
         return;
       }
       const allowedCompanyId = readNonEmptyString(context.invocationScope?.companyId);
       if (companyId) {
-        // Fail closed (matches requireInvocationCompanyScope): a company-scoped
-        // stream notification with no resolvable invocation scope cannot be
-        // tenant-verified — drop it rather than forwarding it under no pin.
         if (!allowedCompanyId) {
-          log.warn(
-            { method: notification.method, companyId },
-            "dropping company-scoped plugin stream notification with no resolvable invocation scope",
+          // No resolvable invocation scope: the notification is out-of-dispatch
+          // (async loop, reconnect callback — e.g. a status snapshot loop
+          // seeded by an earlier dispatch). Fail closed UNLESS the channel
+          // carries a pin captured at `streams.open` from a host-validated
+          // dispatch, in which case the pin tenant-verifies the emit per
+          // notification. The pin's companyId comes from the
+          // dispatch scope, never from the worker's claim, so a worker can
+          // still never attribute a channel to a company it was not
+          // dispatched by. Opens are never pinned here: an id-less open is
+          // unattributable even under the single-in-flight heuristic.
+          if (notification.method !== "streams.open") {
+            const pin = readNonEmptyString(pinnedStreamChannels.get(channel));
+            if (pin && pin === companyId) {
+              // A pinned close tears the pin down with the channel, so later
+              // emits for it fail closed again.
+              if (notification.method === "streams.close") {
+                pinnedStreamChannels.delete(channel);
+              }
+              forwardStreamNotification(notification.method, params);
+              return;
+            }
+            dropStreamNotification(
+              notification.method,
+              channel,
+              companyId,
+              pin ? "pin_mismatch" : "unpinned_channel",
+              pin
+                ? "dropping plugin stream notification outside pinned channel company"
+                : "dropping company-scoped plugin stream notification with no pinned channel",
+            );
+            return;
+          }
+          dropStreamNotification(
+            notification.method,
+            channel,
+            companyId,
+            "no_invocation_scope",
+            "dropping company-scoped plugin stream open with no resolvable invocation scope",
           );
           return;
         }
         if (companyId !== allowedCompanyId) {
-          log.warn(
-            { method: notification.method, companyId, allowedCompanyId },
+          dropStreamNotification(
+            notification.method,
+            channel,
+            companyId,
+            "company_mismatch",
             "dropping plugin stream notification outside invocation company scope",
           );
           return;
         }
       }
 
-      // Track open channels so we can emit synthetic close on crash
-      if (notification.method === "streams.open") {
-        const ch = String(params.channel ?? "");
-        if (ch) openStreamChannels.set(ch, companyId);
-      } else if (notification.method === "streams.close") {
-        openStreamChannels.delete(String(params.channel ?? ""));
+      // SECURITY: the pin checks above live inside `if (companyId)`, so a
+      // notification that omits the company claim entirely would skip them.
+      // On a pinned channel the pin IS the attribution: an empty claim is a
+      // mismatch with it, and an unclaimed close must not tear down a verified
+      // pin. (An empty-company stream would fail closed at the SSE bridge
+      // anyway, but the attribution decision belongs to this layer, not
+      // downstream.) Company-agnostic channels are never pinned, so this
+      // guard cannot affect them.
+      if (!companyId && channel && pinnedStreamChannels.has(channel)) {
+        dropStreamNotification(
+          notification.method,
+          channel,
+          companyId,
+          "pin_mismatch",
+          "dropping plugin stream notification with no company claim on a pinned channel",
+        );
+        return;
       }
 
-      if (options.onStreamNotification) {
-        try {
-          options.onStreamNotification(notification.method, params);
-        } catch (err) {
-          log.error(
-            {
-              method: notification.method,
-              err: err instanceof Error ? err.message : String(err),
-            },
-            "stream notification handler failed",
-          );
-        }
+      // Host-verified (in-dispatch with matching company, or company-agnostic).
+      // Track channel pins so out-of-dispatch emits for the channel can be
+      // attributed later, and so we can emit synthetic close on crash.
+      if (notification.method === "streams.open") {
+        if (channel && companyId) captureStreamPin(channel, companyId, notification.method);
+      } else if (notification.method === "streams.close") {
+        pinnedStreamChannels.delete(channel);
+      } else if (notification.method === "streams.emit" && channel && allowedCompanyId) {
+        // An in-dispatch emit on a never-opened channel still pins it: async
+        // loops seeded by a dispatch keep emitting after the dispatch settles.
+        captureStreamPin(channel, allowedCompanyId, notification.method);
       }
+
+      forwardStreamNotification(notification.method, params);
       return;
     }
 
@@ -3431,15 +3648,15 @@ export function createPluginWorkerHandle(
 
     // Emit synthetic close for any orphaned stream channels so SSE clients
     // are notified instead of hanging indefinitely.
-    if (openStreamChannels.size > 0 && options.onStreamNotification) {
-      for (const [channel, companyId] of openStreamChannels) {
+    if (pinnedStreamChannels.size > 0 && options.onStreamNotification) {
+      for (const [channel, companyId] of pinnedStreamChannels) {
         try {
           options.onStreamNotification("streams.close", { channel, companyId });
         } catch {
           // Best-effort cleanup — don't let it interfere with exit handling
         }
       }
-      openStreamChannels.clear();
+      pinnedStreamChannels.clear();
     }
 
     emitter.emit("exit", { pluginId, code, signal });
@@ -4003,6 +4220,23 @@ export function createPluginWorkerHandle(
 /**
  * Options for creating a PluginWorkerManager.
  */
+/**
+ * Persist sink for worker `ctx.logger` notifications (the `log` JSON-RPC
+ * notification). The server wires it to the plugin-host-services log buffer
+ * (`bufferPluginLogEntry`) so every worker logger call lands in `plugin_logs`
+ * (§26.1) and the operator logs panel can show plugin errors. The sink receives
+ * RAW values — the persist side applies the same truncation/sanitisation
+ * semantics as the `logger.log` host service. When absent (unit tests), worker
+ * log notifications only hit the host log.
+ */
+export type PluginWorkerLogPersistSink = (entry: {
+  pluginId: string;
+  companyId: string | null;
+  level: string;
+  message: string;
+  meta: Record<string, unknown> | null;
+}) => void;
+
 export interface PluginWorkerManagerOptions {
   /**
    * Optional callback invoked when a worker emits a lifecycle event
@@ -4023,6 +4257,12 @@ export interface PluginWorkerManagerOptions {
    */
   runContextRegistry?: PluginRunContextRegistry;
   /**
+   * Persist sink for worker `ctx.logger` notifications; see
+   * {@link PluginWorkerLogPersistSink}. Injected by the server so worker logger
+   * calls persist to `plugin_logs` on the shared buffered path.
+   */
+  workerLogPersist?: PluginWorkerLogPersistSink;
+  /**
    * The process-scoped aggregate ceiling for concurrent duplex channel routes,
    * across every worker in the process. The manager builds one shared slot
    * controller from it and injects it into every worker handle, so one tenant can
@@ -4032,6 +4272,18 @@ export interface PluginWorkerManagerOptions {
    * stays upstream admission only.
    */
   maxConcurrentDuplexRoutes?: number | null;
+  /**
+   * Callback invoked with verified stream notifications from any plugin worker
+   * (`streams.open`/`emit`/`close`). The manager stamps `pluginId` so one bus
+   * can fan out for every plugin. The server wires this to the
+   * {@link PluginStreamBus}; without it, per-worker `WorkerStartOptions.onStreamNotification`
+   * callbacks still work but no manager-level fan-out happens.
+   */
+  onStreamNotification?: (event: {
+    pluginId: string;
+    method: string;
+    params: Record<string, unknown>;
+  }) => void;
 }
 
 /**
@@ -4143,8 +4395,19 @@ export function createPluginWorkerManager(
         // caller already supplied its own (a test may inject its own).
         duplexRouteSlots,
         ...options,
+        // Stamp the emitting pluginId on stream notifications fanned out at the
+        // manager level, unless the caller supplied its own per-worker callback.
+        onStreamNotification:
+          options.onStreamNotification ??
+          (managerOptions?.onStreamNotification
+            ? (method, params) => {
+                const notify = managerOptions.onStreamNotification;
+                if (notify) notify({ pluginId, method, params });
+              }
+            : undefined),
       }, {
         runContextRegistry: managerOptions?.runContextRegistry,
+        workerLogPersist: managerOptions?.workerLogPersist,
       });
       workers.set(pluginId, handle);
 

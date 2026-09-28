@@ -140,10 +140,9 @@ describeEmbeddedPostgres("companySkillService.detail", () => {
       },
     });
 
-    const detail = await Promise.race([
-      svc.detail(companyId, skillId),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("skill detail timed out")), 1_000)),
-    ]);
+    // No wall-clock race: a hanging adapter probe (mockListSkills never resolves)
+    // still fails this test via the vitest per-test timeout (testTimeout 15s).
+    const detail = await svc.detail(companyId, skillId);
 
     expect(mockListSkills).not.toHaveBeenCalled();
     expect(detail?.usedByAgents).toEqual([
@@ -216,10 +215,9 @@ describeEmbeddedPostgres("companySkillService.detail", () => {
 
     const tracked = createTrackedDb(db);
     const trackedSvc = companySkillService(tracked.db);
-    const detail = await Promise.race([
-      trackedSvc.detail(companyId, skillId),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("skill detail timed out")), 1_000)),
-    ]);
+    // No wall-clock race: a hanging adapter probe (mockListSkills never resolves)
+    // still fails this test via the vitest per-test timeout (testTimeout 15s).
+    const detail = await trackedSvc.detail(companyId, skillId);
 
     expect(detail?.usedByAgents).toEqual([
       expect.objectContaining({

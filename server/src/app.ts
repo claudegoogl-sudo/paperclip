@@ -81,6 +81,7 @@ import {
 } from "./routes/chat-channels.js";
 import { smokeLabRoutes } from "./routes/smoke-lab.js";
 import { pluginConfigEgressRoutes } from "./routes/plugin-config-egress.js";
+import { pluginPrivateEgressRoutes } from "./routes/plugin-private-egress.js";
 import { costRoutes } from "./routes/costs.js";
 import { activityRoutes } from "./routes/activity.js";
 import { dashboardRoutes } from "./routes/dashboard.js";
@@ -136,10 +137,12 @@ import {
   resolveBundledCatalogRoot,
   resolveBundledPluginInstalls,
 } from "./services/bundled-plugins.js";
+import { createPluginWorkerManager, type PluginWorkerManager } from "./services/plugin-worker-manager.js";
 import {
-  createPluginWorkerManager,
-  type PluginWorkerManager,
-} from "./services/plugin-worker-manager.js";
+  createPluginStreamBus,
+  publishWorkerStreamNotification,
+  type PluginStreamBus,
+} from "./services/plugin-stream-bus.js";
 import { createPluginJobScheduler } from "./services/plugin-job-scheduler.js";
 import { pluginJobStore } from "./services/plugin-job-store.js";
 import { createPluginToolDispatcher } from "./services/plugin-tool-dispatcher.js";
@@ -161,6 +164,7 @@ import { heartbeatService } from "./services/heartbeat.js";
 import { pluginLifecycleManager } from "./services/plugin-lifecycle.js";
 import { createPluginJobCoordinator } from "./services/plugin-job-coordinator.js";
 import {
+  bufferPluginLogEntry,
   buildHostServices,
   flushPluginLogBuffer,
 } from "./services/plugin-host-services.js";
@@ -504,6 +508,12 @@ export async function createApp(
      */
     escalationApprovalCompanyId?: string;
     pluginWorkerManager?: PluginWorkerManager;
+    // Stream bus wired to the SAME worker manager instance passed above: the
+    // manager publishes verified worker stream notifications here and the
+    // plugin SSE bridge subscribes on it. When app builds its own manager it
+    // also builds the bus and wires the two; an injected manager must come
+    // with its bus (index.ts wires both) or the SSE bridge has no publisher.
+    pluginStreamBus?: PluginStreamBus;
     decisionServiceOptions: DecisionServiceOptions;
     // The run-context registry the injected pluginWorkerManager was
     // built with. MUST be the same instance, so a worker's host-minted service
@@ -657,9 +667,23 @@ export async function createApp(
   // run-contexts would never be found (Gate 1 → runcontext_invalid).
   const pluginRunContextRegistry =
     opts.pluginRunContextRegistry ?? createPluginRunContextRegistry();
+  // The SSE bridge needs BOTH halves wired to the same manager — a
+  // publisher (manager onStreamNotification → bus) and the bus itself
+  // (bridgeDeps.streamBus). Build the bus here and wire the internal-manager
+  // path; an injected manager must pair with the bus it publishes to.
+  const pluginStreamBus = opts.pluginStreamBus ?? createPluginStreamBus();
   const workerManager =
     opts.pluginWorkerManager ??
-    createPluginWorkerManager({ runContextRegistry: pluginRunContextRegistry });
+    createPluginWorkerManager({
+      runContextRegistry: pluginRunContextRegistry,
+      // Worker ctx.logger notifications persist to plugin_logs on the same
+      // buffered path as the logger.log host service (§26.1), so the operator
+      // logs panel can show plugin errors.
+      workerLogPersist: (entry) => bufferPluginLogEntry({ db, ...entry }),
+      onStreamNotification: ({ pluginId, method, params }) => {
+        publishWorkerStreamNotification(pluginStreamBus, pluginId, method, params);
+      },
+    });
   const connectionIntentHeartbeat = heartbeatService(db, {
     pluginWorkerManager: workerManager,
   });
@@ -845,6 +869,7 @@ export async function createApp(
     ?? process.env.PAPERCLIP_TOOL_RUNTIME_TRUSTED_HOST
     ?? null;
   api.use(pluginConfigEgressRoutes(db));
+  api.use(pluginPrivateEgressRoutes(db));
   api.use(costRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(activityRoutes(db));
   api.use(dashboardRoutes(db));
@@ -1024,12 +1049,22 @@ export async function createApp(
   // while the plugin is active ('ready'). Gating on status means reconcile()
   // disarms the watcher on disable/uninstall (status leaves 'ready') even
   // though disable keeps packagePath in the DB.
+  // File-change restarts go through a lifecycle bound to the runtime-services
+  // loader so they take the full deactivate + activateReadyPlugin path
+  // (manifest re-read, migrations, fresh host handlers, startup config
+  // delivery). The shared `lifecycle` above is built without a loader (the
+  // loader needs it as a runtime service), so its restartWorker() would fall
+  // back to a bare process bounce. Lifecycle-event subscriptions stay on the
+  // shared `lifecycle`, which is where the loader emits them.
+  const devWatcherRestartLifecycle = pluginLifecycleManager(db, { loader, workerManager, eventBus });
   const devWatcher = createPluginDevWatcher(
     lifecycle,
     async (pluginId) => {
       const plugin = await pluginRegistry.getById(pluginId);
       return plugin?.status === "ready" ? plugin.packagePath ?? null : null;
     },
+    undefined,
+    { restartWorker: (pluginId) => devWatcherRestartLifecycle.restartWorker(pluginId) },
   );
   api.use(
     pluginRoutes(
@@ -1038,7 +1073,7 @@ export async function createApp(
       { scheduler, jobStore },
       { workerManager },
       { toolDispatcher },
-      { workerManager },
+      { workerManager, streamBus: pluginStreamBus },
       { toolGateway },
       { reconciler: devWatcher },
     ),

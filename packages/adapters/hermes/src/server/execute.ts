@@ -680,7 +680,7 @@ export async function execute(
   const env: Record<string, string> = {
     ...allowlistedProcessEnv(),
     ...(userEnv && typeof userEnv === "object" ? userEnv : {}),
-    ...buildPaperclipEnv(ctx.agent),
+    ...buildPaperclipEnv(ctx.agent, { apiBase: "agent" }),
     ...buildRuntimeToolsEnv(ctx.runtimeTools),
   };
 

@@ -5,7 +5,9 @@
  * The bug: `await import('/.../dist/manifest.js')` is keyed by absolute
  * specifier in Node's ESM loader cache, so every install/upgrade against
  * the same path returned the originally-imported module for the lifetime
- * of the host process. Fix: cache-bust via `?mtime=...` on the file URL.
+ * of the host process. Fix: cache-bust via a content digest (`?digest=...`)
+ * on the file URL. The key must be content-derived, not mtime-derived — see
+ * the identical-mtime regression test below.
  *
  * The "install → overwrite → upgrade → assert-new-tool" scenario from the
  * ticket reduces to this: `loadManifestModule` must observe the rewritten
@@ -94,6 +96,32 @@ describe("plugin-loader / loadManifestModule", () => {
 
     // Same URL → ESM loader returns the same module namespace identity.
     expect(second).toBe(first);
+  });
+
+  it("serves the new module when the rewritten file keeps an IDENTICAL mtime (npm-pack normalized tar mtimes)", async () => {
+    const manifestPath = path.join(workDir, "manifest-same-mtime.js");
+    const sameMtimeSec = 1_700_000_900;
+
+    await writeManifestWithTool(manifestPath, "stale", sameMtimeSec);
+    const first = (await loadManifestModule(manifestPath)) as {
+      tools: { name: string }[];
+    };
+    expect(first.tools[0]?.name).toBe("stale");
+
+    // Upgrade stage: the replacement file has different bytes but the SAME
+    // mtime. `npm pack` normalizes every tar entry mtime to a fixed epoch,
+    // so a freshly staged module can carry the identical mtime of the file
+    // it replaces. The cache key must still change — or Node serves the
+    // cached OLD module and the upgrade reports the old version as
+    // installed.
+    await writeManifestWithTool(manifestPath, "fresh", sameMtimeSec);
+    const second = (await loadManifestModule(manifestPath)) as {
+      tools: { name: string }[];
+    };
+
+    expect(second.tools[0]?.name).toBe("fresh");
+    // Different URL → a fresh import → a distinct module namespace.
+    expect(second).not.toBe(first);
   });
 });
 

@@ -8,27 +8,33 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const logActivityMock = vi.fn();
 
-function registerModuleMocks() {
-  vi.doMock("../services/index.js", () => ({
-    accessService: () => ({
-      isInstanceAdmin: vi.fn(),
-      canUser: vi.fn(),
-      hasPermission: vi.fn(),
-    }),
-    agentService: () => ({
-      getById: vi.fn(),
-    }),
-    boardAuthService: () => ({
-      createChallenge: vi.fn(),
-      resolveBoardAccess: vi.fn(),
-      assertCurrentBoardKey: vi.fn(),
-      revokeBoardApiKey: vi.fn(),
-    }),
-    deduplicateAgentName: vi.fn(),
-    logActivity: (...args: unknown[]) => logActivityMock(...args),
-    notifyHireApproved: vi.fn(),
-  }));
-}
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("../services/index.js", () => ({
+  accessService: () => ({
+    isInstanceAdmin: vi.fn(),
+    canUser: vi.fn(),
+    hasPermission: vi.fn(),
+  }),
+  agentService: () => ({
+    getById: vi.fn(),
+  }),
+  boardAuthService: () => ({
+    createChallenge: vi.fn(),
+    resolveBoardAccess: vi.fn(),
+    assertCurrentBoardKey: vi.fn(),
+    revokeBoardApiKey: vi.fn(),
+  }),
+  deduplicateAgentName: vi.fn(),
+  logActivity: (...args: unknown[]) => logActivityMock(...args),
+  notifyHireApproved: vi.fn(),
+}));
 
 function createDbStub() {
   const createdInvite = {
@@ -111,12 +117,6 @@ async function createApp(authPublicBaseUrl?: string) {
 
 describe("invite URL: authPublicBaseUrl precedence", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../routes/access.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
     logActivityMock.mockReset();
   });
@@ -139,6 +139,21 @@ describe("invite URL: authPublicBaseUrl precedence", () => {
     expect(res.body.inviteUrl).not.toContain("127.0.0.1");
   });
 
+  it("keeps the public invite URL when an agent-run loopback base is configured", async () => {
+    vi.stubEnv("PAPERCLIP_AGENT_API_URL", "http://127.0.0.1:3100");
+    try {
+      const app = await createApp("https://paperclip.example.com");
+      const res = await request(app)
+        .post("/api/companies/company-1/invites")
+        .set("host", "127.0.0.1:3100")
+        .send({ allowedJoinTypes: "human", humanRole: "viewer" });
+      expect(res.status).toBe(201);
+      expect(res.body.inviteUrl).toMatch(/^https:\/\/paperclip\.example\.com\/invite\/pcp_invite_/);
+      expect(res.body.inviteUrl).not.toContain("127.0.0.1");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
   it("falls back to request-derived host when authPublicBaseUrl is not configured", async () => {
     const app = await createApp(undefined);
 

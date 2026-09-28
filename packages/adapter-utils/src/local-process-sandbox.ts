@@ -3,6 +3,7 @@ import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { CHILD_ENV_SIGNING_KEY_DENYLIST, signingKeyScrubSource } from "./child-env-scrub.js";
 
 export type LocalProcessSandboxAccess = "ro" | "rw";
 export type LocalProcessNetworkScope = "deny" | "allowlist";
@@ -309,7 +310,7 @@ async function startNetworkAllowlistProxy(
   };
 }
 
-async function createNetworkProxyBridge(): Promise<string> {
+export async function createNetworkProxyBridge(): Promise<string> {
   const source = `
 const net = require("node:net");
 const { spawn } = require("node:child_process");
@@ -325,7 +326,9 @@ const server = net.createServer((client) => {
   upstream.on("error", close);
 });
 server.listen(${SANDBOX_PROXY_PORT}, "127.0.0.1", () => {
-  const child = spawn(executable, args, { stdio: "inherit", env: process.env });
+  const childEnv = { ...process.env };
+  ${signingKeyScrubSource("childEnv")}
+  const child = spawn(executable, args, { stdio: "inherit", env: childEnv });
   const forward = (signal) => { if (!child.killed) child.kill(signal); };
   process.on("SIGTERM", () => forward("SIGTERM"));
   process.on("SIGINT", () => forward("SIGINT"));
@@ -380,6 +383,8 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
   const bwrapCommand = input.options.command?.trim() || "bwrap";
   const args = ["--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc", "--unshare-uts"];
   const env: Record<string, string | undefined> = {};
+  // Explicitly unset every signing-capable name in the sandboxed child.
+  for (const key of CHILD_ENV_SIGNING_KEY_DENYLIST) env[key] = undefined;
   let cleanup: (() => Promise<void>) | undefined;
   let executable = input.executable;
   let executableArgs = input.args;

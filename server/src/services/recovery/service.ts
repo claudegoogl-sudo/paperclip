@@ -17,6 +17,15 @@ import {
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  HOST_MAX_CONCURRENT_RUNS_ENV_VAR,
+  resolveHostRunCeiling,
+} from "../host-run-ceiling.js";
+import {
+  RECOVERY_REPLAY_MAX_CONCURRENT_ENV_VAR,
+  createRecoveryReplayPacer,
+  resolveRecoveryReplayCap,
+} from "./replay-pacing.js";
+import {
   hasCommittedNativeBoardResponseWait,
   readNativeBoardResponseWaitSource,
 } from "../native-runtime/native-board-response-wait.js";
@@ -941,6 +950,65 @@ function isRepeatedProductiveContinuationRecovery(
   );
 }
 
+/**
+ * Write an `issue.recovery_skipped` activity row at most once per quiet period.
+ *
+ * The stranded-issue sweep re-evaluates parked issues every tick and the skip
+ * decision is (correctly) repeated each time. Logging it each time wrote one
+ * identical row per sweep (~every 30 s) for every parked issue. Suppress the
+ * write when the latest skip row for this issue carries the same details and
+ * is not older than the issue's `updatedAt` (which comments, status, assignee
+ * and execution-policy changes all bump).
+ */
+async function logRecoverySkippedOnceWithDb(
+  db: Db,
+  issue: { id: string; companyId: string; updatedAt: Date | string | null },
+  details: Record<string, unknown>,
+) {
+  // Stamp the issue version this skip was decided against; an unchanged
+  // stamp + unchanged reason means nothing new to record.
+  const stamped: Record<string, unknown> = {
+    ...details,
+    issueUpdatedAt: issue.updatedAt ? new Date(issue.updatedAt).toISOString() : null,
+  };
+  const [latest] = await db
+    .select({ details: activityLog.details })
+    .from(activityLog)
+    .where(
+      and(
+        eq(activityLog.companyId, issue.companyId),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, issue.id),
+        eq(activityLog.action, "issue.recovery_skipped"),
+      ),
+    )
+    .orderBy(desc(activityLog.createdAt))
+    .limit(1);
+  if (latest) {
+    const prev = (latest.details ?? {}) as Record<string, unknown>;
+    const same = Object.keys(stamped).every((k) => prev[k] === stamped[k]);
+    if (same) {
+      logger.debug(
+        { issueId: issue.id, reason: details.reason },
+        "recovery skip row deduped (issue unchanged since last skip row)",
+      );
+      return false;
+    }
+  }
+  await logActivity(db, {
+    companyId: issue.companyId,
+    actorType: "system",
+    actorId: "system",
+    agentId: null,
+    runId: null,
+    action: "issue.recovery_skipped",
+    entityType: "issue",
+    entityId: issue.id,
+    details: stamped,
+  });
+  return true;
+}
+
 export function recoveryService(
   db: Db,
   deps: {
@@ -950,8 +1018,50 @@ export function recoveryService(
     ) => Promise<typeof heartbeatRuns.$inferSelect | null>;
     liveRunExecutions?: Readonly<{ has(id: string): boolean }>;
     beforeOrphanedRunTerminalWrite?: (runId: string) => Promise<void>;
+    /**
+     * Resolved host run ceiling (from the heartbeat service). When absent, the
+     * replay cap derives from the env ceiling the same way the heartbeat does.
+     */
+    hostCeilingValue?: number;
+    /** Raw `PAPERCLIP_RECOVERY_REPLAY_MAX_CONCURRENT` value; falls back to process env. */
+    replayMaxConcurrentEnvValue?: unknown;
+    /** Timing overrides for tests; production uses the >= 2s jittered defaults. */
+    replayPacing?: {
+      minDelayMs?: number;
+      jitterSpanMs?: number;
+      random?: () => number;
+      now?: () => number;
+      setTimeoutImpl?: (ms: number) => Promise<void>;
+    };
   },
 ) {
+  // Staggered boot/recovery replay (see ./replay-pacing.ts): the wakes this service
+  // drives during a recovery drain — stranded-issue continuation replays, assignment
+  // dispatch, disposition repair, dependency-wake heals — dispatch through the normal
+  // admission gate, so an unpaced drain can spawn a full house of adapter processes
+  // seconds after a restart. Every wake still runs and still goes through
+  // `reserveHostRunSlot`; the pacer only bounds how many start at once.
+  const replayCap = resolveRecoveryReplayCap(
+    deps.replayMaxConcurrentEnvValue ?? process.env[RECOVERY_REPLAY_MAX_CONCURRENT_ENV_VAR],
+    deps.hostCeilingValue
+      ?? resolveHostRunCeiling(process.env[HOST_MAX_CONCURRENT_RUNS_ENV_VAR]).value,
+  );
+  const replayPacer = createRecoveryReplayPacer({
+    cap: replayCap.value,
+    logger,
+    ...deps.replayPacing,
+  });
+  logger.info(
+    {
+      event: "recovery_replay_pacing_resolved",
+      recoveryReplayMaxConcurrent: replayCap.value,
+      source: replayCap.source,
+      envVar: RECOVERY_REPLAY_MAX_CONCURRENT_ENV_VAR,
+      ...(replayCap.invalidEnvValue ? { ignoredEnvValue: replayCap.invalidEnvValue } : {}),
+    },
+    "resolved recovery replay pacing cap",
+  );
+  const enqueueWakeup = replayPacer.wrapWake(deps.enqueueWakeup);
   const runLogStore = getRunLogStore();
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
@@ -2020,7 +2130,7 @@ export function recoveryService(
       )
         return null;
     }
-    const queued = await deps.enqueueWakeup(input.agentId, {
+    const queued = await enqueueWakeup(input.agentId, {
       source: "automation",
       triggerDetail: "system",
       reason: input.reason,
@@ -2078,7 +2188,7 @@ export function recoveryService(
     issue: typeof issues.$inferSelect,
     agentId: string,
   ) {
-    return deps.enqueueWakeup(agentId, {
+    return enqueueWakeup(agentId, {
       source: "assignment",
       triggerDetail: "system",
       reason: "issue_assigned",
@@ -2254,7 +2364,7 @@ export function recoveryService(
         },
       });
 
-      const queued = await deps.enqueueWakeup(creatorAgent.id, {
+      const queued = await enqueueWakeup(creatorAgent.id, {
         source: "automation",
         triggerDetail: "system",
         reason: "issue_assigned",
@@ -3225,7 +3335,7 @@ export function recoveryService(
     if (!scheduledRun) {
       try {
         if (timing.delayMs === 0) {
-          const enqueuedRun = await deps.enqueueWakeup(agentId, {
+          const enqueuedRun = await enqueueWakeup(agentId, {
             source: "automation",
             triggerDetail: "system",
             reason: ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
@@ -4494,20 +4604,10 @@ export function recoveryService(
         // source_scoped_recovery_action wake; it resumes when an external event
         // posts a comment and wakes the assignee normally.
         if (isStandbyWakeTargetIssue(issue)) {
-          await logActivity(db, {
-            companyId: issue.companyId,
-            actorType: "system",
-            actorId: "system",
-            agentId: null,
-            runId: null,
-            action: "issue.recovery_skipped",
-            entityType: "issue",
-            entityId: issue.id,
-            details: {
-              identifier: issue.identifier,
-              source: "recovery.reconcile_stranded_assigned_issue_skipped",
-              reason: "standby_wake_target",
-            },
+          await logRecoverySkippedOnceWithDb(db, issue, {
+            identifier: issue.identifier,
+            source: "recovery.reconcile_stranded_assigned_issue_skipped",
+            reason: "standby_wake_target",
           });
           result.skipped += 1;
           continue;
@@ -4519,21 +4619,11 @@ export function recoveryService(
           agentId,
         );
         if (pendingApproval) {
-          await logActivity(db, {
-            companyId: issue.companyId,
-            actorType: "system",
-            actorId: "system",
-            agentId: null,
-            runId: null,
-            action: "issue.recovery_skipped",
-            entityType: "issue",
-            entityId: issue.id,
-            details: {
-              identifier: issue.identifier,
-              source: "recovery.reconcile_stranded_assigned_issue_skipped",
-              reason: "pending_board_approval",
-              approvalId: pendingApproval.approvalId,
-            },
+          await logRecoverySkippedOnceWithDb(db, issue, {
+            identifier: issue.identifier,
+            source: "recovery.reconcile_stranded_assigned_issue_skipped",
+            reason: "pending_board_approval",
+            approvalId: pendingApproval.approvalId,
           });
           result.skipped += 1;
           result.skippedDueToPendingApproval += 1;
@@ -4546,22 +4636,12 @@ export function recoveryService(
           agentId,
         );
         if (pendingInteraction) {
-          await logActivity(db, {
-            companyId: issue.companyId,
-            actorType: "system",
-            actorId: "system",
-            agentId: null,
-            runId: null,
-            action: "issue.recovery_skipped",
-            entityType: "issue",
-            entityId: issue.id,
-            details: {
-              identifier: issue.identifier,
-              source: "recovery.reconcile_stranded_assigned_issue_skipped",
-              reason: "pending_wake_assignee_interaction",
-              interactionId: pendingInteraction.interactionId,
-              kind: pendingInteraction.kind,
-            },
+          await logRecoverySkippedOnceWithDb(db, issue, {
+            identifier: issue.identifier,
+            source: "recovery.reconcile_stranded_assigned_issue_skipped",
+            reason: "pending_wake_assignee_interaction",
+            interactionId: pendingInteraction.interactionId,
+            kind: pendingInteraction.kind,
           });
           result.skipped += 1;
           result.skippedDueToPendingWakeAssigneeInteraction += 1;
@@ -5657,7 +5737,7 @@ export function recoveryService(
         }
 
         try {
-          const wake = await deps.enqueueWakeup(agentId, {
+          const wake = await enqueueWakeup(agentId, {
             source: "automation",
             triggerDetail: "system",
             reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
