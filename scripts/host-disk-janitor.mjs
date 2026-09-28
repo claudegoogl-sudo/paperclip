@@ -883,6 +883,34 @@ export function collectLiveProcessPaths(procDir = CONFIG.PROC_DIR) {
   return { ok: true, paths };
 }
 
+/**
+ * Host paths bind-mounted into running containers. Root-owned container
+ * processes are invisible to the /proc scan (we run as the agent uid), so
+ * every running container's mount Sources count as live. Any docker failure
+ * => { ok: false } (caller fails the category closed). `exec` is injectable.
+ */
+export function collectDockerMountSources(exec = (bin, args) => execFileSync(bin, args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 60000 })) {
+  try {
+    const ids = exec("docker", ["ps", "-q"]).split(/\s+/).filter(Boolean);
+    const paths = new Set();
+    if (ids.length === 0) return { ok: true, paths };
+    const info = JSON.parse(exec("docker", ["inspect", ...ids]));
+    for (const c of info) for (const m of c.Mounts || []) if (m.Source) paths.add(m.Source);
+    return { ok: true, paths };
+  } catch (err) {
+    return { ok: false, error: `docker mount scan failed: ${err.message}`, paths: new Set() };
+  }
+}
+
+/** /proc scan + docker mount sources, fail closed if either fails. */
+export function collectLivePaths(config = CONFIG) {
+  const proc = collectLiveProcessPaths(config.PROC_DIR);
+  if (!proc.ok) return proc;
+  const docker = (config.DOCKER_MOUNTS || collectDockerMountSources)();
+  if (!docker.ok) return { ok: false, error: docker.error, paths: proc.paths };
+  return { ok: true, paths: new Set([...proc.paths, ...docker.paths]), dockerMounts: docker.paths.size };
+}
+
 /** True when any live-process path is the entry itself or inside it. */
 export function isEntryInUse(entryPath, livePaths) {
   const resolved = path.resolve(entryPath);
@@ -920,7 +948,7 @@ export function evaluateTmpUnmatched(nowMs, config = CONFIG, { live, registeredP
       out.excluded.push({ path: p, reason: "registered-package-path" });
       continue;
     }
-    const age = strictNewestLeafMtime(p);
+    const age = strictNewestLeafMtime(p, config.TMP_AGE_LSTAT || lstatSync);
     if (!age.ok) {
       out.excluded.push({ path: p, reason: "age-walk-error" });
       continue;
@@ -940,19 +968,25 @@ export function evaluateTmpUnmatched(nowMs, config = CONFIG, { live, registeredP
 }
 
 /**
- * Fail-closed newest-inside mtime for the unmatched /tmp category: full walk,
- * leaf mtimes only; ANY readdir/lstat error => { ok: false } (caller keeps the
- * entry). Empty tree falls back to root ctime (absence of evidence = fresh).
+ * Fail-closed age signal for the unmatched /tmp category. newest = max of
+ * every leaf mtime, every directory mtime (root included), and the top-level
+ * entry's own ctime. Directory mtimes and the top-level ctime cannot be
+ * carried over by `cp -a` / `tar x` / `npm pack` extracts (those preserve
+ * leaf mtimes only), so a tree copied in yesterday reads as fresh. Inner
+ * ctimes are deliberately NOT used: hardlink-count changes (store prune,
+ * sibling deletes) bump them and would make every tree look fresh.
+ * ANY readdir/lstat error => { ok: false } (caller keeps the entry).
+ * `lstat` is injectable for tests (ctime cannot be set with utimes).
  */
-export function strictNewestLeafMtime(rootPath) {
+export function strictNewestLeafMtime(rootPath, lstat = lstatSync) {
   let rootStat;
   try {
-    rootStat = lstatSync(rootPath);
+    rootStat = lstat(rootPath);
   } catch {
     return { ok: false };
   }
-  if (!rootStat.isDirectory()) return { ok: true, newestMtimeMs: rootStat.mtimeMs };
-  let newest = 0;
+  let newest = Math.max(rootStat.mtimeMs, rootStat.ctimeMs);
+  if (!rootStat.isDirectory()) return { ok: true, newestMtimeMs: newest };
   const stack = [rootPath];
   while (stack.length) {
     const dir = stack.pop();
@@ -966,15 +1000,15 @@ export function strictNewestLeafMtime(rootPath) {
       const cp = path.join(dir, c.name);
       let st;
       try {
-        st = lstatSync(cp);
+        st = lstat(cp);
       } catch {
         return { ok: false };
       }
+      newest = Math.max(newest, st.mtimeMs);
       if (st.isDirectory()) stack.push(cp);
-      else newest = Math.max(newest, st.mtimeMs);
     }
   }
-  return { ok: true, newestMtimeMs: Math.max(newest, newest ? 0 : rootStat.ctimeMs) };
+  return { ok: true, newestMtimeMs: newest };
 }
 
 /** Newest leaf mtime under a path (for reporting age only). */
@@ -1386,18 +1420,36 @@ export async function run({
 
   // -- /tmp unmatched agent scratch (any name, agent uid, >= N days idle) --
   {
-    const live = collectLiveProcessPaths(config.PROC_DIR);
+    const live = collectLivePaths(config);
     const { candidates, excluded } = evaluateTmpUnmatched(nowMs, config, { live, registeredPaths });
     // Fail closed on registered-path lookup failure too (same rule as above).
     const eligible = registeredGuardActive ? candidates : [];
     const sized = eligible.map((c) => ({ ...c, sizeBytes: duBytes(c.path) }));
     const deleteEnabled = apply && config.TMP_UNMATCHED_DELETE;
-    if (deleteEnabled) {
+    if (deleteEnabled && sized.length) {
+      // Sizing takes minutes; re-scan live users right before deleting and
+      // re-check age + in-use per entry immediately before rmSync.
+      const liveNow = collectLivePaths(config);
+      const cutoffMs = nowMs - config.TMP_UNMATCHED_MAX_AGE_DAYS * DAY_MS;
       for (const c of sized) {
+        if (!liveNow.ok) {
+          c.result = "skipped-at-delete (live-scan-failed)";
+          continue;
+        }
+        const age = strictNewestLeafMtime(c.path, config.TMP_AGE_LSTAT || lstatSync);
+        if (!age.ok || age.newestMtimeMs > cutoffMs) {
+          c.result = `skipped-at-delete (${age.ok ? "fresh" : "age-walk-error"})`;
+          continue;
+        }
+        if (isEntryInUse(c.path, liveNow.paths)) {
+          c.result = "skipped-at-delete (in-use)";
+          continue;
+        }
         try {
-          rmSync(c.path, { recursive: true, force: true });
-        } catch {
-          // already gone -- idempotent
+          (config.TMP_RM || rmSync)(c.path, { recursive: true });
+          c.result = "deleted";
+        } catch (err) {
+          c.result = `failed:${err.code || "ERR"}`;
         }
       }
     }
@@ -1407,10 +1459,14 @@ export async function run({
       deleted: deleteEnabled,
       liveProcessScan: live.ok ? { ok: true, paths: live.paths.size } : { ok: false, error: live.error },
       eligible: sized.length,
-      reclaimedBytes: sized.reduce((s, c) => s + c.sizeBytes, 0),
+      deletedCount: sized.filter((c) => c.result === "deleted").length,
+      reclaimedBytes: deleteEnabled
+        ? sized.filter((c) => c.result === "deleted").reduce((s, c) => s + c.sizeBytes, 0)
+        : sized.reduce((s, c) => s + c.sizeBytes, 0),
       candidates: sized.map((c) => ({
         path: c.path,
         sizeBytes: c.sizeBytes,
+        result: c.result || null,
         ageDays: Math.max(0, Math.floor((nowMs - c.newestMtimeMs) / DAY_MS)),
       })),
       excluded,
@@ -1524,13 +1580,13 @@ function printSummary(summary) {
     const act = u.deleted ? "deleted" : "candidates";
     const verbU = u.deleted ? "deleted" : "would delete";
     console.log(
-      `tmp unmatched (>=${u.maxAgeDays}d idle, agent uid): ${u.eligible} ${act}, ${bytesToHuman(u.reclaimedBytes)} ` +
+      `tmp unmatched (>=${u.maxAgeDays}d idle, agent uid): ${u.deleted ? `${u.deletedCount}/${u.eligible}` : u.eligible} ${act}, ${bytesToHuman(u.reclaimedBytes)} ` +
         `${u.deleted ? "freed" : "reclaimable"}` +
         (u.deleteEnabled ? "" : " [REPORT-ONLY: deletion gate PLA_JANITOR_TMP_UNMATCHED_DELETE=1 is off]"),
     );
     if (!u.liveProcessScan.ok) console.log(`  live-process scan FAILED -- category fail-closed: ${u.liveProcessScan.error}`);
     for (const e of u.candidates) {
-      console.log(`  ${u.deleted ? "deleted" : u.deleteEnabled ? verbU : "candidate"}: ${e.path}  ${bytesToHuman(e.sizeBytes)}  ${e.ageDays}d`);
+      console.log(`  ${u.deleted ? e.result : u.deleteEnabled ? verbU : "candidate"}: ${e.path}  ${bytesToHuman(e.sizeBytes)}  ${e.ageDays}d`);
     }
     const counts = {};
     for (const e of u.excluded) counts[e.reason] = (counts[e.reason] || 0) + 1;

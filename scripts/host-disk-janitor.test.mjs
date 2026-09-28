@@ -5,6 +5,7 @@ import {
   mkdirSync,
   writeFileSync,
   rmSync,
+  lstatSync,
   utimesSync,
   lutimesSync,
   existsSync,
@@ -38,6 +39,7 @@ import {
   findRegisteredOverlap,
   tmpUnmatchedExclusionReason,
   collectLiveProcessPaths,
+  collectDockerMountSources,
   strictNewestLeafMtime,
   isEntryInUse,
   evaluateTmpUnmatched,
@@ -508,6 +510,16 @@ test("parseDfUsePercent reads the Use% column from df -kP output", () => {
 // and apply-twice idempotency (AC4).
 // ---------------------------------------------------------------------------
 
+// Test-only lstat: dirs contribute nothing and ctime reads as mtime, so
+// fixtures aged with utimes behave as "old" under the real age signal.
+function leafOnlyLstat(p) {
+  const st = lstatSync(p);
+  const out = Object.assign(Object.create(Object.getPrototypeOf(st)), st);
+  if (st.isDirectory()) Object.assign(out, { mtimeMs: 0, ctimeMs: 0 });
+  else out.ctimeMs = st.mtimeMs;
+  return out;
+}
+
 function buildSandbox() {
   const home = tmpdir("janitor-sandbox-");
   const backupsDir = path.join(home, "backups");
@@ -599,6 +611,9 @@ function buildSandbox() {
     // Report-only owner-decision scan must never walk the real $HOME in tests.
     OWNER_DECISION_GLOBS: [],
     OWNER_DECISION_PATHS: [],
+    // Fixtures can only age leaf mtimes (ctime is not settable); never shell out to docker.
+    TMP_AGE_LSTAT: leafOnlyLstat,
+    DOCKER_MOUNTS: () => ({ ok: true, paths: new Set() }),
   };
   return { home, remotes: [staleRemote, liveRemote], config };
 }
@@ -878,7 +893,7 @@ const UID = process.getuid();
 const OLD = new Date(Date.now() - 40 * 24 * 3600 * 1000);
 
 function unmatchedConfig(tmpDir, extra = {}) {
-  return { ...CONFIG, TMP_DIR: tmpDir, TMP_OWNER_UID: UID, TMP_UNMATCHED_MAX_AGE_DAYS: 14, ...extra };
+  return { ...CONFIG, TMP_DIR: tmpDir, TMP_OWNER_UID: UID, TMP_UNMATCHED_MAX_AGE_DAYS: 14, TMP_AGE_LSTAT: leafOnlyLstat, DOCKER_MOUNTS: () => ({ ok: true, paths: new Set() }), ...extra };
 }
 
 test("tmpUnmatchedExclusionReason: protected names, special files, foreign owner fail closed", () => {
@@ -1020,7 +1035,7 @@ function fakeFetch({ open = [], comments = [] } = {}) {
     const json = (b, status = 200) => ({ ok: status < 400, status, json: async () => b });
     if (method === "GET" && url.includes("/companies/")) return json(open);
     if (method === "GET" && url.endsWith("/comments")) return json(comments);
-    if (method === "POST" && url.includes("/companies/")) return json({ id: "new-id", identifier: "PLA-9999" }, 201);
+    if (method === "POST" && url.includes("/companies/")) return json({ id: "new-id", identifier: "ALARM-2" }, 201);
     return json({}, 200);
   };
   return { impl, calls };
@@ -1040,7 +1055,7 @@ test("fileDiskAlarmIssue: create assigns the owner with status todo", async () =
 });
 
 test("fileDiskAlarmIssue: dedup hit on unassigned backlog alarm reassigns to owner + todo and posts the daily bump", async () => {
-  const f = fakeFetch({ open: [{ id: "a1", identifier: "PLA-2010", title: "[host-disk-alarm] x", status: "backlog", assigneeAgentId: null }] });
+  const f = fakeFetch({ open: [{ id: "a1", identifier: "ALARM-1", title: "[host-disk-alarm] x", status: "backlog", assigneeAgentId: null }] });
   const r = await fileDiskAlarmIssue({ usePercent: 91, threshold: 85, companyId: "c", credential: CRED, nowMs: NOW, config: ALARM_CFG, fetchImpl: f.impl });
   assert.equal(r.created, false);
   assert.equal(r.reassigned, true);
@@ -1097,18 +1112,104 @@ test("addendum: strict age walk fails closed on unreadable subdir and uses newes
   writeFileSync(f, "x");
   const old = new Date(Date.now() - 40 * 86400000);
   utimesSync(f, old, old);
-  const r = strictNewestLeafMtime(root);
+  const r = strictNewestLeafMtime(root, leafOnlyLstat);
   assert.equal(r.ok, true);
   assert.ok(Math.abs(r.newestMtimeMs - old.getTime()) < 2000);
   if (process.getuid() !== 0) {
     const locked = path.join(root, "locked");
     mkdirSync(locked);
     chmodSync(locked, 0o000);
-    try { assert.equal(strictNewestLeafMtime(root).ok, false); } finally { chmodSync(locked, 0o755); }
+    try { assert.equal(strictNewestLeafMtime(root, leafOnlyLstat).ok, false); } finally { chmodSync(locked, 0o755); }
   }
 });
 
 test("addendum: claude-*/prime-* session dirs are protected names", () => {
   const cfg = { TMP_UNMATCHED_EXCLUDE_PATTERNS: [/^\./, /^claude-/, /^prime-/], TMP_SCRATCH_PATTERNS: [], TMP_OWNER_UID: 1000 };
   for (const n of ["claude-abc", "prime-xyz"]) assert.equal(tmpUnmatchedExclusionReason({ name: n, kind: "dir", uid: 1000 }, { ...cfg }), "protected-name");
+});
+
+test("age signal: copied tree with old leaf mtimes but fresh root ctime/dir mtimes is kept", () => {
+  const dir = tmpdir("janitor-copied-");
+  touch(path.join(dir, "copied-yesterday", "deep", "x"), { mtime: OLD }); // cp -a / tar x shape
+  const r = strictNewestLeafMtime(path.join(dir, "copied-yesterday"));
+  assert.equal(r.ok, true);
+  assert.ok(Date.now() - r.newestMtimeMs < 60000, "real lstat must see the fresh ctime/dir mtime");
+  // real lstat in the category => fresh => not a candidate
+  const res = evaluateTmpUnmatched(Date.now(), unmatchedConfig(dir, { TMP_AGE_LSTAT: lstatSync }), {
+    live: { ok: true, paths: new Set() },
+  });
+  assert.equal(res.candidates.length, 0);
+  // the leaf-only view (old behaviour) would have called it old
+  const leaf = strictNewestLeafMtime(path.join(dir, "copied-yesterday"), leafOnlyLstat);
+  assert.ok(Date.now() - leaf.newestMtimeMs > 20 * 86400000);
+});
+
+test("collectDockerMountSources: mount sources are live; docker failure fails closed", () => {
+  const exec = (bin, args) => {
+    if (args[0] === "ps") return "abc\ndef\n";
+    return JSON.stringify([{ Mounts: [{ Source: "/tmp/juk-data" }] }, { Mounts: [{ Source: "/srv/x" }, {}] }]);
+  };
+  const ok = collectDockerMountSources(exec);
+  assert.equal(ok.ok, true);
+  assert.deepEqual([...ok.paths].sort(), ["/srv/x", "/tmp/juk-data"]);
+  assert.equal(collectDockerMountSources(() => "").paths.size, 0);
+  assert.equal(collectDockerMountSources(() => "").ok, true);
+  const bad = collectDockerMountSources(() => { throw new Error("ENOENT docker"); });
+  assert.equal(bad.ok, false);
+});
+
+test("run(): docker-mounted entry is kept; docker scan failure keeps the whole category", async () => {
+  const { config } = buildSandbox();
+  touch(path.join(config.TMP_DIR, "mounted", "x"), { mtime: OLD });
+  touch(path.join(config.TMP_DIR, "idle", "x"), { mtime: OLD });
+  const cfg = { ...config, TMP_OWNER_UID: UID, TMP_SCRATCH_PATTERNS: [/^pla/], TMP_UNMATCHED_DELETE: true };
+  const mounted = path.join(config.TMP_DIR, "mounted");
+  const s1 = await run({
+    apply: true,
+    config: { ...cfg, DOCKER_MOUNTS: () => ({ ok: true, paths: new Set([path.join(mounted, "x")]) }) },
+    loadRegistered: testRegistered(),
+  });
+  assert.ok(existsSync(mounted));
+  assert.ok(!existsSync(path.join(config.TMP_DIR, "idle")));
+  assert.ok(s1.categories.tmpUnmatched.excluded.some((e) => e.path === mounted && e.reason === "in-use-by-live-process"));
+  const s2 = await run({
+    apply: true,
+    config: { ...cfg, DOCKER_MOUNTS: () => ({ ok: false, error: "down", paths: new Set() }) },
+    loadRegistered: testRegistered(),
+  });
+  assert.equal(s2.categories.tmpUnmatched.eligible, 0);
+  assert.ok(existsSync(mounted));
+});
+
+test("run(): re-check at delete time skips entries that became live; rm failures are not counted as freed", async () => {
+  const { config } = buildSandbox();
+  touch(path.join(config.TMP_DIR, "turns-live", "x"), { mtime: OLD });
+  touch(path.join(config.TMP_DIR, "rm-fails", "x"), { mtime: OLD });
+  touch(path.join(config.TMP_DIR, "ok", "x"), { mtime: OLD });
+  let calls = 0;
+  const turnsLive = path.join(config.TMP_DIR, "turns-live");
+  const summary = await run({
+    apply: true,
+    config: {
+      ...config,
+      TMP_OWNER_UID: UID,
+      TMP_SCRATCH_PATTERNS: [/^pla/],
+      TMP_UNMATCHED_DELETE: true,
+      // first scan: nothing live; second (pre-delete) scan: turns-live is a docker mount
+      DOCKER_MOUNTS: () => ({ ok: true, paths: calls++ === 0 ? new Set() : new Set([turnsLive]) }),
+      TMP_RM: (p, opts) => {
+        if (p.endsWith("rm-fails")) throw Object.assign(new Error("perm"), { code: "EACCES" });
+        return rmSync(p, opts);
+      },
+    },
+    loadRegistered: testRegistered(),
+  });
+  const u = summary.categories.tmpUnmatched;
+  const by = Object.fromEntries(u.candidates.map((c) => [path.basename(c.path), c]));
+  assert.equal(by["turns-live"].result, "skipped-at-delete (in-use)");
+  assert.equal(by["rm-fails"].result, "failed:EACCES");
+  assert.equal(by.ok.result, "deleted");
+  assert.equal(u.deletedCount, 1);
+  assert.equal(u.reclaimedBytes, by.ok.sizeBytes);
+  assert.ok(existsSync(turnsLive));
 });
