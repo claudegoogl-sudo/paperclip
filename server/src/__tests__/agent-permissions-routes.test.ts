@@ -120,100 +120,106 @@ const mockInstanceSettingsService = vi.hoisted(() => ({
   getGeneral: vi.fn(),
 }));
 
-function registerModuleMocks() {
-  vi.doMock("@paperclipai/adapter-opencode-local/server", async () => {
-    const actual = await vi.importActual<typeof import("@paperclipai/adapter-opencode-local/server")>("@paperclipai/adapter-opencode-local/server");
-    return {
-      ...actual,
-      ensureOpenCodeModelConfiguredAndAvailable: mockEnsureOpenCodeModelConfiguredAndAvailable,
-    };
-  });
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("@paperclipai/adapter-opencode-local/server", async () => {
+  const actual = await vi.importActual<typeof import("@paperclipai/adapter-opencode-local/server")>("@paperclipai/adapter-opencode-local/server");
+  return {
+    ...actual,
+    ensureOpenCodeModelConfiguredAndAvailable: mockEnsureOpenCodeModelConfiguredAndAvailable,
+  };
+});
 
-  vi.doMock("@paperclipai/shared/telemetry", () => ({
-    trackAgentCreated: mockTrackAgentCreated,
-    trackErrorHandlerCrash: vi.fn(),
-  }));
+vi.mock("@paperclipai/shared/telemetry", () => ({
+  trackAgentCreated: mockTrackAgentCreated,
+  trackErrorHandlerCrash: vi.fn(),
+}));
 
-  vi.doMock("../telemetry.js", () => ({
-    getTelemetryClient: mockGetTelemetryClient,
-  }));
+vi.mock("../telemetry.js", () => ({
+  getTelemetryClient: mockGetTelemetryClient,
+}));
 
-  vi.doMock("../services/agents.js", () => ({
-    agentService: () => mockAgentService,
-  }));
+vi.mock("../services/agents.js", () => ({
+  agentService: () => mockAgentService,
+}));
 
-  vi.doMock("../services/access.js", () => ({
-    accessService: () => mockAccessService,
-  }));
+vi.mock("../services/access.js", () => ({
+  accessService: () => mockAccessService,
+}));
 
-  vi.doMock("../services/approvals.js", () => ({
-    approvalService: () => mockApprovalService,
-  }));
+vi.mock("../services/approvals.js", () => ({
+  approvalService: () => mockApprovalService,
+}));
 
-  vi.doMock("../services/company-skills.js", () => ({
-    companySkillService: () => mockCompanySkillService,
-  }));
+vi.mock("../services/company-skills.js", () => ({
+  companySkillService: () => mockCompanySkillService,
+}));
 
-  vi.doMock("../services/budgets.js", () => ({
-    budgetService: () => mockBudgetService,
-  }));
+vi.mock("../services/budgets.js", () => ({
+  budgetService: () => mockBudgetService,
+}));
 
-  vi.doMock("../services/heartbeat.js", () => ({
-    heartbeatService: () => mockHeartbeatService,
-  }));
+vi.mock("../services/heartbeat.js", () => ({
+  heartbeatService: () => mockHeartbeatService,
+}));
 
-  vi.doMock("../services/issue-approvals.js", () => ({
-    issueApprovalService: () => mockIssueApprovalService,
-  }));
+vi.mock("../services/issue-approvals.js", () => ({
+  issueApprovalService: () => mockIssueApprovalService,
+}));
 
-  vi.doMock("../services/issues.js", () => ({
-    issueService: () => mockIssueService,
-  }));
+vi.mock("../services/issues.js", () => ({
+  issueService: () => mockIssueService,
+}));
 
-  vi.doMock("../services/secrets.js", () => ({
-    secretService: () => mockSecretService,
-  }));
+vi.mock("../services/secrets.js", () => ({
+  secretService: () => mockSecretService,
+}));
 
-  vi.doMock("../services/environments.js", () => ({
-    environmentService: () => mockEnvironmentService,
-  }));
+vi.mock("../services/environments.js", () => ({
+  environmentService: () => mockEnvironmentService,
+}));
 
-  vi.doMock("../services/agent-instructions.js", () => ({
-    agentInstructionsService: () => mockAgentInstructionsService,
-    syncInstructionsBundleConfigFromFilePath: mockSyncInstructionsBundleConfigFromFilePath,
-  }));
+vi.mock("../services/agent-instructions.js", () => ({
+  agentInstructionsService: () => mockAgentInstructionsService,
+  syncInstructionsBundleConfigFromFilePath: mockSyncInstructionsBundleConfigFromFilePath,
+}));
 
-  vi.doMock("../services/workspace-operations.js", () => ({
-    workspaceOperationService: () => mockWorkspaceOperationService,
-  }));
+vi.mock("../services/workspace-operations.js", () => ({
+  workspaceOperationService: () => mockWorkspaceOperationService,
+}));
 
-  vi.doMock("../services/activity-log.js", () => ({
-    logActivity: mockLogActivity,
-  }));
+vi.mock("../services/activity-log.js", () => ({
+  logActivity: mockLogActivity,
+}));
 
-  vi.doMock("../services/instance-settings.js", () => ({
-    instanceSettingsService: () => mockInstanceSettingsService,
-  }));
+vi.mock("../services/instance-settings.js", () => ({
+  instanceSettingsService: () => mockInstanceSettingsService,
+}));
 
-  vi.doMock("../services/index.js", () => ({
-    agentService: () => mockAgentService,
-    agentInstructionsService: () => mockAgentInstructionsService,
-    accessService: () => mockAccessService,
-    approvalService: () => mockApprovalService,
-    builtInAgentService: () => mockBuiltInAgentService,
-    companySkillService: () => mockCompanySkillService,
-    budgetService: () => mockBudgetService,
-    heartbeatService: () => mockHeartbeatService,
-    ISSUE_LIST_DEFAULT_LIMIT: 500,
-    issueApprovalService: () => mockIssueApprovalService,
-    issueService: () => mockIssueService,
-    logActivity: mockLogActivity,
-    secretService: () => mockSecretService,
-    syncInstructionsBundleConfigFromFilePath: mockSyncInstructionsBundleConfigFromFilePath,
-    workspaceOperationService: () => mockWorkspaceOperationService,
-    environmentService: () => mockEnvironmentService,
-  }));
-}
+vi.mock("../services/index.js", () => ({
+  agentService: () => mockAgentService,
+  agentInstructionsService: () => mockAgentInstructionsService,
+  accessService: () => mockAccessService,
+  approvalService: () => mockApprovalService,
+  builtInAgentService: () => mockBuiltInAgentService,
+  companySkillService: () => mockCompanySkillService,
+  budgetService: () => mockBudgetService,
+  heartbeatService: () => mockHeartbeatService,
+  ISSUE_LIST_DEFAULT_LIMIT: 500,
+  issueApprovalService: () => mockIssueApprovalService,
+  issueService: () => mockIssueService,
+  logActivity: mockLogActivity,
+  secretService: () => mockSecretService,
+  syncInstructionsBundleConfigFromFilePath: mockSyncInstructionsBundleConfigFromFilePath,
+  workspaceOperationService: () => mockWorkspaceOperationService,
+  environmentService: () => mockEnvironmentService,
+}));
 
 function createDbStub(options: { requireBoardApprovalForNewAgents?: boolean } = {}) {
   return {
@@ -281,30 +287,6 @@ async function requestApp(
 
 describe.sequential("agent permission routes", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("@paperclipai/shared/telemetry");
-    vi.doUnmock("../telemetry.js");
-    vi.doUnmock("../services/access.js");
-    vi.doUnmock("../services/activity-log.js");
-    vi.doUnmock("../services/agent-instructions.js");
-    vi.doUnmock("../services/agents.js");
-    vi.doUnmock("../services/approvals.js");
-    vi.doUnmock("../services/budgets.js");
-    vi.doUnmock("../services/company-skills.js");
-    vi.doUnmock("../services/heartbeat.js");
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../services/instance-settings.js");
-    vi.doUnmock("../services/issue-approvals.js");
-    vi.doUnmock("../services/issues.js");
-    vi.doUnmock("../services/secrets.js");
-    vi.doUnmock("../services/environments.js");
-    vi.doUnmock("../services/workspace-operations.js");
-    vi.doUnmock("../adapters/index.js");
-    vi.doUnmock("../routes/agents.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    vi.doUnmock("@paperclipai/adapter-opencode-local/server");
-    registerModuleMocks();
     vi.resetAllMocks();
     mockAgentService.getById.mockReset();
     mockAgentService.list.mockReset();
@@ -539,6 +521,105 @@ describe.sequential("agent permission routes", () => {
       .send({ name: "backdoor" }));
 
     expect(res.status).toBe(403);
+  });
+
+  it.each([
+    ["standard", { kind: "standard" }],
+    ["task_bridge", { kind: "task_bridge", projectId: "11111111-1111-4111-8111-111111111111" }],
+    ["skill_test", { kind: "skill_test", issueId: "11111111-1111-4111-8111-111111111111" }],
+    ["notify_only", { kind: "notify_only", issueIds: ["11111111-1111-4111-8111-111111111111"] }],
+  ])("refuses to mint a notify_only key from a %s agent key", async (_label, keyScope) => {
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_key",
+      keyScope,
+      runId: "run-1",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/agents/${agentId}/keys`)
+      .send({ name: "pager", scope: { kind: "notify_only", issueIds: ["11111111-1111-4111-8111-111111111111"] } }));
+
+    expect(res.status).toBe(403);
+  });
+
+  it("refuses to mint a notify_only key from the owning agent's own JWT (board only)", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      source: "agent_jwt",
+      runId: "run-1",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/agents/${agentId}/keys`)
+      .send({ name: "pager", ttlSeconds: 3600, scope: { kind: "notify_only", issueIds: ["11111111-1111-4111-8111-111111111111"] } }));
+
+    expect(res.status).toBe(403);
+  });
+
+  it.each([
+    ["no expiry", {}],
+    ["expiry over 90 days", { ttlSeconds: 91 * 24 * 60 * 60 }],
+    ["expiry in the past", { expiresAt: "2000-01-01T00:00:00Z" }],
+  ])("rejects a board notify_only mint with %s (422)", async (_label, lifetime) => {
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/agents/${agentId}/keys`)
+      .send({ name: "pager", ...lifetime, scope: { kind: "notify_only", issueIds: ["11111111-1111-4111-8111-111111111111"] } }));
+
+    expect(res.status).toBe(422);
+  });
+
+  it("rejects a board notify_only mint naming an issue outside the agent's company (422)", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    // DB stub resolves one in-company row; the second id is foreign.
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/agents/${agentId}/keys`)
+      .send({
+        name: "pager",
+        ttlSeconds: 3600,
+        scope: {
+          kind: "notify_only",
+          issueIds: ["11111111-1111-4111-8111-111111111111", "33333333-3333-4333-8333-333333333333"],
+        },
+      }));
+
+    expect(res.status).toBe(422);
+    expect(JSON.stringify(res.body)).toContain("company");
+  });
+
+  it("rejects a notify_only mint with an empty issue allow-list (400)", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl)
+      .post(`/api/agents/${agentId}/keys`)
+      .send({ name: "pager", scope: { kind: "notify_only", issueIds: [] } }));
+
+    expect(res.status).toBe(400);
   });
 
   it("blocks wakeups for authenticated company members without agent admin permission", async () => {

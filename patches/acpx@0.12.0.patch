@@ -1,8 +1,6 @@
-diff --git a/dist/live-checkpoint-ClPCSdrW.js b/dist/live-checkpoint-ClPCSdrW.js
-index 243c9d13bcba520923b63adfddad75cf2d94362d..336a1699b80b9e99416f9da4346ca73ee2ad1626 100644
 --- a/dist/live-checkpoint-ClPCSdrW.js
 +++ b/dist/live-checkpoint-ClPCSdrW.js
-@@ -1532,7 +1532,7 @@ const ZED_TAG_KEYS = /* @__PURE__ */ new Set([
+@@ -1532,7 +1532,7 @@
  	"RedactedThinking",
  	"ToolUse"
  ]);
@@ -11,7 +9,7 @@ index 243c9d13bcba520923b63adfddad75cf2d94362d..336a1699b80b9e99416f9da4346ca73e
  const OPAQUE_VALUE_PATHS = /* @__PURE__ */ new Set([
  	"agent_capabilities",
  	"messages.Agent.content.ToolUse.input",
-@@ -2557,7 +2557,7 @@ function readCommandLineChar(state) {
+@@ -2557,7 +2557,7 @@
  		escaping: false,
  		hasPart: true
  	};
@@ -20,9 +18,10 @@ index 243c9d13bcba520923b63adfddad75cf2d94362d..336a1699b80b9e99416f9da4346ca73e
  		current: state.current,
  		quote: state.quote,
  		escaping: true,
-@@ -3959,7 +3959,24 @@ var AcpClient = class {
--		this.attachAgentLifecycleObservers(child);
-+		this.attachAgentLifecycleObservers(child);
+@@ -3957,9 +3957,26 @@
+ 		this.lastAgentExit = void 0;
+ 		this.lastKnownPid = child.pid ?? void 0;
+ 		this.attachAgentLifecycleObservers(child);
 +		if (this.options.onAgentSpawn) {
 +			try {
 +				if (typeof child.pid !== "number" || child.pid <= 0) {
@@ -46,7 +45,7 @@ index 243c9d13bcba520923b63adfddad75cf2d94362d..336a1699b80b9e99416f9da4346ca73e
  			if (!this.options.verbose) return;
  			process.stderr.write(chunk);
  		});
-@@ -3994,7 +4011,7 @@ var AcpClient = class {
+@@ -3994,7 +4011,7 @@
  			geminiAcp: isGeminiAcpCommand(spawnCommand, args),
  			copilotAcp: isCopilotAcpCommand(spawnCommand, args),
  			claudeAcp: isClaudeAcpCommand(spawnCommand, args),
@@ -55,11 +54,18 @@ index 243c9d13bcba520923b63adfddad75cf2d94362d..336a1699b80b9e99416f9da4346ca73e
  		};
  	}
  	logAgentLaunch(plan) {
-diff --git a/dist/runtime.d.ts b/dist/runtime.d.ts
-index ccdbe5b032521518022223733049b8b38793473b..3d4e04231e78efeecd8540735b08e1e43547ff2d 100644
+@@ -4919,7 +4936,7 @@
+ 		allowed_tools: Array.isArray(options.allowedTools) ? [...options.allowedTools] : void 0,
+ 		max_turns: typeof options.maxTurns === "number" ? options.maxTurns : void 0,
+ 		system_prompt: normalizeSystemPromptOption(options.systemPrompt),
+-		env: storedEnvRecord(options.env)
++		env: storedEnvRecord(options.persistedEnv ?? options.env)
+ 	};
+ 	return hasPersistedSessionOptions(next) ? next : void 0;
+ }
 --- a/dist/runtime.d.ts
 +++ b/dist/runtime.d.ts
-@@ -266,6 +266,9 @@ type AcpRuntimeOptions = {
+@@ -266,6 +266,9 @@
    timeoutMs?: number;
    probeAgent?: string;
    verbose?: boolean;
@@ -69,11 +75,16 @@ index ccdbe5b032521518022223733049b8b38793473b..3d4e04231e78efeecd8540735b08e1e4
    onPermissionRequest?: (req: AcpPermissionRequest, ctx: {
      signal: AbortSignal;
    }) => Promise<AcpPermissionDecision | undefined>;
-diff --git a/dist/runtime.js b/dist/runtime.js
-index 6c9cc999e50a11c399c68b3a0f1b7af4bc2317c0..33b5054b2906502d1d4b512bfa259bd2ba5a9f05 100644
 --- a/dist/runtime.js
 +++ b/dist/runtime.js
-@@ -744,7 +744,8 @@ var AcpRuntimeManager = class {
+@@ -738,13 +738,15 @@
+ 	deps;
+ 	activeControllers = /* @__PURE__ */ new Map();
+ 	pendingPersistentClients = /* @__PURE__ */ new Map();
++	sessionSpawnEnvs = /* @__PURE__ */ new Map();
+ 	closingActiveRecords = /* @__PURE__ */ new Set();
+ 	constructor(options, deps = {}) {
+ 		this.options = options;
  		this.deps = deps;
  	}
  	createClient(options) {
@@ -83,11 +94,81 @@ index 6c9cc999e50a11c399c68b3a0f1b7af4bc2317c0..33b5054b2906502d1d4b512bfa259bd2
  	}
  	async readPendingPersistentClient(record, options) {
  		const pendingClient = this.pendingPersistentClients.get(record.acpxRecordId);
-diff --git a/dist/session-options-jkYbBxGE.d.ts b/dist/session-options-jkYbBxGE.d.ts
-index 9d37f377fb6a0828e0d2bc5a48754f3aa71509a4..680bc080fc5d6ffd266ed1b27d3d5056add9d980 100644
+@@ -763,6 +765,27 @@
+ 		this.pendingPersistentClients.delete(recordId);
+ 		await pendingClient.close().catch(() => {});
+ 	}
++	rememberSessionSpawnEnv(recordId, sessionOptions) {
++		const env = sessionOptions?.env;
++		if (!env || typeof env !== "object" || Object.keys(env).length === 0) {
++			this.sessionSpawnEnvs.delete(recordId);
++			return;
++		}
++		this.sessionSpawnEnvs.set(recordId, { ...env });
++	}
++	refreshPersistedSessionEnv(record, sessionOptions) {
++		const source = sessionOptions?.persistedEnv ?? sessionOptions?.env;
++		if (!source || typeof source !== "object") return;
++		const nextEnv = {};
++		for (const [key, value] of Object.entries(source)) {
++			if (typeof value === "string") nextEnv[key] = value;
++		}
++		if (Object.keys(nextEnv).length === 0) return;
++		record.acpx = {
++			...record.acpx,
++			session_options: { ...record.acpx?.session_options, env: nextEnv }
++		};
++	}
+ 	async refreshClosedState(record) {
+ 		if (!this.closingActiveRecords.has(record.acpxRecordId)) return record.closed === true;
+ 		const latest = await this.options.sessionStore.load(record.acpxRecordId).catch(() => void 0);
+@@ -832,6 +855,8 @@
+ 			existing.closed = false;
+ 			existing.closedAt = void 0;
+ 			this.closingActiveRecords.delete(existing.acpxRecordId);
++			this.rememberSessionSpawnEnv(existing.acpxRecordId, input.sessionOptions);
++			this.refreshPersistedSessionEnv(existing, input.sessionOptions);
+ 			await this.options.sessionStore.save(existing);
+ 			return existing;
+ 		}
+@@ -856,6 +881,7 @@
+ 				cwd,
+ 				session
+ 			});
++			this.rememberSessionSpawnEnv(record.acpxRecordId, input.sessionOptions);
+ 			keepClientOpen = await this.keepPersistentClient(input.mode, record.acpxRecordId, client);
+ 			return record;
+ 		} finally {
+@@ -1027,6 +1053,9 @@
+ 		return turn;
+ 	}
+ 	createTurnClient(record) {
++		const spawnEnv = this.sessionSpawnEnvs.get(record.acpxRecordId);
++		const recordOptions = sessionOptionsFromRecord(record);
++		const sessionOptions = spawnEnv && Object.keys(spawnEnv).length > 0 ? { ...recordOptions, env: { ...recordOptions?.env, ...spawnEnv } } : recordOptions;
+ 		return this.createClient({
+ 			agentCommand: record.agentCommand,
+ 			cwd: record.cwd,
+@@ -1035,7 +1064,7 @@
+ 			nonInteractivePermissions: this.options.nonInteractivePermissions,
+ 			onPermissionRequest: this.options.onPermissionRequest,
+ 			verbose: this.options.verbose,
+-			sessionOptions: sessionOptionsFromRecord(record)
++			sessionOptions
+ 		});
+ 	}
+ 	createRuntimeTurnCheckpoint(record, conversation, readAcpxState) {
+@@ -1308,6 +1337,7 @@
+ 				reset_on_next_ensure: true
+ 			};
+ 		} else await this.closePendingPersistentClient(record.acpxRecordId);
++		this.sessionSpawnEnvs.delete(record.acpxRecordId);
+ 		record.closed = true;
+ 		record.closedAt = isoNow();
+ 		await this.options.sessionStore.save(record);
 --- a/dist/session-options-jkYbBxGE.d.ts
 +++ b/dist/session-options-jkYbBxGE.d.ts
-@@ -84,6 +84,9 @@ type AcpClientOptions = {
+@@ -84,6 +84,9 @@
    terminal?: boolean;
    suppressSdkConsoleErrors?: boolean;
    verbose?: boolean;
@@ -97,3 +178,18 @@ index 9d37f377fb6a0828e0d2bc5a48754f3aa71509a4..680bc080fc5d6ffd266ed1b27d3d5056
    sessionOptions?: {
      model?: string;
      allowedTools?: string[];
+@@ -268,6 +271,14 @@
+    * passing them to acpx.
+    */
+   env?: Record<string, string>;
++  /**
++   * Paperclip fork: env map persisted on the session record
++   * INSTEAD of `env`. `env` keeps the real spawn values in memory only; the
++   * record file is plaintext on disk, so this map must carry reference
++   * markers, never resolved secret values. Omitted -> legacy behavior
++   * (`env` persisted verbatim, for non-Paperclip callers).
++   */
++  persistedEnv?: Record<string, string>;
+ };
+ //#endregion
+ export { AcpPermissionRequest as a, NonInteractivePermissionPolicy as c, PermissionStats as d, SessionRecord as f, AcpPermissionDecision as i, PermissionMode as l, SystemPromptOption as n, AuthPolicy as o, PromptInput as p, AcpClientOptions as r, McpServer$1 as s, SessionAgentOptions as t, PermissionPolicy as u };

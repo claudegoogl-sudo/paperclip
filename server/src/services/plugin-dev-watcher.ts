@@ -172,7 +172,16 @@ export function createPluginDevWatcher(
   lifecycle: PluginLifecycleManager,
   resolvePluginPackagePath?: ResolvePluginPackagePath,
   fsDeps?: PluginDevWatcherFsDeps,
+  options?: {
+    /**
+     * Restart implementation used on file change. Defaults to
+     * `lifecycle.restartWorker`. The host passes a runtime-services-backed
+     * lifecycle here so file-change restarts take the full reload path.
+     */
+    restartWorker?: (pluginId: string) => Promise<void>;
+  },
 ): PluginDevWatcher {
+  const restartWorker = options?.restartWorker ?? ((pluginId: string) => lifecycle.restartWorker(pluginId));
   const watchers = new Map<string, FSWatcher>();
   // Absolute package path each active watcher is bound to, so a runtime
   // repoint (soft-uninstall + local reinstall from a new dir) can be detected
@@ -251,7 +260,7 @@ export function createPluginDevWatcher(
               "plugin-dev-watcher: file change detected, restarting worker",
             );
 
-            lifecycle.restartWorker(pluginId).catch((err) => {
+            restartWorker(pluginId).catch((err) => {
               log.warn(
                 {
                   pluginId,

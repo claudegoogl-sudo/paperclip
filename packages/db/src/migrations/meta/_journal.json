@@ -1721,6 +1721,13 @@
       "when": 1786985800000,
       "tag": "0249_board_api_key_auth_events",
       "breakpoints": true
+    },
+    {
+      "idx": 250,
+      "version": "7",
+      "when": 1786985900000,
+      "tag": "0250_plugin_private_egress_optin",
+      "breakpoints": true
     }
   ]
 }

@@ -58,6 +58,7 @@
               "guides/board-operator/activity-log",
               "guides/board-operator/secret-egress-allowlists",
               "guides/board-operator/task-bridge-keys",
+              "guides/board-operator/notify-only-keys",
               "guides/board-operator/importing-and-exporting"
             ]
           },

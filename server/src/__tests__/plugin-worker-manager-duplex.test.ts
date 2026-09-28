@@ -656,6 +656,37 @@ describe("plugin worker manager duplex channel route", () => {
     }
   });
 
+  it("carries a batched transport-close exit through the pre-bind replay to the wait result", async () => {
+    const handle = makeDuplexHandle();
+    try {
+      await handle.start();
+      const session = await handle.openDuplexChannel(
+        duplexOpenInput({
+          // The worker writes the open reply and the data and transport-close exit
+          // frames in one stdout write, so the exit arrives before the route
+          // binds. The pre-bind hold must keep the discriminator, so the replayed
+          // exit still settles the wait as a transport close, not a bare exit.
+          batchWithOpenReply: true,
+          workerSessionId: "ws-A",
+          data: [{ chunk: "batched-one" }],
+          transportClosed: true,
+        }),
+      );
+      const chunks: string[] = [];
+      // The session streams raw `Uint8Array` chunks. Decode each one back to
+      // text, so the assertion below compares the plain-text payload the
+      // fixture directive scripted.
+      session.onData((chunk) => chunks.push(new TextDecoder().decode(chunk)));
+      // The discriminator survives the pre-bind hold and replay, so the wait
+      // resolves with the transport-close mark and no exit code.
+      await expect(session.wait()).resolves.toEqual({ exitCode: null, transportClosed: true });
+      expect(chunks).toEqual(["batched-one"]);
+      await session.close();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
   it("ends the route when a batched frame passes the per-chunk limit before the bind", async () => {
     const handle = makeDuplexHandle({
       duplexChannelLimits: { maxChunkChars: 4 },

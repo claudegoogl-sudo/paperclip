@@ -262,14 +262,33 @@ export async function loginBoardCli(params: {
     );
 
     if (status.status === "approved") {
-      const me = await requestJson<{ userId: string; user?: { id: string } | null }>(
-        `${apiBase}/api/cli-auth/me`,
-        {
-          headers: {
-            authorization: `Bearer ${challenge.boardApiToken}`,
+      let me: { userId: string; user?: { id: string } | null };
+      try {
+        me = await requestJson<{ userId: string; user?: { id: string } | null }>(
+          `${apiBase}/api/cli-auth/me`,
+          {
+            headers: {
+              authorization: `Bearer ${challenge.boardApiToken}`,
+            },
           },
-        },
-      );
+        );
+      } catch (err) {
+        // The key is minted and approved but will never be stored. Revoke it
+        // (best effort) so it does not linger as an orphan only this dead
+        // process ever held.
+        const revoked = await requestJson(`${apiBase}/api/cli-auth/revoke-current`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${challenge.boardApiToken}` },
+          body: "{}",
+        }).then(() => true, () => false);
+        const reason = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `CLI login approved, but identity check failed: ${reason}. ` +
+            (revoked
+              ? "The new key was revoked; nothing was stored."
+              : "Revoking the new key also failed; revoke it from the board (board API keys) — nothing was stored."),
+        );
+      }
       setStoredBoardCredential({
         apiBase,
         token: challenge.boardApiToken,

@@ -51,26 +51,32 @@ vi.mock("../services/workspace-runtime.js", () => ({
   stopRuntimeServicesForProjectWorkspace: vi.fn(),
 }));
 
-function registerModuleMocks() {
-  vi.doMock("../telemetry.js", () => ({
-    getTelemetryClient: mockGetTelemetryClient,
-  }));
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("../telemetry.js", () => ({
+  getTelemetryClient: mockGetTelemetryClient,
+}));
 
-  vi.doMock("../services/index.js", () => ({
-    accessService: () => mockAccessService,
-    environmentService: () => mockEnvironmentService,
-    goalService: () => mockGoalService,
-    logActivity: mockLogActivity,
-    projectService: () => mockProjectService,
-    secretService: () => mockSecretService,
-    workspaceOperationService: () => mockWorkspaceOperationService,
-  }));
+vi.mock("../services/index.js", () => ({
+  accessService: () => mockAccessService,
+  environmentService: () => mockEnvironmentService,
+  goalService: () => mockGoalService,
+  logActivity: mockLogActivity,
+  projectService: () => mockProjectService,
+  secretService: () => mockSecretService,
+  workspaceOperationService: () => mockWorkspaceOperationService,
+}));
 
-  vi.doMock("../services/workspace-runtime.js", () => ({
-    startRuntimeServicesForWorkspaceControl: vi.fn(),
-    stopRuntimeServicesForProjectWorkspace: vi.fn(),
-  }));
-}
+vi.mock("../services/workspace-runtime.js", () => ({
+  startRuntimeServicesForWorkspaceControl: vi.fn(),
+  stopRuntimeServicesForProjectWorkspace: vi.fn(),
+}));
 
 async function createApp(routeType: "project" | "goal") {
   const { errorHandler } = await vi.importActual<typeof import("../middleware/index.js")>(
@@ -105,15 +111,6 @@ async function createApp(routeType: "project" | "goal") {
 
 describe("project and goal telemetry routes", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../telemetry.js");
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../services/workspace-runtime.js");
-    vi.doUnmock("../routes/projects.js");
-    vi.doUnmock("../routes/goals.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
     mockAccessService.decide.mockResolvedValue({
       allowed: true,

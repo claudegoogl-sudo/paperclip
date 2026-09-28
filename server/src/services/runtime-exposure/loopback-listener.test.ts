@@ -129,8 +129,26 @@ describe("listenerBindFactsForPort", () => {
 });
 
 describe("diagnoseRuntimeListenerBinds against live listeners", () => {
-  const appPort = RUNTIME_EXPOSURE_APP_PORT_MIN + 900;
-  const hmrPort = deriveViteHmrPort(appPort);
+  // The whole dedicated app range (42000-42999) sits inside Linux's default
+  // ephemeral source-port range, so ANY fixed port here can transiently
+  // collide with an unrelated loopback connection's source port and fail
+  // `listen` with EADDRINUSE on a loaded runner (seen in Release run
+  // 35798195266: both 127.0.0.1:42900 and [::]:42900 were squatted by the
+  // same transient occupant). Scan a small window of the allowlist instead
+  // of pinning one port: a squatted candidate is skipped and the test
+  // converges on a bindable one.
+  const APP_PORT_CANDIDATES = Array.from(
+    { length: 10 },
+    (_, index) => RUNTIME_EXPOSURE_APP_PORT_MIN + 900 + index,
+  );
+
+  function isEaddrInuse(err: unknown): boolean {
+    return (
+      typeof err === "object" &&
+      err !== null &&
+      (err as NodeJS.ErrnoException).code === "EADDRINUSE"
+    );
+  }
 
   async function withListener<T>(
     port: number,
@@ -150,14 +168,54 @@ describe("diagnoseRuntimeListenerBinds against live listeners", () => {
     }
   }
 
+  /** Retry `bind` across the candidate window when a port is EADDRINUSE-squatted. */
+  async function withBindableListener<T>(
+    host: string | undefined,
+    body: (boundPort: number) => Promise<T>,
+  ): Promise<T> {
+    let lastError: unknown = null;
+    for (const candidate of APP_PORT_CANDIDATES) {
+      try {
+        return await withListener(candidate, host, () => body(candidate));
+      } catch (err) {
+        if (!isEaddrInuse(err)) throw err;
+        lastError = err;
+      }
+    }
+    throw lastError ?? new Error("no app port candidate could be bound");
+  }
+
+  /**
+   * Bind the app/HMR pair for one candidate (app loopback-only, HMR
+   * hostless, mirroring the tests' original shapes). Either port being
+   * squatted moves the whole pair to the next candidate so the derived
+   * pairing always holds.
+   */
+  async function withAppAndHmrListeners<T>(
+    body: (appPort: number, hmrPort: number) => Promise<T>,
+  ): Promise<T> {
+    let lastError: unknown = null;
+    for (const candidate of APP_PORT_CANDIDATES) {
+      const hmrCandidate = deriveViteHmrPort(candidate);
+      try {
+        return await withListener(candidate, "127.0.0.1", () =>
+          withListener(hmrCandidate, undefined, () => body(candidate, hmrCandidate)));
+      } catch (err) {
+        if (!isEaddrInuse(err)) throw err;
+        lastError = err;
+      }
+    }
+    throw lastError ?? new Error("no app/HMR port candidate pair could be bound");
+  }
+
   it("stays silent for a real loopback listener", async () => {
-    await withListener(appPort, "127.0.0.1", async () => {
+    await withBindableListener("127.0.0.1", async (appPort) => {
       expect(await diagnoseRuntimeListenerBinds([appPort])).toBeNull();
     });
   });
 
   it("names the port and the wildcard address for a real 0.0.0.0 listener", async () => {
-    await withListener(appPort, undefined, async () => {
+    await withBindableListener(undefined, async (appPort) => {
       const diagnosis = await diagnoseRuntimeListenerBinds([appPort]);
       expect(diagnosis).toContain(`port ${appPort}`);
       // Node's hostless listen is dual-stack, so /proc shows :: and/or 0.0.0.0.
@@ -167,16 +225,21 @@ describe("diagnoseRuntimeListenerBinds against live listeners", () => {
   });
 
   it("catches the HMR companion port too, not just the app port", async () => {
-    await withListener(appPort, "127.0.0.1", async () => {
-      await withListener(hmrPort, undefined, async () => {
-        const diagnosis = await diagnoseRuntimeListenerBinds([appPort, hmrPort]);
-        expect(diagnosis).toContain(`port ${hmrPort}`);
-        expect(diagnosis).not.toContain(`port ${appPort} is bound`);
-      });
+    await withAppAndHmrListeners(async (appPort, hmrPort) => {
+      const diagnosis = await diagnoseRuntimeListenerBinds([appPort, hmrPort]);
+      expect(diagnosis).toContain(`port ${hmrPort}`);
+      expect(diagnosis).not.toContain(`port ${appPort} is bound`);
     });
   });
 
   it("stays silent for a port with no listener, leaving the verdict to the broker", async () => {
+    // Bind-release a candidate first: a successful bind proves the port is
+    // bindable right now, so once released it is verifiably listener-free for
+    // the diagnose call below (the /proc LISTEN row disappears on close with
+    // no connections pending). This keeps the original coverage — a port with
+    // no listener at all must also stay silent — without pinning a constant
+    // an ephemeral-port squatter could occupy.
+    const appPort = await withBindableListener("127.0.0.1", async (port) => port);
     expect(await diagnoseRuntimeListenerBinds([appPort])).toBeNull();
   });
 });

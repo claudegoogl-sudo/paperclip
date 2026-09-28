@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { StorageService, StorageProvider, PutFileInput, PutFileResult } from "./types.js";
-import { badRequest, forbidden, unprocessable } from "../errors.js";
+import { forbidden, unprocessable } from "../errors.js";
+import { assertObjectKeyReadable } from "./object-key.js";
 
 const MAX_SEGMENT_LENGTH = 120;
 
@@ -10,9 +11,17 @@ function sanitizeSegment(value: string): string {
     .trim()
     .replace(/[^a-zA-Z0-9._-]+/g, "_")
     .replace(/_{2,}/g, "_")
-    .replace(/^_+|_+$/g, "");
+    // Collapse dot-runs so a segment can never carry a ".." sequence, then
+    // strip leading/trailing dots (after the length slice, which could
+    // otherwise re-expose a trailing dot). The stored filename is assembled
+    // as `${stem}${ext}`; stems never end on a dot and exts start with at
+    // most one dot, so the concatenation stays free of "..".
+    .replace(/\.{2,}/g, ".")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, MAX_SEGMENT_LENGTH)
+    .replace(/^\.+|\.+$/g, "");
   if (!cleaned) return "file";
-  return cleaned.slice(0, MAX_SEGMENT_LENGTH);
+  return cleaned;
 }
 
 function normalizeNamespace(namespace: string): string {
@@ -33,10 +42,13 @@ function splitFilename(filename: string | null): { stem: string; ext: string } {
   const extRaw = path.extname(base);
   const stemRaw = extRaw ? base.slice(0, base.length - extRaw.length) : base;
   const stem = sanitizeSegment(stemRaw);
-  const ext = extRaw
+  // extname() output is "", ".", or ".suffix"; a bare "." (trailing-dot
+  // filenames like "x.") must not survive into the stored filename.
+  const extNormalized = extRaw
     .toLowerCase()
     .replace(/[^a-z0-9.]/g, "")
-    .slice(0, 16);
+    .replace(/\.{2,}/g, ".");
+  const ext = extNormalized === "." ? "" : extNormalized.slice(0, 16);
   return {
     stem,
     ext,
@@ -48,9 +60,8 @@ function ensureCompanyPrefix(companyId: string, objectKey: string): void {
   if (!objectKey.startsWith(expectedPrefix)) {
     throw forbidden("Object does not belong to company");
   }
-  if (objectKey.includes("..")) {
-    throw badRequest("Invalid object key");
-  }
+  // Same predicate the write path asserts — one validity concept, no drift.
+  assertObjectKeyReadable(objectKey);
 }
 
 function hashBuffer(input: Buffer): string {
@@ -94,6 +105,8 @@ export function createStorageService(provider: StorageProvider): StorageService 
     async putFile(input: PutFileInput): Promise<PutFileResult> {
       assertPutFileInput(input);
       const objectKey = buildObjectKey(input.companyId, input.namespace, input.originalFilename);
+      // Fail closed: never store a key the read path would refuse.
+      assertObjectKeyReadable(objectKey);
       const byteSize = input.body.length;
       const contentType = input.contentType.trim().toLowerCase();
       await provider.putObject({

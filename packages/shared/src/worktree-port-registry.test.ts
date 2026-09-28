@@ -37,6 +37,9 @@ describe("worktree port registry lock", () => {
     const firstEntered = deferred();
     const releaseFirst = deferred();
     let secondEntered = false;
+    // Captured inside the first holder's callback after the backdate below
+    // is observed to stick.
+    let backdatedAgeMs = 0;
 
     const first = withWorktreePortRegistryLock(homeDir, async () => {
       fs.renameSync(path.join(lockPath, "owner.json"), path.join(lockPath, "owner.unavailable.json"));
@@ -47,13 +50,24 @@ describe("worktree port registry lock", () => {
         processIdentity: "unavailable-process-identity",
       })}\n`);
       const oldTimestamp = new Date(Date.now() - 10_000);
-      fs.utimesSync(lockPath, oldTimestamp, oldTimestamp);
+      // The lock heartbeat worker fires its first liveness touch (which
+      // utimesSync-es the lock dir to now) concurrently with this callback,
+      // so the backdate below can be overwritten by an in-flight touch that
+      // the runner scheduled late. Backdate and re-read synchronously on
+      // this thread and retry until the backdate is observed to stick, so
+      // the staleness assertion cannot race the toucher across the task
+      // boundary below.
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        fs.utimesSync(lockPath, oldTimestamp, oldTimestamp);
+        backdatedAgeMs = Date.now() - fs.statSync(lockPath).mtimeMs;
+        if (backdatedAgeMs > 9_000) break;
+      }
       firstEntered.resolve();
       await releaseFirst.promise;
     });
     await firstEntered.promise;
 
-    expect(Date.now() - fs.statSync(lockPath).mtimeMs).toBeGreaterThan(5_000);
+    expect(backdatedAgeMs).toBeGreaterThan(5_000);
 
     const second = withWorktreePortRegistryLock(homeDir, async () => {
       secondEntered = true;

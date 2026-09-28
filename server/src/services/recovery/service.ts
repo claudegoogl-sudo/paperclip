@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -90,6 +90,15 @@ import {
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import {
+  HOST_MAX_CONCURRENT_RUNS_ENV_VAR,
+  resolveHostRunCeiling,
+} from "../host-run-ceiling.js";
+import {
+  RECOVERY_REPLAY_MAX_CONCURRENT_ENV_VAR,
+  createRecoveryReplayPacer,
+  resolveRecoveryReplayCap,
+} from "./replay-pacing.js";
+import {
   collectDispositionRepairSourceState,
   dispositionRepairDelayMs,
   DISPOSITION_REPAIR_MAX_ATTEMPTS,
@@ -102,8 +111,81 @@ const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = [
   ...UNSUCCESSFUL_HEARTBEAT_RUN_STATUSES,
   "interrupted",
 ] as const;
+
+/**
+ * Write an `issue.recovery_skipped` activity row at most once per quiet period.
+ *
+ * The stranded-issue sweep re-evaluates parked issues every tick and the skip
+ * decision is (correctly) repeated each time. Logging it each time wrote one
+ * identical row per sweep (~every 30 s) for every parked issue. Suppress the
+ * write when the latest skip row for this issue carries the same details and
+ * is not older than the issue's `updatedAt` (which comments, status, assignee
+ * and execution-policy changes all bump).
+ */
+async function logRecoverySkippedOnceWithDb(
+  db: Db,
+  issue: { id: string; companyId: string; updatedAt: Date | string | null },
+  details: Record<string, unknown>,
+) {
+  // Stamp the issue version this skip was decided against; an unchanged
+  // stamp + unchanged reason means nothing new to record.
+  const stamped: Record<string, unknown> = {
+    ...details,
+    issueUpdatedAt: issue.updatedAt ? new Date(issue.updatedAt).toISOString() : null,
+  };
+  const [latest] = await db
+    .select({ details: activityLog.details })
+    .from(activityLog)
+    .where(
+      and(
+        eq(activityLog.companyId, issue.companyId),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, issue.id),
+        eq(activityLog.action, "issue.recovery_skipped"),
+      ),
+    )
+    .orderBy(desc(activityLog.createdAt))
+    .limit(1);
+  if (latest) {
+    const prev = (latest.details ?? {}) as Record<string, unknown>;
+    const same = Object.keys(stamped).every((k) => prev[k] === stamped[k]);
+    if (same) {
+      logger.debug(
+        { issueId: issue.id, reason: details.reason },
+        "recovery skip row deduped (issue unchanged since last skip row)",
+      );
+      return false;
+    }
+  }
+  await logActivity(db, {
+    companyId: issue.companyId,
+    actorType: "system",
+    actorId: "system",
+    agentId: null,
+    runId: null,
+    action: "issue.recovery_skipped",
+    entityType: "issue",
+    entityId: issue.id,
+    details: stamped,
+  });
+  return true;
+}
+
 export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
+// Cross-run correlation windows (fleet-stall umbrella): a single shared upstream
+// stall silences many runs within seconds of each other. A run may join an existing
+// evaluation of a sibling run only while that evaluation is fresh and the sibling
+// went silent within an absolute window of this run. Absolute ±window rather than
+// floor(time/60s) bucket equality so two events 1s apart across a bucket edge still
+// correlate.
+export const ACTIVE_RUN_CORRELATION_WINDOW_MS = 60 * 1000;
+export const ACTIVE_RUN_CORRELATION_MAX_EVALUATION_AGE_MS = 10 * 60 * 1000;
+// Watchdog decision value recorded on each correlated run so per-run decisions
+// (dismiss/snooze/terminate) keep working against the shared evaluation issue.
+// Not a human signal: excluded from the closed-evaluation auto-dismiss
+// "hasAnyDecision" guard and inert in the snooze/dismiss readers.
+export const WATCHDOG_DECISION_CORRELATED = "correlated";
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 export const DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS = 60 * 60 * 1000;
 
@@ -798,7 +880,54 @@ function buildLivenessOriginalIssueComment(finding: IssueLivenessFinding, escala
   ].join("\n");
 }
 
-export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup }) {
+export function recoveryService(
+  db: Db,
+  deps: {
+    enqueueWakeup: RecoveryWakeup;
+    /**
+     * Resolved host run ceiling (from the heartbeat service). When absent, the
+     * replay cap derives from the env ceiling the same way the heartbeat does.
+     */
+    hostCeilingValue?: number;
+    /** Raw `PAPERCLIP_RECOVERY_REPLAY_MAX_CONCURRENT` value; falls back to process env. */
+    replayMaxConcurrentEnvValue?: unknown;
+    /** Timing overrides for tests; production uses the >= 2s jittered defaults. */
+    replayPacing?: {
+      minDelayMs?: number;
+      jitterSpanMs?: number;
+      random?: () => number;
+      now?: () => number;
+      setTimeoutImpl?: (ms: number) => Promise<void>;
+    };
+  },
+) {
+  // Staggered boot/recovery replay (see ./replay-pacing.ts): the wakes this service
+  // drives during a recovery drain — stranded-issue continuation replays, assignment
+  // dispatch, disposition repair, dependency-wake heals — dispatch through the normal
+  // admission gate, so an unpaced drain can spawn a full house of adapter processes
+  // seconds after a restart. Every wake still runs and still goes through
+  // `reserveHostRunSlot`; the pacer only bounds how many start at once.
+  const replayCap = resolveRecoveryReplayCap(
+    deps.replayMaxConcurrentEnvValue ?? process.env[RECOVERY_REPLAY_MAX_CONCURRENT_ENV_VAR],
+    deps.hostCeilingValue
+      ?? resolveHostRunCeiling(process.env[HOST_MAX_CONCURRENT_RUNS_ENV_VAR]).value,
+  );
+  const replayPacer = createRecoveryReplayPacer({
+    cap: replayCap.value,
+    logger,
+    ...deps.replayPacing,
+  });
+  logger.info(
+    {
+      event: "recovery_replay_pacing_resolved",
+      recoveryReplayMaxConcurrent: replayCap.value,
+      source: replayCap.source,
+      envVar: RECOVERY_REPLAY_MAX_CONCURRENT_ENV_VAR,
+      ...(replayCap.invalidEnvValue ? { ignoredEnvValue: replayCap.invalidEnvValue } : {}),
+    },
+    "resolved recovery replay pacing cap",
+  );
+  const enqueueWakeup = replayPacer.wrapWake(deps.enqueueWakeup);
   const issuesSvc = issueService(db);
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -1195,7 +1324,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     retryOfRunId?: string | null;
     extraContext?: Record<string, unknown>;
   }) {
-    const queued = await deps.enqueueWakeup(input.agentId, {
+    const queued = await enqueueWakeup(input.agentId, {
       source: "automation",
       triggerDetail: "system",
       reason: input.reason,
@@ -1233,7 +1362,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   async function enqueueInitialAssignedTodoDispatch(issue: typeof issues.$inferSelect, agentId: string) {
-    return deps.enqueueWakeup(agentId, {
+    return enqueueWakeup(agentId, {
       source: "assignment",
       triggerDetail: "system",
       reason: "issue_assigned",
@@ -1348,7 +1477,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         },
       });
 
-      const queued = await deps.enqueueWakeup(creatorAgent.id, {
+      const queued = await enqueueWakeup(creatorAgent.id, {
         source: "automation",
         triggerDetail: "system",
         reason: "issue_assigned",
@@ -2113,6 +2242,187 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return true;
   }
 
+  // Anchor for a previously correlated run: the run has no evaluation issue of its
+  // own (findOpenStaleRunEvaluation never anchors it), so the decision row is the
+  // durable per-run bookkeeping that keeps later scan cycles from re-correlating
+  // and re-commenting on the shared evaluation.
+  async function findOpenCorrelatedEvaluation(companyId: string, runId: string) {
+    const [row] = await db
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        priority: issues.priority,
+      })
+      .from(heartbeatRunWatchdogDecisions)
+      .innerJoin(issues, eq(issues.id, heartbeatRunWatchdogDecisions.evaluationIssueId))
+      .where(
+        and(
+          eq(heartbeatRunWatchdogDecisions.companyId, companyId),
+          eq(heartbeatRunWatchdogDecisions.runId, runId),
+          eq(heartbeatRunWatchdogDecisions.decision, WATCHDOG_DECISION_CORRELATED),
+          eq(issues.companyId, companyId),
+          visibleIssueCondition(),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .orderBy(desc(heartbeatRunWatchdogDecisions.createdAt))
+      .limit(1);
+    return row ?? null;
+  }
+
+  // Oldest fresh open evaluation whose source run went silent within the correlation
+  // window of this run — the shared-upstream-stall candidate to join. Company-scoped:
+  // issues, agents and run data are company data, and a cross-company merge would leak
+  // one company's run ids/agent names into another company's thread.
+  async function findCorrelatableStaleRunEvaluation(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    now: Date;
+  }) {
+    const silenceStartedAt = silenceStartedAtForRun(input.run);
+    if (!silenceStartedAt) return null;
+    const candidates = await db
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        priority: issues.priority,
+        originId: issues.originId,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, input.run.companyId),
+          eq(issues.originKind, STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND),
+          ne(issues.originId, input.run.id),
+          gte(
+            issues.createdAt,
+            new Date(input.now.getTime() - ACTIVE_RUN_CORRELATION_MAX_EVALUATION_AGE_MS),
+          ),
+          visibleIssueCondition(),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .orderBy(asc(issues.createdAt))
+      .limit(25);
+    for (const candidate of candidates) {
+      if (!candidate.originId) continue;
+      const [siblingRun] = await db
+        .select({
+          lastOutputAt: heartbeatRuns.lastOutputAt,
+          processStartedAt: heartbeatRuns.processStartedAt,
+          startedAt: heartbeatRuns.startedAt,
+          createdAt: heartbeatRuns.createdAt,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, candidate.originId))
+        .limit(1);
+      if (!siblingRun) continue;
+      const siblingSilenceStartedAt = silenceStartedAtForRun(siblingRun);
+      if (
+        siblingSilenceStartedAt &&
+        Math.abs(siblingSilenceStartedAt.getTime() - silenceStartedAt.getTime()) <=
+          ACTIVE_RUN_CORRELATION_WINDOW_MS
+      ) {
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  // One correlation comment per (evaluation issue, correlated run) pair. The
+  // activity-log row is the persistence record that suppresses repeats across scan
+  // cycles and process restarts (same pattern as ensureSourceIssueCommentedForStaleEvaluation).
+  async function appendCorrelatedRunComment(input: {
+    evaluationIssue: { id: string; identifier: string | null };
+    run: typeof heartbeatRuns.$inferSelect;
+    runningAgent: { name: string };
+    evidence: Awaited<ReturnType<typeof collectStaleRunEvidence>>;
+    level: string;
+  }) {
+    const [priorCorrelation] = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, input.run.companyId),
+          eq(activityLog.action, "heartbeat.output_stale_run_correlated"),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, input.evaluationIssue.id),
+          eq(activityLog.runId, input.run.id),
+        ),
+      )
+      .limit(1);
+    if (priorCorrelation) return false;
+    await issuesSvc.addComment(
+      input.evaluationIssue.id,
+      [
+        "Correlated silent run — shared-upstream stall candidate. Watchdog tied this run to this evaluation instead of filing a duplicate ticket.",
+        "",
+        `- Agent: ${input.runningAgent.name}`,
+        `- Run: \`${input.run.id}\``,
+        `- Silent for: ${formatDuration(input.evidence.silenceAgeMs)} (${input.level})`,
+        `- Last output at: ${input.run.lastOutputAt?.toISOString() ?? "none recorded"}`,
+        "",
+        "Per-run dismiss/terminate still works via watchdog decisions against this issue.",
+      ].join("\n"),
+      { runId: input.run.id },
+    );
+    await logActivity(db, {
+      companyId: input.run.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: input.run.id,
+      action: "heartbeat.output_stale_run_correlated",
+      entityType: "issue",
+      entityId: input.evaluationIssue.id,
+      details: {
+        source: "recovery.scan_silent_active_runs",
+        level: input.level,
+        silenceAgeMs: input.evidence.silenceAgeMs,
+        lastOutputAt: input.run.lastOutputAt?.toISOString() ?? null,
+      },
+    });
+    return true;
+  }
+
+  // Durable per-run bookkeeping for a correlated run (idempotent per
+  // (company, run, evaluation) triple). Points the run's watchdog decision history at
+  // the shared evaluation so per-run dismiss/resolve operates on the right issue.
+  async function recordCorrelatedWatchdogDecision(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    evaluationIssue: { id: string };
+  }) {
+    const [existingRow] = await db
+      .select({ id: heartbeatRunWatchdogDecisions.id })
+      .from(heartbeatRunWatchdogDecisions)
+      .where(
+        and(
+          eq(heartbeatRunWatchdogDecisions.companyId, input.run.companyId),
+          eq(heartbeatRunWatchdogDecisions.runId, input.run.id),
+          eq(heartbeatRunWatchdogDecisions.evaluationIssueId, input.evaluationIssue.id),
+          eq(heartbeatRunWatchdogDecisions.decision, WATCHDOG_DECISION_CORRELATED),
+        ),
+      )
+      .limit(1);
+    if (existingRow) return existingRow;
+    const [row] = await db
+      .insert(heartbeatRunWatchdogDecisions)
+      .values({
+        companyId: input.run.companyId,
+        runId: input.run.id,
+        evaluationIssueId: input.evaluationIssue.id,
+        decision: WATCHDOG_DECISION_CORRELATED,
+        snoozedUntil: null,
+        reason:
+          "Auto-correlated by the silent-run watchdog: sibling evaluation went silent within the correlation window (single shared-upstream stall).",
+        createdByAgentId: null,
+        createdByUserId: null,
+        createdByRunId: null,
+      })
+      .returning({ id: heartbeatRunWatchdogDecisions.id });
+    return row ?? null;
+  }
+
   async function inspectSilentActiveRun(input: {
     run: typeof heartbeatRuns.$inferSelect;
     now: Date;
@@ -2244,6 +2554,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             and(
               eq(heartbeatRunWatchdogDecisions.companyId, input.run.companyId),
               eq(heartbeatRunWatchdogDecisions.runId, input.run.id),
+              // System correlation rows are not the "a human explicitly opted in to
+              // the watchdog lifecycle" signal this guard exists for.
+              ne(heartbeatRunWatchdogDecisions.decision, WATCHDOG_DECISION_CORRELATED),
             ),
           )
           .limit(1)
@@ -2303,6 +2616,32 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         });
       }
       return { kind: "existing" as const, evaluationIssueId: existing.id };
+    }
+
+    // Cross-run correlation (fleet-stall umbrella): a shared upstream stall silences
+    // many runs within seconds of each other. Tie this run into a fresh sibling
+    // evaluation instead of manufacturing one more ticket in a cluster. Order matters:
+    // own evaluation > correlated anchor > fresh correlate > create.
+    const correlatedAnchor = await findOpenCorrelatedEvaluation(input.run.companyId, input.run.id);
+    if (correlatedAnchor) {
+      return { kind: "correlated" as const, evaluationIssueId: correlatedAnchor.id };
+    }
+    const correlatable = await findCorrelatableStaleRunEvaluation({ run: input.run, now: input.now });
+    if (correlatable) {
+      await appendCorrelatedRunComment({
+        evaluationIssue: correlatable,
+        run: input.run,
+        runningAgent,
+        evidence,
+        level,
+      });
+      await recordCorrelatedWatchdogDecision({ run: input.run, evaluationIssue: correlatable });
+      if (level === "critical" && correlatable.priority !== "high") {
+        await issuesSvc.update(correlatable.id, {
+          priority: "high",
+        });
+      }
+      return { kind: "correlated" as const, evaluationIssueId: correlatable.id };
     }
 
     const ownerAgentId = await resolveStaleRunOwnerAgentId({ run: input.run, runningAgent, sourceIssue });
@@ -2365,7 +2704,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       });
     }
     if (ownerAgentId) {
-      await deps.enqueueWakeup(ownerAgentId, {
+      await enqueueWakeup(ownerAgentId, {
         source: "assignment",
         triggerDetail: "system",
         reason: "issue_assigned",
@@ -2785,6 +3124,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const result = {
       scanned: candidates.length,
       created: 0,
+      correlated: 0,
       existing: 0,
       escalated: 0,
       folded: 0,
@@ -2830,6 +3170,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           dismissedFalsePositive: decisionState.dismissedFalsePositive,
         });
         if (outcome.kind === "created") result.created += 1;
+      else if (outcome.kind === "correlated") result.correlated += 1;
       else if (outcome.kind === "existing") result.existing += 1;
       else if (outcome.kind === "escalated") result.escalated += 1;
       else if (outcome.kind === "folded") result.folded += 1;
@@ -2886,23 +3227,42 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
 
     const boardActor = input.actor.type === "board";
+    // Correlated binding: a run tied into a sibling run's evaluation by the watchdog's
+    // cross-run correlation has no evaluation issue of its own (originId of the shared
+    // issue is the sibling run). A prior `correlated` decision row is the durable
+    // run→evaluation binding that keeps per-run dismiss/snooze/terminate working
+    // against the shared evaluation issue.
+    const correlatedBinding = evaluationIssue
+      ? await db
+          .select({ id: heartbeatRunWatchdogDecisions.id })
+          .from(heartbeatRunWatchdogDecisions)
+          .where(
+            and(
+              eq(heartbeatRunWatchdogDecisions.companyId, run.companyId),
+              eq(heartbeatRunWatchdogDecisions.runId, run.id),
+              eq(heartbeatRunWatchdogDecisions.evaluationIssueId, evaluationIssue.id),
+              eq(heartbeatRunWatchdogDecisions.decision, WATCHDOG_DECISION_CORRELATED),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null)
+      : null;
+    const evaluationBoundToRun =
+      evaluationIssue !== null &&
+      evaluationIssue.originKind === STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND &&
+      (evaluationIssue.originId === run.id || correlatedBinding !== null);
     const assignedRecoveryOwner =
       input.actor.type === "agent" &&
       Boolean(input.actor.agentId) &&
-      evaluationIssue !== null &&
-      evaluationIssue.originKind === STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND &&
-      evaluationIssue.originId === run.id &&
-      evaluationIssue.hiddenAt === null &&
-      !["done", "cancelled"].includes(evaluationIssue.status) &&
+      evaluationBoundToRun &&
+      evaluationIssue?.hiddenAt === null &&
+      !["done", "cancelled"].includes(evaluationIssue?.status ?? "") &&
       evaluationIssue?.assigneeAgentId === input.actor.agentId;
     if (!boardActor && !assignedRecoveryOwner) {
       throw forbidden("Only the board or the assigned recovery owner can record watchdog decisions");
     }
 
-    if (evaluationIssue && (
-      evaluationIssue.originKind !== STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND ||
-      evaluationIssue.originId !== run.id
-    )) {
+    if (evaluationIssue && !evaluationBoundToRun) {
       throw forbidden("Watchdog decision evaluation issue is not bound to the target run");
     }
 
@@ -3761,7 +4121,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     if (!scheduledRun) {
       try {
         if (timing.delayMs === 0) {
-          const enqueuedRun = await deps.enqueueWakeup(agentId, {
+          const enqueuedRun = await enqueueWakeup(agentId, {
             source: "automation",
             triggerDetail: "system",
             reason: ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
@@ -4781,20 +5141,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         // source_scoped_recovery_action wake; it resumes when an external event
         // posts a comment and wakes the assignee normally.
         if (isStandbyWakeTargetIssue(issue)) {
-          await logActivity(db, {
-            companyId: issue.companyId,
-            actorType: "system",
-            actorId: "system",
-            agentId: null,
-            runId: null,
-            action: "issue.recovery_skipped",
-            entityType: "issue",
-            entityId: issue.id,
-            details: {
-              identifier: issue.identifier,
-              source: "recovery.reconcile_stranded_assigned_issue_skipped",
-              reason: "standby_wake_target",
-            },
+          await logRecoverySkippedOnceWithDb(db, issue, {
+            identifier: issue.identifier,
+            source: "recovery.reconcile_stranded_assigned_issue_skipped",
+            reason: "standby_wake_target",
           });
           result.skipped += 1;
           continue;
@@ -4806,21 +5156,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           agentId,
         );
         if (pendingApproval) {
-          await logActivity(db, {
-            companyId: issue.companyId,
-            actorType: "system",
-            actorId: "system",
-            agentId: null,
-            runId: null,
-            action: "issue.recovery_skipped",
-            entityType: "issue",
-            entityId: issue.id,
-            details: {
-              identifier: issue.identifier,
-              source: "recovery.reconcile_stranded_assigned_issue_skipped",
-              reason: "pending_board_approval",
-              approvalId: pendingApproval.approvalId,
-            },
+          await logRecoverySkippedOnceWithDb(db, issue, {
+            identifier: issue.identifier,
+            source: "recovery.reconcile_stranded_assigned_issue_skipped",
+            reason: "pending_board_approval",
+            approvalId: pendingApproval.approvalId,
           });
           result.skipped += 1;
           result.skippedDueToPendingApproval += 1;
@@ -4833,22 +5173,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           agentId,
         );
         if (pendingInteraction) {
-          await logActivity(db, {
-            companyId: issue.companyId,
-            actorType: "system",
-            actorId: "system",
-            agentId: null,
-            runId: null,
-            action: "issue.recovery_skipped",
-            entityType: "issue",
-            entityId: issue.id,
-            details: {
-              identifier: issue.identifier,
-              source: "recovery.reconcile_stranded_assigned_issue_skipped",
-              reason: "pending_wake_assignee_interaction",
-              interactionId: pendingInteraction.interactionId,
-              kind: pendingInteraction.kind,
-            },
+          await logRecoverySkippedOnceWithDb(db, issue, {
+            identifier: issue.identifier,
+            source: "recovery.reconcile_stranded_assigned_issue_skipped",
+            reason: "pending_wake_assignee_interaction",
+            interactionId: pendingInteraction.interactionId,
+            kind: pendingInteraction.kind,
           });
           result.skipped += 1;
           result.skippedDueToPendingWakeAssigneeInteraction += 1;
@@ -6346,7 +6676,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       },
     });
 
-    const wake = await deps.enqueueWakeup(ownerSelection.agentId, {
+    const wake = await enqueueWakeup(ownerSelection.agentId, {
       source: "assignment",
       triggerDetail: "system",
       reason: "issue_assigned",
@@ -6551,7 +6881,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
 
         try {
-          const wake = await deps.enqueueWakeup(agentId, {
+          const wake = await enqueueWakeup(agentId, {
             source: "automation",
             triggerDetail: "system",
             reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,

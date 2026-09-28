@@ -44,6 +44,7 @@ import type {
   PrincipalPermissionGrant,
   PermissionKey,
   PrincipalType,
+  StreamDropNotice,
 } from "./types.js";
 import { NOOP_PLUGIN_TRACER } from "./types.js";
 import type {
@@ -2561,6 +2562,12 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
     },
     streams: (() => {
       const channelCompanyMap = new Map<string, string>();
+      // Test-harness mirror of the production drop subscription: the harness
+      // has no host to send `streams.dropped`, so registered handlers only
+      // fire if a spec invokes the returned notifier directly (tests that
+      // simulate host drop feedback capture handlers via `onDropped` and
+      // call them with a hand-built `StreamDropNotice`).
+      const dropHandlers = new Set<(notice: StreamDropNotice) => void>();
       return {
         open(channel: string, companyId: string) {
           channelCompanyMap.set(channel, companyId);
@@ -2570,6 +2577,12 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         },
         close(channel: string) {
           channelCompanyMap.delete(channel);
+        },
+        onDropped(handler: (notice: StreamDropNotice) => void) {
+          dropHandlers.add(handler);
+          return () => {
+            dropHandlers.delete(handler);
+          };
         },
       };
     })(),

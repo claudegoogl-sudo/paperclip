@@ -121,50 +121,56 @@ const annotationComment = {
   updatedAt: new Date("2026-05-14T12:01:00.000Z"),
 };
 
-function registerModuleMocks() {
-  vi.doMock("../services/index.js", () => ({
-    accessService: () => ({
-      canUser: vi.fn(),
-      decide: vi.fn(async (input: { action?: string }) => ({
-        allowed: true,
-        action: input.action,
-        reason: "allow_test",
-        explanation: "Allowed by test mock.",
-      })),
-      hasPermission: vi.fn(async () => false),
-    }),
-    agentService: () => ({ getById: vi.fn(), list: vi.fn(async () => []) }),
-    companySkillService: () => ({
-      completeTestRunForIssue: vi.fn(async () => null),
-    }),
-    companyService: () => ({ getById: vi.fn(async () => ({ id: companyId })) }),
-    documentAnnotationService: () => mockAnnotationService,
-    documentService: () => mockDocumentService,
-    environmentService: () => ({}),
-    executionWorkspaceService: () => ({}),
-    feedbackService: () => ({}),
-    goalService: () => ({}),
-    heartbeatService: () => mockHeartbeatService,
-    instanceSettingsService: () => ({
-      get: vi.fn(async () => ({ id: "settings", general: {} })),
-      getExperimental: vi.fn(async () => ({})),
-      getGeneral: vi.fn(async () => ({})),
-      listCompanyIds: vi.fn(async () => [companyId]),
-    }),
-    issueApprovalService: () => ({}),
-    issueRecoveryActionService: () => ({
-      getActiveForIssue: vi.fn(async () => null),
-      listActiveForIssues: vi.fn(async () => new Map()),
-    }),
-    issueReferenceService: () => mockIssueReferenceService,
-    issueService: () => mockIssueService,
-    issueThreadInteractionService: () => mockIssueThreadInteractionService,
-    logActivity: mockLogActivity,
-    projectService: () => ({}),
-    routineService: () => ({ syncRunStatusForIssue: vi.fn(async () => undefined) }),
-    workProductService: () => ({}),
-  }));
-}
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("../services/index.js", () => ({
+  accessService: () => ({
+    canUser: vi.fn(),
+    decide: vi.fn(async (input: { action?: string }) => ({
+      allowed: true,
+      action: input.action,
+      reason: "allow_test",
+      explanation: "Allowed by test mock.",
+    })),
+    hasPermission: vi.fn(async () => false),
+  }),
+  agentService: () => ({ getById: vi.fn(), list: vi.fn(async () => []) }),
+  companySkillService: () => ({
+    completeTestRunForIssue: vi.fn(async () => null),
+  }),
+  companyService: () => ({ getById: vi.fn(async () => ({ id: companyId })) }),
+  documentAnnotationService: () => mockAnnotationService,
+  documentService: () => mockDocumentService,
+  environmentService: () => ({}),
+  executionWorkspaceService: () => ({}),
+  feedbackService: () => ({}),
+  goalService: () => ({}),
+  heartbeatService: () => mockHeartbeatService,
+  instanceSettingsService: () => ({
+    get: vi.fn(async () => ({ id: "settings", general: {} })),
+    getExperimental: vi.fn(async () => ({})),
+    getGeneral: vi.fn(async () => ({})),
+    listCompanyIds: vi.fn(async () => [companyId]),
+  }),
+  issueApprovalService: () => ({}),
+  issueRecoveryActionService: () => ({
+    getActiveForIssue: vi.fn(async () => null),
+    listActiveForIssues: vi.fn(async () => new Map()),
+  }),
+  issueReferenceService: () => mockIssueReferenceService,
+  issueService: () => mockIssueService,
+  issueThreadInteractionService: () => mockIssueThreadInteractionService,
+  logActivity: mockLogActivity,
+  projectService: () => ({}),
+  routineService: () => ({ syncRunStatusForIssue: vi.fn(async () => undefined) }),
+  workProductService: () => ({}),
+}));
 
 async function createApp(actor: "board" | "agent" = "board", actorCompanyId = companyId) {
   const [{ issueRoutes }, { errorHandler }] = await Promise.all([
@@ -197,10 +203,6 @@ async function createApp(actor: "board" | "agent" = "board", actorCompanyId = co
 
 describe("document annotation routes", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../routes/issues.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
     mockIssueService.getById.mockResolvedValue({
       id: issueId,

@@ -1152,6 +1152,39 @@ const plugin = definePlugin({
 
 Stream notifications are fire-and-forget JSON-RPC messages (no `id` field). They are sent via `notifyHost()` synchronously during handler execution.
 
+### Attribution: emit inside a dispatch, or pin the channel first
+
+The host tenant-verifies every stream notification. A `streams.emit` from an
+async loop, timer, or reconnect callback — code running **outside any
+dispatch** — cannot be attributed on its own, and the host fails closed
+rather than guess the tenant. Two supported shapes:
+
+1. **Open inside a dispatch, emit anywhere.** Call `ctx.streams.open(channel,
+   companyId)` while servicing a dispatch for that company (a tool call, action,
+   or job). The host pins the channel to that company. Later out-of-dispatch
+   `emit`/`close` calls for the channel are verified against the pin and
+   delivered — this is the pattern for status loops seeded by a dispatch.
+2. **Emit inside the dispatch.** Anything emitted while the dispatch is in
+   flight is verified against the dispatch scope directly (and pins the channel
+   as a side effect).
+
+Everything else is dropped. A drop is never silent: the host logs a warning
+(queryable per §26.1) and sends a `streams.dropped` notification back to the
+worker, which this SDK forwards to the plugin log:
+
+```
+[warn] host dropped streams emit (unpinned_channel) channel="status"
+```
+
+Reason codes: `invalid_invocation_scope`, `no_invocation_scope`,
+`company_mismatch`, `unpinned_channel`, `pin_mismatch`.
+
+If your emitter cannot be dispatched first (a pure background poller with no
+triggering call), open the channel from the first attributed dispatch you do
+get — for example the config-apply replay — or fall back to
+`usePluginData` polling from the UI. Workers bundled against SDKs older than
+the `streams.dropped` support ignore the drop signal; rebuild to surface it.
+
 ### UI side
 
 Use the `usePluginStream` hook (see [Hooks reference](#usepluginstreamtchannel-options) above) to subscribe to events from the UI.
@@ -1161,8 +1194,11 @@ Use the `usePluginStream` hook (see [Hooks reference](#usepluginstreamtchannel-o
 The host maintains an in-memory `PluginStreamBus` that fans out worker notifications to connected SSE clients:
 
 1. Worker emits `streams.emit` notification via stdout
-2. Host (`plugin-worker-manager`) receives the notification and publishes to `PluginStreamBus`
+2. Host (`plugin-worker-manager`) tenant-verifies it (invocation scope or channel pin, see above) and publishes to `PluginStreamBus`
 3. SSE endpoint (`GET /api/plugins/:pluginId/bridge/stream/:channel?companyId=...`) subscribes to the bus and writes events to the response
+
+The server wires the manager and the bus to the same instance at startup; a
+stream endpoint without a wired bus responds `501`.
 
 The bus is keyed by `pluginId:channel:companyId`, so multiple UI clients can subscribe to the same stream independently.
 
