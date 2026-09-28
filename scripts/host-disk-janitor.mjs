@@ -1535,7 +1535,7 @@ function printSummary(summary) {
     const counts = {};
     for (const e of u.excluded) counts[e.reason] = (counts[e.reason] || 0) + 1;
     console.log(`  excluded: ${Object.entries(counts).map(([k, v]) => `${k}=${v}`).join(", ") || "none"}`);
-    for (const e of u.excluded.filter((x) => x.reason === "in-use-by-live-process" || x.reason === "registered-package-path")) {
+    for (const e of u.excluded) {
       console.log(`  excluded (${e.reason}): ${e.path}`);
     }
   }
