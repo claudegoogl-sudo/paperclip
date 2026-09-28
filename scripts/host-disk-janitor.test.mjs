@@ -5,12 +5,15 @@ import {
   mkdirSync,
   writeFileSync,
   rmSync,
+  lstatSync,
   utimesSync,
   lutimesSync,
   existsSync,
   readdirSync,
   symlinkSync,
+  chmodSync,
 } from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -29,11 +32,34 @@ import {
   scanTmpCandidates,
   evaluateTmpEntry,
   parseDfUsePercent,
+  parseEmbeddedPostgresDataDir,
+  parsePostmasterOpts,
+  resolveDbCredential,
+  loadRegisteredPackagePaths,
+  findRegisteredOverlap,
+  tmpUnmatchedExclusionReason,
+  collectLiveProcessPaths,
+  collectDockerMountSources,
+  strictNewestLeafMtime,
+  isEntryInUse,
+  evaluateTmpUnmatched,
+  scanOwnerDecisionPaths,
+  fileDiskAlarmIssue,
+  dailyBumpMarker,
   run,
 } from "./host-disk-janitor.mjs";
 
 function tmpdir(prefix) {
   return mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+// 2026-09-09 reap fix: run() consults the embedded Postgres for registered plugin install
+// roots and FAILS CLOSED (deletes nothing in the worktree/tmp categories) when
+// that lookup does not answer. Tests must be hermetic -- and a CI runner has
+// no Postgres at all -- so every run() call in this file injects this stub
+// instead of letting the real DB lookup run.
+function testRegistered(paths = []) {
+  return async () => ({ status: "ok", paths, source: "test" });
 }
 
 function touch(filePath, { mtime } = {}) {
@@ -484,6 +510,16 @@ test("parseDfUsePercent reads the Use% column from df -kP output", () => {
 // and apply-twice idempotency (AC4).
 // ---------------------------------------------------------------------------
 
+// Test-only lstat: dirs contribute nothing and ctime reads as mtime, so
+// fixtures aged with utimes behave as "old" under the real age signal.
+function leafOnlyLstat(p) {
+  const st = lstatSync(p);
+  const out = Object.assign(Object.create(Object.getPrototypeOf(st)), st);
+  if (st.isDirectory()) Object.assign(out, { mtimeMs: 0, ctimeMs: 0 });
+  else out.ctimeMs = st.mtimeMs;
+  return out;
+}
+
 function buildSandbox() {
   const home = tmpdir("janitor-sandbox-");
   const backupsDir = path.join(home, "backups");
@@ -572,6 +608,12 @@ function buildSandbox() {
     // which is exactly the kind of blast radius this janitor must not have.
     PAPERCLIP_AUTH_JSON_PATH: path.join(home, "no-such-auth.json"),
     SELF_SCRIPT_PATH: path.join(home, "__self_not_under_any_candidate__", "host-disk-janitor.mjs"),
+    // Report-only owner-decision scan must never walk the real $HOME in tests.
+    OWNER_DECISION_GLOBS: [],
+    OWNER_DECISION_PATHS: [],
+    // Fixtures can only age leaf mtimes (ctime is not settable); never shell out to docker.
+    TMP_AGE_LSTAT: leafOnlyLstat,
+    DOCKER_MOUNTS: () => ({ ok: true, paths: new Set() }),
   };
   return { home, remotes: [staleRemote, liveRemote], config };
 }
@@ -583,7 +625,7 @@ test("run() dry-run reports correct candidates without touching disk", async () 
     worktrees: readdirSync(path.join(home, "work")).length,
   };
 
-  const summary = await run({ apply: false, config });
+  const summary = await run({ apply: false, config, loadRegistered: testRegistered() });
 
   assert.equal(summary.categories.backups.totalFiles, 30);
   // 24 kept by the hourly bucket, +1 by daily (newest of the single
@@ -605,7 +647,7 @@ test("run() dry-run reports correct candidates without touching disk", async () 
 
 test("run() --apply deletes eligible items and excludes live/dirty ones (AC3 regression guard)", async () => {
   const { home, remotes, config } = buildSandbox();
-  const summary = await run({ apply: true, config });
+  const summary = await run({ apply: true, config, loadRegistered: testRegistered() });
 
   assert.equal(summary.categories.backups.prunedFiles, 4);
   assert.equal(readdirSync(config.BACKUPS_DIR).length, 26);
@@ -624,10 +666,10 @@ test("run() --apply deletes eligible items and excludes live/dirty ones (AC3 reg
 
 test("run() --apply twice in a row is a no-op the second time (AC4 idempotency)", async () => {
   const { home, remotes, config } = buildSandbox();
-  const first = await run({ apply: true, config });
+  const first = await run({ apply: true, config, loadRegistered: testRegistered() });
   assert.ok(first.categories.backups.prunedFiles > 0);
 
-  const second = await run({ apply: true, config });
+  const second = await run({ apply: true, config, loadRegistered: testRegistered() });
   assert.equal(second.categories.backups.prunedFiles, 0);
   assert.equal(second.categories.runLogs.prunedFiles, 0);
   assert.equal(second.categories.worktrees.eligible, 0);
@@ -678,7 +720,7 @@ test("run() --apply prunes stale git-worktree registrations after deleting eligi
 
   assert.equal(evaluateWorktree(wtPath, Date.now(), config).eligible, true, "sanity: stale worktree is eligible");
 
-  const summary = await run({ apply: true, config });
+  const summary = await run({ apply: true, config, loadRegistered: testRegistered() });
 
   assert.ok(!existsSync(wtPath), "stale worktree directory must be deleted");
   assert.ok(
@@ -695,10 +737,479 @@ test("run() --apply prunes stale git-worktree registrations after deleting eligi
 test("run() dry-run alarm never makes a network call even when threshold is exceeded", async () => {
   const { home, remotes, config } = buildSandbox();
   const alarmConfig = { ...config, DISK_ALARM_THRESHOLD_PCT: 0 }; // guaranteed to alarm
-  const summary = await run({ apply: false, config: alarmConfig });
+  const summary = await run({ apply: false, config: alarmConfig, loadRegistered: testRegistered() });
   assert.equal(summary.diskAlarm.alarmed, true);
   assert.equal(summary.diskAlarm.wouldFileIssue, true);
   assert.equal(summary.diskAlarm.action, null);
   rmSync(home, { recursive: true, force: true });
   for (const remote of remotes) rmSync(remote, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-09-09 reap fix: DB-registered plugin package paths are never deletion-eligible
+// ---------------------------------------------------------------------------
+
+test("parseEmbeddedPostgresDataDir prefers the instance data dir over unrelated postgres processes", () => {
+  const psText = [
+    "  123 /usr/lib/postgresql/15/bin/postgres -D /var/lib/postgresql/15/main -p 5432",
+    "  456 /work/pg18-tools/bin/postgres -D /tmp/sync8241-staging/pgdata -p 55432 -c listen_addresses=127.0.0.1",
+    "  789 @embedded-postgres/native/bin/postgres -D /home/op/.paperclip/instances/default/db -p 54329 -c listen_addresses=",
+  ].join("\n");
+  assert.equal(parseEmbeddedPostgresDataDir(psText), "/home/op/.paperclip/instances/default/db");
+  assert.equal(parseEmbeddedPostgresDataDir("no postgres here"), null);
+});
+
+test("parsePostmasterOpts tolerates the per-argument quoting postmaster.opts uses", () => {
+  const opts = '"-p" "54329" "-c" "unix_socket_directories=/tmp/paperclip-pg-abc" "-c" "listen_addresses="';
+  const parsed = parsePostmasterOpts(opts);
+  assert.equal(parsed.port, 54329);
+  assert.equal(parsed.socketDir, "/tmp/paperclip-pg-abc");
+});
+
+test("resolveDbCredential reads a 0600 credential file and refuses looser modes (value never logged)", () => {
+  const io = {
+    exists: () => true,
+    mode: (p) => (p.startsWith("/good") ? 0o600 : 0o644),
+    read: () => "secret-value-must-never-be-printed",
+  };
+  assert.deepEqual(
+    { source: resolveDbCredential({ env: {}, dataDir: "/good/db", io }).source },
+    { source: "credfile" },
+  );
+  assert.throws(() => resolveDbCredential({ env: {}, dataDir: "/bad/db", io }), /expected 600/);
+  assert.throws(() => resolveDbCredential({ env: {}, dataDir: null, io }), /data dir/);
+});
+
+test("findRegisteredOverlap matches equal, candidate-inside-root, and root-inside-candidate", () => {
+  const roots = ["/live/tree", "/other/root"];
+  assert.equal(findRegisteredOverlap("/live/tree", roots), "/live/tree"); // equal
+  assert.equal(findRegisteredOverlap("/live/tree/sub/dir", roots), "/live/tree"); // candidate inside root
+  assert.equal(findRegisteredOverlap("/live", roots), "/live/tree"); // root inside candidate
+  assert.equal(findRegisteredOverlap("/unrelated/path", roots), null);
+  assert.equal(findRegisteredOverlap("/unrelated/path", []), null);
+  assert.equal(findRegisteredOverlap("/live/./tree", roots), "/live/tree"); // normalization
+});
+
+test("evaluateWorktree never makes a registered plain-copy install eligible (2026-09-09 reap regression)", () => {
+  const home = tmpdir("janitor-registered-");
+  const work = path.join(home, "work");
+  const deployTree = path.join(work, "deploy-tree");
+  mkdirSync(deployTree, { recursive: true });
+  // A plain-copy install: no .git, every file 60 days old -> old not-a-repo,
+  // which is exactly the shape the janitor reaped on 2026-09-09.
+  writeFileSync(path.join(deployTree, "index.js"), "old");
+  const oldTime = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000);
+  utimesSync(path.join(deployTree, "index.js"), oldTime, oldTime);
+  const config = {
+    ...CONFIG,
+    SELF_SCRIPT_PATH: path.join(home, "elsewhere", "host-disk-janitor.mjs"),
+  };
+
+  const withoutDb = evaluateWorktree(deployTree, Date.now(), config, []);
+  assert.equal(withoutDb.eligible, true, "sanity: without the registry the old not-a-repo dir is eligible");
+
+  const withDb = evaluateWorktree(deployTree, Date.now(), config, [deployTree]);
+  assert.equal(withDb.eligible, false, "registered root must never be eligible");
+  assert.equal(withDb.registeredRoot, deployTree);
+  assert.equal(withDb.classification, "not-a-repo");
+  assert.equal(withDb.isOldEnough, true, "exclusion must not depend on age");
+
+  rmSync(home, { recursive: true, force: true });
+});
+
+test("evaluateTmpEntry applies the same registered-path guard", () => {
+  const home = tmpdir("janitor-tmpreg-");
+  const scratch = path.join(home, "pla9001");
+  mkdirSync(scratch, { recursive: true });
+  writeFileSync(path.join(scratch, "f.txt"), "x");
+  const oldTime = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000);
+  utimesSync(path.join(scratch, "f.txt"), oldTime, oldTime);
+  const config = { ...CONFIG };
+  assert.equal(evaluateTmpEntry(scratch, Date.now(), config, [scratch]).eligible, false);
+  assert.equal(evaluateTmpEntry(scratch, Date.now(), config, []).eligible, true);
+  rmSync(home, { recursive: true, force: true });
+});
+
+test("loadRegisteredPackagePaths JSON override dedupes and resolves; malformed override fails unavailable", async () => {
+  const ok = await loadRegisteredPackagePaths({
+    config: { ...CONFIG, REGISTERED_PATHS_JSON_OVERRIDE: '["/a/b", "/a/b/"]' },
+  });
+  assert.equal(ok.status, "ok");
+  assert.equal(ok.source, "json-override");
+  assert.deepEqual(ok.paths, ["/a/b"]);
+
+  const bad = await loadRegisteredPackagePaths({
+    config: { ...CONFIG, REGISTERED_PATHS_JSON_OVERRIDE: '{"not":"an array"}' },
+  });
+  assert.equal(bad.status, "unavailable");
+  assert.match(bad.error, /not a JSON array/);
+});
+
+test("run() fails CLOSED when the registered-path lookup is unavailable (registry-outage fail-safe)", async () => {
+  const { home, remotes, config } = buildSandbox();
+  const summary = await run({
+    apply: false,
+    config,
+    loadRegistered: async () => ({ status: "unavailable", paths: [], source: "db", error: "injected outage" }),
+  });
+  assert.equal(summary.registeredPackagePaths.status, "unavailable");
+  assert.equal(summary.categories.worktrees.eligible, 0, "no worktree may be deleted while the registry is unreachable");
+  assert.equal(summary.categories.worktrees.eligibleBeforeRegisteredGuard, 2);
+  assert.equal(summary.categories.worktrees.guardFailureExcludedPaths.length, 2);
+  assert.equal(summary.categories.tmpScratch.eligible, 0);
+  assert.equal(summary.categories.tmpScratch.guardFailureExcludedPaths.length, 1);
+  rmSync(home, { recursive: true, force: true });
+  for (const remote of remotes) rmSync(remote, { recursive: true, force: true });
+});
+
+test("run() excludes a registered candidate and reports the exclusion with its root", async () => {
+  const { home, remotes, config } = buildSandbox();
+  const registeredRoot = path.join(config.WORKTREE_SCAN_DIRS[0], "derived-extract");
+  const summary = await run({
+    apply: false,
+    config,
+    loadRegistered: testRegistered([registeredRoot]),
+  });
+  assert.equal(summary.registeredPackagePaths.count, 1);
+  assert.equal(summary.categories.worktrees.eligible, 1); // only stale-safe-repo remains
+  assert.equal(summary.categories.worktrees.excludedRegistered.length, 1);
+  assert.deepEqual(
+    summary.categories.worktrees.excludedRegistered[0],
+    { path: registeredRoot, registeredRoot },
+  );
+  assert.ok(
+    !summary.categories.worktrees.eligiblePaths.includes(registeredRoot),
+    "registered candidate must not appear among deletion candidates",
+  );
+  rmSync(home, { recursive: true, force: true });
+  for (const remote of remotes) rmSync(remote, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// /tmp unmatched category (any name, agent uid, >= TMP_UNMATCHED_MAX_AGE_DAYS)
+// ---------------------------------------------------------------------------
+
+const UID = process.getuid();
+const OLD = new Date(Date.now() - 40 * 24 * 3600 * 1000);
+
+function unmatchedConfig(tmpDir, extra = {}) {
+  return { ...CONFIG, TMP_DIR: tmpDir, TMP_OWNER_UID: UID, TMP_UNMATCHED_MAX_AGE_DAYS: 14, TMP_AGE_LSTAT: leafOnlyLstat, DOCKER_MOUNTS: () => ({ ok: true, paths: new Set() }), ...extra };
+}
+
+test("tmpUnmatchedExclusionReason: protected names, special files, foreign owner fail closed", () => {
+  const cfg = { ...CONFIG, TMP_OWNER_UID: 1000 };
+  const ok = (name, kind = "dir", uid = 1000) => tmpUnmatchedExclusionReason({ name, kind, uid }, cfg);
+  assert.equal(ok("f53rb"), null);
+  assert.equal(ok("sync8241-staging"), null);
+  assert.equal(ok("notes.json", "file"), null);
+  assert.equal(ok("paperclip-pg-abc"), "protected-name");
+  assert.equal(ok("systemd-private-xyz-llama.service-1"), "protected-name");
+  assert.equal(ok(".X11-unix"), "protected-name");
+  assert.equal(ok(".ICE-unix"), "protected-name");
+  assert.equal(ok(".hidden-anything"), "protected-name");
+  assert.equal(ok("tmux-1000"), "protected-name");
+  assert.equal(ok("some.sock", "socket"), "special-file:socket");
+  assert.equal(ok("pipe", "fifo"), "special-file:fifo");
+  assert.equal(ok("link", "symlink"), "special-file:symlink");
+  assert.equal(ok("rootdir", "dir", 0), "foreign-owner");
+  assert.equal(ok("pla7777"), "pattern-category"); // owned by the 30-day pattern rule
+});
+
+test("evaluateTmpUnmatched: old uid-owned any-name entries are candidates; fresh, protected, socket, registered are not", async () => {
+  const dir = tmpdir("janitor-unmatched-");
+  touch(path.join(dir, "f53rb", "deep", "a.bin"), { mtime: OLD });
+  touch(path.join(dir, "old-file.json"), { mtime: OLD });
+  touch(path.join(dir, "fresh-dir", "x"));
+  touch(path.join(dir, "mixed", "old"), { mtime: OLD });
+  touch(path.join(dir, "mixed", "new")); // one fresh leaf keeps the whole entry
+  touch(path.join(dir, "paperclip-pg-1", "x"), { mtime: OLD });
+  touch(path.join(dir, "tmux-1000", "x"), { mtime: OLD });
+  touch(path.join(dir, ".X11-unix", "x"), { mtime: OLD });
+  touch(path.join(dir, "registered-plugin", "x"), { mtime: OLD });
+  const sockPath = path.join(dir, "live.sock");
+  const server = net.createServer();
+  await new Promise((r) => server.listen(sockPath, r));
+  try {
+    const live = { ok: true, paths: new Set() };
+    const res = evaluateTmpUnmatched(Date.now(), unmatchedConfig(dir), {
+      live,
+      registeredPaths: [path.join(dir, "registered-plugin")],
+    });
+    const cands = res.candidates.map((c) => path.basename(c.path)).sort();
+    assert.deepEqual(cands, ["f53rb", "old-file.json"]);
+    const reasons = Object.fromEntries(res.excluded.map((e) => [path.basename(e.path), e.reason]));
+    assert.equal(reasons["paperclip-pg-1"], "protected-name");
+    assert.equal(reasons["tmux-1000"], "protected-name");
+    assert.equal(reasons[".X11-unix"], "protected-name");
+    assert.equal(reasons["live.sock"], "special-file:socket");
+    assert.equal(reasons["registered-plugin"], "registered-package-path");
+  } finally {
+    server.close();
+  }
+});
+
+test("evaluateTmpUnmatched: entry that is a live cwd or holds an open fd is excluded", () => {
+  const dir = tmpdir("janitor-unmatched-live-");
+  touch(path.join(dir, "cwd-of-proc", "x"), { mtime: OLD });
+  touch(path.join(dir, "fd-holder", "sub", "db.sqlite"), { mtime: OLD });
+  touch(path.join(dir, "idle", "x"), { mtime: OLD });
+  const live = {
+    ok: true,
+    paths: new Set([path.join(dir, "cwd-of-proc"), path.join(dir, "fd-holder", "sub", "db.sqlite")]),
+  };
+  const res = evaluateTmpUnmatched(Date.now(), unmatchedConfig(dir), { live });
+  assert.deepEqual(res.candidates.map((c) => path.basename(c.path)), ["idle"]);
+  assert.equal(res.excluded.filter((e) => e.reason === "in-use-by-live-process").length, 2);
+});
+
+test("evaluateTmpUnmatched: failed /proc scan keeps everything (fail closed)", () => {
+  const dir = tmpdir("janitor-unmatched-procfail-");
+  touch(path.join(dir, "idle", "x"), { mtime: OLD });
+  const res = evaluateTmpUnmatched(Date.now(), unmatchedConfig(dir), { live: { ok: false, paths: new Set() } });
+  assert.equal(res.candidates.length, 0);
+  assert.equal(res.excluded[0].reason, "live-process-scan-failed");
+  // and collectLiveProcessPaths itself reports !ok on an unreadable proc dir
+  assert.equal(collectLiveProcessPaths(path.join(dir, "no-such-proc")).ok, false);
+  // an empty proc dir (no readable cwd at all) is also a failure, not "no users"
+  const emptyProc = tmpdir("janitor-emptyproc-");
+  assert.equal(collectLiveProcessPaths(emptyProc).ok, false);
+});
+
+test("collectLiveProcessPaths sees this test process's own cwd and open fds", () => {
+  const live = collectLiveProcessPaths("/proc");
+  assert.equal(live.ok, true);
+  assert.ok(live.paths.has(process.cwd()));
+  assert.equal(isEntryInUse(path.dirname(process.cwd()), live.paths), true);
+});
+
+test("run(): unmatched category is report-only unless TMP_UNMATCHED_DELETE is on; deletes when on; idempotent", async () => {
+  const { config } = buildSandbox();
+  touch(path.join(config.TMP_DIR, "free-form-scratch", "x"), { mtime: OLD });
+  const cfg = { ...config, TMP_OWNER_UID: UID, TMP_SCRATCH_PATTERNS: [/^pla/] };
+  const gated = await run({ apply: true, config: { ...cfg, TMP_UNMATCHED_DELETE: false }, loadRegistered: testRegistered() });
+  assert.equal(gated.categories.tmpUnmatched.deleted, false);
+  assert.ok(gated.categories.tmpUnmatched.candidates.some((c) => c.path.endsWith("free-form-scratch")));
+  assert.ok(existsSync(path.join(config.TMP_DIR, "free-form-scratch")));
+  const on = await run({ apply: true, config: { ...cfg, TMP_UNMATCHED_DELETE: true }, loadRegistered: testRegistered() });
+  assert.equal(on.categories.tmpUnmatched.deleted, true);
+  assert.ok(!existsSync(path.join(config.TMP_DIR, "free-form-scratch")));
+  const again = await run({ apply: true, config: { ...cfg, TMP_UNMATCHED_DELETE: true }, loadRegistered: testRegistered() });
+  assert.ok(!again.categories.tmpUnmatched.candidates.some((c) => c.path.endsWith("free-form-scratch")));
+});
+
+test("run(): unmatched category fails closed when the registered-path lookup is unavailable", async () => {
+  const { config } = buildSandbox();
+  touch(path.join(config.TMP_DIR, "free-form-scratch", "x"), { mtime: OLD });
+  const summary = await run({
+    apply: true,
+    config: { ...config, TMP_OWNER_UID: UID, TMP_UNMATCHED_DELETE: true },
+    loadRegistered: async () => ({ status: "unavailable", paths: [], source: "test", error: "down" }),
+  });
+  assert.equal(summary.categories.tmpUnmatched.eligible, 0);
+  assert.ok(existsSync(path.join(config.TMP_DIR, "free-form-scratch")));
+});
+
+test("scanOwnerDecisionPaths lists but never deletes", () => {
+  const home = tmpdir("janitor-owner-");
+  touch(path.join(home, ".pap1886-build", "big"), { mtime: OLD });
+  touch(path.join(home, "hist.sqlite"));
+  const cfg = {
+    ...CONFIG,
+    OWNER_DECISION_GLOBS: [{ dir: home, pattern: /^\.pap18/ }],
+    OWNER_DECISION_PATHS: [path.join(home, "hist.sqlite"), path.join(home, "missing")],
+  };
+  const out = scanOwnerDecisionPaths(cfg).map((e) => path.basename(e.path));
+  assert.deepEqual(out, [".pap1886-build", "hist.sqlite"]);
+  assert.ok(existsSync(path.join(home, ".pap1886-build", "big")));
+});
+
+// ---------------------------------------------------------------------------
+// Disk alarm wakes an owner
+// ---------------------------------------------------------------------------
+
+function fakeFetch({ open = [], comments = [] } = {}) {
+  const calls = [];
+  const impl = async (url, init = {}) => {
+    const method = init.method || "GET";
+    calls.push({ url, method, body: init.body ? JSON.parse(init.body) : undefined });
+    const json = (b, status = 200) => ({ ok: status < 400, status, json: async () => b });
+    if (method === "GET" && url.includes("/companies/")) return json(open);
+    if (method === "GET" && url.endsWith("/comments")) return json(comments);
+    if (method === "POST" && url.includes("/companies/")) return json({ id: "new-id", identifier: "ALARM-2" }, 201);
+    return json({}, 200);
+  };
+  return { impl, calls };
+}
+
+const CRED = { apiBase: "http://api.test", token: "t" };
+const ALARM_CFG = { ...CONFIG, DISK_ALARM_ASSIGNEE_AGENT_ID: "cto-agent" };
+const NOW = Date.parse("2026-09-28T02:00:00Z");
+
+test("fileDiskAlarmIssue: create assigns the owner with status todo", async () => {
+  const f = fakeFetch();
+  const r = await fileDiskAlarmIssue({ usePercent: 91, threshold: 85, companyId: "c", credential: CRED, nowMs: NOW, config: ALARM_CFG, fetchImpl: f.impl });
+  assert.equal(r.created, true);
+  const post = f.calls.find((c) => c.method === "POST");
+  assert.equal(post.body.assigneeAgentId, "cto-agent");
+  assert.equal(post.body.status, "todo");
+});
+
+test("fileDiskAlarmIssue: dedup hit on unassigned backlog alarm reassigns to owner + todo and posts the daily bump", async () => {
+  const f = fakeFetch({ open: [{ id: "a1", identifier: "ALARM-1", title: "[host-disk-alarm] x", status: "backlog", assigneeAgentId: null }] });
+  const r = await fileDiskAlarmIssue({ usePercent: 91, threshold: 85, companyId: "c", credential: CRED, nowMs: NOW, config: ALARM_CFG, fetchImpl: f.impl });
+  assert.equal(r.created, false);
+  assert.equal(r.reassigned, true);
+  assert.equal(r.commented, true);
+  const patch = f.calls.find((c) => c.method === "PATCH");
+  assert.deepEqual(patch.body, { assigneeAgentId: "cto-agent", status: "todo" });
+  const post = f.calls.find((c) => c.method === "POST");
+  assert.match(post.body.body, /91%/);
+  assert.ok(post.body.body.includes(dailyBumpMarker(NOW)));
+  assert.equal(f.calls.filter((c) => c.method === "POST" && c.url.includes("/companies/")).length, 0);
+});
+
+test("fileDiskAlarmIssue: keeps an existing assignee, bumps a backlog one to todo", async () => {
+  const f = fakeFetch({ open: [{ id: "a1", title: "[host-disk-alarm] x", status: "backlog", assigneeAgentId: "someone" }] });
+  await fileDiskAlarmIssue({ usePercent: 90, threshold: 85, companyId: "c", credential: CRED, nowMs: NOW, config: ALARM_CFG, fetchImpl: f.impl });
+  assert.deepEqual(f.calls.find((c) => c.method === "PATCH").body, { assigneeAgentId: "someone", status: "todo" });
+});
+
+test("fileDiskAlarmIssue: at most one comment per UTC day; no reassign when already owned + active", async () => {
+  const open = [{ id: "a1", title: "[host-disk-alarm] x", status: "todo", assigneeAgentId: "cto-agent" }];
+  const same = fakeFetch({ open, comments: [{ body: `earlier\n${dailyBumpMarker(NOW - 3600 * 1000)}` }] });
+  const r1 = await fileDiskAlarmIssue({ usePercent: 91, threshold: 85, companyId: "c", credential: CRED, nowMs: NOW, config: ALARM_CFG, fetchImpl: same.impl });
+  assert.equal(r1.commented, false);
+  assert.equal(r1.reassigned, false);
+  assert.equal(same.calls.filter((c) => c.method !== "GET").length, 0);
+  const nextDay = fakeFetch({ open, comments: [{ body: dailyBumpMarker(NOW - 86400 * 1000) }] });
+  const r2 = await fileDiskAlarmIssue({ usePercent: 92, threshold: 85, companyId: "c", credential: CRED, nowMs: NOW, config: ALARM_CFG, fetchImpl: nextDay.impl });
+  assert.equal(r2.commented, true);
+});
+
+test("fileDiskAlarmIssue: unreadable comments => no comment (never spam on a flaky read)", async () => {
+  const open = [{ id: "a1", title: "[host-disk-alarm] x", status: "todo", assigneeAgentId: "cto-agent" }];
+  const f = fakeFetch({ open });
+  const impl = async (url, init = {}) =>
+    url.endsWith("/comments") && !init.method ? { ok: false, status: 500, json: async () => ({}) } : f.impl(url, init);
+  const r = await fileDiskAlarmIssue({ usePercent: 91, threshold: 85, companyId: "c", credential: CRED, nowMs: NOW, config: ALARM_CFG, fetchImpl: impl });
+  assert.equal(r.commented, false);
+  assert.match(r.commentError, /skipped/);
+});
+
+test("addendum: /proc/*/maps paths count as live-process use", () => {
+  const proc = mkdtempSync(path.join(os.tmpdir(), "jan-proc-"));
+  mkdirSync(path.join(proc, "42"));
+  symlinkSync("/", path.join(proc, "42", "cwd"));
+  writeFileSync(path.join(proc, "42", "maps"), "7f00-7f01 r-xp 0 08:01 9 /tmp/scratchX/lib/addon.node\n7f02-7f03 rw-p 0 0 0 [heap]\n");
+  const live = collectLiveProcessPaths(proc);
+  assert.equal(live.ok, true);
+  assert.ok(live.paths.has("/tmp/scratchX/lib/addon.node"));
+});
+
+test("addendum: strict age walk fails closed on unreadable subdir and uses newest-inside mtime", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "jan-age-"));
+  const f = path.join(root, "a.txt");
+  writeFileSync(f, "x");
+  const old = new Date(Date.now() - 40 * 86400000);
+  utimesSync(f, old, old);
+  const r = strictNewestLeafMtime(root, leafOnlyLstat);
+  assert.equal(r.ok, true);
+  assert.ok(Math.abs(r.newestMtimeMs - old.getTime()) < 2000);
+  if (process.getuid() !== 0) {
+    const locked = path.join(root, "locked");
+    mkdirSync(locked);
+    chmodSync(locked, 0o000);
+    try { assert.equal(strictNewestLeafMtime(root, leafOnlyLstat).ok, false); } finally { chmodSync(locked, 0o755); }
+  }
+});
+
+test("addendum: claude-*/prime-* session dirs are protected names", () => {
+  const cfg = { TMP_UNMATCHED_EXCLUDE_PATTERNS: [/^\./, /^claude-/, /^prime-/], TMP_SCRATCH_PATTERNS: [], TMP_OWNER_UID: 1000 };
+  for (const n of ["claude-abc", "prime-xyz"]) assert.equal(tmpUnmatchedExclusionReason({ name: n, kind: "dir", uid: 1000 }, { ...cfg }), "protected-name");
+});
+
+test("age signal: copied tree with old leaf mtimes but fresh root ctime/dir mtimes is kept", () => {
+  const dir = tmpdir("janitor-copied-");
+  touch(path.join(dir, "copied-yesterday", "deep", "x"), { mtime: OLD }); // cp -a / tar x shape
+  const r = strictNewestLeafMtime(path.join(dir, "copied-yesterday"));
+  assert.equal(r.ok, true);
+  assert.ok(Date.now() - r.newestMtimeMs < 60000, "real lstat must see the fresh ctime/dir mtime");
+  // real lstat in the category => fresh => not a candidate
+  const res = evaluateTmpUnmatched(Date.now(), unmatchedConfig(dir, { TMP_AGE_LSTAT: lstatSync }), {
+    live: { ok: true, paths: new Set() },
+  });
+  assert.equal(res.candidates.length, 0);
+  // the leaf-only view (old behaviour) would have called it old
+  const leaf = strictNewestLeafMtime(path.join(dir, "copied-yesterday"), leafOnlyLstat);
+  assert.ok(Date.now() - leaf.newestMtimeMs > 20 * 86400000);
+});
+
+test("collectDockerMountSources: mount sources are live; docker failure fails closed", () => {
+  const exec = (bin, args) => {
+    if (args[0] === "ps") return "abc\ndef\n";
+    return JSON.stringify([{ Mounts: [{ Source: "/tmp/juk-data" }] }, { Mounts: [{ Source: "/srv/x" }, {}] }]);
+  };
+  const ok = collectDockerMountSources(exec);
+  assert.equal(ok.ok, true);
+  assert.deepEqual([...ok.paths].sort(), ["/srv/x", "/tmp/juk-data"]);
+  assert.equal(collectDockerMountSources(() => "").paths.size, 0);
+  assert.equal(collectDockerMountSources(() => "").ok, true);
+  const bad = collectDockerMountSources(() => { throw new Error("ENOENT docker"); });
+  assert.equal(bad.ok, false);
+});
+
+test("run(): docker-mounted entry is kept; docker scan failure keeps the whole category", async () => {
+  const { config } = buildSandbox();
+  touch(path.join(config.TMP_DIR, "mounted", "x"), { mtime: OLD });
+  touch(path.join(config.TMP_DIR, "idle", "x"), { mtime: OLD });
+  const cfg = { ...config, TMP_OWNER_UID: UID, TMP_SCRATCH_PATTERNS: [/^pla/], TMP_UNMATCHED_DELETE: true };
+  const mounted = path.join(config.TMP_DIR, "mounted");
+  const s1 = await run({
+    apply: true,
+    config: { ...cfg, DOCKER_MOUNTS: () => ({ ok: true, paths: new Set([path.join(mounted, "x")]) }) },
+    loadRegistered: testRegistered(),
+  });
+  assert.ok(existsSync(mounted));
+  assert.ok(!existsSync(path.join(config.TMP_DIR, "idle")));
+  assert.ok(s1.categories.tmpUnmatched.excluded.some((e) => e.path === mounted && e.reason === "in-use-by-live-process"));
+  const s2 = await run({
+    apply: true,
+    config: { ...cfg, DOCKER_MOUNTS: () => ({ ok: false, error: "down", paths: new Set() }) },
+    loadRegistered: testRegistered(),
+  });
+  assert.equal(s2.categories.tmpUnmatched.eligible, 0);
+  assert.ok(existsSync(mounted));
+});
+
+test("run(): re-check at delete time skips entries that became live; rm failures are not counted as freed", async () => {
+  const { config } = buildSandbox();
+  touch(path.join(config.TMP_DIR, "turns-live", "x"), { mtime: OLD });
+  touch(path.join(config.TMP_DIR, "rm-fails", "x"), { mtime: OLD });
+  touch(path.join(config.TMP_DIR, "ok", "x"), { mtime: OLD });
+  let calls = 0;
+  const turnsLive = path.join(config.TMP_DIR, "turns-live");
+  const summary = await run({
+    apply: true,
+    config: {
+      ...config,
+      TMP_OWNER_UID: UID,
+      TMP_SCRATCH_PATTERNS: [/^pla/],
+      TMP_UNMATCHED_DELETE: true,
+      // first scan: nothing live; second (pre-delete) scan: turns-live is a docker mount
+      DOCKER_MOUNTS: () => ({ ok: true, paths: calls++ === 0 ? new Set() : new Set([turnsLive]) }),
+      TMP_RM: (p, opts) => {
+        if (p.endsWith("rm-fails")) throw Object.assign(new Error("perm"), { code: "EACCES" });
+        return rmSync(p, opts);
+      },
+    },
+    loadRegistered: testRegistered(),
+  });
+  const u = summary.categories.tmpUnmatched;
+  const by = Object.fromEntries(u.candidates.map((c) => [path.basename(c.path), c]));
+  assert.equal(by["turns-live"].result, "skipped-at-delete (in-use)");
+  assert.equal(by["rm-fails"].result, "failed:EACCES");
+  assert.equal(by.ok.result, "deleted");
+  assert.equal(u.deletedCount, 1);
+  assert.equal(u.reclaimedBytes, by.ok.sizeBytes);
+  assert.ok(existsSync(turnsLive));
 });
