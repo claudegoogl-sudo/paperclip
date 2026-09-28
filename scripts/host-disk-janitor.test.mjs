@@ -10,6 +10,7 @@ import {
   existsSync,
   readdirSync,
   symlinkSync,
+  chmodSync,
 } from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -37,6 +38,7 @@ import {
   findRegisteredOverlap,
   tmpUnmatchedExclusionReason,
   collectLiveProcessPaths,
+  strictNewestLeafMtime,
   isEntryInUse,
   evaluateTmpUnmatched,
   scanOwnerDecisionPaths,
@@ -1077,4 +1079,36 @@ test("fileDiskAlarmIssue: unreadable comments => no comment (never spam on a fla
   const r = await fileDiskAlarmIssue({ usePercent: 91, threshold: 85, companyId: "c", credential: CRED, nowMs: NOW, config: ALARM_CFG, fetchImpl: impl });
   assert.equal(r.commented, false);
   assert.match(r.commentError, /skipped/);
+});
+
+test("addendum: /proc/*/maps paths count as live-process use", () => {
+  const proc = mkdtempSync(path.join(os.tmpdir(), "jan-proc-"));
+  mkdirSync(path.join(proc, "42"));
+  symlinkSync("/", path.join(proc, "42", "cwd"));
+  writeFileSync(path.join(proc, "42", "maps"), "7f00-7f01 r-xp 0 08:01 9 /tmp/scratchX/lib/addon.node\n7f02-7f03 rw-p 0 0 0 [heap]\n");
+  const live = collectLiveProcessPaths(proc);
+  assert.equal(live.ok, true);
+  assert.ok(live.paths.has("/tmp/scratchX/lib/addon.node"));
+});
+
+test("addendum: strict age walk fails closed on unreadable subdir and uses newest-inside mtime", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "jan-age-"));
+  const f = path.join(root, "a.txt");
+  writeFileSync(f, "x");
+  const old = new Date(Date.now() - 40 * 86400000);
+  utimesSync(f, old, old);
+  const r = strictNewestLeafMtime(root);
+  assert.equal(r.ok, true);
+  assert.ok(Math.abs(r.newestMtimeMs - old.getTime()) < 2000);
+  if (process.getuid() !== 0) {
+    const locked = path.join(root, "locked");
+    mkdirSync(locked);
+    chmodSync(locked, 0o000);
+    try { assert.equal(strictNewestLeafMtime(root).ok, false); } finally { chmodSync(locked, 0o755); }
+  }
+});
+
+test("addendum: claude-*/prime-* session dirs are protected names", () => {
+  const cfg = { TMP_UNMATCHED_EXCLUDE_PATTERNS: [/^\./, /^claude-/, /^prime-/], TMP_SCRATCH_PATTERNS: [], TMP_OWNER_UID: 1000 };
+  for (const n of ["claude-abc", "prime-xyz"]) assert.equal(tmpUnmatchedExclusionReason({ name: n, kind: "dir", uid: 1000 }, { ...cfg }), "protected-name");
 });
