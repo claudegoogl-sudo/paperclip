@@ -138,7 +138,7 @@ import type {
   ClaudeSetupTokenOverwrite,
   SetupTokenTransportAdvisory,
 } from "@paperclipai/shared";
-import { SETUP_TOKEN_TRANSPORT_ADVISORY_CODE } from "@paperclipai/shared";
+import { SETUP_TOKEN_TRANSPORT_ADVISORY_CODE, isModelOnlyAgentPatch } from "@paperclipai/shared";
 import { DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX } from "@paperclipai/adapter-codex-local";
 import {
   checkStagedCredentialReadiness,
@@ -1525,6 +1525,35 @@ export function agentRoutes(
       resource: { type: "agent", companyId: targetAgent.companyId, agentId: targetAgent.id },
     });
     if (decision.allowed) return;
+    throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+  }
+
+  // Model-only PATCH from an agent actor: first the normal config-update
+  // decision (agents:configure, allow_self, ...). If that denies, fall back to
+  // the separate agent_model:update action, which only agents:configure-model
+  // (or agents:configure) satisfies. The fallback is never consulted by any
+  // other route, so the narrow grant cannot unlock other config writes.
+  async function assertCanUpdateAgentModel(req: Request, targetAgent: { id: string; companyId: string }) {
+    if (!hasCompanyAccess(req, targetAgent.companyId)) {
+      throw notFound("Agent not found");
+    }
+    assertCompanyAccess(req, targetAgent.companyId);
+    const resource = { type: "agent" as const, companyId: targetAgent.companyId, agentId: targetAgent.id };
+    const decision = await access.decide({ actor: req.actor, action: "agent_config:update", resource });
+    if (decision.allowed) return;
+    const modelDecision = await access.decide({ actor: req.actor, action: "agent_model:update", resource });
+    if (modelDecision.allowed) {
+      logger.info(
+        {
+          actorAgentId: req.actor.type === "agent" ? req.actor.agentId : null,
+          targetAgentId: targetAgent.id,
+          companyId: targetAgent.companyId,
+          permissionKey: modelDecision.grant?.permissionKey ?? null,
+        },
+        "agent model-only update allowed by agent_model:update",
+      );
+      return;
+    }
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
   }
 
@@ -4010,6 +4039,9 @@ export function agentRoutes(
       return;
     }
 
+    // Classify the body BEFORE any normalization mutates it. Only this exact
+    // shape may fall back to the narrow agents:configure-model grant.
+    const modelOnlyPatch = isModelOnlyAgentPatch(req.body);
     const patchData = { ...(req.body as Record<string, unknown>) };
     const replaceAdapterConfig = patchData.replaceAdapterConfig === true;
     delete patchData.replaceAdapterConfig;
@@ -4133,6 +4165,8 @@ export function agentRoutes(
     );
     if (profileOnlyChange) {
       await assertCanApplyAgentProfileChange(req, existing);
+    } else if (modelOnlyPatch && req.actor.type === "agent") {
+      await assertCanUpdateAgentModel(req, existing);
     } else {
       await assertCanUpdateAgent(req, existing);
     }

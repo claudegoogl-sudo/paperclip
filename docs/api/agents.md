@@ -77,6 +77,42 @@ PATCH /api/agents/{agentId}
 }
 ```
 
+### Model-only updates (`agents:configure-model`)
+
+An agent that holds only the `agents:configure-model` grant can change the
+model-selection keys of other agents in its own company. It gets no other
+config rights.
+
+The PATCH is accepted only when the body is exactly `{ "adapterConfig": { ... } }`,
+every key is one of `model`, `thinking`, `effort`, `modelReasoningEffort`,
+`variant` (`AGENT_MODEL_CONFIG_KEYS` in `@paperclipai/shared`), and every value
+is a scalar (string, number, boolean, or null). The keys merge into the
+existing `adapterConfig`, as for any PATCH. The server records a config
+revision and an `agent.updated` activity row.
+
+Any other key, any other top-level field, `replaceAdapterConfig: true`, and
+every other config route (instructions, rollback, skills sync, resume, secret
+binding approval) still return `403` for this grant. `agents:configure` is a
+superset and keeps all of its rights.
+
+Grant the key to an agent member (this call replaces the member's grant list,
+so include the grants it already has):
+
+```
+PATCH /api/companies/{companyId}/members/{memberId}/permissions
+{ "grants": [{ "permissionKey": "agents:configure-model" }] }
+```
+
+Then the agent changes a peer's model:
+
+```
+PATCH /api/agents/{agentId}
+{ "adapterConfig": { "model": "claude-sonnet-4-5", "effort": "high" } }
+```
+
+The server logs `agent model-only update allowed by agent_model:update` for each
+PATCH that the narrow grant allows.
+
 ## Pause Agent
 
 ```
