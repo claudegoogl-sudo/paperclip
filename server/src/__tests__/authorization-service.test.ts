@@ -332,6 +332,57 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  it("agents:configure-model only satisfies agent_model:update, never agent_config:update", async () => {
+    const company = await createCompany(db, "AgentModelGrant");
+    const otherCompany = await createCompany(db, "AgentModelGrantOther");
+    const modelAgent = await createAgent(db, company.id);
+    const configureAgent = await createAgent(db, company.id);
+    const noGrantAgent = await createAgent(db, company.id);
+    const targetAgent = await createAgent(db, company.id);
+    const foreignAgent = await createAgent(db, otherCompany.id);
+    await grantAgentPermission(db, company.id, modelAgent.id, "agents:configure-model");
+    await grantAgentPermission(db, company.id, configureAgent.id, "agents:configure");
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: noGrantAgent.id,
+      status: "active",
+      membershipRole: "member",
+    });
+    const authz = authorizationService(db);
+    const asAgent = (id: string) => ({ type: "agent" as const, agentId: id, companyId: company.id, source: "agent_key" as const });
+    const target = { type: "agent" as const, companyId: company.id, agentId: targetAgent.id };
+
+    await expect(authz.decide({ actor: asAgent(modelAgent.id), action: "agent_model:update", resource: target }))
+      .resolves.toMatchObject({ allowed: true, reason: "allow_explicit_grant", grant: { permissionKey: "agents:configure-model" } });
+
+    // AC4 / AC3g / AC3h: the narrow grant never satisfies agent_config:update,
+    // with or without requiresChangeGrant / consentedChange.
+    for (const scope of [undefined, { requiresChangeGrant: true }, { requiresChangeGrant: true, consentedChange: true }]) {
+      const decision = await authz.decide({
+        actor: asAgent(modelAgent.id),
+        action: "agent_config:update",
+        resource: target,
+        ...(scope ? { scope } : {}),
+      });
+      expect(decision.allowed).toBe(false);
+    }
+
+    // agents:configure is a superset.
+    await expect(authz.decide({ actor: asAgent(configureAgent.id), action: "agent_model:update", resource: target }))
+      .resolves.toMatchObject({ allowed: true, grant: { permissionKey: "agents:configure" } });
+
+    await expect(authz.decide({ actor: asAgent(noGrantAgent.id), action: "agent_model:update", resource: target }))
+      .resolves.toMatchObject({ allowed: false });
+
+    // AC3i: another company's agent.
+    await expect(authz.decide({
+      actor: asAgent(modelAgent.id),
+      action: "agent_model:update",
+      resource: { type: "agent", companyId: otherCompany.id, agentId: foreignAgent.id },
+    })).resolves.toMatchObject({ allowed: false });
+  });
+
   it("enforces direct or consented suggest grants for skill configuration changes", async () => {
     const company = await createCompany(db, "SkillChangeGrant");
     const directAgent = await createAgent(db, company.id);

@@ -2638,3 +2638,8 @@ export {
   isPaperclipDevRunnerCommand,
   rewriteUrlHostToLoopback,
 } from "./runtime-exposure/loopback-bind.js";
+export {
+  AGENT_MODEL_CONFIG_KEYS,
+  isModelOnlyAgentPatch,
+  type AgentModelConfigKey,
+} from "./agent-model-patch.js";

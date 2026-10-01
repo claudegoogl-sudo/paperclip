@@ -1057,6 +1057,7 @@ export type JoinRequestStatus = (typeof JOIN_REQUEST_STATUSES)[number];
 export const PERMISSION_KEYS = [
   "agents:create",
   "agents:configure",
+  "agents:configure-model",
   "agents:suggest-changes",
   "skills:create",
   "skills:suggest-changes",

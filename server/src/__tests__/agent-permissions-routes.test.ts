@@ -1948,6 +1948,208 @@ describe.sequential("agent permission routes", () => {
     });
   });
 
+  describe("agents:configure-model narrow grant (model-only PATCH)", () => {
+    const peerAgentId = "55555555-5555-4555-8555-555555555555";
+    const otherCompanyId = "66666666-6666-4666-8666-666666666666";
+    const peerAgent = {
+      ...baseAgent,
+      id: peerAgentId,
+      name: "Peer",
+      urlKey: "peer",
+      adapterType: "process",
+      adapterConfig: { model: "old-model", command: "echo" },
+    };
+
+    function grantOnlyConfigureModel() {
+      // Simulates an actor whose ONLY grant is agents:configure-model: the
+      // authorization service allows agent_model:update and nothing else.
+      mockAccessService.canUser.mockResolvedValue(false);
+      mockAccessService.hasPermission.mockResolvedValue(false);
+      mockAccessService.decide.mockImplementation(async (input: { action?: string }) => {
+        const allowed = input.action === "agent_model:update";
+        return allowed
+          ? {
+            allowed: true,
+            action: input.action,
+            reason: "allow_explicit_grant",
+            explanation: "Allowed by explicit grant agents:configure-model.",
+            grant: { principalType: "agent", principalId: agentId, permissionKey: "agents:configure-model", scope: null },
+          }
+          : {
+            allowed: false,
+            action: input.action,
+            reason: "deny_no_grant",
+            explanation: `Missing permission for ${input.action ?? "action"}`,
+          };
+      });
+    }
+
+    async function agentApp() {
+      return createApp({ type: "agent", agentId, companyId, source: "agent_key", runId: "run-1" });
+    }
+
+    function modelActionRequested() {
+      return mockAccessService.decide.mock.calls.some(
+        ([input]) => (input as { action?: string }).action === "agent_model:update",
+      );
+    }
+
+    beforeEach(() => {
+      grantOnlyConfigureModel();
+      mockAgentService.getById.mockImplementation(async (id: string) => {
+        if (id === peerAgentId) return peerAgent;
+        if (id === agentId) return { ...baseAgent };
+        return null;
+      });
+      mockSyncInstructionsBundleConfigFromFilePath.mockImplementation((_agent, config) => config);
+      mockAgentService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...peerAgent,
+        ...patch,
+      }));
+    });
+
+    it("AC2: allows a model-only PATCH on a same-company agent, records revision + agent.updated", async () => {
+      const app = await agentApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${peerAgentId}`)
+        .send({ adapterConfig: { model: "new-model", effort: "high", thinking: true, variant: null } }));
+
+      expect(res.status).toBe(200);
+      expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+        action: "agent_model:update",
+        resource: { type: "agent", companyId, agentId: peerAgentId },
+      }));
+      const [updatedId, patch, options] = mockAgentService.update.mock.calls[0]!;
+      expect(updatedId).toBe(peerAgentId);
+      // Merge semantics: untouched existing keys survive.
+      expect((patch as Record<string, any>).adapterConfig).toMatchObject({
+        model: "new-model",
+        effort: "high",
+        command: "echo",
+      });
+      expect(options).toMatchObject({ recordRevision: { createdByAgentId: agentId, source: "patch" } });
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "agent.updated",
+        agentId,
+        entityId: peerAgentId,
+      }));
+    });
+
+    it.each([
+      ["provider", "x"],
+      ["failover", "x"],
+      ["env", { FOO: "bar" }],
+      ["command", "rm"],
+      ["apiKeyPolicy", "x"],
+      ["cwd", "/tmp"],
+      ["instructionsFilePath", "/etc/passwd"],
+      ["promptTemplate", "x"],
+    ])("AC3a: denies adapterConfig key %s alongside model", async (key, value) => {
+      const app = await agentApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${peerAgentId}`)
+        .send({ adapterConfig: { model: "new-model", [key]: value } }));
+      expect(res.status).toBe(403);
+      expect(modelActionRequested()).toBe(false);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("AC3a: denies a non-scalar model value", async () => {
+      const app = await agentApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${peerAgentId}`)
+        .send({ adapterConfig: { model: { nested: "x" } } }));
+      expect(res.status).toBe(403);
+      expect(modelActionRequested()).toBe(false);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["adapterType", "process"],
+      ["runtimeConfig", {}],
+      ["budgetMonthlyCents", 100],
+      ["spentMonthlyCents", 0],
+      ["status", "idle"],
+      ["reportsTo", null],
+      ["role", "engineer"],
+      ["name", "Renamed"],
+      ["metadata", {}],
+      ["defaultEnvironmentId", null],
+      ["desiredSkills", []],
+      ["instructionsBundle", {}],
+    ])("AC3b: denies extra top-level field %s", async (field, value) => {
+      const app = await agentApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${peerAgentId}`)
+        .send({ adapterConfig: { model: "new-model" }, [field]: value }));
+      expect([403, 422, 400]).toContain(res.status);
+      expect(res.status).not.toBe(200);
+      expect(modelActionRequested()).toBe(false);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("AC3c: denies replaceAdapterConfig: true", async () => {
+      const app = await agentApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${peerAgentId}`)
+        .send({ adapterConfig: { model: "new-model" }, replaceAdapterConfig: true }));
+      expect(res.status).toBe(403);
+      expect(modelActionRequested()).toBe(false);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["PUT instructions-bundle/file", (r: request.SuperTest<request.Test>) =>
+        r.put(`/api/agents/${peerAgentId}/instructions-bundle/file`).send({ path: "AGENTS.md", content: "x" })],
+      ["PATCH instructions-bundle", (r: request.SuperTest<request.Test>) =>
+        r.patch(`/api/agents/${peerAgentId}/instructions-bundle`).send({ mode: "managed" })],
+      ["PATCH instructions-path", (r: request.SuperTest<request.Test>) =>
+        r.patch(`/api/agents/${peerAgentId}/instructions-path`).send({ path: "/tmp/x.md" })],
+      ["AC3e POST config-revisions rollback", (r: request.SuperTest<request.Test>) =>
+        r.post(`/api/agents/${peerAgentId}/config-revisions/77777777-7777-4777-8777-777777777777/rollback`).send({})],
+      ["AC3f POST skills/sync", (r: request.SuperTest<request.Test>) =>
+        r.post(`/api/agents/${peerAgentId}/skills/sync`).send({ mode: "add", desiredSkills: [] })],
+      ["AC3h POST resume", (r: request.SuperTest<request.Test>) =>
+        r.post(`/api/agents/${peerAgentId}/resume`).send({})],
+    ])("AC3d-h: %s stays denied", async (_label, build) => {
+      const app = await agentApp();
+      const res = await requestApp(app, (baseUrl) => build(request(baseUrl) as any));
+      expect(res.status).toBe(403);
+      expect(modelActionRequested()).toBe(false);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("AC3i: a target agent in another company is not found", async () => {
+      mockAgentService.getById.mockImplementation(async (id: string) => {
+        if (id === peerAgentId) return { ...peerAgent, companyId: otherCompanyId };
+        if (id === agentId) return { ...baseAgent };
+        return null;
+      });
+      const app = await agentApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${peerAgentId}`)
+        .send({ adapterConfig: { model: "new-model" } }));
+      expect([403, 404]).toContain(res.status);
+      expect(modelActionRequested()).toBe(false);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+    });
+
+    it("AC5: a model-only PATCH by an agents:configure holder never needs the narrow action", async () => {
+      mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+        allowed: input.action === "agent_config:update",
+        action: input.action,
+        reason: input.action === "agent_config:update" ? "allow_explicit_grant" : "deny_no_grant",
+        explanation: "test",
+      }));
+      const app = await agentApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl)
+        .patch(`/api/agents/${peerAgentId}`)
+        .send({ adapterConfig: { model: "new-model" } }));
+      expect(res.status).toBe(200);
+      expect(modelActionRequested()).toBe(false);
+    });
+  });
+
   it("rejects heartbeat cancellation outside the caller company scope", async () => {
     mockHeartbeatService.getRun.mockResolvedValue({
       id: "run-1",

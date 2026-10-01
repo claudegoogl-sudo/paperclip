@@ -61,6 +61,7 @@ export type AuthorizationAction =
   | PermissionKey
   | "agent_config:read"
   | "agent_config:update"
+  | "agent_model:update"
   | "skill_config:update"
   | "agent:read"
   | "agent:wake"
@@ -146,7 +147,12 @@ function companyIdForResource(resource: AuthorizationResource) {
 }
 
 function permissionForAction(action: AuthorizationAction): PermissionKey | null {
-  if (action === "agent_config:read" || action === "agent_config:update" || action === "skill_config:update") {
+  if (
+    action === "agent_config:read" ||
+    action === "agent_config:update" ||
+    action === "agent_model:update" ||
+    action === "skill_config:update"
+  ) {
     return null;
   }
   if (
@@ -975,6 +981,7 @@ export function authorizationService(db: Db) {
       input.action === "decision_triage:manage" ||
       input.action === "agent_config:read" ||
       input.action === "agent_config:update" ||
+      input.action === "agent_model:update" ||
       input.action === "skill_config:update" ||
       input.action === "inbox:manage" ||
       input.action === "runtime:manage" ||
@@ -1498,6 +1505,35 @@ export function authorizationService(db: Db) {
       return broadDecision;
     }
 
+    // agent_model:update is a separate action on purpose: it is asked for
+    // only by the model-only PATCH path, never by decideWithProtectedChangeGrants,
+    // so the narrow grant cannot satisfy any requiresChangeGrant decision.
+    // agents:configure is a superset and is accepted too.
+    async function decideWithAgentModelGrant(
+      principalType: PrincipalType,
+      principalId: string,
+    ): Promise<AuthorizationDecision> {
+      const configureDecision = await decidePrincipalGrant({
+        companyId,
+        principalType,
+        principalId,
+        action: input.action,
+        permissionKey: "agents:configure",
+        scope: input.scope,
+      });
+      if (configureDecision.allowed || configureDecision.reason === "deny_missing_membership") {
+        return configureDecision;
+      }
+      return decidePrincipalGrant({
+        companyId,
+        principalType,
+        principalId,
+        action: input.action,
+        permissionKey: "agents:configure-model",
+        scope: input.scope,
+      });
+    }
+
     async function decideWithAgentConfigReadGrant(
       principalType: PrincipalType,
       principalId: string,
@@ -1710,6 +1746,9 @@ export function authorizationService(db: Db) {
       }
       if (input.action === "agent_config:read") {
         return decideWithAgentConfigReadGrant("user", input.actor.userId);
+      }
+      if (input.action === "agent_model:update") {
+        return decideWithAgentModelGrant("user", input.actor.userId);
       }
       if (input.action === "agent_config:update") {
         return decideWithProtectedChangeGrants("user", input.actor.userId, {
@@ -2224,6 +2263,10 @@ export function authorizationService(db: Db) {
         });
       }
       return decideWithAgentConfigReadGrant("agent", actorAgentId);
+    }
+
+    if (input.action === "agent_model:update") {
+      return decideWithAgentModelGrant("agent", actorAgentId);
     }
 
     if (input.action === "agent_config:update") {
