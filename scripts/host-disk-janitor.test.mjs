@@ -29,11 +29,25 @@ import {
   scanTmpCandidates,
   evaluateTmpEntry,
   parseDfUsePercent,
+  parseEmbeddedPostgresDataDir,
+  parsePostmasterOpts,
+  resolveDbCredential,
+  loadRegisteredPackagePaths,
+  findRegisteredOverlap,
   run,
 } from "./host-disk-janitor.mjs";
 
 function tmpdir(prefix) {
   return mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+// 2026-09-09 reap fix: run() consults the embedded Postgres for registered plugin install
+// roots and FAILS CLOSED (deletes nothing in the worktree/tmp categories) when
+// that lookup does not answer. Tests must be hermetic -- and a CI runner has
+// no Postgres at all -- so every run() call in this file injects this stub
+// instead of letting the real DB lookup run.
+function testRegistered(paths = []) {
+  return async () => ({ status: "ok", paths, source: "test" });
 }
 
 function touch(filePath, { mtime } = {}) {
@@ -583,7 +597,7 @@ test("run() dry-run reports correct candidates without touching disk", async () 
     worktrees: readdirSync(path.join(home, "work")).length,
   };
 
-  const summary = await run({ apply: false, config });
+  const summary = await run({ apply: false, config, loadRegistered: testRegistered() });
 
   assert.equal(summary.categories.backups.totalFiles, 30);
   // 24 kept by the hourly bucket, +1 by daily (newest of the single
@@ -605,7 +619,7 @@ test("run() dry-run reports correct candidates without touching disk", async () 
 
 test("run() --apply deletes eligible items and excludes live/dirty ones (AC3 regression guard)", async () => {
   const { home, remotes, config } = buildSandbox();
-  const summary = await run({ apply: true, config });
+  const summary = await run({ apply: true, config, loadRegistered: testRegistered() });
 
   assert.equal(summary.categories.backups.prunedFiles, 4);
   assert.equal(readdirSync(config.BACKUPS_DIR).length, 26);
@@ -624,10 +638,10 @@ test("run() --apply deletes eligible items and excludes live/dirty ones (AC3 reg
 
 test("run() --apply twice in a row is a no-op the second time (AC4 idempotency)", async () => {
   const { home, remotes, config } = buildSandbox();
-  const first = await run({ apply: true, config });
+  const first = await run({ apply: true, config, loadRegistered: testRegistered() });
   assert.ok(first.categories.backups.prunedFiles > 0);
 
-  const second = await run({ apply: true, config });
+  const second = await run({ apply: true, config, loadRegistered: testRegistered() });
   assert.equal(second.categories.backups.prunedFiles, 0);
   assert.equal(second.categories.runLogs.prunedFiles, 0);
   assert.equal(second.categories.worktrees.eligible, 0);
@@ -678,7 +692,7 @@ test("run() --apply prunes stale git-worktree registrations after deleting eligi
 
   assert.equal(evaluateWorktree(wtPath, Date.now(), config).eligible, true, "sanity: stale worktree is eligible");
 
-  const summary = await run({ apply: true, config });
+  const summary = await run({ apply: true, config, loadRegistered: testRegistered() });
 
   assert.ok(!existsSync(wtPath), "stale worktree directory must be deleted");
   assert.ok(
@@ -695,10 +709,150 @@ test("run() --apply prunes stale git-worktree registrations after deleting eligi
 test("run() dry-run alarm never makes a network call even when threshold is exceeded", async () => {
   const { home, remotes, config } = buildSandbox();
   const alarmConfig = { ...config, DISK_ALARM_THRESHOLD_PCT: 0 }; // guaranteed to alarm
-  const summary = await run({ apply: false, config: alarmConfig });
+  const summary = await run({ apply: false, config: alarmConfig, loadRegistered: testRegistered() });
   assert.equal(summary.diskAlarm.alarmed, true);
   assert.equal(summary.diskAlarm.wouldFileIssue, true);
   assert.equal(summary.diskAlarm.action, null);
+  rmSync(home, { recursive: true, force: true });
+  for (const remote of remotes) rmSync(remote, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-09-09 reap fix: DB-registered plugin package paths are never deletion-eligible
+// ---------------------------------------------------------------------------
+
+test("parseEmbeddedPostgresDataDir prefers the instance data dir over unrelated postgres processes", () => {
+  const psText = [
+    "  123 /usr/lib/postgresql/15/bin/postgres -D /var/lib/postgresql/15/main -p 5432",
+    "  456 /work/pg18-tools/bin/postgres -D /tmp/sync8241-staging/pgdata -p 55432 -c listen_addresses=127.0.0.1",
+    "  789 @embedded-postgres/native/bin/postgres -D /home/op/.paperclip/instances/default/db -p 54329 -c listen_addresses=",
+  ].join("\n");
+  assert.equal(parseEmbeddedPostgresDataDir(psText), "/home/op/.paperclip/instances/default/db");
+  assert.equal(parseEmbeddedPostgresDataDir("no postgres here"), null);
+});
+
+test("parsePostmasterOpts tolerates the per-argument quoting postmaster.opts uses", () => {
+  const opts = '"-p" "54329" "-c" "unix_socket_directories=/tmp/paperclip-pg-abc" "-c" "listen_addresses="';
+  const parsed = parsePostmasterOpts(opts);
+  assert.equal(parsed.port, 54329);
+  assert.equal(parsed.socketDir, "/tmp/paperclip-pg-abc");
+});
+
+test("resolveDbCredential reads a 0600 credential file and refuses looser modes (value never logged)", () => {
+  const io = {
+    exists: () => true,
+    mode: (p) => (p.startsWith("/good") ? 0o600 : 0o644),
+    read: () => "secret-value-must-never-be-printed",
+  };
+  assert.deepEqual(
+    { source: resolveDbCredential({ env: {}, dataDir: "/good/db", io }).source },
+    { source: "credfile" },
+  );
+  assert.throws(() => resolveDbCredential({ env: {}, dataDir: "/bad/db", io }), /expected 600/);
+  assert.throws(() => resolveDbCredential({ env: {}, dataDir: null, io }), /data dir/);
+});
+
+test("findRegisteredOverlap matches equal, candidate-inside-root, and root-inside-candidate", () => {
+  const roots = ["/live/tree", "/other/root"];
+  assert.equal(findRegisteredOverlap("/live/tree", roots), "/live/tree"); // equal
+  assert.equal(findRegisteredOverlap("/live/tree/sub/dir", roots), "/live/tree"); // candidate inside root
+  assert.equal(findRegisteredOverlap("/live", roots), "/live/tree"); // root inside candidate
+  assert.equal(findRegisteredOverlap("/unrelated/path", roots), null);
+  assert.equal(findRegisteredOverlap("/unrelated/path", []), null);
+  assert.equal(findRegisteredOverlap("/live/./tree", roots), "/live/tree"); // normalization
+});
+
+test("evaluateWorktree never makes a registered plain-copy install eligible (2026-09-09 reap regression)", () => {
+  const home = tmpdir("janitor-registered-");
+  const work = path.join(home, "work");
+  const deployTree = path.join(work, "deploy-tree");
+  mkdirSync(deployTree, { recursive: true });
+  // A plain-copy install: no .git, every file 60 days old -> old not-a-repo,
+  // which is exactly the shape the janitor reaped on 2026-09-09.
+  writeFileSync(path.join(deployTree, "index.js"), "old");
+  const oldTime = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000);
+  utimesSync(path.join(deployTree, "index.js"), oldTime, oldTime);
+  const config = {
+    ...CONFIG,
+    SELF_SCRIPT_PATH: path.join(home, "elsewhere", "host-disk-janitor.mjs"),
+  };
+
+  const withoutDb = evaluateWorktree(deployTree, Date.now(), config, []);
+  assert.equal(withoutDb.eligible, true, "sanity: without the registry the old not-a-repo dir is eligible");
+
+  const withDb = evaluateWorktree(deployTree, Date.now(), config, [deployTree]);
+  assert.equal(withDb.eligible, false, "registered root must never be eligible");
+  assert.equal(withDb.registeredRoot, deployTree);
+  assert.equal(withDb.classification, "not-a-repo");
+  assert.equal(withDb.isOldEnough, true, "exclusion must not depend on age");
+
+  rmSync(home, { recursive: true, force: true });
+});
+
+test("evaluateTmpEntry applies the same registered-path guard", () => {
+  const home = tmpdir("janitor-tmpreg-");
+  const scratch = path.join(home, "pla9001");
+  mkdirSync(scratch, { recursive: true });
+  writeFileSync(path.join(scratch, "f.txt"), "x");
+  const oldTime = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000);
+  utimesSync(path.join(scratch, "f.txt"), oldTime, oldTime);
+  const config = { ...CONFIG };
+  assert.equal(evaluateTmpEntry(scratch, Date.now(), config, [scratch]).eligible, false);
+  assert.equal(evaluateTmpEntry(scratch, Date.now(), config, []).eligible, true);
+  rmSync(home, { recursive: true, force: true });
+});
+
+test("loadRegisteredPackagePaths JSON override dedupes and resolves; malformed override fails unavailable", async () => {
+  const ok = await loadRegisteredPackagePaths({
+    config: { ...CONFIG, REGISTERED_PATHS_JSON_OVERRIDE: '["/a/b", "/a/b/"]' },
+  });
+  assert.equal(ok.status, "ok");
+  assert.equal(ok.source, "json-override");
+  assert.deepEqual(ok.paths, ["/a/b"]);
+
+  const bad = await loadRegisteredPackagePaths({
+    config: { ...CONFIG, REGISTERED_PATHS_JSON_OVERRIDE: '{"not":"an array"}' },
+  });
+  assert.equal(bad.status, "unavailable");
+  assert.match(bad.error, /not a JSON array/);
+});
+
+test("run() fails CLOSED when the registered-path lookup is unavailable (registry-outage fail-safe)", async () => {
+  const { home, remotes, config } = buildSandbox();
+  const summary = await run({
+    apply: false,
+    config,
+    loadRegistered: async () => ({ status: "unavailable", paths: [], source: "db", error: "injected outage" }),
+  });
+  assert.equal(summary.registeredPackagePaths.status, "unavailable");
+  assert.equal(summary.categories.worktrees.eligible, 0, "no worktree may be deleted while the registry is unreachable");
+  assert.equal(summary.categories.worktrees.eligibleBeforeRegisteredGuard, 2);
+  assert.equal(summary.categories.worktrees.guardFailureExcludedPaths.length, 2);
+  assert.equal(summary.categories.tmpScratch.eligible, 0);
+  assert.equal(summary.categories.tmpScratch.guardFailureExcludedPaths.length, 1);
+  rmSync(home, { recursive: true, force: true });
+  for (const remote of remotes) rmSync(remote, { recursive: true, force: true });
+});
+
+test("run() excludes a registered candidate and reports the exclusion with its root", async () => {
+  const { home, remotes, config } = buildSandbox();
+  const registeredRoot = path.join(config.WORKTREE_SCAN_DIRS[0], "derived-extract");
+  const summary = await run({
+    apply: false,
+    config,
+    loadRegistered: testRegistered([registeredRoot]),
+  });
+  assert.equal(summary.registeredPackagePaths.count, 1);
+  assert.equal(summary.categories.worktrees.eligible, 1); // only stale-safe-repo remains
+  assert.equal(summary.categories.worktrees.excludedRegistered.length, 1);
+  assert.deepEqual(
+    summary.categories.worktrees.excludedRegistered[0],
+    { path: registeredRoot, registeredRoot },
+  );
+  assert.ok(
+    !summary.categories.worktrees.eligiblePaths.includes(registeredRoot),
+    "registered candidate must not appear among deletion candidates",
+  );
   rmSync(home, { recursive: true, force: true });
   for (const remote of remotes) rmSync(remote, { recursive: true, force: true });
 });
