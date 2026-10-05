@@ -447,6 +447,16 @@ export const SECURITY_POSTURE_COLUMNS = [
   },
   {
     table: "routine_triggers",
+    column: "archived",
+    reason: "Dangerous value false: part of the trigger admission check in routines.ts (archived triggers never fire), so a flatten re-arms every archived schedule and webhook trigger.",
+  },
+  {
+    table: "routine_triggers",
+    column: "setup_pending",
+    reason: "Dangerous value false: setup-pending webhook triggers are refused by the dispatch admission check until setup completes, so a flatten makes half-configured triggers live.",
+  },
+  {
+    table: "routine_triggers",
     column: "replay_window_sec",
     reason: "Dangerous value a large number, or NULL which falls back to 300s: the bound on how long a captured signed request stays replayable, and widening it is invisible in the response.",
   },

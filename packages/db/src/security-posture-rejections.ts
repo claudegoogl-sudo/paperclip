@@ -5023,4 +5023,103 @@ export const SECURITY_POSTURE_REJECTIONS = [
     reason: "subject_agent_id is indexed for admin lookup of in-flight flows; rows are matched by the state token and swept by expiry, and no consumer reads it as an authorization predicate (code_verifier on this table is registered).",
   },
 
+  // upstream v2026.1001.0 additions (classified during the 1001.0 sync merge)
+  {
+    table: "agents",
+    columns: [
+     "appearance",
+    ],
+    reason: "Display appearance metadata (avatar/colour). No authorization or execution path reads it.",
+  },
+  {
+    table: "chat_conversations",
+    columns: [
+     "communication_guidance",
+    ],
+    reason: "Prompt guidance text for chat delivery. Content, not a control; no consumer reads it as a predicate.",
+  },
+  {
+    table: "chat_endpoints",
+    columns: [
+     "communication_instructions",
+    ],
+    reason: "Operator-authored instruction text for an endpoint. Content, not a control; no consumer reads it as a predicate.",
+  },
+  {
+    table: "chat_github_configurations",
+    columns: [
+     "company_id",
+     "configuration",
+     "created_at",
+     "endpoint_id",
+     "revision",
+     "updated_at",
+     "updated_by_user_id",
+    ],
+    reason: "Per-endpoint GitHub review configuration and its bookkeeping. In this release no server consumer reads these columns as an authorization predicate (only the schema and migration reference the table).",
+  },
+  {
+    table: "chat_github_registrations",
+    columns: [
+     "company_id",
+     "consumed_at",
+     "created_at",
+     "endpoint_id",
+     "expires_at",
+     "id",
+     "state_hash",
+     "status",
+     "trusted_origin",
+     "user_id",
+    ],
+    reason: "GitHub app registration handshake rows. In this release no server code reads the table (schema and migration only), so no column is evaluated as a predicate yet; revisit when a consumer lands.",
+  },
+  {
+    table: "chat_github_reviews",
+    columns: [
+     "assessment",
+     "check_id",
+     "check_url",
+     "company_id",
+     "conclusion",
+     "configuration_revision",
+     "created_at",
+     "delivery_id",
+     "endpoint_id",
+     "event",
+     "head_sha",
+     "id",
+     "issue_id",
+     "policy_snapshot",
+     "publication_receipts",
+     "pull_number",
+     "repository",
+     "repository_id",
+     "run_id",
+     "state",
+     "summary_id",
+     "summary_url",
+     "updated_at",
+    ],
+    reason: "Review run records (check ids, URLs, assessment, receipts). Output/bookkeeping data; no consumer reads them as an authorization predicate.",
+  },
+  {
+    table: "routine_triggers",
+    columns: [
+     "last_webhook_delivery",
+    ],
+    reason: "last_webhook_delivery is a display snapshot of the last inbound delivery; it is written for the UI and never compared in the admission check.",
+  },
+  {
+    table: "routine_webhook_test_receipts",
+    columns: [
+     "company_id",
+     "delivery_key_hash",
+     "id",
+     "received_at",
+     "trigger_id",
+    ],
+    reason: "Webhook test-delivery receipts. delivery_key_hash only dedupes repeated test deliveries for one trigger; authentication of the delivery happens before the receipt is written.",
+  },
+
 ];

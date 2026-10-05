@@ -2092,28 +2092,28 @@
       "idx": 300,
       "version": "7",
       "when": 1789743991329,
-      "tag": "0280_unique_genesis",
+      "tag": "0300_unique_genesis",
       "breakpoints": true
     },
     {
       "idx": 301,
       "version": "7",
       "when": 1789827314772,
-      "tag": "0281_true_boom_boom",
+      "tag": "0301_true_boom_boom",
       "breakpoints": true
     },
     {
       "idx": 302,
       "version": "7",
       "when": 1790004509370,
-      "tag": "0282_colossal_shocker",
+      "tag": "0302_colossal_shocker",
       "breakpoints": true
     },
     {
       "idx": 303,
       "version": "7",
       "when": 1790018362070,
-      "tag": "0283_jittery_psynapse",
+      "tag": "0303_jittery_psynapse",
       "breakpoints": true
     }
   ]

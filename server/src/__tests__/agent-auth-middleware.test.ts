@@ -252,9 +252,32 @@ describe("agent auth middleware", () => {
     "/api/routine-triggers/public/not-a-public-id/fire",
     `/api/routine-triggers/public/${"a".repeat(24)}/fire/extra`,
   ])("does not bypass actor authentication for %s", async (path) => {
+    // Fork divergence (see the fall-through test above): an unverified bearer
+    // is not rejected with 401 here, so prove the bypass did not apply by
+    // observing that the middleware actually tried to resolve the bearer.
     const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
-    const res = await request(createApp(db)).post(path).set("Authorization", "Bearer routine-secret");
-    expect(res.status).toBe(401);
+    let selects = 0;
+    const select = db.select;
+    db.select = (...args: unknown[]) => {
+      selects += 1;
+      return select(...args);
+    };
+    await request(createApp(db)).post(path).set("Authorization", "Bearer routine-secret");
+    expect(selects).toBeGreaterThan(0);
+  });
+
+  it("skips bearer resolution entirely on the public routine webhook path", async () => {
+    const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
+    let selects = 0;
+    const select = db.select;
+    db.select = (...args: unknown[]) => {
+      selects += 1;
+      return select(...args);
+    };
+    await request(createApp(db))
+      .post(`/api/routine-triggers/public/${"a".repeat(24)}/fire`)
+      .set("Authorization", "Bearer routine-secret");
+    expect(selects).toBe(0);
   });
   it("leaves public MCP gateway bearers for the gateway protocol to validate", async () => {
     const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
