@@ -147,7 +147,7 @@ jobs:
       - name: Reject internal/instance-local references in the fork delta (sync branches)
         if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'sync/upstream-')
         env:
-          UPSTREAM_SYNC_BASE: dffc2b3ca1b9e88fa21cb17493083e682dffd1ca
+          UPSTREAM_SYNC_BASE: 8f8a0ab7effbd6a0584107d8038736c134ee5047
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: node ./scripts/check-no-internal-ids.mjs "$UPSTREAM_SYNC_BASE" "$PR_HEAD_SHA"
 
