@@ -200,6 +200,9 @@ function denySkillPolicy(action = "skills.import") {
     logActivity: mockLogActivity,
   }));
 
+// The module mocks above are hoisted vi.mock calls, so they are already
+// registered before any import. hoistModuleGraph still needs a register hook.
+function registerModuleMocks() {}
 
 describe("company skill mutation permissions", () => {
   const routeModules = hoistModuleGraph(registerModuleMocks, async () => {
