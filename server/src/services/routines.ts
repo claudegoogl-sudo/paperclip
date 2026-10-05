@@ -25,6 +25,7 @@ import {
   routineDocuments,
   routines,
   routineTriggers,
+  routineWebhookTestReceipts,
 } from "@paperclipai/db";
 import type {
   CreateRoutine,
@@ -633,6 +634,7 @@ function routineRevisionSnapshotRoutine(routine: RoutineRow): RoutineRevisionSna
 function routineRevisionSnapshotTrigger(trigger: RoutineTriggerRow): RoutineRevisionSnapshotV1["triggers"][number] {
   return {
     id: trigger.id,
+    setupPending: trigger.setupPending,
     kind: trigger.kind as RoutineRevisionSnapshotV1["triggers"][number]["kind"],
     label: trigger.label,
     enabled: trigger.enabled,
@@ -651,7 +653,7 @@ async function buildRoutineRevisionSnapshot(
   const triggers = await executor
     .select()
     .from(routineTriggers)
-    .where(and(eq(routineTriggers.companyId, routine.companyId), eq(routineTriggers.routineId, routine.id)))
+    .where(and(eq(routineTriggers.companyId, routine.companyId), eq(routineTriggers.routineId, routine.id), eq(routineTriggers.archived, false)))
     .orderBy(asc(routineTriggers.createdAt), asc(routineTriggers.id));
 
   return {
@@ -1112,7 +1114,7 @@ export function routineService(
     const rows = await db
       .select()
       .from(routineTriggers)
-      .where(and(eq(routineTriggers.companyId, companyId), inArray(routineTriggers.routineId, routineIds)))
+      .where(and(eq(routineTriggers.companyId, companyId), inArray(routineTriggers.routineId, routineIds), eq(routineTriggers.archived, false)))
       .orderBy(asc(routineTriggers.createdAt), asc(routineTriggers.id));
     const map = new Map<string, RoutineTrigger[]>();
     for (const row of rows) {
@@ -1472,6 +1474,14 @@ export function routineService(
       await tx.execute(
         sql`select id from ${routines} where ${routines.id} = ${input.routine.id} and ${routines.companyId} = ${input.routine.companyId} for update`,
       );
+
+      if (input.trigger && (input.source === "webhook" || input.source === "schedule")) {
+        const currentTrigger = await txDb.select().from(routineTriggers).where(eq(routineTriggers.id, input.trigger.id)).then((rows) => rows[0]);
+        const currentRoutine = await txDb.select({ status: routines.status }).from(routines).where(eq(routines.id, input.routine.id)).then((rows) => rows[0]);
+        if (!currentTrigger || currentTrigger.archived || !currentTrigger.enabled || currentTrigger.setupPending || currentRoutine?.status !== "active") {
+          throw conflict("Routine trigger is not active");
+        }
+      }
 
       if (input.idempotencyKey) {
         const existing = await txDb
@@ -2106,11 +2116,20 @@ export function routineService(
     });
     // Boxed so the assignment inside the transaction callback survives control-flow narrowing.
     const stalePinRelease: { value: StalePinRelease | null } = { value: null };
+    let reusedExistingRun = false;
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       await tx.execute(
         sql`select id from ${routines} where ${routines.id} = ${input.routine.id} and ${routines.companyId} = ${input.routine.companyId} for update`,
       );
+
+      if (input.trigger && (input.source === "webhook" || input.source === "schedule")) {
+        const currentTrigger = await txDb.select().from(routineTriggers).where(eq(routineTriggers.id, input.trigger.id)).then((rows) => rows[0]);
+        const currentRoutine = await txDb.select({ status: routines.status }).from(routines).where(eq(routines.id, input.routine.id)).then((rows) => rows[0]);
+        if (!currentTrigger || currentTrigger.archived || !currentTrigger.enabled || currentTrigger.setupPending || currentRoutine?.status !== "active") {
+          throw conflict("Routine trigger is not active");
+        }
+      }
 
       if (input.idempotencyKey) {
         const existing = await txDb
@@ -2132,6 +2151,7 @@ export function routineService(
           if (input.rejectIdempotencyReplay) {
             throw conflict("Webhook replay detected");
           }
+          reusedExistingRun = true;
           return existing;
         }
       }
@@ -2412,7 +2432,7 @@ export function routineService(
       }
     }
 
-    if (input.source === "schedule" || input.source === "webhook") {
+    if (!reusedExistingRun && (input.source === "schedule" || input.source === "webhook")) {
       const actorId = input.source === "schedule" ? "routine-scheduler" : "routine-webhook";
       try {
         await logActivity(db, {
@@ -2500,7 +2520,7 @@ export function routineService(
           : null,
         row.parentIssueId ? issueSvc.getById(row.parentIssueId) : null,
         getRoutineDescriptionDocument(row.id),
-        db.select().from(routineTriggers).where(eq(routineTriggers.routineId, row.id)).orderBy(asc(routineTriggers.createdAt)),
+        db.select().from(routineTriggers).where(and(eq(routineTriggers.routineId, row.id), eq(routineTriggers.archived, false))).orderBy(asc(routineTriggers.createdAt)),
         db
           .select({
             id: routineRuns.id,
@@ -2583,7 +2603,10 @@ export function routineService(
         assignee,
         parentIssue,
         descriptionDocument,
-        triggers: triggers as RoutineTrigger[],
+        triggers: triggers.map((trigger) => ({
+          ...trigger,
+          webhookUrl: trigger.kind === "webhook" && trigger.publicId ? routineWebhookUrl(trigger.publicId) : null,
+        })) as RoutineTrigger[],
         recentRuns,
         activeIssue,
       };
@@ -2700,6 +2723,7 @@ export function routineService(
             eq(routineTriggers.routineId, existing.id),
             eq(routineTriggers.kind, "schedule"),
             eq(routineTriggers.enabled, true),
+            eq(routineTriggers.archived, false),
           ),
         )
         .limit(1)
@@ -2881,6 +2905,7 @@ export function routineService(
             kind: input.kind,
             label: input.label ?? null,
             enabled: input.enabled ?? true,
+            setupPending: input.kind === "webhook" && input.setupPending === true,
             cronExpression: input.kind === "schedule" ? input.cronExpression : null,
             timezone: input.kind === "schedule" ? (input.timezone || "UTC") : null,
             nextRunAt,
@@ -2951,6 +2976,8 @@ export function routineService(
           .set({
             label: patch.label === undefined ? existing.label : patch.label,
             enabled: patch.enabled ?? existing.enabled,
+            ...(patch.setupPending === false ? { setupPending: false } : {}),
+            ...(patch.archived !== undefined ? { archived: patch.archived } : {}),
             cronExpression,
             timezone,
             nextRunAt,
@@ -3027,6 +3054,7 @@ export function routineService(
           .update(routineTriggers)
           .set({
             lastRotatedAt: new Date(),
+            lastWebhookDelivery: null,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
             updatedAt: new Date(),
@@ -3195,6 +3223,8 @@ export function routineService(
             enabled: triggerSnapshot.enabled,
             cronExpression: triggerSnapshot.kind === "schedule" ? triggerSnapshot.cronExpression : null,
             timezone: triggerSnapshot.kind === "schedule" ? triggerSnapshot.timezone : null,
+            setupPending: triggerSnapshot.setupPending ?? current?.setupPending ?? false,
+            archived: false,
             publicId: triggerSnapshot.kind === "webhook" ? (current?.publicId ?? webhookSecret?.publicId ?? triggerSnapshot.publicId) : null,
             secretId: triggerSnapshot.kind === "webhook" ? (current?.secretId ?? webhookSecret?.secretId ?? null) : null,
             signingMode: triggerSnapshot.kind === "webhook" ? triggerSnapshot.signingMode : null,
@@ -3301,78 +3331,118 @@ export function routineService(
       rawBody?: Buffer | null;
       payload?: Record<string, unknown> | null;
     }) => {
-      const trigger = await db
-        .select()
-        .from(routineTriggers)
-        .where(and(eq(routineTriggers.publicId, publicId), eq(routineTriggers.kind, "webhook")))
-        .then((rows) => rows[0] ?? null);
-      if (!trigger) throw notFound("Routine trigger not found");
-      const routine = await getRoutineById(trigger.routineId);
-      if (!routine) throw notFound("Routine not found");
-      if (!trigger.enabled || routine.status !== "active") throw conflict("Routine trigger is not active");
-
-      let hmacReplayKey: string | null = null;
-      if (trigger.signingMode === "none") {
-        // No authentication — the publicId in the URL acts as a shared secret.
-      } else if (trigger.signingMode === "github_hmac") {
-        const secretValue = await resolveTriggerSecret(trigger, routine.companyId);
-        const rawBody = input.rawBody ?? Buffer.from(JSON.stringify(input.payload ?? {}));
-        // Accept X-Hub-Signature-256 (GitHub/Sentry) or fall back to the
-        // generic X-Paperclip-Signature header so operators can use github_hmac
-        // mode with either header convention.
-        const providedSignature = (input.hubSignatureHeader ?? input.signatureHeader)?.trim() ?? "";
-        if (!providedSignature) throw unauthorized();
-        const expectedHmac = crypto
-          .createHmac("sha256", secretValue)
-          .update(rawBody)
-          .digest("hex");
-        const normalizedSignature = providedSignature.replace(/^sha256=/, "");
-        const normalizedBuf = Buffer.from(normalizedSignature);
-        const expectedBuf = Buffer.from(expectedHmac);
-        const valid =
-          normalizedBuf.length === expectedBuf.length &&
-          crypto.timingSafeEqual(normalizedBuf, expectedBuf);
-        if (!valid) throw unauthorized();
-      } else if (trigger.signingMode === "bearer") {
-        const secretValue = await resolveTriggerSecret(trigger, routine.companyId);
-        const expected = `Bearer ${secretValue}`;
-        const provided = input.authorizationHeader?.trim() ?? "";
-        const expectedBuf = Buffer.from(expected);
-        const providedBuf = Buffer.alloc(expectedBuf.length);
-        providedBuf.write(provided.slice(0, expectedBuf.length));
-        const valid =
-          provided.length === expected.length &&
-          crypto.timingSafeEqual(providedBuf, expectedBuf);
-        if (!valid) {
-          throw unauthorized();
+      // Serialize setup completion with authentication and receipt persistence. A
+      // delivery is classified exactly once, before any dispatch can occur.
+      const accepted = await db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const found = await txDb.select().from(routineTriggers)
+          .where(and(eq(routineTriggers.publicId, publicId), eq(routineTriggers.kind, "webhook")))
+          .then((rows) => rows[0] ?? null);
+        if (!found) throw notFound("Routine trigger not found");
+        await tx.execute(sql`select id from ${routines} where ${routines.id} = ${found.routineId} for update`);
+        const trigger = await txDb.select().from(routineTriggers).where(eq(routineTriggers.id, found.id)).then((rows) => rows[0]);
+        if (!trigger || trigger.archived) throw notFound("Routine trigger not found");
+        const routine = await txDb.select().from(routines).where(eq(routines.id, trigger.routineId)).then((rows) => rows[0]);
+        if (!routine) throw notFound("Routine not found");
+        if (routine.status === "archived") throw conflict("Routine is archived");
+        if (!trigger.enabled || (!trigger.setupPending && routine.status !== "active")) throw conflict("Routine trigger is not active");
+        const recordDelivery = async (status: "received" | "rejected") => {
+          const receivedAt = new Date().toISOString();
+          await txDb.update(routineTriggers).set({ lastWebhookDelivery: { status, receivedAt, test: trigger.setupPending } }).where(eq(routineTriggers.id, trigger.id));
+          await logActivity(txDb, {
+            companyId: routine.companyId, actorType: "system", actorId: "routine-webhook",
+            action: trigger.setupPending ? `routine.webhook_test_${status}` : `routine.webhook_${status}`,
+            entityType: "routine", entityId: routine.id,
+            details: { triggerId: trigger.id, test: trigger.setupPending, result: status === "received" ? "passed" : "rejected" },
+          });
+        };
+        let hmacReplayKey: string | null = null;
+        try {
+          if (trigger.signingMode === "none") {
+            // No authentication — the publicId in the URL acts as a shared secret.
+          } else if (trigger.signingMode === "github_hmac") {
+            const secretValue = await resolveTriggerSecret(trigger, routine.companyId);
+            const rawBody = input.rawBody ?? Buffer.from(JSON.stringify(input.payload ?? {}));
+            // Accept X-Hub-Signature-256 (GitHub/Sentry) or fall back to the
+            // generic X-Paperclip-Signature header so operators can use github_hmac
+            // mode with either header convention.
+            const providedSignature = (input.hubSignatureHeader ?? input.signatureHeader)?.trim() ?? "";
+            if (!providedSignature) throw unauthorized();
+            const expectedHmac = crypto
+              .createHmac("sha256", secretValue)
+              .update(rawBody)
+              .digest("hex");
+            const normalizedSignature = providedSignature.replace(/^sha256=/, "");
+            const normalizedBuf = Buffer.from(normalizedSignature);
+            const expectedBuf = Buffer.from(expectedHmac);
+            const valid =
+              normalizedBuf.length === expectedBuf.length &&
+              crypto.timingSafeEqual(normalizedBuf, expectedBuf);
+            if (!valid) throw unauthorized();
+          } else if (trigger.signingMode === "bearer") {
+            const secretValue = await resolveTriggerSecret(trigger, routine.companyId);
+            const expected = `Bearer ${secretValue}`;
+            const provided = input.authorizationHeader?.trim() ?? "";
+            const expectedBuf = Buffer.from(expected);
+            const providedBuf = Buffer.alloc(expectedBuf.length);
+            providedBuf.write(provided.slice(0, expectedBuf.length));
+            const valid =
+              provided.length === expected.length &&
+              crypto.timingSafeEqual(providedBuf, expectedBuf);
+            if (!valid) {
+              throw unauthorized();
+            }
+          } else {
+            const secretValue = await resolveTriggerSecret(trigger, routine.companyId);
+            const rawBody = input.rawBody ?? Buffer.from(JSON.stringify(input.payload ?? {}));
+            const providedSignature = input.signatureHeader?.trim() ?? "";
+            const providedTimestamp = input.timestampHeader?.trim() ?? "";
+            if (!providedSignature || !providedTimestamp) throw unauthorized();
+            const tsMillis = normalizeWebhookTimestampMs(providedTimestamp);
+            if (tsMillis == null) throw unauthorized();
+            const replayWindowSec = trigger.replayWindowSec ?? 300;
+            if (Math.abs(Date.now() - tsMillis) > replayWindowSec * 1000) {
+              throw unauthorized();
+            }
+            const expectedHmac = crypto
+              .createHmac("sha256", secretValue)
+              .update(`${providedTimestamp}.`)
+              .update(rawBody)
+              .digest("hex");
+            const normalizedSignature = providedSignature.replace(/^sha256=/, "");
+            const providedBuf = Buffer.from(normalizedSignature);
+            const expectedBuf = Buffer.from(expectedHmac);
+            const valid =
+              providedBuf.length === expectedBuf.length &&
+              crypto.timingSafeEqual(providedBuf, expectedBuf);
+            if (!valid) throw unauthorized();
+            hmacReplayKey = `webhook-hmac:${crypto
+              .createHash("sha256")
+              .update(`${trigger.id}:${providedTimestamp}:${expectedHmac}`)
+              .digest("hex")}`;
+          }
+        } catch (error) {
+          await recordDelivery("rejected");
+          return { routine, trigger, hmacReplayKey, testReceived: false, error };
         }
-      } else {
-        const secretValue = await resolveTriggerSecret(trigger, routine.companyId);
-        const rawBody = input.rawBody ?? Buffer.from(JSON.stringify(input.payload ?? {}));
-        const providedSignature = input.signatureHeader?.trim() ?? "";
-        const providedTimestamp = input.timestampHeader?.trim() ?? "";
-        if (!providedSignature || !providedTimestamp) throw unauthorized();
-        const tsMillis = normalizeWebhookTimestampMs(providedTimestamp);
-        if (tsMillis == null) throw unauthorized();
-        const replayWindowSec = trigger.replayWindowSec ?? 300;
-        if (Math.abs(Date.now() - tsMillis) > replayWindowSec * 1000) {
-          throw unauthorized();
+        const deliveryKey = hmacReplayKey ?? input.idempotencyKey;
+        const deliveryKeyHash = deliveryKey ? crypto.createHash("sha256").update(deliveryKey).digest("hex") : null;
+        if (trigger.setupPending) {
+          if (deliveryKeyHash) await txDb.insert(routineWebhookTestReceipts).values({ companyId: routine.companyId, triggerId: trigger.id, deliveryKeyHash }).onConflictDoNothing();
+          await recordDelivery("received");
+          return { routine, trigger, hmacReplayKey, testReceived: true };
         }
-        const expectedHmac = crypto
-          .createHmac("sha256", secretValue)
-          .update(`${providedTimestamp}.`)
-          .update(rawBody)
-          .digest("hex");
-        const normalizedSignature = providedSignature.replace(/^sha256=/, "");
-        const valid =
-          normalizedSignature.length === expectedHmac.length &&
-          crypto.timingSafeEqual(Buffer.from(normalizedSignature), Buffer.from(expectedHmac));
-        if (!valid) throw unauthorized();
-        hmacReplayKey = `webhook-hmac:${crypto
-          .createHash("sha256")
-          .update(`${trigger.id}:${providedTimestamp}:${expectedHmac}`)
-          .digest("hex")}`;
-      }
+        if (deliveryKeyHash) {
+          const receipt = await txDb.select({ id: routineWebhookTestReceipts.id }).from(routineWebhookTestReceipts)
+            .where(and(eq(routineWebhookTestReceipts.triggerId, trigger.id), eq(routineWebhookTestReceipts.deliveryKeyHash, deliveryKeyHash))).limit(1);
+          if (receipt.length) return { routine, trigger, hmacReplayKey, testReceived: true };
+        }
+        await recordDelivery("received");
+        return { routine, trigger, hmacReplayKey, testReceived: false };
+      });
+      if ("error" in accepted) throw accepted.error;
+      if (accepted.testReceived) return { status: "test_received" as const, test: true, routineStarted: false, linkedIssueId: null };
+      const { routine, trigger, hmacReplayKey } = accepted;
 
       const eligibility = await getAutomaticRoutineDispatchEligibility(routine);
       if (!eligibility.eligible) {
@@ -3493,6 +3563,7 @@ export function routineService(
           and(
             eq(routineTriggers.kind, "schedule"),
             eq(routineTriggers.enabled, true),
+            eq(routineTriggers.archived, false),
             eq(routines.status, "active"),
             isNotNull(routineTriggers.nextRunAt),
             lte(routineTriggers.nextRunAt, now),
@@ -3539,6 +3610,7 @@ export function routineService(
             and(
               eq(routineTriggers.id, row.trigger.id),
               eq(routineTriggers.enabled, true),
+              eq(routineTriggers.archived, false),
               eq(routineTriggers.nextRunAt, row.trigger.nextRunAt),
             ),
           )

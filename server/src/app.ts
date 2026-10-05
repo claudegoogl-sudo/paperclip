@@ -1,3 +1,4 @@
+import { agentAvatarRoutes } from "./routes/agent-avatars.js";
 import { aiConnectionRoutes } from "./routes/ai-connections.js";
 import { projectToolRoutes } from "./routes/project-tools.js";
 import { emailChannelService } from "./services/email-channels.js";
@@ -133,11 +134,13 @@ import {
 } from "./services/plugin-loader.js";
 import {
   SELF_HOSTED_AUTO_INSTALL_KEYS,
+  BUNDLED_PLUGIN_CATALOG,
   ensureBundledPlugins,
   resolveBundledCatalogRoot,
   resolveBundledPluginInstalls,
 } from "./services/bundled-plugins.js";
 import { createPluginWorkerManager, type PluginWorkerManager } from "./services/plugin-worker-manager.js";
+import { readDistributionPluginCatalog, distributionPluginActivationGuard } from "./services/distribution-plugin-catalog.js";
 import {
   createPluginStreamBus,
   publishWorkerStreamNotification,
@@ -702,15 +705,25 @@ export async function createApp(
   const emailChannels = emailChannelService(db, { heartbeat: connectionIntentHeartbeat, storage: opts.storageService, publicBaseUrl: opts.chatWebhookPublicBaseUrl ?? opts.authPublicBaseUrl });
   app.use(emailWebhookRoutes(emailChannels));
   app.use(chatWebhookRoutes(chatChannels));
+  // The instance validates single-use registration state and its trusted
+  // current origin. This exact GET is the only public setup return.
+  app.get("/api/chat-github/manifest/callback", async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    res.set("Referrer-Policy", "no-referrer");
+    const redirect = await chatChannels.completeGitHubRegistration(String(req.query.state ?? ""), String(req.query.code ?? ""));
+    res.redirect(303, redirect);
+  });
   const managedAutoInstallKeys = opts.managedPluginAutoInstall ?? null;
   const bundledCatalogRoot =
     opts.bundledPluginCatalogRoot ?? resolveBundledCatalogRoot(process.env);
+  const distributionPlugins = readDistributionPluginCatalog(bundledCatalogRoot, BUNDLED_PLUGIN_CATALOG);
   const bundledPluginInstalls = resolveBundledPluginInstalls(
     managedAutoInstallKeys ?? SELF_HOSTED_AUTO_INSTALL_KEYS,
     {
       catalogRoot: bundledCatalogRoot,
       env: process.env,
       enforceCatalogRoot: managedAutoInstallKeys !== null,
+      distributionPlugins,
     },
   );
   const managedBundledPluginKeys =
@@ -733,6 +746,8 @@ export async function createApp(
 
   // Mount API routes
   const api = Router();
+  const agentAvatars = agentAvatarRoutes();
+  api.use(agentAvatars.router);
   api.use(boardMutationGuard());
   api.use(
     "/health",
@@ -832,7 +847,7 @@ export async function createApp(
   api.use(projectToolRoutes(db));
   api.use(projectRoutes(db));
   api.use(caseRoutes(db, opts.storageService));
-  api.use(issueTreeControlRoutes(db));
+  api.use(issueTreeControlRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(fileResourceRoutes(db));
   api.use(routineRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(pipelineRoutes(db));
@@ -981,6 +996,7 @@ export async function createApp(
       localPluginDir: opts.localPluginDir ?? DEFAULT_LOCAL_PLUGIN_DIR,
       migrationDb: opts.pluginMigrationDb,
       escalationGateway,
+      assertPackageActivation: distributionPluginActivationGuard(bundledCatalogRoot, distributionPlugins, managedAutoInstallKeys),
     },
     {
       workerManager,
@@ -1419,7 +1435,8 @@ export async function createApp(
     { registry: pluginRegistry, loader, lifecycle, logger },
     // Managed mode reinstalls soft-uninstalled bundles (the control plane
     // owns provisioning); self-hosted leaves an operator's uninstall alone.
-    // Operator-DISABLED plugins are never touched in either mode.
+    // Disabled plugins never start automatically. Added distribution permissions
+    // still enter upgrade_pending so enabling them requires an operator decision.
     { reinstallUninstalled: managedAutoInstallKeys !== null },
   )
     .then(() => loader.loadAll())
@@ -1486,6 +1503,9 @@ export async function createApp(
       pluginRunContextRegistry.dispose();
       await emailChannels.shutdown();
       await chatChannels.shutdown();
+      // End the avatar worker pool, if a request ever started one, so no
+      // render outlives the HTTP teardown.
+      await agentAvatars.close();
       // Cancel every live setup-token login session and AWAIT the cancellation,
       // so each direct child stops and the server releases each lease before the
       // caller stops the database and the provider. A lease release that

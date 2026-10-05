@@ -100,7 +100,7 @@ canonical Plan revision, capture its pending UI, approve in the browser, and
 prove exactly two successful runs. `warm_three_turn` provides exactly two
 browser follow-up messages, preserves one project/execution-workspace scope,
 verifies host file contents after every turn, and finishes within three
-ten-minute turn deadlines.
+ten-minute turn deadlines. Native turns 1 and 2 include an actionable human review in the completion report's `attentionRequests`. Paperclip creates the review gate from that report. An explicit question-tool wait yields the turn and suppresses its final prose, so it is not interchangeable with this completion-review fixture. Turn 3 reports Done without another review.
 
 Every selected case runs in its own isolated Paperclip process, and independent
 cases may run concurrently. Follow-up turns inside one case retain their shared
@@ -158,9 +158,9 @@ manual or scheduled campaign, not a PR requirement.
 
 ## Persistent chat fixtures
 
-`chat-cases.ts` defines the six-case `agent-chat` suite; `chat-flow.ts` drives the
+`chat-cases.ts` defines the eight-case `agent-chat` suite; `chat-flow.ts` drives the
 production composer, plan revision/approval controls, questions, reset command,
-and project cards. Keep its 24 local cells intentional. `expectedRunCount`
+and project cards. Keep its 28 local cells intentional. `expectedRunCount`
 counts provider turns, including cancelled and handed-off task runs, but excludes
 synthetic `/new` runs. Assertions must inspect all company runs because ordinary
 issue lists exclude the source conversation. `assertChatHandoff` rejects missing
@@ -172,3 +172,26 @@ workspaces, task documents, and ordering. They pass through the normal sanitizer
 Screenshots are allowlisted to the exact disposable agent chat. Cleanup cancels
 all active runs in the isolated company, including handed-off work; usage from
 failed and cancelled runs must not disappear from campaign totals.
+
+
+Warm three-turn continuity grades the exact workspace file after each turn,
+task completion, and sandbox/session identity. It also requires a visible
+persisted final reply with each turn marker once and in order. It does not
+grade exact final-reply wording; the hello
+and continuation fixtures retain those exact-response checks. This separates
+workspace persistence failures from model response-format variance.
+
+`chat-hardening.ts` adds the explicit-only `agent-chat-hardening` journeys. Use
+the ordinary public APIs to seed source documents and blockers. Keep the answer
+out of the user's status/review request. Grade the exact source values, latest
+blocker, preserved task identities, worker-authored output, and real executions.
+The status request asks for JSON so the grader can distinguish the current
+blocker from a historical mention and compare active-run count separately from
+task status. The request must not reveal those expected values.
+Capture the source after seeding and compare every field in the public issue
+update contract, plus labels, dependencies, and dedicated-endpoint settings.
+Derived inbound references may change when the chat legitimately cites a task.
+The lost-acknowledgement probe may interrupt only the fixture browser's own
+comment request after the real server has committed it. Retain its request ID
+and replay that same request through the public API after restarting the server.
+Never fabricate tool results or repair task state after a failed assertion.

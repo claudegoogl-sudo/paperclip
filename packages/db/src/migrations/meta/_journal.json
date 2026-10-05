@@ -2087,6 +2087,34 @@
       "when": 1786985900000,
       "tag": "0299_plugin_private_egress_optin",
       "breakpoints": true
+    },
+    {
+      "idx": 300,
+      "version": "7",
+      "when": 1789743991329,
+      "tag": "0280_unique_genesis",
+      "breakpoints": true
+    },
+    {
+      "idx": 301,
+      "version": "7",
+      "when": 1789827314772,
+      "tag": "0281_true_boom_boom",
+      "breakpoints": true
+    },
+    {
+      "idx": 302,
+      "version": "7",
+      "when": 1790004509370,
+      "tag": "0282_colossal_shocker",
+      "breakpoints": true
+    },
+    {
+      "idx": 303,
+      "version": "7",
+      "when": 1790018362070,
+      "tag": "0283_jittery_psynapse",
+      "breakpoints": true
     }
   ]
 }

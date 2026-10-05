@@ -97,7 +97,7 @@ import { resolveClaudeDesiredSkillNames } from "./skills.js";
 import { isBedrockModelId } from "./models.js";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
 import { buildRuntimeContractFingerprint } from "./runtime-contract.js";
-import { buildClaudeExecutionPermissionArgs } from "./permissions.js";
+import { buildClaudeExecutionPermissionArgs, claudeSandboxPermissionEnv } from "./permissions.js";
 import { resolveClaudeModel, SANDBOX_INSTALL_COMMAND, models as ADAPTER_MODELS } from "../index.js";
 import {
   createClaudeAcpExecutor,
@@ -556,6 +556,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     graceSec,
     extraArgs,
   } = runtimeConfig;
+  Object.assign(env, claudeSandboxPermissionEnv({ dangerouslySkipPermissions, targetIsSandbox: executionTargetIsSandbox }));
   let loggedEnv = initialLoggedEnv;
   let effectiveExecutionCwd = adapterExecutionTargetRemoteCwd(executionTarget, cwd);
   const terminalResultCleanupGraceMs = Math.max(
@@ -1078,7 +1079,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
     if (dangerouslySkipPermissions && executionTargetIsRemote) {
       commandNotes.push(
-        "Using a broad --allowedTools whitelist for remote execution so hosted targets do not inherit local Claude bypass permissions.",
+        "Using full Claude permission bypass for remote execution, including connected tools.",
       );
     }
     if (attemptInstructionsFilePath && !resumeSessionId) {

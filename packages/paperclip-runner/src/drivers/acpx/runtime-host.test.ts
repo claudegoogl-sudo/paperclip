@@ -209,7 +209,11 @@ describe("ACPX runtime host", () => {
     } finally { await host.close({ reason: "gateway test complete" }); }
   });
 
-  it("automatically permits only admitted Paperclip reads in the Claude SDK", async () => {
+  it.each([
+    ["approve-reads", ["mcp__paperclip__get_task_context"]],
+    ["approve-paperclip", ["mcp__paperclip__create_task", "mcp__paperclip__get_task_context", "mcp__paperclip__reassign_task", "mcp__paperclip__write_document"]],
+    ["deny-all", undefined],
+  ] as const)("binds exact assigned Claude tools to %s before provider launch", async (permissionMode, allow) => {
     const fixture = await hostFixture();
     const dependencies = fixture.dependencies({
       openRuntime: async (options) => {
@@ -217,9 +221,7 @@ describe("ACPX runtime host", () => {
           join(options.launchEnvironment.CLAUDE_CONFIG_DIR!, "settings.json"),
           "utf8",
         ));
-        expect(settings.permissions).toEqual({
-          allow: ["mcp__paperclip__get_task_context"],
-        });
+        expect(settings.permissions).toEqual(allow ? { allow } : undefined);
         expect(options.mcpServers).toMatchObject([
           { name: "paperclip", runnerOwned: true },
         ]);
@@ -232,9 +234,9 @@ describe("ACPX runtime host", () => {
       ...fixture.options,
       agent: "claude",
       model: "claude-sonnet-5",
-      permissionMode: "approve-reads",
+      permissionMode,
       semanticTools: {
-        tools: ["get_task_context", "write_document", "unknown_read"].map((name) => ({
+        tools: ["get_task_context", "write_document", "create_task", "reassign_task", "unknown_read"].map((name) => ({
           name,
           inputSchema: { type: "object" },
           // Supplied hints cannot grant write or unknown operations read access.
@@ -276,17 +278,22 @@ describe("ACPX runtime host", () => {
       aggregateDigest: canonicalNativeRuntimeContextDigest(snapshot),
     };
     let skillsHome = "";
+    const providerStartTurn = vi.fn(() => runtimeTurn());
     let assigned = true;
+    let expectedReference = "ASSIGNED_SKILL_MARKER";
     const dependencies = fixture.dependencies({
       openRuntime: async (options) => {
         skillsHome = join(options.launchEnvironment.CLAUDE_CONFIG_DIR!, "skills");
         expect(await readdir(skillsHome)).toEqual(assigned ? ["assigned"] : []);
         if (assigned) {
           const reference = join(skillsHome, "assigned", "references", "answer.txt");
-          expect(await readFile(reference, "utf8")).toBe("ASSIGNED_SKILL_MARKER");
+          expect(await readFile(reference, "utf8")).toBe(expectedReference);
+          expect(await readFile(join(skillsHome, "assigned", "SKILL.md"), "utf8"))
+            .toBe(await readFile(join(skillRoot, "SKILL.md"), "utf8"));
           expect((await stat(reference)).mode & 0o222).toBe(0);
         }
         return runtimePort({
+          startTurn: providerStartTurn,
           getStatus: async () => ({ models: { currentModelId: "claude-sonnet-5" } }),
         });
       },
@@ -304,8 +311,41 @@ describe("ACPX runtime host", () => {
           { ...options, runtimeContext: context },
           dependencies,
         );
+        let message = JSON.stringify({
+          schema: "paperclip.native-model-envelope.v2",
+          task: { description: "Use /assigned", prompt: "A new direct user request" },
+          interactionResponses: index ? [{ response: { status: "accepted" } }] : [],
+        });
+        if (index === 1) {
+          // The provider command is internal overhead, not part of the caller's
+          // 1 MiB allowance. Keep the exact envelope even at that boundary.
+          message += " ".repeat(1024 * 1024 - Buffer.byteLength(message));
+          expect(() => host.startTurn({ text: `${message} `, requestId: "oversized" }))
+            .toThrow("turn text exceeds its bounded size");
+        }
+        host.startTurn({ text: message, requestId: `skill-turn-${index}` });
+        expect(providerStartTurn).toHaveBeenLastCalledWith({
+          text: `/assigned ${message}`, requestId: `skill-turn-${index}`,
+        });
         await host.close({ reason: "reopen test" });
+        // A changed source must replace the prior materialized revision on resume.
+        expectedReference = "UPDATED_ASSIGNED_SKILL_MARKER";
+        await writeFile(join(skillRoot, "references", "answer.txt"), expectedReference);
+        await writeFile(join(skillRoot, "SKILL.md"), "---\nname: assigned\ndescription: Updated instructions.\n---\nRead references/answer.txt before responding.");
       }
+      // The same agent's next ordinary task must not inherit the command.
+      const ordinary = await AcpxRuntimeHost.open(
+        { ...options, runtimeContext: context }, dependencies,
+      );
+      const ordinaryMessage = JSON.stringify({
+        schema: "paperclip.native-model-envelope.v2",
+        task: { description: "An ordinary task", prompt: "Mention /assigned in a note" },
+      });
+      ordinary.startTurn({ text: ordinaryMessage, requestId: "ordinary-task" });
+      expect(providerStartTurn).toHaveBeenLastCalledWith({
+        text: ordinaryMessage, requestId: "ordinary-task",
+      });
+      await ordinary.close({ reason: "ordinary task verified" });
       // No stale assignment survives a later launch without runtime context.
       assigned = false;
       const host = await AcpxRuntimeHost.open(options, dependencies);

@@ -7,7 +7,7 @@ import { HTTP_LOG_REDACT_PATHS } from "./http-log-redaction.js";
 import { readConfigFile } from "../config-file.js";
 import { resolveDefaultLogsDir, resolveHomeAwarePath } from "../home-paths.js";
 import {
-  isPrivateChatWebhookHttpRequest,
+  isPrivateWebhookHttpRequest,
   isSecretSensitiveHttpRequest,
   shouldSilenceHttpSuccessLog,
 } from "./http-log-policy.js";
@@ -114,13 +114,30 @@ function requestClassificationUrl(req: {
       : undefined;
 }
 
-function isPrivateWebhook(req: { method?: string; originalUrl?: unknown; url?: unknown }) {
-  return isPrivateChatWebhookHttpRequest(req.method, requestClassificationUrl(req));
+function isPrivateWebhook(req: {
+  method?: string;
+  originalUrl?: unknown;
+  url?: unknown;
+}) {
+  return isPrivateWebhookHttpRequest(
+    req.method,
+    requestClassificationUrl(req),
+  );
 }
 
-function requestLogUrl(req: { method?: string; originalUrl?: unknown; url?: unknown }) {
+function privateWebhookLogUrl(url: unknown) {
+  return typeof url === "string" && /\/routine-triggers\/public(?:\/|$)/i.test(url)
+    ? "/api/routine-triggers/public/:publicId/fire"
+    : "/api/chat-webhooks/:publicId/:provider";
+}
+
+function requestLogUrl(req: {
+  method?: string;
+  originalUrl?: unknown;
+  url?: unknown;
+}) {
   return isPrivateWebhook(req)
-    ? "/api/chat-webhooks/:publicId/:provider"
+    ? privateWebhookLogUrl(requestClassificationUrl(req))
     : stripSecretBearingUrlParts(typeof req.url === "string" ? req.url : "");
 }
 
@@ -165,7 +182,7 @@ export function createHttpLogger(baseLogger: pino.Logger) {
           return {
             id: req.id,
             method: req.method,
-            url: "/api/chat-webhooks/:publicId/:provider",
+            url: privateWebhookLogUrl(req.url),
           };
         }
         return {

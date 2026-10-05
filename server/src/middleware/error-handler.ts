@@ -250,6 +250,18 @@ export function errorHandler(
     return;
   }
 
+  // Only body-parser's malformed-JSON errors are client input failures.
+  // Parser messages can quote request bytes; return a constant response and
+  // keep the raw error out of crash reporting and HTTP error context.
+  if (
+    err instanceof SyntaxError &&
+    "status" in err && err.status === 400 &&
+    "type" in err && err.type === "entity.parse.failed"
+  ) {
+    res.status(400).json({ error: "Invalid JSON body" });
+    return;
+  }
+
   // Surface generic errors (e.g. body-parser PayloadTooLargeError) that carry
   // a numeric status in the 4xx range with that status instead of flattening
   // to 500. 5xx numerics fall through to the telemetry/attach branch below.
@@ -294,7 +306,6 @@ export function errorHandler(
     });
     return;
   }
-
   const rootError = err instanceof Error ? err : new Error(String(err));
 
   // The client tore down the connection mid-request (closed tab, dropped

@@ -1,6 +1,7 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import * as cloudIdentity from "../cloud-runtime-identity.js";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -90,7 +91,14 @@ describe("PaperclipRunnerToolAuthority", () => {
       issueId,
       runId,
     });
-    expect(authority.definitions()).toHaveLength(25);
+    expect(authority.definitions()).toHaveLength(27);
+    const questions = authority.definitions().find(tool => tool.name === "request_human_input")!;
+    expect(questions.description).toContain("ask only the next unanswered question");
+    expect(questions.description).toContain("Never infer answers");
+    expect(questions.description).toContain("Do not fabricate answer links");
+    expect(JSON.stringify(questions.inputSchema)).toContain("at least two distinct meaningful options");
+    expect(JSON.stringify(questions.inputSchema)).toContain("answerMode:'text'");
+
     expect(authority.definitions().map((tool) => tool.name)).toEqual(
       expect.arrayContaining([
         "connections_search",
@@ -106,6 +114,7 @@ describe("PaperclipRunnerToolAuthority", () => {
         "read_document",
         "list_document_revisions",
         "write_document",
+        "create_skill",
         "list_agents",
         "get_agent",
         "list_approvals",
@@ -148,6 +157,63 @@ describe("PaperclipRunnerToolAuthority", () => {
         arguments: {},
       }),
     ).rejects.toThrow("paperclip_runner_tool_not_advertised");
+  });
+
+  it("returns public task URLs from the current claimed origin in context and search results", async () => {
+    const origin = vi.spyOn(cloudIdentity, "runtimeCanonicalOrigin").mockReturnValue("https://board.example");
+    const authority = new PaperclipRunnerToolAuthority(db, { companyId, agentId, issueId, runId });
+    try {
+      expect(await authority.execute({ tool: "get_task_context", callId: "public-task-url", arguments: {} }))
+        .toMatchObject({ activeTask: { id: issueId, url: `https://board.example/issues/${issueId}` } });
+      expect(await authority.execute({ tool: "search_tasks", callId: "search-public-task-url", arguments: { query: "Exercise real runner tools" } }))
+        .toMatchObject({ tasks: expect.arrayContaining([expect.objectContaining({ id: issueId, url: `https://board.example/issues/${issueId}` })]) });
+      origin.mockReturnValue("https://renamed.example");
+      expect(await authority.execute({ tool: "get_task_context", callId: "renamed-task-url", arguments: {} }))
+        .toMatchObject({ activeTask: { url: `https://renamed.example/issues/${issueId}` } });
+      origin.mockReturnValue("https://localhost");
+      expect(await authority.execute({ tool: "get_task_context", callId: "unsafe-task-url", arguments: {} }))
+        .toMatchObject({ activeTask: { url: null } });
+    } finally {
+      origin.mockRestore();
+    }
+  });
+
+  it("exposes existing child tasks on continuation without crossing company boundaries", async () => {
+    const completedChildId = randomUUID();
+    const activeChildId = randomUUID();
+    const unrelatedId = randomUUID();
+    const otherCompanyId = randomUUID();
+    const foreignChildId = randomUUID();
+    const hiddenChildIds = Array.from({ length: 101 }, () => randomUUID());
+    await db.insert(companies).values({ id: otherCompanyId, name: "Other company", issuePrefix: "OTHER" });
+    await db.insert(issues).values([
+      { id: completedChildId, companyId, parentId: issueId, title: "Existing completed draft", status: "done", assigneeAgentId: agentId },
+      { id: activeChildId, companyId, parentId: issueId, title: "Existing active review", status: "in_progress", assigneeAgentId: agentId },
+      { id: unrelatedId, companyId, title: "Unrelated task", status: "todo" },
+      // Even inconsistent imported data cannot expose another company's task.
+      { id: foreignChildId, companyId: otherCompanyId, parentId: issueId, title: "Foreign child", status: "todo" },
+      // Hidden rows must neither enter context nor consume the visible child limit.
+      ...hiddenChildIds.map((id) => ({ id, companyId, parentId: issueId, title: "Hidden child",
+        hiddenAt: new Date(), createdAt: new Date(Date.now() + 1000) })),
+    ]);
+    try {
+      const authority = new PaperclipRunnerToolAuthority(db, { companyId, agentId, issueId, runId });
+      const context = await authority.execute({ tool: "get_task_context", callId: "context-existing-children", arguments: {} });
+      expect(context).toMatchObject({
+        childTasks: expect.arrayContaining([
+          expect.objectContaining({ id: completedChildId, status: "done", parentId: issueId }),
+          expect.objectContaining({ id: activeChildId, status: "in_progress", assigneeAgentId: agentId }),
+        ]),
+        childTasksTruncated: false,
+        delegationGuidance: expect.stringContaining("Reuse existing child tasks"),
+      });
+      expect(JSON.stringify(context)).not.toContain(foreignChildId);
+      expect(JSON.stringify(context)).not.toContain(unrelatedId);
+      for (const id of hiddenChildIds) expect(JSON.stringify(context)).not.toContain(id);
+    } finally {
+      await db.delete(issues).where(inArray(issues.id, [completedChildId, activeChildId, unrelatedId, foreignChildId, ...hiddenChildIds]));
+      await db.delete(companies).where(eq(companies.id, otherCompanyId));
+    }
   });
 
   it("preserves direct-chat file tools across the guarded API rollout", () => {
@@ -249,13 +315,13 @@ describe("PaperclipRunnerToolAuthority", () => {
         "current Paperclip task bound to this run",
       );
       expect(advertised.description).toContain(
-        "interactionKind 'questions' with payload.questions",
+        "payload.questions for choices",
       );
       expect(advertised.description).toContain(
-        "supported provider question controls or a safe fallback",
+        "Paperclip renders it and authenticates the response",
       );
       expect(advertised.description).toContain(
-        "Normal task permissions and review gates still apply",
+        "Preserve existing review gates",
       );
       expect(advertised.description).not.toContain("mock");
       expect(advertised.description).not.toContain("questionSpec");
@@ -268,7 +334,7 @@ describe("PaperclipRunnerToolAuthority", () => {
     },
   );
 
-  it("executes the advertised payload.questions shape once on the bound reviewed task", async () => {
+  it.each(["choice", "text"] as const)("executes the advertised %s question once on the bound reviewed task", async (answerMode) => {
     const binding = {
       companyId: randomUUID(),
       agentId: randomUUID(),
@@ -278,7 +344,7 @@ describe("PaperclipRunnerToolAuthority", () => {
     await db.insert(companies).values({
       id: binding.companyId,
       name: "Question invocation",
-      issuePrefix: "RQA",
+      issuePrefix: answerMode === "choice" ? "RQA" : "RQT",
     });
     await db.insert(agents).values({
       id: binding.agentId,
@@ -328,6 +394,33 @@ describe("PaperclipRunnerToolAuthority", () => {
         ],
       },
     ];
+    const payloadDescription = (advertised.inputSchema as {
+      properties: { payload: { description: string } };
+    }).properties.payload.description;
+    expect(payloadDescription).toContain("at least two distinct meaningful options");
+    expect(payloadDescription).toContain("questionSet");
+    expect(payloadDescription).not.toContain("use exactly");
+    const payload = answerMode === "choice"
+      ? { version: 1, questions }
+      : {
+          version: 1,
+          questions: [{
+            id: "goal",
+            prompt: "What should we accomplish?",
+            selectionMode: "single",
+            required: true,
+            options: [{ id: "describe", label: "Your answer", freeText: true }],
+          }],
+          questionSet: {
+            schema: "paperclip.question_set.v1",
+            questions: [{
+              id: "goal",
+              prompt: "What should we accomplish?",
+              answerMode: "text",
+              required: true,
+            }],
+          },
+        };
     const call = {
       tool: "request_human_input",
       callId: "advertised-question",
@@ -337,7 +430,7 @@ describe("PaperclipRunnerToolAuthority", () => {
         title: "Choose one color",
         prompt: "Choose one color",
         continuationPolicy: "wake_assignee",
-        payload: { version: 1, questions },
+        payload,
       },
     };
     const first = await authority.execute(call);
@@ -350,7 +443,7 @@ describe("PaperclipRunnerToolAuthority", () => {
         kind: "ask_user_questions",
         status: "pending",
         continuationPolicy: "wake_assignee",
-        payload: { version: 1, questions },
+        payload,
       },
     });
     await expect(
