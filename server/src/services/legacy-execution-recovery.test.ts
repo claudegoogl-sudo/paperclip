@@ -17,7 +17,12 @@ it.each(["workspace_git_scan_timeout", "workspace_git_scan_saturated"])("does no
   expect(legacyExecutionNeedsReconciliation({ ...run, resultJson: {
     executionRecovery: { kind: "bootstrap", providerWorkStarted: true },
   } })).toBe(true);
-  expect(legacyExecutionNeedsReconciliation({ ...run, errorCode: "setup_failed" })).toBe(true);
+  // Fork divergence: bootstrap evidence that the provider never started is
+  // authoritative for every error code (see legacyExecutionNeedsReconciliation),
+  // so a setup failure with the same evidence is not held either. Without that
+  // evidence it is still held.
+  expect(legacyExecutionNeedsReconciliation({ ...run, errorCode: "setup_failed" })).toBe(false);
+  expect(legacyExecutionNeedsReconciliation({ ...run, errorCode: "setup_failed", resultJson: {} })).toBe(true);
 });
 
 it("permits subscription waits only with explicit evidence that provider work never started", () => {
