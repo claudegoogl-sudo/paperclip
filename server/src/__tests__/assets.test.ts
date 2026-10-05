@@ -412,12 +412,6 @@ function parseBinaryResponse(res: IncomingMessage, callback: (error: Error | nul
 
 describe("GET /api/assets/:assetId/content", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../routes/assets.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
     getAssetByIdMock.mockReset();
   });
