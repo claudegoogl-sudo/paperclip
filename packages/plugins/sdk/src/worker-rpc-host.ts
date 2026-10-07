@@ -1056,6 +1056,16 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           });
         },
 
+        async listWakeupRequests(issueIds: string[], companyId: string, options) {
+          return callHost("issues.listWakeupRequests", {
+            companyId,
+            issueIds,
+            statuses: options?.statuses,
+            since: options?.since,
+            limit: options?.limit,
+          });
+        },
+
         async requestWakeup(issueId: string, companyId: string, options) {
           return callHost("issues.requestWakeup", {
             issueId,

@@ -61,6 +61,7 @@ import type {
   PluginIssueAttachmentContent,
   PluginIssueWakeupBatchResult,
   PluginIssueWakeupResult,
+  PluginIssueWakeupRequest,
   PluginJobContext,
   PluginExecutionWorkspaceMetadata,
   PluginWorkspace,
@@ -2079,6 +2080,16 @@ export interface WorkerToHostMethods {
       includeAssignees?: boolean;
     },
     result: PluginIssueSubtree,
+  ];
+  "issues.listWakeupRequests": [
+    params: {
+      companyId: string;
+      issueIds: string[];
+      statuses?: string[];
+      since?: string;
+      limit?: number;
+    },
+    result: PluginIssueWakeupRequest[],
   ];
   "issues.requestWakeup": [
     params: {
