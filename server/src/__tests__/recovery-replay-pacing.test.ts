@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb, heartbeatRuns, issues } from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRuns, issueComments, issueRelations, issues } from "@paperclipai/db";
+import { eq } from "drizzle-orm";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -155,5 +156,137 @@ describeEmbeddedPostgres("staggered boot recovery replay", () => {
     // An isolated wake starts immediately: the pacer never delays a lone dispatch.
     expect(starts).toHaveLength(1);
     expect(Date.now() - starts[0]).toBeLessThan(5000);
+  });
+
+  describe("dependency-blocked todo issues", () => {
+    async function seedIssue(companyId: string, status: string, assigneeAgentId: string | null, title = "fixture") {
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title,
+        status,
+        priority: "medium",
+        responsibleUserId: "responsible-user",
+        assigneeAgentId,
+      });
+      return issueId;
+    }
+
+    async function block(companyId: string, blockerId: string, dependentId: string) {
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerId,
+        relatedIssueId: dependentId,
+        type: "blocks",
+      });
+    }
+
+    function makeRecovery(wakes: string[], pacingLines: unknown[]) {
+      return recoveryService(db, {
+        enqueueWakeup: async (agentId) => {
+          wakes.push(agentId);
+          return { id: randomUUID() } as unknown as typeof heartbeatRuns.$inferSelect;
+        },
+        hostCeilingValue: 4,
+        replayPacing: {
+          minDelayMs: 1,
+          jitterSpanMs: 0,
+          random: () => 0,
+          logger: {
+            info: (obj) => {
+              if (obj.event === "recovery_replay_pacing") pacingLines.push(obj);
+            },
+          },
+        },
+      });
+    }
+
+    it("AC1/AC2: a blocked todo issue is counted as dependencyBlocked, gets no wake and no pacing line", async () => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent(companyId, "Blocked");
+      const blockerId = await seedIssue(companyId, "in_progress", null, "open blocker");
+      const dependentId = await seedAssignedTodoIssue(companyId, agentId);
+      await block(companyId, blockerId, dependentId);
+
+      const wakes: string[] = [];
+      const pacingLines: unknown[] = [];
+      const recovery = makeRecovery(wakes, pacingLines);
+      for (let tick = 0; tick < 3; tick += 1) {
+        const result = await recovery.reconcileStrandedAssignedIssues();
+        expect(result.dependencyBlocked).toBe(1);
+        expect(result.assignmentDispatched).toBe(0);
+      }
+      expect(wakes).toHaveLength(0);
+      expect(pacingLines).toHaveLength(0);
+    });
+
+    it("AC3: once the last blocker is done the next tick dispatches the dependent", async () => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent(companyId, "Unblocked");
+      const blockerId = await seedIssue(companyId, "in_progress", null, "blocker");
+      const dependentId = await seedAssignedTodoIssue(companyId, agentId);
+      await block(companyId, blockerId, dependentId);
+
+      const wakes: string[] = [];
+      const recovery = makeRecovery(wakes, []);
+      expect((await recovery.reconcileStrandedAssignedIssues()).dependencyBlocked).toBe(1);
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerId));
+      const result = await recovery.reconcileStrandedAssignedIssues();
+      expect(result.dependencyBlocked).toBe(0);
+      expect(result.assignmentDispatched).toBe(1);
+      expect(wakes).toEqual([agentId]);
+    });
+
+    it("AC4: a cancelled blocker gets exactly one deduped notice and the edge stays", async () => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent(companyId, "Stuck");
+      const blockerId = await seedIssue(companyId, "cancelled", null, "superseded work");
+      const dependentId = await seedAssignedTodoIssue(companyId, agentId);
+      await block(companyId, blockerId, dependentId);
+
+      const wakes: string[] = [];
+      const recovery = makeRecovery(wakes, []);
+      const first = await recovery.reconcileStrandedAssignedIssues();
+      expect(first.cancelledBlockerNoticesPosted).toBe(1);
+      expect(first.dependencyBlocked).toBe(1);
+      const second = await recovery.reconcileStrandedAssignedIssues();
+      expect(second.cancelledBlockerNoticesPosted).toBe(0);
+
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, dependentId));
+      expect(comments).toHaveLength(1);
+      expect(comments[0].body).toContain("superseded work");
+      expect(comments[0].body).toContain("a cancelled blocker never resolves".replace("a c", "A c"));
+      expect(comments[0].body).toContain("`blockedByIssueIds`");
+      const edges = await db.select().from(issueRelations).where(eq(issueRelations.relatedIssueId, dependentId));
+      expect(edges).toHaveLength(1);
+      expect(wakes).toHaveLength(0);
+    });
+
+    it("a failing cancelled-blocker notice never stops dispatch of other issues", async () => {
+      const companyId = await seedCompany();
+      const stuckAgent = await seedAgent(companyId, "StuckNotice");
+      const readyAgent = await seedAgent(companyId, "ReadyNotice");
+      const blockerId = await seedIssue(companyId, "cancelled", null, "cancelled blocker");
+      const dependentId = await seedAssignedTodoIssue(companyId, stuckAgent);
+      await block(companyId, blockerId, dependentId);
+      await seedAssignedTodoIssue(companyId, readyAgent);
+
+      // Make every comment insert fail, so addComment throws for the notice.
+      await db.execute(sql`create or replace function pla_test_fail_comment() returns trigger as $$
+        begin raise exception 'injected comment failure'; end $$ language plpgsql`);
+      await db.execute(sql`create trigger pla_test_fail_comment before insert on issue_comments
+        for each row execute function pla_test_fail_comment()`);
+      try {
+        const wakes: string[] = [];
+        const result = await makeRecovery(wakes, []).reconcileStrandedAssignedIssues();
+        expect(result.cancelledBlockerNoticesPosted).toBe(0);
+        expect(result.dependencyBlocked).toBe(1);
+        expect(result.assignmentDispatched).toBe(1);
+        expect(wakes).toEqual([readyAgent]);
+      } finally {
+        await db.execute(sql`drop trigger if exists pla_test_fail_comment on issue_comments`);
+      }
+    });
   });
 });
