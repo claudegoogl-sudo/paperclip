@@ -46,7 +46,12 @@ import {
   scanOwnerDecisionPaths,
   fileDiskAlarmIssue,
   dailyBumpMarker,
-  run,
+  run as runRaw,
+  loadReferencedPaths,
+  extractPathsFromText,
+  extractPathsFromUnit,
+  parseKeepList,
+  findReferenceOverlap,
 } from "./host-disk-janitor.mjs";
 
 function tmpdir(prefix) {
@@ -60,6 +65,16 @@ function tmpdir(prefix) {
 // instead of letting the real DB lookup run.
 function testRegistered(paths = []) {
   return async () => ({ status: "ok", paths, source: "test" });
+}
+
+// 2026-10-03 reap fix: run() also reads live references (crontab, systemd
+// user units, routines, agents). Same hermeticity rule: default to an empty
+// "ok" stub; reference tests below pass a real sandboxed loader explicitly.
+function testReferences(refs = []) {
+  return async () => ({ status: "ok", refs, errors: [] });
+}
+function run(opts = {}) {
+  return runRaw({ loadReferences: testReferences(), ...opts });
 }
 
 function touch(filePath, { mtime } = {}) {
@@ -1212,4 +1227,155 @@ test("run(): re-check at delete time skips entries that became live; rm failures
   assert.equal(u.deletedCount, 1);
   assert.equal(u.reclaimedBytes, by.ok.sizeBytes);
   assert.ok(existsSync(turnsLive));
+});
+
+// ---------------------------------------------------------------------------
+// Live-reference guard (2026-10-03: a cron/routine-driven tool that nobody
+// had edited in 30 days was reaped as an "abandoned worktree")
+// ---------------------------------------------------------------------------
+
+function refSandbox({ crontab = "", units = {}, db = { routines: [], agents: [] }, keepList = null } = {}) {
+  const home = tmpdir("janitor-refs-");
+  const workDir = path.join(home, "work");
+  mkdirSync(workDir, { recursive: true });
+  const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+  for (const name of ["inbox-watchdog", "fork-drift", "routine-tool", "kept-tool", "listed-tool", "abandoned"]) {
+    touch(path.join(workDir, name, "sweep.sh"), { mtime: old });
+  }
+  const crontabFile = path.join(home, "crontab.txt");
+  writeFileSync(crontabFile, crontab.replaceAll("$SANDBOX", home));
+  const unitDir = path.join(home, ".config/systemd/user");
+  mkdirSync(unitDir, { recursive: true });
+  for (const [name, text] of Object.entries(units)) writeFileSync(path.join(unitDir, name), text);
+  const keepFile = path.join(home, ".config/host-disk-janitor/keep.txt");
+  if (keepList !== null) {
+    mkdirSync(path.dirname(keepFile), { recursive: true });
+    writeFileSync(keepFile, keepList.replaceAll("$SANDBOX", home));
+  }
+  const config = {
+    ...CONFIG,
+    BACKUPS_DIR: path.join(home, "none-backups"),
+    RUN_LOGS_DIR: path.join(home, "none-runlogs"),
+    WORKTREE_SCAN_DIRS: [workDir],
+    WORKTREE_HOME_GLOB_ROOT: home,
+    WORKTREE_OBJECT_STORE_DIR: path.join(home, "no-store"),
+    SELF_SCRIPT_PATH: path.join(home, "elsewhere/janitor.mjs"),
+    TMP_DIR: path.join(home, "none-tmp"),
+    TMP_UNMATCHED_DELETE: false,
+    DISK_ALARM_PATH: home,
+    DISK_ALARM_THRESHOLD_PERCENT: 101,
+    CRONTAB_FILE_OVERRIDE: crontabFile,
+    SYSTEMD_USER_DIR: unitDir,
+    DB_REFS_JSON_OVERRIDE: JSON.stringify(db).replaceAll("$SANDBOX", home),
+    KEEP_LIST_FILE: keepFile,
+  };
+  const loadReferences = ({ config: c }) => loadReferencedPaths({ config: c, home });
+  return { home, workDir, config, loadReferences };
+}
+
+async function refRun(sb, apply = true) {
+  return runRaw({ apply, config: sb.config, loadRegistered: testRegistered(), loadReferences: sb.loadReferences });
+}
+
+test("extractPathsFromText expands ~ / $HOME / %h and ignores URL fragments", () => {
+  const home = "/h";
+  assert.deepEqual(
+    extractPathsFromText("0 * * * * bash /h/work/a/sweep.sh --apply >> ~/logs/x.log 2>&1", home).sort(),
+    ["/h/logs/x.log", "/h/work/a/sweep.sh"],
+  );
+  assert.deepEqual(extractPathsFromText("run $HOME/work/b/x and ${HOME}/work/c", home).sort(), ["/h/work/b/x", "/h/work/c"]);
+  assert.deepEqual(extractPathsFromText("see http://127.0.0.1:3100/api/issues", home), []);
+  assert.deepEqual(extractPathsFromUnit("[Service]\nExecStart=/usr/bin/bash %h/work/fork-drift/run.sh\nDescription=/nope\n", home).sort(), [
+    "/h/work/fork-drift/run.sh",
+    "/usr/bin/bash",
+  ]);
+  assert.deepEqual(parseKeepList("# c\n\n~/work/x\nrelative/ignored\n/abs/y # tail\n", home), ["/h/work/x", "/abs/y"]);
+});
+
+test("findReferenceOverlap ignores references at/above a scan root (agent cwd = $HOME)", () => {
+  const refs = [{ path: "/h", source: "agent a" }, { path: "/h/work", source: "crontab" }];
+  assert.equal(findReferenceOverlap("/h/work/x", refs, ["/h/work", "/h"]), null);
+  assert.equal(findReferenceOverlap("/h/work/x", [{ path: "/h/work/x/a/b", source: "s" }], ["/h/work"]).source, "s");
+  assert.equal(findReferenceOverlap("/h/work/x/sub", [{ path: "/h/work/x", source: "s" }], ["/h/work"]).source, "s");
+});
+
+test("(i) old non-git dir referenced by a crontab line is kept", async () => {
+  const sb = refSandbox({ crontab: "# bash $SANDBOX/work/abandoned/sweep.sh (comment: ignored)\n*/5 * * * * bash $SANDBOX/work/inbox-watchdog/sweep.sh --apply\n" });
+  const s = await refRun(sb);
+  const wt = s.categories.worktrees;
+  assert.ok(existsSync(path.join(sb.workDir, "inbox-watchdog")));
+  assert.deepEqual(wt.excludedReferenced.map((e) => [path.basename(e.path), e.source]), [["inbox-watchdog", "crontab"]]);
+  assert.ok(!existsSync(path.join(sb.workDir, "abandoned")), "commented-out cron line must not protect");
+  rmSync(sb.home, { recursive: true, force: true });
+});
+
+test("(ii) old non-git dir referenced by a systemd user unit with %h is kept", async () => {
+  const sb = refSandbox({
+    units: {
+      "paperclip-fork-drift.service": "[Service]\nType=oneshot\nWorkingDirectory=%h/work/fork-drift\nExecStart=/usr/bin/env bash %h/work/fork-drift/check.sh\n",
+      "paperclip-fork-drift.timer": "[Timer]\nOnCalendar=daily\n",
+    },
+  });
+  const s = await refRun(sb);
+  assert.ok(existsSync(path.join(sb.workDir, "fork-drift")));
+  const e = s.categories.worktrees.excludedReferenced.find((x) => path.basename(x.path) === "fork-drift");
+  assert.equal(e.source, "systemd paperclip-fork-drift.service");
+  rmSync(sb.home, { recursive: true, force: true });
+});
+
+test("(iii) exact 2026-10-03 case: inbox-watchdog/sweep.sh referenced only in a routine description is kept; agent adapter_config too", async () => {
+  const sb = refSandbox({
+    db: {
+      routines: [{ id: "r1", title: "ScanBot", description: "CHECK7: run `bash $SANDBOX/work/inbox-watchdog/sweep.sh --apply` every tick" }],
+      agents: [{ name: "bot", adapter_config: { cwd: "$SANDBOX", env: { TOOL: "$SANDBOX/work/routine-tool/bin" } } }],
+    },
+  });
+  const s = await refRun(sb);
+  assert.ok(existsSync(path.join(sb.workDir, "inbox-watchdog")));
+  assert.ok(existsSync(path.join(sb.workDir, "routine-tool")));
+  const bySource = Object.fromEntries(s.categories.worktrees.excludedReferenced.map((e) => [path.basename(e.path), e.source]));
+  assert.equal(bySource["inbox-watchdog"], "routine r1");
+  assert.equal(bySource["routine-tool"], "agent bot");
+  assert.ok(!existsSync(path.join(sb.workDir, "abandoned")), "agent cwd = $HOME must not shield everything");
+  rmSync(sb.home, { recursive: true, force: true });
+});
+
+test("(iv) .janitor-keep marker and keep.txt entries are kept", async () => {
+  const sb = refSandbox({ keepList: "# operator keep-list\n$SANDBOX/work/listed-tool\n" });
+  const marker = path.join(sb.workDir, "kept-tool", ".janitor-keep");
+  writeFileSync(marker, "");
+  utimesSync(marker, new Date(Date.now() - 400 * 86400000), new Date(Date.now() - 400 * 86400000)); // marker age is irrelevant
+  const s = await refRun(sb);
+  assert.ok(existsSync(path.join(sb.workDir, "kept-tool")));
+  assert.ok(existsSync(path.join(sb.workDir, "listed-tool")));
+  assert.deepEqual(s.categories.worktrees.excludedKeepMarker.map((p) => path.basename(p)), ["kept-tool"]);
+  assert.match(s.categories.worktrees.excludedReferenced.find((e) => path.basename(e.path) === "listed-tool").source, /^keep-list /);
+  rmSync(sb.home, { recursive: true, force: true });
+});
+
+test("(v) old unreferenced dir is still deleted, idempotently", async () => {
+  const sb = refSandbox({ crontab: "0 2 * * * bash $SANDBOX/work/inbox-watchdog/sweep.sh\n" });
+  const s = await refRun(sb);
+  assert.ok(!existsSync(path.join(sb.workDir, "abandoned")));
+  assert.ok(s.categories.worktrees.eligiblePaths.some((p) => path.basename(p) === "abandoned"));
+  const again = await refRun(sb);
+  assert.equal(again.categories.worktrees.eligible, 0);
+  assert.ok(existsSync(path.join(sb.workDir, "inbox-watchdog")));
+  rmSync(sb.home, { recursive: true, force: true });
+});
+
+test("(vi) any reference source read failure => worktree category deletes nothing", async () => {
+  for (const breakIt of [
+    (sb) => { sb.config.CRONTAB_FILE_OVERRIDE = path.join(sb.home, "missing-crontab"); },
+    (sb) => { sb.config.DB_REFS_JSON_OVERRIDE = JSON.stringify({ fail: "injected DB outage" }); },
+  ]) {
+    const sb = refSandbox();
+    breakIt(sb);
+    const s = await refRun(sb);
+    assert.equal(s.referencedPaths.status, "unavailable");
+    assert.equal(s.categories.worktrees.eligible, 0);
+    assert.ok(s.categories.worktrees.referenceGuardFailureExcludedPaths.length >= 6);
+    for (const name of ["abandoned", "inbox-watchdog", "fork-drift"]) assert.ok(existsSync(path.join(sb.workDir, name)));
+    rmSync(sb.home, { recursive: true, force: true });
+  }
 });
