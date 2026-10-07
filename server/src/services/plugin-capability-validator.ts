@@ -97,6 +97,7 @@ const OPERATION_CAPABILITIES: Record<string, readonly PluginCapability[]> = {
   "issues.relations.removeBlockers": ["issue.relations.write"],
   "issues.assertCheckoutOwner": ["issues.checkout"],
   "issues.getSubtree": ["issue.subtree.read"],
+  "issues.listWakeupRequests": ["issue.wakeups.read"],
   "issues.requestWakeup": ["issues.wakeup"],
   "issues.requestWakeups": ["issues.wakeup"],
   "issue.comments.create": ["issue.comments.create"],

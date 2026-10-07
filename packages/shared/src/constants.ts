@@ -1375,6 +1375,10 @@ export const PLUGIN_CAPABILITIES = [
   "issues.read",
   "issue.relations.read",
   "issue.subtree.read",
+  // Read pending (and, with `since`, recent) agent wakeup requests for a set
+  // of issues. Allow-listed fields only (no payload/context snapshot).
+  // Default-deny: deliberately NOT implied by issues.read.
+  "issue.wakeups.read",
   "issue.comments.read",
   // Read pending issue-thread interactions (decision cards) on an issue.
   "issue.interactions.read",

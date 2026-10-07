@@ -45,8 +45,14 @@ import type {
   PermissionKey,
   PrincipalType,
   StreamDropNotice,
+  PluginIssueWakeupRequest,
 } from "./types.js";
-import { NOOP_PLUGIN_TRACER } from "./types.js";
+import {
+  NOOP_PLUGIN_TRACER,
+  PLUGIN_WAKEUP_REQUESTS_DEFAULT_STATUSES,
+  PLUGIN_WAKEUP_REQUESTS_MAX_ISSUE_IDS,
+  PLUGIN_WAKEUP_REQUESTS_MAX_ROWS,
+} from "./types.js";
 import type {
   PluginEnvironmentValidateConfigParams,
   PluginEnvironmentValidationResult,
@@ -113,6 +119,8 @@ export interface TestHarness {
     issues?: Issue[];
     issueComments?: IssueComment[];
     issueInteractions?: IssueThreadInteraction[];
+    /** Rows for `ctx.issues.listWakeupRequests` (companyId scopes them). */
+    wakeupRequests?: Array<PluginIssueWakeupRequest & { companyId: string }>;
     issueAttachments?: Array<IssueAttachment & { contentBase64?: string }>;
     approvals?: Approval[];
     agents?: Agent[];
@@ -499,6 +507,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
   const blockedByIssueIds = new Map<string, string[]>();
   const issueComments = new Map<string, IssueComment[]>();
   const issueInteractions = new Map<string, IssueThreadInteraction[]>();
+  const wakeupRequests: Array<PluginIssueWakeupRequest & { companyId: string }> = [];
   const issueAttachments = new Map<string, IssueAttachment[]>();
   const attachmentContentById = new Map<string, string>();
   const approvals = new Map<string, Approval>();
@@ -1715,6 +1724,27 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
           adoptedFromRunId: null,
         };
       },
+      async listWakeupRequests(issueIds, companyId, options) {
+        requireCapability(manifest, capabilitySet, "issue.wakeups.read");
+        if (!companyId) throw new Error("companyId is required for this operation");
+        if (!Array.isArray(issueIds) || issueIds.length > PLUGIN_WAKEUP_REQUESTS_MAX_ISSUE_IDS) {
+          throw new Error(`issueIds must be an array of at most ${PLUGIN_WAKEUP_REQUESTS_MAX_ISSUE_IDS} ids`);
+        }
+        const ids = new Set(issueIds);
+        const sinceMs = options?.since ? Date.parse(options.since) : null;
+        if (sinceMs !== null && Number.isNaN(sinceMs)) throw new Error("since must be an ISO timestamp");
+        const statuses = options?.statuses ?? (sinceMs === null ? [...PLUGIN_WAKEUP_REQUESTS_DEFAULT_STATUSES] : null);
+        const limit = Math.min(Math.max(1, Math.floor(options?.limit ?? PLUGIN_WAKEUP_REQUESTS_MAX_ROWS)), PLUGIN_WAKEUP_REQUESTS_MAX_ROWS);
+        return wakeupRequests
+          .filter((row) => row.companyId === companyId && ids.has(row.issueId))
+          .filter((row) => !statuses || statuses.includes(row.status))
+          .filter((row) => sinceMs === null || Date.parse(row.requestedAt) >= sinceMs)
+          .sort((a, b) => Date.parse(b.requestedAt) - Date.parse(a.requestedAt))
+          .slice(0, limit)
+          .map(({ id, issueId, agentId, status, reason, source, requestedAt }) => ({
+            id, issueId, agentId, status, reason, source, requestedAt,
+          }));
+      },
       async requestWakeup(issueId, companyId) {
         requireCapability(manifest, capabilitySet, "issues.wakeup");
         const record = issues.get(issueId);
@@ -2670,6 +2700,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         issueAttachments.set(attachment.issueId, list);
         attachmentContentById.set(attachment.id, contentBase64 ?? "");
       }
+      for (const row of input.wakeupRequests ?? []) wakeupRequests.push(row);
       for (const row of input.approvals ?? []) approvals.set(row.id, row);
       for (const row of input.agents ?? []) agents.set(row.id, row);
       for (const row of input.goals ?? []) goals.set(row.id, row);

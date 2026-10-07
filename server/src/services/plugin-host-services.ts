@@ -1,6 +1,7 @@
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
+  agentWakeupRequests,
   agentTaskSessions as agentTaskSessionsTable,
   agents as agentsTable,
   budgetIncidents,
@@ -13,7 +14,7 @@ import {
   principalPermissionGrants,
   projects as projectsTable,
 } from "@paperclipai/db";
-import { eq, and, like, desc, inArray, sql, isNull, isNotNull, gt, lte } from "drizzle-orm";
+import { eq, and, like, desc, inArray, sql, isNull, isNotNull, gt, gte, lte } from "drizzle-orm";
 import type {
   HostServices,
   Company,
@@ -570,6 +571,11 @@ function truncStr(s: string, max: number): string {
  * the meta it spreads into the host pino log line — one sanitiser, every
  * surface that persists or logs plugin-authored meta.
  */
+/** Bounds for the plugin `issues.listWakeupRequests` read (issue.wakeups.read). */
+const WAKEUP_REQUESTS_MAX_ISSUE_IDS = 200;
+const WAKEUP_REQUESTS_MAX_ROWS = 1000;
+const WAKEUP_REQUESTS_DEFAULT_STATUSES = ["queued", "deferred_issue_execution"] as const;
+
 export function sanitiseMeta(meta: Record<string, unknown> | null | undefined): Record<string, unknown> | null {
   if (meta == null) return null;
   // Strip pino reserved keys
@@ -2637,6 +2643,64 @@ export function buildHostServices(
           checkoutRunId: ownership.checkoutRunId,
           adoptedFromRunId: ownership.adoptedFromRunId,
         };
+      },
+      async listWakeupRequests(params) {
+        // Company scoping: identical to getSubtree — companyId is mandatory,
+        // the host only returns rows whose agent_wakeup_requests.company_id
+        // equals it (instance-scoped plugins must call once per company).
+        const companyId = ensureCompanyId(params.companyId);
+        await noPluginAvailabilityGate(companyId);
+        const issueIds = Array.isArray(params.issueIds)
+          ? [...new Set(params.issueIds.filter((id): id is string => typeof id === "string" && id.length > 0))]
+          : null;
+        if (!issueIds) throw new Error("issueIds must be an array");
+        if (issueIds.length > WAKEUP_REQUESTS_MAX_ISSUE_IDS) {
+          throw new Error(`issueIds exceeds limit of ${WAKEUP_REQUESTS_MAX_ISSUE_IDS}`);
+        }
+        if (issueIds.length === 0) return [];
+        let since: Date | null = null;
+        if (params.since !== undefined && params.since !== null) {
+          since = new Date(params.since);
+          if (Number.isNaN(since.getTime())) throw new Error("since must be an ISO timestamp");
+        }
+        const statuses = Array.isArray(params.statuses)
+          ? params.statuses.filter((s): s is string => typeof s === "string").slice(0, 32)
+          : since ? null : [...WAKEUP_REQUESTS_DEFAULT_STATUSES];
+        if (statuses && statuses.length === 0) return [];
+        const requested = typeof params.limit === "number" && Number.isFinite(params.limit)
+          ? Math.floor(params.limit) : WAKEUP_REQUESTS_MAX_ROWS;
+        const limit = Math.min(Math.max(1, requested), WAKEUP_REQUESTS_MAX_ROWS);
+        const issueIdExpr = sql<string>`${agentWakeupRequests.payload} ->> 'issueId'`;
+        // Allow-listed columns only: payload/context snapshot, idempotency
+        // key, requester ids and error text are never selected.
+        const rows = await db
+          .select({
+            id: agentWakeupRequests.id,
+            issueId: issueIdExpr,
+            agentId: agentWakeupRequests.agentId,
+            status: agentWakeupRequests.status,
+            reason: agentWakeupRequests.reason,
+            source: agentWakeupRequests.source,
+            requestedAt: agentWakeupRequests.requestedAt,
+          })
+          .from(agentWakeupRequests)
+          .where(and(
+            eq(agentWakeupRequests.companyId, companyId),
+            inArray(issueIdExpr, issueIds),
+            statuses ? inArray(agentWakeupRequests.status, statuses) : undefined,
+            since ? gte(agentWakeupRequests.requestedAt, since) : undefined,
+          ))
+          .orderBy(desc(agentWakeupRequests.requestedAt))
+          .limit(limit);
+        return rows.map((row) => ({
+          id: row.id,
+          issueId: row.issueId,
+          agentId: row.agentId,
+          status: row.status,
+          reason: row.reason ?? null,
+          source: row.source,
+          requestedAt: row.requestedAt instanceof Date ? row.requestedAt.toISOString() : String(row.requestedAt),
+        }));
       },
       async getSubtree(params) {
         const companyId = ensureCompanyId(params.companyId);
