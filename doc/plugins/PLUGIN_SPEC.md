@@ -822,6 +822,7 @@ Relation and read helpers:
 - `ctx.issues.relations.addBlockers(issueId, blockerIssueIds, companyId)`
 - `ctx.issues.relations.removeBlockers(issueId, blockerIssueIds, companyId)`
 - `ctx.issues.getSubtree(issueId, companyId, options)`
+- `ctx.issues.listWakeupRequests(issueIds, companyId, options)` — pending/recent wakeup requests, allow-listed fields (`issue.wakeups.read`)
 - `ctx.issues.summaries.getOrchestration({ issueId, companyId, includeSubtree, billingCode })`
 
 Governance helpers:
@@ -922,6 +923,7 @@ The host enforces capabilities in the SDK layer and refuses calls outside the gr
 - `issue.documents.read`
 - `issue.relations.read`
 - `issue.subtree.read`
+- `issue.wakeups.read`
 - `agents.read`
 - `goals.read`
 - `activity.read`

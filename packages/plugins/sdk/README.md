@@ -316,6 +316,7 @@ Declare in `manifest.capabilities`. Grouped by scope:
 | | `issue.documents.read` |
 | | `issue.relations.read` |
 | | `issue.subtree.read` |
+| | `issue.wakeups.read` |
 | | `agents.read` |
 | | `goals.read` |
 | | `goals.create` |
@@ -539,6 +540,21 @@ const subtree = await ctx.issues.getSubtree(missionIssueId, companyId, {
 });
 ```
 
+Liveness/watchdog plugins can read pending agent wakeup requests for up to 200
+issues of one company (capability `issue.wakeups.read`, default-deny, not implied
+by `issues.read`). Without options it returns `queued` and
+`deferred_issue_execution` rows; with `since` and no `statuses` it returns rows of
+any status requested at or after `since` (newest first, max 1000 rows). Only
+`id, issueId, agentId, status, reason, source, requestedAt` are returned — never
+the wake payload or context snapshot.
+
+```ts
+const pending = await ctx.issues.listWakeupRequests(issueIds, companyId);
+const recent = await ctx.issues.listWakeupRequests(issueIds, companyId, {
+  since: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+});
+```
+
 Agent-run actions can assert checkout ownership before mutating in-progress work:
 
 ```ts
@@ -603,6 +619,7 @@ Required capabilities:
 | `ctx.issues.relations.get` | `issue.relations.read` |
 | `ctx.issues.relations.setBlockedBy` / `addBlockers` / `removeBlockers` | `issue.relations.write` |
 | `ctx.issues.getSubtree` | `issue.subtree.read` |
+| `ctx.issues.listWakeupRequests` | `issue.wakeups.read` |
 | `ctx.issues.assertCheckoutOwner` | `issues.checkout` |
 | `ctx.issues.createComment` | `issue.comments.create` |
 | `ctx.issues.createComment` with `actorUserId` | `issue.comments.create` + `issue.comments.create_human_attributed` |

@@ -300,6 +300,7 @@ export interface HostServices {
     removeBlockers(params: WorkerToHostMethods["issues.relations.removeBlockers"][0]): Promise<WorkerToHostMethods["issues.relations.removeBlockers"][1]>;
     assertCheckoutOwner(params: WorkerToHostMethods["issues.assertCheckoutOwner"][0]): Promise<WorkerToHostMethods["issues.assertCheckoutOwner"][1]>;
     getSubtree(params: WorkerToHostMethods["issues.getSubtree"][0]): Promise<WorkerToHostMethods["issues.getSubtree"][1]>;
+    listWakeupRequests(params: WorkerToHostMethods["issues.listWakeupRequests"][0]): Promise<WorkerToHostMethods["issues.listWakeupRequests"][1]>;
     requestWakeup(params: WorkerToHostMethods["issues.requestWakeup"][0]): Promise<WorkerToHostMethods["issues.requestWakeup"][1]>;
     requestWakeups(params: WorkerToHostMethods["issues.requestWakeups"][0]): Promise<WorkerToHostMethods["issues.requestWakeups"][1]>;
     getOrchestrationSummary(params: WorkerToHostMethods["issues.summaries.getOrchestration"][0]): Promise<WorkerToHostMethods["issues.summaries.getOrchestration"][1]>;
@@ -547,6 +548,7 @@ const METHOD_CAPABILITY_MAP: Record<
   "issues.relations.removeBlockers": "issue.relations.write",
   "issues.assertCheckoutOwner": "issues.checkout",
   "issues.getSubtree": "issue.subtree.read",
+  "issues.listWakeupRequests": "issue.wakeups.read",
   "issues.requestWakeup": "issues.wakeup",
   "issues.requestWakeups": "issues.wakeup",
   "issues.summaries.getOrchestration": "issues.orchestration.read",
@@ -1319,6 +1321,9 @@ export function createHostClientHandlers(
     }),
     "issues.getSubtree": gated("issues.getSubtree", async (params) => {
       return services.issues.getSubtree(params);
+    }),
+    "issues.listWakeupRequests": gated("issues.listWakeupRequests", async (params) => {
+      return services.issues.listWakeupRequests(params);
     }),
     "issues.requestWakeup": gated("issues.requestWakeup", async (params) => {
       return services.issues.requestWakeup(params);
