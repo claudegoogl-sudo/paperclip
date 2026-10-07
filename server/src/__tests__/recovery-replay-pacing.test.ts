@@ -262,5 +262,31 @@ describeEmbeddedPostgres("staggered boot recovery replay", () => {
       expect(edges).toHaveLength(1);
       expect(wakes).toHaveLength(0);
     });
+
+    it("a failing cancelled-blocker notice never stops dispatch of other issues", async () => {
+      const companyId = await seedCompany();
+      const stuckAgent = await seedAgent(companyId, "StuckNotice");
+      const readyAgent = await seedAgent(companyId, "ReadyNotice");
+      const blockerId = await seedIssue(companyId, "cancelled", null, "cancelled blocker");
+      const dependentId = await seedAssignedTodoIssue(companyId, stuckAgent);
+      await block(companyId, blockerId, dependentId);
+      await seedAssignedTodoIssue(companyId, readyAgent);
+
+      // Make every comment insert fail, so addComment throws for the notice.
+      await db.execute(sql`create or replace function pla_test_fail_comment() returns trigger as $$
+        begin raise exception 'injected comment failure'; end $$ language plpgsql`);
+      await db.execute(sql`create trigger pla_test_fail_comment before insert on issue_comments
+        for each row execute function pla_test_fail_comment()`);
+      try {
+        const wakes: string[] = [];
+        const result = await makeRecovery(wakes, []).reconcileStrandedAssignedIssues();
+        expect(result.cancelledBlockerNoticesPosted).toBe(0);
+        expect(result.dependencyBlocked).toBe(1);
+        expect(result.assignmentDispatched).toBe(1);
+        expect(wakes).toEqual([readyAgent]);
+      } finally {
+        await db.execute(sql`drop trigger if exists pla_test_fail_comment on issue_comments`);
+      }
+    });
   });
 });

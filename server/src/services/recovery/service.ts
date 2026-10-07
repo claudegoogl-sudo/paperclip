@@ -1448,6 +1448,7 @@ export function recoveryService(
         const blocker = cancelledBlockers.get(blockerId);
         if (!blocker || noticed.has(`${dependentId}:${blockerId}`)) continue;
         const label = blocker.identifier ?? blocker.id;
+        try {
         await issuesSvc.addComment(
           dependentId,
           [
@@ -1474,6 +1475,19 @@ export function recoveryService(
           },
           "posted cancelled-blocker notice on dependent issue",
         );
+        } catch (err) {
+          // Advisory only: one bad pair must never stop the recovery sweep.
+          logger.warn(
+            {
+              event: "recovery_cancelled_blocker_notice_failed",
+              companyId: entry.companyId,
+              issueId: dependentId,
+              blockerIssueId: blocker.id,
+              errName: err instanceof Error ? err.name : typeof err,
+            },
+            "failed to post cancelled-blocker notice; continuing recovery scan",
+          );
+        }
       }
     }
     return posted;
@@ -5161,7 +5175,19 @@ export function recoveryService(
         }
       }
     }
-    const cancelledBlockerNoticesPosted = await noticeCancelledBlockers(candidates, readinessByIssueId);
+    let cancelledBlockerNoticesPosted = 0;
+    try {
+      cancelledBlockerNoticesPosted = await noticeCancelledBlockers(candidates, readinessByIssueId);
+    } catch (err) {
+      // Advisory only: a failed notice query must never stop dispatch.
+      logger.warn(
+        {
+          event: "recovery_cancelled_blocker_notice_failed",
+          errName: err instanceof Error ? err.name : typeof err,
+        },
+        "cancelled-blocker notice step failed; continuing recovery scan",
+      );
+    }
 
     const result = {
       assignmentDispatched: 0,
