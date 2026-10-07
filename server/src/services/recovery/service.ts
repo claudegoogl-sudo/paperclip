@@ -880,6 +880,13 @@ function buildLivenessOriginalIssueComment(finding: IssueLivenessFinding, escala
   ].join("\n");
 }
 
+const CANCELLED_BLOCKER_NOTICE_MARKER = "paperclip:cancelled-blocker-notice";
+
+type IssueDependencyReadinessLike = {
+  isDependencyReady: boolean;
+  unresolvedBlockerIssueIds: string[];
+};
+
 export function recoveryService(
   db: Db,
   deps: {
@@ -898,6 +905,8 @@ export function recoveryService(
       random?: () => number;
       now?: () => number;
       setTimeoutImpl?: (ms: number) => Promise<void>;
+      /** Test spy for the pacer's `recovery_replay_pacing` log line. */
+      logger?: { info: (obj: Record<string, unknown>, msg?: string) => void };
     };
   },
 ) {
@@ -1379,6 +1388,95 @@ export function recoveryService(
         source: "issue.assigned_todo_liveness_dispatch",
       }, "normal_model"),
     });
+  }
+
+  /**
+   * A `cancelled` blocker never resolves (only `done` does), so its dependent
+   * waits forever and nothing tells anyone. Post one system comment per
+   * (dependent, cancelled blocker) pair. Dedupe is by a hidden marker in prior
+   * comment bodies, so re-running the scan never posts twice. The blocker edge
+   * is NOT removed: that stays an operator decision.
+   */
+  async function noticeCancelledBlockers(
+    candidates: Array<typeof issues.$inferSelect>,
+    readinessByIssueId: Map<string, IssueDependencyReadinessLike>,
+  ) {
+    const unresolvedByDependent = new Map<string, { companyId: string; blockerIds: string[] }>();
+    for (const candidate of candidates) {
+      if (candidate.status !== "todo" && candidate.status !== "in_progress") continue;
+      const readiness = readinessByIssueId.get(candidate.id);
+      if (!readiness || readiness.unresolvedBlockerIssueIds.length === 0) continue;
+      unresolvedByDependent.set(candidate.id, {
+        companyId: candidate.companyId,
+        blockerIds: [...readiness.unresolvedBlockerIssueIds],
+      });
+    }
+    if (unresolvedByDependent.size === 0) return 0;
+
+    const allBlockerIds = [...new Set([...unresolvedByDependent.values()].flatMap((entry) => entry.blockerIds))];
+    const cancelledBlockers = new Map(
+      (await db
+        .select({ id: issues.id, identifier: issues.identifier, title: issues.title })
+        .from(issues)
+        .where(and(inArray(issues.id, allBlockerIds), eq(issues.status, "cancelled"))))
+        .map((row) => [row.id, row] as const),
+    );
+    if (cancelledBlockers.size === 0) return 0;
+
+    const affectedDependentIds = [...unresolvedByDependent.entries()]
+      .filter(([, entry]) => entry.blockerIds.some((id) => cancelledBlockers.has(id)))
+      .map(([dependentId]) => dependentId);
+    const priorNotices = await db
+      .select({ issueId: issueComments.issueId, body: issueComments.body })
+      .from(issueComments)
+      .where(
+        and(
+          inArray(issueComments.issueId, affectedDependentIds),
+          sql`${issueComments.body} like ${`%${CANCELLED_BLOCKER_NOTICE_MARKER}%`}`,
+        ),
+      );
+    const noticed = new Set<string>();
+    const markerPattern = new RegExp(`${CANCELLED_BLOCKER_NOTICE_MARKER} blocker=([0-9a-f-]+)`, "g");
+    for (const row of priorNotices) {
+      for (const match of row.body.matchAll(markerPattern)) noticed.add(`${row.issueId}:${match[1]}`);
+    }
+
+    let posted = 0;
+    for (const dependentId of affectedDependentIds) {
+      const entry = unresolvedByDependent.get(dependentId)!;
+      for (const blockerId of entry.blockerIds) {
+        const blocker = cancelledBlockers.get(blockerId);
+        if (!blocker || noticed.has(`${dependentId}:${blockerId}`)) continue;
+        const label = blocker.identifier ?? blocker.id;
+        await issuesSvc.addComment(
+          dependentId,
+          [
+            "## Blocked by a cancelled issue",
+            "",
+            `This issue is blocked by ${label} (\`${blocker.title}\`), which is \`cancelled\`.`,
+            "",
+            "- A cancelled blocker never resolves, so this issue will not be woken by it.",
+            "- Remove it or replace it with its successor via `blockedByIssueIds`.",
+            "- Paperclip does not remove the blocker relationship automatically.",
+            "",
+            `<!-- ${CANCELLED_BLOCKER_NOTICE_MARKER} blocker=${blocker.id} -->`,
+          ].join("\n"),
+          {},
+        );
+        noticed.add(`${dependentId}:${blockerId}`);
+        posted += 1;
+        logger.info(
+          {
+            event: "recovery_cancelled_blocker_notice",
+            companyId: entry.companyId,
+            issueId: dependentId,
+            blockerIssueId: blocker.id,
+          },
+          "posted cancelled-blocker notice on dependent issue",
+        );
+      }
+    }
+    return posted;
   }
 
   async function isInvocationBudgetBlocked(issue: typeof issues.$inferSelect, agentId: string) {
@@ -5041,8 +5139,34 @@ export function recoveryService(
         ),
       );
 
+    // One dependency-readiness query per company per tick (not per issue). A
+    // dependency-blocked `todo` issue must not be "dispatched" by the liveness
+    // scan: heartbeat admission would only record a skipped
+    // `issue_dependencies_blocked` wake row (plus a pacing log line) every tick,
+    // forever, which reads like a stalled replay queue. The real wake for such an
+    // issue is `issue_blockers_resolved` (or the next tick once it is ready).
+    const readinessByIssueId = new Map<string, IssueDependencyReadinessLike>();
+    {
+      const idsByCompany = new Map<string, string[]>();
+      for (const candidate of candidates) {
+        if (candidate.status !== "todo" && candidate.status !== "in_progress") continue;
+        const ids = idsByCompany.get(candidate.companyId) ?? [];
+        ids.push(candidate.id);
+        idsByCompany.set(candidate.companyId, ids);
+      }
+      for (const [companyId, ids] of idsByCompany.entries()) {
+        const readinessMap = await issuesSvc.listDependencyReadiness(companyId, ids);
+        for (const [issueId, readiness] of readinessMap.entries()) {
+          readinessByIssueId.set(issueId, readiness);
+        }
+      }
+    }
+    const cancelledBlockerNoticesPosted = await noticeCancelledBlockers(candidates, readinessByIssueId);
+
     const result = {
       assignmentDispatched: 0,
+      dependencyBlocked: 0,
+      cancelledBlockerNoticesPosted,
       dispatchRequeued: 0,
       continuationRequeued: 0,
       dispositionRepairRequeued: 0,
@@ -5576,6 +5700,12 @@ export function recoveryService(
 
       if (issue.status === "todo") {
         if (!latestRun) {
+          const readiness = readinessByIssueId.get(issue.id);
+          if (readiness && !readiness.isDependencyReady) {
+            result.dependencyBlocked += 1;
+            continue;
+          }
+
           if (await hasQueuedIssueWake(issue.companyId, issue.id)) {
             result.skipped += 1;
             continue;
