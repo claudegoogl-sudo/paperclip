@@ -263,6 +263,41 @@ describeEmbeddedPostgres("staggered boot recovery replay", () => {
       expect(wakes).toHaveLength(0);
     });
 
+    it("a dependent in status blocked gets one notice per cancelled blocker over 2 ticks; status and edges unchanged", async () => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent(companyId, "BlockedStatus");
+      const cancelledA = await seedIssue(companyId, "cancelled", null, "cancelled A");
+      const cancelledB = await seedIssue(companyId, "cancelled", null, "cancelled B");
+      const openBlocker = await seedIssue(companyId, "in_progress", null, "open blocker");
+      const dependentId = await seedIssue(companyId, "blocked", agentId, "blocked dependent");
+      await block(companyId, cancelledA, dependentId);
+      await block(companyId, cancelledB, dependentId);
+      await block(companyId, openBlocker, dependentId);
+      // A closed dependent never gets a notice.
+      const doneDependent = await seedIssue(companyId, "done", agentId, "done dependent");
+      await block(companyId, cancelledA, doneDependent);
+
+      const wakes: string[] = [];
+      const recovery = makeRecovery(wakes, []);
+      const first = await recovery.reconcileStrandedAssignedIssues();
+      expect(first.cancelledBlockerNoticesPosted).toBe(2);
+      const second = await recovery.reconcileStrandedAssignedIssues();
+      expect(second.cancelledBlockerNoticesPosted).toBe(0);
+
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, dependentId));
+      expect(comments).toHaveLength(2);
+      const bodies = comments.map((c) => c.body).join("\n");
+      expect(bodies).toContain(`paperclip:cancelled-blocker-notice blocker=${cancelledA}`);
+      expect(bodies).toContain(`paperclip:cancelled-blocker-notice blocker=${cancelledB}`);
+      expect(bodies).toContain("A cancelled blocker never resolves");
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, doneDependent))).toHaveLength(0);
+      const edges = await db.select().from(issueRelations).where(eq(issueRelations.relatedIssueId, dependentId));
+      expect(edges).toHaveLength(3);
+      const [row] = await db.select().from(issues).where(eq(issues.id, dependentId));
+      expect(row.status).toBe("blocked");
+      expect(wakes).toHaveLength(0);
+    });
+
     it("a failing cancelled-blocker notice never stops dispatch of other issues", async () => {
       const companyId = await seedCompany();
       const stuckAgent = await seedAgent(companyId, "StuckNotice");

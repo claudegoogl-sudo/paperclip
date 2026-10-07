@@ -1,4 +1,5 @@
 import { and, asc, desc, eq, gt, gte, inArray, isNull, ne, notInArray, or, sql } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -1397,49 +1398,47 @@ export function recoveryService(
    * comment bodies, so re-running the scan never posts twice. The blocker edge
    * is NOT removed: that stays an operator decision.
    */
-  async function noticeCancelledBlockers(
-    candidates: Array<typeof issues.$inferSelect>,
-    readinessByIssueId: Map<string, IssueDependencyReadinessLike>,
-  ) {
-    const unresolvedByDependent = new Map<string, { companyId: string; blockerIds: string[] }>();
-    for (const candidate of candidates) {
-      if (candidate.status !== "todo" && candidate.status !== "in_progress") continue;
-      const readiness = readinessByIssueId.get(candidate.id);
-      if (!readiness || readiness.unresolvedBlockerIssueIds.length === 0) continue;
-      unresolvedByDependent.set(candidate.id, {
-        companyId: candidate.companyId,
-        blockerIds: [...readiness.unresolvedBlockerIssueIds],
-      });
-    }
-    if (unresolvedByDependent.size === 0) return 0;
-
-    const allBlockerIds = [...new Set([...unresolvedByDependent.values()].flatMap((entry) => entry.blockerIds))];
-    const cancelledBlockers = new Map(
-      (await db
-        .select({ id: issues.id, identifier: issues.identifier, title: issues.title })
-        .from(issues)
-        .where(and(inArray(issues.id, allBlockerIds), eq(issues.status, "cancelled"))))
-        .map((row) => [row.id, row] as const),
-    );
-    if (cancelledBlockers.size === 0) return 0;
-
-    const affectedDependentIds = [...unresolvedByDependent.entries()]
-      .filter(([, entry]) => entry.blockerIds.some((id) => cancelledBlockers.has(id)))
-      .map(([dependentId]) => dependentId);
-    const priorNotices = await db
-      .select({ issueId: issueComments.issueId, body: issueComments.body })
-      .from(issueComments)
+  async function noticeCancelledBlockers() {
+    // ONE query per tick across all companies: every open dependent (todo,
+    // in_progress or blocked) held by a `cancelled` blocker, minus pairs that
+    // already carry the hidden notice marker. Dependents in `blocked` are not in
+    // the stranded-scan candidate list, so this must not ride on it.
+    const blockerIssues = alias(issues, "cancelled_blocker");
+    const pairs = await db
+      .select({
+        dependentId: issueRelations.relatedIssueId,
+        companyId: issueRelations.companyId,
+        blockerId: blockerIssues.id,
+        blockerIdentifier: blockerIssues.identifier,
+        blockerTitle: blockerIssues.title,
+      })
+      .from(issueRelations)
+      .innerJoin(blockerIssues, eq(issueRelations.issueId, blockerIssues.id))
+      .innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id))
       .where(
         and(
-          inArray(issueComments.issueId, affectedDependentIds),
-          sql`${issueComments.body} like ${`%${CANCELLED_BLOCKER_NOTICE_MARKER}%`}`,
+          eq(issueRelations.type, "blocks"),
+          eq(blockerIssues.status, "cancelled"),
+          inArray(issues.status, ["todo", "in_progress", "blocked"]),
+          sql`not exists (
+            select 1 from ${issueComments}
+            where ${issueComments.issueId} = ${issueRelations.relatedIssueId}
+              and ${issueComments.body} like '%' || ${CANCELLED_BLOCKER_NOTICE_MARKER} || ' blocker=' || ${blockerIssues.id}::text || '%'
+          )`,
         ),
       );
-    const noticed = new Set<string>();
-    const markerPattern = new RegExp(`${CANCELLED_BLOCKER_NOTICE_MARKER} blocker=([0-9a-f-]+)`, "g");
-    for (const row of priorNotices) {
-      for (const match of row.body.matchAll(markerPattern)) noticed.add(`${row.issueId}:${match[1]}`);
+    if (pairs.length === 0) return 0;
+
+    const affectedDependentIds = [...new Set(pairs.map((pair) => pair.dependentId))];
+    const unresolvedByDependent = new Map<string, { companyId: string; blockerIds: string[] }>();
+    const cancelledBlockers = new Map<string, { id: string; identifier: string | null; title: string }>();
+    for (const pair of pairs) {
+      const entry = unresolvedByDependent.get(pair.dependentId) ?? { companyId: pair.companyId, blockerIds: [] };
+      if (!entry.blockerIds.includes(pair.blockerId)) entry.blockerIds.push(pair.blockerId);
+      unresolvedByDependent.set(pair.dependentId, entry);
+      cancelledBlockers.set(pair.blockerId, { id: pair.blockerId, identifier: pair.blockerIdentifier, title: pair.blockerTitle });
     }
+    const noticed = new Set<string>();
 
     let posted = 0;
     for (const dependentId of affectedDependentIds) {
@@ -5177,7 +5176,7 @@ export function recoveryService(
     }
     let cancelledBlockerNoticesPosted = 0;
     try {
-      cancelledBlockerNoticesPosted = await noticeCancelledBlockers(candidates, readinessByIssueId);
+      cancelledBlockerNoticesPosted = await noticeCancelledBlockers();
     } catch (err) {
       // Advisory only: a failed notice query must never stop dispatch.
       logger.warn(
