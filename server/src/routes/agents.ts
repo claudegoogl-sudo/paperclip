@@ -1514,6 +1514,54 @@ export function agentRoutes(
     };
   }
 
+  /**
+   * Requested scope for every `agent_config:update` decision. Always carries
+   * the target agent id so an `agents:configure` grant scoped to
+   * `{targetAgentIds:[...]}` can match; an unscoped grant (scope null) still
+   * matches any requested scope, so existing unscoped grants are unchanged.
+   */
+  function agentConfigUpdateScope(
+    targetAgent: { id: string },
+    extra: Record<string, unknown> = {},
+  ): Record<string, unknown> {
+    return { ...extra, targetAgentId: targetAgent.id };
+  }
+
+  /**
+   * Agent callers that update ANOTHER agent may change only the model
+   * selection. Everything else (env, command, runtimeConfig, name, ...) and
+   * replaceAdapterConfig are rejected. Self-updates and board callers are
+   * not affected.
+   */
+  const CROSS_AGENT_ADAPTER_CONFIG_ALLOWED_KEYS = new Set(["model", "fallbackModel"]);
+  function assertAgentCrossAgentPatchIsModelOnly(
+    req: Request,
+    targetAgent: { id: string },
+    body: Record<string, unknown>,
+  ) {
+    if (req.actor.type !== "agent") return;
+    if (req.actor.agentId === targetAgent.id) return;
+    const rejected: string[] = [];
+    for (const key of Object.keys(body)) {
+      if (key !== "adapterConfig") rejected.push(key);
+    }
+    const adapterConfig = asRecord(body.adapterConfig);
+    if (hasOwn(body, "adapterConfig") && !adapterConfig) rejected.push("adapterConfig");
+    if (adapterConfig) {
+      for (const key of Object.keys(adapterConfig)) {
+        if (!CROSS_AGENT_ADAPTER_CONFIG_ALLOWED_KEYS.has(key)) rejected.push(`adapterConfig.${key}`);
+      }
+    }
+    if (rejected.length === 0) return;
+    logger.warn(
+      { actorAgentId: req.actor.agentId, targetAgentId: targetAgent.id, rejectedFields: rejected.sort() },
+      "agent.cross_agent_update.denied_fields",
+    );
+    throw forbidden(
+      `Agent callers may only change adapterConfig.model / adapterConfig.fallbackModel on another agent (rejected: ${rejected.join(", ")})`,
+    );
+  }
+
   async function assertCanUpdateAgent(req: Request, targetAgent: { id: string; companyId: string }) {
     if (!hasCompanyAccess(req, targetAgent.companyId)) {
       throw notFound("Agent not found");
@@ -1523,6 +1571,7 @@ export function agentRoutes(
       actor: req.actor,
       action: "agent_config:update",
       resource: { type: "agent", companyId: targetAgent.companyId, agentId: targetAgent.id },
+      scope: agentConfigUpdateScope(targetAgent),
     });
     if (decision.allowed) return;
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
@@ -2096,7 +2145,7 @@ export function agentRoutes(
       throw notFound("Agent not found");
     }
     assertCompanyAccess(req, targetAgent.companyId);
-    const changeScope = { requiresChangeGrant: true };
+    const changeScope = agentConfigUpdateScope(targetAgent, { requiresChangeGrant: true });
     const decision = await access.decide({
       actor: req.actor,
       action: "agent_config:update",
@@ -2175,7 +2224,7 @@ export function agentRoutes(
       actor: req.actor,
       action: "agent_config:update",
       resource: { type: "agent", companyId: targetAgent.companyId, agentId: targetAgent.id },
-      scope: { requiresChangeGrant: true },
+      scope: agentConfigUpdateScope(targetAgent, { requiresChangeGrant: true }),
     });
     if (decision.allowed) return;
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
@@ -4009,6 +4058,8 @@ export function agentRoutes(
       res.status(422).json({ error: "Use /api/agents/:id/permissions for permission changes" });
       return;
     }
+
+    assertAgentCrossAgentPatchIsModelOnly(req, existing, req.body as Record<string, unknown>);
 
     const patchData = { ...(req.body as Record<string, unknown>) };
     const replaceAdapterConfig = patchData.replaceAdapterConfig === true;
