@@ -5191,7 +5191,14 @@ export function secretService(db: Db) {
       const paths = collectSecretRefPaths(asRecord(input.instanceConfigSchema));
       if (paths.size === 0) return { bound: 0, revoked: 0 };
 
-      const refsAtPaths = (cfg: unknown): Map<string, string> => {
+      // A secret-ref path holds either a legacy bare-UUID string or the
+      // canonical object `{ type: "secret_ref", secretId, version? }`. Both
+      // shapes MUST count as a ref here: a string -> object migration save with
+      // the same secretId is "unchanged", not "cleared". Recognising only
+      // strings made the first object-shape save revoke the binding row that
+      // `syncSecretRefsForTarget` had just written (binding_missing at resolve).
+      const versionByPath = new Map<string, SecretVersionSelector>();
+      const refsAtPaths = (cfg: unknown, trackVersions = false): Map<string, string> => {
         const out = new Map<string, string>();
         const record = asRecord(cfg);
         if (!record) return out;
@@ -5199,13 +5206,31 @@ export function secretService(db: Db) {
           const value = readConfigValueAtPath(record, dotPath);
           if (typeof value === "string" && isUuidSecretRef(value)) {
             out.set(dotPath, value.toLowerCase());
+            continue;
+          }
+          const obj = asRecord(value);
+          if (
+            obj &&
+            obj.type === "secret_ref" &&
+            typeof obj.secretId === "string" &&
+            isUuidSecretRef(obj.secretId)
+          ) {
+            out.set(dotPath, obj.secretId.toLowerCase());
+            if (
+              trackVersions &&
+              typeof obj.version === "number" &&
+              Number.isInteger(obj.version) &&
+              obj.version > 0
+            ) {
+              versionByPath.set(dotPath, obj.version);
+            }
           }
         }
         return out;
       };
 
       const oldRefs = refsAtPaths(input.previousConfig);
-      const newRefs = refsAtPaths(input.nextConfig);
+      const newRefs = refsAtPaths(input.nextConfig, true);
 
       // Resolve the binding's owning company. For per-company settings the ref
       // MUST belong to that company (else skip — never bind cross-company). For
@@ -5280,7 +5305,7 @@ export function secretService(db: Db) {
               targetType: "plugin",
               targetId: input.pluginId,
               configPath: dotPath,
-              versionSelector: "latest",
+              versionSelector: String(versionByPath.get(dotPath) ?? "latest"),
               required: true,
               label: "plugin-config",
             })

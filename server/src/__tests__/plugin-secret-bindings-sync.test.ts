@@ -308,4 +308,103 @@ describeEmbeddedPostgres("secretService.syncPluginSecretBindings", () => {
       expect(rows[0]).toMatchObject({ companyId: companyC, secretId: secretC });
     });
   });
+
+  describe("string -> object ref migration (route sequence: syncSecretRefsForTarget then syncPluginSecretBindings)", () => {
+    const OBJ_SCHEMA = {
+      type: "object",
+      properties: {
+        githubPatSecretId: {
+          format: "secret-ref",
+          oneOf: [
+            { type: "string" },
+            {
+              type: "object",
+              properties: { type: { const: "secret_ref" }, secretId: { type: "string" }, version: { type: "integer" } },
+            },
+          ],
+        },
+      },
+    };
+
+    async function saveCompanyConfig(
+      companyId: string,
+      pluginId: string,
+      previousConfig: unknown,
+      nextConfig: Record<string, unknown>,
+    ) {
+      const svc = secretService(db);
+      const ref = nextConfig.githubPatSecretId as { secretId: string; version?: number } | undefined;
+      await svc.syncSecretRefsForTarget(
+        companyId,
+        { targetType: "plugin", targetId: pluginId },
+        ref && typeof ref === "object"
+          ? [{ secretId: ref.secretId, configPath: "githubPatSecretId", versionSelector: ref.version ?? "latest" }]
+          : [],
+        { replaceAll: true },
+      );
+      return svc.syncPluginSecretBindings({
+        pluginId,
+        instanceConfigSchema: OBJ_SCHEMA,
+        previousConfig,
+        nextConfig,
+        companyId,
+      });
+    }
+
+    it("legacy string -> object (same secretId) keeps exactly one binding with version + egress intact", async () => {
+      const companyId = await seedCompany("Acme");
+      const secretId = await seedSecret(companyId, "pat");
+      const pluginId = randomUUID();
+      const legacy = { githubPatSecretId: secretId };
+      await secretService(db).syncPluginSecretBindings({
+        pluginId, instanceConfigSchema: OBJ_SCHEMA, previousConfig: null, nextConfig: legacy, companyId,
+      });
+      await db
+        .update(companySecretBindings)
+        .set({ allowedEgress: ["https://api.github.com"], egressAllowlistEnforced: false })
+        .where(eq(companySecretBindings.targetId, pluginId));
+
+      const res = await saveCompanyConfig(companyId, pluginId, legacy, {
+        githubPatSecretId: { type: "secret_ref", secretId, version: 3 },
+      });
+
+      expect(res.revoked).toBe(0);
+      const rows = await bindingsFor(pluginId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        companyId,
+        secretId,
+        configPath: "githubPatSecretId",
+        versionSelector: "3",
+        allowedEgress: ["https://api.github.com"],
+        egressAllowlistEnforced: false,
+      });
+    });
+
+    it("object -> object repoint moves the binding to the new secret", async () => {
+      const companyId = await seedCompany("Acme");
+      const a = await seedSecret(companyId, "pat-a");
+      const b = await seedSecret(companyId, "pat-b");
+      const pluginId = randomUUID();
+      const first = { githubPatSecretId: { type: "secret_ref", secretId: a } };
+      await saveCompanyConfig(companyId, pluginId, null, first);
+      await saveCompanyConfig(companyId, pluginId, first, { githubPatSecretId: { type: "secret_ref", secretId: b } });
+      const rows = await bindingsFor(pluginId);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ secretId: b, versionSelector: "latest" });
+    });
+
+    it("object -> cleared removes the binding", async () => {
+      const companyId = await seedCompany("Acme");
+      const a = await seedSecret(companyId, "pat-a");
+      const pluginId = randomUUID();
+      const first = { githubPatSecretId: { type: "secret_ref", secretId: a } };
+      await saveCompanyConfig(companyId, pluginId, null, first);
+      const res = await secretService(db).syncPluginSecretBindings({
+        pluginId, instanceConfigSchema: OBJ_SCHEMA, previousConfig: first, nextConfig: {}, companyId,
+      });
+      expect(res.revoked).toBe(1);
+      expect(await bindingsFor(pluginId)).toHaveLength(0);
+    });
+  });
 });
