@@ -5316,7 +5316,17 @@ export function secretService(db: Db) {
                 companySecretBindings.targetId,
                 companySecretBindings.configPath,
               ],
-              set: { secretId: value, updatedAt: new Date() },
+              // Explicit pinned version -> apply it. Otherwise keep the existing
+              // pin only while the row still names the same secret; a repoint
+              // resets to "latest" (an old pin may not exist on the new secret).
+              // Egress columns are deliberately never touched here.
+              set: {
+                secretId: value,
+                versionSelector: versionByPath.has(dotPath)
+                  ? String(versionByPath.get(dotPath))
+                  : sql`CASE WHEN ${companySecretBindings.secretId} = ${value} THEN ${companySecretBindings.versionSelector} ELSE 'latest' END`,
+                updatedAt: new Date(),
+              },
             })
             .returning({ id: companySecretBindings.id });
           bound += upserted.length;
