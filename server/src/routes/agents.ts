@@ -84,7 +84,7 @@ import type {
 import { getDisabledAdapterTypes } from "../services/adapter-plugin-store.js";
 import { skillVersionSelectionMap } from "../services/runtime-skill-selections.js";
 import { secretService } from "../services/secrets.js";
-import { authorizationDeniedDetails } from "../services/authorization.js";
+import { agentConfigUpdateScope, authorizationDeniedDetails } from "../services/authorization.js";
 import {
   detectAdapterModel,
   findActiveServerAdapter,
@@ -1520,12 +1520,7 @@ export function agentRoutes(
    * `{targetAgentIds:[...]}` can match; an unscoped grant (scope null) still
    * matches any requested scope, so existing unscoped grants are unchanged.
    */
-  function agentConfigUpdateScope(
-    targetAgent: { id: string },
-    extra: Record<string, unknown> = {},
-  ): Record<string, unknown> {
-    return { ...extra, targetAgentId: targetAgent.id };
-  }
+  // agentConfigUpdateScope() lives in services/authorization.ts (shared with routes/secrets.ts).
 
   /**
    * Agent callers that update ANOTHER agent may change only the model
@@ -1560,6 +1555,27 @@ export function agentRoutes(
     throw forbidden(
       `Agent callers may only change adapterConfig.model / adapterConfig.fallbackModel on another agent (rejected: ${rejected.join(", ")})`,
     );
+  }
+
+  /**
+   * Cross-agent write guard. Agent callers may only change *another* agent through
+   * the model-only path of `PATCH /agents/:id` (see assertAgentCrossAgentPatchIsModelOnly).
+   * Every other agent-config write route (instructions, profile, skills sync,
+   * config rollback) is self-only for agent callers, even when an
+   * `agents:configure` grant (scoped or unscoped) would allow it. Board callers
+   * and self-updates are unaffected.
+   */
+  function assertNoCrossAgentAgentWrite(
+    req: Request,
+    targetAgent: { id: string; companyId: string },
+    route: string,
+  ) {
+    if (req.actor.type !== "agent" || req.actor.agentId === targetAgent.id) return;
+    logger.warn(
+      { actorAgentId: req.actor.agentId, targetAgentId: targetAgent.id, route },
+      "agent.cross_agent_write.denied",
+    );
+    throw forbidden(`Agent callers may not use ${route} on another agent`);
   }
 
   async function assertCanUpdateAgent(req: Request, targetAgent: { id: string; companyId: string }) {
@@ -2145,6 +2161,7 @@ export function agentRoutes(
       throw notFound("Agent not found");
     }
     assertCompanyAccess(req, targetAgent.companyId);
+    assertNoCrossAgentAgentWrite(req, targetAgent, "protected agent change (instructions/profile)");
     const changeScope = agentConfigUpdateScope(targetAgent, { requiresChangeGrant: true });
     const decision = await access.decide({
       actor: req.actor,
@@ -2219,6 +2236,9 @@ export function agentRoutes(
     targetAgent: { id: string; companyId: string },
   ) {
     if (req.actor.type !== "agent") return;
+    // Resume is intentionally NOT self-only: cross-agent resume with a direct
+    // agents:configure grant is an existing, tested feature and changes no
+    // configuration. It is now bound to the grant's target scope instead.
 
     const decision = await access.decide({
       actor: req.actor,
@@ -2937,6 +2957,7 @@ export function agentRoutes(
       const id = req.params.id as string;
       const agent = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
       if (!agent) return;
+      assertNoCrossAgentAgentWrite(req, agent, "POST /agents/:id/skills/sync");
       await assertCanUpdateAgent(req, agent);
 
       const requestedSkills = normalizeDesiredSkillSelections(req.body.desiredSkills);
@@ -3330,6 +3351,7 @@ export function agentRoutes(
     const revisionId = req.params.revisionId as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
+    assertNoCrossAgentAgentWrite(req, existing, "POST /agents/:id/config-revisions/:revisionId/rollback");
     await assertCanUpdateAgent(req, existing);
 
     const actor = getActorInfo(req);

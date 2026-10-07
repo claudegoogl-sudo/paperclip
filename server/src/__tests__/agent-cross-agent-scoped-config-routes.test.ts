@@ -284,3 +284,53 @@ describe("cross-agent PATCH /agents/:id: scoped agents:configure + model-only al
     expect(res.status, JSON.stringify(res.body)).toBe(200);
   });
 });
+
+describe("cross-agent non-PATCH agent-config writes are self-only for agent callers (F1)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Grant allows everything: the route guard, not the grant, must deny.
+    mockAccessService.decide.mockResolvedValue({ allowed: true, reason: "allow_explicit_grant", explanation: "grant" });
+    mockAccessService.canUser.mockResolvedValue(true);
+    mockAccessService.hasPermission.mockResolvedValue(true);
+    mockAgentService.getById.mockImplementation(async (id: string) => ({ ...baseAgent, id, adapterConfig: {} }));
+  });
+
+  const routes: Array<[string, (r: ReturnType<typeof request>) => any]> = [
+    ["PATCH instructions-path", (r) => r.patch(`/api/agents/${agentId}/instructions-path`).send({ path: "AGENTS.md" })],
+    ["PATCH instructions-bundle", (r) => r.patch(`/api/agents/${agentId}/instructions-bundle`).send({ mode: "managed" })],
+    ["PUT instructions-bundle/file", (r) => r.put(`/api/agents/${agentId}/instructions-bundle/file`).send({ path: "AGENTS.md", content: "x" })],
+    ["DELETE instructions-bundle/file", (r) => r.delete(`/api/agents/${agentId}/instructions-bundle/file?path=AGENTS.md`)],
+    ["POST skills/sync", (r) => r.post(`/api/agents/${agentId}/skills/sync`).send({ mode: "replace", desiredSkills: [] })],
+    ["POST config rollback", (r) => r.post(`/api/agents/${agentId}/config-revisions/rev-1/rollback`).send({})],
+  ];
+
+  it.each(routes)("%s on another agent by an agent caller -> 403", async (_label, call) => {
+    const app = await createApp(conciergeActor());
+    const res = await requestApp(app, (baseUrl) => call(request(baseUrl)));
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    // instructions-path is already board-only upstream of the new guard.
+    expect(JSON.stringify(res.body)).toMatch(/on another agent|Only board-authenticated/);
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+});
+
+describe("cross-agent resume stays grant-gated and is bound to the grant's target scope", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockAccessService.decide.mockImplementation(async (input: any) => {
+      const target = input.scope?.targetAgentId;
+      if (typeof target === "string" && grantScopeTargetIds.includes(target)) {
+        return { allowed: true, reason: "allow_explicit_grant", explanation: "scoped grant" };
+      }
+      return { allowed: false, reason: "deny_scope", explanation: "Permission agents:configure does not cover the requested scope." };
+    });
+    mockAgentService.getById.mockImplementation(async (id: string) => ({ ...baseAgent, id, status: "paused" }));
+  });
+
+  it("denies resume of an agent outside the grant scope (deny_scope)", async () => {
+    const app = await createApp(conciergeActor());
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).post(`/api/agents/${ceoId}/resume`).send({}));
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(JSON.stringify(res.body)).toContain("deny_scope");
+  });
+});
