@@ -48,6 +48,7 @@ import {
   existsSync,
   openSync,
   readSync,
+  readlinkSync,
   readdirSync,
   readFileSync,
   lstatSync,
@@ -152,11 +153,33 @@ export const CONFIG = {
   TMP_DIR: process.env.PLA_JANITOR_TMP_DIR || os.tmpdir(),
   TMP_SCRATCH_PATTERNS: [/^pcvt-/, /^pla\d/],
   TMP_MAX_AGE_DAYS: 30,
+  // Unmatched /tmp category: any top-level entry owned by the janitor's own
+  // uid (the `paperclip` agent user), any name, whose newest leaf-file mtime
+  // is older than this. Agents name scratch dirs freely (`f53rb`,
+  // `sync8241-staging`, ...) so the pattern rule above misses most of it.
+  TMP_UNMATCHED_MAX_AGE_DAYS: Number(process.env.PLA_JANITOR_TMP_UNMATCHED_MAX_AGE_DAYS || 14),
+  // Destructive-scope gate: the unmatched category is REPORT-ONLY until this
+  // is enabled (CEO approval required to expand deletion scope). With the
+  // gate off, --apply lists candidates but deletes nothing in this category.
+  TMP_UNMATCHED_DELETE: process.env.PLA_JANITOR_TMP_UNMATCHED_DELETE === "1",
+  TMP_OWNER_UID: typeof process.getuid === "function" ? process.getuid() : -1,
+  // Never touched by the unmatched category, whatever the owner or age.
+  TMP_UNMATCHED_EXCLUDE_PATTERNS: [/^\./, /^paperclip-pg-/, /^systemd-private-/, /^tmux-/, /^snap-private-tmp$/, /^claude-/, /^claude$/, /^prime-/, /^prime$/],
+  PROC_DIR: process.env.PLA_JANITOR_PROC_DIR || "/proc",
+  // Report-only: large paths outside janitor roots that need an owner call.
+  OWNER_DECISION_GLOBS: [
+    { dir: HOME, pattern: /^\.pap18/ },
+  ],
+  OWNER_DECISION_PATHS: [path.join(HOME, ".ipython/profile_default/history.sqlite")],
 
   // -- disk alarm --
   DISK_ALARM_PATH: process.env.PLA_JANITOR_DISK_PATH || "/",
   DISK_ALARM_THRESHOLD_PCT: 85,
   DISK_ALARM_ISSUE_TITLE_MARKER: "[host-disk-alarm]",
+  // The alarm must wake a named owner: new alarm issues are assigned (todo),
+  // and a deduped open alarm that is unassigned/backlog is re-assigned.
+  DISK_ALARM_ASSIGNEE_AGENT_ID:
+    process.env.PLA_JANITOR_ALARM_ASSIGNEE_AGENT_ID || "ca7c92dd-2c00-4811-ae20-dd3bb1782c1d",
   // companyId is not a secret (it is a UUID identifying the operator
   // company, not a credential) so it is safe to keep as a plain config
   // default. The bearer token itself is never stored here -- see
@@ -777,6 +800,278 @@ export function evaluateTmpEntry(entryPath, nowMs, config = CONFIG, registeredPa
 }
 
 // ---------------------------------------------------------------------------
+// /tmp unmatched agent scratch (any name, owned by the agent uid)
+// ---------------------------------------------------------------------------
+
+/**
+ * Pure structural filter for one top-level /tmp entry. Returns the exclusion
+ * reason, or null when the entry may be age-checked. `entry` is
+ * `{ name, uid, kind }` with kind one of dir|file|symlink|socket|fifo|other.
+ * Anything that is not a plain dir/file is excluded (sockets/FIFOs are live
+ * IPC endpoints; symlinks are not ours to judge).
+ */
+export function tmpUnmatchedExclusionReason(entry, config = CONFIG) {
+  if (config.TMP_SCRATCH_PATTERNS.some((p) => p.test(entry.name))) return "pattern-category";
+  if (config.TMP_UNMATCHED_EXCLUDE_PATTERNS.some((p) => p.test(entry.name))) return "protected-name";
+  if (entry.kind !== "dir" && entry.kind !== "file") return `special-file:${entry.kind}`;
+  if (entry.uid !== config.TMP_OWNER_UID) return "foreign-owner";
+  return null;
+}
+
+function statKind(st) {
+  if (st.isDirectory()) return "dir";
+  if (st.isFile()) return "file";
+  if (st.isSymbolicLink()) return "symlink";
+  if (st.isSocket()) return "socket";
+  if (st.isFIFO()) return "fifo";
+  return "other";
+}
+
+/**
+ * Collect every path that is the cwd, root, or an open fd target of a live
+ * process. Returns { ok: false } when /proc cannot be read at all, and also
+ * when not a single cwd link was readable (a hardened /proc would otherwise
+ * look like "no live users" -- the unsafe answer). Per-process races
+ * (process exits mid-scan) are skipped.
+ */
+export function collectLiveProcessPaths(procDir = CONFIG.PROC_DIR) {
+  let pids;
+  try {
+    pids = readdirSync(procDir).filter((n) => /^\d+$/.test(n));
+  } catch (err) {
+    return { ok: false, error: `cannot read ${procDir}: ${err.message}`, paths: new Set() };
+  }
+  const paths = new Set();
+  let cwdReads = 0;
+  for (const pid of pids) {
+    const base = path.join(procDir, pid);
+    for (const link of ["cwd", "root"]) {
+      try {
+        paths.add(readlinkSync(path.join(base, link)).replace(/ \(deleted\)$/, ""));
+        if (link === "cwd") cwdReads += 1;
+      } catch {
+        // exited or not ours
+      }
+    }
+    // mmap'd files (shared libs, node addons, sqlite -shm) of a live process.
+    try {
+      for (const line of readFileSync(path.join(base, "maps"), "utf8").split("\n")) {
+        const i = line.indexOf("/");
+        if (i >= 0) paths.add(line.slice(i).replace(/ \(deleted\)$/, ""));
+      }
+    } catch {
+      // exited or not ours
+    }
+    let fds = [];
+    try {
+      fds = readdirSync(path.join(base, "fd"));
+    } catch {
+      continue;
+    }
+    for (const fd of fds) {
+      try {
+        const target = readlinkSync(path.join(base, "fd", fd));
+        if (target.startsWith("/")) paths.add(target.replace(/ \(deleted\)$/, ""));
+      } catch {
+        // fd closed mid-scan
+      }
+    }
+  }
+  if (cwdReads === 0) {
+    return { ok: false, error: `no readable /proc/*/cwd among ${pids.length} pid(s)`, paths };
+  }
+  return { ok: true, paths };
+}
+
+/**
+ * Host paths bind-mounted into running containers. Root-owned container
+ * processes are invisible to the /proc scan (we run as the agent uid), so
+ * every running container's mount Sources count as live. Any docker failure
+ * => { ok: false } (caller fails the category closed). `exec` is injectable.
+ */
+export function collectDockerMountSources(exec = (bin, args) => execFileSync(bin, args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 60000 })) {
+  try {
+    const ids = exec("docker", ["ps", "-q"]).split(/\s+/).filter(Boolean);
+    const paths = new Set();
+    if (ids.length === 0) return { ok: true, paths };
+    const info = JSON.parse(exec("docker", ["inspect", ...ids]));
+    for (const c of info) for (const m of c.Mounts || []) if (m.Source) paths.add(m.Source);
+    return { ok: true, paths };
+  } catch (err) {
+    return { ok: false, error: `docker mount scan failed: ${err.message}`, paths: new Set() };
+  }
+}
+
+/** /proc scan + docker mount sources, fail closed if either fails. */
+export function collectLivePaths(config = CONFIG) {
+  const proc = collectLiveProcessPaths(config.PROC_DIR);
+  if (!proc.ok) return proc;
+  const docker = (config.DOCKER_MOUNTS || collectDockerMountSources)();
+  if (!docker.ok) return { ok: false, error: docker.error, paths: proc.paths };
+  return { ok: true, paths: new Set([...proc.paths, ...docker.paths]), dockerMounts: docker.paths.size };
+}
+
+/** True when any live-process path is the entry itself or inside it. */
+export function isEntryInUse(entryPath, livePaths) {
+  const resolved = path.resolve(entryPath);
+  for (const p of livePaths) {
+    if (p === resolved || isPathAncestorOf(resolved, p)) return true;
+  }
+  return false;
+}
+
+/**
+ * Scan and classify the unmatched category. Pure given its inputs except for
+ * filesystem reads under config.TMP_DIR. `live` is the result of
+ * collectLiveProcessPaths(); when !live.ok, nothing is eligible (fail closed).
+ */
+export function evaluateTmpUnmatched(nowMs, config = CONFIG, { live, registeredPaths = [] } = {}) {
+  const out = { candidates: [], excluded: [] };
+  if (!existsSync(config.TMP_DIR)) return out;
+  const cutoffMs = nowMs - config.TMP_UNMATCHED_MAX_AGE_DAYS * DAY_MS;
+  for (const name of readdirSync(config.TMP_DIR)) {
+    const p = path.join(config.TMP_DIR, name);
+    let st;
+    try {
+      st = lstatSync(p);
+    } catch {
+      continue;
+    }
+    const reason = tmpUnmatchedExclusionReason({ name, uid: st.uid, kind: statKind(st) }, config);
+    if (reason === "pattern-category") continue; // handled by the pattern rule
+    if (reason) {
+      out.excluded.push({ path: p, reason });
+      continue;
+    }
+    const registeredRoot = findRegisteredOverlap(p, registeredPaths);
+    if (registeredRoot) {
+      out.excluded.push({ path: p, reason: "registered-package-path" });
+      continue;
+    }
+    const age = strictNewestLeafMtime(p, config.TMP_AGE_LSTAT || lstatSync);
+    if (!age.ok) {
+      out.excluded.push({ path: p, reason: "age-walk-error" });
+      continue;
+    }
+    if (age.newestMtimeMs > cutoffMs) continue; // fresh -- not a candidate
+    if (!live || !live.ok) {
+      out.excluded.push({ path: p, reason: "live-process-scan-failed" });
+      continue;
+    }
+    if (isEntryInUse(p, live.paths)) {
+      out.excluded.push({ path: p, reason: "in-use-by-live-process" });
+      continue;
+    }
+    out.candidates.push({ path: p, newestMtimeMs: age.newestMtimeMs });
+  }
+  return out;
+}
+
+/**
+ * Fail-closed age signal for the unmatched /tmp category. newest = max of
+ * every leaf mtime, every directory mtime (root included), and the top-level
+ * entry's own ctime. Directory mtimes and the top-level ctime cannot be
+ * carried over by `cp -a` / `tar x` / `npm pack` extracts (those preserve
+ * leaf mtimes only), so a tree copied in yesterday reads as fresh. Inner
+ * ctimes are deliberately NOT used: hardlink-count changes (store prune,
+ * sibling deletes) bump them and would make every tree look fresh.
+ * ANY readdir/lstat error => { ok: false } (caller keeps the entry).
+ * `lstat` is injectable for tests (ctime cannot be set with utimes).
+ */
+export function strictNewestLeafMtime(rootPath, lstat = lstatSync) {
+  let rootStat;
+  try {
+    rootStat = lstat(rootPath);
+  } catch {
+    return { ok: false };
+  }
+  let newest = Math.max(rootStat.mtimeMs, rootStat.ctimeMs);
+  if (!rootStat.isDirectory()) return { ok: true, newestMtimeMs: newest };
+  const stack = [rootPath];
+  while (stack.length) {
+    const dir = stack.pop();
+    let children;
+    try {
+      children = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return { ok: false };
+    }
+    for (const c of children) {
+      const cp = path.join(dir, c.name);
+      let st;
+      try {
+        st = lstat(cp);
+      } catch {
+        return { ok: false };
+      }
+      newest = Math.max(newest, st.mtimeMs);
+      if (st.isDirectory()) stack.push(cp);
+    }
+  }
+  return { ok: true, newestMtimeMs: newest };
+}
+
+/** Newest leaf mtime under a path (for reporting age only). */
+export function newestLeafMtimeMs(rootPath) {
+  let newest = 0;
+  let rootStat;
+  try {
+    rootStat = lstatSync(rootPath);
+  } catch {
+    return 0;
+  }
+  if (!rootStat.isDirectory()) return rootStat.mtimeMs;
+  const stack = [rootPath];
+  while (stack.length) {
+    const dir = stack.pop();
+    let children;
+    try {
+      children = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const c of children) {
+      const cp = path.join(dir, c.name);
+      if (c.isDirectory()) stack.push(cp);
+      else {
+        try {
+          newest = Math.max(newest, lstatSync(cp).mtimeMs);
+        } catch {
+          // gone
+        }
+      }
+    }
+  }
+  return newest || rootStat.ctimeMs;
+}
+
+/** Report-only list of big paths outside janitor roots. Never deletes. */
+export function scanOwnerDecisionPaths(config = CONFIG) {
+  const paths = [...config.OWNER_DECISION_PATHS];
+  for (const g of config.OWNER_DECISION_GLOBS) {
+    try {
+      for (const n of readdirSync(g.dir)) if (g.pattern.test(n)) paths.push(path.join(g.dir, n));
+    } catch {
+      // dir missing
+    }
+  }
+  return paths
+    .filter((p) => existsSync(p))
+    .sort()
+    .map((p) => ({ path: p, sizeBytes: duBytes(p), newestMtimeMs: newestLeafMtimeMs(p) }));
+}
+
+function duBytes(p) {
+  try {
+    return Number(execFileSync("du", ["-sk", p], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).split(/\s/)[0]) * 1024;
+  } catch (err) {
+    // du exits 1 on unreadable subdirs but still prints the total
+    const m = String(err.stdout || "").match(/^(\d+)/);
+    return m ? Number(m[1]) * 1024 : dirSizeBytes(p);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Disk alarm
 // ---------------------------------------------------------------------------
 
@@ -824,32 +1119,92 @@ export function readApiCredential(config = CONFIG) {
 // instead of depending on it staying on an unfiltered first page.
 const ALARM_OPEN_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
 
-async function fileDiskAlarmIssue({ usePercent, threshold, companyId, credential }) {
-  const marker = CONFIG.DISK_ALARM_ISSUE_TITLE_MARKER;
+export function dailyBumpMarker(nowMs) {
+  return `<!-- host-disk-janitor:daily-bump ${new Date(nowMs).toISOString().slice(0, 10)} -->`;
+}
+
+/**
+ * File or bump the disk alarm so a named owner always wakes:
+ *   - no open alarm  -> create it assigned to DISK_ALARM_ASSIGNEE_AGENT_ID, status todo.
+ *   - open alarm     -> if unassigned or backlog, assign + todo; then post at
+ *                       most ONE comment per UTC day (idempotent via a dated
+ *                       marker in the comment body, so re-runs converge).
+ * `fetchImpl` is injectable for tests. The token is only ever placed in the
+ * Authorization header -- never logged or returned.
+ */
+export async function fileDiskAlarmIssue({
+  usePercent,
+  threshold,
+  companyId,
+  credential,
+  nowMs = Date.now(),
+  config = CONFIG,
+  fetchImpl = fetch,
+}) {
+  const marker = config.DISK_ALARM_ISSUE_TITLE_MARKER;
+  const assignee = config.DISK_ALARM_ASSIGNEE_AGENT_ID;
   const createUrl = `${credential.apiBase}/api/companies/${companyId}/issues`;
   const searchUrl =
     `${createUrl}?q=${encodeURIComponent(marker)}&status=${encodeURIComponent(ALARM_OPEN_STATUSES.join(","))}`;
   const headers = { Authorization: `Bearer ${credential.token}`, "Content-Type": "application/json" };
 
-  let existingOpen = false;
+  let existing = null;
   try {
-    const listResp = await fetch(searchUrl, { headers });
+    const listResp = await fetchImpl(searchUrl, { headers });
     if (listResp.ok) {
       const body = await listResp.json();
       const issues = Array.isArray(body) ? body : body.issues || body.data || [];
-      existingOpen = issues.some(
-        (issue) =>
-          typeof issue.title === "string" &&
-          issue.title.includes(marker) &&
-          !["done", "closed", "cancelled"].includes(String(issue.status).toLowerCase()),
-      );
+      existing =
+        issues.find(
+          (issue) =>
+            typeof issue.title === "string" &&
+            issue.title.includes(marker) &&
+            !["done", "closed", "cancelled"].includes(String(issue.status).toLowerCase()),
+        ) || null;
     }
   } catch {
     // Best-effort dedup only; fall through and attempt to create.
   }
 
-  if (existingOpen) {
-    return { created: false, reason: "alarm issue already open" };
+  if (existing) {
+    const ref = existing.identifier || existing.id;
+    const result = { created: false, reason: "alarm issue already open", identifier: ref, reassigned: false, commented: false };
+    const issueUrl = `${credential.apiBase}/api/issues/${existing.id}`;
+    if (!existing.assigneeAgentId || String(existing.status).toLowerCase() === "backlog") {
+      const patch = await fetchImpl(issueUrl, {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify({ assigneeAgentId: existing.assigneeAgentId || assignee, status: "todo" }),
+      });
+      result.reassigned = patch.ok;
+      if (!patch.ok) result.reassignError = `HTTP ${patch.status}`;
+    }
+    const dayMarker = dailyBumpMarker(nowMs);
+    let alreadyToday = null;
+    try {
+      const cResp = await fetchImpl(`${issueUrl}/comments`, { headers });
+      if (cResp.ok) {
+        const cBody = await cResp.json();
+        const comments = Array.isArray(cBody) ? cBody : cBody.comments || cBody.data || [];
+        alreadyToday = comments.some((c) => typeof c.body === "string" && c.body.includes(dayMarker));
+      }
+    } catch {
+      // unknown -> do not comment (never spam on a flaky read)
+    }
+    if (alreadyToday === false) {
+      const body = [
+        `host-disk-janitor: root disk still at **${usePercent}%** (threshold ${threshold}%).`,
+        ``,
+        `See the janitor log and \`node scripts/host-disk-janitor.mjs --dry-run\` for reclaim candidates.`,
+        dayMarker,
+      ].join("\n");
+      const post = await fetchImpl(`${issueUrl}/comments`, { method: "POST", headers, body: JSON.stringify({ body }) });
+      result.commented = post.ok;
+      if (!post.ok) result.commentError = `HTTP ${post.status}`;
+    } else if (alreadyToday === null) {
+      result.commentError = "could not read comments; skipped daily bump";
+    }
+    return result;
   }
 
   const title = `${marker} host disk usage at ${usePercent}% (threshold ${threshold}%)`;
@@ -861,16 +1216,16 @@ async function fileDiskAlarmIssue({ usePercent, threshold, companyId, credential
     `Run the janitor's dry-run to see current reclaim candidates: node scripts/host-disk-janitor.mjs --dry-run`,
   ].join("\n");
 
-  const resp = await fetch(createUrl, {
+  const resp = await fetchImpl(createUrl, {
     method: "POST",
     headers,
-    body: JSON.stringify({ title, description, priority: "high" }),
+    body: JSON.stringify({ title, description, priority: "high", status: "todo", assigneeAgentId: assignee }),
   });
   if (!resp.ok) {
     return { created: false, reason: `issue creation failed: HTTP ${resp.status}` };
   }
   const created = await resp.json();
-  return { created: true, identifier: created.identifier || created.id };
+  return { created: true, identifier: created.identifier || created.id, assigneeAgentId: assignee };
 }
 
 // ---------------------------------------------------------------------------
@@ -1063,6 +1418,69 @@ export async function run({
     };
   }
 
+  // -- /tmp unmatched agent scratch (any name, agent uid, >= N days idle) --
+  {
+    const live = collectLivePaths(config);
+    const { candidates, excluded } = evaluateTmpUnmatched(nowMs, config, { live, registeredPaths });
+    // Fail closed on registered-path lookup failure too (same rule as above).
+    const eligible = registeredGuardActive ? candidates : [];
+    const sized = eligible.map((c) => ({ ...c, sizeBytes: duBytes(c.path) }));
+    const deleteEnabled = apply && config.TMP_UNMATCHED_DELETE;
+    if (deleteEnabled && sized.length) {
+      // Sizing takes minutes; re-scan live users right before deleting and
+      // re-check age + in-use per entry immediately before rmSync.
+      const liveNow = collectLivePaths(config);
+      const cutoffMs = nowMs - config.TMP_UNMATCHED_MAX_AGE_DAYS * DAY_MS;
+      for (const c of sized) {
+        if (!liveNow.ok) {
+          c.result = "skipped-at-delete (live-scan-failed)";
+          continue;
+        }
+        const age = strictNewestLeafMtime(c.path, config.TMP_AGE_LSTAT || lstatSync);
+        if (!age.ok || age.newestMtimeMs > cutoffMs) {
+          c.result = `skipped-at-delete (${age.ok ? "fresh" : "age-walk-error"})`;
+          continue;
+        }
+        if (isEntryInUse(c.path, liveNow.paths)) {
+          c.result = "skipped-at-delete (in-use)";
+          continue;
+        }
+        try {
+          (config.TMP_RM || rmSync)(c.path, { recursive: true });
+          c.result = "deleted";
+        } catch (err) {
+          c.result = `failed:${err.code || "ERR"}`;
+        }
+      }
+    }
+    summary.categories.tmpUnmatched = {
+      maxAgeDays: config.TMP_UNMATCHED_MAX_AGE_DAYS,
+      deleteEnabled: config.TMP_UNMATCHED_DELETE,
+      deleted: deleteEnabled,
+      liveProcessScan: live.ok ? { ok: true, paths: live.paths.size } : { ok: false, error: live.error },
+      eligible: sized.length,
+      deletedCount: sized.filter((c) => c.result === "deleted").length,
+      reclaimedBytes: deleteEnabled
+        ? sized.filter((c) => c.result === "deleted").reduce((s, c) => s + c.sizeBytes, 0)
+        : sized.reduce((s, c) => s + c.sizeBytes, 0),
+      candidates: sized.map((c) => ({
+        path: c.path,
+        sizeBytes: c.sizeBytes,
+        result: c.result || null,
+        ageDays: Math.max(0, Math.floor((nowMs - c.newestMtimeMs) / DAY_MS)),
+      })),
+      excluded,
+      guardFailureExcludedPaths: registeredGuardActive ? [] : candidates.map((c) => c.path),
+    };
+  }
+
+  // -- report-only: owner decision needed (never deleted) --
+  summary.ownerDecision = scanOwnerDecisionPaths(config).map((e) => ({
+    path: e.path,
+    sizeBytes: e.sizeBytes,
+    ageDays: Math.max(0, Math.floor((nowMs - e.newestMtimeMs) / DAY_MS)),
+  }));
+
   // -- disk alarm --
   {
     let disk;
@@ -1083,6 +1501,8 @@ export async function run({
           threshold: config.DISK_ALARM_THRESHOLD_PCT,
           companyId: config.DISK_ALARM_COMPANY_ID,
           credential,
+          nowMs,
+          config,
         });
       }
     }
@@ -1155,6 +1575,30 @@ function printSummary(summary) {
   for (const p of c.tmpScratch.guardFailureExcludedPaths || []) {
     console.log(`  excluded (registered-path lookup failed): ${p}`);
   }
+  {
+    const u = c.tmpUnmatched;
+    const act = u.deleted ? "deleted" : "candidates";
+    const verbU = u.deleted ? "deleted" : "would delete";
+    console.log(
+      `tmp unmatched (>=${u.maxAgeDays}d idle, agent uid): ${u.deleted ? `${u.deletedCount}/${u.eligible}` : u.eligible} ${act}, ${bytesToHuman(u.reclaimedBytes)} ` +
+        `${u.deleted ? "freed" : "reclaimable"}` +
+        (u.deleteEnabled ? "" : " [REPORT-ONLY: deletion gate PLA_JANITOR_TMP_UNMATCHED_DELETE=1 is off]"),
+    );
+    if (!u.liveProcessScan.ok) console.log(`  live-process scan FAILED -- category fail-closed: ${u.liveProcessScan.error}`);
+    for (const e of u.candidates) {
+      console.log(`  ${u.deleted ? e.result : u.deleteEnabled ? verbU : "candidate"}: ${e.path}  ${bytesToHuman(e.sizeBytes)}  ${e.ageDays}d`);
+    }
+    const counts = {};
+    for (const e of u.excluded) counts[e.reason] = (counts[e.reason] || 0) + 1;
+    console.log(`  excluded: ${Object.entries(counts).map(([k, v]) => `${k}=${v}`).join(", ") || "none"}`);
+    for (const e of u.excluded) {
+      console.log(`  excluded (${e.reason}): ${e.path}`);
+    }
+  }
+  if (summary.ownerDecision && summary.ownerDecision.length) {
+    console.log(`owner decision needed (report-only, never deleted):`);
+    for (const e of summary.ownerDecision) console.log(`  ${e.path}  ${bytesToHuman(e.sizeBytes)}  ${e.ageDays}d`);
+  }
   console.log("");
   const d = summary.diskAlarm;
   if (d.usePercent === null) {
@@ -1164,7 +1608,15 @@ function printSummary(summary) {
     if (d.wouldFileIssue) {
       console.log(`             would file an issue titled "${CONFIG.DISK_ALARM_ISSUE_TITLE_MARKER} host disk usage at ${d.usePercent}% (threshold ${d.threshold}%)" (dry-run: no network call made)`);
     } else if (d.action) {
-      console.log(`             ${d.action.created ? `filed issue ${d.action.identifier}` : `no issue filed: ${d.action.reason}`}`);
+      const a = d.action;
+      if (a.created) console.log(`             filed issue ${a.identifier} (assigned ${a.assigneeAgentId}, todo)`);
+      else if (a.identifier) {
+        console.log(
+          `             open alarm ${a.identifier}: reassigned=${a.reassigned} daily-comment=${a.commented}` +
+            (a.reassignError ? ` reassignError=${a.reassignError}` : "") +
+            (a.commentError ? ` commentError=${a.commentError}` : ""),
+        );
+      } else console.log(`             no issue filed: ${a.reason}`);
     }
   } else {
     console.log(`disk alarm:  OK -- ${d.usePercent}% used (threshold ${d.threshold}%)`);
