@@ -581,6 +581,16 @@ Delivery semantics:
 - no global ordering guarantee across all event types
 - per-entity ordering is best effort but not guaranteed after retries
 
+Wire shape: the host sends `onEvent` as a JSON-RPC request and does not wait
+for the result. The worker replies when the handler settles. The event's
+company scope is live only while the handler runs. The cap is 15 minutes for
+a worker that declared `echoesInvocationId` and has echoed at least one valid
+invocation id in this process. For every other worker the cap is 30 seconds
+(or the configured rpc timeout if lower). After the reply, a worker call from
+a job or timer is resolved as if no event is in flight. Above 256 in-flight
+events per worker, the host sends the event as a notification with the same
+cap.
+
 ### 13.6 `runJob`
 
 Runs a declared scheduled job.
