@@ -4508,6 +4508,32 @@ function issueAttachmentConflictError(
  * Tenant checks shared by the attach preflight and the bind: the target issue
  * must exist and every asset must exist and belong to the issue's company.
  */
+/** One attachment row newly bound to a comment by `attachAssetsToComment`. */
+export interface BoundIssueAttachment {
+  companyId: string;
+  issueId: string;
+  attachmentId: string;
+  commentId: string;
+  contentType: string | null;
+  byteSize: number | null;
+}
+
+/**
+ * Log one `issue.attachment_bound` activity per newly bound row. The action maps
+ * to the `issue.attachment.created` plugin event, giving plugins an in-scope
+ * trigger for late-bound media. Metadata only — no content, no URLs.
+ */
+export function attachmentBoundActivityDetails(row: BoundIssueAttachment): Record<string, unknown> {
+  return {
+    attachmentId: row.attachmentId,
+    issueId: row.issueId,
+    commentId: row.commentId,
+    contentType: row.contentType,
+    byteSize: row.byteSize,
+    binding: "bind",
+  };
+}
+
 async function resolveBindableAssetContext(
   dbOrTx: any,
   issueId: string,
@@ -9347,9 +9373,13 @@ export function issueService(db: Db) {
       issueId: string;
       issueCommentId: string;
       assetIds: string[];
-    }): Promise<void> => {
-      if (input.assetIds.length === 0) return;
+    }): Promise<BoundIssueAttachment[]> => {
+      if (input.assetIds.length === 0) return [];
       const { issue, uniqueAssetIds } = await resolveBindableAssetContext(db, input.issueId, input.assetIds);
+      // Rows this call newly bound (bind of an unbound row, or fresh insert).
+      // Idempotent re-binds ("skip") are excluded so callers emit exactly one
+      // attachment event per real state change and retries converge.
+      const newlyBound: Array<{ attachmentId: string; assetId: string }> = [];
 
       await db.transaction(async (tx) => {
         for (const assetId of uniqueAssetIds) {
@@ -9368,16 +9398,18 @@ export function issueService(db: Db) {
               .update(issueAttachments)
               .set({ issueCommentId: input.issueCommentId, updatedAt: new Date() })
               .where(eq(issueAttachments.id, existing.id));
+            newlyBound.push({ attachmentId: existing.id, assetId });
             continue;
           }
           if (state === "insert") {
             try {
-              await tx.insert(issueAttachments).values({
+              const [inserted] = await tx.insert(issueAttachments).values({
                 companyId: issue.companyId,
                 issueId: issue.id,
                 assetId,
                 issueCommentId: input.issueCommentId,
-              });
+              }).returning({ id: issueAttachments.id });
+              if (inserted) newlyBound.push({ attachmentId: inserted.id, assetId });
             } catch (err) {
               if (!isUniqueViolation(err, "issue_attachments_asset_uq")) throw err;
               // Lost an INSERT race against a concurrent bind/upload of the
@@ -9404,6 +9436,21 @@ export function issueService(db: Db) {
           throw issueAttachmentConflictError(assetId, existing);
         }
       });
+
+      if (newlyBound.length === 0) return [];
+      const meta = await db
+        .select({ id: assets.id, contentType: assets.contentType, byteSize: assets.byteSize })
+        .from(assets)
+        .where(inArray(assets.id, newlyBound.map((row) => row.assetId)));
+      const metaById = new Map(meta.map((row) => [row.id, row] as const));
+      return newlyBound.map((row) => ({
+        companyId: issue.companyId,
+        issueId: issue.id,
+        attachmentId: row.attachmentId,
+        commentId: input.issueCommentId,
+        contentType: metaById.get(row.assetId)?.contentType ?? null,
+        byteSize: metaById.get(row.assetId)?.byteSize ?? null,
+      }));
     },
 
     // Tenant-scoped at the data layer: callers must pass the validated (issue)

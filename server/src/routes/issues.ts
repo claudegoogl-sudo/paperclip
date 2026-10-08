@@ -206,6 +206,7 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_LOOKBACK_DAYS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
+  attachmentBoundActivityDetails,
   readAcceptedPlanConfirmationTarget,
 } from "../services/issues.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
@@ -12787,11 +12788,25 @@ export function issueRoutes(
     // (pre-checked above, re-checked in-transaction here). Mirrors the host
     // bridge path.
     if (commentAttachmentIds.length > 0) {
-      await svc.attachAssetsToComment({
+      const bound = await svc.attachAssetsToComment({
         issueId: currentIssue.id,
         issueCommentId: comment.id,
         assetIds: commentAttachmentIds,
       });
+      for (const row of bound) {
+        await logActivity(db, {
+          companyId: currentIssue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "issue.attachment_bound",
+          entityType: "issue",
+          entityId: currentIssue.id,
+          details: attachmentBoundActivityDetails(row),
+        });
+      }
     }
 
     await issueReferencesSvc.syncComment(comment.id);
@@ -13368,9 +13383,12 @@ export function issueRoutes(
       entityId: issueId,
       details: {
         attachmentId: attachment.id,
+        issueId,
+        commentId: attachment.issueCommentId ?? null,
         originalFilename: attachment.originalFilename,
         contentType: attachment.contentType,
         byteSize: attachment.byteSize,
+        binding: "upload",
       },
     });
 

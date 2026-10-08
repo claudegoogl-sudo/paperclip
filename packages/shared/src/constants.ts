@@ -1756,6 +1756,7 @@ export const PLUGIN_EVENT_TYPES = [
   "issue.created",
   "issue.updated",
   "issue.comment.created",
+  "issue.attachment.created",
   "issue.document.created",
   "issue.document.updated",
   "issue.document.deleted",

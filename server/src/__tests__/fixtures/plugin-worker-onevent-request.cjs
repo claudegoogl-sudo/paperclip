@@ -7,6 +7,7 @@
 //   probe-inside   id-less companies.list, reply ~150ms later (in flight)
 //   config-after   reply, then id-less config.get ~30ms later
 //   config-inside  id-less config.get, reply ~150ms later
+//   attach-list    echoed issues.listAttachments for payload.issueId
 //   hang           never reply
 //   throw          reply with an error, then id-less companies.list ~30ms later
 // `runJob` replies after 400ms (a second in-flight dispatch).
@@ -69,6 +70,21 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line
         const inv = message.paperclipInvocation && message.paperclipInvocation.id;
         setTimeout(() => echoed("config.get", {}, inv), 400);
         setTimeout(() => reply(null), 450);
+        return;
+      }
+      case "attach-list": {
+        // issue.attachment.created relay shape: an echoed issues.listAttachments
+        // for the event's issue. payload.probeCompanyId lets a test ask for a
+        // different company than the event's (must be refused).
+        const ev = message.params.event;
+        const inv = message.paperclipInvocation && message.paperclipInvocation.id;
+        const payload = ev.payload || {};
+        echoed(
+          "issues.listAttachments",
+          { issueId: payload.issueId, companyId: payload.probeCompanyId || ev.companyId },
+          inv,
+        );
+        setTimeout(() => reply(null), 150);
         return;
       }
       case "hang":

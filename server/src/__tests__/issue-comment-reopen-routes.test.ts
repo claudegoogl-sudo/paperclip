@@ -10,7 +10,7 @@ const mockIssueService = vi.hoisted(() => ({
   assertCheckoutOwner: vi.fn(),
   update: vi.fn(),
   addComment: vi.fn(),
-  attachAssetsToComment: vi.fn(async () => undefined),
+  attachAssetsToComment: vi.fn(async () => []),
   validateAssetsBindableToIssue: vi.fn(async () => undefined),
   getDependencyReadiness: vi.fn(),
   getCurrentScheduledRetry: vi.fn(),
@@ -274,7 +274,7 @@ describe.sequential("issue comment reopen routes", () => {
     mockIssueService.update.mockReset();
     mockIssueService.addComment.mockReset();
     mockIssueService.attachAssetsToComment.mockReset();
-    mockIssueService.attachAssetsToComment.mockResolvedValue(undefined);
+    mockIssueService.attachAssetsToComment.mockResolvedValue([]);
     mockIssueService.getDependencyReadiness.mockReset();
     mockIssueService.getCurrentScheduledRetry.mockReset();
     mockIssueService.findMentionedAgents.mockReset();
