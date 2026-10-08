@@ -19,7 +19,8 @@
  *   |--- request(initialize) ------------->  |  → calls plugin.setup(ctx)
  *   |<-- response(ok:true) ----------------  |
  *   |                                        |
- *   |--- notification(onEvent) ----------->  |  → dispatches to registered handler
+ *   |--- request(onEvent) ---------------->  |  → dispatches to registered handler
+ *   |<-- response(void) ------------------  |    (host clears the event scope)
  *   |                                        |
  *   |<-- request(state.get) ---------------  |  ← SDK client call from plugin code
  *   |--- response(result) ---------------->  |

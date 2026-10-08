@@ -98,6 +98,12 @@ class DuplexAggregateBytesExceededError extends Error {
 
 /** Default timeout for RPC calls in milliseconds. */
 const DEFAULT_RPC_TIMEOUT_MS = 30_000;
+/** Cap for one `onEvent` request (handler scope lifetime). */
+const ONEVENT_RPC_TIMEOUT_CAP_MS = 30_000;
+/** Per-worker cap on in-flight `onEvent` requests before falling back to a notification. */
+export const MAX_PENDING_EVENT_REQUESTS = 256;
+/** Rate limit for onEvent dispatch warnings (timeout / overflow). */
+const EVENT_DISPATCH_WARN_INTERVAL_MS = 60_000;
 
 /**
  * Upper bound for the *default* RPC timeout path (15 minutes). Explicit
@@ -3107,6 +3113,14 @@ export function createPluginWorkerHandle(
       (message as { paperclipInvocationId?: unknown }).paperclipInvocationId,
     );
     if (!invocationId) {
+      // SECURITY-CRITICAL: `onEvent` is a request (see `notify`), so an event in
+      // flight IS counted in `inFlightInvocationIds` below, like `runJob`. A
+      // legacy no-echo worker's id-less call made while exactly one event is in
+      // flight is attributed to that event's tenant. Guards: workers that declare
+      // `echoesInvocationId` are excluded, `idlessCallsSeenWithNoDispatch`
+      // withdraws it per method, 2+ in flight = no attribution, and the event's
+      // scope lives at most `ONEVENT_RPC_TIMEOUT_CAP_MS`.
+      //
       // SECURITY-CRITICAL: an older worker SDK (e.g. platform.cad ≤0.1.7) does not
       // echo `paperclipInvocationId` on its worker→host callbacks, so we cannot
       // bind this call to an invocation by id. When EXACTLY ONE host→worker
@@ -4054,6 +4068,48 @@ export function createPluginWorkerHandle(
   // RPC call implementation
   // -----------------------------------------------------------------------
 
+  // -----------------------------------------------------------------------
+  // onEvent dispatch as a request (scope lifetime = handler runtime)
+  // -----------------------------------------------------------------------
+
+  /** Upper bound on one onEvent handler's scope; never above the rpc default. */
+  const eventRpcTimeoutMs = Math.min(rpcTimeoutMs, ONEVENT_RPC_TIMEOUT_CAP_MS);
+  let pendingEventRequests = 0;
+  const eventDispatchWarn = new Map<string, { lastAt: number; suppressed: number }>();
+
+  function warnEventDispatch(kind: string, message: string, extra?: Record<string, unknown>): void {
+    const now = Date.now();
+    const state = eventDispatchWarn.get(kind) ?? { lastAt: 0, suppressed: 0 };
+    if (now - state.lastAt < EVENT_DISPATCH_WARN_INTERVAL_MS) {
+      state.suppressed += 1;
+      eventDispatchWarn.set(kind, state);
+      return;
+    }
+    log.warn(
+      { kind, suppressed: state.suppressed, pendingEventRequests, timeoutMs: eventRpcTimeoutMs, ...extra },
+      `plugin onEvent dispatch: ${message}`,
+    );
+    eventDispatchWarn.set(kind, { lastAt: now, suppressed: 0 });
+  }
+
+  function dispatchEventRequest(params: unknown): void {
+    pendingEventRequests += 1;
+    callInternal("onEvent", params as HostToWorkerMethods["onEvent"][0], eventRpcTimeoutMs).then(
+      () => {
+        pendingEventRequests -= 1;
+      },
+      (err: unknown) => {
+        pendingEventRequests -= 1;
+        if (err instanceof JsonRpcCallError && err.code === PLUGIN_RPC_ERROR_CODES.TIMEOUT) {
+          warnEventDispatch("timeout", "handler did not reply before timeout; scope cleared");
+        } else {
+          // Handler errors are logged by the worker SDK itself; keep host noise low.
+          log.debug({ err: err instanceof Error ? err.message : String(err) }, "plugin onEvent handler failed");
+        }
+      },
+    );
+  }
+
   function callInternal<M extends HostToWorkerMethodName>(
     method: M,
     params: HostToWorkerMethods[M][0],
@@ -4239,8 +4295,24 @@ export function createPluginWorkerHandle(
 
     notify(method: string, params: unknown) {
       if (status !== "running") return;
+      // SECURITY-CRITICAL: `onEvent` is dispatched as a JSON-RPC REQUEST, not a
+      // notification. The worker SDK replies when the handler settles, and
+      // `callInternal` clears the invocation on reply, error, or timeout. So the
+      // event's company scope lives exactly as long as its handler, instead of
+      // a fixed 15 min after send (which made every later id-less call from a
+      // job or timer `invalidInvocationScope`). The caller stays fire-and-forget.
+      if (method === "onEvent" && pendingEventRequests < MAX_PENDING_EVENT_REQUESTS) {
+        dispatchEventRequest(params);
+        return;
+      }
+      // Overflow (event flood) or any other notification. For an overflowed
+      // `onEvent` the invocation TTL is the bounded event timeout, never 15 min.
+      if (method === "onEvent") {
+        warnEventDispatch("overflow", "onEvent in-flight cap reached; sent as notification with bounded scope TTL");
+      }
       const invocationScope = deriveInvocationScope(method, params);
-      const invocation = invocationScope ? registerInvocation(invocationScope, MAX_RPC_TIMEOUT_MS, method) : null;
+      const ttlMs = method === "onEvent" ? eventRpcTimeoutMs : MAX_RPC_TIMEOUT_MS;
+      const invocation = invocationScope ? registerInvocation(invocationScope, ttlMs, method) : null;
       try {
         sendMessage({
           jsonrpc: JSONRPC_VERSION,
