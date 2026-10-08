@@ -1226,6 +1226,12 @@ export function createPluginWorkerHandle(
   // `paperclipInvocationId` on dispatch-servicing calls. Reassigned from each
   // successful handshake, so a crash-restarted worker re-declares.
   let echoesInvocationId = false;
+  // SECURITY-CRITICAL: set once the host has seen a worker->host call that carries a
+  // valid echoed invocation id (a live scope the host minted for THIS worker),
+  // AND the worker declared `echoesInvocationId`. Never cleared; resets with
+  // the process. Gates the long onEvent scope cap (a declaration alone is not
+  // proof: one SDK generation declared echo but did not echo).
+  let echoObserved = false;
   // SECURITY-CRITICAL: host-observed counterpart to `echoesInvocationId`. Method names
   // this worker has been seen calling id-less while NO dispatch was in flight
   // — direct proof that it issues that call outside any dispatch, so
@@ -3208,6 +3214,7 @@ export function createPluginWorkerHandle(
     }
     const entry = activeInvocations.get(invocationId);
     if (!entry) return { invalidInvocationScope: true };
+    if (echoesInvocationId) echoObserved = true;
     return { invocationScope: entry.scope, traceparent: entry.traceparent };
   }
 
@@ -4094,11 +4101,42 @@ export function createPluginWorkerHandle(
 
   function dispatchEventRequest(params: unknown): void {
     pendingEventRequests += 1;
-    callInternal("onEvent", params as HostToWorkerMethods["onEvent"][0], eventRpcTimeoutMs).then(
+    // SECURITY-CRITICAL: scope cap depends on observed echo.
+    // - Echo-trusted worker (declared AND observed echo): MAX_RPC_TIMEOUT_MS.
+    //   Every call is bound to its own host-minted id, so a long scope adds no
+    //   cross-company attribution. Long handlers (e.g. a rate-limited relay)
+    //   keep their scope.
+    // - Any other worker: `eventRpcTimeoutMs` (<= 30s). Checked when that cap
+    //   elapses, so a worker that turns echo-trusted mid-handler keeps its scope.
+    let requestId: number | undefined;
+    const untrustedCapTimer = setTimeout(() => {
+      if (echoObserved || requestId === undefined) return;
+      pendingRequests.get(requestId)?.resolve({
+        jsonrpc: JSONRPC_VERSION,
+        id: requestId,
+        error: {
+          code: PLUGIN_RPC_ERROR_CODES.TIMEOUT,
+          message: `RPC call "onEvent" timed out after ${eventRpcTimeoutMs}ms (no observed invocation-id echo)`,
+        },
+      } as JsonRpcResponse);
+    }, eventRpcTimeoutMs);
+    if (untrustedCapTimer.unref) untrustedCapTimer.unref();
+    callInternal(
+      "onEvent",
+      params as HostToWorkerMethods["onEvent"][0],
+      MAX_RPC_TIMEOUT_MS,
+      undefined,
+      false,
+      (id) => {
+        requestId = id;
+      },
+    ).then(
       () => {
+        clearTimeout(untrustedCapTimer);
         pendingEventRequests -= 1;
       },
       (err: unknown) => {
+        clearTimeout(untrustedCapTimer);
         pendingEventRequests -= 1;
         if (err instanceof JsonRpcCallError && err.code === PLUGIN_RPC_ERROR_CODES.TIMEOUT) {
           warnEventDispatch("timeout", "handler did not reply before timeout; scope cleared");
@@ -4116,6 +4154,7 @@ export function createPluginWorkerHandle(
     timeoutMs?: number,
     executeLogSink?: ExecuteLogSink,
     meterDuplexWrite = false,
+    onRequestId?: (id: number) => void,
   ): Promise<HostToWorkerMethods[M][1]> {
     const rpcPromise = new Promise<HostToWorkerMethods[M][1]>((resolve, reject) => {
       if (!childProcess?.stdin?.writable) {
@@ -4183,6 +4222,7 @@ export function createPluginWorkerHandle(
       };
 
       pendingRequests.set(id, pending);
+      onRequestId?.(id);
 
       try {
         const request = {
@@ -4311,7 +4351,7 @@ export function createPluginWorkerHandle(
         warnEventDispatch("overflow", "onEvent in-flight cap reached; sent as notification with bounded scope TTL");
       }
       const invocationScope = deriveInvocationScope(method, params);
-      const ttlMs = method === "onEvent" ? eventRpcTimeoutMs : MAX_RPC_TIMEOUT_MS;
+      const ttlMs = method === "onEvent" && !echoObserved ? eventRpcTimeoutMs : MAX_RPC_TIMEOUT_MS;
       const invocation = invocationScope ? registerInvocation(invocationScope, ttlMs, method) : null;
       try {
         sendMessage({

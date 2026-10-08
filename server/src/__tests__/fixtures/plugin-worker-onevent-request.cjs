@@ -18,6 +18,9 @@ const send = (m) => process.stdout.write(`${JSON.stringify(m)}\n`);
 const idless = (method, params) =>
   send({ jsonrpc: "2.0", id: `w-${nextRequestId++}`, method, params });
 
+const echoed = (method, params, invocationId) =>
+  send({ jsonrpc: "2.0", id: `w-${nextRequestId++}`, method, params, paperclipInvocationId: invocationId });
+
 readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", (line) => {
   if (!line.trim()) return;
   const message = JSON.parse(line);
@@ -52,6 +55,22 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line
         idless("config.get", {});
         setTimeout(() => reply(null), 150);
         return;
+      case "long-echo": {
+        // Echo early (company-scoped read), then a later echoed call past the
+        // untrusted cap, like a slow relay send followed by its record write.
+        const inv = message.paperclipInvocation && message.paperclipInvocation.id;
+        echoed("config.get", {}, inv);
+        setTimeout(() => echoed("config.get", {}, inv), 400);
+        setTimeout(() => reply(null), 450);
+        return;
+      }
+      case "late-echo": {
+        // Declares echo, but the first echoed call comes after the untrusted cap.
+        const inv = message.paperclipInvocation && message.paperclipInvocation.id;
+        setTimeout(() => echoed("config.get", {}, inv), 400);
+        setTimeout(() => reply(null), 450);
+        return;
+      }
       case "hang":
         return;
       case "throw":

@@ -144,6 +144,27 @@ describe("onEvent dispatched as a request: scope lifetime = handler runtime", ()
     });
   });
 
+  it("(9) echo-trusted worker: an onEvent handler longer than the untrusted cap keeps its scope", async () => {
+    const h = harness({ echoes: true, rpcTimeoutMs: 150 }); // untrusted cap = 150ms
+    await withHandle(h, async () => {
+      h.handle.notify("onEvent", event("long-echo", "company-a"));
+      await sleep(700);
+      // Both echoed calls resolve to company-a, including the one at ~400ms.
+      expect(h.configGet).toHaveBeenCalledTimes(2);
+      expect(h.configGet).toHaveBeenLastCalledWith({ companyId: "company-a" }, expect.anything());
+    });
+  });
+
+  it("(10) declared-but-never-echoed worker: scope is cleared at the untrusted cap", async () => {
+    const h = harness({ echoes: true, rpcTimeoutMs: 150 });
+    await withHandle(h, async () => {
+      h.handle.notify("onEvent", event("late-echo", "company-a"));
+      await sleep(700);
+      // The first echo arrives at ~400ms, after the 150ms cap: refused.
+      expect(h.configGet).not.toHaveBeenCalled();
+    });
+  });
+
   it("(8) handler throws: error reply clears the invocation", async () => {
     const h = harness({ echoes: true });
     await withHandle(h, async () => {
