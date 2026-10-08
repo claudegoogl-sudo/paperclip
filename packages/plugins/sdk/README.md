@@ -121,6 +121,7 @@ Subscribe in `setup` with `ctx.events.on(name, handler)` or `ctx.events.on(name,
 | `project.workspace_created`, `project.workspace_updated`, `project.workspace_deleted` | project_workspace |
 | `issue.created`, `issue.updated`, `issue.comment.created` | issue |
 | `issue.document.created`, `issue.document.updated`, `issue.document.deleted` | issue |
+| `issue.attachment.created` | issue |
 | `issue.relations.updated`, `issue.checked_out`, `issue.released`, `issue.assignment_wakeup_requested` | issue |
 | `agent.created`, `agent.updated`, `agent.status_changed` | agent |
 | `agent.run.started`, `agent.run.finished`, `agent.run.failed`, `agent.run.cancelled` | run |
@@ -129,6 +130,17 @@ Subscribe in `setup` with `ctx.events.on(name, handler)` or `ctx.events.on(name,
 | `budget.incident.opened`, `budget.incident.resolved` | budget_incident |
 | `cost_event.created` | cost |
 | `activity.logged` | activity |
+
+**Attachment events:** `issue.attachment.created` fires once per attachment when a file is uploaded to an issue (`payload.binding: "upload"`, `commentId` set if the upload named one, else `null`) and when a pre-uploaded asset is bound to a comment (`payload.binding: "bind"`). Payload: `attachmentId`, `issueId`, `commentId`, `contentType`, `byteSize` (metadata only; no content or URLs). The handler runs in the event's company scope, so it can read the file:
+
+```ts
+ctx.events.on("issue.attachment.created", async (event) => {
+  const { issueId, attachmentId } = event.payload as { issueId: string; attachmentId: string };
+  const rows = await ctx.issues.listAttachments(issueId, event.companyId); // needs issue.attachments.read
+  const row = rows.find((r) => r.id === attachmentId);
+  if (row) await ctx.artifacts.fetch(row.assetId);
+});
+```
 
 **Plugin-to-plugin:** Subscribe to `plugin.<pluginId>.<eventName>` (e.g. `plugin.acme.linear.sync-done`). Emit with `ctx.events.emit("sync-done", companyId, payload)`; the host namespaces it automatically.
 

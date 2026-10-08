@@ -38,7 +38,7 @@ import { companyService } from "./companies.js";
 import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
 import { executionWorkspaceService } from "./execution-workspaces.js";
-import { issueService } from "./issues.js";
+import { attachmentBoundActivityDetails, issueService } from "./issues.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { goalService } from "./goals.js";
 import { documentService } from "./documents.js";
@@ -3071,11 +3071,21 @@ export function buildHostServices(
           { agentId: params.actorUserId ? undefined : params.authorAgentId, userId: params.actorUserId },
         )) as IssueComment;
         if (attachmentIds.length > 0) {
-          await issues.attachAssetsToComment({
+          const bound = await issues.attachAssetsToComment({
             issueId: issue.id,
             issueCommentId: comment.id,
             assetIds: attachmentIds,
           });
+          for (const row of bound) {
+            await logPluginActivity({
+              companyId,
+              action: "issue.attachment_bound",
+              entityType: "issue",
+              entityId: issue.id,
+              actor: { actorAgentId: params.actorUserId ? null : params.authorAgentId ?? null, actorUserId: params.actorUserId ?? null },
+              details: attachmentBoundActivityDetails(row),
+            });
+          }
         }
         await logPluginActivity({
           companyId,

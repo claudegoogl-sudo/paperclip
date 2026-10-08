@@ -16,6 +16,10 @@ const PLUGIN_EVENT_SET: ReadonlySet<string> = new Set(PLUGIN_EVENT_TYPES);
 const ACTIVITY_ACTION_TO_PLUGIN_EVENT: Readonly<Record<string, PluginEventType>> = {
   issue_comment_added: "issue.comment.created",
   issue_comment_created: "issue.comment.created",
+  // Upload (commentId bound at upload time, or unbound) and late bind of a
+  // pre-uploaded asset to a comment both surface as one plugin event.
+  issue_attachment_added: "issue.attachment.created",
+  issue_attachment_bound: "issue.attachment.created",
   issue_document_created: "issue.document.created",
   issue_document_updated: "issue.document.updated",
   issue_document_deleted: "issue.document.deleted",
