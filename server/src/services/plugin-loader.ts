@@ -1697,7 +1697,7 @@ export function diffPrivilegeEscalations(
   const c = candidate as unknown as Record<string, unknown>;
   // Reuse the shared escalation predicate used by upgrade/install.
   const caps = [...new Set(diffAddedCapabilities(a.capabilities as string[] | undefined, c.capabilities as string[] | undefined))].sort();
-  if (caps.length) out.push(`adds capabilities ${caps.join(", ")}`);
+  if (caps.length) out.push(`adds capabilities that were not granted: ${caps.join(", ")}`);
   const tools = added(names(a.tools, "name"), names(c.tools, "name"));
   if (tools.length) out.push(`adds tools ${tools.join(", ")}`);
   const hooks = added(names(a.webhooks, "endpointKey"), names(c.webhooks, "endpointKey"));

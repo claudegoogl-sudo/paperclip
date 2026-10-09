@@ -109,7 +109,7 @@ describe("activation-time manifest refresh capability gate", () => {
     const result = await loader.loadSingle(PLUGIN_ID, { markErrorOnFailure: false });
 
     expect(result.success).toBe(false);
-    expect(result.error).toContain("adds capabilities secrets.read-ref");
+    expect(result.error).toContain("adds capabilities that were not granted: secrets.read-ref");
     expect(result.error).toContain("/upgrade");
     expect(mockRegistry.update).not.toHaveBeenCalled();
     expect(workerManager.startWorker).not.toHaveBeenCalled();
