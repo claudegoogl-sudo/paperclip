@@ -419,6 +419,10 @@ export interface CapabilityEscalationRequest {
    * rejection leaves the plugin inactive (`uninstalled`).
    */
   origin?: CapabilityEscalationOrigin;
+  /** Package name of the approved source (install/reinstall parks). */
+  packageName?: string;
+  /** Local path of the approved source (install/reinstall parks, local only). */
+  packagePath?: string;
 }
 
 /** Entry point that parked a capability escalation. */
@@ -504,6 +508,12 @@ export interface ApprovedUpgrade {
    * before this anchor existed still resolve (version + caps still enforced).
    */
   digest?: string | null;
+  /**
+   * Source the board approved (install/reinstall parks only). A reinstall park
+   * does not write the new source to the row; `completeUpgrade` applies it.
+   */
+  packageName?: string | null;
+  packagePath?: string | null;
 }
 
 /**
@@ -2030,6 +2040,22 @@ export function pluginLoader(
       return plugin;
     }
 
+    // SECURITY: activation must never adopt capabilities the row was not
+    // granted. A package changed on disk (local-path swap, or a parked
+    // install/reinstall) goes through the escalation gate, not through here.
+    const grantedCaps = (plugin.manifestJson as PaperclipPluginManifestV1 | null)?.capabilities ?? [];
+    const addedOnDisk = diffAddedCapabilities(grantedCaps, manifest.capabilities ?? []);
+    if (addedOnDisk.length > 0) {
+      log.warn(
+        { pluginId: plugin.id, pluginKey: plugin.pluginKey, addedCapabilities: addedOnDisk },
+        "plugin-loader: on-disk manifest adds capabilities the plugin was not granted — refusing to activate",
+      );
+      throw new Error(
+        `Plugin "${plugin.pluginKey}" package on disk declares capabilities that were not granted: ` +
+          `${addedOnDisk.join(", ")}. Use upgrade so the board can approve them.`,
+      );
+    }
+
     await registry.update(plugin.id, {
       packageName: plugin.packageName,
       version: manifest.version,
@@ -2418,16 +2444,19 @@ export function pluginLoader(
         // One transaction: the row write and the approval filing succeed
         // together. If the gateway throws, the row change rolls back — a fresh
         // install leaves no row and a reinstall stays `uninstalled` (fail closed).
+        // Known gap: the gateway writes on the outer db, so a commit failure
+        // AFTER `file` succeeded leaves an orphan pending approval. Approving it
+        // is a no-op (completeUpgrade requires `upgrade_pending`), so it is
+        // harmless and the board can reject it.
         await db.transaction(async (tx) => {
           const txRegistry = pluginRegistryService(tx as unknown as Db);
           if (existing) {
             pluginId = existing.id;
-            // Record the new source only. version + manifest stay the granted
-            // contract until `completeUpgrade` applies the approved package.
-            await txRegistry.update(existing.id, {
-              packageName: discovered.packageName,
-              ...(discovered.source === "local-filesystem" ? { packagePath: discovered.packagePath } : {}),
-            });
+            // Do NOT write the new source to the row. version, manifest,
+            // packageName and packagePath stay the granted contract. The new
+            // source travels in the approval payload, and only
+            // `completeUpgrade` applies it. A rejection then leaves the row on
+            // its previous source.
           } else {
             // Store the manifest with NO granted capabilities. `completeUpgrade`
             // then diffs against [] so the approval must cover every declared
@@ -2456,6 +2485,8 @@ export function pluginLoader(
               addedCapabilities: gate.addedCapabilities,
               digest: discovered.digest!,
               origin: "install",
+              packageName: discovered.packageName,
+              ...(discovered.source === "local-filesystem" ? { packagePath: discovered.packagePath } : {}),
             }));
         });
 
@@ -2766,9 +2797,11 @@ export function pluginLoader(
       }
 
       const oldManifest = plugin.manifestJson as PaperclipPluginManifestV1;
+      // An install/reinstall park carries the approved source on the approval;
+      // the row still points at the previous source until this step.
       const {
-        packageName = plugin.packageName,
-        localPath = plugin.packagePath ?? undefined,
+        packageName = approved.packageName ?? plugin.packageName,
+        localPath = approved.packagePath ?? plugin.packagePath ?? undefined,
       } = upgradeOptions;
 
       // Prefer the immutable snapshot captured at park over the

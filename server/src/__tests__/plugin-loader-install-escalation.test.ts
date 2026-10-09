@@ -20,6 +20,7 @@ import {
   type CapabilityEscalationGateway,
   type CapabilityEscalationRequest,
 } from "../services/plugin-loader.js";
+import { pluginLifecycleManager } from "../services/plugin-lifecycle.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -45,7 +46,14 @@ function createGatewayStub() {
   // treated as approved, which is what `completeUpgrade` verifies against.
   const approvedByPlugin = new Map<
     string,
-    { approvalId: string; toVersion: string; addedCapabilities: string[]; digest?: string }
+    {
+      approvalId: string;
+      toVersion: string;
+      addedCapabilities: string[];
+      digest?: string;
+      packageName?: string | null;
+      packagePath?: string | null;
+    }
   >();
   let counter = 0;
   const gateway: CapabilityEscalationGateway = {
@@ -63,6 +71,8 @@ function createGatewayStub() {
         // Anchor the approved contract to the exact package contents,
         // mirroring what the real approvals-backed gateway persists at park.
         digest: input.digest,
+        packageName: input.packageName ?? null,
+        packagePath: input.packagePath ?? null,
       });
       return approvalId;
     },
@@ -313,5 +323,85 @@ describeEmbeddedPostgres("plugin-loader install/reinstall capability gate", () =
     } as any)) as any;
     expect(result.installStatus).toBe("installed");
     expect(filed).toHaveLength(0);
+  });
+  // --- SE review MF-1: a parked row must not be activated around the gate ---
+
+  it("MF-1(i): enable on a parked fresh install is refused and nothing is activated", async () => {
+    const pkg = await writePackage(manifest("0.1.0", ["issues.read", "issues.create"]));
+    const { filed, gateway } = createGatewayStub();
+    const loader = makeLoader(gateway);
+    await loader.installPlugin({ localPath: pkg });
+    const pluginId = filed[0]!.pluginId;
+    const lifecycle = pluginLifecycleManager(db, loader);
+    await expect(lifecycle.enable(pluginId)).rejects.toThrow(/upgrade_pending/);
+    const r = await row(pluginId);
+    expect(r?.status).toBe("upgrade_pending");
+    expect(r?.manifestJson.capabilities).toEqual([]);
+  });
+
+  it("MF-1(ii)/SF-1: reinstall park keeps the old source; enable is refused; approve applies the new source; reject keeps the old one", async () => {
+    const oldManifest = manifest("0.1.0", ["issues.read"]);
+    const oldPkg = await writePackage(oldManifest);
+    const pluginId = await seedUninstalled(oldManifest, oldPkg);
+    const newPkg = await writePackage(manifest("0.2.0", ["issues.read", "issues.create"]));
+    const { filed, gateway } = createGatewayStub();
+    const loader = makeLoader(gateway);
+    await loader.installPlugin({ localPath: newPkg });
+    expect(filed[0]).toMatchObject({ packagePath: newPkg });
+    expect((await row(pluginId))?.packagePath).toBe(oldPkg);
+
+    const lifecycle = pluginLifecycleManager(db, loader);
+    await expect(lifecycle.enable(pluginId)).rejects.toThrow(/upgrade_pending/);
+    expect((await row(pluginId))?.packagePath).toBe(oldPkg);
+    expect((await row(pluginId))?.status).toBe("upgrade_pending");
+
+    const done = await loader.completeUpgrade(pluginId);
+    expect(done.status).toBe("ready");
+    const r = await row(pluginId);
+    expect(r?.version).toBe("0.2.0");
+    expect(r?.manifestJson.capabilities).toEqual(["issues.read", "issues.create"]);
+    expect(r?.packagePath).not.toBe(oldPkg);
+  });
+
+  it("SF-1: rejected reinstall stays uninstalled on the previous source", async () => {
+    const oldManifest = manifest("0.1.0", ["issues.read"]);
+    const oldPkg = await writePackage(oldManifest);
+    const pluginId = await seedUninstalled(oldManifest, oldPkg);
+    const newPkg = await writePackage(manifest("0.2.0", ["issues.read", "issues.create"]));
+    const { gateway } = createGatewayStub();
+    const loader = makeLoader(gateway);
+    await loader.installPlugin({ localPath: newPkg });
+    const reverted = await loader.revertPendingUpgrade(pluginId, { origin: "install" } as any);
+    expect(reverted.status).toBe("uninstalled");
+    expect((await row(pluginId))?.packagePath).toBe(oldPkg);
+    expect((await row(pluginId))?.version).toBe("0.1.0");
+  });
+
+  it("MF-1(iii): activation refuses an on-disk manifest that adds a capability; row manifest unchanged", async () => {
+    const granted = manifest("0.1.0", ["issues.read"]);
+    const pkg = await writePackage(manifest("0.1.0", ["issues.read", "issues.create"]));
+    const pluginId = randomUUID();
+    await db.insert(plugins).values({
+      id: pluginId,
+      pluginKey: granted.id,
+      packageName: granted.id,
+      version: granted.version,
+      apiVersion: granted.apiVersion,
+      categories: granted.categories,
+      manifestJson: granted,
+      packagePath: pkg,
+      status: "ready",
+      installOrder: 1,
+    });
+    const loader = pluginLoader(
+      db,
+      { enableLocalFilesystem: false, enableNpmDiscovery: false, localPluginDir } as Parameters<typeof pluginLoader>[1],
+      { lifecycleManager: { markError: async () => undefined }, instanceInfo: { hostVersion: "0.0.0" } } as any,
+    );
+    const result = await loader.loadSingle(pluginId, { markErrorOnFailure: false });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/not granted: issues\.create/);
+    const r = await row(pluginId);
+    expect(r?.manifestJson.capabilities).toEqual(["issues.read"]);
   });
 });

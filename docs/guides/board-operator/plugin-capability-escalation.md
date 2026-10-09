@@ -83,6 +83,14 @@ Each transition emits a structured log line you can grep in production:
 - `plugin-loader: snapshot skipped symlink whose target escapes the package root` (on park) — the approved source tree contained a link pointing outside the package; its target is not copied.
 - `plugin-loader: pruned unreferenced upgrade snapshot` (on apply, revert, or uninstall) — an old snapshot left the content-addressed store.
 
+## A parked plugin cannot be enabled
+
+A plugin in `upgrade_pending` cannot be enabled. `POST /api/plugins/:id/enable` returns 400. Only the board decision moves it on: approve applies the package, reject reverts it.
+
+- A reinstall park does not change the row. Version, manifest, `packageName` and `packagePath` keep the granted values. The new source is stored on the approval and applied only on approve. A rejected reinstall stays `uninstalled` on its previous source.
+- Activation refuses a package on disk whose manifest adds capabilities the plugin was not granted. Log line: `plugin-loader: on-disk manifest adds capabilities the plugin was not granted — refusing to activate`. Use `/upgrade` so the board can approve them.
+- Fresh install with no escalation gateway configured is not gated (legacy behavior). Configure the gateway on deployments that need the gate.
+
 ## Happy-path walkthrough
 
 1. Plugin `paperclip.example` is installed at `0.1.0` with `["issues.read"]`.
