@@ -726,18 +726,16 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
   });
 
   it("refreshes persisted manifests from disk before activation", async () => {
-    // The installed row already holds every capability the on-disk manifest
-    // declares: activation may refresh manifest content, never grow capabilities
-    // (that path is covered by the refusal test below).
+    // The installed row already holds every privilege the on-disk manifest
+    // declares (capabilities, coreReadTables, tools): activation may refresh
+    // non-privilege content only. Privilege growth is covered by the refusal
+    // tests below and in plugin-activation-capability-gate.test.ts.
     const baseManifest = manifest("paperclip.refresh");
     const staleManifest: PaperclipPluginManifestV1 = {
       ...baseManifest,
       capabilities: [...baseManifest.capabilities, "agent.tools.register"],
-    };
-    const refreshedManifest: PaperclipPluginManifestV1 = {
-      ...staleManifest,
       database: {
-        ...staleManifest.database!,
+        ...baseManifest.database!,
         coreReadTables: ["companies"],
       },
       tools: [
@@ -748,6 +746,11 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
           parametersSchema: { type: "object", properties: {} },
         },
       ],
+    };
+    const refreshedManifest: PaperclipPluginManifestV1 = {
+      ...staleManifest,
+      displayName: "Refreshed Display Name",
+      description: "Refreshed description from disk.",
     };
     const namespace = derivePluginDatabaseNamespace(refreshedManifest.id);
     const packageRoot = await createInstallablePluginPackage(
@@ -832,6 +835,7 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
       .from(plugins)
       .where(eq(plugins.id, pluginId));
     expect(plugin?.manifestJson.database?.coreReadTables).toEqual(["companies"]);
+    expect(plugin?.manifestJson.displayName).toBe("Refreshed Display Name");
   });
 
   it("refuses activation when the on-disk manifest adds ungranted capabilities", async () => {

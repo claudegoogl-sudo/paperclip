@@ -52,6 +52,7 @@ import type { PluginToolDispatcher } from "./plugin-tool-dispatcher.js";
 import type { PluginLifecycleManager } from "./plugin-lifecycle.js";
 import { pluginDatabaseService } from "./plugin-database.js";
 import { resolveBundledCatalogRoot } from "./bundled-plugins.js";
+import { collectSecretRefPaths } from "./json-schema-secret-refs.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1674,6 +1675,47 @@ export async function deliverStoredPluginConfig(input: {
   return { delivered, failed };
 }
 
+/**
+ * Privilege-bearing additions between an approved (registry) manifest and a
+ * candidate (on-disk) manifest. Empty = candidate is a privilege subset and
+ * may be applied without the capability-escalation approval gate.
+ */
+export function diffPrivilegeEscalations(
+  approved: PaperclipPluginManifestV1 | null | undefined,
+  candidate: PaperclipPluginManifestV1,
+): string[] {
+  const out: string[] = [];
+  const added = (a: readonly string[] | undefined, b: readonly string[] | undefined) => {
+    const base = new Set(a ?? []);
+    return [...new Set(b ?? [])].filter((x) => !base.has(x)).sort();
+  };
+  const names = (list: unknown, key: string): string[] =>
+    Array.isArray(list)
+      ? list.map((e) => (e && typeof e === "object" ? String((e as Record<string, unknown>)[key] ?? "") : ""))
+      : [];
+  const a = (approved ?? {}) as unknown as Record<string, unknown>;
+  const c = candidate as unknown as Record<string, unknown>;
+  // Reuse the shared escalation predicate used by upgrade/install.
+  const caps = [...new Set(diffAddedCapabilities(a.capabilities as string[] | undefined, c.capabilities as string[] | undefined))].sort();
+  if (caps.length) out.push(`adds capabilities that were not granted: ${caps.join(", ")}`);
+  const tools = added(names(a.tools, "name"), names(c.tools, "name"));
+  if (tools.length) out.push(`adds tools ${tools.join(", ")}`);
+  const hooks = added(names(a.webhooks, "endpointKey"), names(c.webhooks, "endpointKey"));
+  if (hooks.length) out.push(`adds webhooks ${hooks.join(", ")}`);
+  if (c.database !== undefined && JSON.stringify(c.database) !== JSON.stringify(a.database)) {
+    out.push("changes database declaration");
+  }
+  // Reuse the host's own secret-ref walker (follows properties/items AND
+  // allOf/anyOf/oneOf) so this gate cannot diverge from the binding path.
+  const secretPaths = (schema: unknown): string[] =>
+    schema && typeof schema === "object"
+      ? [...collectSecretRefPaths(schema as Record<string, unknown>)]
+      : [];
+  const secrets = added(secretPaths(a.instanceConfigSchema), secretPaths(c.instanceConfigSchema));
+  if (secrets.length) out.push(`adds secret-ref config fields ${secrets.join(", ")}`);
+  return out;
+}
+
 export function pluginLoader(
   db: Db,
   options: PluginLoaderOptions = {},
@@ -2040,21 +2082,33 @@ export function pluginLoader(
       return plugin;
     }
 
-    // SECURITY: activation must never adopt capabilities the row was not
-    // granted. A package changed on disk (local-path swap, or a parked
-    // install/reinstall) goes through the escalation gate, not through here.
-    const grantedCaps = (plugin.manifestJson as PaperclipPluginManifestV1 | null)?.capabilities ?? [];
-    const addedOnDisk = diffAddedCapabilities(grantedCaps, manifest.capabilities ?? []);
-    if (addedOnDisk.length > 0) {
+    // SECURITY: activation-time refresh must never widen privilege. Any
+    // privilege-bearing addition must go through POST /api/plugins/:id/upgrade
+    // (capability-escalation approval gate). Fail activation closed instead.
+    const escalations = diffPrivilegeEscalations(
+      plugin.manifestJson as PaperclipPluginManifestV1 | null,
+      manifest,
+    );
+    if (escalations.length > 0) {
       log.warn(
-        { pluginId: plugin.id, pluginKey: plugin.pluginKey, addedCapabilities: addedOnDisk },
-        "plugin-loader: on-disk manifest adds capabilities the plugin was not granted — refusing to activate",
+        { pluginId: plugin.id, pluginKey: plugin.pluginKey, escalations },
+        "plugin-loader: on-disk manifest escalates privilege — refusing activation-time refresh",
       );
       throw new Error(
-        `Plugin "${plugin.pluginKey}" package on disk declares capabilities that were not granted: ` +
-          `${addedOnDisk.join(", ")}. Use upgrade so the board can approve them.`,
+        `On-disk manifest for plugin ${plugin.pluginKey} escalates privilege (${escalations.join("; ")}); ` +
+          `refusing to apply outside the approval gate — use POST /api/plugins/${plugin.id}/upgrade`,
       );
     }
+
+    log.warn(
+      {
+        pluginId: plugin.id,
+        pluginKey: plugin.pluginKey,
+        fromVersion: plugin.version,
+        toVersion: manifest.version,
+      },
+      "plugin-loader: applying non-escalating on-disk manifest drift outside /upgrade",
+    );
 
     await registry.update(plugin.id, {
       packageName: plugin.packageName,
