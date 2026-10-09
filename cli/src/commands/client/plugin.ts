@@ -464,6 +464,22 @@ export function registerPluginCommands(program: Command): void {
             ),
           );
 
+          // Install-time capability gate: always show what the plugin declares,
+          // and say clearly when it waits for a board approval.
+          const gate = installedPlugin as PluginRecord & {
+            capabilities?: string[];
+            approvalId?: string | null;
+          };
+          const declared = gate.capabilities ?? [];
+          console.log(`  Capabilities: ${declared.length > 0 ? declared.join(", ") : "none"}`);
+          if (gate.approvalId) {
+            console.log(
+              pc.yellow(
+                `  Waiting for board approval ${gate.approvalId}: the plugin does not start until it is approved.`,
+              ),
+            );
+          }
+
           if (installedPlugin.lastError) {
             console.log(pc.red(`  Warning: ${installedPlugin.lastError}`));
           }

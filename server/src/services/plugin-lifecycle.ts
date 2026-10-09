@@ -201,7 +201,10 @@ export interface PluginLifecycleManager {
    * rejected its capability escalation, then re-activate the worker at the
    * still-installed (pre-upgrade) version. Idempotent.
    */
-  revertUpgradeRejected(pluginId: string): Promise<PluginRecord>;
+  revertUpgradeRejected(
+    pluginId: string,
+    options?: { origin?: "upgrade" | "install" },
+  ): Promise<PluginRecord>;
 
   /**
    * Start the worker process for a plugin that is already in `ready` state.
@@ -764,7 +767,10 @@ export function pluginLifecycleManager(
     },
 
     // -- revertUpgradeRejected -------------------------------------------
-    async revertUpgradeRejected(pluginId: string): Promise<PluginRecord> {
+    async revertUpgradeRejected(
+      pluginId: string,
+      options: { origin?: "upgrade" | "install" } = {},
+    ): Promise<PluginRecord> {
       const before = await requirePlugin(pluginId);
       if (before.status !== "upgrade_pending") {
         log.info(
@@ -776,7 +782,16 @@ export function pluginLifecycleManager(
 
       // Parking never mutated version/manifest/caps, so this only restores the
       // lifecycle status to `ready` at the still-installed version.
-      const reverted = (await pluginLoaderInstance.revertPendingUpgrade(pluginId)) as PluginRecord;
+      const reverted = (await pluginLoaderInstance.revertPendingUpgrade(pluginId, options)) as PluginRecord;
+
+      // A rejected install/reinstall stays inactive: no worker activation.
+      if (options.origin === "install") {
+        log.info(
+          { pluginId, pluginKey: reverted.pluginKey, status: reverted.status },
+          "plugin lifecycle: parked install rejected — plugin left inactive",
+        );
+        return reverted;
+      }
 
       log.info(
         { pluginId, pluginKey: reverted.pluginKey, version: reverted.version },

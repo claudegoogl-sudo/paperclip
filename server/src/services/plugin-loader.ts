@@ -376,6 +376,13 @@ export interface PluginLoaderOptions {
    * the approval is filed against.
    */
   escalationGateway?: CapabilityEscalationGateway;
+
+  /**
+   * Capabilities a FRESH install may declare without a board approval when an
+   * escalation gateway is configured. Default empty: any declared capability
+   * parks a fresh install. Ignored when no gateway is configured.
+   */
+  installCapabilityAllowlist?: readonly string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -406,6 +413,44 @@ export interface CapabilityEscalationRequest {
    * package that declares the same version.
    */
   digest: string;
+  /**
+   * Which entry point parked the plugin. `"upgrade"` (default) = `/upgrade`;
+   * a rejection restores `ready`. `"install"` = install or reinstall; a
+   * rejection leaves the plugin inactive (`uninstalled`).
+   */
+  origin?: CapabilityEscalationOrigin;
+}
+
+/** Entry point that parked a capability escalation. */
+export type CapabilityEscalationOrigin = "upgrade" | "install";
+
+/**
+ * Capabilities present in `next` but not in `prev`. The single escalation
+ * predicate shared by `upgradePlugin` and `installPlugin` (reinstall + fresh).
+ */
+export function diffAddedCapabilities(
+  prev: readonly string[] | null | undefined,
+  next: readonly string[] | null | undefined,
+): string[] {
+  const prevSet = new Set(prev ?? []);
+  return (next ?? []).filter((c) => !prevSet.has(c));
+}
+
+/**
+ * Error thrown when an escalation needs board approval but no escalation
+ * gateway is configured. Shared by `/upgrade` and reinstall so both refuse with
+ * the same message.
+ */
+export function ungovernedEscalationError(
+  pluginRef: string,
+  addedCapabilities: readonly string[],
+  previousCapabilities: readonly string[],
+): Error {
+  return new Error(
+    `Upgrade for "${pluginRef}" introduces new capabilities that require approval: ${addedCapabilities.join(", ")}. ` +
+      `The previous version declared [${previousCapabilities.join(", ")}]. ` +
+      `Please review and approve the capability escalation before upgrading.`,
+  );
 }
 
 /**
@@ -512,7 +557,32 @@ export interface PluginInstallOptions {
    * Defaults to the localPluginDir configured on the service.
    */
   installDir?: string;
+
+  /**
+   * SECURITY-CRITICAL: skip the install-time capability-escalation gate. Only
+   * for host-driven boot provisioning of bundled plugins (env + filesystem
+   * control already equals host control). Never set from an HTTP request.
+   */
+  exemptFromCapabilityGate?: boolean;
 }
+
+/**
+ * Result of `installPlugin`: the discovered package plus the gate outcome.
+ *
+ * - `installStatus: "installed"` — row written as `installed`; the caller moves
+ *   it to `ready`.
+ * - `installStatus: "upgrade_pending"` — the install added capabilities and was
+ *   parked for a board approval (`approvalId`). The caller must NOT load it.
+ */
+export type InstallPluginResult = DiscoveredPlugin & {
+  installStatus: "installed" | "upgrade_pending";
+  /** Capability-escalation approval id when parked, else `null`. */
+  approvalId: string | null;
+  /** Capabilities the installed manifest declares. */
+  capabilities: string[];
+  /** Capabilities that needed approval (empty when not parked). */
+  addedCapabilities: string[];
+};
 
 // ---------------------------------------------------------------------------
 // Runtime options — services needed for initializing loaded plugins
@@ -704,7 +774,7 @@ export interface PluginLoader {
    *
    * @see PLUGIN_SPEC.md §8.3 — Install Process
    */
-  installPlugin(options: PluginInstallOptions): Promise<DiscoveredPlugin>;
+  installPlugin(options: PluginInstallOptions): Promise<InstallPluginResult>;
 
   /**
    * Upgrade an already-installed plugin to a newer version.
@@ -740,7 +810,10 @@ export interface PluginLoader {
    * rejected. Because parking never mutates the version/manifest/capabilities,
    * this only restores the lifecycle status to `ready`. Idempotent.
    */
-  revertPendingUpgrade(pluginId: string): Promise<PluginRecord>;
+  revertPendingUpgrade(
+    pluginId: string,
+    options?: { origin?: CapabilityEscalationOrigin },
+  ): Promise<PluginRecord>;
 
   /**
    * Check whether a plugin API version is supported by this host.
@@ -1602,7 +1675,9 @@ export function pluginLoader(
     enableLocalFilesystem = true,
     enableNpmDiscovery = true,
     escalationGateway,
+    installCapabilityAllowlist = [],
   } = options;
+  const installCapabilityAllowSet = new Set(installCapabilityAllowlist);
 
   const registry = pluginRegistryService(db);
   const manifestValidator = pluginManifestValidator();
@@ -2287,9 +2362,123 @@ export function pluginLoader(
     // installPlugin
     // -----------------------------------------------------------------------
 
-    async installPlugin(installOptions: PluginInstallOptions): Promise<DiscoveredPlugin> {
+    async installPlugin(installOptions: PluginInstallOptions): Promise<InstallPluginResult> {
       const discovered = await fetchAndValidate(installOptions);
       const manifest = discovered.manifest!;
+      const declaredCapabilities: string[] = [...(manifest.capabilities ?? [])];
+
+      // SECURITY-CRITICAL: install-time capability-escalation gate. Install
+      // must not be a side door around the `/upgrade` approval:
+      // - Reinstall over a soft-uninstalled row reuses the same plugin id and
+      //   all plugin data, so it is diffed against the stored (granted)
+      //   capabilities exactly like an upgrade.
+      // - A fresh install (no row) with a gateway configured parks when it
+      //   declares any capability outside the operator allowlist. Without a
+      //   gateway, fresh installs keep the previous behavior.
+      const existing = (await registry.getByKey(manifest.id)) as PluginRecord | null;
+      let park:
+        | { fromCapabilities: string[]; fromVersion: string; addedCapabilities: string[] }
+        | null = null;
+      if (!installOptions.exemptFromCapabilityGate) {
+        if (existing && existing.status === "uninstalled") {
+          const grantedCapabilities: string[] = [...(existing.manifestJson?.capabilities ?? [])];
+          const addedCapabilities = diffAddedCapabilities(grantedCapabilities, declaredCapabilities);
+          if (addedCapabilities.length > 0) {
+            if (!escalationGateway) {
+              log.warn(
+                { pluginId: existing.id, pluginKey: manifest.id, addedCapabilities },
+                "plugin-loader: reinstall introduces new capabilities and no escalation gateway is configured — refusing",
+              );
+              throw ungovernedEscalationError(manifest.id, addedCapabilities, grantedCapabilities);
+            }
+            park = {
+              fromCapabilities: grantedCapabilities,
+              fromVersion: existing.version,
+              addedCapabilities,
+            };
+          }
+        } else if (!existing && escalationGateway) {
+          const notAllowlisted = declaredCapabilities.filter((c) => !installCapabilityAllowSet.has(c));
+          if (notAllowlisted.length > 0) {
+            // The approval lists ALL declared capabilities: nothing is granted yet.
+            park = { fromCapabilities: [], fromVersion: "", addedCapabilities: declaredCapabilities };
+          }
+        }
+      }
+
+      if (park && escalationGateway) {
+        const gateway = escalationGateway;
+        const gate = park;
+        // Snapshot the verified bytes BEFORE filing (same anchor as /upgrade).
+        if (discovered.source === "local-filesystem") {
+          await ensureUpgradeSnapshot(discovered.packagePath, discovered.digest!);
+        }
+        let pluginId = "";
+        let approvalId = "";
+        // One transaction: the row write and the approval filing succeed
+        // together. If the gateway throws, the row change rolls back — a fresh
+        // install leaves no row and a reinstall stays `uninstalled` (fail closed).
+        await db.transaction(async (tx) => {
+          const txRegistry = pluginRegistryService(tx as unknown as Db);
+          if (existing) {
+            pluginId = existing.id;
+            // Record the new source only. version + manifest stay the granted
+            // contract until `completeUpgrade` applies the approved package.
+            await txRegistry.update(existing.id, {
+              packageName: discovered.packageName,
+              ...(discovered.source === "local-filesystem" ? { packagePath: discovered.packagePath } : {}),
+            });
+          } else {
+            // Store the manifest with NO granted capabilities. `completeUpgrade`
+            // then diffs against [] so the approval must cover every declared
+            // capability, and an operator `enable` on the parked row can never
+            // run the worker with unapproved capabilities.
+            const row = await txRegistry.install(
+              {
+                packageName: discovered.packageName,
+                packagePath: discovered.source === "local-filesystem" ? discovered.packagePath : undefined,
+              },
+              { ...manifest, capabilities: [] },
+            );
+            if (!row) throw new Error(`Plugin install did not return a registry row: ${manifest.id}`);
+            pluginId = row.id;
+          }
+          await txRegistry.updateStatus(pluginId, { status: "upgrade_pending" });
+          approvalId =
+            (await gateway.findPending({ pluginId, toVersion: manifest.version })) ??
+            (await gateway.file({
+              pluginId,
+              pluginKey: manifest.id,
+              fromVersion: gate.fromVersion,
+              toVersion: manifest.version,
+              fromCapabilities: gate.fromCapabilities,
+              toCapabilities: declaredCapabilities,
+              addedCapabilities: gate.addedCapabilities,
+              digest: discovered.digest!,
+              origin: "install",
+            }));
+        });
+
+        log.warn(
+          {
+            pluginId,
+            pluginKey: manifest.id,
+            approvalId,
+            reinstall: Boolean(existing),
+            capabilities: declaredCapabilities,
+            addedCapabilities: gate.addedCapabilities,
+          },
+          "plugin-loader: install requires capability approval — parked in upgrade_pending pending board approval",
+        );
+
+        return {
+          ...discovered,
+          installStatus: "upgrade_pending",
+          approvalId,
+          capabilities: declaredCapabilities,
+          addedCapabilities: gate.addedCapabilities,
+        };
+      }
 
       // Step 6: Persist install record and apply plugin-owned schema migrations
       // in one database transaction. If migration validation fails, the plugin
@@ -2330,7 +2519,13 @@ export function pluginLoader(
         "plugin-loader: plugin installed successfully",
       );
 
-      return discovered;
+      return {
+        ...discovered,
+        installStatus: "installed",
+        approvalId: null,
+        capabilities: declaredCapabilities,
+        addedCapabilities: [],
+      };
     },
 
     // -----------------------------------------------------------------------
@@ -2399,7 +2594,7 @@ export function pluginLoader(
       // 3. Detect capability escalation — new capabilities not in the old manifest
       const oldCaps = new Set(oldManifest.capabilities ?? []);
       const newCaps = newManifest.capabilities ?? [];
-      const addedCapabilities = newCaps.filter((c) => !oldCaps.has(c));
+      const addedCapabilities = diffAddedCapabilities(oldManifest.capabilities, newCaps);
 
       if (addedCapabilities.length > 0) {
         // Fail closed when no governance path is wired: never silently escalate.
@@ -2408,11 +2603,7 @@ export function pluginLoader(
             { pluginId, addedCapabilities, oldVersion: oldManifest.version, newVersion: newManifest.version },
             "plugin-loader: upgrade introduces new capabilities and no escalation gateway is configured — refusing",
           );
-          throw new Error(
-            `Upgrade for "${pluginId}" introduces new capabilities that require approval: ${addedCapabilities.join(", ")}. ` +
-              `The previous version declared [${[...oldCaps].join(", ")}]. ` +
-              `Please review and approve the capability escalation before upgrading.`,
-          );
+          throw ungovernedEscalationError(pluginId, addedCapabilities, [...oldCaps]);
         }
 
         // SECURITY-CRITICAL: snapshot the verified bytes to immutable storage
@@ -2472,6 +2663,7 @@ export function pluginLoader(
             addedCapabilities,
             // Anchor the approval to the exact package contents.
             digest: discovered.digest!,
+            origin: "upgrade",
           }));
 
         // Park WITHOUT touching version/manifest/caps. Because nothing else is
@@ -2626,8 +2818,7 @@ export function pluginLoader(
             `does not match the board-approved version "${approved.toVersion}".`,
         );
       }
-      const oldCaps = new Set(oldManifest.capabilities ?? []);
-      const fetchedAddedCaps = (newManifest.capabilities ?? []).filter((c) => !oldCaps.has(c));
+      const fetchedAddedCaps = diffAddedCapabilities(oldManifest.capabilities, newManifest.capabilities);
       const approvedAddedCaps = new Set(approved.addedCapabilities);
       const unapprovedCaps = fetchedAddedCaps.filter((c) => !approvedAddedCaps.has(c));
       if (unapprovedCaps.length > 0) {
@@ -2694,7 +2885,10 @@ export function pluginLoader(
      * Parking never mutated the version/manifest/caps, so this only restores
      * the lifecycle status to `ready`. Idempotent.
      */
-    async revertPendingUpgrade(pluginId: string): Promise<PluginRecord> {
+    async revertPendingUpgrade(
+      pluginId: string,
+      revertOptions: { origin?: CapabilityEscalationOrigin } = {},
+    ): Promise<PluginRecord> {
       const plugin = (await registry.getById(pluginId)) as PluginRecord | null;
       if (!plugin) throw new Error(`Plugin not found: ${pluginId}`);
 
@@ -2706,11 +2900,15 @@ export function pluginLoader(
         return plugin;
       }
 
-      const updated = await registry.updateStatus(pluginId, { status: "ready" });
+      // An install/reinstall park never had an approved install, so a
+      // rejection leaves it inactive. An /upgrade park restores `ready` at the
+      // still-installed version.
+      const restoreStatus = revertOptions.origin === "install" ? "uninstalled" : "ready";
+      const updated = await registry.updateStatus(pluginId, { status: restoreStatus });
 
       log.info(
-        { pluginId, version: plugin.version },
-        "plugin-loader: parked upgrade rejected and reverted to ready",
+        { pluginId, version: plugin.version, origin: revertOptions.origin ?? "upgrade", restoreStatus },
+        "plugin-loader: parked capability escalation rejected and reverted",
       );
 
       // The rejected upgrade's snapshot (if any) is no longer referenced.

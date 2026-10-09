@@ -62,6 +62,9 @@ export interface CapabilityEscalationPayload extends Record<string, unknown> {
   // contents. Optional because approvals filed before this anchor existed have
   // no stored digest — the loader's version + caps checks still apply to those.
   digest?: string;
+  // Entry point that parked the plugin. Absent on approvals filed before
+  // install was gated; treated as "upgrade".
+  origin?: "upgrade" | "install";
 }
 
 /** Outcome the board reached on an escalation approval. */
@@ -206,6 +209,7 @@ export function createApprovalsCapabilityEscalationGateway(input: {
       fromCapabilities: request.fromCapabilities,
       toCapabilities: request.toCapabilities,
       digest: request.digest,
+      origin: request.origin ?? "upgrade",
     };
     const created = await approvals.create(companyId, {
       type: CAPABILITY_ESCALATION_APPROVAL_TYPE,
@@ -227,6 +231,7 @@ export function createApprovalsCapabilityEscalationGateway(input: {
         toVersion: request.toVersion,
         addedCapabilities: request.addedCapabilities,
         digest: request.digest,
+        origin: request.origin ?? "upgrade",
       },
       "capability-escalation: filed board approval for plugin capability escalation",
     );

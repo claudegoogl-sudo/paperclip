@@ -29,6 +29,19 @@ import { api } from "./client";
  * `launchers` array aggregates both legacy `manifest.launchers` and
  * `manifest.ui.launchers`.
  */
+/**
+ * `POST /plugins/install` response: the plugin record plus the install-time
+ * capability gate outcome.
+ */
+export type PluginInstallResponse = PluginRecord & {
+  /** Capabilities the installed package declares. */
+  capabilities?: string[];
+  /** Capabilities that need board approval (empty when not parked). */
+  addedCapabilities?: string[];
+  /** Capability-escalation approval id when the install is parked, else null. */
+  approvalId?: string | null;
+};
+
 export type PluginUiContribution = {
   pluginId: string;
   pluginKey: string;
@@ -242,7 +255,7 @@ export const pluginsApi = {
    * @param params.isLocalPath - Set to `true` when `packageName` is a local path.
    */
   install: (params: { packageName: string; version?: string; isLocalPath?: boolean }) =>
-    api.post<PluginRecord>("/plugins/install", params),
+    api.post<PluginInstallResponse>("/plugins/install", params),
 
   /**
    * Uninstall a plugin.

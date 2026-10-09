@@ -741,6 +741,11 @@ export async function createApp(
       localPluginDir: opts.localPluginDir ?? DEFAULT_LOCAL_PLUGIN_DIR,
       migrationDb: opts.pluginMigrationDb,
       escalationGateway,
+      // Capabilities a fresh install may declare without a board approval.
+      // Default empty: any capability parks a fresh install (gateway set only).
+      installCapabilityAllowlist: parsePluginCrossCompanyReadAllowlist(
+        process.env.PAPERCLIP_PLUGIN_INSTALL_CAPABILITY_ALLOWLIST,
+      ),
     },
     {
       workerManager,
@@ -819,7 +824,7 @@ export async function createApp(
     if (outcome === "approved") {
       await upgradeLifecycle.completeUpgradeApproved(payload.pluginId);
     } else {
-      await upgradeLifecycle.revertUpgradeRejected(payload.pluginId);
+      await upgradeLifecycle.revertUpgradeRejected(payload.pluginId, { origin: payload.origin });
     }
   });
   // Create the dev-watcher before the plugin routes so the routes can

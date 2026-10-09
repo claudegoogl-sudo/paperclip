@@ -49,6 +49,18 @@ The `digest` is a content hash (`sha256:<hex>`) of the exact package captured wh
 
 At park time the loader also copies the package into a content-addressed snapshot store (`<local plugin dir>/.upgrade-snapshots/<digest>`). Approval applies the snapshot, not the original source directory, so the loaded bytes are host-controlled. The copy is link-safe and bounded: it dereferences only symlinks that resolve inside the approved package, refuses devices, FIFOs, and sockets, and stops the park with an error if the tree exceeds 1 GiB or 200,000 files. A symlink that points outside the package (for example into host data) is skipped, so its contents never enter the snapshot. Snapshots no longer referenced by any installed plugin are pruned on apply, revert, and uninstall.
 
+## Install and reinstall
+
+Install is not a side door around the gate.
+
+- **Reinstall over a soft-uninstalled plugin.** Reinstall reuses the same plugin id and all plugin data (config, secret refs, state, jobs, webhooks). The new manifest is diffed against the stored (granted) capabilities, exactly like an upgrade. Added capabilities park the plugin in `upgrade_pending` and file the same approval with `"origin": "install"`. Same or fewer capabilities: installs as before. Without `PAPERCLIP_PLUGIN_ESCALATION_COMPANY_ID`, a capability-adding reinstall is refused with the same error as `/upgrade`.
+- **Fresh install** (no row, or after uninstall with `purge=true`). When the gateway is configured, a manifest that declares any capability outside `PAPERCLIP_PLUGIN_INSTALL_CAPABILITY_ALLOWLIST` (comma separated; default empty) is parked. The approval lists all declared capabilities (`fromCapabilities: []`). Until approval, the stored manifest grants no capabilities. Without the gateway, fresh installs behave as before.
+- **Approve** → the approved package is applied and the plugin goes to `ready`. **Reject** → an install-origin park goes to `uninstalled` (inactive), not `ready`.
+- **Gateway error** during install → the install fails and nothing is activated (fresh: no row; reinstall: stays `uninstalled`).
+- **Boot auto-install** of bundled plugins (for example the kubernetes sandbox provider) is exempt: its path comes from host env and the host image, so it is already host-controlled.
+
+`POST /api/plugins/install` returns the plugin record plus `capabilities`, `addedCapabilities` and `approvalId` (`null` when not parked). `paperclipai plugin install` prints the capabilities and the approval id. The UI shows them in the install toast. The `plugin.installed` activity entry records `capabilities` and `approvalId`. Log line on park: `plugin-loader: install requires capability approval — parked in upgrade_pending pending board approval`.
+
 ## Configuration
 
 The escalation gateway is only wired up when the server knows which company owns the board approval queue for plugin upgrades. Set:
