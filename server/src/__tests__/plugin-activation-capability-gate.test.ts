@@ -188,6 +188,36 @@ describe("activation-time manifest refresh capability gate", () => {
       "adds secret-ref config fields k",
     ]);
   });
+
+  it("treats a jsonb-reordered database declaration as unchanged (activation proceeds)", async () => {
+    // jsonb key order: by length, then bytes -> migrationsDir before namespaceSlug.
+    const registryDb = { coreReadTables: ["issues"], migrationsDir: "migrations", namespaceSlug: "capgate" };
+    const authoredDb = { namespaceSlug: "capgate", migrationsDir: "migrations", coreReadTables: ["issues"] };
+    const caps = ["database.namespace.migrate", "database.namespace.read"];
+    const reg = manifestWith(caps, { database: registryDb } as never);
+    const disk = manifestWith(caps, { database: authoredDb } as never);
+    expect(JSON.stringify(reg.database)).not.toBe(JSON.stringify(disk.database));
+    expect(diffPrivilegeEscalations(reg, disk)).toEqual([]);
+    mockRegistry.getById.mockResolvedValue({ ...registryPlugin(caps), manifestJson: reg });
+    writeOnDisk(disk);
+    const { loader } = makeLoader();
+    const result = await loader.loadSingle(PLUGIN_ID, { markErrorOnFailure: false });
+    expect(result.error ?? "").not.toMatch(/escalates privilege/);
+    // Canonical short-circuit: identical content -> no refresh write, no refusal.
+    expect(mockRegistry.update).not.toHaveBeenCalled();
+  });
+
+  it("still refuses a real database declaration change", () => {
+    const base = manifestWith([], { database: { namespaceSlug: "x", migrationsDir: "m", coreReadTables: ["issues"] } } as never);
+    for (const db of [
+      { migrationsDir: "m2", namespaceSlug: "x", coreReadTables: ["issues"] },
+      { coreReadTables: ["issues", "agents"], migrationsDir: "m", namespaceSlug: "x" },
+    ]) {
+      expect(diffPrivilegeEscalations(base, manifestWith([], { database: db } as never))).toEqual([
+        "changes database declaration",
+      ]);
+    }
+  });
 });
 
 describe("isPluginDevWatchEnabled", () => {
