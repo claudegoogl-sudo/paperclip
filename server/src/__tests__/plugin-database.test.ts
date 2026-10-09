@@ -726,10 +726,16 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
   });
 
   it("refreshes persisted manifests from disk before activation", async () => {
-    const staleManifest = manifest("paperclip.refresh");
+    // The installed row already holds every capability the on-disk manifest
+    // declares: activation may refresh manifest content, never grow capabilities
+    // (that path is covered by the refusal test below).
+    const baseManifest = manifest("paperclip.refresh");
+    const staleManifest: PaperclipPluginManifestV1 = {
+      ...baseManifest,
+      capabilities: [...baseManifest.capabilities, "agent.tools.register"],
+    };
     const refreshedManifest: PaperclipPluginManifestV1 = {
       ...staleManifest,
-      capabilities: [...staleManifest.capabilities, "agent.tools.register"],
       database: {
         ...staleManifest.database!,
         coreReadTables: ["companies"],
@@ -826,6 +832,51 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
       .from(plugins)
       .where(eq(plugins.id, pluginId));
     expect(plugin?.manifestJson.database?.coreReadTables).toEqual(["companies"]);
+  });
+
+  it("refuses activation when the on-disk manifest adds ungranted capabilities", async () => {
+    const staleManifest = manifest("paperclip.refresh-escalate");
+    const escalatedManifest: PaperclipPluginManifestV1 = {
+      ...staleManifest,
+      capabilities: [...staleManifest.capabilities, "agent.tools.register"],
+    };
+    const packageRoot = await createInstallablePluginPackage(escalatedManifest, "SELECT 1;");
+    const pluginId = await installPluginRecord(staleManifest);
+    await db
+      .update(plugins)
+      .set({ packagePath: packageRoot, status: "ready" })
+      .where(eq(plugins.id, pluginId));
+
+    const workerManager = {
+      startWorker: vi.fn().mockResolvedValue(undefined),
+      stopAll: vi.fn().mockResolvedValue(undefined),
+    };
+    const loader = pluginLoader(db, {
+      enableLocalFilesystem: false,
+      enableNpmDiscovery: false,
+    }, {
+      workerManager,
+      eventBus: { forPlugin: vi.fn(() => ({})), subscriptionCount: vi.fn(() => 0) },
+      jobScheduler: { registerPlugin: vi.fn().mockResolvedValue(undefined), stop: vi.fn() },
+      jobStore: { syncJobDeclarations: vi.fn().mockResolvedValue(undefined) },
+      toolDispatcher: { registerPluginTools: vi.fn() },
+      lifecycleManager: { markError: vi.fn().mockResolvedValue(undefined) },
+      buildHostHandlers: vi.fn(() => ({})),
+      instanceInfo: {
+        instanceId: "test-instance",
+        hostVersion: "1.0.0",
+        deploymentMode: "authenticated",
+        deploymentExposure: "public",
+      },
+    } as never);
+
+    const result = await loader.loadSingle(pluginId);
+
+    expect(result.success).toBe(false);
+    expect(String(result.error)).toMatch(/not granted: agent\.tools\.register/);
+    expect(workerManager.startWorker).not.toHaveBeenCalled();
+    const [plugin] = await db.select().from(plugins).where(eq(plugins.id, pluginId));
+    expect(plugin?.manifestJson.capabilities).not.toContain("agent.tools.register");
   });
 
   it("rejects checksum changes for already applied migrations", async () => {
