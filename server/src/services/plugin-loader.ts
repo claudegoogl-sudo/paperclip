@@ -52,6 +52,7 @@ import type { PluginToolDispatcher } from "./plugin-tool-dispatcher.js";
 import type { PluginLifecycleManager } from "./plugin-lifecycle.js";
 import { pluginDatabaseService } from "./plugin-database.js";
 import { resolveBundledCatalogRoot } from "./bundled-plugins.js";
+import { collectSecretRefPaths } from "./json-schema-secret-refs.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1704,21 +1705,12 @@ export function diffPrivilegeEscalations(
   if (c.database !== undefined && JSON.stringify(c.database) !== JSON.stringify(a.database)) {
     out.push("changes database declaration");
   }
-  const secretPaths = (schema: unknown): string[] => {
-    const found: string[] = [];
-    const walk = (node: unknown, at: string) => {
-      if (!node || typeof node !== "object") return;
-      const n = node as Record<string, unknown>;
-      if (n.format === "secret-ref") found.push(at || "/");
-      const props = n.properties as Record<string, unknown> | undefined;
-      if (props && typeof props === "object") {
-        for (const [k, v] of Object.entries(props)) walk(v, `${at}/${k}`);
-      }
-      if (n.items) walk(n.items, `${at}/[]`);
-    };
-    walk(schema, "");
-    return found;
-  };
+  // Reuse the host's own secret-ref walker (follows properties/items AND
+  // allOf/anyOf/oneOf) so this gate cannot diverge from the binding path.
+  const secretPaths = (schema: unknown): string[] =>
+    schema && typeof schema === "object"
+      ? [...collectSecretRefPaths(schema as Record<string, unknown>)]
+      : [];
   const secrets = added(secretPaths(a.instanceConfigSchema), secretPaths(c.instanceConfigSchema));
   if (secrets.length) out.push(`adds secret-ref config fields ${secrets.join(", ")}`);
   return out;

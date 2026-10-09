@@ -115,6 +115,28 @@ describe("activation-time manifest refresh capability gate", () => {
     expect(workerManager.startWorker).not.toHaveBeenCalled();
   });
 
+  it("loadSingle refuses a secret-ref field added inside a oneOf branch", async () => {
+    mockRegistry.getById.mockResolvedValue(registryPlugin(["events.subscribe"]));
+    writeOnDisk(
+      manifestWith(["events.subscribe"], {
+        version: "1.0.1",
+        instanceConfigSchema: {
+          type: "object",
+          properties: {
+            cred: { oneOf: [{ type: "object", properties: { token: { type: "string", format: "secret-ref" } } }] },
+          },
+        },
+      }),
+    );
+    const { loader } = makeLoader();
+
+    const result = await loader.loadSingle(PLUGIN_ID, { markErrorOnFailure: false });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("adds secret-ref config fields");
+    expect(mockRegistry.update).not.toHaveBeenCalled();
+  });
+
   it("restartWorker (dev-watcher reload path) refuses the same escalation", async () => {
     mockRegistry.getById.mockResolvedValue(registryPlugin(["events.subscribe"]));
     writeOnDisk(manifestWith(["events.subscribe", "secrets.read-ref"], { version: "1.0.1" }));
@@ -163,7 +185,7 @@ describe("activation-time manifest refresh capability gate", () => {
       "adds tools t1",
       "adds webhooks w1",
       "changes database declaration",
-      "adds secret-ref config fields /k",
+      "adds secret-ref config fields k",
     ]);
   });
 });
