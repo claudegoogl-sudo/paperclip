@@ -14,18 +14,174 @@ All environment variables that Paperclip uses for server configuration.
 | `PAPERCLIP_BIND_HOST` | (unset) | Required when `PAPERCLIP_BIND=custom` |
 | `HOST` | `127.0.0.1` | Legacy host override; prefer `PAPERCLIP_BIND` for new setups |
 | `DATABASE_URL` | (embedded) | PostgreSQL connection string |
-| `PAPERCLIP_ALLOW_EMBEDDED_POSTGRES_PUBLIC` | `true` | When `false`, an `authenticated` + `public` deployment with no `DATABASE_URL` refuses to boot instead of falling back to embedded PostgreSQL. Default (`true`, or unset) warns and continues on embedded PostgreSQL. Set `false` to require an external managed Postgres in production. |
-| `PAPERCLIP_DB_POOL_MAX` | `20` | Maximum connections in the application's PostgreSQL pool. Raise it for busier instances, but keep the total across all processes under the server's `max_connections` (commonly `100`). Values below `1` or non-integers fall back to the default. |
-| `PAPERCLIP_DB_STATEMENT_TIMEOUT_MS` | `60000` | Per-query `statement_timeout` for the application pool, in milliseconds. A query exceeding it is cancelled and its pool connection released, so one slow query cannot starve the pool. Set `0` to disable (not recommended). Non-integers and negative values fall back to the default. Database migrations run on a separate connection and are not affected. This is a backstop: a read request whose client disconnects has its queries cancelled right away rather than at this timeout — see [Connection pool behavior](../../doc/DATABASE.md#connection-pool-behavior). |
 | `PAPERCLIP_HOME` | `~/.paperclip` | Base directory for all Paperclip data |
 | `PAPERCLIP_INSTANCE_ID` | `default` | Instance identifier (for multiple local instances) |
 | `PAPERCLIP_DEPLOYMENT_MODE` | `local_trusted` | Runtime mode override |
 | `PAPERCLIP_DEPLOYMENT_EXPOSURE` | `private` | Exposure policy when deployment mode is `authenticated` |
 | `PAPERCLIP_API_URL` | (auto-derived) | Paperclip API base URL. When set externally (e.g., via Kubernetes ConfigMap, load balancer, or reverse proxy), the server preserves the value instead of deriving it from the listen host and port. Useful for deployments where the public-facing URL differs from the local bind address. |
+| `PAPERCLIP_CHAT_WEBHOOK_PUBLIC_URL` | (board public origin) | Optional HTTPS origin for native chat provider webhooks when ingress and the board use different hosts. Must have no credentials, path, query, or fragment; invalid configuration refuses startup. Used only for provider callback URLs, not board links, authentication, trusted hosts, or identity confirmation. |
+| `PAPERCLIP_RUNNER_PUBLIC_URL` | (unset) | Explicit `wss://` base URL used only when a remote `paperclip_runner` target dials Paperclip directly. Paperclip appends `/api/runner/v1/connect/<runId>`; the reverse proxy must forward WebSocket upgrades for that route. This value is never inferred from request headers. Daytona ignores it and uses provider ingress. |
+| `PAPERCLIP_RUNNER_CA_BUNDLE_PATH` | (unset) | Optional PEM CA bundle for direct runner WSS. Platform roots remain enabled. There is no insecure TLS bypass. |
+| `PAPERCLIP_RUNNER_REMOTE_BINARY_PATH` | (host build) | Host-local path to a `paperclip-runnerd` artifact built for the remote target OS and architecture. Required when Paperclip and the remote sandbox do not share a compatible platform; build metadata and the required transport mode are verified before launch. |
+| `PAPERCLIP_RUNNER_REMOTE_CODEX_PATH` | (unset) | Optional host-local path to a Codex executable built for the remote target OS and architecture. For remote Codex-backed runners, Paperclip stages and verifies this executable beside `paperclip-runnerd`. |
+| `PAPERCLIP_RUNNER_REMOTE_CODEX_NPM_SPEC` | (unset) | Optional pinned npm package spec (for example, `@openai/codex@0.153.4`) installed inside each fresh remote lease when its Codex harness is not baked into the sandbox image. Mutually exclusive with `PAPERCLIP_RUNNER_REMOTE_CODEX_PATH`; Paperclip verifies the installed executable before starting `runnerd`. |
+| `PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH` | (unset) | Host-local path to the immutable provider pack built by `pnpm --filter @paperclipai/paperclip-runner build:provider-pack`. The pack includes its target-built Node 24.11 runtime, locked production dependencies, OpenCode proxy/executable, and ACPX sidecar. Remote OpenCode and ACPX fail closed without it. A preinstalled pack is accepted only when its complete digested manifest matches this build-owned pack; otherwise Paperclip stages this pack into the sandbox. |
 | `PAPERCLIP_AGENT_API_URL` | loopback listen origin (`http://127.0.0.1:<port>`, or `http://[::1]:<port>` for IPv6) when the server binds loopback or a wildcard; otherwise `PAPERCLIP_API_URL` | Base URL injected into local agent runs as their `PAPERCLIP_API_URL`. Kept separate from the public base so agents on the server host never send API calls (and their credentials) through a public access proxy that may answer with an HTML login page. Set it to override, e.g. `http://host.docker.internal:3100` for containerised agents. Invite/join links, board UI links and routine webhook URLs keep using the public base. Sandbox callback bridges are unaffected. |
 | `PAPERCLIP_MAX_CONCURRENT_RUNS_HOST` | `ceil(vCPU / 2)` | Host-wide ceiling on concurrently executing agent runs — see [Host-wide run concurrency](#host-wide-run-concurrency). |
 | `PAPERCLIP_RUN_ADMISSION_MEMORY_PCT` | `90` | Defer new run admission once the service cgroup's memory usage reaches this percentage of its effective soft limit (`memory.high`, or `memory.max` when no soft limit is set) — see [Memory-pressure run admission](#memory-pressure-run-admission). |
 | `PAPERCLIP_RECOVERY_REPLAY_MAX_CONCURRENT` | `ceil(PAPERCLIP_MAX_CONCURRENT_RUNS_HOST / 2)` | Cap on concurrently in-flight boot/recovery replay dispatches, with a jittered `>= 2s` spacing between dispatch starts — see [Staggered boot recovery replay](#staggered-boot-recovery-replay). |
+| `PAPERCLIP_HIDDEN_SETTINGS` | (unset) | Comma-separated settings surfaces to hide from the UI and floor at the API, for operators hosting Paperclip for others (managed cloud, internal shared server). See [Hiding settings surfaces](#hiding-settings-surfaces). |
+| `PAPERCLIP_SETTING_DEFAULTS` | (unset) | JSON object replacing the schema default of selected instance settings, for hosting operators. See [Operator setting defaults](#operator-setting-defaults). |
+
+Daytona connectivity for `paperclip_runner` uses authenticated provider
+WebSocket ingress and follows the instance experimental setting
+`enableNativeRunner` (default `false`). There is no separate ingress opt-in.
+Disabling Paperclip Runner blocks fresh native starts while persisted native
+runs retain their recovery path. The deprecated `enableRunnerPreviewIngress`
+key remains accepted in stored and managed configuration for version-skew
+compatibility, but it has no runtime effect. The setting has no effect on
+legacy adapters or callback bridges.
+
+### Webhook-only chat ingress
+
+Keep `PAPERCLIP_PUBLIC_URL` (or the explicit authentication public URL) pointed
+at the actual board. If the board is private, set
+`PAPERCLIP_CHAT_WEBHOOK_PUBLIC_URL=https://chat-ingress.example.com` and forward
+only `POST /api/chat-webhooks/*` from that host. Provider signatures still gate
+ingress; this variable does not expose routes or grant provider access.
+Never forward the private `local_trusted` board through a public tunnel.
+
+In Paperclip Cloud, chat callback URLs and account-linking URLs follow the
+instance's signed canonical origin after a warm instance is claimed, without
+requiring a restart. An explicit `PAPERCLIP_CHAT_WEBHOOK_PUBLIC_URL` still takes
+precedence for provider callbacks only; board links follow the claimed origin.
+Existing provider-side callback settings must be updated if they were created
+with an old URL.
+
+Task links in external messages require an externally safe HTTPS board URL.
+Local/private board URLs are omitted with instructions to open the task in
+Paperclip; the public webhook host is never substituted for the board. Identity
+confirmation stays on the board and requires the user to be able to reach it.
+
+### Preinstalled remote runner images
+
+Remote sandbox images may preinstall `paperclip-runnerd`, `codex`, and the
+provider pack at `/opt/paperclip-runner/provider-pack` instead of
+paying the upload and npm-install cost on every fresh lease. Put both executable
+names on the sandbox user's `PATH`; `$HOME/.local/bin` is checked explicitly
+before `PATH`. Paperclip verifies runner build metadata, the selected PRP
+transport capability, Codex startup, the provider-pack digest, exact harness
+pins, Node compatibility, and packaged bridge digests before linking artifacts
+into the run-specific runtime directory. A missing or incompatible executable falls back
+to `PAPERCLIP_RUNNER_REMOTE_BINARY_PATH` and
+`PAPERCLIP_RUNNER_REMOTE_CODEX_NPM_SPEC` (or
+`PAPERCLIP_RUNNER_REMOTE_CODEX_PATH`) without changing the selected transport.
+OpenCode and ACPX instead fall back only to
+`PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH`; they never start a provider
+process on the Paperclip host for a remote target.
+The Daytona environment editor's **Configure image** action can create this
+image without a separate container registry: install the executables in its
+setup sandbox, finish setup, and Paperclip captures and promotes the resulting
+Daytona snapshot for future leases.
+
+### Hiding settings surfaces
+
+`PAPERCLIP_HIDDEN_SETTINGS` takes keys from the registry in
+`packages/shared/src/settings-visibility.ts`:
+
+- Any instance settings page: `instance.profile`, `instance.environments`,
+  `instance.access`, `instance.experimental`,
+  `instance.plugins`, `instance.adapters` — removed from navigation and
+  routing (the General page is the settings root and stays visible). Hiding
+  `instance.access`, `instance.plugins`, or `instance.adapters` also floors
+  their management endpoints with `403 settings_operator_managed`; hiding
+  `instance.experimental` floors every experimental toggle write.
+- Any Instance → General section: `instance.general.censorUsernameInLogs`,
+  `instance.general.keyboardShortcuts`, `instance.general.backupRetention`,
+  `instance.general.feedbackDataSharingPreference` (each also rejects
+  value-changing writes via `PATCH /api/instance/settings/general`), plus the
+  UI-only `instance.general.deploymentStatus` and `instance.general.signOut`.
+- Any experimental toggle: `instance.experimental.<flagKey>` (e.g.
+  `instance.experimental.enableSmokeLab`) — the card disappears and
+  value-changing writes are rejected.
+- Any top-level company settings page: `company.members`, `company.invites`,
+  `company.secrets`, `company.export`, `company.import` — removed from the
+  settings sidebar, tab bar, and routing (the company General page is the
+  settings root and stays visible). These are UI-visibility keys: the
+  membership, invite, secret, and export APIs stay live for agents and
+  integrations. `company.import` is the exception — hiding it also floors
+  every company-import route with `403 settings_operator_managed`. On
+  cloud-managed instances import is floored unconditionally with
+  `403 cloud_managed`, independent of this variable.
+- A single tab of the Secrets page: `company.secrets.vaults` (Provider
+  vaults) and `company.secrets.proposals` (Proposals) — the tab disappears
+  while the rest of the page stays up. UI-visibility only; the secret
+  provider-config and proposal APIs stay live for agents and integrations.
+
+Unknown keys are logged and ignored, so one list can be rolled across a fleet
+of mixed app versions, and retired keys (like `instance.heartbeats`, whose
+page was removed) can stay in an operator list without breaking older or
+newer releases. With the variable unset nothing is hidden and behavior
+is identical to earlier releases. Hiding a toggle does not change its value;
+pair hiding with the desired default where it matters (for general settings,
+see [Operator setting defaults](#operator-setting-defaults)).
+
+### Operator setting defaults
+
+`PAPERCLIP_SETTING_DEFAULTS` takes a JSON object whose fields come from the
+registry in `packages/shared/src/setting-defaults.ts` (currently
+`feedbackDataSharingPreference`). The operator value substitutes for the
+schema default at read time: any field whose effective value is still the
+schema default resolves to the operator value, while an explicit non-default
+user choice always wins. The overlay is never persisted, so unsetting the
+variable restores stock behavior wherever a user has not chosen otherwise.
+A client that writes back the full settings object it read does not persist
+the operator value either: writing the operator value over a still-unchosen
+field is treated as an echo of the overlay and the field stays unchosen.
+
+Example: `PAPERCLIP_SETTING_DEFAULTS='{"feedbackDataSharingPreference":"allowed"}'`
+defaults AI feedback sharing to allowed; pairing it with
+`instance.general.feedbackDataSharingPreference` in `PAPERCLIP_HIDDEN_SETTINGS`
+also hides the control and floors value-changing writes.
+
+Unknown field names are logged and ignored (mixed-version fleet safe).
+Malformed JSON or an invalid value for a known field refuses startup — policy
+configuration fails closed.
+
+## Secrets
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PAPERCLIP_SECRETS_MASTER_KEY` | (from file) | 32-byte encryption key (base64/hex/raw) |
+| `PAPERCLIP_SECRETS_MASTER_KEY_FILE` | `~/.paperclip/.../secrets/master.key` | Path to key file |
+| `PAPERCLIP_SECRETS_STRICT_MODE` | `false` | Require secret refs for sensitive env vars |
+
+## Agent Runtime (Injected into agent processes)
+
+These are set automatically by the server when invoking agents:
+
+| Variable | Description |
+|----------|-------------|
+| `PAPERCLIP_AGENT_ID` | Agent's unique ID |
+| `PAPERCLIP_COMPANY_ID` | Company ID |
+| `PAPERCLIP_API_URL` | Paperclip API base URL (inherits the server-level value; see Server Configuration above) |
+| `PAPERCLIP_API_KEY` | Short-lived JWT for API auth |
+| `PAPERCLIP_RUN_ID` | Current heartbeat run ID |
+| `PAPERCLIP_TASK_ID` | Issue that triggered this wake |
+| `PAPERCLIP_WAKE_REASON` | Wake trigger reason |
+| `PAPERCLIP_WAKE_COMMENT_ID` | Comment that triggered this wake |
+| `PAPERCLIP_APPROVAL_ID` | Resolved approval ID |
+| `PAPERCLIP_APPROVAL_STATUS` | Approval decision |
+| `PAPERCLIP_LINKED_ISSUE_IDS` | Comma-separated linked issue IDs |
+
+## LLM Provider Keys (for adapters)
+
+| Variable | Description |
+|----------|-------------|
+| `ANTHROPIC_API_KEY` | Anthropic API key (for Claude Code adapter) |
+| `OPENAI_API_KEY` | OpenAI API key (for Codex adapter) |
+
+
 
 ## Host-wide run concurrency
 
@@ -160,118 +316,3 @@ operator turn a mismatch into a fast, loud abort instead of a silent crash loop.
 |----------|---------|-------------|
 | `PAPERCLIP_REQUIRE_FORK_BUILD` | (unset) | When truthy (`1`/`true`/`yes`/`on`), abort at boot unless the running build carries a `-fork.<n>` version marker |
 | `PAPERCLIP_EXPECTED_VERSION` | (unset) | When set, abort at boot unless the running CLI version matches this value exactly |
-
-| `PAPERCLIP_HIDDEN_SETTINGS` | (unset) | Comma-separated settings surfaces to hide from the UI and floor at the API, for operators hosting Paperclip for others (managed cloud, internal shared server). See [Hiding settings surfaces](#hiding-settings-surfaces). |
-| `PAPERCLIP_SETTING_DEFAULTS` | (unset) | JSON object replacing the schema default of selected instance settings, for hosting operators. See [Operator setting defaults](#operator-setting-defaults). |
-
-### Hiding settings surfaces
-
-`PAPERCLIP_HIDDEN_SETTINGS` takes keys from the registry in
-`packages/shared/src/settings-visibility.ts`:
-
-- Any instance settings page: `instance.profile`, `instance.environments`,
-  `instance.access`, `instance.experimental`,
-  `instance.plugins`, `instance.adapters` — removed from navigation and
-  routing (the General page is the settings root and stays visible). Hiding
-  `instance.access`, `instance.plugins`, or `instance.adapters` also floors
-  their management endpoints with `403 settings_operator_managed`; hiding
-  `instance.experimental` floors every experimental toggle write.
-- Any Instance → General section: `instance.general.censorUsernameInLogs`,
-  `instance.general.keyboardShortcuts`, `instance.general.backupRetention`,
-  `instance.general.feedbackDataSharingPreference` (each also rejects
-  value-changing writes via `PATCH /api/instance/settings/general`), plus the
-  UI-only `instance.general.deploymentStatus` and `instance.general.signOut`.
-- Any experimental toggle: `instance.experimental.<flagKey>` (e.g.
-  `instance.experimental.enableSmokeLab`) — the card disappears and
-  value-changing writes are rejected.
-- Any top-level company settings page: `company.members`, `company.invites`,
-  `company.secrets`, `company.export`, `company.import` — removed from the
-  settings sidebar, tab bar, and routing (the company General page is the
-  settings root and stays visible). These are UI-visibility keys: the
-  membership, invite, secret, and export APIs stay live for agents and
-  integrations. `company.import` is the exception — hiding it also floors
-  every company-import route with `403 settings_operator_managed`. On
-  cloud-managed instances import is floored unconditionally with
-  `403 cloud_managed`, independent of this variable.
-- A single tab of the Secrets page: `company.secrets.vaults` (Provider
-  vaults) and `company.secrets.proposals` (Proposals) — the tab disappears
-  while the rest of the page stays up. UI-visibility only; the secret
-  provider-config and proposal APIs stay live for agents and integrations.
-
-Unknown keys are logged and ignored, so one list can be rolled across a fleet
-of mixed app versions, and retired keys (like `instance.heartbeats`, whose
-page was removed) can stay in an operator list without breaking older or
-newer releases. With the variable unset nothing is hidden and behavior
-is identical to earlier releases. Hiding a toggle does not change its value;
-pair hiding with the desired default where it matters (for general settings,
-see [Operator setting defaults](#operator-setting-defaults)).
-
-### Operator setting defaults
-
-`PAPERCLIP_SETTING_DEFAULTS` takes a JSON object whose fields come from the
-registry in `packages/shared/src/setting-defaults.ts` (currently
-`feedbackDataSharingPreference`). The operator value substitutes for the
-schema default at read time: any field whose effective value is still the
-schema default resolves to the operator value, while an explicit non-default
-user choice always wins. The overlay is never persisted, so unsetting the
-variable restores stock behavior wherever a user has not chosen otherwise.
-A client that writes back the full settings object it read does not persist
-the operator value either: writing the operator value over a still-unchosen
-field is treated as an echo of the overlay and the field stays unchosen.
-
-Example: `PAPERCLIP_SETTING_DEFAULTS='{"feedbackDataSharingPreference":"allowed"}'`
-defaults AI feedback sharing to allowed; pairing it with
-`instance.general.feedbackDataSharingPreference` in `PAPERCLIP_HIDDEN_SETTINGS`
-also hides the control and floors value-changing writes.
-
-Unknown field names are logged and ignored (mixed-version fleet safe).
-Malformed JSON or an invalid value for a known field refuses startup — policy
-configuration fails closed.
-
-## Secrets
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PAPERCLIP_SECRETS_MASTER_KEY` | (from file) | 32-byte encryption key (base64/hex/raw) |
-| `PAPERCLIP_SECRETS_MASTER_KEY_FILE` | `~/.paperclip/.../secrets/master.key` | Path to key file |
-| `PAPERCLIP_SECRETS_STRICT_MODE` | `false` | Require secret refs for sensitive env vars |
-
-## Agent Runtime (Injected into agent processes)
-
-These are set automatically by the server when invoking agents:
-
-| Variable | Description |
-|----------|-------------|
-| `PAPERCLIP_AGENT_ID` | Agent's unique ID |
-| `PAPERCLIP_COMPANY_ID` | Company ID |
-| `PAPERCLIP_API_URL` | Paperclip API base URL (inherits the server-level value; see Server Configuration above) |
-| `PAPERCLIP_API_KEY` | Short-lived JWT for API auth |
-| `PAPERCLIP_RUN_ID` | Current heartbeat run ID |
-| `PAPERCLIP_TASK_ID` | Issue that triggered this wake |
-| `PAPERCLIP_WAKE_REASON` | Wake trigger reason |
-| `PAPERCLIP_WAKE_COMMENT_ID` | Comment that triggered this wake |
-| `PAPERCLIP_APPROVAL_ID` | Resolved approval ID |
-| `PAPERCLIP_APPROVAL_STATUS` | Approval decision |
-| `PAPERCLIP_LINKED_ISSUE_IDS` | Comma-separated linked issue IDs |
-
-## LLM Provider Keys (for adapters)
-
-| Variable | Description |
-|----------|-------------|
-| `ANTHROPIC_API_KEY` | Anthropic API key (for Claude Code adapter) |
-| `OPENAI_API_KEY` | OpenAI API key (for Codex adapter) |
-
-## MCP Tool-Call Timeouts (Claude Code adapter)
-
-Claude Code leaves MCP tool calls effectively unbounded by default (~28h), so a
-non-returning tool (including external MCP servers such as `@playwright/mcp`) can
-hang a run indefinitely and wedge its issue's execution lock. The adapter injects
-safe ceilings into the Claude CLI environment unless an operator sets them
-explicitly (via `config.env` or the host process env).
-
-| Variable | Description |
-|----------|-------------|
-| `MCP_TOOL_TIMEOUT` | Per-tool-call wall-clock ceiling in ms passed to the Claude CLI. Injected default `300000` (5 min) when unset. |
-| `MCP_TIMEOUT` | MCP server startup timeout in ms passed to the Claude CLI. Injected default `30000` (30s) when unset. |
-| `PAPERCLIP_MCP_TOOL_TIMEOUT_MS` | Tunes the injected `MCP_TOOL_TIMEOUT` default. |
-| `PAPERCLIP_MCP_STARTUP_TIMEOUT_MS` | Tunes the injected `MCP_TIMEOUT` default. |

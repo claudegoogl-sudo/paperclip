@@ -21,7 +21,7 @@ export default defineConfig({
   },
   test: {
     environment: "node",
-    include: ["src/**/*.test.ts"],
+    include: ["src/**/*.test.ts", "scripts/**/*.test.mjs"],
     // Embedded-Postgres suites boot in beforeAll and tear down in afterAll. On a
     // loaded runner both ends can outlast vitest's 10s defaults and redden a
     // passing suite, so the global budget is explicit. Under the loaded serial
@@ -31,6 +31,7 @@ export default defineConfig({
     // genuinely hung hook; teardownTimeout mirrors it. See
     // packages/db/src/test-embedded-postgres.ts for the SIGKILL-escalation path
     // that bounds cleanup() well inside this budget.
+
     hookTimeout: 30000,
     teardownTimeout: 30000,
     // The route/authz suites import very large modules (for example

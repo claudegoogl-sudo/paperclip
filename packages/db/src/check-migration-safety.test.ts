@@ -507,7 +507,7 @@ describe("migration safety check", () => {
 });
 
 const POSTURE_RULE = "unqualified-mutation-security-posture-column";
-const MIGRATION_0233 = "0233_secret_binding_egress_allowlist.sql";
+const MIGRATION_0233 = "0282_secret_binding_egress_allowlist.sql";
 
 function postureFindings(sql: string) {
   return analyze(sql).newFindings.filter((finding) => finding.rule === POSTURE_RULE);

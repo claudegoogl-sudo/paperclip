@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
 
 const mockAgentService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -199,24 +200,32 @@ function denySkillPolicy(action = "skills.import") {
     logActivity: mockLogActivity,
   }));
 
-
-async function createApp(actor: Record<string, unknown>) {
-  const [{ companySkillRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/company-skills.js")>("../routes/company-skills.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
-  const app = express();
-  app.use(express.json());
-  app.use((req, _res, next) => {
-    (req as any).actor = actor;
-    next();
-  });
-  app.use("/api", companySkillRoutes({} as any));
-  app.use(errorHandler);
-  return app;
-}
+// The module mocks above are hoisted vi.mock calls, so they are already
+// registered before any import. hoistModuleGraph still needs a register hook.
+function registerModuleMocks() {}
 
 describe("company skill mutation permissions", () => {
+  const routeModules = hoistModuleGraph(registerModuleMocks, async () => {
+    const [{ companySkillRoutes }, { errorHandler }] = await Promise.all([
+      vi.importActual<typeof import("../routes/company-skills.js")>("../routes/company-skills.js"),
+      vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+    ]);
+    return { companySkillRoutes, errorHandler };
+  });
+
+  function createApp(actor: Record<string, unknown>) {
+    const { companySkillRoutes, errorHandler } = routeModules.value;
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      (req as any).actor = actor;
+      next();
+    });
+    app.use("/api", companySkillRoutes({} as any));
+    app.use(errorHandler);
+    return app;
+  }
+
   beforeEach(() => {
     vi.clearAllMocks();
     mockGetTelemetryClient.mockReturnValue({ track: vi.fn() });
