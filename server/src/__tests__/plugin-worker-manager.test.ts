@@ -352,6 +352,8 @@ describe("plugin-worker-manager stderr failure context", () => {
             runId: "run-1",
             agentId: "agent-1",
           },
+          // Host-minted from its own dispatch record, never from worker params.
+          invocationDispatchMethod: "performAction",
           serviceScope: { runId: expect.any(String) },
         },
       );
@@ -393,6 +395,7 @@ describe("plugin-worker-manager stderr failure context", () => {
         { companyId: "company-1" },
         {
           invocationScope: { companyId: "company-1" },
+          invocationDispatchMethod: "getData",
           serviceScope: { runId: expect.any(String) },
         },
       );
