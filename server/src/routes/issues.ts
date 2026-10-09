@@ -267,6 +267,7 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_LOOKBACK_DAYS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
+  attachmentBoundActivityDetails,
   readAcceptedPlanConfirmationTarget,
   type IssuePostCommitAction,
 } from "../services/issues.js";
@@ -18000,6 +18001,36 @@ export function issueRoutes(
           issueCommentId: comment.id,
           assetIds: commentAttachmentIds,
         });
+        // addComment binds pre-existing attachment rows inline, so
+        // attachAssetsToComment only reports standalone assets. The comment is
+        // new, so every row now bound to it was bound by this request: emit
+        // one issue.attachment_bound per row (plugin issue.attachment.created).
+        const bound = (
+          await svc.listAttachments(currentIssue.id, currentIssue.companyId)
+        )
+          .filter((row) => row.issueCommentId === comment.id)
+          .map((row) => ({
+            companyId: row.companyId,
+            issueId: row.issueId,
+            attachmentId: row.id,
+            commentId: comment.id,
+            contentType: row.contentType ?? null,
+            byteSize: row.byteSize ?? null,
+          }));
+        for (const row of bound) {
+          await logActivity(db, {
+            companyId: currentIssue.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+            action: "issue.attachment_bound",
+            entityType: "issue",
+            entityId: currentIssue.id,
+            details: attachmentBoundActivityDetails(row),
+          });
+        }
       }
 
       await issueReferencesSvc.syncComment(comment.id);
@@ -18679,9 +18710,12 @@ export function issueRoutes(
         entityId: issueId,
         details: {
           attachmentId: attachment.id,
+          issueId,
+          commentId: attachment.issueCommentId ?? null,
           originalFilename: attachment.originalFilename,
           contentType: attachment.contentType,
           byteSize: attachment.byteSize,
+          binding: "upload",
         },
       });
 

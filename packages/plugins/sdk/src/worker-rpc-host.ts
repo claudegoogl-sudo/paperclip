@@ -19,7 +19,8 @@
  *   |--- request(initialize) ------------->  |  → calls plugin.setup(ctx)
  *   |<-- response(ok:true) ----------------  |
  *   |                                        |
- *   |--- notification(onEvent) ----------->  |  → dispatches to registered handler
+ *   |--- request(onEvent) ---------------->  |  → dispatches to registered handler
+ *   |<-- response(void) ------------------  |    (host clears the event scope)
  *   |                                        |
  *   |<-- request(state.get) ---------------  |  ← SDK client call from plugin code
  *   |--- response(result) ---------------->  |
@@ -1054,6 +1055,16 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             includeDocuments: options?.includeDocuments,
             includeActiveRuns: options?.includeActiveRuns,
             includeAssignees: options?.includeAssignees,
+          });
+        },
+
+        async listWakeupRequests(issueIds: string[], companyId: string, options) {
+          return callHost("issues.listWakeupRequests", {
+            companyId,
+            issueIds,
+            statuses: options?.statuses,
+            since: options?.since,
+            limit: options?.limit,
           });
         },
 

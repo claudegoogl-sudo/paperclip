@@ -127,6 +127,7 @@ import { readBrandedStaticIndexHtml } from "./static-index-html.js";
 import { staticUiCacheControl } from "./static-ui-cache.js";
 import { applyUiBranding } from "./ui-branding.js";
 import { logger } from "./middleware/logger.js";
+import { logActivity } from "./services/activity-log.js";
 import {
   DEFAULT_LOCAL_PLUGIN_DIR,
   pluginLoader,
@@ -217,6 +218,15 @@ const VITE_DEV_STATIC_PATHS = new Set([
   "/site.webmanifest",
   "/sw.js",
 ]);
+
+/**
+ * Parse the operator allowlist of plugin keys that may use
+ * `companies.cross-read`. Comma/whitespace separated; empty or absent = none.
+ */
+export function parsePluginCrossCompanyReadAllowlist(raw: string | undefined): string[] {
+  if (!raw) return [];
+  return [...new Set(raw.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean))];
+}
 
 export function isDatabaseConnectionUnavailableError(err: unknown): boolean {
   const error = err as { code?: unknown; message?: unknown; cause?: unknown };
@@ -534,6 +544,12 @@ export async function createApp(
      * bundled catalog fail-to-start (see services/bundled-plugins.ts).
      */
     managedPluginAutoInstall?: readonly string[] | null;
+    /**
+     * Plugin keys the operator allows to use `companies.cross-read`. Default
+     * (absent) reads `PAPERCLIP_PLUGIN_CROSS_COMPANY_READ_ALLOWLIST`
+     * (comma-separated plugin keys); empty = no plugin may cross-read.
+     */
+    pluginCrossCompanyReadAllowlist?: readonly string[] | null;
     /** Test override for the bundled plugin catalog root. */
     bundledPluginCatalogRoot?: string;
   },
@@ -714,6 +730,16 @@ export async function createApp(
     res.redirect(303, redirect);
   });
   const managedAutoInstallKeys = opts.managedPluginAutoInstall ?? null;
+  const crossCompanyReadAllowlist = new Set(
+    opts.pluginCrossCompanyReadAllowlist ??
+      parsePluginCrossCompanyReadAllowlist(process.env.PAPERCLIP_PLUGIN_CROSS_COMPANY_READ_ALLOWLIST),
+  );
+  if (crossCompanyReadAllowlist.size > 0) {
+    logger.warn(
+      { pluginKeys: [...crossCompanyReadAllowlist] },
+      "plugin cross-company read allowlist is active",
+    );
+  }
   const bundledCatalogRoot =
     opts.bundledPluginCatalogRoot ?? resolveBundledCatalogRoot(process.env);
   const distributionPlugins = readDistributionPluginCatalog(bundledCatalogRoot, BUNDLED_PLUGIN_CATALOG);
@@ -1035,6 +1061,35 @@ export async function createApp(
           pluginId,
           capabilities: manifest.capabilities,
           services,
+          crossCompanyReadAllowed: crossCompanyReadAllowlist.has(manifest.id),
+          onCrossCompanyRead: (event) => {
+            logger.info(
+              { ...event, pluginKey: manifest.id },
+              "plugin.cross_company_read",
+            );
+            // Unfiltered companies.list ("*") is recorded on the caller's company.
+            const auditCompanyId =
+              event.targetCompanyId === "*" ? event.invocationCompanyId : event.targetCompanyId;
+            if (!auditCompanyId) return;
+            void logActivity(db, {
+              companyId: auditCompanyId,
+              actorType: "plugin",
+              actorId: pluginId,
+              action: "plugin.cross_company_read",
+              entityType: "company",
+              entityId: event.targetCompanyId,
+              agentId: event.agentId,
+              runId: event.runId,
+              details: {
+                pluginKey: manifest.id,
+                method: event.method,
+                targetCompanyId: event.targetCompanyId,
+                callerCompanyId: event.invocationCompanyId,
+              },
+            }).catch((err) => {
+              logger.warn({ err, pluginKey: manifest.id }, "cross-company read audit write failed");
+            });
+          },
         });
       },
     },

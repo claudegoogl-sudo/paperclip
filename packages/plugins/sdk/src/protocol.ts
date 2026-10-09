@@ -61,6 +61,7 @@ import type {
   PluginIssueAttachmentContent,
   PluginIssueWakeupBatchResult,
   PluginIssueWakeupResult,
+  PluginIssueWakeupRequest,
   PluginJobContext,
   PluginExecutionWorkspaceMetadata,
   PluginWorkspace,
@@ -322,6 +323,13 @@ export interface PluginInvocationContext {
  */
 export interface WorkerHostCallContext {
   invocationScope?: PluginInvocationScope | null;
+  /**
+   * SECURITY-CRITICAL: the host→worker method of the host's OWN dispatch record
+   * for the echoed invocation id (e.g. `"executeTool"`). Set only by the host
+   * worker manager alongside `invocationScope`; never read from worker params.
+   * The cross-company read exemption requires `"executeTool"`.
+   */
+  invocationDispatchMethod?: string;
   invalidInvocationScope?: boolean;
   /**
    * The W3C `traceparent` the host minted for the echoed invocation. The host
@@ -2121,6 +2129,16 @@ export interface WorkerToHostMethods {
       includeAssignees?: boolean;
     },
     result: PluginIssueSubtree,
+  ];
+  "issues.listWakeupRequests": [
+    params: {
+      companyId: string;
+      issueIds: string[];
+      statuses?: string[];
+      since?: string;
+      limit?: number;
+    },
+    result: PluginIssueWakeupRequest[],
   ];
   "issues.requestWakeup": [
     params: {

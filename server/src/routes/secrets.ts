@@ -24,7 +24,7 @@ import { logActivity, secretService } from "../services/index.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
 import { forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
-import { authorizationDeniedDetails } from "../services/authorization.js";
+import { agentConfigUpdateScope, authorizationDeniedDetails } from "../services/authorization.js";
 import { accessService } from "../services/access.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
@@ -175,7 +175,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
       actor: req.actor,
       action: "agent_config:update",
       resource: { type: "agent", companyId: req.params.companyId as string, agentId: proposal.targetId },
-      scope: { requiresChangeGrant: true },
+      scope: agentConfigUpdateScope({ id: proposal.targetId }, { requiresChangeGrant: true }),
     });
   }
 

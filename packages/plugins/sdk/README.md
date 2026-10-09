@@ -121,6 +121,7 @@ Subscribe in `setup` with `ctx.events.on(name, handler)` or `ctx.events.on(name,
 | `project.workspace_created`, `project.workspace_updated`, `project.workspace_deleted` | project_workspace |
 | `issue.created`, `issue.updated`, `issue.comment.created` | issue |
 | `issue.document.created`, `issue.document.updated`, `issue.document.deleted` | issue |
+| `issue.attachment.created` | issue |
 | `issue.relations.updated`, `issue.checked_out`, `issue.released`, `issue.assignment_wakeup_requested` | issue |
 | `agent.created`, `agent.updated`, `agent.status_changed` | agent |
 | `agent.run.started`, `agent.run.finished`, `agent.run.failed`, `agent.run.cancelled` | run |
@@ -129,6 +130,17 @@ Subscribe in `setup` with `ctx.events.on(name, handler)` or `ctx.events.on(name,
 | `budget.incident.opened`, `budget.incident.resolved` | budget_incident |
 | `cost_event.created` | cost |
 | `activity.logged` | activity |
+
+**Attachment events:** `issue.attachment.created` fires once per attachment when a file is uploaded to an issue (`payload.binding: "upload"`, `commentId` set if the upload named one, else `null`) and when a pre-uploaded asset is bound to a comment (`payload.binding: "bind"`). Payload: `attachmentId`, `issueId`, `commentId`, `contentType`, `byteSize` (metadata only; no content or URLs). The handler runs in the event's company scope, so it can read the file:
+
+```ts
+ctx.events.on("issue.attachment.created", async (event) => {
+  const { issueId, attachmentId } = event.payload as { issueId: string; attachmentId: string };
+  const rows = await ctx.issues.listAttachments(issueId, event.companyId); // needs issue.attachments.read
+  const row = rows.find((r) => r.id === attachmentId);
+  if (row) await ctx.artifacts.fetch(row.assetId);
+});
+```
 
 **Plugin-to-plugin:** Subscribe to `plugin.<pluginId>.<eventName>` (e.g. `plugin.acme.linear.sync-done`). Emit with `ctx.events.emit("sync-done", companyId, payload)`; the host namespaces it automatically.
 
@@ -310,6 +322,7 @@ Declare in `manifest.capabilities`. Grouped by scope:
 | Scope | Capability |
 |-------|------------|
 | **Company** | `companies.read` |
+| | `companies.cross-read` — default-deny cross-company reads during agent tool calls; also needs operator allowlist `PAPERCLIP_PLUGIN_CROSS_COMPANY_READ_ALLOWLIST` (see PLUGIN_SPEC §15.1.1) |
 | | `projects.read` |
 | | `project.workspaces.read` |
 | | `issues.read` |
@@ -317,6 +330,7 @@ Declare in `manifest.capabilities`. Grouped by scope:
 | | `issue.documents.read` |
 | | `issue.relations.read` |
 | | `issue.subtree.read` |
+| | `issue.wakeups.read` |
 | | `agents.read` |
 | | `goals.read` |
 | | `goals.create` |
@@ -540,6 +554,21 @@ const subtree = await ctx.issues.getSubtree(missionIssueId, companyId, {
 });
 ```
 
+Liveness/watchdog plugins can read pending agent wakeup requests for up to 200
+issues of one company (capability `issue.wakeups.read`, default-deny, not implied
+by `issues.read`). Without options it returns `queued` and
+`deferred_issue_execution` rows; with `since` and no `statuses` it returns rows of
+any status requested at or after `since` (newest first, max 1000 rows). Only
+`id, issueId, agentId, status, reason, source, requestedAt` are returned — never
+the wake payload or context snapshot.
+
+```ts
+const pending = await ctx.issues.listWakeupRequests(issueIds, companyId);
+const recent = await ctx.issues.listWakeupRequests(issueIds, companyId, {
+  since: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+});
+```
+
 Agent-run actions can assert checkout ownership before mutating in-progress work:
 
 ```ts
@@ -604,6 +633,7 @@ Required capabilities:
 | `ctx.issues.relations.get` | `issue.relations.read` |
 | `ctx.issues.relations.setBlockedBy` / `addBlockers` / `removeBlockers` | `issue.relations.write` |
 | `ctx.issues.getSubtree` | `issue.subtree.read` |
+| `ctx.issues.listWakeupRequests` | `issue.wakeups.read` |
 | `ctx.issues.assertCheckoutOwner` | `issues.checkout` |
 | `ctx.issues.createComment` | `issue.comments.create` |
 | `ctx.issues.createComment` with `actorUserId` | `issue.comments.create` + `issue.comments.create_human_attributed` |

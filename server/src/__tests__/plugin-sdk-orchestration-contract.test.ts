@@ -254,4 +254,35 @@ describe("plugin SDK orchestration contract", () => {
       harness.ctx.issues.requestWakeup(blockedIssueId, companyId),
     ).rejects.toThrow("Issue is blocked by unresolved blockers");
   });
+
+  it("fakes issues.listWakeupRequests behind issue.wakeups.read", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    const agentId = randomUUID();
+    const row = (status: string, minutesAgo: number, overrides: Record<string, unknown> = {}) => ({
+      id: randomUUID(), companyId, issueId, agentId, status, reason: status, source: "assignment",
+      requestedAt: new Date(Date.now() - minutesAgo * 60_000).toISOString(), ...overrides,
+    });
+    const seedRows = [
+      row("queued", 1), row("deferred_issue_execution", 3), row("completed", 30), row("completed", 600),
+      row("queued", 2, { companyId: randomUUID() }),
+    ];
+
+    const denied = createTestHarness({ manifest: manifest(["issues.read", "issue.subtree.read"]) });
+    denied.seed({ wakeupRequests: seedRows });
+    await expect(denied.ctx.issues.listWakeupRequests([issueId], companyId)).rejects.toThrow(/issue\.wakeups\.read/);
+
+    const harness = createTestHarness({ manifest: manifest(["issue.wakeups.read"]) });
+    harness.seed({ wakeupRequests: seedRows });
+    const pending = await harness.ctx.issues.listWakeupRequests([issueId], companyId);
+    expect(pending.map((r) => r.status)).toEqual(["queued", "deferred_issue_execution"]);
+    expect(Object.keys(pending[0]!).sort()).toEqual(["agentId", "id", "issueId", "reason", "requestedAt", "source", "status"]);
+    const recent = await harness.ctx.issues.listWakeupRequests([issueId], companyId, {
+      since: new Date(Date.now() - 2 * 60 * 60_000).toISOString(),
+    });
+    expect(recent.map((r) => r.status)).toEqual(["queued", "deferred_issue_execution", "completed"]);
+    await expect(
+      harness.ctx.issues.listWakeupRequests(Array.from({ length: 201 }, () => randomUUID()), companyId),
+    ).rejects.toThrow(/at most 200/);
+  });
 });

@@ -530,6 +530,18 @@ function scopeBoolean(scope: Record<string, unknown> | null | undefined, key: st
   return scope?.[key] === true;
 }
 
+/**
+ * Requested scope for every `agent_config:update` decision on a specific target
+ * agent. Carries `targetAgentId` so a grant scoped to `{targetAgentIds:[...]}`
+ * can match; an unscoped grant (scope null) still matches any requested scope.
+ */
+export function agentConfigUpdateScope(
+  targetAgent: { id: string },
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return { ...extra, targetAgentId: targetAgent.id };
+}
+
 export function authorizationDeniedDetails(decision: AuthorizationDecision) {
   return {
     ...(decision.code ? { code: decision.code } : {}),

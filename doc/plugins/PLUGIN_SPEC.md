@@ -583,6 +583,16 @@ Delivery semantics:
 - no global ordering guarantee across all event types
 - per-entity ordering is best effort but not guaranteed after retries
 
+Wire shape: the host sends `onEvent` as a JSON-RPC request and does not wait
+for the result. The worker replies when the handler settles. The event's
+company scope is live only while the handler runs. The cap is 15 minutes for
+a worker that declared `echoesInvocationId` and has echoed at least one valid
+invocation id in this process. For every other worker the cap is 30 seconds
+(or the configured rpc timeout if lower). After the reply, a worker call from
+a job or timer is resolved as if no event is in flight. Above 256 in-flight
+events per worker, the host sends the event as a notification with the same
+cap.
+
 ### 13.6 `runJob`
 
 Runs a declared scheduled job.
@@ -824,6 +834,7 @@ Relation and read helpers:
 - `ctx.issues.relations.addBlockers(issueId, blockerIssueIds, companyId)`
 - `ctx.issues.relations.removeBlockers(issueId, blockerIssueIds, companyId)`
 - `ctx.issues.getSubtree(issueId, companyId, options)`
+- `ctx.issues.listWakeupRequests(issueIds, companyId, options)` — pending/recent wakeup requests, allow-listed fields (`issue.wakeups.read`)
 - `ctx.issues.summaries.getOrchestration({ issueId, companyId, includeSubtree, billingCode })`
 
 Governance helpers:
@@ -924,12 +935,42 @@ The host enforces capabilities in the SDK layer and refuses calls outside the gr
 - `issue.documents.read`
 - `issue.relations.read`
 - `issue.subtree.read`
+- `issue.wakeups.read`
 - `agents.read`
 - `goals.read`
 - `activity.read`
 - `costs.read`
 - `issues.orchestration.read`
 - `database.namespace.read`
+- `companies.cross-read` (default-deny, operator opt-in; see §15.1.1)
+
+#### 15.1.1 `companies.cross-read`
+
+By default every plugin→host call is pinned to the company of the current
+dispatch. `companies.cross-read` lets a plugin read **other** companies, but
+only when **all** of these hold:
+
+1. The manifest declares `companies.cross-read` (plus the normal read
+   capability for the method, e.g. `issues.read`).
+2. The operator lists the plugin key in the instance environment variable
+   `PAPERCLIP_PLUGIN_CROSS_COMPANY_READ_ALLOWLIST` (comma-separated plugin
+   keys). Empty or unset = no plugin may cross-read. The manifest alone grants
+   nothing.
+3. The worker echoes an invocation id that the host resolves to its own
+   `executeTool` (agent tool) dispatch. Actions, data/stream handlers, events,
+   jobs, webhooks, `setup()` loops, service-scope calls, legacy id-less calls,
+   and unknown or expired ids never qualify.
+4. The method is in the frozen host-side set: `companies.list` (returned
+   unfiltered), `companies.get`, `issues.list`, `issues.get`, `agents.list`,
+   `agents.get`. No other method (no writes, no comments) is affected.
+
+Row-level checks still run: `issues.get` with company A and an issue of
+company B returns not found. Each admitted foreign read writes a
+`plugin.cross_company_read` activity row to the **target** company (an
+unfiltered `companies.list` is recorded on the caller's company) with the
+plugin key, method, calling agent and run id. Bodies are never logged.
+
+Example (operator): `PAPERCLIP_PLUGIN_CROSS_COMPANY_READ_ALLOWLIST=platform.fleet-reader`
 
 ### Data Write
 

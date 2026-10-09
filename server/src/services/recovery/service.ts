@@ -10,11 +10,13 @@ import {
   gte,
   inArray,
   isNull,
+  ne,
   not,
   notInArray,
   or,
   sql,
 } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import {
   HOST_MAX_CONCURRENT_RUNS_ENV_VAR,
@@ -1009,6 +1011,12 @@ async function logRecoverySkippedOnceWithDb(
   return true;
 }
 
+const CANCELLED_BLOCKER_NOTICE_MARKER = "paperclip:cancelled-blocker-notice";
+
+type IssueDependencyReadinessLike = {
+  isDependencyReady: boolean;
+  unresolvedBlockerIssueIds: string[];
+};
 export function recoveryService(
   db: Db,
   deps: {
@@ -1032,6 +1040,8 @@ export function recoveryService(
       random?: () => number;
       now?: () => number;
       setTimeoutImpl?: (ms: number) => Promise<void>;
+      /** Test spy for the pacer's `recovery_replay_pacing` log line. */
+      logger?: { info: (obj: Record<string, unknown>, msg?: string) => void };
     };
   },
 ) {
@@ -2211,6 +2221,107 @@ export function recoveryService(
         "normal_model",
       ),
     });
+  }
+
+  /**
+   * A `cancelled` blocker never resolves (only `done` does), so its dependent
+   * waits forever and nothing tells anyone. Post one system comment per
+   * (dependent, cancelled blocker) pair. Dedupe is by a hidden marker in prior
+   * comment bodies, so re-running the scan never posts twice. The blocker edge
+   * is NOT removed: that stays an operator decision.
+   */
+  async function noticeCancelledBlockers() {
+    // ONE query per tick across all companies: every open dependent (todo,
+    // in_progress or blocked) held by a `cancelled` blocker, minus pairs that
+    // already carry the hidden notice marker. Dependents in `blocked` are not in
+    // the stranded-scan candidate list, so this must not ride on it.
+    const blockerIssues = alias(issues, "cancelled_blocker");
+    const pairs = await db
+      .select({
+        dependentId: issueRelations.relatedIssueId,
+        companyId: issueRelations.companyId,
+        blockerId: blockerIssues.id,
+        blockerIdentifier: blockerIssues.identifier,
+        blockerTitle: blockerIssues.title,
+      })
+      .from(issueRelations)
+      .innerJoin(blockerIssues, eq(issueRelations.issueId, blockerIssues.id))
+      .innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id))
+      .where(
+        and(
+          eq(issueRelations.type, "blocks"),
+          eq(blockerIssues.status, "cancelled"),
+          inArray(issues.status, ["todo", "in_progress", "blocked"]),
+          sql`not exists (
+            select 1 from ${issueComments}
+            where ${issueComments.issueId} = ${issueRelations.relatedIssueId}
+              and ${issueComments.body} like '%' || ${CANCELLED_BLOCKER_NOTICE_MARKER} || ' blocker=' || ${blockerIssues.id}::text || '%'
+          )`,
+        ),
+      );
+    if (pairs.length === 0) return 0;
+
+    const affectedDependentIds = [...new Set(pairs.map((pair) => pair.dependentId))];
+    const unresolvedByDependent = new Map<string, { companyId: string; blockerIds: string[] }>();
+    const cancelledBlockers = new Map<string, { id: string; identifier: string | null; title: string }>();
+    for (const pair of pairs) {
+      const entry = unresolvedByDependent.get(pair.dependentId) ?? { companyId: pair.companyId, blockerIds: [] };
+      if (!entry.blockerIds.includes(pair.blockerId)) entry.blockerIds.push(pair.blockerId);
+      unresolvedByDependent.set(pair.dependentId, entry);
+      cancelledBlockers.set(pair.blockerId, { id: pair.blockerId, identifier: pair.blockerIdentifier, title: pair.blockerTitle });
+    }
+    const noticed = new Set<string>();
+
+    let posted = 0;
+    for (const dependentId of affectedDependentIds) {
+      const entry = unresolvedByDependent.get(dependentId)!;
+      for (const blockerId of entry.blockerIds) {
+        const blocker = cancelledBlockers.get(blockerId);
+        if (!blocker || noticed.has(`${dependentId}:${blockerId}`)) continue;
+        const label = blocker.identifier ?? blocker.id;
+        try {
+        await issuesSvc.addComment(
+          dependentId,
+          [
+            "## Blocked by a cancelled issue",
+            "",
+            `This issue is blocked by ${label} (\`${blocker.title}\`), which is \`cancelled\`.`,
+            "",
+            "- A cancelled blocker never resolves, so this issue will not be woken by it.",
+            "- Remove it or replace it with its successor via `blockedByIssueIds`.",
+            "- Paperclip does not remove the blocker relationship automatically.",
+            "",
+            `<!-- ${CANCELLED_BLOCKER_NOTICE_MARKER} blocker=${blocker.id} -->`,
+          ].join("\n"),
+          {},
+        );
+        noticed.add(`${dependentId}:${blockerId}`);
+        posted += 1;
+        logger.info(
+          {
+            event: "recovery_cancelled_blocker_notice",
+            companyId: entry.companyId,
+            issueId: dependentId,
+            blockerIssueId: blocker.id,
+          },
+          "posted cancelled-blocker notice on dependent issue",
+        );
+        } catch (err) {
+          // Advisory only: one bad pair must never stop the recovery sweep.
+          logger.warn(
+            {
+              event: "recovery_cancelled_blocker_notice_failed",
+              companyId: entry.companyId,
+              issueId: dependentId,
+              blockerIssueId: blocker.id,
+              errName: err instanceof Error ? err.name : typeof err,
+            },
+            "failed to post cancelled-blocker notice; continuing recovery scan",
+          );
+        }
+      }
+    }
+    return posted;
   }
 
   // The onboarding first task (origin `onboarding_first_task`) is created with
@@ -4427,8 +4538,46 @@ export function recoveryService(
         ),
       );
 
+    // One dependency-readiness query per company per tick (not per issue). A
+    // dependency-blocked `todo` issue must not be "dispatched" by the liveness
+    // scan: heartbeat admission would only record a skipped
+    // `issue_dependencies_blocked` wake row (plus a pacing log line) every tick,
+    // forever, which reads like a stalled replay queue. The real wake for such an
+    // issue is `issue_blockers_resolved` (or the next tick once it is ready).
+    const readinessByIssueId = new Map<string, IssueDependencyReadinessLike>();
+    {
+      const idsByCompany = new Map<string, string[]>();
+      for (const candidate of candidates) {
+        if (candidate.status !== "todo" && candidate.status !== "in_progress") continue;
+        const ids = idsByCompany.get(candidate.companyId) ?? [];
+        ids.push(candidate.id);
+        idsByCompany.set(candidate.companyId, ids);
+      }
+      for (const [companyId, ids] of idsByCompany.entries()) {
+        const readinessMap = await issuesSvc.listDependencyReadiness(companyId, ids);
+        for (const [issueId, readiness] of readinessMap.entries()) {
+          readinessByIssueId.set(issueId, readiness);
+        }
+      }
+    }
+    let cancelledBlockerNoticesPosted = 0;
+    try {
+      cancelledBlockerNoticesPosted = await noticeCancelledBlockers();
+    } catch (err) {
+      // Advisory only: a failed notice query must never stop dispatch.
+      logger.warn(
+        {
+          event: "recovery_cancelled_blocker_notice_failed",
+          errName: err instanceof Error ? err.name : typeof err,
+        },
+        "cancelled-blocker notice step failed; continuing recovery scan",
+      );
+    }
+
     const result = {
       assignmentDispatched: 0,
+      dependencyBlocked: 0,
+      cancelledBlockerNoticesPosted,
       dispatchRequeued: 0,
       continuationRequeued: 0,
       dispositionRepairRequeued: 0,
@@ -5210,6 +5359,11 @@ export function recoveryService(
           // as stranded).
           if (await isOnboardingFirstTaskAwaitingUser(issue)) {
             result.onboardingFirstTaskExempted += 1;
+            continue;
+          }
+          const readiness = readinessByIssueId.get(issue.id);
+          if (readiness && !readiness.isDependencyReady) {
+            result.dependencyBlocked += 1;
             continue;
           }
 

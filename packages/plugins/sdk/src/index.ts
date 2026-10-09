@@ -267,6 +267,8 @@ export type {
   PluginIssueCheckoutOwnership,
   PluginIssueWakeupResult,
   PluginIssueWakeupBatchResult,
+  PluginIssueWakeupRequest,
+  PluginIssueWakeupRequestListOptions,
   PluginIssueRunSummary,
   PluginIssueApprovalSummary,
   PluginIssueCostSummary,

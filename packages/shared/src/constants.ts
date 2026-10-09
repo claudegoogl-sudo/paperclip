@@ -1377,12 +1377,21 @@ export type PluginCategory = (typeof PLUGIN_CATEGORIES)[number];
 export const PLUGIN_CAPABILITIES = [
   // Data Read
   "companies.read",
+  // Cross-company READ during an agent tool dispatch (executeTool) for a fixed
+  // host-side set of 6 read methods. Default-deny: the manifest declaration
+  // grants nothing unless the operator also lists the plugin key in
+  // `plugins.crossCompanyReadAllowlist` (instance config). Never implied.
+  "companies.cross-read",
   "projects.read",
   "project.workspaces.read",
   "execution.workspaces.read",
   "issues.read",
   "issue.relations.read",
   "issue.subtree.read",
+  // Read pending (and, with `since`, recent) agent wakeup requests for a set
+  // of issues. Allow-listed fields only (no payload/context snapshot).
+  // Default-deny: deliberately NOT implied by issues.read.
+  "issue.wakeups.read",
   "issue.comments.read",
   // Read pending issue-thread interactions (decision cards) on an issue.
   "issue.interactions.read",
@@ -1761,6 +1770,7 @@ export const PLUGIN_EVENT_TYPES = [
   "issue.created",
   "issue.updated",
   "issue.comment.created",
+  "issue.attachment.created",
   "issue.document.created",
   "issue.document.updated",
   "issue.document.deleted",

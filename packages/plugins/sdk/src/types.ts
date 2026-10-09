@@ -1535,6 +1535,38 @@ export interface PluginIssueWakeupResult {
   runId: string | null;
 }
 
+/** Hard caps for `issues.listWakeupRequests`. */
+export const PLUGIN_WAKEUP_REQUESTS_MAX_ISSUE_IDS = 200;
+export const PLUGIN_WAKEUP_REQUESTS_MAX_ROWS = 1000;
+export const PLUGIN_WAKEUP_REQUESTS_DEFAULT_STATUSES = ["queued", "deferred_issue_execution"] as const;
+
+/**
+ * Allow-listed view of one `agent_wakeup_requests` row. Payload, context
+ * snapshot, idempotency key, actor ids and error text are never exposed.
+ */
+export interface PluginIssueWakeupRequest {
+  id: string;
+  issueId: string;
+  agentId: string;
+  status: string;
+  reason: string | null;
+  source: string;
+  requestedAt: string;
+}
+
+export interface PluginIssueWakeupRequestListOptions {
+  /**
+   * Statuses to include. Defaults to `queued` + `deferred_issue_execution`
+   * when `since` is not set. When `since` is set and `statuses` is omitted,
+   * rows of ANY status requested at/after `since` are returned.
+   */
+  statuses?: string[];
+  /** ISO timestamp; only rows with requestedAt >= since. */
+  since?: string;
+  /** Max rows (default + cap 1000). Newest first. */
+  limit?: number;
+}
+
 export interface PluginIssueWakeupBatchResult {
   issueId: string;
   queued: boolean;
@@ -1835,6 +1867,16 @@ export interface PluginIssuesClient {
     companyId: string,
     options?: PluginIssueSubtreeOptions,
   ): Promise<PluginIssueSubtree>;
+  /**
+   * Read pending (default: `queued` | `deferred_issue_execution`) or, with
+   * `since`, recent agent wakeup requests for up to 200 issues in one company.
+   * Read-only, allow-listed fields. Requires `issue.wakeups.read`.
+   */
+  listWakeupRequests(
+    issueIds: string[],
+    companyId: string,
+    options?: PluginIssueWakeupRequestListOptions,
+  ): Promise<PluginIssueWakeupRequest[]>;
   requestWakeup(
     issueId: string,
     companyId: string,
