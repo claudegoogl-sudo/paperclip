@@ -1676,6 +1676,30 @@ export async function deliverStoredPluginConfig(input: {
 }
 
 /**
+ * Key-order-independent JSON serialisation. `plugins.manifest_json` is jsonb,
+ * which re-orders object keys (by length, then bytes), so a plain
+ * `JSON.stringify` compare against an authored manifest reports a difference
+ * when the content is identical. Object keys are sorted recursively; array
+ * order is preserved (it is content). `undefined` members are dropped, as in
+ * `JSON.stringify`.
+ */
+export function canonicalJson(value: unknown): string {
+  const norm = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.map((e) => (e === undefined ? null : norm(e)));
+    if (v && typeof v === "object") {
+      const src = v as Record<string, unknown>;
+      const out: Record<string, unknown> = {};
+      for (const k of Object.keys(src).sort()) {
+        if (src[k] !== undefined) out[k] = norm(src[k]);
+      }
+      return out;
+    }
+    return v;
+  };
+  return JSON.stringify(norm(value)) ?? "undefined";
+}
+
+/**
  * Privilege-bearing additions between an approved (registry) manifest and a
  * candidate (on-disk) manifest. Empty = candidate is a privilege subset and
  * may be applied without the capability-escalation approval gate.
@@ -1702,7 +1726,7 @@ export function diffPrivilegeEscalations(
   if (tools.length) out.push(`adds tools ${tools.join(", ")}`);
   const hooks = added(names(a.webhooks, "endpointKey"), names(c.webhooks, "endpointKey"));
   if (hooks.length) out.push(`adds webhooks ${hooks.join(", ")}`);
-  if (c.database !== undefined && JSON.stringify(c.database) !== JSON.stringify(a.database)) {
+  if (c.database !== undefined && canonicalJson(c.database) !== canonicalJson(a.database)) {
     out.push("changes database declaration");
   }
   // Reuse the host's own secret-ref walker (follows properties/items AND
@@ -2078,7 +2102,7 @@ export function pluginLoader(
       );
     }
 
-    if (JSON.stringify(manifest) === JSON.stringify(plugin.manifestJson)) {
+    if (canonicalJson(manifest) === canonicalJson(plugin.manifestJson)) {
       return plugin;
     }
 
