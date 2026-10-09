@@ -1369,6 +1369,11 @@ export type PluginCategory = (typeof PLUGIN_CATEGORIES)[number];
 export const PLUGIN_CAPABILITIES = [
   // Data Read
   "companies.read",
+  // Cross-company READ during an agent tool dispatch (executeTool) for a fixed
+  // host-side set of 6 read methods. Default-deny: the manifest declaration
+  // grants nothing unless the operator also lists the plugin key in
+  // `plugins.crossCompanyReadAllowlist` (instance config). Never implied.
+  "companies.cross-read",
   "projects.read",
   "project.workspaces.read",
   "execution.workspaces.read",

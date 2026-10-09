@@ -710,6 +710,8 @@ interface PendingRequest {
 
 interface ActiveInvocation {
   scope: PluginInvocationScope;
+  /** Host→worker method of this host-issued dispatch (host-minted, never worker-supplied). */
+  method?: string;
   timer?: ReturnType<typeof setTimeout>;
   /**
    * SECURITY-CRITICAL: when this invocation is a company-scoped background dispatch
@@ -1525,7 +1527,12 @@ export function createPluginWorkerHandle(
       ...(traceparent ? { traceparent } : {}),
       ...(backgroundRunId ? { backgroundRunId } : {}),
     };
-    const entry: ActiveInvocation = { scope: effectiveScope, traceparent, backgroundRunId };
+    const entry: ActiveInvocation = {
+      scope: effectiveScope,
+      traceparent,
+      backgroundRunId,
+      ...(method !== undefined ? { method } : {}),
+    };
     if (ttlMs !== undefined) {
       entry.timer = setTimeout(() => {
         activeInvocations.delete(invocation.id);
@@ -3215,7 +3222,11 @@ export function createPluginWorkerHandle(
     const entry = activeInvocations.get(invocationId);
     if (!entry) return { invalidInvocationScope: true };
     if (echoesInvocationId) echoObserved = true;
-    return { invocationScope: entry.scope, traceparent: entry.traceparent };
+    return {
+      invocationScope: entry.scope,
+      traceparent: entry.traceparent,
+      ...(entry.method ? { invocationDispatchMethod: entry.method } : {}),
+    };
   }
 
   /**

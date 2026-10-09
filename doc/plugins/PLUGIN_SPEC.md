@@ -940,6 +940,35 @@ The host enforces capabilities in the SDK layer and refuses calls outside the gr
 - `costs.read`
 - `issues.orchestration.read`
 - `database.namespace.read`
+- `companies.cross-read` (default-deny, operator opt-in; see §15.1.1)
+
+#### 15.1.1 `companies.cross-read`
+
+By default every plugin→host call is pinned to the company of the current
+dispatch. `companies.cross-read` lets a plugin read **other** companies, but
+only when **all** of these hold:
+
+1. The manifest declares `companies.cross-read` (plus the normal read
+   capability for the method, e.g. `issues.read`).
+2. The operator lists the plugin key in the instance environment variable
+   `PAPERCLIP_PLUGIN_CROSS_COMPANY_READ_ALLOWLIST` (comma-separated plugin
+   keys). Empty or unset = no plugin may cross-read. The manifest alone grants
+   nothing.
+3. The worker echoes an invocation id that the host resolves to its own
+   `executeTool` (agent tool) dispatch. Actions, data/stream handlers, events,
+   jobs, webhooks, `setup()` loops, service-scope calls, legacy id-less calls,
+   and unknown or expired ids never qualify.
+4. The method is in the frozen host-side set: `companies.list` (returned
+   unfiltered), `companies.get`, `issues.list`, `issues.get`, `agents.list`,
+   `agents.get`. No other method (no writes, no comments) is affected.
+
+Row-level checks still run: `issues.get` with company A and an issue of
+company B returns not found. Each admitted foreign read writes a
+`plugin.cross_company_read` activity row to the **target** company (an
+unfiltered `companies.list` is recorded on the caller's company) with the
+plugin key, method, calling agent and run id. Bodies are never logged.
+
+Example (operator): `PAPERCLIP_PLUGIN_CROSS_COMPANY_READ_ALLOWLIST=platform.fleet-reader`
 
 ### Data Write
 

@@ -411,7 +411,51 @@ export interface HostClientFactoryOptions {
    * returned map delegates to the corresponding service method.
    */
   services: HostServices;
+
+  /**
+   * SECURITY-CRITICAL: operator opt-in for the `companies.cross-read`
+   * capability. The host sets this to true only when this plugin's key is in
+   * the instance-config `plugins.crossCompanyReadAllowlist`. Default false =
+   * fail closed: the manifest capability alone grants nothing.
+   */
+  crossCompanyReadAllowed?: boolean;
+
+  /**
+   * Audit sink for each cross-company read that the exemption admitted.
+   * Receives identifiers only, never request or response bodies.
+   */
+  onCrossCompanyRead?: (event: CrossCompanyReadAuditEvent) => void;
 }
+
+/** Audit record for one admitted cross-company read. Identifiers only. */
+export interface CrossCompanyReadAuditEvent {
+  pluginId: string;
+  method: WorkerToHostMethodName;
+  /** The company the call read, or `"*"` for an unfiltered `companies.list`. */
+  targetCompanyId: string;
+  /** The invocation company (the calling agent's company). */
+  invocationCompanyId: string;
+  agentId: string | null;
+  runId: string | null;
+}
+
+/**
+ * SECURITY-CRITICAL: the frozen, host-side set of worker→host methods the
+ * `companies.cross-read` exemption may reach. Reads only. No manifest list, no
+ * wildcard, no prefix match. Adding a method needs a new security review; a
+ * set-equality test fails CI if this changes.
+ */
+export const CROSS_COMPANY_READ_METHODS: readonly WorkerToHostMethodName[] = Object.freeze([
+  "companies.list",
+  "companies.get",
+  "issues.list",
+  "issues.get",
+  "agents.list",
+  "agents.get",
+] as const);
+
+/** The only host dispatch kind under which the cross-company exemption applies. */
+export const CROSS_COMPANY_READ_DISPATCH_METHOD = "executeTool";
 
 // ---------------------------------------------------------------------------
 // Handler map type (compatible with WorkerToHostHandlers from worker manager)
@@ -887,6 +931,47 @@ export function createHostClientHandlers(
     return noCompanyScope;
   }
 
+  /**
+   * SECURITY-CRITICAL: true only when ALL hold: operator allowlisted this
+   * plugin, the manifest declares `companies.cross-read`, the method is in the
+   * frozen read set, and the echoed invocation id resolved to a host-issued
+   * `executeTool` dispatch (kind from the host's own record, never params).
+   * serviceScope / single-in-flight / no-scope / invalid-scope paths never
+   * qualify because they carry no host dispatch method.
+   */
+  function crossCompanyReadAdmitted(
+    method: WorkerToHostMethodName,
+    context: WorkerHostCallContext | undefined,
+  ): boolean {
+    return (
+      options.crossCompanyReadAllowed === true &&
+      capabilitySet.has("companies.cross-read" as PluginCapability) &&
+      CROSS_COMPANY_READ_METHODS.includes(method) &&
+      !context?.invalidInvocationScope &&
+      !!readNonEmptyString(context?.invocationScope?.companyId) &&
+      context?.invocationDispatchMethod === CROSS_COMPANY_READ_DISPATCH_METHOD
+    );
+  }
+
+  function auditCrossCompanyRead(
+    method: WorkerToHostMethodName,
+    targetCompanyId: string,
+    context: WorkerHostCallContext | undefined,
+  ): void {
+    try {
+      options.onCrossCompanyRead?.({
+        pluginId,
+        method,
+        targetCompanyId,
+        invocationCompanyId: readNonEmptyString(context?.invocationScope?.companyId) ?? "",
+        agentId: readNonEmptyString(context?.invocationScope?.agentId),
+        runId: readNonEmptyString(context?.invocationScope?.runId),
+      });
+    } catch {
+      // Audit sink failures must not change authorization outcome.
+    }
+  }
+
   function requireInvocationCompanyScope(
     method: WorkerToHostMethodName,
     params: unknown,
@@ -894,6 +979,16 @@ export function createHostClientHandlers(
   ): void {
     const requested = requestedCompanyScope(method, params);
     if (requested.kind === "none") return;
+
+    if (crossCompanyReadAdmitted(method, context)) {
+      const own = readNonEmptyString(context?.invocationScope?.companyId);
+      if (requested.kind === "all") {
+        auditCrossCompanyRead(method, "*", context);
+        return;
+      }
+      if (requested.companyId !== own) auditCrossCompanyRead(method, requested.companyId, context);
+      return;
+    }
 
     const allowedCompanyId = readNonEmptyString(context?.invocationScope?.companyId);
 
@@ -1224,6 +1319,8 @@ export function createHostClientHandlers(
     // Companies
     "companies.list": gated("companies.list", async (params, context) => {
       const rows = await services.companies.list(params);
+      // Admitted cross-company read: unfiltered (audited in the gate).
+      if (crossCompanyReadAdmitted("companies.list", context)) return rows;
       const allowedCompanyId = readNonEmptyString(context?.invocationScope?.companyId);
       if (!allowedCompanyId) return rows;
       return rows.filter((company) =>

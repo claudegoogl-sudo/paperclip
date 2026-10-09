@@ -321,6 +321,7 @@ Declare in `manifest.capabilities`. Grouped by scope:
 | Scope | Capability |
 |-------|------------|
 | **Company** | `companies.read` |
+| | `companies.cross-read` — default-deny cross-company reads during agent tool calls; also needs operator allowlist `PAPERCLIP_PLUGIN_CROSS_COMPANY_READ_ALLOWLIST` (see PLUGIN_SPEC §15.1.1) |
 | | `projects.read` |
 | | `project.workspaces.read` |
 | | `issues.read` |
