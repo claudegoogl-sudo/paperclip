@@ -239,6 +239,63 @@ describe.sequential("plugin install and upgrade authz", () => {
     expect(mockLifecycle.load).toHaveBeenCalledWith(pluginId);
   }, 20_000);
 
+  it("does not load a capability-parked install and reports capabilities + approvalId", async () => {
+    const pluginId = "11111111-1111-4111-8111-111111111111";
+    const pluginKey = "paperclip.example";
+    mockRegistry.getByKey.mockResolvedValue({
+      id: pluginId,
+      pluginKey,
+      packageName: "paperclip-plugin-example",
+      version: "1.0.0",
+    });
+    mockRegistry.getById.mockResolvedValue({
+      id: pluginId,
+      pluginKey,
+      packageName: "paperclip-plugin-example",
+      version: "1.0.0",
+      status: "upgrade_pending",
+    });
+    mockLifecycle.load.mockResolvedValue(undefined);
+    const { logActivity } = await import("../services/activity-log.js");
+    vi.mocked(logActivity).mockClear();
+
+    const { app } = await createApp(
+      { type: "board", userId: "admin-1", source: "session", isInstanceAdmin: true, companyIds: ["company-1"] },
+      {
+        installPlugin: vi.fn().mockResolvedValue({
+          manifest: { id: pluginKey },
+          installStatus: "upgrade_pending",
+          approvalId: "approval-9",
+          capabilities: ["issues.read", "issues.create"],
+          addedCapabilities: ["issues.create"],
+        }),
+      },
+    );
+
+    const res = await request(app)
+      .post("/api/plugins/install")
+      .send({ packageName: "paperclip-plugin-example" });
+
+    expect(res.status).toBe(200);
+    expect(mockLifecycle.load).not.toHaveBeenCalled();
+    expect(res.body).toMatchObject({
+      status: "upgrade_pending",
+      approvalId: "approval-9",
+      capabilities: ["issues.read", "issues.create"],
+      addedCapabilities: ["issues.create"],
+    });
+    expect(vi.mocked(logActivity)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "plugin.installed",
+        details: expect.objectContaining({
+          capabilities: ["issues.read", "issues.create"],
+          approvalId: "approval-9",
+        }),
+      }),
+    );
+  }, 20_000);
+
   it("rejects plugin upgrades for non-admin board users", async () => {
     const pluginId = "11111111-1111-4111-8111-111111111111";
     const { app } = await createApp({
