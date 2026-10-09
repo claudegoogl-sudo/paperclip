@@ -196,8 +196,9 @@ operator explicitly reviews suggestions and calls the enforce route.
 
 The plugin `ctx.http.fetch` guard denies every non-public address: RFC1918,
 IPv6 ULA, loopback, link-local (including `169.254.169.254`), the host's own
-interface addresses, and (when `PAPERCLIP_PLUGIN_FETCH_CGNAT=deny`) CGNAT
-`100.64.0.0/10`. Some plugins must reach one device on a routed LAN, for
+interface addresses, and CGNAT `100.64.0.0/10` (Tailscale tailnet). CGNAT is
+denied by default; `PAPERCLIP_PLUGIN_FETCH_CGNAT=allow-legacy` is a rollback
+switch that re-allows it for one release and logs each fetch. Some plugins must reach one device on a routed LAN, for
 example a printer at `http://192.168.2.86:8898`. An **instance admin** can
 opt exact origins in for **one plugin**.
 

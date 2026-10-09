@@ -47,10 +47,14 @@ export type CgnatMode = "allow-legacy" | "deny";
 
 export const CGNAT_MODE_ENV = "PAPERCLIP_PLUGIN_FETCH_CGNAT";
 
-/** Read the CGNAT switch. Unknown/empty values fall back to `allow-legacy`. */
+/**
+ * Read the CGNAT switch. Default is `deny`. Only the exact value
+ * `allow-legacy` re-enables CGNAT egress (rollback switch for one release);
+ * unknown/empty values fail closed to `deny`.
+ */
 export function resolveCgnatMode(env: NodeJS.ProcessEnv = process.env): CgnatMode {
   const raw = env[CGNAT_MODE_ENV]?.trim().toLowerCase();
-  return raw === "deny" ? "deny" : "allow-legacy";
+  return raw === "allow-legacy" ? "allow-legacy" : "deny";
 }
 
 type InterfaceSource = () => ReturnType<typeof networkInterfaces>;
