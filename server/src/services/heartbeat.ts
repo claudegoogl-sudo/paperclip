@@ -237,6 +237,7 @@ import {
   resolveWorktreeRunExecutionActivation,
 } from "./instance-settings.js";
 import { usageLimitParkService } from "./usage-limit-park.js";
+import { instanceAdmissionHoldService } from "./instance-admission-hold.js";
 import {
   evaluateExecutionAllowlist,
   isExecutionForcedToKubernetes,
@@ -7284,6 +7285,7 @@ export function resolveHeartbeatSchedulingSuppression(
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
   const instanceSettings = instanceSettingsService(db);
   const usageLimitPark = usageLimitParkService(db);
+  const instanceAdmissionHold = instanceAdmissionHoldService(db);
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
   });
@@ -14972,6 +14974,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
+    // Operator admission hold (installer drain): queued runs stay queued until
+    // the hold is cleared or expires; the periodic sweep re-enters here.
+    if (await instanceAdmissionHold.isHeld()) return;
     const cutoff = await getWorktreeExecutionCutoff();
 
     const queuedRuns = await db
@@ -15149,6 +15154,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // wake, sweep, routine trigger, scheduled-retry promotion) — the account-wide
     // usage-limit quota this guards is instance-wide, so the gate must be too.
     if (await usageLimitPark.isParked()) return [];
+    // Operator admission hold: same choke point, admission-only. The queued run
+    // stays queued (never cancelled) and starts once the hold ends.
+    if (await instanceAdmissionHold.isHeld()) return [];
 
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
@@ -15358,6 +15366,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // an already-running run above must never be stopped mid-flight by a park
         // that started after it was dispatched.
         if (await usageLimitPark.isParked()) return;
+        if (await instanceAdmissionHold.isHeld()) return;
         // Same defense-in-depth as the park above: this is a second, independently reachable
         // path into a claim, so the host ceiling has to hold here too. The run stays queued.
         const reservation = await reserveHostRunSlot();
@@ -21707,6 +21716,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // (API route, recovery sweep) distinguish "parked on purpose" from "stuck", so a
     // parked fleet isn't misreported as a stall.
     getUsageLimitParkState: (now?: Date) => usageLimitPark.getState(now),
+
+    // Operator admission hold (installer drain before a service stop).
+    getInstanceAdmissionHoldState: (now?: Date) => instanceAdmissionHold.getState(now),
+    setInstanceAdmissionHold: async (input: {
+      holdUntil: Date;
+      reason: string;
+      actorType: string | null;
+      actorId: string | null;
+    }) => {
+      const state = await instanceAdmissionHold.set(input);
+      logger.warn(
+        { holdUntil: state.holdUntil?.toISOString() ?? null, reason: state.reason, actorType: input.actorType },
+        "instance admission hold set: queued runs will not start until it is cleared or expires",
+      );
+      return state;
+    },
+    clearInstanceAdmissionHold: async (input: { actorType: string | null; actorId: string | null }) => {
+      const state = await instanceAdmissionHold.clear(input);
+      logger.info({ actorType: input.actorType }, "instance admission hold cleared: resuming queued runs");
+      await resumeQueuedRuns();
+      return state;
+    },
 
     getHostRunCeilingState: async () => {
       const memoryPressure = runAdmissionMemoryPressure.lastReading();

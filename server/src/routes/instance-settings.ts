@@ -6,7 +6,7 @@ import {
   patchInstanceExperimentalSettingsSchema,
   patchInstanceGeneralSettingsSchema,
 } from "@paperclipai/shared";
-import { forbidden } from "../errors.js";
+import { badRequest, forbidden } from "../errors.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import { validate } from "../middleware/validate.js";
@@ -69,6 +69,75 @@ export function instanceSettingsRoutes(db: Db) {
   const svc = instanceSettingsService(db);
   const environments = environmentService(db);
   const heartbeat = heartbeatService(db);
+
+  // Operator admission hold — admission-only instance gate used by the core
+  // installer to drain running work before a service stop. While held, queued
+  // runs stay queued and running runs finish; the hold self-expires (capped
+  // server-side at now + 60 min). Instance-admin board actors only.
+  async function logAdmissionHoldActivity(req: Request, action: string, details: Record<string, unknown>) {
+    const actor = getActorInfo(req);
+    const companyIds = await svc.listCompanyIds();
+    await Promise.all(
+      companyIds.map((companyId) =>
+        logActivity(db, {
+          companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action,
+          entityType: "instance_admission_hold",
+          entityId: "default",
+          details,
+        }),
+      ),
+    );
+  }
+
+  router.get("/instance/admission-hold", async (req, res) => {
+    assertCanManageInstanceSettings(req);
+    res.json(await heartbeat.getInstanceAdmissionHoldState());
+  });
+
+  router.put("/instance/admission-hold", async (req, res) => {
+    assertCanManageInstanceSettings(req);
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const holdUntilRaw = body.holdUntil;
+    const holdUntil = typeof holdUntilRaw === "string" ? new Date(holdUntilRaw) : null;
+    if (!holdUntil || Number.isNaN(holdUntil.getTime())) {
+      throw badRequest("holdUntil must be an ISO-8601 timestamp");
+    }
+    if (holdUntil.getTime() <= Date.now()) {
+      throw badRequest("holdUntil must be in the future");
+    }
+    const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+    if (reason.length === 0 || reason.length > 500) {
+      throw badRequest("reason is required (1-500 characters)");
+    }
+    const actor = getActorInfo(req);
+    const state = await heartbeat.setInstanceAdmissionHold({
+      holdUntil,
+      reason,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+    });
+    await logAdmissionHoldActivity(req, "instance.admission_hold.set", {
+      holdUntil: state.holdUntil?.toISOString() ?? null,
+      requestedHoldUntil: holdUntil.toISOString(),
+      reason,
+    });
+    res.json(state);
+  });
+
+  router.delete("/instance/admission-hold", async (req, res) => {
+    assertCanManageInstanceSettings(req);
+    const actor = getActorInfo(req);
+    const before = await heartbeat.getInstanceAdmissionHoldState();
+    const state = await heartbeat.clearInstanceAdmissionHold({ actorType: actor.actorType, actorId: actor.actorId });
+    await logAdmissionHoldActivity(req, "instance.admission_hold.cleared", { wasHeld: before.held });
+    res.json(state);
+  });
 
   router.get("/instance/settings", async (req, res) => {
     assertBoardOrgAccess(req);

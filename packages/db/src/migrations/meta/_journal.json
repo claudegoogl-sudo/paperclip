@@ -1728,6 +1728,13 @@
       "when": 1786985900000,
       "tag": "0250_plugin_private_egress_optin",
       "breakpoints": true
+    },
+    {
+      "idx": 251,
+      "version": "7",
+      "when": 1786986000000,
+      "tag": "0251_instance_admission_holds",
+      "breakpoints": true
     }
   ]
 }
