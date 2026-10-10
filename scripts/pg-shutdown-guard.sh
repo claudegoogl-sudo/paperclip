@@ -238,13 +238,9 @@ pg_guard_wait_clean() {
 # pg_guard_active_runs — fail (exit 3) when heartbeat runs are queued/running,
 # unless PG_GUARD_ALLOW_ACTIVE_RUNS=1 with a stated reason.
 pg_guard_active_runs() {
-  local token company_id company_name payload count=0
-  if [ -n "${PG_GUARD_TOKEN:-}" ]; then
-    token="$PG_GUARD_TOKEN"
-  else
-    token="$(jq -r '.credentials["http://localhost:3100"].token // empty' "$PG_GUARD_TOKEN_FILE" 2>/dev/null || true)"
-  fi
-  if [ -z "$token" ]; then
+  local company_id company_name payload count=0 r
+  # Token goes to curl on stdin via pg_guard__req, never in argv.
+  if ! pg_guard__load_token >/dev/null 2>&1; then
     pg_guard_warn "REASON: no board token at $PG_GUARD_TOKEN_FILE — cannot check for active runs"
     if [ "${PG_GUARD_ALLOW_UNREACHABLE:-0}" = "1" ]; then
       pg_guard_info "proceeding without run check — override reason: ${PG_GUARD_OVERRIDE_REASON:-unstated}"
@@ -254,7 +250,8 @@ pg_guard_active_runs() {
   fi
 
   local companies
-  companies="$(curl -fsS --max-time 10 -H "Authorization: Bearer $token" "$PG_GUARD_API_BASE/companies" 2>/dev/null)" || {
+  r="$(pg_guard__req GET /companies)"
+  case "$(pg_guard__code "$r")" in 2??) companies="$(pg_guard__body "$r")" ;; *) false ;; esac || {
     pg_guard_warn "REASON: could not list companies at $PG_GUARD_API_BASE — active-run check not possible"
     if [ "${PG_GUARD_ALLOW_UNREACHABLE:-0}" = "1" ]; then
       pg_guard_info "proceeding without run check — override reason: ${PG_GUARD_OVERRIDE_REASON:-unstated}"
@@ -266,7 +263,8 @@ pg_guard_active_runs() {
   while read -r company_id; do
     [ -n "$company_id" ] || continue
     company_name="$(printf '%s' "$companies" | jq -r --arg id "$company_id" '.[] | select(.id==$id) | (.name // .urlKey // .id)' 2>/dev/null || echo "$company_id")"
-    payload="$(curl -fsS --max-time 10 -H "Authorization: Bearer $token" "$PG_GUARD_API_BASE/companies/$company_id/heartbeat-runs?limit=200" 2>/dev/null)" || payload="[]"
+    r="$(pg_guard__req GET "/companies/$company_id/heartbeat-runs?limit=200")"
+    case "$(pg_guard__code "$r")" in 2??) payload="$(pg_guard__body "$r")" ;; *) payload="[]" ;; esac
     while IFS=$'\t' read -r status run_id agent_id started_at; do
       [ -n "$status" ] || continue
       pg_guard_info "ACTIVE RUN company=$company_name status=$status run=${run_id:0:8} agent=${agent_id:0:8} started=${started_at:-unknown}"
