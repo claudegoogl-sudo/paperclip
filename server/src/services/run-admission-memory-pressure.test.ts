@@ -10,6 +10,7 @@ import {
   RUN_ADMISSION_MEMORY_PCT_MIN,
   computeEffectiveMemoryLimitBytes,
   computeMemoryPressurePct,
+  computeNonReclaimableBytes,
   createRunAdmissionMemoryPressureReader,
   parseCgroupMemoryLimit,
   parseMemoryEventsCounter,
@@ -227,11 +228,11 @@ describe("run admission memory-pressure reader", () => {
       sampleTtlMs: 1000,
     });
     for (let i = 0; i < 10; i += 1) await reader.read();
-    expect(fileReads).toBe(4); // current + high + max + events, exactly once
+    expect(fileReads).toBe(5); // current + stat + high + max + events, exactly once
 
     nowMs = 1001; // window expired: the next read samples again
     await reader.read();
-    expect(fileReads).toBe(8);
+    expect(fileReads).toBe(10);
   });
 
   it("never throws: an unreadable /proc falls back, and a broken override degrades to a no-op", async () => {
@@ -252,5 +253,78 @@ describe("run admission memory-pressure reader", () => {
       unavailableReason: "cgroup_unreadable",
       cgroupDir: "/definitely/not/a/cgroup/dir",
     });
+  });
+});
+
+const GIB = 1024 ** 3;
+const LIVE_LIMIT = Math.round(15.81 * GIB);
+function statBody(inactiveFile: number) {
+  return `anon 3242459136\nfile 11000000000\nactive_file 579820584\ninactive_file ${inactiveFile}\nshmem 150000000\n`;
+}
+
+describe("run admission pressure excludes reclaimable page cache", () => {
+  it("AC1: cache-heavy cgroup (15.24 GiB current, 9.72 GiB inactive_file) reads ~34.8% and is below 90", async () => {
+    const dir = await makeCgroupFixture({
+      "memory.current": `${Math.round(15.24 * GIB)}\n`,
+      "memory.stat": statBody(Math.round(9.72 * GIB)),
+      "memory.high": "max\n",
+      "memory.max": `${LIVE_LIMIT}\n`,
+    });
+    const reading = await createRunAdmissionMemoryPressureReader({ env: envWithCgroupDir(dir) }).read();
+    expect(reading).toMatchObject({
+      available: true,
+      pressureBasis: "current_minus_inactive_file",
+      memoryCurrentBytes: Math.round(15.24 * GIB),
+      inactiveFileBytes: Math.round(9.72 * GIB),
+      nonReclaimableBytes: Math.round(15.24 * GIB) - Math.round(9.72 * GIB),
+    });
+    expect(reading.memoryPressurePct).toBeCloseTo(34.9, 0);
+    expect(reading.memoryPressurePct!).toBeLessThan(RUN_ADMISSION_MEMORY_PCT_DEFAULT);
+  });
+
+  it("AC2 / cold cache after restart: anon fill (15.0 GiB current, 0.2 GiB inactive_file) still reads >= 90", async () => {
+    const dir = await makeCgroupFixture({
+      "memory.current": `${15 * GIB}\n`,
+      "memory.stat": statBody(Math.round(0.2 * GIB)),
+      "memory.max": `${LIVE_LIMIT}\n`,
+    });
+    const reading = await createRunAdmissionMemoryPressureReader({ env: envWithCgroupDir(dir) }).read();
+    expect(reading.pressureBasis).toBe("current_minus_inactive_file");
+    expect(reading.memoryPressurePct!).toBeGreaterThanOrEqual(RUN_ADMISSION_MEMORY_PCT_DEFAULT);
+  });
+
+  it("AC3: missing or garbled memory.stat falls back to raw memory.current (old behaviour)", async () => {
+    for (const stat of [undefined, "garbage\nnot a stat file\n", "inactive_file oops\n"]) {
+      const files: Record<string, string> = {
+        "memory.current": "9500000000\n",
+        "memory.high": "10000000000\n",
+      };
+      if (stat !== undefined) files["memory.stat"] = stat;
+      const dir = await makeCgroupFixture(files);
+      const reading = await createRunAdmissionMemoryPressureReader({ env: envWithCgroupDir(dir) }).read();
+      expect(reading).toMatchObject({
+        available: true,
+        pressureBasis: "current",
+        memoryPressurePct: 95,
+        memoryCurrentBytes: 9_500_000_000,
+        nonReclaimableBytes: 9_500_000_000,
+        inactiveFileBytes: null,
+      });
+    }
+  });
+
+  it("AC4: a racy sample with inactive_file > memory.current clamps to 0 (no NaN, no negative)", async () => {
+    expect(computeNonReclaimableBytes(100, 250)).toEqual({
+      nonReclaimableBytes: 0,
+      pressureBasis: "current_minus_inactive_file",
+    });
+    expect(computeNonReclaimableBytes(100, null)).toEqual({ nonReclaimableBytes: 100, pressureBasis: "current" });
+    const dir = await makeCgroupFixture({
+      "memory.current": "1000\n",
+      "memory.stat": statBody(5000),
+      "memory.high": "10000\n",
+    });
+    const reading = await createRunAdmissionMemoryPressureReader({ env: envWithCgroupDir(dir) }).read();
+    expect(reading).toMatchObject({ memoryPressurePct: 0, nonReclaimableBytes: 0 });
   });
 });

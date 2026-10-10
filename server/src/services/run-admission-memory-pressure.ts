@@ -21,6 +21,16 @@ import {
  * threshold, through the exact same deferral/drain machinery a ceiling refusal already
  * uses. Nothing here queues or retries on its own.
  *
+ * Reclaimable page cache is excluded from the numerator. `memory.current` counts
+ * `inactive_file` pages, which the kernel drops on demand; a long-lived service cgroup
+ * sits near its limit from cache alone, and counting it deferred dispatch with zero runs
+ * active. The gating number is therefore `max(0, memory.current - inactive_file)` from the
+ * same sample (`pressureBasis: "current_minus_inactive_file"`). When `memory.stat` is
+ * unreadable or has no `inactive_file` row, the reading falls back to raw `memory.current`
+ * (`pressureBasis: "current"`, the previous behaviour) — a missing stat file never turns
+ * the gate off. After a restart the cache is cold, so `inactive_file` is small and anon
+ * growth from replayed runs still reaches the threshold.
+ *
  * Failure is a no-op, never a block: on hosts without cgroup v2 memory files (macOS,
  * Windows, minimal containers, CI), or when no limit is set, the reading reports
  * `available: false` and admission proceeds exactly as before.
@@ -81,8 +91,8 @@ export function parseCgroupMemoryLimit(raw: string): number | null {
 }
 
 /**
- * Extracts a counter from a memory.events body. The file is line-based
- * (`high <n>`, `max <n>`, `oom <n>`, ...); only the requested row counts.
+ * Extracts a counter from a memory.events (or memory.stat) body. Both files are
+ * line-based (`high <n>`, `inactive_file <n>`, ...); only the requested row counts.
  */
 export function parseMemoryEventsCounter(raw: string, key: string): number | null {
   for (const line of raw.split("\n")) {
@@ -95,6 +105,26 @@ export function parseMemoryEventsCounter(raw: string, key: string): number | nul
     return parseCgroupMemoryLimit(value.trim());
   }
   return null;
+}
+
+export type RunAdmissionMemoryPressureBasis = "current" | "current_minus_inactive_file";
+
+/**
+ * Non-reclaimable bytes: `memory.current` minus reclaimable `inactive_file`, clamped at 0
+ * (the two files are read separately, so a racy sample can see inactive_file > current).
+ * A null `inactive_file` falls back to raw `memory.current`.
+ */
+export function computeNonReclaimableBytes(
+  memoryCurrentBytes: number,
+  inactiveFileBytes: number | null,
+): { nonReclaimableBytes: number; pressureBasis: RunAdmissionMemoryPressureBasis } {
+  if (inactiveFileBytes === null || !Number.isFinite(inactiveFileBytes)) {
+    return { nonReclaimableBytes: memoryCurrentBytes, pressureBasis: "current" };
+  }
+  return {
+    nonReclaimableBytes: Math.max(0, memoryCurrentBytes - inactiveFileBytes),
+    pressureBasis: "current_minus_inactive_file",
+  };
 }
 
 /**
@@ -129,7 +159,13 @@ export type RunAdmissionMemoryPressureReading = {
   available: boolean;
   unavailableReason: "disabled_in_tests" | "cgroup_unreadable" | "no_effective_limit" | null;
   memoryPressurePct: number | null;
+  /** Raw memory.current (includes reclaimable page cache). */
   memoryCurrentBytes: number | null;
+  /** memory.stat `inactive_file`; null when memory.stat is unreadable or lacks the row. */
+  inactiveFileBytes: number | null;
+  /** The numerator of memoryPressurePct. */
+  nonReclaimableBytes: number | null;
+  pressureBasis: RunAdmissionMemoryPressureBasis | null;
   /** memory.high; null when "max" (unset) or unreadable. */
   memoryHighBytes: number | null;
   /** memory.max; null when "max" (unset) or unreadable. */
@@ -174,6 +210,9 @@ function unavailable(
     unavailableReason: reason,
     memoryPressurePct: null,
     memoryCurrentBytes: null,
+    inactiveFileBytes: null,
+    nonReclaimableBytes: null,
+    pressureBasis: null,
     memoryHighBytes: null,
     memoryMaxBytes: null,
     effectiveLimitBytes: null,
@@ -246,8 +285,9 @@ export function createRunAdmissionMemoryPressureReader(
     if (disabledInTests) return unavailable("disabled_in_tests", null, now);
     const dir = await resolveDir();
     if (!dir) return unavailable("cgroup_unreadable", null, now);
-    const [currentResult, highResult, maxResult, eventsResult] = await Promise.allSettled([
+    const [currentResult, statResult, highResult, maxResult, eventsResult] = await Promise.allSettled([
       readFileImpl(`${dir}/memory.current`, "utf8"),
+      readFileImpl(`${dir}/memory.stat`, "utf8"),
       readFileImpl(`${dir}/memory.high`, "utf8"),
       readFileImpl(`${dir}/memory.max`, "utf8"),
       readFileImpl(`${dir}/memory.events`, "utf8"),
@@ -267,6 +307,14 @@ export function createRunAdmissionMemoryPressureReader(
       eventsResult.status === "fulfilled"
         ? parseMemoryEventsCounter(eventsResult.value, "high")
         : null;
+    const inactiveFileBytes =
+      statResult.status === "fulfilled"
+        ? parseMemoryEventsCounter(statResult.value, "inactive_file")
+        : null;
+    const { nonReclaimableBytes, pressureBasis } = computeNonReclaimableBytes(
+      memoryCurrentBytes,
+      inactiveFileBytes,
+    );
     const effectiveLimitBytes = computeEffectiveMemoryLimitBytes(memoryHighBytes, memoryMaxBytes);
     if (effectiveLimitBytes === null) {
       // No soft and no hard limit: there is nothing to be under pressure relative to.
@@ -275,8 +323,11 @@ export function createRunAdmissionMemoryPressureReader(
     return {
       available: true,
       unavailableReason: null,
-      memoryPressurePct: computeMemoryPressurePct(memoryCurrentBytes, effectiveLimitBytes),
+      memoryPressurePct: computeMemoryPressurePct(nonReclaimableBytes, effectiveLimitBytes),
       memoryCurrentBytes,
+      inactiveFileBytes: pressureBasis === "current" ? null : inactiveFileBytes,
+      nonReclaimableBytes,
+      pressureBasis,
       memoryHighBytes,
       memoryMaxBytes,
       effectiveLimitBytes,
