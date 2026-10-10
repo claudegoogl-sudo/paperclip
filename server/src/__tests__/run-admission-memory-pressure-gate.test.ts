@@ -146,6 +146,9 @@ describeEmbeddedPostgres("memory-pressure-aware run admission", () => {
       "memory.high": "10000000000\n",
       "memory.max": "12000000000\n",
       "memory.events": "low 0\nhigh 7\nmax 1\noom 0\noom_kill 0\n",
+      // Cold cache (e.g. just after a restart): reclaimable inactive_file is small,
+      // so the non-reclaimable numerator stays at 95% and the gate still defers.
+      "memory.stat": "anon 9000000000\nactive_file 400000000\ninactive_file 0\n",
     });
     const heartbeat = buildHeartbeat(cgroupDir, "90");
     warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
@@ -181,8 +184,30 @@ describeEmbeddedPostgres("memory-pressure-aware run admission", () => {
       memoryPressurePct: 95,
       memoryPressureThresholdPct: 90,
       memoryCurrentBytes: 9_500_000_000,
+      inactiveFileBytes: 0,
+      nonReclaimableBytes: 9_500_000_000,
+      pressureBasis: "current_minus_inactive_file",
       effectiveMemoryLimitBytes: 10_000_000_000,
       memoryEventsHigh: 7,
+    });
+  });
+
+  it("reclaimable page cache does not defer: 96% raw usage that is mostly inactive_file dispatches", async () => {
+    const cgroupDir = await makeCgroupFixture({
+      "memory.current": "9600000000\n",
+      "memory.high": "10000000000\n",
+      "memory.max": "12000000000\n",
+      "memory.stat": "anon 3000000000\nactive_file 500000000\ninactive_file 6100000000\n",
+    });
+    const heartbeat = buildHeartbeat(cgroupDir, "90");
+    const { agentId, runId } = await seedAgentWithQueuedRun();
+
+    const claimed = await heartbeat.startNextQueuedRunForAgent(agentId);
+    expect(claimed.map((run) => run.id)).toEqual([runId]);
+    await expect(heartbeat.getHostRunCeilingState()).resolves.toMatchObject({
+      memoryPressurePct: 35,
+      memoryPressureAvailable: true,
+      deferralsByMemory: 0,
     });
   });
 
