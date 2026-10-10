@@ -72,6 +72,7 @@ import {
 import { createPluginSecretsHandler, type PluginSecretsResolveParams } from "./plugin-secrets-handler.js";
 import { createPluginArtifactsHandler } from "./plugin-artifacts-handler.js";
 import { enforcePluginConfigEgress } from "./plugin-config-egress.js";
+import { filterOverrideToTenantScope } from "./plugin-config-scope.js";
 import { normalizeIssueAttachmentMaxBytes } from "../attachment-types.js";
 import {
   defaultPluginWakeRateLimiter,
@@ -1844,7 +1845,19 @@ export function buildHostServices(
     ]);
     const base = (configRow?.configJson as Record<string, unknown> | undefined) ?? {};
     if (!override) return { ...base };
-    return { ...base, ...override };
+    // Merge-time scope filter (defense in depth): an override row written
+    // before the write gate existed must not shadow an operator-plane key.
+    const manifest = (await registry.getById(pluginId))?.manifestJson as
+      | { instanceConfigSchema?: { properties?: Record<string, unknown> } }
+      | undefined;
+    const { kept, dropped } = filterOverrideToTenantScope(manifest?.instanceConfigSchema, override);
+    if (dropped.length > 0) {
+      configGateLog.warn(
+        { pluginId, companyId, droppedKeys: dropped },
+        "plugin.config_override.ignored_non_tenant_keys",
+      );
+    }
+    return { ...base, ...kept };
   };
 
   /**
