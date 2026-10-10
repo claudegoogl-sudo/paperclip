@@ -694,6 +694,12 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       return app;
     }
 
+    // Route post-update work (dependency wakes, handoff bookkeeping) runs async after
+    // the response. Wait long enough for it to land so a zero-wake assertion is real.
+    async function settleRouteWork() {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+
     for (const variant of ["without unblockDescriptor", "with unblockDescriptor"] as const) {
       it(`HTTP PATCH status=blocked onto already-done blockers never wakes, across two sweeps (AC1/AC5, ${variant})`, async () => {
         const { companyId, blockedIssueId, blockerIssueId } =
@@ -713,6 +719,9 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         // the service-level AC1 test above covers that park shape.
         const expected = variant === "with unblockDescriptor" ? { http: 200, status: "blocked" } : { http: 422, status: "todo" };
         expect(res.status, JSON.stringify(res.body)).toBe(expected.http);
+        // Let the route's async enqueue land before asserting zero wakes.
+        await settleRouteWork();
+        expect(await wakesFor(companyId)).toHaveLength(0);
 
         const heartbeat = heartbeatService(db);
         for (let sweep = 0; sweep < 2; sweep += 1) {
@@ -829,7 +838,10 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
           unblockDescriptor: { owner: "board", action: "Resume once the parked work lands" },
         });
         expect(res.status, JSON.stringify(res.body)).toBe(200);
-        await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+        // No wake-row deletes: let the route's async post-update work settle, then
+        // assert the PATCH itself enqueued nothing.
+        await settleRouteWork();
+        expect(await wakesFor(companyId)).toHaveLength(0);
 
         const heartbeat = heartbeatService(db);
         for (let sweep = 0; sweep < 2; sweep += 1) {

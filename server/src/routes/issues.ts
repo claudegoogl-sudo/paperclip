@@ -10884,12 +10884,20 @@ export function issueRoutes(
         }
       }
 
+      const restoreRemovedBlockerCount = Array.isArray(req.body.blockedByIssueIds)
+        ? (existingRelations?.blockedBy ?? []).filter(
+          (relation) => !(req.body.blockedByIssueIds as string[]).includes(relation.id),
+        ).length
+        : 0;
       const restoredBlockedReadyDependency =
         issue.status === "blocked" &&
         issue.assigneeAgentId &&
         (
-          existing.status !== "blocked" ||
-          Array.isArray(req.body.blockedByIssueIds) ||
+          // Edge rule (same as the resolved-dependency backstop): only wake when the
+          // issue was ALREADY blocked and this request removed >=1 blocker, or when the
+          // assignee changed. Parking into `blocked` onto done blockers, or an add-only
+          // change, is a deliberate park and must not self-wake.
+          (existing.status === "blocked" && restoreRemovedBlockerCount > 0) ||
           existing.assigneeAgentId !== issue.assigneeAgentId
         );
       if (restoredBlockedReadyDependency && typeof dependencyReadinessSvc.getDependencyReadiness === "function") {
