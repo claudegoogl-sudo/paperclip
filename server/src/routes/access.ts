@@ -2087,12 +2087,12 @@ function mergeInviteDefaults(
   return Object.keys(merged).length ? merged : null;
 }
 
-function requestIp(req: Request) {
-  const forwarded = req.header("x-forwarded-for");
-  if (forwarded) {
-    const first = forwarded.split(",")[0]?.trim();
-    if (first) return first;
-  }
+/**
+ * Client IP for audit records. Uses `req.ip`, so `X-Forwarded-For` is only
+ * honoured for peers allowed by the app's `trust proxy` setting. Never read
+ * the raw header here: its leftmost element is caller-controlled.
+ */
+export function requestIp(req: Request) {
   return req.ip || "unknown";
 }
 
@@ -2649,10 +2649,8 @@ export function accessRoutes(
   // token space would be online-enumerable. Applied as a router-level middleware
   // so every current and future `/invites/:token` sub-route is covered.
   //
-  // The key is deliberately NOT `requestIp()`: that helper prefers the
-  // client-supplied `X-Forwarded-For` header (fine for log/audit fields,
-  // but trivially spoofable as a rate-limit key — rotating fake XFF values
-  // would mint a fresh budget per request). `req.ip` honors Express's
+  // Never key on the raw `X-Forwarded-For` header: rotating fake XFF
+  // values would mint a fresh budget per request. `req.ip` honors Express's
   // `trust proxy` setting (configured from TRUST_PROXY in app.ts, default:
   // trust nothing), so it is the socket's remote address unless the
   // operator explicitly trusts a proxy — an unforgeable key either way.
