@@ -1709,6 +1709,34 @@ manage `company_secret_bindings` directly:
   Each ref must belong to `:companyId`; a cross-company ref is rejected with
   `422` rather than silently skipped.
 
+#### Override key scope (`x-paperclip-scope`)
+
+A per-company override may set only keys the manifest marks tenant-scoped:
+
+```json
+"instanceConfigSchema": {
+  "type": "object",
+  "properties": {
+    "label":       { "type": "string", "x-paperclip-scope": "tenant" },
+    "baseUrl":     { "type": "string", "format": "uri", "x-paperclip-scope": "tenant" },
+    "internalUrl": { "type": "string", "format": "uri" }
+  }
+}
+```
+
+- No annotation (or `"operator"`) means **operator** scope. The override
+  route rejects such keys with `422` (`details.keys` lists them). Set them in
+  the operator-authored `plugin_config` row instead (`POST .../config`).
+- A tenant key whose schema declares `format: "uri"` or `format: "secret-ref"`
+  (also inside `oneOf`/`anyOf`/`allOf`) needs instance-admin authority (`403`
+  otherwise). The gate restricts *who* may set the value, not the value.
+- At read time (`config.getForServiceScope`) the host drops any stored override
+  key that is not tenant-scoped, and logs
+  `plugin.config_override.ignored_non_tenant_keys` with the dropped key names.
+  So an override row written before this gate cannot shadow an operator key.
+- The host reads the scope from its stored manifest only. Existing plugins need
+  no rebuild; unannotated plugins simply have no tenant-overridable keys.
+
 A secret ref that points at a missing secret (orphan), or — on the
 per-company path — at another company's secret, is persisted to config but
 produces **no** binding. The host logs a `warn` at config time
