@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
 import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -28,6 +30,8 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { errorHandler } from "../middleware/index.js";
+import { issueRoutes } from "../routes/issues.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -669,6 +673,127 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         expect(result.dependencyWakeParkedSkipped).toBe(1);
         expect(await wakesFor(companyId)).toHaveLength(0);
       }
+    });
+
+    function routeApp(companyId: string) {
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => {
+        req.actor = {
+          type: "board",
+          userId: "board-user",
+          companyIds: [companyId],
+          memberships: [{ companyId, membershipRole: "operator", status: "active" }],
+          isInstanceAdmin: true,
+          source: "local_implicit",
+        } as Express.Request["actor"];
+        next();
+      });
+      app.use("/api", issueRoutes(db, {} as any));
+      app.use(errorHandler);
+      return app;
+    }
+
+    for (const variant of ["without unblockDescriptor", "with unblockDescriptor"] as const) {
+      it(`HTTP PATCH status=blocked onto already-done blockers never wakes, across two sweeps (AC1/AC5, ${variant})`, async () => {
+        const { companyId, blockedIssueId, blockerIssueId } =
+          await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+        await db
+          .update(issues)
+          .set({ completedAt: new Date(Date.now() - 60 * 60 * 1000) })
+          .where(eq(issues.id, blockerIssueId));
+        await issueService(db).update(blockedIssueId, { status: "todo" });
+
+        const body: Record<string, unknown> = { status: "blocked" };
+        if (variant === "with unblockDescriptor") {
+          body.unblockDescriptor = { owner: "board", action: "Resume once the parked work lands" };
+        }
+        const res = await request(routeApp(companyId)).patch(`/api/issues/${blockedIssueId}`).send(body);
+        // The route already rejects a bare park onto all-done blockers (422);
+        // the service-level AC1 test above covers that park shape.
+        const expected = variant === "with unblockDescriptor" ? { http: 200, status: "blocked" } : { http: 422, status: "todo" };
+        expect(res.status, JSON.stringify(res.body)).toBe(expected.http);
+
+        const heartbeat = heartbeatService(db);
+        for (let sweep = 0; sweep < 2; sweep += 1) {
+          const result = await heartbeat.reconcileIssueGraphLiveness();
+          expect(result.dependencyWakesHealed).toBe(0);
+        }
+        expect(await wakesFor(companyId)).toHaveLength(0);
+        const [row] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, blockedIssueId));
+        expect(row?.status).toBe(expected.status);
+      });
+    }
+
+    it("heals once when the blocker finalizes after the dependent was parked (finalize barrier)", async () => {
+      const { companyId, blockedIssueId, blockerIssueId, executionWorkspaceId } =
+        await seedResolvedDependencyBackstopFixture({ workspaceState: "not_finalized" });
+      // T1: blocker done. T2: dependent parked. Finalize has not landed yet.
+      await db
+        .update(issues)
+        .set({ completedAt: new Date(Date.now() - 60 * 60 * 1000) })
+        .where(eq(issues.id, blockerIssueId));
+      await repark(blockedIssueId);
+      const heartbeat = heartbeatService(db);
+      expect((await heartbeat.reconcileIssueGraphLiveness()).dependencyWakesHealed).toBe(0);
+
+      // T3: finalize succeeds -> the dependency set only now became ready.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      const finalizedAt = new Date();
+      await db.insert(workspaceOperations).values({
+        companyId,
+        executionWorkspaceId,
+        issueId: blockerIssueId,
+        phase: "workspace_finalize",
+        status: "succeeded",
+        startedAt: finalizedAt,
+        finishedAt: finalizedAt,
+      });
+
+      const first = await heartbeat.reconcileIssueGraphLiveness();
+      expect(first.dependencyWakesHealed).toBe(1);
+      expect(first.dependencyWakeParkedSkipped).toBe(0);
+      await heartbeat.reconcileIssueGraphLiveness();
+      expect(await wakesFor(companyId)).toHaveLength(1);
+    });
+
+    it("heals once when the last open blocker is removed while the dependent stays blocked", async () => {
+      const { companyId, blockedIssueId, blockerIssueId } =
+        await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+      await db
+        .update(issues)
+        .set({ completedAt: new Date(Date.now() - 60 * 60 * 1000) })
+        .where(eq(issues.id, blockerIssueId));
+      const openBlockerId = randomUUID();
+      const [company] = await db.select({ issuePrefix: companies.issuePrefix }).from(companies).where(eq(companies.id, companyId));
+      await db.insert(issues).values({
+        id: openBlockerId,
+        companyId,
+        title: "Open blocker",
+        status: "in_progress",
+        priority: "medium",
+        issueNumber: 3,
+        identifier: `${company!.issuePrefix}-3`,
+      });
+      await db.insert(issueRelations).values({ companyId, issueId: openBlockerId, relatedIssueId: blockedIssueId, type: "blocks" });
+      await repark(blockedIssueId);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+
+      const res = await request(routeApp(companyId))
+        .patch(`/api/issues/${blockedIssueId}`)
+        .send({ blockedByIssueIds: [blockerIssueId] });
+      expect(res.status).toBe(200);
+      // Simulate the route-time wake being lost (dropped before delivery).
+      await db.update(heartbeatRuns).set({ wakeupRequestId: null }).where(eq(heartbeatRuns.companyId, companyId));
+      await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, blockedIssueId));
+
+      const heartbeat = heartbeatService(db);
+      const first = await heartbeat.reconcileIssueGraphLiveness();
+      expect(first.dependencyWakesHealed).toBe(1);
+      expect(first.dependencyWakeParkedSkipped).toBe(0);
+      await heartbeat.reconcileIssueGraphLiveness();
+      expect(await wakesFor(companyId)).toHaveLength(1);
     });
   });
 
