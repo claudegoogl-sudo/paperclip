@@ -394,6 +394,20 @@ describeEmbeddedPostgres("heartbeat late completion after external interruption 
       .orderBy(heartbeatRunEvents.seq);
   }
 
+  async function waitForRunEvents(
+    runId: string,
+    ready: (rows: Awaited<ReturnType<typeof loadRunEvents>>) => boolean,
+    timeoutMs = 5_000,
+  ) {
+    const deadline = Date.now() + timeoutMs;
+    let rows = await loadRunEvents(runId);
+    while (!ready(rows) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      rows = await loadRunEvents(runId);
+    }
+    return rows;
+  }
+
   it("overwrites an externally reaped interrupted row when the worker completes cleanly (AC1/AC2)", async () => {
     mockAdapterExecute.mockImplementationOnce(
       mockExternalReapMidRun({
@@ -422,7 +436,12 @@ describeEmbeddedPostgres("heartbeat late completion after external interruption 
       exitCode: 0,
     });
 
-    const events = await loadRunEvents(runId);
+    // The completion CAS flips the row to `succeeded` before the provenance
+    // event is appended, so a status poll can return before the event lands.
+    // Wait (bounded) for the event instead of reading once.
+    const events = await waitForRunEvents(runId, (rows) =>
+      rows.some((event) => (event.message ?? "").startsWith("completed after reap:")),
+    );
     const provenanceEvents = events.filter((event) =>
       (event.message ?? "").startsWith("completed after reap:"),
     );
