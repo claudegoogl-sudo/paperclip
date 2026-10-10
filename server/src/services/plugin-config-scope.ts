@@ -31,16 +31,75 @@ export function isTenantScopedConfigKey(schema: SchemaLike, key: string): boolea
   return propertySchema(schema, key)?.[PLUGIN_CONFIG_SCOPE_KEYWORD] === "tenant";
 }
 
-/** True when the key's schema declares a URL or secret-ref format. */
+const MAX_SCHEMA_DEPTH = 16;
+const SUBSCHEMA_KEYS = [
+  "items", "additionalItems", "additionalProperties", "unevaluatedProperties", "unevaluatedItems",
+  "contains", "propertyNames", "not", "if", "then", "else",
+] as const;
+const SUBSCHEMA_LIST_KEYS = ["oneOf", "anyOf", "allOf", "prefixItems", "items"] as const;
+const SUBSCHEMA_MAP_KEYS = ["properties", "patternProperties", "dependentSchemas", "definitions", "$defs"] as const;
+
+function resolveLocalRef(root: unknown, ref: string): unknown {
+  if (!ref.startsWith("#")) return undefined;
+  if (ref === "#") return root;
+  if (!ref.startsWith("#/")) return undefined;
+  let cur: unknown = root;
+  for (const raw of ref.slice(2).split("/")) {
+    const part = decodeURIComponent(raw).replace(/~1/g, "/").replace(/~0/g, "~");
+    if (!cur || typeof cur !== "object" || !Object.prototype.hasOwnProperty.call(cur, part)) return undefined;
+    cur = (cur as Record<string, unknown>)[part];
+  }
+  return cur;
+}
+
+/**
+ * Recursive walk over every subschema of `node`. Returns true when any
+ * subschema declares a high-risk format. Fail-closed: an unresolvable `$ref`
+ * or hitting the depth bound counts as high-risk.
+ */
+function subschemaIsHighRisk(root: unknown, node: unknown, depth: number, seen: Set<unknown>): boolean {
+  if (typeof node === "boolean" || node == null) return false;
+  if (typeof node !== "object" || Array.isArray(node)) return false;
+  if (seen.has(node)) return false; // cycle: already being / been inspected
+  if (depth > MAX_SCHEMA_DEPTH) return true;
+  seen.add(node);
+  const n = node as Record<string, unknown>;
+  if (typeof n.format === "string" && HIGH_RISK_FORMATS.has(n.format)) return true;
+  for (const refKey of ["$ref", "$dynamicRef", "$recursiveRef"] as const) {
+    const ref = n[refKey];
+    if (ref === undefined) continue;
+    if (typeof ref !== "string") return true;
+    const target = resolveLocalRef(root, ref);
+    if (target === undefined) return true;
+    if (subschemaIsHighRisk(root, target, depth + 1, seen)) return true;
+  }
+  const next = (c: unknown) => subschemaIsHighRisk(root, c, depth + 1, seen);
+  for (const k of SUBSCHEMA_KEYS) if (n[k] !== undefined && !Array.isArray(n[k]) && next(n[k])) return true;
+  for (const k of SUBSCHEMA_LIST_KEYS) {
+    const list = n[k];
+    if (Array.isArray(list)) for (const c of list) if (next(c)) return true;
+  }
+  for (const k of SUBSCHEMA_MAP_KEYS) {
+    const map = n[k];
+    if (map && typeof map === "object" && !Array.isArray(map)) for (const c of Object.values(map)) if (next(c)) return true;
+  }
+  const deps = n.dependencies;
+  if (deps && typeof deps === "object" && !Array.isArray(deps)) {
+    for (const c of Object.values(deps)) if (!Array.isArray(c) && next(c)) return true;
+  }
+  return false;
+}
+
+/**
+ * True when the key's schema, or ANY nested subschema of it (properties,
+ * items, combinators at any depth, `$ref` targets, if/then/else, not, ...),
+ * declares a URL or secret-ref format. Unresolvable `$ref` or excessive depth
+ * is treated as high-risk (fail-closed).
+ */
 export function isHighRiskConfigKey(schema: SchemaLike, key: string): boolean {
   const prop = propertySchema(schema, key);
   if (!prop) return false;
-  const formats = [prop.format];
-  for (const branch of ["oneOf", "anyOf", "allOf"] as const) {
-    const list = prop[branch];
-    if (Array.isArray(list)) for (const b of list) if (b && typeof b === "object") formats.push((b as Record<string, unknown>).format);
-  }
-  return formats.some((f) => typeof f === "string" && HIGH_RISK_FORMATS.has(f));
+  return subschemaIsHighRisk(schema, prop, 0, new Set());
 }
 
 /** Override keys the manifest does not declare tenant-scoped. */

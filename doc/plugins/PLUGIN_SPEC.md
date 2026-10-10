@@ -1728,8 +1728,15 @@ A per-company override may set only keys the manifest marks tenant-scoped:
   route rejects such keys with `422` (`details.keys` lists them). Set them in
   the operator-authored `plugin_config` row instead (`POST .../config`).
 - A tenant key whose schema declares `format: "uri"` or `format: "secret-ref"`
-  (also inside `oneOf`/`anyOf`/`allOf`) needs instance-admin authority (`403`
-  otherwise). The gate restricts *who* may set the value, not the value.
+  anywhere in its subschema tree (nested `properties`, `items`/`prefixItems`,
+  `additionalProperties`, `oneOf`/`anyOf`/`allOf` at any depth, `if`/`then`/`else`,
+  `not`, local `$ref` targets, ...) needs instance-admin authority (`403`
+  otherwise). An unresolvable or non-local `$ref`, or a schema nested deeper than
+  16 levels, is treated as high-risk (fail-closed). The gate restricts *who* may
+  set the value, not the value.
+- Scope is read from **top-level** properties only. An `x-paperclip-scope`
+  annotation on a nested property is ignored: overrides merge shallowly, so a
+  tenant may replace the whole top-level value.
 - At read time (`config.getForServiceScope`) the host drops any stored override
   key that is not tenant-scoped, and logs
   `plugin.config_override.ignored_non_tenant_keys` with the dropped key names.

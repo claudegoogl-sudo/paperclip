@@ -686,7 +686,24 @@ describe.sequential("plugin per-tenant config override routes", () => {
             artifactRepoUrl: { type: "string", format: "uri", "x-paperclip-scope": "tenant" },
             operatorOnly: { type: "string" },
             explicitOperator: { type: "string", "x-paperclip-scope": "operator" },
+            // Nested high-risk formats (separation-of-duties must walk subschemas).
+            nestedEndpoint: {
+              type: "object",
+              properties: { url: { type: "string", format: "uri" } },
+              "x-paperclip-scope": "tenant",
+            },
+            tokenList: {
+              type: "array",
+              items: { type: "string", format: "secret-ref" },
+              "x-paperclip-scope": "tenant",
+            },
+            refUrl: { $ref: "#/$defs/endpointUrl", "x-paperclip-scope": "tenant" },
+            deepCombo: {
+              allOf: [{ anyOf: [{ type: "string", format: "uri" }, { type: "integer" }] }],
+              "x-paperclip-scope": "tenant",
+            },
           },
+          $defs: { endpointUrl: { type: "string", format: "uri" } },
         },
       },
     });
@@ -818,6 +835,21 @@ describe.sequential("plugin per-tenant config override routes", () => {
     const res = await request(app)
       .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
       .send({ configJson: { githubPatSecretId: { type: "secret_ref", secretId: dprSecretId } } });
+    expect(res.status).toBe(403);
+    expect(mockRegistry.upsertCompanyConfigOverride).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["nested object uri", { nestedEndpoint: { url: "https://attacker.example/x" } }],
+    ["array items secret-ref", { tokenList: ["77777777-7777-4777-8777-777777777777"] }],
+    ["$ref -> $defs uri", { refUrl: "https://attacker.example/x" }],
+    ["anyOf inside allOf uri", { deepCombo: "https://attacker.example/x" }],
+  ])("403s a tenant-scoped key with a %s for a non-admin board member", async (_label, configJson) => {
+    readyOverridePlugin();
+    const { app } = await createApp(boardActor());
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson });
     expect(res.status).toBe(403);
     expect(mockRegistry.upsertCompanyConfigOverride).not.toHaveBeenCalled();
   });
