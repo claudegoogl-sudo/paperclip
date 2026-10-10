@@ -6868,6 +6868,27 @@ export function recoveryService(
     return { kind: "created" as const, escalationIssueId: escalation.id };
   }
 
+  async function wasParkedAfterBlockersResolved(
+    companyId: string,
+    blockedTransitionAt: Date | string | null | undefined,
+    blockerIssueIds: string[],
+  ): Promise<boolean> {
+    if (!blockedTransitionAt || blockerIssueIds.length === 0) return false;
+    const blockedAt = blockedTransitionAt instanceof Date ? blockedTransitionAt : new Date(blockedTransitionAt);
+    if (Number.isNaN(blockedAt.getTime())) return false;
+    const blockers = await db
+      .select({ completedAt: issues.completedAt })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), inArray(issues.id, blockerIssueIds)));
+    if (blockers.length !== new Set(blockerIssueIds).size) return false;
+    let lastResolvedAt = 0;
+    for (const blocker of blockers) {
+      if (!blocker.completedAt) return false;
+      lastResolvedAt = Math.max(lastResolvedAt, new Date(blocker.completedAt).getTime());
+    }
+    return blockedAt.getTime() >= lastResolvedAt;
+  }
+
   async function reconcileResolvedDependencyWakeBackstop(opts?: ResolvedDependencyWakeBackstopOptions) {
     const result = {
       checked: 0,
@@ -6877,6 +6898,7 @@ export function recoveryService(
       interactionSkipped: 0,
       pauseHoldSkipped: 0,
       notReadySkipped: 0,
+      parkedAfterResolutionSkipped: 0,
       candidateLimitSkipped: 0,
       deferredOrFailed: 0,
       enqueueFailed: 0,
@@ -6996,6 +7018,18 @@ export function recoveryService(
           continue;
         }
 
+        // Edge gate: a dependent that entered `blocked` at or after the moment
+        // its LAST blocker completed was parked by choice. No blocker resolved
+        // during this blocked cycle, so there is no missed wake to heal. Without
+        // this gate the level-triggered sweep woke every such issue, the agent
+        // re-parked it, and the next sweep woke it again (self-wake loop). The
+        // check reads durable issue columns only, so it survives the wake-row
+        // retention prune. Missing timestamps keep the legacy heal behavior.
+        if (await wasParkedAfterBlockersResolved(companyId, candidate.blockedTransitionAt, readiness.blockerIssueIds)) {
+          result.parkedAfterResolutionSkipped += 1;
+          continue;
+        }
+
         // Level-triggered dedup: key on the full blocker set (the current ready
         // state), not on any single resolved edge. An older completed per-edge
         // wake for an earlier partial resolution has a different key, so it does
@@ -7097,6 +7131,13 @@ export function recoveryService(
       }
     }
 
+    if (result.parkedAfterResolutionSkipped > 0) {
+      logger.info(
+        { parkedAfterResolutionSkipped: result.parkedAfterResolutionSkipped, source },
+        "issue graph liveness backstop skipped dependents parked as blocked after their blockers resolved",
+      );
+    }
+
     if (result.healed > 0) {
       logger.warn(
         { healed: result.healed, issueIds: result.issueIds, source, blockerIssueId: opts?.blockerIssueId ?? null },
@@ -7171,6 +7212,7 @@ export function recoveryService(
       dependencyWakeInteractionSkipped: 0,
       dependencyWakePauseHoldSkipped: 0,
       dependencyWakeNotReadySkipped: 0,
+      dependencyWakeParkedSkipped: 0,
       dependencyWakeCandidateLimitSkipped: 0,
       dependencyWakeDeferredOrFailed: 0,
       dependencyWakeEnqueueFailed: 0,
@@ -7190,6 +7232,7 @@ export function recoveryService(
     result.dependencyWakeInteractionSkipped = dependencyWakeBackstop.interactionSkipped;
     result.dependencyWakePauseHoldSkipped = dependencyWakeBackstop.pauseHoldSkipped;
     result.dependencyWakeNotReadySkipped = dependencyWakeBackstop.notReadySkipped;
+    result.dependencyWakeParkedSkipped = dependencyWakeBackstop.parkedAfterResolutionSkipped;
     result.dependencyWakeCandidateLimitSkipped = dependencyWakeBackstop.candidateLimitSkipped;
     result.dependencyWakeDeferredOrFailed = dependencyWakeBackstop.deferredOrFailed;
     result.dependencyWakeEnqueueFailed = dependencyWakeBackstop.enqueueFailed;

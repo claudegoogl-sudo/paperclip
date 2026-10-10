@@ -585,6 +585,93 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     });
   });
 
+
+  describe("parked-after-resolution edge gate", () => {
+    async function wakesFor(companyId: string) {
+      return db
+        .select({ status: agentWakeupRequests.status, id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.reason, "issue_blockers_resolved")));
+    }
+
+    async function repark(issueId: string) {
+      const svc = issueService(db);
+      await svc.update(issueId, { status: "todo" });
+      await svc.update(issueId, { status: "blocked" });
+    }
+
+    it("does not wake a dependent parked as blocked after all blockers were already done (AC1)", async () => {
+      const { companyId, blockedIssueId, blockerIssueId } =
+        await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+      await db
+        .update(issues)
+        .set({ completedAt: new Date(Date.now() - 60 * 60 * 1000) })
+        .where(eq(issues.id, blockerIssueId));
+      await repark(blockedIssueId);
+
+      const heartbeat = heartbeatService(db);
+      for (let sweep = 0; sweep < 2; sweep += 1) {
+        const result = await heartbeat.reconcileIssueGraphLiveness();
+        expect(result.dependencyWakesHealed).toBe(0);
+        expect(result.dependencyWakeParkedSkipped).toBe(1);
+      }
+
+      expect(await wakesFor(companyId)).toHaveLength(0);
+      const [row] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, blockedIssueId));
+      expect(row?.status).toBe("blocked");
+    });
+
+    it("still heals exactly one missed wake when the blocker resolves during the blocked cycle (AC2)", async () => {
+      const { companyId, blockedIssueId, blockerIssueId } =
+        await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+      const svc = issueService(db);
+      await db.update(issues).set({ status: "in_progress", completedAt: null }).where(eq(issues.id, blockerIssueId));
+      await repark(blockedIssueId);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      // Service-level transition: no route-time wake fires, which simulates the miss.
+      await svc.update(blockerIssueId, { status: "done" });
+
+      const heartbeat = heartbeatService(db);
+      const first = await heartbeat.reconcileIssueGraphLiveness();
+      expect(first.dependencyWakesHealed).toBe(1);
+      expect(first.dependencyWakeParkedSkipped).toBe(0);
+      const second = await heartbeat.reconcileIssueGraphLiveness();
+      expect(second.dependencyWakesHealed).toBe(0);
+      expect(await wakesFor(companyId)).toHaveLength(1);
+    });
+
+    it("does not re-wake after the healed wake ends in a terminal status, is pruned, and the agent re-parks (AC4)", async () => {
+      const { companyId, blockedIssueId, blockerIssueId } =
+        await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+      const svc = issueService(db);
+      await db.update(issues).set({ status: "in_progress", completedAt: null }).where(eq(issues.id, blockerIssueId));
+      await repark(blockedIssueId);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await svc.update(blockerIssueId, { status: "done" });
+
+      const heartbeat = heartbeatService(db);
+      expect((await heartbeat.reconcileIssueGraphLiveness()).dependencyWakesHealed).toBe(1);
+      await heartbeat.reconcileIssueGraphLiveness();
+
+      for (const terminal of ["completed", "coalesced", "skipped", "cancelled", "failed"] as const) {
+        // Simulate the woken agent re-parking, the wake row ending terminal, then the retention prune.
+        await db
+          .update(agentWakeupRequests)
+          .set({ status: terminal, finishedAt: new Date() })
+          .where(eq(agentWakeupRequests.companyId, companyId));
+        await db.update(heartbeatRuns).set({ wakeupRequestId: null }).where(eq(heartbeatRuns.companyId, companyId));
+        await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        await repark(blockedIssueId);
+
+        const result = await heartbeat.reconcileIssueGraphLiveness();
+        expect(result.dependencyWakesHealed).toBe(0);
+        expect(result.dependencyWakeParkedSkipped).toBe(1);
+        expect(await wakesFor(companyId)).toHaveLength(0);
+      }
+    });
+  });
+
   it("retries a resolved dependency wake when the prior wake was skipped as stale", async () => {
     const { companyId, agentId, blockedIssueId, blockerIssueId } =
       await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
