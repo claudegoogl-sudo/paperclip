@@ -392,7 +392,7 @@ const actor = { actorType: "user" as const, actorId: "browser-reviewer" };
       await db.update(costEvents).set(legacyCost).where(eq(costEvents.companyId, f.company.id));
       await db.update(financeEvents).set(legacyCost).where(eq(financeEvents.companyId, f.company.id));
       const migration = await readFile(new URL(
-        "../../../packages/db/src/migrations/0290_browser_use_cloud.sql", import.meta.url,
+        "../../../packages/db/src/migrations/0311_browser_use_cloud.sql", import.meta.url,
       ), "utf8");
       for (let attempt = 0; attempt < 2; attempt++) {
         for (const statement of migration.split("--> statement-breakpoint")) {
