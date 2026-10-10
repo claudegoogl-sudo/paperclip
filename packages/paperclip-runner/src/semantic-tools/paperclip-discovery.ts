@@ -12,6 +12,7 @@ import type {
 
 const NAMESPACE: Readonly<Record<PaperclipSemanticActionId, string>> =
   Object.freeze({
+    set_task_title: "active_task",
     search_api: "api_fallback",
     call_api: "api_fallback",
     get_task_context: "active_task",
@@ -28,6 +29,7 @@ const NAMESPACE: Readonly<Record<PaperclipSemanticActionId, string>> =
     block_task: "active_task",
     request_review: "active_task",
     list_agents: "discovery",
+    hire_agent: "delegation",
     get_agent: "discovery",
     search_tasks: "discovery",
     list_approvals: "governance",

@@ -29,7 +29,7 @@ function currentUtcMonthWindow(now = new Date()) {
   };
 }
 
-async function getMonthlySpendTotal(
+export async function getMonthlySpendTotal(
   db: Db,
   scope: { companyId: string; agentId?: string | null },
 ) {

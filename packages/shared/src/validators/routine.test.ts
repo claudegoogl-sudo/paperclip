@@ -31,7 +31,7 @@ const fullRoutinePayload = {
 };
 
 describe("routine validators", () => {
-  it("accepts versioned routine revision snapshots with safe trigger metadata", () => {
+  it.each(["bearer", "app_webhook", "fireflies_hmac"])("accepts versioned routine revision snapshots with %s trigger metadata", (signingMode) => {
     const parsed = routineRevisionSnapshotV1Schema.parse({
       version: 1,
       routine: {
@@ -57,7 +57,7 @@ describe("routine validators", () => {
         cronExpression: null,
         timezone: null,
         publicId: "routine_webhook_123",
-        signingMode: "bearer",
+        signingMode,
         replayWindowSec: 300,
       }],
     });

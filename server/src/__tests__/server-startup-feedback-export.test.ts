@@ -10,6 +10,7 @@ const ORIGINAL_PAPERCLIP_LISTEN_HOST = process.env.PAPERCLIP_LISTEN_HOST;
 const ORIGINAL_PAPERCLIP_LISTEN_PORT = process.env.PAPERCLIP_LISTEN_PORT;
 
 const {
+  completionSweepMock,
   createAppMock,
   createBetterAuthInstanceMock,
   createDbMock,
@@ -33,6 +34,7 @@ const {
   routineServiceFactoryMock,
   routineServiceMock,
 } = vi.hoisted(() => {
+  const completionSweepMock = vi.fn(async () => undefined);
   const createAppMock = vi.fn(async () => ({
     // Fork createApp returns { app, pluginToolDispatcher }; the dispatcher is
     // only invoked lazily by the tool-health sweep probe, so a stub suffices.
@@ -151,6 +153,7 @@ const {
   const loadConfigMock = vi.fn();
 
   return {
+    completionSweepMock,
     createAppMock,
     createBetterAuthInstanceMock,
     createDbMock,
@@ -374,6 +377,11 @@ vi.mock("../services/index.js", () => ({
   })),
 }));
 
+vi.mock("../services/chat-completion-delivery.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/chat-completion-delivery.js")>()),
+  chatCompletionDeliveryService: () => ({ sweepPending: completionSweepMock }),
+}));
+
 vi.mock("../services/connection-intent-delivery.js", () => ({
   connectionIntentDeliveryService: vi.fn(() => ({
     sweepPending: vi.fn(async () => ({ scanned: 0, failed: 0 })),
@@ -553,6 +561,13 @@ describe("startServer feedback export wiring", () => {
       storageService: { id: "storage-service" },
       serverPort: 3210,
     });
+  });
+
+  it("keeps startup available when completion delivery recovery fails", async () => {
+    completionSweepMock.mockRejectedValueOnce(new Error("temporary delivery failure"));
+    const { startServer } = await import("../index.js");
+    await expect(startServer()).resolves.toBeDefined();
+    expect(completionSweepMock).toHaveBeenCalled();
   });
 
   it("never invokes the retired review detector at startup or on periodic recovery", async () => {

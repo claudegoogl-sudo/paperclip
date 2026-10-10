@@ -462,3 +462,6 @@ export {
   MEMBERSHIP_STATUSES,
   PRINCIPAL_TYPES,
 } from "@paperclipai/shared";
+
+export { PluginEnvironmentCreationCleanupError, environmentCreationCleanupErrorData, readEnvironmentCreationCleanupError } from "./environment-creation-cleanup.js";
+export type { PluginEnvironmentCreationCleanup } from "./environment-creation-cleanup.js";

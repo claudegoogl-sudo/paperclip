@@ -23,6 +23,16 @@ export function resolveClaudeModel(
 }
 
 export const type = "claude_local";
+
+export function claudeLocalReasoningEffortsForModel(model: string): readonly string[] {
+  const id = model.trim().replace(/\[1m\]$/, "").replace(/^(?:(?:us|eu|apac|global)\.)?anthropic\./, "");
+  if (/^claude-haiku-/.test(id)) return [];
+  if (/^claude-(?:opus-5(?:-5)?|opus-4-[78]|sonnet-5|fable-5(?:-1)?)$/.test(id)) {
+    return ["low", "medium", "high", "xhigh", "max"];
+  }
+  if (/^claude-(?:opus|sonnet)-4-6(?:-v1)?$/.test(id)) return ["low", "medium", "high", "max"];
+  return ["low", "medium", "high"];
+}
 export const label = "Claude Code";
 
 export const SANDBOX_INSTALL_COMMAND = "npm install -g @anthropic-ai/claude-code";
@@ -34,6 +44,7 @@ export const models: AdapterModel[] = [
   { id: "claude-fable-5", label: "Claude Fable 5" },
   // Safeguards-lifted — must never be an automatic fallback target.
   { id: "claude-mythos-5", label: "Claude Mythos 5", safeguardsLifted: true },
+  { id: "claude-opus-5-5", label: "Claude Opus 5.5" },
   { id: "claude-opus-5", label: "Claude Opus 5" },
   { id: "claude-opus-4-7", label: "Claude Opus 4.7" },
   { id: "claude-opus-4-6", label: "Claude Opus 4.6" },
@@ -53,7 +64,7 @@ Core fields:
 - model (string, optional): Claude model id. Missing or blank defaults to ${DEFAULT_CLAUDE_LOCAL_MODEL} in both CLI and ACP, including existing agents. Explicit model IDs and ANTHROPIC_MODEL overrides are preserved. Bedrock/Vertex without an explicit model retain their provider default.
 - model (string, optional): Claude model id
 - fallbackModel (string, optional): Claude model id used for a single automatic retry when the primary model returns a policy refusal. Must be a known adapter model and is never a safeguards-lifted model (claude-mythos-5 is hard-rejected). On a refusal the run retries exactly once on a fresh session with this model and returns that result; without it, refusals surface as today. resultJson carries fallbackModelUsed/primaryRefused telemetry when it fires.
-- effort (string, optional): reasoning effort passed via --effort (low|medium|high)
+- effort (string, optional): model-specific reasoning effort passed via --effort (low|medium|high; current Opus, Sonnet 5, and Fable models also support xhigh|max)
 - chrome (boolean, optional): pass --chrome when running Claude
 - promptTemplate (string, optional): run prompt template
 - maxTurnsPerRun (number, optional): max turns for one run
@@ -81,6 +92,7 @@ Operational fields:
 - graceSec (number, optional): SIGTERM grace period in seconds
 
 Notes:
+- Claude Opus 5.5 uses model ID \`claude-opus-5-5\` and requires Claude Code v2.1.280 or later.
 - filesystemScope and networkScope are spawn-level confinement and are orthogonal to Claude permission flags. Both require Bubblewrap on the host and explicit engine="cli"; default or explicit ACP is rejected because ACP confinement is not yet supported. networkScope="allowlist" injects HTTP_PROXY/HTTPS_PROXY for the CLI while its private network namespace blocks direct sockets, so every required provider/API hostname must be listed explicitly.
 - The Claude ACP lane requires Node >=24.11.0 and @agentclientprotocol/claude-agent-acp to be installed with this adapter package. Missing prerequisites fail both default and explicit ACP runs with an actionable setup error; the adapter never switches engines automatically.
 - For ACP runs, model selection is passed through ANTHROPIC_MODEL at ACP server startup; Paperclip-managed Claude permissions and ephemeral skill materialization are handled by the shared ACP engine.

@@ -321,6 +321,7 @@ export {
   connectionMethodSupportsCatalogSetup,
   connectionMethodSupportsAutomaticOAuth,
   credentialConfigPath,
+  connectionCredentialConfigPath,
   getAppDefinitionForUrl,
   getAppStoreDefinition,
   getAvailableConnectionMethod,
@@ -332,6 +333,13 @@ export {
   recommendedDefaultsForApp,
   resolveConnectionMethodServerUrl,
 } from "./app-definitions.js";
+export {
+  connectionSetupStateForApp,
+  connectionSetupStateForMethod,
+  connectionSetupVerbForApp,
+  connectionSetupVerbForMethod,
+  type ConnectionSetupState,
+} from "./connection-setup-state.js";
 export { APP_DEFINITIONS } from "./app-definitions.generated.js";
 export * from "./google-workspace-connectors.js";
 export * from "./github-connectors.js";
@@ -1981,6 +1989,8 @@ export {
   type CompanySearchExtractQuery,
   type CompanySearchQuery,
   createIssueSchema,
+  setIssueTitleSchema,
+  type SetIssueTitle,
   createIssueInputSchema,
   createChildIssueSchema,
   createAcceptedPlanDecompositionSchema,
@@ -1997,6 +2007,7 @@ export {
   issueExecutionPolicySchema,
   issueExecutionStateSchema,
   resolveIssueRecoveryActionSchema,
+  retryWorkspaceExportSchema,
   issueReviewRequestSchema,
   issueExecutionWorkspaceSettingsSchema,
   checkoutIssueSchema,
@@ -2038,6 +2049,8 @@ export {
   requestItemVerdictsResultSchema,
   createIssueThreadInteractionSchema,
   acceptIssueThreadInteractionSchema,
+  resolveConfirmationFromCommentSchema,
+  type ResolveConfirmationFromComment,
   rejectIssueThreadInteractionSchema,
   cancelIssueThreadInteractionSchema,
   skipIssueThreadInteractionSchema,
@@ -2727,11 +2740,13 @@ export {
   type InstanceFeatureKey,
 } from "./feature-catalog.js";
 export {
+  EXPERIMENTAL_SETTINGS_WILDCARD,
   HIDEABLE_COMPANY_PAGES,
   HIDEABLE_COMPANY_SECTIONS,
   HIDEABLE_GENERAL_SECTIONS,
   HIDEABLE_INSTANCE_PAGES,
   HIDEABLE_SETTING_KEYS,
+  HIDEABLE_WORKSPACE_SECTIONS,
   SETTINGS_OPERATOR_MANAGED_ERROR_CODE,
   UI_ONLY_GENERAL_SECTIONS,
   experimentalSettingKey,
@@ -2747,6 +2762,7 @@ export {
   type HideableGeneralSection,
   type HideableInstancePage,
   type HideableSettingKey,
+  type HideableWorkspaceSection,
   type ParsedHiddenSettings,
 } from "./settings-visibility.js";
 export {
@@ -2826,3 +2842,25 @@ export * from "./announcements.js";
 export { REMOTE_MCP_CONNECTOR_METHODS, isRemoteMcpConnectorId, isRemoteMcpConnectorMethod, type RemoteMcpConnectorId } from "./remote-mcp-connectors.js";
 
 export { isRetiredComposioConnection, RETIRED_COMPOSIO_MESSAGE } from "./retired-composio.js";
+
+export * from "./slack-tools.js";
+
+export { MEMORY_CONNECTOR_IDS, isMemoryConnectorId, type MemoryConnectorId } from "./memory-connectors.js";
+export * from "./connection-routing.js";
+export * from "./connection-search.js";
+
+export { WORKSPACE_RESTORE_FAILURE_CODES, hasWorkspaceRestoreFailure, safeWorkspaceRestorePath, isNativeWorkspaceExportRepairCause } from "./workspace-restore.js";
+
+
+export type { AgentInstructionErrorCode, AgentInstructionErrorDetails, AgentInstructionSource, AgentInstructionRevision, AgentInstructionSnapshot, AgentInstructionCommitReceipt, AgentInstructionHistory, AgentInstructionDiff } from "./types/agent.js";
+export { restoreAgentInstructionSchema } from "./validators/agent.js";
+
+export type { AgentInstructionCandidate } from "./types/agent.js";
+export { resolveAgentInstructionCandidateSchema, type ResolveAgentInstructionCandidate } from "./validators/agent.js";
+
+export { isHeartbeatRunVisibleInMine } from "./heartbeat-inbox.js";
+export * from "./browser-use.js";
+
+export * from "./types/skill-source.js";
+export * from "./validators/skill-source.js";
+export * from "./github-skill-repository.js";

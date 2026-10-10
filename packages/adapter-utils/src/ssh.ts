@@ -1562,9 +1562,11 @@ export async function prepareWorkspaceForSshExecution(input: {
   localDir: string;
   remoteDir?: string;
   onProgress?: RuntimeProgressSink;
+  workspaceFileMode?: "all";
+  workspaceExclude?: string[];
 }): Promise<{ gitBacked: boolean }> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
-  const gitSnapshot = await readLocalGitWorkspaceSnapshot(input.localDir);
+  const gitSnapshot = input.workspaceFileMode === "all" ? null : await readLocalGitWorkspaceSnapshot(input.localDir);
 
   if (gitSnapshot) {
     await importGitWorkspaceToSsh({
@@ -1599,7 +1601,7 @@ export async function prepareWorkspaceForSshExecution(input: {
     spec: input.spec,
     localDir: input.localDir,
     remoteDir,
-    exclude: [".paperclip-runtime"],
+    exclude: [".paperclip-runtime", ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : [])],
     onProgress: input.onProgress,
     progressLabel: "workspace",
   });

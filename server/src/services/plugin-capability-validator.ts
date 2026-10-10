@@ -168,6 +168,7 @@ const UI_SLOT_CAPABILITIES: Record<PluginUiSlotType, PluginCapability> = {
   dashboardWidget: "ui.dashboardWidget.register",
   globalToolbarButton: "ui.action.register",
   appShellOverlay: "ui.action.register",
+  organizationSwitcher: "ui.sidebar.register",
   toolbarButton: "ui.action.register",
   contextMenuItem: "ui.action.register",
   commentAnnotation: "ui.commentAnnotation.register",

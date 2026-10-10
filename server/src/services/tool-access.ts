@@ -1,7 +1,16 @@
-import { isRemoteMcpConnectorMethod, connectionPurposeTransportSchema } from "@paperclipai/shared";
+import { isInsufficientConnectionScope, INSUFFICIENT_CONNECTION_SCOPE_MESSAGE } from "./connection-permission-errors.js";
+import { BROWSER_USE_TOOLS } from "@paperclipai/shared";
+import { browserUseClient, isBrowserUseConnection } from "./browser-use-client.js";
+import { browserUseService } from "./browser-use.js";
+import { COGNEE_STDIO_TEMPLATE, cogneeCloudUrl } from "./cognee-connection.js";
+import { isMemoryConnectorId, isRemoteMcpConnectorMethod, connectionPurposeTransportSchema } from "@paperclipai/shared";
 import { instanceSettingsService } from "./instance-settings.js";
 import { githubBotRequest } from "./chat-github-client.js";
 import { syncConnectionCredentialBindings } from "./connection-credential-bindings.js";
+import {
+  emitConnectionCreated,
+  emitConnectionUpdated,
+} from "./connector-telemetry.js";
 import { canBrowseProjectRepositoryGrant, mergeProjectRepository } from "./project-repositories.js";
 import { captureRunIdentity } from "./run-identity.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -36,6 +45,7 @@ import {
   companySecrets,
   principalPermissionGrants,
   userSecretDefinitions,
+  userSecretDeclarations,
   heartbeatRuns,
   issues,
   issueThreadInteractions,
@@ -187,6 +197,7 @@ import {
 import { isUniqueViolation } from "../db-errors.js";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
+import { isSlackMcpAccessDisabledResponse } from "./slack-mcp-error.js";
 import {
   initializeMcpHttpSession,
   McpHttpInitializationError,
@@ -211,6 +222,7 @@ import {
   splitRemoteUrlCredential,
 } from "./remote-url-credentials.js";
 import { secretService } from "./secrets.js";
+import { connectionCredentialConfigPath as credentialRefConfigPath, connectionGrantCredentialRef, connectionSecretsUsedByOtherConsumers, resolveConnectionGrantSecret, validateConnectionGrantSecretOwnership, writeConnectionCredential } from "./connection-credentials.js";
 import { agentmailApi } from "./agentmail-api.js";
 import type { ConfigureRailwaySsh, RailwaySshSetup } from "@paperclipai/shared";
 import { generateRailwaySshKey, RAILWAY_SSH_SECRET_PATH, validateRailwayKnownHosts } from "./railway-ssh.js";
@@ -225,6 +237,7 @@ import {
   narrowestScopeBindings,
   profileIdsInBindingOrder,
 } from "./tool-profile-binding-precedence.js";
+import { assertGoogleChatToolArgumentsSupported, googleChatToolDescription, googleChatToolInputSchema } from "./google-chat-tool-policy.js";
 import {
   recordToolRuntimeAuditWriteFailure,
   TOOL_RUNTIME_AUDIT_WRITE_FAILURE_METRIC,
@@ -823,6 +836,7 @@ const APPROVED_STDIO_TEMPLATES: Record<
       },
     ],
   },
+  "paperclip.cognee-cloud": COGNEE_STDIO_TEMPLATE,
   "paperclip.google-sheets": {
     name: "Google Sheets",
     command: "paperclip-google-sheets-mcp-server",
@@ -1048,7 +1062,7 @@ function credentialFieldsFor(app: AppDefinition, methodKey?: string | null) {
   const method = connectionMethodFor(app, methodKey);
   return (method.credentialFields ?? []).map((field) => ({
     label: field.label,
-    configPath: credentialConfigPath(field),
+    configPath: credentialConfigPath(field, method),
     helpUrl: method.consoleLinks?.keys ?? method.consoleLinks?.docs ?? "",
     required: field.required,
     placement:
@@ -1060,11 +1074,6 @@ function credentialFieldsFor(app: AppDefinition, methodKey?: string | null) {
   }));
 }
 
-function credentialRefConfigPath(ref: { name: string }): string {
-  return ref.name.startsWith("credentials.")
-    ? ref.name
-    : `credentials.${ref.name}`;
-}
 
 export function normalizeConnectionMethodConfig(
   method: ConnectionMethodDef,
@@ -1295,7 +1304,9 @@ export function projectConnectionMethodToolInputSchema(
 export function projectedConnectionToolArguments(
   connection: typeof toolConnections.$inferSelect,
   parameters: unknown,
+  toolName: string,
 ): Record<string, unknown> {
+  assertGoogleChatToolArgumentsSupported(connection, toolName, parameters);
   const sourceTemplateKey =
     typeof connection.config.sourceTemplateKey === "string"
       ? connection.config.sourceTemplateKey
@@ -1313,7 +1324,9 @@ export function projectedConnectionToolArguments(
 export function projectedConnectionToolInputSchema(
   connection: typeof toolConnections.$inferSelect,
   inputSchema: Record<string, unknown>,
+  toolName: string,
 ): Record<string, unknown> {
+  inputSchema = googleChatToolInputSchema(connection, toolName, inputSchema);
   const sourceTemplateKey =
     typeof connection.config.sourceTemplateKey === "string"
       ? connection.config.sourceTemplateKey
@@ -1705,7 +1718,9 @@ function toCatalogEntryForConnection(
     inputSchema: projectedConnectionToolInputSchema(
       connection,
       rawCatalogEntry.inputSchema ?? {},
+      row.toolName,
     ),
+    description: googleChatToolDescription(connection, row.toolName, rawCatalogEntry.description),
   };
   if (
     connection.transport === "local_stdio" &&
@@ -2344,16 +2359,33 @@ export function classifyRisk(
   if (annotations.destructiveHint === true || annotations.destructive === true)
     return "destructive";
   const normalizedToolName = normalizedProviderToolName(tool.name);
+  if (isMemoryConnectorId(sourceTemplateKey)) {
+    if (verbMatches(tool.name, "delete|remove|destroy|forget|prune|reset")) return "destructive";
+    // Supermemory uses one add_memory tool for both save and forget.
+    if (sourceTemplateKey === "supermemory" && normalizedToolName === "add-memory") return "destructive";
+    if (verbMatches(tool.name, "add|remember|save|record|ingest|cognify|update|create|set|upload|select|rename|share")) return "write";
+    if (annotations.readOnlyHint === false || annotations.writeHint === true) return "write";
+    const reads = ["get", "list", "search", "recall", "query", "retrieve", "who"];
+    return verbMatches(tool.name, reads.join("|")) ? "read" : "write";
+  }
   const reviewedReads = AGGREGATOR_READ_TOOLS.get(sourceTemplateKey ?? "");
   if (reviewedReads) {
     if (verbMatches(tool.name, "delete|remove|destroy|unpublish")) return "destructive";
     if (annotations.readOnlyHint === false || annotations.writeHint === true) return "write";
     return reviewedReads.has(tool.name) ? "read" : "write";
   }
+  if (sourceTemplateKey === "browser-use-cloud") {
+    return BROWSER_USE_TOOLS.find(t => t.name === tool.name)?.annotations.readOnlyHint ? "read" : "destructive";
+  }
   if (sourceTemplateKey === "railway") {
     const reviewed = railwayRisk(normalizedToolName);
     return reviewed === "read" && (annotations.readOnlyHint === false || annotations.writeHint === true) ? "write" : reviewed;
   }
+  // Fireflies sharing, moving, and access revocation are mutations even when
+  // a provider omits annotations or mistakenly advertises a read hint.
+  if (sourceTemplateKey === "fireflies" && [
+    "fireflies-share-meeting", "fireflies-revoke-meeting-access", "fireflies-move-meeting",
+  ].includes(normalizedToolName)) return "write";
   if (sourceTemplateKey === "posthog" && normalizedToolName === "exec")
     return "destructive";
   if (
@@ -2817,9 +2849,14 @@ function healthFailureHttpStatus(failure: {
   code: string;
 }): number {
   if (failure.status === "missing_secret") return 422;
+  if (failure.code === "oauth_challenge") return 422;
+  if (failure.code === "oauth_refresh_missing") return 422;
+  if (failure.code === "oauth_reauthorization_required") return 422;
+  if (failure.code === "slack_mcp_access_disabled") return 422;
   if (failure.code === "user_authorization_required") return 422;
   if (failure.code === "composio_broker_retired") return 422;
   if (failure.code === "tool_connection_transport_unsupported") return 422;
+  if (failure.code === "cognee_access_unverified" || failure.code === "memory_api_key_rejected") return 422;
   if (failure.code.endsWith("_endpoint_rejected")) return 422;
   return 502;
 }
@@ -2838,6 +2875,15 @@ function sanitizeHttpFailure(error: unknown): {
 } {
   if (error instanceof HttpError) {
     const code = asRecord(error.details).code;
+    if (code === "cognee_access_unverified" || code === "memory_api_key_rejected") {
+      return { status: "error", message: error.message, code };
+    }
+    if (code === "grant_credential_invalid" || code === "oauth_insufficient_scope") {
+      return { status: code === "grant_credential_invalid" ? "missing_secret" : "degraded", message: error.message, code };
+    }
+    if (code === "slack_mcp_access_disabled") {
+      return { status: "error", message: error.message, code };
+    }
     if (code === "user_authorization_required") {
       return { status: "error", message: error.message, code };
     }
@@ -2965,6 +3011,34 @@ function readStdioTemplateId(config: Record<string, unknown>): string {
   return templateId.trim();
 }
 
+async function gitHubReadGrantAccess(db: Db, companyId: string, connectionId: string, userId: string | null, localTrusted: boolean) {
+  const [connection] = await db.select().from(toolConnections).where(and(eq(toolConnections.companyId, companyId), eq(toolConnections.id, connectionId)));
+  if (!connection || !connection.enabled || connection.status !== "active" || asRecord(connection.config).sourceTemplateKey !== "github") {
+    throw forbidden("GitHub connection is unavailable. Choose a connection you can use.");
+  }
+  const [membership] = userId ? await db.select().from(companyMemberships).where(and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.principalId, userId), eq(companyMemberships.principalType, "user"), eq(companyMemberships.status, "active"))) : [];
+  if (!localTrusted && (!membership || membership.membershipRole === "viewer")) throw forbidden("GitHub access requires an active company member.");
+  const grants = await db.select().from(connectionGrants).where(and(eq(connectionGrants.companyId, companyId), eq(connectionGrants.connectionId, connectionId)));
+  const members = await db.select().from(connectionGrantMembers).where(eq(connectionGrantMembers.companyId, companyId));
+  const candidates = grants.filter(grant => !(grant.kind === "organization" && ["per_user", "per_agent"].includes(connection.credentialPolicy)) && canBrowseProjectRepositoryGrant({
+    grant, userId, activeMember: localTrusted || Boolean(membership), audience: members.filter(member => member.grantId === grant.id).map(member => member.subjectId),
+  }));
+  const allowed: typeof candidates = [];
+  for (const grant of candidates) {
+    const ref = grant.credentialSecretRefs.find(ref => ref.configPath === "oauth.access_token" || /authorization|token|api_key/i.test(ref.configPath));
+    if (!ref) continue;
+    try {
+      await validateConnectionGrantSecretOwnership(db, connection, grant, ref);
+      allowed.push(grant);
+    } catch (error) {
+      if (!(error instanceof HttpError && asRecord(error.details).code === "grant_credential_invalid")) throw error;
+    }
+  }
+  const legacyShared = !grants.length && connection.credentialPolicy === "shared";
+  if (!allowed.length && !legacyShared) throw forbidden("Choose a GitHub connection with an active authorization you can use.");
+  return { connection, allowed, legacyShared };
+}
+
 export function toolAccessService(
   db: Db,
   options: ToolAccessServiceOptions = {},
@@ -2982,27 +3056,23 @@ export function toolAccessService(
     if (!ref) return publicEndpoint;
     let value: string;
     try {
-      value = await secrets.resolveSecretValue(
-        connection.companyId,
-        ref.secretId,
-        ref.version ?? "latest",
-        {
-          consumerType: "tool_connection",
-          consumerId: connection.id,
-          configPath: REMOTE_URL_SECRET_CONFIG_PATH,
-          actorType: actor?.actorType ?? "system",
-          actorId: actor?.actorId ?? null,
-        },
-      );
-    } catch {
-      throw unprocessable(
-        "A configured credential secret could not be resolved.",
-        {
-          code: "mcp_remote_missing_secret",
-          connectionId: connection.id,
-          credential: REMOTE_URL_SECRET_CONFIG_PATH,
-        },
-      );
+      const grant = await vaultGrantForConnection(connection, actor);
+      const grantRef = grant ? connectionGrantCredentialRef(grant, ref) : undefined;
+      if (grant && !grantRef) throw unprocessable("Your MCP URL credential is missing. Reconnect this connection.", {
+        code: "grant_credential_invalid", connectionId: connection.id, grantId: grant.id,
+      });
+      value = grant && grantRef
+        ? (await resolveOAuthGrantSecret(connection, grant, grantRef, actor, undefined)).value
+        : await secrets.resolveSecretValue(connection.companyId, ref.secretId, ref.version ?? "latest", {
+            consumerType: "tool_connection", consumerId: connection.id,
+            configPath: REMOTE_URL_SECRET_CONFIG_PATH,
+            actorType: actor?.actorType ?? "system", actorId: actor?.actorId ?? null,
+          });
+    } catch (error) {
+      if (error instanceof HttpError) throw error;
+      throw unprocessable("Your MCP URL credential could not be resolved. Reconnect this connection.", {
+        code: "mcp_remote_missing_secret", connectionId: connection.id, credential: REMOTE_URL_SECRET_CONFIG_PATH,
+      });
     }
     if (!remoteUrlCredentialMatchesPublicUrl(publicEndpoint, value)) {
       throw unprocessable(
@@ -3502,7 +3572,9 @@ export function toolAccessService(
   function assertLocalStdioCanBeEnabled(
     transport: ToolConnectionTransport,
     enabled: boolean,
+    config: Record<string, unknown> = {},
   ) {
+    if (config.templateId === "paperclip.cognee-cloud") return;
     if (
       transport === "local_stdio" &&
       enabled &&
@@ -5796,150 +5868,7 @@ export function toolAccessService(
     grantSecretRefs: ToolCredentialSecretRef[] = [],
     dbClient: ToolAccessMutationDb = db,
   ) {
-    await dbClient
-      .delete(companySecretBindings)
-      .where(
-        and(
-          eq(companySecretBindings.companyId, connection.companyId),
-          eq(companySecretBindings.targetType, "tool_connection"),
-          eq(companySecretBindings.targetId, connection.id),
-        ),
-      );
-    // A metadata edit or pause/resume must retain declarations for every
-    // active personal/dedicated grant, not just connection-owned credentials.
-    const activeGrants = await dbClient
-      .select({ refs: connectionGrants.credentialSecretRefs })
-      .from(connectionGrants)
-      .where(
-        and(
-          eq(connectionGrants.companyId, connection.companyId),
-          eq(connectionGrants.connectionId, connection.id),
-          eq(connectionGrants.status, "active"),
-        ),
-      );
-    const rawBindings = [
-      ...connection.credentialRefs.map((ref) => ({
-        secretId: ref.secretId,
-        configPath: credentialRefConfigPath(ref),
-        projectionClass: "unclassified",
-        projectionAllowlistKey: null,
-        required: true,
-        label: null,
-      })),
-      ...[
-        ...connection.credentialSecretRefs,
-        ...grantSecretRefs,
-        ...activeGrants.flatMap((grant) => grant.refs),
-      ].map((ref) => ({
-        secretId: ref.secretId,
-        configPath: ref.configPath,
-        projectionClass: ref.projectionClass ?? "unclassified",
-        projectionAllowlistKey: ref.projectionAllowlistKey ?? null,
-        required: ref.required ?? true,
-        label: ref.label ?? null,
-      })),
-    ];
-    // Organization grants can mirror connection-owned credentials, and more
-    // than one personal grant can reference the same client registration.
-    // Binding rows are unique per secret/config path, so collapse those mirrors
-    // before replacing the durable projection declarations.
-    const bindings = [
-      ...new Map(
-        rawBindings.map((ref) => [`${ref.secretId}:${ref.configPath}`, ref]),
-      ).values(),
-    ];
-    const secretRows =
-      bindings.length > 0
-        ? await dbClient
-            .select({
-              id: companySecrets.id,
-              scope: companySecrets.scope,
-              userSecretDefinitionId: companySecrets.userSecretDefinitionId,
-            })
-            .from(companySecrets)
-            .where(
-              and(
-                eq(companySecrets.companyId, connection.companyId),
-                inArray(companySecrets.id, [
-                  ...new Set(bindings.map((ref) => ref.secretId)),
-                ]),
-              ),
-            )
-        : [];
-    const secretById = new Map(secretRows.map((row) => [row.id, row]));
-    const definitionIds = [
-      ...new Set(
-        secretRows.flatMap((row) =>
-          row.userSecretDefinitionId ? [row.userSecretDefinitionId] : [],
-        ),
-      ),
-    ];
-    const definitions =
-      definitionIds.length > 0
-        ? await dbClient
-            .select({
-              id: userSecretDefinitions.id,
-              key: userSecretDefinitions.key,
-            })
-            .from(userSecretDefinitions)
-            .where(
-              and(
-                eq(userSecretDefinitions.companyId, connection.companyId),
-                inArray(userSecretDefinitions.id, definitionIds),
-              ),
-            )
-        : [];
-    const definitionKeyById = new Map(
-      definitions.map((row) => [row.id, row.key]),
-    );
-    const userDeclarations = [
-      ...new Map(
-        bindings
-          .flatMap((ref) => {
-            const secret = secretById.get(ref.secretId);
-            const definitionKey =
-              secret?.scope === "user" && secret.userSecretDefinitionId
-                ? definitionKeyById.get(secret.userSecretDefinitionId)
-                : null;
-            return definitionKey
-              ? [
-                  {
-                    definitionKey,
-                    configPath: ref.configPath,
-                    envKey: ref.configPath,
-                    versionSelector: "latest" as const,
-                    required: ref.required,
-                    label: ref.label,
-                  },
-                ]
-              : [];
-          })
-          .map((ref) => [`${ref.definitionKey}:${ref.configPath}`, ref]),
-      ).values(),
-    ];
-    await secrets.syncUserSecretDeclarationsForTarget(
-      connection.companyId,
-      { targetType: "tool_connection", targetId: connection.id },
-      userDeclarations,
-      { replaceAll: true, db: dbClient },
-    );
-    const companyBindings = bindings.filter(
-      (ref) => secretById.get(ref.secretId)?.scope !== "user",
-    );
-    if (companyBindings.length === 0) return;
-    await dbClient.insert(companySecretBindings).values(
-      companyBindings.map((ref) => ({
-        companyId: connection.companyId,
-        secretId: ref.secretId,
-        targetType: "tool_connection" as const,
-        targetId: connection.id,
-        configPath: ref.configPath,
-        required: ref.required,
-        label: ref.label,
-        projectionClass: ref.projectionClass,
-        projectionAllowlistKey: ref.projectionAllowlistKey,
-      })),
-    );
+    await syncConnectionCredentialBindings(db, connection, grantSecretRefs, dbClient);
   }
 
   /**
@@ -5951,8 +5880,8 @@ export function toolAccessService(
    * target. Two independent tests have to agree before a secret is destroyed:
    *
    * 1. Provenance — the key sits in the `tool_app.` namespace only the
-   *    connect/reconnect/OAuth paths mint, and the row is a company-scoped
-   *    Paperclip secret rather than a per-user credential.
+   *    connect/reconnect/OAuth paths mint, or its user-secret definition does.
+   *    Personal definitions must also have no declarations on other targets.
    * 2. Exclusivity — nothing outside this connection references it: no
    *    `company_secret_bindings` row from another target, and no other
    *    connection or connection grant naming the same secret id.
@@ -5990,7 +5919,7 @@ export function toolAccessService(
       );
     const byId = new Map(secretRows.map((row) => [row.id, row]));
 
-    const referencedElsewhere = new Set<string>();
+    const referencedElsewhere = await connectionSecretsUsedByOtherConsumers(db, unique);
     const foreignBindings = await db
       .select({ secretId: companySecretBindings.secretId })
       .from(companySecretBindings)
@@ -6038,6 +5967,15 @@ export function toolAccessService(
         referencedElsewhere.add(ref.secretId);
     }
 
+    const definitionIds = secretRows.flatMap((row) => row.userSecretDefinitionId ? [row.userSecretDefinitionId] : []);
+    const definitions = definitionIds.length ? await db.select().from(userSecretDefinitions)
+      .where(and(eq(userSecretDefinitions.companyId, connection.companyId), inArray(userSecretDefinitions.id, definitionIds))) : [];
+    const dedicatedDefinitions = new Set(definitions.filter((row) => row.key.startsWith(CONNECTION_OWNED_SECRET_KEY_PREFIX) || row.key.startsWith(`tool_oauth.${connection.id}.`)).map((row) => row.id));
+    const foreignDeclarations = definitionIds.length ? await db.select().from(userSecretDeclarations).where(and(
+      inArray(userSecretDeclarations.userSecretDefinitionId, definitionIds),
+      sql`not (${userSecretDeclarations.targetType} = 'tool_connection' and ${userSecretDeclarations.targetId} = ${connection.id})`,
+    )) : [];
+    const sharedDefinitions = new Set(foreignDeclarations.map((row) => row.userSecretDefinitionId));
     const owned: string[] = [];
     const retained: string[] = [];
     for (const secretId of unique) {
@@ -6049,10 +5987,10 @@ export function toolAccessService(
         owned.push(secretId);
         continue;
       }
-      const dedicated =
-        row.scope === "company" &&
-        row.userSecretDefinitionId === null &&
-        row.key.startsWith(CONNECTION_OWNED_SECRET_KEY_PREFIX);
+      const dedicated = row.scope === "user" && row.userSecretDefinitionId
+        ? dedicatedDefinitions.has(row.userSecretDefinitionId) && !sharedDefinitions.has(row.userSecretDefinitionId)
+        : row.scope === "company" && row.userSecretDefinitionId === null
+          && row.key.startsWith(CONNECTION_OWNED_SECRET_KEY_PREFIX);
       if (dedicated && !referencedElsewhere.has(secretId)) owned.push(secretId);
       else retained.push(secretId);
     }
@@ -6412,6 +6350,13 @@ export function toolAccessService(
 
       return { connection: updatedConnection, applicationArchived };
     });
+    emitConnectionUpdated(archived.connection, connection, "archive");
+
+    // Hosted work needs its credential to stop. Agent/viewer access is already
+    // revoked above; retain cleanup authority until provider shutdown confirms.
+    if (isBrowserUseConnection(connection)) {
+      await browserUseService(db, options.remoteHttpRequest).stopBeforeCredentialRemoval(connection.companyId, connection.id);
+    }
 
     // Only now, with every access path closed, revoke the credentials. Each
     // `secrets.remove` marks the row deleted before it calls the provider, so a
@@ -6488,7 +6433,7 @@ export function toolAccessService(
   async function ensureRuntimeSlot(
     connection: typeof toolConnections.$inferSelect,
   ): Promise<ToolRuntimeSlot | null> {
-    if (connection.transport !== "local_stdio") return null;
+    if (connection.transport !== "local_stdio" || connection.config.templateId === "paperclip.cognee-cloud") return null;
     const slotKey = `mcp:${connection.companyId}:${connection.id}`;
     const [existing] = await db
       .select()
@@ -6570,6 +6515,16 @@ export function toolAccessService(
         .limit(2);
       if (personalGrants.length === 1) return personalGrants[0]!;
     }
+    if (connection.credentialPolicy === "per_user") {
+      throw unprocessable(
+        "This connection needs the current user's authorization",
+        {
+          code: "user_authorization_required",
+          setupUrl: connectionSetupUrl(connection),
+          reconnectUrl: connectionReconnectUrl(connection),
+        },
+      );
+    }
     const [organization] = await db
       .select()
       .from(connectionGrants)
@@ -6583,16 +6538,6 @@ export function toolAccessService(
       )
       .limit(1);
     if (organization?.status === "active") return organization;
-    if (connection.credentialPolicy === "per_user") {
-      throw unprocessable(
-        "This connection needs the current user's authorization",
-        {
-          code: "user_authorization_required",
-          setupUrl: connectionSetupUrl(connection),
-          reconnectUrl: connectionReconnectUrl(connection),
-        },
-      );
-    }
     return null;
   }
 
@@ -6649,12 +6594,14 @@ export function toolAccessService(
     const headers: Record<string, string> = {};
     const scope = credentialScope(connection);
     for (const ref of connection.credentialRefs) {
+      if (ref.placement !== "header") continue;
       let value: string;
       const configPath = credentialRefConfigPath(ref);
       try {
-        const grantRef = grant?.credentialSecretRefs.find(
-          (candidate) => candidate.configPath === configPath,
-        );
+        const grantRef = grant ? connectionGrantCredentialRef(grant, ref) : undefined;
+        if (grant && !grantRef) throw unprocessable("Your credential is missing. Reconnect this connection.", {
+          code: "grant_credential_invalid", connectionId: connection.id, grantId: grant.id, credential: configPath,
+        });
         value =
           grantRef && grant
             ? (
@@ -6822,6 +6769,10 @@ export function toolAccessService(
           ),
         );
     }
+    if (isInsufficientConnectionScope(response)) {
+      await response.body?.cancel().catch(() => undefined);
+      throw unprocessable(INSUFFICIENT_CONNECTION_SCOPE_MESSAGE, { code: "oauth_insufficient_scope", connectionId: connection.id });
+    }
     if (
       response.status === 401 &&
       connection.credentialSource === "vercel_connect"
@@ -6875,6 +6826,16 @@ export function toolAccessService(
       }
     }
     if (!response.ok) {
+      if ((response.status === 401 || response.status === 403)
+        && connection.authKind === "api_key" && isMemoryConnectorId(connection.config.sourceTemplateKey)) {
+        throw unprocessable("The provider rejected this API key. Check the key and its account access, then try again.", { code: "memory_api_key_rejected" });
+      }
+      if (await isSlackMcpAccessDisabledResponse(endpoint, response)) {
+        throw unprocessable(
+          "Slack MCP access is disabled for this app. Ask the Slack app owner to enable MCP access, then refresh this connection.",
+          { code: "slack_mcp_access_disabled", setupUrl: connectionSetupUrl(connection) },
+        );
+      }
       const authenticate = response.headers.get("www-authenticate") ?? "";
       if (
         response.status === 401 &&
@@ -6920,7 +6881,7 @@ export function toolAccessService(
             })
             .where(eq(toolConnections.id, connection.id));
         }
-        throw new HttpError(502, "This app needs you to sign in.", {
+        throw unprocessable("This app needs you to sign in.", {
           code: "oauth_challenge",
           status: response.status,
           setupUrl: connectionSetupUrl(connection),
@@ -6974,6 +6935,34 @@ export function toolAccessService(
     connection.config = nextConfig;
     connection.transportConfig = nextConfig;
     return apiStatus === "available" ? [...descriptors, ...RAILWAY_TOOLS] : descriptors;
+  }
+
+  async function validateCogneeConnection(connection: typeof toolConnections.$inferSelect, actor?: ActorInfo, probe = true) {
+    if (connection.config.templateId !== "paperclip.cognee-cloud") return;
+    const grant = await vaultGrantForConnection(connection, actor);
+    const refs = grant?.credentialSecretRefs ?? connection.credentialSecretRefs;
+    const values: Record<string, string> = {};
+    for (const key of COGNEE_STDIO_TEMPLATE.envKeys) {
+      const ref = refs.find((candidate) => candidate.configPath === `env.${key}`);
+      if (!ref) throw unprocessable("Reconnect Cognee to restore its Cloud credentials", { code: "missing_secret" });
+      values[key] = grant
+        ? (await resolveOAuthGrantSecret(connection, grant, ref, actor, undefined)).value
+        : await secrets.resolveSecretValue(connection.companyId, ref.secretId, ref.versionSelector ?? "latest", {
+            consumerType: "tool_connection", consumerId: connection.id, configPath: ref.configPath,
+            actorType: "system", actorId: null,
+          });
+    }
+    let base: URL;
+    try { base = cogneeCloudUrl(values.COGNEE_BASE_URL!); }
+    catch { throw badRequest("Copy the tenant API Base URL from Cognee’s API Keys page."); }
+    // Scheduled health checks validate configuration and vault access. A transient
+    // Cloud probe must not withdraw an already assigned local tool catalog.
+    if (!probe) return;
+    const response = await requestRemoteHttpEndpoint(new URL("/api/v1/datasets/", base), {
+      method: "GET", headers: { "X-Api-Key": values.COGNEE_API_KEY! }, signal: AbortSignal.timeout(15_000),
+    });
+    await response.body?.cancel();
+    if (!response.ok) throw unprocessable("Cognee Cloud could not verify access. Check the tenant URL, API key, and workspace subscription.", { code: "cognee_access_unverified" });
   }
 
   async function localTools(
@@ -7038,6 +7027,11 @@ export function toolAccessService(
   ): Promise<McpToolDescriptor[]> {
     assertSupportedConnection(connection);
     if (connection.connectionPurpose === "ai") throw unprocessable("AI connections provide runtime authentication, not tool actions");
+    if (isBrowserUseConnection(connection)) {
+      const headers = credentialHeaders ?? await resolveCredentialHeaders(connection, actor);
+      await browserUseClient(headers, (url, init) => requestRemoteHttpEndpoint(new URL(url), init), connection.id).probe();
+      return BROWSER_USE_TOOLS;
+    }
     if (isAgentMailConnection(connection)) {
       await validateAgentMailConnection(connection);
       return [];
@@ -7048,6 +7042,7 @@ export function toolAccessService(
       throw unsupportedToolConnectionTransport();
     }
     await resolveCredentialHeaders(connection);
+    await validateCogneeConnection(connection, actor);
     return localTools(connection);
   }
 
@@ -7367,6 +7362,8 @@ export function toolAccessService(
           });
         for (const grant of grantsToCheck)
           await refreshManagedGitHubGrantAccess(connection, grant, actor);
+      } else if (isBrowserUseConnection(connection)) {
+        await discoverTools(connection, undefined, actor);
       } else if (isAgentMailConnection(connection)) {
         await validateAgentMailConnection(connection);
       } else if (connection.transport === "mcp_remote") {
@@ -7397,6 +7394,7 @@ export function toolAccessService(
       } else if (connection.transport === "local_stdio") {
         await resolveCredentialHeaders(connection);
         await stdioTemplateId(connection.companyId, connection.config);
+        await validateCogneeConnection(connection, actor, false);
       } else {
         throw unsupportedToolConnectionTransport();
       }
@@ -7406,6 +7404,8 @@ export function toolAccessService(
         pluginOkMessage ?? (config.sourceTemplateKey === "github" &&
           oauth.connectorProfile === "github.code"
           ? "GitHub account, installation, and repository access are available."
+          : isBrowserUseConnection(connection)
+            ? "Browser Use API key is connected."
           : isAgentMailConnection(connection)
             ? "AgentMail API key is connected."
             : connection.transport === "local_stdio"
@@ -7704,14 +7704,14 @@ export function toolAccessService(
     if (!refreshOptions.skipDefaultProfileSync || preserveMcpAccess) {
       await enableCatalogEntriesByDefault({
         connection: updatedConnection,
-        newCatalogEntryIds: refreshOptions.enableAllByDefault && !isRemoteMcpConnectorMethod(connection.config.sourceTemplateKey, connection.config.connectionMethodKey)
-          ? activeEntries.map((entry) => entry.id)
-          : activeEntries
-              .filter((entry) => {
-                const previous = existingByName.get(entry.toolName);
-                return !previous || previous.status === "quarantined";
-              })
-              .map((entry) => entry.id),
+        // Discovery must not re-enable actions the operator turned Off,
+        // including curated MCP connections during API-key replacement.
+        newCatalogEntryIds: activeEntries
+          .filter((entry) => {
+            const previous = existingByName.get(entry.toolName);
+            return !previous || previous.status === "quarantined";
+          })
+          .map((entry) => entry.id),
         activeCatalogEntryIds: activeEntries.map((entry) => entry.id),
         restoreDraftDefaults: refreshOptions.restoreDraftDefaults || preserveMcpAccess,
         actor,
@@ -8203,6 +8203,7 @@ export function toolAccessService(
       await ensureDefaultOrganizationGrant(updated);
       await syncCredentialBindings(updated);
       await ensureRuntimeSlot(updated);
+      emitConnectionUpdated(updated, existing, "example");
       return { row: updated, created: false };
     }
     const connectionId = randomUUID();
@@ -8231,6 +8232,7 @@ export function toolAccessService(
     await ensureDefaultOrganizationGrant(created);
     await syncCredentialBindings(created);
     await ensureRuntimeSlot(created);
+    emitConnectionCreated(created, "example");
     return { row: created, created: true };
   }
 
@@ -9228,9 +9230,22 @@ export function toolAccessService(
     const galleryMethod = galleryEntry
       ? connectionMethodForConnection(galleryEntry, connection)
       : null;
+    // Pinned endpoints describe the provider's console-registered OAuth app.
+    // A method that also offers dynamic registration registers against the MCP
+    // server's own authorization server (Linear: mcp.linear.app, not
+    // linear.app), which only discovery finds. So the pins stand in for
+    // discovery only when no registration is possible or the connection
+    // already carries an operator-entered client.
+    const storedOAuth = oauthConfig(connection);
+    const usesOperatorClient =
+      storedOAuth.clientRegistrationSource === "manual" &&
+      connection.ownership !== "dcr" &&
+      typeof storedOAuth.clientId === "string" &&
+      storedOAuth.clientId.trim().length > 0;
     const hasCompleteGalleryEndpointHints = Boolean(
       galleryMethod?.defaults?.authorizationEndpoint &&
-      galleryMethod.defaults.tokenEndpoint,
+      galleryMethod.defaults.tokenEndpoint &&
+      (!galleryMethod.ownershipModes.includes("dcr") || usesOperatorClient),
     );
     // The smoke-lab fixture's endpoints are first-party and complete, so
     // discovery is not just unnecessary there, it must not run: an unreachable
@@ -9294,147 +9309,24 @@ export function toolAccessService(
       ownerUserId?: string;
     },
     context?: {
-      dbClient: ToolAccessMutationDb;
+      dbClient: Db | DbTransaction;
       secretClient: ReturnType<typeof secretService>;
     },
   ) {
-    const dbClient = context?.dbClient ?? db;
-    const secretClient = context?.secretClient ?? secrets;
-    const existing =
-      input.existingRefs === undefined
-        ? oauthSecretRef(input.connection, input.configPath)
-        : input.existingRefs.find((ref) => ref.configPath === input.configPath);
-    if (existing) {
-      await secretClient.rotate(
-        existing.secretId,
-        { value: input.value },
-        actorForSecret(input.actor),
-      );
-      return existing;
-    }
-    if (input.ownerUserId) {
-      const definitionKey = `tool_oauth.${input.connection.id}.${input.configPath.replace(/[^a-z0-9_:-]+/gi, "_")}`;
-      let [definition] = await dbClient
-        .select()
-        .from(userSecretDefinitions)
-        .where(
-          and(
-            eq(userSecretDefinitions.companyId, input.companyId),
-            eq(userSecretDefinitions.key, definitionKey),
-            isNull(userSecretDefinitions.deletedAt),
-          ),
-        )
-        .limit(1);
-      if (!definition) {
-        [definition] = await dbClient
-          .insert(userSecretDefinitions)
-          .values({
-            companyId: input.companyId,
-            key: definitionKey,
-            name: `${input.connection.name} ${input.label}`,
-            description: `Personal OAuth ${input.label.toLowerCase()} for ${input.connection.name}.`,
-            provider: "local_encrypted",
-            managedMode: "paperclip_managed",
-            createdByAgentId:
-              input.actor?.actorType === "agent" ? input.actor.actorId : null,
-            createdByUserId:
-              input.actor?.actorType === "user" ? input.actor.actorId : null,
-          })
-          .onConflictDoNothing()
-          .returning();
-        if (!definition) {
-          [definition] = await dbClient
-            .select()
-            .from(userSecretDefinitions)
-            .where(
-              and(
-                eq(userSecretDefinitions.companyId, input.companyId),
-                eq(userSecretDefinitions.key, definitionKey),
-                isNull(userSecretDefinitions.deletedAt),
-              ),
-            )
-            .limit(1);
-        }
-      }
-      if (!definition)
-        throw new Error("Failed to create personal OAuth secret definition");
-      const [existingUserValue] = await dbClient
-        .select()
-        .from(companySecrets)
-        .where(
-          and(
-            eq(companySecrets.companyId, input.companyId),
-            eq(companySecrets.scope, "user"),
-            eq(companySecrets.ownerUserId, input.ownerUserId),
-            eq(companySecrets.userSecretDefinitionId, definition.id),
-            ne(companySecrets.status, "deleted"),
-          ),
-        )
-        .limit(1);
-      if (existingUserValue) {
-        // A removed/revoked grant can predate credential cleanup and therefore
-        // lose its ref while its deterministic owner value remains. Reconnect
-        // is explicit fresh consent, so revive that owner-bound value and
-        // rotate it instead of colliding with the one-value-per-definition
-        // constraint.
-        if (existingUserValue.status !== "active") {
-          await secretClient.updateCurrentUserSecretValue(
-            input.companyId,
-            input.ownerUserId,
-            existingUserValue.id,
-            { status: "active" },
-            actorForSecret(input.actor),
-          );
-        }
-        const secret = await secretClient.rotateCurrentUserSecretValue(
-          input.companyId,
-          input.ownerUserId,
-          existingUserValue.id,
-          { value: input.value },
-          actorForSecret(input.actor),
-        );
-        return {
-          secretId: secret.id,
-          versionSelector: "latest" as const,
-          configPath: input.configPath,
-          required: input.configPath === "oauth.access_token",
-          label: input.label,
-        };
-      }
-      const secret = await secretClient.createCurrentUserSecretValue(
-        input.companyId,
-        input.ownerUserId,
-        {
-          definitionId: definition.id,
-          value: input.value,
-        },
-        actorForSecret(input.actor),
-      );
-      return {
-        secretId: secret.id,
-        versionSelector: "latest" as const,
-        configPath: input.configPath,
-        required: input.configPath === "oauth.access_token",
-        label: input.label,
-      };
-    }
-    const secret = await secretClient.create(
-      input.companyId,
-      {
-        name: `${input.connection.name} ${input.label} ${randomUUID().slice(0, 8)}`,
-        key: `tool_app.${randomUUID()}.${input.configPath.replace(/[^a-z0-9_:-]+/gi, "_")}`,
-        provider: "local_encrypted",
-        value: input.value,
-        description: `OAuth ${input.label.toLowerCase()} for ${input.connection.name}.`,
-      },
-      actorForSecret(input.actor),
-    );
+    const existing = input.existingRefs === undefined
+      ? oauthSecretRef(input.connection, input.configPath)
+      : input.existingRefs.find((ref) => ref.configPath === input.configPath);
+    const write = (client: Db | DbTransaction) => writeConnectionCredential(client, {
+      companyId: input.companyId, connectionName: input.connection.name, configPath: input.configPath,
+      label: input.label, value: input.value, existingRef: existing ?? undefined, actor: actorForSecret(input.actor),
+      // Registration authenticates the OAuth client, never the person invoking tools.
+      ownerUserId: input.configPath === "oauth.client_secret" ? undefined : input.ownerUserId,
+      definitionKey: input.ownerUserId ? `tool_oauth.${input.connection.id}.${input.configPath.replace(/[^a-z0-9_:-]+/gi, "_")}` : undefined,
+    });
+    const { secret } = context ? await write(context.dbClient) : await db.transaction(write);
     return {
-      secretId: secret.id,
-      versionSelector: "latest" as const,
-      configPath: input.configPath,
-      required: input.configPath === "oauth.access_token",
-      label: input.label,
+      secretId: secret.id, versionSelector: "latest" as const, configPath: input.configPath,
+      required: input.configPath === "oauth.access_token", label: input.label,
     };
   }
 
@@ -10077,6 +9969,13 @@ export function toolAccessService(
    * connection may register once — and only once — protected-resource and
    * authorization-server discovery actually produced a metadata document; an
    * endpoint that merely returned a 401 does not earn a registration.
+   *
+   * A curated method pinned to customer-owned clients still earns a registration
+   * when the provider's own metadata advertises one. `ownershipModes` is a
+   * point-in-time research snapshot, and providers add dynamic registration
+   * without telling us; live discovery is the better evidence of the two, so a
+   * stale catalog entry costs the operator a console detour rather than silently
+   * outranking what the server just said about itself.
    */
   function canRegisterOAuthClientDynamically(
     connection: typeof toolConnections.$inferSelect,
@@ -10084,10 +9983,9 @@ export function toolAccessService(
     galleryEntry: AppDefinition | null,
   ): boolean {
     if (galleryEntry) {
-      return connectionMethodForConnection(
-        galleryEntry,
-        connection,
-      ).ownershipModes.includes("dcr");
+      const method = connectionMethodForConnection(galleryEntry, connection);
+      if (method.ownershipModes.includes("dcr")) return true;
+      return method.auth === "oauth" && Boolean(endpoints.registrationUrl);
     }
     return (
       connection.transport === "mcp_remote" && Boolean(endpoints.metadataUrl)
@@ -10573,7 +10471,10 @@ export function toolAccessService(
         ),
       )
       .returning();
-    if (updated) await syncCredentialBindings(updated);
+    if (updated) {
+      await syncCredentialBindings(updated);
+      emitConnectionUpdated(updated, connection, "credential_refresh");
+    }
     return updated ?? null;
   }
 
@@ -10882,74 +10783,11 @@ export function toolAccessService(
     accessContext:
       { issueId?: string | null; heartbeatRunId?: string | null } | undefined,
   ) {
-    const [secret] = await db
-      .select({
-        scope: companySecrets.scope,
-        ownerUserId: companySecrets.ownerUserId,
-        userSecretDefinitionId: companySecrets.userSecretDefinitionId,
-        latestVersion: companySecrets.latestVersion,
-      })
-      .from(companySecrets)
-      .where(
-        and(
-          eq(companySecrets.id, ref.secretId),
-          eq(companySecrets.companyId, connection.companyId),
-        ),
-      )
-      .limit(1);
-    if (!secret) throw notFound("OAuth credential secret not found");
-    const consumerContext = {
-      consumerType: "tool_connection" as const,
-      consumerId: connection.id,
-      configPath: ref.configPath,
-      actorType: actor?.actorType ?? ("system" as const),
-      actorId: actor?.actorId ?? null,
-      responsibleUserId: grant.subjectUserId,
-      issueId: accessContext?.issueId,
-      heartbeatRunId: accessContext?.heartbeatRunId,
-    };
-    if (secret.scope !== "user") {
-      return {
-        value: await secrets.resolveSecretValue(
-          connection.companyId,
-          ref.secretId,
-          ref.versionSelector ?? "latest",
-          consumerContext,
-        ),
-        latestVersion: secret.latestVersion,
-      };
-    }
-    if (
-      grant.kind !== "user" ||
-      !grant.subjectUserId ||
-      secret.ownerUserId !== grant.subjectUserId ||
-      !secret.userSecretDefinitionId
-    ) {
-      throw unprocessable("Personal authorization has an invalid credential", {
-        code: "grant_credential_invalid",
-        connectionId: connection.id,
-        grantId: grant.id,
-        credential: ref.configPath,
-      });
-    }
-    const resolved = await secrets.resolveUserSecretValue(
-      connection.companyId,
-      {
-        definitionId: secret.userSecretDefinitionId,
-        responsibleUserId: grant.subjectUserId,
-        version: ref.versionSelector ?? "latest",
-        required: ref.required ?? true,
-      },
-      consumerContext,
-    );
-    if (!resolved)
-      throw unprocessable("Personal OAuth credential is not configured", {
-        code: "user_secret_missing",
-        connectionId: connection.id,
-        grantId: grant.id,
-        credential: ref.configPath,
-      });
-    return { value: resolved.value, latestVersion: secret.latestVersion };
+    return resolveConnectionGrantSecret(db, connection, grant, ref, {
+      consumerType: "tool_connection", consumerId: connection.id,
+      actorType: actor?.actorType ?? "system", actorId: actor?.actorId ?? null,
+      issueId: accessContext?.issueId, heartbeatRunId: accessContext?.heartbeatRunId,
+    });
   }
 
   async function clearOAuthGrantRefreshLease(
@@ -11461,6 +11299,11 @@ export function toolAccessService(
                 )
                 .returning();
               await syncCredentialBindings(reauthorizationRequired);
+              emitConnectionUpdated(
+                reauthorizationRequired,
+                latestConnection,
+                "credential_refresh",
+              );
             } else {
               const activeGrantRefs = await db
                 .select({
@@ -11989,12 +11832,10 @@ export function toolAccessService(
     return `${base.slice(0, 151).trimEnd()} (${randomUUID().slice(0, 6)})`;
   }
 
-  async function assertMcpAggregatorSetupEnabled(provider: unknown, method: unknown) {
-    if (isRemoteMcpConnectorMethod(provider, method)
-      && !(await instanceSettingsService(db).getExperimental()).enableMcpAggregators) {
-      throw forbidden("Enable MCP aggregators in Settings → Experimental to set up this connection", {
-        code: "mcp_aggregators_disabled",
-      });
+  async function assertExperimentalConnectorSetupEnabled(provider: unknown, existing = false) {
+    if (!existing && isMemoryConnectorId(provider)
+      && !(await instanceSettingsService(db).getExperimental()).enableMemoryConnectors) {
+      throw forbidden("Enable memory connectors in Settings → Experimental to set up this connection", { code: "memory_connectors_disabled" });
     }
   }
 
@@ -12146,7 +11987,10 @@ export function toolAccessService(
       ? connectionMethodFor(galleryEntry, inferredMethodKey)
       : null;
     const remoteMcpConnector = isRemoteMcpConnectorMethod(galleryEntry?.slug, method?.key);
-    await assertMcpAggregatorSetupEnabled(galleryEntry?.slug, method?.key);
+    await assertExperimentalConnectorSetupEnabled(galleryEntry?.slug, Boolean(
+      input.reconnectConnectionId && requestedResumeConnection?.status !== "draft"
+      && requestedResumeConnection?.config.sourceTemplateKey === galleryEntry?.slug,
+    ));
     if (galleryEntry && input.link) {
       const acceptsProviderGeneratedUrl =
         method?.transport === "mcp_remote" &&
@@ -12466,7 +12310,7 @@ export function toolAccessService(
         ? splitRemoteUrlCredential(input.link)
         : null;
     const baseConfig =
-      transport === "mcp_remote"
+      (transport === "mcp_remote" || transport === "rest_api")
         ? {
             url:
               (remoteMcpConnector ? remoteUrlCredential?.publicUrl : undefined) ??
@@ -12574,6 +12418,7 @@ export function toolAccessService(
       [];
     const credentialRefs: McpConnectionCredentialRef[] = [];
     const createdSecretIds: string[] = [];
+    const createdDefinitionIds: string[] = [];
     // "Just me" needs a named board user to own the consent. An agent actor
     // cannot hold a personal identity, and silently falling back to a shared
     // credential is exactly the mis-scoping the design forbids, so refuse.
@@ -12669,17 +12514,13 @@ export function toolAccessService(
           throw badRequest(`Missing credential value for ${field.configPath}`);
         }
         if (!value) continue;
-        const secret = await secrets.create(
-          companyId,
-          {
-            name: `${name} ${field.label} ${randomUUID().slice(0, 8)}`,
-            key: `tool_app.${randomUUID()}.${field.configPath.replace(/[^a-z0-9_:-]+/gi, "_")}`,
-            provider: "local_encrypted",
-            value,
-            description: `Credential for ${name} (${field.configPath}).`,
-          },
-          actorForSecret(actor),
-        );
+        const written = await db.transaction((tx) => writeConnectionCredential(tx, {
+          companyId, connectionName: name, configPath: field.configPath,
+          label: field.label, value, ownerUserId: personalIdentityUserId,
+          actor: actorForSecret(actor),
+        }));
+        const { secret } = written;
+        if (written.definitionId) createdDefinitionIds.push(written.definitionId);
         createdSecretIds.push(secret.id);
         credentialSecretRefs.push({
           secretId: secret.id,
@@ -12708,17 +12549,13 @@ export function toolAccessService(
         }
       }
       if (remoteUrlCredential?.secretUrl) {
-        const secret = await secrets.create(
-          companyId,
-          {
-            name: `${name} MCP server URL ${randomUUID().slice(0, 8)}`,
-            key: `tool_app.${randomUUID()}.remote_url`,
-            provider: "local_encrypted",
-            value: remoteUrlCredential.secretUrl,
-            description: `Credential-bearing MCP server URL for ${name}.`,
-          },
-          actorForSecret(actor),
-        );
+        const written = await db.transaction((tx) => writeConnectionCredential(tx, {
+          companyId, connectionName: name, configPath: REMOTE_URL_SECRET_CONFIG_PATH,
+          label: "MCP server URL", value: remoteUrlCredential.secretUrl!,
+          ownerUserId: personalIdentityUserId, actor: actorForSecret(actor),
+        }));
+        const { secret } = written;
+        if (written.definitionId) createdDefinitionIds.push(written.definitionId);
         createdSecretIds.push(secret.id);
         credentialSecretRefs.push({
           secretId: secret.id,
@@ -12808,7 +12645,7 @@ export function toolAccessService(
                 applicationKey: `app-gallery:${galleryEntry?.slug ?? "link"}:${randomUUID()}`,
                 name: applicationName,
                 description: safeApplicationDescription,
-                type: transport === "mcp_remote" ? "mcp_http" : "mcp_stdio",
+                type: transport === "rest_api" && galleryEntry?.slug === "browser-use-cloud" ? "rest_api" : transport === "mcp_remote" ? "mcp_http" : "mcp_stdio",
                 status: "draft",
                 metadata: galleryEntry
                   ? {
@@ -12910,6 +12747,15 @@ export function toolAccessService(
           })
           .returning();
       }
+      if (revivedConnectionPrevious) {
+        emitConnectionUpdated(
+          connectionRow,
+          revivedConnectionPrevious,
+          "gallery",
+        );
+      } else {
+        emitConnectionCreated(connectionRow, "gallery");
+      }
       if (personalIdentityUserId) {
         // "Just me" (PAP-17835 seam #4). The credential is committed straight to
         // the caller's own grant; the connection row keeps only the header
@@ -12933,11 +12779,17 @@ export function toolAccessService(
           let changedGrant: typeof connectionGrants.$inferSelect;
           let previousGrant: typeof connectionGrants.$inferSelect | null = null;
           if (retainedPersonalIdentity?.grant) {
-            const [currentGrant] = await db
-              .select()
+            const [grantSnapshot] = await db
+              .select({
+                grant: connectionGrants,
+                // Preserve PostgreSQL microseconds for the optimistic update;
+                // a JavaScript Date truncates them and falsely reports a race.
+                updatedAtVersion: sql<string>`${connectionGrants.updatedAt}::text`,
+              })
               .from(connectionGrants)
               .where(eq(connectionGrants.id, retainedPersonalIdentity.grant.id))
               .limit(1);
+            const currentGrant = grantSnapshot?.grant;
             if (!currentGrant)
               throw conflict(
                 "The personal credential changed during setup. Please try again.",
@@ -12956,7 +12808,7 @@ export function toolAccessService(
               .where(
                 and(
                   eq(connectionGrants.id, currentGrant.id),
-                  eq(connectionGrants.updatedAt, currentGrant.updatedAt),
+                  sql`${connectionGrants.updatedAt} = ${grantSnapshot!.updatedAtVersion}::timestamptz`,
                 ),
               )
               .returning();
@@ -13408,6 +13260,9 @@ export function toolAccessService(
       if (!preserveConcurrentRevival) {
         for (const secretId of createdSecretIds) {
           await secrets.remove(secretId).catch(() => undefined);
+        }
+        for (const definitionId of createdDefinitionIds) {
+          await db.delete(userSecretDefinitions).where(eq(userSecretDefinitions.id, definitionId)).catch(() => undefined);
         }
       }
       if (identityRollbackError) {
@@ -13935,6 +13790,11 @@ export function toolAccessService(
 
       return { profileId, profileBindings, policies, updatedConnection };
     });
+    emitConnectionUpdated(
+      transactionResult.updatedConnection,
+      connection,
+      "gallery",
+    );
 
     const details = await profileDetails(
       transactionResult.profileId,
@@ -14044,7 +13904,7 @@ export function toolAccessService(
   ): Promise<ToolConnectionHealthCheckResult> {
     const connection = await getConnectionRow(connectionId, companyId);
     assertSupportedConnection(connection);
-    await assertMcpAggregatorSetupEnabled(connection.config.sourceTemplateKey, connection.config.connectionMethodKey);
+    await assertExperimentalConnectorSetupEnabled(connection.config.sourceTemplateKey, connection.status !== "draft");
     if (connection.status === "archived")
       throw conflict("Archived app connections cannot be reconnected");
     if (connection.credentialSource === "vercel_connect") {
@@ -14063,12 +13923,23 @@ export function toolAccessService(
     const galleryEntry = sourceTemplateKey
       ? getConnectableAppDefinition(sourceTemplateKey)
       : null;
-    const credentialFields = galleryEntry
-      ? credentialFieldsFor(
-          galleryEntry,
-          connectionMethodForConnection(galleryEntry, connection).key,
-        )
-      : [
+    const storedCredentialFields = connection.credentialRefs
+      .filter((ref) => ref.placement === "header" || ref.placement === "url")
+      .map((ref) => ({
+        label: ref.placement === "url" ? "MCP server URL" : ref.prefix === "Bearer " ? "App key" : ref.key ?? ref.name,
+        configPath: credentialRefConfigPath(ref),
+        helpUrl: "",
+        required: false,
+        placement: ref.placement,
+        key: ref.key,
+        prefix: ref.prefix,
+      }));
+    const galleryCredentialFields = galleryEntry
+      ? credentialFieldsFor(galleryEntry, connectionMethodForConnection(galleryEntry, connection).key)
+      : [];
+    const credentialFields = galleryCredentialFields.length > 0
+      ? galleryCredentialFields
+      : storedCredentialFields.length > 0 ? storedCredentialFields : [
           {
             label: "App key",
             configPath: "credentials.authorization",
@@ -14085,7 +13956,7 @@ export function toolAccessService(
         (input.credentialValues[field.configPath]?.trim().length ?? 0) > 0,
     );
     if (providedFields.length === 0)
-      throw badRequest("Paste a new key to reconnect this app");
+      throw badRequest("Enter a replacement credential to reconnect this app");
 
     const personalIdentity = await fixedPersonalIdentityForReconnect(
       connection,
@@ -14100,56 +13971,45 @@ export function toolAccessService(
       ...(connection.credentialRefs ?? []),
     ];
 
-    for (const field of providedFields) {
-      const value = input.credentialValues[field.configPath]!.trim();
-      const existing = credentialSecretRefs.find(
-        (ref) => ref.configPath === field.configPath,
-      );
-      if (existing) {
-        await secrets.rotate(
-          existing.secretId,
-          { value },
-          actorForSecret(actor),
-        );
-        continue;
-      }
-      const secret = await secrets.create(
-        companyId,
-        {
-          name: `${connection.name} ${field.label} ${randomUUID().slice(0, 8)}`,
-          key: `tool_app.${randomUUID()}.${field.configPath.replace(/[^a-z0-9_:-]+/gi, "_")}`,
-          provider: "local_encrypted",
-          value,
-          description: `Credential for ${connection.name} (${field.configPath}).`,
-        },
-        actorForSecret(actor),
-      );
-      credentialSecretRefs.push({
-        secretId: secret.id,
-        versionSelector: "latest",
-        configPath: field.configPath,
-        required: field.required ?? true,
-        label: field.label,
-      });
-      if (field.placement === "header" && field.key) {
-        const nextCredentialRef = {
-          name: field.configPath,
-          secretId: secret.id,
-          version: "latest",
-          placement: "header",
-          key: field.key,
-          prefix: field.prefix ?? null,
-        } satisfies McpConnectionCredentialRef;
-        const existingCredentialRefIndex = credentialRefs.findIndex(
-          (ref) => ref.name === field.configPath,
-        );
-        if (existingCredentialRefIndex >= 0)
-          credentialRefs[existingCredentialRefIndex] = nextCredentialRef;
-        else credentialRefs.push(nextCredentialRef);
-      }
-    }
-
     const updated = await db.transaction(async (tx) => {
+      for (const field of providedFields) {
+        const value = input.credentialValues[field.configPath]!.trim();
+        if (field.placement === "url" && !remoteUrlCredentialMatchesPublicUrl(String(connection.config.url ?? ""), value)) {
+          throw badRequest("The replacement server URL must use the same endpoint as this connection.", {
+            code: "mcp_remote_url_credential_mismatch",
+          });
+        }
+        const existing = credentialSecretRefs.find(
+          (ref) => ref.configPath === field.configPath,
+        );
+        const { secret } = await writeConnectionCredential(tx, {
+          companyId, connectionName: connection.name, configPath: field.configPath,
+          label: field.label, value, ownerUserId: personalIdentity?.subjectUserId,
+          existingRef: existing, actor: actorForSecret(actor),
+        });
+        const nextRef = { secretId: secret.id, versionSelector: "latest" as const,
+          configPath: field.configPath, required: field.required ?? true, label: field.label };
+        const refIndex = credentialSecretRefs.findIndex((ref) => ref.configPath === field.configPath);
+        if (refIndex >= 0) credentialSecretRefs[refIndex] = nextRef;
+        else credentialSecretRefs.push(nextRef);
+        if ((field.placement === "header" && field.key) || field.placement === "url") {
+          const nextCredentialRef = {
+            name: field.configPath,
+            secretId: secret.id,
+            version: "latest",
+            placement: field.placement,
+            key: field.key ?? "url",
+            prefix: field.prefix ?? null,
+          } satisfies McpConnectionCredentialRef;
+          const existingCredentialRefIndex = credentialRefs.findIndex(
+            (ref) => credentialRefConfigPath(ref) === field.configPath,
+          );
+          if (existingCredentialRefIndex >= 0)
+            credentialRefs[existingCredentialRefIndex] = nextCredentialRef;
+          else credentialRefs.push(nextCredentialRef);
+        }
+      }
+
       const updatedAt = new Date();
       if (personalIdentity) {
         const grantValues = {
@@ -14191,12 +14051,10 @@ export function toolAccessService(
         })
         .where(eq(toolConnections.id, connection.id))
         .returning();
+      await syncConnectionCredentialBindings(tx, nextConnection,
+        personalIdentity ? credentialSecretRefs : []);
       return nextConnection;
     });
-    await syncCredentialBindings(
-      updated,
-      personalIdentity ? credentialSecretRefs : [],
-    );
     const health = await checkConnectionHealth(updated.id, actor);
     const refresh = await refreshCatalog(updated.id, actor, {
       enableAllByDefault: true,
@@ -14220,7 +14078,7 @@ export function toolAccessService(
   ): Promise<ToolOAuthStartResult> {
     let connection = await getConnectionRow(connectionId, companyId);
     assertSupportedConnection(connection);
-    await assertMcpAggregatorSetupEnabled(connection.config.sourceTemplateKey, connection.config.connectionMethodKey);
+    await assertExperimentalConnectorSetupEnabled(connection.config.sourceTemplateKey, connection.status !== "draft");
     if (connection.status === "archived")
       throw conflict("Archived app connections cannot start sign in");
     const sourceTemplateKey =
@@ -15045,6 +14903,10 @@ export function toolAccessService(
       stateRow.connectionId,
       stateRow.companyId,
     );
+    const preCloudCallbackLifecycle = {
+      status: connection.status,
+      enabled: connection.enabled,
+    };
     // The connection lifecycle, not the incidental presence of its app profile,
     // distinguishes setup from reauthorization. New connections and connections
     // revived after removal are drafts until this callback completes. A profile
@@ -15406,6 +15268,10 @@ export function toolAccessService(
           .where(eq(issueThreadInteractions.id, stateRow.interactionId));
       }
     });
+    // The transaction above committed the connection's lifecycle write; a
+    // Paperclip Cloud connector callback is the managed variant of an OAuth
+    // callback completion.
+    emitConnectionUpdated(connection, preCloudCallbackLifecycle, "oauth_callback");
     if (githubMetadata) {
       const [githubGrant] = await db
         .select({ id: connectionGrants.id })
@@ -15638,6 +15504,10 @@ export function toolAccessService(
             : null,
       });
     }
+    const preActivationLifecycle = {
+      status: connection.status,
+      enabled: connection.enabled,
+    };
     [connection] = await db
       .update(toolConnections)
       .set({
@@ -15654,6 +15524,11 @@ export function toolAccessService(
         ),
       )
       .returning();
+    emitConnectionUpdated(
+      connection,
+      preActivationLifecycle,
+      "oauth_callback",
+    );
     await db
       .update(toolApplications)
       .set({ status: "active", updatedAt: now() })
@@ -15749,6 +15624,13 @@ export function toolAccessService(
       stateRow.connectionId,
       stateRow.companyId,
     );
+    // Reauthorization refreshes credentials and catalog without rebuilding the
+    // operator's action profile, policy rules, or access bindings.
+    const shouldFinalizeDefaults = connection.status === "draft";
+    const preCallbackLifecycle = {
+      status: connection.status,
+      enabled: connection.enabled,
+    };
     const sourceTemplateKey =
       typeof connection.config.sourceTemplateKey === "string"
         ? connection.config.sourceTemplateKey
@@ -16024,14 +15906,19 @@ export function toolAccessService(
           tx,
         );
       });
+      emitConnectionUpdated(
+        connection,
+        preCallbackLifecycle,
+        "oauth_callback",
+      );
 
       // Personal OAuth used to return immediately after saving the grant. That
       // left the connection draft/paused and its catalog empty, so the person
       // who had just consented landed on a false "Nothing to test" state.
       // Activate and discover with the just-issued token before returning.
       const refresh = await refreshCatalog(connection.id, input.actor, {
-        enableAllByDefault: true,
-        skipDefaultProfileSync: true,
+        enableAllByDefault: shouldFinalizeDefaults,
+        skipDefaultProfileSync: shouldFinalizeDefaults,
         credentialHeaders: { Authorization: `Bearer ${token.accessToken}` },
       });
       const [application] = await db
@@ -16046,17 +15933,19 @@ export function toolAccessService(
             connectionMethodForConnection(galleryEntry, connection).key,
           )
         : { access: "all_agents" as const, askFirstRiskLevels: [] };
-      const finished = await finishOAuthCatalogWithRecommendedDefaults({
-        interactionId: stateRow.interactionId,
-        connection,
-        catalog: refresh.catalog,
-        suggestedDefaults,
-        actor: input.actor,
-      });
+      const finished = shouldFinalizeDefaults
+        ? await finishOAuthCatalogWithRecommendedDefaults({
+            interactionId: stateRow.interactionId,
+            connection,
+            catalog: refresh.catalog,
+            suggestedDefaults,
+            actor: input.actor,
+          })
+        : null;
       return {
         connectionId: refresh.connection.id,
         application: toApplication(application),
-        connection: finished.connection,
+        connection: finished?.connection ?? refresh.connection,
         catalog: refresh.catalog,
         actions: groupedActions(refresh.catalog),
         suggestedDefaults,
@@ -16240,11 +16129,16 @@ export function toolAccessService(
       await ensureDefaultOrganizationGrant(connection, tx);
       await syncCredentialBindings(connection, [], tx);
     });
+    emitConnectionUpdated(
+      connection,
+      preCallbackLifecycle,
+      "oauth_callback",
+    );
 
     await checkConnectionHealth(connection.id, input.actor);
     const refresh = await refreshCatalog(connection.id, input.actor, {
-      enableAllByDefault: true,
-      skipDefaultProfileSync: true,
+      enableAllByDefault: shouldFinalizeDefaults,
+      skipDefaultProfileSync: shouldFinalizeDefaults,
     });
     const [application] = await db
       .select()
@@ -16259,17 +16153,19 @@ export function toolAccessService(
           access: "all_agents" as const,
           askFirstRiskLevels: [],
         };
-    const finished = await finishOAuthCatalogWithRecommendedDefaults({
-      interactionId: stateRow.interactionId,
-      connection,
-      catalog: refresh.catalog,
-      suggestedDefaults,
-      actor: input.actor,
-    });
+    const finished = shouldFinalizeDefaults
+      ? await finishOAuthCatalogWithRecommendedDefaults({
+          interactionId: stateRow.interactionId,
+          connection,
+          catalog: refresh.catalog,
+          suggestedDefaults,
+          actor: input.actor,
+        })
+      : null;
     return {
       connectionId: refresh.connection.id,
       application: toApplication(application),
-      connection: finished.connection,
+      connection: finished?.connection ?? refresh.connection,
       catalog: refresh.catalog,
       actions: groupedActions(refresh.catalog),
       suggestedDefaults,
@@ -16294,6 +16190,10 @@ export function toolAccessService(
     if (requestingAgentId)
       await assertAgentsInCompany(companyId, [requestingAgentId]);
     let connection = await getConnectionRow(connectionId, companyId);
+    const preFinalizeLifecycle = {
+      status: connection.status,
+      enabled: connection.enabled,
+    };
     if (connection.authKind !== "oauth")
       throw badRequest("This connection does not use browser sign-in");
     if (connection.status === "archived")
@@ -16603,6 +16503,12 @@ export function toolAccessService(
       for (const secretId of personalSecretIds) await secrets.remove(secretId);
     }
 
+    // Both identity branches above commit their own lifecycle write (draft ->
+    // active) before `finishGalleryAppConnection` re-reads the row, so that
+    // step alone would never observe this transition. This is the OAuth
+    // access-finalization step of the same gallery setup flow (Apps and inline
+    // task cards both reach it), hence `gallery`.
+    emitConnectionUpdated(connection, preFinalizeLifecycle, "gallery");
     const catalog = await db
       .select()
       .from(toolCatalogEntries)
@@ -16669,7 +16575,7 @@ export function toolAccessService(
     if (!app || app.availability?.available === false)
       throw notFound("App not found");
     const method = connectionMethodFor(app, methodKey);
-    await assertMcpAggregatorSetupEnabled(app.slug, method.key);
+    await assertExperimentalConnectorSetupEnabled(app.slug);
     if (method.transport !== "mcp_remote" || !method.defaults?.serverUrl) {
       throw unprocessable(
         "This app method does not use a hosted remote MCP endpoint",
@@ -16873,6 +16779,8 @@ export function toolAccessService(
 
     reconnectGalleryApp,
 
+    storeConnectorOAuthSecret: createOrRotateOAuthSecret,
+    resolveConnectorOAuthGrantSecret: resolveOAuthGrantSecret,
     startOAuth,
 
     startAuthorizationForAgent: async (input: {
@@ -17245,7 +17153,48 @@ export function toolAccessService(
 
     // Repository discovery uses credential audiences, not connection-management
     // visibility. An administrator cannot browse another user's private repos.
-    listProjectRepositories: async (
+    listProjectRepositories: async (companyId: string, userId: string | null, localTrusted = false) =>
+      toolAccessService(db).listGitHubRepositories(companyId, userId, localTrusted),
+
+    // Return identifiers, never credentials, so each attempted read can recheck its grant.
+    githubReadConnectionIds: async (companyId: string, userId: string | null, localTrusted = false): Promise<string[]> => {
+      const connections = await db.select().from(toolConnections).where(and(eq(toolConnections.companyId, companyId), eq(toolConnections.enabled, true))).orderBy(desc(toolConnections.updatedAt));
+      const ids: string[] = [];
+      for (const connection of connections) {
+        if (connection.status !== "active" || asRecord(connection.config).sourceTemplateKey !== "github") continue;
+        try {
+          await gitHubReadGrantAccess(db, companyId, connection.id, userId, localTrusted);
+          ids.push(connection.id);
+        } catch (error) {
+          // Only ineligible grants are skipped; database/service failures must surface.
+          if (!(error instanceof Error && "status" in error && error.status === 403)) throw error;
+        }
+      }
+      return ids;
+    },
+
+    githubReadGrantIds: async (companyId: string, connectionId: string, userId: string | null, localTrusted = false): Promise<Array<string | null>> => {
+      const { allowed, legacyShared } = await gitHubReadGrantAccess(db, companyId, connectionId, userId, localTrusted);
+      return legacyShared ? [null] : allowed.map(grant => grant.id);
+    },
+
+    // Server-side reads share the same grant audience and credential lifecycle as discovery.
+    githubReadHeaders: async (companyId: string, connectionId: string, userId: string | null, localTrusted = false, forceRefresh = false, grantId?: string | null): Promise<Record<string, string>> => {
+      const { connection, allowed, legacyShared } = await gitHubReadGrantAccess(db, companyId, connectionId, userId, localTrusted);
+      const actor: ActorInfo = { actorType: "user", actorId: userId ?? "board" };
+      if (legacyShared && !grantId) return resolveCredentialHeaders(connection, actor);
+      let grant = grantId ? allowed.find(candidate => candidate.id === grantId) : allowed.length === 1 ? allowed[0] : undefined;
+      if (!grant) throw forbidden("Choose an active GitHub authorization you can use.");
+      if (asRecord(asRecord(connection.config).oauth).connectorProfile === "github.code") {
+        grant = await refreshOAuthGrantCredentials({ companyId, connectionId, grantId: grant.id, actor, forceRefresh });
+      }
+      const ref = grant.credentialSecretRefs.find(ref => ref.configPath === "oauth.access_token" || /authorization|token|api_key/i.test(ref.configPath));
+      if (!ref) throw unprocessable("Reconnect GitHub to read repository files.");
+      const secret = await resolveOAuthGrantSecret(connection, grant, ref, actor, undefined);
+      return { Authorization: `Bearer ${secret.value}` };
+    },
+
+    listGitHubRepositories: async (
       companyId: string,
       userId: string | null,
       localTrusted = false,
@@ -17286,6 +17235,7 @@ export function toolAccessService(
         string,
         import("@paperclipai/shared").ProjectRepository
       >();
+      const usableConnections: Array<{ id: string; name: string }> = [];
       let connectionCount = 0;
       let failedConnectionCount = 0;
       for (const connection of connections) {
@@ -17320,6 +17270,7 @@ export function toolAccessService(
           (localTrusted || (!!userId && memberships.length > 0));
         if (!availableGrants.length && !legacyShared) continue;
         connectionCount += 1;
+        usableConnections.push({ id: connection.id, name: connection.name });
         const actor: ActorInfo = {
           actorType: "user",
           actorId: userId ?? "board",
@@ -17368,7 +17319,7 @@ export function toolAccessService(
               rows = await loadGitHubTokenRepositories(headers);
             }
             for (const row of rows) {
-              mergeProjectRepository(repositories, row, connection.name);
+              mergeProjectRepository(repositories, row, connection.name, connection.id);
             }
           } catch {
             // Credential/provider errors may contain secrets. Only expose an
@@ -17382,6 +17333,7 @@ export function toolAccessService(
         repositories: [...repositories.values()].sort((a, b) =>
           a.fullName.localeCompare(b.fullName),
         ),
+        connections: usableConnections,
         connectionCount,
         failedConnectionCount,
       };
@@ -17465,7 +17417,7 @@ export function toolAccessService(
       if (transport === "mcp_remote")
         await assertRemoteConnectionEndpointsAllowed(config);
       if (transport === "local_stdio") await stdioTemplateId(companyId, config);
-      assertLocalStdioCanBeEnabled(transport, input.enabled ?? false);
+      assertLocalStdioCanBeEnabled(transport, input.enabled ?? false, config);
       await assertGoogleSheetsSpreadsheetOwnership(companyId, config);
       if (applicationId) {
         const app = await assertApplication(companyId, applicationId);
@@ -17485,7 +17437,7 @@ export function toolAccessService(
             companyId,
             applicationKey: normalizeKey(input.applicationName ?? input.name),
             name: input.applicationName ?? input.name,
-            type: transport === "mcp_remote" ? "mcp_http" : "mcp_stdio",
+            type: isBrowserUseConnection({ transport, config }) ? "rest_api" : transport === "mcp_remote" ? "mcp_http" : "mcp_stdio",
             status: "active",
             metadata: {},
           })
@@ -17526,6 +17478,7 @@ export function toolAccessService(
       await ensureDefaultOrganizationGrant(row);
       await syncCredentialBindings(row);
       await ensureRuntimeSlot(row);
+      emitConnectionCreated(row, "api");
       return toConnection(row);
     },
 
@@ -18388,6 +18341,7 @@ export function toolAccessService(
       assertLocalStdioCanBeEnabled(
         existing.transport,
         input.enabled ?? existing.enabled,
+        config,
       );
       await assertGoogleSheetsSpreadsheetOwnership(existing.companyId, config, {
         excludeConnectionId: existing.id,
@@ -18416,6 +18370,7 @@ export function toolAccessService(
         .returning();
       await syncCredentialBindings(row);
       await ensureRuntimeSlot(row);
+      emitConnectionUpdated(row, existing, "api");
       return toConnection(row);
     },
 
@@ -19519,6 +19474,7 @@ export function toolAccessService(
         input.connectionId,
         input.companyId,
       );
+      if (isBrowserUseConnection(connection)) throw forbidden("Browser Use credentials stay in the governed tool gateway and cannot be exported.");
       if (connection.connectionPurpose === "ai") throw unprocessable("AI credentials are available only through the runtime resolver");
       const application = await getConnectionApplication(connection);
       const brokerEnabled = connectionTokenBrokerEnabled(connection);

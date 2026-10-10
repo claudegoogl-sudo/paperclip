@@ -256,6 +256,8 @@ describe("issue feedback trace routes", () => {
     const res = await request(app).get("/api/feedback-traces/trace-1");
 
     expect(res.status, JSON.stringify({ body: res.body, errors: app.locals.routeErrors })).toBe(404);
+    expect(mockFeedbackService.getFeedbackTraceById).toHaveBeenCalledExactlyOnceWith("trace-1", true);
+    expect(mockFeedbackService.getFeedbackTraceBundle).not.toHaveBeenCalled();
   });
 
   it("returns 404 for bundle fetches when a board user lacks access to the trace company", async () => {
@@ -276,5 +278,7 @@ describe("issue feedback trace routes", () => {
     const res = await request(app).get("/api/feedback-traces/trace-1/bundle");
 
     expect(res.status, JSON.stringify({ body: res.body, errors: app.locals.routeErrors })).toBe(404);
+    expect(mockFeedbackService.getFeedbackTraceBundle).toHaveBeenCalledExactlyOnceWith("trace-1");
+    expect(mockFeedbackService.getFeedbackTraceById).not.toHaveBeenCalled();
   });
 });
