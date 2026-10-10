@@ -22,6 +22,7 @@ import {
   type RuntimeProgressPhase,
   type RuntimeProgressSink,
 } from "./runtime-progress.js";
+import { scrubSigningKeys, scrubbedProcessEnv } from "./child-env-scrub.js";
 
 export interface SshConnectionConfig {
   host: string;
@@ -59,7 +60,7 @@ export function createSshCommandManagedRuntimeRunner(input: {
       const command = commandInput.command.trim();
       const args = commandInput.args ?? [];
       const cwd = commandInput.cwd?.trim() || defaultCwd;
-      const envEntries = Object.entries(commandInput.env ?? {})
+      const envEntries = Object.entries(scrubSigningKeys(commandInput.env ?? {}))
         .filter((entry): entry is [string, string] => typeof entry[1] === "string");
       const envPrefix = envEntries.length > 0
         ? `env ${envEntries.map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ")} `
@@ -206,9 +207,11 @@ async function execFileText(
       file,
       args,
       {
+        // Caller env (e.g. the agent git identity) is honored, but always
+        // passes through the signing-key scrub like every other child spawn.
+        env: options.env ? scrubSigningKeys(options.env) : scrubbedProcessEnv(),
         timeout: options.timeout ?? 15_000,
         maxBuffer: options.maxBuffer ?? 1024 * 128,
-        env: options.env,
       },
       (error, stdout, stderr) => {
         if (error) {
@@ -235,6 +238,7 @@ async function spawnText(
 ): Promise<SshCommandResult> {
   return await new Promise<SshCommandResult>((resolve, reject) => {
     const child = spawn(file, args, {
+      env: scrubbedProcessEnv(),
       stdio: [options.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
     });
 
@@ -420,11 +424,8 @@ function tarExcludeArgs(exclude: string[] | undefined): string[] {
 }
 
 function tarSpawnEnv(): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
-    // Prevent macOS bsdtar from emitting AppleDouble metadata files like ._README.md.
-    COPYFILE_DISABLE: "1",
-  };
+  // Prevent macOS bsdtar from emitting AppleDouble metadata files like ._README.md.
+  return scrubbedProcessEnv({ COPYFILE_DISABLE: "1" });
 }
 
 // Converts a tar `--exclude` pattern into a regexp for the local-size estimate.
@@ -671,6 +672,7 @@ async function streamLocalFileToSsh(input: {
   await new Promise<void>((resolve, reject) => {
     const source = createReadStream(input.localFile);
     const ssh = spawn("ssh", sshArgs, {
+      env: scrubbedProcessEnv(),
       stdio: ["pipe", "ignore", "pipe"],
     });
 
@@ -725,6 +727,7 @@ async function streamSshToLocalFile(input: {
 
   await new Promise<void>((resolve, reject) => {
     const ssh = spawn("ssh", sshArgs, {
+      env: scrubbedProcessEnv(),
       stdio: ["ignore", "pipe", "pipe"],
     });
     const sink = createWriteStream(input.localFile, { mode: 0o600 });
@@ -1214,7 +1217,7 @@ export async function runSshCommand(
     const auth = await createSshAuthArgs(config);
     cleanup = auth.cleanup;
     const sshArgs = [...auth.args];
-    const envEntries = Object.entries(options.env ?? {})
+    const envEntries = Object.entries(scrubSigningKeys(options.env ?? {}))
       .filter((entry): entry is [string, string] => typeof entry[1] === "string");
     for (const [key] of envEntries) {
       if (!isValidShellEnvKey(key)) {
@@ -1283,7 +1286,7 @@ export async function buildSshSpawnTarget(input: {
   }
   const auth = await createSshAuthArgs(input.spec);
   const sshArgs = [...auth.args];
-  const envArgs = Object.entries(input.env)
+  const envArgs = Object.entries(scrubSigningKeys(input.env))
     .filter((entry): entry is [string, string] => typeof entry[1] === "string")
     .map(([key, value]) => `${key}=${shellQuote(value)}`);
   const remoteCommandParts = [shellQuote(input.command), ...input.args.map((arg) => shellQuote(arg))].join(" ");
@@ -1376,6 +1379,7 @@ export async function syncDirectoryToSsh(input: {
       env: tarSpawnEnv(),
     });
     const ssh = spawn("ssh", sshArgs, {
+      env: scrubbedProcessEnv(),
       stdio: ["pipe", "ignore", "pipe"],
     });
 
@@ -1487,6 +1491,7 @@ export async function syncDirectoryFromSsh(input: {
   try {
     await new Promise<void>((resolve, reject) => {
       const ssh = spawn("ssh", sshArgs, {
+        env: scrubbedProcessEnv(),
         stdio: ["ignore", "pipe", "pipe"],
       });
       const tar = spawn("tar", ["-xf", "-", "-C", stagingDir], {
@@ -1960,6 +1965,7 @@ export async function startSshEnvLabFixture(input: {
 
   const child = spawn(sshdPath, ["-D", "-f", sshdConfigPath, "-E", sshdLogPath], {
     detached: true,
+    env: scrubbedProcessEnv(),
     stdio: "ignore",
   });
   child.unref();

@@ -4,6 +4,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { buildAgentGitIdentityEnv, type AgentGitIdentityInput } from "./git-identity.js";
+import { scrubSigningKeys } from "./child-env-scrub.js";
 
 export interface GitCommandResult {
   stdout: string;
@@ -121,7 +122,7 @@ export async function runLocalGit(
       {
         timeout: options.timeout ?? 15_000,
         maxBuffer: options.maxBuffer ?? 1024 * 128,
-        env: options.env ?? process.env,
+        env: scrubSigningKeys(options.env ?? process.env),
       },
       (error, stdout, stderr) => {
         if (error) {

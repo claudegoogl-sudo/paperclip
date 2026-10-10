@@ -1461,11 +1461,15 @@ export function pluginRoutes(
         return;
       }
 
-      // Transition to ready state
       const existingPlugin = await registry.getByKey(discovered.manifest.id);
       if (existingPlugin) {
-        await lifecycle.load(existingPlugin.id);
-        reconcileWatch(existingPlugin.id);
+        const parked = discovered.installStatus === "upgrade_pending";
+        // A parked install waits for its capability-escalation approval: do
+        // NOT load it. Approve -> the approvals resolver completes it to ready.
+        if (!parked) {
+          await lifecycle.load(existingPlugin.id);
+          reconcileWatch(existingPlugin.id);
+        }
         const updated = await registry.getById(existingPlugin.id);
         await logPluginMutationActivity(req, "plugin.installed", existingPlugin.id, {
           pluginId: existingPlugin.id,
@@ -1473,9 +1477,18 @@ export function pluginRoutes(
           packageName: updated?.packageName ?? existingPlugin.packageName,
           version: updated?.version ?? existingPlugin.version,
           source: isLocalPath ? "local_path" : "npm",
+          capabilities: discovered.capabilities,
+          approvalId: discovered.approvalId,
         });
         publishGlobalLiveEvent({ type: "plugin.ui.updated", payload: { pluginId: existingPlugin.id, action: "installed" } });
-        res.json(updated);
+        res.json({
+          ...updated,
+          // Declared capabilities of the requested package (the stored
+          // manifest of a parked install holds only the granted set).
+          capabilities: discovered.capabilities,
+          addedCapabilities: discovered.addedCapabilities,
+          approvalId: discovered.approvalId,
+        });
       } else {
         // This shouldn't happen since installPlugin already registers in the DB
         res.status(500).json({ error: "Plugin installed but not found in registry" });

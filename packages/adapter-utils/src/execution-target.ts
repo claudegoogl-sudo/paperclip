@@ -86,6 +86,7 @@ import {
 } from "./acpx-engine/startup-timing.js";
 import type { RuntimeProgressSink, RuntimeStatusSink } from "./runtime-progress.js";
 import type { LocalProcessSandboxOptions } from "./local-process-sandbox.js";
+import { signingKeyScrubSource } from "./child-env-scrub.js";
 
 export type { RuntimeProgressSink } from "./runtime-progress.js";
 
@@ -817,7 +818,12 @@ export async function runAdapterExecutionTargetProcess(
 ): Promise<RunProcessResult> {
   if (target?.kind === "remote" && target.transport === "sandbox") {
     const runner = requireSandboxRunner(target);
-    const env = sanitizeRemoteExecutionEnv(options.env);
+    // Run clock context for the sandboxed agent process (mirrors the local
+    // spawn injection): both stamps are ISO-8601 UTC and host-controlled.
+    const env: Record<string, string> = {
+      ...sanitizeRemoteExecutionEnv(options.env),
+      PAPERCLIP_NOW: new Date().toISOString(),
+    };
     await options.onRuntimeProgress?.({
       phase: "adapter_startup",
       message: "Starting adapter in environment",
@@ -830,6 +836,7 @@ export async function runAdapterExecutionTargetProcess(
       runLogTail.start(options.onLog);
     }
     try {
+      env.PAPERCLIP_RUN_STARTED_AT = new Date().toISOString();
       const result = await runner.execute({
         command: execCommand,
         args: execArgs,
@@ -2847,6 +2854,8 @@ if ((await isSymbolicLink(sessionDir)) || (await isSymbolicLink(stdinDir))) {
 const childEnv = { ...process.env, ...(config.env || {}) };
 delete childEnv.PAPERCLIP_PROCESS_SESSION_DIR;
 delete childEnv.PAPERCLIP_PROCESS_SESSION_COMMAND_B64;
+// Never pass a signing-capable server secret to the session child.
+${signingKeyScrubSource("childEnv")}
 
 // I1: exactly one child process per emitted wrapper. Do not add a second
 // tracked child handle.
@@ -2938,6 +2947,8 @@ if ((await isSymbolicLink(sessionDir)) || (await isSymbolicLink(stdinDir))) {
 const childEnv = { ...process.env, ...(config.env || {}) };
 delete childEnv.PAPERCLIP_PROCESS_SESSION_DIR;
 delete childEnv.PAPERCLIP_PROCESS_SESSION_COMMAND_B64;
+// Never pass a signing-capable server secret to the session child.
+${signingKeyScrubSource("childEnv")}
 
 // I1: exactly one child process per emitted wrapper. Do not add a second
 // tracked child handle.

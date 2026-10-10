@@ -1803,7 +1803,15 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .update(routineTriggers)
       .set({ nextRunAt: new Date("2020-01-01T00:00:00.000Z") })
       .where(eq(routineTriggers.id, trigger.id));
-    await input.svc.tickScheduledTriggers(new Date());
+    // Fire the tick from a fixed instant 120s before the retry's due time (due = next tick +
+    // retryOffsetMs), not from the wall clock. The skip reason's pending-vs-overdue wording is
+    // computed from the tick's `now` against that due time, so a wall-clock `now` made the
+    // classification depend on where the next top-of-hour tick sat when the test ran: with the
+    // hourly cron and retryOffsetMs = -60s, a run inside the final minute of an hour saw the
+    // seeded retry already 1 minute in the past and failed the "due in" assertion (observed on
+    // CI 2026-09-23). Anchoring the tick to next tick - 120s pins the classifier inputs for
+    // every wall-clock moment; the trigger's nextRunAt is backdated above, so the tick fires.
+    await input.svc.tickScheduledTriggers(new Date(trigger.nextRunAt!.getTime() - 120 * 1000));
     return db
       .select()
       .from(routineRuns)

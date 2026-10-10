@@ -332,6 +332,34 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  it("matches a target-scoped agents:configure grant only when the request names the target agent", async () => {
+    const company = await createCompany(db, "ScopedAgentConfigure");
+    const concierge = await createAgent(db, company.id);
+    const scanBot = await createAgent(db, company.id);
+    const ceo = await createAgent(db, company.id, { role: "ceo" });
+    await grantAgentPermission(db, company.id, concierge.id, "agents:configure", { targetAgentIds: [scanBot.id] });
+
+    const authz = authorizationService(db);
+    const decideFor = (targetId: string, scope: Record<string, unknown>) => authz.decide({
+      actor: { type: "agent", agentId: concierge.id, companyId: company.id, source: "agent_key" },
+      action: "agent_config:update",
+      resource: { type: "agent", companyId: company.id, agentId: targetId },
+      scope,
+    });
+
+    // Shape produced by routes/agents.ts agentConfigUpdateScope().
+    await expect(decideFor(scanBot.id, { targetAgentId: scanBot.id })).resolves.toMatchObject({ allowed: true });
+    await expect(decideFor(scanBot.id, { requiresChangeGrant: true, targetAgentId: scanBot.id }))
+      .resolves.toMatchObject({ allowed: true });
+    await expect(decideFor(ceo.id, { targetAgentId: ceo.id })).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_scope",
+    });
+    // Regression for the original bug: the pre-fix route sent no targetAgentId,
+    // so a scoped grant could never match (fails closed).
+    await expect(decideFor(scanBot.id, {})).resolves.toMatchObject({ allowed: false });
+  });
+
   it("enforces direct or consented suggest grants for skill configuration changes", async () => {
     const company = await createCompany(db, "SkillChangeGrant");
     const directAgent = await createAgent(db, company.id);

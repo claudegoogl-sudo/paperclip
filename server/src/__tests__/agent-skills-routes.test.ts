@@ -68,6 +68,56 @@ const mockAdapter = vi.hoisted(() => ({
   syncSkills: vi.fn(),
 }));
 
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("@paperclipai/shared/telemetry", () => ({
+  trackAgentCreated: mockTrackAgentCreated,
+  trackErrorHandlerCrash: vi.fn(),
+}));
+
+vi.mock("../telemetry.js", () => ({
+  getTelemetryClient: mockGetTelemetryClient,
+}));
+
+vi.mock("../services/index.js", () => ({
+  agentService: () => mockAgentService,
+  agentInstructionsService: () => mockAgentInstructionsService,
+  accessService: () => mockAccessService,
+  approvalService: () => mockApprovalService,
+  builtInAgentService: () => ({ ensureCompanyDefaultAgentGrants: vi.fn() }),
+  companySkillService: () => mockCompanySkillService,
+  budgetService: () => mockBudgetService,
+  heartbeatService: () => mockHeartbeatService,
+  issueApprovalService: () => mockIssueApprovalService,
+  issueService: () => ({}),
+  logActivity: mockLogActivity,
+  secretService: () => mockSecretService,
+  syncInstructionsBundleConfigFromFilePath: mockSyncInstructionsBundleConfigFromFilePath,
+  workspaceOperationService: () => mockWorkspaceOperationService,
+}));
+
+vi.mock("../services/secrets.js", () => ({
+  secretService: () => mockSecretService,
+}));
+
+vi.mock("../services/instance-settings.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/instance-settings.js")>()),
+  instanceSettingsService: () => mockInstanceSettingsService,
+}));
+
+vi.mock("../adapters/index.js", () => ({
+  findServerAdapter: vi.fn(() => mockAdapter),
+  findActiveServerAdapter: vi.fn(() => mockAdapter),
+  listAdapterModels: vi.fn(),
+  detectAdapterModel: vi.fn(),
+}));
+
 function expectResponseId(value: unknown): string {
   expect(value).toEqual(expect.any(String));
   expect(value).not.toBe("");
@@ -117,50 +167,6 @@ vi.mock("../adapters/index.js", () => ({
   listAdapterModels: vi.fn(),
   detectAdapterModel: vi.fn(),
 }));
-
-function registerModuleMocks() {
-  vi.doMock("@paperclipai/shared/telemetry", () => ({
-    trackAgentCreated: mockTrackAgentCreated,
-    trackErrorHandlerCrash: vi.fn(),
-  }));
-
-  vi.doMock("../telemetry.js", () => ({
-    getTelemetryClient: mockGetTelemetryClient,
-  }));
-
-  vi.doMock("../services/index.js", () => ({
-    agentService: () => mockAgentService,
-    agentInstructionsService: () => mockAgentInstructionsService,
-    accessService: () => mockAccessService,
-    approvalService: () => mockApprovalService,
-    builtInAgentService: () => ({ ensureCompanyDefaultAgentGrants: vi.fn() }),
-    companySkillService: () => mockCompanySkillService,
-    budgetService: () => mockBudgetService,
-    heartbeatService: () => mockHeartbeatService,
-    issueApprovalService: () => mockIssueApprovalService,
-    issueService: () => ({}),
-    logActivity: mockLogActivity,
-    secretService: () => mockSecretService,
-    syncInstructionsBundleConfigFromFilePath: mockSyncInstructionsBundleConfigFromFilePath,
-    workspaceOperationService: () => mockWorkspaceOperationService,
-  }));
-
-  vi.doMock("../services/secrets.js", () => ({
-    secretService: () => mockSecretService,
-  }));
-
-  vi.doMock("../services/instance-settings.js", async (importOriginal) => ({
-    ...(await importOriginal<typeof import("../services/instance-settings.js")>()),
-    instanceSettingsService: () => mockInstanceSettingsService,
-  }));
-
-  vi.doMock("../adapters/index.js", () => ({
-    findServerAdapter: vi.fn(() => mockAdapter),
-    findActiveServerAdapter: vi.fn(() => mockAdapter),
-    listAdapterModels: vi.fn(),
-    detectAdapterModel: vi.fn(),
-  }));
-}
 
 function createDb(requireBoardApprovalForNewAgents = false) {
   return {
@@ -247,11 +253,6 @@ function makeAgent(adapterType: string) {
 
 describe.sequential("agent skill routes", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../routes/agents.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
     for (const mock of Object.values(mockAgentService)) mock.mockReset();
     for (const mock of Object.values(mockAccessService)) mock.mockReset();

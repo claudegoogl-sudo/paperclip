@@ -245,4 +245,24 @@ describe("createPluginDevWatcher", () => {
 
     devWatcher.close();
   });
+
+  it("routes file-change restarts through the injected restartWorker when provided", async () => {
+    vi.useFakeTimers();
+    const pluginDir = makeTempPluginDir();
+    writePluginPackage(pluginDir);
+    const { handlers } = installMockFsWatcher();
+    const lifecycle = createLifecycle();
+    const restartWorker = vi.fn().mockResolvedValue(undefined);
+
+    const devWatcher = createPluginDevWatcher(lifecycle as never, undefined, undefined, { restartWorker });
+    devWatcher.watch("plugin-1", pluginDir);
+
+    handlers.all?.("change", path.join(pluginDir, "dist", "manifest.js"));
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(restartWorker).toHaveBeenCalledWith("plugin-1");
+    expect(lifecycle.restartWorker).not.toHaveBeenCalled();
+
+    devWatcher.close();
+  });
 });

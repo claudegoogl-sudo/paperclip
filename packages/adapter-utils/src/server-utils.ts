@@ -15,6 +15,11 @@ import type {
   AdapterSkillEntry,
   AdapterSkillSnapshot,
 } from "./types.js";
+import {
+  CHILD_ENV_SIGNING_KEY_DENYLIST,
+  deleteSigningKeys,
+  scrubSigningKeys,
+} from "./child-env-scrub.js";
 
 export interface RunProcessResult {
   exitCode: number | null;
@@ -719,6 +724,14 @@ type PaperclipWakePayload = {
   missingCount: number;
   truncated: boolean;
   fallbackFetchNeeded: boolean;
+  runStartedAt: string | null;
+  siblingRuns: PaperclipWakeSiblingRun[];
+};
+
+type PaperclipWakeSiblingRun = {
+  runId: string | null;
+  agentName: string | null;
+  startedAt: string | null;
 };
 
 function normalizePaperclipWakeRecovery(value: unknown): PaperclipWakeRecovery | null {
@@ -1326,6 +1339,23 @@ function markdownFencedText(value: string): string {
   return `${fence}text\n${value}\n${fence}`;
 }
 
+const MAX_WAKE_SIBLING_RUNS = 5;
+
+function normalizePaperclipWakeSiblingRuns(value: unknown): PaperclipWakeSiblingRun[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((entry) => {
+      const sibling = parseObject(entry);
+      const runId = asString(sibling.runId, "").trim() || null;
+      const agentName = asString(sibling.agentName, "").trim() || null;
+      const startedAt = asString(sibling.startedAt, "").trim() || null;
+      if (!runId && !agentName && !startedAt) return null;
+      return { runId, agentName, startedAt };
+    })
+    .filter((entry): entry is PaperclipWakeSiblingRun => Boolean(entry))
+    .slice(0, MAX_WAKE_SIBLING_RUNS);
+}
+
 export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayload | null {
   const payload = parseObject(value);
   const comments = Array.isArray(payload.comments)
@@ -1408,6 +1438,8 @@ export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayl
     missingCount: asNumber(commentWindow.missingCount, 0),
     truncated: asBoolean(payload.truncated, false),
     fallbackFetchNeeded: asBoolean(payload.fallbackFetchNeeded, false),
+    runStartedAt: asString(payload.runStartedAt, "").trim() || null,
+    siblingRuns: normalizePaperclipWakeSiblingRuns(payload.siblingRuns),
   };
 }
 
@@ -1492,6 +1524,25 @@ export function renderPaperclipWakePrompt(
 ): string {
   const normalized = normalizePaperclipWakePayload(value);
   if (!normalized) return "";
+  // Run clock context. `now` is stamped at render time so the agent can
+  // sanity-check its own clock at wake; `run started` uses the server-recorded
+  // run start when present and falls back to render time. Sibling runs are
+  // metadata-only orientation for parallel runs on the same issue (no env
+  // dumps, no output bodies, capped).
+  const nowIso = new Date().toISOString();
+  const runStartedIso = normalized.runStartedAt ?? nowIso;
+  const siblingRunLines =
+    normalized.siblingRuns.length === 0
+      ? ["- sibling runs on this issue: none active"]
+      : [
+          `- sibling runs on this issue (active, this run excluded): ${normalized.siblingRuns.length}`,
+          ...normalized.siblingRuns.map((sibling) => {
+            const agent = sibling.agentName ?? "unknown agent";
+            const runId = sibling.runId ?? "unknown run";
+            const started = sibling.startedAt ? `started ${sibling.startedAt}` : "not started yet";
+            return `  - ${agent} run ${runId} ${started}`;
+          }),
+        ];
   const resumedSession = options.resumedSession === true;
   // The heartbeat prompt template already carries the execution contract on
   // fresh sessions; only resume deltas (which replace the template) and
@@ -1574,6 +1625,9 @@ export function renderPaperclipWakePrompt(
         ]
       : []),
     `- fallback fetch needed: ${normalized.fallbackFetchNeeded ? "yes" : "no"}`,
+    `- now: ${nowIso}`,
+    `- run started: ${runStartedIso}`,
+    ...siblingRunLines,
     ...(recoveryScoped
       ? [
           `- recovery cause: ${recovery?.cause ?? "unknown"}`,
@@ -2082,11 +2136,24 @@ export function buildInvocationEnvForLogs(
   return redactEnvForLogs(merged);
 }
 
-export function buildPaperclipEnv(agent: {
-  id: string;
-  companyId: string;
-  name?: string | null;
-}): Record<string, string> {
+export interface BuildPaperclipEnvOptions {
+  /**
+   * Which API base the run receives as PAPERCLIP_API_URL.
+   * - "runtime" (default): the runtime/public base. Use for adapters whose
+   *   agent runs OFF the server host (openclaw-gateway, cursor-cloud): a
+   *   loopback URL there would point at the remote host's own loopback and
+   *   send the run credential to whatever listens on that port.
+   * - "agent": PAPERCLIP_AGENT_API_URL when set (server boot defaults it to
+   *   the loopback listen origin). Only for adapters that spawn the agent on
+   *   the server host.
+   */
+  apiBase?: "agent" | "runtime";
+}
+
+export function buildPaperclipEnv(
+  agent: { id: string; companyId: string; name?: string | null },
+  options: BuildPaperclipEnvOptions = {},
+): Record<string, string> {
   const resolveHostForUrl = (rawHost: string): string => {
     const host = rawHost.trim();
     if (!host || host === "0.0.0.0" || host === "::") return "localhost";
@@ -2109,10 +2176,16 @@ export function buildPaperclipEnv(agent: {
   // An explicit PAPERCLIP_API_URL override must win over the URL derived from
   // authPublicBaseUrl: the derived URL can be unreachable from inside the
   // runtime container (e.g. when the public base URL is VPN/tailnet-only).
+  // PAPERCLIP_AGENT_API_URL is the dedicated agent-run base (server boot
+  // defaults it to the loopback listen origin); it wins over the
+  // runtime/public base, which may be behind an interactive access proxy.
+  const agentApiUrl =
+    options.apiBase === "agent" ? process.env.PAPERCLIP_AGENT_API_URL?.trim() : undefined;
   const apiUrl =
-    process.env.PAPERCLIP_API_URL ??
-    process.env.PAPERCLIP_RUNTIME_API_URL ??
-    `http://${runtimeHost}:${runtimePort}`;
+    agentApiUrl ||
+    (process.env.PAPERCLIP_API_URL ??
+      process.env.PAPERCLIP_RUNTIME_API_URL ??
+      `http://${runtimeHost}:${runtimePort}`);
   vars.PAPERCLIP_API_URL = apiUrl;
   return vars;
 }
@@ -2358,9 +2431,19 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
   return shapedWorkspaceEnv;
 }
 
+export {
+  CHILD_ENV_SIGNING_KEY_DENYLIST,
+  scrubSigningKeys,
+  scrubbedProcessEnv,
+} from "./child-env-scrub.js";
+
+export const CHILD_ENV_INHERITED_ONLY_DENYLIST = ["DATABASE_URL"] as const;
+
 export function sanitizeInheritedPaperclipEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.PAPERCLIPAI_CMD;
+  deleteSigningKeys(env);
+  for (const key of CHILD_ENV_INHERITED_ONLY_DENYLIST) delete env[key];
   for (const key of Object.keys(env)) {
     if (!key.startsWith("PAPERCLIP_")) continue;
     if (key === "PAPERCLIP_RUNTIME_API_URL") continue;
@@ -2557,6 +2640,11 @@ export const CLAUDE_CODE_NESTING_VARS = [
  *   adapter uses this because its child may run on a prompt-logging provider.
  *
  * The CLAUDE_CODE_* nesting-var strip and `ensurePathInEnv` apply either way.
+ * The signing-key denylist (`CHILD_ENV_SIGNING_KEY_DENYLIST`) is also removed
+ * either way, and AFTER `env` is layered: a caller (adapterConfig.env, a secret
+ * binding) must not be able to re-inject a signing key.
+ * `CHILD_ENV_INHERITED_ONLY_DENYLIST` (`DATABASE_URL`) is removed from the
+ * inherited env only; a caller-supplied value is kept.
  */
 export function buildChildEnv(
   env: Record<string, string>,
@@ -2570,6 +2658,7 @@ export function buildChildEnv(
   for (const key of CLAUDE_CODE_NESTING_VARS) {
     delete rawMerged[key];
   }
+  deleteSigningKeys(rawMerged);
   return ensurePathInEnv(rawMerged);
 }
 
@@ -3416,13 +3505,31 @@ export async function runChildProcess(
     if (opts.localProcessSandbox?.homeDir) {
       mergedEnv.HOME = opts.localProcessSandbox.homeDir;
     }
+    // Run clock context for the spawned process. PAPERCLIP_NOW is stamped when
+    // the spawn request is prepared (prompt render just preceded it on agent
+    // lanes); PAPERCLIP_RUN_STARTED_AT is stamped immediately before the OS
+    // spawn so the child can measure its own run start. Both are ISO-8601 UTC
+    // and host-controlled: adapter-provided env cannot override them.
+    const paperclipNow = new Date().toISOString();
+    mergedEnv.PAPERCLIP_NOW = paperclipNow;
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
       remoteExecution: opts.remoteExecution ?? null,
-      remoteEnv: opts.remoteExecution ? opts.env : null,
+      remoteEnv: opts.remoteExecution
+        ? scrubSigningKeys({ ...opts.env, PAPERCLIP_NOW: paperclipNow, PAPERCLIP_RUN_STARTED_AT: paperclipNow })
+        : null,
       localProcessSandbox: opts.localProcessSandbox ?? null,
     })
       .then((target) => {
-        const childEnv = { ...mergedEnv, ...target.env };
+        const startedAt = new Date().toISOString();
+        const childEnv: NodeJS.ProcessEnv = {
+          ...mergedEnv,
+          ...target.env,
+          PAPERCLIP_NOW: paperclipNow,
+          PAPERCLIP_RUN_STARTED_AT: startedAt,
+        };
+        // target.env is layered after the scrub in buildChildEnv; re-apply the
+        // signing-key denylist so no spawn target can re-inject a signing key.
+        deleteSigningKeys(childEnv);
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
         }
@@ -3433,7 +3540,6 @@ export async function runChildProcess(
           shell: false,
           stdio: [opts.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
         }) as ChildProcessWithEvents;
-        const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
 
         const spawnPersistPromise =
