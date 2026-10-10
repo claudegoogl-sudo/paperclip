@@ -45,9 +45,12 @@ describe("plugin-egress-ip-classifier", () => {
     expect(classifyEgressIp("8.8.8.8", { interfaces: boom }).category).toBe("public");
   });
 
-  it("reads the CGNAT switch with allow-legacy default", () => {
-    expect(resolveCgnatMode({})).toBe("allow-legacy");
+  it("reads the CGNAT switch with deny default; allow-legacy only when set explicitly", () => {
+    expect(resolveCgnatMode({})).toBe("deny");
     expect(resolveCgnatMode({ PAPERCLIP_PLUGIN_FETCH_CGNAT: "deny" })).toBe("deny");
-    expect(resolveCgnatMode({ PAPERCLIP_PLUGIN_FETCH_CGNAT: "bogus" })).toBe("allow-legacy");
+    expect(resolveCgnatMode({ PAPERCLIP_PLUGIN_FETCH_CGNAT: "bogus" })).toBe("deny");
+    expect(resolveCgnatMode({ PAPERCLIP_PLUGIN_FETCH_CGNAT: "" })).toBe("deny");
+    expect(resolveCgnatMode({ PAPERCLIP_PLUGIN_FETCH_CGNAT: "allow-legacy" })).toBe("allow-legacy");
+    expect(resolveCgnatMode({ PAPERCLIP_PLUGIN_FETCH_CGNAT: " Allow-Legacy " })).toBe("allow-legacy");
   });
 });
