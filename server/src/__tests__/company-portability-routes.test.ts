@@ -87,24 +87,29 @@ vi.mock("../services/index.js", () => ({
   logActivity: mockLogActivity,
 }));
 
-function registerCompanyRouteMocks() {
-  vi.doMock("../services/index.js", () => ({
-    accessService: () => mockAccessService,
-    agentService: () => mockAgentService,
-    budgetService: () => mockBudgetService,
-    companyArtifactsService: () => mockCompanyArtifactsService,
-    companyPortabilityService: () => mockCompanyPortabilityService,
-    companyService: () => mockCompanyService,
-    feedbackService: () => mockFeedbackService,
-    instanceSettingsService: () => mockInstanceSettingsService,
-    logActivity: mockLogActivity,
-  }));
-}
-
 let appImportCounter = 0;
 
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("../services/index.js", () => ({
+  accessService: () => mockAccessService,
+  agentService: () => mockAgentService,
+  budgetService: () => mockBudgetService,
+  companyArtifactsService: () => mockCompanyArtifactsService,
+  companyPortabilityService: () => mockCompanyPortabilityService,
+  companyService: () => mockCompanyService,
+  feedbackService: () => mockFeedbackService,
+  instanceSettingsService: () => mockInstanceSettingsService,
+  logActivity: mockLogActivity,
+}));
+
 async function createApp(actor: Record<string, unknown>) {
-  registerCompanyRouteMocks();
   appImportCounter += 1;
   const routeModulePath = `../routes/companies.js?company-portability-routes-${appImportCounter}`;
   const middlewareModulePath = `../middleware/index.js?company-portability-routes-${appImportCounter}`;
@@ -223,7 +228,6 @@ function boardActor(userId: string) {
 // actor is chosen per request from the `x-test-user-id` header. This lets one
 // app exercise cross-user isolation and the per-user duplicate guard.
 async function createBoardApp() {
-  registerCompanyRouteMocks();
   appImportCounter += 1;
   const routeModulePath = `../routes/companies.js?company-portability-routes-${appImportCounter}`;
   const middlewareModulePath = `../middleware/index.js?company-portability-routes-${appImportCounter}`;
@@ -859,9 +863,12 @@ describe.sequential("company portability routes", () => {
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
-  it.sequential("keeps Cloud-managed global import apply synchronous when async opt-in is absent", async () => {
+  it.sequential("floors global import apply on a cloud-managed instance, even for the trusted tenant actor", async () => {
+    // The trusted-tenant tests above run without the cloud env signal on
+    // purpose: the import floor keys on isCloudManagedInstance(), not on the
+    // actor. With the signal present, even the trusted tenant actor is
+    // floored — importing is disabled on cloud-managed instances outright.
     vi.stubEnv("PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN", "tenant-secret");
-    mockCompanyPortabilityService.importBundle.mockResolvedValueOnce(createImportResult("created"));
     try {
       const app = await createApp(cloudTenantActor());
 
@@ -870,15 +877,10 @@ describe.sequential("company portability routes", () => {
         .set(cloudHeaders)
         .send(importRequest);
 
-      expect(res.status).toBe(200);
-      expect(res.body.company.id).toBe(companyId);
-      expect(res.body.company.action).toBe("created");
-      expect(res.body.job).toBeUndefined();
-      expect(mockCompanyPortabilityService.importBundle).toHaveBeenCalledWith(importRequest, "cloud-user-1", { pauseAutomations: false });
-      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
-        action: "company.imported",
-        companyId,
-      }));
+      expect(res.status).toBe(403);
+      expect(res.body).toMatchObject({ code: "cloud_managed" });
+      expect(mockCompanyPortabilityService.importBundle).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalled();
     } finally {
       vi.unstubAllEnvs();
     }

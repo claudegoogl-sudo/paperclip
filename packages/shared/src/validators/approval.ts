@@ -27,6 +27,10 @@ export const approvalPayloadSchemasByType: Partial<Record<ApprovalType, z.ZodTyp
   request_board_approval: requestBoardApprovalPayloadSchema,
 };
 
+export const APPROVAL_PAYLOAD_EMPTY_CODE = "approval_payload_empty";
+export const APPROVAL_PAYLOAD_EMPTY_MESSAGE =
+  "Approval payload must not be empty. Include at least one field describing the request so the operator can decide the card.";
+
 /**
  * Discriminated payload validation, shared by the server route (authoritative
  * 4xx boundary) and the MCP tool schema (early agent-facing feedback).
@@ -35,6 +39,15 @@ export function refineApprovalPayload(
   value: { type: string; payload: unknown },
   ctx: z.RefinementCtx,
 ): void {
+  if (isEmptyApprovalPayload(value.payload)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["payload"],
+      message: APPROVAL_PAYLOAD_EMPTY_MESSAGE,
+      params: { code: APPROVAL_PAYLOAD_EMPTY_CODE },
+    });
+    return;
+  }
   const payloadSchema = approvalPayloadSchemasByType[value.type as ApprovalType];
   if (!payloadSchema) return;
   const result = payloadSchema.safeParse(value.payload);
@@ -45,7 +58,7 @@ export function refineApprovalPayload(
     Object.assign(value.payload as Record<string, unknown>, result.data);
     return;
   }
-  for (const issue of result.error.errors) {
+  for (const issue of result.error.issues) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       path: ["payload", ...issue.path],
@@ -56,10 +69,23 @@ export function refineApprovalPayload(
 
 export const createApprovalSchema = z.object({
   type: z.enum(APPROVAL_TYPES),
-  requestedByAgentId: z.string().uuid().optional().nullable(),
+  requestedByAgentId: z.string().guid().optional().nullable(),
   payload: z.record(z.string(), z.unknown()),
-  issueIds: z.array(z.string().uuid()).optional(),
+  issueIds: z.array(z.string().guid()).optional(),
 });
+
+/**
+ * A contentless approval payload (`{}`) is not a decidable request: the
+ * operator cannot tell what is being asked, and a pending card cannot be
+ * repaired by its author. `refineApprovalPayload` applies this predicate for
+ * every approval type, so route and MCP tool share one check.
+ */
+export function isEmptyApprovalPayload(payload: unknown): boolean {
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    return true;
+  }
+  return Object.keys(payload as Record<string, unknown>).length === 0;
+}
 
 export type CreateApproval = z.infer<typeof createApprovalSchema>;
 

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { applyPendingMigrations, ensurePostgresDatabase } from "./client.js";
+import { applyPendingMigrations, closeRegisteredClients, ensurePostgresDatabase } from "./client.js";
 import {
   EMBEDDED_POSTGRES_HOST,
   buildEmbeddedPostgresConnectionString,
@@ -430,6 +430,10 @@ export async function startEmbeddedPostgresTestDatabase(
       return {
         connectionString,
         cleanup: async () => {
+          // End every client a caller created against this cluster first (upstream
+          // semantics): a still-registered client whose stop kills its socket can crash
+          // the process when a queued write fires later.
+          await closeRegisteredClients(connectionString).catch(() => {});
           if (instance) {
             await stopEmbeddedPostgresBounded(instance, dataDir).catch(() => {});
           }

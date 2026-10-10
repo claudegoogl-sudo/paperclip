@@ -144,13 +144,13 @@ describe("approval creation payload validation", () => {
     mockIssueApprovalService.linkManyForApproval.mockResolvedValue(undefined);
   });
 
-  it("rejects an empty request_board_approval payload with 400 and writes no row", async () => {
+  it("rejects an empty request_board_approval payload with the 422 empty-payload contract and writes no row", async () => {
     const res = await request(await createApp())
       .post("/api/companies/company-1/approvals")
       .send({ type: "request_board_approval", payload: {} });
 
-    expect(res.status).toBe(400);
-    expect(res.body.error).toBe("Validation error");
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("approval_payload_empty");
     expect(mockApprovalService.create).not.toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
@@ -294,14 +294,15 @@ describe("approval withdraw route", () => {
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
-  it("refuses withdrawal by a different agent with 403", async () => {
+  it("answers a different agent with the same 404 as a missing approval", async () => {
     mockApprovalService.getById.mockResolvedValue(pendingApproval({ requestedByAgentId: "agent-2" }));
 
     const res = await request(await createAgentApp({ agentId: "agent-1" }))
       .post("/api/approvals/approval-1/withdraw")
       .send({});
 
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ error: "Approval not found" });
     expect(mockApprovalService.withdraw).not.toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalled();
   });

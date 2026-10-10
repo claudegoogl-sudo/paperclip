@@ -105,3 +105,83 @@ describe("agent session wake messages", () => {
     expect(wakePayload?.agentMessage?.text.length).toBeLessThanOrEqual(12_000);
   });
 });
+
+describe("wake payload run clock context", () => {
+  const baseInput = {
+    companyId: "company-1",
+    contextSnapshot: {
+      wakeReason: "issue_assigned",
+      issueId: "issue-1",
+    },
+    issueSummary: {
+      id: "issue-1",
+      identifier: "PAP-15271",
+      title: "Run clock context",
+      description: null,
+      status: "in_progress",
+      priority: "high",
+      workMode: "standard",
+    },
+  };
+
+  const siblingDb = (siblingRows: unknown[]) =>
+    ({
+      select: () => ({
+        from: () => ({
+          where: async () => [],
+          innerJoin: () => ({
+            where: () => ({
+              orderBy: () => ({
+                limit: () => Promise.resolve(siblingRows),
+              }),
+            }),
+          }),
+        }),
+      }),
+    }) as never;
+
+  it("stamps the run start time and same-issue sibling run metadata into the payload", async () => {
+    const wakePayload = await buildPaperclipWakePayload({
+      ...baseInput,
+      db: siblingDb([
+        {
+          runId: "11111111-1111-4111-8111-111111111111",
+          agentName: "QA",
+          startedAt: new Date("2026-09-24T08:01:00.000Z"),
+        },
+      ]),
+      currentRun: { id: "22222222-2222-4222-8222-222222222222", startedAt: "2026-09-24T08:00:00.000Z" },
+    });
+
+    expect(wakePayload).toMatchObject({
+      runStartedAt: "2026-09-24T08:00:00.000Z",
+      siblingRuns: [
+        {
+          runId: "11111111-1111-4111-8111-111111111111",
+          agentName: "QA",
+          startedAt: "2026-09-24T08:01:00.000Z",
+        },
+      ],
+    });
+
+    const prompt = renderPaperclipWakePrompt(wakePayload);
+    expect(prompt).toContain("- run started: 2026-09-24T08:00:00.000Z");
+    expect(prompt).toContain(
+      "  - QA run 11111111-1111-4111-8111-111111111111 started 2026-09-24T08:01:00.000Z",
+    );
+    // The current run never appears in its own sibling list.
+    expect(prompt).not.toContain("22222222-2222-4222-8222-222222222222");
+  });
+
+  it("leaves run clock metadata empty when no current run is provided", async () => {
+    const wakePayload = await buildPaperclipWakePayload({
+      ...baseInput,
+      db: siblingDb([]),
+    });
+
+    expect(wakePayload?.runStartedAt ?? null).toBeNull();
+    expect(wakePayload?.siblingRuns).toEqual([]);
+    const prompt = renderPaperclipWakePrompt(wakePayload);
+    expect(prompt).toContain("- sibling runs on this issue: none active");
+  });
+});

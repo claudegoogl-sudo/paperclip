@@ -1,4 +1,11 @@
 export {
+  nativeFinalizationResultSchema,
+  nativeFinalizationResultV1Schema,
+  nativeReportedWorkDispositionSchema,
+  type NativeFinalizationResultInput,
+} from "./native-finalization.js";
+
+export {
   decisionEffectStalenessSchema,
   decisionOptionStyleSchema,
   commentOnIssueDecisionEffectSchema,
@@ -89,6 +96,7 @@ export {
   startEnvironmentCustomImageSetupSessionSchema,
   finishEnvironmentCustomImageSetupSessionSchema,
   cancelEnvironmentCustomImageSetupSessionSchema,
+  relinkEnvironmentCustomImageTemplateSchema,
   createEnvironmentCustomImageTerminalSessionTokenSchema,
   environmentCustomImageTerminalSessionTokenSchema,
   type EnvironmentCustomImageSetupConnectionSummary,
@@ -97,6 +105,7 @@ export {
   type StartEnvironmentCustomImageSetupSession,
   type FinishEnvironmentCustomImageSetupSession,
   type CancelEnvironmentCustomImageSetupSession,
+  type RelinkEnvironmentCustomImageTemplate,
   type CreateEnvironmentCustomImageTerminalSessionToken,
   type EnvironmentCustomImageTerminalSessionToken,
 } from "./environment-custom-images.js";
@@ -342,6 +351,9 @@ export {
   standardAgentKeyScopeSchema,
   taskBridgeAgentKeyScopeSchema,
   skillTestAgentKeyScopeSchema,
+  notifyOnlyAgentKeyScopeSchema,
+  notifyOnlyAgentKeyExpiryError,
+  NOTIFY_ONLY_AGENT_KEY_MAX_TTL_SECONDS,
   createAgentKeySchema,
   agentApiKeyScopeIsCrossCompany,
   CROSS_COMPANY_AGENT_KEY_MAX_TTL_SECONDS,
@@ -373,6 +385,7 @@ export {
   type AgentApiKeyScope,
   type TaskBridgeAgentKeyScope,
   type SkillTestAgentKeyScope,
+  type NotifyOnlyAgentKeyScope,
   type CreateAgentKey,
   type ResolveAgentKeyExpiryInput,
   type AgentMineInboxQuery,
@@ -460,6 +473,8 @@ export {
   requestConfirmationPayloadSchema,
   requestConfirmationResumeFailureSchema,
   requestConfirmationResultSchema,
+  requestConfirmationSecretProposalPayloadSchema,
+  requestConfirmationSecretProposalResultSchema,
   requestCheckboxConfirmationOptionSchema,
   requestCheckboxConfirmationPayloadSchema,
   requestCheckboxConfirmationResultSchema,
@@ -618,6 +633,9 @@ export {
   createApprovalRequestSchema,
   refineApprovalPayload,
   requestBoardApprovalPayloadSchema,
+  isEmptyApprovalPayload,
+  APPROVAL_PAYLOAD_EMPTY_CODE,
+  APPROVAL_PAYLOAD_EMPTY_MESSAGE,
   resolveApprovalSchema,
   requestApprovalRevisionSchema,
   resubmitApprovalSchema,
@@ -716,7 +734,10 @@ export {
 } from "./finance.js";
 
 export {
+  ASSET_NAMESPACE_MAX_LENGTH,
+  ASSET_NAMESPACE_RULE,
   createAssetImageMetadataSchema,
+  sanitizeAssetNamespace,
   type CreateAssetImageMetadata,
 } from "./asset.js";
 

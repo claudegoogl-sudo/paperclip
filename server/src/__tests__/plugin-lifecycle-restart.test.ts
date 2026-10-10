@@ -29,6 +29,7 @@ const mockRegistry = vi.hoisted(() => ({
   updateStatus: vi.fn(),
   upsertConfig: vi.fn(),
   getConfig: vi.fn(),
+  listConfigs: vi.fn().mockResolvedValue([]),
   list: vi.fn(),
   delete: vi.fn(),
 }));
@@ -54,6 +55,7 @@ function makeWorkerManagerStub() {
       startWorker: vi.fn().mockResolvedValue(undefined),
       stopWorker: vi.fn().mockResolvedValue(undefined),
       restartWorker: vi.fn().mockResolvedValue(undefined),
+      call: vi.fn().mockResolvedValue(undefined),
     } as unknown as PluginWorkerManager,
   };
 }
@@ -181,5 +183,61 @@ describe("pluginLifecycleManager.restartWorker", () => {
     // clobbering worker_stopped emit is gone.
     expect(counts.get("example.plugin")).toBe(6);
     expect(stopped).not.toHaveBeenCalled();
+  });
+
+  it("replays stored company config to the worker after a bare bounce (fallback path)", async () => {
+    mockRegistry.getById.mockResolvedValue(pluginRecord);
+    mockRegistry.listConfigs.mockResolvedValueOnce([
+      { companyId: "company-a", configJson: { url: "http://printer-a" } },
+      { companyId: "company-b", configJson: null },
+    ]);
+
+    const { handle, workerManager } = makeWorkerManagerStub();
+    const order: string[] = [];
+    (handle.restart as ReturnType<typeof vi.fn>).mockImplementation(async () => { order.push("restart"); });
+    (workerManager.call as ReturnType<typeof vi.fn>).mockImplementation(async (_id: string, method: string) => {
+      order.push(method);
+    });
+
+    const lifecycle = pluginLifecycleManager(
+      {} as never,
+      {
+        loader: { hasRuntimeServices: () => false } as unknown as PluginLoader,
+        workerManager,
+      },
+    );
+
+    await lifecycle.restartWorker("plugin-1");
+
+    expect(mockRegistry.listConfigs).toHaveBeenCalledWith("plugin-1");
+    expect(workerManager.call).toHaveBeenCalledWith("plugin-1", "configChanged", {
+      config: { url: "http://printer-a" },
+      companyId: "company-a",
+    });
+    expect(workerManager.call).toHaveBeenCalledWith("plugin-1", "configChanged", {
+      config: {},
+      companyId: "company-b",
+    });
+    // Config delivery must follow the bounce, never precede it.
+    expect(order).toEqual(["restart", "configChanged", "configChanged"]);
+  });
+
+  it("still completes the bounce when one company's config delivery fails", async () => {
+    mockRegistry.getById.mockResolvedValue(pluginRecord);
+    mockRegistry.listConfigs.mockResolvedValueOnce([
+      { companyId: "company-a", configJson: { a: 1 } },
+      { companyId: "company-b", configJson: { b: 2 } },
+    ]);
+    const { workerManager } = makeWorkerManagerStub();
+    (workerManager.call as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce(new Error("worker busy"))
+      .mockResolvedValueOnce(undefined);
+
+    const lifecycle = pluginLifecycleManager(
+      {} as never,
+      { loader: { hasRuntimeServices: () => false } as unknown as PluginLoader, workerManager },
+    );
+    await expect(lifecycle.restartWorker("plugin-1")).resolves.toBeUndefined();
+    expect(workerManager.call).toHaveBeenCalledTimes(2);
   });
 });

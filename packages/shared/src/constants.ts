@@ -1,15 +1,6 @@
 export const COMPANY_STATUSES = ["active", "paused", "archived"] as const;
 export type CompanyStatus = (typeof COMPANY_STATUSES)[number];
 
-// 25 MiB. Raised from 10 MiB so the plugin-artifact write path —
-// whose effective ceiling is Math.min(companyMaxBytes, pluginMaxBytes) — is not
-// silently pinned back to 10 MiB by an unset per-company limit. 25 MiB covers
-// everything Telegram's Bot API getFile can deliver (hard 20 MB inbound cap)
-// with margin for base64/metadata, so an inbound messenger relay can store a CAD
-// model / STL. Per-company overrides may still set anything up to the 1 GiB cap.
-export const DEFAULT_COMPANY_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
-export const MAX_COMPANY_ATTACHMENT_MAX_BYTES = 1024 * 1024 * 1024;
-
 export const DEPLOYMENT_MODES = ["local_trusted", "authenticated"] as const;
 export type DeploymentMode = (typeof DEPLOYMENT_MODES)[number];
 
@@ -47,11 +38,13 @@ export const AGENT_ADAPTER_TYPES = [
   "http",
   "claude_local",
   "codex_local",
+  "paperclip_runner",
   "cursor_cloud",
   "gemini_local",
   "grok_local",
   "hermes_gateway",
   "hermes_local",
+  "kimi_local",
   "opencode_local",
   "pi_local",
   "cursor",
@@ -392,6 +385,7 @@ export type IssueSurfaceVisibility = (typeof ISSUE_SURFACE_VISIBILITIES)[number]
 
 export const ISSUE_RECOVERY_ACTION_KINDS = [
   "missing_disposition",
+  "deliberate_wait_without_target",
   "stranded_assigned_issue",
   "workspace_validation",
   "configuration_validation",
@@ -399,6 +393,8 @@ export const ISSUE_RECOVERY_ACTION_KINDS = [
   "issue_graph_liveness",
 ] as const;
 export type IssueRecoveryActionKind = (typeof ISSUE_RECOVERY_ACTION_KINDS)[number];
+
+export const ISSUE_DISPOSITION_REPAIR_RETRY_REASON = "issue_disposition_repair";
 
 export const ISSUE_RECOVERY_ACTION_STATUSES = [
   "active",
@@ -680,7 +676,10 @@ export type RoutineRunStatus = (typeof ROUTINE_RUN_STATUSES)[number];
 export const ROUTINE_RUN_SOURCES = ["schedule", "manual", "api", "webhook"] as const;
 export type RoutineRunSource = (typeof ROUTINE_RUN_SOURCES)[number];
 
-export const PAUSE_REASONS = ["manual", "budget", "system", "company_archived"] as const;
+// "import" marks agents parked by a company import (safety default) so the UI
+// can explain the pause and offer a scoped bulk-resume; "system" remains the
+// reason for platform-managed pauses (plugins, built-ins).
+export const PAUSE_REASONS = ["manual", "budget", "system", "company_archived", "import"] as const;
 export type PauseReason = (typeof PAUSE_REASONS)[number];
 
 export const PROJECT_COLORS = [
@@ -1371,12 +1370,21 @@ export type PluginCategory = (typeof PLUGIN_CATEGORIES)[number];
 export const PLUGIN_CAPABILITIES = [
   // Data Read
   "companies.read",
+  // Cross-company READ during an agent tool dispatch (executeTool) for a fixed
+  // host-side set of 6 read methods. Default-deny: the manifest declaration
+  // grants nothing unless the operator also lists the plugin key in
+  // `plugins.crossCompanyReadAllowlist` (instance config). Never implied.
+  "companies.cross-read",
   "projects.read",
   "project.workspaces.read",
   "execution.workspaces.read",
   "issues.read",
   "issue.relations.read",
   "issue.subtree.read",
+  // Read pending (and, with `since`, recent) agent wakeup requests for a set
+  // of issues. Allow-listed fields only (no payload/context snapshot).
+  // Default-deny: deliberately NOT implied by issues.read.
+  "issue.wakeups.read",
   "issue.comments.read",
   // Read pending issue-thread interactions (decision cards) on an issue.
   "issue.interactions.read",
@@ -1754,6 +1762,7 @@ export const PLUGIN_EVENT_TYPES = [
   "issue.created",
   "issue.updated",
   "issue.comment.created",
+  "issue.attachment.created",
   "issue.document.created",
   "issue.document.updated",
   "issue.document.deleted",

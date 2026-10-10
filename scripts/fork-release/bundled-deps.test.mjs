@@ -19,7 +19,7 @@ import test from "node:test";
 
 import { bundledReleasePackages, tarballNameFor } from "./stage-bundled-packages.mjs";
 import { checkBundledTarballs } from "./gate-bundled-tarballs.mjs";
-import { copyPackageMetadata } from "../prepare-bundled-package.mjs";
+import { copyPackageMetadata, createBundledInstallManifest, prepareBundledPackage } from "../prepare-bundled-package.mjs";
 
 const repoRoot = join(new URL("..", import.meta.url).pathname, "..");
 
@@ -27,6 +27,7 @@ test("bundled release discovery finds the patched bundled packages", () => {
   const bundled = bundledReleasePackages();
   const byName = new Map(bundled.map((entry) => [entry.name, entry]));
   assert.deepEqual(byName.get("@paperclipai/adapter-utils")?.bundledDeps, ["acpx"]);
+  assert.deepEqual(byName.get("@paperclipai/adapter-acpx-local")?.bundledDeps, ["acpx"]);
   assert.deepEqual(byName.get("@paperclipai/db")?.bundledDeps, ["embedded-postgres"]);
 });
 
@@ -139,6 +140,66 @@ test("the gate rejects a bundled tarball whose bundled copy is pristine", () => 
   assert.match(violations[0], /missing the acpx\.session_options\.env persisted-key-policy exemption/);
 });
 
+test("the gate goes RED for the acpx-local tarball when its bundled acpx is pristine", () => {
+  const root = makeFakeRepo([{ dir: "packages/adapters/acpx-local", name: "@paperclipai/adapter-acpx-local" }]);
+  const outDir = join(root, "out");
+  mkdirSync(outDir, { recursive: true });
+  makeFakeTarball(outDir, {
+    name: "@paperclipai/adapter-acpx-local",
+    version: "9.9.9-test",
+    deps: { acpx: "0.12.0" },
+    bundled: ["acpx"],
+    files: {
+      // Pristine acpx 0.12.0: the exact shape the fork.42 host resolved when
+      // acpx-local's bare `acpx/runtime` import hit the top-level unpatched
+      // copy instead of a bundled patched one.
+      "node_modules/acpx/dist/live-checkpoint-ClPCSdrW.js":
+        'const MAP_OBJECT_PATHS = /* @__PURE__ */ new Set(["request_token_usage", "messages.Agent.tool_results"]);',
+      "dist/server/execute.js": "export {};",
+      "LICENSE": "MIT License\n",
+    },
+  });
+
+  const { checked, violations } = checkBundledTarballs({
+    repoRoot: root,
+    outDir,
+    version: "9.9.9-test",
+    markers: MARKERS,
+  });
+  assert.equal(checked, 1);
+  assert.equal(violations.length, 1);
+  assert.match(violations[0], /@paperclipai\/adapter-acpx-local: .*missing the acpx\.session_options\.env persisted-key-policy exemption/);
+});
+
+test("the gate goes RED for the acpx-local tarball when the bundling is removed", () => {
+  const root = makeFakeRepo([{ dir: "packages/adapters/acpx-local", name: "@paperclipai/adapter-acpx-local" }]);
+  const outDir = join(root, "out");
+  mkdirSync(outDir, { recursive: true });
+  // Packed manifest without bundleDependencies and without node_modules/acpx:
+  // a bare pin bump (`"acpx": "0.12.0"`, no bundle) regresses to exactly this
+  // shape, because npm then resolves the dep from the registry at install
+  // time — pristine, without the repository patch.
+  makeFakeTarball(outDir, {
+    name: "@paperclipai/adapter-acpx-local",
+    version: "9.9.9-test",
+    deps: { acpx: "0.12.0" },
+    bundled: [],
+    files: { "dist/server/execute.js": "export {};", "LICENSE": "MIT License\n" },
+  });
+
+  const { violations } = checkBundledTarballs({
+    repoRoot: root,
+    outDir,
+    version: "9.9.9-test",
+    markers: MARKERS,
+  });
+  // The dependency stays declared (a bare pin bump keeps it); what the gate
+  // catches is the dropped bundle contract and the missing bundled runtime.
+  assert.equal(violations.length, 2);
+  assert.match(violations[0], /@paperclipai\/adapter-acpx-local: packed manifest dropped bundleDependencies entry acpx/);
+  assert.match(violations[1], /@paperclipai\/adapter-acpx-local: tarball does not bundle node_modules\/acpx/);
+});
+
 test("the gate rejects a tarball that dropped the bundle or the manifest contract", () => {
   const root = makeFakeRepo([{ dir: "packages/adapter-utils", name: "@paperclipai/adapter-utils" }]);
   const outDir = join(root, "out");
@@ -194,6 +255,48 @@ test("the gate rejects a bundled tarball that ships without a license", () => {
     violations.some((v) => /does not ship package\/LICENSE/.test(v)),
     `expected a package/LICENSE violation, got: ${JSON.stringify(violations)}`,
   );
+});
+
+test("staging skips files entries that do not exist on disk (npm pack semantics)", () => {
+  const root = mkdtempSync(join(tmpdir(), "fork-release-files-skip-"));
+  try {
+    const sourceDir = join(root, "pkg");
+    const destinationDir = join(root, "stage");
+    mkdirSync(join(sourceDir, "dist"), { recursive: true });
+    writeFileSync(join(sourceDir, "dist", "index.js"), "export {};\n");
+    // adapter-acpx-local lists `skills`, which its build never produces.
+
+    writeFileSync(join(sourceDir, "package.json"), JSON.stringify({
+      name: "@paperclipai/adapter-acpx-local",
+      files: ["dist", "skills"],
+      bundleDependencies: ["acpx"],
+      dependencies: { acpx: "0.12.0" },
+      devDependencies: { vitest: "^4.1.10" },
+    }));
+
+    prepareBundledPackage(sourceDir, destinationDir);
+
+    assert.equal(existsSync(join(destinationDir, "dist", "index.js")), true);
+    assert.equal(existsSync(join(destinationDir, "skills")), false, "missing files entry must be skipped, not fatal");
+    const staged = JSON.parse(readFileSync(join(destinationDir, "package.json"), "utf8"));
+    assert.equal(staged.files.join(), "dist,skills");
+
+    // The transient install manifest (what `npm install` consumes) must not
+    // carry devDependencies: the staged install only needs the bundled-dep
+    // closure, and npm 10.9.x walks dev graphs even under --omit=dev.
+    const install = createBundledInstallManifest(
+      {
+        name: "@paperclipai/db",
+        dependencies: { "embedded-postgres": "18.1.0-beta.16", "@paperclipai/shared": "workspace:*" },
+        devDependencies: { vitest: "^4.1.10", typescript: "^5.7.3" },
+      },
+      ["embedded-postgres"],
+    );
+    assert.deepEqual(install.dependencies, { "embedded-postgres": "18.1.0-beta.16" });
+    assert.equal(install.devDependencies, undefined, "staged install manifest must not carry devDependencies");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("staged package metadata copies the repo-root license when the package has none", () => {

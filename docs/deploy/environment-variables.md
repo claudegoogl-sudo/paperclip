@@ -22,7 +22,10 @@ All environment variables that Paperclip uses for server configuration.
 | `PAPERCLIP_DEPLOYMENT_MODE` | `local_trusted` | Runtime mode override |
 | `PAPERCLIP_DEPLOYMENT_EXPOSURE` | `private` | Exposure policy when deployment mode is `authenticated` |
 | `PAPERCLIP_API_URL` | (auto-derived) | Paperclip API base URL. When set externally (e.g., via Kubernetes ConfigMap, load balancer, or reverse proxy), the server preserves the value instead of deriving it from the listen host and port. Useful for deployments where the public-facing URL differs from the local bind address. |
+| `PAPERCLIP_AGENT_API_URL` | loopback listen origin (`http://127.0.0.1:<port>`, or `http://[::1]:<port>` for IPv6) when the server binds loopback or a wildcard; otherwise `PAPERCLIP_API_URL` | Base URL injected into local agent runs as their `PAPERCLIP_API_URL`. Kept separate from the public base so agents on the server host never send API calls (and their credentials) through a public access proxy that may answer with an HTML login page. Set it to override, e.g. `http://host.docker.internal:3100` for containerised agents. Invite/join links, board UI links and routine webhook URLs keep using the public base. Sandbox callback bridges are unaffected. |
 | `PAPERCLIP_MAX_CONCURRENT_RUNS_HOST` | `ceil(vCPU / 2)` | Host-wide ceiling on concurrently executing agent runs — see [Host-wide run concurrency](#host-wide-run-concurrency). |
+| `PAPERCLIP_RUN_ADMISSION_MEMORY_PCT` | `90` | Defer new run admission once the service cgroup's memory usage reaches this percentage of its effective soft limit (`memory.high`, or `memory.max` when no soft limit is set) — see [Memory-pressure run admission](#memory-pressure-run-admission). |
+| `PAPERCLIP_RECOVERY_REPLAY_MAX_CONCURRENT` | `ceil(PAPERCLIP_MAX_CONCURRENT_RUNS_HOST / 2)` | Cap on concurrently in-flight boot/recovery replay dispatches, with a jittered `>= 2s` spacing between dispatch starts — see [Staggered boot recovery replay](#staggered-boot-recovery-replay). |
 
 ## Host-wide run concurrency
 
@@ -65,6 +68,85 @@ When the ceiling is the scarce resource, a single agent may claim at most
 cannot take the whole host budget. The per-agent `maxConcurrentRuns` still
 applies as a secondary gate.
 
+## Memory-pressure run admission
+
+`PAPERCLIP_MAX_CONCURRENT_RUNS_HOST` bounds how many agent runs execute at
+once, but it cannot see the cgroup memory budget those runs fill. After a
+crash-loop restart, boot recovery replays continuations for every stranded
+`in_progress` issue, and the ceiling happily admits a full house of heavy
+adapter processes — refilling the service cgroup to `memory.high`/`memory.max`
+and converting a recoverable restart into another OOM.
+
+`PAPERCLIP_RUN_ADMISSION_MEMORY_PCT` adds a memory-pressure backoff to the same
+admission gate:
+
+- **What is read:** the server's own cgroup v2 memory files (`memory.current`,
+  `memory.high`, `memory.max`, `memory.events`), discovered via
+  `/proc/self/cgroup` and `/proc/self/mountinfo`.
+- **Threshold:** the variable is a percentage of the *effective soft limit* —
+  `memory.high` when set, `memory.max` otherwise, and the smaller of the two
+  when both are set (so a unit with inverted limits — `MemoryHigh` ≥
+  `MemoryMax` — defers before the hard limit, not after the OOM killer has
+  fired). Range `1`–`100`, default `90`. Unusable values are ignored and the
+  default is used.
+- **Behavior:** a run whose admission would start at or above the threshold is
+  deferred through the exact same deferral/drain machinery a ceiling refusal
+  uses — one more deferral reason, not a new queue. Deferred runs stay queued
+  and are re-offered a slot as running work finishes and memory drains.
+- **No-op off Linux:** on hosts without cgroup v2 memory files (macOS, Windows,
+  minimal CI containers) or with no limit set, the check detects this and
+  changes nothing.
+- **Observability:** each refusal logs
+  `heartbeat dispatch deferred by cgroup memory pressure` at `warn` with the
+  pressure percentage, threshold, current bytes, effective limit, and the
+  cumulative `memory.events` `high` counter; the run-ceiling state surface
+  reports `memoryPressurePct` and `deferralsByMemory`.
+
+Happy path — a host whose service unit sets `MemoryHigh=10G` and
+`MemoryMax=12G` wants admission to back off once anonymous memory passes
+~8.5G:
+
+```bash
+# systemd override
+[Service]
+Environment=PAPERCLIP_RUN_ADMISSION_MEMORY_PCT=85
+```
+
+On restart, boot replay still queues every stranded continuation, but
+admission defers while the cgroup is hot and drains the backlog as memory
+falls back under the threshold.
+
+## Staggered boot recovery replay
+
+The recovery sweep requeues continuations for stranded `in_progress` issues in
+one pass, and the queued-run drain dispatches a queued run per agent — together
+they can spawn a full house of adapter processes seconds after a restart.
+Replay dispatches (recovery-driven wakes and the boot queued-run drain) are
+therefore paced:
+
+- **Cap:** at most `PAPERCLIP_RECOVERY_REPLAY_MAX_CONCURRENT` replay dispatches
+  in flight at once. Default `ceil(hostCeiling / 2)`, clamped to the host
+  ceiling; values below `1` or non-numbers fall back to the default.
+- **Spacing:** a jittered delay of at least 2s (plus up to 4s of jitter)
+  between dispatch starts, so processes respawn spread out instead of in one
+  burst. An isolated dispatch (nothing else replaying) still starts
+  immediately — the spacing only binds during bursts.
+- **Not a queue:** every paced wake still runs, still goes through the normal
+  admission gate (`reserveHostRunSlot`), and a failed dispatch releases its
+  slot immediately.
+- **Observability:** each genuinely delayed replay dispatch logs
+  `recovery replay dispatch staggered` at `info` with the wait, cap, and
+  in-flight counts.
+
+Happy path — a host with a ceiling of 8 wants boot replay to admit at most 2
+continuations at a time:
+
+```bash
+# systemd override
+[Service]
+Environment=PAPERCLIP_RECOVERY_REPLAY_MAX_CONCURRENT=2
+```
+
 ## Run-path Integrity
 
 Optional boot-time self-checks for `paperclipai run`. They guard against a
@@ -78,6 +160,73 @@ operator turn a mismatch into a fast, loud abort instead of a silent crash loop.
 |----------|---------|-------------|
 | `PAPERCLIP_REQUIRE_FORK_BUILD` | (unset) | When truthy (`1`/`true`/`yes`/`on`), abort at boot unless the running build carries a `-fork.<n>` version marker |
 | `PAPERCLIP_EXPECTED_VERSION` | (unset) | When set, abort at boot unless the running CLI version matches this value exactly |
+
+| `PAPERCLIP_HIDDEN_SETTINGS` | (unset) | Comma-separated settings surfaces to hide from the UI and floor at the API, for operators hosting Paperclip for others (managed cloud, internal shared server). See [Hiding settings surfaces](#hiding-settings-surfaces). |
+| `PAPERCLIP_SETTING_DEFAULTS` | (unset) | JSON object replacing the schema default of selected instance settings, for hosting operators. See [Operator setting defaults](#operator-setting-defaults). |
+
+### Hiding settings surfaces
+
+`PAPERCLIP_HIDDEN_SETTINGS` takes keys from the registry in
+`packages/shared/src/settings-visibility.ts`:
+
+- Any instance settings page: `instance.profile`, `instance.environments`,
+  `instance.access`, `instance.experimental`,
+  `instance.plugins`, `instance.adapters` — removed from navigation and
+  routing (the General page is the settings root and stays visible). Hiding
+  `instance.access`, `instance.plugins`, or `instance.adapters` also floors
+  their management endpoints with `403 settings_operator_managed`; hiding
+  `instance.experimental` floors every experimental toggle write.
+- Any Instance → General section: `instance.general.censorUsernameInLogs`,
+  `instance.general.keyboardShortcuts`, `instance.general.backupRetention`,
+  `instance.general.feedbackDataSharingPreference` (each also rejects
+  value-changing writes via `PATCH /api/instance/settings/general`), plus the
+  UI-only `instance.general.deploymentStatus` and `instance.general.signOut`.
+- Any experimental toggle: `instance.experimental.<flagKey>` (e.g.
+  `instance.experimental.enableSmokeLab`) — the card disappears and
+  value-changing writes are rejected.
+- Any top-level company settings page: `company.members`, `company.invites`,
+  `company.secrets`, `company.export`, `company.import` — removed from the
+  settings sidebar, tab bar, and routing (the company General page is the
+  settings root and stays visible). These are UI-visibility keys: the
+  membership, invite, secret, and export APIs stay live for agents and
+  integrations. `company.import` is the exception — hiding it also floors
+  every company-import route with `403 settings_operator_managed`. On
+  cloud-managed instances import is floored unconditionally with
+  `403 cloud_managed`, independent of this variable.
+- A single tab of the Secrets page: `company.secrets.vaults` (Provider
+  vaults) and `company.secrets.proposals` (Proposals) — the tab disappears
+  while the rest of the page stays up. UI-visibility only; the secret
+  provider-config and proposal APIs stay live for agents and integrations.
+
+Unknown keys are logged and ignored, so one list can be rolled across a fleet
+of mixed app versions, and retired keys (like `instance.heartbeats`, whose
+page was removed) can stay in an operator list without breaking older or
+newer releases. With the variable unset nothing is hidden and behavior
+is identical to earlier releases. Hiding a toggle does not change its value;
+pair hiding with the desired default where it matters (for general settings,
+see [Operator setting defaults](#operator-setting-defaults)).
+
+### Operator setting defaults
+
+`PAPERCLIP_SETTING_DEFAULTS` takes a JSON object whose fields come from the
+registry in `packages/shared/src/setting-defaults.ts` (currently
+`feedbackDataSharingPreference`). The operator value substitutes for the
+schema default at read time: any field whose effective value is still the
+schema default resolves to the operator value, while an explicit non-default
+user choice always wins. The overlay is never persisted, so unsetting the
+variable restores stock behavior wherever a user has not chosen otherwise.
+A client that writes back the full settings object it read does not persist
+the operator value either: writing the operator value over a still-unchosen
+field is treated as an echo of the overlay and the field stays unchosen.
+
+Example: `PAPERCLIP_SETTING_DEFAULTS='{"feedbackDataSharingPreference":"allowed"}'`
+defaults AI feedback sharing to allowed; pairing it with
+`instance.general.feedbackDataSharingPreference` in `PAPERCLIP_HIDDEN_SETTINGS`
+also hides the control and floors value-changing writes.
+
+Unknown field names are logged and ignored (mixed-version fleet safe).
+Malformed JSON or an invalid value for a known field refuses startup — policy
+configuration fails closed.
 
 ## Secrets
 

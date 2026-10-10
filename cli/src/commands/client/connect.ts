@@ -101,10 +101,17 @@ async function connectWizard(opts: ConnectOptions) {
     // middleware force-inherits the acting key's scope on any successor), but
     // the CLI sends the explicit scope so the request is self-describing and a
     // future server-side audit can reconstruct intent.
+    // expiresAt is now required server-side. `connect` mints a
+    // long-lived plugin_ops-scoped key at the max allowed TTL (90 days) so a
+    // developer's local profile keeps working without a change in day-to-day
+    // behaviour; `paperclipai token board create` is the path for a shorter,
+    // deliberately-scoped key.
+    const connectBoardKeyExpiresAt = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000);
     const key = await boardApi.post<CreatedBoardKey>("/api/board-api-keys", createBoardApiKeySchema.parse({
       name: tokenName,
       requestedCompanyId: company?.id ?? null,
       scope: { kind: "plugin_ops" },
+      expiresAt: connectBoardKeyExpiresAt,
     }));
     if (!key) throw new Error("Failed to create board token");
     upsertProfile(profileName, {

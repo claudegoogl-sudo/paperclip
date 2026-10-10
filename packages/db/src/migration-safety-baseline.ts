@@ -155,23 +155,6 @@ export const MIGRATION_SAFETY_BASELINE = [
     reason: "Batched DO-loop backfill with keyset pagination (LIMIT 5000 per batch); reviewed and approved as part of PAP-1505 fix. Already merged to master before this guard landed.",
   },
   {
-    // id recomputed after the fork-migration renumber 0136-0153 -> 0223-0240:
-    // findingId hashes the migration filename, so 0138_* -> 0225_* changed it.
-    id: "7b32e0d28820baba",
-    rule: "unqualified-mutation-security-posture-column",
-    migration: "0225_secret_binding_egress_allowlist.sql",
-    table: "company_secret_bindings",
-    reason: "The statement this rule exists to prevent: a re-run of this migration re-applied the unqualified UPDATE and cleared the egress-enforcement flag on every existing binding. 0138 is already applied in every environment and its text is immutable history, so it is baselined rather than edited; the flattened rows are remediated separately. Baselined for history only — any NEW unqualified write to a posture column must fail CI.",
-  },
-  {
-    id: "581d6169b285ee0f",
-    rule: "unqualified-mutation-security-posture-column",
-    migration: "0225_secret_binding_egress_allowlist.sql",
-    table: "company_secret_bindings",
-    reason:
-      "Same statement as the entry above, after the in-flight rewrite that wraps it in a DO block gated on whether this run created the column. The rollout UPDATE is still textually unqualified, so the rule fires by design — it recognises a selective WHERE, not an arbitrary PL/pgSQL guard, because a guard that is subtly wrong is invisible to a static check. The guard was reviewed: it makes re-application a no-op. Entered here so the finding is covered whichever way the two changes land; the entry is inert (reported as a stale id) until the rewrite merges.",
-  },
-  {
     id: "9101cdb1c8bec88c",
     rule: "unqualified-mutation-security-posture-column",
     migration: "0173_inbox_policy_agent_cleanup.sql",
@@ -190,9 +173,20 @@ export const MIGRATION_SAFETY_BASELINE = [
   {
     id: "7b32e0d28820baba",
     rule: "unqualified-mutation-security-posture-column",
-    migration: "0225_secret_binding_egress_allowlist.sql",
+    migration: "0233_secret_binding_egress_allowlist.sql",
     table: "company_secret_bindings",
     reason:
       "Fork 0138 renumbered to 0223-0240 block: sets the default-on enforcement flag to false only when the column did not previously exist (guarded by column_existed), so live rows keep their applied state.",
+  },
+  {
+    // id recomputed for the 2026.831.1 sync: the fork-migration renumber
+    // 0138_* -> 0233_* and the guarded DO-block rollout text both feed
+    // findingId (rule + migration filename + table + normalized statement).
+    id: "8d8eaa2bca851a5f",
+    rule: "unqualified-mutation-security-posture-column",
+    migration: "0233_secret_binding_egress_allowlist.sql",
+    table: "company_secret_bindings",
+    reason:
+      "Rollout UPDATE for the EG4 egress-enforcement flag, wrapped in a DO block gated on whether this run created the column, so re-application is a no-op and live rows keep their applied state. The UPDATE is still textually unqualified, so the rule fires by design — it recognises a selective WHERE, not an arbitrary PL/pgSQL guard, because a guard that is subtly wrong is invisible to a static check. This guard was reviewed on those terms. Baselined for this migration only — any NEW unqualified write to a posture column must fail CI.",
   },
 ] as const satisfies readonly MigrationSafetyBaselineEntry[];

@@ -59,30 +59,6 @@ vi.mock("../adapters/plugin-loader.js", () => ({
   reloadExternalAdapter: mocks.reloadExternalAdapter,
 }));
 
-function registerRouteMocks() {
-  vi.doMock("node:child_process", () => ({
-    execFile: mocks.execFile,
-  }));
-
-  vi.doMock("../services/adapter-plugin-store.js", () => ({
-    listAdapterPlugins: mocks.listAdapterPlugins,
-    addAdapterPlugin: mocks.addAdapterPlugin,
-    removeAdapterPlugin: mocks.removeAdapterPlugin,
-    getAdapterPluginByType: mocks.getAdapterPluginByType,
-    getAdapterPluginsDir: mocks.getAdapterPluginsDir,
-    getDisabledAdapterTypes: mocks.getDisabledAdapterTypes,
-    setAdapterDisabled: mocks.setAdapterDisabled,
-  }));
-
-  vi.doMock("../adapters/plugin-loader.js", () => ({
-    buildExternalAdapters: mocks.buildExternalAdapters,
-    loadExternalAdapterPackage: mocks.loadExternalAdapterPackage,
-    getUiParserSource: mocks.getUiParserSource,
-    getOrExtractUiParserSource: mocks.getOrExtractUiParserSource,
-    reloadExternalAdapter: mocks.reloadExternalAdapter,
-  }));
-}
-
 const EXTERNAL_ADAPTER_TYPE = "external_admin_test";
 const EXTERNAL_PACKAGE_NAME = "paperclip-external-adapter";
 let adapterRoutes: typeof import("../routes/adapters.js").adapterRoutes;
@@ -90,6 +66,36 @@ let errorHandler: typeof import("../middleware/index.js").errorHandler;
 let registerServerAdapter: typeof import("../adapters/registry.js").registerServerAdapter;
 let unregisterServerAdapter: typeof import("../adapters/registry.js").unregisterServerAdapter;
 let setOverridePaused: typeof import("../adapters/registry.js").setOverridePaused;
+
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("node:child_process", () => ({
+  execFile: mocks.execFile,
+}));
+
+vi.mock("../services/adapter-plugin-store.js", () => ({
+  listAdapterPlugins: mocks.listAdapterPlugins,
+  addAdapterPlugin: mocks.addAdapterPlugin,
+  removeAdapterPlugin: mocks.removeAdapterPlugin,
+  getAdapterPluginByType: mocks.getAdapterPluginByType,
+  getAdapterPluginsDir: mocks.getAdapterPluginsDir,
+  getDisabledAdapterTypes: mocks.getDisabledAdapterTypes,
+  setAdapterDisabled: mocks.setAdapterDisabled,
+}));
+
+vi.mock("../adapters/plugin-loader.js", () => ({
+  buildExternalAdapters: mocks.buildExternalAdapters,
+  loadExternalAdapterPackage: mocks.loadExternalAdapterPackage,
+  getUiParserSource: mocks.getUiParserSource,
+  getOrExtractUiParserSource: mocks.getOrExtractUiParserSource,
+  reloadExternalAdapter: mocks.reloadExternalAdapter,
+}));
 
 function createAdapter(type = EXTERNAL_ADAPTER_TYPE): ServerAdapterModule {
   return {
@@ -237,16 +243,6 @@ function resetInstalledExternalAdapterState() {
 
 describe.sequential("adapter management route authorization", () => {
   beforeEach(async () => {
-    vi.resetModules();
-    vi.doUnmock("node:child_process");
-    vi.doUnmock("../services/adapter-plugin-store.js");
-    vi.doUnmock("../adapters/plugin-loader.js");
-    vi.doUnmock("../routes/adapters.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    vi.doUnmock("../adapters/registry.js");
-    registerRouteMocks();
-    vi.doMock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
 
     const [routes, middleware, registry] = await Promise.all([
       vi.importActual<typeof import("../routes/adapters.js")>("../routes/adapters.js"),
@@ -366,5 +362,42 @@ describe.sequential("adapter management route authorization", () => {
         expect(mocks.loadExternalAdapterPackage).not.toHaveBeenCalled();
       },
     );
+  });
+
+  describe("operator-hidden adapter management floor", () => {
+    beforeEach(() => {
+      process.env.PAPERCLIP_HIDDEN_SETTINGS = "instance.adapters";
+    });
+    afterEach(() => {
+      delete process.env.PAPERCLIP_HIDDEN_SETTINGS;
+    });
+
+    it.each(["install", "disable", "override", "delete", "reload", "reinstall"] as const)(
+      "floors adapter %s for instance admins when the operator hides the Adapters surface",
+      async (routeName) => {
+        resetInstalledExternalAdapterState();
+        if (routeName !== "install") {
+          seedInstalledExternalAdapter();
+        }
+        const app = createApp(instanceAdmin);
+
+        const res = await sendMutatingRequest(app, routeName);
+
+        expect(res.status, `${routeName}: ${JSON.stringify(res.body)}`).toBe(403);
+        expect(res.body.details).toMatchObject({ code: "settings_operator_managed" });
+        expect(mocks.execFile).not.toHaveBeenCalled();
+        expect(mocks.loadExternalAdapterPackage).not.toHaveBeenCalled();
+        expect(mocks.reloadExternalAdapter).not.toHaveBeenCalled();
+      },
+    );
+
+    it("keeps adapter reads open while the surface is hidden", async () => {
+      seedInstalledExternalAdapter();
+      const app = createApp(boardMember("admin"));
+
+      const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/adapters"));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+    });
   });
 });

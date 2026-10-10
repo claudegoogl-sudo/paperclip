@@ -52,6 +52,23 @@ describe("paperclip MCP tools", () => {
     );
   });
 
+  it("lists the company skill library with the default company id", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse([{ key: "paperclipai/bundled/product/wireframe", name: "wireframe" }]),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipListSkills");
+    const response = await tool.execute({});
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url] = fetchMock.mock.calls[0] as [string];
+    expect(String(url)).toBe(
+      "http://localhost:3100/api/companies/11111111-1111-1111-1111-111111111111/skills",
+    );
+    expect(response.content[0]?.text).toContain("wireframe");
+  });
+
   it("uses default company id for company-scoped list tools", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       mockJsonResponse([{ id: "issue-1" }]),
@@ -385,12 +402,25 @@ describe("paperclip MCP tools", () => {
       payload: {},
     });
 
+    // The shared validator flags the empty payload before per-type checks.
+    expect(JSON.stringify(res)).toContain("approval_payload_empty");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects a request_board_approval payload missing title and summary at the tool boundary", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipCreateApproval");
+    const res = await tool.execute({
+      type: "request_board_approval",
+      payload: { note: "context only" },
+    });
+
     const text = JSON.stringify(res);
-    // Missing keys surface as zod "Required" issues pointing at the payload fields.
     expect(text).toContain("payload");
     expect(text).toContain("title");
     expect(text).toContain("summary");
-    expect(text).toContain("Required");
     expect(fetchMock).not.toHaveBeenCalled();
   });
 

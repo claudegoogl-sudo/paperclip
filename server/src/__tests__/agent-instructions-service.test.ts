@@ -162,6 +162,41 @@ describe("agent instructions service", () => {
     ]);
   });
 
+  it("skips instruction-edit backup artifacts from bundle listings and exports", async () => {
+    const externalRoot = await makeTempDir("paperclip-agent-instructions-backups-");
+    cleanupDirs.add(externalRoot);
+
+    await fs.writeFile(path.join(externalRoot, "AGENTS.md"), "# Current Agent\n", "utf8");
+    await fs.writeFile(path.join(externalRoot, "AGENTS.md.bak-20260828-2012"), "# Stale Agent\n", "utf8");
+    await fs.writeFile(path.join(externalRoot, "AGENTS.md.bak"), "# Older Agent\n", "utf8");
+    await fs.mkdir(path.join(externalRoot, "instructions-bak-20260829-juk1rule"), { recursive: true });
+    await fs.writeFile(
+      path.join(externalRoot, "instructions-bak-20260829-juk1rule", "AGENTS.md"),
+      "# Restored Agent\n",
+      "utf8",
+    );
+    await fs.mkdir(path.join(externalRoot, "docs"), { recursive: true });
+    await fs.writeFile(path.join(externalRoot, "docs", "TOOLS.md"), "## Tools\n", "utf8");
+
+    const svc = agentInstructionsService();
+    const agent = makeAgent({
+      instructionsBundleMode: "external",
+      instructionsRootPath: externalRoot,
+      instructionsEntryFile: "AGENTS.md",
+      instructionsFilePath: path.join(externalRoot, "AGENTS.md"),
+    });
+
+    const bundle = await svc.getBundle(agent);
+    const exported = await svc.exportFiles(agent);
+
+    expect(bundle.files.map((file) => file.path)).toEqual(["AGENTS.md", "docs/TOOLS.md"]);
+    expect(Object.keys(exported.files).sort((left, right) => left.localeCompare(right))).toEqual([
+      "AGENTS.md",
+      "docs/TOOLS.md",
+    ]);
+    expect(exported.files["AGENTS.md"]).toBe("# Current Agent\n");
+  });
+
   it("recovers a managed bundle from disk when bundle config metadata is missing", async () => {
     const paperclipHome = await makeTempDir("paperclip-agent-instructions-recover-");
     cleanupDirs.add(paperclipHome);

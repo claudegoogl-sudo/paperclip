@@ -8,6 +8,7 @@ const mockAgentService = vi.hoisted(() => ({
 
 const mockHeartbeatService = vi.hoisted(() => ({
   buildRunOutputSilence: vi.fn(),
+  buildRunLivenessProbe: vi.fn(() => null),
   decorateActiveRunStatus: vi.fn(),
   getRunIssueSummary: vi.fn(),
   getActiveRunIssueSummaryForAgent: vi.fn(),
@@ -35,63 +36,69 @@ const mockRunSecretRedactionRegistry = vi.hoisted(() => ({
 
 const routeAgentId = "11111111-1111-4111-8111-111111111111";
 
-function registerModuleMocks() {
-  vi.doMock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
 
-  vi.doMock("../services/agents.js", () => ({
-    agentService: () => mockAgentService,
-  }));
+vi.mock("../services/agents.js", () => ({
+  agentService: () => mockAgentService,
+}));
 
-  vi.doMock("../services/heartbeat.js", () => ({
-    heartbeatService: () => mockHeartbeatService,
-  }));
+vi.mock("../services/heartbeat.js", () => ({
+  heartbeatService: () => mockHeartbeatService,
+}));
 
-  vi.doMock("../services/instance-settings.js", () => ({
-    instanceSettingsService: () => mockInstanceSettingsService,
-  }));
+vi.mock("../services/instance-settings.js", () => ({
+  instanceSettingsService: () => mockInstanceSettingsService,
+}));
 
-  vi.doMock("../services/issues.js", () => ({
-    issueService: () => mockIssueService,
-  }));
+vi.mock("../services/issues.js", () => ({
+  issueService: () => mockIssueService,
+}));
 
-  vi.doMock("../services/run-secret-redaction.js", () => ({
-    createRunSecretRedactionRegistry: () => mockRunSecretRedactionRegistry,
-  }));
+vi.mock("../services/run-secret-redaction.js", () => ({
+  createRunSecretRedactionRegistry: () => mockRunSecretRedactionRegistry,
+}));
 
-  vi.doMock("../services/index.js", () => ({
-    agentService: () => mockAgentService,
-    agentInstructionsService: () => ({}),
-    accessService: () => ({
-      canUser: vi.fn(async () => true),
-      decide: vi.fn(async (input: { action?: string }) => ({
-        allowed: true,
-        action: input.action,
-        reason: "allow_explicit_grant",
-        explanation: "Allowed by test grant.",
-      })),
-      hasPermission: vi.fn(async () => true),
-    }),
-    approvalService: () => ({}),
-    builtInAgentService: () => ({ ensureCompanyDefaultAgentGrants: vi.fn() }),
-    companySkillService: () => ({ listRuntimeSkillEntries: vi.fn() }),
-    budgetService: () => ({}),
-    heartbeatService: () => mockHeartbeatService,
-    issueApprovalService: () => ({}),
-    issueService: () => mockIssueService,
-    logActivity: vi.fn(),
-    secretService: () => ({}),
-    syncInstructionsBundleConfigFromFilePath: vi.fn((_agent, config) => config),
-    workspaceOperationService: () => ({}),
-  }));
+vi.mock("../services/index.js", () => ({
+  agentService: () => mockAgentService,
+  agentInstructionsService: () => ({}),
+  accessService: () => ({
+    canUser: vi.fn(async () => true),
+    decide: vi.fn(async (input: { action?: string }) => ({
+      allowed: true,
+      action: input.action,
+      reason: "allow_explicit_grant",
+      explanation: "Allowed by test grant.",
+    })),
+    hasPermission: vi.fn(async () => true),
+  }),
+  approvalService: () => ({}),
+  builtInAgentService: () => ({ ensureCompanyDefaultAgentGrants: vi.fn() }),
+  companySkillService: () => ({ listRuntimeSkillEntries: vi.fn() }),
+  budgetService: () => ({}),
+  heartbeatService: () => mockHeartbeatService,
+  issueApprovalService: () => ({}),
+  issueService: () => mockIssueService,
+  logActivity: vi.fn(),
+  secretService: () => ({}),
+  syncInstructionsBundleConfigFromFilePath: vi.fn((_agent, config) => config),
+  workspaceOperationService: () => ({}),
+}));
 
-  vi.doMock("../adapters/index.js", () => ({
-    findServerAdapter: vi.fn(),
-    listAdapterModels: vi.fn(),
-    detectAdapterModel: vi.fn(),
-    findActiveServerAdapter: vi.fn(),
-    requireServerAdapter: vi.fn(),
-  }));
-}
+vi.mock("../adapters/index.js", () => ({
+  findServerAdapter: vi.fn(),
+  listAdapterModels: vi.fn(),
+  detectAdapterModel: vi.fn(),
+  findActiveServerAdapter: vi.fn(),
+  requireServerAdapter: vi.fn(),
+}));
 
 async function createApp(db: Record<string, unknown> = {}) {
   const [{ agentRoutes }, { errorHandler }] = await Promise.all([
@@ -165,17 +172,6 @@ async function requestApp(
 
 describe("agent live run routes", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../services/agents.js");
-    vi.doUnmock("../services/heartbeat.js");
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../services/instance-settings.js");
-    vi.doUnmock("../services/issues.js");
-    vi.doUnmock("../adapters/index.js");
-    vi.doUnmock("../routes/agents.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
     mockIssueService.getByIdentifier.mockResolvedValue({
       id: "issue-1",
@@ -324,7 +320,7 @@ describe("agent live run routes", () => {
   it("includes ephemeral current status fields on active run polling", async () => {
     mockHeartbeatService.decorateActiveRunStatus.mockImplementation((run) => ({
       ...run,
-      currentStatusMessage: "Syncing workspace to sandbox",
+      currentStatusMessage: "Syncing workspace to environment",
       currentStatusUpdatedAt: new Date("2026-04-10T09:30:05.000Z"),
       currentToolName: "bash",
       lastAssistantSnippet: "Inspecting files",
@@ -342,7 +338,7 @@ describe("agent live run routes", () => {
       { companyId: "company-1", issueId: "issue-1" },
     );
     expect(res.body).toMatchObject({
-      currentStatusMessage: "Syncing workspace to sandbox",
+      currentStatusMessage: "Syncing workspace to environment",
       currentStatusUpdatedAt: "2026-04-10T09:30:05.000Z",
       currentToolName: "bash",
       lastAssistantSnippet: "Inspecting files",

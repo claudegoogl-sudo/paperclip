@@ -11,6 +11,10 @@ const prepareEmbeddedPostgresNativeRuntime = vi.hoisted(() => vi.fn(async () => 
 vi.mock("./client.js", () => ({
   ensurePostgresDatabase,
   applyPendingMigrations,
+  // The port-collision retry path calls this for best-effort cleanup of the
+  // abandoned attempt; the merge dropped it from the factory, which made the
+  // import itself fail under the mock.
+  closeRegisteredClients: vi.fn(async () => {}),
 }));
 
 vi.mock("./embedded-postgres-native.js", () => ({

@@ -16,6 +16,8 @@ import {
   ensureAdapterExecutionTargetFile,
   ensureAdapterExecutionTargetRuntimeCommandInstalled,
   prepareAdapterExecutionTargetRuntime,
+  adapterExecutionTargetDuplexObservabilityRecorder,
+  adapterExecutionTargetEnablesSandboxDuplexBridge,
   readAdapterExecutionTarget,
   resolveAdapterExecutionTargetTimeoutSec,
   resolveAdapterExecutionTargetCommandForLogs,
@@ -35,9 +37,10 @@ import {
   ensurePaperclipSkillSymlink,
   ensurePathInEnv,
   refreshPaperclipWorkspaceEnvForExecution,
+  isPaperclipSkillSourceMissing,
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueWorkModeFromContext,
-  resolvePaperclipDesiredSkillNames,
+  resolveLegacyPaperclipDesiredSkillNames,
   removeMaintainerOnlySkillSymlinks,
   renderTemplate,
   renderPaperclipWakePrompt,
@@ -50,6 +53,12 @@ import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 import { isPiUnknownSessionError, parsePiJsonl } from "./parse.js";
 import { ensurePiModelConfiguredAndAvailable } from "./models.js";
 import { preparePiRuntimeConfig } from "./runtime-config.js";
+import {
+  armProviderWaitGuard,
+  providerWaitTimeoutResult,
+  resolveProviderWaitGuardConfig,
+  type ProviderWaitTimeoutInfo,
+} from "./provider-wait-guard.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
@@ -124,9 +133,10 @@ async function buildPiSkillsDir(config: Record<string, unknown>): Promise<string
   const target = path.join(tmp, "skills");
   await fs.mkdir(target, { recursive: true });
   const availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
-  const desiredNames = new Set(resolvePaperclipDesiredSkillNames(config, availableEntries));
+  const desiredNames = new Set(resolveLegacyPaperclipDesiredSkillNames(config, availableEntries));
   for (const entry of availableEntries) {
     if (!desiredNames.has(entry.key)) continue;
+    if (isPaperclipSkillSourceMissing(entry)) continue;
     await fs.symlink(entry.source, path.join(target, entry.runtimeName));
   }
   return target;
@@ -257,14 +267,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   const piSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
-  const desiredPiSkillNames = resolvePaperclipDesiredSkillNames(config, piSkillEntries);
+  const desiredPiSkillNames = resolveLegacyPaperclipDesiredSkillNames(config, piSkillEntries);
   if (!executionTargetIsRemote) {
     await ensurePiSkillsInjected(onLog, piSkillEntries, desiredPiSkillNames);
   }
 
   // Build environment
   const envConfig = parseObject(config.env);
-  const env: Record<string, string> = { ...buildPaperclipEnv(agent) };
+  const env: Record<string, string> = { ...buildPaperclipEnv(agent, { apiBase: "agent" }) };
   env.PAPERCLIP_RUN_ID = runId;
 
   const wakeTaskId =
@@ -359,6 +369,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       asNumber(config.timeoutSec, 0),
     );
     const graceSec = asNumber(config.graceSec, 20);
+    // Opt-in silent-provider-wait watchdog (see provider-wait-guard.ts). Never
+    // armed for sandbox targets: those runs already carry a wall-clock backstop
+    // (DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC) and no local process handle.
+    const providerWaitGuardConfig = resolveProviderWaitGuardConfig(config, runtimeEnv);
     await ensureAdapterExecutionTargetRuntimeCommandInstalled({
       runId,
       target: executionTarget,
@@ -469,6 +483,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       paperclipBridge = await startAdapterExecutionTargetPaperclipBridge({
         runId,
         target: runtimeExecutionTarget,
+        enableSandboxDuplexBridge: adapterExecutionTargetEnablesSandboxDuplexBridge(runtimeExecutionTarget),
+        duplexObservabilityRecorder: adapterExecutionTargetDuplexObservabilityRecorder(runtimeExecutionTarget),
         runtimeRootDir: remoteRuntimeRootDir,
         adapterKey: "pi",
         timeoutSec,
@@ -668,6 +684,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const runAttempt = async (sessionFile: string) => {
       const args = buildArgs(sessionFile);
+      const providerWaitGuardApplies =
+        providerWaitGuardConfig.enabled &&
+        !(runtimeExecutionTarget?.kind === "remote" && runtimeExecutionTarget.transport === "sandbox");
+      const providerWaitGuard = providerWaitGuardApplies
+        ? armProviderWaitGuard({ runId, config: providerWaitGuardConfig, graceSec, onLog })
+        : null;
       if (onMeta) {
         await onMeta({
           adapterType: "pi_local",
@@ -705,16 +727,30 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         }
       };
 
-      const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
-        cwd,
-        env: executionTargetIsRemote ? env : runtimeEnv,
-        timeoutSec,
-        graceSec,
-        onSpawn,
-        onRuntimeProgress: ctx.onRuntimeProgress,
-        onLog: bufferedOnLog,
-        runLogTail: paperclipBridge?.runLogTail,
-      });
+      let proc: Awaited<ReturnType<typeof runAdapterExecutionTargetProcess>>;
+      try {
+        proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
+          cwd,
+          env: executionTargetIsRemote ? env : runtimeEnv,
+          timeoutSec,
+          graceSec,
+          onSpawn: async (meta) => {
+            providerWaitGuard?.onSpawn(meta);
+            await onSpawn?.(meta);
+          },
+          onRuntimeProgress: ctx.onRuntimeProgress,
+          onLog: async (stream, chunk) => {
+            // Any output proves liveness: reset the idle clock before the
+            // chunk flows into the (stdout line) buffer.
+            await providerWaitGuard?.noteChunk(stream, chunk);
+            await bufferedOnLog(stream, chunk);
+          },
+          runLogTail: paperclipBridge?.runLogTail,
+            settleRunDisposition: paperclipBridge?.settleRunDisposition,
+        });
+      } finally {
+        providerWaitGuard?.dispose();
+      }
 
       // Flush any remaining buffer content
       if (stdoutBuffer) {
@@ -725,17 +761,30 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         proc,
         rawStderr: proc.stderr,
         parsed: parsePiJsonl(proc.stdout),
+        providerWaitTimeout: providerWaitGuard?.waitTimeout() ?? null,
       };
     };
 
     const toResult = (
       attempt: {
-        proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string };
+        proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; errorCode?: string | null };
         rawStderr: string;
         parsed: ReturnType<typeof parsePiJsonl>;
+        providerWaitTimeout?: ProviderWaitTimeoutInfo | null;
       },
       clearSessionOnMissingSession = false,
     ): AdapterExecutionResult => {
+      if (attempt.providerWaitTimeout) {
+        // The watchdog terminated a silently stalled CLI process. Report a
+        // distinct error code (never the generic adapter failure), flag the
+        // fault as a transient upstream condition so the agent is not parked in
+        // the error state, and keep timedOut=false: the host maps timedOut runs
+        // onto the generic timeout code, which would mask this diagnosis.
+        return providerWaitTimeoutResult({
+          proc: attempt.proc,
+          wait: attempt.providerWaitTimeout,
+        });
+      }
       if (attempt.proc.timedOut) {
         return {
           exitCode: attempt.proc.exitCode,
@@ -773,6 +822,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         signal: attempt.proc.signal,
         timedOut: false,
         errorMessage: (effectiveExitCode ?? 0) === 0 ? null : fallbackErrorMessage,
+        // Forward the transport-level error code from the run-disposition seam.
+        // A lost duplex control channel surfaces the typed `duplex_channel_lost`
+        // code; every other result carries no code here.
+        errorCode: attempt.proc.errorCode ?? null,
         usage: {
           inputTokens: attempt.parsed.usage.inputTokens,
           outputTokens: attempt.parsed.usage.outputTokens,
@@ -798,7 +851,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     try {
       const initial = await runAttempt(sessionPath);
       const initialFailed =
-        !initial.proc.timedOut && ((initial.proc.exitCode ?? 0) !== 0 || initial.parsed.errors.length > 0);
+        !initial.proc.timedOut &&
+        !initial.providerWaitTimeout &&
+        ((initial.proc.exitCode ?? 0) !== 0 || initial.parsed.errors.length > 0);
 
       if (
         canResumeSession &&

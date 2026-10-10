@@ -1,6 +1,7 @@
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
+  agentWakeupRequests,
   agentTaskSessions as agentTaskSessionsTable,
   agents as agentsTable,
   budgetIncidents,
@@ -13,7 +14,7 @@ import {
   principalPermissionGrants,
   projects as projectsTable,
 } from "@paperclipai/db";
-import { eq, and, like, desc, inArray, sql, isNull, isNotNull, gt, lte } from "drizzle-orm";
+import { eq, and, like, desc, inArray, sql, isNull, isNotNull, gt, gte, lte } from "drizzle-orm";
 import type {
   HostServices,
   Company,
@@ -37,7 +38,7 @@ import { companyService } from "./companies.js";
 import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
 import { executionWorkspaceService } from "./execution-workspaces.js";
-import { issueService } from "./issues.js";
+import { attachmentBoundActivityDetails, issueService } from "./issues.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { goalService } from "./goals.js";
 import { documentService } from "./documents.js";
@@ -86,12 +87,26 @@ import type { IncomingMessage, RequestOptions as HttpRequestOptions } from "node
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
+import {
+  canonicalizeIp,
+  classifyEgressIp,
+  isEgressAllowed,
+  resolveCgnatMode,
+  type ClassifyOptions,
+} from "./plugin-egress-ip-classifier.js";
+import {
+  isPrivateEgressEligible,
+  loadPluginPrivateEgressOrigins,
+  normalizeStoredPrivateEgressOrigins,
+  privateEgressRequestOrigin,
+} from "./plugin-private-egress.js";
 import { logger } from "../middleware/logger.js";
 import { requireAgentActorSource, requirePluginBoardActorSource } from "./actor-source.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { accessService } from "./access.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { redactEventPayload, sanitizeRecord } from "../redaction.js";
+import { redactSecretsDeepForLog, redactSecretsForLog } from "../secret-patterns.js";
 import type { WorkerHostCallContext } from "@paperclipai/plugin-sdk";
 import {
   normalizeProviderFamily,
@@ -126,40 +141,6 @@ const ALLOWED_PROTOCOLS = new Set(["http:", "https:"]);
 const TELEMETRY_EVENT_NAME_REGEX = /^[a-z0-9][a-z0-9_-]*$/;
 
 /**
- * Check if an IP address is in a private/reserved range (RFC 1918, loopback,
- * link-local, etc.) that plugins should never be able to reach.
- *
- * Handles IPv4-mapped IPv6 addresses (e.g. ::ffff:127.0.0.1) which Node's
- * dns.lookup may return depending on OS configuration.
- */
-function isPrivateIP(ip: string): boolean {
-  const lower = ip.toLowerCase();
-
-  // Unwrap IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) and re-check as IPv4
-  const v4MappedMatch = lower.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
-  if (v4MappedMatch && v4MappedMatch[1]) return isPrivateIP(v4MappedMatch[1]);
-
-  // IPv4 patterns
-  if (ip.startsWith("10.")) return true;
-  if (ip.startsWith("172.")) {
-    const second = parseInt(ip.split(".")[1]!, 10);
-    if (second >= 16 && second <= 31) return true;
-  }
-  if (ip.startsWith("192.168.")) return true;
-  if (ip.startsWith("127.")) return true;                   // loopback
-  if (ip.startsWith("169.254.")) return true;               // link-local
-  if (ip === "0.0.0.0") return true;
-
-  // IPv6 patterns
-  if (lower === "::1") return true;                          // loopback
-  if (lower.startsWith("fc") || lower.startsWith("fd")) return true; // ULA
-  if (lower.startsWith("fe80")) return true;                 // link-local
-  if (lower === "::") return true;
-
-  return false;
-}
-
-/**
  * Validate a URL for plugin fetch: protocol whitelist + private IP blocking.
  *
  * SSRF Prevention Strategy:
@@ -183,9 +164,82 @@ export interface ValidatedFetchTarget {
   useTls: boolean;
 }
 
-async function validateAndResolveFetchUrl(
+/** Injectable dependencies for {@link validateAndResolveFetchUrl} (tests). */
+export interface FetchUrlValidationOptions {
+  pluginId?: string;
+  dnsLookup?: (hostname: string, options: { all: true }) => Promise<Array<{ address: string; family: number }>>;
+  interfaces?: ClassifyOptions["interfaces"];
+  env?: NodeJS.ProcessEnv;
+  log?: Pick<typeof logger, "warn" | "info">;
+  /**
+   * Instance-admin private-origin opt-in for THIS plugin (see
+   * `plugin-private-egress.ts`). Consulted only when every resolved address
+   * is denied. Absent = today's behaviour, byte-identical.
+   */
+  loadPrivateEgressOrigins?: () => Promise<readonly string[]>;
+}
+
+type ClassifiedFetchAddress = {
+  entry: { address: string; family: number };
+  cls: ReturnType<typeof classifyEgressIp>;
+};
+
+/**
+ * Private-origin opt-in decision. Returns the address to pin (the same
+ * `ValidatedFetchTarget` path as any public target — no second resolve), or
+ * null so the caller throws today's error text unchanged. Fails closed.
+ */
+async function resolvePrivateEgressOptIn(
+  parsed: URL,
+  originalHostname: string,
+  classified: ClassifiedFetchAddress[],
+  options: FetchUrlValidationOptions,
+): Promise<ClassifiedFetchAddress | null> {
+  const log = options.log ?? logger;
+  // IP literals only: a hostname never matches, so DNS (rebinding or not)
+  // can never select an opted-in address. An IP literal resolves to exactly
+  // itself, so there is exactly one candidate.
+  if (isIP(originalHostname) === 0 || classified.length !== 1) return null;
+  const origin = privateEgressRequestOrigin(parsed);
+  if (!origin) return null;
+  const candidate = classified[0]!;
+  // The pinned address must be the literal itself (classifier-canonical).
+  const literal = canonicalizeIp(originalHostname);
+  if (!literal || candidate.cls.canonical === null || literal.canonical !== candidate.cls.canonical) return null;
+  let stored: readonly string[];
+  try {
+    stored = await options.loadPrivateEgressOrigins!();
+  } catch (err) {
+    log.warn(
+      { err, event: "plugin.http_fetch.private_egress", decision: "deny", reason: "lookup_failed", pluginId: options.pluginId ?? null },
+      "plugin.http_fetch.private_egress lookup failed; failing closed",
+    );
+    return null;
+  }
+  if (stored.length === 0) return null;
+  // Re-validate on read against the CURRENT host interfaces. own_host and
+  // loopback/link-local/metadata are never eligible, whatever is stored.
+  const origins = normalizeStoredPrivateEgressOrigins(stored, { interfaces: options.interfaces });
+  const matched = origins.includes(origin) && isPrivateEgressEligible(candidate.cls);
+  // Value-free: scheme/IP/port origin only, never path, query or headers.
+  log.info(
+    {
+      event: "plugin.http_fetch.private_egress",
+      decision: matched ? "allow" : "deny",
+      pluginId: options.pluginId ?? null,
+      origin,
+      matchedEntry: matched ? origin : null,
+      category: candidate.cls.category,
+    },
+    matched ? "plugin.http_fetch.private_allowed" : "plugin.http_fetch.private_denied",
+  );
+  return matched ? candidate : null;
+}
+
+export async function validateAndResolveFetchUrl(
   urlString: string,
   checkConfigEgress?: (urlString: string) => Promise<void>,
+  options: FetchUrlValidationOptions = {},
 ): Promise<ValidatedFetchTarget> {
   let parsed: URL;
   try {
@@ -216,7 +270,8 @@ async function validateAndResolveFetchUrl(
 
   // Race the DNS lookup against a timeout to prevent indefinite hangs
   // when DNS is misconfigured or unresponsive.
-  const dnsPromise = dnsLookup(originalHostname, { all: true });
+  const lookup = options.dnsLookup ?? dnsLookup;
+  const dnsPromise = lookup(originalHostname, { all: true });
   const timeoutPromise = new Promise<never>((_, reject) => {
     setTimeout(
       () => reject(new Error(`DNS lookup timed out after ${DNS_LOOKUP_TIMEOUT_MS}ms for ${originalHostname}`)),
@@ -233,7 +288,20 @@ async function validateAndResolveFetchUrl(
     // Filter to only non-private IPs instead of rejecting the entire request
     // when some IPs are private. This handles multi-homed hosts that resolve
     // to both private and public addresses.
-    const safeResults = results.filter((entry) => !isPrivateIP(entry.address));
+    // Parsed, deny-by-default classification (plugin-egress-ip-classifier):
+    // embedded-IPv4 IPv6 forms are unwrapped, own-host addresses are always
+    // denied, CGNAT follows the PAPERCLIP_PLUGIN_FETCH_CGNAT switch.
+    const cgnatMode = resolveCgnatMode(options.env);
+    const classified = results.map((entry) => ({
+      entry,
+      cls: classifyEgressIp(entry.address, { interfaces: options.interfaces }),
+    }));
+    const safe = classified.filter(({ cls }) => isEgressAllowed(cls, cgnatMode));
+    if (safe.length === 0 && options.loadPrivateEgressOrigins) {
+      const optedIn = await resolvePrivateEgressOptIn(parsed, originalHostname, classified, options);
+      if (optedIn) safe.push(optedIn);
+    }
+    const safeResults = safe.map(({ entry }) => entry);
     if (safeResults.length === 0) {
       throw new Error(
         `All resolved IPs for ${originalHostname} are in private/reserved ranges`,
@@ -241,6 +309,20 @@ async function validateAndResolveFetchUrl(
     }
 
     const resolved = safeResults[0]!;
+    if (safe[0]!.cls.category === "cgnat") {
+      // Legacy CGNAT allowance must be visible. Scheme/IP/port only —
+      // never path, query or headers.
+      (options.log ?? logger).warn(
+        {
+          event: "plugin.http_fetch.cgnat_legacy_allowed",
+          pluginId: options.pluginId ?? null,
+          scheme: parsed.protocol.replace(/:$/, ""),
+          ip: resolved.address,
+          port: parsed.port ? Number(parsed.port) : parsed.protocol === "https:" ? 443 : 80,
+        },
+        "plugin.http_fetch.cgnat_legacy_allowed",
+      );
+    }
     return {
       parsedUrl: parsed,
       resolvedAddress: resolved.address,
@@ -482,8 +564,19 @@ function truncStr(s: string, max: number): string {
   return s.slice(0, max) + "...[truncated]";
 }
 
-/** Sanitise a plugin-supplied meta object: enforce size limit and strip reserved keys. */
-function sanitiseMeta(meta: Record<string, unknown> | null | undefined): Record<string, unknown> | null {
+/**
+ * Sanitise a plugin-supplied meta object: strip reserved pino keys,
+ * pattern-redact secret-shaped string leaves, and enforce the serialised size
+ * limit. Exported so the plugin worker manager can apply the SAME semantics to
+ * the meta it spreads into the host pino log line — one sanitiser, every
+ * surface that persists or logs plugin-authored meta.
+ */
+/** Bounds for the plugin `issues.listWakeupRequests` read (issue.wakeups.read). */
+const WAKEUP_REQUESTS_MAX_ISSUE_IDS = 200;
+const WAKEUP_REQUESTS_MAX_ROWS = 1000;
+const WAKEUP_REQUESTS_DEFAULT_STATUSES = ["queued", "deferred_issue_execution"] as const;
+
+export function sanitiseMeta(meta: Record<string, unknown> | null | undefined): Record<string, unknown> | null {
   if (meta == null) return null;
   // Strip pino reserved keys
   const cleaned: Record<string, unknown> = {};
@@ -492,17 +585,54 @@ function sanitiseMeta(meta: Record<string, unknown> | null | undefined): Record<
       cleaned[k] = v;
     }
   }
+  // SECURITY: pattern-redact every string leaf BEFORE the size check, so the
+  // enforced size is the persisted size. Same shared pattern set the pino
+  // host-log path uses (secret-patterns.ts) in its log-surface posture: every
+  // credential shape is scrubbed regardless of issuer. `plugin_logs` is read
+  // back raw by `GET /api/plugins/:pluginId/logs`, so a shape-valid secret in
+  // worker-authored meta must never persist unredacted. A self-referential or
+  // otherwise non-serialisable meta fails closed to the `_sanitised` marker.
+  let redacted: Record<string, unknown>;
+  try {
+    redacted = redactSecretsDeepForLog(cleaned);
+  } catch {
+    return { _sanitised: true, _error: "meta was not JSON-serialisable" };
+  }
   // Enforce total serialised size
   let json: string;
   try {
-    json = JSON.stringify(cleaned);
+    json = JSON.stringify(redacted);
   } catch {
     return { _sanitised: true, _error: "meta was not JSON-serialisable" };
   }
   if (json.length > MAX_LOG_META_JSON_LENGTH) {
     return { _sanitised: true, _error: `meta exceeded ${MAX_LOG_META_JSON_LENGTH} chars` };
   }
-  return cleaned;
+  return redacted;
+}
+
+/** Levels the persist sink accepts verbatim; anything else normalises to "info". */
+const KNOWN_PLUGIN_LOG_LEVELS: ReadonlySet<string> = new Set([
+  "debug",
+  "info",
+  "warn",
+  "error",
+  // Host-minted by `metrics.write` (§26): metrics persist to `plugin_logs` so
+  // they are queryable alongside regular logs. A worker cannot mint it — the
+  // host service hard-codes it — but the allowlist must keep it working.
+  "metric",
+]);
+
+/**
+ * Normalise a plugin-controlled log level before persist: trim, lowercase,
+ * known set passes through, everything else collapses to "info". The value
+ * lands in `plugin_logs.level` and is used as a read filter
+ * (`GET /api/plugins/:pluginId/logs?level=`), so a worker must never be able
+ * to persist an unbounded string there.
+ */
+function normaliseLogLevel(level: string | null | undefined): string {
+  const candidate = typeof level === "string" ? level.trim().toLowerCase() : "";
+  return KNOWN_PLUGIN_LOG_LEVELS.has(candidate) ? candidate : "info";
 }
 
 interface BufferedLogEntry {
@@ -562,6 +692,46 @@ export async function flushPluginLogBuffer(): Promise<void> {
         console.error("[plugin-host-services] Batch log flush failed:", err);
       }
     }
+  }
+}
+
+/**
+ * Append one plugin log entry to the shared batch buffer, applying the exact
+ * persist semantics of the `logger.log` host service: secret-pattern
+ * redaction and truncation of the message, level normalisation to the known
+ * set, and meta sanitisation (reserved pino keys stripped, secret-pattern
+ * redaction of every string leaf, serialised size cap), then a
+ * size-triggered flush.
+ *
+ * Exported so the plugin worker manager can persist worker `ctx.logger`
+ * notifications (the `log` JSON-RPC notification) on the SAME buffered path —
+ * every worker logger call must land in `plugin_logs` (§26.1), and the
+ * operator logs panel reads only that table. Fire-and-forget: never throws
+ * into the caller's notification path.
+ */
+export function bufferPluginLogEntry(entry: {
+  db: Db;
+  pluginId: string;
+  companyId: string | null;
+  level?: string;
+  message?: unknown;
+  meta?: Record<string, unknown> | null;
+}): void {
+  _logBuffer.push({
+    db: entry.db,
+    pluginId: entry.pluginId,
+    companyId: entry.companyId ?? null,
+    level: normaliseLogLevel(entry.level),
+    // SECURITY: `message` is worker-authored free text and `plugin_logs` is
+    // read back raw, so it goes through the same text redactor the pino
+    // host-log path uses (log-surface posture) after truncation.
+    message: redactSecretsForLog(truncStr(String(entry.message ?? ""), MAX_LOG_MESSAGE_LENGTH)),
+    meta: sanitiseMeta(entry.meta ?? null),
+  });
+  if (_logBuffer.length >= LOG_BUFFER_FLUSH_SIZE) {
+    flushPluginLogBuffer().catch((err) => {
+      console.error("[plugin-host-services] Triggered log flush failed:", err);
+    });
   }
 }
 
@@ -640,6 +810,7 @@ const PROVIDER_SPAN_ATTR_ALLOWLIST: ReadonlySet<string> = new Set<string>([
   SPAN_ATTRS.packWallMs,
   SPAN_ATTRS.transferWallMs,
   SPAN_ATTRS.transferGuardCount,
+  SPAN_ATTRS.transferDirection,
 ]);
 
 /** The subset of allowed keys that carry a finite number. */
@@ -652,11 +823,15 @@ const PROVIDER_SPAN_NUMERIC_ATTRS: ReadonlySet<string> = new Set<string>([
 /** The closed value set for the `outcome` attribute. */
 const KNOWN_SPAN_OUTCOMES: ReadonlySet<string> = new Set(["ok", "skipped", "failed"]);
 
+/** The closed value set for the `transfer.direction` attribute. */
+const KNOWN_TRANSFER_DIRECTIONS: ReadonlySet<string> = new Set(["inbound", "outbound"]);
+
 /**
  * Re-clamp the worker-sent attributes at the trust boundary. Drop every key that
  * is not on the allowlist. Re-map `provider` through `normalizeProviderFamily`,
- * bound `outcome` to its closed set, and keep a numeric attribute only when it
- * is a finite number. The result holds only bounded, low-cardinality values.
+ * bound `outcome` and `transfer.direction` each to its closed set, and keep a
+ * numeric attribute only when it is a finite number. The result holds only
+ * bounded, low-cardinality values.
  */
 export function clampProviderSpanAttributes(
   raw: Record<string, unknown> | undefined,
@@ -671,6 +846,10 @@ export function clampProviderSpanAttributes(
     }
     if (key === SPAN_ATTRS.outcome) {
       if (typeof value === "string" && KNOWN_SPAN_OUTCOMES.has(value)) clamped[key] = value;
+      continue;
+    }
+    if (key === SPAN_ATTRS.transferDirection) {
+      if (typeof value === "string" && KNOWN_TRANSFER_DIRECTIONS.has(value)) clamped[key] = value;
       continue;
     }
     if (PROVIDER_SPAN_NUMERIC_ATTRS.has(key)) {
@@ -885,8 +1064,10 @@ export function buildHostServices(
             createStandaloneAsset: (input) => issues.createStandaloneAsset(input),
           },
           async resolveCompanyMaxBytes(companyId: string) {
-            const company = await companies.getById(companyId);
-            return normalizeIssueAttachmentMaxBytes(company?.attachmentMaxBytes);
+            // Upstream removed the per-company attachment-limit column, so the
+            // deployment-wide ceiling is the single bound for artifact writes.
+            void companyId;
+            return normalizeIssueAttachmentMaxBytes(null);
           },
           runContextRegistry: options.runContextRegistry,
         })
@@ -1925,6 +2106,7 @@ export function buildHostServices(
         // allowlist before any DNS resolution happens.
         const target = await validateAndResolveFetchUrl(params.url, (url) =>
           enforcePluginConfigEgress(db, pluginId, url),
+          { pluginId, loadPrivateEgressOrigins: () => loadPluginPrivateEgressOrigins(db, pluginId) },
         );
 
         const controller = new AbortController();
@@ -2009,25 +2191,23 @@ export function buildHostServices(
     metrics: {
       async write(params) {
         const safeName = truncStr(String(params.name ?? ""), MAX_METRIC_NAME_LENGTH);
-        logger.debug({ pluginId, name: safeName, value: params.value, tags: params.tags }, "Plugin metric write");
+        logger.debug(
+          redactSecretsDeepForLog({ pluginId, name: safeName, value: params.value, tags: params.tags }),
+          "Plugin metric write",
+        );
 
         // Persist metrics to plugin_logs via the batch buffer (same path as
         // logger.log) so they benefit from batched writes and are flushed
         // reliably on shutdown. Using level "metric" makes them queryable
         // alongside regular logs via the same API (§26).
-        _logBuffer.push({
+        bufferPluginLogEntry({
           db,
           pluginId,
           companyId: params.companyId ?? null,
           level: "metric",
           message: safeName,
-          meta: sanitiseMeta({ value: params.value, tags: params.tags ?? null }),
+          meta: { value: params.value, tags: params.tags ?? null },
         });
-        if (_logBuffer.length >= LOG_BUFFER_FLUSH_SIZE) {
-          flushPluginLogBuffer().catch((err) => {
-            console.error("[plugin-host-services] Triggered metric flush failed:", err);
-          });
-        }
       },
     },
 
@@ -2048,7 +2228,10 @@ export function buildHostServices(
     logger: {
       async log(params) {
         const { level, meta } = params;
-        const safeMessage = truncStr(String(params.message ?? ""), MAX_LOG_MESSAGE_LENGTH);
+        // The host log line must meet the same secret-pattern bar as the
+        // persisted row; the persist side re-applies truncation + redaction
+        // on the raw value in `bufferPluginLogEntry` below.
+        const safeMessage = redactSecretsForLog(truncStr(String(params.message ?? ""), MAX_LOG_MESSAGE_LENGTH));
         const safeMeta = sanitiseMeta(meta);
         const pluginLogger = logger.child({ service: "plugin-worker", pluginId });
         const logFields = {
@@ -2063,20 +2246,16 @@ export function buildHostServices(
         else pluginLogger.info(logFields, `[plugin] ${safeMessage}`);
 
         // Persist to plugin_logs table via the module-level batch buffer (§26.1).
-        // Fire-and-forget — logging should never block the worker.
-        _logBuffer.push({
+        // Fire-and-forget — logging should never block the worker. The shared
+        // helper applies the same truncation/sanitisation semantics as above.
+        bufferPluginLogEntry({
           db,
           pluginId,
           companyId: params.companyId ?? null,
-          level: level ?? "info",
-          message: safeMessage,
-          meta: safeMeta,
+          level,
+          message: params.message,
+          meta,
         });
-        if (_logBuffer.length >= LOG_BUFFER_FLUSH_SIZE) {
-          flushPluginLogBuffer().catch((err) => {
-            console.error("[plugin-host-services] Triggered log flush failed:", err);
-          });
-        }
       },
     },
 
@@ -2465,6 +2644,64 @@ export function buildHostServices(
           adoptedFromRunId: ownership.adoptedFromRunId,
         };
       },
+      async listWakeupRequests(params) {
+        // Company scoping: identical to getSubtree — companyId is mandatory,
+        // the host only returns rows whose agent_wakeup_requests.company_id
+        // equals it (instance-scoped plugins must call once per company).
+        const companyId = ensureCompanyId(params.companyId);
+        await noPluginAvailabilityGate(companyId);
+        const issueIds = Array.isArray(params.issueIds)
+          ? [...new Set(params.issueIds.filter((id): id is string => typeof id === "string" && id.length > 0))]
+          : null;
+        if (!issueIds) throw new Error("issueIds must be an array");
+        if (issueIds.length > WAKEUP_REQUESTS_MAX_ISSUE_IDS) {
+          throw new Error(`issueIds exceeds limit of ${WAKEUP_REQUESTS_MAX_ISSUE_IDS}`);
+        }
+        if (issueIds.length === 0) return [];
+        let since: Date | null = null;
+        if (params.since !== undefined && params.since !== null) {
+          since = new Date(params.since);
+          if (Number.isNaN(since.getTime())) throw new Error("since must be an ISO timestamp");
+        }
+        const statuses = Array.isArray(params.statuses)
+          ? params.statuses.filter((s): s is string => typeof s === "string").slice(0, 32)
+          : since ? null : [...WAKEUP_REQUESTS_DEFAULT_STATUSES];
+        if (statuses && statuses.length === 0) return [];
+        const requested = typeof params.limit === "number" && Number.isFinite(params.limit)
+          ? Math.floor(params.limit) : WAKEUP_REQUESTS_MAX_ROWS;
+        const limit = Math.min(Math.max(1, requested), WAKEUP_REQUESTS_MAX_ROWS);
+        const issueIdExpr = sql<string>`${agentWakeupRequests.payload} ->> 'issueId'`;
+        // Allow-listed columns only: payload/context snapshot, idempotency
+        // key, requester ids and error text are never selected.
+        const rows = await db
+          .select({
+            id: agentWakeupRequests.id,
+            issueId: issueIdExpr,
+            agentId: agentWakeupRequests.agentId,
+            status: agentWakeupRequests.status,
+            reason: agentWakeupRequests.reason,
+            source: agentWakeupRequests.source,
+            requestedAt: agentWakeupRequests.requestedAt,
+          })
+          .from(agentWakeupRequests)
+          .where(and(
+            eq(agentWakeupRequests.companyId, companyId),
+            inArray(issueIdExpr, issueIds),
+            statuses ? inArray(agentWakeupRequests.status, statuses) : undefined,
+            since ? gte(agentWakeupRequests.requestedAt, since) : undefined,
+          ))
+          .orderBy(desc(agentWakeupRequests.requestedAt))
+          .limit(limit);
+        return rows.map((row) => ({
+          id: row.id,
+          issueId: row.issueId,
+          agentId: row.agentId,
+          status: row.status,
+          reason: row.reason ?? null,
+          source: row.source,
+          requestedAt: row.requestedAt instanceof Date ? row.requestedAt.toISOString() : String(row.requestedAt),
+        }));
+      },
       async getSubtree(params) {
         const companyId = ensureCompanyId(params.companyId);
         await noPluginAvailabilityGate(companyId);
@@ -2811,25 +3048,44 @@ export function buildHostServices(
         // comment authorship (send-it-back-to-me, approvals, audit). Relays are
         // attributed to the plugin's own agent identity; operator identity, if any,
         // belongs in the comment body/metadata, not in host-minted authorship.
+        // Bind any standalone assets created via artifacts.create onto this
+        // comment. The preflight runs BEFORE the comment row exists, so a
+        // conflicting attachmentIds list fails createComment explicitly and
+        // leaves no comment behind; the bind itself re-checks in-transaction
+        // after addComment. Binding is idempotent for the same comment and
+        // conflict-aware: an asset already bound to a different comment/issue
+        // fails the call explicitly instead of silently dropping the
+        // attachment.
+        const attachmentIds = Array.isArray(params.attachmentIds)
+          ? params.attachmentIds.filter((id): id is string => typeof id === "string" && id.length > 0)
+          : [];
+        if (attachmentIds.length > 0) {
+          await issues.validateAssetsBindableToIssue({
+            issueId: issue.id,
+            assetIds: attachmentIds,
+          });
+        }
         const comment = (await issues.addComment(
           issue.id,
           params.body,
           { agentId: params.actorUserId ? undefined : params.authorAgentId, userId: params.actorUserId },
         )) as IssueComment;
-        // Bind any standalone assets created via artifacts.create onto
-        // this comment. attachAssetsToComment re-checks each asset's company
-        // against the (already tenant-validated) issue's company, so a worker
-        // cannot surface a foreign tenant's asset. Idempotent on the UNIQUE
-        // asset_id index, so a retried createComment does not duplicate.
-        const attachmentIds = Array.isArray(params.attachmentIds)
-          ? params.attachmentIds.filter((id): id is string => typeof id === "string" && id.length > 0)
-          : [];
         if (attachmentIds.length > 0) {
-          await issues.attachAssetsToComment({
+          const bound = await issues.attachAssetsToComment({
             issueId: issue.id,
             issueCommentId: comment.id,
             assetIds: attachmentIds,
           });
+          for (const row of bound) {
+            await logPluginActivity({
+              companyId,
+              action: "issue.attachment_bound",
+              entityType: "issue",
+              entityId: issue.id,
+              actor: { actorAgentId: params.actorUserId ? null : params.authorAgentId ?? null, actorUserId: params.actorUserId ?? null },
+              details: attachmentBoundActivityDetails(row),
+            });
+          }
         }
         await logPluginActivity({
           companyId,

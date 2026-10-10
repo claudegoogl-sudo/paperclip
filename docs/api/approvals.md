@@ -104,6 +104,10 @@ Lets the requesting agent retract its own pending approval (for example a
 request sent with a broken payload). Rules:
 
 - Only the agent that created the request (`requestedByAgentId`) may withdraw.
+  Any other agent gets `404 Approval not found`, the same answer as a missing
+  or cross-company approval.
+- An empty payload (`{}`) is refused at create with `422`
+  `approval_payload_empty`, for every approval type.
 - Only while the approval is `pending` — a decided card can never be withdrawn.
 - The row is not deleted; the status becomes a terminal `withdrawn`, and an
   activity-log entry records the withdrawing agent and run.

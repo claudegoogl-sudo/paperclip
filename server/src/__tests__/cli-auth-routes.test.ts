@@ -37,20 +37,26 @@ vi.mock("../services/index.js", () => ({
   deduplicateAgentName: vi.fn((name: string) => name),
 }));
 
-function registerModuleMocks() {
-  vi.doMock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
-
-  vi.doMock("../services/index.js", () => ({
-    accessService: () => mockAccessService,
-    agentService: () => mockAgentService,
-    boardAuthService: () => mockBoardAuthService,
-    logActivity: mockLogActivity,
-    notifyHireApproved: vi.fn(),
-    deduplicateAgentName: vi.fn((name: string) => name),
-  }));
-}
-
 let appImportCounter = 0;
+
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
+
+vi.mock("../services/index.js", () => ({
+  accessService: () => mockAccessService,
+  agentService: () => mockAgentService,
+  boardAuthService: () => mockBoardAuthService,
+  logActivity: mockLogActivity,
+  notifyHireApproved: vi.fn(),
+  deduplicateAgentName: vi.fn((name: string) => name),
+}));
 
 async function createApp(actor: any, db: any = {} as any) {
   appImportCounter += 1;
@@ -92,12 +98,6 @@ async function createApp(actor: any, db: any = {} as any) {
 
 describe.sequential("cli auth routes", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../routes/access.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.resetAllMocks();
   });
 
@@ -307,6 +307,8 @@ describe.sequential("cli auth routes", () => {
   });
 
   it.sequential("creates a named board API key and logs audit activity", async () => {
+    // Computed, not hard-coded: expiry must be in the future for the schema.
+    const successorExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
     mockBoardAuthService.createNamedBoardApiKey.mockResolvedValue({
       id: "board-key-4",
       name: "external-admin",
@@ -314,7 +316,7 @@ describe.sequential("cli auth routes", () => {
       createdAt: new Date("2026-05-23T12:00:00.000Z"),
       lastUsedAt: null,
       revokedAt: null,
-      expiresAt: new Date("2026-06-23T12:00:00.000Z"),
+      expiresAt: successorExpiresAt,
     });
     mockBoardAuthService.resolveBoardActivityCompanyIds.mockResolvedValue(["11111111-1111-4111-8111-111111111111"]);
 
@@ -330,7 +332,8 @@ describe.sequential("cli auth routes", () => {
       .send({
         name: "external-admin",
         requestedCompanyId: "11111111-1111-4111-8111-111111111111",
-        expiresAt: "2026-06-23T12:00:00.000Z",
+        expiresAt: successorExpiresAt.toISOString(),
+        scope: { kind: "plugin_ops" },
       });
 
     expect(res.status, res.text || JSON.stringify(res.body)).toBe(201);
@@ -338,13 +341,13 @@ describe.sequential("cli auth routes", () => {
       id: "board-key-4",
       name: "external-admin",
       token: "pcp_board_plaintext",
-      expiresAt: "2026-06-23T12:00:00.000Z",
+      expiresAt: successorExpiresAt.toISOString(),
     });
     expect(mockBoardAuthService.createNamedBoardApiKey).toHaveBeenCalledWith({
       userId: "user-1",
       name: "external-admin",
-      expiresAt: new Date("2026-06-23T12:00:00.000Z"),
-      scope: null,
+      expiresAt: successorExpiresAt,
+      scope: { kind: "plugin_ops" },
     });
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),

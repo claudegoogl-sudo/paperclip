@@ -774,28 +774,32 @@ describe("worker setup-token pseudo-terminal dispatch", () => {
     let killed = 0;
     let closed = 0;
 
-    // The worker emits output and exit through `ctx.setupTokenPty`, bound to the
+    // The worker emits output and exit through `ctx.loginPty`, bound to the
     // worker session id. The test drives them through the captured emitters.
     const controllablePlugin = definePlugin({
       async setup(ctx) {
-        emitOutput = (chunk: string) => ctx.setupTokenPty.output("ws-1", chunk);
-        resolveWait = (value) => ctx.setupTokenPty.exit("ws-1", value.exitCode);
+        emitOutput = (chunk: string) => ctx.loginPty.output("ws-1", chunk);
+        resolveWait = (value) => ctx.loginPty.exit("ws-1", value.exitCode);
       },
-      async onSetupTokenPtyOpen(params) {
-        // The open carries the host route id and the fixed command. The worker
-        // returns a worker session id for the output binding only.
+      async onLoginPtyOpen(params) {
+        // The open carries the host route id, the closed command key, and the
+        // validated session home. The worker returns a worker session id for the
+        // output binding only. The open carries no command string.
         expect(params.hostRouteId).toBe("route-1");
-        expect(params.command).toBe("claude setup-token");
+        expect(params.loginCommandKey).toBe("claude");
+        expect(params.sessionHome).toBe(
+          "/tmp/paperclip-adapter-login/11111111-2222-4333-8444-555555555555",
+        );
         expect(params.providerLeaseId).toBe("lease-1");
         return { workerSessionId: "ws-1" };
       },
-      async onSetupTokenPtyInput(params) {
+      async onLoginPtyInput(params) {
         inputs.push(params.data);
       },
-      async onSetupTokenPtyStop() {
+      async onLoginPtyStop() {
         killed += 1;
       },
-      async onSetupTokenPtyClose(params) {
+      async onLoginPtyClose(params) {
         // The close keys on the host route id and returns a bound acknowledgement.
         closed += 1;
         return { hostRouteId: params.hostRouteId };
@@ -839,10 +843,10 @@ describe("worker setup-token pseudo-terminal dispatch", () => {
       await expect(
         callWorker("initialize", {
           manifest: {
-            id: "paperclip.setup-token-pty",
+            id: "paperclip.login-pty",
             apiVersion: 1,
             version: "1.0.0",
-            displayName: "Setup Token PTY Test",
+            displayName: "Login PTY Test",
             description: "Test plugin",
             author: "Paperclip",
             categories: ["automation"],
@@ -855,31 +859,32 @@ describe("worker setup-token pseudo-terminal dispatch", () => {
       ).resolves.toMatchObject({
         ok: true,
         supportedMethods: expect.arrayContaining([
-          "setupTokenPtyOpen",
-          "setupTokenPtyInput",
-          "setupTokenPtyStop",
-          "setupTokenPtyClose",
+          "loginPtyOpen",
+          "loginPtyInput",
+          "loginPtyStop",
+          "loginPtyClose",
         ]),
       });
 
       await expect(
-        callWorker("setupTokenPtyOpen", {
+        callWorker("loginPtyOpen", {
           hostRouteId: "route-1",
           driverKey: "daytona",
           companyId: "company-1",
           environmentId: "env-1",
           providerLeaseId: "lease-1",
-          command: "claude setup-token",
+          loginCommandKey: "claude",
+          sessionHome: "/tmp/paperclip-adapter-login/11111111-2222-4333-8444-555555555555",
         }),
       ).resolves.toEqual({ workerSessionId: "ws-1" });
 
       // The worker streams output as a notification bound to the worker session id.
       emitOutput?.("prompt output");
-      await callWorker("setupTokenPtyInput", { workerSessionId: "ws-1", data: "browser-code" });
-      await callWorker("setupTokenPtyStop", { workerSessionId: "ws-1" });
+      await callWorker("loginPtyInput", { workerSessionId: "ws-1", data: "browser-code" });
+      await callWorker("loginPtyStop", { workerSessionId: "ws-1" });
       resolveWait?.({ exitCode: 0 });
       await expect(
-        callWorker("setupTokenPtyClose", { hostRouteId: "route-1" }),
+        callWorker("loginPtyClose", { hostRouteId: "route-1" }),
       ).resolves.toEqual({ hostRouteId: "route-1" });
 
       await new Promise((resolve) => setImmediate(resolve));
@@ -888,13 +893,13 @@ describe("worker setup-token pseudo-terminal dispatch", () => {
       expect(killed).toBe(1);
       expect(closed).toBe(1);
       const outputNotes = notifications.filter(
-        (note) => note.method === "setupTokenPty.output",
+        (note) => note.method === "loginPty.output",
       );
       expect(outputNotes.map((note) => note.params)).toEqual([
         { workerSessionId: "ws-1", chunk: "prompt output" },
       ]);
       const exitNotes = notifications.filter(
-        (note) => note.method === "setupTokenPty.exit",
+        (note) => note.method === "loginPty.exit",
       );
       expect(exitNotes.map((note) => note.params)).toEqual([
         { workerSessionId: "ws-1", exitCode: 0 },
@@ -902,6 +907,443 @@ describe("worker setup-token pseudo-terminal dispatch", () => {
     } finally {
       worker.stop();
       hostReadline.close();
+    }
+  });
+});
+
+describe("worker duplex channel dispatch", () => {
+  it("dispatches open, write, stop, and close, and reports the duplex methods", async () => {
+    const hostToWorker = new PassThrough();
+    const workerToHost = new PassThrough();
+    const hostReadline = createInterface({ input: workerToHost });
+    const pending = new Map<string, (response: JsonRpcResponse) => void>();
+    let nextRequestId = 1;
+
+    const writes: string[] = [];
+    let stopped = 0;
+    let closed = 0;
+
+    // The plugin declares the four duplex channel handlers. The open returns a
+    // worker session id. The close keys on the host route id and returns a bound
+    // acknowledgement.
+    const controllablePlugin = definePlugin({
+      async setup() {},
+      async onDuplexChannelOpen(params) {
+        expect(params.hostRouteId).toBe("route-1");
+        expect(params.command).toEqual(["paperclip-bridge"]);
+        expect(params.providerLeaseId).toBe("lease-1");
+        return { workerSessionId: "ws-1" };
+      },
+      async onDuplexChannelWrite(params) {
+        writes.push(params.data);
+      },
+      async onDuplexChannelStop() {
+        stopped += 1;
+      },
+      async onDuplexChannelClose(params) {
+        closed += 1;
+        return { hostRouteId: params.hostRouteId };
+      },
+    });
+
+    const worker = startWorkerRpcHost({
+      plugin: controllablePlugin,
+      stdin: hostToWorker,
+      stdout: workerToHost,
+    });
+
+    function callWorker(method: string, params: unknown) {
+      const id = `host-${nextRequestId++}`;
+      const result = new Promise<unknown>((resolve, reject) => {
+        pending.set(id, (response) => {
+          if ("error" in response && response.error) {
+            reject(new Error(response.error.message));
+            return;
+          }
+          resolve((response as { result?: unknown }).result);
+        });
+      });
+      hostToWorker.write(serializeMessage(createRequest(method, params, id)));
+      return result;
+    }
+
+    hostReadline.on("line", (line) => {
+      const message = parseMessage(line);
+      if (isJsonRpcResponse(message)) {
+        pending.get(String(message.id))?.(message);
+        pending.delete(String(message.id));
+      }
+    });
+
+    try {
+      await expect(
+        callWorker("initialize", {
+          manifest: {
+            id: "paperclip.duplex-channel",
+            apiVersion: 1,
+            version: "1.0.0",
+            displayName: "Duplex Channel Test",
+            description: "Test plugin",
+            author: "Paperclip",
+            categories: ["automation"],
+            capabilities: [],
+            entrypoints: {},
+          },
+          config: {},
+          databaseNamespace: null,
+        }),
+      ).resolves.toMatchObject({
+        ok: true,
+        supportedMethods: expect.arrayContaining([
+          "duplexChannelOpen",
+          "duplexChannelWrite",
+          "duplexChannelStop",
+          "duplexChannelClose",
+        ]),
+      });
+
+      await expect(
+        callWorker("duplexChannelOpen", {
+          hostRouteId: "route-1",
+          driverKey: "daytona",
+          companyId: "company-1",
+          environmentId: "env-1",
+          providerLeaseId: "lease-1",
+          command: ["paperclip-bridge"],
+        }),
+      ).resolves.toEqual({ workerSessionId: "ws-1" });
+
+      await callWorker("duplexChannelWrite", { workerSessionId: "ws-1", data: "payload" });
+      await callWorker("duplexChannelStop", { workerSessionId: "ws-1" });
+      await expect(
+        callWorker("duplexChannelClose", { hostRouteId: "route-1" }),
+      ).resolves.toEqual({ hostRouteId: "route-1" });
+
+      expect(writes).toEqual(["payload"]);
+      expect(stopped).toBe(1);
+      expect(closed).toBe(1);
+    } finally {
+      worker.stop();
+      hostReadline.close();
+    }
+  });
+
+  it("reports no duplex methods when the plugin declares no duplex handlers", async () => {
+    const hostToWorker = new PassThrough();
+    const workerToHost = new PassThrough();
+    const hostReadline = createInterface({ input: workerToHost });
+    const pending = new Map<string, (response: JsonRpcResponse) => void>();
+    let nextRequestId = 1;
+
+    // A plugin with no duplex handlers advertises no duplex method. The Phase 1
+    // capability `duplexCommandStream` still resolves false for this provider,
+    // because the prerequisite verb `duplexChannelOpen` is absent.
+    const barePlugin = definePlugin({
+      async setup() {},
+    });
+
+    const worker = startWorkerRpcHost({
+      plugin: barePlugin,
+      stdin: hostToWorker,
+      stdout: workerToHost,
+    });
+
+    function callWorker(method: string, params: unknown) {
+      const id = `host-${nextRequestId++}`;
+      const result = new Promise<unknown>((resolve, reject) => {
+        pending.set(id, (response) => {
+          if ("error" in response && response.error) {
+            reject(new Error(response.error.message));
+            return;
+          }
+          resolve((response as { result?: unknown }).result);
+        });
+      });
+      hostToWorker.write(serializeMessage(createRequest(method, params, id)));
+      return result;
+    }
+
+    hostReadline.on("line", (line) => {
+      const message = parseMessage(line);
+      if (isJsonRpcResponse(message)) {
+        pending.get(String(message.id))?.(message);
+        pending.delete(String(message.id));
+      }
+    });
+
+    try {
+      const result = (await callWorker("initialize", {
+        manifest: {
+          id: "paperclip.bare",
+          apiVersion: 1,
+          version: "1.0.0",
+          displayName: "Bare Test",
+          description: "Test plugin",
+          author: "Paperclip",
+          categories: ["automation"],
+          capabilities: [],
+          entrypoints: {},
+        },
+        config: {},
+        databaseNamespace: null,
+      })) as { supportedMethods: string[] };
+
+      expect(result.supportedMethods).not.toContain("duplexChannelOpen");
+      expect(result.supportedMethods).not.toContain("duplexChannelWrite");
+      expect(result.supportedMethods).not.toContain("duplexChannelStop");
+      expect(result.supportedMethods).not.toContain("duplexChannelClose");
+    } finally {
+      worker.stop();
+      hostReadline.close();
+    }
+  });
+});
+
+
+describe("worker streams.dropped feedback", () => {
+  it("forwards a host streams.dropped notification to the plugin log as a warning", async () => {
+    const hostToWorker = new PassThrough();
+    const workerToHost = new PassThrough();
+    const hostReadline = createInterface({ input: workerToHost });
+    const pending = new Map<string, (response: JsonRpcResponse) => void>();
+    const logNotifications: Array<Record<string, unknown>> = [];
+    let nextRequestId = 1;
+    const plugin = definePlugin({
+      async setup(ctx) {
+        ctx.actions.register("noop", async () => ({ ok: true }));
+      },
+    });
+    const worker = startWorkerRpcHost({
+      plugin,
+      stdin: hostToWorker,
+      stdout: workerToHost,
+    });
+
+    function callWorker(method: string, params: unknown) {
+      const id = `host-${nextRequestId++}`;
+      const result = new Promise<unknown>((resolve, reject) => {
+        pending.set(id, (response) => {
+          if ("error" in response && response.error) {
+            reject(new Error(response.error.message));
+            return;
+          }
+          resolve((response as { result?: unknown }).result);
+        });
+      });
+      hostToWorker.write(serializeMessage(createRequest(method, params, id)));
+      return result;
+    }
+
+    hostReadline.on("line", (line) => {
+      const message = parseMessage(line);
+      if (isJsonRpcNotification(message) && message.method === "log") {
+        logNotifications.push((message as JsonRpcNotification).params as Record<string, unknown>);
+        return;
+      }
+      if (!isJsonRpcResponse(message)) return;
+      pending.get(String(message.id))?.(message);
+      pending.delete(String(message.id));
+    });
+
+    try {
+      await expect(callWorker("initialize", {
+        manifest: {
+          id: "paperclip.test-stream-drop",
+          apiVersion: 1,
+          version: "1.0.0",
+          displayName: "Stream Drop Test",
+          description: "Test plugin",
+          author: "Paperclip",
+          categories: ["automation"],
+          capabilities: [],
+          entrypoints: {},
+        },
+        config: {},
+        databaseNamespace: null,
+      })).resolves.toMatchObject({ ok: true });
+
+      // Host → worker drop signal (fire-and-forget, no id).
+      hostToWorker.write(serializeMessage({
+        jsonrpc: "2.0" as const,
+        method: "streams.dropped",
+        params: {
+          method: "streams.emit",
+          channel: "printer-status",
+          companyId: "company-1",
+          reason: "unpinned_channel",
+        },
+      }));
+      // Let the readline loop settle.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(logNotifications).toHaveLength(1);
+      expect(logNotifications[0]).toMatchObject({
+        level: "warn",
+        message: expect.stringContaining("unpinned_channel"),
+      });
+      expect(String(logNotifications[0].message)).toContain('channel="printer-status"');
+    } finally {
+      worker.stop();
+      hostReadline.close();
+      hostToWorker.destroy();
+      workerToHost.destroy();
+    }
+  });
+});
+
+
+describe("worker streams.dropped onDropped subscribers", () => {
+  function startDropTestHost(onSetup: (ctx: import("../src/types.js").PluginContext) => void) {
+    const hostToWorker = new PassThrough();
+    const workerToHost = new PassThrough();
+    const hostReadline = createInterface({ input: workerToHost });
+    const workerMessages: Array<{ method?: string; id?: unknown; params?: unknown; result?: unknown }> = [];
+    const plugin = definePlugin({
+      async setup(ctx) {
+        onSetup(ctx);
+      },
+    });
+    const worker = startWorkerRpcHost({
+      plugin,
+      stdin: hostToWorker,
+      stdout: workerToHost,
+    });
+    const logNotifications: Array<Record<string, unknown>> = [];
+    hostReadline.on("line", (line) => {
+      const message = parseMessage(line);
+      if (!message) return;
+      const record = message as { method?: string; id?: unknown; params?: unknown; result?: unknown };
+      workerMessages.push(record);
+      if (record.method === "log") {
+        logNotifications.push(record.params as Record<string, unknown>);
+      }
+    });
+    const stop = () => {
+      worker.stop();
+      hostReadline.close();
+      hostToWorker.destroy();
+      workerToHost.destroy();
+    };
+    return { hostToWorker, workerMessages, logNotifications, stop };
+  }
+
+  function writeDrop(hostToWorker: PassThrough, params: Record<string, unknown>): void {
+    hostToWorker.write(
+      serializeMessage({
+        jsonrpc: "2.0" as const,
+        method: "streams.dropped",
+        params,
+      }),
+    );
+  }
+
+  // `setup()` (and therefore any `ctx.streams.onDropped` registration) runs
+  // on the `initialize` request — send it before simulating host drops.
+  async function initialize(
+    hostToWorker: PassThrough,
+    workerMessages: Array<{ id?: unknown }>,
+  ): Promise<void> {
+    hostToWorker.write(
+      serializeMessage(
+        createRequest(
+          "initialize",
+          {
+            manifest: {
+              id: "paperclip.stream-drop-subscribers",
+              apiVersion: 1,
+              version: "1.0.0",
+              displayName: "Stream Drop Subscribers",
+              description: "Test plugin",
+              author: "Paperclip",
+              categories: ["automation"],
+              capabilities: [],
+              entrypoints: {},
+            },
+            config: {},
+            databaseNamespace: null,
+          },
+          "init-1",
+        ),
+      ),
+    );
+    const deadline = Date.now() + 2000;
+    while (!workerMessages.some((m) => m.id === "init-1")) {
+      if (Date.now() > deadline) throw new Error("initialize timed out");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+
+  it("hands a streams.dropped notice to ctx.streams.onDropped subscribers", async () => {
+    const seen: import("../src/types.js").StreamDropNotice[] = [];
+    const { hostToWorker, workerMessages, logNotifications, stop } = startDropTestHost((ctx) => {
+      ctx.streams.onDropped((notice) => {
+        seen.push(notice);
+      });
+    });
+    await initialize(hostToWorker, workerMessages);
+
+    try {
+      writeDrop(hostToWorker, {
+        method: "streams.open",
+        channel: "klipper",
+        companyId: "company-1",
+        reason: "invalid_invocation_scope",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(seen).toEqual([
+        { method: "streams.open", channel: "klipper", companyId: "company-1", reason: "invalid_invocation_scope" },
+      ]);
+      // The plugin-log warn diagnostic stays in place alongside the dispatch.
+      expect(logNotifications.some((l) => l.level === "warn" && String(l.message).includes("invalid_invocation_scope"))).toBe(true);
+    } finally {
+      stop();
+    }
+  });
+
+  it("stops delivery after the unsubscribe function is called", async () => {
+    const seen: import("../src/types.js").StreamDropNotice[] = [];
+    const { hostToWorker, workerMessages, stop } = startDropTestHost((ctx) => {
+      const unsubscribe = ctx.streams.onDropped((notice) => {
+        seen.push(notice);
+      });
+      unsubscribe();
+    });
+    await initialize(hostToWorker, workerMessages);
+
+    try {
+      writeDrop(hostToWorker, { method: "streams.emit", channel: "klipper", reason: "pin_mismatch" });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(seen).toEqual([]);
+    } finally {
+      stop();
+    }
+  });
+
+  it("contains a throwing handler: logs the failure and later handlers still run", async () => {
+    const seen: import("../src/types.js").StreamDropNotice[] = [];
+    const { hostToWorker, workerMessages, logNotifications, stop } = startDropTestHost((ctx) => {
+      ctx.streams.onDropped(() => {
+        throw new Error("handler boom");
+      });
+      ctx.streams.onDropped((notice) => {
+        seen.push(notice);
+      });
+    });
+    await initialize(hostToWorker, workerMessages);
+
+    try {
+      writeDrop(hostToWorker, { method: "streams.open", channel: "ch", reason: "unpinned_channel" });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(seen).toEqual([{ method: "streams.open", channel: "ch", reason: "unpinned_channel" }]);
+      expect(
+        logNotifications.some(
+          (l) => l.level === "error" && String(l.message).includes("streams.dropped handler failed") && String(l.message).includes("handler boom"),
+        ),
+      ).toBe(true);
+    } finally {
+      stop();
     }
   });
 });

@@ -6,11 +6,17 @@ const mockStorage = vi.hoisted(() => ({
   headObject: vi.fn(),
 }));
 
-function registerModuleMocks() {
-  vi.doMock("../storage/index.js", () => ({
-    getStorageService: () => mockStorage,
-  }));
-}
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("../storage/index.js", () => ({
+  getStorageService: () => mockStorage,
+}));
 
 function createSelectChain(rows: unknown[]) {
   const query = {
@@ -73,11 +79,6 @@ async function createApp(
 
 describe("GET /invites/:token", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../storage/index.js");
-    vi.doUnmock("../routes/access.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     mockStorage.headObject.mockReset();
     mockStorage.headObject.mockResolvedValue({ exists: true, contentLength: 3, contentType: "image/png" });
   });
@@ -103,7 +104,6 @@ describe("GET /invites/:token", () => {
         [
           {
             name: "Acme Robotics",
-            brandColor: "#114488",
             logoAssetId: "logo-1",
           },
         ],
@@ -124,7 +124,7 @@ describe("GET /invites/:token", () => {
     expect(res.status).toBe(200);
     expect(res.body.companyId).toBe("company-1");
     expect(res.body.companyName).toBe("Acme Robotics");
-    expect(res.body.companyBrandColor).toBe("#114488");
+    expect(res.body).not.toHaveProperty("companyBrandColor");
     expect(res.body.companyLogoUrl).toBe("/api/invites/pcp_invite_test/logo");
     expect(res.body.inviteType).toBe("company_join");
   }, 10_000);
@@ -152,7 +152,6 @@ describe("GET /invites/:token", () => {
         [
           {
             name: "Acme Robotics",
-            brandColor: "#114488",
             logoAssetId: "logo-1",
           },
         ],
@@ -196,7 +195,6 @@ describe("GET /invites/:token", () => {
         [
           {
             name: "Acme Robotics",
-            brandColor: "#114488",
             logoAssetId: "logo-1",
           },
         ],
@@ -244,7 +242,6 @@ describe("GET /invites/:token", () => {
     };
     const companyBranding = {
       name: "Acme Robotics",
-      brandColor: "#114488",
       logoAssetId: "logo-1",
     };
     const logoAsset = {

@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { scrubSigningKeys } from "../child-env-scrub.js";
 
 export interface CommandResult {
   exitCode: number | null;
@@ -39,7 +40,7 @@ export async function runCommand(
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: options.cwd,
-      env: options.env ?? process.env,
+      env: scrubSigningKeys(options.env ?? process.env),
       detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
     });

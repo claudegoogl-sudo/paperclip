@@ -110,10 +110,17 @@ export async function observeCrossIssueInfluence(
     }
 
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
+    // A run row that exists and matches company+agent but has no source issue
+    // in its snapshot is a legitimate run shape (timer, manual/on-demand, and
+    // retry wakes only enrich the snapshot when the wake payload carries the
+    // issue), not an attribution failure. The cap is a rate backstop, not a
+    // permission decision, so the write proceeds under the shared per-run cap.
+    // No source-issue exemption exists for such runs by definition: there is
+    // no source issue to exempt, so every guarded write counts toward the cap.
     if (
-      sourceIssueId === input.targetIssueId ||
-      (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
+      sourceIssueId !== null &&
+      (sourceIssueId === input.targetIssueId ||
+        (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase()))
     ) {
       return null;
     }
@@ -160,6 +167,10 @@ export async function observeCrossIssueInfluence(
       runId: input.runId,
       agentId: input.agentId,
       sourceIssueId,
+      // Contextless timer/manual/retry runs have no source issue to log; the
+      // flag makes the new allow-under-cap population visible in production
+      // logs without changing the counter semantics.
+      contextlessRun: sourceIssueId === null,
       targetIssueId: input.targetIssueId,
       kind: input.kind,
       count: decision.count,

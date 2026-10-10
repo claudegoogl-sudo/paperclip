@@ -56,6 +56,22 @@ import {
   badRequest,
   tooManyRequests
 } from "../errors.js";
+import { getHiddenSettings } from "../services/settings-visibility.js";
+
+/**
+ * Floor: when the hosting operator hides the Instance Access surface
+ * (`instance.access` in PAPERCLIP_HIDDEN_SETTINGS), instance-admin user
+ * management is rejected alongside it — user administration then belongs to
+ * the operator's own control plane. Applies to the Access page's reads too;
+ * invite and company-membership routes are company-scoped and stay open.
+ */
+function assertAccessAdminVisible() {
+  if (getHiddenSettings().has("instance.access")) {
+    throw forbidden("Instance user administration is managed by the hosting operator on this instance", {
+      code: "settings_operator_managed",
+    });
+  }
+}
 import {
   createInviteRateLimiter,
   type InviteRateLimiter,
@@ -1080,14 +1096,13 @@ function toInviteSummaryResponse(
     | string
     | {
       name: string | null;
-      brandColor: string | null;
       logoUrl: string | null;
     }
     | null = null,
   authPublicBaseUrl?: string
 ) {
   const companyInfo = typeof company === "string"
-    ? { name: company, brandColor: null, logoUrl: null }
+    ? { name: company, logoUrl: null }
     : company;
   const baseUrl = resolveBaseUrl(req, authPublicBaseUrl);
   const invitePath = `/invite/${token}`;
@@ -1100,7 +1115,6 @@ function toInviteSummaryResponse(
     companyId: invite.companyId,
     companyName: companyInfo?.name ?? null,
     companyLogoUrl: companyInfo?.logoUrl ?? null,
-    companyBrandColor: companyInfo?.brandColor ?? null,
     inviteType: invite.inviteType,
     allowedJoinTypes: invite.allowedJoinTypes,
     humanRole: extractInviteHumanRole(invite),
@@ -2898,11 +2912,44 @@ export function accessRoutes(
         assertCompanyAccess(req, req.body.requestedCompanyId);
       }
 
+      // Privilege ceiling: a request authenticated by a board
+      // API key must not be able to mint a successor key that is broader in
+      // scope, or longer-lived, than the minting key itself. Session-authenticated
+      // requests (a human/owner in the board UI/CLI login flow) are not bound by
+      // this -- they already carry full user authority independent of any key.
+      // `enforceBoardKeyScopeMiddleware` already force-inherits the acting
+      // scope for a plugin_ops key before this handler runs; this is the
+      // second, defense-in-depth half that also covers the expiry ceiling and
+      // remains correct even if the middleware chain changes.
+      if (req.actor.source === "board_key") {
+        // INVARIANT: the successor key's scope must be same-or-narrower than
+        // the minting key's scope. This is currently expressed by enumerating
+        // the single narrow kind (`plugin_ops`) because
+        // `boardApiKeyScopeSchema` is a two-member union (standard | plugin_ops);
+        // if a third scope kind is ever added, replace this with an explicit
+        // narrowness rank comparison (deny by default) so the ceiling cannot
+        // be bypassed by an unranked kind.
+        const actorScope = req.actor.boardKeyScope ?? { kind: "standard" as const };
+        if (actorScope.kind === "plugin_ops" && req.body.scope.kind !== "plugin_ops") {
+          throw forbidden(
+            "Board API key cannot mint a key with broader scope than itself",
+            { code: "board_key_privilege_ceiling" },
+          );
+        }
+        const actorExpiresAt = req.actor.boardKeyExpiresAt;
+        if (actorExpiresAt && req.body.expiresAt.getTime() > actorExpiresAt.getTime()) {
+          throw forbidden(
+            "Board API key cannot mint a key with a later expiry than itself",
+            { code: "board_key_privilege_ceiling" },
+          );
+        }
+      }
+
       const key = await boardAuth.createNamedBoardApiKey({
         userId: req.actor.userId,
         name: req.body.name,
-        expiresAt: req.body.expiresAt === undefined ? undefined : req.body.expiresAt,
-        scope: req.body.scope ?? null,
+        expiresAt: req.body.expiresAt,
+        scope: req.body.scope,
       });
       const companyIds = await boardAuth.resolveBoardActivityCompanyIds({
         userId: req.actor.userId,
@@ -3185,17 +3232,15 @@ export function accessRoutes(
     inviteToken: string | null = null,
   ): Promise<{
     name: string | null;
-    brandColor: string | null;
     logoAssetId: string | null;
     logoUrl: string | null;
   }> {
     if (!companyId) {
-      return { name: null, brandColor: null, logoAssetId: null, logoUrl: null };
+      return { name: null, logoAssetId: null, logoUrl: null };
     }
     const company = await db
       .select({
         name: companies.name,
-        brandColor: companies.brandColor,
         logoAssetId: companyLogos.assetId,
       })
       .from(companies)
@@ -3227,7 +3272,6 @@ export function accessRoutes(
 
     return {
       name: company?.name ?? null,
-      brandColor: company?.brandColor ?? null,
       logoAssetId: company?.logoAssetId ?? null,
       logoUrl,
     };
@@ -4779,6 +4823,7 @@ export function accessRoutes(
     "/admin/users/:userId/promote-instance-admin",
     async (req, res) => {
       await assertInstanceAdmin(req);
+      assertAccessAdminVisible();
       const userId = req.params.userId as string;
       const result = await access.promoteInstanceAdmin(userId);
       res.status(201).json(result);
@@ -4787,6 +4832,7 @@ export function accessRoutes(
 
   router.get("/admin/users", async (req, res) => {
     await assertInstanceAdmin(req);
+    assertAccessAdminVisible();
     const query = searchAdminUsersQuerySchema.parse(req.query);
     const needle = query.query.trim().toLowerCase();
     const users = await db
@@ -4849,6 +4895,7 @@ export function accessRoutes(
     "/admin/users/:userId/demote-instance-admin",
     async (req, res) => {
       await assertInstanceAdmin(req);
+      assertAccessAdminVisible();
       const userId = req.params.userId as string;
       const removed = await access.demoteInstanceAdmin(userId);
       if (!removed) throw notFound("Instance admin role not found");
@@ -4858,6 +4905,7 @@ export function accessRoutes(
 
   router.get("/admin/users/:userId/company-access", async (req, res) => {
     await assertInstanceAdmin(req);
+    assertAccessAdminVisible();
     const userId = req.params.userId as string;
     res.json(await loadUserCompanyAccessResponse(db, access, userId));
   });
@@ -4867,6 +4915,7 @@ export function accessRoutes(
     validate(updateUserCompanyAccessSchema),
     async (req, res) => {
       await assertInstanceAdmin(req);
+      assertAccessAdminVisible();
       const userId = req.params.userId as string;
       await access.setUserCompanyAccess(
         userId,

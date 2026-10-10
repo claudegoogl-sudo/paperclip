@@ -10,6 +10,11 @@ import {
   createFileSessionStore,
   type AcpRuntime,
 } from "acpx/runtime";
+import {
+  buildPersistedSessionEnv,
+  findPersistedEnvValueLeaks,
+  PERSISTED_ENV_REF_PREFIX,
+} from "./session-persist-env.js";
 
 /**
  * Regression tests for the fork.37 claude_local ensure_session failure
@@ -116,7 +121,7 @@ beforeAll(async () => {
 import { writeFileSync } from "node:fs";
 const probe = process.env.ACPX_STUB_ENV_PROBE;
 if (probe) {
-  const keys = ["PAPERCLIP_AGENT_ID", "PAPERCLIP_API_KEY", "ANTHROPIC_MODEL", "ACPX_STUB_MARK"];
+  const keys = ["PAPERCLIP_AGENT_ID", "PAPERCLIP_API_KEY", "ANTHROPIC_MODEL", "ANTHROPIC_AUTH_TOKEN", "ACPX_STUB_MARK"];
   const snap = Object.fromEntries(keys.filter((k) => process.env[k] !== undefined).map((k) => [k, process.env[k]]));
   writeFileSync(probe, JSON.stringify(snap));
 }
@@ -249,6 +254,11 @@ describe("claude_local session env persistence (fork.37 regression)", () => {
       // Deliberately omit sessionOptions here: resume must re-supply env from
       // the persisted record. (adapter-utils passes prepared.env on this path
       // too; the record is the safety net this test pins.)
+      //
+      // This pins LEGACY (non-Paperclip) callers that pass no
+      // `persistedEnv` — their env is still persisted verbatim. Paperclip
+      // callers pass `persistedEnv` (markers) and re-supply real env at
+      // ensureSession; that contract is pinned in the env-ref describe below.
     });
     expect(resumed.acpxRecordId).toBe("env-policy-resume");
 
@@ -331,9 +341,130 @@ describe("claude_local session env persistence (fork.37 regression)", () => {
     );
     expect(marker).toBe(true);
 
+    // The patch also carries persistedEnv (the record env override)
+    // and the runtime manager's in-memory spawn-env stash that cold turn
+    // clients merge over the marker-only record env.
+    const runtimeJs = await fs.readFile(path.join(acpxDist, "dist", "runtime.js"), "utf8");
+    expect(runtimeJs).toContain("sessionSpawnEnvs");
+    expect(runtimeJs).toContain("persistedEnv ?? sessionOptions?.env");
+    const dtsFiles = (await fs.readdir(distDir)).filter(
+      (f) => f.startsWith("session-options-") && f.endsWith(".d.ts"),
+    );
+    expect(dtsFiles.length).toBeGreaterThan(0);
+    const dtsTexts = await Promise.all(
+      dtsFiles.map((f) => fs.readFile(path.join(distDir, f), "utf8")),
+    );
+    expect(dtsTexts.some((text) => text.includes("persistedEnv?: Record<string, string>"))).toBe(true);
+
     // Repo root is four levels up from src/acpx-engine/<this file>.
     const repoRoot = path.resolve(fileURLToPath(new URL(import.meta.url)), "..", "..", "..", "..", "..");
     const patchPath = path.join(repoRoot, "patches", "acpx@0.12.0.patch");
     await expect(fs.access(patchPath)).resolves.toBeUndefined();
+  });
+});
+
+describe("session records persist env refs, never resolved secret values", () => {
+  // DUMMY values only (secret-handling directive): never a real credential.
+  const DUMMY_ENV = {
+    PAPERCLIP_AGENT_ID: "agent-7718-regression",
+    ANTHROPIC_MODEL: "claude-test-model",
+    ANTHROPIC_AUTH_TOKEN: "dummy-zai-token-NOT-A-REAL-SECRET-7718",
+    PAPERCLIP_API_KEY: "pcp-dummy-run-key-NOT-A-REAL-KEY-7718",
+  };
+
+  it("AC1/AC4: persistedEnv session writes markers, not values, through the real save path; spawn still gets real env", { timeout: 30_000 }, async () => {
+    const work = await makeTempRoot("paperclip-acpx-envref-ac1-");
+    const stateDir = path.join(work, "state");
+    const envProbe = path.join(work, "env-snap-7718-fresh.json");
+    process.env.ACPX_STUB_ENV_PROBE = envProbe;
+
+    const runtime = makeRuntime(stateDir);
+    const handle = await ensureAndTrack(runtime, {
+      sessionKey: "env-ref-fresh",
+      agent: "stub",
+      mode: "persistent",
+      cwd: work,
+      sessionOptions: {
+        env: { ...DUMMY_ENV },
+        persistedEnv: buildPersistedSessionEnv(DUMMY_ENV),
+      },
+    });
+    expect(handle.acpxRecordId).toBe("env-ref-fresh");
+
+    // RED-GREEN CORE: the raw record JSON on disk must not contain either
+    // dummy secret value anywhere, and the persisted env must be marker-only.
+    const recordPath = path.join(stateDir, "sessions", "env-ref-fresh.json");
+    const rawRecord = await fs.readFile(recordPath, "utf8");
+    expect(rawRecord).not.toContain(DUMMY_ENV.ANTHROPIC_AUTH_TOKEN);
+    expect(rawRecord).not.toContain(DUMMY_ENV.PAPERCLIP_API_KEY);
+    const record = JSON.parse(rawRecord) as { acpx?: { session_options?: { env?: Record<string, string> } } };
+    const persistedEnv = record.acpx?.session_options?.env ?? {};
+    expect(Object.keys(persistedEnv).sort()).toEqual(Object.keys(DUMMY_ENV).sort());
+    for (const [key, value] of Object.entries(persistedEnv)) {
+      expect(value).toBe(PERSISTED_ENV_REF_PREFIX + key);
+    }
+    expect(findPersistedEnvValueLeaks(DUMMY_ENV, persistedEnv)).toEqual([]);
+
+    // The spawned agent process still received the real values.
+    const spawnedEnv = JSON.parse(await fs.readFile(envProbe, "utf8")) as Record<string, string>;
+    expect(spawnedEnv.ANTHROPIC_AUTH_TOKEN).toBe(DUMMY_ENV.ANTHROPIC_AUTH_TOKEN);
+    expect(spawnedEnv.PAPERCLIP_API_KEY).toBe(DUMMY_ENV.PAPERCLIP_API_KEY);
+  });
+
+  it("AC2: cold-restart reuse re-supplies env at ensureSession and respawns with it — the record's markers are never the spawn source", { timeout: 30_000 }, async () => {
+    const work = await makeTempRoot("paperclip-acpx-envref-ac2-");
+    const stateDir = path.join(work, "state");
+    const envProbe = path.join(work, "env-snap-7718-resume.json");
+    process.env.ACPX_STUB_ENV_PROBE = envProbe;
+
+    // First manager: create the session with marker-only persistence.
+    const first = makeRuntime(stateDir);
+    await ensureAndTrack(first, {
+      sessionKey: "env-ref-resume",
+      agent: "stub",
+      mode: "persistent",
+      cwd: work,
+      sessionOptions: {
+        env: { ...DUMMY_ENV },
+        persistedEnv: buildPersistedSessionEnv(DUMMY_ENV),
+      },
+    });
+    await closeAll();
+
+    // Cold restart: new runtime manager (no warm handles, no in-memory env).
+    // The production shape — adapter-utils calls ensureSession again with the
+    // freshly resolved env BEFORE any turn — must respawn the agent with the
+    // real values even though the record on disk carries only markers.
+    const second = makeRuntime(stateDir);
+    const resumed = await second.ensureSession({
+      sessionKey: "env-ref-resume",
+      agent: "stub",
+      mode: "persistent",
+      cwd: work,
+      sessionOptions: {
+        env: { ...DUMMY_ENV },
+        persistedEnv: buildPersistedSessionEnv(DUMMY_ENV),
+      },
+    });
+    expect(resumed.acpxRecordId).toBe("env-ref-resume");
+
+    const turn = second.startTurn({
+      handle: resumed,
+      text: "env-ref resume probe",
+      mode: "prompt",
+      requestId: "env-ref-resume-1",
+    });
+    const result = await turn.result;
+    expect(result).toBeDefined();
+
+    const relaunchedEnv = JSON.parse(await fs.readFile(envProbe, "utf8")) as Record<string, string>;
+    expect(relaunchedEnv.ANTHROPIC_AUTH_TOKEN).toBe(DUMMY_ENV.ANTHROPIC_AUTH_TOKEN);
+    expect(relaunchedEnv.PAPERCLIP_API_KEY).toBe(DUMMY_ENV.PAPERCLIP_API_KEY);
+    expect(relaunchedEnv.ANTHROPIC_AUTH_TOKEN).not.toContain(PERSISTED_ENV_REF_PREFIX);
+
+    // And the record is still marker-only after the turn re-saved it.
+    const rawRecord = await fs.readFile(path.join(stateDir, "sessions", "env-ref-resume.json"), "utf8");
+    expect(rawRecord).not.toContain(DUMMY_ENV.ANTHROPIC_AUTH_TOKEN);
+    expect(rawRecord).not.toContain(DUMMY_ENV.PAPERCLIP_API_KEY);
   });
 });

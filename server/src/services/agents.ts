@@ -28,7 +28,12 @@ import {
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
-import { adapterConfigReferencesSecrets, syncAgentAdapterEnvBindings } from "./agent-secret-bindings.js";
+import {
+  adapterConfigReferencesSecrets,
+  collectSecretRefs,
+  collectUserSecretRefs,
+  syncAgentAdapterEnvBindings,
+} from "./agent-secret-bindings.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
 import {
@@ -468,7 +473,8 @@ export function agentService(db: Db) {
   async function syncAgentSecretBindings(
     agent: { id: string; companyId: string; adapterConfig: unknown },
     dbClient: Db = db,
-    previousAdapterConfig?: unknown,
+    previousAdapterConfig: unknown = null,
+    actor: RevisionMetadata = {},
   ) {
     const scopedSecretsSvc = dbClient === db ? secretsSvc : secretService(dbClient);
     const { refusedConfigPaths } = await syncAgentAdapterEnvBindings({
@@ -494,6 +500,47 @@ export function agentService(db: Db) {
         details: {
           refusedConfigPaths,
           reason: "incoming adapter config has zero secret refs while persisted config still referenced secrets at these paths",
+        },
+      });
+    }
+    const previousRefs = new Set([
+      ...collectSecretRefs(previousAdapterConfig).map((ref) => `secret:${ref.secretId}:${ref.configPath}`),
+      ...collectUserSecretRefs(previousAdapterConfig).map((ref) => `user:${ref.definitionKey}:${ref.configPath}`),
+    ]);
+    const createdRefs = [
+      ...collectSecretRefs(agent.adapterConfig).map((ref) => ({
+        key: `secret:${ref.secretId}:${ref.configPath}`,
+        configPath: ref.configPath,
+        bindingType: "secret_ref",
+        secretId: ref.secretId,
+        definitionKey: null,
+      })),
+      ...collectUserSecretRefs(agent.adapterConfig).map((ref) => ({
+        key: `user:${ref.definitionKey}:${ref.configPath}`,
+        configPath: ref.configPath,
+        bindingType: "user_secret_ref",
+        secretId: null,
+        definitionKey: ref.definitionKey,
+      })),
+    ].filter((ref) => !previousRefs.has(ref.key));
+    const actorType = actor.createdByUserId ? "user" as const : actor.createdByAgentId ? "agent" as const : "system" as const;
+    const actorId = actor.createdByUserId ?? actor.createdByAgentId ?? "system";
+    for (const ref of createdRefs) {
+      await logActivity(dbClient, {
+        companyId: agent.companyId,
+        actorType,
+        actorId,
+        agentId: actor.createdByAgentId ?? null,
+        action: "secret.binding.created",
+        entityType: "agent",
+        entityId: agent.id,
+        details: {
+          targetType: "agent",
+          targetId: agent.id,
+          configPath: ref.configPath,
+          bindingType: ref.bindingType,
+          secretId: ref.secretId,
+          definitionKey: ref.definitionKey,
         },
       });
     }
@@ -561,7 +608,6 @@ export function agentService(db: Db) {
           companyId: input.companyId,
           ownerUserId: ownerUserId ?? "",
           adapterType: CLAUDE_LOCAL_ADAPTER_TYPE,
-          environmentId: input.environmentId ?? "",
         });
         if (!consumed) {
           throw claudeOAuthClaimRejectedError();
@@ -690,7 +736,12 @@ export function agentService(db: Db) {
             claudeLogin: options?.claudeLogin,
           });
         }
-        await syncAgentSecretBindings(updated, txDb, existing.adapterConfig);
+        await syncAgentSecretBindings(
+          updated,
+          txDb,
+          existing.adapterConfig,
+          options?.recordRevision,
+        );
       }
 
       const normalizedUpdated = await agentService(txDb).getById(updated.id);
@@ -996,7 +1047,7 @@ export function agentService(db: Db) {
           });
         }
         if (adapterConfigReferencesSecrets(updated.adapterConfig)) {
-          await syncAgentSecretBindings(updated, txDb);
+          await syncAgentSecretBindings(updated, txDb, existing.adapterConfig);
         }
         const agent = await agentService(txDb).getById(updated.id);
         if (!agent) {

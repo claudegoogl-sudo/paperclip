@@ -23,7 +23,7 @@ import {
 // the log-only rollout flip.
 
 const MIGRATION_URL = new URL(
-  "./migrations/0225_secret_binding_egress_allowlist.sql",
+  "./migrations/0233_secret_binding_egress_allowlist.sql",
   import.meta.url,
 );
 
@@ -34,7 +34,7 @@ const MIGRATION_URL = new URL(
 // back: 0144 is idempotent by construction, so restoring this way cannot drift
 // from the trigger the migration actually defines.
 const MIGRATION_0231_URL = new URL(
-  "./migrations/0231_secret_binding_posture_audit.sql",
+  "./migrations/0239_secret_binding_posture_audit.sql",
   import.meta.url,
 );
 const POSTURE_AUDIT_TRIGGER = "company_secret_binding_posture_audit_trg";

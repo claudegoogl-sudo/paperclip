@@ -17,6 +17,8 @@ import {
   heartbeatRuns,
   issueThreadInteractions,
   issues,
+  pluginConfig,
+  plugins,
   principalPermissionGrants,
   secretAccessEvents,
   toolAccessAuditEvents,
@@ -41,12 +43,14 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import { classifyRisk, toolAccessService } from "../services/tool-access.js";
 import { toolAccessPolicyService } from "../services/tool-access-policy.js";
 import { secretService } from "../services/secrets.js";
 import { canonicalToolArguments, signToolArguments } from "../services/tool-content-guards.js";
 import { createToolGatewayService, type ToolGatewayService } from "../services/tool-gateway.js";
 import { toolAccessRoutes } from "../routes/tool-access.js";
+import { createPluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
 import { errorHandler } from "../middleware/index.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -459,6 +463,8 @@ describeEmbeddedPostgres("tool access service", () => {
     await db.delete(companyMemberships);
     await db.delete(companies);
     await db.delete(authUsers);
+    await db.delete(pluginConfig);
+    await db.delete(plugins);
   });
 
   afterAll(async () => {
@@ -7007,6 +7013,237 @@ describeEmbeddedPostgres("tool access service", () => {
       expect.objectContaining({ targetType: "agent", targetId: agent.id }),
     ]));
   });
+
+  describe("plugin-backed mcp_remote connection health", () => {
+    let pluginSeq = 0;
+
+    async function createPluginRow(status: "ready" | "uninstalled" = "ready") {
+      pluginSeq += 1;
+      const pluginKey = `fixture.plugin-${pluginSeq}-${randomUUID().slice(0, 6)}`;
+      const [plugin] = await db
+        .insert(plugins)
+        .values({
+          pluginKey,
+          packageName: `paperclip-plugin-${pluginKey}`,
+          version: "0.0.1",
+          apiVersion: 1,
+          categories: [],
+          manifestJson: { id: pluginKey, name: pluginKey, version: "0.0.1" } as PaperclipPluginManifestV1,
+          status,
+        })
+        .returning();
+      return plugin!;
+    }
+
+    async function createPluginConnection(
+      companyId: string,
+      plugin: typeof plugins.$inferSelect,
+      opts: { withConfigRow?: boolean; configJson?: Record<string, unknown> } = {},
+    ) {
+      const [application] = await db
+        .insert(toolApplications)
+        .values({
+          companyId,
+          applicationKey: `paperclip_plugin:${plugin.pluginKey}`,
+          name: `Plugin: ${plugin.pluginKey}`,
+          type: "paperclip_plugin",
+          status: "active",
+          pluginId: plugin.id,
+        })
+        .returning();
+      const [connection] = await db
+        .insert(toolConnections)
+        .values({
+          companyId,
+          applicationId: application!.id,
+          name: `Plugin: ${plugin.pluginKey}`,
+          uid: plugin.pluginKey,
+          connectionKind: "managed",
+          ownership: "customer",
+          transport: "mcp_remote",
+          authKind: "none",
+          status: "active",
+          enabled: true,
+          config: { pluginKey: plugin.pluginKey, type: "paperclip_plugin" },
+          transportConfig: { pluginKey: plugin.pluginKey, type: "paperclip_plugin" },
+        })
+        .returning();
+      if (opts.withConfigRow) {
+        await db.insert(pluginConfig).values({
+          pluginId: plugin.id,
+          companyId,
+          configJson: opts.configJson ?? {},
+        });
+      }
+      return connection!;
+    }
+
+    async function seedPluginConnection(opts: { withConfigRow?: boolean; configJson?: Record<string, unknown> } = {}) {
+      const company = await createCompany(db);
+      const plugin = await createPluginRow();
+      const connection = await createPluginConnection(company.id, plugin, opts);
+      return { company, plugin, connection };
+    }
+
+    it("reports a configured plugin-backed connection healthy through the real sweep, and red once the per-company config row is gone", async () => {
+      const probe = vi.fn(() => 2);
+      const { plugin, connection } = await seedPluginConnection({ withConfigRow: true });
+      const service = toolAccessService(db, { pluginToolRuntimeProbe: probe });
+
+      const sweep = await service.sweepConnectionHealth({ staleAfterMs: 0 });
+      expect(sweep).toMatchObject({ checked: 1, healthy: 1, failed: 0, failedConnectionIds: [] });
+      const [healthy] = await db.select().from(toolConnections).where(eq(toolConnections.id, connection.id));
+      expect(healthy.healthStatus).toBe("ok");
+      expect(healthy.healthMessage).not.toContain("config.url");
+      expect(healthy.healthMessage).toContain("registered tools");
+      // The probe must be keyed by pluginKey (the registry's registration
+      // key), never the DB uuid — see the uuid regression test below.
+      expect(probe).toHaveBeenCalledWith({ pluginKey: plugin.pluginKey });
+
+      // Negative control: removing the per-company config row — the thing
+      // the resolution must read — turns the same sweep back to failure.
+      await db.delete(pluginConfig);
+      const after = await service.sweepConnectionHealth({ staleAfterMs: 0 });
+      expect(after).toMatchObject({ checked: 1, healthy: 0, failed: 1 });
+    });
+
+    it("probes the runtime by pluginKey, the key tools are registered under — not the DB uuid", async () => {
+      const { plugin, connection } = await seedPluginConnection({ withConfigRow: true });
+
+      // Real registration chain, exactly as the loader drives it
+      // (plugin-tool-dispatcher registerFromDb →
+      // registry.registerPlugin(plugin.pluginKey, manifest, plugin.id)):
+      // tools are registered under the pluginKey; the DB uuid only rides
+      // along as pluginDbId.
+      const dispatcher = createPluginToolDispatcher({});
+      dispatcher.registerPluginTools(
+        plugin.pluginKey,
+        {
+          ...(plugin.manifestJson as PaperclipPluginManifestV1),
+          tools: [{
+            name: "ping",
+            displayName: "Ping",
+            description: "probe fixture",
+            parametersSchema: { type: "object", properties: {} },
+          }],
+        },
+        plugin.id,
+      );
+      // Registration-key shape: the pluginKey sees the tool; the DB uuid
+      // does not — that asymmetry is what makes this test discriminating.
+      expect(dispatcher.toolCount(plugin.pluginKey)).toBe(1);
+      expect(dispatcher.toolCount(plugin.id)).toBe(0);
+
+      // Wiring mirrors app.ts (probe → dispatcher.toolCount), with one guard:
+      // a key of the wrong shape (e.g. a regression handing back the DB uuid,
+      // or the uuid under a differently-named field) must yield 0 tools, not
+      // accidentally fall through to toolCount()=total. If the service passed
+      // plugin.id the lookup would miss, toolCount would be 0, and health
+      // would fail closed with mcp_remote_plugin_unavailable — the
+      // 0/14-configured-connections symptom this pins down.
+      const probeInputs: unknown[] = [];
+      const service = toolAccessService(db, {
+        pluginToolRuntimeProbe: (input) => {
+          probeInputs.push(input);
+          return typeof input.pluginKey === "string" ? dispatcher.toolCount(input.pluginKey) : 0;
+        },
+      });
+
+      await expect(
+        service.checkHealth(connection.id, { actorType: "user", actorId: "board" }),
+      ).resolves.toBeDefined();
+      expect(probeInputs).toEqual([{ pluginKey: plugin.pluginKey }]);
+      const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, connection.id));
+      expect(row.healthStatus).toBe("ok");
+      expect(row.healthMessage).toBe(`Plugin ${plugin.pluginKey} is running with 1 registered tool.`);
+    });
+
+    it("fails closed when no plugin_config row exists anywhere for the connection's company", async () => {
+      const { connection } = await seedPluginConnection();
+      const service = toolAccessService(db, { pluginToolRuntimeProbe: () => 3 });
+
+      await expect(service.checkHealth(connection.id, { actorType: "user", actorId: "board" })).rejects.toMatchObject({
+        status: 502,
+        details: expect.objectContaining({ code: "mcp_remote_plugin_unconfigured" }),
+      });
+      const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, connection.id));
+      expect(row.healthStatus).toBe("error");
+      expect(row.healthMessage).toContain("not configured for this company");
+    });
+
+    it("resolves plugin_config only for the connection's own company (isolation)", async () => {
+      const probe = vi.fn(() => 5);
+      const companyA = await createCompany(db);
+      const companyB = await createCompany(db);
+      const plugin = await createPluginRow();
+      const connectionA = await createPluginConnection(companyA.id, plugin);
+      const connectionB = await createPluginConnection(companyB.id, plugin);
+      // Only company B is configured; A must not resolve B's row.
+      await db.insert(pluginConfig).values({ pluginId: plugin.id, companyId: companyB.id, configJson: {} });
+
+      const service = toolAccessService(db, { pluginToolRuntimeProbe: probe });
+      await expect(service.checkHealth(connectionA.id, { actorType: "user", actorId: "board" })).rejects.toMatchObject({
+        details: expect.objectContaining({ code: "mcp_remote_plugin_unconfigured" }),
+      });
+      await service.checkHealth(connectionB.id, { actorType: "user", actorId: "board" });
+      const [rowA] = await db.select().from(toolConnections).where(eq(toolConnections.id, connectionA.id));
+      const [rowB] = await db.select().from(toolConnections).where(eq(toolConnections.id, connectionB.id));
+      expect(rowA.healthStatus).toBe("error");
+      expect(rowB.healthStatus).toBe("ok");
+    });
+
+    it("probes config.url from the per-company config row over HTTP without consulting the runtime probe", async () => {
+      const probe = vi.fn(() => 0);
+      const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+        mcpHttpResponse({ jsonrpc: "2.0", id: "paperclip-catalog-refresh", result: { tools: [] } }),
+      );
+      const { connection } = await seedPluginConnection({
+        withConfigRow: true,
+        configJson: { url: "https://plugin-fixture.example/mcp" },
+      });
+      const service = toolAccessService(db, { pluginToolRuntimeProbe: probe });
+
+      await service.checkHealth(connection.id, { actorType: "user", actorId: "board" });
+      expect(String(fetchMock.mock.calls[0]?.[0])).toBe("https://plugin-fixture.example/mcp");
+      expect(probe).not.toHaveBeenCalled();
+    });
+
+    it("fails closed when the plugin runtime probe is unwired or reports no registered tools", async () => {
+      const { connection: unwired } = await seedPluginConnection({ withConfigRow: true });
+      const withoutProbe = toolAccessService(db);
+      await expect(withoutProbe.checkHealth(unwired.id, { actorType: "user", actorId: "board" })).rejects.toMatchObject({
+        details: expect.objectContaining({ code: "mcp_remote_plugin_unavailable" }),
+      });
+
+      const { connection: empty } = await seedPluginConnection({ withConfigRow: true });
+      const emptyRuntime = toolAccessService(db, { pluginToolRuntimeProbe: () => 0 });
+      await expect(emptyRuntime.checkHealth(empty.id, { actorType: "user", actorId: "board" })).rejects.toMatchObject({
+        details: expect.objectContaining({ code: "mcp_remote_plugin_unavailable" }),
+      });
+      const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, empty.id));
+      expect(row.healthStatus).toBe("error");
+      expect(row.healthMessage).toContain("no registered tools");
+    });
+
+    it("still sweeps plain remote connections by their own config.url", async () => {
+      const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+        mcpHttpResponse({ jsonrpc: "2.0", id: "paperclip-catalog-refresh", result: { tools: [] } }),
+      );
+      const company = await createCompany(db);
+      const service = toolAccessService(db, { pluginToolRuntimeProbe: () => 2 });
+      await service.createConnection(company.id, {
+        name: "Plain remote",
+        transport: "mcp_remote",
+        config: { url: "https://fixture.example/mcp" },
+        enabled: true,
+        status: "active",
+      });
+
+      const sweep = await service.sweepConnectionHealth({ staleAfterMs: 0 });
+      expect(sweep).toMatchObject({ checked: 1, healthy: 1, failed: 0 });
+      expect(String(fetchMock.mock.calls[0]?.[0])).toBe("https://fixture.example/mcp");
+    });
+  });
 });
 
 describe("classifyRisk", () => {
@@ -7092,4 +7329,5 @@ describe("classifyRisk", () => {
     expect(notionRisk("notion-delete-page")).toBe("destructive");
     expect(classifyRisk({ name: "move_pages" })).toBe("read");
   });
+
 });

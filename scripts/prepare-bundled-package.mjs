@@ -43,6 +43,16 @@ export function createBundledInstallManifest(publishManifest, bundledDependencie
     if (Object.keys(installManifest[section]).length === 0) delete installManifest[section];
   }
 
+  // The staged install only materializes the bundled-dep closure. Dropping
+  // devDependencies keeps the staged `npm install` from even RESOLVING the
+  // package's dev toolchain (vitest, drizzle-kit, ...), which npm 10.9.x
+  // still walks under --omit=dev — and fresh registry releases in those
+  // graphs have crashed its arborist (`Cannot read properties of null
+  // (reading 'edgesOut')`), failing the release build on registry drift
+  // unrelated to the bundled dep. The publish manifest (restored after the
+  // install) keeps devDependencies exactly as before.
+  delete installManifest.devDependencies;
+
   return installManifest;
 }
 
@@ -100,8 +110,15 @@ export function prepareBundledPackage(sourceDir, destinationDir) {
 
   rmSync(destinationDir, { recursive: true, force: true });
   mkdirSync(destinationDir, { recursive: true });
+  // npm pack silently skips `files` entries that do not exist on disk; mirror
+  // that here so packages whose manifest lists a build-generated entry that
+  // this package's build never produces (e.g. adapter-acpx-local lists
+  // `skills`, which only claude-local/codex-local/server get) stage cleanly
+  // instead of failing the fork release build.
   for (const entry of sourcePackage.files ?? []) {
-    cpSync(resolve(sourceDir, entry), resolve(destinationDir, entry), { recursive: true });
+    const sourceEntry = resolve(sourceDir, entry);
+    if (!existsSync(sourceEntry)) continue;
+    cpSync(sourceEntry, resolve(destinationDir, entry), { recursive: true });
   }
   copyPackageMetadata(sourceDir, destinationDir);
 

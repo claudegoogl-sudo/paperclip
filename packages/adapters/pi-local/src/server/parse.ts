@@ -81,6 +81,12 @@ export function parsePiJsonl(stdout: string): ParsedPiOutput {
       if (!succeeded) {
         const finalError = asString(event.finalError, "").trim();
         result.errors.push(finalError || "Pi exhausted automatic retries without producing a response.");
+      } else {
+        // A successful retry means whatever transient "error" events preceded it
+        // (provider auth hiccups, dropped connections, etc.) were recovered from.
+        // Leaving them in `errors` would make execute.ts treat a clean, completed
+        // run as a failure even though the process exits 0 and agent_end follows.
+        result.errors.length = 0;
       }
       continue;
     }

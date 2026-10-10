@@ -22,16 +22,26 @@ const mockEnvironmentService = vi.hoisted(() => ({
 }));
 const mockLogActivity = vi.hoisted(() => vi.fn());
 
-function registerModuleMocks() {
-  vi.doMock("../services/index.js", () => ({
-    heartbeatService: () => mockHeartbeatService,
-    instanceSettingsService: () => mockInstanceSettingsService,
-    logActivity: mockLogActivity,
-  }));
-  vi.doMock("../services/environments.js", () => ({
-    environmentService: () => mockEnvironmentService,
-  }));
-}
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently importActual()s middleware/index.js and
+// routes/instance-settings.js, and both graphs contain services/index.js (the
+// error handler reaches it too). With doMock-registered mocks that first
+// evaluation could race the registry under load and bind the REAL services
+// module, constructing the real heartbeatService (the tell is the one-shot
+// "resolved host-wide concurrent run ceiling" INFO log) and rejecting the
+// request under test with a 500 — observed on CI in the serialized shard
+// (run 35877211616, 2026-09-23) and reproduced locally under CPU pressure.
+// A hoisted vi.mock applies to every import graph deterministically, so the
+// real services module can never leak into a request.
+vi.mock("../services/index.js", () => ({
+  heartbeatService: () => mockHeartbeatService,
+  instanceSettingsService: () => mockInstanceSettingsService,
+  logActivity: mockLogActivity,
+}));
+vi.mock("../services/environments.js", () => ({
+  environmentService: () => mockEnvironmentService,
+}));
 
 // Identity object the mocked db.transaction hands to writers; tests assert
 // both the marker clear and the settings update receive THIS same tx.
@@ -61,12 +71,6 @@ async function createApp(actor: any) {
 
 describe("instance settings routes", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../routes/instance-settings.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
     mockInstanceSettingsService.get.mockReset();
     mockInstanceSettingsService.getGeneral.mockReset();
@@ -803,6 +807,125 @@ describe("instance settings routes", () => {
 
       expect(res.status).toBe(200);
       expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith({ executionMode: "kubernetes" });
+    });
+  });
+
+  describe("operator-hidden settings floor", () => {
+    const adminActor = {
+      type: "board",
+      userId: "admin-1",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: ["company-1"],
+    };
+
+    afterEach(() => {
+      delete process.env.PAPERCLIP_HIDDEN_SETTINGS;
+    });
+
+    it("rejects a write that changes a hidden general field", async () => {
+      process.env.PAPERCLIP_HIDDEN_SETTINGS = "instance.general.censorUsernameInLogs";
+      const app = await createApp(adminActor);
+
+      const res = await request(app)
+        .patch("/api/instance/settings/general")
+        .send({ censorUsernameInLogs: true });
+
+      expect(res.status).toBe(403);
+      expect(res.body.details).toMatchObject({ code: "settings_operator_managed" });
+      expect(mockInstanceSettingsService.updateGeneral).not.toHaveBeenCalled();
+    });
+
+    it("allows a same-value echo of a hidden general field", async () => {
+      process.env.PAPERCLIP_HIDDEN_SETTINGS = "instance.general.censorUsernameInLogs";
+      const app = await createApp(adminActor);
+
+      const res = await request(app)
+        .patch("/api/instance/settings/general")
+        .send({ censorUsernameInLogs: false, keyboardShortcuts: true });
+
+      expect(res.status).toBe(200);
+      expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith({
+        censorUsernameInLogs: false,
+        keyboardShortcuts: true,
+      });
+    });
+
+    it("deep-compares hidden backupRetention echoes instead of rejecting them", async () => {
+      process.env.PAPERCLIP_HIDDEN_SETTINGS = "instance.general.backupRetention";
+      mockInstanceSettingsService.getGeneral.mockResolvedValue({
+        censorUsernameInLogs: false,
+        keyboardShortcuts: false,
+        feedbackDataSharingPreference: "prompt",
+        backupRetention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+      });
+      const app = await createApp(adminActor);
+
+      const echo = await request(app)
+        .patch("/api/instance/settings/general")
+        .send({ backupRetention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 } });
+      expect(echo.status).toBe(200);
+
+      const change = await request(app)
+        .patch("/api/instance/settings/general")
+        .send({ backupRetention: { dailyDays: 14, weeklyWeeks: 4, monthlyMonths: 1 } });
+      expect(change.status).toBe(403);
+      expect(change.body.details).toMatchObject({ code: "settings_operator_managed" });
+    });
+
+    it("rejects a write that changes a hidden experimental toggle", async () => {
+      process.env.PAPERCLIP_HIDDEN_SETTINGS = "instance.experimental.enableEnvironments";
+      const app = await createApp(adminActor);
+
+      const res = await request(app)
+        .patch("/api/instance/settings/experimental")
+        .send({ enableEnvironments: true });
+
+      expect(res.status).toBe(403);
+      expect(res.body.details).toMatchObject({ code: "settings_operator_managed" });
+      expect(mockInstanceSettingsService.updateExperimental).not.toHaveBeenCalled();
+    });
+
+    it("allows writes to non-hidden experimental toggles while others are hidden", async () => {
+      process.env.PAPERCLIP_HIDDEN_SETTINGS =
+        "instance.experimental.enableEnvironments,instance.experimental.enableServerInfoDebugView";
+      const app = await createApp(adminActor);
+
+      const res = await request(app)
+        .patch("/api/instance/settings/experimental")
+        .send({ enableIsolatedWorkspaces: true });
+
+      expect(res.status).toBe(200);
+      expect(mockInstanceSettingsService.updateExperimental).toHaveBeenCalledWith({
+        enableIsolatedWorkspaces: true,
+      });
+    });
+
+    it("floors every experimental toggle when the whole Experimental page is hidden", async () => {
+      process.env.PAPERCLIP_HIDDEN_SETTINGS = "instance.experimental";
+      const app = await createApp(adminActor);
+
+      const res = await request(app)
+        .patch("/api/instance/settings/experimental")
+        .send({ enableIsolatedWorkspaces: true });
+
+      expect(res.status).toBe(403);
+      expect(res.body.details).toMatchObject({ code: "settings_operator_managed" });
+      expect(mockInstanceSettingsService.updateExperimental).not.toHaveBeenCalled();
+    });
+
+    it("keeps every field writable when the env var is unset", async () => {
+      const app = await createApp(adminActor);
+
+      const general = await request(app)
+        .patch("/api/instance/settings/general")
+        .send({ censorUsernameInLogs: true });
+      expect(general.status).toBe(200);
+
+      const experimental = await request(app)
+        .patch("/api/instance/settings/experimental")
+        .send({ enableEnvironments: true });
+      expect(experimental.status).toBe(200);
     });
   });
 });

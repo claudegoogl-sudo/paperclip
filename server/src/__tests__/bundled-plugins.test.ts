@@ -279,7 +279,7 @@ describe("ensureBundledPlugins", () => {
   it("installs and loads a missing bundled plugin", async () => {
     const { deps, installPlugin } = makeDeps();
     await ensureBundledPlugins([K8S], deps, { reinstallUninstalled: true });
-    expect(installPlugin).toHaveBeenCalledWith({ localPath: K8S.localPath });
+    expect(installPlugin).toHaveBeenCalledWith({ localPath: K8S.localPath, exemptFromCapabilityGate: true });
     expect(deps.lifecycle.load).toHaveBeenCalledWith(
       "id-paperclip.kubernetes-sandbox-provider",
     );
@@ -407,7 +407,7 @@ describe("ensureBundledPlugins", () => {
     // Daytona was removed from the autoInstall list; only kubernetes remains.
     await ensureBundledPlugins([K8S], deps, { reinstallUninstalled: true });
     expect(installPlugin).toHaveBeenCalledOnce();
-    expect(installPlugin).toHaveBeenCalledWith({ localPath: K8S.localPath });
+    expect(installPlugin).toHaveBeenCalledWith({ localPath: K8S.localPath, exemptFromCapabilityGate: true });
     // No uninstall/unload calls exist on the provisioner deps at all; daytona
     // was never queried beyond its own key and its row is untouched.
     expect(deps.lifecycle.load).toHaveBeenCalledTimes(1);

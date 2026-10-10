@@ -14,11 +14,6 @@
  *   - Exact types:   "application/pdf"
  *   - Wildcards:     "image/*"  or  "application/vnd.openxmlformats-officedocument.*"
  */
-import {
-  DEFAULT_COMPANY_ATTACHMENT_MAX_BYTES,
-  MAX_COMPANY_ATTACHMENT_MAX_BYTES,
-} from "@paperclipai/shared";
-
 export const DEFAULT_ALLOWED_TYPES: readonly string[] = [
   "image/png",
   "image/jpeg",
@@ -57,13 +52,25 @@ export const DEFAULT_ALLOWED_TYPES: readonly string[] = [
  * bytes are stored. Wildcards are intentionally avoided here: the list is exact
  * so the reachable type surface is auditable.
  *
- * `text/html`, `text/csv` and `application/zip` are excluded from the plugin set
- * even though the human route (`DEFAULT_ALLOWED_TYPES`) allows them: an inbound
- * external relay has no need for active/markup document types (stored-XSS /
- * formula-injection surface) nor archive containers (zip-bomb / smuggling
- * surface), so dropping them minimises the hostile-input
- * surface. `application/zip` entered `DEFAULT_ALLOWED_TYPES` upstream after the
- * original review, so it is excluded here to preserve the SE-approved posture.
+ * `text/html` is excluded from the plugin set even though the human route
+ * (`DEFAULT_ALLOWED_TYPES`) allows it: an inbound external relay has no need
+ * for active/markup document types (stored-XSS surface), so dropping it
+ * minimises the hostile-input surface.
+ *
+ * The SecurityEngineer ruling (2026-09-08) admitted three more families
+ * for OPAQUE STORAGE on the plugin path:
+ *  - `application/zip` (via `DEFAULT_ALLOWED_TYPES`): storage-only — the alias
+ *    types `application/x-zip-compressed` / `application/x-zip` stay denied;
+ *    the messenger layer normalises the alias before the host gate.
+ *  - `text/csv` (via `DEFAULT_ALLOWED_TYPES`) and the exact
+ *    `text/tab-separated-values`: formula-injection bait, so BOTH serving
+ *    routes force `Content-Disposition: attachment` for plugin-created
+ *    spreadsheet-bait assets — see {@link isSpreadsheetBaitPluginArtifact}.
+ *
+ * GUARDRAIL: plugin-artifact archives are opaque stored bytes only. No
+ * consumer may extract, decompress, or render them without a new
+ * SecurityEngineer ruling specifying bounded decompression (pattern:
+ * `packages/shared/src/portability-zip.ts`).
  *
  * Also includes a broadened set of inert common-file types so
  * an operator can relay everyday documents, CAD models, photos and video through
@@ -76,16 +83,14 @@ export const DEFAULT_ALLOWED_TYPES: readonly string[] = [
  * {@link DEFAULT_ALLOWED_TYPES} on this host lineage, so they are not re-listed.
  *
  * Deliberately NOT included pending SecurityEngineer ruling:
- * `image/svg+xml` (active-content/XSS) and archive containers
- * (zip/gzip/7z/tar — zip-bomb / smuggling). Executables are never added.
+ * `image/svg+xml` (active-content/XSS) and the remaining archive containers
+ * (gzip/7z/tar — zip-bomb / smuggling). Executables are never added.
  *
  * All entries are lowercase: {@link isAllowedPluginArtifactMimeType} lowercases
  * its input before matching, so case variants would be dead duplicates.
  */
 const PLUGIN_ARTIFACT_EXCLUDED_DEFAULT_TYPES: readonly string[] = [
   "text/html",
-  "text/csv",
-  "application/zip",
 ];
 
 export const PLUGIN_ARTIFACT_ALLOWED_MIME_TYPES: readonly string[] = [
@@ -98,6 +103,15 @@ export const PLUGIN_ARTIFACT_ALLOWED_MIME_TYPES: readonly string[] = [
   "audio/wav",
   "audio/x-wav",
   "audio/flac",
+  // SE ruling (D2): tab-separated values join csv (admitted via
+  // DEFAULT_ALLOWED_TYPES) for opaque operator-relay storage; both serving
+  // routes force downloads for plugin-created spreadsheet-bait assets
+  // (see isSpreadsheetBaitPluginArtifact).
+  "text/tab-separated-values",
+  // SE ruling: inert KiCad CAD exchange formats — static board/schematic
+  // text with no executable or active-content surface.
+  "application/x-kicad-pcb",
+  "application/x-kicad-schematic",
   // Inert 3D / CAD geometry (static, non-executable).
   "model/stl",
   "application/vnd.ms-pki.stl",
@@ -137,6 +151,54 @@ export const PLUGIN_ARTIFACT_ALLOWED_MIME_TYPES: readonly string[] = [
 export function isAllowedPluginArtifactMimeType(contentType: string): boolean {
   const ct = normalizeContentType(contentType);
   return PLUGIN_ARTIFACT_ALLOWED_MIME_TYPES.includes(ct);
+}
+
+/** Content types that spreadsheet applications interpret as formula-bearing. */
+const SPREADSHEET_BAIT_PLUGIN_CONTENT_TYPES: readonly string[] = [
+  "text/csv",
+  "text/tab-separated-values",
+];
+
+/** Filename extensions treated as spreadsheet bait regardless of content type. */
+const SPREADSHEET_BAIT_PLUGIN_EXTENSIONS: readonly string[] = [
+  ".csv",
+  ".tsv",
+  ".xls",
+  ".xlsx",
+  ".xlsm",
+  ".ods",
+];
+
+/**
+ * SE-ruling (D2) spreadsheet-bait disposition guard for the serving routes.
+ *
+ * Returns true when a stored asset MUST be served as a download
+ * (`Content-Disposition: attachment`) rather than inline: the asset is
+ * plugin-created — its objectKey lives under the company's
+ * `plugin-artifacts/` namespace — AND it looks like a spreadsheet, either by
+ * normalized content type ({@link SPREADSHEET_BAIT_PLUGIN_CONTENT_TYPES}) or
+ * by filename extension ({@link SPREADSHEET_BAIT_PLUGIN_EXTENSIONS}).
+ *
+ * csv/tsv admission to the plugin path makes formula-injection possible only
+ * if a browser renders the bytes inline into a spreadsheet application, so
+ * the plugin path is pinned to download-only. Human-upload serving is
+ * intentionally unchanged: the objectKey namespace check scopes this guard to
+ * plugin-created assets alone.
+ */
+export function isSpreadsheetBaitPluginArtifact(input: {
+  companyId: string;
+  objectKey: string;
+  contentType: string | null | undefined;
+  originalFilename: string | null | undefined;
+}): boolean {
+  if (!input.objectKey.startsWith(`${input.companyId}/plugin-artifacts/`)) {
+    return false;
+  }
+  if (SPREADSHEET_BAIT_PLUGIN_CONTENT_TYPES.includes(normalizeContentType(input.contentType))) {
+    return true;
+  }
+  const filename = (input.originalFilename ?? "").trim().toLowerCase();
+  return SPREADSHEET_BAIT_PLUGIN_EXTENSIONS.some((ext) => filename.endsWith(ext));
 }
 
 export const DEFAULT_ATTACHMENT_CONTENT_TYPE = "application/octet-stream";
@@ -241,19 +303,46 @@ export function isAllowedContentType(contentType: string): boolean {
   return matchesContentType(contentType, allowedPatterns);
 }
 
-// Default raised 10 MiB → 25 MiB. This is the shared upper bound for
-// BOTH the human upload route (routes/assets.ts multer limit) and the per-company
-// `normalizeIssueAttachmentMaxBytes` ceiling that the plugin-artifact write path
-// inherits. Raising it is intentional: it is required so a fresh install with no
-// env tuning accepts a ~15-20 MiB STL via the plugin/messenger relay path, and it
-// lifts the human upload default to match. `PAPERCLIP_ATTACHMENT_MAX_BYTES` still
-// overrides it for operators who want a different shared cap.
+/**
+ * The one attachment size ceiling for this deployment. Every upload path —
+ * assets, task attachments, cases, and company import — bounds itself by this
+ * value, so an operator raises or lowers the limit in exactly one place.
+ */
 export const MAX_ATTACHMENT_BYTES =
   Number(process.env.PAPERCLIP_ATTACHMENT_MAX_BYTES) || 25 * 1024 * 1024;
 
 export function normalizeIssueAttachmentMaxBytes(value: number | null | undefined): number {
-  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
-    return Math.min(DEFAULT_COMPANY_ATTACHMENT_MAX_BYTES, MAX_ATTACHMENT_BYTES);
+  // Upstream removed the per-company attachment-limit column and the shared
+  // DEFAULT_/MAX_COMPANY_ATTACHMENT_MAX_BYTES bounds with it, so the single
+  // deployment-wide ceiling above is the only bound. Kept as a function so the
+  // plugin artifact write path's ceiling hook keeps its shape.
+  void value;
+  return MAX_ATTACHMENT_BYTES;
+}
+
+const ATTACHMENT_SIZE_UNITS: readonly string[] = ["KB", "MB", "GB"];
+
+/**
+ * Render a byte count the way a person reading an error message expects it:
+ * 1024-based steps under the conventional consumer labels, at most one decimal
+ * place, and no trailing ".0". The default cap renders as "10 MB" rather than
+ * "10485760 bytes". Sub-kilobyte values stay in bytes so a tiny configured cap
+ * does not collapse to "0 KB".
+ */
+export function formatAttachmentSize(bytes: number): string {
+  // Defensive: the cap itself can never be negative or NaN (`Number(env) || default`
+  // falls back on both), but never render "NaN bytes" at a user.
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 bytes";
+  if (bytes < 1024) return bytes === 1 ? "1 byte" : `${bytes} bytes`;
+
+  let value = bytes / 1024;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < ATTACHMENT_SIZE_UNITS.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
   }
-  return Math.min(Math.floor(value), MAX_COMPANY_ATTACHMENT_MAX_BYTES, MAX_ATTACHMENT_BYTES);
+
+  // toFixed(1) then strip a trailing ".0": 10.5 -> "10.5", 10.0 -> "10".
+  const rounded = value.toFixed(1).replace(/\.0$/, "");
+  return `${rounded} ${ATTACHMENT_SIZE_UNITS[unitIndex]}`;
 }

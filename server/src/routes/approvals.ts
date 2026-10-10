@@ -4,6 +4,9 @@ import { heartbeatRuns, type Db } from "@paperclipai/db";
 import {
   addApprovalCommentSchema,
   createApprovalRequestSchema,
+  createApprovalSchema,
+  APPROVAL_PAYLOAD_EMPTY_CODE,
+  APPROVAL_PAYLOAD_EMPTY_MESSAGE,
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
   resubmitApprovalSchema,
@@ -225,11 +228,30 @@ export function approvalRoutes(
     res.json(redactApprovalPayload(approval));
   });
 
-  router.post("/companies/:companyId/approvals", validate(createApprovalRequestSchema), async (req, res) => {
+  router.post("/companies/:companyId/approvals", validate(createApprovalSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     if (!(await assertApprovalAccessAllowed(req, res, companyId))) return;
     if (!(await assertApprovalMutationAllowedByRunContext(req, res, companyId))) return;
+    // Content checks run after access checks so callers without access learn
+    // nothing about payload contracts. One shared validator (also used by the
+    // MCP tool); the empty-payload issue keeps its dedicated 422 contract.
+    const parsedRequest = createApprovalRequestSchema.safeParse(req.body);
+    if (!parsedRequest.success) {
+      if (
+        parsedRequest.error.issues.some(
+          (issue) =>
+            issue.code === "custom" &&
+            (issue.params as { code?: string } | undefined)?.code === APPROVAL_PAYLOAD_EMPTY_CODE,
+        )
+      ) {
+        res.status(422).json({ error: APPROVAL_PAYLOAD_EMPTY_MESSAGE, code: APPROVAL_PAYLOAD_EMPTY_CODE });
+        return;
+      }
+      res.status(400).json({ error: "Validation error", details: parsedRequest.error.issues });
+      return;
+    }
+    req.body = parsedRequest.data;
     const rawIssueIds = req.body.issueIds;
     const issueIds = Array.isArray(rawIssueIds)
       ? rawIssueIds.filter((value: unknown): value is string => typeof value === "string")
@@ -514,8 +536,14 @@ export function approvalRoutes(
     }
     if (!(await assertApprovalMutationAllowedByRunContext(req, res, approval.companyId))) return;
 
-    if (req.actor.type !== "agent" || !req.actor.agentId || req.actor.agentId !== approval.requestedByAgentId) {
+    if (req.actor.type !== "agent" || !req.actor.agentId) {
       res.status(403).json({ error: "Only the requesting agent can withdraw this approval" });
+      return;
+    }
+    // Another agent gets the same 404 as a missing approval: withdraw is not
+    // an oracle for which agent owns which approval id.
+    if (req.actor.agentId !== approval.requestedByAgentId) {
+      res.status(404).json({ error: "Approval not found" });
       return;
     }
 

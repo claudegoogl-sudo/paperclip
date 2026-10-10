@@ -64,6 +64,7 @@ const mockApprovalService = vi.hoisted(() => ({
 
 const mockInstanceSettingsService = vi.hoisted(() => ({
   getGeneral: vi.fn(async () => ({ censorUsernameInLogs: false })),
+  getExperimental: vi.fn(async () => ({ enableNativeRunner: false })),
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
@@ -93,45 +94,6 @@ vi.mock("../services/secrets.js", () => ({
   secretService: () => mockSecretService,
 }));
 
-function registerModuleMocks() {
-  vi.doMock("../services/index.js", () => ({
-    agentService: () => mockAgentService,
-    agentInstructionsService: () => mockAgentInstructionsService,
-    accessService: () => mockAccessService,
-    approvalService: () => mockApprovalService,
-    builtInAgentService: () => ({ ensureCompanyDefaultAgentGrants: vi.fn() }),
-    companySkillService: () => mockCompanySkillService,
-    budgetService: () => mockBudgetService,
-    heartbeatService: () => mockHeartbeatService,
-    issueApprovalService: () => mockIssueApprovalService,
-    issueService: () => ({}),
-    logActivity: mockLogActivity,
-    secretService: () => mockSecretService,
-    syncInstructionsBundleConfigFromFilePath: vi.fn((_agent, config) => config),
-    workspaceOperationService: () => ({}),
-  }));
-
-  vi.doMock("../services/instance-settings.js", () => ({
-    instanceSettingsService: () => mockInstanceSettingsService,
-  }));
-
-  vi.doMock("../services/secrets.js", () => ({
-    secretService: () => mockSecretService,
-  }));
-
-  // The adapter registry reads the disabled set from this store. Mock it so a
-  // test can declare an adapter disabled without writing to the real
-  // ~/.paperclip/adapter-settings.json.
-  vi.doMock("../services/adapter-plugin-store.js", () => ({
-    getDisabledAdapterTypes: mockAdapterPluginStore.getDisabledAdapterTypes,
-    isAdapterDisabled: (type: string) =>
-      mockAdapterPluginStore.getDisabledAdapterTypes().includes(type),
-    listAdapterPlugins: () => [],
-    getAdapterPluginByType: () => undefined,
-    setAdapterDisabled: vi.fn(),
-  }));
-}
-
 const externalAdapter: ServerAdapterModule = {
   type: "external_test",
   execute: async () => ({ exitCode: 0, signal: null, timedOut: false }),
@@ -144,6 +106,51 @@ const externalAdapter: ServerAdapterModule = {
 };
 
 const missingAdapterType = "missing_adapter_validation_test";
+
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("../services/index.js", () => ({
+  agentService: () => mockAgentService,
+  agentInstructionsService: () => mockAgentInstructionsService,
+  accessService: () => mockAccessService,
+  approvalService: () => mockApprovalService,
+  builtInAgentService: () => ({ ensureCompanyDefaultAgentGrants: vi.fn() }),
+  companySkillService: () => mockCompanySkillService,
+  budgetService: () => mockBudgetService,
+  heartbeatService: () => mockHeartbeatService,
+  issueApprovalService: () => mockIssueApprovalService,
+  issueService: () => ({}),
+  logActivity: mockLogActivity,
+  secretService: () => mockSecretService,
+  syncInstructionsBundleConfigFromFilePath: vi.fn((_agent, config) => config),
+  workspaceOperationService: () => ({}),
+}));
+
+vi.mock("../services/instance-settings.js", () => ({
+  instanceSettingsService: () => mockInstanceSettingsService,
+}));
+
+vi.mock("../services/secrets.js", () => ({
+  secretService: () => mockSecretService,
+}));
+
+// The adapter registry reads the disabled set from this store. Mock it so a
+// test can declare an adapter disabled without writing to the real
+// ~/.paperclip/adapter-settings.json.
+vi.mock("../services/adapter-plugin-store.js", () => ({
+  getDisabledAdapterTypes: mockAdapterPluginStore.getDisabledAdapterTypes,
+  isAdapterDisabled: (type: string) =>
+    mockAdapterPluginStore.getDisabledAdapterTypes().includes(type),
+  listAdapterPlugins: () => [],
+  getAdapterPluginByType: () => undefined,
+  setAdapterDisabled: vi.fn(),
+}));
 
 async function createApp() {
   const [{ agentRoutes }, { errorHandler }] = await Promise.all([
@@ -213,12 +220,6 @@ async function unregisterTestAdapter(type: string) {
 
 describe("agent routes adapter validation", () => {
   beforeEach(async () => {
-    vi.resetModules();
-    vi.doUnmock("../routes/agents.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    vi.doUnmock("../routes/agents.js");
-    registerModuleMocks();
     vi.clearAllMocks();
     mockAdapterPluginStore.getDisabledAdapterTypes.mockReturnValue([]);
     mockCompanySkillService.listRuntimeSkillEntries.mockResolvedValue([]);
@@ -234,6 +235,7 @@ describe("agent routes adapter validation", () => {
     mockAccessService.setPrincipalPermission.mockResolvedValue(undefined);
     mockLogActivity.mockResolvedValue(undefined);
     mockSecretService.syncEnvBindingsForTarget.mockResolvedValue(undefined);
+    mockInstanceSettingsService.getExperimental.mockResolvedValue({ enableNativeRunner: false });
     mockAgentInstructionsService.materializeManagedBundle.mockImplementation(async (agent: { adapterConfig: unknown }) => ({
       adapterConfig: agent.adapterConfig,
     }));
@@ -564,5 +566,53 @@ describe("agent routes adapter validation", () => {
     );
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
+  });
+
+  it("rejects a new paperclip_runner selection while the rollout flag is off", async () => {
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .post("/api/companies/company-1/agents")
+        .send({ name: "Native Codex", adapterType: "paperclip_runner" }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.details).toMatchObject({ code: "paperclip_runner_rollout_disabled" });
+    expect(mockAgentService.create).not.toHaveBeenCalled();
+  });
+
+  it("allows a new paperclip_runner selection while the rollout flag is on", async () => {
+    mockInstanceSettingsService.getExperimental.mockResolvedValue({ enableNativeRunner: true });
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .post("/api/companies/company-1/agents")
+        .send({
+          name: "Native Codex",
+          adapterType: "paperclip_runner",
+          adapterConfig: { provider: "codex" },
+        }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockAgentService.create).toHaveBeenCalledOnce();
+  });
+
+  it("keeps an existing paperclip_runner agent editable after the flag is disabled", async () => {
+    const existing = await mockAgentService.getById();
+    mockAgentService.getById.mockResolvedValue({
+      ...existing,
+      adapterType: "paperclip_runner",
+      adapterConfig: { provider: "codex" },
+    });
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ name: "Native Codex (recorded)" }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalledOnce();
   });
 });

@@ -99,9 +99,8 @@ export function PluginManager() {
 
   useEffect(() => {
     setBreadcrumbs([
-      { label: selectedCompany?.name ?? "Company", href: "/dashboard" },
+      { label: selectedCompany?.name ?? "Organization", href: "/dashboard" },
       { label: "Settings", href: "/company/settings" },
-      { label: "Instance settings", href: "/company/settings/instance/general" },
       { label: "Plugins" },
     ]);
   }, [selectedCompany?.name, setBreadcrumbs]);
@@ -125,11 +124,23 @@ export function PluginManager() {
   const installMutation = useMutation({
     mutationFn: (params: { packageName: string; version?: string; isLocalPath?: boolean }) =>
       pluginsApi.install(params),
-    onSuccess: () => {
+    onSuccess: (result) => {
       invalidatePluginQueries();
       setInstallDialogOpen(false);
       setInstallPackage("");
-      pushToast({ title: "Plugin installed successfully", tone: "success" });
+      // Show the declared capabilities and, when the install was parked by the
+      // capability-escalation gate, that it waits for a board approval.
+      const capabilities = result?.capabilities ?? [];
+      const capabilityLine = `Capabilities: ${capabilities.length > 0 ? capabilities.join(", ") : "none"}`;
+      if (result?.approvalId) {
+        pushToast({
+          title: "Plugin waiting for board approval",
+          body: `${capabilityLine}. Approval ${result.approvalId} must be approved before the plugin starts.`,
+          tone: "info",
+        });
+      } else {
+        pushToast({ title: "Plugin installed successfully", body: capabilityLine, tone: "success" });
+      }
     },
     onError: (err: Error) => {
       pushToast({ title: "Failed to install plugin", body: err.message, tone: "error" });
@@ -190,7 +201,7 @@ export function PluginManager() {
   if (error) return <div className="p-4 text-sm text-destructive">Failed to load plugins.</div>;
 
   return (
-    <div className="space-y-6 max-w-5xl">
+    <div className="max-w-6xl space-y-6">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <Puzzle className="h-6 w-6 text-muted-foreground" />
