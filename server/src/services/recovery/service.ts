@@ -6919,8 +6919,13 @@ export function recoveryService(
         if (at) lastResolvedAt = Math.max(lastResolvedAt, new Date(at).getTime());
       }
     }
-    const [blockerChange] = await db
-      .select({ createdAt: activityLog.createdAt })
+    // Only a blocker-set change that REMOVED a blocker while the issue was
+    // already blocked can make it ready after blockedTransitionAt. A same-request
+    // park (status->blocked + done blockers) or a replace of an open blocker with
+    // a done one is a parked-by-choice shape, not a readiness edge. Legacy rows
+    // without dependentStatusBefore keep the conservative (count it) behavior.
+    const blockerChanges = await db
+      .select({ createdAt: activityLog.createdAt, details: activityLog.details })
       .from(activityLog)
       .where(
         and(
@@ -6931,9 +6936,18 @@ export function recoveryService(
         ),
       )
       .orderBy(desc(activityLog.createdAt))
-      .limit(1);
-    if (blockerChange?.createdAt) {
-      lastResolvedAt = Math.max(lastResolvedAt, new Date(blockerChange.createdAt).getTime());
+      .limit(20);
+    for (const change of blockerChanges) {
+      if (!change.createdAt) continue;
+      const details = (change.details ?? {}) as Record<string, unknown>;
+      const removed = Array.isArray(details.removedBlockedByIssueIds) ? details.removedBlockedByIssueIds : null;
+      const statusBefore = typeof details.dependentStatusBefore === "string" ? details.dependentStatusBefore : null;
+      if (statusBefore !== null) {
+        if (statusBefore !== "blocked") continue;
+        if (!removed || removed.length === 0) continue;
+      }
+      lastResolvedAt = Math.max(lastResolvedAt, new Date(change.createdAt).getTime());
+      break;
     }
     return blockedAt.getTime() >= lastResolvedAt;
   }

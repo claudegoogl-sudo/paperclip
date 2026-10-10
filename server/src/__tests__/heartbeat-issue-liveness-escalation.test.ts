@@ -795,6 +795,51 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       await heartbeat.reconcileIssueGraphLiveness();
       expect(await wakesFor(companyId)).toHaveLength(1);
     });
+
+    for (const shape of ["park", "replace"] as const) {
+      it(`same-request ${shape}: PATCH status=blocked + blockedByIssueIds=[done] + unblockDescriptor never wakes`, async () => {
+        const { companyId, blockedIssueId, blockerIssueId } =
+          await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
+        await db
+          .update(issues)
+          .set({ completedAt: new Date(Date.now() - 60 * 60 * 1000) })
+          .where(eq(issues.id, blockerIssueId));
+        // Start unparked with no relation to the done blocker.
+        await db.delete(issueRelations).where(eq(issueRelations.relatedIssueId, blockedIssueId));
+        if (shape === "replace") {
+          const openBlockerId = randomUUID();
+          const [company] = await db.select({ issuePrefix: companies.issuePrefix }).from(companies).where(eq(companies.id, companyId));
+          await db.insert(issues).values({
+            id: openBlockerId,
+            companyId,
+            title: "Open blocker",
+            status: "in_progress",
+            priority: "medium",
+            issueNumber: 3,
+            identifier: `${company!.issuePrefix}-3`,
+          });
+          await db.insert(issueRelations).values({ companyId, issueId: openBlockerId, relatedIssueId: blockedIssueId, type: "blocks" });
+        }
+        await issueService(db).update(blockedIssueId, { status: "todo" });
+        await new Promise((resolve) => setTimeout(resolve, 5));
+
+        const res = await request(routeApp(companyId)).patch(`/api/issues/${blockedIssueId}`).send({
+          status: "blocked",
+          blockedByIssueIds: [blockerIssueId],
+          unblockDescriptor: { owner: "board", action: "Resume once the parked work lands" },
+        });
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+
+        const heartbeat = heartbeatService(db);
+        for (let sweep = 0; sweep < 2; sweep += 1) {
+          expect((await heartbeat.reconcileIssueGraphLiveness()).dependencyWakesHealed).toBe(0);
+        }
+        expect(await wakesFor(companyId)).toHaveLength(0);
+        const [row] = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, blockedIssueId));
+        expect(row?.status).toBe("blocked");
+      });
+    }
   });
 
   it("retries a resolved dependency wake when the prior wake was skipped as stale", async () => {

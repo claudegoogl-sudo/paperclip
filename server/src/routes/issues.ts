@@ -10375,6 +10375,10 @@ export function issueRoutes(
           entityId: issue.id,
           details: {
             identifier: issue.identifier,
+            // Status of the dependent before this request. The resolved-dependency
+            // backstop uses it to tell a removal on an already-blocked issue (a real
+            // readiness edge) from a same-request park/replace (not an edge).
+            dependentStatusBefore: existing.status,
             blockedByIssueIds: req.body.blockedByIssueIds,
             addedBlockedByIssueIds,
             removedBlockedByIssueIds,
