@@ -190,6 +190,13 @@ out="$(PG_GUARD_ALLOW_ACTIVE_RUNS=1 PG_GUARD_OVERRIDE_REASON=test bash "$GUARD" 
 [ "$rc" = 0 ] && printf '%s' "$out" | grep -q 'override reason: test' && ok "override proceeds with reason" || { bad "override broke ($rc)"; echo "$out"; }
 [ "$(calls PUT)" = 0 ] && ! held && ok "override sets no hold" || bad "override set a hold"
 out="$(bash "$GUARD" active-runs 2>&1)"; [ $? = 3 ] && ok "active-runs (legacy) still refuses busy board" || bad "active-runs changed"
+setup -1 none
+out="$(bash "$GUARD" active-runs 2>&1)"; [ $? = 0 ] && printf '%s' "$out" | grep -q 'window is quiet' && ok "active-runs (legacy) quiet board exit 0" || { bad "active-runs quiet changed"; echo "$out"; }
+out="$(PG_GUARD_API_BASE="http://127.0.0.1:1/api" bash "$GUARD" active-runs 2>&1)"; [ $? = 3 ] && ok "active-runs (legacy) unreadable API exit 3" || bad "active-runs unreadable changed"
+
+echo "== case: override + legacy active-runs keep the token out of curl argv =="
+jq -e 'all(.[]; .[2])' "$TMP/calls.json" >/dev/null && ok "legacy calls carried the bearer header" || bad "legacy call missing auth header"
+grep -q 'test-token' "$TMP/argv.log" && bad "token found in curl argv (override/active-runs)" || ok "token absent from curl argv incl. override/active-runs ($(wc -l < "$TMP/argv.log") curl calls checked)"
 
 echo; echo "drain self-test: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
