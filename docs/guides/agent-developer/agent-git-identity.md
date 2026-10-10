@@ -18,6 +18,7 @@ The identity is derived deterministically from the agent row (name, id, company 
 - The full agent id in the email local part makes the identity **collision-free across agents and companies** — two agents named "QA" can never share an identity, and duplicate names inside one company stay distinct.
 - The company id in the domain makes the identity **company-discriminated**.
 - `.invalid` is a reserved TLD (RFC 2606). A derived identity can never be confusable with a real user email, and an agent named like an email address cannot produce a deliverable-looking identity.
+- Commits pushed to a public repository publish the agent id and company id in the email. These are internal identifiers, not credentials, but treat them as visible once pushed.
 
 ### Example
 
