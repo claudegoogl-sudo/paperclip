@@ -168,6 +168,16 @@ export function resolvePluginWatchTargets(
  * Create a PluginDevWatcher that monitors local plugin directories and
  * restarts workers on file changes.
  */
+/**
+ * Whether the plugin dev watcher (hot reload from local package paths) is
+ * enabled. Opt-in only: `PAPERCLIP_PLUGIN_DEV_WATCH=1` (or `true`). Default
+ * off, so production hosts never re-activate plugins from mutated disk state.
+ */
+export function isPluginDevWatchEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = (env.PAPERCLIP_PLUGIN_DEV_WATCH ?? "").trim().toLowerCase();
+  return v === "1" || v === "true";
+}
+
 export function createPluginDevWatcher(
   lifecycle: PluginLifecycleManager,
   resolvePluginPackagePath?: ResolvePluginPackagePath,

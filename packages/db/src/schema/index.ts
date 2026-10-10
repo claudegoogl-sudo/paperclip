@@ -217,3 +217,4 @@ export { aiProviderDefaults } from "./ai_provider_defaults.js";
 export * from "./email.js";
 export { announcementDismissals, announcementPublications } from "./announcement_dismissals.js";
 export { usageLimitParks } from "./usage_limit_parks.js";
+export { instanceAdmissionHolds } from "./instance_admission_holds.js";

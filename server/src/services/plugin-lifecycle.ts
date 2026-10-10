@@ -146,7 +146,8 @@ export interface PluginLifecycleManager {
   load(pluginId: string): Promise<PluginRecord>;
 
   /**
-   * Enable a plugin that is in `disabled`, `error`, or `upgrade_pending` state.
+   * Enable a plugin that is in `disabled` or `error` state. A parked
+   * (`upgrade_pending`) plugin is rejected: only the board approval moves it on.
    * Transitions → `ready`.
    */
   enable(pluginId: string): Promise<PluginRecord>;
@@ -201,7 +202,10 @@ export interface PluginLifecycleManager {
    * rejected its capability escalation, then re-activate the worker at the
    * still-installed (pre-upgrade) version. Idempotent.
    */
-  revertUpgradeRejected(pluginId: string): Promise<PluginRecord>;
+  revertUpgradeRejected(
+    pluginId: string,
+    options?: { origin?: "upgrade" | "install" },
+  ): Promise<PluginRecord>;
 
   /**
    * Start the worker process for a plugin that is already in `ready` state.
@@ -520,11 +524,20 @@ export function pluginLifecycleManager(
     async enable(pluginId: string): Promise<PluginRecord> {
       const plugin = await requirePlugin(pluginId);
 
-      // Only allow enabling from disabled, error, or upgrade_pending states
-      if (plugin.status !== "disabled" && plugin.status !== "error" && plugin.status !== "upgrade_pending") {
+      // Only allow enabling from disabled or error. A parked plugin
+      // (upgrade_pending) leaves that state only through the board approval
+      // (approve -> completeUpgrade, reject -> revert). Enabling it would skip
+      // the capability-escalation gate.
+      if (plugin.status === "upgrade_pending") {
+        throw badRequest(
+          `Cannot enable plugin in status 'upgrade_pending'. ` +
+            `The pending capability approval must be approved or rejected first.`,
+        );
+      }
+      if (plugin.status !== "disabled" && plugin.status !== "error") {
         throw badRequest(
           `Cannot enable plugin in status '${plugin.status}'. ` +
-            `Plugin must be in 'disabled', 'error', or 'upgrade_pending' status to be enabled.`,
+            `Plugin must be in 'disabled' or 'error' status to be enabled.`,
         );
       }
 
@@ -764,7 +777,10 @@ export function pluginLifecycleManager(
     },
 
     // -- revertUpgradeRejected -------------------------------------------
-    async revertUpgradeRejected(pluginId: string): Promise<PluginRecord> {
+    async revertUpgradeRejected(
+      pluginId: string,
+      options: { origin?: "upgrade" | "install" } = {},
+    ): Promise<PluginRecord> {
       const before = await requirePlugin(pluginId);
       if (before.status !== "upgrade_pending") {
         log.info(
@@ -776,7 +792,16 @@ export function pluginLifecycleManager(
 
       // Parking never mutated version/manifest/caps, so this only restores the
       // lifecycle status to `ready` at the still-installed version.
-      const reverted = (await pluginLoaderInstance.revertPendingUpgrade(pluginId)) as PluginRecord;
+      const reverted = (await pluginLoaderInstance.revertPendingUpgrade(pluginId, options)) as PluginRecord;
+
+      // A rejected install/reinstall stays inactive: no worker activation.
+      if (options.origin === "install") {
+        log.info(
+          { pluginId, pluginKey: reverted.pluginKey, status: reverted.status },
+          "plugin lifecycle: parked install rejected — plugin left inactive",
+        );
+        return reverted;
+      }
 
       log.info(
         { pluginId, pluginKey: reverted.pluginKey, version: reverted.version },

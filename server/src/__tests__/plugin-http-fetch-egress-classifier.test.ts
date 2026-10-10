@@ -80,7 +80,14 @@ describe("plugin http.fetch egress IP classification", () => {
     await pinned("http://[64:ff9b::808:808]/", "64:ff9b::808:808");
   });
 
-  it("AC5: CGNAT allow-legacy (default) pins + warns without path/query/headers", async () => {
+  it("CGNAT is denied by default (no env set), including embedded forms", async () => {
+    await denied("http://100.64.0.1/");
+    await denied("http://100.100.1.2:7125/");
+    await denied("http://[::ffff:6464:102]/");
+  });
+
+  it("AC5: CGNAT allow-legacy (explicit rollback) pins + warns without path/query/headers", async () => {
+    process.env.PAPERCLIP_PLUGIN_FETCH_CGNAT = "allow-legacy";
     const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined as never);
     await pinned("http://100.100.1.2:7125/printer/objects?secret=1", "100.100.1.2");
     await pinned("https://[::ffff:6464:102]/x?y=z", "::ffff:6464:102");
@@ -132,7 +139,10 @@ describe("plugin http.fetch egress IP classification", () => {
     await denied("http://93.184.216.34/");
     await denied("http://[::ffff:5db8:d822]/");
     await denied("http://[2a01:4f8:1:2:0:0:0:5]/");
-    await denied("http://100.101.102.103/"); // allow-legacy is the default mode
+    await denied("http://100.101.102.103/");
+    process.env.PAPERCLIP_PLUGIN_FETCH_CGNAT = "allow-legacy";
+    await denied("http://100.101.102.103/"); // own-host stays denied even under allow-legacy
+    delete process.env.PAPERCLIP_PLUGIN_FETCH_CGNAT;
     stubs.dns["self.example"] = [{ address: "93.184.216.34", family: 4 }];
     await denied("http://self.example/");
   });

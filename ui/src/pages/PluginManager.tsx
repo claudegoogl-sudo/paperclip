@@ -124,11 +124,23 @@ export function PluginManager() {
   const installMutation = useMutation({
     mutationFn: (params: { packageName: string; version?: string; isLocalPath?: boolean }) =>
       pluginsApi.install(params),
-    onSuccess: () => {
+    onSuccess: (result) => {
       invalidatePluginQueries();
       setInstallDialogOpen(false);
       setInstallPackage("");
-      pushToast({ title: "Plugin installed successfully", tone: "success" });
+      // Show the declared capabilities and, when the install was parked by the
+      // capability-escalation gate, that it waits for a board approval.
+      const capabilities = result?.capabilities ?? [];
+      const capabilityLine = `Capabilities: ${capabilities.length > 0 ? capabilities.join(", ") : "none"}`;
+      if (result?.approvalId) {
+        pushToast({
+          title: "Plugin waiting for board approval",
+          body: `${capabilityLine}. Approval ${result.approvalId} must be approved before the plugin starts.`,
+          tone: "info",
+        });
+      } else {
+        pushToast({ title: "Plugin installed successfully", body: capabilityLine, tone: "success" });
+      }
     },
     onError: (err: Error) => {
       pushToast({ title: "Failed to install plugin", body: err.message, tone: "error" });

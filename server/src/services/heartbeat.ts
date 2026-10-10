@@ -487,6 +487,7 @@ import {
 } from "./instance-settings.js";
 import { usageLimitParkService } from "./usage-limit-park.js";
 import { highCommentVolumeAlertService } from "./high-comment-volume-alert.js";
+import { instanceAdmissionHoldService } from "./instance-admission-hold.js";
 import {
   evaluateExecutionAllowlist,
   isExecutionForcedToKubernetes,
@@ -9886,6 +9887,7 @@ export function heartbeatService(
   let shutdownInProgress = false;
   const instanceSettings = instanceSettingsService(db);
   const usageLimitPark = usageLimitParkService(db);
+  const instanceAdmissionHold = instanceAdmissionHoldService(db);
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
   });
@@ -13419,6 +13421,106 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
 
     return { run: current, updated: false as const };
+  }
+
+  // Completion-wins finalization: a run row that an external path reaped to
+  // `interrupted` (graceful-shutdown drain, lease-release terminalization)
+  // while its worker was actually still alive must not permanently contradict
+  // the worker's own clean exit. When the adapter's execution path returns a
+  // positive completion after the row left `running`, this compare-and-set
+  // makes the completion the last writer of the row: it overwrites the
+  // externally-written reap marker with the true outcome and preserves the
+  // reap as append-only provenance (a `completedAfterInterrupt` note merged
+  // into resultJson plus one lifecycle event recording both writes). Nothing
+  // is deleted. The CAS only matches `status='interrupted'`, so
+  // operator-intent outcomes (`cancelled`, `timed_out`) never yield, and a
+  // re-delivered completion finds no interrupted marker and converges
+  // without duplicating provenance or side effects.
+  async function persistRunCompletionAfterExternalInterrupt(
+    runId: string,
+    completion: {
+      // Callers reach this path only when the outcome is positive
+      // (`outcomeSucceeded` guard), but TS cannot narrow the shared `status`
+      // union through that boolean, so accept the wide type here.
+      status: string;
+      exitCode: number | null;
+      signal: string | null;
+      errorCode: string | null;
+      errorMessage: string | null;
+      finishedAt: Date;
+      usageJson: Record<string, unknown> | null;
+      resultJson: Record<string, unknown> | null;
+      sessionIdAfter: string | null;
+      stdoutExcerpt: string | null;
+      stderrExcerpt: string | null;
+      logBytes: number | null;
+      logSha256?: string | null;
+      logCompressed?: boolean;
+    },
+  ) {
+    const reaped = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    if (!reaped || reaped.status !== "interrupted") {
+      return { run: reaped, updated: false as const };
+    }
+
+    const reapedAt = reaped.finishedAt ? new Date(reaped.finishedAt) : null;
+    const resultJson = {
+      ...parseObject(reaped.resultJson),
+      ...parseObject(completion.resultJson),
+      completedAfterInterrupt: {
+        reapedErrorCode: reaped.errorCode ?? null,
+        reapedAt: reapedAt ? reapedAt.toISOString() : null,
+        completedAt: completion.finishedAt.toISOString(),
+        exitCode: completion.exitCode,
+      },
+    };
+    const write = await setRunStatusFromLive(runId, completion.status, ["interrupted"], {
+      finishedAt: completion.finishedAt,
+      error: completion.errorMessage,
+      errorCode: completion.errorCode,
+      exitCode: completion.exitCode,
+      signal: completion.signal,
+      usageJson: completion.usageJson,
+      resultJson,
+      sessionIdAfter: completion.sessionIdAfter,
+      stdoutExcerpt: completion.stdoutExcerpt,
+      stderrExcerpt: completion.stderrExcerpt,
+      logBytes: completion.logBytes,
+      ...(completion.logSha256 != null ? { logSha256: completion.logSha256 } : {}),
+      ...(completion.logCompressed != null ? { logCompressed: completion.logCompressed } : {}),
+    });
+    if (!write.updated || !write.run) {
+      return write;
+    }
+
+    const seq = await nextRunEventSeq(write.run.id);
+    await appendRunEvent(write.run, seq, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message: `completed after reap: exit ${completion.exitCode} at ${completion.finishedAt.toISOString()}`,
+      payload: {
+        reapedStatus: "interrupted",
+        reapedErrorCode: reaped.errorCode ?? null,
+        reapedAt: reapedAt ? reapedAt.toISOString() : null,
+        completionStatus: completion.status,
+        exitCode: completion.exitCode,
+      },
+    });
+    logger.info(
+      {
+        runId,
+        reapedErrorCode: reaped.errorCode ?? null,
+        status: completion.status,
+        exitCode: completion.exitCode,
+      },
+      "persisted late run completion over an external interruption reap",
+    );
+    return write;
   }
 
   // Invariant: when a run releases its environment lease, the run row must be
@@ -20265,6 +20367,9 @@ export function heartbeatService(
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
     await resumeExecutionWaitComments();
+    // Operator admission hold (installer drain): queued runs stay queued until
+    // the hold is cleared or expires; the periodic sweep re-enters here.
+    if (await instanceAdmissionHold.isHeld()) return;
     const cutoff = await getWorktreeExecutionCutoff();
     const pendingInterrupts = await db.select({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId })
       .from(agentWakeupRequests).innerJoin(companies, eq(companies.id, agentWakeupRequests.companyId))
@@ -20701,6 +20806,9 @@ export function heartbeatService(
     // wake, sweep, routine trigger, scheduled-retry promotion) — the account-wide
     // usage-limit quota this guards is instance-wide, so the gate must be too.
     if (await usageLimitPark.isParked()) return [];
+    // Operator admission hold: same choke point, admission-only. The queued run
+    // stays queued (never cancelled) and starts once the hold ends.
+    if (await instanceAdmissionHold.isHeld()) return [];
 
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
@@ -21033,6 +21141,7 @@ export function heartbeatService(
         // an already-running run above must never be stopped mid-flight by a park
         // that started after it was dispatched.
         if (await usageLimitPark.isParked()) return;
+        if (await instanceAdmissionHold.isHeld()) return;
         // Same defense-in-depth as the park above: this is a second, independently reachable
         // path into a claim, so the host ceiling has to hold here too. The run stays queued.
         const reservation = await reserveHostRunSlot();
@@ -26054,6 +26163,37 @@ export function heartbeatService(
               )
               .returning()
               .then((rows) => rows[0] ?? null);
+          }
+          if (!persistedRun && (outcome === "succeeded" || outcome === "succeeded_dirty")) {
+            // Completion-wins: an external reap (graceful-shutdown drain,
+            // lease-release terminalization) wrote `interrupted` while the
+            // worker was still alive. The positive completion is the last
+            // writer; the reap path already released the wakeup and issue
+            // execution, so only refresh liveness and agent status here.
+            const reapCompletionWrite = await persistRunCompletionAfterExternalInterrupt(run.id, {
+              status,
+              exitCode: adapterResult.exitCode,
+              signal: adapterResult.signal,
+              errorCode: runErrorCode,
+              errorMessage: runErrorMessage,
+              finishedAt: new Date(),
+              usageJson,
+              resultJson: persistedResultJson,
+              sessionIdAfter: nextSessionState.displayId ?? nextSessionState.legacySessionId,
+              stdoutExcerpt,
+              stderrExcerpt,
+              logBytes: logSummary?.bytes ?? null,
+              logSha256: logSummary?.sha256 ?? null,
+              logCompressed: logSummary?.compressed ?? false,
+            });
+            if (reapCompletionWrite.updated && reapCompletionWrite.run) {
+              await classifyAndPersistRunLiveness(reapCompletionWrite.run, persistedResultJson);
+              await finalizeAgentStatus(agent.id, outcome, null, undefined, {
+                keepIdleOnFailure: false,
+                wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+              });
+              return;
+            }
           }
           if (!persistedRun) {
             logger.info(
@@ -31617,6 +31757,28 @@ export function heartbeatService(
     // (API route, recovery sweep) distinguish "parked on purpose" from "stuck", so a
     // parked fleet isn't misreported as a stall.
     getUsageLimitParkState: (now?: Date) => usageLimitPark.getState(now),
+
+    // Operator admission hold (installer drain before a service stop).
+    getInstanceAdmissionHoldState: (now?: Date) => instanceAdmissionHold.getState(now),
+    setInstanceAdmissionHold: async (input: {
+      holdUntil: Date;
+      reason: string;
+      actorType: string | null;
+      actorId: string | null;
+    }) => {
+      const state = await instanceAdmissionHold.set(input);
+      logger.warn(
+        { holdUntil: state.holdUntil?.toISOString() ?? null, reason: state.reason, actorType: input.actorType },
+        "instance admission hold set: queued runs will not start until it is cleared or expires",
+      );
+      return state;
+    },
+    clearInstanceAdmissionHold: async (input: { actorType: string | null; actorId: string | null }) => {
+      const state = await instanceAdmissionHold.clear(input);
+      logger.info({ actorType: input.actorType }, "instance admission hold cleared: resuming queued runs");
+      await resumeQueuedRuns();
+      return state;
+    },
 
     getHostRunCeilingState: async () => {
       const memoryPressure = runAdmissionMemoryPressure.lastReading();

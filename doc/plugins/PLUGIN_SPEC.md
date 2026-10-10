@@ -1029,7 +1029,7 @@ Example (operator): `PAPERCLIP_PLUGIN_CROSS_COMPANY_READ_ALLOWLIST=platform.flee
 - IPv6 forms that embed an IPv4 address (`::ffff:7f00:1`, `::127.0.0.1`, `64:ff9b::7f00:1`) are unwrapped. The inner IPv4 is classified.
 - 6to4 (`2002::/16`), Teredo (`2001::/32`) and local-use NAT64 (`64:ff9b:1::/48`) are denied.
 - Addresses of the host's own network interfaces are always denied.
-- CGNAT (`100.64.0.0/10`) is controlled by `PAPERCLIP_PLUGIN_FETCH_CGNAT`: `allow-legacy` (default) allows it and logs `plugin.http_fetch.cgnat_legacy_allowed` (plugin id, scheme, IP, port only); `deny` blocks it.
+- CGNAT (`100.64.0.0/10`) is controlled by `PAPERCLIP_PLUGIN_FETCH_CGNAT`: `deny` (default; also used for any unknown value) blocks it unless the instance admin opted the exact origin in for the plugin; `allow-legacy` (explicit rollback switch, kept for one release) allows it and logs `plugin.http_fetch.cgnat_legacy_allowed` (plugin id, scheme, IP, port only).
 - Redirects are not followed. The worker receives the 30x response.
 
 Example: `http://[::ffff:127.0.0.1]:3100/` fails with `All resolved IPs for ... are in private/reserved ranges`.
@@ -1962,6 +1962,8 @@ For developing a plugin against a running Paperclip instance:
 
 - The operator installs the plugin from a local path: `npx paperclipai plugin install ./path/to/plugin`
 - The host watches the plugin directory for changes and restarts the worker on rebuild.
+- Local-path plugin hot reload (the dev watcher) is opt-in. Set `PAPERCLIP_PLUGIN_DEV_WATCH=1` to enable it. It is off by default.
+- On every activation (boot, enable, worker restart, hot reload) the host re-reads the on-disk manifest. If that manifest adds capabilities, tools, webhooks, secret-ref config fields, or changes the `database` declaration, activation fails closed and the registry keeps the approved manifest. Use `POST /api/plugins/:pluginId/upgrade` so the change goes through the capability-escalation approval gate. Removals and non-privilege changes still apply automatically, with a warning log line.
 - `devUiUrl` in plugin config can point to a local Vite dev server for UI hot-reload.
 - The plugin settings page shows real-time logs from the worker for debugging.
 

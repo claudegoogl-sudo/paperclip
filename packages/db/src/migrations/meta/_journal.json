@@ -2115,6 +2115,13 @@
       "when": 1790018362070,
       "tag": "0303_jittery_psynapse",
       "breakpoints": true
+    },
+    {
+      "idx": 304,
+      "version": "7",
+      "when": 1790018363070,
+      "tag": "0304_instance_admission_holds",
+      "breakpoints": true
     }
   ]
 }
