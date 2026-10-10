@@ -92,7 +92,8 @@
               "deploy/secrets",
               "deploy/storage",
               "deploy/environment-variables",
-              "deploy/manual-run-row-reap-runbook"
+              "deploy/manual-run-row-reap-runbook",
+              "deploy/instance-admission-hold"
             ]
           }
         ]

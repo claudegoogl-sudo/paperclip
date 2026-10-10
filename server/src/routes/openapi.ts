@@ -2182,6 +2182,33 @@ registry.registerPath({
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
 
+registry.registerPath({
+  method: "get",
+  path: "/api/instance/admission-hold",
+  tags: ["agents"],
+  summary: "Get the operator instance admission hold",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "put",
+  path: "/api/instance/admission-hold",
+  tags: ["agents"],
+  summary: "Set the operator instance admission hold (admission-only, self-expiring, capped at now + 60 min)",
+  request: {
+    body: jsonBody(z.object({ holdUntil: z.string().datetime(), reason: z.string().min(1).max(500) })),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/instance/admission-hold",
+  tags: ["agents"],
+  summary: "Clear the operator instance admission hold and resume queued runs",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
 // ─── Adapters ────────────────────────────────────────────────────────────────
 
 registry.registerPath({

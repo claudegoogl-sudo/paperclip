@@ -1401,6 +1401,14 @@ export const SECURITY_POSTURE_REJECTIONS = [
     reason: "Singleton parking record for provider usage limits. Availability backoff; parking never widens what a resumed run may reach.",
   },
   {
+    table: "instance_admission_holds",
+    columns: [
+      "created_at", "hold_until", "id", "reason", "set_by_actor_id", "set_by_actor_type", "singleton_key",
+      "updated_at"
+    ],
+    reason: "Singleton operator admission hold (installer drain). Admission-only delay; a hold only defers when queued runs start and never widens what any run may reach.",
+  },
+  {
     table: "user",
     columns: ["created_at", "email", "id", "image", "name", "updated_at"],
     reason: "User identity and display fields owned by better-auth. Authorization is instance_user_roles.role and company_memberships, both registered.",
