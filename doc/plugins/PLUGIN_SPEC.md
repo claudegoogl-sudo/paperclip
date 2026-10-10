@@ -1960,6 +1960,8 @@ For developing a plugin against a running Paperclip instance:
 
 - The operator installs the plugin from a local path: `npx paperclipai plugin install ./path/to/plugin`
 - The host watches the plugin directory for changes and restarts the worker on rebuild.
+- Local-path plugin hot reload (the dev watcher) is opt-in. Set `PAPERCLIP_PLUGIN_DEV_WATCH=1` to enable it. It is off by default.
+- On every activation (boot, enable, worker restart, hot reload) the host re-reads the on-disk manifest. If that manifest adds capabilities, tools, webhooks, secret-ref config fields, or changes the `database` declaration, activation fails closed and the registry keeps the approved manifest. Use `POST /api/plugins/:pluginId/upgrade` so the change goes through the capability-escalation approval gate. Removals and non-privilege changes still apply automatically, with a warning log line.
 - `devUiUrl` in plugin config can point to a local Vite dev server for UI hot-reload.
 - The plugin settings page shows real-time logs from the worker for debugging.
 

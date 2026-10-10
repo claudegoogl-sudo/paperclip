@@ -121,7 +121,7 @@ import {
 } from "./services/plugin-host-services.js";
 import { createPluginEventBus } from "./services/plugin-event-bus.js";
 import { setPluginEventBus } from "./services/activity-log.js";
-import { createPluginDevWatcher } from "./services/plugin-dev-watcher.js";
+import { createPluginDevWatcher, isPluginDevWatchEnabled } from "./services/plugin-dev-watcher.js";
 import { createPluginHostServiceCleanup } from "./services/plugin-host-service-cleanup.js";
 import { createEventRelayProbe } from "./services/plugin-event-relay-probe.js";
 import { pluginRegistryService } from "./services/plugin-registry.js";
@@ -741,6 +741,11 @@ export async function createApp(
       localPluginDir: opts.localPluginDir ?? DEFAULT_LOCAL_PLUGIN_DIR,
       migrationDb: opts.pluginMigrationDb,
       escalationGateway,
+      // Capabilities a fresh install may declare without a board approval.
+      // Default empty: any capability parks a fresh install (gateway set only).
+      installCapabilityAllowlist: parsePluginCrossCompanyReadAllowlist(
+        process.env.PAPERCLIP_PLUGIN_INSTALL_CAPABILITY_ALLOWLIST,
+      ),
     },
     {
       workerManager,
@@ -819,7 +824,7 @@ export async function createApp(
     if (outcome === "approved") {
       await upgradeLifecycle.completeUpgradeApproved(payload.pluginId);
     } else {
-      await upgradeLifecycle.revertUpgradeRejected(payload.pluginId);
+      await upgradeLifecycle.revertUpgradeRejected(payload.pluginId, { origin: payload.origin });
     }
   });
   // Create the dev-watcher before the plugin routes so the routes can
@@ -839,7 +844,11 @@ export async function createApp(
   // back to a bare process bounce. Lifecycle-event subscriptions stay on the
   // shared `lifecycle`, which is where the loader emits them.
   const devWatcherRestartLifecycle = pluginLifecycleManager(db, { loader, workerManager, eventBus });
-  const devWatcher = createPluginDevWatcher(
+  // Defense in depth: hot reload re-activates plugins from on-disk code, so
+  // it is opt-in (PAPERCLIP_PLUGIN_DEV_WATCH=1) and off by default.
+  const devWatchEnabled = isPluginDevWatchEnabled(process.env);
+  logger.info({ devWatchEnabled }, "plugin dev watcher configuration");
+  const devWatcher = devWatchEnabled ? createPluginDevWatcher(
     lifecycle,
     async (pluginId) => {
       const plugin = await pluginRegistry.getById(pluginId);
@@ -847,7 +856,7 @@ export async function createApp(
     },
     undefined,
     { restartWorker: (pluginId) => devWatcherRestartLifecycle.restartWorker(pluginId) },
-  );
+  ) : null;
   api.use(
     pluginRoutes(
       db,
@@ -857,7 +866,7 @@ export async function createApp(
       { toolDispatcher },
       { workerManager, streamBus: pluginStreamBus },
       { toolGateway },
-      { reconciler: devWatcher },
+      devWatcher ? { reconciler: devWatcher } : undefined,
     ),
   );
   api.use(adapterRoutes({

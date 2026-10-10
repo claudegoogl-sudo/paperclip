@@ -204,7 +204,7 @@ export interface BundledPluginProvisionerDeps {
     ): Promise<unknown>;
   };
   loader: {
-    installPlugin(options: { localPath: string }): Promise<{
+    installPlugin(options: { localPath: string; exemptFromCapabilityGate?: boolean }): Promise<{
       manifest: { id: string } | null;
     }>;
     loadManifest(packagePath: string): Promise<PaperclipPluginManifestV1 | null>;
@@ -322,7 +322,16 @@ export async function ensureBundledPlugins(
         { pluginKey: install.pluginKey, pluginPath: install.localPath },
         "auto-installing bundled plugin",
       );
-      const discovered = await deps.loader.installPlugin({ localPath: install.localPath });
+      // SECURITY: boot auto-install is exempt from the install-time
+      // capability-escalation gate. The bundle path comes from host env + the
+      // host filesystem (the image), and whoever controls those already
+      // controls the host, so a board approval would add no protection — and
+      // parking here would leave a bundled provider (e.g. kubernetes) offline
+      // at every boot. HTTP and CLI installs never set this flag.
+      const discovered = await deps.loader.installPlugin({
+        localPath: install.localPath,
+        exemptFromCapabilityGate: true,
+      });
       if (!discovered.manifest) {
         deps.logger.error(
           { pluginKey: install.pluginKey },
