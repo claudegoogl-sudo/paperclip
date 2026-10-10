@@ -31,6 +31,7 @@ import { createDb } from "../src/client.js";
 import {
   buildEmbeddedPostgresConnectionString,
   readEmbeddedPostgresCredential,
+  socketDirectoryPathFor,
 } from "../src/embedded-postgres-auth.js";
 import { agentTaskSessions } from "../src/schema/index.js";
 
@@ -238,6 +239,7 @@ function readDatabaseUrlFromConfig(configPath: string): string {
     port,
     database: "paperclip",
     password: cred.password,
+    socketDir: dataDir ? socketDirectoryPathFor(dataDir) : undefined,
   });
 }
 

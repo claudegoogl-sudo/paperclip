@@ -1,5 +1,6 @@
 export {
   createDb,
+  closeRegisteredClients,
   getPostgresDataDirectory,
   ensurePostgresDatabase,
   resetPostgresDatabase,
@@ -22,6 +23,9 @@ export {
   createQueryCancellationScope,
   type QueryCancellationScope,
 } from "./query-cancellation.js";
+// Re-exported for repo-root scripts (scripts/*.ts), which cannot resolve
+// "drizzle-orm" directly under pnpm's strict node_modules layout.
+export { and, eq, like } from "drizzle-orm";
 export {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -50,19 +54,31 @@ export {
   buildEmbeddedPostgresConstructorOptions,
   buildScramSha256PgHba,
   credentialFilePathFor,
+  assertEmbeddedPostgresSocketPathWithinLimit,
+  embeddedPostgresSocketFilePath,
+  embeddedPostgresSocketRuntimeRoot,
+  embeddedPostgresSqlOptions,
+  ensureEmbeddedPostgresSocketDir,
   generateEmbeddedPostgresPassword,
   isPgHbaScramOnly,
+  migrateLegacyEmbeddedPostgresSocket,
   readEmbeddedPostgresCredential,
+  readPidFileSocketDir,
+  resolveEmbeddedPostgresConnection,
   resolveEmbeddedPostgresPasswordForStartup,
   rewritePgHbaToScram,
   rotateEmbeddedPostgresAuthIfNeeded,
   scrubEmbeddedPostgresConnectionString,
+  socketDirectoryPathFor,
+  stopRunningEmbeddedPostgres,
   writeEmbeddedPostgresCredential,
+  SOCKET_DIR_QUERY_PARAM,
   type BuildEmbeddedPostgresConnectionStringInput,
   type EmbeddedPostgresAuthMethod,
   type EmbeddedPostgresConstructorOptions,
   type EmbeddedPostgresCredential,
   type EmbeddedPostgresDatabase,
+  type ResolvedEmbeddedPostgresConnection,
   type ResolvedEmbeddedPostgresPassword,
   type RotateEmbeddedPostgresAuthEvent,
   type RotateEmbeddedPostgresAuthInput,
@@ -72,6 +88,7 @@ export {
   ensureLinuxSharedLibraryAliases,
   prepareEmbeddedPostgresNativeRuntime,
 } from "./embedded-postgres-native.js";
+export { loadWithoutEmbeddedPostgresExitHooks } from "./embedded-postgres-lifecycle.js";
 export { issueRelations } from "./schema/issue_relations.js";
 export { issueReferenceMentions } from "./schema/issue_reference_mentions.js";
 export * from "./schema/index.js";

@@ -4,7 +4,8 @@ import path from "node:path";
 import { gunzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
-import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import { createBufferedTextFileWriter, embeddedSocketConninfo, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import { buildEmbeddedPostgresConnectionString } from "./embedded-postgres-auth.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -74,6 +75,49 @@ describe("createBufferedTextFileWriter", () => {
   });
 });
 
+describe("embeddedSocketConninfo", () => {
+  it("routes pg_dump/psql over the unix socket, not the pinned TCP host", () => {
+    // The embedded connection string always carries a loopback host:port so URL
+    // guards keep working; the socket travels in the `?paperclip_socket=`
+    // sentinel. When routing a CLI (pg_dump/psql) we must connect over the
+    // socket, because the TCP listener is killed in production.
+    const socketDir = "/tmp/paperclip-pg-deadbeefdeadbeef";
+    const conninfo = embeddedSocketConninfo({
+      connectionString:
+        "postgres://paperclip:s3cr3t@127.0.0.1:54400/paperclip",
+      socketDir,
+    });
+    // host is the socket dir; the TCP host must not appear (it would win over
+    // PGHOST and hit the dead listener).
+    expect(conninfo.dbnameArg).toContain(`host='${socketDir}'`);
+    expect(conninfo.dbnameArg).not.toContain("127.0.0.1");
+    expect(conninfo.dbnameArg).toContain("port='54400'");
+    expect(conninfo.dbnameArg).toContain("user='paperclip'");
+    expect(conninfo.dbnameArg).toContain("dbname='paperclip'");
+    // Password rides in PGPASSWORD (returned separately), never in argv.
+    expect(conninfo.password).toBe("s3cr3t");
+    expect(conninfo.dbnameArg).not.toContain("s3cr3t");
+  });
+
+  it("round-trips a sentinel-carrying URL and escapes conninfo values", () => {
+    // A socket dir with a quote must be escaped per libpq conninfo rules so it
+    // cannot break out of the value.
+    const socketDir = "/tmp/pg's dir";
+    const url = buildEmbeddedPostgresConnectionString({
+      port: 5599,
+      database: "postgres",
+      password: "p@ss word",
+      socketDir,
+    });
+    // Simulate the production strip that resolveEmbeddedPostgresConnection does
+    // before the CLI call: the sentinel is removed, leaving a bare URL.
+    const bare = url.replace(/\?paperclip_socket=[^&]*$/, "");
+    const conninfo = embeddedSocketConninfo({ connectionString: bare, socketDir });
+    expect(conninfo.dbnameArg).toContain("host='/tmp/pg\\'s dir'");
+    expect(conninfo.password).toBe("p@ss word");
+  });
+});
+
 describeEmbeddedPostgres("runDatabaseBackup", () => {
   it(
     "keeps the newest backup for each retained calendar month",
@@ -139,6 +183,21 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
             "metadata" jsonb,
             "created_at" timestamptz NOT NULL DEFAULT now()
           );
+        `);
+        await sourceSql.unsafe(`
+          CREATE FUNCTION "public"."backup_test_mark_done"()
+          RETURNS trigger
+          LANGUAGE plpgsql
+          AS $$
+          BEGIN
+            NEW."state" := 'done';
+            RETURN NEW;
+          END;
+          $$;
+          CREATE TRIGGER "backup_test_mark_done_trigger"
+          BEFORE UPDATE OF "title" ON "public"."backup_test_records"
+          FOR EACH ROW
+          EXECUTE FUNCTION "public"."backup_test_mark_done"();
         `);
 
         const payload = "x".repeat(8192);
@@ -213,6 +272,18 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
             metadata: { index: 159, even: false },
           },
         ]);
+
+        await restoreSql.unsafe(`
+          UPDATE "public"."backup_test_records"
+          SET "title" = 'triggered'
+          WHERE "title" = 'row-0'
+        `);
+        const triggeredRows = await restoreSql.unsafe<{ state: string }[]>(`
+          SELECT "state"::text AS "state"
+          FROM "public"."backup_test_records"
+          WHERE "title" = 'triggered'
+        `);
+        expect(triggeredRows).toEqual([{ state: "done" }]);
       } finally {
         await sourceSql.end();
         await restoreSql.end();

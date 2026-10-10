@@ -43,6 +43,16 @@ export function createBundledInstallManifest(publishManifest, bundledDependencie
     if (Object.keys(installManifest[section]).length === 0) delete installManifest[section];
   }
 
+  // The staged install only materializes the bundled-dep closure. Dropping
+  // devDependencies keeps the staged `npm install` from even RESOLVING the
+  // package's dev toolchain (vitest, drizzle-kit, ...), which npm 10.9.x
+  // still walks under --omit=dev — and fresh registry releases in those
+  // graphs have crashed its arborist (`Cannot read properties of null
+  // (reading 'edgesOut')`), failing the release build on registry drift
+  // unrelated to the bundled dep. The publish manifest (restored after the
+  // install) keeps devDependencies exactly as before.
+  delete installManifest.devDependencies;
+
   return installManifest;
 }
 
@@ -71,6 +81,24 @@ export function applyBundledDependencyPatches(destinationDir, bundledDependencie
   }
 }
 
+/// Copy the package's publish metadata files into the staging directory,
+/// falling back to the repo-root license when the package ships none of its
+/// own. Every published tarball must carry a license: fork.39's restaged
+/// bundled packages (adapter-utils, db) shipped without one because neither
+/// package directory has a LICENSE file and the copy used to be a silent
+/// no-op in that case. README is deliberately not fallen back — a root
+/// README describes the monorepo, not the package.
+export function copyPackageMetadata(sourceDir, destinationDir, rootDir = repoRoot) {
+  for (const entry of ["README.md", "LICENSE", "LICENSE.md"]) {
+    let sourcePath = resolve(sourceDir, entry);
+    if (entry !== "README.md" && !existsSync(sourcePath)) {
+      const rootFallback = resolve(rootDir, entry);
+      if (existsSync(rootFallback)) sourcePath = rootFallback;
+    }
+    if (existsSync(sourcePath)) cpSync(sourcePath, resolve(destinationDir, entry));
+  }
+}
+
 export function prepareBundledPackage(sourceDir, destinationDir) {
   const sourcePackagePath = resolve(sourceDir, "package.json");
   const sourcePackage = JSON.parse(readFileSync(sourcePackagePath, "utf8"));
@@ -82,13 +110,17 @@ export function prepareBundledPackage(sourceDir, destinationDir) {
 
   rmSync(destinationDir, { recursive: true, force: true });
   mkdirSync(destinationDir, { recursive: true });
+  // npm pack silently skips `files` entries that do not exist on disk; mirror
+  // that here so packages whose manifest lists a build-generated entry that
+  // this package's build never produces (e.g. adapter-acpx-local lists
+  // `skills`, which only claude-local/codex-local/server get) stage cleanly
+  // instead of failing the fork release build.
   for (const entry of sourcePackage.files ?? []) {
-    cpSync(resolve(sourceDir, entry), resolve(destinationDir, entry), { recursive: true });
+    const sourceEntry = resolve(sourceDir, entry);
+    if (!existsSync(sourceEntry)) continue;
+    cpSync(sourceEntry, resolve(destinationDir, entry), { recursive: true });
   }
-  for (const entry of ["README.md", "LICENSE", "LICENSE.md"]) {
-    const sourcePath = resolve(sourceDir, entry);
-    if (existsSync(sourcePath)) cpSync(sourcePath, resolve(destinationDir, entry));
-  }
+  copyPackageMetadata(sourceDir, destinationDir);
 
   const deployedPackagePath = resolve(destinationDir, "package.json");
   const publishManifest = materializePublishManifest(sourcePackage);

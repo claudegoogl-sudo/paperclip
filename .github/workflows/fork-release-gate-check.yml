@@ -1,0 +1,131 @@
+name: Fork Release Gate Check
+
+# CI validation for the fork release gate. Runs on PRs and pushes that touch
+# the gate, and exercises the full build + static gate path with NO release
+# interaction (no draft, no upload, no publish):
+#
+#   1. build the release set (same build.sh the release workflow drives)
+#   2. the static preflight gates must PASS the clean set
+#   3. the same gates must FAIL the set after the test-only injector
+#      reproduces the historically-shipped dev-exports defect
+#   4. the same gates must FAIL the set after the second test-only injector
+#      strips a provider tarball's dist (the empty-provider defect)
+#
+# The install/boot half of the gate runs in the Fork Release workflow's
+# preflight job before anything is published.
+
+on:
+  pull_request:
+    paths:
+      - "scripts/fork-release/**"
+      - ".github/workflows/fork-release.yml"
+      - ".github/workflows/fork-release-gate-check.yml"
+  push:
+    branches:
+      - master
+    paths:
+      - "scripts/fork-release/**"
+      - ".github/workflows/fork-release.yml"
+      - ".github/workflows/fork-release-gate-check.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build_and_gate:
+    name: Build set, gate must pass clean and refuse corrupted
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GATE_VERSION: 0.0.${{ github.run_number }}-gatecheck
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      # The lockfile is CI-owned (PRs cannot commit pnpm-lock.yaml), so a
+      # manifest-changing PR leaves the committed lockfile stale and the
+      # build's `pnpm install --frozen-lockfile` would refuse it. Regenerate
+      # the lockfile in place first — the same thing the PR policy job does
+      # before its downstream jobs install. Converges to a no-op when the
+      # committed lockfile already matches the manifests.
+      - name: Regenerate the CI-owned lockfile against the checkout manifests
+        run: pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile
+
+      - name: Setup Rust toolchain for the runner package (pin + cargo)
+        run: |
+          set -euo pipefail
+          TOOLCHAIN_FILE=packages/paperclip-runner/rust-toolchain.toml
+          if [ -f "$TOOLCHAIN_FILE" ]; then
+            CHANNEL="$(awk -F'"' '/^[[:space:]]*channel[[:space:]]*=/{print $2; exit}' "$TOOLCHAIN_FILE")"
+            echo "Installing pinned Rust toolchain ${CHANNEL} (minimal profile + cargo + rustfmt)"
+            rustup toolchain install "$CHANNEL" --profile minimal --component cargo --component rustfmt
+          else
+            echo "No rust-toolchain.toml pin found; using the image default toolchain"
+          fi
+
+      - name: Build + pack + URL-pin the release set
+        run: bash scripts/fork-release/build.sh "$GATE_VERSION" --out dist-tarballs
+
+      - name: Static gates must pass the clean set
+        run: |
+          node scripts/fork-release/preflight.mjs \
+            --core-url "https://github.com/claudegoogl-sudo/paperclip/releases/download/v$GATE_VERSION/paperclipai-$GATE_VERSION.tgz" \
+            --assets-dir "$PWD/dist-tarballs" \
+            --sha256sums "$PWD/dist-tarballs/SHA256SUMS.txt" \
+            --steps checksums,closure,exports
+
+      - name: Static gates must refuse the corrupted set (dev-exports defect)
+        run: |
+          cp -r dist-tarballs dist-tarballs-corrupt
+          node scripts/fork-release/negative-test-fork34.mjs --dir dist-tarballs-corrupt
+          set +e
+          node scripts/fork-release/preflight.mjs \
+            --core-url "https://github.com/claudegoogl-sudo/paperclip/releases/download/v$GATE_VERSION/paperclipai-$GATE_VERSION.tgz" \
+            --assets-dir "$PWD/dist-tarballs-corrupt" \
+            --sha256sums "$PWD/dist-tarballs-corrupt/SHA256SUMS.txt" \
+            --steps checksums,closure,exports
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "GATE DEFECT: the corrupted set passed the static gates" >&2
+            exit 1
+          fi
+          echo "gate refused the corrupted set (exit $status) — blocking behavior confirmed"
+
+      - name: Static gates must refuse a provider tarball with no dist (empty-provider defect)
+        run: |
+          cp -r dist-tarballs dist-tarballs-empty-provider
+          node scripts/fork-release/negative-test-empty-provider.mjs --dir dist-tarballs-empty-provider
+          set +e
+          node scripts/fork-release/preflight.mjs \
+            --core-url "https://github.com/claudegoogl-sudo/paperclip/releases/download/v$GATE_VERSION/paperclipai-$GATE_VERSION.tgz" \
+            --assets-dir "$PWD/dist-tarballs-empty-provider" \
+            --sha256sums "$PWD/dist-tarballs-empty-provider/SHA256SUMS.txt" \
+            --steps checksums,closure,exports
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "GATE DEFECT: the empty-provider set passed the static gates" >&2
+            exit 1
+          fi
+          echo "gate refused the empty-provider set (exit $status) — blocking behavior confirmed"
+
+      - name: Upload the built release set
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-check-dist
+          path: dist-tarballs/
+          retention-days: 3
+          if-no-files-found: ignore

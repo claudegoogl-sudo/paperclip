@@ -11,10 +11,12 @@ import {
   createEmbeddedPostgresLogBuffer,
   ensurePostgresDatabase,
   formatEmbeddedPostgresError,
+  migrateLegacyEmbeddedPostgresSocket,
   prepareEmbeddedPostgresNativeRuntime,
   resolveEmbeddedPostgresPasswordForStartup,
   rotateEmbeddedPostgresAuthIfNeeded,
   routines,
+  socketDirectoryPathFor,
 } from "@paperclipai/db";
 import { eq, inArray } from "drizzle-orm";
 import { loadPaperclipEnvFile } from "../config/env.js";
@@ -127,6 +129,10 @@ async function ensureEmbeddedPostgres(dataDir: string, preferredPort: number): P
   await prepareEmbeddedPostgresNativeRuntime();
 
   const postmasterPidFile = path.resolve(dataDir, "postmaster.pid");
+  // If a legacy cluster (socket on /tmp) is running, stop it so the
+  // start path below brings it back with the new socket dir + flags. No-op
+  // when nothing is running or the running cluster already uses our dir.
+  await migrateLegacyEmbeddedPostgresSocket(dataDir);
   const runningPid = readRunningPostmasterPid(postmasterPidFile);
   const startupPasswordResolution = resolveEmbeddedPostgresPasswordForStartup(dataDir);
   if (runningPid) {
@@ -215,16 +221,21 @@ async function openConfiguredDb(configPath: string): Promise<{
         config.database.embeddedPostgresDataDir,
         config.database.embeddedPostgresPort,
       );
+      // The socket dir travels in the URL sentinel; createDb/applyPendingMigrations
+      // decode it and route via the unix socket (TCP is off on the cluster).
+      const socketDir = socketDirectoryPathFor(config.database.embeddedPostgresDataDir);
       const adminConnectionString = buildEmbeddedPostgresConnectionString({
         port: embeddedHandle.port,
         database: "postgres",
         password: embeddedHandle.password,
+        socketDir,
       });
       await ensurePostgresDatabase(adminConnectionString, "paperclip");
       const connectionString = buildEmbeddedPostgresConnectionString({
         port: embeddedHandle.port,
         database: "paperclip",
         password: embeddedHandle.password,
+        socketDir,
       });
       await applyPendingMigrations(connectionString);
       const db = createDb(connectionString) as ClosableDb;
@@ -286,16 +297,21 @@ export async function disableAllRoutinesInConfig(
         config.database.embeddedPostgresDataDir,
         config.database.embeddedPostgresPort,
       );
+      // The socket dir travels in the URL sentinel; createDb/applyPendingMigrations
+      // decode it and route via the unix socket (TCP is off on the cluster).
+      const socketDir = socketDirectoryPathFor(config.database.embeddedPostgresDataDir);
       const adminConnectionString = buildEmbeddedPostgresConnectionString({
         port: embeddedHandle.port,
         database: "postgres",
         password: embeddedHandle.password,
+        socketDir,
       });
       await ensurePostgresDatabase(adminConnectionString, "paperclip");
       const connectionString = buildEmbeddedPostgresConnectionString({
         port: embeddedHandle.port,
         database: "paperclip",
         password: embeddedHandle.password,
+        socketDir,
       });
       await applyPendingMigrations(connectionString);
       db = createDb(connectionString) as ClosableDb;

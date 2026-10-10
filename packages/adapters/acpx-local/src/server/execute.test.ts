@@ -21,6 +21,16 @@ async function pathExists(candidate: string): Promise<boolean> {
   return fs.access(candidate).then(() => true).catch(() => false);
 }
 
+function sessionOptionsOf(input: Record<string, unknown> | undefined): {
+  env?: Record<string, string>;
+  persistedEnv?: Record<string, string>;
+} {
+  return (input?.sessionOptions ?? {}) as {
+    env?: Record<string, string>;
+    persistedEnv?: Record<string, string>;
+  };
+}
+
 async function onlyChildDir(parent: string): Promise<string> {
   const entries = await fs.readdir(parent);
   expect(entries).toHaveLength(1);
@@ -39,13 +49,16 @@ async function createSkill(root: string, name: string, body = `---\nrequired: fa
   };
 }
 
-function buildRuntime() {
+function buildRuntime(ensureSessionInputs: Record<string, unknown>[] = []) {
   return {
-    ensureSession: async () => ({
-      backendSessionId: "backend-session",
-      agentSessionId: "agent-session",
-      runtimeSessionName: "runtime-session",
-    }),
+    ensureSession: async (input: Record<string, unknown>) => {
+      ensureSessionInputs.push(input);
+      return {
+        backendSessionId: "backend-session",
+        agentSessionId: "agent-session",
+        runtimeSessionName: "runtime-session",
+      };
+    },
     startTurn: () => ({
       events: (async function* () {
         yield { type: "done", stopReason: "end_turn" };
@@ -65,12 +78,13 @@ async function runExecutor(
   } = {},
 ) {
   const runtimeOptions: Record<string, unknown>[] = [];
+  const ensureSessionInputs: Record<string, unknown>[] = [];
   const meta: Record<string, unknown>[] = [];
   const logs: Array<{ stream: string; text: string }> = [];
   const execute = createAcpxLocalExecutor({
     createRuntime: (options) => {
       runtimeOptions.push(options as unknown as Record<string, unknown>);
-      return buildRuntime() as never;
+      return buildRuntime(ensureSessionInputs) as never;
     },
   });
 
@@ -93,7 +107,7 @@ async function runExecutor(
   } as never);
 
   expect(result.exitCode).toBe(0);
-  return { logs, meta, runtimeOptions, result };
+  return { logs, meta, runtimeOptions, ensureSessionInputs, result };
 }
 
 describe("acpx_local runtime skill isolation", () => {
@@ -248,21 +262,19 @@ describe("acpx_local runtime skill isolation", () => {
 
     const wrappers = await fs.readdir(path.join(stateDir, "wrappers"));
     expect(wrappers.filter((name) => name.endsWith(".sh"))).toHaveLength(2);
-    expect(wrappers.filter((name) => name.endsWith(".env"))).toHaveLength(2);
+    // The value-bearing wrapper `.env` sidecar is gone entirely: env values
+    // never land on disk, they ride the spawn env in memory only.
+    expect(wrappers.filter((name) => name.endsWith(".env"))).toHaveLength(0);
     expect(wrappers.some((name) => name.startsWith("custom-a-"))).toBe(true);
     expect(wrappers.some((name) => name.startsWith("custom-b-"))).toBe(true);
     const wrapperPath = path.join(stateDir, "wrappers", wrappers.find((name) => name.startsWith("custom-b-") && name.endsWith(".sh"))!);
-    const envPath = path.join(stateDir, "wrappers", wrappers.find((name) => name.startsWith("custom-b-") && name.endsWith(".env"))!);
     const wrapper = await fs.readFile(wrapperPath, "utf8");
-    const env = await fs.readFile(envPath, "utf8");
-    expect((await fs.stat(envPath)).mode & 0o777).toBe(0o600);
     expect((await fs.stat(wrapperPath)).mode & 0o777).toBe(0o700);
     expect(wrapper).toContain("node ./fake-acp.js");
     expect(wrapper).not.toContain("PAPERCLIP_API_KEY");
     expect(wrapper).not.toContain("new-key");
     expect(wrapper).not.toContain("old-key");
-    expect(env).toContain("PAPERCLIP_API_KEY='new-key'");
-    expect(env).not.toContain("old-key");
+    expect(wrapper).not.toContain("source");
   });
 
   it("shapes ACPX wrapper workspace env for remote execution identities", async () => {
@@ -271,7 +283,9 @@ describe("acpx_local runtime skill isolation", () => {
     const workspaceDir = path.join(root, "workspace");
     await fs.mkdir(workspaceDir, { recursive: true });
 
-    await runExecutor(
+    // Workspace shaping now lands on the memory-only spawn env handed to the
+    // runtime (sessionOptions.env) instead of a wrapper env sidecar file.
+    const { ensureSessionInputs } = await runExecutor(
       {
         agentCommand: "node ./fake-acp.js",
         stateDir,
@@ -303,17 +317,11 @@ describe("acpx_local runtime skill isolation", () => {
         },
       },
     );
-
     const wrappers = await fs.readdir(path.join(stateDir, "wrappers"));
-    const envPath = path.join(
-      stateDir,
-      "wrappers",
-      wrappers.find((name) => name.endsWith(".env"))!,
-    );
-    const env = await fs.readFile(envPath, "utf8");
-
-    expect(env).toContain("PAPERCLIP_WORKSPACE_CWD='/remote/workspace'");
-    expect(env).not.toContain("PAPERCLIP_WORKSPACE_WORKTREE_PATH=");
+    expect(wrappers.filter((name) => name.endsWith(".env"))).toHaveLength(0);
+    const spawnEnv = sessionOptionsOf(ensureSessionInputs[0]).env ?? {};
+    expect(spawnEnv.PAPERCLIP_WORKSPACE_CWD).toBe("/remote/workspace");
+    expect(Object.keys(spawnEnv).some((key) => key.startsWith("PAPERCLIP_WORKSPACE_WORKTREE_PATH"))).toBe(false);
   });
 
   it("cleans aged credential wrapper scripts across ACPX agent changes", async () => {
@@ -345,12 +353,14 @@ describe("acpx_local runtime skill isolation", () => {
 
     const wrappers = await fs.readdir(wrappersDir);
     expect(wrappers.filter((name) => name.endsWith(".sh"))).toHaveLength(1);
-    expect(wrappers.filter((name) => name.endsWith(".env"))).toHaveLength(1);
+    // No env sidecars exist to keep clean — but the aged legacy artifacts
+    // (both the .sh and any pre-fix .env) are still swept.
+    expect(wrappers.filter((name) => name.endsWith(".env"))).toHaveLength(0);
     expect(wrappers.some((name) => name.startsWith("custom-a-"))).toBe(false);
     expect(wrappers.some((name) => name.startsWith("custom-b-"))).toBe(true);
   });
 
-  it("keeps distinct wrapper env files for concurrent runs with different credentials", async () => {
+  it("reuses one value-free wrapper across runs with different credentials", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const baseConfig = {
@@ -359,22 +369,34 @@ describe("acpx_local runtime skill isolation", () => {
       stateDir,
     };
 
-    await runExecutor({
+    // Wrapper identity depends on the env KEY SET only, never values: two
+    // runs with different credential values share one wrapper file, and each
+    // run supplies its own values through the memory-only spawn env.
+    const first = await runExecutor({
       ...baseConfig,
       env: { PAPERCLIP_API_KEY: "first-key" },
     });
-    await runExecutor({
+    const second = await runExecutor({
       ...baseConfig,
       env: { PAPERCLIP_API_KEY: "second-key" },
     });
 
-    const envFileNames = (await fs.readdir(path.join(stateDir, "wrappers"))).filter((name) => name.endsWith(".env"));
-    expect(envFileNames).toHaveLength(2);
-    const envFiles = await Promise.all(
-      envFileNames.map(async (name) => fs.readFile(path.join(stateDir, "wrappers", name), "utf8")),
-    );
-    expect(envFiles.filter((contents) => contents.includes("PAPERCLIP_API_KEY='first-key'"))).toHaveLength(1);
-    expect(envFiles.filter((contents) => contents.includes("PAPERCLIP_API_KEY='second-key'"))).toHaveLength(1);
+    const wrappers = await fs.readdir(path.join(stateDir, "wrappers"));
+    expect(wrappers.filter((name) => name.endsWith(".sh"))).toHaveLength(1);
+    expect(wrappers.filter((name) => name.endsWith(".env"))).toHaveLength(0);
+    for (const name of wrappers) {
+      const contents = await fs.readFile(path.join(stateDir, "wrappers", name), "utf8");
+      expect(contents).not.toContain("first-key");
+      expect(contents).not.toContain("second-key");
+    }
+    const firstEnv = sessionOptionsOf(first.ensureSessionInputs[0]).env ?? {};
+    const secondEnv = sessionOptionsOf(second.ensureSessionInputs[0]).env ?? {};
+    expect(firstEnv.PAPERCLIP_API_KEY).toBe("first-key");
+    expect(secondEnv.PAPERCLIP_API_KEY).toBe("second-key");
+    const firstPersisted = sessionOptionsOf(first.ensureSessionInputs[0]).persistedEnv ?? {};
+    const secondPersisted = sessionOptionsOf(second.ensureSessionInputs[0]).persistedEnv ?? {};
+    expect(firstPersisted.PAPERCLIP_API_KEY).toBe("__paperclip_secret_ref:PAPERCLIP_API_KEY");
+    expect(secondPersisted.PAPERCLIP_API_KEY).toBe("__paperclip_secret_ref:PAPERCLIP_API_KEY");
   });
 
   it("enriches acpx.error diagnostics and child stderr when ensureSession rejects", async () => {

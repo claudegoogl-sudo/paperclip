@@ -8,6 +8,7 @@ import {
   instanceUserRoles,
   invites,
   readEmbeddedPostgresCredential,
+  socketDirectoryPathFor,
 } from "@paperclipai/db";
 import { inferBindModeFromHost } from "@paperclipai/shared";
 import { loadPaperclipEnvFile } from "../config/env.js";
@@ -39,10 +40,13 @@ function resolveDbUrl(configPath?: string, explicitDbUrl?: string) {
           `Start the Paperclip server once so it generates one.`,
       );
     }
+    // The socket dir travels in the URL sentinel; createDb(url) decodes it
+    // and connects via the unix socket (TCP is off on the embedded cluster).
     return buildEmbeddedPostgresConnectionString({
       port,
       database: "paperclip",
       password: cred.password,
+      ...(dataDir ? { socketDir: socketDirectoryPathFor(dataDir) } : {}),
     });
   }
   return null;

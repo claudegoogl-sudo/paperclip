@@ -6,6 +6,49 @@ import { open as openFile } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import { createGunzip, createGzip } from "node:zlib";
 import postgres from "postgres";
+import { resolveEmbeddedPostgresConnection } from "./embedded-postgres-auth.js";
+
+// Build the `pg_dump`/`psql` `--dbname` argument (and the password to pass via
+// PGPASSWORD) for a socket-only embedded cluster. libpq gives an explicit host
+// in the connection *string* precedence over the PGHOST env var, so a URL that
+// pins `host=127.0.0.1` shells out to TCP even when PGHOST points at the unix
+// socket — and against a socket-only cluster (TCP listener killed) that is
+// refused. Emit a libpq keyword/value conninfo with `host=<socketDir>` and no
+// TCP host instead. The password rides in PGPASSWORD (env), never in argv, so
+// it cannot leak via `ps`.
+export function embeddedSocketConninfo(input: {
+  connectionString: string;
+  socketDir: string;
+}): { dbnameArg: string; password: string | null } {
+  const url = new URL(input.connectionString);
+  const user = url.username ? decodeURIComponent(url.username) : "";
+  const password = url.password ? decodeURIComponent(url.password) : null;
+  const dbname = url.pathname.replace(/^\//, "");
+  const port = url.port;
+  // Single-quote each value and escape `'` and `\` per libpq conninfo rules.
+  const kv = (key: string, value: string): string =>
+    `${key}='${value.replace(/(['\\])/g, "\\$1")}'`;
+  const parts = [kv("host", input.socketDir)];
+  if (port) parts.push(kv("port", port));
+  if (user) parts.push(kv("user", user));
+  if (dbname) parts.push(kv("dbname", dbname));
+  return { dbnameArg: parts.join(" "), password };
+}
+
+// Decode a possibly-sentinel-carrying embedded connection string into the
+// arguments a `postgres()` call needs: the sentinel is stripped and, when a
+// unix socket is present, returned as the `{ host }` options override.
+function openBackupSql(
+  connectionString: string,
+  connectTimeout: number,
+): ReturnType<typeof postgres> {
+  const resolved = resolveEmbeddedPostgresConnection(connectionString);
+  return postgres(resolved.connectionString, {
+    max: 1,
+    connect_timeout: connectTimeout,
+    ...resolved.sqlOptions,
+  });
+}
 
 export type BackupRetentionPolicy = {
   dailyDays: number;
@@ -501,10 +544,27 @@ async function runPgDumpBackup(opts: {
   const pgDumpBin = process.env.PAPERCLIP_PG_DUMP_PATH || "pg_dump";
   const partialFile = `${opts.backupFile}.partial`;
 
+  // Strip the `?paperclip_socket=` sentinel: libpq has no such URI option and
+  // would reject it. When a unix socket is present, route pg_dump over it via a
+  // `host=<socketDir>` conninfo (a URL that also pins host=127.0.0.1 would win
+  // over PGHOST and hit the killed TCP listener) with the password in
+  // PGPASSWORD, not argv.
+  const resolved = resolveEmbeddedPostgresConnection(opts.connectionString);
+  const socketDir =
+    "host" in resolved.sqlOptions ? resolved.sqlOptions.host : null;
+  const socketConn = socketDir
+    ? embeddedSocketConninfo({
+        connectionString: resolved.connectionString,
+        socketDir,
+      })
+    : null;
+  const dbnameArg = socketConn
+    ? socketConn.dbnameArg
+    : resolved.connectionString;
   const child = spawn(
     pgDumpBin,
     [
-      `--dbname=${opts.connectionString}`,
+      `--dbname=${dbnameArg}`,
       "--format=plain",
       "--clean",
       "--if-exists",
@@ -515,6 +575,9 @@ async function runPgDumpBackup(opts: {
       stdio: ["ignore", "pipe", "pipe"],
       env: {
         ...process.env,
+        ...(socketConn?.password != null
+          ? { PGPASSWORD: socketConn.password }
+          : {}),
         PGCONNECT_TIMEOUT: String(opts.connectTimeout),
       },
     },
@@ -538,10 +601,25 @@ async function runPgDumpBackup(opts: {
 
 async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: number): Promise<void> {
   const psqlBin = process.env.PAPERCLIP_PSQL_PATH || "psql";
+  // Strip the `?paperclip_socket=` sentinel and, when a unix socket is present,
+  // route psql over it via a `host=<socketDir>` conninfo + PGPASSWORD (see
+  // runPgDumpBackup for why a host-pinned URL would miss the socket).
+  const resolved = resolveEmbeddedPostgresConnection(opts.connectionString);
+  const socketDir =
+    "host" in resolved.sqlOptions ? resolved.sqlOptions.host : null;
+  const socketConn = socketDir
+    ? embeddedSocketConninfo({
+        connectionString: resolved.connectionString,
+        socketDir,
+      })
+    : null;
+  const dbnameArg = socketConn
+    ? socketConn.dbnameArg
+    : resolved.connectionString;
   const child = spawn(
     psqlBin,
     [
-      `--dbname=${opts.connectionString}`,
+      `--dbname=${dbnameArg}`,
       "--set=ON_ERROR_STOP=1",
       "--quiet",
       "--no-psqlrc",
@@ -550,6 +628,9 @@ async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: 
       stdio: ["pipe", "ignore", "pipe"],
       env: {
         ...process.env,
+        ...(socketConn?.password != null
+          ? { PGPASSWORD: socketConn.password }
+          : {}),
         PGCONNECT_TIMEOUT: String(connectTimeout),
       },
     },
@@ -716,7 +797,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
   const canUsePgDump = !hasBackupTransforms(opts);
   const excludedTableNames = normalizeTableNameSet(opts.excludeTables);
   const nullifiedColumnsByTable = normalizeNullifyColumnMap(opts.nullifyColumns);
-  let sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
+  let sql = openBackupSql(opts.connectionString, connectTimeout);
   let sqlClosed = false;
   const closeSql = async () => {
     if (sqlClosed) return;
@@ -753,7 +834,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         if (backupEngine === "pg_dump") {
           throw error;
         }
-        sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
+        sql = openBackupSql(opts.connectionString, connectTimeout);
         sqlClosed = false;
       }
     }
@@ -775,6 +856,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     emitStatement("BEGIN;");
     emitStatement("SET LOCAL session_replication_role = replica;");
     emitStatement("SET LOCAL client_min_messages = warning;");
+    emitStatement("SET LOCAL check_function_bodies = false;");
     emit("");
 
     const allTables = await sql<TableDefinition[]>`
@@ -993,7 +1075,9 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       emit("");
     }
 
-    // Foreign keys (after all tables and referenced unique constraints are created)
+    // Collect foreign keys now. Emit them after routines and standalone indexes
+    // because PostgreSQL permits a non-constraint unique index to be the target
+    // of a foreign key.
     const allForeignKeys = await sql<{
       constraint_name: string;
       source_schema: string;
@@ -1033,14 +1117,29 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         && includedTableNames.has(tableKey(fk.target_schema, fk.target_table)),
     );
 
-    if (fks.length > 0) {
-      emit("-- Foreign keys");
-      for (const fk of fks) {
-        const srcCols = fk.source_columns.map((c) => `"${c}"`).join(", ");
-        const tgtCols = fk.target_columns.map((c) => `"${c}"`).join(", ");
-        emitStatement(
-          `ALTER TABLE ${quoteQualifiedName(fk.source_schema, fk.source_table)} ADD CONSTRAINT "${fk.constraint_name}" FOREIGN KEY (${srcCols}) REFERENCES ${quoteQualifiedName(fk.target_schema, fk.target_table)} (${tgtCols}) ON UPDATE ${fk.update_rule} ON DELETE ${fk.delete_rule};`,
-        );
+    // JavaScript backups are used when a worktree seed filters or transforms
+    // table data. Preserve user-defined routines before indexes because an
+    // expression index may depend on a user-defined function.
+    const routines = await sql<{ definition: string }[]>`
+      SELECT pg_get_functiondef(p.oid) AS definition
+      FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE ${sql.unsafe(nonSystemSchemaPredicate("n.nspname"))}
+        AND p.prokind IN ('f', 'p')
+        AND NOT EXISTS (
+          SELECT 1
+          FROM pg_depend d
+          WHERE d.classid = 'pg_proc'::regclass
+            AND d.objid = p.oid
+            AND d.deptype = 'e'
+        )
+      ORDER BY n.nspname, p.proname, pg_get_function_identity_arguments(p.oid)
+    `;
+    if (routines.length > 0) {
+      emit("-- Functions and procedures");
+      for (const routine of routines) {
+        const definition = routine.definition.trimEnd();
+        emitStatement(definition.endsWith(";") ? definition : `${definition};`);
       }
       emit("");
     }
@@ -1067,6 +1166,18 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       emit("");
     }
 
+    if (fks.length > 0) {
+      emit("-- Foreign keys");
+      for (const fk of fks) {
+        const srcCols = fk.source_columns.map((c) => `"${c}"`).join(", ");
+        const tgtCols = fk.target_columns.map((c) => `"${c}"`).join(", ");
+        emitStatement(
+          `ALTER TABLE ${quoteQualifiedName(fk.source_schema, fk.source_table)} ADD CONSTRAINT "${fk.constraint_name}" FOREIGN KEY (${srcCols}) REFERENCES ${quoteQualifiedName(fk.target_schema, fk.target_table)} (${tgtCols}) ON UPDATE ${fk.update_rule} ON DELETE ${fk.delete_rule};`,
+        );
+      }
+      emit("");
+    }
+
     // Dump data for each table
     for (const { schema_name, tablename } of tables) {
       const currentTableKey = tableKey(schema_name, tablename);
@@ -1089,7 +1200,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       if (backupEngine !== "javascript" && nullifiedColumns.size === 0) {
         emit(`COPY ${qualifiedTableName} (${colNames}) FROM stdin;`);
         await writer.writeRaw("\n");
-        const copySql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
+        const copySql = openBackupSql(opts.connectionString, connectTimeout);
         try {
           const copyStream = await copySql
             .unsafe(`COPY ${qualifiedTableName} (${colNames}) TO STDOUT`)
@@ -1118,6 +1229,33 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
           emitStatement(`INSERT INTO ${qualifiedTableName} (${colNames}) VALUES (${values.join(", ")});`);
         }
         await writer.drain();
+      }
+      emit("");
+    }
+
+    const allTriggers = await sql<{
+      schema_name: string;
+      tablename: string;
+      definition: string;
+    }[]>`
+      SELECT
+        n.nspname AS schema_name,
+        c.relname AS tablename,
+        pg_get_triggerdef(t.oid, true) AS definition
+      FROM pg_trigger t
+      JOIN pg_class c ON c.oid = t.tgrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE NOT t.tgisinternal
+        AND ${sql.unsafe(nonSystemSchemaPredicate("n.nspname"))}
+      ORDER BY n.nspname, c.relname, t.tgname
+    `;
+    const triggers = allTriggers.filter((entry) => (
+      includedTableNames.has(tableKey(entry.schema_name, entry.tablename))
+    ));
+    if (triggers.length > 0) {
+      emit("-- Triggers");
+      for (const trigger of triggers) {
+        emitStatement(`${trigger.definition};`);
       }
       emit("");
     }
@@ -1213,7 +1351,7 @@ export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promi
     }
   }
 
-  const sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
+  const sql = openBackupSql(opts.connectionString, connectTimeout);
 
   try {
     await sql`SELECT 1`;

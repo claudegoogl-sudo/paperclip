@@ -588,9 +588,11 @@ export interface PluginConfigClient {
    * Fork-only background read: the company's effective plugin config
    * (company config row merged with the tenant `configOverrides` subtree),
    * for use OUTSIDE any dispatch (e.g. a `setup()`-started loop). The host
-   * fail-closes unless the plugin is installed and enabled for the named
-   * company, so a worker can only ever read config for a company it is
-   * genuinely provisioned for.
+   * fail-closes unless the named company is genuinely provisioned for this
+   * plugin install — it must hold a `plugin_config` row for it, and the
+   * plugin must be installed and enabled for that company. Every denial
+   * collapses to one opaque error, so a worker can only ever read config
+   * for a company that configured THIS plugin.
    */
   getForServiceScope(companyId: string): Promise<Record<string, unknown>>;
 }
@@ -1018,6 +1020,13 @@ export interface PluginActivityClient {
  *
  * `plugin.state.read` capability required for `get()`.
  * `plugin.state.write` capability required for `set()` and `delete()`.
+ *
+ * SECURITY (company scope): `scopeKind: "company"` keys state by a company id.
+ * Every company-scoped `get()` / `set()` / `delete()` is reach-checked
+ * server-side — the named company must be one the plugin is genuinely
+ * provisioned for (installed, enabled, and not company-disabled) — and a
+ * missing/empty `scopeId` is rejected rather than served as the unkeyed
+ * fallback partition. Calls naming any other company fail closed.
  *
  * @see PLUGIN_SPEC.md §21.3 `plugin_state`
  */
@@ -1514,6 +1523,38 @@ export interface PluginIssueWakeupResult {
   runId: string | null;
 }
 
+/** Hard caps for `issues.listWakeupRequests`. */
+export const PLUGIN_WAKEUP_REQUESTS_MAX_ISSUE_IDS = 200;
+export const PLUGIN_WAKEUP_REQUESTS_MAX_ROWS = 1000;
+export const PLUGIN_WAKEUP_REQUESTS_DEFAULT_STATUSES = ["queued", "deferred_issue_execution"] as const;
+
+/**
+ * Allow-listed view of one `agent_wakeup_requests` row. Payload, context
+ * snapshot, idempotency key, actor ids and error text are never exposed.
+ */
+export interface PluginIssueWakeupRequest {
+  id: string;
+  issueId: string;
+  agentId: string;
+  status: string;
+  reason: string | null;
+  source: string;
+  requestedAt: string;
+}
+
+export interface PluginIssueWakeupRequestListOptions {
+  /**
+   * Statuses to include. Defaults to `queued` + `deferred_issue_execution`
+   * when `since` is not set. When `since` is set and `statuses` is omitted,
+   * rows of ANY status requested at/after `since` are returned.
+   */
+  statuses?: string[];
+  /** ISO timestamp; only rows with requestedAt >= since. */
+  since?: string;
+  /** Max rows (default + cap 1000). Newest first. */
+  limit?: number;
+}
+
 export interface PluginIssueWakeupBatchResult {
   issueId: string;
   queued: boolean;
@@ -1814,6 +1855,16 @@ export interface PluginIssuesClient {
     companyId: string,
     options?: PluginIssueSubtreeOptions,
   ): Promise<PluginIssueSubtree>;
+  /**
+   * Read pending (default: `queued` | `deferred_issue_execution`) or, with
+   * `since`, recent agent wakeup requests for up to 200 issues in one company.
+   * Read-only, allow-listed fields. Requires `issue.wakeups.read`.
+   */
+  listWakeupRequests(
+    issueIds: string[],
+    companyId: string,
+    options?: PluginIssueWakeupRequestListOptions,
+  ): Promise<PluginIssueWakeupRequest[]>;
   requestWakeup(
     issueId: string,
     companyId: string,
@@ -2345,6 +2396,20 @@ export interface PluginAuthorizationClient {
  * Streams are scoped to `(pluginId, channel, companyId)`. Multiple UI clients
  * can subscribe to the same channel concurrently.
  *
+ * Attribution: the host tenant-verifies every notification. Open
+ * the channel inside a dispatch for the target company — the host pins the
+ * channel to that company, so later out-of-dispatch emits (status loops,
+ * reconnect callbacks) are delivered against the pin. Emits that cannot be
+ * attributed are dropped with a plugin-visible `streams.dropped` signal.
+ *
+ * Pins are bounded per worker: once the host's per-worker cap is reached,
+ * capturing a new pin evicts the least-recently pinned channel, and the
+ * eviction is reported with a `streams.dropped` signal
+ * (`reason: "pin_cap_exceeded"`) naming the evicted channel. Close channels
+ * you are done with (`ctx.streams.close`) to stay under the cap; an evicted
+ * channel keeps working inside dispatches but loses its out-of-dispatch
+ * attribution until it is re-opened.
+ *
  * @example
  * ```ts
  * // Worker: stream chat tokens to the UI
@@ -2377,6 +2442,42 @@ export interface PluginStreamsClient {
    * clients so they know no more events will arrive.
    */
   close(channel: string): void;
+
+  /**
+   * Subscribe to host `streams.dropped` feedback for this worker.
+   *
+   * The host tenant-verifies every worker→host `streams.*` notification and
+   * sends a `streams.dropped` notification when it drops one (unknown
+   * invocation scope, pin mismatch, unpinned channel, …). The SDK always
+   * surfaces the drop on the plugin log; this subscription hands the same
+   * notice to plugin code so a worker can repair local bookkeeping that
+   * assumed delivery — e.g. clear a cached "channel is open" mirror so the
+   * next dispatch re-opens the channel instead of deduping against a pin
+   * the host never recorded.
+   *
+   * The handler is fire-and-forget: it runs synchronously off the host
+   * notification loop, and a throw is contained (logged, never propagated
+   * into the readline loop). Returns an unsubscribe function.
+   */
+  onDropped(handler: (notice: StreamDropNotice) => void): () => void;
+}
+
+/**
+ * Host feedback that a worker→host `streams.*` notification was dropped.
+ *
+ * Mirrors the `streams.dropped` notification params the host sends (see
+ * `PLUGIN_SPEC.md` §14 — SDK Surface): every field is optional because the
+ * host omits what the dropped notification did not carry.
+ */
+export interface StreamDropNotice {
+  /** The dropped worker→host notification method (`streams.open`, …). */
+  method?: string;
+  /** Channel of the dropped notification, when one was named. */
+  channel?: string;
+  /** Claimed companyId of the dropped notification, when one was sent. */
+  companyId?: string;
+  /** Why the host dropped it (`invalid_invocation_scope`, `pin_mismatch`, …). */
+  reason?: string;
 }
 
 /**
@@ -2404,7 +2505,7 @@ export interface PluginExecutionClient {
 }
 
 /**
- * `ctx.setupTokenPty` — stream one live login pseudo-terminal's output and exit
+ * `ctx.loginPty` — stream one live login pseudo-terminal's output and exit
  * from a sandbox provider worker to the host.
  *
  * The worker opener registers the output listener on the session and forwards
@@ -2415,7 +2516,7 @@ export interface PluginExecutionClient {
  * chunk or an exit that carries an unknown or a mismatched identifier, and it
  * never logs the raw bytes. The default is a no-op that never throws.
  */
-export interface PluginSetupTokenPtyClient {
+export interface PluginLoginPtyClient {
   /**
    * Deliver one raw output chunk of a live login pseudo-terminal.
    *
@@ -2430,6 +2531,44 @@ export interface PluginSetupTokenPtyClient {
    * @param exitCode - The child exit code, or null when the child ended with no code.
    */
   exit(workerSessionId: string, exitCode: number | null): void;
+}
+
+/**
+ * `ctx.duplexChannel` — stream one persistent duplex channel's data and exit from
+ * a sandbox provider worker to the host.
+ *
+ * The worker registers the data listener on the channel and forwards each raw
+ * chunk through `data(workerSessionId, chunk)`. It forwards the child exit through
+ * `exit(workerSessionId, exitCode)`. Each call carries the worker session
+ * identifier the open reply returned, so the host binds the data to the open route
+ * by that identifier while the route is open. The host drops a chunk or an exit
+ * that carries an unknown or a mismatched identifier, and it never logs the raw
+ * bytes. The default is a no-op that never throws. This client models the
+ * `loginPty` client, but it carries no login command allowlist.
+ */
+export interface PluginDuplexChannelClient {
+  /**
+   * Deliver one raw data chunk of a persistent duplex channel.
+   *
+   * @param hostRouteId - The host route identifier the open request carried. The worker echoes it, so the host routes the exact pair.
+   * @param workerSessionId - The worker session identifier the open reply returned.
+   * @param chunk - The raw channel output bytes.
+   */
+  data(hostRouteId: string, workerSessionId: string, chunk: Uint8Array): void;
+  /**
+   * Deliver the child exit of a persistent duplex channel.
+   *
+   * @param hostRouteId - The host route identifier the open request carried. The worker echoes it, so the host routes the exact pair.
+   * @param workerSessionId - The worker session identifier the open reply returned.
+   * @param exitCode - The child exit code, or null when the child ended with no code.
+   * @param transportClosed - True when the transport closed with no exit data, so the exit is a reason-less transport close, not a process exit. Absent marks a real process exit.
+   */
+  exit(
+    hostRouteId: string,
+    workerSessionId: string,
+    exitCode: number | null,
+    transportClosed?: boolean,
+  ): void;
 }
 
 // ---------------------------------------------------------------------------
@@ -2560,7 +2699,11 @@ export interface PluginContext {
   /** Stream one live login pseudo-terminal's output and exit to the host.
    * The default is a no-op for a provider that opens no login
    * pseudo-terminal. */
-  setupTokenPty: PluginSetupTokenPtyClient;
+  loginPty: PluginLoginPtyClient;
+
+  /** Stream one persistent duplex channel's data and exit to the host. The
+   * default is a no-op for a provider that opens no duplex channel. */
+  duplexChannel: PluginDuplexChannelClient;
 
   /** Register agent tool handlers. Requires `agent.tools.register`. */
   tools: PluginToolsClient;

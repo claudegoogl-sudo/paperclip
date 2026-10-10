@@ -307,4 +307,28 @@ describe("redactSensitiveText serialized-JSON integrity", () => {
     expect(redactedLine).not.toContain("github_pat_11AAAA");
     expect(() => JSON.parse(redactedLine)).not.toThrow();
   });
+
+  it("JSON line keeps its trailing newline through redaction", () => {
+    // Run-log consumers persist one JSON event per NDJSON line and join
+    // records on the newline boundary. If redaction drops the trailing "\n",
+    // adjacent lines merge into one unparseable blob.
+    registerRunSecretValue(RUN_ID, KEY);
+    const event = { type: "message_end", message: `token ${KEY} used` };
+    const lineWithNewline = `${JSON.stringify(event)}\n`;
+
+    const redacted = redactSensitiveText(lineWithNewline);
+
+    expect(redacted.endsWith("\n")).toBe(true);
+    // Positive control: the fix must not weaken scrubbing.
+    expect(redacted).not.toContain(KEY);
+    const parsed = JSON.parse(redacted.trimEnd()) as typeof event;
+    expect(parsed.message).toBe(`token ${REDACTED_VAULT_VALUE} used`);
+
+    // Leading whitespace (e.g. indentation from a pretty-printed transcript)
+    // must be preserved too.
+    const leadingWhitespace = `  ${JSON.stringify(event)}`;
+    const redactedLeading = redactSensitiveText(leadingWhitespace);
+    expect(redactedLeading.startsWith("  ")).toBe(true);
+    expect(redactedLeading).not.toContain(KEY);
+  });
 });

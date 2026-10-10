@@ -129,63 +129,68 @@ function denySkillPolicy(action = "skills.import") {
   };
 }
 
-function registerModuleMocks() {
-  vi.doMock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
+// Hoisted module mocks (not per-test vi.doMock + vi.resetModules): the mock
+// registry must be in place before ANY import of the route module, in every
+// test. createApp concurrently importActual()s middleware and route modules
+// whose graphs share the mocked services, so a load-dependent registry race
+// could bind the REAL services module and 500 the request under test
+// (master Release runs 35877211616 / 35888840397). A hoisted vi.mock applies
+// to every import graph deterministically.
 
-  vi.doMock("@paperclipai/shared/telemetry", () => ({
+  vi.mock("@paperclipai/shared/telemetry", () => ({
     trackSkillImported: mockTrackSkillImported,
     trackErrorHandlerCrash: vi.fn(),
   }));
 
-  vi.doMock("../telemetry.js", () => ({
+  vi.mock("../telemetry.js", () => ({
     getTelemetryClient: mockGetTelemetryClient,
   }));
 
-  vi.doMock("../services/access.js", () => ({
+  vi.mock("../services/access.js", () => ({
     accessService: () => mockAccessService,
   }));
 
-  vi.doMock("../services/activity-log.js", () => ({
+  vi.mock("../services/activity-log.js", () => ({
     logActivity: mockLogActivity,
   }));
 
-  vi.doMock("../services/agents.js", () => ({
+  vi.mock("../services/agents.js", () => ({
     agentService: () => mockAgentService,
   }));
 
-  vi.doMock("../services/company-skills.js", async () => {
+  vi.mock("../services/company-skills.js", async () => {
     const actual = await vi.importActual<typeof import("../services/company-skills.js")>(
-      "../services/company-skills.js",
+  "../services/company-skills.js",
     );
     return {
-      ...actual,
-      companySkillService: () => mockCompanySkillService,
+  ...actual,
+  companySkillService: () => mockCompanySkillService,
     };
   });
 
-  vi.doMock("../services/company-skill-policy.js", async () => {
+  vi.mock("../services/company-skill-policy.js", async () => {
     const actual = await vi.importActual<typeof import("../services/company-skill-policy.js")>(
-      "../services/company-skill-policy.js",
+  "../services/company-skill-policy.js",
     );
     return {
-      ...actual,
-      companySkillPolicyService: () => mockCompanySkillPolicyService,
+  ...actual,
+  companySkillPolicyService: () => mockCompanySkillPolicyService,
     };
   });
 
-  vi.doMock("../services/skills-catalog.js", () => mockCatalogService);
+  vi.mock("../services/skills-catalog.js", () => mockCatalogService);
 
-  vi.doMock("../services/change-consent-gate.js", async () => {
+  vi.mock("../services/change-consent-gate.js", async () => {
     const actual = await vi.importActual<typeof import("../services/change-consent-gate.js")>(
-      "../services/change-consent-gate.js",
+  "../services/change-consent-gate.js",
     );
     return {
-      ...actual,
-      changeConsentGateService: () => mockReflectionCoachMutationGate,
+  ...actual,
+  changeConsentGateService: () => mockReflectionCoachMutationGate,
     };
   });
 
-  vi.doMock("../services/index.js", () => ({
+  vi.mock("../services/index.js", () => ({
     accessService: () => mockAccessService,
     agentService: () => mockAgentService,
     companySkillService: () => mockCompanySkillService,
@@ -193,7 +198,7 @@ function registerModuleMocks() {
     heartbeatService: () => mockHeartbeatService,
     logActivity: mockLogActivity,
   }));
-}
+
 
 async function createApp(actor: Record<string, unknown>) {
   const [{ companySkillRoutes }, { errorHandler }] = await Promise.all([
@@ -213,21 +218,6 @@ async function createApp(actor: Record<string, unknown>) {
 
 describe("company skill mutation permissions", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("@paperclipai/shared/telemetry");
-    vi.doUnmock("../telemetry.js");
-    vi.doUnmock("../services/access.js");
-    vi.doUnmock("../services/activity-log.js");
-    vi.doUnmock("../services/agents.js");
-    vi.doUnmock("../services/company-skills.js");
-    vi.doUnmock("../services/company-skill-policy.js");
-    vi.doUnmock("../services/skills-catalog.js");
-    vi.doUnmock("../services/change-consent-gate.js");
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../routes/company-skills.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
     mockGetTelemetryClient.mockReturnValue({ track: vi.fn() });
     mockCompanySkillService.importFromSource.mockResolvedValue({

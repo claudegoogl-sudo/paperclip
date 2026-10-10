@@ -91,10 +91,23 @@ vi.mock("../adapters", () => ({
   getUIAdapter: (type: string) => ({
     type,
     label: type === "hermes_gateway" ? "Hermes Gateway" : "Codex",
-    ConfigFields: ({ adapterType }: { adapterType: string }) =>
+    // The stand-in also records the two gates the form resolves for every
+    // adapter, so a test can assert the plumbing without rendering a real
+    // adapter's fields.
+    ConfigFields: ({ adapterType, hideInstructionsFile, managedSandboxOnly }: {
+      adapterType: string;
+      hideInstructionsFile?: boolean;
+      managedSandboxOnly?: boolean;
+    }) =>
       adapterType === "hermes_gateway"
         ? <div data-testid="hermes-gateway-config-fields">Hermes Gateway fields</div>
-        : null,
+        : (
+          <div
+            data-testid="adapter-config-fields"
+            data-hide-instructions-file={String(hideInstructionsFile === true)}
+            data-managed-sandbox-only={String(managedSandboxOnly === true)}
+          />
+        ),
     buildAdapterConfig: (values: { model?: string }) => ({
       model: values.model || undefined,
     }),
@@ -102,9 +115,28 @@ vi.mock("../adapters", () => ({
   }),
 }));
 
+// The projected login capability per adapter type. The server projects these
+// safe scalar fields. `codex_local` drives the displayed-code panel; `claude_local`
+// drives the submitted-browser-code panel. A test overrides this map to add a
+// third adapter with a projected login capability.
+const mockLoginProjections = vi.hoisted(
+  () =>
+    new Map<string, { panelMode: string; timeoutPolicy: string }>([
+      ["codex_local", { panelMode: "displayed_code", timeoutPolicy: "caller_bounded" }],
+      ["claude_local", { panelMode: "submitted_browser_code", timeoutPolicy: "fixed" }],
+      // A third adapter, not a built-in, with a projected displayed-code login.
+      ["vendor_local", { panelMode: "displayed_code", timeoutPolicy: "caller_bounded" }],
+      // A non-built-in adapter with a submitted-browser-code login. Every login
+      // runs on a real pseudo-terminal, so the gate requires the provider pty
+      // capability from the login capability, not the adapter name.
+      ["pty_vendor_local", { panelMode: "submitted_browser_code", timeoutPolicy: "fixed" }],
+    ]),
+);
+
 vi.mock("../adapters/use-adapter-capabilities", () => ({
-  useAdapterCapabilities: () => (adapterType: string) =>
-    adapterType === "hermes_gateway"
+  useAdapterCapabilities: () => (adapterType: string) => {
+    const login = mockLoginProjections.get(adapterType);
+    return adapterType === "hermes_gateway"
       ? {
           supportsInstructionsBundle: false,
           supportsSkills: false,
@@ -120,7 +152,9 @@ vi.mock("../adapters/use-adapter-capabilities", () => ({
           requiresMaterializedRuntimeSkills: false,
           supportsModelProfiles: true,
           supportsAcp: true,
-        },
+          ...(login ? { login } : {}),
+        };
+  },
 }));
 
 vi.mock("../adapters/use-disabled-adapters", () => ({
@@ -318,6 +352,32 @@ const AUTH_MISSING_RESULT = {
   testedAt: new Date(0).toISOString(),
 };
 
+const VENDOR_AUTH_MISSING_RESULT = {
+  adapterType: "vendor_local",
+  status: "fail",
+  checks: [
+    {
+      code: "adapter_auth_missing",
+      level: "error",
+      message: "The sandbox has no ready authentication.",
+    },
+  ],
+  testedAt: new Date(0).toISOString(),
+};
+
+const PTY_VENDOR_AUTH_MISSING_RESULT = {
+  adapterType: "pty_vendor_local",
+  status: "fail",
+  checks: [
+    {
+      code: "adapter_auth_missing",
+      level: "error",
+      message: "The sandbox has no ready authentication.",
+    },
+  ],
+  testedAt: new Date(0).toISOString(),
+};
+
 const CLAUDE_AUTH_MISSING_RESULT = {
   adapterType: "claude_local",
   status: "warn",
@@ -341,8 +401,8 @@ const CLAUDE_AUTH_MISSING_RESULT = {
 // for a provider with the capability.
 const SANDBOX_CAPABILITIES = getEnvironmentCapabilities(["claude_local", "codex_local"], {
   sandboxProviders: {
-    daytona: { supportsSetupTokenLogin: true, displayName: "Daytona" },
-    e2b: { supportsSetupTokenLogin: false, displayName: "E2B" },
+    daytona: { supportsLoginPty: true, displayName: "Daytona" },
+    e2b: { supportsLoginPty: false, displayName: "E2B" },
   },
 });
 
@@ -362,12 +422,31 @@ async function renderCodexSandbox(agentOverrides: Partial<Agent> = {}) {
       makeEnvironment({ id: "local-1", name: "Local", driver: "local" }),
       makeEnvironment({
         id: "sandbox-1",
-        name: "E2B",
+        name: "Daytona",
         driver: "sandbox",
-        config: { provider: "e2b" },
+        config: { provider: "daytona" },
       }),
     ],
     { defaultEnvironmentId: "sandbox-1", ...agentOverrides },
+    { showAdapterTestEnvironmentButton: true },
+  );
+}
+
+// A third adapter, not a built-in, in a sandbox environment. Its projected login
+// capability drives the login affordance and the displayed-code panel. The
+// provider advertises the login pseudo-terminal capability the login needs.
+async function renderVendorSandbox(agentOverrides: Partial<Agent> = {}) {
+  return renderForm(
+    [
+      makeEnvironment({ id: "local-1", name: "Local", driver: "local" }),
+      makeEnvironment({
+        id: "sandbox-1",
+        name: "Daytona",
+        driver: "sandbox",
+        config: { provider: "daytona" },
+      }),
+    ],
+    { adapterType: "vendor_local", defaultEnvironmentId: "sandbox-1", ...agentOverrides },
     { showAdapterTestEnvironmentButton: true },
   );
 }
@@ -678,6 +757,28 @@ describe("AgentConfigForm environment selector", () => {
     expect(selector?.textContent).toContain("E2B · sandbox");
   });
 
+  it("shows the environment override for Kimi local agents", async () => {
+    const result = await renderForm(
+      [
+        makeEnvironment({ id: "local-1", name: "Local", driver: "local" }),
+        makeEnvironment({
+          id: "sandbox-1",
+          name: "E2B",
+          driver: "sandbox",
+          config: { provider: "e2b" },
+        }),
+      ],
+      { adapterType: "kimi_local" },
+    );
+    roots.push(result.root);
+
+    const text = result.container.textContent ?? "";
+    const selector = result.container.querySelector("select");
+
+    expect(text).toContain("Environment override");
+    expect(selector?.textContent).toContain("E2B · sandbox");
+  });
+
   it("keeps an existing non-runnable override visible so it can be cleared", async () => {
     const result = await renderForm(
       [
@@ -699,6 +800,27 @@ describe("AgentConfigForm environment selector", () => {
     expect(text).toContain("Environment override");
     expect(selector?.textContent).toContain("Default: Local");
     expect(selector?.textContent).toContain("Fake Sandbox · sandbox");
+  });
+
+  it("labels the platform-managed instance default by name, without the driver key", async () => {
+    mockInstanceSettingsApi.get.mockResolvedValue({ defaultEnvironmentId: "managed-1" });
+    const result = await renderForm([
+      makeEnvironment({
+        id: "managed-1",
+        name: "Paperclip Computer",
+        driver: "sandbox",
+        config: { provider: "daytona" },
+        metadata: { managedByPaperclip: true },
+      }),
+    ]);
+    roots.push(result.root);
+
+    const selector = result.container.querySelector("select");
+
+    expect(selector?.textContent).toContain("Default: Paperclip Computer");
+    expect(selector?.textContent).toContain("Paperclip Computer");
+    expect(selector?.textContent).not.toContain("(sandbox)");
+    expect(selector?.textContent).not.toContain("· sandbox");
   });
 
   it("renders non-local adapter config fields in the Adapter card", async () => {
@@ -935,6 +1057,56 @@ describe("AgentConfigForm environment selector", () => {
     expect(findButton(result.container, "Log in")).toBeTruthy();
   });
 
+  it("hides the Codex login for a provider without the login pseudo-terminal capability", async () => {
+    // The Codex device login runs on a real pseudo-terminal, so it needs a
+    // provider that advertises the login pseudo-terminal capability. E2B reports
+    // no capability, so the panel stays hidden even after the auth-missing check.
+    mockAgentsApi.testEnvironment.mockResolvedValue(AUTH_MISSING_RESULT);
+    const result = await renderForm(
+      [
+        makeEnvironment({ id: "local-1", name: "Local", driver: "local" }),
+        makeEnvironment({
+          id: "sandbox-1",
+          name: "E2B",
+          driver: "sandbox",
+          config: { provider: "e2b" },
+        }),
+      ],
+      { adapterType: "codex_local", defaultEnvironmentId: "sandbox-1" },
+      { showAdapterTestEnvironmentButton: true },
+    );
+    roots.push(result.root);
+
+    await runTest(result.container);
+
+    expect(findButton(result.container, "Log in")).toBeFalsy();
+  });
+
+  it("shows the login affordance and the displayed-code panel for a third adapter with a projected login capability", async () => {
+    // The adapter is not a built-in. Its projected login capability drives the
+    // login affordance and the panel, so the form reads the capability, not the
+    // adapter name. The displayed-code panel shows the server code.
+    mockAgentsApi.testEnvironment.mockResolvedValue(VENDOR_AUTH_MISSING_RESULT);
+    const result = await renderVendorSandbox();
+    roots.push(result.root);
+
+    expect(findButton(result.container, "Log in")).toBeFalsy();
+
+    await runTest(result.container);
+
+    // The projected capability gates the login affordance on for the third
+    // adapter.
+    expect(findButton(result.container, "Log in")).toBeTruthy();
+
+    await startLogin(result.container);
+
+    // The displayed-code panel shows the one-time code and the authentication
+    // URL. It shows no browser-code input, so the dispatcher picked the panel
+    // from the projected `displayed_code` mode.
+    expect(result.container.textContent).toContain("WXYZ-1234");
+    expect(result.container.querySelector('input[aria-label="Browser code"]')).toBeFalsy();
+  });
+
   it("hides the Login button before Test and shows it after the adapter_auth_missing check for a Claude sandbox", async () => {
     mockAgentsApi.testEnvironment.mockResolvedValue(CLAUDE_AUTH_MISSING_RESULT);
     const result = await renderClaudeSandbox();
@@ -973,7 +1145,7 @@ describe("AgentConfigForm environment selector", () => {
 
   it("hides the Login button for a Daytona sandbox while the capabilities report no setup-token support", async () => {
     // Reproduces the reported defect: the Test carries the auth-missing check,
-    // but the capabilities endpoint reports `supportsSetupTokenLogin: false`
+    // but the capabilities endpoint reports `supportsLoginPty: false`
     // for Daytona (a stale persisted plugin manifest). The gate hides the
     // panel. The server-side fix refreshes the persisted manifest so the
     // capability reports true and the panel shows (see the companion positive
@@ -982,7 +1154,7 @@ describe("AgentConfigForm environment selector", () => {
     mockEnvironmentsApi.capabilities.mockResolvedValue(
       getEnvironmentCapabilities(["claude_local", "codex_local"], {
         sandboxProviders: {
-          daytona: { supportsSetupTokenLogin: false, displayName: "Daytona" },
+          daytona: { supportsLoginPty: false, displayName: "Daytona" },
         },
       }),
     );
@@ -1006,6 +1178,57 @@ describe("AgentConfigForm environment selector", () => {
     expect(findButton(result.container, "Log in")).toBeFalsy();
   });
 
+  it("gates a pseudo-terminal login on the provider pty capability for a non-Claude adapter", async () => {
+    // The gate reads the adapter login transport, not the adapter name. This
+    // adapter is not `claude_local`, but its login runs on a pseudo-terminal.
+    // The E2B provider reports no pty capability, so the panel stays hidden even
+    // after the auth-missing check.
+    mockAgentsApi.testEnvironment.mockResolvedValue(PTY_VENDOR_AUTH_MISSING_RESULT);
+    const result = await renderForm(
+      [
+        makeEnvironment({ id: "local-1", name: "Local", driver: "local" }),
+        makeEnvironment({
+          id: "sandbox-1",
+          name: "E2B",
+          driver: "sandbox",
+          config: { provider: "e2b" },
+        }),
+      ],
+      { adapterType: "pty_vendor_local", defaultEnvironmentId: "sandbox-1" },
+      { showAdapterTestEnvironmentButton: true },
+    );
+    roots.push(result.root);
+
+    await runTest(result.container);
+
+    expect(findButton(result.container, "Log in")).toBeFalsy();
+  });
+
+  it("shows a pseudo-terminal login for a non-Claude adapter when the provider advertises pty support", async () => {
+    // The same non-Claude pseudo-terminal adapter on Daytona. Daytona advertises
+    // the pty capability, so the panel shows. This confirms the gate follows the
+    // provider capability, not the adapter name.
+    mockAgentsApi.testEnvironment.mockResolvedValue(PTY_VENDOR_AUTH_MISSING_RESULT);
+    const result = await renderForm(
+      [
+        makeEnvironment({ id: "local-1", name: "Local", driver: "local" }),
+        makeEnvironment({
+          id: "sandbox-1",
+          name: "Daytona",
+          driver: "sandbox",
+          config: { provider: "daytona" },
+        }),
+      ],
+      { adapterType: "pty_vendor_local", defaultEnvironmentId: "sandbox-1" },
+      { showAdapterTestEnvironmentButton: true },
+    );
+    roots.push(result.root);
+
+    await runTest(result.container);
+
+    expect(findButton(result.container, "Log in")).toBeTruthy();
+  });
+
   it("shows the Login button when a parent lifts the test feedback and renders the panel from the descriptor", async () => {
     // The create page hides the inline feedback branch and renders the test
     // result and the login panel itself. This harness mirrors that parent: it
@@ -1016,9 +1239,9 @@ describe("AgentConfigForm environment selector", () => {
       makeEnvironment({ id: "local-1", name: "Local", driver: "local" }),
       makeEnvironment({
         id: "sandbox-1",
-        name: "E2B",
+        name: "Daytona",
         driver: "sandbox",
-        config: { provider: "e2b" },
+        config: { provider: "daytona" },
       }),
     ]);
 
@@ -1097,6 +1320,73 @@ describe("AgentConfigForm environment selector", () => {
     roots.push(result.root);
 
     await runTest(result.container);
+
+    expect(findButton(result.container, "Log in")).toBeFalsy();
+  });
+
+  it("shows the Login button for an agent with no own environment under the managed-sandbox-only policy", async () => {
+    // The agent has no own environment, so the login target resolves the same
+    // way as the adapter Test target. The managed-sandbox-only policy redirects
+    // that resolution from the hidden local environment to the managed sandbox.
+    // The login affordance must read the managed sandbox, so it shows after the
+    // auth-missing check. A login target that stayed local would hide the panel
+    // for the target the real run uses.
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({
+      enableEnvironments: true,
+      enableManagedSandboxOnly: true,
+    });
+    mockAgentsApi.testEnvironment.mockResolvedValue(CLAUDE_AUTH_MISSING_RESULT);
+    const result = await renderForm(
+      [
+        makeEnvironment({
+          id: "local-1",
+          name: "Local",
+          driver: "local",
+          metadata: { defaultForInstance: true },
+        }),
+        makeEnvironment({
+          id: "managed-1",
+          name: "Managed",
+          driver: "sandbox",
+          config: { provider: "daytona" },
+          metadata: { managedByPaperclip: true },
+        }),
+      ],
+      { adapterType: "claude_local", defaultEnvironmentId: null },
+      { showAdapterTestEnvironmentButton: true },
+    );
+    roots.push(result.root);
+
+    expect(findButton(result.container, "Log in")).toBeFalsy();
+
+    await runTest(result.container);
+
+    expect(findButton(result.container, "Log in")).toBeTruthy();
+  });
+
+  it("keeps the Login button hidden under the managed-sandbox-only policy when no managed sandbox is available", async () => {
+    // The policy is on, but no managed sandbox environment exists, so the login
+    // target resolution fails closed. The render catches that failure and
+    // resolves no login environment, so the affordance stays hidden. The Test
+    // surfaces the same case as a fail-closed error.
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({
+      enableEnvironments: true,
+      enableManagedSandboxOnly: true,
+    });
+    mockAgentsApi.testEnvironment.mockResolvedValue(CLAUDE_AUTH_MISSING_RESULT);
+    const result = await renderForm(
+      [
+        makeEnvironment({
+          id: "local-1",
+          name: "Local",
+          driver: "local",
+          metadata: { defaultForInstance: true },
+        }),
+      ],
+      { adapterType: "claude_local", defaultEnvironmentId: null },
+      { showAdapterTestEnvironmentButton: true },
+    );
+    roots.push(result.root);
 
     expect(findButton(result.container, "Log in")).toBeFalsy();
   });
@@ -2408,4 +2698,148 @@ describe("AgentConfigForm edit-mode Claude OAuth binding", () => {
     expect(bindings.CLAUDE_CODE_OAUTH_TOKEN).toEqual(FIXED_CLAUDE_OAUTH_BINDING);
   });
 
+});
+
+describe("AgentConfigForm managed-sandbox-only host surfaces", () => {
+  let roots: Root[] = [];
+
+  const MANAGED_AGENT_CONFIG = {
+    cwd: "/srv/agents/cody",
+    command: "claude",
+    engine: "acp",
+    agentCommand: "claude-agent-acp",
+    stateDir: "/srv/agents/cody/acp-state",
+  };
+
+  function setManagedSandboxOnly(enabled: boolean) {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({
+      enableEnvironments: true,
+      enableManagedSandboxOnly: enabled,
+    });
+  }
+
+  /** Every `Field` renders its label in a `<label>`, so this reads the form. */
+  function fieldLabels(container: HTMLElement) {
+    return Array.from(container.querySelectorAll("label")).map((label) => label.textContent?.trim() ?? "");
+  }
+
+  function choosePathButtons(container: HTMLElement) {
+    return Array.from(container.querySelectorAll("button")).filter(
+      (button) => button.textContent?.trim() === "Choose",
+    );
+  }
+
+  beforeEach(() => {
+    mockAgentsApi.adapterModelProfiles.mockResolvedValue([]);
+    mockAgentsApi.adapterModels.mockResolvedValue([]);
+    mockAgentsApi.detectModel.mockResolvedValue(null);
+    mockAgentsApi.list.mockResolvedValue([]);
+    mockInstanceSettingsApi.get.mockResolvedValue({ defaultEnvironmentId: null });
+    mockInstanceSettingsApi.getGeneral.mockResolvedValue({ executionMode: "any" });
+    mockEnvironmentsApi.capabilities.mockResolvedValue(SANDBOX_CAPABILITIES);
+    mockSecretsApi.list.mockResolvedValue([]);
+    mockSecretsApi.listProposals.mockResolvedValue([]);
+    mockAgentsApi.getClaudeOAuthTokenStatus.mockResolvedValue(null);
+    setManagedSandboxOnly(false);
+  });
+
+  afterEach(async () => {
+    for (const root of roots) {
+      await act(async () => {
+        root.unmount();
+      });
+    }
+    roots = [];
+    document.body.innerHTML = "";
+    vi.clearAllMocks();
+  });
+
+  it("shows the host path and execution-engine fields when the policy is off", async () => {
+    const result = await renderForm(
+      [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
+      { adapterType: "claude_local", adapterConfig: MANAGED_AGENT_CONFIG },
+    );
+    roots.push(result.root);
+
+    const labels = fieldLabels(result.container);
+    expect(labels).toContain("Working directory (deprecated)");
+    expect(labels).toContain("Command");
+    expect(labels).toContain("Execution engine");
+    expect(labels).toContain("ACP server command");
+    expect(labels).toContain("ACP state directory");
+    expect(choosePathButtons(result.container).length).toBeGreaterThan(0);
+
+    const adapterFields = result.container.querySelector('[data-testid="adapter-config-fields"]');
+    expect(adapterFields?.getAttribute("data-managed-sandbox-only")).toBe("false");
+    expect(adapterFields?.getAttribute("data-hide-instructions-file")).toBe("false");
+  });
+
+  it("hides the host path and execution-engine fields for claude_local when the policy is on", async () => {
+    setManagedSandboxOnly(true);
+    const result = await renderForm(
+      [makeEnvironment({ id: "managed-1", name: "Managed", driver: "sandbox", config: { provider: "daytona" } })],
+      { adapterType: "claude_local", adapterConfig: MANAGED_AGENT_CONFIG },
+    );
+    roots.push(result.root);
+
+    const labels = fieldLabels(result.container);
+    expect(labels).not.toContain("Working directory (deprecated)");
+    expect(labels).not.toContain("Command");
+    expect(labels).not.toContain("Execution engine");
+    expect(labels).not.toContain("ACP server command");
+    expect(labels).not.toContain("ACP state directory");
+    expect(choosePathButtons(result.container)).toHaveLength(0);
+    // The stored values stay untouched: hiding is presentation, and an import
+    // that carries adapter configuration from another instance must still save.
+    expect(result.container.textContent).not.toContain("/srv/agents/cody");
+  });
+
+  it("keeps the non-path ACP controls visible when the policy hides the engine choice", async () => {
+    setManagedSandboxOnly(true);
+    const result = await renderForm(
+      [makeEnvironment({ id: "managed-1", name: "Managed", driver: "sandbox", config: { provider: "daytona" } })],
+      { adapterType: "claude_local", adapterConfig: MANAGED_AGENT_CONFIG },
+    );
+    roots.push(result.root);
+
+    const labels = fieldLabels(result.container);
+    expect(labels).toContain("ACP session mode");
+    expect(labels).toContain("ACP non-interactive permissions");
+  });
+
+  it("keeps the host-path fields hidden while the policy is still loading", async () => {
+    // A cold cache resolves the policy to false on the first render. The gate
+    // fails closed so a managed instance never flashes a stored host path.
+    mockInstanceSettingsApi.getExperimental.mockImplementation(() => new Promise(() => {}));
+    const result = await renderForm(
+      [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
+      { adapterType: "claude_local", adapterConfig: MANAGED_AGENT_CONFIG },
+    );
+    roots.push(result.root);
+
+    const labels = fieldLabels(result.container);
+    expect(labels).not.toContain("Working directory (deprecated)");
+    expect(labels).not.toContain("Command");
+    expect(labels).not.toContain("Execution engine");
+    expect(choosePathButtons(result.container)).toHaveLength(0);
+    expect(result.container.textContent).not.toContain("/srv/agents/cody");
+  });
+
+  it("hides the command field and forces the instructions-file gate for codex_local when the policy is on", async () => {
+    setManagedSandboxOnly(true);
+    const result = await renderForm(
+      [makeEnvironment({ id: "managed-1", name: "Managed", driver: "sandbox", config: { provider: "daytona" } })],
+      { adapterType: "codex_local", adapterConfig: MANAGED_AGENT_CONFIG },
+    );
+    roots.push(result.root);
+
+    const labels = fieldLabels(result.container);
+    expect(labels).not.toContain("Working directory (deprecated)");
+    expect(labels).not.toContain("Command");
+    expect(choosePathButtons(result.container)).toHaveLength(0);
+
+    const adapterFields = result.container.querySelector('[data-testid="adapter-config-fields"]');
+    expect(adapterFields?.getAttribute("data-managed-sandbox-only")).toBe("true");
+    expect(adapterFields?.getAttribute("data-hide-instructions-file")).toBe("true");
+  });
 });

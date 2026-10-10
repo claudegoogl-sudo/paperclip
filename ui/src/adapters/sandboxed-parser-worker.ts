@@ -43,25 +43,38 @@ const WORKER_BOOTSTRAP = `
 
 const _undefined = void 0;
 
+// Some of these globals (notably 'caches') are spec'd as readonly
+// accessor properties on WorkerGlobalScope in current browser engines —
+// a direct 'self.caches = _undefined' throws "Cannot set property caches
+// ... which has only a getter" in strict mode, which aborted worker
+// bootstrap entirely (worker.onerror fired before 'ready' was ever sent,
+// so every external-adapter UI parser silently failed to load and every
+// run log/preview fell back to raw unstyled stdout lines). Route every
+// shadow through a helper that swallows a getter-only TypeError instead
+// of letting it kill the whole bootstrap script.
+function shadowGlobal(name) {
+  try { self[name] = _undefined; } catch {}
+}
+
 // Network
-self.fetch = _undefined;
-self.XMLHttpRequest = _undefined;
-self.WebSocket = _undefined;
-self.EventSource = _undefined;
-self.RTCPeerConnection = _undefined;
-self.RTCDataChannel = _undefined;
-self.Request = _undefined;
-self.Response = _undefined;
-self.Headers = _undefined;
-self.Cache = _undefined;
-self.CacheStorage = _undefined;
-self.caches = _undefined;
+shadowGlobal("fetch");
+shadowGlobal("XMLHttpRequest");
+shadowGlobal("WebSocket");
+shadowGlobal("EventSource");
+shadowGlobal("RTCPeerConnection");
+shadowGlobal("RTCDataChannel");
+shadowGlobal("Request");
+shadowGlobal("Response");
+shadowGlobal("Headers");
+shadowGlobal("Cache");
+shadowGlobal("CacheStorage");
+shadowGlobal("caches");
 
 // Import / eval escape hatches
-self.importScripts = _undefined;
-self.Worker = _undefined;
-self.SharedWorker = _undefined;
-self.Blob = _undefined;
+shadowGlobal("importScripts");
+shadowGlobal("Worker");
+shadowGlobal("SharedWorker");
+shadowGlobal("Blob");
 if (self.URL) {
   try { Object.defineProperty(self.URL, "createObjectURL", { value: _undefined, writable: false, configurable: false }); } catch {}
   try { Object.defineProperty(self.URL, "revokeObjectURL", { value: _undefined, writable: false, configurable: false }); } catch {}
@@ -73,11 +86,11 @@ if (self.navigator) {
 }
 
 // Service worker / broadcast channel
-self.BroadcastChannel = _undefined;
+shadowGlobal("BroadcastChannel");
 
 // IndexedDB (prevents persistent state exfiltration)
-self.indexedDB = _undefined;
-self.IDBFactory = _undefined;
+shadowGlobal("indexedDB");
+shadowGlobal("IDBFactory");
 
 // ── 2. Parser state ─────────────────────────────────────────────────────────
 

@@ -46,23 +46,28 @@ const mockFeedbackService = vi.hoisted(() => ({
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
 
-function registerCompanyRouteMocks() {
-  vi.doMock("../services/index.js", () => ({
-    accessService: () => mockAccessService,
-    agentService: () => mockAgentService,
-    budgetService: () => mockBudgetService,
-    companyArtifactsService: () => mockCompanyArtifactsService,
-    companyPortabilityService: () => mockCompanyPortabilityService,
-    companyService: () => mockCompanyService,
-    feedbackService: () => mockFeedbackService,
-    logActivity: mockLogActivity,
-  }));
-}
-
 let appImportCounter = 0;
 
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("../services/index.js", () => ({
+  accessService: () => mockAccessService,
+  agentService: () => mockAgentService,
+  budgetService: () => mockBudgetService,
+  companyArtifactsService: () => mockCompanyArtifactsService,
+  companyPortabilityService: () => mockCompanyPortabilityService,
+  companyService: () => mockCompanyService,
+  feedbackService: () => mockFeedbackService,
+  logActivity: mockLogActivity,
+}));
+
 async function createApp(actor: Record<string, unknown>) {
-  registerCompanyRouteMocks();
   appImportCounter += 1;
   const routeModulePath = `../routes/companies.js?cross-company-authz-${appImportCounter}`;
   const middlewareModulePath = `../middleware/index.js?cross-company-authz-${appImportCounter}`;
@@ -94,10 +99,8 @@ function createCompany(id: string) {
     spentMonthlyCents: 0,
     requireBoardApprovalForNewAgents: false,
     feedbackDataSharingEnabled: false,
-    brandColor: "#123456",
     logoAssetId: null,
     logoUrl: null,
-    attachmentMaxBytes: 25_000_000,
     createdAt: now,
     updatedAt: now,
   };
@@ -217,9 +220,6 @@ function boardActor(input: {
 
 describe.sequential("company route cross-company authorization", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
     vi.clearAllMocks();
     resetMockDefaults();
   });
@@ -235,7 +235,7 @@ describe.sequential("company route cross-company authorization", () => {
     },
     {
       label: "PATCH /api/companies/:companyId/branding",
-      request: (app: express.Express) => request(app).patch(`/api/companies/${companyBId}/branding`).send({ brandColor: "#654321" }),
+      request: (app: express.Express) => request(app).patch(`/api/companies/${companyBId}/branding`).send({ description: "Nope" }),
     },
     {
       label: "POST /api/companies/:companyId/archive",
@@ -279,8 +279,8 @@ describe.sequential("company route cross-company authorization", () => {
     const app = await createApp(companyACeoActor());
 
     await request(app).get(`/api/companies/${companyAId}`).expect(200);
-    await request(app).patch(`/api/companies/${companyAId}`).send({ brandColor: "#abcdef" }).expect(200);
-    await request(app).patch(`/api/companies/${companyAId}/branding`).send({ brandColor: "#abcdef" }).expect(200);
+    await request(app).patch(`/api/companies/${companyAId}`).send({ description: "Branding" }).expect(200);
+    await request(app).patch(`/api/companies/${companyAId}/branding`).send({ description: "Branding" }).expect(200);
     await request(app).post(`/api/companies/${companyAId}/export`).send(exportRequest).expect(200);
     await request(app).post(`/api/companies/${companyAId}/exports/preview`).send(exportRequest).expect(200);
     await request(app).post(`/api/companies/${companyAId}/imports/preview`).send(importRequest(companyAId)).expect(200);
@@ -322,7 +322,7 @@ describe.sequential("company route cross-company authorization", () => {
       memberships: [{ companyId: companyBId, membershipRole: "member", status: "active" }],
     }));
     await request(memberApp).patch(`/api/companies/${companyBId}`).send({ description: "Updated" }).expect(200);
-    await request(memberApp).patch(`/api/companies/${companyBId}/branding`).send({ brandColor: "#abcdef" }).expect(200);
+    await request(memberApp).patch(`/api/companies/${companyBId}/branding`).send({ description: "Branding" }).expect(200);
     await request(memberApp).post(`/api/companies/${companyBId}/archive`).send({}).expect(200);
     await request(memberApp).delete(`/api/companies/${companyBId}`).expect(200);
     await request(memberApp).post(`/api/companies/${companyBId}/export`).send(exportRequest).expect(200);

@@ -107,10 +107,12 @@ export interface HostServices {
     /**
      * Fork-only background read: per-company effective plugin config
      * (company `plugin_config` row merged with the tenant `configOverrides`
-     * subtree) behind the fail-closed `requirePluginEnabledForCompany`
-     * provisioning gate. Reachable under the bare worker-lifetime
-     * `serviceScope`; rejects a missing/empty `companyId` and never accepts
-     * `kind:"all"`.
+     * subtree) behind the fail-closed server-side provisioning gate: the
+     * company must hold a `plugin_config` row for THIS plugin install and
+     * the plugin must be installed and enabled for it; every denial
+     * collapses to one opaque error (no existence oracle). Reachable under
+     * the bare worker-lifetime `serviceScope`; rejects a missing/empty
+     * `companyId` and never accepts `kind:"all"`.
      */
     getForServiceScope(
       params: WorkerToHostMethods["config.getForServiceScope"][0],
@@ -298,6 +300,7 @@ export interface HostServices {
     removeBlockers(params: WorkerToHostMethods["issues.relations.removeBlockers"][0]): Promise<WorkerToHostMethods["issues.relations.removeBlockers"][1]>;
     assertCheckoutOwner(params: WorkerToHostMethods["issues.assertCheckoutOwner"][0]): Promise<WorkerToHostMethods["issues.assertCheckoutOwner"][1]>;
     getSubtree(params: WorkerToHostMethods["issues.getSubtree"][0]): Promise<WorkerToHostMethods["issues.getSubtree"][1]>;
+    listWakeupRequests(params: WorkerToHostMethods["issues.listWakeupRequests"][0]): Promise<WorkerToHostMethods["issues.listWakeupRequests"][1]>;
     requestWakeup(params: WorkerToHostMethods["issues.requestWakeup"][0]): Promise<WorkerToHostMethods["issues.requestWakeup"][1]>;
     requestWakeups(params: WorkerToHostMethods["issues.requestWakeups"][0]): Promise<WorkerToHostMethods["issues.requestWakeups"][1]>;
     getOrchestrationSummary(params: WorkerToHostMethods["issues.summaries.getOrchestration"][0]): Promise<WorkerToHostMethods["issues.summaries.getOrchestration"][1]>;
@@ -408,7 +411,51 @@ export interface HostClientFactoryOptions {
    * returned map delegates to the corresponding service method.
    */
   services: HostServices;
+
+  /**
+   * SECURITY-CRITICAL: operator opt-in for the `companies.cross-read`
+   * capability. The host sets this to true only when this plugin's key is in
+   * the instance-config `plugins.crossCompanyReadAllowlist`. Default false =
+   * fail closed: the manifest capability alone grants nothing.
+   */
+  crossCompanyReadAllowed?: boolean;
+
+  /**
+   * Audit sink for each cross-company read that the exemption admitted.
+   * Receives identifiers only, never request or response bodies.
+   */
+  onCrossCompanyRead?: (event: CrossCompanyReadAuditEvent) => void;
 }
+
+/** Audit record for one admitted cross-company read. Identifiers only. */
+export interface CrossCompanyReadAuditEvent {
+  pluginId: string;
+  method: WorkerToHostMethodName;
+  /** The company the call read, or `"*"` for an unfiltered `companies.list`. */
+  targetCompanyId: string;
+  /** The invocation company (the calling agent's company). */
+  invocationCompanyId: string;
+  agentId: string | null;
+  runId: string | null;
+}
+
+/**
+ * SECURITY-CRITICAL: the frozen, host-side set of worker→host methods the
+ * `companies.cross-read` exemption may reach. Reads only. No manifest list, no
+ * wildcard, no prefix match. Adding a method needs a new security review; a
+ * set-equality test fails CI if this changes.
+ */
+export const CROSS_COMPANY_READ_METHODS: readonly WorkerToHostMethodName[] = Object.freeze([
+  "companies.list",
+  "companies.get",
+  "issues.list",
+  "issues.get",
+  "agents.list",
+  "agents.get",
+] as const);
+
+/** The only host dispatch kind under which the cross-company exemption applies. */
+export const CROSS_COMPANY_READ_DISPATCH_METHOD = "executeTool";
 
 // ---------------------------------------------------------------------------
 // Handler map type (compatible with WorkerToHostHandlers from worker manager)
@@ -545,6 +592,7 @@ const METHOD_CAPABILITY_MAP: Record<
   "issues.relations.removeBlockers": "issue.relations.write",
   "issues.assertCheckoutOwner": "issues.checkout",
   "issues.getSubtree": "issue.subtree.read",
+  "issues.listWakeupRequests": "issue.wakeups.read",
   "issues.requestWakeup": "issues.wakeup",
   "issues.requestWakeups": "issues.wakeup",
   "issues.summaries.getOrchestration": "issues.orchestration.read",
@@ -645,9 +693,16 @@ const METHOD_CAPABILITY_MAP: Record<
  * A distinct safety argument per entry:
  *
  *  - `state.get` / `state.set` / `state.delete`: company-scoped plugin state is
- *    the plugin's OWN data, partitioned by `(pluginId, company)`. Reading or
- *    writing its company-B partition leaks nothing cross-tenant and is reachable
- *    during any company-B dispatch anyway.
+ *    the plugin's OWN data, partitioned by `(pluginId, scopeKind, scopeId, ...)`,
+ *    and every company-scoped call is reach-checked server-side by
+ *    `requirePluginEnabledForCompany` (via `requireStateCompanyReach` in
+ *    plugin-host-services) BEFORE the store is touched — fail-closed, including
+ *    a missing/empty company `scopeId` (never served from the store's
+ *    NULL-`scopeId` partition). A worker-forged `companyId` can therefore only
+ *    reach companies the plugin is genuinely provisioned for: the reachable set
+ *    equals the plugin's install reach; serviceScope only relaxes the timing
+ *    constraint. Non-company `scopeKind`s key state by entity ids only the
+ *    plugin itself can have written, so no company reach exists to widen.
  *  - `issues.createComment`: the host service independently verifies the target
  *    issue belongs to the claimed company (`requireInCompany`), so a
  *    worker-forged `companyId` cannot reach a foreign issue. The reachable set
@@ -683,14 +738,20 @@ const METHOD_CAPABILITY_MAP: Record<
  *    set the digest already accumulates). serviceScope only relaxes the timing
  *    constraint so the digest can reconcile on worker startup / poll with no
  *    active dispatch. Both reject `kind:"all"` and missing/empty `companyId`, so
- *    no single call can enumerate across tenants.
+ *    no single call can enumerate across tenants. These reads deliberately keep
+ *    distinguishable company-existence failures (`Company not found` /
+ *    `not available` / `disabled`) so reconcile misconfig stays diagnosable;
+ *    the byte-equal no-existence-oracle denial collapse is a
+ *    `config.getForServiceScope`-specific contract, not a property of the
+ *    allowlist as a whole.
  *  - `config.getForServiceScope`: per-company effective plugin config
  *    (company `plugin_config` row merged with the tenant `configOverrides`
- *    subtree) behind the same `requirePluginEnabledForCompany` gate as the
- *    reconcile reads — identical reach argument (install reach only), and the
- *    rows returned are the plugin's OWN config surface for that company, which
- *    any dispatch for that company could read anyway. Rejects `kind:"all"` and
- *    missing/empty `companyId`.
+ *    subtree) behind the server-side provisioning gate — the company must
+ *    hold a `plugin_config` row for THIS install (fail-closed, opaque
+ *    error), identical reach argument (configured-install reach only), and
+ *    the rows returned are the plugin's OWN config surface for that
+ *    company, which any dispatch for that company could read anyway.
+ *    Rejects `kind:"all"` and missing/empty `companyId`.
  *
  * Deliberately excluded: the upstream public reads `config.get`,
  * `secrets.resolve` and `approvals.list`. Their guards are restored to
@@ -870,6 +931,47 @@ export function createHostClientHandlers(
     return noCompanyScope;
   }
 
+  /**
+   * SECURITY-CRITICAL: true only when ALL hold: operator allowlisted this
+   * plugin, the manifest declares `companies.cross-read`, the method is in the
+   * frozen read set, and the echoed invocation id resolved to a host-issued
+   * `executeTool` dispatch (kind from the host's own record, never params).
+   * serviceScope / single-in-flight / no-scope / invalid-scope paths never
+   * qualify because they carry no host dispatch method.
+   */
+  function crossCompanyReadAdmitted(
+    method: WorkerToHostMethodName,
+    context: WorkerHostCallContext | undefined,
+  ): boolean {
+    return (
+      options.crossCompanyReadAllowed === true &&
+      capabilitySet.has("companies.cross-read" as PluginCapability) &&
+      CROSS_COMPANY_READ_METHODS.includes(method) &&
+      !context?.invalidInvocationScope &&
+      !!readNonEmptyString(context?.invocationScope?.companyId) &&
+      context?.invocationDispatchMethod === CROSS_COMPANY_READ_DISPATCH_METHOD
+    );
+  }
+
+  function auditCrossCompanyRead(
+    method: WorkerToHostMethodName,
+    targetCompanyId: string,
+    context: WorkerHostCallContext | undefined,
+  ): void {
+    try {
+      options.onCrossCompanyRead?.({
+        pluginId,
+        method,
+        targetCompanyId,
+        invocationCompanyId: readNonEmptyString(context?.invocationScope?.companyId) ?? "",
+        agentId: readNonEmptyString(context?.invocationScope?.agentId),
+        runId: readNonEmptyString(context?.invocationScope?.runId),
+      });
+    } catch {
+      // Audit sink failures must not change authorization outcome.
+    }
+  }
+
   function requireInvocationCompanyScope(
     method: WorkerToHostMethodName,
     params: unknown,
@@ -877,6 +979,16 @@ export function createHostClientHandlers(
   ): void {
     const requested = requestedCompanyScope(method, params);
     if (requested.kind === "none") return;
+
+    if (crossCompanyReadAdmitted(method, context)) {
+      const own = readNonEmptyString(context?.invocationScope?.companyId);
+      if (requested.kind === "all") {
+        auditCrossCompanyRead(method, "*", context);
+        return;
+      }
+      if (requested.companyId !== own) auditCrossCompanyRead(method, requested.companyId, context);
+      return;
+    }
 
     const allowedCompanyId = readNonEmptyString(context?.invocationScope?.companyId);
 
@@ -1207,6 +1319,8 @@ export function createHostClientHandlers(
     // Companies
     "companies.list": gated("companies.list", async (params, context) => {
       const rows = await services.companies.list(params);
+      // Admitted cross-company read: unfiltered (audited in the gate).
+      if (crossCompanyReadAdmitted("companies.list", context)) return rows;
       const allowedCompanyId = readNonEmptyString(context?.invocationScope?.companyId);
       if (!allowedCompanyId) return rows;
       return rows.filter((company) =>
@@ -1304,6 +1418,9 @@ export function createHostClientHandlers(
     }),
     "issues.getSubtree": gated("issues.getSubtree", async (params) => {
       return services.issues.getSubtree(params);
+    }),
+    "issues.listWakeupRequests": gated("issues.listWakeupRequests", async (params) => {
+      return services.issues.listWakeupRequests(params);
     }),
     "issues.requestWakeup": gated("issues.requestWakeup", async (params) => {
       return services.issues.requestWakeup(params);

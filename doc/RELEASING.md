@@ -274,6 +274,15 @@ The workflow:
   branch that `git mv`s them to `releases/vYYYY.MDD.P.md` — open and merge
   its PR to restore the canonical layout
 
+## Fork Core-Host Releases
+
+Releases of the fork core host (`*-fork.N` versions) are GitHub-Release
+tarball sets, not npm publishes. They are cut by the `Fork Release` workflow,
+which hard-gates any publish behind a clean-sandbox preflight: install of the
+core tarball from the exact release URLs, boot against a scratch data dir,
+and `GET /` returning 200 with the dashboard title. See
+[`scripts/fork-release/README.md`](../scripts/fork-release/README.md).
+
 ## Docker Image Tags
 
 [`docker.yml`](../.github/workflows/docker.yml) publishes both the self-hosted

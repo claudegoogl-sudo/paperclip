@@ -75,6 +75,23 @@ soaked — write one that stands on its own. A candidate branch carries its
 own `releases/vYYYY.MDD.P.md` (preflight prefers source-tree notes), so
 author the notes as a commit on the candidate.
 
+## Fork releases (`v*-fork.N`)
+
+Fork releases for our own deployment are cut outside the npm lanes above.
+
+- A published fork release is immutable. **Never delete one** — install and
+  rollback scripts point at its asset URLs, and a deleted release strands
+  the documented rollback path.
+- A broken release is marked **DO-NOT-USE** in its release notes and fixed
+  forward with the next release.
+- Every fork release is mirrored to `~/backups/fork-releases/<tag>/` at
+  publish time. The cutover starts only after
+  `scripts/mirror-fork-release.sh <tag>` passes its offline self-test and
+  writes the `.mirror-ok` marker.
+
+Runbook with the full checklist and the offline-rollback commands:
+[`runbooks/FORK-RELEASES.md`](runbooks/FORK-RELEASES.md).
+
 ## After any incomplete run
 
 The failure playbooks in [`RELEASING.md`](RELEASING.md) cover: red canary,

@@ -78,6 +78,11 @@ export interface Config {
   pluginWebhookDeliveryFailedRetentionDays: number;
   pluginWebhookDeliveryMaxRows: number;
   pluginWebhookDeliveryRetentionIntervalMinutes: number;
+  workspaceReaperCooldownDays: number;
+  boardApiKeyAuthEventRetentionEnabled: boolean;
+  boardApiKeyAuthEventRetentionDays: number;
+  boardApiKeyAuthEventMaxRows: number;
+  boardApiKeyAuthEventRetentionIntervalMinutes: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -313,6 +318,41 @@ export function loadConfig(): Config {
     1,
     Number(process.env.PAPERCLIP_PLUGIN_WEBHOOK_DELIVERY_RETENTION_INTERVAL_MINUTES) || 60,
   );
+  // The terminal-workspace reaper waits this many days after an issue tree
+  // becomes terminal before it archives the workspace. A person can reopen the
+  // work inside this window. A value of 0 disables the cooldown and restores
+  // immediate reaping. A negative or non-numeric value falls back to the
+  // default. The day granularity and the default of 7 obey the
+  // PAPERCLIP_DB_BACKUP_RETENTION_DAYS precedent above.
+  const workspaceReaperCooldownDaysEnv =
+    process.env.PAPERCLIP_WORKSPACE_REAPER_COOLDOWN_DAYS?.trim();
+  const workspaceReaperCooldownDaysRaw = Number(workspaceReaperCooldownDaysEnv);
+  const workspaceReaperCooldownDays =
+    workspaceReaperCooldownDaysEnv
+      && Number.isFinite(workspaceReaperCooldownDaysRaw)
+      && workspaceReaperCooldownDaysRaw >= 0
+      ? workspaceReaperCooldownDaysRaw
+      : 7;
+  const boardApiKeyAuthEventRetentionEnabled =
+    process.env.PAPERCLIP_BOARD_KEY_AUTH_EVENT_RETENTION_ENABLED !== "false";
+  // Auth events: 90 days. A quarter's look-back outlives the audit cycle that
+  // motivated the log (the credential-abuse investigation that drove it needed
+  // ~3 months of history) without letting the table drift toward activity_log's
+  // scale.
+  const boardApiKeyAuthEventRetentionDays = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_BOARD_KEY_AUTH_EVENT_RETENTION_DAYS) || 90,
+  );
+  // Load-bearing size bound: one row per source-minute under a sustained
+  // distributed attempt still has to stop somewhere. 500k rows is tens of MB.
+  const boardApiKeyAuthEventMaxRows = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_BOARD_KEY_AUTH_EVENT_MAX_ROWS) || 500_000,
+  );
+  const boardApiKeyAuthEventRetentionIntervalMinutes = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_BOARD_KEY_AUTH_EVENT_RETENTION_INTERVAL_MINUTES) || 60,
+  );
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -376,6 +416,11 @@ export function loadConfig(): Config {
     pluginWebhookDeliveryFailedRetentionDays,
     pluginWebhookDeliveryMaxRows,
     pluginWebhookDeliveryRetentionIntervalMinutes,
+    workspaceReaperCooldownDays,
+    boardApiKeyAuthEventRetentionEnabled,
+    boardApiKeyAuthEventRetentionDays,
+    boardApiKeyAuthEventMaxRows,
+    boardApiKeyAuthEventRetentionIntervalMinutes,
     serveUi:
       process.env.SERVE_UI !== undefined
         ? process.env.SERVE_UI === "true"

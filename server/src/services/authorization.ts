@@ -21,7 +21,7 @@ import type {
   SkillTestAgentKeyScope,
   TaskBridgeAgentKeyScope,
 } from "@paperclipai/shared";
-import { LOW_TRUST_REVIEW_PRESET, extractAgentMentionIds, type LowTrustBoundary } from "@paperclipai/shared";
+import { LOW_TRUST_REVIEW_PRESET, extractAgentMentionIds, isUuidLike, type LowTrustBoundary } from "@paperclipai/shared";
 import {
   LOW_TRUST_ISSUE_ANCESTRY_MAX_DEPTH,
   isIssueWithinLowTrustBoundary,
@@ -519,6 +519,18 @@ function scopeBoolean(scope: Record<string, unknown> | null | undefined, key: st
   return scope?.[key] === true;
 }
 
+/**
+ * Requested scope for every `agent_config:update` decision on a specific target
+ * agent. Carries `targetAgentId` so a grant scoped to `{targetAgentIds:[...]}`
+ * can match; an unscoped grant (scope null) still matches any requested scope.
+ */
+export function agentConfigUpdateScope(
+  targetAgent: { id: string },
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return { ...extra, targetAgentId: targetAgent.id };
+}
+
 export function authorizationDeniedDetails(decision: AuthorizationDecision) {
   return {
     ...(decision.code ? { code: decision.code } : {}),
@@ -753,6 +765,10 @@ export function authorizationService(db: Db) {
 
   async function loadRunPolicy(runId: string | null | undefined, companyId: string, agentId: string) {
     if (!runId) return null;
+    // The run header is caller-controlled; a malformed value is unknown, not
+    // an error. Treat it as missing so the untrusted string never reaches a
+    // UUID equality (PostgreSQL would cast-error into a 500).
+    if (!isUuidLike(runId)) return null;
     const row = await db
       .select({
         id: heartbeatRuns.id,
@@ -772,6 +788,8 @@ export function authorizationService(db: Db) {
 
   async function loadRunIssueId(runId: string | null | undefined, companyId: string, agentId: string) {
     if (!runId) return null;
+    // Same caller-controlled-header rule as loadRunPolicy.
+    if (!isUuidLike(runId)) return null;
     const row = await db
       .select({
         companyId: heartbeatRuns.companyId,
@@ -1838,6 +1856,30 @@ export function authorizationService(db: Db) {
         action: input.action,
         reason: "deny_company_boundary",
         explanation: "Actor agent was not found in the target company.",
+      });
+    }
+
+    if (input.actor.keyScope?.kind === "notify_only") {
+      // Defense in depth behind enforceAgentKeyScopeMiddleware: a notify_only
+      // key may only read its allow-listed issues. Interaction create is
+      // authorized in the route by the same allow-list; everything else denies.
+      const allowedIssueIds = new Set(input.actor.keyScope.issueIds.map((id) => id.toLowerCase()));
+      if (
+        input.action === "issue:read" &&
+        input.resource.type === "issue" &&
+        typeof input.resource.issueId === "string" &&
+        allowedIssueIds.has(input.resource.issueId.toLowerCase())
+      ) {
+        return allow({
+          action: input.action,
+          reason: "allow_explicit_grant",
+          explanation: "Allowed for an issue on the notify_only key allow-list.",
+        });
+      }
+      return deny({
+        action: input.action,
+        reason: "deny_scope",
+        explanation: "notify_only keys can only read allow-listed issues and create interactions on them.",
       });
     }
 

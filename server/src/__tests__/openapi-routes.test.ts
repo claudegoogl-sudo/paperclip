@@ -47,6 +47,7 @@ const apiPrefixes: Record<string, string> = {
   "onboarding-seed.ts": "/api",
   "openapi.ts": "/api",
   "plugin-config-egress.ts": "/api",
+  "plugin-private-egress.ts": "/api",
   "plugin-ui-static.ts": "/api",
   "plugins.ts": "/api",
   "projects.ts": "/api",
@@ -212,6 +213,11 @@ describe("openapi routes", () => {
     });
     expect(res.body.paths["/api/companies/{companyId}/folders"].post.responses["201"]).toBeDefined();
     expect(
+      Object.keys(
+        res.body.paths["/api/issues/{id}/work-products/{workProductId}/review-document"].post.responses,
+      ).sort(),
+    ).toEqual(["200", "201", "401", "403", "404", "409", "413", "415", "422"]);
+    expect(
       res.body.paths["/api/issues/{id}/interactions/{interactionId}/withdraw"].post.summary,
     ).toBe("Withdraw a pending issue thread interaction");
     const createInteraction = res.body.paths["/api/issues/{id}/interactions"].post;
@@ -296,6 +302,7 @@ describe("openapi routes", () => {
     expect(spec.paths["/api/invites/{token}/accept"].post.responses["202"]).toBeDefined();
     expect(spec.paths["/api/board-api-keys"].post.responses["201"]).toBeDefined();
     expect(spec.paths["/api/companies/import"].post.responses["202"]).toBeDefined();
+    expect(spec.paths["/api/routines/{id}/run"].post.responses["422"]).toBeDefined();
   });
 
   it("publishes the Claude browser-code grammar and strict setup-token response shapes", () => {

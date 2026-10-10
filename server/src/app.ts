@@ -36,7 +36,7 @@ import {
   createProductionSetupTokenSandboxProvider,
   createProductionSetupTokenCleanupStore,
   createSetupTokenSecretWriter,
-  createWorkerBoundSetupTokenPtyOpener,
+  createWorkerBoundLoginPtyOpener,
 } from "./services/setup-token-transport-binding.js";
 import { environmentService } from "./services/environments.js";
 import { environmentRuntimeService } from "./services/environment-runtime.js";
@@ -57,6 +57,7 @@ import { secretRoutes } from "./routes/secrets.js";
 import { toolAccessRoutes } from "./routes/tool-access.js";
 import { smokeLabRoutes } from "./routes/smoke-lab.js";
 import { pluginConfigEgressRoutes } from "./routes/plugin-config-egress.js";
+import { pluginPrivateEgressRoutes } from "./routes/plugin-private-egress.js";
 import { costRoutes } from "./routes/costs.js";
 import { activityRoutes } from "./routes/activity.js";
 import { dashboardRoutes } from "./routes/dashboard.js";
@@ -71,6 +72,7 @@ import { sidebarPreferenceRoutes } from "./routes/sidebar-preferences.js";
 import { resourceMembershipRoutes } from "./routes/resource-memberships.js";
 import { inboxDismissalRoutes } from "./routes/inbox-dismissals.js";
 import { instanceSettingsRoutes } from "./routes/instance-settings.js";
+import { instanceSettingsService } from "./services/instance-settings.js";
 import { openApiRoutes } from "./routes/openapi.js";
 import {
   instanceDatabaseBackupRoutes,
@@ -85,8 +87,10 @@ import { mcpGatewayProtocolRoutes, toolGatewayRoutes } from "./routes/tool-gatew
 import { adapterRoutes } from "./routes/adapters.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { readBrandedStaticIndexHtml } from "./static-index-html.js";
+import { staticUiCacheControl } from "./static-ui-cache.js";
 import { applyUiBranding } from "./ui-branding.js";
 import { logger } from "./middleware/logger.js";
+import { logActivity } from "./services/activity-log.js";
 import { DEFAULT_LOCAL_PLUGIN_DIR, pluginLoader, type PluginLoader } from "./services/plugin-loader.js";
 import {
   SELF_HOSTED_AUTO_INSTALL_KEYS,
@@ -95,6 +99,11 @@ import {
   resolveBundledPluginInstalls,
 } from "./services/bundled-plugins.js";
 import { createPluginWorkerManager, type PluginWorkerManager } from "./services/plugin-worker-manager.js";
+import {
+  createPluginStreamBus,
+  publishWorkerStreamNotification,
+  type PluginStreamBus,
+} from "./services/plugin-stream-bus.js";
 import { createPluginJobScheduler } from "./services/plugin-job-scheduler.js";
 import { pluginJobStore } from "./services/plugin-job-store.js";
 import { createPluginToolDispatcher } from "./services/plugin-tool-dispatcher.js";
@@ -105,10 +114,14 @@ import {
 } from "./services/plugin-run-context-registry.js";
 import { pluginLifecycleManager } from "./services/plugin-lifecycle.js";
 import { createPluginJobCoordinator } from "./services/plugin-job-coordinator.js";
-import { buildHostServices, flushPluginLogBuffer } from "./services/plugin-host-services.js";
+import {
+  bufferPluginLogEntry,
+  buildHostServices,
+  flushPluginLogBuffer,
+} from "./services/plugin-host-services.js";
 import { createPluginEventBus } from "./services/plugin-event-bus.js";
 import { setPluginEventBus } from "./services/activity-log.js";
-import { createPluginDevWatcher } from "./services/plugin-dev-watcher.js";
+import { createPluginDevWatcher, isPluginDevWatchEnabled } from "./services/plugin-dev-watcher.js";
 import { createPluginHostServiceCleanup } from "./services/plugin-host-service-cleanup.js";
 import { createEventRelayProbe } from "./services/plugin-event-relay-probe.js";
 import { pluginRegistryService } from "./services/plugin-registry.js";
@@ -149,6 +162,15 @@ const VITE_DEV_STATIC_PATHS = new Set([
   "/site.webmanifest",
   "/sw.js",
 ]);
+
+/**
+ * Parse the operator allowlist of plugin keys that may use
+ * `companies.cross-read`. Comma/whitespace separated; empty or absent = none.
+ */
+export function parsePluginCrossCompanyReadAllowlist(raw: string | undefined): string[] {
+  if (!raw) return [];
+  return [...new Set(raw.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean))];
+}
 
 export function isDatabaseConnectionUnavailableError(err: unknown): boolean {
   const error = err as { code?: unknown; message?: unknown; cause?: unknown };
@@ -329,6 +351,12 @@ export async function createApp(
      */
     escalationApprovalCompanyId?: string;
     pluginWorkerManager?: PluginWorkerManager;
+    // Stream bus wired to the SAME worker manager instance passed above: the
+    // manager publishes verified worker stream notifications here and the
+    // plugin SSE bridge subscribes on it. When app builds its own manager it
+    // also builds the bus and wires the two; an injected manager must come
+    // with its bus (index.ts wires both) or the SSE bridge has no publisher.
+    pluginStreamBus?: PluginStreamBus;
     decisionServiceOptions: DecisionServiceOptions;
     // The run-context registry the injected pluginWorkerManager was
     // built with. MUST be the same instance, so a worker's host-minted service
@@ -344,6 +372,12 @@ export async function createApp(
      * bundled catalog fail-to-start (see services/bundled-plugins.ts).
      */
     managedPluginAutoInstall?: readonly string[] | null;
+    /**
+     * Plugin keys the operator allows to use `companies.cross-read`. Default
+     * (absent) reads `PAPERCLIP_PLUGIN_CROSS_COMPANY_READ_ALLOWLIST`
+     * (comma-separated plugin keys); empty = no plugin may cross-read.
+     */
+    pluginCrossCompanyReadAllowlist?: readonly string[] | null;
     /** Test override for the bundled plugin catalog root. */
     bundledPluginCatalogRoot?: string;
   },
@@ -395,6 +429,18 @@ export async function createApp(
       bindHost: opts.bindHost,
     }),
   );
+  // The dedicated proxy IP or CIDR allowlist for requests that arrive through
+  // a TLS-terminating proxy. The global `TRUST_PROXY` setting never satisfies
+  // anything that reads this list; an operator sets it to the real
+  // TLS-terminating proxy addresses. An empty value keeps the confidential
+  // setup-token login responses on direct TLS (or a `local_trusted` loopback
+  // peer) only, and keeps board-key auth-event rows pinned to the immediate
+  // socket peer. Declared here, before both consumers (the actor middleware
+  // and the setup-token login transport).
+  const setupTokenLoginProxyAllowlist = (process.env.CLAUDE_LOGIN_TRUSTED_PROXIES ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
   // Resolve the acting credential (req.actor) and bind its provenance into
   // AsyncLocalStorage so logActivity records it centrally. The provenance
   // regression test drives the same registerActorContext, so removing the
@@ -402,6 +448,10 @@ export async function createApp(
   registerActorContext(app, db, {
     deploymentMode: opts.deploymentMode,
     resolveSession: opts.resolveSession,
+    // Same dedicated operator allowlist the confidential-transport guard uses
+    // (SR-7); the board-key auth-event log reads it only to derive
+    // source_ip. Never derived from the global TRUST_PROXY setting.
+    authEventTrustedProxies: setupTokenLoginProxyAllowlist,
   });
   app.use("/api/auth", authRoutes(db));
   if (opts.betterAuthHandler) {
@@ -428,10 +478,34 @@ export async function createApp(
   // run-contexts would never be found (Gate 1 → runcontext_invalid).
   const pluginRunContextRegistry =
     opts.pluginRunContextRegistry ?? createPluginRunContextRegistry();
+  // The SSE bridge needs BOTH halves wired to the same manager — a
+  // publisher (manager onStreamNotification → bus) and the bus itself
+  // (bridgeDeps.streamBus). Build the bus here and wire the internal-manager
+  // path; an injected manager must pair with the bus it publishes to.
+  const pluginStreamBus = opts.pluginStreamBus ?? createPluginStreamBus();
   const workerManager =
     opts.pluginWorkerManager ??
-    createPluginWorkerManager({ runContextRegistry: pluginRunContextRegistry });
+    createPluginWorkerManager({
+      runContextRegistry: pluginRunContextRegistry,
+      // Worker ctx.logger notifications persist to plugin_logs on the same
+      // buffered path as the logger.log host service (§26.1), so the operator
+      // logs panel can show plugin errors.
+      workerLogPersist: (entry) => bufferPluginLogEntry({ db, ...entry }),
+      onStreamNotification: ({ pluginId, method, params }) => {
+        publishWorkerStreamNotification(pluginStreamBus, pluginId, method, params);
+      },
+    });
   const managedAutoInstallKeys = opts.managedPluginAutoInstall ?? null;
+  const crossCompanyReadAllowlist = new Set(
+    opts.pluginCrossCompanyReadAllowlist ??
+      parsePluginCrossCompanyReadAllowlist(process.env.PAPERCLIP_PLUGIN_CROSS_COMPANY_READ_ALLOWLIST),
+  );
+  if (crossCompanyReadAllowlist.size > 0) {
+    logger.warn(
+      { pluginKeys: [...crossCompanyReadAllowlist] },
+      "plugin cross-company read allowlist is active",
+    );
+  }
   const bundledCatalogRoot =
     opts.bundledPluginCatalogRoot ?? resolveBundledCatalogRoot(process.env);
   const bundledPluginInstalls = resolveBundledPluginInstalls(
@@ -489,15 +563,6 @@ export async function createApp(
   // back through the callback below, so the shutdown hook can cancel every live
   // session (SR-4).
   let setupTokenLoginService: SetupTokenSessionService | null = null;
-  // The dedicated proxy IP or CIDR allowlist for the confidential setup-token
-  // login responses (SR-7). The global `TRUST_PROXY` setting does not satisfy
-  // the guard; an operator sets this allowlist to the real TLS-terminating
-  // proxy addresses. An empty value keeps the confidential responses on direct
-  // TLS (or a `local_trusted` loopback peer) only.
-  const setupTokenLoginProxyAllowlist = (process.env.CLAUDE_LOGIN_TRUSTED_PROXIES ?? "")
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0);
   // The explicit operator declaration that a platform edge terminates TLS for
   // every client request (SR-7). This complements the allowlist for managed
   // platforms (Railway, Render, Fly, and the like) where the app socket is
@@ -527,7 +592,7 @@ export async function createApp(
     sandbox: createProductionSetupTokenSandboxProvider({
       environments: environmentService(db),
       environmentRuntime: environmentRuntimeService(db, { pluginWorkerManager: workerManager }),
-      openLivePtySession: createWorkerBoundSetupTokenPtyOpener({
+      openLivePtySession: createWorkerBoundLoginPtyOpener({
         workerManager,
         environments: environmentService(db),
         log: (line) => logger.info(line),
@@ -556,12 +621,10 @@ export async function createApp(
       confidentialEdgeTlsTerminated: setupTokenLoginEdgeTlsTerminated,
       setupTokenLogin: setupTokenLoginTransport,
       onSetupTokenLoginService: (service) => {
+        // Capture the service, so the graceful-shutdown hook cancels every live
+        // session and releases each lease. The standalone scheduled reaper owns
+        // the startup and interval lease cleanup now (SR-4).
         setupTokenLoginService = service;
-        // Startup reaper (SR-4): release any lease whose login session is
-        // terminal or past its deadline after a restart. The DB is ready here.
-        void service.reap().catch((err) => {
-          logger.error({ err }, "Setup-token login startup reaper failed");
-        });
       },
     }),
   );
@@ -592,6 +655,7 @@ export async function createApp(
     ?? process.env.PAPERCLIP_TOOL_RUNTIME_TRUSTED_HOST
     ?? null;
   api.use(pluginConfigEgressRoutes(db));
+  api.use(pluginPrivateEgressRoutes(db));
   api.use(costRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(activityRoutes(db));
   api.use(dashboardRoutes(db));
@@ -643,6 +707,9 @@ export async function createApp(
     deploymentMode: opts.deploymentMode,
     deploymentExposure: opts.deploymentExposure,
     trustedLocalStdioRuntimeHost,
+    // Plugin-backed connections report health via the plugin tool runtime
+    // instead of requiring a config.url their records never carry.
+    pluginToolRuntimeProbe: ({ pluginKey }) => toolDispatcher.toolCount(pluginKey),
     toolGateway,
   }));
   api.use(smokeLabRoutes(db, {
@@ -674,6 +741,11 @@ export async function createApp(
       localPluginDir: opts.localPluginDir ?? DEFAULT_LOCAL_PLUGIN_DIR,
       migrationDb: opts.pluginMigrationDb,
       escalationGateway,
+      // Capabilities a fresh install may declare without a board approval.
+      // Default empty: any capability parks a fresh install (gateway set only).
+      installCapabilityAllowlist: parsePluginCrossCompanyReadAllowlist(
+        process.env.PAPERCLIP_PLUGIN_INSTALL_CAPABILITY_ALLOWLIST,
+      ),
     },
     {
       workerManager,
@@ -705,6 +777,35 @@ export async function createApp(
           pluginId,
           capabilities: manifest.capabilities,
           services,
+          crossCompanyReadAllowed: crossCompanyReadAllowlist.has(manifest.id),
+          onCrossCompanyRead: (event) => {
+            logger.info(
+              { ...event, pluginKey: manifest.id },
+              "plugin.cross_company_read",
+            );
+            // Unfiltered companies.list ("*") is recorded on the caller's company.
+            const auditCompanyId =
+              event.targetCompanyId === "*" ? event.invocationCompanyId : event.targetCompanyId;
+            if (!auditCompanyId) return;
+            void logActivity(db, {
+              companyId: auditCompanyId,
+              actorType: "plugin",
+              actorId: pluginId,
+              action: "plugin.cross_company_read",
+              entityType: "company",
+              entityId: event.targetCompanyId,
+              agentId: event.agentId,
+              runId: event.runId,
+              details: {
+                pluginKey: manifest.id,
+                method: event.method,
+                targetCompanyId: event.targetCompanyId,
+                callerCompanyId: event.invocationCompanyId,
+              },
+            }).catch((err) => {
+              logger.warn({ err, pluginKey: manifest.id }, "cross-company read audit write failed");
+            });
+          },
         });
       },
     },
@@ -723,7 +824,7 @@ export async function createApp(
     if (outcome === "approved") {
       await upgradeLifecycle.completeUpgradeApproved(payload.pluginId);
     } else {
-      await upgradeLifecycle.revertUpgradeRejected(payload.pluginId);
+      await upgradeLifecycle.revertUpgradeRejected(payload.pluginId, { origin: payload.origin });
     }
   });
   // Create the dev-watcher before the plugin routes so the routes can
@@ -735,13 +836,27 @@ export async function createApp(
   // while the plugin is active ('ready'). Gating on status means reconcile()
   // disarms the watcher on disable/uninstall (status leaves 'ready') even
   // though disable keeps packagePath in the DB.
-  const devWatcher = createPluginDevWatcher(
+  // File-change restarts go through a lifecycle bound to the runtime-services
+  // loader so they take the full deactivate + activateReadyPlugin path
+  // (manifest re-read, migrations, fresh host handlers, startup config
+  // delivery). The shared `lifecycle` above is built without a loader (the
+  // loader needs it as a runtime service), so its restartWorker() would fall
+  // back to a bare process bounce. Lifecycle-event subscriptions stay on the
+  // shared `lifecycle`, which is where the loader emits them.
+  const devWatcherRestartLifecycle = pluginLifecycleManager(db, { loader, workerManager, eventBus });
+  // Defense in depth: hot reload re-activates plugins from on-disk code, so
+  // it is opt-in (PAPERCLIP_PLUGIN_DEV_WATCH=1) and off by default.
+  const devWatchEnabled = isPluginDevWatchEnabled(process.env);
+  logger.info({ devWatchEnabled }, "plugin dev watcher configuration");
+  const devWatcher = devWatchEnabled ? createPluginDevWatcher(
     lifecycle,
     async (pluginId) => {
       const plugin = await pluginRegistry.getById(pluginId);
       return plugin?.status === "ready" ? plugin.packagePath ?? null : null;
     },
-  );
+    undefined,
+    { restartWorker: (pluginId) => devWatcherRestartLifecycle.restartWorker(pluginId) },
+  ) : null;
   api.use(
     pluginRoutes(
       db,
@@ -749,12 +864,15 @@ export async function createApp(
       { scheduler, jobStore },
       { workerManager },
       { toolDispatcher },
-      { workerManager },
+      { workerManager, streamBus: pluginStreamBus },
       { toolGateway },
-      { reconciler: devWatcher },
+      devWatcher ? { reconciler: devWatcher } : undefined,
     ),
   );
-  api.use(adapterRoutes());
+  api.use(adapterRoutes({
+    getNativeRunnerEnabled: async () =>
+      (await instanceSettingsService(db).getExperimental()).enableNativeRunner === true,
+  }));
   api.use(
     accessRoutes(db, {
       deploymentMode: opts.deploymentMode,
@@ -792,15 +910,15 @@ export async function createApp(
       );
       // Non-hashed static files (favicon.ico, manifest, robots.txt, etc.):
       // short cache so operators who swap them out see the new version
-      // reasonably fast. Override for `index.html` specifically — it is
-      // served by this middleware for `/` and `/index.html`, and it must
-      // never outlive the asset hashes it points at.
+      // reasonably fast, with must-revalidate overrides for index.html and
+      // sw.js (see staticUiCacheControl for why those two).
       app.use(
         express.static(uiDist, {
           maxAge: "1h",
           setHeaders(res, filePath) {
-            if (path.basename(filePath) === "index.html") {
-              res.set("Cache-Control", "no-cache");
+            const override = staticUiCacheControl(filePath);
+            if (override) {
+              res.set("Cache-Control", override);
             }
           },
         }),
@@ -1081,5 +1199,7 @@ export async function createApp(
     void flushPluginLogBuffer();
   });
 
-  return app;
+  // The plugin tool dispatcher is exposed so the standalone tool-health sweep
+  // service (index.ts) can probe plugin-backed connection health.
+  return { app, pluginToolDispatcher: toolDispatcher };
 }
