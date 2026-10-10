@@ -247,10 +247,9 @@ describeEmbeddedPostgres("manager release of dead-run checkout locks", () => {
       executionRunId: null,
     });
 
-    // The route's pre-auth orphan-clear guard has already detached the terminal
-    // run's locks by the time svc.release runs, so prevCheckoutRunId records the
-    // (null) run the release transaction itself cleared. The non-null variant is
-    // pinned at the service level below.
+    // The route captures the lock holders before its pre-auth orphan-clear
+    // guard nulls them, so the audit row names the real dead run and the
+    // assignee whose lock was released.
     const audit = await db
       .select({ action: activityLog.action, details: activityLog.details })
       .from(activityLog)
@@ -260,7 +259,8 @@ describeEmbeddedPostgres("manager release of dead-run checkout locks", () => {
     expect(audit!.details).toMatchObject({
       managerOverride: true,
       reason: "stale_checkout_run",
-      prevCheckoutRunId: null,
+      prevCheckoutRunId: seed.deadRunId,
+      prevAssigneeAgentId: seed.assigneeAgentId,
       actorAgentId: seed.managerAgentId,
     });
   });

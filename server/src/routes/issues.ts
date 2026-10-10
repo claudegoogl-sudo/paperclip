@@ -11215,6 +11215,12 @@ export function issueRoutes(
 
   router.post("/issues/:id/release", async (req, res) => {
     const id = req.params.id as string;
+    // Capture lock holders BEFORE the orphan guard nulls them, so the manager
+    // override audit row records whose lock / which dead run was released
+    // (the guard's own clear is silent). Agent actors only; only used after
+    // the access checks below pass.
+    const preGuard =
+      req.actor.type === "agent" ? await svc.getById(id).catch(() => null) : null;
     // See PATCH route — back-fill orphan-checkout state up front.
     await svc.clearOrphanCheckoutLocksIfTerminal(id);
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
@@ -11269,7 +11275,10 @@ export function issueRoutes(
             details: {
               managerOverride: true,
               reason: "stale_checkout_run",
-              prevCheckoutRunId: released.previous.checkoutRunId,
+              prevCheckoutRunId:
+                preGuard?.checkoutRunId ?? released.previous.checkoutRunId ?? null,
+              prevAssigneeAgentId:
+                preGuard?.assigneeAgentId ?? released.previous.assigneeAgentId ?? null,
               actorAgentId: actor.agentId ?? null,
             },
           }
