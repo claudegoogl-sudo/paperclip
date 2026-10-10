@@ -1,5 +1,5 @@
 /**
- * PLA-1845 — per-tenant plugin-enablement gate on the service/background
+ * per-tenant plugin-enablement gate on the service/background
  * `secrets.resolve` paths.
  *
  * An operator who disables a plugin for company X expects X's bound secrets to
@@ -13,7 +13,7 @@
  *  - service path, plugin disabled for the binding's OWNING company -> opaque
  *    not_found, no `allowed` audit row, and the value is never decrypted.
  *  - service path, plugin enabled -> resolves (guards against over-tightening
- *    the PLA-768 path).
+ *    the service-context path).
  *  - background path, the same pair, keyed on the TRIGGERING company.
  *  - a host built without the gate fails closed on both paths.
  *  - the denial is not an enablement oracle: disabled and not-bound are
@@ -145,7 +145,7 @@ afterEach(() => {
   clearRunSecretValues(BG_RUN_ID);
 });
 
-describe("service-context resolve honours per-tenant plugin enablement (PLA-1845)", () => {
+describe("service-context resolve honours per-tenant plugin enablement", () => {
   it("denies with not_found when the plugin is disabled for the binding's owning company", async () => {
     const { handler, registry, resolverFn, ensurePluginEnabledForCompany } = buildHandler({
       disabledFor: [COMPANY_OWNER],
@@ -187,7 +187,7 @@ describe("service-context resolve honours per-tenant plugin enablement (PLA-1845
     expect(details[0].secretCompanyId ?? null).toBeNull();
   });
 
-  it("still resolves when the plugin is enabled (no over-tightening of PLA-768)", async () => {
+  it("still resolves when the plugin is enabled (no over-tightening of service-context scoping)", async () => {
     const { handler, registry, ensurePluginEnabledForCompany } = buildHandler({
       resolveValue: "bot-token-xyz",
     });
@@ -235,7 +235,7 @@ describe("service-context resolve honours per-tenant plugin enablement (PLA-1845
   });
 });
 
-describe("background-context resolve honours per-tenant plugin enablement (PLA-1845)", () => {
+describe("background-context resolve honours per-tenant plugin enablement", () => {
   it("denies with not_found when the plugin is disabled for the triggering company", async () => {
     const { handler, registry, resolverFn, ensurePluginEnabledForCompany } = buildHandler({
       disabledFor: [COMPANY_OWNER],
@@ -261,7 +261,7 @@ describe("background-context resolve honours per-tenant plugin enablement (PLA-1
     expect(details.some((d) => d.outcome === "allowed")).toBe(false);
   });
 
-  it("still resolves when the plugin is enabled (no over-tightening of PLA-773)", async () => {
+  it("still resolves when the plugin is enabled (no over-tightening of background-context scoping)", async () => {
     const { handler, registry, ensurePluginEnabledForCompany } = buildHandler({
       resolveValue: "bg-token-abc",
     });
