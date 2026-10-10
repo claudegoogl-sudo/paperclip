@@ -62,7 +62,7 @@
     "storybook-visual:baseline": "node scripts/storybook-visual-baseline.mjs",
     "test:storybook-visual": "node scripts/storybook-visual-baseline.mjs download && node scripts/storybook-visual-baseline.mjs verify && pnpm build-storybook && npx playwright test --config tests/storybook-visual/playwright.config.ts",
     "test:storybook-visual:update": "node scripts/storybook-visual-baseline.mjs download && pnpm build-storybook && npx playwright test --config tests/storybook-visual/playwright.config.ts --update-snapshots && node scripts/storybook-visual-baseline.mjs pack",
-    "test:upstream-sync": "node --test scripts/upstream-sync.test.mjs scripts/plugin-activation-soak.test.mjs",
+    "test:upstream-sync": "node --test scripts/upstream-sync.test.mjs scripts/plugin-activation-soak.test.mjs scripts/resolve-trivial-sync-conflicts.test.mjs",
     "test:plugin-activation-soak": "node --test scripts/plugin-activation-soak.test.mjs",
     "test:scaffold-create-paperclip-plugin": "node --test scripts/smoke-create-paperclip-plugin.test.mjs",
     "test:e2e": "npx playwright test --config tests/e2e/playwright.config.ts",

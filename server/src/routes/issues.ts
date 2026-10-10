@@ -175,6 +175,7 @@ import {
   formatAttachmentSize,
   GENERIC_ATTACHMENT_CONTENT_TYPES,
   isInlineAttachmentContentType,
+  isSpreadsheetBaitPluginArtifact,
   MAX_ATTACHMENT_BYTES,
   normalizeContentType,
   normalizeUploadAttachmentContentType,
@@ -205,6 +206,7 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_LOOKBACK_DAYS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
+  attachmentBoundActivityDetails,
   readAcceptedPlanConfirmationTarget,
 } from "../services/issues.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
@@ -260,6 +262,37 @@ import {
 } from "../services/cross-issue-influence-limit.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
+
+/**
+ * Per-key create cap for run-less `notify_only` agent keys: a leaked pager key
+ * must not be able to flood an operator with cards. Sliding one-hour window,
+ * in-process (a restart resets it, which only ever loosens by one window).
+ */
+export const NOTIFY_ONLY_CREATE_LIMIT_PER_HOUR = 10;
+const NOTIFY_ONLY_CREATE_WINDOW_MS = 60 * 60 * 1000;
+const notifyOnlyCreateLog = new Map<string, number[]>();
+
+export function consumeNotifyOnlyCreateQuota(keyId: string, now: number = Date.now()): boolean {
+  const cutoff = now - NOTIFY_ONLY_CREATE_WINDOW_MS;
+  const recent = (notifyOnlyCreateLog.get(keyId) ?? []).filter((t) => t > cutoff);
+  if (recent.length >= NOTIFY_ONLY_CREATE_LIMIT_PER_HOUR) {
+    notifyOnlyCreateLog.set(keyId, recent);
+    return false;
+  }
+  recent.push(now);
+  notifyOnlyCreateLog.set(keyId, recent);
+  // Bound memory: drop keys whose window is empty.
+  if (notifyOnlyCreateLog.size > 1000) {
+    for (const [k, ts] of notifyOnlyCreateLog) {
+      if (!ts.some((t) => t > cutoff)) notifyOnlyCreateLog.delete(k);
+    }
+  }
+  return true;
+}
+
+export function resetNotifyOnlyCreateQuotaForTests(): void {
+  notifyOnlyCreateLog.clear();
+}
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
@@ -11303,7 +11336,38 @@ export function issueRoutes(
     const id = req.params.id as string;
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!issue) return;
-    if (req.actor.type === "agent") {
+    // notify_only agent keys are run-less by design: the issue allow-list (also
+    // enforced by enforceAgentKeyScopeMiddleware) is their whole authorization,
+    // and the card is stored with sourceRunId = null.
+    const notifyOnlyScope = req.actor.type === "agent" && req.actor.keyScope?.kind === "notify_only"
+      ? req.actor.keyScope
+      : null;
+    if (notifyOnlyScope) {
+      if (!notifyOnlyScope.issueIds.some((allowedId) => allowedId.toLowerCase() === issue.id.toLowerCase())) {
+        res.status(403).json({ error: "Agent API key scope does not permit this issue", code: "agent_key_scope_violation" });
+        return;
+      }
+      // A pager only asks for acknowledgement: no task suggestions or questions.
+      if (req.body.kind !== "request_confirmation") {
+        res.status(403).json({
+          error: "notify_only keys may only create request_confirmation interactions",
+          code: "agent_key_scope_violation",
+        });
+        return;
+      }
+      if (!consumeNotifyOnlyCreateQuota(req.actor.keyId ?? `agent:${req.actor.agentId}`)) {
+        logger.warn(
+          { agentId: req.actor.agentId, keyId: req.actor.keyId, issueId: issue.id },
+          "notify_only interaction create rate limit exceeded",
+        );
+        res.status(429).json({
+          error: "notify_only interaction create rate limit exceeded",
+          code: "agent_key_rate_limited",
+        });
+        return;
+      }
+      if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
+    } else if (req.actor.type === "agent") {
       if (!(await assertAgentIssueMutationAllowed(req, res, issue, { allowVisibleIssueWrite: true }))) return;
       if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
     } else {
@@ -11311,8 +11375,8 @@ export function issueRoutes(
     }
 
     const actor = getActorInfo(req);
-    const agentSourceRunId = req.actor.type === "agent" ? requireAgentRunId(req, res) : null;
-    if (req.actor.type === "agent" && !agentSourceRunId) return;
+    const agentSourceRunId = req.actor.type === "agent" && !notifyOnlyScope ? requireAgentRunId(req, res) : null;
+    if (req.actor.type === "agent" && !notifyOnlyScope && !agentSourceRunId) return;
     if (
       req.body.kind === "request_confirmation"
       && req.body.addresseeAgentId
@@ -12724,11 +12788,25 @@ export function issueRoutes(
     // (pre-checked above, re-checked in-transaction here). Mirrors the host
     // bridge path.
     if (commentAttachmentIds.length > 0) {
-      await svc.attachAssetsToComment({
+      const bound = await svc.attachAssetsToComment({
         issueId: currentIssue.id,
         issueCommentId: comment.id,
         assetIds: commentAttachmentIds,
       });
+      for (const row of bound) {
+        await logActivity(db, {
+          companyId: currentIssue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "issue.attachment_bound",
+          entityType: "issue",
+          entityId: currentIssue.id,
+          details: attachmentBoundActivityDetails(row),
+        });
+      }
     }
 
     await issueReferencesSvc.syncComment(comment.id);
@@ -13305,9 +13383,12 @@ export function issueRoutes(
       entityId: issueId,
       details: {
         attachmentId: attachment.id,
+        issueId,
+        commentId: attachment.issueCommentId ?? null,
         originalFilename: attachment.originalFilename,
         contentType: attachment.contentType,
         byteSize: attachment.byteSize,
+        binding: "upload",
       },
     });
 
@@ -13363,9 +13444,21 @@ export function issueRoutes(
       res.setHeader("Content-Security-Policy", "sandbox; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'");
     }
     const filename = attachment.originalFilename ?? "attachment";
-    const disposition = parseBooleanQuery(req.query.download)
-      ? "attachment"
-      : isInlineAttachmentContentType(responseContentType) ? "inline" : "attachment";
+    // SE ruling (D2): plugin-created spreadsheet-bait assets (csv/tsv content
+    // type or spreadsheet filename under the plugin-artifacts namespace) are
+    // pinned to download — a browser must never render them inline.
+    const disposition =
+      parseBooleanQuery(req.query.download) ||
+      isSpreadsheetBaitPluginArtifact({
+        companyId: attachment.companyId,
+        objectKey: attachment.objectKey,
+        contentType: responseContentType,
+        originalFilename: attachment.originalFilename,
+      })
+        ? "attachment"
+        : isInlineAttachmentContentType(responseContentType)
+          ? "inline"
+          : "attachment";
     res.setHeader("Content-Disposition", `${disposition}; filename=\"${filename.replaceAll("\"", "")}\"`);
 
     object.stream.on("error", (err) => {

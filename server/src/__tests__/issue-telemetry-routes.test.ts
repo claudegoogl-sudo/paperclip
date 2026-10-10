@@ -45,77 +45,83 @@ const mockDb = vi.hoisted(() => ({
     callback({ select: mockDbSelect })),
 }));
 
-function registerModuleMocks() {
-  vi.doMock("@paperclipai/shared/telemetry", () => ({
-    trackAgentTaskCompleted: mockTrackAgentTaskCompleted,
-    trackErrorHandlerCrash: vi.fn(),
-  }));
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("@paperclipai/shared/telemetry", () => ({
+  trackAgentTaskCompleted: mockTrackAgentTaskCompleted,
+  trackErrorHandlerCrash: vi.fn(),
+}));
 
-  vi.doMock("../telemetry.js", () => ({
-    getTelemetryClient: mockGetTelemetryClient,
-  }));
+vi.mock("../telemetry.js", () => ({
+  getTelemetryClient: mockGetTelemetryClient,
+}));
 
-  vi.doMock("../services/index.js", () => ({
-    companyService: () => ({
-      getById: vi.fn(async () => ({ id: "company-1" })),
+vi.mock("../services/index.js", () => ({
+  companyService: () => ({
+    getById: vi.fn(async () => ({ id: "company-1" })),
+  }),
+  accessService: () => ({
+    canUser: vi.fn(),
+    decide: vi.fn(async () => ({
+      allowed: true,
+      action: "issue:mutate",
+      reason: "allow_test",
+      explanation: "Allowed by test mock.",
+    })),
+    hasPermission: vi.fn(),
+  }),
+  agentService: () => mockAgentService,
+  companySkillService: () => ({
+    completeTestRunForIssue: vi.fn(async () => null),
+  }),
+  documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
+  documentService: () => ({}),
+  executionWorkspaceService: () => ({}),
+  feedbackService: () => ({}),
+  goalService: () => ({}),
+  heartbeatService: () => ({
+    wakeup: vi.fn(async () => undefined),
+    reportRunActivity: vi.fn(async () => undefined),
+  }),
+  instanceSettingsService: () => ({}),
+  issueApprovalService: () => ({}),
+  issueReferenceService: () => ({
+    deleteDocumentSource: async () => undefined,
+    diffIssueReferenceSummary: () => ({
+      addedReferencedIssues: [],
+      removedReferencedIssues: [],
+      currentReferencedIssues: [],
     }),
-    accessService: () => ({
-      canUser: vi.fn(),
-      decide: vi.fn(async () => ({
-        allowed: true,
-        action: "issue:mutate",
-        reason: "allow_test",
-        explanation: "Allowed by test mock.",
-      })),
-      hasPermission: vi.fn(),
-    }),
-    agentService: () => mockAgentService,
-    companySkillService: () => ({
-      completeTestRunForIssue: vi.fn(async () => null),
-    }),
-    documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
-    documentService: () => ({}),
-    executionWorkspaceService: () => ({}),
-    feedbackService: () => ({}),
-    goalService: () => ({}),
-    heartbeatService: () => ({
-      wakeup: vi.fn(async () => undefined),
-      reportRunActivity: vi.fn(async () => undefined),
-    }),
-    instanceSettingsService: () => ({}),
-    issueApprovalService: () => ({}),
-    issueReferenceService: () => ({
-      deleteDocumentSource: async () => undefined,
-      diffIssueReferenceSummary: () => ({
-        addedReferencedIssues: [],
-        removedReferencedIssues: [],
-        currentReferencedIssues: [],
-      }),
-      emptySummary: () => ({ outbound: [], inbound: [] }),
-      listIssueReferenceSummary: async () => ({ outbound: [], inbound: [] }),
-      syncComment: async () => undefined,
-      syncDocument: async () => undefined,
-      syncIssue: async () => undefined,
-    }),
-    issueThreadInteractionService: () => ({
-      listForIssue: vi.fn(async () => []),
-      expirePendingInteractionsForTerminalIssue: vi.fn(async () => []),
-      expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
-      expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
-    }),
-    issueRecoveryActionService: () => ({
-      getActiveForIssue: vi.fn(async () => null),
-      listActiveForIssues: vi.fn(async () => new Map()),
-    }),
-    issueService: () => mockIssueService,
-    logActivity: vi.fn(async () => undefined),
-    projectService: () => ({}),
-    routineService: () => ({
-      syncRunStatusForIssue: vi.fn(async () => undefined),
-    }),
-    workProductService: () => ({}),
-  }));
-}
+    emptySummary: () => ({ outbound: [], inbound: [] }),
+    listIssueReferenceSummary: async () => ({ outbound: [], inbound: [] }),
+    syncComment: async () => undefined,
+    syncDocument: async () => undefined,
+    syncIssue: async () => undefined,
+  }),
+  issueThreadInteractionService: () => ({
+    listForIssue: vi.fn(async () => []),
+    expirePendingInteractionsForTerminalIssue: vi.fn(async () => []),
+    expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
+    expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
+  }),
+  issueRecoveryActionService: () => ({
+    getActiveForIssue: vi.fn(async () => null),
+    listActiveForIssues: vi.fn(async () => new Map()),
+  }),
+  issueService: () => mockIssueService,
+  logActivity: vi.fn(async () => undefined),
+  projectService: () => ({}),
+  routineService: () => ({
+    syncRunStatusForIssue: vi.fn(async () => undefined),
+  }),
+  workProductService: () => ({}),
+}));
 
 function makeIssue(status: "todo" | "done") {
   return {
@@ -148,14 +154,6 @@ async function createApp(actor: Record<string, unknown>) {
 
 describe("issue telemetry routes", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("@paperclipai/shared/telemetry");
-    vi.doUnmock("../telemetry.js");
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../routes/issues.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
     mockGetTelemetryClient.mockReturnValue({ track: vi.fn() });
     mockIssueService.getById.mockResolvedValue(makeIssue("todo"));

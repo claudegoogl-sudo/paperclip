@@ -107,6 +107,11 @@ export const SECURITY_POSTURE_COLUMNS = [
     column: "allowed_egress",
     reason: "Operator-added extra destinations layered on the config key's own value; the enforcement switch evaluates it, so a blanket widen admits attacker-chosen origins plugin-wide.",
   },
+  {
+    table: "plugins",
+    column: "private_egress_origins",
+    reason: "Exact private origins exempted from the plugin ctx.http.fetch private-range guard; a blanket widen gives a shared plugin worker LAN reach for every tenant.",
+  },
 
   {
     table: "board_api_key_auth_events",

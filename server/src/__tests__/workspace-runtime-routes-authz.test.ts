@@ -69,41 +69,46 @@ vi.mock("../routes/workspace-runtime-service-authz.js", () => ({
   assertCanManageExecutionWorkspaceRuntimeServices: mockAssertCanManageExecutionWorkspaceRuntimeServices,
 }));
 
-function registerWorkspaceRouteMocks() {
-  vi.doMock("../telemetry.js", () => ({
-    getTelemetryClient: mockGetTelemetryClient,
-  }));
-
-  vi.doMock("../services/index.js", () => ({
-    accessService: () => mockAccessService,
-    environmentService: () => mockEnvironmentService,
-    executionWorkspaceService: () => mockExecutionWorkspaceService,
-    heartbeatService: () => mockHeartbeatService,
-    logActivity: mockLogActivity,
-    projectService: () => mockProjectService,
-    secretService: () => mockSecretService,
-    workspaceOperationService: () => mockWorkspaceOperationService,
-    workspaceRuntimeLeaseService: () => mockWorkspaceRuntimeLeaseService,
-    LEASED_WORKSPACE_RUNTIME_ACTIONS: ["start", "stop", "restart", "repair"],
-  }));
-
-  vi.doMock("../services/workspace-runtime.js", () => ({
-    cleanupExecutionWorkspaceArtifacts: vi.fn(),
-    startRuntimeServicesForWorkspaceControl: vi.fn(),
-    stopRuntimeServicesForExecutionWorkspace: vi.fn(),
-    stopRuntimeServicesForProjectWorkspace: vi.fn(),
-  }));
-
-  vi.doMock("../routes/workspace-runtime-service-authz.js", () => ({
-    assertCanManageProjectWorkspaceRuntimeServices: mockAssertCanManageProjectWorkspaceRuntimeServices,
-    assertCanManageExecutionWorkspaceRuntimeServices: mockAssertCanManageExecutionWorkspaceRuntimeServices,
-  }));
-}
-
 let appImportCounter = 0;
 
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("../telemetry.js", () => ({
+  getTelemetryClient: mockGetTelemetryClient,
+}));
+
+vi.mock("../services/index.js", () => ({
+  accessService: () => mockAccessService,
+  environmentService: () => mockEnvironmentService,
+  executionWorkspaceService: () => mockExecutionWorkspaceService,
+  heartbeatService: () => mockHeartbeatService,
+  logActivity: mockLogActivity,
+  projectService: () => mockProjectService,
+  secretService: () => mockSecretService,
+  workspaceOperationService: () => mockWorkspaceOperationService,
+  workspaceRuntimeLeaseService: () => mockWorkspaceRuntimeLeaseService,
+  LEASED_WORKSPACE_RUNTIME_ACTIONS: ["start", "stop", "restart", "repair"],
+}));
+
+vi.mock("../services/workspace-runtime.js", () => ({
+  cleanupExecutionWorkspaceArtifacts: vi.fn(),
+  startRuntimeServicesForWorkspaceControl: vi.fn(),
+  stopRuntimeServicesForExecutionWorkspace: vi.fn(),
+  stopRuntimeServicesForProjectWorkspace: vi.fn(),
+}));
+
+vi.mock("../routes/workspace-runtime-service-authz.js", () => ({
+  assertCanManageProjectWorkspaceRuntimeServices: mockAssertCanManageProjectWorkspaceRuntimeServices,
+  assertCanManageExecutionWorkspaceRuntimeServices: mockAssertCanManageExecutionWorkspaceRuntimeServices,
+}));
+
 async function createProjectApp(actor: Record<string, unknown>) {
-  registerWorkspaceRouteMocks();
   appImportCounter += 1;
   const routeModulePath = `../routes/projects.js?workspace-runtime-routes-authz-${appImportCounter}`;
   const middlewareModulePath = `../middleware/index.js?workspace-runtime-routes-authz-${appImportCounter}`;
@@ -123,7 +128,6 @@ async function createProjectApp(actor: Record<string, unknown>) {
 }
 
 async function createExecutionWorkspaceApp(actor: Record<string, unknown>) {
-  registerWorkspaceRouteMocks();
   appImportCounter += 1;
   const routeModulePath = `../routes/execution-workspaces.js?workspace-runtime-routes-authz-${appImportCounter}`;
   const middlewareModulePath = `../middleware/index.js?workspace-runtime-routes-authz-${appImportCounter}`;

@@ -87,6 +87,7 @@ import {
   toolAccessService,
   workspaceOperationService,
 } from "./services/index.js";
+import { markServerShutdownStarted } from "./services/server-shutdown-state.js";
 import { questionResponseDeliveryService } from "./services/question-response-delivery.js";
 import { queueIssueAssignmentWakeup } from "./services/issue-assignment-wakeup.js";
 import { createSecretProposalsService } from "./services/secret-proposals.js";
@@ -109,9 +110,19 @@ import {
   startEgressPostureSweep,
 } from "./services/egress-posture.js";
 import { startTaskBridgeRenewalSweep } from "./services/task-bridge-renewal.js";
-import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
+import {
+  buildRuntimeApiCandidateUrls,
+  chooseAgentApiUrl,
+  choosePrimaryRuntimeApiUrl,
+  isInsecureNonLoopbackApiUrl,
+} from "./runtime-api.js";
 import { isLoopbackHost, rewriteLoopbackUrlPort } from "./url-utils.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
+import { bufferPluginLogEntry } from "./services/plugin-host-services.js";
+import {
+  createPluginStreamBus,
+  publishWorkerStreamNotification,
+} from "./services/plugin-stream-bus.js";
 import { createPluginRunContextRegistry } from "./services/plugin-run-context-registry.js";
 import {
   createDuplexAggregateByteLedgerTelemetry,
@@ -1008,9 +1019,28 @@ export async function startServer(): Promise<StartedServer> {
   // and createApp — passing the manager without its registry would leave the
   // handler reading a disjoint, empty registry (Gate 1 -> runcontext_invalid).
   const pluginRunContextRegistry = createPluginRunContextRegistry();
+  // One process-wide stream bus. Verified worker stream notifications publish
+  // here and the plugin SSE bridge (`GET /api/plugins/:pluginId/bridge/stream/:channel`)
+  // fans them out to subscribed UIs. Without this wiring the SSE
+  // bridge was a silently-dead surface — the endpoint 501'd and no worker
+  // notification ever reached a subscriber.
+  const pluginStreamBus = createPluginStreamBus();
   const pluginWorkerManager = createPluginWorkerManager({
     runContextRegistry: pluginRunContextRegistry,
     duplexAggregateByteLedger,
+    // Worker ctx.logger notifications persist to plugin_logs on the same
+    // buffered path as the logger.log host service (§26.1), so the operator
+    // logs panel can show plugin errors.
+    workerLogPersist: (entry) => bufferPluginLogEntry({ db, ...entry }),
+    onStreamNotification: ({ pluginId, method, params }) => {
+      const published = publishWorkerStreamNotification(pluginStreamBus, pluginId, method, params);
+      if (!published) {
+        logger.warn(
+          { pluginId, method },
+          "unrecognized plugin stream notification could not be published",
+        );
+      }
+    },
   });
   const heartbeat = config.heartbeatSchedulerEnabled
     ? heartbeatService(db as any, { pluginWorkerManager, duplexAggregateByteLedger })
@@ -1022,7 +1052,7 @@ export async function startServer(): Promise<StartedServer> {
   // document parsed fail-closed above (`plugins.autoInstall`). Absent env means
   // self-hosted: createApp falls back to its built-in kubernetes-only default.
   const managedPluginAutoInstall = managedConfig?.plugins.autoInstall ?? null;
-  const app = await createApp(db as any, {
+  const { app, pluginToolDispatcher } = await createApp(db as any, {
     uiMode,
     serverPort: listenPort,
     storageService,
@@ -1060,6 +1090,7 @@ export async function startServer(): Promise<StartedServer> {
     betterAuthHandler,
     resolveSession,
     pluginWorkerManager,
+    pluginStreamBus,
     decisionServiceOptions,
     managedPluginAutoInstall,
     pluginRunContextRegistry,
@@ -1096,6 +1127,20 @@ export async function startServer(): Promise<StartedServer> {
   process.env.PAPERCLIP_RUNTIME_API_URL = runtimeApiUrl;
   process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON = JSON.stringify(runtimeApiCandidates);
   process.env.PAPERCLIP_API_URL = configuredApiUrl;
+  const agentApiUrl = chooseAgentApiUrl({
+    explicitAgentApiUrl: process.env.PAPERCLIP_AGENT_API_URL ?? null,
+    bindHost: runtimeListenHost,
+    port: listenPort,
+    fallbackApiUrl: configuredApiUrl,
+  });
+  process.env.PAPERCLIP_AGENT_API_URL = agentApiUrl;
+  logger.info({ agentApiUrl, runtimeApiUrl: configuredApiUrl }, "agent run API base selected");
+  if (isInsecureNonLoopbackApiUrl(agentApiUrl)) {
+    logger.warn(
+      { agentApiUrl },
+      "agent run API base is cleartext http to a non-loopback host; run credentials cross the network unencrypted",
+    );
+  }
 
   
   setupRunnerPrpWebSocketServer(server, { apiUrl: configuredApiUrl });
@@ -1490,6 +1535,9 @@ export async function startServer(): Promise<StartedServer> {
       trustedLocalStdioRuntimeHost: process.env.PAPERCLIP_TRUSTED_MCP_RUNTIME_HOST
         ?? process.env.PAPERCLIP_TOOL_RUNTIME_TRUSTED_HOST
         ?? null,
+      // Plugin-backed connections report health via the plugin tool runtime
+      // instead of requiring a config.url their records never carry.
+      pluginToolRuntimeProbe: ({ pluginKey }) => pluginToolDispatcher.toolCount(pluginKey),
     });
     const worktreeRunExecutionActivation = await resolveWorktreeRunExecutionActivationState({
       getExperimental: () => instanceSettingsService(db).getExperimental(),
@@ -1581,7 +1629,7 @@ export async function startServer(): Promise<StartedServer> {
         }
 
         const scanned = await heartbeat.scanSilentActiveRuns();
-        if (scanned.created > 0 || scanned.escalated > 0) {
+        if (scanned.created > 0 || scanned.correlated > 0 || scanned.escalated > 0) {
           logger.warn({ ...scanned }, "startup active-run output watchdog created review work");
         }
 
@@ -1836,7 +1884,7 @@ export async function startServer(): Promise<StartedServer> {
             })
             .then(async () => {
               const scanned = await heartbeat.scanSilentActiveRuns();
-              if (scanned.created > 0 || scanned.escalated > 0) {
+              if (scanned.created > 0 || scanned.correlated > 0 || scanned.escalated > 0) {
                 logger.warn({ ...scanned }, "periodic active-run output watchdog created review work");
               }
             })
@@ -2051,6 +2099,10 @@ export async function startServer(): Promise<StartedServer> {
 
   {
     const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
+      // Mark the shutdown BEFORE the first await: every heartbeat terminal-state
+      // path that fires while the drain is still walking runs must observe the
+      // flag no later than the drain itself.
+      markServerShutdownStarted(signal);
       await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
       heartbeatSchedulerStopped = true;
       if (heartbeatSchedulerInterval) {

@@ -92,6 +92,7 @@ const mockIssueThreadInteractionService = vi.hoisted(() => ({
   expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
   expireRequestConfirmationsSupersededByHistoricalComments: vi.fn(async () => []),
   listForIssue: vi.fn(async () => []),
+  create: vi.fn(),
 }));
 const mockIssueApprovalService = vi.hoisted(() => ({
   link: vi.fn(),
@@ -156,56 +157,62 @@ const mockExternalObjectService = vi.hoisted(() => ({
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 const mockObserveCrossIssueInfluence = vi.hoisted(() => vi.fn(async () => null));
 
-function registerRouteMocks() {
-  vi.doMock("@paperclipai/shared/telemetry", () => ({
+// Hoisted module mocks (not per-test vi.doMock + vi.resetModules): the mock
+// registry must be in place before ANY import of the route module, in every
+// test. createApp concurrently importActual()s middleware and route modules
+// whose graphs share the mocked services, so a load-dependent registry race
+// could bind the REAL services module and 500 the request under test
+// (master Release runs 35877211616 / 35888840397). A hoisted vi.mock applies
+// to every import graph deterministically.
+  vi.mock("@paperclipai/shared/telemetry", () => ({
     trackAgentTaskCompleted: vi.fn(),
     trackErrorHandlerCrash: vi.fn(),
   }));
 
-  vi.doMock("../telemetry.js", () => ({
+  vi.mock("../telemetry.js", () => ({
     getTelemetryClient: vi.fn(() => ({ track: vi.fn() })),
   }));
 
-  vi.doMock("../services/access.js", () => ({
+  vi.mock("../services/access.js", () => ({
     accessService: () => mockAccessService,
   }));
 
-  vi.doMock("../services/agents.js", () => ({
+  vi.mock("../services/agents.js", () => ({
     agentService: () => mockAgentService,
   }));
 
-  vi.doMock("../services/documents.js", () => ({
+  vi.mock("../services/documents.js", () => ({
     documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
     documentService: () => mockDocumentService,
   }));
 
-  vi.doMock("../services/issues.js", () => ({
+  vi.mock("../services/issues.js", () => ({
     issueService: () => mockIssueService,
   }));
 
-  vi.doMock("../services/work-products.js", () => ({
+  vi.mock("../services/work-products.js", () => ({
     workProductService: () => mockWorkProductService,
   }));
 
-  vi.doMock("../services/external-objects.js", () => ({
+  vi.mock("../services/external-objects.js", () => ({
     externalObjectService: () => mockExternalObjectService,
   }));
 
-  vi.doMock("../services/activity-log.js", () => ({
+  vi.mock("../services/activity-log.js", () => ({
     logActivity: mockLogActivity,
   }));
 
-  vi.doMock("../services/cross-issue-influence-limit.js", () => ({
+  vi.mock("../services/cross-issue-influence-limit.js", () => ({
     observeCrossIssueInfluence: mockObserveCrossIssueInfluence,
     crossIssueInfluenceLimitError: vi.fn(),
     crossIssueInfluenceRunContextError: () => new HttpError(
-      403,
-      "Agent issue comments and updates require a valid heartbeat run so cross-issue influence can be contained",
-      { code: "cross_issue_influence_run_context_required" },
+  403,
+  "Agent issue comments and updates require a valid heartbeat run so cross-issue influence can be contained",
+  { code: "cross_issue_influence_run_context_required" },
     ),
   }));
 
-  vi.doMock("../services/index.js", () => ({
+  vi.mock("../services/index.js", () => ({
     ISSUE_LIST_DEFAULT_LIMIT: 100,
     ISSUE_LIST_MAX_LIMIT: 500,
     accessService: () => mockAccessService,
@@ -213,42 +220,42 @@ function registerRouteMocks() {
     budgetService: () => mockBudgetService,
     clampIssueListLimit: (value: number) => Math.min(Math.max(value, 1), 500),
     companySkillService: () => ({
-      completeTestRunForIssue: vi.fn(async () => null),
+  completeTestRunForIssue: vi.fn(async () => null),
     }),
     companyService: () => mockCompanyService,
     documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
     documentService: () => mockDocumentService,
     executionWorkspaceService: () => ({}),
     feedbackService: () => ({
-      listIssueVotesForUser: vi.fn(async () => []),
-      saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
+  listIssueVotesForUser: vi.fn(async () => []),
+  saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
     }),
     goalService: () => ({}),
     heartbeatService: () => mockHeartbeatService,
     instanceSettingsService: () => ({
-      get: vi.fn(async () => ({
-        id: "instance-settings-1",
-        general: {
-          censorUsernameInLogs: false,
-          feedbackDataSharingPreference: "prompt",
-        },
-      })),
-      listCompanyIds: vi.fn(async () => [companyId]),
+  get: vi.fn(async () => ({
+    id: "instance-settings-1",
+    general: {
+      censorUsernameInLogs: false,
+      feedbackDataSharingPreference: "prompt",
+    },
+  })),
+  listCompanyIds: vi.fn(async () => [companyId]),
     }),
     issueApprovalService: () => mockIssueApprovalService,
     issueRecoveryActionService: () => mockIssueRecoveryActionService,
     issueReferenceService: () => ({
-      deleteDocumentSource: async () => undefined,
-      diffIssueReferenceSummary: () => ({
-        addedReferencedIssues: [],
-        removedReferencedIssues: [],
-        currentReferencedIssues: [],
-      }),
-      emptySummary: () => ({ outbound: [], inbound: [] }),
-      listIssueReferenceSummary: async () => ({ outbound: [], inbound: [] }),
-      syncComment: async () => undefined,
-      syncDocument: async () => undefined,
-      syncIssue: async () => undefined,
+  deleteDocumentSource: async () => undefined,
+  diffIssueReferenceSummary: () => ({
+    addedReferencedIssues: [],
+    removedReferencedIssues: [],
+    currentReferencedIssues: [],
+  }),
+  emptySummary: () => ({ outbound: [], inbound: [] }),
+  listIssueReferenceSummary: async () => ({ outbound: [], inbound: [] }),
+  syncComment: async () => undefined,
+  syncDocument: async () => undefined,
+  syncIssue: async () => undefined,
     }),
     issueService: () => mockIssueService,
     issueThreadInteractionService: () => mockIssueThreadInteractionService,
@@ -256,11 +263,11 @@ function registerRouteMocks() {
     logActivity: mockLogActivity,
     projectService: () => mockProjectService,
     routineService: () => ({
-      syncRunStatusForIssue: vi.fn(async () => undefined),
+  syncRunStatusForIssue: vi.fn(async () => undefined),
     }),
     workProductService: () => mockWorkProductService,
   }));
-}
+
 
 function makeIssue(overrides: Record<string, unknown> = {}) {
   return {
@@ -405,22 +412,6 @@ function boardActor() {
 
 describe("agent issue mutation checkout ownership", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("@paperclipai/shared/telemetry");
-    vi.doUnmock("../telemetry.js");
-    vi.doUnmock("../services/access.js");
-    vi.doUnmock("../services/activity-log.js");
-    vi.doUnmock("../services/cross-issue-influence-limit.js");
-    vi.doUnmock("../services/agents.js");
-    vi.doUnmock("../services/documents.js");
-    vi.doUnmock("../services/external-objects.js");
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../services/issues.js");
-    vi.doUnmock("../services/work-products.js");
-    vi.doUnmock("../routes/issues.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerRouteMocks();
     vi.clearAllMocks();
     mockAccessService.canUser.mockReset();
     mockAccessService.decide.mockReset();
@@ -2412,6 +2403,131 @@ describe("agent issue mutation checkout ownership", () => {
       expect(res.status, JSON.stringify(res.body)).toBe(403);
       expect(res.body.error).toBe("Task-watchdog run context is not backed by an active persisted watchdog.");
       expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("notify_only agent key on interaction create", () => {
+    const keyId = "88888888-8888-4888-8888-888888888888";
+    const otherIssueId = "99999999-9999-4999-8999-999999999990";
+    const cardBody = {
+      kind: "request_confirmation",
+      payload: { version: 1, prompt: "Token watch fired. Acknowledge?" },
+    };
+
+    function notifyOnlyActor(issueIds: string[]) {
+      return {
+        type: "agent",
+        agentId: peerAgentId,
+        companyId,
+        source: "agent_key",
+        keyId,
+        keyScope: { kind: "notify_only", issueIds },
+        // intentionally no runId: the pager is not a heartbeat run
+      };
+    }
+
+    beforeEach(() => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId }));
+      mockIssueThreadInteractionService.create.mockReset();
+      mockIssueThreadInteractionService.create.mockImplementation(async (_issue: unknown, input: Record<string, unknown>) => ({
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        kind: input.kind,
+        status: "pending",
+        sourceRunId: input.sourceRunId ?? null,
+        addresseeAgentId: null,
+      }));
+    });
+
+    it("creates a run-less card on an allow-listed issue with key provenance and no run id", async () => {
+      const res = await request(await createApp(notifyOnlyActor([issueId])))
+        .post(`/api/issues/${issueId}/interactions`)
+        .send(cardBody);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueThreadInteractionService.create).toHaveBeenCalledWith(
+        expect.objectContaining({ id: issueId }),
+        expect.objectContaining({ sourceRunId: null }),
+        expect.objectContaining({ agentId: peerAgentId }),
+      );
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.thread_interaction_created",
+          actorType: "agent",
+          agentId: peerAgentId,
+          agentApiKeyId: keyId,
+          runId: null,
+        }),
+      );
+    });
+
+    it("returns 403 for an issue that is not on the key allow-list", async () => {
+      const res = await request(await createApp(notifyOnlyActor([otherIssueId])))
+        .post(`/api/issues/${issueId}/interactions`)
+        .send(cardBody);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.code).toBe("agent_key_scope_violation");
+      expect(mockIssueThreadInteractionService.create).not.toHaveBeenCalled();
+    });
+
+    it.each(["suggest_tasks", "ask_user_questions"])("returns 403 for a %s card (request_confirmation only)", async (kind) => {
+      const res = await request(await createApp(notifyOnlyActor([issueId])))
+        .post(`/api/issues/${issueId}/interactions`)
+        .send({ kind, payload: {} });
+
+      // Either the kind gate (403) or body validation (400) must refuse; never create.
+      expect([400, 403], JSON.stringify(res.body)).toContain(res.status);
+      if (res.status === 403) expect(res.body.code).toBe("agent_key_scope_violation");
+      expect(mockIssueThreadInteractionService.create).not.toHaveBeenCalled();
+    });
+
+    it("rate-limits card creation per key to 10 per hour (429)", async () => {
+      const issuesModule = await import("../routes/issues.js");
+      issuesModule.resetNotifyOnlyCreateQuotaForTests();
+      const app = await createApp(notifyOnlyActor([issueId]));
+      for (let i = 0; i < issuesModule.NOTIFY_ONLY_CREATE_LIMIT_PER_HOUR; i += 1) {
+        const ok = await request(app).post(`/api/issues/${issueId}/interactions`).send(cardBody);
+        expect(ok.status, JSON.stringify(ok.body)).toBe(201);
+      }
+      const res = await request(app).post(`/api/issues/${issueId}/interactions`).send(cardBody);
+      expect(res.status, JSON.stringify(res.body)).toBe(429);
+      expect(res.body.code).toBe("agent_key_rate_limited");
+      expect(mockIssueThreadInteractionService.create).toHaveBeenCalledTimes(
+        issuesModule.NOTIFY_ONLY_CREATE_LIMIT_PER_HOUR,
+      );
+    });
+
+    it("keeps the run-id rule for a standard agent key without a run id (401)", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: peerAgentId, checkoutRunId: null, executionRunId: null }));
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: peerAgentId,
+        companyId,
+        source: "agent_key",
+        keyId,
+        keyScope: { kind: "standard" },
+      }))
+        .post(`/api/issues/${issueId}/interactions`)
+        .send(cardBody);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(401);
+      expect(res.body.error).toBe("Agent run id required");
+      expect(mockIssueThreadInteractionService.create).not.toHaveBeenCalled();
+    });
+
+    it("still accepts an agent_jwt with a run id and records that run", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: peerAgentId, checkoutRunId: null, executionRunId: null }));
+      const res = await request(await createApp(peerActor({ source: "agent_jwt" })))
+        .post(`/api/issues/${issueId}/interactions`)
+        .send(cardBody);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(mockIssueThreadInteractionService.create).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ sourceRunId: "66666666-6666-4666-8666-666666666666" }),
+        expect.anything(),
+      );
     });
   });
 });

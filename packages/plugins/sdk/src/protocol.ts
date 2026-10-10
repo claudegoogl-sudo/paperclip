@@ -61,6 +61,7 @@ import type {
   PluginIssueAttachmentContent,
   PluginIssueWakeupBatchResult,
   PluginIssueWakeupResult,
+  PluginIssueWakeupRequest,
   PluginJobContext,
   PluginExecutionWorkspaceMetadata,
   PluginWorkspace,
@@ -322,6 +323,13 @@ export interface PluginInvocationContext {
  */
 export interface WorkerHostCallContext {
   invocationScope?: PluginInvocationScope | null;
+  /**
+   * SECURITY-CRITICAL: the host→worker method of the host's OWN dispatch record
+   * for the echoed invocation id (e.g. `"executeTool"`). Set only by the host
+   * worker manager alongside `invocationScope`; never read from worker params.
+   * The cross-company read exemption requires `"executeTool"`.
+   */
+  invocationDispatchMethod?: string;
   invalidInvocationScope?: boolean;
   /**
    * The W3C `traceparent` the host minted for the echoed invocation. The host
@@ -2080,6 +2088,16 @@ export interface WorkerToHostMethods {
     },
     result: PluginIssueSubtree,
   ];
+  "issues.listWakeupRequests": [
+    params: {
+      companyId: string;
+      issueIds: string[];
+      statuses?: string[];
+      since?: string;
+      limit?: number;
+    },
+    result: PluginIssueWakeupRequest[],
+  ];
   "issues.requestWakeup": [
     params: {
       issueId: string;
@@ -2520,6 +2538,38 @@ export interface WorkerToHostNotifications {
   "streams.close": {
     channel: string;
     companyId: string;
+  };
+
+  /**
+   * Host→worker feedback: the host DROPPED a `streams.*`
+   * notification because it could not be tenant-verified — no resolvable
+   * invocation scope, no channel pin captured at `streams.open` inside an
+   * attributed dispatch, or a companyId that mismatches the pin.
+   *
+   * This notification is fire-and-forget in both directions: the worker RPC
+   * host forwards it to the plugin log (`level: "warn"`) so out-of-dispatch
+   * emitters are diagnosable instead of silently dead. Reason codes:
+   * `invalid_invocation_scope`, `no_invocation_scope`, `company_mismatch`,
+   * `unpinned_channel`, `pin_mismatch`, `pin_cap_exceeded`.
+   *
+   * `pin_cap_exceeded` is the eviction report: the host bounds the pins it
+   * keeps per worker, so capturing a new pin once the cap is reached evicts
+   * the least-recently captured pin. On eviction `channel`/`companyId` name
+   * the EVICTED pin (not the notification being processed) and `method` is
+   * the capture that triggered the eviction. The channel itself keeps
+   * working in-dispatch; only its out-of-dispatch attribution and exit-time
+   * cleanup are given up. Close channels you are done with to stay under
+   * the cap.
+   */
+  "streams.dropped": {
+    /** The dropped worker→host notification method (`streams.emit`, …). */
+    method: string;
+    /** Channel of the dropped notification, when one was named. */
+    channel?: string;
+    /** Claimed companyId of the dropped notification, when one was sent. */
+    companyId?: string;
+    /** Why the host dropped it. */
+    reason: string;
   };
 
   /**

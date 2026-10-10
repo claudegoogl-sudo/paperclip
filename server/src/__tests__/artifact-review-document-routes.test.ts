@@ -31,100 +31,106 @@ const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 const mockEnsureForWorkProduct = vi.hoisted(() => vi.fn());
 const mockSyncDocumentSafely = vi.hoisted(() => vi.fn(async () => undefined));
 
-function registerRouteMocks() {
-  vi.doMock("@paperclipai/shared/telemetry", () => ({
-    trackAgentTaskCompleted: vi.fn(),
-    trackErrorHandlerCrash: vi.fn(),
-  }));
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("@paperclipai/shared/telemetry", () => ({
+  trackAgentTaskCompleted: vi.fn(),
+  trackErrorHandlerCrash: vi.fn(),
+}));
 
-  vi.doMock("../telemetry.js", () => ({
-    getTelemetryClient: vi.fn(() => ({ track: vi.fn() })),
-  }));
+vi.mock("../telemetry.js", () => ({
+  getTelemetryClient: vi.fn(() => ({ track: vi.fn() })),
+}));
 
-  vi.doMock("../services/issues.js", () => ({
-    issueService: () => mockIssueService,
-  }));
+vi.mock("../services/issues.js", () => ({
+  issueService: () => mockIssueService,
+}));
 
-  vi.doMock("../services/activity-log.js", () => ({
-    logActivity: mockLogActivity,
-  }));
+vi.mock("../services/activity-log.js", () => ({
+  logActivity: mockLogActivity,
+}));
 
-  vi.doMock("../services/artifact-review-documents.js", () => ({
-    artifactReviewDocumentService: () => ({
-      ensureForWorkProduct: mockEnsureForWorkProduct,
-    }),
-  }));
+vi.mock("../services/artifact-review-documents.js", () => ({
+  artifactReviewDocumentService: () => ({
+    ensureForWorkProduct: mockEnsureForWorkProduct,
+  }),
+}));
 
-  vi.doMock("../services/external-objects.js", () => ({
-    externalObjectService: () => ({
-      syncDocumentSafely: mockSyncDocumentSafely,
-    }),
-  }));
+vi.mock("../services/external-objects.js", () => ({
+  externalObjectService: () => ({
+    syncDocumentSafely: mockSyncDocumentSafely,
+  }),
+}));
 
-  vi.doMock("../services/index.js", () => ({
-    accessService: () => mockAccessService,
-    agentService: () => ({
-      getById: vi.fn(),
+vi.mock("../services/index.js", () => ({
+  accessService: () => mockAccessService,
+  agentService: () => ({
+    getById: vi.fn(),
+  }),
+  companySkillService: () => ({}),
+  companyService: () => mockCompanyService,
+  documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
+  documentService: () => ({}),
+  executionWorkspaceService: () => ({}),
+  feedbackService: () => ({
+    listIssueVotesForUser: vi.fn(async () => []),
+    saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
+  }),
+  goalService: () => ({}),
+  heartbeatService: () => ({
+    wakeup: vi.fn(async () => undefined),
+    reportRunActivity: vi.fn(async () => undefined),
+    getRun: vi.fn(async () => null),
+    getActiveRunForAgent: vi.fn(async () => null),
+    cancelRun: vi.fn(async () => null),
+  }),
+  instanceSettingsService: () => ({
+    get: vi.fn(async () => ({
+      id: "instance-settings-1",
+      general: {
+        censorUsernameInLogs: false,
+        feedbackDataSharingPreference: "prompt",
+      },
+    })),
+    listCompanyIds: vi.fn(async () => ["company-1"]),
+  }),
+  issueApprovalService: () => ({}),
+  issueReferenceService: () => ({
+    deleteDocumentSource: async () => undefined,
+    diffIssueReferenceSummary: () => ({
+      addedReferencedIssues: [],
+      removedReferencedIssues: [],
+      currentReferencedIssues: [],
     }),
-    companySkillService: () => ({}),
-    companyService: () => mockCompanyService,
-    documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
-    documentService: () => ({}),
-    executionWorkspaceService: () => ({}),
-    feedbackService: () => ({
-      listIssueVotesForUser: vi.fn(async () => []),
-      saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
-    }),
-    goalService: () => ({}),
-    heartbeatService: () => ({
-      wakeup: vi.fn(async () => undefined),
-      reportRunActivity: vi.fn(async () => undefined),
-      getRun: vi.fn(async () => null),
-      getActiveRunForAgent: vi.fn(async () => null),
-      cancelRun: vi.fn(async () => null),
-    }),
-    instanceSettingsService: () => ({
-      get: vi.fn(async () => ({
-        id: "instance-settings-1",
-        general: {
-          censorUsernameInLogs: false,
-          feedbackDataSharingPreference: "prompt",
-        },
-      })),
-      listCompanyIds: vi.fn(async () => ["company-1"]),
-    }),
-    issueApprovalService: () => ({}),
-    issueReferenceService: () => ({
-      deleteDocumentSource: async () => undefined,
-      diffIssueReferenceSummary: () => ({
-        addedReferencedIssues: [],
-        removedReferencedIssues: [],
-        currentReferencedIssues: [],
-      }),
-      emptySummary: () => ({ outbound: [], inbound: [] }),
-      listIssueReferenceSummary: async () => ({ outbound: [], inbound: [] }),
-      syncComment: async () => undefined,
-      syncDocument: async () => undefined,
-      syncIssue: async () => undefined,
-    }),
-    issueThreadInteractionService: () => ({
-      listForIssue: vi.fn(async () => []),
-      expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
-      expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
-    }),
-    issueRecoveryActionService: () => ({
-      getActiveForIssue: vi.fn(async () => null),
-      listActiveForIssues: vi.fn(async () => new Map()),
-    }),
-    issueService: () => mockIssueService,
-    logActivity: mockLogActivity,
-    projectService: () => ({}),
-    routineService: () => ({
-      syncRunStatusForIssue: vi.fn(async () => undefined),
-    }),
-    workProductService: () => mockWorkProductService,
-  }));
-}
+    emptySummary: () => ({ outbound: [], inbound: [] }),
+    listIssueReferenceSummary: async () => ({ outbound: [], inbound: [] }),
+    syncComment: async () => undefined,
+    syncDocument: async () => undefined,
+    syncIssue: async () => undefined,
+  }),
+  issueThreadInteractionService: () => ({
+    listForIssue: vi.fn(async () => []),
+    expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
+    expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
+  }),
+  issueRecoveryActionService: () => ({
+    getActiveForIssue: vi.fn(async () => null),
+    listActiveForIssues: vi.fn(async () => new Map()),
+  }),
+  issueService: () => mockIssueService,
+  logActivity: mockLogActivity,
+  projectService: () => ({}),
+  routineService: () => ({
+    syncRunStatusForIssue: vi.fn(async () => undefined),
+  }),
+  workProductService: () => mockWorkProductService,
+}));
 
 function createStorageService(): StorageService {
   return {
@@ -211,9 +217,7 @@ function makeDocument(overrides: Record<string, unknown> = {}) {
 
 describe("work product review-document route", () => {
   beforeEach(() => {
-    vi.resetModules();
     vi.clearAllMocks();
-    registerRouteMocks();
     mockIssueService.getById.mockResolvedValue(makeIssue());
     mockWorkProductService.getById.mockResolvedValue(makeWorkProduct());
   });

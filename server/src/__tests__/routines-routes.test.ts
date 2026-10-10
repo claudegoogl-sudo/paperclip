@@ -133,37 +133,43 @@ const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockTrackRoutineCreated = vi.hoisted(() => vi.fn());
 const mockGetTelemetryClient = vi.hoisted(() => vi.fn());
 
-function registerModuleMocks() {
-  vi.doMock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
 
-  vi.doMock("@paperclipai/shared/telemetry", () => ({
-    trackRoutineCreated: mockTrackRoutineCreated,
-    trackErrorHandlerCrash: vi.fn(),
-  }));
+vi.mock("@paperclipai/shared/telemetry", () => ({
+  trackRoutineCreated: mockTrackRoutineCreated,
+  trackErrorHandlerCrash: vi.fn(),
+}));
 
-  vi.doMock("../telemetry.js", () => ({
-    getTelemetryClient: mockGetTelemetryClient,
-  }));
+vi.mock("../telemetry.js", () => ({
+  getTelemetryClient: mockGetTelemetryClient,
+}));
 
-  vi.doMock("../services/access.js", () => ({
-    accessService: () => mockAccessService,
-  }));
+vi.mock("../services/access.js", () => ({
+  accessService: () => mockAccessService,
+}));
 
-  vi.doMock("../services/routines.js", () => ({
-    routineService: () => mockRoutineService,
-  }));
+vi.mock("../services/routines.js", () => ({
+  routineService: () => mockRoutineService,
+}));
 
-  vi.doMock("../services/activity-log.js", () => ({
-    logActivity: mockLogActivity,
-  }));
+vi.mock("../services/activity-log.js", () => ({
+  logActivity: mockLogActivity,
+}));
 
-  vi.doMock("../services/index.js", () => ({
-    accessService: () => mockAccessService,
-    documentAnnotationService: () => mockAnnotationService,
-    logActivity: mockLogActivity,
-    routineService: () => mockRoutineService,
-  }));
-}
+vi.mock("../services/index.js", () => ({
+  accessService: () => mockAccessService,
+  documentAnnotationService: () => mockAnnotationService,
+  logActivity: mockLogActivity,
+  routineService: () => mockRoutineService,
+}));
 
 async function createApp(actor: Record<string, unknown>) {
   const [{ errorHandler }, { routineRoutes }] = await Promise.all([
@@ -183,17 +189,6 @@ async function createApp(actor: Record<string, unknown>) {
 
 describe("routine routes", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("@paperclipai/shared/telemetry");
-    vi.doUnmock("../telemetry.js");
-    vi.doUnmock("../services/access.js");
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../services/activity-log.js");
-    vi.doUnmock("../services/routines.js");
-    vi.doUnmock("../routes/routines.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
     mockGetTelemetryClient.mockReturnValue({ track: vi.fn() });
     mockRoutineService.list.mockResolvedValue([routine]);
