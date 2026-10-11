@@ -823,6 +823,7 @@ describe("routine routes", () => {
       { name: "POST /routines/:id/run", send: (app) => request(app).post(`/api/routines/${routineId}/run`).send({}), svcFn: () => mockRoutineService.runRoutine },
       { name: "POST /routines/:id/triggers", send: (app) => request(app).post(`/api/routines/${routineId}/triggers`).send({ kind: "schedule", cronExpression: "0 * * * *", timezone: "UTC" }), svcFn: () => mockRoutineService.createTrigger },
       { name: "PATCH /routine-triggers/:id enabled=true", send: (app) => request(app).patch(`/api/routine-triggers/${trigger.id}`).send({ enabled: true }), svcFn: () => mockRoutineService.updateTrigger },
+      { name: "POST /routine-triggers/:id/rotate-secret", send: (app) => request(app).post(`/api/routine-triggers/${trigger.id}/rotate-secret`).send({}), svcFn: () => mockRoutineService.rotateTriggerSecret },
     ];
 
     for (const c of startWorkCases) {
@@ -844,6 +845,11 @@ describe("routine routes", () => {
         mockRoutineService.createTrigger.mockResolvedValue({
           trigger,
           secretMaterial: null,
+          revision: { id: revisionId, revisionNumber: 2, changeSummary: null, snapshot: { triggers: [trigger] } },
+        });
+        mockRoutineService.rotateTriggerSecret.mockResolvedValue({
+          trigger,
+          secretMaterial: { webhookUrl: "https://example.test/hook", webhookSecret: "test-only" },
           revision: { id: revisionId, revisionNumber: 2, changeSummary: null, snapshot: { triggers: [trigger] } },
         });
         const allowed = await c.send(app);

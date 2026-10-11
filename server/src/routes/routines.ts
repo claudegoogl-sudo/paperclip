@@ -636,6 +636,9 @@ export function routineRoutes(
         res.status(404).json({ error: "Routine trigger not found" });
         return;
       }
+      // A fresh webhook secret is a capability to fire the trigger (which
+      // starts work for the assignee), so rotation needs tasks:assign too.
+      await assertAgentMayStartWorkFor(req, routine);
       const rotated = await svc.rotateTriggerSecret(trigger.id, {
         agentId: req.actor.type === "agent" ? req.actor.agentId : null,
         userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
