@@ -1,7 +1,7 @@
 import type { Request } from "express";
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { companies, principalPermissionGrants } from "@paperclipai/db";
+import { agents, companies, companyMemberships, goals, issues, labels, principalPermissionGrants, projects } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 
 /**
@@ -294,4 +294,24 @@ export async function checkCrossCompanyPatch(
     }
   }
   return { ok: true, changedFields: keys.sort() };
+}
+
+export function dbCrossCompanyPatchLookups(db: Db): CrossCompanyPatchLookups {
+  return {
+    async agentCompany(agentId) {
+      const row = await db.select({ companyId: agents.companyId, status: agents.status })
+        .from(agents).where(eq(agents.id, agentId)).limit(1).then((r) => r[0] ?? null);
+      return row ? { companyId: row.companyId, active: row.status !== "terminated" && row.status !== "paused" } : null;
+    },
+    async userIsMember(companyId, userId) {
+      const row = await db.select({ status: companyMemberships.status }).from(companyMemberships)
+        .where(and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.principalType, "user"),
+          eq(companyMemberships.principalId, userId))).limit(1).then((r) => r[0] ?? null);
+      return row?.status === "active";
+    },
+    labelCompany: (labelId) => db.select({ c: labels.companyId }).from(labels).where(eq(labels.id, labelId)).limit(1).then((r) => r[0]?.c ?? null),
+    issueCompany: (issueId) => db.select({ c: issues.companyId }).from(issues).where(eq(issues.id, issueId)).limit(1).then((r) => r[0]?.c ?? null),
+    projectCompany: (projectId) => db.select({ c: projects.companyId }).from(projects).where(eq(projects.id, projectId)).limit(1).then((r) => r[0]?.c ?? null),
+    goalCompany: (goalId) => db.select({ c: goals.companyId }).from(goals).where(eq(goals.id, goalId)).limit(1).then((r) => r[0]?.c ?? null),
+  };
 }

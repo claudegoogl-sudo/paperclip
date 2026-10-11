@@ -170,7 +170,9 @@ import {
   decideCrossCompanyIssueAccess,
   dbCrossCompanyDeps,
   recordCrossCompanyIssueAccess,
+  checkCrossCompanyPatch,
   type CrossCompanyIssueOp,
+  dbCrossCompanyPatchLookups,
 } from "./cross-company-issue-access.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
@@ -3976,6 +3978,8 @@ export function issueRoutes(
       return true;
     }
   });
+
+  const crossCompanyPatchLookups = dbCrossCompanyPatchLookups(db);
 
   async function getIssueWithCrossCompany(
     req: Request,
@@ -9519,8 +9523,35 @@ export function issueRoutes(
     // (assignee re-checks-out cleanly on next call) or returns a structured 4xx
     // instead of 5xx-ing on the orphan.
     await svc.clearOrphanCheckoutLocksIfTerminal(id);
-    const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
-    if (!existing) return;
+    const resolvedPatch = await getIssueWithCrossCompany(req, res, id, "issue.update");
+    if (!resolvedPatch) return;
+    const existing = resolvedPatch.issue;
+    const crossCompanyPatch = resolvedPatch.crossCompany;
+    if (crossCompanyPatch) {
+      const guard = await checkCrossCompanyPatch(
+        req.body as Record<string, unknown>,
+        existing.companyId,
+        req.actor.agentId!,
+        crossCompanyPatchLookups,
+      );
+      await recordCrossCompanyIssueAccess((row) => logActivity(db, row), {
+        targetCompanyId: existing.companyId,
+        homeCompanyId: req.actor.companyId!,
+        agentId: req.actor.agentId!,
+        runId: req.actor.runId ?? null,
+        issueId: existing.id,
+        op: "issue.update",
+        method: req.method,
+        route: "/issues/:id",
+        outcome: guard.ok ? "allowed" : "denied",
+        reason: guard.ok ? undefined : `field:${guard.field}`,
+        changedFields: guard.ok ? guard.changedFields : [guard.field],
+      });
+      if (!guard.ok) {
+        res.status(422).json({ error: guard.error, field: guard.field });
+        return;
+      }
+    }
     if (!assertNoSecretPatternInWritePayload(req, res, [
       { name: "description", value: req.body.description },
       { name: "comment", value: req.body.comment },
@@ -9538,16 +9569,23 @@ export function issueRoutes(
       await denyIssueWrite(req, res, existing, "issue_write_attribution_spoof_rejected");
       return;
     }
-    const issueMutationAccess = await assertAgentIssueMutationAllowed(
-      req,
-      res,
-      existing,
-      { allowVisibleIssueWrite: true },
-    );
+    // Cross-company: the double-key helper + field guard above ARE the
+    // authorization. assertAgentIssueMutationAllowed / decide() hard-deny any
+    // foreign-company agent (deny_company_boundary), so they are skipped here.
+    const issueMutationAccess = crossCompanyPatch
+      ? true
+      : await assertAgentIssueMutationAllowed(
+          req,
+          res,
+          existing,
+          { allowVisibleIssueWrite: true },
+        );
     if (!issueMutationAccess) return;
-    const issueMutationAuthorizationReason = req.actor.type === "agent"
-      ? issueWriteAuthorizationReason(req, await decideIssueAccess(req, existing, "issue:mutate"))
-      : issueWriteAuthorizationReason(req, true);
+    const issueMutationAuthorizationReason = crossCompanyPatch
+      ? issueWriteAuthorizationReason(req, true)
+      : req.actor.type === "agent"
+        ? issueWriteAuthorizationReason(req, await decideIssueAccess(req, existing, "issue:mutate"))
+        : issueWriteAuthorizationReason(req, true);
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
 
     const actor = getActorInfo(req);
