@@ -134,7 +134,10 @@ setInterval(() => {}, 1000);
 const SYNTHETIC_EADDRINUSE_ON_BASE_PORT_GUEST = `
 import http from "node:http";
 const p = Number(process.env.PORT);
-if (p === 42000) {
+const argv = process.argv.slice(2);
+const collideAt = argv.indexOf("--collide-port");
+const collidePort = collideAt >= 0 ? Number(argv[collideAt + 1]) : 42000;
+if (p === collidePort) {
   process.stderr.write("node:events:497\\nError: listen EADDRINUSE: address already in use 127.0.0.1:" + p + "\\n");
   process.exit(1);
 }
@@ -281,6 +284,26 @@ async function findFreeExposureAppPort(startAt: number): Promise<number> {
     }
   }
   throw new Error("no free app/HMR port pair available in the dedicated runtime exposure range");
+}
+
+/**
+ * Pin the allocator's first pick to a pair that is verifiably free on the real
+ * host right now. The allocator scans upward from the bottom of the dedicated
+ * range; a live lane or a transient socket on 42000 used to shift its pick to
+ * 42001 and fail single-allocation assertions for a reason unrelated to the
+ * behaviour under test. Ports below the chosen base are reported busy, so the
+ * scan lands on the base unless the code under test re-allocates.
+ */
+async function pinnedBasePortDeps(): Promise<{ base: number; isPortAvailable: (port: number) => Promise<boolean> }> {
+  const base = await findFreeExposureAppPort(42_000);
+  const hmrBase = deriveViteHmrPort(base);
+  return {
+    base,
+    isPortAvailable: async (port) => {
+      if (port < base || (port >= deriveViteHmrPort(42_000) && port < hmrBase)) return false;
+      return isLoopbackPortFree(port);
+    },
+  };
 }
 
 function installDeps(overrides: {
@@ -765,13 +788,14 @@ describe("recovers when a guest loses its assigned exposure port during startup 
         return broker.reserve(runtimeId, requested);
       },
     };
-    installDeps({ broker: recordingBroker });
+    const { base, isPortAvailable } = await pinnedBasePortDeps();
+    installDeps({ broker: recordingBroker, isPortAvailable });
 
     const logs: string[] = [];
     const error = await startRuntimeServicesForWorkspaceControl({
       ...startInput({
         serviceName: "paperclip-dev",
-        command: `${guestCommand("dev-runner-eaddrinuse-synthetic.mjs")} --bind lan`,
+        command: `${guestCommand("dev-runner-eaddrinuse-synthetic.mjs")} --bind lan --collide-port ${base}`,
         expose: LEGACY_HTTP_EXPOSE,
         port: { type: "auto", envKey: "PORT" },
       }),
@@ -780,12 +804,12 @@ describe("recovers when a guest loses its assigned exposure port during startup 
       },
     }).then(() => null, (err: unknown) => err as Error);
 
-    // No host listener owns 42000, so the printed EADDRINUSE line is unverified.
+    // No host listener owns the base port, so the printed EADDRINUSE line is unverified.
     // The start fails terminally after ONE allocation and never burns the pool.
     expect(error).not.toBeNull();
-    expect(error!.message).toContain("42000");
+    expect(error!.message).toContain(String(base));
     expect(error!.message).toContain("not verified");
-    expect(reservedAppPorts).toEqual([42_000]);
+    expect(reservedAppPorts).toEqual([base]);
 
     // No quarantine and no re-allocation happened for the unverified claim.
     const diagnosis = logs.join("");
@@ -803,7 +827,8 @@ describe("recovers when a guest loses its assigned exposure port during startup 
         return broker.reserve(runtimeId, requested);
       },
     };
-    installDeps({ broker: recordingBroker });
+    const { base, isPortAvailable } = await pinnedBasePortDeps();
+    installDeps({ broker: recordingBroker, isPortAvailable });
 
     const logs: string[] = [];
     const error = await startRuntimeServicesForWorkspaceControl({
@@ -823,7 +848,7 @@ describe("recovers when a guest loses its assigned exposure port during startup 
     // burns the bounded retries on a valid pair.
     expect(error).not.toBeNull();
     expect(error!.message).toContain("39999");
-    expect(reservedAppPorts).toEqual([42_000]);
+    expect(reservedAppPorts).toEqual([base]);
 
     // No quarantine and no re-allocation happened for the auxiliary conflict.
     const diagnosis = logs.join("");
@@ -841,7 +866,8 @@ describe("recovers when a guest loses its assigned exposure port during startup 
         return broker.reserve(runtimeId, requested);
       },
     };
-    installDeps({ broker: recordingBroker });
+    const { base, isPortAvailable } = await pinnedBasePortDeps();
+    installDeps({ broker: recordingBroker, isPortAvailable });
 
     const logs: string[] = [];
     const error = await startRuntimeServicesForWorkspaceControl({
@@ -856,13 +882,13 @@ describe("recovers when a guest loses its assigned exposure port during startup 
       },
     }).then(() => null, (err: unknown) => err as Error);
 
-    // The assigned port 42000 appears on a benign line, but EADDRINUSE names only
+    // The assigned base port appears on a benign line, but EADDRINUSE names only
     // the auxiliary port 39999. The parser matches the error and the port on the
     // same line, so the assigned pair is not a collision. The start fails
     // terminally after ONE allocation and never quarantines the valid pair.
     expect(error).not.toBeNull();
     expect(error!.message).toContain("39999");
-    expect(reservedAppPorts).toEqual([42_000]);
+    expect(reservedAppPorts).toEqual([base]);
 
     const diagnosis = logs.join("");
     expect(diagnosis).not.toContain("Quarantined pair");

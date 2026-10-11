@@ -2183,6 +2183,22 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "post",
+  path: "/api/instance/usage-limit-park",
+  tags: ["agents"],
+  summary: "Clear the instance-wide usage-limit park (instance admin only; logs activity, resumes queued runs)",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/instance/usage-limit-park",
+  tags: ["agents"],
+  summary: "Clear the instance-wide usage-limit park (instance admin only; logs activity, resumes queued runs)",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
   method: "get",
   path: "/api/instance/admission-hold",
   tags: ["agents"],

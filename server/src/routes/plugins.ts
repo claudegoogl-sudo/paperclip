@@ -93,6 +93,7 @@ import {
   getActorInfo,
 } from "./authz.js";
 import { validateInstanceConfig } from "../services/plugin-config-validator.js";
+import { highRiskOverrideKeys, nonTenantOverrideKeys } from "../services/plugin-config-scope.js";
 import {
   findLocalFolderDeclaration,
   getStoredLocalFolders,
@@ -3544,6 +3545,22 @@ export function pluginRoutes(
     }
 
     const schema = plugin.manifestJson?.instanceConfigSchema;
+
+    // Scope gate. Read ONLY from the host-stored manifest, never from the
+    // worker. A key without `x-paperclip-scope: "tenant"` is operator-plane
+    // and may be set only in the operator-authored plugin_config row.
+    const operatorKeys = nonTenantOverrideKeys(schema as never, body.configJson);
+    if (operatorKeys.length > 0) {
+      res.status(422).json({
+        error: "Config keys are not tenant-overridable",
+        details: { keys: operatorKeys },
+      });
+      return;
+    }
+    // Separation of duties: URL- and secret-ref-shaped keys need instance admin.
+    if (highRiskOverrideKeys(schema as never, body.configJson).length > 0) {
+      assertInstanceAdmin(req);
+    }
     if (schema && Object.keys(schema).length > 0) {
       const validation = validateInstanceConfig(body.configJson, schema);
       if (!validation.valid) {

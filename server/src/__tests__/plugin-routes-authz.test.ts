@@ -680,9 +680,30 @@ describe.sequential("plugin per-tenant config override routes", () => {
                   additionalProperties: false,
                 },
               ],
+              "x-paperclip-scope": "tenant",
             },
-            label: { type: "string" },
+            label: { type: "string", "x-paperclip-scope": "tenant" },
+            artifactRepoUrl: { type: "string", format: "uri", "x-paperclip-scope": "tenant" },
+            operatorOnly: { type: "string" },
+            explicitOperator: { type: "string", "x-paperclip-scope": "operator" },
+            // Nested high-risk formats (separation-of-duties must walk subschemas).
+            nestedEndpoint: {
+              type: "object",
+              properties: { url: { type: "string", format: "uri" } },
+              "x-paperclip-scope": "tenant",
+            },
+            tokenList: {
+              type: "array",
+              items: { type: "string", format: "secret-ref" },
+              "x-paperclip-scope": "tenant",
+            },
+            refUrl: { $ref: "#/$defs/endpointUrl", "x-paperclip-scope": "tenant" },
+            deepCombo: {
+              allOf: [{ anyOf: [{ type: "string", format: "uri" }, { type: "integer" }] }],
+              "x-paperclip-scope": "tenant",
+            },
           },
+          $defs: { endpointUrl: { type: "string", format: "uri" } },
         },
       },
     });
@@ -718,7 +739,7 @@ describe.sequential("plugin per-tenant config override routes", () => {
       companyId: companyB,
       status: "active",
     });
-    const { app } = await createApp(boardActor());
+    const { app } = await createApp(boardActor({ isInstanceAdmin: true }));
     const res = await request(app)
       .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
       .send({
@@ -734,7 +755,7 @@ describe.sequential("plugin per-tenant config override routes", () => {
   it("returns 422 when a referenced secret cannot be found", async () => {
     readyOverridePlugin();
     mockSecretService.getById.mockResolvedValue(null);
-    const { app } = await createApp(boardActor());
+    const { app } = await createApp(boardActor({ isInstanceAdmin: true }));
     const res = await request(app)
       .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
       .send({
@@ -759,7 +780,7 @@ describe.sequential("plugin per-tenant config override routes", () => {
       companyId: companyA,
       settingsJson: { configOverrides: { githubPatSecretId: ownCompanyRef } },
     });
-    const { app } = await createApp(boardActor());
+    const { app } = await createApp(boardActor({ isInstanceAdmin: true }));
     const res = await request(app)
       .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
       .send({ configJson: { githubPatSecretId: ownCompanyRef } });
@@ -774,6 +795,93 @@ describe.sequential("plugin per-tenant config override routes", () => {
       companyA,
       { githubPatSecretId: ownCompanyRef },
     );
+  });
+
+  it("422s an unannotated (operator-plane) override key", async () => {
+    readyOverridePlugin();
+    const { app } = await createApp(boardActor({ isInstanceAdmin: true }));
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson: { label: "ok", operatorOnly: "x" } });
+    expect(res.status).toBe(422);
+    expect(res.body.details.keys).toEqual(["operatorOnly"]);
+    expect(mockRegistry.upsertCompanyConfigOverride).not.toHaveBeenCalled();
+  });
+
+  it("422s an explicitly operator-scoped key and a key absent from the schema", async () => {
+    readyOverridePlugin();
+    const { app } = await createApp(boardActor({ isInstanceAdmin: true }));
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson: { explicitOperator: "x", notInSchema: "y" } });
+    expect(res.status).toBe(422);
+    expect(res.body.details.keys).toEqual(["explicitOperator", "notInSchema"]);
+    expect(mockRegistry.upsertCompanyConfigOverride).not.toHaveBeenCalled();
+  });
+
+  it("403s a tenant-scoped format:uri key for a non-admin board member", async () => {
+    readyOverridePlugin();
+    const { app } = await createApp(boardActor());
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson: { artifactRepoUrl: "https://attacker.example/x" } });
+    expect(res.status).toBe(403);
+    expect(mockRegistry.upsertCompanyConfigOverride).not.toHaveBeenCalled();
+  });
+
+  it("403s a tenant-scoped format:secret-ref key for a non-admin board member", async () => {
+    readyOverridePlugin();
+    const { app } = await createApp(boardActor());
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson: { githubPatSecretId: { type: "secret_ref", secretId: dprSecretId } } });
+    expect(res.status).toBe(403);
+    expect(mockRegistry.upsertCompanyConfigOverride).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["nested object uri", { nestedEndpoint: { url: "https://attacker.example/x" } }],
+    ["array items secret-ref", { tokenList: ["77777777-7777-4777-8777-777777777777"] }],
+    ["$ref -> $defs uri", { refUrl: "https://attacker.example/x" }],
+    ["anyOf inside allOf uri", { deepCombo: "https://attacker.example/x" }],
+  ])("403s a tenant-scoped key with a %s for a non-admin board member", async (_label, configJson) => {
+    readyOverridePlugin();
+    const { app } = await createApp(boardActor());
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson });
+    expect(res.status).toBe(403);
+    expect(mockRegistry.upsertCompanyConfigOverride).not.toHaveBeenCalled();
+  });
+
+  it("200s a tenant-scoped format:uri key for an instance admin", async () => {
+    readyOverridePlugin();
+    mockRegistry.upsertCompanyConfigOverride.mockResolvedValue({
+      id: "row-1",
+      pluginId,
+      companyId: companyA,
+      settingsJson: { configOverrides: { artifactRepoUrl: "https://github.com/o/r" } },
+    });
+    const { app } = await createApp(boardActor({ isInstanceAdmin: true }));
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson: { artifactRepoUrl: "https://github.com/o/r" } });
+    expect(res.status).toBe(200);
+  });
+
+  it("200s a tenant-scoped plain key for a non-admin board member", async () => {
+    readyOverridePlugin();
+    mockRegistry.upsertCompanyConfigOverride.mockResolvedValue({
+      id: "row-1",
+      pluginId,
+      companyId: companyA,
+      settingsJson: { configOverrides: { label: "ok" } },
+    });
+    const { app } = await createApp(boardActor());
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson: { label: "ok" } });
+    expect(res.status).toBe(200);
   });
 
   it("clears the override via DELETE", async () => {

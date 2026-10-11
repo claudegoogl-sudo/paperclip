@@ -1449,6 +1449,8 @@ async function stageAcpRemoteRuntime(input: {
   // resolved referenced projects (gated upstream), so the anchor-only path is
   // unchanged.
   additionalSources?: SandboxAdditionalSource[];
+  /** Run's agent, when one is known — attributes sync-created git commits to it. */
+  agent?: AdapterExecutionContext["agent"] | null;
   onLog: AdapterExecutionContext["onLog"];
   onRuntimeProgress: AdapterExecutionContext["onRuntimeProgress"];
   // Optional host span runner for the workspace tarball build. It rides down to
@@ -1467,6 +1469,7 @@ async function stageAcpRemoteRuntime(input: {
     adapterKey: input.adapterKey,
     timeoutSec: input.timeoutSec,
     workspaceLocalDir: input.workspaceLocalDir,
+    agent: input.agent,
     ...(input.workspaceRemoteDir ? { workspaceRemoteDir: input.workspaceRemoteDir } : {}),
     ...(input.assets && input.assets.length > 0 ? { assets: input.assets } : {}),
     ...(input.additionalSources && input.additionalSources.length > 0
@@ -2059,6 +2062,7 @@ async function buildRuntime(input: {
           timeoutSec,
           assets,
           additionalSources,
+          agent,
           onLog: input.ctx.onLog,
           onRuntimeProgress: input.ctx.onRuntimeProgress,
           runtimeSpan: input.stageRuntimeSpan,
