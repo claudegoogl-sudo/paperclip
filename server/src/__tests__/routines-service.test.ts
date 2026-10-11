@@ -985,6 +985,18 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     await expect(db.select().from(routineRuns).where(eq(routineRuns.id, run.id))).resolves.toHaveLength(1);
   });
 
+  it("keeps revision restore assignee-only for agents (no routines:manage widening)", async () => {
+    const { routine, svc } = await seedFixture();
+    const revision1Id = routine.latestRevisionId!;
+    await svc.update(routine.id, { description: "revision 2" }, {});
+    await expect(
+      svc.restoreRevision(routine.id, revision1Id, { agentId: randomUUID() }),
+    ).rejects.toMatchObject({
+      status: 403,
+      message: "Agents can only restore routine revisions assigned to themselves",
+    });
+  });
+
   it("defaults activity gates when restoring a legacy routine revision snapshot", async () => {
     const { routine, svc } = await seedFixture();
     const revision1Id = routine.latestRevisionId!;

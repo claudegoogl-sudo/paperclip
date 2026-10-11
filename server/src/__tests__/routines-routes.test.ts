@@ -745,7 +745,6 @@ describe("routine routes", () => {
       { name: "GET /routines/:id/revisions", send: (app) => request(app).get(`/api/routines/${routineId}/revisions`) },
       { name: "GET /routines/:id/description/annotations", send: (app) => request(app).get(`/api/routines/${routineId}/description/annotations`) },
       { name: "POST /routines/:id/revisions/:revisionId/restore", send: (app) => request(app).post(`/api/routines/${routineId}/revisions/${revisionId}/restore`).send({}) },
-      { name: "POST /routines/:id/run", send: (app) => request(app).post(`/api/routines/${routineId}/run`).send({}) },
       { name: "DELETE /routine-triggers/:id", send: (app) => request(app).delete(`/api/routine-triggers/${trigger.id}`) },
     ];
 
@@ -818,6 +817,48 @@ describe("routine routes", () => {
       const allowed = await request(app).patch(`/api/routines/${routineId}`).send({ status: "active" });
       expect(allowed.status).toBe(200);
       expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "tasks:assign" }));
+    });
+
+    const startWorkCases: Array<{ name: string; send: (app: express.Express) => request.Test; svcFn: () => ReturnType<typeof vi.fn> }> = [
+      { name: "POST /routines/:id/run", send: (app) => request(app).post(`/api/routines/${routineId}/run`).send({}), svcFn: () => mockRoutineService.runRoutine },
+      { name: "POST /routines/:id/triggers", send: (app) => request(app).post(`/api/routines/${routineId}/triggers`).send({ kind: "schedule", cronExpression: "0 * * * *", timezone: "UTC" }), svcFn: () => mockRoutineService.createTrigger },
+      { name: "PATCH /routine-triggers/:id enabled=true", send: (app) => request(app).patch(`/api/routine-triggers/${trigger.id}`).send({ enabled: true }), svcFn: () => mockRoutineService.updateTrigger },
+    ];
+
+    for (const c of startWorkCases) {
+      it(`${c.name}: grantee without tasks:assign gets 403 and starts no work`, async () => {
+        allowManage();
+        const app = await createApp(grantee);
+        const denied = await c.send(app);
+        expect(denied.status).toBe(403);
+        expect(denied.body.error).toContain("tasks:assign");
+        expect(c.svcFn()).not.toHaveBeenCalled();
+        expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+          action: "tasks:assign",
+          scope: { assigneeAgentId: agentId },
+        }));
+
+        mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+          allowed: true, action: input.action, reason: "allow_explicit_grant", explanation: "test",
+        }));
+        mockRoutineService.createTrigger.mockResolvedValue({
+          trigger,
+          secretMaterial: null,
+          revision: { id: revisionId, revisionNumber: 2, changeSummary: null, snapshot: { triggers: [trigger] } },
+        });
+        const allowed = await c.send(app);
+        expect(allowed.status).not.toBe(403);
+        expect(allowed.status).toBeLessThan(500);
+      });
+    }
+
+    it("PATCH /routine-triggers/:id without enabled=true does not need tasks:assign", async () => {
+      allowManage();
+      const app = await createApp(grantee);
+      const res = await request(app).patch(`/api/routine-triggers/${trigger.id}`).send({ enabled: false });
+      expect(res.status).not.toBe(403);
+      expect(res.status).toBeLessThan(500);
+      expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({ action: "tasks:assign" }));
     });
 
     it("does not let a grantee create routines for another agent", async () => {

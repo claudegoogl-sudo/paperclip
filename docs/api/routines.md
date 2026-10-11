@@ -210,7 +210,7 @@ Agents can read all routines in their company but can only create and manage rou
 
 ### `routines:manage` grant
 
-An agent with the `routines:manage` principal grant can manage routines assigned to **other agents in its own company**: update fields, read revisions, restore revisions, read/write description annotations, add/update/delete triggers, rotate trigger secrets, and run the routine manually.
+An agent with the `routines:manage` principal grant can manage routines assigned to **other agents in its own company**: update fields, read revisions, read/write description annotations, add/update/delete triggers, rotate trigger secrets, and run the routine manually. Restoring a revision stays assignee-only (a revision can bring back an old assignee or status). Starting work for the assignee — activating the routine, running it manually, creating a trigger, or re-enabling a trigger — also needs `tasks:assign` for that assignee.
 
 - Scope is optional. `{ "targetAgentIds": ["<agentId>", ...] }` limits the grant to routines assigned to those agents. No scope = every routine in the company.
 - The grant never allows reassignment. A grantee may resend the current `assigneeAgentId` unchanged, but any other value returns `403 Agents can only assign routines to themselves`.

@@ -129,6 +129,25 @@ export function routineRoutes(
     return routine;
   }
 
+  // A routines:manage grantee that starts work for another agent (activate,
+  // manual run, trigger create, trigger re-enable) also needs task-assignment
+  // authority over that agent. No-op for the assignee itself and for board.
+  async function assertAgentMayStartWorkFor(
+    req: Request,
+    routine: { companyId: string; assigneeAgentId: string | null },
+  ) {
+    if (req.actor.type !== "agent" || routine.assigneeAgentId === req.actor.agentId) return;
+    const assignDecision = await access.decide({
+      actor: req.actor,
+      action: "tasks:assign",
+      resource: { type: "issue", companyId: routine.companyId, assigneeAgentId: routine.assigneeAgentId },
+      scope: { assigneeAgentId: routine.assigneeAgentId },
+    });
+    if (!assignDecision.allowed) {
+      throw forbidden("Missing permission: tasks:assign");
+    }
+  }
+
   async function logRoutineRevisionCreated(req: Request, input: {
     companyId: string;
     routineId: string;
@@ -390,19 +409,7 @@ export function routineRoutes(
       routine.status !== "active";
     if (statusWillActivate) {
       await assertBoardCanAssignTasks(req, routine.companyId);
-      if (req.actor.type === "agent" && routine.assigneeAgentId !== req.actor.agentId) {
-        // A routines:manage grantee activating another agent's routine starts
-        // work for that agent, so it also needs task-assignment authority.
-        const assignDecision = await access.decide({
-          actor: req.actor,
-          action: "tasks:assign",
-          resource: { type: "issue", companyId: routine.companyId, assigneeAgentId: routine.assigneeAgentId },
-          scope: { assigneeAgentId: routine.assigneeAgentId },
-        });
-        if (!assignDecision.allowed) {
-          throw forbidden("Missing permission: tasks:assign");
-        }
-      }
+      await assertAgentMayStartWorkFor(req, routine);
     }
     if (
       req.actor.type === "agent" &&
@@ -497,6 +504,7 @@ export function routineRoutes(
       return;
     }
     await assertBoardCanAssignTasks(req, routine.companyId);
+    await assertAgentMayStartWorkFor(req, routine);
     const created = await svc.createTrigger(routine.id, req.body, {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
@@ -538,6 +546,9 @@ export function routineRoutes(
       return;
     }
     await assertBoardCanAssignTasks(req, routine.companyId);
+    if (req.body.enabled === true) {
+      await assertAgentMayStartWorkFor(req, routine);
+    }
     const updated = await svc.updateTrigger(trigger.id, req.body, {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
@@ -662,6 +673,7 @@ export function routineRoutes(
       return;
     }
     await assertBoardCanAssignTasks(req, routine.companyId);
+    await assertAgentMayStartWorkFor(req, routine);
     const run = await svc.runRoutine(routine.id, req.body, {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? null : null,
