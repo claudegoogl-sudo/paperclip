@@ -1735,6 +1735,13 @@
       "when": 1786986000000,
       "tag": "0251_instance_admission_holds",
       "breakpoints": true
+    },
+    {
+      "idx": 252,
+      "version": "7",
+      "when": 1786986100000,
+      "tag": "0252_plugin_operator_config",
+      "breakpoints": true
     }
   ]
 }

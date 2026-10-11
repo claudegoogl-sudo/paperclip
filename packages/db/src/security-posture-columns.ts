@@ -367,6 +367,11 @@ export const SECURITY_POSTURE_COLUMNS = [
     reason: "Dangerous value true (also the absent-row default): the sole per-company plugin opt-out, so a flatten re-enables plugins for companies that explicitly disabled them.",
   },
   {
+    table: "plugin_operator_config",
+    column: "config_json",
+    reason: "Instance-wide operator-plane plugin config (cross-tenant policy and routing maps, secret-ref bindings); a flatten copies one plugin's operator config onto every other plugin.",
+  },
+  {
     table: "plugin_config",
     column: "config_json",
     reason: "Per-plugin config carrying secret-ref bindings and per-company policy; a flatten copies one plugin's configuration — and its secret reach — onto every other plugin.",

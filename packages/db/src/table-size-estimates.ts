@@ -122,6 +122,7 @@ export const LOCAL_TABLE_ROW_COUNTS = [
   { table: "pipelines", localRows: 0 },
   { table: "plugin_company_settings", localRows: 0 },
   { table: "plugin_config", localRows: 0 },
+  { table: "plugin_operator_config", localRows: 0 },
   { table: "plugin_database_namespaces", localRows: 0 },
   { table: "plugin_entities", localRows: 0 },
   { table: "plugin_job_runs", localRows: 0 },

@@ -1199,6 +1199,11 @@ export const SECURITY_POSTURE_REJECTIONS = [
     reason: "Per-company plugin settings payload and last error. The single opt-out gate, enabled, is registered.",
   },
   {
+    table: "plugin_operator_config",
+    columns: ["created_at", "id", "plugin_id", "updated_at"],
+    reason: "Identifier and timestamps for the per-plugin operator config row. The payload column, config_json, is registered.",
+  },
+  {
     table: "plugin_config",
     columns: ["created_at", "id", "last_error", "plugin_id", "updated_at"],
     reason: "Per-plugin last-error and timestamps. The column carrying secret-ref bindings and per-company policy, config_json, is registered.",
