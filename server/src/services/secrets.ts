@@ -55,7 +55,12 @@ import { collectSecretRefs } from "./agent-secret-bindings.js";
 import { isValidAllowlistEntry } from "../handle-egress.js";
 import { purgeHandlesByBinding } from "../handle-vault.js";
 import { listEgressWouldDeny, type EgressWouldDenyObservationRow } from "./egress-harvest.js";
-import { egressPostureFor } from "./egress-posture.js";
+import {
+  egressPostureCarryIndex,
+  egressPostureCarryKey,
+  egressPostureFor,
+  preservedEgressPosture,
+} from "./egress-posture.js";
 import {
   collectSecretRefPaths,
   isUuidSecretRef,
@@ -5114,9 +5119,13 @@ export function secretService(db: Db | DbTransaction) {
       let refusedWipeConfigPaths: string[] = [];
 
       await db.transaction(async (tx) => {
-        // Capture existing egress allowlist settings before deletion
+        // Capture existing egress allowlist settings before deletion. The
+        // posture is operator state keyed by the binding identity, not the
+        // row id, so the delete+reinsert below must carry it onto the new
+        // rows via the shared preserve helper.
         const existingBindings = await tx
           .select({
+            companyId: companySecretBindings.companyId,
             configPath: companySecretBindings.configPath,
             allowedEgress: companySecretBindings.allowedEgress,
             egressAllowlistEnforced: companySecretBindings.egressAllowlistEnforced,
@@ -5129,15 +5138,7 @@ export function secretService(db: Db | DbTransaction) {
               eq(companySecretBindings.targetId, target.targetId),
             ),
           );
-        const egressSettings = new Map(
-          existingBindings.map((b) => [
-            b.configPath,
-            {
-              allowedEgress: b.allowedEgress,
-              egressAllowlistEnforced: b.egressAllowlistEnforced,
-            },
-          ])
-        );
+        const egressSettings = egressPostureCarryIndex(existingBindings);
 
         if (options?.replaceAll) {
           await tx
@@ -5189,7 +5190,7 @@ export function secretService(db: Db | DbTransaction) {
         if (normalizedRefs.length === 0) return;
         await tx.insert(companySecretBindings).values(
           normalizedRefs.map((ref) => {
-            const existing = egressSettings.get(ref.configPath);
+            const existing = egressSettings.get(egressPostureCarryKey(companyId, ref.configPath));
             return {
               companyId,
               secretId: ref.secretId,
@@ -5203,8 +5204,7 @@ export function secretService(db: Db | DbTransaction) {
               projectionAllowlistKey: ref.projectionAllowlistKey,
               // Fork AC4: preserve existing per-path egress allowlist settings
               // across binding re-syncs; enforcement defaults to ON (deny-by-default).
-              allowedEgress: existing?.allowedEgress ?? [],
-              egressAllowlistEnforced: existing?.egressAllowlistEnforced ?? true,
+              ...preservedEgressPosture(existing),
             };
           }),
         );
@@ -5300,6 +5300,29 @@ export function secretService(db: Db | DbTransaction) {
       }
 
       const writeBindings = async (executor: SecretBindingDb) => {
+        // Egress posture is operator state keyed by the binding identity
+        // (companyId, targetType, targetId, configPath), not by the row id.
+        // This replace deletes and re-inserts every non-env binding, so the
+        // operator-set posture must be captured before the delete and carried
+        // onto the new rows via the shared preserve helper — re-inserting
+        // bare would silently wipe every operator allowlist back to [] (deny-all
+        // while enforcing) on each instance-target config save.
+        const existingBindings = await executor
+          .select({
+            companyId: companySecretBindings.companyId,
+            configPath: companySecretBindings.configPath,
+            allowedEgress: companySecretBindings.allowedEgress,
+            egressAllowlistEnforced: companySecretBindings.egressAllowlistEnforced,
+          })
+          .from(companySecretBindings)
+          .where(
+            and(
+              eq(companySecretBindings.targetType, target.targetType),
+              eq(companySecretBindings.targetId, target.targetId),
+              notLike(companySecretBindings.configPath, "env.%"),
+            ),
+          );
+        const egressCarry = egressPostureCarryIndex(existingBindings);
         await executor
           .delete(companySecretBindings)
           .where(
@@ -5311,18 +5334,24 @@ export function secretService(db: Db | DbTransaction) {
           );
         if (normalizedRefs.length === 0) return;
         await executor.insert(companySecretBindings).values(
-          normalizedRefs.map((ref) => ({
-            companyId: ref.companyId,
-            secretId: ref.secretId,
-            targetType: target.targetType,
-            targetId: target.targetId,
-            configPath: ref.configPath,
-            versionSelector: String(ref.versionSelector),
-            required: ref.required,
-            label: ref.label,
-            projectionClass: ref.projectionClass,
-            projectionAllowlistKey: ref.projectionAllowlistKey,
-          })),
+          normalizedRefs.map((ref) => {
+            const existing = egressCarry.get(egressPostureCarryKey(ref.companyId, ref.configPath));
+            return {
+              companyId: ref.companyId,
+              secretId: ref.secretId,
+              targetType: target.targetType,
+              targetId: target.targetId,
+              configPath: ref.configPath,
+              versionSelector: String(ref.versionSelector),
+              required: ref.required,
+              label: ref.label,
+              projectionClass: ref.projectionClass,
+              projectionAllowlistKey: ref.projectionAllowlistKey,
+              // Same shared preserve semantics as the other delete+reinsert
+              // syncs: carry operator posture, default to born-enforcing.
+              ...preservedEgressPosture(existing),
+            };
+          }),
         );
       };
 
@@ -5495,6 +5524,28 @@ export function secretService(db: Db | DbTransaction) {
       const unboundPaths: string[] = [];
 
       await db.transaction(async (tx) => {
+        // Capture operator-set egress posture for this plugin's bindings
+        // before any revoke deletes. The upsert below leaves live rows (and
+        // their posture) untouched, but a cleared-then-re-added or repointed
+        // path is a delete+reinsert and must carry the old row's posture via
+        // the shared preserve helper instead of falling back to column
+        // defaults.
+        const pluginBindings = await tx
+          .select({
+            companyId: companySecretBindings.companyId,
+            configPath: companySecretBindings.configPath,
+            allowedEgress: companySecretBindings.allowedEgress,
+            egressAllowlistEnforced: companySecretBindings.egressAllowlistEnforced,
+          })
+          .from(companySecretBindings)
+          .where(
+            and(
+              eq(companySecretBindings.targetType, "plugin"),
+              eq(companySecretBindings.targetId, input.pluginId),
+            ),
+          );
+        const egressCarry = egressPostureCarryIndex(pluginBindings);
+
         // 1) Revoke bindings for paths that were cleared or repointed.
         for (const [dotPath, oldValue] of oldRefs) {
           if (newRefs.get(dotPath) === oldValue) continue; // unchanged
@@ -5549,6 +5600,9 @@ export function secretService(db: Db | DbTransaction) {
               versionSelector: String(versionByPath.get(dotPath) ?? "latest"),
               required: true,
               label: "plugin-config",
+              // Carry posture across a revoke+rebind of the same path; the
+              // conflict branch leaves live rows (and their posture) alone.
+              ...preservedEgressPosture(egressCarry.get(egressPostureCarryKey(owner, dotPath))),
             })
             .onConflictDoUpdate({
               target: [
@@ -5678,9 +5732,13 @@ export function secretService(db: Db | DbTransaction) {
       }
 
       const writeBindings = async (targetDb: SecretBindingDb) => {
-        // Capture existing egress allowlist settings before deletion
+        // Capture existing egress allowlist settings before deletion. The
+        // posture is operator state keyed by the binding identity, not the
+        // row id, so the delete+reinsert below must carry it onto the new
+        // rows via the shared preserve helper.
         const existingBindings = await targetDb
           .select({
+            companyId: companySecretBindings.companyId,
             configPath: companySecretBindings.configPath,
             allowedEgress: companySecretBindings.allowedEgress,
             egressAllowlistEnforced: companySecretBindings.egressAllowlistEnforced,
@@ -5694,15 +5752,7 @@ export function secretService(db: Db | DbTransaction) {
               like(companySecretBindings.configPath, `${pathPrefix}.%`),
             ),
           );
-        const egressSettings = new Map(
-          existingBindings.map((b) => [
-            b.configPath,
-            {
-              allowedEgress: b.allowedEgress,
-              egressAllowlistEnforced: b.egressAllowlistEnforced,
-            },
-          ])
-        );
+        const egressSettings = egressPostureCarryIndex(existingBindings);
 
         await targetDb
           .delete(companySecretBindings)
@@ -5717,7 +5767,7 @@ export function secretService(db: Db | DbTransaction) {
         if (refs.length === 0) return;
         await targetDb.insert(companySecretBindings).values(
           refs.map((ref) => {
-            const existing = egressSettings.get(ref.configPath);
+            const existing = egressSettings.get(egressPostureCarryKey(companyId, ref.configPath));
             return {
               companyId,
               secretId: ref.secretId,
@@ -5730,8 +5780,7 @@ export function secretService(db: Db | DbTransaction) {
               projectionAllowlistKey: ref.projectionAllowlistKey,
               // Fork AC4: preserve existing per-path egress allowlist settings
               // across binding re-syncs; enforcement defaults to ON (deny-by-default).
-              allowedEgress: existing?.allowedEgress ?? [],
-              egressAllowlistEnforced: existing?.egressAllowlistEnforced ?? true,
+              ...preservedEgressPosture(existing),
             };
           }),
           );

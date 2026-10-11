@@ -2156,6 +2156,82 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  describe("routines:manage grant", () => {
+    async function decideManage(
+      actorAgentId: string,
+      actorCompanyId: string,
+      targetCompanyId: string,
+      assigneeAgentId: string,
+    ) {
+      return authorizationService(db).decide({
+        actor: { type: "agent", agentId: actorAgentId, companyId: actorCompanyId, source: "agent_key" },
+        action: "routines:manage",
+        resource: { type: "agent", companyId: targetCompanyId, agentId: assigneeAgentId },
+        scope: { targetAgentId: assigneeAgentId },
+      });
+    }
+
+    it("allows an unscoped grant and denies without a grant", async () => {
+      const company = await createCompany(db, "RoutinesManage");
+      const granted = await createAgent(db, company.id);
+      const ungranted = await createAgent(db, company.id);
+      const assignee = await createAgent(db, company.id);
+      await grantAgentPermission(db, company.id, granted.id, "routines:manage");
+
+      await expect(decideManage(granted.id, company.id, company.id, assignee.id))
+        .resolves.toMatchObject({ allowed: true, reason: "allow_explicit_grant" });
+      await expect(decideManage(ungranted.id, company.id, company.id, assignee.id))
+        .resolves.toMatchObject({ allowed: false });
+    });
+
+    it("honours a targetAgentIds-scoped grant (hit and miss)", async () => {
+      const company = await createCompany(db, "RoutinesManageScoped");
+      const actor = await createAgent(db, company.id);
+      const inScope = await createAgent(db, company.id);
+      const outOfScope = await createAgent(db, company.id);
+      await grantAgentPermission(db, company.id, actor.id, "routines:manage", { targetAgentIds: [inScope.id] });
+
+      await expect(decideManage(actor.id, company.id, company.id, inScope.id))
+        .resolves.toMatchObject({ allowed: true, reason: "allow_explicit_grant" });
+      await expect(decideManage(actor.id, company.id, company.id, outOfScope.id))
+        .resolves.toMatchObject({ allowed: false });
+    });
+
+    it("denies cross-company even with a grant in the actor company", async () => {
+      const source = await createCompany(db, "RoutinesManageSrc");
+      const target = await createCompany(db, "RoutinesManageDst");
+      const actor = await createAgent(db, source.id);
+      const foreignAssignee = await createAgent(db, target.id);
+      await grantAgentPermission(db, source.id, actor.id, "routines:manage");
+
+      await expect(decideManage(actor.id, source.id, target.id, foreignAssignee.id))
+        .resolves.toMatchObject({ allowed: false, reason: "deny_company_boundary" });
+    });
+
+    it("denies low-trust agents even with an explicit grant", async () => {
+      const company = await createCompany(db, "RoutinesManageLowTrust");
+      const project = await createProject(db, company.id, "Allowed");
+      const assignee = await createAgent(db, company.id);
+      const actor = await createAgent(db, company.id, {
+        permissions: {
+          trustPreset: LOW_TRUST_REVIEW_PRESET,
+          authorizationPolicy: {
+            trustBoundary: {
+              mode: LOW_TRUST_REVIEW_PRESET,
+              companyId: company.id,
+              projectIds: [project.id],
+              allowedAgentIds: [assignee.id],
+            },
+          },
+        },
+      });
+      await grantAgentPermission(db, company.id, actor.id, "routines:manage");
+
+      await expect(decideManage(actor.id, company.id, company.id, assignee.id))
+        .resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
+    });
+  });
+
   it("allows scoped assignment to an explicit target-agent allowlist only", async () => {
     const company = await createCompany(db, "AllowlistScope");
     const actorAgent = await createAgent(db, company.id);

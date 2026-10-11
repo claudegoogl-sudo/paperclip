@@ -3240,14 +3240,15 @@ function issueListActorIdentity(req: Request, companyId: string) {
   return { actorType: "none", key, hash: shortHash(key) };
 }
 
-function issueListClientIdentity(req: Request) {
-  const forwardedFor = Array.isArray(req.headers["x-forwarded-for"])
-    ? req.headers["x-forwarded-for"][0]
-    : req.headers["x-forwarded-for"];
+/**
+ * Client identity for issue-list request logging. Uses `req.ip` only, so
+ * `X-Forwarded-For` is honoured solely through the express `trust proxy`
+ * setting (see middleware/trust-proxy.ts). Never read the raw header here:
+ * its left-most entry is attacker-controlled text.
+ */
+export function issueListClientIdentity(req: Request) {
   const client = [
-    String(forwardedFor ?? req.ip ?? "unknown-ip")
-      .split(",")[0]
-      ?.trim() ?? "unknown-ip",
+    req.ip ?? "unknown-ip",
     req.header("user-agent") ?? "unknown-agent",
   ].join(":");
   return { key: client, hash: shortHash(client) };
@@ -14051,6 +14052,10 @@ export function issueRoutes(
             entityId: issue.id,
             details: {
               identifier: issue.identifier,
+              // Status of the dependent before this request. The resolved-dependency
+              // backstop uses it to tell a removal on an already-blocked issue (a real
+              // readiness edge) from a same-request park/replace (not an edge).
+              dependentStatusBefore: existing.status,
               blockedByIssueIds: req.body.blockedByIssueIds,
               addedBlockedByIssueIds,
               removedBlockedByIssueIds,
@@ -14701,11 +14706,19 @@ export function issueRoutes(
           }
         }
 
+        const restoreRemovedBlockerCount = Array.isArray(req.body.blockedByIssueIds)
+          ? (existingRelations?.blockedBy ?? []).filter(
+              (relation) => !(req.body.blockedByIssueIds as string[]).includes(relation.id),
+            ).length
+          : 0;
         const restoredBlockedReadyDependency =
           issue.status === "blocked" &&
           issue.assigneeAgentId &&
-          (existing.status !== "blocked" ||
-            Array.isArray(req.body.blockedByIssueIds) ||
+          // Edge rule (same as the resolved-dependency backstop): only wake when the
+          // issue was ALREADY blocked and this request removed >=1 blocker, or when the
+          // assignee changed. Parking into `blocked` onto done blockers, or an add-only
+          // change, is a deliberate park and must not self-wake.
+          ((existing.status === "blocked" && restoreRemovedBlockerCount > 0) ||
             existing.assigneeAgentId !== issue.assigneeAgentId);
         if (
           restoredBlockedReadyDependency &&
@@ -15098,6 +15111,14 @@ export function issueRoutes(
 
   router.post("/issues/:id/release", async (req, res) => {
     const id = req.params.id as string;
+    // Capture lock holders BEFORE the orphan guard nulls them, so the manager
+    // override audit row records whose lock / which dead run was released
+    // (the guard's own clear is silent). Agent actors only; only used after
+    // the access checks below pass.
+    const preGuard =
+      req.actor.type === "agent" ? await svc.getById(id).catch(() => null) : null;
+    // See PATCH route — back-fill orphan-checkout state up front.
+    await svc.clearOrphanCheckoutLocksIfTerminal(id);
     const existing = await getAccessibleResource(
       req,
       res,
@@ -15109,10 +15130,30 @@ export function issueRoutes(
     const actorRunId = requireAgentRunId(req, res);
     if (req.actor.type === "agent" && !actorRunId) return;
 
+    // Manager checkout-management override: the mutation boundary
+    // above already admits agents holding tasks:manage_active_checkouts for the
+    // assignee; surface that fact to the service, which re-verifies the data
+    // preconditions (in_progress + terminal-or-missing holding run) on the
+    // locked row. Board force-release remains the only live-run override.
+    let managerOverride = false;
+    if (
+      req.actor.type === "agent" &&
+      req.actor.agentId &&
+      existing.assigneeAgentId &&
+      existing.assigneeAgentId !== req.actor.agentId
+    ) {
+      managerOverride = await hasActiveCheckoutManagementOverride(
+        req.actor.agentId,
+        existing.companyId,
+        existing.assigneeAgentId,
+      );
+    }
+
     const released = await svc.release(
       id,
       req.actor.type === "agent" ? req.actor.agentId : undefined,
       actorRunId,
+      { managerOverride },
     );
     if (!released) {
       res.status(404).json({ error: "Issue not found" });
@@ -15121,7 +15162,7 @@ export function issueRoutes(
 
     const actor = getActorInfo(req);
     await logActivity(db, {
-      companyId: released.companyId,
+      companyId: released.issue.companyId,
       actorType: actor.actorType,
       actorId: actor.actorId,
       agentId: actor.agentId,
@@ -15129,10 +15170,23 @@ export function issueRoutes(
       agentApiKeyId: actor.agentApiKeyId,
       action: "issue.released",
       entityType: "issue",
-      entityId: released.id,
+      entityId: released.issue.id,
+      ...(released.managerOverride
+        ? {
+            details: {
+              managerOverride: true,
+              reason: "stale_checkout_run",
+              prevCheckoutRunId:
+                preGuard?.checkoutRunId ?? released.previous.checkoutRunId ?? null,
+              prevAssigneeAgentId:
+                preGuard?.assigneeAgentId ?? released.previous.assigneeAgentId ?? null,
+              actorAgentId: actor.agentId ?? null,
+            },
+          }
+        : {}),
     });
 
-    res.json(released);
+    res.json(released.issue);
   });
 
   router.post("/issues/:id/admin/force-release", async (req, res) => {

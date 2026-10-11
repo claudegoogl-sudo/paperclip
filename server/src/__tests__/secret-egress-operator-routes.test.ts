@@ -289,4 +289,61 @@ describeDb("operator egress routes", () => {
     const crossCompany = await request(appA).get(`/api/companies/${companyB}/secret-egress-bindings`);
     expect(crossCompany.status, JSON.stringify(crossCompany.body)).toBe(403);
   });
+  // A rejected interactive-board attempt must be audited.
+  it("audits a board-key denial: exactly one activity_log row per rejected route, true provenance", async () => {
+    const companyId = await seedCompany("aud");
+    const bindingId = await seedBinding(companyId);
+    const app = appFor(boardKeyActor(companyId));
+
+    const review = await request(app).get(`/api/companies/${companyId}/secret-egress-bindings`);
+    expect(review.status, JSON.stringify(review.body)).toBe(403);
+    expect(review.body.error).toBe("Interactive operator session required");
+
+    let rows = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+    expect(rows).toHaveLength(1);
+    expect(rows[0].action).toBe("authz.interactive_board_denied");
+    expect(rows[0].actorType).toBe("user");
+    expect(rows[0].entityType).toBe("route");
+    expect(rows[0].entityId).toBe("GET /companies/:companyId/secret-egress-bindings");
+    const details = rows[0].details as Record<string, unknown>;
+    expect(details.actorSource).toBe("board_key");
+    expect(details.actorSource).not.toBe("session");
+    expect(details.method).toBe("GET");
+    // Allow-list of logged detail keys: nothing credential-shaped can ride along.
+    expect(Object.keys(details).sort()).toEqual(["actorSource", "agentId", "method", "reason", "route", "runId"]);
+    expect(JSON.stringify(rows[0])).not.toContain("key-1");
+
+    const enforce = await request(app)
+      .post(`/api/companies/${companyId}/secret-egress-bindings/${bindingId}/enforce`)
+      .send({ allowEmpty: true });
+    expect(enforce.status).toBe(403);
+    rows = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => r.entityId)).toContain(
+      "POST /companies/:companyId/secret-egress-bindings/:bindingId/enforce",
+    );
+  });
+
+  it("audits an agent denial with agent provenance (agent_jwt/agent_key, agentId, runId)", async () => {
+    const companyId = await seedCompany("aga");
+    const actor = agentActor(companyId);
+    const res = await request(appFor(actor)).get(`/api/companies/${companyId}/secret-egress-bindings`);
+    expect(res.status).toBe(403);
+    const rows = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+    expect(rows).toHaveLength(1);
+    expect(rows[0].actorType).toBe("agent");
+    expect((rows[0].details as Record<string, unknown>).agentId).toBe("agent-1");
+    expect((rows[0].details as Record<string, unknown>).actorSource).not.toBe("session");
+  });
+
+  it("the authorized session path writes no denial row", async () => {
+    const companyId = await seedCompany("okk");
+    await seedBinding(companyId);
+    const res = await request(appFor(boardActor(companyId))).get(
+      `/api/companies/${companyId}/secret-egress-bindings`,
+    );
+    expect(res.status).toBe(200);
+    const rows = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
+    expect(rows).toHaveLength(0);
+  });
 });

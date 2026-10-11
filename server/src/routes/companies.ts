@@ -381,6 +381,10 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
       throw badRequest("scope must be a single accessible value when provided");
     }
     const result = await svc.list();
+    const visible =
+      req.actor.source === "local_implicit" || req.actor.isInstanceAdmin
+        ? result
+        : result.filter((company) => new Set(req.actor.companyIds ?? []).has(company.id));
     // Navigation needs the same membership scope as company detail routes.
     // Instance admins can inspect the directory without membership, but that
     // visibility alone does not let them open a company's inbox or tasks.
@@ -388,12 +392,21 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
       res.json(result.filter((company) => hasCompanyAccess(req, company.id)));
       return;
     }
-    if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) {
-      res.json(result);
+    // plugin_ops board keys (long-lived, on disk) only need discovery fields.
+    // Least privilege: drop budget/spend, governance and consent fields. The
+    // scope comes from the authenticated key, never from the request.
+    if (req.actor.type === "board" && req.actor.source === "board_key" && req.actor.boardKeyScope?.kind === "plugin_ops") {
+      res.json(
+        visible.map((company) => ({
+          id: company.id,
+          name: company.name,
+          status: company.status,
+          issuePrefix: company.issuePrefix,
+        })),
+      );
       return;
     }
-    const allowed = new Set(req.actor.companyIds ?? []);
-    res.json(result.filter((company) => allowed.has(company.id)));
+    res.json(visible);
   });
 
   router.get("/stats", async (req, res) => {

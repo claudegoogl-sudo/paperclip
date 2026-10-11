@@ -709,6 +709,7 @@ export const APPROVAL_STATUSES = [
   "approved",
   "rejected",
   "cancelled",
+  "withdrawn",
 ] as const;
 export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
 
@@ -1077,6 +1078,7 @@ export const PERMISSION_KEYS = [
   "tasks:manage_active_checkouts",
   "pipelines:write",
   "joins:approve",
+  "routines:manage",
 ] as const;
 export type PermissionKey = (typeof PERMISSION_KEYS)[number];
 

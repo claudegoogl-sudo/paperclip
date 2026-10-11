@@ -75,6 +75,7 @@ import {
   statusDecisions,
   routines,
   workAssessments,
+  workspaceOperations,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
@@ -6025,6 +6026,7 @@ export function recoveryService(
       interactionSkipped: 0,
       pauseHoldSkipped: 0,
       notReadySkipped: 0,
+      parkedAfterResolutionSkipped: 0,
       candidateLimitSkipped: 0,
       deferredOrFailed: 0,
       enqueueFailed: 0,
@@ -6166,6 +6168,21 @@ export function recoveryService(
           continue;
         }
 
+        // Edge gate: a dependent that entered `blocked` at or after the moment
+        // its LAST blocker completed was parked by choice. No blocker resolved
+        // during this blocked cycle, so there is no missed wake to heal. Without
+        // this gate the level-triggered sweep woke every such issue, the agent
+        // re-parked it, and the next sweep woke it again (self-wake loop). The
+        // check reads durable issue columns only, so it survives the wake-row
+        // retention prune. Missing timestamps keep the legacy heal behavior.
+        if (
+          source !== "workspace.finalize" &&
+          await wasParkedAfterBlockersResolved(companyId, candidate.id, candidate.blockedTransitionAt, readiness.blockerIssueIds)
+        ) {
+          result.parkedAfterResolutionSkipped += 1;
+          continue;
+        }
+
         // Level-triggered dedup: key on the full blocker set (the current ready
         // state), not on any single resolved edge. An older completed per-edge
         // wake for an earlier partial resolution has a different key, so it does
@@ -6273,6 +6290,13 @@ export function recoveryService(
           );
         }
       }
+    }
+
+    if (result.parkedAfterResolutionSkipped > 0) {
+      logger.info(
+        { parkedAfterResolutionSkipped: result.parkedAfterResolutionSkipped, source },
+        "issue graph liveness backstop skipped dependents parked as blocked after their blockers resolved",
+      );
     }
 
     if (result.healed > 0) {
@@ -6710,6 +6734,89 @@ export function recoveryService(
     return result;
   }
 
+  /**
+   * True when the dependent entered `blocked` at or after the moment its
+   * dependency set last became ready, i.e. it was parked by choice and no wake
+   * was missed. "Last became ready" is the latest of, per blocker:
+   *   - `completedAt` (blocker done), and
+   *   - the latest successful `workspace_finalize` on the blocker's execution
+   *     workspace (a done blocker only counts once finalize lands),
+   * and, for the dependent, the latest `issue.blockers_updated` activity (a
+   * blocker removed or wired while blocked can make the set ready).
+   * All inputs are durable rows, so this survives the wake-row retention prune.
+   * Any missing timestamp returns false (legacy heal behavior).
+   */
+  async function wasParkedAfterBlockersResolved(
+    companyId: string,
+    dependentIssueId: string,
+    blockedTransitionAt: Date | string | null | undefined,
+    blockerIssueIds: string[],
+  ): Promise<boolean> {
+    if (!blockedTransitionAt || blockerIssueIds.length === 0) return false;
+    const blockedAt = blockedTransitionAt instanceof Date ? blockedTransitionAt : new Date(blockedTransitionAt);
+    if (Number.isNaN(blockedAt.getTime())) return false;
+    const blockers = await db
+      .select({ completedAt: issues.completedAt, executionWorkspaceId: issues.executionWorkspaceId })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), inArray(issues.id, blockerIssueIds)));
+    if (blockers.length !== new Set(blockerIssueIds).size) return false;
+    let lastResolvedAt = 0;
+    const workspaceIds = new Set<string>();
+    for (const blocker of blockers) {
+      if (!blocker.completedAt) return false;
+      lastResolvedAt = Math.max(lastResolvedAt, new Date(blocker.completedAt).getTime());
+      if (blocker.executionWorkspaceId) workspaceIds.add(blocker.executionWorkspaceId);
+    }
+    if (workspaceIds.size > 0) {
+      const finalizes = await db
+        .select({ startedAt: workspaceOperations.startedAt, finishedAt: workspaceOperations.finishedAt })
+        .from(workspaceOperations)
+        .where(
+          and(
+            eq(workspaceOperations.companyId, companyId),
+            inArray(workspaceOperations.executionWorkspaceId, [...workspaceIds]),
+            eq(workspaceOperations.phase, "workspace_finalize"),
+            eq(workspaceOperations.status, "succeeded"),
+          ),
+        );
+      for (const op of finalizes) {
+        const at = op.finishedAt ?? op.startedAt;
+        if (at) lastResolvedAt = Math.max(lastResolvedAt, new Date(at).getTime());
+      }
+    }
+    // Only a blocker-set change that REMOVED a blocker while the issue was
+    // already blocked can make it ready after blockedTransitionAt. A same-request
+    // park (status->blocked + done blockers) or a replace of an open blocker with
+    // a done one is a parked-by-choice shape, not a readiness edge. Legacy rows
+    // without dependentStatusBefore keep the conservative (count it) behavior.
+    const blockerChanges = await db
+      .select({ createdAt: activityLog.createdAt, details: activityLog.details })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, dependentIssueId),
+          eq(activityLog.action, "issue.blockers_updated"),
+        ),
+      )
+      .orderBy(desc(activityLog.createdAt))
+      .limit(20);
+    for (const change of blockerChanges) {
+      if (!change.createdAt) continue;
+      const details = (change.details ?? {}) as Record<string, unknown>;
+      const removed = Array.isArray(details.removedBlockedByIssueIds) ? details.removedBlockedByIssueIds : null;
+      const statusBefore = typeof details.dependentStatusBefore === "string" ? details.dependentStatusBefore : null;
+      if (statusBefore !== null) {
+        if (statusBefore !== "blocked") continue;
+        if (!removed || removed.length === 0) continue;
+      }
+      lastResolvedAt = Math.max(lastResolvedAt, new Date(change.createdAt).getTime());
+      break;
+    }
+    return blockedAt.getTime() >= lastResolvedAt;
+  }
+
   return {
     buildRunOutputSilence,
     escalateStrandedRecoveryIssueInPlace,
@@ -6725,3 +6832,4 @@ export function recoveryService(
     readRecoveryTimerIntervalMs,
   };
 }
+

@@ -19,7 +19,8 @@ import {
   updateUserSecretValueSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
-import { assertBoard, assertBoardOrAgent, assertCompanyAccess, getAccessibleResource, assertInteractiveBoard, hasCompanyAccess } from "./authz.js";
+import { assertBoard, assertBoardOrAgent, assertCompanyAccess, getAccessibleResource, assertInteractiveBoard, getActorInfo, hasCompanyAccess, requireInteractiveBoard } from "./authz.js";
+import { logger } from "../middleware/logger.js";
 import { logActivity, secretService } from "../services/index.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
@@ -1161,11 +1162,65 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
   // on-host release-verification scripts keep working against auth.json unchanged.
   // ---------------------------------------------------------------------------
 
+
+  // Audited wrapper around `assertInteractiveBoard`. A rejected attempt on these routes is the exact event
+  // the gate exists to catch (e.g. a same-uid agent replaying the board key from
+  // auth.json), so it must leave an activity_log row. Provenance comes from
+  // `getActorInfo` (true actor source, never the fail-open "session" label).
+  // Only ids and labels are logged — no headers, body, or credential material.
+  // The audit write is best-effort: a logging failure never turns the 403 into
+  // a different status, and the authorized path writes nothing.
+  async function assertInteractiveBoardAudited(
+    req: Parameters<typeof assertInteractiveBoard>[0],
+    companyId: string,
+    route: string,
+  ) {
+    if (requireInteractiveBoard(req)) return;
+    if (req.actor.type !== "none") {
+      try {
+        const info = getActorInfo(req);
+        const entry = {
+          companyId,
+          actorType: info.actorType,
+          actorId: info.actorId,
+          action: "authz.interactive_board_denied",
+          entityType: "route",
+          entityId: route,
+          details: {
+            method: req.method,
+            route,
+            actorSource: info.actorSource,
+            agentId: info.agentId,
+            runId: info.runId,
+            reason: "interactive_operator_session_required",
+          },
+        };
+        try {
+          await logActivity(db, {
+            ...entry,
+            agentId: info.agentId,
+            runId: info.runId,
+            agentApiKeyId: info.agentApiKeyId,
+          });
+        } catch {
+          // agent_id/run_id are FK columns; a probe carrying an unknown id must
+          // still be recorded, so retry with those ids kept only in details.
+          await logActivity(db, entry);
+        }
+      } catch (err) {
+        logger.warn({ err, route, companyId }, "failed to audit interactive-board denial");
+      }
+    } else {
+      logger.warn({ route, companyId, method: req.method }, "unauthenticated interactive-board denial");
+    }
+    assertInteractiveBoard(req);
+  }
+
   // Review surface: current allowlist + posture per binding, plus harvested
   // would-deny origins as UNCHECKED suggestions (never auto-applied). Read-only.
   router.get("/companies/:companyId/secret-egress-bindings", async (req, res) => {
-    assertInteractiveBoard(req);
     const companyId = req.params.companyId as string;
+    await assertInteractiveBoardAudited(req, companyId, "GET /companies/:companyId/secret-egress-bindings");
     assertCompanyAccess(req, companyId);
     const bindings = await svc.listEgressReview(companyId);
     res.json({ bindings });
@@ -1178,8 +1233,8 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
     "/companies/:companyId/secret-egress-bindings/:bindingId/allowlist",
     validate(setBindingEgressAllowlistSchema),
     async (req, res) => {
-      assertInteractiveBoard(req);
       const companyId = req.params.companyId as string;
+      await assertInteractiveBoardAudited(req, companyId, "POST /companies/:companyId/secret-egress-bindings/:bindingId/allowlist");
       const bindingId = req.params.bindingId as string;
       assertCompanyAccess(req, companyId);
 
@@ -1213,8 +1268,8 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
     "/companies/:companyId/secret-egress-bindings/:bindingId/enforce",
     validate(enforceBindingEgressSchema),
     async (req, res) => {
-      assertInteractiveBoard(req);
       const companyId = req.params.companyId as string;
+      await assertInteractiveBoardAudited(req, companyId, "POST /companies/:companyId/secret-egress-bindings/:bindingId/enforce");
       const bindingId = req.params.bindingId as string;
       assertCompanyAccess(req, companyId);
 

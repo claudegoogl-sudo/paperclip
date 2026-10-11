@@ -984,6 +984,18 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     await expect(db.select().from(routineRuns).where(eq(routineRuns.id, run.id))).resolves.toHaveLength(1);
   });
 
+  it("keeps revision restore assignee-only for agents (no routines:manage widening)", async () => {
+    const { routine, svc } = await seedFixture();
+    const revision1Id = routine.latestRevisionId!;
+    await svc.update(routine.id, { description: "revision 2" }, {});
+    await expect(
+      svc.restoreRevision(routine.id, revision1Id, { agentId: randomUUID() }),
+    ).rejects.toMatchObject({
+      status: 403,
+      message: "Agents can only restore routine revisions assigned to themselves",
+    });
+  });
+
   it("defaults activity gates when restoring a legacy routine revision snapshot", async () => {
     const { routine, svc } = await seedFixture();
     const revision1Id = routine.latestRevisionId!;
@@ -1810,7 +1822,16 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     // seeded retry already 1 minute in the past and failed the "due in" assertion (observed on
     // CI 2026-09-23). Anchoring the tick to next tick - 120s pins the classifier inputs for
     // every wall-clock moment; the trigger's nextRunAt is backdated above, so the tick fires.
-    await input.svc.tickScheduledTriggers(new Date(trigger.nextRunAt!.getTime() - 120 * 1000));
+    // The skip-reason classifier reads the dispatch's own wall-clock `triggeredAt`, not the tick's
+    // `now`, so anchoring the tick argument alone did not pin it (CI 2026-10-11 hit the same
+    // final-minute-of-the-hour flake again). Fake only `Date` for the tick so both clocks agree.
+    const tickAt = new Date(trigger.nextRunAt!.getTime() - 120 * 1000);
+    vi.useFakeTimers({ toFake: ["Date"], now: tickAt });
+    try {
+      await input.svc.tickScheduledTriggers(tickAt);
+    } finally {
+      vi.useRealTimers();
+    }
     return db
       .select()
       .from(routineRuns)

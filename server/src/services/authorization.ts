@@ -1024,7 +1024,8 @@ export function authorizationService(db: Db | DbTransaction) {
       input.action === "inbox:manage" ||
       input.action === "runtime:manage" ||
       input.action === "secrets:read" ||
-      input.action === "secrets:propose"
+      input.action === "secrets:propose" ||
+      input.action === "routines:manage"
     ) {
       return lowTrustDeny(
         `${LOW_TRUST_REVIEW_PRESET} agents cannot use company-wide or privileged ${input.action} APIs by default.`,

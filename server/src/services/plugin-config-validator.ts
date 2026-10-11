@@ -38,6 +38,8 @@ export function validateInstanceConfig(
   // hold a Paperclip secret UUID rather than a raw value. The format is a UI
   // hint only — UUID validation happens in the secrets handler at resolve time.
   ajv.addFormat("secret-ref", { validate: () => true });
+  // Annotation-only keyword: per-tenant override scope (see plugin-config-scope.ts).
+  ajv.addKeyword({ keyword: "x-paperclip-scope", schemaType: "string" });
   const validate = ajv.compile(schema);
   const valid = validate(configJson);
 

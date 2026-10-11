@@ -3770,6 +3770,22 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "post",
+  path: "/api/instance/usage-limit-park",
+  tags: ["agents"],
+  summary: "Clear the instance-wide usage-limit park (instance admin only; logs activity, resumes queued runs)",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/instance/usage-limit-park",
+  tags: ["agents"],
+  summary: "Clear the instance-wide usage-limit park (instance admin only; logs activity, resumes queued runs)",
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
+});
+
+registry.registerPath({
   method: "get",
   path: "/api/instance/admission-hold",
   tags: ["agents"],
@@ -5257,6 +5273,21 @@ registry.registerPath({
     body: jsonBody(resubmitApprovalSchema),
   },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/approvals/{id}/withdraw",
+  tags: ["approvals"],
+  summary: "Withdraw a pending approval as the requesting agent",
+  request: { params: z.object({ id: z.string() }) },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    422: r.unprocessable,
+  },
 });
 
 registry.registerPath({

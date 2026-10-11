@@ -72,6 +72,7 @@ import {
 import { createPluginSecretsHandler, type PluginSecretsResolveParams } from "./plugin-secrets-handler.js";
 import { createPluginArtifactsHandler } from "./plugin-artifacts-handler.js";
 import { enforcePluginConfigEgress } from "./plugin-config-egress.js";
+import { filterOverrideToTenantScope } from "./plugin-config-scope.js";
 import { normalizeIssueAttachmentMaxBytes } from "../attachment-types.js";
 import {
   defaultPluginWakeRateLimiter,
@@ -982,6 +983,11 @@ export function buildHostServices(
     pluginDbId: pluginId,
     pluginKey,
     runContextRegistry: options.runContextRegistry,
+    // SECURITY-CRITICAL: the service/background resolve paths learn their owning company
+    // only inside the handler, so the enablement gate has to be injected rather
+    // than applied out here. Wrapped in an arrow because
+    // `requirePluginEnabledForCompany` is declared below this construction.
+    ensurePluginEnabledForCompany: (companyId) => requirePluginEnabledForCompany(companyId),
   });
   const companies = companyService(db);
   const agents = agentService(db);
@@ -1140,7 +1146,10 @@ export function buildHostServices(
    * cross-tenant-sensitive enumeration can never run for a company the plugin
    * is not genuinely provisioned for. Pre-existing handlers are NOT rewired:
    * their per-entity `requireInCompany` cross-check stays as upstream wrote
-   * it, and the company-scoped state handlers are the only added consumer.
+   * it. Added consumers: the company-scoped state handlers, and the secrets
+   * handler's service/background resolve paths — those have no per-entity
+   * company to cross-check (the owning company is derived from the binding),
+   * so this is the only gate that can enforce per-tenant disablement there.
    *
    * Denial order (each step throws rather than returning an empty list — a
    * silent empty would mask a misconfig and reopen the very downtime gap this
@@ -1844,7 +1853,19 @@ export function buildHostServices(
     ]);
     const base = (configRow?.configJson as Record<string, unknown> | undefined) ?? {};
     if (!override) return { ...base };
-    return { ...base, ...override };
+    // Merge-time scope filter (defense in depth): an override row written
+    // before the write gate existed must not shadow an operator-plane key.
+    const manifest = (await registry.getById(pluginId))?.manifestJson as
+      | { instanceConfigSchema?: { properties?: Record<string, unknown> } }
+      | undefined;
+    const { kept, dropped } = filterOverrideToTenantScope(manifest?.instanceConfigSchema, override);
+    if (dropped.length > 0) {
+      configGateLog.warn(
+        { pluginId, companyId, droppedKeys: dropped },
+        "plugin.config_override.ignored_non_tenant_keys",
+      );
+    }
+    return { ...base, ...kept };
   };
 
   /**

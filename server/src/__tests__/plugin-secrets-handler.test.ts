@@ -210,6 +210,84 @@ describeEmbeddedPostgres("createPluginSecretsHandler shared vault integration", 
       .where(eq(secretAccessEvents.secretId, foreignSecret.id));
     expect(events).toHaveLength(0);
   });
+
+  // Regression pin for the Layer-1 tenancy predicate in the DEFAULT binding
+  // lookup (`findBinding`, used by the run-context dispatch path). The binding
+  // query must filter on `company_secret_bindings.company_id`; a secret id is
+  // globally unique, so dropping that predicate would let company A's
+  // dispatch resolve a secret company B bound to the same plugin. The test
+  // uses the real DB lookup. The value resolver is a spy that does NOT check
+  // the company (it models a Layer-2 regression), so this test isolates the
+  // Layer-1 predicate: removing it lets the foreign binding through to the
+  // resolver and this test fails. The real resolver's own company check is
+  // defence in depth and is covered by the test above.
+  it("dispatch-path binding lookup is scoped to the dispatching company", async () => {
+    await seedPlugin();
+    const companyA = await seedCompany("A");
+    const companyB = await seedCompany("B");
+    const svc = secretService(db);
+    const ownSecret = await svc.create(companyA, {
+      name: `own-plugin-secret-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "own-value",
+    });
+    await svc.syncSecretRefsForTarget(companyA, { targetType: "plugin", targetId: pluginId }, [
+      { secretId: ownSecret.id, configPath: "apiKey" },
+    ], { replaceAll: true });
+    const foreignSecret = await svc.create(companyB, {
+      name: `foreign-plugin-secret-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "foreign-value",
+    });
+    await svc.syncSecretRefsForTarget(companyB, { targetType: "plugin", targetId: pluginId }, [
+      { secretId: foreignSecret.id, configPath: "apiKey" },
+    ], { replaceAll: true });
+
+    const values = new Map([[ownSecret.id, "own-value"], [foreignSecret.id, "foreign-value"]]);
+    const resolverSpy = vi.fn(async (input: { secretId: string }) => values.get(input.secretId) ?? "");
+
+    const registry = createPluginRunContextRegistry();
+    registry.register(pluginId, {
+      agentId: "agent-a",
+      companyId: companyA,
+      runId: "run-tenancy",
+      projectId: "proj-a",
+      toolName: "tenancy.check",
+      registeredAt: Date.now(),
+    });
+    const handler = createPluginSecretsHandler({
+      db,
+      pluginDbId: pluginId,
+      pluginKey: "paperclip.plugin-secrets-test",
+      runContextRegistry: registry,
+      resolver: { resolve: resolverSpy },
+    });
+
+    // Positive control: the same lookup resolves the dispatching company's
+    // own binding, so a rejection below is the predicate, not a broken setup.
+    await expect(
+      handler.resolve({ secretRef: ownSecret.id, runId: "run-tenancy" }),
+    ).resolves.toBe("own-value");
+
+    const err = await handler
+      .resolve({ secretRef: foreignSecret.id, runId: "run-tenancy" })
+      .then(
+        () => null,
+        (e: unknown) => e as { code?: string },
+      );
+    expect(err).not.toBeNull();
+    expect(err?.code).toBe("not_found");
+    expect(resolverSpy).toHaveBeenCalledTimes(1);
+    expect(resolverSpy).not.toHaveBeenCalledWith(
+      expect.objectContaining({ secretId: foreignSecret.id }),
+    );
+
+    const events = await db
+      .select()
+      .from(secretAccessEvents)
+      .where(eq(secretAccessEvents.secretId, foreignSecret.id));
+    expect(events).toHaveLength(0);
+  });
 });
 /**
  * Tests for the company-scoped `secrets.resolve` handler.
