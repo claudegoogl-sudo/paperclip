@@ -57,6 +57,7 @@ export function createPluginWakeRateLimiter(options: {
   const maxKeys = options.maxKeys ?? DEFAULT_SLIDING_WINDOW_MAX_KEYS;
   const now = options.now ?? Date.now;
   const store = createSlidingWindowRateLimitStore({
+    name: "plugin-wake",
     windowMs,
     max: maxWakes,
     maxKeys,
