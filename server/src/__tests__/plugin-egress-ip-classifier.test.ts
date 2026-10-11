@@ -37,12 +37,15 @@ describe("plugin-egress-ip-classifier", () => {
     expect(classifyEgressIp("2a00:1450::1", { interfaces: none }).category).toBe("public");
   });
 
-  it("own-host beats public and cgnat, and a failing interface source does not throw", () => {
+  it("own-host beats public and cgnat, and a failing interface source fails closed without throwing", () => {
     const ifaces = () => ({ eth0: [{ address: "8.8.8.8" }], ts: [{ address: "100.64.0.9" }] }) as never;
     expect(classifyEgressIp("8.8.8.8", { interfaces: ifaces }).category).toBe("own_host");
     expect(classifyEgressIp("::ffff:6440:9", { interfaces: ifaces }).category).toBe("own_host");
     const boom = () => { throw new Error("x"); };
-    expect(classifyEgressIp("8.8.8.8", { interfaces: boom }).category).toBe("public");
+    const failed = classifyEgressIp("8.8.8.8", { interfaces: boom });
+    expect(failed.category).toBe("invalid");
+    expect(failed.reason).toBe("own-host interface read failed");
+    expect(isEgressAllowed(failed, "allow-legacy")).toBe(false);
   });
 
   it("reads the CGNAT switch with deny default; allow-legacy only when set explicitly", () => {

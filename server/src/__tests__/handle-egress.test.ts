@@ -58,6 +58,26 @@ describe("EG2 — normalization bypass set (each fails closed)", () => {
     expect(normalizeDestination("url", "http://[::1]/").ok).toBe(false);
   });
 
+  it("embedded-IPv4 IPv6 literals (hex-mapped / translated / compatible / NAT64) fail closed", () => {
+    for (const dest of [
+      "http://[::ffff:7f00:1]/", // ::ffff:127.0.0.1, hex-mapped
+      "http://[::ffff:127.0.0.1]/", // URL parser rewrites to the hex form
+      "http://[::ffff:a9fe:a9fe]/", // 169.254.169.254 metadata, hex-mapped
+      "http://[::ffff:0:7f00:1]/", // SIIT-translated loopback
+      "http://[::7f00:1]/", // IPv4-compatible loopback
+      "http://[64:ff9b::a9fe:a9fe]/", // NAT64-embedded metadata
+      "http://[0:0:0:0:0:ffff:7f00:1]/", // fully expanded hex-mapped
+      "http://[fe81::1]/", // link-local beyond the fe80: prefix
+      "http://[febf::1]/",
+      "http://[fc00::1]/", // ULA
+    ]) {
+      expect(normalizeDestination("url", dest).ok, dest).toBe(false);
+    }
+    // Non-forbidden literals still classify as IPs (not over-blocked).
+    expect(normalizeDestination("url", "http://[2606:4700::1]/").ok).toBe(true);
+    expect(normalizeDestination("url", "http://8.8.8.8/").ok).toBe(true);
+  });
+
   it("IDN/punycode/homoglyph + trailing-dot FQDN deny", () => {
     // Cyrillic 'а' homoglyph in apple.com → punycode host, not the ASCII host.
     expect(allows("url", "https://аpple.com/", ["https://apple.com"])).toBe(false);
