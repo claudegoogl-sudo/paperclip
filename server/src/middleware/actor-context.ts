@@ -10,6 +10,14 @@ import type { RequestHandler } from "express";
 export interface ActorProvenance {
   source: string | null;
   keyId: string | null;
+  /**
+   * `<actorType>:<actorId>` of the authenticated request actor (e.g.
+   * `user:<userId>`, `agent:<agentId>`), or absent. Type + id only — never a
+   * token, email, or request body. Consumed by the secret-binding posture audit
+   * trigger via the transaction-local `paperclip.actor` GUC. Never persisted:
+   * `captureActorProvenance` strips it.
+   */
+  auditActor?: string | null;
 }
 
 const actorProvenanceStore = new AsyncLocalStorage<ActorProvenance>();
@@ -34,9 +42,28 @@ export function actorProvenanceMiddleware(): RequestHandler {
     const provenance: ActorProvenance = {
       source: req.actor?.source ?? null,
       keyId: req.actor?.keyId ?? null,
+      auditActor: auditActorFromRequestActor(req.actor),
     };
     runWithActorProvenance(provenance, () => next());
   };
+}
+
+/**
+ * Reduces a request actor to `<actorType>:<actorId>`, or `null` when the actor
+ * is unauthenticated or has no id. Only the type and id leave this function.
+ */
+export function auditActorFromRequestActor(
+  actor: { type?: string; userId?: string | null; agentId?: string | null } | undefined | null,
+): string | null {
+  if (!actor) return null;
+  if (actor.type === "agent" && actor.agentId) return `agent:${actor.agentId}`;
+  if (actor.type === "board" && actor.userId) return `user:${actor.userId}`;
+  return null;
+}
+
+/** The current request's audit actor (`<type>:<id>`), or `null` outside a request. */
+export function getAuditActor(): string | null {
+  return getActorProvenance()?.auditActor ?? null;
 }
 
 /**
