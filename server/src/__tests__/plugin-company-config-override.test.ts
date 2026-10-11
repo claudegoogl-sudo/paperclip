@@ -9,10 +9,13 @@ import {
   companySecrets,
   createDb,
   pluginCompanySettings,
+  pluginConfig,
   plugins,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { pluginRegistryService } from "../services/plugin-registry.js";
+import { secretService } from "../services/secrets.js";
+import { createPluginSecretsHandler } from "../services/plugin-secrets-handler.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -44,6 +47,7 @@ describeEmbeddedPostgres("pluginRegistryService.upsertCompanyConfigOverride", ()
   afterEach(async () => {
     await db.delete(companySecretBindings);
     await db.delete(pluginCompanySettings);
+    await db.delete(pluginConfig);
     await db.delete(plugins);
     await db.delete(companySecretVersions);
     await db.delete(companySecrets);
@@ -283,6 +287,110 @@ describeEmbeddedPostgres("pluginRegistryService.upsertCompanyConfigOverride", ()
     expect(effective).toEqual({
       defaultBranch: "main",
       githubPatSecretId: secretA,
+    });
+  });
+  describe("base plugin_config and override share one binding key", () => {
+    async function bindingAt(pluginId: string, companyId: string) {
+      const rows = (await bindingsFor(pluginId)).filter(
+        (r) => r.companyId === companyId && r.configPath === "githubPatSecretId",
+      );
+      expect(rows.length).toBeLessThanOrEqual(1);
+      return rows[0] ?? null;
+    }
+
+    it("clearing an override keeps the base config's binding (exact incident sequence) and resolve succeeds", async () => {
+      const companyA = await seedCompany("A");
+      const real = await secretService(db).create(companyA, {
+        provider: "local_encrypted",
+        name: `pat-${randomUUID()}`,
+        key: `pat.${randomUUID()}`,
+        value: "base-pat-value",
+      });
+      const pluginId = await seedPlugin();
+      const registry = pluginRegistryService(db);
+      const ref = { type: "secret_ref", secretId: real.id };
+
+      // Settings lived in the override, then were moved to the base config,
+      // then the override was cleared.
+      await registry.upsertCompanyConfigOverride(pluginId, companyA, { githubPatSecretId: ref });
+      await registry.upsertConfig(pluginId, companyA, { configJson: { githubPatSecretId: ref } });
+      await registry.deleteCompanyConfigOverride(pluginId, companyA);
+
+      expect(await bindingAt(pluginId, companyA)).toMatchObject({ secretId: real.id });
+      const handler = createPluginSecretsHandler({ db, pluginId } as never);
+      await expect(
+        handler.resolve({ companyId: companyA, secretRef: ref, configPath: "githubPatSecretId" } as never),
+      ).resolves.toBe("base-pat-value");
+    });
+
+    it("clearing an override repoints the binding to the base config's secret", async () => {
+      const companyA = await seedCompany("A");
+      const baseSecret = await seedSecret(companyA, "base");
+      const overrideSecret = await seedSecret(companyA, "override");
+      const pluginId = await seedPlugin();
+      const registry = pluginRegistryService(db);
+
+      await registry.upsertConfig(pluginId, companyA, { configJson: { githubPatSecretId: baseSecret } });
+      await registry.upsertCompanyConfigOverride(pluginId, companyA, { githubPatSecretId: overrideSecret });
+      expect(await bindingAt(pluginId, companyA)).toMatchObject({ secretId: overrideSecret });
+
+      await registry.deleteCompanyConfigOverride(pluginId, companyA);
+      expect(await bindingAt(pluginId, companyA)).toMatchObject({ secretId: baseSecret });
+    });
+
+    it("clearing an override still revokes when no base config references the path", async () => {
+      const companyA = await seedCompany("A");
+      const secretA = await seedSecret(companyA, "pat");
+      const pluginId = await seedPlugin();
+      const registry = pluginRegistryService(db);
+
+      await registry.upsertConfig(pluginId, companyA, { configJson: { label: "no-secret" } });
+      await registry.upsertCompanyConfigOverride(pluginId, companyA, { githubPatSecretId: secretA });
+      await registry.deleteCompanyConfigOverride(pluginId, companyA);
+      expect(await bindingAt(pluginId, companyA)).toBeNull();
+    });
+
+    it("PUT override that drops or changes the path keeps / restores the base binding", async () => {
+      const companyA = await seedCompany("A");
+      const baseSecret = await seedSecret(companyA, "base");
+      const overrideSecret = await seedSecret(companyA, "override");
+      const pluginId = await seedPlugin();
+      const registry = pluginRegistryService(db);
+
+      await registry.upsertConfig(pluginId, companyA, { configJson: { githubPatSecretId: baseSecret } });
+      await registry.upsertCompanyConfigOverride(pluginId, companyA, { githubPatSecretId: overrideSecret });
+      // Drop the path from the override.
+      await registry.upsertCompanyConfigOverride(pluginId, companyA, { label: "x" });
+      expect(await bindingAt(pluginId, companyA)).toMatchObject({ secretId: baseSecret });
+      // Re-add then change it back to the base secret value.
+      await registry.upsertCompanyConfigOverride(pluginId, companyA, { githubPatSecretId: overrideSecret });
+      await registry.upsertCompanyConfigOverride(pluginId, companyA, { githubPatSecretId: baseSecret });
+      expect(await bindingAt(pluginId, companyA)).toMatchObject({ secretId: baseSecret });
+      await registry.upsertCompanyConfigOverride(pluginId, companyA, {});
+      expect(await bindingAt(pluginId, companyA)).toMatchObject({ secretId: baseSecret });
+    });
+
+    it("base save while an override exists is not undone by later override writes (both orders)", async () => {
+      const companyA = await seedCompany("A");
+      const baseSecret = await seedSecret(companyA, "base");
+      const overrideSecret = await seedSecret(companyA, "override");
+      const pluginId = await seedPlugin();
+      const registry = pluginRegistryService(db);
+
+      // Order 1: override first, then base, then clear override.
+      await registry.upsertCompanyConfigOverride(pluginId, companyA, { githubPatSecretId: overrideSecret });
+      await registry.upsertConfig(pluginId, companyA, { configJson: { githubPatSecretId: baseSecret } });
+      // Override still wins while it exists.
+      expect(await bindingAt(pluginId, companyA)).toMatchObject({ secretId: overrideSecret });
+      await registry.upsertCompanyConfigOverride(pluginId, companyA, { label: "drop" });
+      expect(await bindingAt(pluginId, companyA)).toMatchObject({ secretId: baseSecret });
+
+      // Order 2: base cleared while override holds the path keeps the override binding.
+      await registry.upsertCompanyConfigOverride(pluginId, companyA, { githubPatSecretId: overrideSecret });
+      await registry.patchConfig(pluginId, companyA, { configJson: { githubPatSecretId: null } });
+      expect(await bindingAt(pluginId, companyA)).toMatchObject({ secretId: overrideSecret });
+      await registry.deleteCompanyConfigOverride(pluginId, companyA);
+      expect(await bindingAt(pluginId, companyA)).toBeNull();
     });
   });
 });
