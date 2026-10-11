@@ -19,6 +19,7 @@ import {
   type SshEnvLabFixtureState,
 } from "./ssh.js";
 import { prepareRemoteManagedRuntime } from "./remote-managed-runtime.js";
+import { deriveAgentGitIdentity } from "./git-identity.js";
 
 const SSH_FIXTURE_TEST_TIMEOUT_MS = 30_000;
 let sshEnvLabUnsupportedReason: string | null = null;
@@ -1007,17 +1008,24 @@ describe("ssh env-lab fixture", () => {
       remoteCwd: started.workspaceDir,
     } as const;
 
+    const agent = {
+      id: "558b662c-0f1f-473a-ab7d-d4e56fb3c29b",
+      name: "SSH Fixture Agent",
+      companyId: "d49b266c-50dc-42c5-b45e-308c7f3ffc1f",
+    };
     const preparedA = await prepareRemoteManagedRuntime({
       spec,
       runId: "run-commit-a",
       adapterKey: "test-adapter",
       workspaceLocalDir: localRepo,
+      agent,
     });
     const preparedB = await prepareRemoteManagedRuntime({
       spec,
       runId: "run-commit-b",
       adapterKey: "test-adapter",
       workspaceLocalDir: localRepo,
+      agent,
     });
 
     await runSshCommand(
@@ -1039,6 +1047,10 @@ describe("ssh env-lab fixture", () => {
     await expect(readFile(path.join(localRepo, "run-a.txt"), "utf8")).resolves.toBe("from run a\n");
     await expect(readFile(path.join(localRepo, "run-b.txt"), "utf8")).resolves.toBe("from run b\n");
     expect(await git(localRepo, ["log", "-1", "--pretty=%s"])).toContain("Paperclip SSH sync merge");
+    // The SSH transport threads the run's agent into the sync merge commit.
+    const identity = deriveAgentGitIdentity(agent);
+    expect(await git(localRepo, ["log", "-1", "--pretty=%an|%ae|%cn|%ce"]))
+      .toBe(`${identity.name}|${identity.email}|${identity.name}|${identity.email}`);
 
     const recentSubjects = await git(localRepo, ["log", "--pretty=%s", "-3"]);
     expect(recentSubjects).toContain("remote update a");

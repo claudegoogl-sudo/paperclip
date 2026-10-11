@@ -3,6 +3,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
+import type { AgentGitIdentityInput } from "./git-identity.js";
 import type { SshRemoteExecutionSpec } from "./ssh.js";
 import {
   prepareCommandManagedRuntime,
@@ -1388,6 +1389,8 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
   assets?: AdapterManagedRuntimeAsset[];
   /** Referenced (additional) projects to stage into the sandbox as plain, read-only trees. */
   additionalSources?: SandboxAdditionalSource[];
+  /** Run's agent, when one is known — attributes sync-created git commits to it. */
+  agent?: AgentGitIdentityInput | null;
   installCommand?: string | null;
   /** When provided alongside `installCommand`, skip the install if the binary is already on PATH. */
   detectCommand?: string | null;
@@ -1426,6 +1429,7 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
       syncWorkspace: input.syncWorkspace,
       assets: input.assets,
       additionalSources: input.additionalSources,
+      agent: input.agent,
       onProgress: input.onProgress,
     });
     return {
@@ -1461,6 +1465,7 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
     preserveAbsentOnRestore: input.preserveAbsentOnRestore,
     assets: input.assets,
     additionalSources: input.additionalSources,
+    agent: input.agent,
     installCommand: input.installCommand,
     detectCommand: input.detectCommand,
     onProgress: input.onProgress,
