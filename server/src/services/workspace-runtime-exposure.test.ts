@@ -130,19 +130,17 @@ setInterval(() => {}, 1000);
  * pair on the printed line alone. Otherwise repeated starts drain the shared
  * exposure-port pool. The start must surface the failure terminally after a single
  * allocation.
+ *
+ * The claim targets whichever port the allocator actually assigned, not a
+ * hard-coded range base: the whole dedicated range sits inside Linux's
+ * ephemeral source-port span, so a transient squatter on the base port
+ * legitimately relocates the allocation (PAP-17419) and the modeled
+ * guest-controlled claim is identical for any assigned port.
  */
-const SYNTHETIC_EADDRINUSE_ON_BASE_PORT_GUEST = `
-import http from "node:http";
+const SYNTHETIC_EADDRINUSE_ASSIGNED_PORT_GUEST = `
 const p = Number(process.env.PORT);
-if (p === 42000) {
-  process.stderr.write("node:events:497\\nError: listen EADDRINUSE: address already in use 127.0.0.1:" + p + "\\n");
-  process.exit(1);
-}
-const health = (rq, r) => { if (rq.url === "/api/health") { r.setHeader("content-type", "application/json"); r.end(JSON.stringify({ status: "ok" })); return true; } return false; };
-for (const q of [p, p + 10000]) {
-  http.createServer((rq, r) => { if (health(rq, r)) return; r.statusCode = 200; r.end("ok"); }).listen(q, "127.0.0.1");
-}
-setInterval(() => {}, 1000);
+process.stderr.write("node:events:497\\nError: listen EADDRINUSE: address already in use 127.0.0.1:" + p + "\\n");
+process.exit(1);
 `;
 
 /**
@@ -189,7 +187,7 @@ beforeAll(async () => {
   // collision the host cannot confirm. The start must not quarantine the pair.
   await fs.writeFile(
     path.join(guestDir, "dev-runner-eaddrinuse-synthetic.mjs"),
-    SYNTHETIC_EADDRINUSE_ON_BASE_PORT_GUEST,
+    SYNTHETIC_EADDRINUSE_ASSIGNED_PORT_GUEST,
   );
   // A guest that fails on a fixed auxiliary port, not on its assigned app or HMR
   // port. It models an unrelated helper listener that an external process holds.
@@ -780,12 +778,17 @@ describe("recovers when a guest loses its assigned exposure port during startup 
       },
     }).then(() => null, (err: unknown) => err as Error);
 
-    // No host listener owns 42000, so the printed EADDRINUSE line is unverified.
-    // The start fails terminally after ONE allocation and never burns the pool.
+    // No host listener owns the assigned port, so the printed EADDRINUSE line is
+    // unverified. The start fails terminally after ONE allocation and never burns
+    // the pool. The assigned port is read back from the single allocation rather
+    // than pinned to the range base (42000): an ephemeral-port squatter on the
+    // base legitimately relocates the allocation (PAP-17419) and must not fail
+    // this quarantine-classification test.
     expect(error).not.toBeNull();
-    expect(error!.message).toContain("42000");
+    expect(reservedAppPorts).toHaveLength(1);
+    const assignedPort = reservedAppPorts[0]!;
+    expect(error!.message).toContain(String(assignedPort));
     expect(error!.message).toContain("not verified");
-    expect(reservedAppPorts).toEqual([42_000]);
 
     // No quarantine and no re-allocation happened for the unverified claim.
     const diagnosis = logs.join("");
@@ -820,10 +823,12 @@ describe("recovers when a guest loses its assigned exposure port during startup 
 
     // The failure names an unrelated port, so the assigned pair is not a
     // collision. The start fails terminally after ONE allocation, and never
-    // burns the bounded retries on a valid pair.
+    // burns the bounded retries on a valid pair. One allocation is asserted by
+    // count, not by pinned port value: an ephemeral squatter on the range base
+    // legitimately relocates the allocation (PAP-17419).
     expect(error).not.toBeNull();
     expect(error!.message).toContain("39999");
-    expect(reservedAppPorts).toEqual([42_000]);
+    expect(reservedAppPorts).toHaveLength(1);
 
     // No quarantine and no re-allocation happened for the auxiliary conflict.
     const diagnosis = logs.join("");
@@ -856,13 +861,15 @@ describe("recovers when a guest loses its assigned exposure port during startup 
       },
     }).then(() => null, (err: unknown) => err as Error);
 
-    // The assigned port 42000 appears on a benign line, but EADDRINUSE names only
-    // the auxiliary port 39999. The parser matches the error and the port on the
-    // same line, so the assigned pair is not a collision. The start fails
-    // terminally after ONE allocation and never quarantines the valid pair.
+    // The assigned port appears on a benign line, but EADDRINUSE names only the
+    // auxiliary port 39999. The parser matches the error and the port on the same
+    // line, so the assigned pair is not a collision. The start fails terminally
+    // after ONE allocation and never quarantines the valid pair. One allocation is
+    // asserted by count, not by pinned port value: an ephemeral squatter on the
+    // range base legitimately relocates the allocation (PAP-17419).
     expect(error).not.toBeNull();
     expect(error!.message).toContain("39999");
-    expect(reservedAppPorts).toEqual([42_000]);
+    expect(reservedAppPorts).toHaveLength(1);
 
     const diagnosis = logs.join("");
     expect(diagnosis).not.toContain("Quarantined pair");
