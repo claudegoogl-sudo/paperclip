@@ -630,12 +630,18 @@ export {
 
 export {
   createApprovalSchema,
+  createApprovalRequestSchema,
+  refineApprovalPayload,
+  requestBoardApprovalPayloadSchema,
   isEmptyApprovalPayload,
+  APPROVAL_PAYLOAD_EMPTY_CODE,
+  APPROVAL_PAYLOAD_EMPTY_MESSAGE,
   resolveApprovalSchema,
   requestApprovalRevisionSchema,
   resubmitApprovalSchema,
   addApprovalCommentSchema,
   type CreateApproval,
+  type RequestBoardApprovalPayload,
   type ResolveApproval,
   type RequestApprovalRevision,
   type ResubmitApproval,
