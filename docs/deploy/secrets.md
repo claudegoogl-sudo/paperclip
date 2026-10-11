@@ -27,6 +27,44 @@ you bind to an agent as exposed to that agent. Limit blast radius with bindings
 provider supports them, and rotation when an agent transcript or downstream
 system might have captured a value.
 
+## Never Paste Live Secret Values Into Board Text
+
+This rule applies to every agent, QA run, and cross-company test run.
+
+**NEVER paste a live agent/API key value into an issue comment, document, PR
+body, attachment, or any board-visible text.** Soft-deleting the comment
+afterward does **not** undo the exposure: the plaintext persists in database
+backups and anywhere it was quoted or relayed. Revocation, not deletion, is what
+neutralizes a leaked key.
+
+### Delivering a key to a cross-company / QA run
+
+Prefer these delivery paths, in order, so a live value never lands in
+board-visible text:
+
+1. **Mint at test time inside the run itself.** The QA run mints its own
+   least-privilege scoped key (`POST /api/agents/{id}/keys`), uses it, and
+   `DELETE`s it at run end. The value is created and destroyed inside the run and
+   never touches a comment.
+2. **Operator relay or interaction artifact** when a human must receive the
+   value — deliver it through the operator relay/interaction path, never as a
+   plaintext comment body.
+3. **Reference by id or short prefix only.** If a value must be named in text at
+   all, use the key id or a `<=6-8` character prefix, never the full value.
+
+### If a value is exposed
+
+Handle exposure in this order — each step is independent of the others'
+completion:
+
+1. **Revoke first.** Revoke the key immediately. Do **not** gate revocation on
+   any other issue's status; a leaked key is neutralized by revocation, not by
+   deletion.
+2. **Soft-delete the comment** (or document/attachment) that carried the value.
+3. **Sweep** sibling issues, digests, attachments, and database backups for
+   copies or relayed quotes of the value.
+4. **File the incident** so the exposure and remediation are recorded.
+
 ## Using Secrets In Runs
 
 Creating a company secret does not automatically create an environment variable.
