@@ -273,7 +273,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     } else {
       expect(result.outcome).toBe("scheduled");
       if (result.outcome !== "scheduled" || !result.run) throw new Error("Expected a bounded retry");
-      await db.update(heartbeatRuns).set({ status: "failed", errorCode: "workspace_restore_failed", scheduledRetryAttempt: 2,
+      await db.update(heartbeatRuns).set({ status: "failed", errorCode: "workspace_restore_failed", scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
         resultJson: { workspaceRestoreFailure: classification, conversationContinuation: "continue_conversation_v1", errorFamily: "transient_upstream" },
       }).where(eq(heartbeatRuns.id, result.run.id));
       expect(await heartbeat.scheduleBoundedRetry(result.run.id, { now, random: () => 0 })).toMatchObject({ outcome: "retry_exhausted" });
