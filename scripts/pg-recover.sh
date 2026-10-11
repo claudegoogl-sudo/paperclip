@@ -669,8 +669,21 @@ cmd_tick() {
   if [ -z "$expected_socket_dir" ]; then
     die "could not derive expected unix socket directory for $PG_RECOVER_DATA_DIR"
   fi
-  mkdir -p "$expected_socket_dir" 2>/dev/null || true
-  chmod 0700 "$expected_socket_dir" 2>/dev/null || true
+  # CWE-379: the root may be shared/world-writable (/tmp). Never
+  # follow or adopt a pre-seeded entry: refuse symlinks, non-dirs, dirs we do
+  # not own, and any group/world mode. Mirrors ensureEmbeddedPostgresSocketDir().
+  if [ ! -e "$expected_socket_dir" ] && [ ! -L "$expected_socket_dir" ]; then
+    (umask 077; mkdir -p "$expected_socket_dir") 2>/dev/null || true
+  fi
+  if [ -L "$expected_socket_dir" ] || [ ! -d "$expected_socket_dir" ]; then
+    die "socket dir $expected_socket_dir is a symlink or not a directory — refusing to start (CWE-379)"
+  fi
+  if [ "$(stat -c %u "$expected_socket_dir" 2>/dev/null)" != "$(id -u)" ]; then
+    die "socket dir $expected_socket_dir is not owned by uid $(id -u) — refusing to start (CWE-379)"
+  fi
+  if [ "$(stat -c %a "$expected_socket_dir" 2>/dev/null)" != "700" ]; then
+    die "socket dir $expected_socket_dir mode is $(stat -c %a "$expected_socket_dir" 2>/dev/null), not 700 — refusing to start (CWE-379)"
+  fi
   expected_socket_file="$expected_socket_dir/.s.PGSQL.$PG_RECOVER_PORT"
 
   # Export for wrapper binaries used by drills/tests (reads $PG_RECOVER_LOG).
