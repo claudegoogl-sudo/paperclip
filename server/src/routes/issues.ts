@@ -11227,6 +11227,12 @@ export function issueRoutes(
 
   router.post("/issues/:id/release", async (req, res) => {
     const id = req.params.id as string;
+    // Capture lock holders BEFORE the orphan guard nulls them, so the manager
+    // override audit row records whose lock / which dead run was released
+    // (the guard's own clear is silent). Agent actors only; only used after
+    // the access checks below pass.
+    const preGuard =
+      req.actor.type === "agent" ? await svc.getById(id).catch(() => null) : null;
     // See PATCH route — back-fill orphan-checkout state up front.
     await svc.clearOrphanCheckoutLocksIfTerminal(id);
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
@@ -11235,10 +11241,30 @@ export function issueRoutes(
     const actorRunId = requireAgentRunId(req, res);
     if (req.actor.type === "agent" && !actorRunId) return;
 
+    // Manager checkout-management override: the mutation boundary
+    // above already admits agents holding tasks:manage_active_checkouts for the
+    // assignee; surface that fact to the service, which re-verifies the data
+    // preconditions (in_progress + terminal-or-missing holding run) on the
+    // locked row. Board force-release remains the only live-run override.
+    let managerOverride = false;
+    if (
+      req.actor.type === "agent" &&
+      req.actor.agentId &&
+      existing.assigneeAgentId &&
+      existing.assigneeAgentId !== req.actor.agentId
+    ) {
+      managerOverride = await hasActiveCheckoutManagementOverride(
+        req.actor.agentId,
+        existing.companyId,
+        existing.assigneeAgentId,
+      );
+    }
+
     const released = await svc.release(
       id,
       req.actor.type === "agent" ? req.actor.agentId : undefined,
       actorRunId,
+      { managerOverride },
     );
     if (!released) {
       res.status(404).json({ error: "Issue not found" });
@@ -11247,7 +11273,7 @@ export function issueRoutes(
 
     const actor = getActorInfo(req);
     await logActivity(db, {
-      companyId: released.companyId,
+      companyId: released.issue.companyId,
       actorType: actor.actorType,
       actorId: actor.actorId,
       agentId: actor.agentId,
@@ -11255,10 +11281,23 @@ export function issueRoutes(
       agentApiKeyId: actor.agentApiKeyId,
       action: "issue.released",
       entityType: "issue",
-      entityId: released.id,
+      entityId: released.issue.id,
+      ...(released.managerOverride
+        ? {
+            details: {
+              managerOverride: true,
+              reason: "stale_checkout_run",
+              prevCheckoutRunId:
+                preGuard?.checkoutRunId ?? released.previous.checkoutRunId ?? null,
+              prevAssigneeAgentId:
+                preGuard?.assigneeAgentId ?? released.previous.assigneeAgentId ?? null,
+              actorAgentId: actor.agentId ?? null,
+            },
+          }
+        : {}),
     });
 
-    res.json(released);
+    res.json(released.issue);
   });
 
   router.post("/issues/:id/admin/force-release", async (req, res) => {
