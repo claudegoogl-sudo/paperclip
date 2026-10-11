@@ -20,6 +20,7 @@ import {
   withShallowGitWorkspaceClone,
   WORKSPACE_GIT_SCAN_SATURATED_CODE,
 } from "./git-workspace-sync.js";
+import type { AgentGitIdentityInput } from "./git-identity.js";
 import { captureDirectorySnapshot, mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
 import {
   createRuntimeProgressReporter,
@@ -983,6 +984,8 @@ export async function prepareSandboxManagedRuntime(input: {
    * Defaults to none, so a legacy/anchor-only call is behavior-identical.
    */
   additionalSources?: SandboxAdditionalSource[];
+  /** Run's agent, when one is known — attributes sync-created git commits to it. */
+  agent?: AgentGitIdentityInput | null;
   // Upload progress sink. Threaded for the byte-counting transport rewrite; the
   // child task wires it into writeFile/readFile.
   onProgress?: RuntimeProgressSink;
@@ -1646,6 +1649,7 @@ export async function prepareSandboxManagedRuntime(input: {
                         await integrateImportedGitHead({
                           localDir: input.workspaceLocalDir,
                           importedHead: gitHeadToIntegrate,
+                          agent: input.agent,
                         });
                       }
                     : undefined,

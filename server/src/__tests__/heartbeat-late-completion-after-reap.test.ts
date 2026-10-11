@@ -316,6 +316,10 @@ describeEmbeddedPostgres("heartbeat late completion after external interruption 
   function mockExternalReapMidRun(input: {
     reapStatus: "interrupted" | "cancelled" | "timed_out" | "succeeded";
     resultJson?: Record<string, unknown>;
+    // Exit code the "first writer" records. Written in the SAME update as the
+    // terminal status so a poller can never observe a terminal row that is
+    // missing it (two separate writes made AC4 flaky: exitCode null).
+    exitCode?: number | null;
   }) {
     return async () => {
       const [active] = await db
@@ -339,6 +343,7 @@ describeEmbeddedPostgres("heartbeat late completion after external interruption 
                   ? "Run timed out"
                   : null,
           resultJson: input.resultJson ?? null,
+          ...(input.exitCode !== undefined ? { exitCode: input.exitCode } : {}),
         })
         .where(eq(heartbeatRuns.id, runId));
       return {
@@ -500,23 +505,12 @@ describeEmbeddedPostgres("heartbeat late completion after external interruption 
     // Re-delivery arrives after another path already finalized the row with
     // its own exit code and provenance; the CAS must lose and converge.
     // The row is already terminal (exitCode 1) before the completion
-    // re-delivery finalizes: the reap simulation marks it succeeded with the
-    // prior provenance, then the wrapper pins the first writer's exit code.
-    const inner = mockExternalReapMidRun({ reapStatus: "succeeded", resultJson: priorProvenance });
-    mockAdapterExecute.mockImplementationOnce(async () => {
-      const result = await inner();
-      const [current] = await db
-        .select({ id: heartbeatRuns.id })
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.status, "succeeded"));
-      if (current) {
-        await db
-          .update(heartbeatRuns)
-          .set({ exitCode: 1 })
-          .where(eq(heartbeatRuns.id, current.id));
-      }
-      return result;
-    });
+    // re-delivery finalizes. Status, exit code and provenance land in ONE
+    // update: waitForRunToSettle returns on the first terminal status, so a
+    // separate exitCode write could be observed missing.
+    mockAdapterExecute.mockImplementationOnce(
+      mockExternalReapMidRun({ reapStatus: "succeeded", resultJson: priorProvenance, exitCode: 1 }),
+    );
 
     const { runId } = await seedQueuedRunFixture();
     const heartbeat = heartbeatService(db);
