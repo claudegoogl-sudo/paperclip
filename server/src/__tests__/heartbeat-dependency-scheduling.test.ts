@@ -2,31 +2,22 @@ import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  activityLog,
   agents,
-  agentRuntimeState,
   agentWakeupRequests,
-  companySkills,
   companies,
   createDb,
-  documentRevisions,
-  documents,
-  environmentLeases,
-  environments,
-  executionWorkspaces,
-  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
-  issueDocuments,
   issueRelations,
   issueTreeHolds,
   issues,
-  workspaceOperations,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { runningProcesses } from "../adapters/index.ts";
 
@@ -100,25 +91,6 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
   }, 20_000);
 
   afterEach(async () => {
-    let idlePolls = 0;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      const runs = await db
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns);
-      const hasActiveRun = runs.some((run) => run.status === "queued" || run.status === "running");
-      if (!hasActiveRun) {
-        idlePolls += 1;
-        if (idlePolls >= 3) break;
-      } else {
-        idlePolls = 0;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-        const runIds = await db
-          .select({ id: heartbeatRuns.id })
-          .from(heartbeatRuns)
-          .then((runs) => runs.map((run) => run.id));
-        await Promise.all(runIds.map((runId) => heartbeat.waitForRunExecutionDrain(runId)));
         mockAdapterExecute.mockReset();
         mockAdapterExecute.mockImplementation(async () => ({
           exitCode: 0,
@@ -130,44 +102,10 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
           model: "test-model",
         }));
         runningProcesses.clear();
-        // Quiescence period: heartbeatRunEvents may be written after run status transitions
-        // to terminal (e.g., appendRunEvent at heartbeat.ts:10288 after setRunStatus).
-        // The drain above awaits run execution, but we still wait a bit for
-        // post-status-change async side effects to complete before teardown.
-        await new Promise((resolve) => setTimeout(resolve, 150));
-    await db.delete(environmentLeases);
-    await db.delete(activityLog);
-    await db.delete(companySkills);
-    await db.delete(issueComments);
-    await db.delete(issueDocuments);
-    await db.delete(documentRevisions);
-    await db.delete(documents);
-    await db.delete(issueRelations);
-    await db.delete(issueTreeHolds);
-    await db.delete(issues);
-    await db.delete(heartbeatRunEvents);
-    await db.delete(activityLog);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(agents);
-    await db.delete(companySkills);
-    await db.delete(environments);
-    await db.delete(workspaceOperations);
-    await db.delete(executionWorkspaces);
-    await db.delete(environmentLeases);
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      try {
-        await db.transaction(async (tx) => {
-          await tx.delete(companySkills);
-          await tx.delete(companies);
-        });
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
+    // Wait for in-flight background heartbeat runs and wakeups to finish, then reset
+    // every table atomically (TRUNCATE ... CASCADE) so late writes cannot race the teardown.
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {

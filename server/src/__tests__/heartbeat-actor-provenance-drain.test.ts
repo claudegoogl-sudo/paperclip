@@ -4,22 +4,17 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   activityLog,
   agents,
-  agentRuntimeState,
   agentWakeupRequests,
   companies,
-  companySkills,
   createDb,
-  environmentLeases,
-  environments,
-  executionWorkspaces,
-  workspaceOperations,
-  heartbeatRunEvents,
   heartbeatRuns,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import {
   ACTOR_PROVENANCE_PAYLOAD_KEY,
   getActorProvenance,
@@ -73,22 +68,13 @@ describeEmbeddedPostgres("heartbeat drains restore enqueue-time actor provenance
   afterEach(async () => {
     const runIds = (await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)).map((r) => r.id);
     await Promise.all(runIds.map((id) => heartbeat.waitForRunExecutionDrain(id)));
-    await new Promise((r) => setTimeout(r, 150));
     runningProcesses.clear();
     mockAdapterExecute.mockReset();
     holder.seen = [];
-    await db.delete(environmentLeases);
-    await db.delete(activityLog);
-    await db.delete(heartbeatRunEvents);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(agents);
-    await db.delete(companySkills);
-    await db.delete(environments);
-    await db.delete(workspaceOperations);
-    await db.delete(executionWorkspaces);
-    await db.delete(companies);
+    // Wait for in-flight background heartbeat runs and wakeups to finish, then reset
+    // every table atomically (TRUNCATE ... CASCADE) so late writes cannot race the teardown.
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {

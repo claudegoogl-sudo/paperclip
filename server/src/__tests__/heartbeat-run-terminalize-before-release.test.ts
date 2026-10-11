@@ -13,6 +13,8 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 vi.mock("../telemetry.ts", () => ({ getTelemetryClient: () => mockTelemetryClient }));
@@ -67,11 +69,10 @@ describeEmbeddedPostgres("heartbeat teardown terminalizes the run before releasi
   }, 20_000);
 
   afterEach(async () => {
-    await db.delete(heartbeatRunEvents);
-    await db.delete(issues);
-    await db.delete(heartbeatRuns);
-    await db.delete(agents);
-    await db.delete(companies);
+    // Wait for in-flight background heartbeat runs and wakeups to finish, then reset
+    // every table atomically (TRUNCATE ... CASCADE) so late writes cannot race the teardown.
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {

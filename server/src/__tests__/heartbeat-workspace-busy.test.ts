@@ -6,20 +6,11 @@ import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
-  agentRuntimeState,
   agentWakeupRequests,
-  activityLog,
-  budgetPolicies,
   companies,
-  companySkills,
   createDb,
   environments,
-  environmentLeases,
-  executionWorkspaces,
-  heartbeatRunEvents,
   heartbeatRuns,
-  issueComments,
-  issueRelations,
   issues,
   projects,
   projectWorkspaces,
@@ -29,6 +20,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import {
   registerServerAdapter,
   unregisterServerAdapter,
@@ -110,18 +102,17 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
   }, 20_000);
 
   afterEach(async () => {
-    // Seeded holder runs are synthetic "running" rows with no real execution
-    // behind them; cancel them first so the drain helper does not spin
-    // waiting for them to finish.
     await db
       .update(heartbeatRuns)
       .set({ status: "cancelled", finishedAt: new Date() })
       .where(eq(heartbeatRuns.status, "running"));
-    await drainHeartbeatRunsToQuiescence(db, heartbeat);
-    await cleanupFixture();
     executedRunIds.length = 0;
     executedInputs.clear();
     await instanceSettingsService(db).updateGeneral({ executionMode: "any" });
+    // Wait for in-flight background heartbeat runs and wakeups to finish, then reset
+    // every table atomically (TRUNCATE ... CASCADE) so late writes cannot race the teardown.
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {
@@ -129,42 +120,6 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
     if (workspaceCwd) await fs.rm(workspaceCwd, { recursive: true, force: true });
     await tempDb?.cleanup();
   });
-
-  async function cleanupFixture() {
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      try {
-        await cleanupFixtureOnce();
-        return;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-  }
-
-  async function cleanupFixtureOnce() {
-    await db.delete(activityLog);
-    await db.delete(environmentLeases);
-    await db.delete(issueComments);
-    await db.delete(issueRelations);
-    await db.delete(issues);
-    await db.delete(executionWorkspaces);
-    await db.delete(projectWorkspaces);
-    await db.delete(projects);
-    await db.delete(heartbeatRunEvents);
-    await db.delete(activityLog);
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    await db.delete(heartbeatRunEvents);
-    await db.delete(activityLog);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(budgetPolicies);
-    await db.delete(agents);
-    await db.delete(environments);
-    await db.delete(companySkills);
-    await db.delete(companies);
-  }
 
   async function waitForRunToLeaveActiveStates(runId: string, timeoutMs = 10_000) {
     const deadline = Date.now() + timeoutMs;
