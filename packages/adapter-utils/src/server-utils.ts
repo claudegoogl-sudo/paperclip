@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs, type Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { buildAgentGitIdentityEnv } from "./git-identity.js";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
 import {
   buildLocalProcessSandboxSpawnTarget,
@@ -2150,7 +2151,7 @@ export interface BuildPaperclipEnvOptions {
 }
 
 export function buildPaperclipEnv(
-  agent: { id: string; companyId: string },
+  agent: { id: string; companyId: string; name?: string | null },
   options: BuildPaperclipEnvOptions = {},
 ): Record<string, string> {
   const resolveHostForUrl = (rawHost: string): string => {
@@ -2162,6 +2163,11 @@ export function buildPaperclipEnv(
   const vars: Record<string, string> = {
     PAPERCLIP_AGENT_ID: agent.id,
     PAPERCLIP_COMPANY_ID: agent.companyId,
+    // Per-agent git attribution: every commit from an agent run is
+    // authored/committed as the agent by default. Names and emails only — no
+    // secrets. Adapter/user config env may still override these explicit GIT_*
+    // keys; the PAPERCLIP_* runtime keys above cannot be overridden.
+    ...buildAgentGitIdentityEnv(agent),
   };
   const runtimeHost = resolveHostForUrl(
     process.env.PAPERCLIP_LISTEN_HOST ?? process.env.HOST ?? "localhost",

@@ -1,4 +1,5 @@
 import os from "node:os";
+import { classifyEgressIp } from "./services/plugin-egress-ip-classifier.js";
 
 function normalizeHost(value: string | null | undefined): string {
   return (value ?? "").trim();
@@ -15,11 +16,11 @@ function isWildcardHost(host: string): boolean {
 }
 
 function isLinkLocalHost(host: string): boolean {
-  const normalized = normalizeHost(host).toLowerCase();
-  if (normalized.startsWith("169.254.")) return true;
-  // IPv6 link-local block is fe80::/10 (fe80:: through febf::)
-  if (/^fe[89ab][0-9a-f]:/.test(normalized)) return true;
-  return false;
+  // Range check on the canonical form (shared classifier) instead of string
+  // prefixes, so embedded-IPv4 forms (::ffff:a9fe:a14) are caught too.
+  // 169.254.0.0/16 and fe80::/10. Empty interface source: ranges only.
+  const c = classifyEgressIp(normalizeHost(host), { interfaces: () => ({}) });
+  return c.reason === "link-local";
 }
 
 function formatOrigin(protocol: string, host: string, port: number): string {

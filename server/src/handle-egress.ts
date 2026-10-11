@@ -31,6 +31,8 @@
  * the {@link ./handle-vault.ts} records and the host-mediated registry.
  */
 
+import { classifyEgressIp } from "./services/plugin-egress-ip-classifier.js";
+
 /** The kind of destination a tool's egress descriptor points at. */
 export type EgressKind = "url" | "host" | "gitRemote";
 
@@ -161,35 +163,27 @@ function hostHoldsHandle(host: string): boolean {
  * check runs AFTER normalization (EG2.4).
  */
 function classifyHost(host: string): "not_ip" | "ip_ok" | "forbidden" {
-  // IPv6 literal (URL keeps the brackets in hostname).
-  if (host.startsWith("[") && host.endsWith("]")) {
-    const inner = host.slice(1, -1).toLowerCase();
-    if (
-      inner === "::1" || // loopback
-      inner === "::" || // unspecified
-      inner.startsWith("fe80:") || // link-local
-      inner.startsWith("fc") || // unique-local
-      inner.startsWith("fd") ||
-      inner.includes("127.0.0.1") || // ::ffff:127.0.0.1 mapped
-      inner.endsWith(":0.0.0.0")
-    ) {
-      return "forbidden";
-    }
-    return "ip_ok";
-  }
-  // IPv4 dotted literal.
-  const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (m) {
-    const o = m.slice(1).map(Number);
-    if (o.some((n) => n > 255)) return "forbidden"; // malformed octet
-    const [a, b] = o;
-    if (a === 127) return "forbidden"; // loopback
-    if (a === 0) return "forbidden"; // unspecified / 0.0.0.0
-    if (a === 169 && b === 254) return "forbidden"; // link-local + 169.254.169.254 metadata
-    return "ip_ok";
-  }
-  return "not_ip";
+  const bracketed = host.startsWith("[") && host.endsWith("]");
+  const dotted = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+  if (!bracketed && !dotted) return "not_ip";
+  // Shared classifier: canonicalizes embedded-IPv4 IPv6 forms (::ffff:7f00:1,
+  // ::ffff:0:a.b.c.d, ::a.b.c.d, 64:ff9b::/96) to the inner IPv4 before range
+  // checks, so hex-mapped literals cannot slip past a string-prefix test.
+  // Interface lookup is not used here (empty source) — own-host denial is the
+  // plugin http.fetch path's job; this keeps the egress allowlist decision
+  // pure and deterministic.
+  const c = classifyEgressIp(host, { interfaces: () => ({}) });
+  if (c.category === "invalid") return "forbidden"; // malformed literal: fail closed
+  if (c.reason && HANDLE_EGRESS_FORBIDDEN_REASONS.has(c.reason)) return "forbidden";
+  return "ip_ok";
 }
+
+/**
+ * Ranges an IP-literal handle destination may never target: loopback,
+ * unspecified/this-network (covers ::, ::1 via IPv4-compatible unwrap),
+ * link-local (incl. 169.254.169.254 metadata) and IPv6 unique-local.
+ */
+const HANDLE_EGRESS_FORBIDDEN_REASONS = new Set(["loopback", "this-network", "link-local", "ula"]);
 
 /**
  * Canonicalize a host through the WHATWG URL parser so we inherit its IDNA
