@@ -151,6 +151,10 @@ async function auditAgentJwtRunHeaderMismatch(
   input: { companyId: string; agentId: string; claimRunId: string; headerRunId: string; method: string; url: string },
 ) {
   try {
+    // F5: actor_source/actor_key_id are NULL here BY CONSTRUCTION, not by omission. This row
+    // audits the *failure* to establish an actor, and it is written from inside actorMiddleware,
+    // which runs before actorProvenanceMiddleware binds any provenance. There is no established
+    // credential provenance to record.
     await db.insert(activityLog).values({
       companyId: input.companyId,
       actorType: "agent",
@@ -305,6 +309,10 @@ async function auditAgentKeyMissingResponsibleUser(
   input: { companyId: string; agentId: string; keyId: string; method: string; url: string },
 ) {
   try {
+    // F5: actor_source/actor_key_id are NULL here BY CONSTRUCTION, not by omission. This row
+    // audits the *failure* to establish an actor, and it is written from inside actorMiddleware,
+    // which runs before actorProvenanceMiddleware binds any provenance. There is no established
+    // credential provenance to record.
     await db.insert(activityLog).values({
       companyId: input.companyId,
       actorType: "agent",

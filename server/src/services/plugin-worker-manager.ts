@@ -70,6 +70,12 @@ import {
   type LoginCommandKey,
 } from "./login-command.js";
 import { logger } from "../middleware/logger.js";
+import {
+  getActorProvenance,
+  runWithActorProvenance,
+  runWithoutActorProvenance,
+  type ActorProvenance,
+} from "../middleware/actor-context.js";
 import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js";
 import { clearRunSecretValues } from "../run-secret-registry.js";
 import { redactSensitiveText } from "../redaction.js";
@@ -724,6 +730,12 @@ interface ActiveInvocation {
   // when no startup span is active. The span host handler reads it to mint the
   // parentage, so a worker never supplies the parent itself.
   traceparent?: string;
+  /**
+   * Credential provenance of the HTTP request that issued this dispatch,
+   * captured synchronously at registration. Re-bound only for worker→host
+   * calls that echo this invocation's id (see `provenanceForWorkerRequest`).
+   */
+  provenance?: ActorProvenance;
 }
 
 /**
@@ -1527,10 +1539,12 @@ export function createPluginWorkerHandle(
       ...(traceparent ? { traceparent } : {}),
       ...(backgroundRunId ? { backgroundRunId } : {}),
     };
+    const provenance = getActorProvenance();
     const entry: ActiveInvocation = {
       scope: effectiveScope,
       traceparent,
       backgroundRunId,
+      ...(provenance ? { provenance } : {}),
       ...(method !== undefined ? { method } : {}),
     };
     if (ttlMs !== undefined) {
@@ -3230,6 +3244,23 @@ export function createPluginWorkerHandle(
   }
 
   /**
+   * Credential provenance for a worker→host request. Positive evidence only:
+   * resolved solely from an echoed, host-minted `paperclipInvocationId` that
+   * hits a live entry. SECURITY: the `singleInFlightScope` heuristic and every
+   * id-less path are deliberately NOT used — a global worker's id-less call
+   * may belong to no dispatch at all (timer, poll loop, job), and stamping it
+   * with whichever request is mid-flight would forge `board_key` attribution.
+   * `null` (recorded as NULL) is the correct answer when the id is absent.
+   */
+  function provenanceForWorkerRequest(message: JsonRpcRequest): ActorProvenance | null {
+    const invocationId = readNonEmptyString(
+      (message as { paperclipInvocationId?: unknown }).paperclipInvocationId,
+    );
+    if (!invocationId) return null;
+    return activeInvocations.get(invocationId)?.provenance ?? null;
+  }
+
+  /**
    * Handle a JSON-RPC request from the worker (worker→host call).
    */
   async function handleWorkerRequest(request: JsonRpcRequest): Promise<void> {
@@ -3255,7 +3286,15 @@ export function createPluginWorkerHandle(
     }
 
     try {
-      const result = await handler(request.params, contextForWorkerMessage(request));
+      const context = contextForWorkerMessage(request);
+      const provenance = provenanceForWorkerRequest(request);
+      const result = provenance
+        ? await runWithActorProvenance(provenance, () => handler(request.params, context))
+        : // No positive evidence: clear any ambient provenance. The stdout
+          // listener inherits the async context the worker was spawned in, so
+          // a worker started inside a request would otherwise leak that
+          // request's credential onto every id-less call.
+          await runWithoutActorProvenance(() => handler(request.params, context));
       sendMessage({
         jsonrpc: JSONRPC_VERSION,
         id: request.id,

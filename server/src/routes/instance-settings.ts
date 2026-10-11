@@ -139,6 +139,41 @@ export function instanceSettingsRoutes(db: Db) {
     res.json(state);
   });
 
+  // Operator escape hatch for the instance-wide usage-limit park. Without it a
+  // mis-dated park can only be lifted by editing the DB. POST and DELETE are
+  // aliases; both clear the park, log one activity entry per company with the
+  // actor, and resume queued runs. Instance-admin board actors only.
+  async function clearUsageLimitPark(req: Request, res: import("express").Response) {
+    assertCanManageInstanceSettings(req);
+    const actor = getActorInfo(req);
+    const before = await heartbeat.getUsageLimitParkState();
+    const state = await heartbeat.clearUsageLimitPark({ actorType: actor.actorType });
+    const companyIds = await svc.listCompanyIds();
+    await Promise.all(
+      companyIds.map((companyId) =>
+        logActivity(db, {
+          companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "instance.usage_limit_park.cleared",
+          entityType: "instance_usage_limit_park",
+          entityId: "default",
+          details: {
+            wasParked: before.parked,
+            previousParkedUntil: before.parkedUntil ? new Date(before.parkedUntil).toISOString() : null,
+            previousReason: before.reason,
+          },
+        }),
+      ),
+    );
+    res.json(state);
+  }
+  router.post("/instance/usage-limit-park", clearUsageLimitPark);
+  router.delete("/instance/usage-limit-park", clearUsageLimitPark);
+
   router.get("/instance/settings", async (req, res) => {
     assertBoardOrgAccess(req);
     res.json(await svc.get());

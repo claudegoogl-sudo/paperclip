@@ -163,13 +163,14 @@ export function canonicalizeIp(input: string): { family: 4 | 6; canonical: strin
   return { family: 6, canonical: groupsToV6(g) };
 }
 
-function ownHostAddresses(source: InterfaceSource): Set<string> {
+/** Own-host address set, or null when the interface read failed. */
+function ownHostAddresses(source: InterfaceSource): Set<string> | null {
   const out = new Set<string>();
   let ifaces: ReturnType<typeof networkInterfaces>;
   try {
     ifaces = source();
   } catch {
-    return out;
+    return null;
   }
   for (const list of Object.values(ifaces)) {
     for (const entry of list ?? []) {
@@ -190,7 +191,11 @@ export function classifyEgressIp(input: string, options: ClassifyOptions = {}): 
   const c = canonicalizeIp(input);
   if (!c) return { category: "invalid", canonical: null, reason: "not an IP literal" };
 
-  if (ownHostAddresses(options.interfaces ?? networkInterfaces).has(c.canonical)) {
+  const own = ownHostAddresses(options.interfaces ?? networkInterfaces);
+  // Fail closed: if we cannot read our own interfaces we cannot prove the
+  // target is not this host, so the address is not classifiable as public.
+  if (!own) return { category: "invalid", canonical: c.canonical, reason: "own-host interface read failed" };
+  if (own.has(c.canonical)) {
     return { category: "own_host", canonical: c.canonical, reason: "own host interface address" };
   }
 

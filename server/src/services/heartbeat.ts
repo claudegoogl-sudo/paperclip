@@ -1,3 +1,9 @@
+import {
+  ACTOR_PROVENANCE_PAYLOAD_KEY,
+  captureActorProvenance,
+  parseActorProvenance,
+  runWithRestoredActorProvenance,
+} from "../middleware/actor-context.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
@@ -236,7 +242,7 @@ import {
   instanceSettingsService,
   resolveWorktreeRunExecutionActivation,
 } from "./instance-settings.js";
-import { usageLimitParkService } from "./usage-limit-park.js";
+import { USAGE_LIMIT_PARK_MAX_HORIZON_MS, usageLimitParkService } from "./usage-limit-park.js";
 import { instanceAdmissionHoldService } from "./instance-admission-hold.js";
 import {
   evaluateExecutionAllowlist,
@@ -960,12 +966,18 @@ function readZeroableAmount(value: unknown): number | null {
 // parks — for a bounded fallback window — rather than silently not parking. Without
 // this fallback the exact storm this ticket exists to stop (a limit result the parser
 // can't extract a reset from) would slip straight through the new gate too.
+// It also mirrors that function's clamp to [now, now + max delay]: the adapter's
+// dated-reset parser rolls a passed day to next year, so an unclamped target can
+// land ~365 days out and freeze the whole instance. See
+// USAGE_LIMIT_PARK_MAX_HORIZON_MS (same 5h ceiling).
 // Exported alongside `isZeroWorkUsageLimitResult` for AC6 replay testing.
 export function resolveUsageLimitParkTarget(input: { now: Date; retryNotBefore: Date | null }): Date {
   const target = input.retryNotBefore
     ? input.retryNotBefore.getTime() + NO_OP_DISPATCH_RETRY_SAFETY_MARGIN_MS
     : input.now.getTime() + NO_OP_DISPATCH_RETRY_FALLBACK_DELAY_MS;
-  return new Date(target);
+  const nowMs = input.now.getTime();
+  const maxDelayMs = Math.min(NO_OP_DISPATCH_RETRY_MAX_DELAY_MS, USAGE_LIMIT_PARK_MAX_HORIZON_MS);
+  return new Date(Math.min(nowMs + maxDelayMs, Math.max(nowMs, target)));
 }
 
 function mergeAdapterRecoveryMetadata(input: {
@@ -15445,7 +15457,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
     return promise;
   }
+  // F3: every dispatch path (immediate, resumeQueuedRuns, startNextQueuedRunForAgent after a
+  // timer/reconcile/routine wake) funnels through executeRun, so restoring provenance here covers
+  // all drains. A run whose wakeup payload carries no provenance runs in the ambient context.
+  async function readRunActorProvenance(runId: string) {
+    const row = await db
+      .select({ payload: agentWakeupRequests.payload })
+      .from(heartbeatRuns)
+      .innerJoin(agentWakeupRequests, eq(heartbeatRuns.wakeupRequestId, agentWakeupRequests.id))
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    const payload = row?.payload as Record<string, unknown> | null | undefined;
+    return parseActorProvenance(payload?.[ACTOR_PROVENANCE_PAYLOAD_KEY]);
+  }
   async function executeRun(runId: string, opts?: { hostReservationHeld?: boolean }) {
+    let provenance: Awaited<ReturnType<typeof readRunActorProvenance>> = null;
+    try {
+      provenance = await readRunActorProvenance(runId);
+    } catch {
+      provenance = null;
+    }
+    // Null => context is explicitly cleared, so a run chained from a board-key run (via
+    // startNextQueuedRunForAgent) does not inherit that run's attribution.
+    return runWithRestoredActorProvenance(provenance, () => executeRunInner(runId, opts));
+  }
+  async function executeRunInner(runId: string, opts?: { hostReservationHeld?: boolean }) {
     // A run claimed by `startNextQueuedRunForAgent` arrives here still holding the host
     // admission reservation that reserved its slot during claim. That reservation is handed
     // back the instant the run registers in-process below (where it starts counting toward
@@ -19861,7 +19897,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const triggerDetail = opts.triggerDetail ?? null;
     const contextSnapshot: Record<string, unknown> = { ...(opts.contextSnapshot ?? {}) };
     const reason = opts.reason ?? null;
-    const payload = opts.payload ?? null;
+    // F3: persist the enqueuing request's credential provenance into the wakeup payload so a
+    // run dispatched later by a timer drain (outside the request ALS) can restore it. Only
+    // `{source, keyId}` is stored; no request context => the key is not written.
+    const enqueueProvenance = captureActorProvenance();
+    // The reserved key is always stripped from caller input so it can never be forged.
+    let payload: Record<string, unknown> | null = opts.payload ? { ...opts.payload } : null;
+    if (payload) delete payload[ACTOR_PROVENANCE_PAYLOAD_KEY];
+    if (enqueueProvenance) {
+      payload = { ...(payload ?? {}), [ACTOR_PROVENANCE_PAYLOAD_KEY]: enqueueProvenance };
+    }
     const {
       contextSnapshot: enrichedContextSnapshot,
       issueIdFromPayload,
@@ -21888,6 +21933,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // (API route, recovery sweep) distinguish "parked on purpose" from "stuck", so a
     // parked fleet isn't misreported as a stall.
     getUsageLimitParkState: (now?: Date) => usageLimitPark.getState(now),
+
+    // Operator escape hatch: without it the only exits from a park are wall-clock
+    // expiry or a successful run (which cannot start while parked).
+    clearUsageLimitPark: async (input: { actorType: string | null }) => {
+      const state = await usageLimitPark.clear({ reason: "manual_unpark" });
+      logger.info({ actorType: input.actorType }, "usage-limit park cleared by operator: resuming queued runs");
+      await resumeQueuedRuns();
+      return state;
+    },
 
     // Operator admission hold (installer drain before a service stop).
     getInstanceAdmissionHoldState: (now?: Date) => instanceAdmissionHold.getState(now),
