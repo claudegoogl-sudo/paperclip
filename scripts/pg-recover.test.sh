@@ -52,20 +52,46 @@ expect_exit() { # <want> <what> <cmd...>
 alert_count() { [ -f "$1" ] && wc -l < "$1" | tr -d ' ' || echo 0; }
 state_get()   { jq -r --arg k "$1" '.[$k] // empty' "$2" 2>/dev/null || true; }
 
-start_listener() { # <port> <basename>
+start_listener() { # <socket_dir> <basename> -- unix-socket fake postmaster
+  # The watchdog probes a UNIX socket (the control-plane postmaster binds no
+  # TCP port). This listener binds <socket_dir>/.s.PGSQL.$PORT and answers an
+  # SSLRequest with the single byte 'N' (what a real postmaster without SSL
+  # sends), which is exactly what the python3 wire-protocol probe requires.
+  mkdir -p "$1"
   python3 -c "
-import socket, sys
-s = socket.socket()
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen(8)
+import socket, sys, os
+path = sys.argv[1] + '/.s.PGSQL.' + sys.argv[3]
+try: os.unlink(path)
+except FileNotFoundError: pass
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(path); s.listen(8)
 open(sys.argv[2], 'w').write('listening')
 while True:
     try:
-        c, _ = s.accept(); c.close()
+        c, _ = s.accept()
+        try:
+            c.settimeout(2); c.recv(8); c.sendall(b'N')
+        except Exception:
+            pass
+        c.close()
     except Exception:
         break
-" "$1" "$2" &
+" "$1" "$2" "$PORT" &
   echo $! > "$2.pid"
+}
+
+# Independent re-derivation of the server's socket dir (dist/index.js
+# embeddedPostgresSocketRuntimeRoot()/socketDirectoryPathFor()): an absolute
+# $XDG_RUNTIME_DIR, else $TMPDIR/$TMP/$TEMP, else /tmp; then
+# paperclip-pg-<sha256(dataDir)[:16]>. Written separately from the script's
+# resolve_socket_dir() so the battery is not checking the script against itself.
+expected_socket_dir() {
+  python3 -c "
+import hashlib, os, sys
+x = os.environ.get('XDG_RUNTIME_DIR', '')
+root = x if x.startswith('/') else (os.environ.get('TMPDIR') or os.environ.get('TMP') or os.environ.get('TEMP') or '/tmp')
+print(root + '/paperclip-pg-' + hashlib.sha256(sys.argv[1].rstrip('/').encode()).hexdigest()[:16])
+" "$PG_RECOVER_DATA_DIR"
 }
 
 TMP="$(mktemp -d /tmp/pg-recover-test.XXXXXX)"
@@ -109,6 +135,10 @@ default_lock_leaked() { # [quiet] -> rc 1 and a FAIL line when a leak is found
 PORT=$((40000 + RANDOM % 20000))
 export PG_RECOVER_PORT="$PORT"
 export PG_RECOVER_DATA_DIR="$TMP/db"
+# Pin the socket runtime root to scratch so the derived socket dir never
+# lands next to the live cluster's socket.
+export XDG_RUNTIME_DIR="$TMP/run"
+SOCK_DIR="$(expected_socket_dir)"
 export PG_RECOVER_LOG="$TMP/pg-recover.log"
 export PG_RECOVER_STAMP="$TMP/pg-recover.stamp"
 export PG_RECOVER_STATE="$TMP/pg-recover-alert.state"
@@ -135,18 +165,42 @@ case "${FAKE_MODE:-fail}" in
   fail)
     echo "$(date -u +%Y-%m-%dT%H:%M:%S).000 UTC [$$] FATAL:  fake start failure (no corruption signature)" >> "$PG_RECOVER_LOG"
     exit 1 ;;
-  ok)
+  ok|wrongsock)
+    # Bind where the watchdog TOLD us to (-c unix_socket_directories=...),
+    # like a real postmaster. Record the argv so the battery can assert the
+    # launch flags. wrongsock: bind a DIFFERENT dir and advertise it in
+    # postmaster.pid line 5 (a postmaster that answers, but not at the path
+    # the control plane dials).
+    printf '%s\n' "$@" > "$TMP/fake-argv"
+    sockdir=""
+    for a in "$@"; do
+      case "$a" in unix_socket_directories=*) sockdir="${a#unix_socket_directories=}" ;; esac
+    done
+    if [ "$FAKE_MODE" = "wrongsock" ]; then
+      sockdir="$TMP/wrong-sock"
+      printf '%s\n%s\n%s\n%s\n%s\n' "$$" "$PG_RECOVER_DATA_DIR" "0" "$PG_RECOVER_PORT" "$sockdir" \
+        > "$PG_RECOVER_DATA_DIR/postmaster.pid"
+    fi
+    mkdir -p "$sockdir"
+    printf '%s' "$sockdir" > "$TMP/fake-bound-dir"
     python3 -c "
-import socket, os, time
-s = socket.socket()
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('127.0.0.1', ${PG_RECOVER_PORT})); s.listen(8)
+import socket, sys, os
+path = sys.argv[1] + '/.s.PGSQL.' + sys.argv[2]
+try: os.unlink(path)  # a real postmaster replaces a stale socket file too
+except FileNotFoundError: pass
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(path); s.listen(8)
 while True:
     try:
-        c, _ = s.accept(); c.close()
+        c, _ = s.accept()
+        try:
+            c.settimeout(2); c.recv(8); c.sendall(b'N')
+        except Exception:
+            pass
+        c.close()
     except Exception:
         break
-" &
+" "$sockdir" "$PG_RECOVER_PORT" &
     echo $! > "$TMP/fake-listener.pid"
     sleep 300 ;;
 esac
@@ -156,7 +210,7 @@ chmod +x "$PG_RECOVER_POSTGRES_BIN"
 echo "== case: healthy port -> no-op, clears PRE-EXISTING stale alert state (negative case) =="
 printf '%s' '{"backoff":true,"alerted_page":true,"alerted_board":true,"reason":"panic","consecutive_failures":3}' > "$PG_RECOVER_STATE"
 printf 'stale junk\n' > "$PG_RECOVER_ALERT_FILE"
-start_listener "$PORT" "$TMP/listener"
+start_listener "$SOCK_DIR" "$TMP/listener"
 sleep 0.4
 expect_exit 0 "healthy tick exits 0" "$RECOVER" tick
 [ "$(alert_count "$PG_RECOVER_ALERT_FILE")" = "1" ] \
@@ -196,7 +250,7 @@ expect_exit 3 "backoff tick does not retry the start" "$RECOVER" tick
 [ "$(alert_count "$PG_RECOVER_ALERT_FILE")" = "2" ] && ok "no re-alert during backoff" || bad "re-alerted during backoff"
 
 echo "== case: healthy observation after backoff re-arms (the only automatic reset) =="
-start_listener "$PORT" "$TMP/listener2"
+start_listener "$SOCK_DIR" "$TMP/listener2"
 sleep 0.4
 expect_exit 0 "post-backoff healthy tick exits 0" "$RECOVER" tick
 [ "$(state_get backoff "$PG_RECOVER_STATE")" = "" ] && ok "backoff cleared by healthy observation" || bad "backoff survived healthy tick"
@@ -222,8 +276,53 @@ export FAKE_MODE="ok"
 expect_exit 0 "launch -> port up -> healthy (exit 0)" "$RECOVER" tick
 grep -q "^started" "$PG_RECOVER_STAMP" && ok "stamp: started" || bad "stamp not started ($(cat "$PG_RECOVER_STAMP"))"
 [ "$(alert_count "$PG_RECOVER_ALERT_FILE")" = "3" ] && ok "no alert on successful start" || bad "alert on successful start"
+[ "$(cat "$TMP/fake-bound-dir" 2>/dev/null)" = "$SOCK_DIR" ] \
+  && ok "watchdog-started postmaster bound the server's derived socket dir ($SOCK_DIR)" \
+  || bad "bound socket dir '$(cat "$TMP/fake-bound-dir" 2>/dev/null)' != derived '$SOCK_DIR'"
+grep -qx 'listen_addresses=' "$TMP/fake-argv" \
+  && ok "launch flags: listen_addresses empty (no TCP bind)" || bad "launch did not pass empty listen_addresses"
+grep -qx "unix_socket_directories=$SOCK_DIR" "$TMP/fake-argv" \
+  && ok "launch flags: explicit unix_socket_directories" || bad "launch missing unix_socket_directories=$SOCK_DIR"
+grep -q '127.0.0.1' "$TMP/fake-argv" && bad "launch still binds 127.0.0.1" || ok "launch flags carry no TCP address"
 kill "$(cat "$TMP/fake-listener.pid")" 2>/dev/null
 rm -f "$TMP/fake-listener.pid"
+
+echo "== case: socket dir resolved from live postmaster.pid line 5 (authoritative over derivation) =="
+ALT_DIR="$TMP/alt-sock"
+sleep 300 & PIDF_PID=$!
+printf '%s\n%s\n0\n%s\n%s\n' "$PIDF_PID" "$PG_RECOVER_DATA_DIR" "$PORT" "$ALT_DIR" > "$PG_RECOVER_DATA_DIR/postmaster.pid"
+start_listener "$ALT_DIR" "$TMP/listener-alt"
+sleep 0.4
+: > "$PG_RECOVER_STAMP"
+expect_exit 0 "postmaster answering at pidfile line-5 dir -> healthy" "$RECOVER" tick
+grep -q "already-up" "$PG_RECOVER_STAMP" && ok "stamp: already-up (probe dialed the pidfile's socket dir)" || bad "pidfile line-5 dir not probed (stamp: $(cat "$PG_RECOVER_STAMP"))"
+kill "$(cat "$TMP/listener-alt.pid")" "$PIDF_PID" 2>/dev/null
+rm -f "$PG_RECOVER_DATA_DIR/postmaster.pid"; sleep 0.3
+
+echo "== case: stale socket FILE with nothing answering is NOT healthy =="
+mkdir -p "$SOCK_DIR"
+python3 -c "
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.bind(sys.argv[1])
+" "$SOCK_DIR/.s.PGSQL.$PORT"
+[ -S "$SOCK_DIR/.s.PGSQL.$PORT" ] && ok "stale socket file present (precondition)" || bad "could not create stale socket file"
+printf '{}' > "$PG_RECOVER_STATE"
+export FAKE_MODE="fail"
+expect_exit 1 "stale socket file -> not healthy, start attempted (exit 1)" "$RECOVER" tick
+rm -f "$SOCK_DIR/.s.PGSQL.$PORT"
+
+echo "== case: postmaster answering at the WRONG socket = failed start (no false green) =="
+printf '{}' > "$PG_RECOVER_STATE"
+: > "$PG_RECOVER_STAMP"
+export FAKE_MODE="wrongsock"
+expect_exit 1 "wrong-socket start counts as a failure (exit 1)" "$RECOVER" tick
+grep -q "NOT at the server's expected socket" "$PG_RECOVER_LOG" \
+  && ok "wrong-socket warning logged" || bad "no wrong-socket warning in log"
+grep -q "^started" "$PG_RECOVER_STAMP" && bad "stamp says started on a wrong-socket start" || ok "stamp not 'started'"
+[ "$(state_get consecutive_failures "$PG_RECOVER_STATE")" = "1" ] && ok "failure counted (1)" || bad "wrong-socket start not counted"
+kill "$(cat "$TMP/fake-listener.pid")" 2>/dev/null
+rm -f "$TMP/fake-listener.pid" "$PG_RECOVER_DATA_DIR/postmaster.pid"
+sleep 0.3
 
 echo "== case: alert payload shape =="
 LAST="$(tail -1 "$PG_RECOVER_ALERT_FILE")"
