@@ -1,3 +1,9 @@
+import {
+  ACTOR_PROVENANCE_PAYLOAD_KEY,
+  captureActorProvenance,
+  parseActorProvenance,
+  runWithRestoredActorProvenance,
+} from "../middleware/actor-context.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
@@ -15451,7 +15457,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
     return promise;
   }
+  // F3: every dispatch path (immediate, resumeQueuedRuns, startNextQueuedRunForAgent after a
+  // timer/reconcile/routine wake) funnels through executeRun, so restoring provenance here covers
+  // all drains. A run whose wakeup payload carries no provenance runs in the ambient context.
+  async function readRunActorProvenance(runId: string) {
+    const row = await db
+      .select({ payload: agentWakeupRequests.payload })
+      .from(heartbeatRuns)
+      .innerJoin(agentWakeupRequests, eq(heartbeatRuns.wakeupRequestId, agentWakeupRequests.id))
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    const payload = row?.payload as Record<string, unknown> | null | undefined;
+    return parseActorProvenance(payload?.[ACTOR_PROVENANCE_PAYLOAD_KEY]);
+  }
   async function executeRun(runId: string, opts?: { hostReservationHeld?: boolean }) {
+    let provenance: Awaited<ReturnType<typeof readRunActorProvenance>> = null;
+    try {
+      provenance = await readRunActorProvenance(runId);
+    } catch {
+      provenance = null;
+    }
+    // Null => context is explicitly cleared, so a run chained from a board-key run (via
+    // startNextQueuedRunForAgent) does not inherit that run's attribution.
+    return runWithRestoredActorProvenance(provenance, () => executeRunInner(runId, opts));
+  }
+  async function executeRunInner(runId: string, opts?: { hostReservationHeld?: boolean }) {
     // A run claimed by `startNextQueuedRunForAgent` arrives here still holding the host
     // admission reservation that reserved its slot during claim. That reservation is handed
     // back the instant the run registers in-process below (where it starts counting toward
@@ -19867,7 +19897,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const triggerDetail = opts.triggerDetail ?? null;
     const contextSnapshot: Record<string, unknown> = { ...(opts.contextSnapshot ?? {}) };
     const reason = opts.reason ?? null;
-    const payload = opts.payload ?? null;
+    // F3: persist the enqueuing request's credential provenance into the wakeup payload so a
+    // run dispatched later by a timer drain (outside the request ALS) can restore it. Only
+    // `{source, keyId}` is stored; no request context => the key is not written.
+    const enqueueProvenance = captureActorProvenance();
+    // The reserved key is always stripped from caller input so it can never be forged.
+    let payload: Record<string, unknown> | null = opts.payload ? { ...opts.payload } : null;
+    if (payload) delete payload[ACTOR_PROVENANCE_PAYLOAD_KEY];
+    if (enqueueProvenance) {
+      payload = { ...(payload ?? {}), [ACTOR_PROVENANCE_PAYLOAD_KEY]: enqueueProvenance };
+    }
     const {
       contextSnapshot: enrichedContextSnapshot,
       issueIdFromPayload,
