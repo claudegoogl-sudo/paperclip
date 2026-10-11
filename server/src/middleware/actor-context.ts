@@ -25,6 +25,25 @@ export function getActorProvenance(): ActorProvenance | null {
 }
 
 /**
+ * Runs `fn` with `provenance` bound as the current actor provenance. Used to
+ * re-enter the originating request's provenance across async boundaries that
+ * AsyncLocalStorage cannot follow on its own (e.g. plugin worker→host RPC).
+ */
+export function runWithActorProvenance<T>(provenance: ActorProvenance, fn: () => T): T {
+  return actorProvenanceStore.run(provenance, fn);
+}
+
+/**
+ * Runs `fn` with NO actor provenance bound. Event-emitter callbacks (e.g. a
+ * plugin worker's stdout listener) inherit the async context in which the
+ * emitter was created, so a worker spawned during a request would otherwise
+ * stamp that request's credential on unrelated later writes.
+ */
+export function runWithoutActorProvenance<T>(fn: () => T): T {
+  return actorProvenanceStore.exit(fn);
+}
+
+/**
  * Express middleware that captures `req.actor`'s credential provenance into
  * AsyncLocalStorage for the remainder of the request. Must be registered AFTER
  * `actorMiddleware`, which is what populates `req.actor`.
@@ -35,7 +54,7 @@ export function actorProvenanceMiddleware(): RequestHandler {
       source: req.actor?.source ?? null,
       keyId: req.actor?.keyId ?? null,
     };
-    actorProvenanceStore.run(provenance, () => next());
+    runWithActorProvenance(provenance, () => next());
   };
 }
 
