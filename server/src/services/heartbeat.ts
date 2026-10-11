@@ -236,7 +236,7 @@ import {
   instanceSettingsService,
   resolveWorktreeRunExecutionActivation,
 } from "./instance-settings.js";
-import { usageLimitParkService } from "./usage-limit-park.js";
+import { USAGE_LIMIT_PARK_MAX_HORIZON_MS, usageLimitParkService } from "./usage-limit-park.js";
 import { instanceAdmissionHoldService } from "./instance-admission-hold.js";
 import {
   evaluateExecutionAllowlist,
@@ -960,12 +960,18 @@ function readZeroableAmount(value: unknown): number | null {
 // parks — for a bounded fallback window — rather than silently not parking. Without
 // this fallback the exact storm this ticket exists to stop (a limit result the parser
 // can't extract a reset from) would slip straight through the new gate too.
+// It also mirrors that function's clamp to [now, now + max delay]: the adapter's
+// dated-reset parser rolls a passed day to next year, so an unclamped target can
+// land ~365 days out and freeze the whole instance. See
+// USAGE_LIMIT_PARK_MAX_HORIZON_MS (same 5h ceiling).
 // Exported alongside `isZeroWorkUsageLimitResult` for AC6 replay testing.
 export function resolveUsageLimitParkTarget(input: { now: Date; retryNotBefore: Date | null }): Date {
   const target = input.retryNotBefore
     ? input.retryNotBefore.getTime() + NO_OP_DISPATCH_RETRY_SAFETY_MARGIN_MS
     : input.now.getTime() + NO_OP_DISPATCH_RETRY_FALLBACK_DELAY_MS;
-  return new Date(target);
+  const nowMs = input.now.getTime();
+  const maxDelayMs = Math.min(NO_OP_DISPATCH_RETRY_MAX_DELAY_MS, USAGE_LIMIT_PARK_MAX_HORIZON_MS);
+  return new Date(Math.min(nowMs + maxDelayMs, Math.max(nowMs, target)));
 }
 
 function mergeAdapterRecoveryMetadata(input: {
@@ -21887,6 +21893,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // (API route, recovery sweep) distinguish "parked on purpose" from "stuck", so a
     // parked fleet isn't misreported as a stall.
     getUsageLimitParkState: (now?: Date) => usageLimitPark.getState(now),
+
+    // Operator escape hatch: without it the only exits from a park are wall-clock
+    // expiry or a successful run (which cannot start while parked).
+    clearUsageLimitPark: async (input: { actorType: string | null }) => {
+      const state = await usageLimitPark.clear({ reason: "manual_unpark" });
+      logger.info({ actorType: input.actorType }, "usage-limit park cleared by operator: resuming queued runs");
+      await resumeQueuedRuns();
+      return state;
+    },
 
     // Operator admission hold (installer drain before a service stop).
     getInstanceAdmissionHoldState: (now?: Date) => instanceAdmissionHold.getState(now),

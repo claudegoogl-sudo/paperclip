@@ -93,7 +93,8 @@
               "deploy/storage",
               "deploy/environment-variables",
               "deploy/manual-run-row-reap-runbook",
-              "deploy/instance-admission-hold"
+              "deploy/instance-admission-hold",
+              "deploy/usage-limit-park"
             ]
           }
         ]
