@@ -1,7 +1,7 @@
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { approvalComments, approvals } from "@paperclipai/db";
-import { notFound, unprocessable } from "../errors.js";
+import { forbidden, notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { agentService } from "./agents.js";
 import { budgetService } from "./budgets.js";
@@ -294,6 +294,42 @@ export function approvalService(db: Db) {
         .where(eq(approvals.id, id))
         .returning()
         .then((rows) => rows[0]);
+    },
+
+    withdraw: async (
+      id: string,
+      actor: { agentId: string; runId?: string | null },
+    ): Promise<{ approval: ApprovalRecord; applied: boolean }> => {
+      const existing = await getExistingApproval(id);
+      if (existing.requestedByAgentId !== actor.agentId) {
+        throw forbidden("Only the requesting agent can withdraw this approval");
+      }
+      if (existing.status === "withdrawn") {
+        // Idempotent retry by the same agent converges instead of erroring.
+        return { approval: existing, applied: false };
+      }
+      if (existing.status !== "pending") {
+        throw unprocessable("Only pending approvals can be withdrawn");
+      }
+
+      const now = new Date();
+      const updated = await db
+        .update(approvals)
+        .set({ status: "withdrawn", updatedAt: now })
+        .where(and(eq(approvals.id, id), eq(approvals.status, "pending")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+
+      if (updated) {
+        return { approval: updated, applied: true };
+      }
+
+      // Lost a race with a board decision — re-read and report the outcome.
+      const latest = await getExistingApproval(id);
+      if (latest.status === "withdrawn") {
+        return { approval: latest, applied: false };
+      }
+      throw unprocessable("Only pending approvals can be withdrawn");
     },
 
     listComments: async (approvalId: string) => {
