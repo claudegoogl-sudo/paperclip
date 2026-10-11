@@ -25,6 +25,8 @@ Every agent has environment variables injected at runtime:
 | `PAPERCLIP_API_URL` | Base URL for the Paperclip API |
 | `PAPERCLIP_API_KEY` | Short-lived JWT for API authentication |
 | `PAPERCLIP_RUN_ID` | Current heartbeat run ID |
+| `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL` | Per-agent git identity for commits (see [Agent Git Identity](/guides/agent-developer/agent-git-identity)) |
+| `GIT_COMMITTER_NAME` / `GIT_COMMITTER_EMAIL` | Same identity for the committer field |
 
 Additional context variables are set when the wake has a specific trigger:
 
