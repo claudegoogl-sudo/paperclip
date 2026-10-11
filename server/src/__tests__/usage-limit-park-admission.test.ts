@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRuns, usageLimitParks } from "@paperclipai/db";
 import { extractClaudeRetryNotBefore } from "@paperclipai/adapter-claude-local/server";
 import {
   getEmbeddedPostgresTestSupport,
@@ -15,7 +15,7 @@ import {
   resolveUsageLimitParkTarget,
   shouldParkForUsageLimit,
 } from "../services/heartbeat.ts";
-import { usageLimitParkService } from "../services/usage-limit-park.ts";
+import { USAGE_LIMIT_PARK_MAX_HORIZON_MS, usageLimitParkService } from "../services/usage-limit-park.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -275,6 +275,72 @@ describeEmbeddedPostgres("usage-limit park", () => {
 
       const state = await usageLimitPark.getState();
       expect(state.parkedUntil?.toISOString()).toBe("2026-07-31T12:00:00.000Z");
+    });
+
+    it("resolveUsageLimitParkTarget clamps a mis-dated reset rolled to next year to the 5h horizon", () => {
+      const now = new Date("2026-07-31T10:00:00.000Z");
+      const retryNotBefore = extractClaudeRetryNotBefore(
+        { errorMessage: "You've hit your weekly limit · resets Jul 30, 8am (UTC)" },
+        now,
+      );
+      // Precondition: the parser rolls the passed day ~1 year ahead.
+      expect(retryNotBefore!.getTime() - now.getTime()).toBeGreaterThan(300 * 24 * 60 * 60 * 1000);
+      const parkedUntil = resolveUsageLimitParkTarget({ now, retryNotBefore });
+      expect(parkedUntil.getTime()).toBeLessThanOrEqual(now.getTime() + USAGE_LIMIT_PARK_MAX_HORIZON_MS);
+      expect(parkedUntil.toISOString()).toBe("2026-07-31T15:00:00.000Z");
+      expect(resolveUsageLimitParkTarget({ now, retryNotBefore: new Date("2026-07-31T09:00:00.000Z") }).getTime())
+        .toBe(now.getTime());
+    });
+
+    it("park() never stores a parkedUntil beyond the horizon, even for a direct far-future input", async () => {
+      const before = Date.now();
+      const state = await usageLimitPark.park({
+        parkedUntil: new Date(before + 364 * 24 * 60 * 60 * 1000),
+        reason: "usage_limit_zero_work",
+        rawLimitText: null,
+        sourceRunId: null,
+      });
+      expect(state.parked).toBe(true);
+      expect(state.parkedUntil!.getTime()).toBeLessThanOrEqual(Date.now() + USAGE_LIMIT_PARK_MAX_HORIZON_MS);
+      expect(state.parkedUntil!.getTime()).toBeGreaterThanOrEqual(before + USAGE_LIMIT_PARK_MAX_HORIZON_MS);
+    });
+
+    it("an already-stored far-future park (pre-fix row) is capped on the next getState() and the next park()", async () => {
+      const farFuture = new Date(Date.now() + 364 * 24 * 60 * 60 * 1000);
+      await db.insert(usageLimitParks).values({
+        singletonKey: "default",
+        parkedUntil: farFuture,
+        reason: "legacy",
+        rawLimitText: null,
+        sourceRunId: null,
+      });
+      const state = await usageLimitPark.getState();
+      expect(state.parkedUntil!.getTime()).toBeLessThanOrEqual(Date.now() + USAGE_LIMIT_PARK_MAX_HORIZON_MS);
+      // Persisted, not just reported.
+      const [row] = await db.select().from(usageLimitParks);
+      expect(row.parkedUntil!.getTime()).toBe(state.parkedUntil!.getTime());
+
+      await db.update(usageLimitParks).set({ parkedUntil: farFuture });
+      const parked = await usageLimitPark.park({
+        parkedUntil: new Date(Date.now() + 60 * 1000),
+        reason: "usage_limit_zero_work",
+        rawLimitText: null,
+        sourceRunId: null,
+      });
+      expect(parked.parkedUntil!.getTime()).toBeLessThanOrEqual(Date.now() + USAGE_LIMIT_PARK_MAX_HORIZON_MS);
+    });
+
+    it("clear() lifts the park and the cleared state is what getState() reports", async () => {
+      await usageLimitPark.park({
+        parkedUntil: new Date(Date.now() + 60 * 60 * 1000),
+        reason: "usage_limit_zero_work",
+        rawLimitText: null,
+        sourceRunId: null,
+      });
+      const cleared = await usageLimitPark.clear({ reason: "manual_unpark" });
+      expect(cleared.parked).toBe(false);
+      const state = await heartbeat.getUsageLimitParkState();
+      expect(state).toMatchObject({ parked: false, parkedUntil: null, reason: "manual_unpark" });
     });
 
     it("clear() ends the park early (first-successful-run recovery)", async () => {
