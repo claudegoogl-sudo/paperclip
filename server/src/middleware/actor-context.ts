@@ -25,25 +25,6 @@ export function getActorProvenance(): ActorProvenance | null {
 }
 
 /**
- * Runs `fn` with `provenance` bound as the current actor provenance. Used to
- * re-enter the originating request's provenance across async boundaries that
- * AsyncLocalStorage cannot follow on its own (e.g. plugin worker→host RPC).
- */
-export function runWithActorProvenance<T>(provenance: ActorProvenance, fn: () => T): T {
-  return actorProvenanceStore.run(provenance, fn);
-}
-
-/**
- * Runs `fn` with NO actor provenance bound. Event-emitter callbacks (e.g. a
- * plugin worker's stdout listener) inherit the async context in which the
- * emitter was created, so a worker spawned during a request would otherwise
- * stamp that request's credential on unrelated later writes.
- */
-export function runWithoutActorProvenance<T>(fn: () => T): T {
-  return actorProvenanceStore.exit(fn);
-}
-
-/**
  * Express middleware that captures `req.actor`'s credential provenance into
  * AsyncLocalStorage for the remainder of the request. Must be registered AFTER
  * `actorMiddleware`, which is what populates `req.actor`.
@@ -69,7 +50,9 @@ export const ACTOR_PROVENANCE_PAYLOAD_KEY = "_paperclipActorProvenance";
  * Runs `fn` with `p` bound as the current actor provenance. With `p === null`
  * it runs `fn()` unchanged (inheriting whatever context is ambient), so genuine
  * background work keeps writing `actor_source = NULL`. `keyId` is a board API
- * key id (a UUID); the token value is never here.
+ * key id (a UUID); the token value is never here. Also used to re-enter the
+ * originating request's provenance across async boundaries AsyncLocalStorage
+ * cannot follow on its own (e.g. plugin worker→host RPC).
  */
 export function runWithActorProvenance<T>(p: ActorProvenance | null, fn: () => T): T {
   if (!p) return fn();
@@ -96,7 +79,12 @@ export function runWithRestoredActorProvenance<T>(p: ActorProvenance | null, fn:
   return actorProvenanceStore.run(bound, fn);
 }
 
-/** Runs `fn` with no actor provenance bound, regardless of the ambient context. */
+/**
+ * Runs `fn` with NO actor provenance bound, regardless of the ambient context.
+ * Event-emitter callbacks (e.g. a plugin worker's stdout listener) inherit the
+ * async context in which the emitter was created, so a worker spawned during a
+ * request would otherwise stamp that request's credential on unrelated writes.
+ */
 export function runWithoutActorProvenance<T>(fn: () => T): T {
   return actorProvenanceStore.exit(fn);
 }
