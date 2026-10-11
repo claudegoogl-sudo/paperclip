@@ -112,7 +112,19 @@ export function routineRoutes(
     if (req.actor.type === "board") return routine;
     if (req.actor.type !== "agent" || !req.actor.agentId) throw unauthorized();
     if (routine.assigneeAgentId !== req.actor.agentId) {
-      throw forbidden("Agents can only manage routines assigned to themselves");
+      // An explicit `routines:manage` grant (optionally scoped to the routine
+      // assignee via targetAgentIds) lets an agent manage routines assigned to
+      // other agents in its own company. Re-assignment stays self-only (see
+      // PATCH below) and activation still needs tasks:assign.
+      const decision = await access.decide({
+        actor: req.actor,
+        action: "routines:manage",
+        resource: { type: "agent", companyId: routine.companyId, agentId: routine.assigneeAgentId },
+        scope: { targetAgentId: routine.assigneeAgentId },
+      });
+      if (!decision.allowed) {
+        throw forbidden("Agents can only manage routines assigned to themselves");
+      }
     }
     return routine;
   }
@@ -378,11 +390,28 @@ export function routineRoutes(
       routine.status !== "active";
     if (statusWillActivate) {
       await assertBoardCanAssignTasks(req, routine.companyId);
+      if (req.actor.type === "agent" && routine.assigneeAgentId !== req.actor.agentId) {
+        // A routines:manage grantee activating another agent's routine starts
+        // work for that agent, so it also needs task-assignment authority.
+        const assignDecision = await access.decide({
+          actor: req.actor,
+          action: "tasks:assign",
+          resource: { type: "issue", companyId: routine.companyId, assigneeAgentId: routine.assigneeAgentId },
+          scope: { assigneeAgentId: routine.assigneeAgentId },
+        });
+        if (!assignDecision.allowed) {
+          throw forbidden("Missing permission: tasks:assign");
+        }
+      }
     }
     if (
       req.actor.type === "agent" &&
       req.body.assigneeAgentId !== undefined &&
-      req.body.assigneeAgentId !== req.actor.agentId
+      req.body.assigneeAgentId !== routine.assigneeAgentId &&
+      // A routines:manage grantee may echo the unchanged assignee; it may not
+      // move the routine to any agent, itself included. Only the current
+      // assignee may (re)assign to itself, as before.
+      (req.body.assigneeAgentId !== req.actor.agentId || routine.assigneeAgentId !== req.actor.agentId)
     ) {
       throw forbidden("Agents can only assign routines to themselves");
     }
