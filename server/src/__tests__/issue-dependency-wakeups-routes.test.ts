@@ -243,7 +243,7 @@ describe("issue dependency wakeups in issue routes", () => {
     });
   });
 
-  it("wakes an assigned blocked issue when blockers are applied after the blocker is already done", async () => {
+  it("does not wake when an issue is parked into blocked onto an already-done blocker (fork reversal of upstream #8943)", async () => {
     const parentIssueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const childIssueId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
     mockIssueService.getById.mockResolvedValue({
@@ -299,22 +299,12 @@ describe("issue dependency wakeups in issue routes", () => {
       });
 
     expect(res.status).toBe(200);
-    await vi.waitFor(() => {
-      expect(mockWakeup).toHaveBeenCalledWith(
-        "agent-2",
-        expect.objectContaining({
-          reason: "issue_blockers_resolved",
-          payload: expect.objectContaining({
-            issueId: parentIssueId,
-            resolvedBlockerIssueId: childIssueId,
-            mutation: "blocked_dependency_restored",
-          }),
-          contextSnapshot: expect.objectContaining({
-            source: "issue.blockers_restored",
-          }),
-        }),
-      );
-    });
+    // Let the route's async post-update work settle, then assert no wake.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(mockWakeup).not.toHaveBeenCalledWith(
+      "agent-2",
+      expect.objectContaining({ reason: "issue_blockers_resolved" }),
+    );
   });
 
   it("wakes the parent when all direct children become terminal", async () => {
@@ -608,7 +598,7 @@ describe("issue dependency wakeups in issue routes", () => {
     expect(mockWakeup).not.toHaveBeenCalledWith("agent-release", expect.anything());
   });
 
-  it("restores a blocked-and-ready dependent under the new blocked cycle key", async () => {
+  it("does not restore-wake a done issue re-parked into blocked onto done blockers", async () => {
     const parentIssueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const childIssueId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
     const blockedTransitionAt = new Date("2026-08-03T18:00:00.000Z");
@@ -646,30 +636,55 @@ describe("issue dependency wakeups in issue routes", () => {
       });
 
     expect(res.status).toBe(200);
+    // Let the route's async post-update work settle, then assert no wake.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(mockWakeup).not.toHaveBeenCalledWith(
+      "agent-2",
+      expect.objectContaining({ reason: "issue_blockers_resolved" }),
+    );
+  });
+
+  it("restore-wakes an already-blocked issue exactly once when a blocker removal leaves it ready", async () => {
+    const parentIssueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const doneBlockerId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const openBlockerId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const blockedTransitionAt = new Date("2026-08-03T18:00:00.000Z");
+    mockIssueService.getById.mockResolvedValue(issueRecord({
+      id: parentIssueId, identifier: "PAP-200", title: "Already blocked", status: "blocked", assigneeAgentId: "agent-2", blockedTransitionAt,
+    }));
+    mockIssueService.update.mockResolvedValue(issueRecord({
+      id: parentIssueId, identifier: "PAP-200", title: "Already blocked", status: "blocked", assigneeAgentId: "agent-2", blockedTransitionAt,
+    }));
+    mockIssueService.getRelationSummaries.mockResolvedValue({
+      blockedBy: [{ id: doneBlockerId }, { id: openBlockerId }],
+      blocks: [],
+    });
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      issueId: parentIssueId,
+      blockerIssueIds: [doneBlockerId],
+      unresolvedBlockerIssueIds: [],
+      unresolvedBlockerCount: 0,
+      pendingFinalizeBlockerIssueIds: [],
+      allBlockersDone: true,
+      isDependencyReady: true,
+    });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${parentIssueId}`)
+      .send({ blockedByIssueIds: [doneBlockerId] });
+
+    expect(res.status).toBe(200);
     await vi.waitFor(() => {
-      expect(mockFindExistingIssueBlockersResolvedWakeForReadyState).toHaveBeenCalledWith(
-        expect.anything(),
-        expect.objectContaining({
-          dependentIssueId: parentIssueId,
-          blockerIssueIds: [childIssueId],
-          blockedTransitionAt,
-        }),
-      );
       expect(mockWakeup).toHaveBeenCalledWith(
         "agent-2",
         expect.objectContaining({
           reason: "issue_blockers_resolved",
-          idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
-            dependentIssueId: parentIssueId,
-            blockerIssueIds: [childIssueId],
-            blockedTransitionAt,
-          }),
-          payload: expect.objectContaining({
-            mutation: "blocked_dependency_restored",
-          }),
+          payload: expect.objectContaining({ mutation: "blocked_dependency_restored" }),
         }),
       );
     });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(mockWakeup.mock.calls.filter(([, opts]) => opts?.reason === "issue_blockers_resolved")).toHaveLength(1);
   });
 
   it("does not emit a dependency wake when an unresolved or cancelled blocker remains", async () => {

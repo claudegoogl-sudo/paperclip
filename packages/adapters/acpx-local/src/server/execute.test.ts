@@ -360,6 +360,45 @@ describe("acpx_local runtime skill isolation", () => {
     expect(wrappers.some((name) => name.startsWith("custom-b-"))).toBe(true);
   });
 
+  it("sweeps aged legacy value-bearing .env sidecars and keeps fresh ones within retention", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const wrappersDir = path.join(stateDir, "wrappers");
+    await fs.mkdir(wrappersDir, { recursive: true });
+    // Simulate files left behind by the pre-fix writer: `<agent>-<hash>.env`
+    // sidecars holding resolved secret values in plaintext.
+    const agedLegacy = path.join(wrappersDir, "custom-a-0123456789ab.env");
+    const freshLegacy = path.join(wrappersDir, "custom-a-ba9876543210.env");
+    const unrelated = path.join(wrappersDir, "notes.txt");
+    await fs.writeFile(agedLegacy, "export PAPERCLIP_API_KEY='legacy-secret-value'\n", { mode: 0o600 });
+    await fs.writeFile(freshLegacy, "export PAPERCLIP_API_KEY='fresh-legacy-value'\n", { mode: 0o600 });
+    await fs.writeFile(unrelated, "keep me\n");
+    const oldDate = new Date(Date.now() - 16 * 60 * 1000);
+    await fs.utimes(agedLegacy, oldDate, oldDate);
+    await fs.utimes(unrelated, oldDate, oldDate);
+
+    await runExecutor({
+      agent: "custom-a",
+      agentCommand: "node ./fake-acp.js",
+      stateDir,
+      env: { PAPERCLIP_API_KEY: "current-key" },
+    });
+
+    expect(await pathExists(agedLegacy)).toBe(false);
+    // Inside the retention window the sweep leaves it alone (it may belong
+    // to a concurrently running pre-fix process); the next run past
+    // retention removes it.
+    expect(await pathExists(freshLegacy)).toBe(true);
+    expect(await pathExists(unrelated)).toBe(true);
+    const wrappers = await fs.readdir(wrappersDir);
+    expect(wrappers.filter((name) => name.endsWith(".sh"))).toHaveLength(1);
+    for (const name of wrappers.filter((n) => n.endsWith(".sh"))) {
+      const contents = await fs.readFile(path.join(wrappersDir, name), "utf8");
+      expect(contents).not.toContain("current-key");
+      expect(contents).not.toContain("legacy-secret-value");
+    }
+  });
+
   it("reuses one value-free wrapper across runs with different credentials", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");

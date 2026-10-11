@@ -1,3 +1,4 @@
+import { ACTOR_PROVENANCE_PAYLOAD_KEY } from "../middleware/actor-context.ts";
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
@@ -7072,6 +7073,22 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     if (retryRun) {
       await waitForRunToSettle(heartbeat, retryRun.id);
     }
+  });
+
+  it("reconcile-originated continuation wakes persist no actor provenance (F3 drain trace)", async () => {
+    const { agentId, runId } = await seedStrandedIssueFixture({ status: "in_progress", runStatus: "failed" });
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(1);
+    const retryRun = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+      .find((row) => row.id !== runId);
+    expect(retryRun?.wakeupRequestId).toBeTruthy();
+    const [wake] = await db
+      .select({ payload: agentWakeupRequests.payload })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, retryRun!.wakeupRequestId!));
+    expect((wake.payload as Record<string, unknown> | null)?.[ACTOR_PROVENANCE_PAYLOAD_KEY]).toBeUndefined();
+    await waitForRunToSettle(heartbeat, retryRun!.id);
   });
 
   it("does not continue seeded in-progress work that has no run linkage", async () => {

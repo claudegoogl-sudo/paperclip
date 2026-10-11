@@ -159,6 +159,26 @@ describe("runtime API discovery", () => {
   });
 });
 
+describe("collectReachableInterfaceHosts link-local classification", () => {
+  it("skips embedded-IPv4 link-local forms that a string prefix misses", () => {
+    const entry = (address: string, family: "IPv4" | "IPv6") =>
+      ({ address, family, internal: false, netmask: "", mac: "00:00:00:00:00:00", cidr: null }) as never;
+    expect(
+      collectReachableInterfaceHosts({
+        networkInterfacesMap: {
+          eth0: [
+            entry("::ffff:a9fe:a14", "IPv6"), // ::ffff:169.254.10.20
+            entry("fe81::1", "IPv6"),
+            entry("febf::2", "IPv6"),
+            entry("192.168.1.5", "IPv4"),
+            entry("2001:4860::5", "IPv6"),
+          ],
+        },
+      }),
+    ).toEqual(["192.168.1.5", "2001:4860::5"]);
+  });
+});
+
 describe("chooseAgentApiUrl", () => {
   const publicBase = "https://paperclip.example.com";
   it("defaults to the loopback listen origin for wildcard and loopback binds, not the public base", () => {

@@ -67,14 +67,22 @@ describeEmbeddedPostgres("plugin reconcile reads host services", () => {
       .then((rows) => rows[0]!);
   }
 
-  async function installPlugin(status: "ready" | "uninstalled" | "disabled" = "ready") {
+  async function installPlugin(
+    status: "ready" | "uninstalled" | "disabled" = "ready",
+    manifestExtra: Record<string, unknown> = {
+      instanceConfigSchema: {
+        type: "object",
+        properties: { label: { type: "string", "x-paperclip-scope": "tenant" } },
+      },
+    },
+  ) {
     return db
       .insert(plugins)
       .values({
         pluginKey: PLUGIN_KEY,
         packageName: "@paperclipai/plugin-messenger",
         version: "0.1.0",
-        manifestJson: { id: PLUGIN_KEY } as any,
+        manifestJson: { id: PLUGIN_KEY, ...manifestExtra } as any,
         status,
       })
       .returning()
@@ -346,6 +354,38 @@ describeEmbeddedPostgres("plugin reconcile reads host services", () => {
     await expect(
       services.config.getForServiceScope({ companyId: company.id }),
     ).resolves.toEqual({ label: "override-value" });
+    services.dispose();
+  });
+
+  it("config.getForServiceScope ignores a pre-planted override for an operator-plane key (pre-gate row)", async () => {
+    const company = await createCompany("REC");
+    const plugin = await installPlugin("ready", {
+      instanceConfigSchema: {
+        type: "object",
+        properties: {
+          label: { type: "string", "x-paperclip-scope": "tenant" },
+          moonrakerBaseUrl: { type: "string", format: "uri" },
+        },
+      },
+    });
+    await db.insert(pluginConfig).values({
+      pluginId: plugin.id,
+      companyId: company.id,
+      configJson: { label: "base-value", moonrakerBaseUrl: "http://printer.lan" },
+    });
+    await db.insert(pluginCompanySettings).values({
+      companyId: company.id,
+      pluginId: plugin.id,
+      enabled: true,
+      // Written directly, bypassing the PUT gate, as a pre-gate row would be.
+      settingsJson: {
+        configOverrides: { label: "override-value", moonrakerBaseUrl: "https://attacker.example" },
+      },
+    });
+    const services = buildHostServices(db, plugin.id, PLUGIN_KEY, createEventBusStub());
+    await expect(
+      services.config.getForServiceScope({ companyId: company.id }),
+    ).resolves.toEqual({ label: "override-value", moonrakerBaseUrl: "http://printer.lan" });
     services.dispose();
   });
 
