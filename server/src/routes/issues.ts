@@ -167,6 +167,12 @@ import { privateJsonEtag } from "../middleware/private-json-etag.js";
 import { createRequestPromiseMemo } from "../lib/request-promise-memo.js";
 import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import {
+  decideCrossCompanyIssueAccess,
+  dbCrossCompanyDeps,
+  recordCrossCompanyIssueAccess,
+  type CrossCompanyIssueOp,
+} from "./cross-company-issue-access.js";
+import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectIssueWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
@@ -3959,6 +3965,52 @@ export function issueRoutes(
     return false;
   }
 
+  // Cross-company issue access (double key). Used ONLY by the four routes
+  // GET /issues/:id, GET/POST /issues/:id/comments, PATCH /issues/:id.
+  // Same-company callers take the unchanged getAccessibleResource path.
+  // A denied foreign issue gets the exact missing-issue 404.
+  const crossCompanyDeps = dbCrossCompanyDeps(db, async (req, companyId) => {
+    try {
+      return await actorIsLowTrustReview(req, companyId);
+    } catch {
+      return true;
+    }
+  });
+
+  async function getIssueWithCrossCompany(
+    req: Request,
+    res: Response,
+    id: string,
+    op: CrossCompanyIssueOp,
+  ): Promise<{ issue: NonNullable<Awaited<ReturnType<typeof getIssueById>>>; crossCompany: boolean } | null> {
+    const issue = await getIssueById(req, id);
+    if (issue && hasCompanyAccess(req, issue.companyId)) {
+      assertCompanyAccess(req, issue.companyId);
+      return { issue, crossCompany: false };
+    }
+    if (issue && req.actor.type === "agent") {
+      const decision = await decideCrossCompanyIssueAccess(req, issue.companyId, op, crossCompanyDeps);
+      if (decision.allowed) {
+        if (op === "issue.read" || op === "comments.list") {
+          await recordCrossCompanyIssueAccess((row) => logActivity(db, row), {
+            targetCompanyId: issue.companyId,
+            homeCompanyId: decision.homeCompanyId,
+            agentId: decision.agentId,
+            runId: req.actor.runId ?? null,
+            issueId: issue.id,
+            op,
+            method: req.method,
+            route: req.route?.path ?? req.path,
+            outcome: "allowed",
+          });
+        }
+        return { issue, crossCompany: true };
+      }
+    }
+    res.status(404).json({ error: "Issue not found" });
+    return null;
+  }
+
   async function assertIssueWriteInfluenceAllowed(
     req: Request,
     res: Response,
@@ -6744,9 +6796,10 @@ export function issueRoutes(
   router.get("/issues/:id", async (req, res) => {
     const requestStartedAt = performance.now();
     const id = req.params.id as string;
-    const issue = await getAccessibleResource(req, res, getIssueById(req, id), "Issue not found");
-    if (!issue) return;
-    if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    const resolved = await getIssueWithCrossCompany(req, res, id, "issue.read");
+    if (!resolved) return;
+    const { issue } = resolved;
+    if (!resolved.crossCompany && !(await assertIssueReadAllowed(req, res, issue))) return;
     const inboxArchiveFieldsPromise = req.actor.type === "board" && req.actor.userId
       ? svc.getActiveInboxArchiveFields(issue, req.actor.userId)
       : Promise.resolve({});
@@ -11348,9 +11401,10 @@ export function issueRoutes(
 
   router.get("/issues/:id/comments", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await getAccessibleResource(req, res, getIssueById(req, id), "Issue not found");
-    if (!issue) return;
-    if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    const resolved = await getIssueWithCrossCompany(req, res, id, "comments.list");
+    if (!resolved) return;
+    const { issue } = resolved;
+    if (!resolved.crossCompany && !(await assertIssueReadAllowed(req, res, issue))) return;
     const afterCommentId =
       typeof req.query.after === "string" && req.query.after.trim().length > 0
         ? req.query.after.trim()

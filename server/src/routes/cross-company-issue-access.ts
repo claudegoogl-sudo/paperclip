@@ -36,7 +36,8 @@ export type CrossCompanyDenyReason =
   | "no_grant"
   | "low_trust"
   | "target_company_inactive"
-  | "same_company";
+  | "same_company"
+  | "scoped_key";
 
 export type CrossCompanyDecision =
   | { allowed: true; homeCompanyId: string; agentId: string }
@@ -117,6 +118,9 @@ export async function decideCrossCompanyIssueAccess(
     decision = { allowed: false, reason: "not_agent" };
   } else if (actor.companyId === targetCompanyId) {
     decision = { allowed: false, reason: "same_company" };
+  } else if (actor.keyScope) {
+    // notify_only / skill_test / task_bridge keys are narrowed on purpose.
+    decision = { allowed: false, reason: "scoped_key" };
   } else if (actor.onBehalfOfUserId?.trim()) {
     decision = { allowed: false, reason: "on_behalf_of_user" };
   } else if (!(deps.allowlist ?? getCrossCompanyAllowlist)().has(actor.agentId.toLowerCase())) {
@@ -139,4 +143,63 @@ export async function decideCrossCompanyIssueAccess(
     );
   }
   return decision;
+}
+
+export interface CrossCompanyAuditInput {
+  targetCompanyId: string;
+  homeCompanyId: string;
+  agentId: string;
+  runId: string | null;
+  issueId: string;
+  op: CrossCompanyIssueOp;
+  method: string;
+  route: string;
+  outcome: "allowed" | "denied";
+  reason?: string;
+  changedFields?: string[];
+}
+
+/**
+ * M9: one row in the TARGET company and one mirror row in the HOME company.
+ * Field NAMES only, never values.
+ */
+export async function recordCrossCompanyIssueAccess(
+  log: (row: {
+    companyId: string;
+    actorType: "agent";
+    actorId: string;
+    agentId: string;
+    runId: string | null;
+    action: string;
+    entityType: string;
+    entityId: string;
+    details: Record<string, unknown>;
+  }) => Promise<unknown>,
+  input: CrossCompanyAuditInput,
+): Promise<void> {
+  const details = {
+    outcome: input.outcome,
+    op: input.op,
+    method: input.method,
+    route: input.route,
+    issueId: input.issueId,
+    targetCompanyId: input.targetCompanyId,
+    homeCompanyId: input.homeCompanyId,
+    reason: input.reason ?? null,
+    changedFields: input.changedFields ?? [],
+  };
+  for (const [companyId, mirror] of [[input.targetCompanyId, false], [input.homeCompanyId, true]] as const) {
+    await log({
+      companyId,
+      actorType: "agent",
+      actorId: input.agentId,
+      agentId: input.agentId,
+      runId: input.runId,
+      action: "issue.cross_company_access",
+      entityType: "issue",
+      entityId: input.issueId,
+      details: { ...details, mirror },
+    });
+  }
+  logger.info({ ...details, agentId: input.agentId, runId: input.runId }, "issue.cross_company_access");
 }

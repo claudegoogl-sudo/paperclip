@@ -76,6 +76,12 @@ describe("cross-company issue access helper", () => {
       .toEqual({ allowed: false, reason: "same_company" });
   });
 
+  it("scoped agent keys never get the exemption", async () => {
+    const d = await decideCrossCompanyIssueAccess(
+      req({ keyScope: { kind: "notify_only", issueIds: [] } as never }), TARGET, "issue.read", deps());
+    expect(d).toEqual({ allowed: false, reason: "scoped_key" });
+  });
+
   it("control agent with grant row but not allowlisted => deny", async () => {
     const other = "33333333-3333-4333-8333-333333333333";
     const d = await decideCrossCompanyIssueAccess(req({ agentId: other }), TARGET, "issue.read", deps({ grants: [[HOME, other]] }));
