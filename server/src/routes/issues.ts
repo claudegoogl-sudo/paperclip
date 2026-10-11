@@ -2589,12 +2589,15 @@ function issueListActorIdentity(req: Request, companyId: string) {
   return { actorType: "none", key, hash: shortHash(key) };
 }
 
-function issueListClientIdentity(req: Request) {
-  const forwardedFor = Array.isArray(req.headers["x-forwarded-for"])
-    ? req.headers["x-forwarded-for"][0]
-    : req.headers["x-forwarded-for"];
+/**
+ * Client identity for issue-list request logging. Uses `req.ip` only, so
+ * `X-Forwarded-For` is honoured solely through the express `trust proxy`
+ * setting (see middleware/trust-proxy.ts). Never read the raw header here:
+ * its left-most entry is attacker-controlled text.
+ */
+export function issueListClientIdentity(req: Request) {
   const client = [
-    String(forwardedFor ?? req.ip ?? "unknown-ip").split(",")[0]?.trim() ?? "unknown-ip",
+    req.ip ?? "unknown-ip",
     req.header("user-agent") ?? "unknown-agent",
   ].join(":");
   return { key: client, hash: shortHash(client) };
