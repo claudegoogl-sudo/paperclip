@@ -2,13 +2,14 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { authUsers, boardApiKeys, companies, createDb } from "@paperclipai/db";
+import { authUsers, boardApiKeys, companies, companyMemberships, createDb } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { registerActorContext } from "../middleware/auth.ts";
 import { errorHandler } from "../middleware/error-handler.ts";
+import { companyRoutes } from "../routes/companies.ts";
 import {
   boardAuthService,
   createBoardApiToken,
@@ -81,6 +82,16 @@ describeEmbeddedPostgres("board API key scope enforcement", () => {
     // Issue comment — the only mutation plugin_ops allows on issues.
     app.post("/api/issues/:issueId/comments", (_req, res) =>
       res.json({ ok: true, route: "issue.comment" }),
+    );
+
+    // Company list / detail / create / update + company issue list — the
+    // board-read snapshot needs only the list and the issue list.
+    app.get("/api/companies", (_req, res) => res.json({ ok: true, route: "companies.list" }));
+    app.post("/api/companies", (_req, res) => res.json({ ok: true, route: "companies.create" }));
+    app.get("/api/companies/:companyId", (_req, res) => res.json({ ok: true, route: "companies.get" }));
+    app.patch("/api/companies/:companyId", (_req, res) => res.json({ ok: true, route: "companies.update" }));
+    app.get("/api/companies/:companyId/issues", (_req, res) =>
+      res.json({ ok: true, route: "companies.issues" }),
     );
 
     // Secret-egress binding review + allowlist seed + enforce-flip — all
@@ -175,6 +186,7 @@ describeEmbeddedPostgres("board API key scope enforcement", () => {
   afterEach(async () => {
     // Clean in dependency order: authUsers cascades to board_api_keys, so we
     // only need to clear the parent rows.
+    await db.delete(companyMemberships);
     await db.delete(companies);
     await db.delete(authUsers);
   });
@@ -219,6 +231,77 @@ describeEmbeddedPostgres("board API key scope enforcement", () => {
     expect(extra.body).toMatchObject({ code: "board_key_scope_violation" });
     const post = await request(app).post("/api/cli-auth/me").set("authorization", `Bearer ${key.token}`).send({});
     expect(post.status).toBe(403);
+  });
+
+  it("a plugin_ops-scoped key reaches GET /api/companies (exact list only) and nothing wider on companies", async () => {
+    const app = buildApp();
+    const key = await createKey("plugin_ops");
+    const auth = { Authorization: `Bearer ${key.token}` };
+
+    const list = await request(app).get("/api/companies").set(auth);
+    expect(list.status).toBe(200);
+    expect(list.body).toMatchObject({ route: "companies.list" });
+
+    // Query string does not change req.path, so the list form with a query
+    // is the same route and is allowed.
+    const listQuery = await request(app).get("/api/companies?x=1").set(auth);
+    expect(listQuery.status).toBe(200);
+    expect(listQuery.body).toMatchObject({ route: "companies.list" });
+
+    const issues = await request(app).get(`/api/companies/${companyId}/issues`).set(auth);
+    expect(issues.status).toBe(200);
+    expect(issues.body).toMatchObject({ route: "companies.issues" });
+
+    const detail = await request(app).get(`/api/companies/${companyId}`).set(auth);
+    expect(detail.status).toBe(403);
+    expect(detail.body).toMatchObject({ code: "board_key_scope_violation" });
+
+    const create = await request(app).post("/api/companies").set(auth).send({ name: "x" });
+    expect(create.status).toBe(403);
+    expect(create.body).toMatchObject({ code: "board_key_scope_violation" });
+
+    const update = await request(app).patch(`/api/companies/${companyId}`).set(auth).send({ name: "x" });
+    expect(update.status).toBe(403);
+    expect(update.body).toMatchObject({ code: "board_key_scope_violation" });
+  });
+
+  it("GET /api/companies projects to id/name/status/issuePrefix for plugin_ops keys; a standard key gets the full shape", async () => {
+    const app = express();
+    app.use(express.json());
+    registerActorContext(app, db, { deploymentMode: "authenticated" });
+    app.use("/api/companies", companyRoutes(db));
+    app.use(errorHandler);
+    // Non-admin member: the route returns only the key owner's companies.
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: operatorUserId,
+      status: "active",
+      membershipRole: "owner",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const scoped = await createKey("plugin_ops");
+    const narrow = await request(app).get("/api/companies").set("authorization", `Bearer ${scoped.token}`);
+    expect(narrow.status).toBe(200);
+    const row = (narrow.body as Array<Record<string, unknown>>).find((c) => c.id === companyId);
+    expect(row).toBeDefined();
+    expect(Object.keys(row!).sort()).toEqual(["id", "issuePrefix", "name", "status"]);
+    for (const c of narrow.body as Array<Record<string, unknown>>) {
+      expect(c).not.toHaveProperty("budgetMonthlyCents");
+      expect(c).not.toHaveProperty("spentMonthlyCents");
+      expect(c).not.toHaveProperty("defaultResponsibleUserId");
+      expect(Object.keys(c).some((k) => k.startsWith("feedbackDataSharing"))).toBe(false);
+    }
+
+    const standard = await createKey("standard");
+    const full = await request(app).get("/api/companies").set("authorization", `Bearer ${standard.token}`);
+    expect(full.status).toBe(200);
+    const fullRow = (full.body as Array<Record<string, unknown>>).find((c) => c.id === companyId);
+    expect(fullRow).toHaveProperty("budgetMonthlyCents");
+    expect(fullRow).toHaveProperty("defaultResponsibleUserId");
+    expect(fullRow).toHaveProperty("feedbackDataSharingEnabled");
   });
 
   it("a plugin_ops-scoped key reaches issue comment", async () => {

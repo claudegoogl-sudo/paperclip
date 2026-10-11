@@ -712,6 +712,12 @@ const PLUGIN_OPS_ALLOWED_ROUTES: ReadonlyArray<{
   { method: "GET", pathPattern: /^\/api\/issues(?:\/[^/]+)?(?:\/.*)?$/ },
   { method: "POST", pathPattern: /^\/api\/issues\/[^/]+\/comments$/ },
   { method: "GET", pathPattern: /^\/api\/companies\/[^/]+\/issues(?:\/.*)?$/ },
+
+  // --- Company list (board-read snapshot discovery; reads only) ---
+  // The board-read snapshot timer must enumerate companies before it reads
+  // each company's issues. Exact match on the list path only: company detail
+  // (GET /companies/:id), create, and update stay outside this scope.
+  { method: "GET", pathPattern: /^\/api\/companies$/ },
 ];
 
 /**
