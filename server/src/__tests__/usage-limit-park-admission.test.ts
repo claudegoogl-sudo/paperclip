@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
+import express from "express";
+import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { agents, companies, createDb, heartbeatRuns, usageLimitParks } from "@paperclipai/db";
 import { extractClaudeRetryNotBefore } from "@paperclipai/adapter-claude-local/server";
@@ -15,6 +17,8 @@ import {
   resolveUsageLimitParkTarget,
   shouldParkForUsageLimit,
 } from "../services/heartbeat.ts";
+import { errorHandler } from "../middleware/index.js";
+import { instanceSettingsRoutes } from "../routes/instance-settings.js";
 import { USAGE_LIMIT_PARK_MAX_HORIZON_MS, usageLimitParkService } from "../services/usage-limit-park.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -292,6 +296,57 @@ describeEmbeddedPostgres("usage-limit park", () => {
         .toBe(now.getTime());
     });
 
+    // Parser-driven target pins at a fixed `now`. Each case feeds the real
+    // adapter parser and asserts the exact park target derived from its output.
+    const PIN_NOW = new Date("2026-07-31T12:00:00.000Z");
+    const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
+
+    it("a 'resets Jan 3' weekly limit rolls ~155 days ahead and the park target clamps to exactly now + 5h", () => {
+      const retryNotBefore = extractClaudeRetryNotBefore(
+        { errorMessage: "You've hit your weekly limit · resets Jan 3, 8am (UTC)" },
+        PIN_NOW,
+      );
+      expect(retryNotBefore?.toISOString()).toBe("2027-01-03T08:00:00.000Z");
+      const days = (retryNotBefore!.getTime() - PIN_NOW.getTime()) / (24 * 60 * 60 * 1000);
+      expect(days).toBeGreaterThan(154);
+      expect(days).toBeLessThan(156);
+      const parkedUntil = resolveUsageLimitParkTarget({ now: PIN_NOW, retryNotBefore });
+      expect(parkedUntil.getTime()).toBeLessThanOrEqual(PIN_NOW.getTime() + FIVE_HOURS_MS);
+      expect(parkedUntil.getTime()).toBe(PIN_NOW.getTime() + FIVE_HOURS_MS);
+    });
+
+    it("a dated 'resets Aug 1, 8am' reset 20h out is beyond 5h, so the park target clamps to exactly now + 5h", () => {
+      const retryNotBefore = extractClaudeRetryNotBefore(
+        { errorMessage: "You've hit your weekly limit · resets Aug 1, 8am (UTC)" },
+        PIN_NOW,
+      );
+      expect(retryNotBefore?.toISOString()).toBe("2026-08-01T08:00:00.000Z");
+      const parkedUntil = resolveUsageLimitParkTarget({ now: PIN_NOW, retryNotBefore });
+      expect(parkedUntil.getTime()).toBe(PIN_NOW.getTime() + FIVE_HOURS_MS);
+    });
+
+    it("a session 'resets 6:50pm' reset is 6h50m out at noon, so the park target clamps to exactly now + 5h", () => {
+      const retryNotBefore = extractClaudeRetryNotBefore(
+        { errorMessage: "You've hit your session limit · resets 6:50pm (UTC)" },
+        PIN_NOW,
+      );
+      expect(retryNotBefore?.toISOString()).toBe("2026-07-31T18:50:00.000Z");
+      const parkedUntil = resolveUsageLimitParkTarget({ now: PIN_NOW, retryNotBefore });
+      expect(parkedUntil.getTime()).toBe(PIN_NOW.getTime() + FIVE_HOURS_MS);
+    });
+
+    it("a session 'resets 6:50pm' reset inside the 5h horizon keeps its exact target: parser instant + safety margin", () => {
+      const now = new Date("2026-07-31T15:00:00.000Z");
+      const retryNotBefore = extractClaudeRetryNotBefore(
+        { errorMessage: "You've hit your session limit · resets 6:50pm (UTC)" },
+        now,
+      );
+      expect(retryNotBefore?.toISOString()).toBe("2026-07-31T18:50:00.000Z");
+      const parkedUntil = resolveUsageLimitParkTarget({ now, retryNotBefore });
+      expect(parkedUntil.getTime()).toBe(retryNotBefore!.getTime() + NO_OP_DISPATCH_RETRY_SAFETY_MARGIN_MS);
+      expect(parkedUntil.toISOString()).toBe("2026-07-31T18:51:00.000Z");
+    });
+
     it("park() never stores a parkedUntil beyond the horizon, even for a direct far-future input", async () => {
       const before = Date.now();
       const state = await usageLimitPark.park({
@@ -394,6 +449,49 @@ describeEmbeddedPostgres("usage-limit park", () => {
         .where(eq(heartbeatRuns.id, queuedRun!.id))
         .then((rows) => rows[0] ?? null);
       expect(persisted?.status).toBe("queued");
+    });
+
+    it("DELETE /api/instance/usage-limit-park as instance admin lifts the park and a held queued run is then admitted", async () => {
+      await usageLimitPark.park({
+        parkedUntil: new Date(Date.now() + 60 * 60 * 1000),
+        reason: "usage_limit_zero_work",
+        rawLimitText: "You've hit your weekly limit · resets 8am (UTC)",
+        sourceRunId: null,
+      });
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      await seedAgent({ companyId, agentId });
+
+      const queuedRun = await heartbeat.wakeup(agentId, {
+        source: "on_demand",
+        reason: "manual_test_wake",
+        requestedByActorType: "system",
+        requestedByActorId: "test",
+      });
+      expect(queuedRun).not.toBeNull();
+      const statusOf = async () =>
+        db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, queuedRun!.id))
+          .then((rows) => rows[0]?.status ?? null);
+      expect(await statusOf()).toBe("queued");
+
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => {
+        (req as any).actor = { type: "board", userId: "admin-1", source: "session", isInstanceAdmin: true };
+        next();
+      });
+      app.use("/api", instanceSettingsRoutes(db));
+      app.use(errorHandler);
+      const res = await request(app).delete("/api/instance/usage-limit-park");
+      expect(res.status).toBe(200);
+      expect(res.body.parked).toBe(false);
+      expect(await usageLimitPark.isParked()).toBe(false);
+
+      await heartbeat.startNextQueuedRunForAgent(agentId);
+      expect(await statusOf()).not.toBe("queued");
     });
 
     it("negative control: the same wake-request path is not blocked when nothing is parked", async () => {
