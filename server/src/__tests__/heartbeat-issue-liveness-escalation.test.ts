@@ -792,6 +792,25 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         .patch(`/api/issues/${blockedIssueId}`)
         .send({ blockedByIssueIds: [blockerIssueId] });
       expect(res.status).toBe(200);
+      // The route restore path enqueues its own wake async after the response.
+      // Wait for it, assert it (route positive path), then simulate it being lost.
+      let routeWakes: Array<{ payload: unknown }> = [];
+      for (let waited = 0; waited < 15_000; waited += 100) {
+        routeWakes = await db
+          .select({ payload: agentWakeupRequests.payload })
+          .from(agentWakeupRequests)
+          .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.reason, "issue_blockers_resolved")));
+        if (routeWakes.length > 0) break;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      // Extra settle so a late duplicate enqueue would still be counted below.
+      await settleRouteWork();
+      routeWakes = await db
+        .select({ payload: agentWakeupRequests.payload })
+        .from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.reason, "issue_blockers_resolved")));
+      expect(routeWakes).toHaveLength(1);
+      expect(routeWakes[0]?.payload).toEqual(expect.objectContaining({ mutation: "blocked_dependency_restored" }));
       // Simulate the route-time wake being lost (dropped before delivery).
       await db.update(heartbeatRuns).set({ wakeupRequestId: null }).where(eq(heartbeatRuns.companyId, companyId));
       await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
