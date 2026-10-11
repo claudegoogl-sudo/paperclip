@@ -291,4 +291,57 @@ describeEmbeddedPostgres("POST /api/board-api-keys secure defaults", () => {
     expect(minted.scopeConfig).not.toBeNull();
     expect(minted.expiresAt).not.toBeNull();
   });
+
+  // The CLI auth-challenge path is a second mint path. It must apply the same
+  // 24h cap on `standard` (full board authority) keys as POST /api/board-api-keys.
+  async function approveChallengeWithScope(
+    approverId: string,
+    requestedKeyScope?: { kind: "standard" } | { kind: "plugin_ops" },
+  ) {
+    await db.insert(authUsers).values({
+      id: approverId,
+      name: "Approver",
+      email: `${approverId}@example.com`,
+      emailVerified: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const service = boardAuthService(db);
+    const { challenge, challengeSecret } = await service.createCliAuthChallenge({
+      command: "paperclipai connect",
+      requestedAccess: "board",
+      ...(requestedKeyScope ? { requestedKeyScope } : {}),
+    });
+    const described = await service.describeCliAuthChallenge(challenge.id, challengeSecret);
+    const result = await service.approveCliAuthChallenge(challenge.id, challengeSecret, approverId);
+    expect(result.status).toBe("approved");
+    const [minted] = await db
+      .select()
+      .from(boardApiKeys)
+      .where(eq(boardApiKeys.id, result.challenge.boardApiKeyId!));
+    return { described, minted };
+  }
+
+  it("CLI auth challenge approval caps a standard-scope key at 24 hours", async () => {
+    const { described, minted } = await approveChallengeWithScope("approver-standard-ttl", {
+      kind: "standard",
+    });
+    expect(minted.scopeConfig).toEqual({ kind: "standard" });
+    const ttlMs = minted.expiresAt!.getTime() - minted.createdAt.getTime();
+    expect(ttlMs).toBeGreaterThan(0);
+    expect(ttlMs).toBeLessThanOrEqual(24 * 60 * 60 * 1000 + 5_000);
+    // The approval page is told the effective scope and TTL before approving.
+    expect(described?.keyScope).toBe("standard");
+    expect(described?.keyTtlMs).toBe(24 * 60 * 60 * 1000);
+  });
+
+  it("CLI auth challenge approval keeps the default TTL for plugin_ops keys", async () => {
+    const { described, minted } = await approveChallengeWithScope("approver-plugin-ops-ttl");
+    expect(minted.scopeConfig).toEqual({ kind: "plugin_ops" });
+    const ttlMs = minted.expiresAt!.getTime() - minted.createdAt.getTime();
+    expect(ttlMs).toBeGreaterThan(29 * 24 * 60 * 60 * 1000);
+    expect(ttlMs).toBeLessThanOrEqual(30 * 24 * 60 * 60 * 1000 + 5_000);
+    expect(described?.keyScope).toBe("plugin_ops");
+    expect(described?.keyTtlMs).toBe(30 * 24 * 60 * 60 * 1000);
+  });
 });

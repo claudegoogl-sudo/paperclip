@@ -776,6 +776,7 @@ export {
   standardBoardKeyScopeSchema,
   pluginOpsBoardKeyScopeSchema,
   boardApiKeyScopeSchema,
+  BOARD_API_KEY_STANDARD_SCOPE_MAX_TTL_HOURS,
   normalizeBoardApiKeyScope,
   isPluginOpsBoardKeyScope,
   type BoardApiKeyScope,
