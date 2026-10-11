@@ -2,7 +2,7 @@ import {
   ACTOR_PROVENANCE_PAYLOAD_KEY,
   captureActorProvenance,
   parseActorProvenance,
-  runWithActorProvenance,
+  runWithRestoredActorProvenance,
 } from "../middleware/actor-context.js";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -15471,7 +15471,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     } catch {
       provenance = null;
     }
-    return runWithActorProvenance(provenance, () => executeRunInner(runId, opts));
+    // Null => context is explicitly cleared, so a run chained from a board-key run (via
+    // startNextQueuedRunForAgent) does not inherit that run's attribution.
+    return runWithRestoredActorProvenance(provenance, () => executeRunInner(runId, opts));
   }
   async function executeRunInner(runId: string, opts?: { hostReservationHeld?: boolean }) {
     // A run claimed by `startNextQueuedRunForAgent` arrives here still holding the host
@@ -19893,9 +19895,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // run dispatched later by a timer drain (outside the request ALS) can restore it. Only
     // `{source, keyId}` is stored; no request context => the key is not written.
     const enqueueProvenance = captureActorProvenance();
-    const payload: Record<string, unknown> | null = enqueueProvenance
-      ? { ...(opts.payload ?? {}), [ACTOR_PROVENANCE_PAYLOAD_KEY]: enqueueProvenance }
-      : (opts.payload ?? null);
+    // The reserved key is always stripped from caller input so it can never be forged.
+    let payload: Record<string, unknown> | null = opts.payload ? { ...opts.payload } : null;
+    if (payload) delete payload[ACTOR_PROVENANCE_PAYLOAD_KEY];
+    if (enqueueProvenance) {
+      payload = { ...(payload ?? {}), [ACTOR_PROVENANCE_PAYLOAD_KEY]: enqueueProvenance };
+    }
     const {
       contextSnapshot: enrichedContextSnapshot,
       issueIdFromPayload,

@@ -24,6 +24,7 @@ import {
   ACTOR_PROVENANCE_PAYLOAD_KEY,
   getActorProvenance,
   runWithActorProvenance,
+  runWithRestoredActorProvenance,
 } from "../middleware/actor-context.ts";
 
 // F3: a heartbeat run enqueued by a board-key request and dispatched later by a timer drain
@@ -134,6 +135,13 @@ describeEmbeddedPostgres("heartbeat drains restore enqueue-time actor provenance
     return { companyId, agentId };
   }
 
+  async function probeRowsByRun() {
+    return db
+      .select({ runId: activityLog.entityId, source: activityLog.actorSource, keyId: activityLog.actorKeyId })
+      .from(activityLog)
+      .where(eq(activityLog.action, "test.provenance_probe"));
+  }
+
   async function probeRows() {
     await waitFor(async () =>
       (await db.select().from(activityLog).where(eq(activityLog.action, "test.provenance_probe"))).length > 0,
@@ -213,5 +221,106 @@ describeEmbeddedPostgres("heartbeat drains restore enqueue-time actor provenance
     for (const r of reqs) {
       expect((r.payload as Record<string, unknown> | null)?.[ACTOR_PROVENANCE_PAYLOAD_KEY]).toBeUndefined();
     }
+  });
+  it("C-1: a caller-supplied reserved key is stripped when there is no request context", async () => {
+    installExecute();
+    const { agentId } = await seedAgent();
+    await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "test",
+      payload: { keep: 1, [ACTOR_PROVENANCE_PAYLOAD_KEY]: { source: "board_key", keyId: "forged" } },
+    });
+    const [req] = await db.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests);
+    const payload = req.payload as Record<string, unknown>;
+    expect(payload[ACTOR_PROVENANCE_PAYLOAD_KEY]).toBeUndefined();
+    expect(payload.keep).toBe(1);
+    expect(await probeRows()).toEqual([{ source: null, keyId: null }]);
+  });
+
+  it("C-1: inside a request scope the server value replaces a caller-supplied reserved key", async () => {
+    installExecute();
+    const { agentId } = await seedAgent();
+    await runWithActorProvenance(BOARD, () =>
+      heartbeat.wakeup(agentId, {
+        source: "on_demand",
+        triggerDetail: "manual",
+        reason: "test",
+        payload: { [ACTOR_PROVENANCE_PAYLOAD_KEY]: { source: "board_key", keyId: "forged", extra: "x" } },
+      }),
+    );
+    const [req] = await db.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests);
+    expect((req.payload as Record<string, unknown>)[ACTOR_PROVENANCE_PAYLOAD_KEY]).toEqual(BOARD);
+  });
+
+  it("F-A: a no-provenance run chained after a board-key run does not inherit its attribution", async () => {
+    const { companyId, agentId } = await seedAgent();
+    let chainedRunId: string | null = null;
+    mockAdapterExecute.mockImplementation(async (ctx: { runId: string; agent: { companyId: string; id: string } }) => {
+      holder.seen.push(getActorProvenance());
+      if (!chainedRunId) {
+        // While run 1 is in flight, queue a background (no-provenance) run for the same agent.
+        const wakeId = randomUUID();
+        chainedRunId = randomUUID();
+        await db.insert(agentWakeupRequests).values({
+          id: wakeId, companyId, agentId, source: "on_demand", triggerDetail: "manual",
+          reason: "chained", payload: {}, status: "queued",
+        });
+        await db.insert(heartbeatRuns).values({
+          id: chainedRunId, companyId, agentId, invocationSource: "on_demand", triggerDetail: "manual",
+          status: "queued", wakeupRequestId: wakeId, responsibleUserId: "responsible-user", contextSnapshot: {},
+        });
+      }
+      await logActivity(holder.db as ReturnType<typeof createDb>, {
+        companyId: ctx.agent.companyId, actorType: "agent", actorId: ctx.agent.id,
+        action: "test.provenance_probe", entityType: "heartbeat_run", entityId: ctx.runId, runId: ctx.runId,
+      });
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "ok", provider: "test", model: "m" };
+    });
+    await runWithActorProvenance(BOARD, () =>
+      heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual", reason: "test" }),
+    );
+    await waitFor(async () => (await probeRowsByRun()).length >= 2, 10_000);
+    const rows = await probeRowsByRun();
+    const chained = rows.find((r) => r.runId === chainedRunId);
+    const first = rows.find((r) => r.runId !== chainedRunId);
+    expect(first).toMatchObject({ source: "board_key", keyId: BOARD.keyId });
+    expect(chained).toMatchObject({ source: null, keyId: null });
+  });
+
+  it("C-2: a wake enqueued from inside a restored board-key run captures no provenance", async () => {
+    const a = await seedAgent();
+    const b = await seedAgent();
+    mockAdapterExecute.mockImplementation(async (ctx: { runId: string; agent: { companyId: string; id: string } }) => {
+      if (ctx.agent.id === a.agentId) {
+        await heartbeat.wakeup(b.agentId, { source: "on_demand", triggerDetail: "manual", reason: "fanout" });
+      }
+      await logActivity(holder.db as ReturnType<typeof createDb>, {
+        companyId: ctx.agent.companyId, actorType: "agent", actorId: ctx.agent.id,
+        action: "test.provenance_probe", entityType: "heartbeat_run", entityId: ctx.runId, runId: ctx.runId,
+      });
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "ok", provider: "test", model: "m" };
+    });
+    await runWithActorProvenance(BOARD, () =>
+      heartbeat.wakeup(a.agentId, { source: "on_demand", triggerDetail: "manual", reason: "test" }),
+    );
+    await waitFor(async () => (await probeRowsByRun()).length >= 2, 10_000);
+    const bReq = await db.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, b.agentId));
+    expect(bReq).toHaveLength(1);
+    expect((bReq[0].payload as Record<string, unknown> | null)?.[ACTOR_PROVENANCE_PAYLOAD_KEY]).toBeUndefined();
+    const bRuns = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.agentId, b.agentId));
+    const rows = await probeRowsByRun();
+    expect(rows.find((r) => r.runId === bRuns[0].id)).toMatchObject({ source: null, keyId: null });
+    expect(rows.find((r) => r.runId !== bRuns[0].id)).toMatchObject({ source: "board_key", keyId: BOARD.keyId });
+  });
+
+  it("restored provenance is visible to readers but never re-captured", () => {
+    runWithRestoredActorProvenance(BOARD, () => {
+      expect(getActorProvenance()).toEqual(BOARD);
+    });
+    runWithActorProvenance(BOARD, () => {
+      runWithRestoredActorProvenance(null, () => expect(getActorProvenance()).toBeNull());
+    });
   });
 });

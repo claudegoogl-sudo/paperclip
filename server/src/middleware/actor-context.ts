@@ -58,12 +58,38 @@ export function runWithActorProvenance<T>(p: ActorProvenance | null, fn: () => T
 }
 
 /**
- * Snapshot of the current provenance reduced to exactly `{source, keyId}`, or
- * `null` when there is no request context or it carries no credential class.
+ * Provenance objects bound by `runWithRestoredActorProvenance`. They are visible to
+ * readers (`logActivity`) but `captureActorProvenance` ignores them, so a restored
+ * scope never propagates attribution to wakes it enqueues (positive-evidence-only).
+ */
+const restoredProvenance = new WeakSet<ActorProvenance>();
+
+/**
+ * Runs `fn` with provenance restored from a persisted wakeup payload. With
+ * `p === null` the ambient context is explicitly CLEARED (not inherited), so a
+ * run chained from a board-key run does not inherit its attribution. Restored
+ * provenance is never re-captured into new wakeup payloads.
+ */
+export function runWithRestoredActorProvenance<T>(p: ActorProvenance | null, fn: () => T): T {
+  if (!p) return runWithoutActorProvenance(fn);
+  const bound: ActorProvenance = { source: p.source, keyId: p.keyId };
+  restoredProvenance.add(bound);
+  return actorProvenanceStore.run(bound, fn);
+}
+
+/** Runs `fn` with no actor provenance bound, regardless of the ambient context. */
+export function runWithoutActorProvenance<T>(fn: () => T): T {
+  return actorProvenanceStore.exit(fn);
+}
+
+/**
+ * Snapshot of the current REQUEST-ORIGIN provenance reduced to exactly
+ * `{source, keyId}`, or `null` when there is no request context, it carries no
+ * credential class, or it was restored by `runWithRestoredActorProvenance`.
  */
 export function captureActorProvenance(): ActorProvenance | null {
   const p = getActorProvenance();
-  if (!p || (!p.source && !p.keyId)) return null;
+  if (!p || restoredProvenance.has(p) || (!p.source && !p.keyId)) return null;
   return { source: p.source ?? null, keyId: p.keyId ?? null };
 }
 
