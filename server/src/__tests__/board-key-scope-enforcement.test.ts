@@ -83,6 +83,16 @@ describeEmbeddedPostgres("board API key scope enforcement", () => {
       res.json({ ok: true, route: "issue.comment" }),
     );
 
+    // Company list / detail / create / update + company issue list — the
+    // board-read snapshot needs only the list and the issue list.
+    app.get("/api/companies", (_req, res) => res.json({ ok: true, route: "companies.list" }));
+    app.post("/api/companies", (_req, res) => res.json({ ok: true, route: "companies.create" }));
+    app.get("/api/companies/:companyId", (_req, res) => res.json({ ok: true, route: "companies.get" }));
+    app.patch("/api/companies/:companyId", (_req, res) => res.json({ ok: true, route: "companies.update" }));
+    app.get("/api/companies/:companyId/issues", (_req, res) =>
+      res.json({ ok: true, route: "companies.issues" }),
+    );
+
     // Secret-egress binding review + allowlist seed + enforce-flip — all
     // assertBoard in prod, all reachable today by any board key. These are the
     // routes the scope taxonomy must keep a plugin_ops key off.
@@ -219,6 +229,38 @@ describeEmbeddedPostgres("board API key scope enforcement", () => {
     expect(extra.body).toMatchObject({ code: "board_key_scope_violation" });
     const post = await request(app).post("/api/cli-auth/me").set("authorization", `Bearer ${key.token}`).send({});
     expect(post.status).toBe(403);
+  });
+
+  it("a plugin_ops-scoped key reaches GET /api/companies (exact list only) and nothing wider on companies", async () => {
+    const app = buildApp();
+    const key = await createKey("plugin_ops");
+    const auth = { Authorization: `Bearer ${key.token}` };
+
+    const list = await request(app).get("/api/companies").set(auth);
+    expect(list.status).toBe(200);
+    expect(list.body).toMatchObject({ route: "companies.list" });
+
+    // Query string does not change req.path, so the list form with a query
+    // is the same route and is allowed.
+    const listQuery = await request(app).get("/api/companies?x=1").set(auth);
+    expect(listQuery.status).toBe(200);
+    expect(listQuery.body).toMatchObject({ route: "companies.list" });
+
+    const issues = await request(app).get(`/api/companies/${companyId}/issues`).set(auth);
+    expect(issues.status).toBe(200);
+    expect(issues.body).toMatchObject({ route: "companies.issues" });
+
+    const detail = await request(app).get(`/api/companies/${companyId}`).set(auth);
+    expect(detail.status).toBe(403);
+    expect(detail.body).toMatchObject({ code: "board_key_scope_violation" });
+
+    const create = await request(app).post("/api/companies").set(auth).send({ name: "x" });
+    expect(create.status).toBe(403);
+    expect(create.body).toMatchObject({ code: "board_key_scope_violation" });
+
+    const update = await request(app).patch(`/api/companies/${companyId}`).set(auth).send({ name: "x" });
+    expect(update.status).toBe(403);
+    expect(update.body).toMatchObject({ code: "board_key_scope_violation" });
   });
 
   it("a plugin_ops-scoped key reaches issue comment", async () => {
