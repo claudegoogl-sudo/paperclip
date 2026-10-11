@@ -153,3 +153,87 @@ those bytes exist only after that release publishes.
   a license. Staging now falls back to the repo-root LICENSE (README is never
   fallen back), and the bundled-deps gate rejects any bundled tarball without
   `package/LICENSE`.
+
+## Provenance stamp + merged-vs-running drift check
+
+**The problem this closes.** `done` on a host-code change means *merged*;
+the fleet reads it as *running*. Those differ on every release train: any PR
+merged between the cut commit and the operator's install is silently absent
+from the running host. Nothing else checks.
+
+### 1. Source-commit stamp (build time)
+
+Every packed tarball's manifest carries a `gitHead` field with the exact
+source commit:
+
+- `scripts/generate-npm-package-json.mjs` stamps the CLI (root) package.
+- `scripts/pack-public-packages.mjs` stamps every other public package
+  (server, adapters, ...) as part of its publishConfig pass.
+- `scripts/prepare-bundled-package.mjs` stamps packages packed from a staged
+  copy outside the repository, where npm/pnpm cannot infer provenance.
+- `scripts/generate-plugin-package-json.mjs` and
+  `scripts/generate-ui-package-json.mjs` stamp the plugin and UI manifests.
+  Their packages regenerate the manifest in a `prepack` step, which would
+  otherwise wipe the stamp written before pack ran.
+
+Resolution order lives in `scripts/source-commit.mjs`: `RELEASE_SOURCE_COMMIT`
+env (validated 40-hex) wins, then `git rev-parse HEAD`. `build.sh` gate (e)
+calls `verifyCommitStamp()` and FAILS the train if any tarball in the release
+set is unstamped or carries a stamp other than the released commit — a train
+can no longer ship without provenance.
+
+### 2. drift-check.mjs (install/verify time)
+
+```
+node scripts/fork-release/drift-check.mjs [options]
+```
+
+Resolves the installed commit — the `gitHead` stamp first, release-tag lookup
+as fallback — fetches the target ref fresh, and prints every commit on the
+target that the running install does not contain, with PR refs (and an
+optional deployment-local ticket regex).
+
+Exit codes: `0` clean, `1` drift (warning, not a hard failure — the operator
+may knowingly run an older pin), `2` environment error, `3` positive-control
+failure.
+
+**Positive control is mandatory.** The resolved base must be an ancestor of
+the target or the check exits 3 and prints NO ledger. A check that cannot
+distinguish "absent" from "looking in the wrong place" manufactures confident
+false alarms — e.g. grepping a single bundle file for a server-side symbol
+returns 0 for every server-side sentinel including ones that definitely
+shipped. Scan the whole install closure via the commit ledger, never one file
+via `grep`.
+
+### 3. drift-sweep.mjs (scheduled)
+
+Same ledger code path as drift-check, posted to a tracker issue when the
+missing-commit set CHANGES (retries and re-runs converge; no spam). Board
+credential is read in-process from `~/.paperclip/auth.json` (or
+`$PAPERCLIP_API_KEY`) and never logged. Every post carries an agent-provenance
+banner and records no operator decision. Control failures fail the service
+and post nothing — never a fabricated ledger.
+
+Deploy:
+
+```
+mkdir -p ~/work/fork-drift ~/.config/fork-drift
+cp scripts/fork-release/drift-check.mjs scripts/fork-release/drift-sweep.mjs ~/work/fork-drift/
+cat > ~/.config/fork-drift/env <<ENV
+DRIFT_TRACKER_ISSUE=<tracker-issue-key>
+DRIFT_AGENT_LABEL=fork-drift sweep
+ENV
+mkdir -p ~/.config/systemd/user
+cp scripts/fork-release/systemd/paperclip-fork-drift.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now paperclip-fork-drift.timer
+journalctl --user -u paperclip-fork-drift.service -n 20
+```
+
+Smoke-test one iteration by hand before enabling the timer:
+
+```
+node ~/work/fork-drift/drift-check.mjs                 # the ledger, human-readable
+node ~/work/fork-drift/drift-sweep.mjs --issue <key>   # one sweep, posts once
+node ~/work/fork-drift/drift-sweep.mjs --issue <key>   # converged: no second post
+```
