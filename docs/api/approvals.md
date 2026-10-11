@@ -36,6 +36,32 @@ POST /api/companies/{companyId}/approvals
 }
 ```
 
+### Attribution rules
+
+The card is always attributed to the authenticated caller:
+
+- **Agent callers**: `requestedByAgentId` may be omitted (attributed to the
+  caller) or set to the caller's own id. Any other value is rejected with
+  `403` — cards cannot be attributed to another agent.
+- **User and board callers**: `requestedByAgentId` must be absent or `null`;
+  a non-null value is rejected with `400`. User cards are attributed via
+  `requestedByUserId` only.
+
+Rejected create attempts are recorded in the activity log
+(`approval.create_denied`).
+
+### Per-agent creation caps
+
+Agent callers are subject to two caps (user/board callers are exempt):
+
+- **Burst cap**: at most 10 creates per agent per 60-second sliding window.
+  Exceeding it returns `429` with a `Retry-After` header and consumes no
+  budget for the rejected request.
+- **Pending-card cap**: at most 5 simultaneously `pending` cards per agent.
+  Exceeding it returns `429` naming the cap; withdraw or resolve an existing
+  card to free budget. There is no `Retry-After` — the cap frees on a human
+  decision, not on a clock.
+
 ## Create Hire Request
 
 ```
