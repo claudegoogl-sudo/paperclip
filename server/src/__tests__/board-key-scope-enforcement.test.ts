@@ -2,13 +2,14 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { authUsers, boardApiKeys, companies, createDb } from "@paperclipai/db";
+import { authUsers, boardApiKeys, companies, companyMemberships, createDb } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { registerActorContext } from "../middleware/auth.ts";
 import { errorHandler } from "../middleware/error-handler.ts";
+import { companyRoutes } from "../routes/companies.ts";
 import {
   boardAuthService,
   createBoardApiToken,
@@ -185,6 +186,7 @@ describeEmbeddedPostgres("board API key scope enforcement", () => {
   afterEach(async () => {
     // Clean in dependency order: authUsers cascades to board_api_keys, so we
     // only need to clear the parent rows.
+    await db.delete(companyMemberships);
     await db.delete(companies);
     await db.delete(authUsers);
   });
@@ -261,6 +263,45 @@ describeEmbeddedPostgres("board API key scope enforcement", () => {
     const update = await request(app).patch(`/api/companies/${companyId}`).set(auth).send({ name: "x" });
     expect(update.status).toBe(403);
     expect(update.body).toMatchObject({ code: "board_key_scope_violation" });
+  });
+
+  it("GET /api/companies projects to id/name/status/issuePrefix for plugin_ops keys; a standard key gets the full shape", async () => {
+    const app = express();
+    app.use(express.json());
+    registerActorContext(app, db, { deploymentMode: "authenticated" });
+    app.use("/api/companies", companyRoutes(db));
+    app.use(errorHandler);
+    // Non-admin member: the route returns only the key owner's companies.
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: operatorUserId,
+      status: "active",
+      membershipRole: "owner",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const scoped = await createKey("plugin_ops");
+    const narrow = await request(app).get("/api/companies").set("authorization", `Bearer ${scoped.token}`);
+    expect(narrow.status).toBe(200);
+    const row = (narrow.body as Array<Record<string, unknown>>).find((c) => c.id === companyId);
+    expect(row).toBeDefined();
+    expect(Object.keys(row!).sort()).toEqual(["id", "issuePrefix", "name", "status"]);
+    for (const c of narrow.body as Array<Record<string, unknown>>) {
+      expect(c).not.toHaveProperty("budgetMonthlyCents");
+      expect(c).not.toHaveProperty("spentMonthlyCents");
+      expect(c).not.toHaveProperty("defaultResponsibleUserId");
+      expect(Object.keys(c).some((k) => k.startsWith("feedbackDataSharing"))).toBe(false);
+    }
+
+    const standard = await createKey("standard");
+    const full = await request(app).get("/api/companies").set("authorization", `Bearer ${standard.token}`);
+    expect(full.status).toBe(200);
+    const fullRow = (full.body as Array<Record<string, unknown>>).find((c) => c.id === companyId);
+    expect(fullRow).toHaveProperty("budgetMonthlyCents");
+    expect(fullRow).toHaveProperty("defaultResponsibleUserId");
+    expect(fullRow).toHaveProperty("feedbackDataSharingEnabled");
   });
 
   it("a plugin_ops-scoped key reaches issue comment", async () => {
