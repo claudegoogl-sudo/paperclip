@@ -689,6 +689,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         );
         return await prepareAdapterExecutionTargetRuntime({
           runId,
+          agent,
           target: executionTarget,
           adapterKey: "claude",
           timeoutSec,
