@@ -203,3 +203,95 @@ export async function recordCrossCompanyIssueAccess(
   }
   logger.info({ ...details, agentId: input.agentId, runId: input.runId }, "issue.cross_company_access");
 }
+
+/** M4: fields a cross-company PATCH may carry. Anything else => 422. */
+export const CROSS_COMPANY_PATCH_ALLOWED_FIELDS: ReadonlySet<string> = new Set([
+  "title",
+  "description",
+  "status",
+  "priority",
+  "comment",
+  "assigneeAgentId",
+  "assigneeUserId",
+  "labelIds",
+  "parentId",
+  "projectId",
+  "goalId",
+  "blockedByIssueIds",
+]);
+
+export interface CrossCompanyPatchLookups {
+  /** companyId of the referenced entity, or null if it does not exist. */
+  agentCompany(id: string): Promise<{ companyId: string; active: boolean } | null>;
+  userIsMember(companyId: string, userId: string): Promise<boolean>;
+  labelCompany(id: string): Promise<string | null>;
+  issueCompany(id: string): Promise<string | null>;
+  projectCompany(id: string): Promise<string | null>;
+  goalCompany(id: string): Promise<string | null>;
+}
+
+export type CrossCompanyPatchCheck =
+  | { ok: true; changedFields: string[] }
+  | { ok: false; status: 422; field: string; error: string };
+
+/**
+ * M4/M5/M6 field guard for cross-company PATCH. Allowlist, not denylist.
+ * Every reference must point into the ISSUE's company; self-assign and
+ * `cancelled` (run control) are rejected.
+ */
+export async function checkCrossCompanyPatch(
+  body: Record<string, unknown>,
+  issueCompanyId: string,
+  actorAgentId: string,
+  lk: CrossCompanyPatchLookups,
+): Promise<CrossCompanyPatchCheck> {
+  const fail = (field: string, error: string): CrossCompanyPatchCheck => ({ ok: false, status: 422, field, error });
+  const keys = Object.keys(body).filter((k) => body[k] !== undefined);
+  for (const k of keys) {
+    if (!CROSS_COMPANY_PATCH_ALLOWED_FIELDS.has(k)) return fail(k, "Field not allowed for cross-company update");
+  }
+  if (body.status === "cancelled") return fail("status", "Cross-company update cannot cancel an issue");
+  const sameCompany = async (field: string, id: unknown, lookup: (id: string) => Promise<string | null>) => {
+    if (id === null) return null;
+    if (typeof id !== "string") return fail(field, "Invalid reference");
+    return (await lookup(id)) === issueCompanyId ? null : fail(field, "Reference must belong to the issue company");
+  };
+  if (body.assigneeAgentId !== undefined && body.assigneeAgentId !== null) {
+    const id = body.assigneeAgentId;
+    if (typeof id !== "string") return fail("assigneeAgentId", "Invalid reference");
+    if (id.toLowerCase() === actorAgentId.toLowerCase()) {
+      return fail("assigneeAgentId", "Cross-company actor cannot assign the issue to itself");
+    }
+    const a = await lk.agentCompany(id);
+    if (!a || a.companyId !== issueCompanyId || !a.active) {
+      return fail("assigneeAgentId", "Assignee must be an active agent of the issue company");
+    }
+  }
+  if (body.assigneeUserId !== undefined && body.assigneeUserId !== null) {
+    if (typeof body.assigneeUserId !== "string" || !(await lk.userIsMember(issueCompanyId, body.assigneeUserId))) {
+      return fail("assigneeUserId", "Assignee must be a member of the issue company");
+    }
+  }
+  for (const [field, lookup] of [
+    ["parentId", lk.issueCompany],
+    ["projectId", lk.projectCompany],
+    ["goalId", lk.goalCompany],
+  ] as const) {
+    if (body[field] === undefined) continue;
+    const r = await sameCompany(field, body[field], lookup);
+    if (r) return r;
+  }
+  for (const [field, lookup] of [
+    ["blockedByIssueIds", lk.issueCompany],
+    ["labelIds", lk.labelCompany],
+  ] as const) {
+    const v = body[field];
+    if (v === undefined) continue;
+    if (!Array.isArray(v)) return fail(field, "Invalid reference list");
+    for (const id of v) {
+      const r = await sameCompany(field, id, lookup);
+      if (r) return r;
+    }
+  }
+  return { ok: true, changedFields: keys.sort() };
+}
