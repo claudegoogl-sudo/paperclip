@@ -18,9 +18,18 @@
 #      the 2026-08-31 fork.37 window (watchdog restarted the cluster during
 #      the tar). flock — not a pidfile — so a crashed window releases the
 #      lock via the kernel on fd close; no stale-lock cleanup exists.
-#   1. Port already listening -> healthy. Clears the failure counter and any
-#      active alert state. No alert, no restart. (A healthy observation is the
-#      ONLY automatic reset.)
+#   1. Postgres already answering -> healthy. Clears the failure counter and
+#      any active alert state. No alert, no restart. (A healthy observation
+#      is the ONLY automatic reset.) The control-plane postmaster is
+#      unix-socket-only (`-c listen_addresses=` empty is PERMANENT hardening
+#      host-side — do NOT re-enable TCP). "healthy" is
+#      decided by port_up(), which probes the unix socket the server would
+#      actually dial (resolved from the live postmaster.pid, or derived the
+#      same way the server derives it — see resolve_socket_dir()), preferring
+#      pg_isready, then a python3 wire-protocol probe, then (degraded,
+#      liveness-only) pg_ctl status. A bare TCP dial or a bare
+#      socket-file-exists check is NOT sufficient — see resolve_socket_dir()
+#      and port_up() below for why.
 #   2. A live postmaster pidfile (PID alive, port not up yet) -> normal
 #      startup in progress; do nothing, do not count a failure, never start a
 #      second postmaster.
@@ -31,8 +40,10 @@
 #      embedded postgres is down the board API is usually down too, so the
 #      board alert fires on the first tick where the API is reachable again.
 #   4. Otherwise: clear a stale pidfile (dead PID only), launch postgres
-#      detached, wait up to PG_RECOVER_START_WAIT for the port to accept
-#      connections.
+#      detached with the SAME transport the live server uses (unix-socket
+#      only, socket dir derived at runtime — see resolve_socket_dir()), wait
+#      up to PG_RECOVER_START_WAIT for the socket to accept AND ANSWER a
+#      query at the path the control plane actually dials.
 #   5. Start failed:
 #        - Log lines emitted by THIS attempt matching the corruption class
 #          ("PANIC:" / "could not locate a valid checkpoint record") escalate
@@ -162,7 +173,113 @@ die() { # setup/config problem
   exit 2
 }
 
-port_up() { (exec 3<>"/dev/tcp/127.0.0.1/$PG_RECOVER_PORT") 2>/dev/null; }
+# ------------------------------------------------------- unix-socket probe
+#
+# The control-plane postmaster is unix-socket-only (see header). port_up()
+# used to be a raw TCP dial, which is permanently false against this
+# postmaster and made the watchdog blind. The probe now:
+#   1. Resolves the socket directory the SAME way the node server does
+#      (never hardcoded): prefer the live postmaster.pid line 5 (the
+#      authoritative value the running postmaster actually bound); else
+#      derive it exactly like embeddedPostgresSocketRuntimeRoot()/
+#      socketDirectoryPathFor() in dist/index.js — sha256(dataDir)[:16]
+#      under $XDG_RUNTIME_DIR (if absolute) else $TMPDIR/$TMP/$TEMP else
+#      /tmp — so a stale/missing pidfile still probes the right path.
+#   2. Prefers `pg_isready` when found on PATH (a real libpq client that
+#      proves query-ability). It is NOT guaranteed present (the embedded
+#      postgres bin dir ships only initdb/pg_ctl/postgres); when absent we
+#      fall back to a python3 probe that opens the actual unix socket file
+#      and completes enough of the wire protocol (SSLRequest -> single-byte
+#      reply) to prove something is actually listening and answering, not
+#      just that a socket *file* exists. A bare `[ -S socket ]` check is
+#      explicitly rejected here: a stale socket file survives a postmaster
+#      crash and would falsely read as healthy.
+#   3. If neither pg_isready nor python3 is available, degrades to a
+#      pg_ctl(1) status check on the data dir (process-liveness only, not
+#      query-ability) and logs a warning that the probe is degraded.
+
+resolve_socket_dir() {
+  local sd
+  sd="$(readPidFileSocketDir 2>/dev/null || true)"
+  if [ -n "$sd" ]; then
+    printf '%s' "$sd"
+    return 0
+  fi
+  local root
+  if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ "${XDG_RUNTIME_DIR#/}" != "$XDG_RUNTIME_DIR" ]; then
+    root="$XDG_RUNTIME_DIR"
+  else
+    root="${TMPDIR:-${TMP:-${TEMP:-/tmp}}}"
+  fi
+  local normalized hash
+  normalized="${PG_RECOVER_DATA_DIR%/}"
+  hash="$(printf '%s' "$normalized" | sha256sum | cut -c1-16)"
+  printf '%s/paperclip-pg-%s' "$root" "$hash"
+}
+
+readPidFileSocketDir() { # mirrors dist/index.js readPidFileSocketDir(): line 5 of postmaster.pid
+  local f="$PG_RECOVER_DATA_DIR/postmaster.pid" line
+  [ -f "$f" ] || return 1
+  line="$(sed -n '5p' "$f" 2>/dev/null || true)"
+  line="${line%%,*}"
+  # trim whitespace
+  line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  [ -n "$line" ] || return 1
+  printf '%s' "$line"
+}
+
+pg_isready_probe() { # <socket_dir> -- returns 0/1/"unavailable" via echo+return 2
+  command -v pg_isready >/dev/null 2>&1 || return 2
+  pg_isready -h "$1" -p "$PG_RECOVER_PORT" >/dev/null 2>&1
+}
+
+python_socket_probe() { # <socket_dir> -- real protocol probe over the unix socket
+  command -v python3 >/dev/null 2>&1 || return 2
+  python3 - "$1" "$PG_RECOVER_PORT" <<'PYEOF' >/dev/null 2>&1
+import socket, sys, struct
+sock_dir, port = sys.argv[1], sys.argv[2]
+path = f"{sock_dir}/.s.PGSQL.{port}"
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(3)
+try:
+    s.connect(path)
+    # SSLRequest packet: length(8) + code(80877103)
+    s.sendall(struct.pack("!ii", 8, 80877103))
+    reply = s.recv(1)
+    sys.exit(0 if len(reply) == 1 else 1)
+except Exception:
+    sys.exit(1)
+finally:
+    s.close()
+PYEOF
+}
+
+pg_ctl_status_probe() { # <data_dir> -- process-liveness only, last-resort
+  local pgctl="${PG_RECOVER_POSTGRES_BIN%/*}/pg_ctl"
+  [ -x "$pgctl" ] || return 2
+  "$pgctl" -D "$PG_RECOVER_DATA_DIR" status >/dev/null 2>&1
+}
+
+port_up() {
+  local socket_dir rc
+  socket_dir="$(resolve_socket_dir)"
+  [ -n "$socket_dir" ] || return 1
+
+  pg_isready_probe "$socket_dir"; rc=$?
+  if [ "$rc" -ne 2 ]; then
+    [ "$rc" -eq 0 ]
+    return $?
+  fi
+
+  python_socket_probe "$socket_dir"; rc=$?
+  if [ "$rc" -ne 2 ]; then
+    [ "$rc" -eq 0 ]
+    return $?
+  fi
+
+  warn "no pg_isready and no python3 on PATH — degrading to pg_ctl status (process-liveness only, not query-ability)"
+  pg_ctl_status_probe "$PG_RECOVER_DATA_DIR"
+}
 
 # ---------------------------------------------------------------- state file
 
@@ -536,16 +653,32 @@ cmd_tick() {
     exit 3
   fi
 
-  # 4. Attempt a start.
-  local lines_before deadline child_pid
+  # 4. Attempt a start. Flags MUST match how the live server launches
+  #    postgres: unix-socket-only, socket dir derived the
+  #    SAME way the server derives it (never hardcoded — see resolve_socket_dir),
+  #    so a watchdog-started postmaster is reachable at the path the control
+  #    plane actually connects to, and so it binds NO tcp port (a bind that
+  #    would make the old TCP-based port_up() false-green while the real
+  #    client path stays broken).
+  local lines_before deadline child_pid expected_socket_dir expected_socket_file
   mkdir -p "$(dirname "$PG_RECOVER_LOG")" 2>/dev/null || true
   lines_before="$(wc -l < "$PG_RECOVER_LOG" 2>/dev/null || echo 0)"
   log "starting embedded postgres (attempt $(( $(sget consecutive_failures || echo 0) + 1 )))"
 
+  expected_socket_dir="$(resolve_socket_dir)"
+  if [ -z "$expected_socket_dir" ]; then
+    die "could not derive expected unix socket directory for $PG_RECOVER_DATA_DIR"
+  fi
+  mkdir -p "$expected_socket_dir" 2>/dev/null || true
+  chmod 0700 "$expected_socket_dir" 2>/dev/null || true
+  expected_socket_file="$expected_socket_dir/.s.PGSQL.$PG_RECOVER_PORT"
+
   # Export for wrapper binaries used by drills/tests (reads $PG_RECOVER_LOG).
   export PG_RECOVER_LOG PG_RECOVER_DATA_DIR PG_RECOVER_PORT
   setsid nohup "$PG_RECOVER_POSTGRES_BIN" -D "$PG_RECOVER_DATA_DIR" -p "$PG_RECOVER_PORT" \
-    -c listen_addresses=127.0.0.1 >> "$PG_RECOVER_LOG" 2>&1 < /dev/null &
+    -c listen_addresses= \
+    -c "unix_socket_directories=$expected_socket_dir" \
+    -c unix_socket_permissions=0700 >> "$PG_RECOVER_LOG" 2>&1 < /dev/null &
   child_pid=$!
   disown 2>/dev/null || true
 
@@ -558,11 +691,17 @@ cmd_tick() {
     sleep 1
   done
 
-  if port_up; then
-    log "port $PG_RECOVER_PORT listening — start ok"
+  # 4b. No false green (AC5): port_up() alone proves SOME postgres answers
+  # a query; also require the socket at the path the server would actually
+  # dial exists, so a start that comes up on an unexpected path still counts
+  # as a failure rather than a silent "start ok".
+  if port_up && [ -S "$expected_socket_file" ]; then
+    log "socket $expected_socket_file answering queries — start ok"
     printf '{}' > "$PG_RECOVER_STATE"
     stamp "started"
     exit 0
+  elif port_up; then
+    warn "postgres is answering but NOT at the server's expected socket $expected_socket_file — treating as a failed start (would not be reachable by the control plane)"
   fi
 
   # 5. Classify the failure from THIS attempt's new log lines.
