@@ -57,7 +57,7 @@ start_listener() { # <socket_dir> <basename> -- unix-socket fake postmaster
   # TCP port). This listener binds <socket_dir>/.s.PGSQL.$PORT and answers an
   # SSLRequest with the single byte 'N' (what a real postmaster without SSL
   # sends), which is exactly what the python3 wire-protocol probe requires.
-  mkdir -p "$1"
+  mkdir -p "$1"; chmod 700 "$1"  # real server creates it 0700; the CWE-379 guard refuses anything else
   python3 -c "
 import socket, sys, os
 path = sys.argv[1] + '/.s.PGSQL.' + sys.argv[3]
@@ -181,7 +181,7 @@ case "${FAKE_MODE:-fail}" in
       printf '%s\n%s\n%s\n%s\n%s\n' "$$" "$PG_RECOVER_DATA_DIR" "0" "$PG_RECOVER_PORT" "$sockdir" \
         > "$PG_RECOVER_DATA_DIR/postmaster.pid"
     fi
-    mkdir -p "$sockdir"
+    mkdir -p "$sockdir"; chmod 700 "$sockdir"
     printf '%s' "$sockdir" > "$TMP/fake-bound-dir"
     python3 -c "
 import socket, sys, os
@@ -300,7 +300,7 @@ kill "$(cat "$TMP/listener-alt.pid")" "$PIDF_PID" 2>/dev/null
 rm -f "$PG_RECOVER_DATA_DIR/postmaster.pid"; sleep 0.3
 
 echo "== case: stale socket FILE with nothing answering is NOT healthy =="
-mkdir -p "$SOCK_DIR"
+mkdir -p "$SOCK_DIR"; chmod 700 "$SOCK_DIR"
 python3 -c "
 import socket, sys
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.bind(sys.argv[1])
@@ -652,6 +652,44 @@ expect_exit 1 "epoch-only leftover does not defer (start attempted, exit 1)" "$R
 [ "$(state_get consecutive_failures "$PG_RECOVER_STATE")" = "1" ] \
   && ok "start attempt counted (recovery not suppressed)" || bad "recovery suppressed by epoch-only file"
 rm -f "$PG_RECOVER_WINDOW_LOCK"
+
+echo "== case: CWE-379 socket-dir guard (pre-seeded entries are refused, never adopted) =="
+# A fresh dir is created 0700 under umask 077; a symlink, non-dir, or a dir
+# with group/world bits is refused with exit 2 and the postmaster never runs.
+export FAKE_MODE="fail"
+guard_case() { # <what> <setup-cmd>
+  printf '{}' > "$PG_RECOVER_STATE"; : > "$PG_RECOVER_LOG"
+  rm -rf "$SOCK_DIR"; eval "$2"
+  local calls_before; calls_before="$(wc -l < "$FAKE_COUNT")"
+  expect_exit 2 "$1 -> refused (exit 2)" "$RECOVER" tick
+  grep -q "refusing to start (CWE-379)" "$PG_RECOVER_LOG" && ok "$1: CWE-379 refusal logged" || bad "$1: no CWE-379 refusal in log"
+  [ "$(wc -l < "$FAKE_COUNT")" = "$calls_before" ] && ok "$1: postgres not launched" || bad "$1: postgres launched despite refusal"
+}
+mkdir -p "$TMP/attacker"; chmod 700 "$TMP/attacker"
+guard_case "symlink socket dir" 'ln -s "$TMP/attacker" "$SOCK_DIR"'
+[ -z "$(ls -A "$TMP/attacker")" ] && ok "symlink target untouched" || bad "symlink target was written to"
+rm -f "$SOCK_DIR"
+guard_case "regular file at socket dir path" ': > "$SOCK_DIR"'
+rm -f "$SOCK_DIR"
+guard_case "world-writable socket dir" 'mkdir -p "$SOCK_DIR"; chmod 0777 "$SOCK_DIR"'
+[ "$(stat -c %a "$SOCK_DIR")" = "777" ] && ok "pre-seeded dir mode not silently tightened (not adopted)" || bad "pre-seeded dir was chmod-ed"
+guard_case "group-readable socket dir" 'mkdir -p "$SOCK_DIR"; chmod 0750 "$SOCK_DIR"'
+rm -rf "$SOCK_DIR"
+# Foreign uid: only provable as root (chown); skip otherwise, say so.
+if [ "$(id -u)" = "0" ] && id nobody >/dev/null 2>&1; then
+  guard_case "foreign-uid socket dir" 'mkdir -p "$SOCK_DIR"; chmod 700 "$SOCK_DIR"; chown nobody "$SOCK_DIR"'
+  rm -rf "$SOCK_DIR"
+else
+  echo "  skip: foreign-uid case needs root (chown)"
+fi
+# Absent -> created 0700 owned by us, and the start proceeds.
+printf '{}' > "$PG_RECOVER_STATE"; : > "$PG_RECOVER_LOG"
+( umask 022; expect_exit 1 "absent socket dir -> created, start attempted (exit 1)" "$RECOVER" tick )
+[ -d "$SOCK_DIR" ] && [ ! -L "$SOCK_DIR" ] && [ "$(stat -c %a "$SOCK_DIR")" = "700" ] && [ "$(stat -c %u "$SOCK_DIR")" = "$(id -u)" ] \
+  && ok "absent socket dir created 0700, owned by us (even under umask 022)" || bad "created socket dir mode/owner wrong: $(stat -c '%a %u' "$SOCK_DIR" 2>/dev/null)"
+# Pre-existing correct dir (0700, ours) is accepted.
+printf '{}' > "$PG_RECOVER_STATE"
+expect_exit 1 "existing 0700 own socket dir accepted, start attempted (exit 1)" "$RECOVER" tick
 
 echo "== case: leak guard — no lock artifact left at the default path =="
 default_lock_leaked || true   # rc 1 on a leak; bad() already counted it
