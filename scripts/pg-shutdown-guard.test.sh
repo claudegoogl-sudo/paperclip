@@ -149,6 +149,21 @@ expect_exit 3 "active-runs: unreachable API refuses" "$GUARD" active-runs
 PG_GUARD_ALLOW_UNREACHABLE=1 PG_GUARD_OVERRIDE_REASON="test override" \
   expect_exit 0 "active-runs: documented override proceeds" env PG_GUARD_ALLOW_UNREACHABLE=1 PG_GUARD_OVERRIDE_REASON="test override" "$GUARD" active-runs
 
+echo "== case: override needs a non-blank PG_GUARD_OVERRIDE_REASON =="
+for v in PG_GUARD_ALLOW_UNREACHABLE PG_GUARD_ALLOW_ACTIVE_RUNS; do
+  for reason in "" "   "; do
+    for cmd in active-runs drain; do
+      expect_exit 3 "$cmd: $v=1 with blank reason '$reason' refuses" env "$v=1" PG_GUARD_OVERRIDE_REASON="$reason" "$GUARD" $cmd
+    done
+  done
+  out="$(env "$v=1" PG_GUARD_OVERRIDE_REASON= "$GUARD" active-runs 2>&1)"
+  case "$out" in
+    *PG_GUARD_OVERRIDE_REASON*"$v"*|*"$v"*PG_GUARD_OVERRIDE_REASON*) ok "$v blank-reason message names both variables" ;;
+    *) bad "$v blank-reason message missing variable names: $out" ;;
+  esac
+done
+expect_exit 0 "active-runs: non-blank reason override still proceeds" env PG_GUARD_ALLOW_UNREACHABLE=1 PG_GUARD_OVERRIDE_REASON="maintenance window" "$GUARD" active-runs
+
 echo ""
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" = 0 ]
