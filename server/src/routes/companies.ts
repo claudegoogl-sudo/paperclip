@@ -356,12 +356,25 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
   router.get("/", async (req, res) => {
     assertBoard(req);
     const result = await svc.list();
-    if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) {
-      res.json(result);
+    const visible =
+      req.actor.source === "local_implicit" || req.actor.isInstanceAdmin
+        ? result
+        : result.filter((company) => new Set(req.actor.companyIds ?? []).has(company.id));
+    // plugin_ops board keys (long-lived, on disk) only need discovery fields.
+    // Least privilege: drop budget/spend, governance and consent fields. The
+    // scope comes from the authenticated key, never from the request.
+    if (req.actor.type === "board" && req.actor.source === "board_key" && req.actor.boardKeyScope?.kind === "plugin_ops") {
+      res.json(
+        visible.map((company) => ({
+          id: company.id,
+          name: company.name,
+          status: company.status,
+          issuePrefix: company.issuePrefix,
+        })),
+      );
       return;
     }
-    const allowed = new Set(req.actor.companyIds ?? []);
-    res.json(result.filter((company) => allowed.has(company.id)));
+    res.json(visible);
   });
 
   router.get("/stats", async (req, res) => {
