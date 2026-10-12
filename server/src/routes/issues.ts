@@ -167,6 +167,17 @@ import { privateJsonEtag } from "../middleware/private-json-etag.js";
 import { createRequestPromiseMemo } from "../lib/request-promise-memo.js";
 import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import {
+  decideCrossCompanyIssueAccess,
+  dbCrossCompanyDeps,
+  recordCrossCompanyIssueAccess,
+  checkCrossCompanyPatch,
+  checkCrossCompanyWriteCap,
+  crossCompanyMarker,
+  withCrossCompanyMarker,
+  type CrossCompanyIssueOp,
+  dbCrossCompanyPatchLookups,
+} from "./cross-company-issue-access.js";
+import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectIssueWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
@@ -2962,8 +2973,10 @@ export function issueRoutes(
 
     // The counter transaction locks and validates the persisted run before it
     // derives the source issue. Never trust the API-key run header by itself.
+    // The run row lives in the ACTOR's company. For same-company writes that equals
+    // issue.companyId; for audited cross-company access it is the home company.
     const decision = await observeCrossIssueInfluence(db, {
-      companyId: issue.companyId,
+      companyId: req.actor.companyId ?? issue.companyId,
       runId: req.actor.runId,
       agentId: req.actor.agentId,
       responsibleUserId: req.actor.onBehalfOfUserId ?? null,
@@ -3957,6 +3970,82 @@ export function issueRoutes(
     if (decision.allowed) return true;
     res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
     return false;
+  }
+
+  // Cross-company issue access (double key). Used ONLY by the four routes
+  // GET /issues/:id, GET/POST /issues/:id/comments, PATCH /issues/:id.
+  // Same-company callers take the unchanged getAccessibleResource path.
+  // A denied foreign issue gets the exact missing-issue 404.
+  const crossCompanyDeps = dbCrossCompanyDeps(db, async (req, companyId) => {
+    try {
+      return await actorIsLowTrustReview(req, companyId);
+    } catch {
+      return true;
+    }
+  });
+
+  const crossCompanyPatchLookups = dbCrossCompanyPatchLookups(db);
+
+  async function getIssueWithCrossCompany(
+    req: Request,
+    res: Response,
+    id: string,
+    op: CrossCompanyIssueOp,
+  ): Promise<{ issue: NonNullable<Awaited<ReturnType<typeof getIssueById>>>; crossCompany: boolean; marker?: string } | null> {
+    const issue = await getIssueById(req, id);
+    if (issue && hasCompanyAccess(req, issue.companyId)) {
+      assertCompanyAccess(req, issue.companyId);
+      return { issue, crossCompany: false };
+    }
+    if (issue && req.actor.type === "agent") {
+      const decision = await decideCrossCompanyIssueAccess(req, issue.companyId, op, crossCompanyDeps);
+      const auditBase = {
+        targetCompanyId: issue.companyId,
+        homeCompanyId: req.actor.companyId ?? "",
+        agentId: req.actor.agentId ?? "",
+        runId: req.actor.runId ?? null,
+        issueId: issue.id,
+        op,
+        method: req.method,
+        route: req.route?.path ?? req.path,
+      };
+      if (!decision.allowed) {
+        // M9: audited denies in both companies. `not_allowlisted` / `same_company`
+        // are ordinary-agent noise and intentionally NOT written to the DB.
+        if (
+          req.actor.agentId && req.actor.companyId &&
+          decision.reason !== "not_allowlisted" && decision.reason !== "same_company" && decision.reason !== "not_agent"
+        ) {
+          await recordCrossCompanyIssueAccess((row) => logActivity(db, row), {
+            ...auditBase, outcome: "denied", reason: decision.reason,
+          });
+        }
+      } else {
+        const isWrite = op === "comment.create" || op === "issue.update";
+        if (isWrite) {
+          // M10: write caps counted from the audit rows.
+          const cap = await checkCrossCompanyWriteCap(crossCompanyDeps, decision.agentId, req.actor.runId ?? null);
+          if (!cap.ok) {
+            await recordCrossCompanyIssueAccess((row) => logActivity(db, row), {
+              ...auditBase, outcome: "denied", reason: `rate_limited:${cap.scope}`,
+            });
+            res.status(429).json({ error: "Cross-company write limit reached", scope: cap.scope });
+            return null;
+          }
+        }
+        if (op === "issue.read" || op === "comments.list" || op === "comment.create") {
+          await recordCrossCompanyIssueAccess((row) => logActivity(db, row), { ...auditBase, outcome: "allowed" });
+        }
+        let marker: string | undefined;
+        if (isWrite) {
+          const d = await crossCompanyDeps.describeActor(decision.agentId, decision.homeCompanyId);
+          marker = crossCompanyMarker(d.agentName, d.homeKey, req.actor.runId ?? null);
+        }
+        return { issue, crossCompany: true, marker };
+      }
+    }
+    res.status(404).json({ error: "Issue not found" });
+    return null;
   }
 
   async function assertIssueWriteInfluenceAllowed(
@@ -6744,9 +6833,10 @@ export function issueRoutes(
   router.get("/issues/:id", async (req, res) => {
     const requestStartedAt = performance.now();
     const id = req.params.id as string;
-    const issue = await getAccessibleResource(req, res, getIssueById(req, id), "Issue not found");
-    if (!issue) return;
-    if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    const resolved = await getIssueWithCrossCompany(req, res, id, "issue.read");
+    if (!resolved) return;
+    const { issue } = resolved;
+    if (!resolved.crossCompany && !(await assertIssueReadAllowed(req, res, issue))) return;
     const inboxArchiveFieldsPromise = req.actor.type === "board" && req.actor.userId
       ? svc.getActiveInboxArchiveFields(issue, req.actor.userId)
       : Promise.resolve({});
@@ -9466,8 +9556,39 @@ export function issueRoutes(
     // (assignee re-checks-out cleanly on next call) or returns a structured 4xx
     // instead of 5xx-ing on the orphan.
     await svc.clearOrphanCheckoutLocksIfTerminal(id);
-    const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
-    if (!existing) return;
+    const resolvedPatch = await getIssueWithCrossCompany(req, res, id, "issue.update");
+    if (!resolvedPatch) return;
+    const existing = resolvedPatch.issue;
+    const crossCompanyPatch = resolvedPatch.crossCompany;
+    if (crossCompanyPatch) {
+      const guard = await checkCrossCompanyPatch(
+        req.body as Record<string, unknown>,
+        existing.companyId,
+        req.actor.agentId!,
+        crossCompanyPatchLookups,
+      );
+      await recordCrossCompanyIssueAccess((row) => logActivity(db, row), {
+        targetCompanyId: existing.companyId,
+        homeCompanyId: req.actor.companyId!,
+        agentId: req.actor.agentId!,
+        runId: req.actor.runId ?? null,
+        issueId: existing.id,
+        op: "issue.update",
+        method: req.method,
+        route: "/issues/:id",
+        outcome: guard.ok ? "allowed" : "denied",
+        reason: guard.ok ? undefined : `field:${guard.field}`,
+        changedFields: guard.ok ? guard.changedFields : [guard.field],
+      });
+      if (!guard.ok) {
+        res.status(422).json({ error: guard.error, field: guard.field });
+        return;
+      }
+      // M8: host-written marker on the PATCH comment; client text is never trusted.
+      if (typeof req.body.comment === "string" && req.body.comment.length > 0 && resolvedPatch.marker) {
+        req.body.comment = withCrossCompanyMarker(resolvedPatch.marker, req.body.comment);
+      }
+    }
     if (!assertNoSecretPatternInWritePayload(req, res, [
       { name: "description", value: req.body.description },
       { name: "comment", value: req.body.comment },
@@ -9485,16 +9606,23 @@ export function issueRoutes(
       await denyIssueWrite(req, res, existing, "issue_write_attribution_spoof_rejected");
       return;
     }
-    const issueMutationAccess = await assertAgentIssueMutationAllowed(
-      req,
-      res,
-      existing,
-      { allowVisibleIssueWrite: true },
-    );
+    // Cross-company: the double-key helper + field guard above ARE the
+    // authorization. assertAgentIssueMutationAllowed / decide() hard-deny any
+    // foreign-company agent (deny_company_boundary), so they are skipped here.
+    const issueMutationAccess = crossCompanyPatch
+      ? true
+      : await assertAgentIssueMutationAllowed(
+          req,
+          res,
+          existing,
+          { allowVisibleIssueWrite: true },
+        );
     if (!issueMutationAccess) return;
-    const issueMutationAuthorizationReason = req.actor.type === "agent"
-      ? issueWriteAuthorizationReason(req, await decideIssueAccess(req, existing, "issue:mutate"))
-      : issueWriteAuthorizationReason(req, true);
+    const issueMutationAuthorizationReason = crossCompanyPatch
+      ? issueWriteAuthorizationReason(req, true)
+      : req.actor.type === "agent"
+        ? issueWriteAuthorizationReason(req, await decideIssueAccess(req, existing, "issue:mutate"))
+        : issueWriteAuthorizationReason(req, true);
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
 
     const actor = getActorInfo(req);
@@ -11348,9 +11476,10 @@ export function issueRoutes(
 
   router.get("/issues/:id/comments", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await getAccessibleResource(req, res, getIssueById(req, id), "Issue not found");
-    if (!issue) return;
-    if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    const resolved = await getIssueWithCrossCompany(req, res, id, "comments.list");
+    if (!resolved) return;
+    const { issue } = resolved;
+    if (!resolved.crossCompany && !(await assertIssueReadAllowed(req, res, issue))) return;
     const afterCommentId =
       typeof req.query.after === "string" && req.query.after.trim().length > 0
         ? req.query.after.trim()
@@ -12413,8 +12542,27 @@ export function issueRoutes(
     const id = req.params.id as string;
     // See PATCH route — back-fill orphan-checkout state up front.
     await svc.clearOrphanCheckoutLocksIfTerminal(id);
-    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
-    if (!issue) return;
+    const resolvedComment = await getIssueWithCrossCompany(req, res, id, "comment.create");
+    if (!resolvedComment) return;
+    const issue = resolvedComment.issue;
+    const crossCompanyComment = resolvedComment.crossCompany;
+    if (crossCompanyComment) {
+      // Cross-company comments are plain comments only: no reopen/resume/
+      // interrupt, no attachment binding, no implicit status move.
+      if (
+        req.body.reopen === true ||
+        req.body.resume === true ||
+        req.body.interrupt === true ||
+        (Array.isArray(req.body.attachmentIds) && req.body.attachmentIds.length > 0)
+      ) {
+        res.status(422).json({ error: "Cross-company comments cannot reopen, resume, interrupt or attach assets" });
+        return;
+      }
+    }
+    if (crossCompanyComment && resolvedComment.marker && typeof req.body.body === "string") {
+      // M8: host-written marker on every cross-company comment.
+      req.body.body = withCrossCompanyMarker(resolvedComment.marker, req.body.body);
+    }
     if (req.actor.type === "agent" && req.body.onBehalfOfUserId != null) {
       await auditAgentIssueCommentAttributionSpoof({
         db,
@@ -12429,7 +12577,8 @@ export function issueRoutes(
     if (!assertNoSecretPatternInWritePayload(req, res, [
       { name: "body", value: req.body.body },
     ], { issueId: issue.id, companyId: issue.companyId })) return;
-    const commentAccessDecision = await assertAgentIssueCommentAllowed(req, res, issue);
+    // Cross-company: double-key helper is the authorization (decide() hard-denies foreign agents).
+    const commentAccessDecision = crossCompanyComment ? true : await assertAgentIssueCommentAllowed(req, res, issue);
     if (!commentAccessDecision) return;
     const commentAuthorizationReason = issueWriteAuthorizationReason(req, commentAccessDecision);
     if (!assertStructuredCommentFieldsAllowed(req, res, {
@@ -12534,6 +12683,7 @@ export function issueRoutes(
       actorId: actor.actorId,
     });
     const effectiveMoveToTodoRequested =
+      !crossCompanyComment &&
       !assigneeSelfCommentOnTerminal &&
       (explicitMoveToTodoRequested ||
         shouldImplicitlyMoveCommentedIssueToTodo({
