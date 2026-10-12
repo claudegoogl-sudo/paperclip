@@ -130,7 +130,7 @@ describe("approval create rejects contentless payloads", () => {
 
     const res = await request(agentApp)
       .post("/api/companies/company-1/approvals")
-      .send({ type: "request_board_approval", payload: { note: null } });
+      .send({ type: "approve_ceo_strategy", payload: { note: null } });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(mockApprovalService.create).toHaveBeenCalledWith(
@@ -146,7 +146,7 @@ describe("approval create rejects contentless payloads", () => {
       .post("/api/companies/company-1/approvals")
       .send({
         type: "request_board_approval",
-        payload: { title: "Approve hosting spend" },
+        payload: { title: "Approve hosting spend", summary: "Monthly hosting renewal." },
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);

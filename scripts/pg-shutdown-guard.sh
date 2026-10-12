@@ -235,15 +235,30 @@ pg_guard_wait_clean() {
   done
 }
 
+# pg_guard__override_reason_ok — an override (PG_GUARD_ALLOW_ACTIVE_RUNS=1 or
+# PG_GUARD_ALLOW_UNREACHABLE=1) must carry a non-blank PG_GUARD_OVERRIDE_REASON
+# so the audit log says why. Empty or whitespace-only reason -> refuse (1).
+pg_guard__override_reason_ok() {
+  if [ "${PG_GUARD_ALLOW_ACTIVE_RUNS:-0}" = "1" ] || [ "${PG_GUARD_ALLOW_UNREACHABLE:-0}" = "1" ]; then
+    local reason="${PG_GUARD_OVERRIDE_REASON:-}"
+    if [ -z "${reason//[[:space:]]/}" ]; then
+      pg_guard_warn "REASON: override refused — PG_GUARD_ALLOW_ACTIVE_RUNS/PG_GUARD_ALLOW_UNREACHABLE is set but PG_GUARD_OVERRIDE_REASON is empty; state why you override"
+      return 1
+    fi
+  fi
+  return 0
+}
+
 # pg_guard_active_runs — fail (exit 3) when heartbeat runs are queued/running,
 # unless PG_GUARD_ALLOW_ACTIVE_RUNS=1 with a stated reason.
 pg_guard_active_runs() {
   local company_id company_name payload count=0 r
+  pg_guard__override_reason_ok || return 3
   # Token goes to curl on stdin via pg_guard__req, never in argv.
   if ! pg_guard__load_token >/dev/null 2>&1; then
     pg_guard_warn "REASON: no board token at $PG_GUARD_TOKEN_FILE — cannot check for active runs"
     if [ "${PG_GUARD_ALLOW_UNREACHABLE:-0}" = "1" ]; then
-      pg_guard_info "proceeding without run check — override reason: ${PG_GUARD_OVERRIDE_REASON:-unstated}"
+      pg_guard_info "proceeding without run check — override reason: ${PG_GUARD_OVERRIDE_REASON}"
       return 0
     fi
     return 3
@@ -254,7 +269,7 @@ pg_guard_active_runs() {
   case "$(pg_guard__code "$r")" in 2??) companies="$(pg_guard__body "$r")" ;; *) false ;; esac || {
     pg_guard_warn "REASON: could not list companies at $PG_GUARD_API_BASE — active-run check not possible"
     if [ "${PG_GUARD_ALLOW_UNREACHABLE:-0}" = "1" ]; then
-      pg_guard_info "proceeding without run check — override reason: ${PG_GUARD_OVERRIDE_REASON:-unstated}"
+      pg_guard_info "proceeding without run check — override reason: ${PG_GUARD_OVERRIDE_REASON}"
       return 0
     fi
     return 3
@@ -275,7 +290,7 @@ pg_guard_active_runs() {
   if [ "$count" -gt 0 ]; then
     pg_guard_warn "REASON: $count heartbeat run(s) queued/running — stopping the service now would abort them"
     if [ "${PG_GUARD_ALLOW_ACTIVE_RUNS:-0}" = "1" ]; then
-      pg_guard_info "proceeding despite active runs — override reason: ${PG_GUARD_OVERRIDE_REASON:-unstated}"
+      pg_guard_info "proceeding despite active runs — override reason: ${PG_GUARD_OVERRIDE_REASON}"
       return 0
     fi
     pg_guard_info "refusing (set PG_GUARD_ALLOW_ACTIVE_RUNS=1 with PG_GUARD_OVERRIDE_REASON to document an override)"
@@ -402,6 +417,7 @@ pg_guard_drain_release() {
 # pg_guard_drain — see the block comment above. 0 = no running runs (hold kept),
 # 3 = timeout / interrupted / API problem (hold cleared).
 pg_guard_drain() {
+  pg_guard__override_reason_ok || return 3
   if [ "${PG_GUARD_ALLOW_ACTIVE_RUNS:-0}" = "1" ]; then
     pg_guard_active_runs; return $?   # override path is unchanged
   fi

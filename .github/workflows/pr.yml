@@ -11,10 +11,26 @@ on:
       # check — the largest, riskiest merges (sync conflict resolution)
       # would ship with no CI signal at all.
       - 'sync/upstream-**'
+  # Merge queue. No `branches:` filter: the queue ref is
+  # refs/heads/gh-readonly-queue/<base>/..., so a `branches: [master]` filter
+  # would match nothing and the required `verify` check would never report.
+  merge_group:
+    types: [checks_requested]
 
+# PR runs share one group per PR number and cancel superseded pushes. Each
+# merge-queue entry gets its own group (keyed on the speculative head sha)
+# and is never cancelled, so sibling queue entries cannot cancel each other.
 concurrency:
-  group: pr-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: pr-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'merge_group' }}
+
+# Event-agnostic diff range for every diff-based guard below. On
+# pull_request these are the PR base/head; on merge_group they are the queue
+# entry's base (the queue's base ref tip) and its speculative merge commit.
+# Steps read these from the environment; never template them into run: lines.
+env:
+  DIFF_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+  DIFF_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
 
 jobs:
   policy:
@@ -32,6 +48,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Show diff range
+        run: |
+          echo "event=$GITHUB_EVENT_NAME DIFF_BASE_SHA=$DIFF_BASE_SHA DIFF_HEAD_SHA=$DIFF_HEAD_SHA"
+          echo "merge-base(origin/master, DIFF_HEAD_SHA)=$(git merge-base origin/master "$DIFF_HEAD_SHA" || echo n/a)"
+
       # The lockfile is CI-owned, so PRs may not hand-edit pnpm-lock.yaml. Two
       # exemptions: `chore/refresh-lockfile` (the dedicated refresh branch) and
       # `sync/upstream-*` branches produced by the upstream-sync routine —
@@ -39,14 +60,18 @@ jobs:
       # pnpm-lock.yaml, and the verify/build/e2e jobs install with
       # --frozen-lockfile, so the matching lockfile MUST travel with the sync.
       - name: Block manual lockfile edits
+        # PR-only: a queued lockfile-refresh PR carries pnpm-lock.yaml by
+        # design and head_ref is empty on merge_group, so the exemptions
+        # below cannot apply there. The PR run already enforced this.
         if: >-
+          github.event_name == 'pull_request' &&
           github.head_ref != 'chore/refresh-lockfile' &&
           !startsWith(github.head_ref, 'sync/upstream-') &&
           github.event.pull_request.user.login != 'dependabot[bot]'
         run: |
           # Diff the PR branch against its merge base so recent base-branch commits
           # do not masquerade as changes made by the PR itself.
-          changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")"
+          changed="$(git diff --name-only "$DIFF_BASE_SHA...$DIFF_HEAD_SHA")"
           if printf '%s\n' "$changed" | grep -qx 'pnpm-lock.yaml'; then
             echo "Do not commit pnpm-lock.yaml in pull requests. CI owns lockfile updates."
             exit 1
@@ -66,8 +91,8 @@ jobs:
       - name: Validate migration ordering against target branch
         run: >-
           node .github/scripts/check-pr-migration-order.mjs
-          "${{ github.event.pull_request.base.sha }}"
-          "${{ github.event.pull_request.head.sha }}"
+          "$DIFF_BASE_SHA"
+          "$DIFF_HEAD_SHA"
 
       - name: Validate Dockerfile deps stage
         run: node ./scripts/check-docker-deps-stage.mjs
@@ -124,6 +149,7 @@ jobs:
       # link, an agent:// link, or a localhost/private-IP deep link into the
       # instance UI. Scoped to added lines only, base...head.
       - name: Reject internal/instance-local references added in this diff
+        # Deliberately PR-only: the PR run already scanned the same added lines.
         if: github.event_name == 'pull_request' && !startsWith(github.head_ref, 'sync/upstream-')
         env:
           # Pass GitHub context through env, never interpolated into the shell
@@ -131,8 +157,8 @@ jobs:
           # Actions script-injection shape and must not be templated near
           # attacker-controlled fields (head_ref, title, body). The script reads
           # PR_BASE_SHA/PR_HEAD_SHA.
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_SHA: ${{ env.DIFF_BASE_SHA }}
+          PR_HEAD_SHA: ${{ env.DIFF_HEAD_SHA }}
         run: node ./scripts/check-no-internal-ids.mjs
 
       # Upstream-sync superset branches re-introduce upstream's own tree as
@@ -147,7 +173,7 @@ jobs:
         if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'sync/upstream-')
         env:
           UPSTREAM_SYNC_BASE: 8e6edcdfa911151adba26be49a41cf5017b3aade
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_HEAD_SHA: ${{ env.DIFF_HEAD_SHA }}
         run: node ./scripts/check-no-internal-ids.mjs "$UPSTREAM_SYNC_BASE" "$PR_HEAD_SHA"
 
       - name: Test no-internal-ids check
@@ -161,13 +187,15 @@ jobs:
       # above), so it lives here in policy alongside the other diff-based
       # guards, in the same workflow as the packages/db build checks.
       - name: Reject content changes to released (append-only) migrations
-        if: github.event_name == 'pull_request'
+        # Also runs on merge_group: two PRs can each pass alone and conflict
+        # once combined (pairwise failure), which only the queue run sees.
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
         env:
           # Pass GitHub context through env rather than interpolating into the
           # shell line (canonical Actions script-injection shape). The script
           # reads PR_BASE_SHA/PR_HEAD_SHA.
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_SHA: ${{ env.DIFF_BASE_SHA }}
+          PR_HEAD_SHA: ${{ env.DIFF_HEAD_SHA }}
         run: node ./scripts/check-migrations-append-only.mjs
 
       - name: Test migrations append-only check
@@ -205,8 +233,8 @@ jobs:
 
       - name: Verify release package bootstrap for changed manifests
         run: |
-          mapfile -t changed_paths < <(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")
-          PAPERCLIP_RELEASE_BOOTSTRAP_BASE_SHA="${{ github.event.pull_request.base.sha }}" \
+          mapfile -t changed_paths < <(git diff --name-only "$DIFF_BASE_SHA...$DIFF_HEAD_SHA")
+          PAPERCLIP_RELEASE_BOOTSTRAP_BASE_SHA="$DIFF_BASE_SHA" \
             node ./scripts/check-release-package-bootstrap.mjs "${changed_paths[@]}"
 
       # Lockfile drift between the checked-out tree and pnpm-lock.yaml comes
@@ -225,7 +253,7 @@ jobs:
       - name: Detect lockfile drift by regenerating
         id: regen_lockfile
         run: |
-          changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")"
+          changed="$(git diff --name-only "$DIFF_BASE_SHA...$DIFF_HEAD_SHA")"
           manifest_pattern='(^|/)package\.json$|^pnpm-workspace\.yaml$|^\.npmrc$|^pnpmfile\.(cjs|js|mjs)$|^patches/'
           pr_lock_inputs=0
           if printf '%s\n' "$changed" | grep -Eq "$manifest_pattern"; then
@@ -532,6 +560,8 @@ jobs:
     # account is suspended. Release canary is still exercised on
     # push-to-master by .github/workflows/release.yml's verify_canary job,
     # so PR runs do not need this signal.
+    # Note: this workflow has no push trigger, so this job never runs here;
+    # it is not live coverage (follow-up: move or delete).
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     timeout-minutes: 20
