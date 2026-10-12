@@ -5328,6 +5328,9 @@ export function agentRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
+    // Fork policy: instructions are self-only for agent callers even when a grant allows
+    // configuration; the 1005.0 revision path would otherwise skip the protected-change guard.
+    assertNoCrossAgentAgentWrite(req, existing, "PUT /agents/:id/instructions-bundle/file");
     const entryFile = deriveBundleState(existing).entryFile;
     if (instructionPath(req.body.path) === entryFile) {
       assertExternalInstructionsAdmin(req, existing);
