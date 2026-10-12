@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { withSecretBindingAuditActor } from "./secret-binding-audit-actor.js";
 import { and, asc, desc, eq, gte, inArray, lt, max, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -2749,7 +2750,11 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
   }
 
   async function syncCredentialBindings(connection: typeof toolConnections.$inferSelect) {
-    await db
+    await withSecretBindingAuditActor(db, (executor) => syncCredentialBindingsWith(executor, connection));
+  }
+
+  async function syncCredentialBindingsWith(executor: Db, connection: typeof toolConnections.$inferSelect) {
+    await executor
       .delete(companySecretBindings)
       .where(
         and(
@@ -2773,7 +2778,7 @@ export function toolAccessService(db: Db, options: ToolAccessServiceOptions = {}
       })),
     ];
     if (bindings.length === 0) return;
-    await db.insert(companySecretBindings).values(bindings.map((ref) => ({
+    await executor.insert(companySecretBindings).values(bindings.map((ref) => ({
       companyId: connection.companyId,
       secretId: ref.secretId,
       targetType: "tool_connection" as const,

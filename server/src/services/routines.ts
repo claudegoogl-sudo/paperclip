@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { stampSecretBindingAuditActor } from "./secret-binding-audit-actor.js";
 import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lte, ne, not, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -1954,6 +1955,7 @@ export function routineService(
         createdByUserId: actor.userId ?? null,
       });
 
+      await stampSecretBindingAuditActor(secretDb);
       await secretDb.insert(companySecretBindings).values({
         companyId,
         secretId: secret.id,
