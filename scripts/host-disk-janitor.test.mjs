@@ -19,6 +19,8 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  shouldPrunePkgCaches,
+  isPkgManagerBusy,
   CONFIG,
   parseBackupTimestamp,
   classifyBackups,
@@ -1378,4 +1380,20 @@ test("(vi) any reference source read failure => worktree category deletes nothin
     for (const name of ["abandoned", "inbox-watchdog", "fork-drift"]) assert.ok(existsSync(path.join(sb.workDir, name)));
     rmSync(sb.home, { recursive: true, force: true });
   }
+});
+
+test("shouldPrunePkgCaches: disk threshold, size threshold, neither", () => {
+  const cfg = { PKG_CACHE_DISK_PCT: 80, PKG_CACHE_MAX_BYTES: 10 * 1024 ** 3 };
+  assert.equal(shouldPrunePkgCaches({ usePercent: 80, totalCacheBytes: 0 }, cfg).prune, true);
+  assert.equal(shouldPrunePkgCaches({ usePercent: 79, totalCacheBytes: 10 * 1024 ** 3 }, cfg).prune, false);
+  assert.equal(shouldPrunePkgCaches({ usePercent: 10, totalCacheBytes: 10 * 1024 ** 3 + 1 }, cfg).sizeHit, true);
+  assert.equal(shouldPrunePkgCaches({ usePercent: null, totalCacheBytes: 1 }, cfg).prune, false);
+});
+
+test("isPkgManagerBusy: same-uid npm/pnpm/npx only", () => {
+  assert.equal(isPkgManagerBusy([{ uid: 1, comm: "bash", args: ["bash"] }], 1), false);
+  assert.equal(isPkgManagerBusy([{ uid: 1, comm: "npm", args: ["npm", "ci"] }], 1), true);
+  assert.equal(isPkgManagerBusy([{ uid: 1, comm: "node", args: ["node", "/usr/lib/node_modules/npm/bin/npm-cli.js", "i"] }], 1), true);
+  assert.equal(isPkgManagerBusy([{ uid: 1, comm: "node", args: ["node", "/usr/bin/pnpm", "store"] }], 1), true);
+  assert.equal(isPkgManagerBusy([{ uid: 2, comm: "npm", args: ["npm"] }], 1), false);
 });
