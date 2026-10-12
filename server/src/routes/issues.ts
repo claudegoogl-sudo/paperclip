@@ -2970,8 +2970,10 @@ export function issueRoutes(
 
     // The counter transaction locks and validates the persisted run before it
     // derives the source issue. Never trust the API-key run header by itself.
+    // The run row lives in the ACTOR's company. For same-company writes that equals
+    // issue.companyId; for audited cross-company access it is the home company.
     const decision = await observeCrossIssueInfluence(db, {
-      companyId: issue.companyId,
+      companyId: req.actor.companyId ?? issue.companyId,
       runId: req.actor.runId,
       agentId: req.actor.agentId,
       responsibleUserId: req.actor.onBehalfOfUserId ?? null,
