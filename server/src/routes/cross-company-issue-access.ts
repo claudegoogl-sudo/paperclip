@@ -1,7 +1,7 @@
 import type { Request } from "express";
-import { and, eq } from "drizzle-orm";
+import { and, eq, gte, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, companies, companyMemberships, goals, issues, labels, principalPermissionGrants, projects } from "@paperclipai/db";
+import { activityLog, agents, companies, companyMemberships, goals, issues, labels, principalPermissionGrants, projects } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 
 /**
@@ -71,6 +71,10 @@ export interface CrossCompanyDeps {
   hasHomeGrant(homeCompanyId: string, agentId: string): Promise<boolean>;
   isTargetCompanyActive(companyId: string): Promise<boolean>;
   isLowTrust(req: Request, targetCompanyId: string): Promise<boolean>;
+  /** M10: allowed cross-company writes, counted from M9 audit rows in the DB. */
+  countWrites(agentId: string, since: Date, runId?: string | null): Promise<number>;
+  /** M8: display labels for the host-written marker. */
+  describeActor(agentId: string, homeCompanyId: string): Promise<{ agentName: string; homeKey: string }>;
   allowlist?: () => ReadonlySet<string>;
 }
 
@@ -103,7 +107,56 @@ export function dbCrossCompanyDeps(
       return rows[0]?.status === "active";
     },
     isLowTrust,
+    async countWrites(agentId, since, runId) {
+      const conds = [
+        eq(activityLog.action, "issue.cross_company_access"),
+        eq(activityLog.agentId, agentId),
+        gte(activityLog.createdAt, since),
+        sql`${activityLog.details}->>'outcome' = 'allowed'`,
+        sql`${activityLog.details}->>'mirror' = 'false'`,
+        sql`${activityLog.details}->>'op' in ('comment.create','issue.update')`,
+      ];
+      if (runId) conds.push(eq(activityLog.runId, runId));
+      const rows = await db.select({ n: sql<number>`count(*)::int` }).from(activityLog).where(and(...conds));
+      return Number(rows[0]?.n ?? 0);
+    },
+    async describeActor(agentId, homeCompanyId) {
+      const a = await db.select({ name: agents.name }).from(agents).where(eq(agents.id, agentId)).limit(1);
+      const c = await db.select({ key: companies.issuePrefix }).from(companies).where(eq(companies.id, homeCompanyId)).limit(1);
+      return { agentName: a[0]?.name ?? agentId, homeKey: c[0]?.key ?? homeCompanyId };
+    },
   };
+}
+
+/** M10 caps. */
+export const CROSS_COMPANY_WRITES_PER_RUN = 10;
+export const CROSS_COMPANY_WRITES_PER_HOUR = 60;
+
+export type CrossCompanyWriteCap = { ok: true } | { ok: false; scope: "run" | "hour" };
+
+export async function checkCrossCompanyWriteCap(
+  deps: Pick<CrossCompanyDeps, "countWrites">,
+  agentId: string,
+  runId: string | null,
+  now: Date = new Date(),
+): Promise<CrossCompanyWriteCap> {
+  if (runId && (await deps.countWrites(agentId, new Date(0), runId)) >= CROSS_COMPANY_WRITES_PER_RUN) {
+    return { ok: false, scope: "run" };
+  }
+  if ((await deps.countWrites(agentId, new Date(now.getTime() - 3_600_000))) >= CROSS_COMPANY_WRITES_PER_HOUR) {
+    return { ok: false, scope: "hour" };
+  }
+  return { ok: true };
+}
+
+/** M8: host-written provenance marker. Always prepended; client text is never trusted. */
+export function crossCompanyMarker(agentName: string, homeKey: string, runId: string | null): string {
+  const clean = (v: string) => v.replace(/[\r\n>\[\]]/g, " ").slice(0, 80);
+  return `> cross-company agent action — ${clean(agentName)} (${clean(homeKey)}), run ${runId ?? "none"} — not an operator decision`;
+}
+
+export function withCrossCompanyMarker(marker: string, body: string): string {
+  return `${marker}\n\n${body}`;
 }
 
 export async function decideCrossCompanyIssueAccess(

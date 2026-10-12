@@ -171,6 +171,9 @@ import {
   dbCrossCompanyDeps,
   recordCrossCompanyIssueAccess,
   checkCrossCompanyPatch,
+  checkCrossCompanyWriteCap,
+  crossCompanyMarker,
+  withCrossCompanyMarker,
   type CrossCompanyIssueOp,
   dbCrossCompanyPatchLookups,
 } from "./cross-company-issue-access.js";
@@ -3988,7 +3991,7 @@ export function issueRoutes(
     res: Response,
     id: string,
     op: CrossCompanyIssueOp,
-  ): Promise<{ issue: NonNullable<Awaited<ReturnType<typeof getIssueById>>>; crossCompany: boolean } | null> {
+  ): Promise<{ issue: NonNullable<Awaited<ReturnType<typeof getIssueById>>>; crossCompany: boolean; marker?: string } | null> {
     const issue = await getIssueById(req, id);
     if (issue && hasCompanyAccess(req, issue.companyId)) {
       assertCompanyAccess(req, issue.companyId);
@@ -3996,21 +3999,49 @@ export function issueRoutes(
     }
     if (issue && req.actor.type === "agent") {
       const decision = await decideCrossCompanyIssueAccess(req, issue.companyId, op, crossCompanyDeps);
-      if (decision.allowed) {
-        if (op === "issue.read" || op === "comments.list" || op === "comment.create") {
+      const auditBase = {
+        targetCompanyId: issue.companyId,
+        homeCompanyId: req.actor.companyId ?? "",
+        agentId: req.actor.agentId ?? "",
+        runId: req.actor.runId ?? null,
+        issueId: issue.id,
+        op,
+        method: req.method,
+        route: req.route?.path ?? req.path,
+      };
+      if (!decision.allowed) {
+        // M9: audited denies in both companies. `not_allowlisted` / `same_company`
+        // are ordinary-agent noise and intentionally NOT written to the DB.
+        if (
+          req.actor.agentId && req.actor.companyId &&
+          decision.reason !== "not_allowlisted" && decision.reason !== "same_company" && decision.reason !== "not_agent"
+        ) {
           await recordCrossCompanyIssueAccess((row) => logActivity(db, row), {
-            targetCompanyId: issue.companyId,
-            homeCompanyId: decision.homeCompanyId,
-            agentId: decision.agentId,
-            runId: req.actor.runId ?? null,
-            issueId: issue.id,
-            op,
-            method: req.method,
-            route: req.route?.path ?? req.path,
-            outcome: "allowed",
+            ...auditBase, outcome: "denied", reason: decision.reason,
           });
         }
-        return { issue, crossCompany: true };
+      } else {
+        const isWrite = op === "comment.create" || op === "issue.update";
+        if (isWrite) {
+          // M10: write caps counted from the audit rows.
+          const cap = await checkCrossCompanyWriteCap(crossCompanyDeps, decision.agentId, req.actor.runId ?? null);
+          if (!cap.ok) {
+            await recordCrossCompanyIssueAccess((row) => logActivity(db, row), {
+              ...auditBase, outcome: "denied", reason: `rate_limited:${cap.scope}`,
+            });
+            res.status(429).json({ error: "Cross-company write limit reached", scope: cap.scope });
+            return null;
+          }
+        }
+        if (op === "issue.read" || op === "comments.list" || op === "comment.create") {
+          await recordCrossCompanyIssueAccess((row) => logActivity(db, row), { ...auditBase, outcome: "allowed" });
+        }
+        let marker: string | undefined;
+        if (isWrite) {
+          const d = await crossCompanyDeps.describeActor(decision.agentId, decision.homeCompanyId);
+          marker = crossCompanyMarker(d.agentName, d.homeKey, req.actor.runId ?? null);
+        }
+        return { issue, crossCompany: true, marker };
       }
     }
     res.status(404).json({ error: "Issue not found" });
@@ -9553,6 +9584,10 @@ export function issueRoutes(
         res.status(422).json({ error: guard.error, field: guard.field });
         return;
       }
+      // M8: host-written marker on the PATCH comment; client text is never trusted.
+      if (typeof req.body.comment === "string" && req.body.comment.length > 0 && resolvedPatch.marker) {
+        req.body.comment = withCrossCompanyMarker(resolvedPatch.marker, req.body.comment);
+      }
     }
     if (!assertNoSecretPatternInWritePayload(req, res, [
       { name: "description", value: req.body.description },
@@ -12523,6 +12558,10 @@ export function issueRoutes(
         res.status(422).json({ error: "Cross-company comments cannot reopen, resume, interrupt or attach assets" });
         return;
       }
+    }
+    if (crossCompanyComment && resolvedComment.marker && typeof req.body.body === "string") {
+      // M8: host-written marker on every cross-company comment.
+      req.body.body = withCrossCompanyMarker(resolvedComment.marker, req.body.body);
     }
     if (req.actor.type === "agent" && req.body.onBehalfOfUserId != null) {
       await auditAgentIssueCommentAttributionSpoof({

@@ -4,6 +4,9 @@ import {
   decideCrossCompanyIssueAccess,
   parseCrossCompanyAllowlist,
   type CrossCompanyDeps,
+  checkCrossCompanyWriteCap,
+  crossCompanyMarker,
+  withCrossCompanyMarker,
 } from "../routes/cross-company-issue-access.js";
 
 const AGENT = "b30654b6-2c2f-48b9-b108-1e07e417996d";
@@ -21,6 +24,8 @@ function deps(over: Partial<CrossCompanyDeps> & { grants?: Array<[string, string
     hasHomeGrant: async (c, a) => grants.some(([gc, ga]) => gc === c && ga === a),
     isTargetCompanyActive: async () => true,
     isLowTrust: async () => false,
+    countWrites: async () => 0,
+    describeActor: async () => ({ agentName: "Concierge", homeKey: "HOME" }),
     ...over,
   };
 }
@@ -86,5 +91,23 @@ describe("cross-company issue access helper", () => {
     const other = "33333333-3333-4333-8333-333333333333";
     const d = await decideCrossCompanyIssueAccess(req({ agentId: other }), TARGET, "issue.read", deps({ grants: [[HOME, other]] }));
     expect(d).toEqual({ allowed: false, reason: "not_allowlisted" });
+  });
+
+  it("M10 write cap: 10 per run, 60 per hour, from counted audit rows", async () => {
+    const mk = (run: number, hour: number) => ({
+      countWrites: async (_a: string, since: Date, runId?: string | null) => (runId ? run : hour),
+    });
+    expect(await checkCrossCompanyWriteCap(mk(9, 59), AGENT, "r1")).toEqual({ ok: true });
+    expect(await checkCrossCompanyWriteCap(mk(10, 0), AGENT, "r1")).toEqual({ ok: false, scope: "run" });
+    expect(await checkCrossCompanyWriteCap(mk(0, 60), AGENT, "r1")).toEqual({ ok: false, scope: "hour" });
+    expect(await checkCrossCompanyWriteCap(mk(0, 60), AGENT, null)).toEqual({ ok: false, scope: "hour" });
+  });
+
+  it("M8 marker: host-written, sanitised, always prepended", () => {
+    const m = crossCompanyMarker("Conc\nierge]", "HO>ME", "run-1");
+    expect(m).not.toMatch(/[\n\]]/);
+    expect(m.startsWith("> cross-company agent action — ")).toBe(true);
+    expect(m).toContain("run run-1 — not an operator decision");
+    expect(withCrossCompanyMarker(m, "x").startsWith(m)).toBe(true);
   });
 });
