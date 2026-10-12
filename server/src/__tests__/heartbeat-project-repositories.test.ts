@@ -11,7 +11,7 @@ import { setExpensiveWorkspaceGitExecutor } from "@paperclipai/adapter-utils/git
 import { buildProjectMentionHref } from "@paperclipai/shared";
 import { createWorkspaceGitOperationScheduler, WorkspaceGitScanError } from "../services/workspace-git-operation-scheduler.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { heartbeatService } from "../services/heartbeat.ts";
+import { BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS, heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
@@ -273,14 +273,21 @@ suite("task project repository provisioning", () => {
     if (scenario === "exhausted") {
       await heartbeat.drainActiveRunExecutions();
       expect((await heartbeat.getRun(retry!.id))?.errorCode).toBe(code);
-      const [last] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, retry!.id));
-      expect(last).toMatchObject({ status: "scheduled_retry", scheduledRetryAttempt: 2 });
-      await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(Date.now() - 1000) }).where(eq(heartbeatRuns.id, last!.id));
-      await heartbeat.promoteDueScheduledRetries();
-      await heartbeat.resumeQueuedRuns();
-      await heartbeat.drainActiveRunExecutions();
-      expect((await heartbeat.getRun(last!.id))?.errorCode).toBe(code);
-      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(3);
+      // The bounded transient ladder (1005.0) runs BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length
+      // attempts; walk it to the end and prove the next promote creates no further run.
+      let current = retry!;
+      for (let attempt = 2; attempt <= BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length; attempt += 1) {
+        const [next] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, current.id));
+        expect(next).toMatchObject({ status: "scheduled_retry", scheduledRetryAttempt: attempt });
+        await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(Date.now() - 1000) }).where(eq(heartbeatRuns.id, next!.id));
+        await heartbeat.promoteDueScheduledRetries();
+        await heartbeat.resumeQueuedRuns();
+        await heartbeat.drainActiveRunExecutions();
+        expect((await heartbeat.getRun(next!.id))?.errorCode).toBe(code);
+        current = next!;
+      }
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, current.id))).toHaveLength(0);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(1 + BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length);
       expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]).toMatchObject({ status: "blocked", assigneeAgentId: agentId });
       expect(execute.mock.calls.filter(([input]) => input.agent.id === agentId)).toHaveLength(0);
       return;

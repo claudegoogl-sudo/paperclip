@@ -1264,7 +1264,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.retryOfRunId, runId))
         .then((rows) => rows[0] ?? null);
-      expect(retry).toMatchObject({ status: "queued", processLossRetryCount: 1 });
+      // 1005.0 schedules process-loss retries durably on the shared bounded ladder.
+      expect(retry).toMatchObject({ status: "scheduled_retry", scheduledRetryAttempt: 1 });
 
       const wakeup = await db
         .select()
@@ -1384,7 +1385,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       // invariant under test is that a retry run EXISTS for the interrupted
       // run and is progressing, not parked or failed.
       expect(retry?.retryOfRunId).toBe(runId);
-      expect(["queued", "running"]).toContain(retry?.status);
+      expect(["queued", "running", "scheduled_retry"]).toContain(retry?.status);
 
       const agent = await db
         .select({ status: agents.status, errorReason: agents.errorReason })

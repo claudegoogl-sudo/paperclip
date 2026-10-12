@@ -26538,7 +26538,7 @@ export function heartbeatService(
           usageBasis: adapterResult.usageBasis ?? null,
         });
         const normalizedUsage = sessionUsageResolution.normalizedUsage;
-        const runErrorMessage =
+        let runErrorMessage =
           outcome === "cancelled"
             ? (latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
             : outcome === "succeeded"
@@ -26550,7 +26550,7 @@ export function heartbeatService(
                 );
         const recordedResponsibleUserDenialCode =
           normalizeResponsibleUserDenialCode(latestRun?.errorCode);
-        const runErrorCode =
+        let runErrorCode =
           outcome === "timed_out"
             ? "timeout"
             : outcome === "cancelled"
@@ -26560,6 +26560,26 @@ export function heartbeatService(
                   recordedResponsibleUserDenialCode ??
                   "adapter_failed")
                 : null;
+
+        // A failure that lands while the server process is shutting down is a
+        // shutdown kill, not an adapter defect. During a shutdown wave the
+        // plugin workers are SIGTERMed and adapter streams die with non-zero
+        // exits (143) or stream errors; reclassify through the shared shutdown
+        // predicate before any terminal write so status, errorCode, stop
+        // metadata, agent status and the failure retry ladders all see the
+        // shutdown class. A genuine adapter error (no shutdown) is untouched.
+        if (outcome === "failed" && isRunKilledByServerShutdown({
+          // In-process signal only: this close path runs in the same process
+          // that dispatched the run, so a persisted boundary from an earlier
+          // process is never evidence about it.
+          inProgress: isServerShutdownInProgress(),
+        })) {
+          const shutdownSignal = currentShutdownSignal("SIGTERM");
+          outcome = "interrupted";
+          runErrorMessage =
+            `Interrupted by server shutdown (${shutdownSignal}) during adapter close; retry queued for restart recovery`;
+          runErrorCode = SERVER_SHUTDOWN_INTERRUPTED_ERROR_CODE;
+        }
 
         let logSummary: {
           bytes: number | null;
@@ -26594,9 +26614,11 @@ export function heartbeatService(
               ? "succeeded_dirty"
               : outcome === "cancelled"
                 ? "cancelled"
-                : outcome === "timed_out"
-                  ? "timed_out"
-                  : "failed";
+                : outcome === "interrupted"
+                  ? "interrupted"
+                  : outcome === "timed_out"
+                    ? "timed_out"
+                    : "failed";
         // Clear early on the first successful dispatch so a stale park set
         // from an earlier (possibly mis-parsed) reset time can never outlive a
         // quota that has, in fact, already recovered.
@@ -26790,6 +26812,19 @@ export function heartbeatService(
               persistedRun,
               persistedResultJson,
             )) ?? persistedRun;
+        }
+
+        // A run reclassified as server-shutdown-interrupted on the adapter close
+        // path gets the same restart-recovery retry as the drain and sweep paths.
+        if (
+          persistedRun &&
+          outcome === "interrupted" &&
+          runErrorCode === SERVER_SHUTDOWN_INTERRUPTED_ERROR_CODE
+        ) {
+          const shutdownRetry = await enqueueProcessLossRetry(persistedRun, agent, new Date());
+          if (!shutdownRetry) {
+            await releaseIssueExecutionAndPromote(persistedRun);
+          }
         }
 
         await setWakeupStatus(
