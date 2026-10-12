@@ -1,5 +1,6 @@
 import { isInsufficientConnectionScope, INSUFFICIENT_CONNECTION_SCOPE_MESSAGE } from "./connection-permission-errors.js";
 import { BROWSER_USE_TOOLS } from "@paperclipai/shared";
+import { stampSecretBindingAuditActor, withSecretBindingAuditActor } from "./secret-binding-audit-actor.js";
 import { browserUseClient, isBrowserUseConnection } from "./browser-use-client.js";
 import { browserUseService } from "./browser-use.js";
 import { COGNEE_STDIO_TEMPLATE, cogneeCloudUrl } from "./cognee-connection.js";
@@ -5868,6 +5869,16 @@ export function toolAccessService(
     grantSecretRefs: ToolCredentialSecretRef[] = [],
     dbClient: ToolAccessMutationDb = db,
   ) {
+    // Record the request actor in company_secret_binding_posture_audit.actor: wrap
+    // the writes in a transaction when running on the bare db, or stamp the caller's
+    // open transaction otherwise.
+    if (dbClient === db) {
+      await withSecretBindingAuditActor(db, (executor) =>
+        syncConnectionCredentialBindings(executor, connection, grantSecretRefs, executor),
+      );
+      return;
+    }
+    await stampSecretBindingAuditActor(dbClient);
     await syncConnectionCredentialBindings(db, connection, grantSecretRefs, dbClient);
   }
 

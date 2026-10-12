@@ -1,4 +1,5 @@
 import { verifyAppWebhook } from "./app-webhook.js";
+import { stampSecretBindingAuditActor } from "./secret-binding-audit-actor.js";
 import crypto from "node:crypto";
 import { verifyFirefliesWebhook } from "./fireflies-webhook.js";
 import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lte, ne, not, or, sql } from "drizzle-orm";
@@ -1973,6 +1974,7 @@ export function routineService(
         createdByUserId: actor.userId ?? null,
       });
 
+      await stampSecretBindingAuditActor(secretDb);
       await secretDb.insert(companySecretBindings).values({
         companyId,
         secretId: secret.id,
