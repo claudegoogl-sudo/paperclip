@@ -192,6 +192,14 @@ function classifyMerge({ tag, base, git: gitImpl = git }) {
 // Pure selection: given the array returned by the pulls list endpoint, pick the
 // open PR whose head is our sync branch on the fork. GitHub's `head` filter is
 // already scoped, but we re-check defensively (state + ref + fork owner).
+// Matches the base branch or a fold round `<branch>-r<digits>`.
+function isSyncHeadRef(ref, branch) {
+  if (typeof ref !== "string") return false;
+  if (ref === branch) return true;
+  if (!ref.startsWith(`${branch}-r`)) return false;
+  return /^\d+$/.test(ref.slice(branch.length + 2));
+}
+
 function pickOpenSyncPr(prs, branch) {
   if (!Array.isArray(prs)) return null;
   return (
@@ -200,7 +208,7 @@ function pickOpenSyncPr(prs, branch) {
         pr &&
         pr.state === "open" &&
         pr.head &&
-        pr.head.ref === branch &&
+        isSyncHeadRef(pr.head.ref, branch) &&
         (!pr.head.repo || !pr.head.repo.owner || pr.head.repo.owner.login === FORK_OWNER),
     ) ?? null
   );
@@ -212,10 +220,9 @@ function pickOpenSyncPr(prs, branch) {
 // injectable for unit tests.
 async function findOpenSyncPr(branch, { token = process.env.GITHUB_TOKEN, fetchImpl = fetch } = {}) {
   if (!token) return null;
-  const head = `${FORK_OWNER}:${branch}`;
   const url =
     `https://api.github.com/repos/${FORK_OWNER}/${FORK_REPO}/pulls` +
-    `?head=${encodeURIComponent(head)}&base=${FORK_BASE_BRANCH}&state=open`;
+    `?base=${FORK_BASE_BRANCH}&state=open&per_page=100`;
   const res = await fetchImpl(url, {
     headers: {
       "User-Agent": `${FORK_OWNER}-upstream-sync`,
