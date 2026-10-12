@@ -83,6 +83,9 @@ export default defineConfig({
     stderr: "pipe",
     env: {
       ...process.env,
+      // The fork's host-wide run ceiling defaults to half the vCPUs; the e2e suites run several agents
+      // at once, so pin a ceiling that does not depend on the runner size.
+      PAPERCLIP_MAX_CONCURRENT_RUNS_HOST: process.env.PAPERCLIP_MAX_CONCURRENT_RUNS_HOST ?? "8",
       NODE_ENV: "test",
       PAPERCLIP_UI_DEV_MIDDLEWARE: "false",
       NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${path.resolve(import.meta.dirname, "fixtures/agent-chat-github.mjs")}`,

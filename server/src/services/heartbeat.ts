@@ -26485,10 +26485,19 @@ export function heartbeatService(
         await processCancellation?.settled;
         let outcome: RunSessionOutcome;
         const latestRun = await getRun(run.id);
-        // An externally reaped `interrupted` row must not pin the outcome: the
+        // A shutdown-reaped `interrupted` row must not pin the outcome of a clean exit: the
         // worker's own positive completion wins via
         // persistRunCompletionAfterExternalInterrupt (CAS on status='interrupted').
-        if (isHeartbeatRunTerminalStatus(latestRun?.status) && latestRun.status !== "interrupted") {
+        if (
+          isHeartbeatRunTerminalStatus(latestRun?.status) &&
+          !(
+            latestRun.status === "interrupted" &&
+            latestRun.errorCode === SERVER_SHUTDOWN_INTERRUPTED_ERROR_CODE &&
+            (adapterResult.exitCode ?? 0) === 0 &&
+            !adapterResult.errorMessage &&
+            !adapterResult.signal
+          )
+        ) {
           outcome = latestRun.status;
         } else if (executionControl.controller.signal.aborted) {
           outcome = "cancelled";

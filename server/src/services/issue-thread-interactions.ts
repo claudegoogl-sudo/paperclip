@@ -584,17 +584,21 @@ function isUserCommentSupersedableKind(
 }
 
 function isIssueThreadInteractionIdempotencyConflict(error: unknown): boolean {
-  if (typeof error !== "object" || error === null) return false;
-  const err = error as {
-    code?: string;
-    constraint?: string;
-    constraint_name?: string;
-  };
-  const constraint = err.constraint ?? err.constraint_name;
-  return (
-    err.code === "23505" &&
-    constraint === ISSUE_THREAD_INTERACTION_IDEMPOTENCY_CONSTRAINT
-  );
+  // drizzle wraps driver errors in a query error whose `cause` carries the
+  // postgres code/constraint; walk the cause chain.
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && typeof current === "object" && current !== null; depth += 1) {
+    const err = current as {
+      code?: string;
+      constraint?: string;
+      constraint_name?: string;
+      cause?: unknown;
+    };
+    const constraint = err.constraint ?? err.constraint_name;
+    if (err.code === "23505" && constraint === ISSUE_THREAD_INTERACTION_IDEMPOTENCY_CONSTRAINT) return true;
+    current = err.cause;
+  }
+  return false;
 }
 
 function isEquivalentCreateRequest(

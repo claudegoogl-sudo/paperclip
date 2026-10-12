@@ -1283,8 +1283,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .from(agents)
         .where(eq(agents.id, agentId))
         .then((rows) => rows[0] ?? null);
-      expect(agent?.status).toBe("error");
-      expect(agent?.errorReason).toContain("Interrupted by server shutdown (SIGTERM)");
+      // 1005.0 keeps the agent idle while the durable restart retry is pending; the shutdown
+      // reason lives on the run row and the lifecycle event, not as an agent error.
+      expect(agent?.status).toBe("idle");
 
       // The boundary marker is consumed by the reap.
       expect(await readLastServerShutdownBoundary(home)).toBeNull();
@@ -1395,8 +1396,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       // Same agent-status shape as a drain-interrupted run: parked in error
       // with the shutdown message, so operators see why (parity with today's
       // server_shutdown_interrupted handling).
-      expect(agent?.status).toBe("error");
-      expect(agent?.errorReason).toContain("Interrupted by server shutdown (SIGTERM)");
+      // 1005.0 keeps the agent idle while the durable restart retry is pending; the shutdown
+      // reason lives on the run row and the lifecycle event, not as an agent error.
+      expect(agent?.status).toBe("idle");
     });
   });
 
@@ -1455,12 +1457,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(lease?.releasedAt).toBeTruthy();
   });
 
-  it.skipIf(process.platform === "win32")("reaps orphaned descendant process groups when the parent pid is already gone", async () => {
+  it.skipIf(process.platform === "win32")("does not signal a live untracked process group when the parent pid is already gone (1005.0 ownership rule)", async () => {
+    // 1005.0 treats a persisted pid/group as proof that SOME process is alive, not that Paperclip
+    // owns it (pid reuse). It marks the run detached and never signals or finalizes it, so an
+    // operator decides. The fork's earlier descendant reap is intentionally not carried over.
     const orphan = await spawnOrphanedProcessGroup();
     cleanupPids.add(orphan.descendantPid);
     expect(isPidAlive(orphan.descendantPid)).toBe(true);
 
-    const { agentId, runId, issueId } = await seedRunFixture({
+    const { agentId, runId } = await seedRunFixture({
       agentStatus: "idle",
       processPid: orphan.processPid,
       processGroupId: orphan.processGroupId,
@@ -1468,42 +1473,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reapOrphanedRuns();
-    expect(result.reaped).toBe(1);
-    expect(result.runIds).toEqual([runId]);
+    expect(result.reaped).toBe(0);
+    expect(isPidAlive(orphan.descendantPid)).toBe(true);
 
-    expect(await waitForPidExit(orphan.descendantPid, 2_000)).toBe(true);
-
-    const runs = await db
-      .select()
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.agentId, agentId));
-    expect(runs).toHaveLength(2);
-
-    const failedRun = runs.find((row) => row.id === runId);
-    expect(failedRun?.status).toBe("failed");
-    expect(failedRun?.errorCode).toBe("process_lost");
-    expect(failedRun?.error).toContain("descendant process group");
-    expect(failedRun?.resultJson).toMatchObject({
-      stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
-      unmanagedBackgroundTask: {
-        kind: "orphaned_process_group_cleanup",
-        stopped: true,
-        stopReason: UNMANAGED_BACKGROUND_TASK_STOP_REASON,
-        reason: UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON,
-        processPid: orphan.processPid,
-        processGroupId: orphan.processGroupId,
-      },
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    expect(runs.find((row) => row.id === runId)).toMatchObject({
+      status: "running",
+      errorCode: "process_detached",
     });
-
-    const retryRun = runs.find((row) => row.id !== runId);
-    expect(["queued", "running"]).toContain(retryRun?.status);
-
-    const issue = await db
-      .select()
-      .from(issues)
-      .where(eq(issues.id, issueId))
-      .then((rows) => rows[0] ?? null);
-    expect(issue?.executionRunId).toBe(retryRun?.id ?? null);
   });
 
 });

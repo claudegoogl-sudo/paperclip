@@ -56,7 +56,11 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
+  const previousHostCeiling = process.env.PAPERCLIP_MAX_CONCURRENT_RUNS_HOST;
   beforeAll(async () => {
+    // The fork's host-wide run ceiling defaults to the vCPU count; this suite occupies an extra
+    // running row to inspect admission, so pin a ceiling that does not depend on the CI runner size.
+    process.env.PAPERCLIP_MAX_CONCURRENT_RUNS_HOST = "8";
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-queued-comments-");
     db = createDb(tempDb.connectionString);
   }, 30_000);
@@ -75,6 +79,8 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
   });
 
   afterAll(async () => {
+    if (previousHostCeiling === undefined) delete process.env.PAPERCLIP_MAX_CONCURRENT_RUNS_HOST;
+    else process.env.PAPERCLIP_MAX_CONCURRENT_RUNS_HOST = previousHostCeiling;
     await tempDb?.cleanup();
   });
 
@@ -443,6 +449,15 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     await request(client).post(`/api/issues/${seeded.issueId}/queued-comments/interrupt`)
       .send({ queueId: seeded.wakeId, targetRunId: seeded.runId, revision: queue.body.revision }).expect(200);
     runningProcesses.delete(seeded.runId);
+    // The fork refuses to signal a persisted pid without verified process identity, so the fixture
+    // plays the provider teardown itself; a signalled child stays a live pid until node reaps it.
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 5_000);
+        child.once("exit", () => { clearTimeout(timer); resolve(); });
+      });
+    }
     await heartbeatService(db).resumeQueuedCommentInterrupt(seeded.companyId, seeded.wakeId);
     const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.wakeId));
     expect(["queued", "coalesced"]).toContain(wake.status);
