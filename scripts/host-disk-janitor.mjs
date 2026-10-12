@@ -74,6 +74,7 @@ import {
   unlinkSync,
   mkdirSync,
   writeFileSync,
+  statfsSync,
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -1491,6 +1492,60 @@ export async function fileDiskAlarmIssue({
 }
 
 // ---------------------------------------------------------------------------
+// Real-freed accounting (df delta + link-count aware sizes)
+// ---------------------------------------------------------------------------
+
+/** Filesystem free bytes (available to unprivileged users) via statvfs, or null. */
+export function fsFreeBytes(p, statfs = statfsSync) {
+  try {
+    const st = statfs(p);
+    return Number(st.bavail) * Number(st.bsize);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Bytes that deleting `files` would actually return to the filesystem.
+ * `files` is `[{ ino, dev, nlink, sizeBytes }]` (lstat fields). An inode is
+ * counted only when every one of its links is inside the deletion set, i.e.
+ * its link count drops to 0. Hardlinks shared with surviving paths (pnpm
+ * stores, cp -al trees) contribute nothing. Open-but-deleted files still pin
+ * space; only the df delta can see that.
+ */
+export function releasableBytes(files) {
+  const seen = new Map();
+  for (const f of files) {
+    const key = `${f.dev}:${f.ino}`;
+    const cur = seen.get(key) || { count: 0, nlink: f.nlink, sizeBytes: f.sizeBytes };
+    cur.count += 1;
+    seen.set(key, cur);
+  }
+  let total = 0;
+  for (const v of seen.values()) if (v.count >= v.nlink) total += v.sizeBytes;
+  return total;
+}
+
+/** lstat-based inode records for releasableBytes(); missing paths skipped. */
+export function inodeRecords(paths, lstat = lstatSync) {
+  const out = [];
+  for (const p of paths) {
+    try {
+      const st = lstat(p);
+      out.push({ dev: st.dev, ino: st.ino, nlink: st.nlink, sizeBytes: st.size });
+    } catch {
+      // gone -- contributes nothing
+    }
+  }
+  return out;
+}
+
+export function formatDfDelta(before, after) {
+  if (before === null || after === null) return "df delta: unavailable (statvfs failed)";
+  return `df delta: free ${bytesToHuman(before)} -> ${bytesToHuman(after)} (${after - before >= 0 ? "+" : "-"}${bytesToHuman(Math.abs(after - before))} real)`;
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -1498,11 +1553,12 @@ function parseArgs(argv) {
   return {
     apply: argv.includes("--apply"),
     json: argv.includes("--json"),
+    only: (argv.find((a) => a.startsWith("--only=")) || "").slice("--only=".length) || null,
   };
 }
 
 function bytesToHuman(bytes) {
-  if (bytes === 0) return "0B";
+  if (!bytes || bytes <= 0) return "0B";
   const units = ["B", "KB", "MB", "GB", "TB"];
   const exp = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
   return `${(bytes / 1024 ** exp).toFixed(2)}${units[exp]}`;
@@ -1518,6 +1574,58 @@ function statSize(p) {
 
 function dirSizeBytes(p) {
   return collectFiles(p).reduce((sum, f) => sum + f.sizeBytes, 0) + statSize(p);
+}
+
+/** Backup retention rule (shared by full runs and --only=backups). */
+function runBackups(summary, { apply, config }) {
+  {
+    const dirExists = existsSync(config.BACKUPS_DIR);
+    const rawEntries = dirExists
+      ? readdirSync(config.BACKUPS_DIR, { withFileTypes: true })
+          .filter((e) => e.isFile())
+          .map((e) => {
+            const fullPath = path.join(config.BACKUPS_DIR, e.name);
+            return { name: e.name, sizeBytes: statSize(fullPath), fullPath };
+          })
+      : [];
+    // Populate `verified` from disk so classifyBackups stays pure. .sql.gz is
+    // the only shape we treat as a backup candidate; only those need an ISIZE
+    // probe (cheap: 4 bytes per file).
+    const entries = rawEntries.map((e) =>
+      e.name.endsWith(".sql.gz") && !e.name.endsWith(".partial")
+        ? { ...e, verified: isArchiveVerified(e.fullPath) }
+        : e,
+    );
+    const { keep, prune, unrecognized, unverified } = classifyBackups(entries, config);
+    // Link-count aware: only inodes whose last link is in the delete set free space.
+    const releasable = releasableBytes(
+      inodeRecords([...unverified, ...prune].map((e) => e.fullPath || path.join(config.BACKUPS_DIR, e.name))),
+    );
+    if (apply) {
+      // Delete unverified and pruned files
+      for (const e of [...unverified, ...prune]) {
+        try {
+          unlinkSync(path.join(config.BACKUPS_DIR, e.name));
+        } catch {
+          // already gone -- idempotent
+        }
+      }
+    }
+    summary.categories.backups = {
+      totalFiles: entries.length,
+      keptFiles: keep.length,
+      prunedFiles: prune.length,
+      unrecognizedFiles: unrecognized.length,
+      unverifiedFiles: unverified.length,
+      reclaimedBytes: releasable,
+      summedBytes: [...unverified, ...prune].reduce((sum, e) => sum + e.sizeBytes, 0),
+      prunedNames: prune.map((e) => e.name),
+      unverifiedNames: unverified.map((e) => e.name),
+      // Full paths, so the log alone attributes every deletion (so the log alone attributes every deletion).
+      prunedPaths: [...unverified, ...prune].map((e) => e.fullPath || path.join(config.BACKUPS_DIR, e.name)),
+      unverifiedPaths: unverified.map((e) => e.fullPath || path.join(config.BACKUPS_DIR, e.name)),
+    };
+  }
 }
 
 
@@ -1562,12 +1670,6 @@ export function listProcs(procDir = "/proc") {
   return out;
 }
 
-export function dfUsedBytes(diskPath) {
-  const out = execFileSync("df", ["-kP", diskPath], { encoding: "utf8" }).trim().split("\n");
-  const f = out[out.length - 1].trim().split(/\s+/);
-  return Number(f[2]) * 1024;
-}
-
 function resolvePnpmStore(config) {
   if (config.PNPM_STORE_DIR) return config.PNPM_STORE_DIR;
   try {
@@ -1583,8 +1685,23 @@ export async function run({
   config = CONFIG,
   loadRegistered = loadRegisteredPackagePaths,
   loadReferences = loadReferencedPaths,
+  only = null,
+  statfs = statfsSync,
 } = {}) {
-  const summary = { mode: apply ? "apply" : "dry-run", timestamp: new Date(nowMs).toISOString(), categories: {} };
+  if (only !== null && only !== "backups") throw new Error(`unsupported --only=${only} (supported: backups)`);
+  const summary = { mode: apply ? "apply" : "dry-run", only, timestamp: new Date(nowMs).toISOString(), categories: {} };
+  const dfPath = config.DISK_ALARM_PATH || "/";
+  summary.df = { path: dfPath, freeBefore: fsFreeBytes(dfPath, statfs) };
+  const finishDf = () => {
+    summary.df.freeAfter = fsFreeBytes(dfPath, statfs);
+    summary.df.deltaBytes =
+      summary.df.freeBefore === null || summary.df.freeAfter === null ? null : summary.df.freeAfter - summary.df.freeBefore;
+  };
+  if (only === "backups") {
+    runBackups(summary, { apply, config });
+    finishDf();
+    return summary;
+  }
 
   // -- DB-registered plugin install roots (the 2026-09-09 live-deploy reap fix) --
   // Loaded once, up front: the worktree AND /tmp categories both consult it.
@@ -1612,49 +1729,7 @@ export async function run({
   };
 
   // -- backups --
-  {
-    const dirExists = existsSync(config.BACKUPS_DIR);
-    const rawEntries = dirExists
-      ? readdirSync(config.BACKUPS_DIR, { withFileTypes: true })
-          .filter((e) => e.isFile())
-          .map((e) => {
-            const fullPath = path.join(config.BACKUPS_DIR, e.name);
-            return { name: e.name, sizeBytes: statSize(fullPath), fullPath };
-          })
-      : [];
-    // Populate `verified` from disk so classifyBackups stays pure. .sql.gz is
-    // the only shape we treat as a backup candidate; only those need an ISIZE
-    // probe (cheap: 4 bytes per file).
-    const entries = rawEntries.map((e) =>
-      e.name.endsWith(".sql.gz") && !e.name.endsWith(".partial")
-        ? { ...e, verified: isArchiveVerified(e.fullPath) }
-        : e,
-    );
-    const { keep, prune, unrecognized, unverified } = classifyBackups(entries, config);
-    if (apply) {
-      // Delete unverified and pruned files
-      for (const e of [...unverified, ...prune]) {
-        try {
-          unlinkSync(path.join(config.BACKUPS_DIR, e.name));
-        } catch {
-          // already gone -- idempotent
-        }
-      }
-    }
-    summary.categories.backups = {
-      totalFiles: entries.length,
-      keptFiles: keep.length,
-      prunedFiles: prune.length,
-      unrecognizedFiles: unrecognized.length,
-      unverifiedFiles: unverified.length,
-      reclaimedBytes: [...unverified, ...prune].reduce((sum, e) => sum + e.sizeBytes, 0),
-      prunedNames: prune.map((e) => e.name),
-      unverifiedNames: unverified.map((e) => e.name),
-      // Full paths, so the log alone attributes every deletion (so the log alone attributes every deletion).
-      prunedPaths: [...unverified, ...prune].map((e) => e.fullPath || path.join(config.BACKUPS_DIR, e.name)),
-      unverifiedPaths: unverified.map((e) => e.fullPath || path.join(config.BACKUPS_DIR, e.name)),
-    };
-  }
+  runBackups(summary, { apply, config });
 
   // -- run-logs --
   {
@@ -1840,7 +1915,7 @@ export async function run({
     };
     if (apply && decision.prune && !busy) {
       let before = null;
-      try { before = dfUsedBytes(config.DISK_ALARM_PATH); } catch { /* best effort */ }
+      before = fsFreeBytes(config.DISK_ALARM_PATH);
       for (const [cmd, args] of [["npm", ["cache", "clean", "--force"]], ["pnpm", ["store", "prune"]]]) {
         try {
           execFileSync(cmd, args, { stdio: "pipe", timeout: 15 * 60 * 1000 });
@@ -1849,7 +1924,7 @@ export async function run({
         }
       }
       pc.applied = true;
-      try { if (before !== null) pc.dfFreedBytes = before - dfUsedBytes(config.DISK_ALARM_PATH); } catch { /* best effort */ }
+      { const after = fsFreeBytes(config.DISK_ALARM_PATH); if (before !== null && after !== null) pc.dfFreedBytes = after - before; }
     }
     summary.categories.pkgCaches = pc;
   }
@@ -1895,10 +1970,34 @@ export async function run({
     };
   }
 
+  finishDf();
   return summary;
 }
 
+function printDf(summary) {
+  if (!summary.df) return;
+  console.log(formatDfDelta(summary.df.freeBefore, summary.df.freeAfter) + ` on ${summary.df.path}`);
+}
+
+function printBackups(summary) {
+  const c = summary.categories;
+  const verb = summary.mode === "apply" ? "deleted" : "would delete";
+  console.log(
+    `backups:     ${c.backups.prunedFiles}/${c.backups.totalFiles} files ${verb}, ` +
+      `${bytesToHuman(c.backups.reclaimedBytes)} ${summary.mode === "apply" ? "freed" : "reclaimable"} ` +
+      `(summed ${bytesToHuman(c.backups.summedBytes)}; kept ${c.backups.keptFiles}, unrecognized ${c.backups.unrecognizedFiles}, unverified ${c.backups.unverifiedFiles})`,
+  );
+  for (const p of c.backups.prunedPaths || []) console.log(`  ${verb}: ${p}`);
+  for (const p of c.backups.unverifiedPaths || []) console.log(`  ${verb} (failed content verification): ${p}`);
+}
+
 function printSummary(summary) {
+  if (summary.only === "backups") {
+    console.log(`host-disk-janitor: mode=${summary.mode} only=backups at ${summary.timestamp}`);
+    printBackups(summary);
+    printDf(summary);
+    return;
+  }
   const c = summary.categories;
   const reg = summary.registeredPackagePaths || { status: "unknown", paths: [], count: 0 };
   const verb = summary.mode === "apply" ? "deleted" : "would delete";
@@ -1923,12 +2022,7 @@ function printSummary(summary) {
     for (const e of refs.errors || []) console.log(`  reason: ${e}`);
   }
   console.log("");
-  console.log(
-    `backups:     ${c.backups.prunedFiles}/${c.backups.totalFiles} files ${summary.mode === "apply" ? "deleted" : "would delete"}, ` +
-      `${bytesToHuman(c.backups.reclaimedBytes)} ${summary.mode === "apply" ? "freed" : "reclaimable"} (kept ${c.backups.keptFiles}, unrecognized ${c.backups.unrecognizedFiles}, unverified ${c.backups.unverifiedFiles})`,
-  );
-  for (const p of c.backups.prunedPaths || []) console.log(`  ${verb}: ${p}`);
-  for (const p of c.backups.unverifiedPaths || []) console.log(`  ${verb} (failed content verification): ${p}`);
+  printBackups(summary);
   console.log(
     `run-logs:    ${c.runLogs.prunedFiles}/${c.runLogs.totalFiles} files ${summary.mode === "apply" ? "deleted" : "would delete"}, ` +
       `${bytesToHuman(c.runLogs.reclaimedBytes)} ${summary.mode === "apply" ? "freed" : "reclaimable"} (kept ${c.runLogs.keptFiles})`,
@@ -2028,6 +2122,7 @@ function printSummary(summary) {
   } else {
     console.log(`disk alarm:  OK -- ${d.usePercent}% used (threshold ${d.threshold}%)`);
   }
+  printDf(summary);
   if (summary.mode !== "apply") {
     console.log("");
     console.log("Dry-run only. Re-run with --apply to delete/act.");
@@ -2039,8 +2134,8 @@ function isMainModule() {
 }
 
 if (isMainModule()) {
-  const { apply, json } = parseArgs(process.argv.slice(2));
-  const summary = await run({ apply });
+  const { apply, json, only } = parseArgs(process.argv.slice(2));
+  const summary = await run({ apply, only });
   if (json) {
     console.log(JSON.stringify(summary, null, 2));
   } else {
@@ -2048,7 +2143,9 @@ if (isMainModule()) {
   }
   try {
     mkdirSync(CONFIG.STATE_DIR, { recursive: true });
-    writeFileSync(path.join(CONFIG.STATE_DIR, "last-run.json"), JSON.stringify(summary, null, 2));
+    // --only runs write their own state file so the liveness watchdog keeps
+    // tracking the full daily run via last-run.json.
+    writeFileSync(path.join(CONFIG.STATE_DIR, only ? `last-run-${only}.json` : "last-run.json"), JSON.stringify(summary, null, 2));
   } catch {
     // Observability is best-effort; never fail the run over a state-file write.
   }
