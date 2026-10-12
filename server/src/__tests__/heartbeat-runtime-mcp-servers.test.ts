@@ -21,7 +21,9 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { buildPaperclipRuntimeMcpServers } from "../services/heartbeat.js";
+import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
+import { buildPaperclipRuntimeMcpServers, heartbeatService } from "../services/heartbeat.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -39,19 +41,10 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
   afterEach(async () => {
     if (originalApiUrl === undefined) delete process.env.PAPERCLIP_API_URL;
     else process.env.PAPERCLIP_API_URL = originalApiUrl;
-    await db.delete(toolMcpGatewayTokens);
-    await db.delete(activityLog);
-    await db.delete(toolAccessAuditEvents);
-    await db.delete(heartbeatRuns);
-    await db.delete(toolMcpGateways);
-    await db.delete(toolConnectionInstalls);
-    await db.delete(toolProfileBindings);
-    await db.delete(toolProfileEntries);
-    await db.delete(toolProfiles);
-    await db.delete(toolConnections);
-    await db.delete(toolApplications);
-    await db.delete(agents);
-    await db.delete(companies);
+    // Wait for in-flight background heartbeat runs and wakeups to finish, then reset
+    // every table atomically (TRUNCATE ... CASCADE) so late writes cannot race the teardown.
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {

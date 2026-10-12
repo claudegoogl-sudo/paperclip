@@ -1,3 +1,4 @@
+import { stampSecretBindingAuditActor, withSecretBindingAuditActor } from "./secret-binding-audit-actor.js";
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, inArray, like, ne, notInArray, notLike, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -1200,14 +1201,17 @@ export function secretService(db: Db) {
     ) {
       return null;
     }
-    const inserted = await db
+    // Closure-safe copies: narrowing of `context.*` does not survive into the callback.
+    const configPath = context.configPath;
+    const consumerId = context.consumerId;
+    const inserted = await withSecretBindingAuditActor(db, (executor) => executor
       .insert(companySecretBindings)
       .values({
         companyId,
         secretId,
         targetType: "agent",
-        targetId: context.consumerId,
-        configPath: context.configPath,
+        targetId: consumerId,
+        configPath,
         versionSelector: String(matchingRef.versionSelector ?? "latest"),
         required: true,
         label: null,
@@ -1216,7 +1220,7 @@ export function secretService(db: Db) {
       })
       .onConflictDoNothing()
       .returning()
-      .then((rows) => rows[0] ?? null);
+      .then((rows) => rows[0] ?? null));
     const binding =
       inserted ??
       (await getBinding({
@@ -4569,7 +4573,7 @@ export function secretService(db: Db) {
         )
         .then((rows) => rows[0] ?? null);
       if (existing) throw conflict(`Secret binding already exists at ${input.configPath}`);
-      return db
+      return withSecretBindingAuditActor(db, (executor) => executor
         .insert(companySecretBindings)
         .values({
           companyId: input.companyId,
@@ -4584,7 +4588,7 @@ export function secretService(db: Db) {
           projectionAllowlistKey: input.projectionAllowlistKey ?? null,
         })
         .returning()
-        .then((rows) => rows[0]);
+        .then((rows) => rows[0]));
     },
 
     /**
@@ -4681,12 +4685,12 @@ export function secretService(db: Db) {
           throw badRequest(`Invalid egress allowlist entry: ${entry}`);
         }
       }
-      const updated = await db
+      const updated = await withSecretBindingAuditActor(db, (executor) => executor
         .update(companySecretBindings)
         .set({ allowedEgress: cleaned, updatedAt: new Date() })
         .where(eq(companySecretBindings.id, binding.id))
         .returning()
-        .then((rows) => rows[0]);
+        .then((rows) => rows[0]));
       const handlesPurged = purgeHandlesByBinding(binding.id);
       return { binding: updated, handlesPurged };
     },
@@ -4719,7 +4723,7 @@ export function secretService(db: Db) {
           { code: "binding_shape_unsupported" },
         );
       }
-      const updated = await db
+      const updated = await withSecretBindingAuditActor(db, (executor) => executor
         .update(companySecretBindings)
         .set({
           autoRenewPolicy: input.policy === null ? null : input.policy as NonNullable<typeof binding.autoRenewPolicy>,
@@ -4727,7 +4731,7 @@ export function secretService(db: Db) {
         })
         .where(eq(companySecretBindings.id, binding.id))
         .returning()
-        .then((rows) => rows[0]);
+        .then((rows) => rows[0]));
       return { binding: updated };
     },
 
@@ -4803,12 +4807,12 @@ export function secretService(db: Db) {
             `allowEmpty to intentionally deny all egress.`,
         );
       }
-      const updated = await db
+      const updated = await withSecretBindingAuditActor(db, (executor) => executor
         .update(companySecretBindings)
         .set({ egressAllowlistEnforced: nextEnforced, updatedAt: new Date() })
         .where(eq(companySecretBindings.id, binding.id))
         .returning()
-        .then((rows) => rows[0]);
+        .then((rows) => rows[0]));
       const handlesPurged = purgeHandlesByBinding(binding.id);
       logger.info(
         {
@@ -4878,6 +4882,7 @@ export function secretService(db: Db) {
       let refusedWipeConfigPaths: string[] = [];
 
       await db.transaction(async (tx) => {
+        await stampSecretBindingAuditActor(tx);
         // Capture existing egress allowlist settings before deletion. The
         // posture is operator state keyed by the binding identity, not the
         // row id, so the delete+reinsert below must carry it onto the new
@@ -5059,6 +5064,7 @@ export function secretService(db: Db) {
       }
 
       const writeBindings = async (executor: SecretBindingDb) => {
+        await stampSecretBindingAuditActor(executor);
         // Egress posture is operator state keyed by the binding identity
         // (companyId, targetType, targetId, configPath), not by the row id.
         // This replace deletes and re-inserts every non-env binding, so the
@@ -5283,6 +5289,7 @@ export function secretService(db: Db) {
       const unboundPaths: string[] = [];
 
       await db.transaction(async (tx) => {
+        await stampSecretBindingAuditActor(tx);
         // Capture operator-set egress posture for this plugin's bindings
         // before any revoke deletes. The upsert below leaves live rows (and
         // their posture) untouched, but a cleared-then-re-added or repointed
@@ -5491,6 +5498,7 @@ export function secretService(db: Db) {
       }
 
       const writeBindings = async (targetDb: SecretBindingDb) => {
+        await stampSecretBindingAuditActor(targetDb);
         // Capture existing egress allowlist settings before deletion. The
         // posture is operator state keyed by the binding identity, not the
         // row id, so the delete+reinsert below must carry it onto the new
