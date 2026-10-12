@@ -2530,6 +2530,8 @@ export function secretService(db: Db | DbTransaction) {
       // update matches the latest version, so a concurrent rotation between the
       // read and the write cannot pass. A mismatch throws a 409 conflict.
       expectedLatestVersion?: number;
+      // Provenance marker stamped onto the new version row (task_bridge renewer).
+      rotationJobId?: string | null;
     },
     actor?: { userId?: string | null; agentId?: string | null },
   ) {
@@ -2626,6 +2628,7 @@ export function secretService(db: Db | DbTransaction) {
         fingerprintSha256: prepared.fingerprintSha256 ?? prepared.valueSha256,
         providerVersionRef: prepared.providerVersionRef ?? null,
         status: "disabled",
+        rotationJobId: input.rotationJobId ?? null,
         createdByAgentId: actor?.agentId ?? null,
         createdByUserId: actor?.userId ?? null,
       });
