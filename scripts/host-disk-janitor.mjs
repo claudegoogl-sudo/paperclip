@@ -206,6 +206,14 @@ export const CONFIG = {
   // -- disk alarm --
   DISK_ALARM_PATH: process.env.PLA_JANITOR_DISK_PATH || "/",
   DISK_ALARM_THRESHOLD_PCT: 85,
+
+  // -- regenerable package caches (npm _cacache, pnpm store) --
+  // Pruned only when disk use >= PKG_CACHE_DISK_PCT OR combined cache size
+  // > PKG_CACHE_MAX_BYTES, and never while an npm/pnpm process runs.
+  PKG_CACHE_DISK_PCT: Number(process.env.PLA_JANITOR_PKG_CACHE_DISK_PCT || 80),
+  PKG_CACHE_MAX_BYTES: Number(process.env.PLA_JANITOR_PKG_CACHE_MAX_GB || 10) * 1024 ** 3,
+  NPM_CACHE_DIR: process.env.PLA_JANITOR_NPM_CACHE_DIR || path.join(HOME, ".npm/_cacache"),
+  PNPM_STORE_DIR: process.env.PLA_JANITOR_PNPM_STORE_DIR || "",
   DISK_ALARM_ISSUE_TITLE_MARKER: "[host-disk-alarm]",
   // The alarm must wake a named owner: new alarm issues are assigned (todo),
   // and a deduped open alarm that is unassigned/backlog is re-assigned.
@@ -1512,6 +1520,63 @@ function dirSizeBytes(p) {
   return collectFiles(p).reduce((sum, f) => sum + f.sizeBytes, 0) + statSize(p);
 }
 
+
+// ---------------------------------------------------------------------------
+// Package caches: npm _cacache + pnpm store (regenerable)
+// ---------------------------------------------------------------------------
+
+/** Pure: decide whether package caches should be pruned. */
+export function shouldPrunePkgCaches({ usePercent, totalCacheBytes }, config = CONFIG) {
+  const diskHit = usePercent !== null && usePercent !== undefined && usePercent >= config.PKG_CACHE_DISK_PCT;
+  const sizeHit = totalCacheBytes > config.PKG_CACHE_MAX_BYTES;
+  return { prune: diskHit || sizeHit, diskHit, sizeHit };
+}
+
+/** Pure: true if any listed process (same uid) is an npm/pnpm/npx run. */
+export function isPkgManagerBusy(procs, uid) {
+  const names = new Set(["npm", "pnpm", "npx", "pnpx"]);
+  for (const p of procs) {
+    if (p.uid !== uid) continue;
+    const argv = p.args || [];
+    const base = (x) => path.basename(String(x || "")).replace(/\.c?js$/, "");
+    if (names.has(base(p.comm))) return true;
+    // `node /usr/lib/node_modules/npm/bin/npm-cli.js ...` / pnpm.cjs
+    if (argv.slice(0, 3).some((a) => /(^|\/)(npm-cli|npx-cli|pnpm)(\.c?js)?$/.test(String(a)) || names.has(base(a)))) return true;
+  }
+  return false;
+}
+
+export function listProcs(procDir = "/proc") {
+  const out = [];
+  for (const name of readdirSync(procDir)) {
+    if (!/^\d+$/.test(name)) continue;
+    try {
+      const st = statSync(path.join(procDir, name));
+      const comm = readFileSync(path.join(procDir, name, "comm"), "utf8").trim();
+      const args = readFileSync(path.join(procDir, name, "cmdline"), "utf8").split("\0").filter(Boolean);
+      out.push({ uid: st.uid, comm, args });
+    } catch {
+      // process exited -- ignore
+    }
+  }
+  return out;
+}
+
+export function dfUsedBytes(diskPath) {
+  const out = execFileSync("df", ["-kP", diskPath], { encoding: "utf8" }).trim().split("\n");
+  const f = out[out.length - 1].trim().split(/\s+/);
+  return Number(f[2]) * 1024;
+}
+
+function resolvePnpmStore(config) {
+  if (config.PNPM_STORE_DIR) return config.PNPM_STORE_DIR;
+  try {
+    return execFileSync("pnpm", ["store", "path"], { encoding: "utf8", timeout: 20000 }).trim();
+  } catch {
+    return path.join(HOME, ".local/share/pnpm/store");
+  }
+}
+
 export async function run({
   apply = false,
   nowMs = Date.now(),
@@ -1749,6 +1814,46 @@ export async function run({
     };
   }
 
+  // -- package caches (npm _cacache, pnpm store) --
+  {
+    const npmDir = config.NPM_CACHE_DIR;
+    const pnpmDir = resolvePnpmStore(config);
+    const npmBytes = existsSync(npmDir) ? dirSizeBytes(npmDir) : 0;
+    const pnpmBytes = existsSync(pnpmDir) ? dirSizeBytes(pnpmDir) : 0;
+    let usePercent = null;
+    try {
+      usePercent = checkDiskUsage(config.DISK_ALARM_PATH).usePercent;
+    } catch {
+      // df failure: fall back to size-only trigger
+    }
+    const decision = shouldPrunePkgCaches({ usePercent, totalCacheBytes: npmBytes + pnpmBytes }, config);
+    const busy = isPkgManagerBusy(listProcs(), process.getuid());
+    const pc = {
+      npm: { path: npmDir, sizeBytes: npmBytes },
+      pnpm: { path: pnpmDir, sizeBytes: pnpmBytes },
+      usePercent,
+      ...decision,
+      busy,
+      applied: false,
+      dfFreedBytes: null,
+      errors: [],
+    };
+    if (apply && decision.prune && !busy) {
+      let before = null;
+      try { before = dfUsedBytes(config.DISK_ALARM_PATH); } catch { /* best effort */ }
+      for (const [cmd, args] of [["npm", ["cache", "clean", "--force"]], ["pnpm", ["store", "prune"]]]) {
+        try {
+          execFileSync(cmd, args, { stdio: "pipe", timeout: 15 * 60 * 1000 });
+        } catch (err) {
+          pc.errors.push(`${cmd} ${args.join(" ")}: ${err.message}`.slice(0, 300));
+        }
+      }
+      pc.applied = true;
+      try { if (before !== null) pc.dfFreedBytes = before - dfUsedBytes(config.DISK_ALARM_PATH); } catch { /* best effort */ }
+    }
+    summary.categories.pkgCaches = pc;
+  }
+
   // -- report-only: owner decision needed (never deleted) --
   summary.ownerDecision = scanOwnerDecisionPaths(config).map((e) => ({
     path: e.path,
@@ -1891,6 +1996,15 @@ function printSummary(summary) {
   if (summary.ownerDecision && summary.ownerDecision.length) {
     console.log(`owner decision needed (report-only, never deleted):`);
     for (const e of summary.ownerDecision) console.log(`  ${e.path}  ${bytesToHuman(e.sizeBytes)}  ${e.ageDays}d`);
+  }
+  {
+    const k = c.pkgCaches;
+    const verdict = !k.prune ? "below threshold" : k.busy ? "SKIPPED (npm/pnpm process running)" : summary.mode === "apply" ? "pruned" : "would prune";
+    console.log(
+      `pkg caches:  npm ${bytesToHuman(k.npm.sizeBytes)} (${k.npm.path}), pnpm ${bytesToHuman(k.pnpm.sizeBytes)} (${k.pnpm.path}) -- ${verdict} ` +
+        `(disk ${k.usePercent ?? "?"}% >= ${CONFIG.PKG_CACHE_DISK_PCT}%: ${k.diskHit}, size > ${bytesToHuman(CONFIG.PKG_CACHE_MAX_BYTES)}: ${k.sizeHit})`,
+    );
+    if (k.applied) console.log(`             real df delta: ${k.dfFreedBytes === null ? "unknown" : bytesToHuman(k.dfFreedBytes)} freed${k.errors.length ? `; errors: ${k.errors.join(" | ")}` : ""}`);
   }
   console.log("");
   const d = summary.diskAlarm;
