@@ -266,7 +266,12 @@ export function errorHandler(
   // a numeric status in the 4xx range with that status instead of flattening
   // to 500. 5xx numerics fall through to the telemetry/attach branch below.
   const numericStatus = extractNumericStatus(err);
-  if (typeof numericStatus === "number" && numericStatus >= 400 && numericStatus < 500) {
+  // Parser failures that are not the exact malformed-JSON shape handled above
+  // stay server errors: their messages can quote request bytes.
+  const isParseFailure =
+    typeof (err as { type?: unknown } | null)?.type === "string" &&
+    ((err as { type: string }).type).endsWith(".parse.failed");
+  if (!isParseFailure && typeof numericStatus === "number" && numericStatus >= 400 && numericStatus < 500) {
     const errLike = err as Error & {
       status?: number;
       statusCode?: number;

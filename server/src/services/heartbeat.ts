@@ -1682,7 +1682,11 @@ const LOW_TRUST_SENSITIVE_ENV_KEY_RE =
 //    binding; adapters enforce this at env-merge time.
 // 3. Any other PAPERCLIP_*-named binding is user data and flows through to
 //    the run env like any non-prefixed binding.
+// Fork (INV-1): worker-supplied run identity must never survive into a
+// resolved child env: the host injects the real values after resolution.
 const FORBIDDEN_ENV_BINDING_KEYS = new Set([
+  "PAPERCLIP_RUN_ID",
+  "PAPERCLIP_API_URL",
   "PAPERCLIP_RUNNER_NETWORK_ACCESS",
   "PAPERCLIP_RUNNER_NETWORK_ROOTS",
   "PAPERCLIP_API_KEY",

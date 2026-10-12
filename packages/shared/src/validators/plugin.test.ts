@@ -89,7 +89,7 @@ describe("plugin manifest UI slot type — v1 floor", () => {
       );
       expect(slotTypeIssue).toBeDefined();
       expect(slotTypeIssue?.message).toBe(
-        `Invalid slot type "${slotType}". v1 supports: dashboardWidget, page`,
+        `Invalid slot type "${slotType}". v1 supports: dashboardWidget, page, organizationSwitcher`,
       );
     },
   );
@@ -319,7 +319,7 @@ describe("plugin managed skill validators", () => {
 // Upstream v2026.525.0 added host-rendered support for `routeSidebar`,
 // `detailTab`, `toolbarButton`, and `companySettingsPage` slots and shipped
 // acceptance tests for them. Our fork's v1 host-rendered floor
-// (PLUGIN_UI_SLOT_TYPES_V1_SUPPORTED = [dashboardWidget, page])
+// (PLUGIN_UI_SLOT_TYPES_V1_SUPPORTED = [dashboardWidget, page, organizationSwitcher])
 // is enforced on the SAME `pluginUiSlotDeclarationSchema`, so it still narrows
 // install-time acceptance to dashboardWidget + page — these upstream slot types
 // are rejected at the manifest validator until the floor is expanded.

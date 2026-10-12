@@ -3593,7 +3593,6 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     expect(row?.status).toBe("pending");
   });
 
-  it("keeps request confirmations pending when user-comment supersede is explicitly disabled", async () => {
   it("keeps request confirmations pending by default when the user sends a message", async () => {
     const { companyId, issueId } = await seedConfirmationIssue("Comment supersede opt-out");
 

@@ -361,7 +361,7 @@ describe("ensureBundledPlugins", () => {
       expect.stringContaining("continuing boot"),
     );
     // The later entry is still provisioned.
-    expect(installPlugin).toHaveBeenCalledWith({ localPath: DAYTONA.localPath });
+    expect(installPlugin).toHaveBeenCalledWith({ localPath: DAYTONA.localPath, exemptFromCapabilityGate: true });
   });
 
   it("reconciles the persisted manifest of a present plugin when the bundle version changed", async () => {
