@@ -2544,9 +2544,13 @@ describe("shared ACPX engine runtime behavior", () => {
       // Real spawn env still carries the resolved values...
       expect(observedSessionOptions?.env?.PAPERCLIP_API_KEY).toBe("runtime-key-7718");
       expect(observedSessionOptions?.env?.ANTHROPIC_AUTH_TOKEN).toBe("dummy-zai-not-a-secret");
-      // ...while the persisted map carries refs only, for the same key set.
+      // ...while the persisted map carries refs only. It covers every Paperclip/provider key but
+      // not the ambient host baseline (HOME, PATH, TMPDIR, ...), which is never persisted.
       const persisted = observedSessionOptions?.persistedEnv ?? {};
-      expect(Object.keys(persisted).sort()).toEqual(Object.keys(observedSessionOptions?.env ?? {}).sort());
+      const spawnKeys = Object.keys(observedSessionOptions?.env ?? {});
+      expect(Object.keys(persisted).every((key) => spawnKeys.includes(key))).toBe(true);
+      expect(Object.keys(persisted)).toEqual(expect.arrayContaining(["PAPERCLIP_API_KEY", "PAPERCLIP_RUN_ID", "ANTHROPIC_AUTH_TOKEN"]));
+      for (const ambient of ["HOME", "PATH", "TMPDIR"]) expect(persisted).not.toHaveProperty(ambient);
       expect(persisted.PAPERCLIP_API_KEY).toBe("__paperclip_secret_ref:PAPERCLIP_API_KEY");
       expect(persisted.ANTHROPIC_AUTH_TOKEN).toBe("__paperclip_secret_ref:ANTHROPIC_AUTH_TOKEN");
       expect(JSON.stringify(persisted)).not.toContain("runtime-key-7718");
