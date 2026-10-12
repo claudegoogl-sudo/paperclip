@@ -19,6 +19,7 @@ const JWT_VALUE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-
 // Skip the JWT value check for these plugin-version keys only; key-name
 // redaction still applies.
 const VERSION_STRING_KEYS = new Set(["fromVersion", "toVersion"]);
+const SEMVER_VALUE_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 const CLI_SECRET_FLAG_RE = new RegExp(String.raw`^-{1,2}${SECRET_FIELD_NAME_PATTERN}$`, "i");
 const JSON_SECRET_FIELD_TEXT_RE = new RegExp(
   String.raw`((?:"|')?${SECRET_FIELD_NAME_PATTERN}(?:"|')?\s*:\s*(?:"|'))[^"'` + "`" + String.raw`\r\n]+((?:"|'))`,
@@ -170,7 +171,7 @@ function sanitizeRecordWithLeaf(
       redacted[redactedKey] = REDACTED_EVENT_VALUE;
       continue;
     }
-    if (typeof value === "string" && !VERSION_STRING_KEYS.has(key) && JWT_VALUE_RE.test(value) && !AUDIT_SURFACE_PAYLOAD_KEY_RE.test(key)) {
+    if (typeof value === "string" && !(VERSION_STRING_KEYS.has(key) && SEMVER_VALUE_RE.test(value)) && JWT_VALUE_RE.test(value) && !AUDIT_SURFACE_PAYLOAD_KEY_RE.test(key)) {
       redacted[redactedKey] = REDACTED_EVENT_VALUE;
       continue;
     }
