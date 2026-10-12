@@ -26485,7 +26485,10 @@ export function heartbeatService(
         await processCancellation?.settled;
         let outcome: RunSessionOutcome;
         const latestRun = await getRun(run.id);
-        if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
+        // An externally reaped `interrupted` row must not pin the outcome: the
+        // worker's own positive completion wins via
+        // persistRunCompletionAfterExternalInterrupt (CAS on status='interrupted').
+        if (isHeartbeatRunTerminalStatus(latestRun?.status) && latestRun.status !== "interrupted") {
           outcome = latestRun.status;
         } else if (executionControl.controller.signal.aborted) {
           outcome = "cancelled";
