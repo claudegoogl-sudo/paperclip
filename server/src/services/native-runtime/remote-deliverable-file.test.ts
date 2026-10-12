@@ -61,7 +61,7 @@ describe.skipIf(!hasLinuxNode)("remote deliverable real Linux descriptor reads",
         "-v", `${root}:${root}`, image, "node", ...nodeArgs,
       ];
       return await new Promise<Awaited<ReturnType<CommandManagedRuntimeRunner["execute"]>>>((resolve) => {
-        execFile(command, args, { encoding: "utf8", timeout: input.timeoutMs, maxBuffer: 16 * 1024 * 1024,
+        execFile(command, args, { encoding: "utf8", timeout: input.timeoutMs, maxBuffer: Math.ceil((MAX_REMOTE_DELIVERABLE_BYTES * 4) / 3) + 1024 * 1024,
           env: { ...process.env, NODE_OPTIONS: "", NODE_PATH: "" } }, (error, stdout, stderr) => resolve({
           pid: null, startedAt: new Date().toISOString(), exitCode: error ? 1 : 0,
           signal: null, timedOut: Boolean(error?.killed), stdout, stderr,
@@ -127,10 +127,10 @@ describe.skipIf(!hasLinuxNode)("remote deliverable real Linux descriptor reads",
     await expect(readVerifiedRemoteWorkspaceFile({ ...request, workspaceRoot, runner })).rejects.toThrow(/paperclip_runner_file_handoff_file_changed/);
   });
 
-  it("accepts the 10 MiB limit with exact bytes and hash", async () => {
+  it("accepts the maximum deliverable size with exact bytes and hash", async () => {
     const maximum = Buffer.alloc(MAX_REMOTE_DELIVERABLE_BYTES, 37);
     await writeFile(join(workspaceRoot, "maximum.bin"), maximum);
     const result = await readVerifiedRemoteWorkspaceFile({ runner, workspaceRoot, contentRef: "maximum.bin", byteSize: maximum.length, sha256: digest(maximum) });
     expect(result.equals(maximum)).toBe(true);
-  }, 20_000);
+  }, 60_000);
 });
