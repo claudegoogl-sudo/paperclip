@@ -2,49 +2,20 @@ import { randomUUID } from "node:crypto";
 import { and, eq, inArray, or } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  activityLog,
-  agentRuntimeState,
   agentWakeupRequests,
   agents,
-  approvals,
   authUsers,
-  budgetPolicies,
   companies,
-  companySecretBindings,
-  companySecrets,
-  companySkills,
-  costEvents,
   createDb,
-  documentAnnotationAnchorSnapshots,
-  documentAnnotationComments,
-  documentAnnotationThreads,
-  documentRevisions,
-  documents,
-  environmentLeases,
-  environments,
-  executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
-  issueApprovals,
-  issueComments,
-  issueDocuments,
-  issuePlanDecompositions,
-  issueRecoveryActions,
-  issueRelations,
-  issueThreadInteractions,
-  issueTreeHoldMembers,
-  issueTreeHolds,
-  issueWorkProducts,
-  issues,
-  plugins,
-  projectWorkspaces,
-  projects,
-  workspaceOperations,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import { runningProcesses } from "../adapters/index.ts";
 
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
@@ -166,84 +137,10 @@ describeEmbeddedPostgres("heartbeat late completion after external interruption 
           .where(inArray(agentWakeupRequests.id, wakeupIds));
       }
     }
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    // Deletion order mirrors the process-recovery suite: clear rows that
-    // reference agents/issues/companies before their parents, with retries
-    // for late inserts from winding-down executions.
-    await db.delete(activityLog);
-    await db.delete(costEvents);
-    await db.delete(agentRuntimeState);
-    await db.delete(companySkills);
-    await db.delete(workspaceOperations);
-    await db.delete(environmentLeases);
-    await db.delete(environments);
-    await db.delete(plugins);
-    await db.delete(issuePlanDecompositions);
-    await db.delete(issueThreadInteractions);
-    await db.delete(documentAnnotationComments);
-    await db.delete(documentAnnotationAnchorSnapshots);
-    await db.delete(documentAnnotationThreads);
-    await db.delete(issueWorkProducts);
-    await db.delete(issueComments);
-    await db.delete(issueDocuments);
-    await db.delete(documentRevisions);
-    await db.delete(documents);
-    await db.delete(issueRelations);
-    await db.delete(issueRecoveryActions);
-    await db.delete(issueTreeHoldMembers);
-    await db.delete(issueTreeHolds);
-    await db.delete(issueApprovals);
-    await db.delete(approvals);
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await db.delete(issueComments);
-      await db.delete(issueDocuments);
-      try {
-        await db.delete(issues);
-        break;
-      } catch {
-        if (attempt === 4) throw new Error("Failed to clear issues during cleanup");
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-    await db.delete(heartbeatRunEvents);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(budgetPolicies);
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await db.delete(agentWakeupRequests);
-      await db.delete(agentRuntimeState);
-      try {
-        await db.delete(agents);
-        break;
-      } catch {
-        if (attempt === 4) throw new Error("Failed to clear agents during cleanup");
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await db.delete(companySkills);
-      await db.delete(workspaceOperations);
-      await db.delete(executionWorkspaces);
-      await db.delete(projectWorkspaces);
-      await db.delete(projects);
-      await db.delete(issuePlanDecompositions);
-      await db.delete(issueThreadInteractions);
-      await db.delete(documentAnnotationComments);
-      await db.delete(documentAnnotationAnchorSnapshots);
-      await db.delete(documentAnnotationThreads);
-      await db.delete(issueDocuments);
-      await db.delete(documentRevisions);
-      await db.delete(documents);
-      await db.delete(companySecretBindings);
-      await db.delete(companySecrets);
-      try {
-        await db.delete(companies);
-        break;
-      } catch {
-        if (attempt === 4) throw new Error("Failed to clear companies during cleanup");
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
+    // Wait for in-flight background heartbeat runs and wakeups to finish, then reset
+    // every table atomically (TRUNCATE ... CASCADE) so late writes cannot race the teardown.
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {

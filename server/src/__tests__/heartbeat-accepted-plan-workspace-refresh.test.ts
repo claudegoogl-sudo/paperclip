@@ -7,33 +7,26 @@ import { promisify } from "node:util";
 import { eq, ne } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  activityLog,
-  agentRuntimeState,
   agentTaskSessions,
-  agentWakeupRequests,
   agents,
   companies,
-  companySkills,
   createDb,
   documentRevisions,
   documents,
   executionWorkspaces,
-  heartbeatRunEvents,
-  heartbeatRuns,
-  issueComments,
   issueDocuments,
   issuePlanDecompositions,
   issueThreadInteractions,
   issues,
   projects,
   projectWorkspaces,
-  workspaceOperations,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import { issueService } from "../services/issues.ts";
@@ -114,46 +107,14 @@ describeEmbeddedPostgres("accepted plan workspace refresh", () => {
 
   afterEach(async () => {
     adapterExecute.mockClear();
-    // Await every in-flight background heartbeat run to quiescence before the
-    // deletes below. A wakeup claims a run and dispatches its execution
-    // fire-and-forget, and that run can dispatch a follow-up wakeup, so a run or
-    // wakeup can still write heartbeat_runs and issues rows when teardown starts
-    // and would race the deletes. The shared drain also awaits an in-flight
-    // wakeup that is still before run registration, which a plain run table
-    // status poll cannot see.
-    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
     while (tempRoots.length > 0) {
       const root = tempRoots.pop();
       if (root) await rm(root, { recursive: true, force: true }).catch(() => undefined);
     }
-    await db.delete(issuePlanDecompositions);
-    await db.delete(issueThreadInteractions);
-    await db.delete(issueDocuments);
-    await db.delete(documentRevisions);
-    await db.delete(documents);
-    await db.delete(agentTaskSessions);
-    await db.delete(executionWorkspaces);
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await db.delete(activityLog);
-      await db.delete(heartbeatRunEvents);
-      try {
-        await db.delete(heartbeatRuns);
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-    await db.delete(issueComments);
-    await db.delete(issues);
-    await db.delete(projectWorkspaces);
-    await db.delete(projects);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(agents);
-    await db.delete(workspaceOperations);
-    await db.delete(companySkills);
-    await db.delete(companies);
+    // Wait for in-flight background heartbeat runs and wakeups to finish, then reset
+    // every table atomically (TRUNCATE ... CASCADE) so late writes cannot race the teardown.
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {

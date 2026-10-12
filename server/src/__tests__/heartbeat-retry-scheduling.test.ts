@@ -4,13 +4,10 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
   agents,
-  agentRuntimeState,
   agentWakeupRequests,
   budgetPolicies,
   companies,
-  companySkills,
   createDb,
-  environmentLeases,
   executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -24,6 +21,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
 import {
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS,
@@ -95,14 +93,10 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
   }, 45_000);
 
   afterEach(async () => {
-    // Await every in-flight background heartbeat run to quiescence before the
-    // cleanup deletes. heartbeat.invoke claims a run and dispatches its
-    // execution fire-and-forget, and that run can schedule a follow-up retry
-    // wakeup, so a run or wakeup can still write heartbeat_runs and issues rows
-    // when teardown starts. The cleanup deletes issues before heartbeat_runs, so
-    // a late write races the deletes and can deadlock or break a foreign key.
-    await drainHeartbeatRunsToQuiescence(db, heartbeat);
-    await cleanupRetryFixture();
+    // Wait for in-flight background heartbeat runs and wakeups to finish, then reset
+    // every table atomically (TRUNCATE ... CASCADE) so late writes cannot race the teardown.
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {
@@ -111,41 +105,8 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
   });
 
   async function cleanupRetryFixture() {
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      try {
-        await cleanupRetryFixtureOnce();
-        return;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-  }
-
-  async function cleanupHeartbeatRunDependents() {
-    await db.delete(heartbeatRunEvents);
-    await db.delete(activityLog);
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    await db.delete(heartbeatRunEvents);
-    await db.delete(activityLog);
-  }
-
-  async function cleanupRetryFixtureOnce() {
-    await db.delete(activityLog);
-    await db.delete(environmentLeases);
-    await db.delete(issueRelations);
-    await db.delete(issueComments);
-    await db.delete(issues);
-    await db.delete(executionWorkspaces);
-    await db.delete(projects);
-    await cleanupHeartbeatRunDependents();
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(budgetPolicies);
-    await db.delete(agents);
-    await db.delete(companySkills);
-    await db.delete(companies);
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    await resetEmbeddedPostgresTestDatabase(db);
   }
 
   async function seedRetryFixture(input: {

@@ -7,19 +7,15 @@ import {
   activityLog,
   agents,
   agentWakeupRequests,
-  agentRuntimeState,
   budgetPolicies,
   companies,
   companyMemberships,
-  companySkills,
   costEvents,
   createDb,
   executionWorkspaces,
-  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueRelations,
-  issueTreeHoldMembers,
   issueTreeHolds,
   issues,
   projects,
@@ -30,6 +26,8 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 
@@ -102,40 +100,15 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
   afterEach(async () => {
     vi.clearAllMocks();
     runningProcesses.clear();
-    // reconcileIssueGraphLiveness heals dependency wakes by enqueuing an
-    // on-demand wake, which dispatches a heartbeat run fire-and-forget (see
-    // startNextQueuedRunForAgent → executeRun in the heartbeat service). That
-    // background run keeps writing rows (workspace_operations, heartbeat_run_events)
-    // after the awaited call resolves. Deterministically await those in-flight
-    // executions before clearing tables — otherwise an escaping heartbeat_run_events
-    // insert can land between the events delete and the heartbeat_runs delete and
-    // trip the run_events → runs foreign key.
-    await heartbeatService(db).drainActiveRunExecutions();
-    await db.delete(activityLog);
-    await db.delete(heartbeatRunEvents);
-    await db.delete(costEvents);
-    await db.delete(workspaceOperations);
-    await db.delete(issueComments);
-    await db.delete(issueTreeHoldMembers);
-    await db.delete(issueTreeHolds);
-    await db.delete(issueRelations);
-    await db.delete(issues);
-    await db.delete(executionWorkspaces);
-    await db.delete(projectWorkspaces);
-    await db.delete(projects);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(budgetPolicies);
-    await db.delete(agents);
-    await db.delete(companyMemberships);
-    await db.delete(companySkills);
-    await db.delete(companies);
     await instanceSettingsService(db).updateExperimental({
       enableIssueGraphLivenessAutoRecovery: false,
       enableIsolatedWorkspaces: false,
       issueGraphLivenessAutoRecoveryLookbackHours: 24,
     });
+    // Wait for in-flight background heartbeat runs and wakeups to finish, then reset
+    // every table atomically (TRUNCATE ... CASCADE) so late writes cannot race the teardown.
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {
