@@ -3995,7 +3995,7 @@ export function issueRoutes(
     if (issue && req.actor.type === "agent") {
       const decision = await decideCrossCompanyIssueAccess(req, issue.companyId, op, crossCompanyDeps);
       if (decision.allowed) {
-        if (op === "issue.read" || op === "comments.list") {
+        if (op === "issue.read" || op === "comments.list" || op === "comment.create") {
           await recordCrossCompanyIssueAccess((row) => logActivity(db, row), {
             targetCompanyId: issue.companyId,
             homeCompanyId: decision.homeCompanyId,
@@ -12505,8 +12505,23 @@ export function issueRoutes(
     const id = req.params.id as string;
     // See PATCH route — back-fill orphan-checkout state up front.
     await svc.clearOrphanCheckoutLocksIfTerminal(id);
-    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
-    if (!issue) return;
+    const resolvedComment = await getIssueWithCrossCompany(req, res, id, "comment.create");
+    if (!resolvedComment) return;
+    const issue = resolvedComment.issue;
+    const crossCompanyComment = resolvedComment.crossCompany;
+    if (crossCompanyComment) {
+      // Cross-company comments are plain comments only: no reopen/resume/
+      // interrupt, no attachment binding, no implicit status move.
+      if (
+        req.body.reopen === true ||
+        req.body.resume === true ||
+        req.body.interrupt === true ||
+        (Array.isArray(req.body.attachmentIds) && req.body.attachmentIds.length > 0)
+      ) {
+        res.status(422).json({ error: "Cross-company comments cannot reopen, resume, interrupt or attach assets" });
+        return;
+      }
+    }
     if (req.actor.type === "agent" && req.body.onBehalfOfUserId != null) {
       await auditAgentIssueCommentAttributionSpoof({
         db,
@@ -12521,7 +12536,8 @@ export function issueRoutes(
     if (!assertNoSecretPatternInWritePayload(req, res, [
       { name: "body", value: req.body.body },
     ], { issueId: issue.id, companyId: issue.companyId })) return;
-    const commentAccessDecision = await assertAgentIssueCommentAllowed(req, res, issue);
+    // Cross-company: double-key helper is the authorization (decide() hard-denies foreign agents).
+    const commentAccessDecision = crossCompanyComment ? true : await assertAgentIssueCommentAllowed(req, res, issue);
     if (!commentAccessDecision) return;
     const commentAuthorizationReason = issueWriteAuthorizationReason(req, commentAccessDecision);
     if (!assertStructuredCommentFieldsAllowed(req, res, {
@@ -12626,6 +12642,7 @@ export function issueRoutes(
       actorId: actor.actorId,
     });
     const effectiveMoveToTodoRequested =
+      !crossCompanyComment &&
       !assigneeSelfCommentOnTerminal &&
       (explicitMoveToTodoRequested ||
         shouldImplicitlyMoveCommentedIssueToTodo({
