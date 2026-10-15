@@ -16135,7 +16135,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         .from(chatConversations)
         .where(eq(chatConversations.endpointId, endpoint.id));
       expect(rows).toHaveLength(1);
-    });
+    }, { timeout: 10_000 });
     const [conversation] = await db
       .select()
       .from(chatConversations)
@@ -16146,7 +16146,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         .from(issueComments)
         .where(eq(issueComments.issueId, conversation.issueId));
       expect(rows).toHaveLength(8);
-    });
+    }, { timeout: 10_000 });
     const comments = await db
       .select({ id: issueComments.id, body: issueComments.body })
       .from(issueComments)

@@ -21,6 +21,9 @@ export default defineConfig({
   },
   test: {
     environment: "node",
+    // The fork's host-wide run ceiling defaults to the vCPU count, so heartbeat suites that start several
+    // runs behave differently on a 4-vCPU CI runner than on a dev host. Pin a runner-independent ceiling.
+    env: { PAPERCLIP_MAX_CONCURRENT_RUNS_HOST: process.env.PAPERCLIP_MAX_CONCURRENT_RUNS_HOST ?? "8" },
     include: ["src/**/*.test.ts", "scripts/**/*.test.mjs"],
     // Embedded-Postgres suites boot in beforeAll and tear down in afterAll. On a
     // loaded runner both ends can outlast vitest's 10s defaults and redden a

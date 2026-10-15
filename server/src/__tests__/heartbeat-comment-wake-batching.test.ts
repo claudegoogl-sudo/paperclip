@@ -4126,7 +4126,8 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
     });
     // Same settle-then-assert reasoning as the missing-agent test above:
     // the idle promoted agent's run is claimed synchronously.
-    expect(verifiedWake?.status).toBe("claimed");
+    // "claimed" when admission is immediate; "queued" when the runner admission gate (host ceiling / memory pressure) defers the run.
+    expect(["claimed", "queued"]).toContain(verifiedWake?.status);
     const promotedRun = await db
       .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
       .from(heartbeatRuns)

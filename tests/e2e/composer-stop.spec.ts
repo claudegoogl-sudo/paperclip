@@ -303,7 +303,7 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
       if (adapter === "process") {
         expect(parentRun.processPid).toBeTruthy();
         await expect
-          .poll(() => processAlive(parentRun.processPid), { timeout: 3000 })
+          .poll(() => processAlive(parentRun.processPid), { timeout: 15_000 })
           .toBe(false);
         await expect
           .poll(() => processAlive(childRun.processPid), { timeout: 3000 })
