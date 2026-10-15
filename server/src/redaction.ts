@@ -354,6 +354,11 @@ const CLI_SECRET_FLAG_RE = new RegExp(
   String.raw`^-{1,2}${SECRET_FIELD_NAME_PATTERN}$`,
   "i",
 );
+// Dotted semver values (e.g. "0.2.24") match the three-segment JWT shape.
+// Skip the JWT value check for these plugin-version keys only; key-name
+// redaction still applies.
+const VERSION_STRING_KEYS = new Set(["fromVersion", "toVersion"]);
+const SEMVER_VALUE_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 const JSON_SECRET_FIELD_TEXT_RE = new RegExp(
   String.raw`((?:"|')?${SECRET_FIELD_NAME_PATTERN}(?:"|')?\s*:\s*(?:"|'))[^"'` +
     "`" +
@@ -998,6 +1003,7 @@ function sanitizeRecordWithLeaf(
     }
     if (
       typeof value === "string" &&
+      !(VERSION_STRING_KEYS.has(key) && SEMVER_VALUE_RE.test(value)) &&
       JWT_VALUE_RE.test(value) &&
       !isPublicExecutorToolSelector(value) &&
       !isPaperclipSchemaDiscriminator(key, value)
