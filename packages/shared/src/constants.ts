@@ -1078,6 +1078,7 @@ export const PERMISSION_KEYS = [
   "pipelines:write",
   "joins:approve",
   "routines:manage",
+  "issues:cross_company_access",
 ] as const;
 export type PermissionKey = (typeof PERMISSION_KEYS)[number];
 
