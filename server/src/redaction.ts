@@ -1001,9 +1001,13 @@ function sanitizeRecordWithLeaf(
       redacted[redactedKey] = redactSensitiveText(value);
       continue;
     }
+    if (typeof value === "string" && VERSION_STRING_KEYS.has(key) && SEMVER_VALUE_RE.test(value)) {
+      // Plugin versions stay visible; the leaf redactor still scrubs host-registered secrets.
+      redacted[redactedKey] = leaf(value);
+      continue;
+    }
     if (
       typeof value === "string" &&
-      !(VERSION_STRING_KEYS.has(key) && SEMVER_VALUE_RE.test(value)) &&
       JWT_VALUE_RE.test(value) &&
       !isPublicExecutorToolSelector(value) &&
       !isPaperclipSchemaDiscriminator(key, value)
