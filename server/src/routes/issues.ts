@@ -11591,6 +11591,10 @@ export function issueRoutes(
     async (req, res) => {
       const companyId = req.params.companyId as string;
       assertCompanyAccess(req, companyId);
+      if (!assertNoSecretPatternInWritePayload(req, res, [
+        { name: "title", value: req.body.title },
+        { name: "description", value: req.body.description },
+      ], { companyId })) return;
       if (isSkillTestScopedActor(req)) {
         res.status(403).json({
           error: "Skill-test run tokens cannot create issues.",
@@ -12835,6 +12839,11 @@ export function issueRoutes(
           req.body.comment = withCrossCompanyMarker(resolvedPatch.marker, req.body.comment);
         }
       }
+      if (!assertNoSecretPatternInWritePayload(req, res, [
+        { name: "description", value: req.body.description },
+        { name: "comment", value: req.body.comment },
+        { name: "title", value: req.body.title },
+      ], { issueId: existing.id, companyId: existing.companyId })) return;
       assertNoAgentHostWorkspaceCommandMutation(
         req,
         collectIssueWorkspaceCommandPaths(req.body),
