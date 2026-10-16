@@ -214,6 +214,7 @@ vi.mock("../adapters/index.ts", async () => {
 import {
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
+  BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS,
   heartbeatService,
   parseSandboxProviderPluginNotReadyFailureMessage,
   redactDetectedSuccessfulRunProgressSummaryForBoard,
@@ -3881,7 +3882,7 @@ it("inherits issueId and taskId from the retried run snapshot on a process-loss 
     await db
       .update(heartbeatRuns)
       .set({
-        scheduledRetryAttempt: 2,
+        scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
         resultJson: {
           executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
         },
@@ -6037,7 +6038,7 @@ it("inherits issueId and taskId from the retried run snapshot on a process-loss 
       .update(heartbeatRuns)
       .set({
         status: "interrupted",
-        scheduledRetryAttempt: 2,
+        scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
         scheduledRetryReason: "transient_failure",
         contextSnapshot: {
           issueId,
@@ -6114,7 +6115,7 @@ it("inherits issueId and taskId from the retried run snapshot on a process-loss 
       .update(heartbeatRuns)
       .set({
         status: "interrupted",
-        scheduledRetryAttempt: 2,
+        scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
         scheduledRetryReason: "transient_failure",
         contextSnapshot: {
           issueId,
@@ -6232,7 +6233,7 @@ it("inherits issueId and taskId from the retried run snapshot on a process-loss 
       .update(heartbeatRuns)
       .set({
         status: "interrupted",
-        scheduledRetryAttempt: 2,
+        scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
         scheduledRetryReason: "transient_failure",
         contextSnapshot: {
           issueId,
@@ -9096,7 +9097,7 @@ it("inherits issueId and taskId from the retried run snapshot on a process-loss 
         status: "interrupted",
         errorCode: "server_shutdown_interrupted",
         error: "Interrupted by graceful server shutdown (SIGTERM)",
-        scheduledRetryAttempt: 2,
+        scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
         scheduledRetryReason: "transient_failure",
         resultJson: {
           stopReason: "interrupted",
@@ -9162,7 +9163,7 @@ it("inherits issueId and taskId from the retried run snapshot on a process-loss 
         status: "interrupted",
         errorCode: "server_shutdown_interrupted",
         error: "Interrupted by graceful server shutdown (SIGTERM)",
-        scheduledRetryAttempt: 2,
+        scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
         scheduledRetryReason: "transient_failure",
         resultJson: {
           stopReason: "interrupted",
