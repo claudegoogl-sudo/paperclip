@@ -696,7 +696,7 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       const svc = issueService(db);
       await db.update(issues).set({ status: "in_progress", completedAt: null }).where(eq(issues.id, blockerIssueId));
       await repark(blockedIssueId);
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      await new Promise((resolve) => setTimeout(resolve, 25));
       // Service-level transition: no route-time wake fires, which simulates the miss.
       await svc.update(blockerIssueId, { status: "done" });
 
@@ -715,7 +715,7 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       const svc = issueService(db);
       await db.update(issues).set({ status: "in_progress", completedAt: null }).where(eq(issues.id, blockerIssueId));
       await repark(blockedIssueId);
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      await new Promise((resolve) => setTimeout(resolve, 25));
       await svc.update(blockerIssueId, { status: "done" });
 
       const heartbeat = heartbeatService(db);
@@ -730,7 +730,7 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
           .where(eq(agentWakeupRequests.companyId, companyId));
         await db.update(heartbeatRuns).set({ wakeupRequestId: null }).where(eq(heartbeatRuns.companyId, companyId));
         await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
-        await new Promise((resolve) => setTimeout(resolve, 5));
+        await new Promise((resolve) => setTimeout(resolve, 25));
         await repark(blockedIssueId);
 
         const result = await heartbeat.reconcileResolvedDependencyWakes();
@@ -812,7 +812,7 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       expect((await heartbeat.reconcileResolvedDependencyWakes()).healed).toBe(0);
 
       // T3: finalize succeeds -> the dependency set only now became ready.
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      await new Promise((resolve) => setTimeout(resolve, 25));
       const finalizedAt = new Date();
       await db.insert(workspaceOperations).values({
         companyId,
@@ -851,7 +851,7 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       });
       await db.insert(issueRelations).values({ companyId, issueId: openBlockerId, relatedIssueId: blockedIssueId, type: "blocks" });
       await repark(blockedIssueId);
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      await new Promise((resolve) => setTimeout(resolve, 25));
 
       const res = await request(routeApp(companyId))
         .patch(`/api/issues/${blockedIssueId}`)
@@ -916,7 +916,7 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
           await db.insert(issueRelations).values({ companyId, issueId: openBlockerId, relatedIssueId: blockedIssueId, type: "blocks" });
         }
         await issueService(db).update(blockedIssueId, { status: "todo" });
-        await new Promise((resolve) => setTimeout(resolve, 5));
+        await new Promise((resolve) => setTimeout(resolve, 25));
 
         const res = await request(routeApp(companyId)).patch(`/api/issues/${blockedIssueId}`).send({
           status: "blocked",
