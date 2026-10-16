@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  agents,
   companies,
   createDb,
   environmentLeases,
@@ -12,6 +11,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 
 const mockTelemetryClient = vi.hoisted(() => ({ track: vi.fn() }));
 vi.mock("../telemetry.ts", () => ({ getTelemetryClient: () => mockTelemetryClient }));
@@ -67,10 +67,12 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
   });
 
   afterEach(async () => {
-    await db.delete(environmentLeases);
+    // `environments` has no FK to `companies`, so the TRUNCATE below does not
+    // cascade to it; clear it explicitly first.
     await db.delete(environments);
-    await db.delete(agents);
-    await db.delete(companies);
+    // Atomic TRUNCATE ... CASCADE from `companies` clears every other
+    // per-test table in one statement instead of the hand-ordered deletes.
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {
