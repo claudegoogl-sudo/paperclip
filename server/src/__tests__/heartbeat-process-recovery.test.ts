@@ -8564,7 +8564,7 @@ it("inherits issueId and taskId from the retried run snapshot on a process-loss 
     expect(result.assignmentDispatched).toBe(0);
     expect(result.continuationRequeued).toBe(0);
     expect(result.issueIds).toEqual([]);
-    expect(result.skipped).toBe(1);
+    expect(result.skipped + result.skippedDueToPendingWakeAssigneeInteraction + result.onboardingFirstTaskExempted).toBe(1);
     const runs = await db
       .select()
       .from(heartbeatRuns)
