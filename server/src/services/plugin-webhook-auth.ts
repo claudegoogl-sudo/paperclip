@@ -102,14 +102,28 @@ type ParsedDigest = { salt: string; digest: Buffer };
  * Returns null for anything malformed. Callers treat null as "not verified",
  * never as an error — see the fall-through rationale above.
  */
-function parseTokenDigest(value: unknown): ParsedDigest | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+export function describeTokenDigestDefect(value: unknown): string | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return "must be an object of the form { salt, digest }";
+  }
   const { salt, digest } = value as { salt?: unknown; digest?: unknown };
-  if (typeof salt !== "string" || salt.length < MIN_SALT_LENGTH) return null;
-  if (typeof digest !== "string" || digest.length !== DIGEST_HEX_LENGTH) return null;
-  const normalized = digest.toLowerCase();
-  if (!HEX_ONLY.test(normalized)) return null;
-  return { salt, digest: Buffer.from(normalized, "hex") };
+  if (typeof salt !== "string") return "'salt' is missing or not a string";
+  if (salt.length < MIN_SALT_LENGTH) return `'salt' must be at least ${MIN_SALT_LENGTH} characters`;
+  if (typeof digest !== "string") return "'digest' is missing or not a string";
+  if (digest.length !== DIGEST_HEX_LENGTH) return `'digest' must be exactly ${DIGEST_HEX_LENGTH} hex characters`;
+  if (!HEX_ONLY.test(digest.toLowerCase())) return "'digest' must contain only hex characters (0-9, a-f)";
+  return null;
+}
+
+/** Shared well-formedness predicate: config-write and request-time use ONE definition. */
+export function isWellFormedTokenDigest(value: unknown): boolean {
+  return describeTokenDigestDefect(value) === null;
+}
+
+function parseTokenDigest(value: unknown): ParsedDigest | null {
+  if (!isWellFormedTokenDigest(value)) return null;
+  const { salt, digest } = value as { salt: string; digest: string };
+  return { salt, digest: Buffer.from(digest.toLowerCase(), "hex") };
 }
 
 /**

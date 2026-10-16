@@ -53,7 +53,7 @@ import {
   type PluginWebhookRateLimiter,
   type PluginWebhookRateLimitTier,
 } from "../services/plugin-webhook-rate-limit.js";
-import { isVerifiedWebhookDelivery } from "../services/plugin-webhook-auth.js";
+import { describeTokenDigestDefect, isVerifiedWebhookDelivery } from "../services/plugin-webhook-auth.js";
 import {
   generateWebhookToken,
   isWebhookTokenDigestConfig,
@@ -2619,6 +2619,21 @@ export function pluginRoutes(
         res.status(400).json({
           error: "Configuration does not match the plugin's instanceConfigSchema",
           fieldErrors: validation.errors,
+        });
+        return;
+      }
+    }
+
+    // Reject a malformed webhook token digest at write time instead of letting
+    // request-time verification silently degrade. Uses the SAME predicate.
+    for (const hook of plugin.manifestJson?.webhooks ?? []) {
+      const key = hook.auth?.tokenDigestConfigKey;
+      if (!key || !(key in body.configJson)) continue;
+      const defect = describeTokenDigestDefect(body.configJson[key]);
+      if (defect) {
+        res.status(400).json({
+          error: `Config key '${key}' (webhook token digest for endpoint '${hook.endpointKey}') is malformed: ${defect}`,
+          fieldErrors: [{ path: key, message: defect }],
         });
         return;
       }
