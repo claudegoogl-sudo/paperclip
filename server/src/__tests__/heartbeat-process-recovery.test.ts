@@ -5375,6 +5375,10 @@ it("inherits issueId and taskId from the retried run snapshot on a process-loss 
   });
 
   it.each(["throw", "result"])("redacts opaque environment-bound credentials from Sentry diagnostics: %s", async (mode) => {
+    // Inherited process.env values are redacted as secrets; a short editor value
+    // (e.g. "vi") would otherwise corrupt the unrelated word "service" below.
+    vi.stubEnv("EDITOR", "");
+    vi.stubEnv("VISUAL", "");
     const { companyId, agentId, runId } = await seedQueuedIssueRunFixture();
     const svc = secretService(db);
     const value = "opaque-runtime-credential-fixture";
@@ -11084,7 +11088,7 @@ it("inherits issueId and taskId from the retried run snapshot on a process-loss 
     const heartbeat = heartbeatService(db);
 
     await heartbeat.reconcileStrandedAssignedIssues();
-    await heartbeat.promoteDueScheduledRetries(new Date(Date.now() + 31_000));
+    await heartbeat.promoteDueScheduledRetries(new Date(Date.now() + 3 * 60_000));
     await heartbeat.resumeQueuedRuns();
 
     const livenessWake = await waitForValue(async () => {
@@ -11176,7 +11180,7 @@ it("inherits issueId and taskId from the retried run snapshot on a process-loss 
     const heartbeat = heartbeatService(db);
 
     await heartbeat.reconcileStrandedAssignedIssues();
-    await heartbeat.promoteDueScheduledRetries(new Date(Date.now() + 31_000));
+    await heartbeat.promoteDueScheduledRetries(new Date(Date.now() + 3 * 60_000));
     await heartbeat.resumeQueuedRuns();
 
     const retryRun = await waitForValue(async () => {
@@ -11428,7 +11432,7 @@ it("inherits issueId and taskId from the retried run snapshot on a process-loss 
     });
     await db
       .update(heartbeatRuns)
-      .set({ scheduledRetryAttempt: 2 })
+      .set({ scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length })
       .where(eq(heartbeatRuns.id, runId));
     const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
     expect(result.continuationRequeued).toBe(0);
@@ -11446,8 +11450,9 @@ it("inherits issueId and taskId from the retried run snapshot on a process-loss 
         .where(eq(issueRecoveryActions.sourceIssueId, issueId)),
     ).toEqual([
       expect.objectContaining({
-        cause: "legacy_execution_requires_reconciliation",
-        evidence: expect.objectContaining({ attempt: 3 }),
+        // Fork ladder is 4 attempts deep, so the spent budget escalates through
+        // the stranded-issue path rather than the legacy reconciliation path.
+        cause: "stranded_assigned_issue",
       }),
     ]);
   });
@@ -13241,6 +13246,8 @@ it("inherits issueId and taskId from the retried run snapshot on a process-loss 
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).toHaveLength(1);
     // Once the child finishes, normal recovery can continue the lead.
     await db.update(issues).set({ status: "done" }).where(eq(issues.id, childId));
+    // A finished child leaves no waiting run behind; clear its stale workspace_busy retry.
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.agentId, workerId));
     expect((await heartbeat.reconcileStrandedAssignedIssues()).continuationRequeued).toBe(1);
     const next = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).find((r) => r.id !== runId);
     if (next) await waitForRunToSettle(heartbeat, next.id);

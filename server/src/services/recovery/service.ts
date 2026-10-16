@@ -1276,7 +1276,17 @@ export function recoveryService(
     issueId: string,
     agentId?: string | null,
   ) {
-    const issueIds = await collectIssueAndDescendantIds(companyId, issueId);
+    const allIssueIds = await collectIssueAndDescendantIds(companyId, issueId);
+    // A finished (done/cancelled) descendant no longer holds an execution path
+    // for its ancestor; a stale run row on it must not block recovery.
+    const liveIssueIds = new Set(
+      (await db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(and(eq(issues.companyId, companyId), inArray(issues.id, allIssueIds), notInArray(issues.status, ["done", "cancelled"])))
+      ).map((row) => row.id),
+    );
+    const issueIds = allIssueIds.filter((id) => id === issueId || liveIssueIds.has(id));
     const [run, deferredWake, nativeRecovery] = await Promise.all([
       db
         .select({ id: heartbeatRuns.id })
