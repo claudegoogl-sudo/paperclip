@@ -1883,6 +1883,41 @@ describe.sequential("webhook token mint route", () => {
     });
   }
 
+  describe("config-write digest validation", () => {
+    const goodSalt = "s".repeat(16);
+    const goodDigest = "a".repeat(64);
+    const post = async (configJson: Record<string, unknown>) => {
+      mintablePlugin();
+      mockSecretService.syncSecretRefsForTarget.mockResolvedValue([]);
+      mockRegistry.upsertConfig.mockResolvedValue({ id: "c", pluginId, companyId: companyA, configJson });
+      const { app } = await adminApp();
+      return request(app).post(`/api/plugins/${pluginId}/config`).send({ companyId: companyA, configJson });
+    };
+
+    it.each([
+      ["missing salt", { digest: goodDigest }, "salt"],
+      ["short salt", { salt: "short", digest: goodDigest }, "salt"],
+      ["wrong-length digest", { salt: goodSalt, digest: "a".repeat(63) }, "digest"],
+      ["non-hex digest", { salt: goodSalt, digest: "z".repeat(64) }, "digest"],
+    ])("400s on %s and never writes", async (_l, value, word) => {
+      const res = await post({ [digestKey]: value });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain(digestKey);
+      expect(res.body.error).toContain(word);
+      expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
+    });
+
+    it("accepts a well-formed digest", async () => {
+      const res = await post({ [digestKey]: { salt: goodSalt, digest: goodDigest } });
+      expect(res.status).toBe(200);
+    });
+
+    it("accepts config with the digest key absent", async () => {
+      const res = await post({ other: 1 });
+      expect(res.status).toBe(200);
+    });
+  });
+
   it("rejects a non-instance-admin board user with 403 and never writes config", async () => {
     mintablePlugin();
     const { app } = await createApp(boardActor());
