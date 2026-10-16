@@ -200,7 +200,8 @@ describe("setupLiveEventsWebSocketServer", () => {
       "upgrade",
       createUpgradeRequest({
         method: "GET",
-        url: `/api/companies/${companyId}/events/ws?token=${token}`,
+        url: `/api/companies/${companyId}/events/ws`,
+        headers: { authorization: `Bearer ${token}` },
       }),
       socket as unknown as Duplex,
       Buffer.alloc(0),
@@ -223,6 +224,57 @@ describe("setupLiveEventsWebSocketServer", () => {
       details: { method: "GET", url: `/api/companies/${companyId}/events/ws` },
     });
     expect(JSON.stringify(activity[0])).not.toContain(token);
+  });
+
+  it("ignores a ?token= query param: a valid agent key is rejected and never reaches key lookup", async () => {
+    const companyId = "company-1";
+    const token = "pcp_test_query_ws_key";
+    const { db, activity } = createDbState({
+      agentKey: { id: randomUUID(), agentId: randomUUID(), companyId, keyHash: hashToken(token) },
+    });
+    const server = new EventEmitter();
+    setupLiveEventsWebSocketServer(server as never, db, { deploymentMode: "authenticated" });
+    const socket = new FakeUpgradeSocket();
+
+    server.emit(
+      "upgrade",
+      createUpgradeRequest({ method: "GET", url: `/api/companies/${companyId}/events/ws?token=${token}` }),
+      socket as unknown as Duplex,
+      Buffer.alloc(0),
+    );
+    await flushPromises();
+    await flushPromises();
+
+    expect(socket.endedChunks[0]).toContain("403 Forbidden");
+    expect(activity).toHaveLength(0);
+  });
+
+  it("still accepts a valid agent key via Authorization: Bearer", async () => {
+    const companyId = "company-1";
+    const token = "pcp_test_bearer_ws_key";
+    const { db } = createDbState({
+      agentKey: { id: randomUUID(), agentId: randomUUID(), companyId, keyHash: hashToken(token) },
+    });
+    const server = new EventEmitter();
+    setupLiveEventsWebSocketServer(server as never, db, { deploymentMode: "authenticated" });
+    const socket = new FakeUpgradeSocket();
+    // Stop before the ws handshake writes; the assertion is that auth passed.
+    socket.writable = false;
+
+    server.emit(
+      "upgrade",
+      createUpgradeRequest({
+        method: "GET",
+        url: `/api/companies/${companyId}/events/ws`,
+        headers: { authorization: `Bearer ${token}` },
+      }),
+      socket as unknown as Duplex,
+      Buffer.alloc(0),
+    );
+    await flushPromises();
+    await flushPromises();
+
+    expect(socket.endedChunks).toEqual([]);
   });
 
   it("destroys and cleans up listeners after flushing a rejection response", async () => {

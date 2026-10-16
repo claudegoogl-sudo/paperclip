@@ -133,9 +133,10 @@ async function authorizeUpgrade(
     resolveCloudActor?: (req: IncomingMessage) => Promise<CloudUpgradeActor | null>;
   },
 ): Promise<UpgradeContext | null> {
-  const queryToken = url.searchParams.get("token")?.trim() ?? "";
-  const authToken = parseBearerToken(req.headers.authorization);
-  const token = authToken ?? (queryToken.length > 0 ? queryToken : null);
+  // Agent keys are accepted ONLY via `Authorization: Bearer`. A `?token=` query
+  // param is deliberately ignored: URLs leak into proxy logs / Referer / history
+  // and WS upgrades bypass HTTP request-log redaction.
+  const token = parseBearerToken(req.headers.authorization);
 
   // Browser board context has no bearer token in local_trusted and authenticated modes.
   if (!token) {
@@ -224,7 +225,7 @@ async function authorizeUpgrade(
     // Detection parity with the HTTP resolver (middleware/auth.ts): emit the
     // same `auth.agent_key_expired` activity_log row so forensics see expired-key
     // rejections regardless of whether they arrive over HTTP or the WS upgrade.
-    // Use `url.pathname` (not `req.url`) so the token query param never lands in
+    // Use `url.pathname` (not `req.url`) so no query string ever lands in
     // the audit row.
     await auditAgentKeyExpired(db, {
       companyId: key.companyId,
