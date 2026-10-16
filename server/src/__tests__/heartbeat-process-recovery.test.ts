@@ -13246,8 +13246,6 @@ it("inherits issueId and taskId from the retried run snapshot on a process-loss 
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).toHaveLength(1);
     // Once the child finishes, normal recovery can continue the lead.
     await db.update(issues).set({ status: "done" }).where(eq(issues.id, childId));
-    // A finished child leaves no waiting run behind; clear its stale workspace_busy retry.
-    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.agentId, workerId));
     expect((await heartbeat.reconcileStrandedAssignedIssues()).continuationRequeued).toBe(1);
     const next = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).find((r) => r.id !== runId);
     if (next) await waitForRunToSettle(heartbeat, next.id);

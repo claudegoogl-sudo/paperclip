@@ -1124,7 +1124,20 @@ export function recoveryService(
     companyId: string,
     issueId: string,
   ): Promise<LatestIssueRun> {
+    // The issue's own latest run is the recovery anchor. A descendant's run may
+    // belong to another agent/issue, which makes chat-control ancestry proof
+    // unresolved and silently blocks the lead's continuation. Fall back to the
+    // descendant tree only when the issue has no run of its own.
+    const own = await getLatestIssueRunAmong(companyId, [issueId]);
+    if (own) return own;
     const issueIds = await collectIssueAndDescendantIds(companyId, issueId);
+    return getLatestIssueRunAmong(companyId, issueIds);
+  }
+
+  async function getLatestIssueRunAmong(
+    companyId: string,
+    issueIds: string[],
+  ): Promise<LatestIssueRun> {
     return db
       .select({
         id: heartbeatRuns.id,
