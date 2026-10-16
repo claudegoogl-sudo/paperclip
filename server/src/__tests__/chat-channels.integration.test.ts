@@ -7686,7 +7686,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         .from(chatConversations)
         .where(eq(chatConversations.endpointId, endpoint.id));
       expect(rows).toHaveLength(1);
-    });
+    }, { timeout: 10_000 });
     const [conversation] = await db
       .select()
       .from(chatConversations)
@@ -10861,7 +10861,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     const { callbacks, endpoint, runtime, service, wakeup } =
       await configuredDiscordEndpoint(fixture, {
         discordGatewayLeaseRenewalIntervalMs: 60_000,
-        discordGatewayLeaseTtlMs: 200,
+        discordGatewayLeaseTtlMs: 2_000,
       });
     const ownedRuntime = runtime.endpoints.get(endpoint.id);
     if (!ownedRuntime)
@@ -10877,7 +10877,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       );
     if (!leaseBeforePause) throw new Error("Expected Discord Gateway lease");
 
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    // TTL is 2s (not 200ms) so setup on a loaded runner cannot outlive it.
+    await new Promise((resolve) => setTimeout(resolve, 2_250));
     const messageId = "555555555555555601";
     const channel = makeThread({
       channelId: "333333333333333333",
