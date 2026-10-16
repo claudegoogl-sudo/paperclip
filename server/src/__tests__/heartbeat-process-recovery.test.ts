@@ -2565,7 +2565,7 @@ it("inherits issueId and taskId from the retried run snapshot on a process-loss 
     expect(retryRun?.contextSnapshot).toMatchObject({
       issueId,
       taskId: inheritedTaskId,
-      wakeReason: "process_lost_retry",
+      wakeReason: "transient_failure_retry",
     });
   });
 
@@ -5755,7 +5755,7 @@ it("inherits issueId and taskId from the retried run snapshot on a process-loss 
         `Authorization: Bearer ${bearerSecret} OPENAI_API_KEY=${apiKeySecret}`,
         { enabled: false },
       ),
-    ).toBe("Authorization: ***REDACTED*** OPENAI_API_KEY=***REDACTED***");
+    ).toBe("Authorization: Bearer ***REDACTED*** OPENAI_API_KEY=***REDACTED***");
 
     mockAdapterExecute.mockResolvedValueOnce({
       exitCode: 0,
