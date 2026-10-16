@@ -113,9 +113,14 @@ async function cleanupHeartbeatInvalidationFixture(db: ReturnType<typeof createD
       `));
       return;
     } catch (error) {
+      const causeMessage = (error as { cause?: { message?: string } } | null)?.cause?.message ?? "";
+      // A background write burst can deadlock against the TRUNCATE (40P01); the
+      // statement is idempotent and rolled back whole, so retrying is safe.
       const isLateCommentRace =
         error instanceof Error &&
-        error.message.includes("issue_comments_issue_id_issues_id_fk");
+        (error.message.includes("issue_comments_issue_id_issues_id_fk") ||
+          /deadlock detected/i.test(error.message) ||
+          /deadlock detected/i.test(causeMessage));
       if (!isLateCommentRace || attempt === 9) {
         throw error;
       }

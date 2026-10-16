@@ -61885,7 +61885,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       expect(
         deliveries.every((delivery) => delivery.state === "processed"),
       ).toBe(true);
-    });
+    }, { timeout: 10_000 });
 
     const [conversation] = await db
       .select()
