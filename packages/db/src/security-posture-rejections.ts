@@ -5244,7 +5244,7 @@ export const SECURITY_POSTURE_REJECTIONS = [
      "stop_requested",
      "updated_at",
     ],
-    reason: "Upstream Browser Use session lifecycle (lease, poll and idle deadlines, provider ids, grant/connection references). The grant is validated by the tool gateway at session start; lease_token only fences concurrent workers. REVIEW: grant_id/lease_token are used as fencing inputs.",
+    reason: "Upstream Browser Use session lifecycle (lease, poll and idle deadlines, provider ids, grant/connection references). The grant is validated by the tool gateway at session start. REVIEW: grant_id and lease_token are read by the session worker as fencing inputs and may act as security predicates; not yet audited, so posture registration is an open follow-up.",
   },
   {
     table: "browser_use_settings",
@@ -5254,7 +5254,7 @@ export const SECURITY_POSTURE_REJECTIONS = [
      "grant_id",
      "max_cost_usd",
     ],
-    reason: "Upstream per-company Browser Use settings (grant, allowed profiles, cost cap). REVIEW: allowed_profile_ids and max_cost_usd are policy inputs read by the Browser Use service; posture registration is a candidate follow-up.",
+    reason: "Upstream per-company Browser Use settings (grant, allowed profiles, cost cap). REVIEW: grant_id, allowed_profile_ids and max_cost_usd are policy inputs read by the Browser Use service and may act as security predicates; not yet audited, so posture registration is an open follow-up.",
   },
   {
     table: "chat_completion_deliveries",

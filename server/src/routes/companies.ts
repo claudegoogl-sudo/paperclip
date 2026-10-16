@@ -381,6 +381,10 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
       throw badRequest("scope must be a single accessible value when provided");
     }
     const result = await svc.list();
+    const pluginOps = req.actor.type === "board" && req.actor.source === "board_key" && req.actor.boardKeyScope?.kind === "plugin_ops";
+    const project = (list: typeof result) => list.map((company) => ({
+      id: company.id, name: company.name, status: company.status, issuePrefix: company.issuePrefix,
+    }));
     const visible =
       req.actor.source === "local_implicit" || req.actor.isInstanceAdmin
         ? result
@@ -389,7 +393,8 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
     // Instance admins can inspect the directory without membership, but that
     // visibility alone does not let them open a company's inbox or tasks.
     if (scope === "accessible") {
-      res.json(result.filter((company) => hasCompanyAccess(req, company.id)));
+      const accessible = result.filter((company) => hasCompanyAccess(req, company.id));
+      res.json(pluginOps ? project(accessible) : accessible);
       return;
     }
     // plugin_ops board keys (long-lived, on disk) only need discovery fields.

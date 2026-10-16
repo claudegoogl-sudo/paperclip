@@ -5418,6 +5418,7 @@ export function agentRoutes(
   router.post("/agents/:id/instructions-bundle/candidates/:runId/resolve", validate(resolveAgentInstructionCandidateSchema), async (req, res) => {
     const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Agent not found");
     if (!existing) return;
+    assertNoCrossAgentAgentWrite(req, existing, "POST /agents/:id/instructions-bundle/candidates/:runId/resolve");
     assertExternalInstructionsAdmin(req, existing);
     const runId = req.params.runId as string;
     if (!isUuidLike(runId)) throw unprocessable("Invalid instruction candidate run id");
@@ -5457,6 +5458,7 @@ export function agentRoutes(
   router.post("/agents/:id/instructions-bundle/restore", validate(restoreAgentInstructionSchema), async (req, res) => {
     const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Agent not found");
     if (!existing) return;
+    assertNoCrossAgentAgentWrite(req, existing, "POST /agents/:id/instructions-bundle/restore");
     assertExternalInstructionsAdmin(req, existing);
     const receipt = await instructionRevisions.restore({ companyId: existing.companyId, agentId: existing.id,
       entryFile: req.body.path, baseRevisionId: req.body.baseRevisionId, revisionId: req.body.revisionId }, req.actor);

@@ -680,6 +680,26 @@ describe("agent instructions bundle routes", () => {
     expect(mockInstructionRevisions.restore).toHaveBeenCalledWith({ companyId: "company-1", agentId: "11111111-1111-4111-8111-111111111111", entryFile: "AGENTS.md", revisionId, baseRevisionId }, expect.objectContaining({ type: "board", userId: "local-board" }));
   });
 
+  it("restricts instruction restore/resolve to self for agent callers", async () => {
+    const target = "11111111-1111-4111-8111-111111111111";
+    const revisionId = "33333333-3333-4333-8333-333333333333";
+    const baseRevisionId = "44444444-4444-4444-8444-444444444444";
+    const runId = "55555555-5555-4555-8555-555555555555";
+    mockInstructionRevisions.restore.mockResolvedValue({ revision: { id: revisionId, entryFile: "AGENTS.md", byteLength: 3 }, content: "old", changed: true, materialization: "current" });
+    mockInstructionWorkingCopies.resolve.mockResolvedValue({ revision: { id: baseRevisionId, entryFile: "AGENTS.md", byteLength: 8 }, content: "r", changed: true, materialization: "current" });
+    const prefix = `/api/agents/${target}/instructions-bundle`;
+    const other = await createApp({ type: "agent", agentId: "other-agent", companyId: "company-1", source: "agent_key" });
+    const r1 = await requestApp(other, (u) => request(u).post(`${prefix}/restore`).send({ path: "AGENTS.md", revisionId, baseRevisionId }));
+    expect(r1.status, JSON.stringify(r1.body)).toBe(403);
+    const r2 = await requestApp(other, (u) => request(u).post(`${prefix}/candidates/${runId}/resolve`).send({ baseRevisionId, content: "x" }));
+    expect(r2.status, JSON.stringify(r2.body)).toBe(403);
+    expect(mockInstructionRevisions.restore).not.toHaveBeenCalled();
+    expect(mockInstructionWorkingCopies.resolve).not.toHaveBeenCalled();
+    const self = await createApp({ type: "agent", agentId: target, companyId: "company-1", source: "agent_key" });
+    const s1 = await requestApp(self, (u) => request(u).post(`${prefix}/restore`).send({ path: "AGENTS.md", revisionId, baseRevisionId }));
+    expect(s1.status, JSON.stringify(s1.body)).toBe(200);
+  });
+
   it("requires a base revision and rejects client-supplied responsible identity", async () => {
     const app = await createApp();
     for (const body of [ { path: "AGENTS.md", content: "stale" }, { path: "AGENTS.md", content: "forged", baseRevisionId: null, responsibleUserId: "forged" } ]) {

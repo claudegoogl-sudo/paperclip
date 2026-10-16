@@ -276,6 +276,17 @@ describe.sequential("company route cross-company authorization", () => {
     await request(app).get(`/api/companies/${companyBId}`).expect(200);
   });
 
+  it("projects plugin_ops board keys to discovery fields on scope=accessible", async () => {
+    mockCompanyService.list.mockResolvedValue([createCompany(companyAId)]);
+    const app = await createApp({
+      ...boardActor({ userId: "ops", source: "board_key", companyIds: [companyAId] }),
+      boardKeyScope: { kind: "plugin_ops" },
+    });
+    const res = await request(app).get("/api/companies?scope=accessible").expect(200);
+    expect(res.body).toHaveLength(1);
+    expect(Object.keys(res.body[0]).sort()).toEqual(["id", "issuePrefix", "name", "status"]);
+  });
+
   it("keeps all companies navigable for the local trusted board", async () => {
     mockCompanyService.list.mockResolvedValue([createCompany(companyAId), createCompany(companyBId)]);
     const app = await createApp(boardActor({ userId: "local-board", source: "local_implicit" }));
