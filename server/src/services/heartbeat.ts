@@ -31664,6 +31664,29 @@ export function heartbeatService(
         continue;
       }
 
+      // Operator Stop ends one response and deliberately leaves the saved user
+      // input deferred until the operator sends new direction. The sweep must not
+      // turn that saved input into a run on its own (timing-dependent otherwise).
+      if (deferredWake.requestedByActorType === "user") {
+        const latestRun = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, issue.companyId),
+              eq(heartbeatRuns.agentId, deferredWake.agentId),
+              sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot} ->> 'issueId') = ${issue.id}`,
+            ),
+          )
+          .orderBy(desc(heartbeatRuns.createdAt))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (latestRun && isAcknowledgedNativeStop(latestRun)) {
+          result.skippedLocked += 1;
+          continue;
+        }
+      }
+
       // Terminal issue: only a comment wake that may reopen the issue is worth
       // promoting (the promotion path owns the reopen rules); every other wake
       // resolves without burning a doomed queued run.
