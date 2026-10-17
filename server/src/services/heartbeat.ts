@@ -31681,7 +31681,12 @@ export function heartbeatService(
           .orderBy(desc(heartbeatRuns.createdAt))
           .limit(1)
           .then((rows) => rows[0] ?? null);
-        if (latestRun && isAcknowledgedNativeStop(latestRun)) {
+        if (
+          latestRun &&
+          latestRun.status === "cancelled" &&
+          (isAcknowledgedNativeStop(latestRun) ||
+            parseObject(latestRun.resultJson).cancelledByActorType === "user")
+        ) {
           result.skippedLocked += 1;
           continue;
         }
