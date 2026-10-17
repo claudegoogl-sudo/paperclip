@@ -406,4 +406,87 @@ describeEmbeddedPostgres("deferred issue-execution wake promotion", () => {
     expect(after.escalated).toBeGreaterThanOrEqual(1);
     expect(after.issueIds).toContain(issueId);
   });
+  describe("sweep and operator Stop", () => {
+    async function seedCancelledRun(
+      companyId: string,
+      agentId: string,
+      issueId: string,
+      resultJson: Record<string, unknown>,
+      createdAt: Date,
+      status: "cancelled" | "succeeded" = "cancelled",
+    ) {
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        status,
+        nativeIssueId: issueId,
+        resultJson,
+        createdAt,
+        contextSnapshot: { issueId, taskId: issueId },
+      });
+      return runId;
+    }
+    const stopReceipt = (runId: string, companyId: string, issueId: string) => ({
+      cancelledByActorType: "user",
+      cancelledByUserId: "board-user",
+      nativeCancellation: {
+        schema: "paperclip.native-cancellation.v1", runId, companyId, issueId,
+        scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged",
+        dispatched: true, intentAuditId: "intent", acknowledgementAuditId: "ack",
+      },
+    });
+    async function setup() {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent(companyId, "Worker");
+      const issueId = await seedIssue(companyId, { status: "todo", assigneeAgentId: agentId });
+      const wakeId = await seedDeferredWake(companyId, agentId, issueId);
+      return { companyId, agentId, issueId, wakeId };
+    }
+    const t0 = () => new Date(Date.now() - 60_000);
+
+    it("(a) does not promote user input after an acknowledged Stop", async () => {
+      const { companyId, agentId, issueId, wakeId } = await setup();
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId, companyId, agentId, invocationSource: "assignment", status: "cancelled",
+        nativeIssueId: issueId, resultJson: stopReceipt(runId, companyId, issueId),
+        createdAt: t0(), contextSnapshot: { issueId },
+      });
+      const sweep = await heartbeat.sweepStrandedDeferredWakes();
+      expect(sweep.promoted).toBe(0);
+      expect((await wakeById(wakeId))?.status).toBe("deferred_issue_execution");
+      expect(await runForWake(wakeId)).toHaveLength(0);
+    });
+
+    it("(b) does not promote user input after a run cancelled by a user", async () => {
+      const { companyId, agentId, issueId, wakeId } = await setup();
+      await seedCancelledRun(companyId, agentId, issueId, { cancelledByActorType: "user" }, t0());
+      const sweep = await heartbeat.sweepStrandedDeferredWakes();
+      expect(sweep.promoted).toBe(0);
+      expect((await wakeById(wakeId))?.status).toBe("deferred_issue_execution");
+      expect(await runForWake(wakeId)).toHaveLength(0);
+    });
+
+    it("(c) promotes once new user direction produced a later run", async () => {
+      const { companyId, agentId, issueId, wakeId } = await setup();
+      await seedCancelledRun(companyId, agentId, issueId, { cancelledByActorType: "user" }, new Date(Date.now() - 120_000));
+      await seedCancelledRun(companyId, agentId, issueId, {}, t0(), "succeeded");
+      const sweep = await heartbeat.sweepStrandedDeferredWakes();
+      expect(sweep.promoted).toBe(1);
+      expect(await runForWake(wakeId)).toHaveLength(1);
+      await waitForCondition(() => mockAdapterExecute.mock.calls.length > 0);
+    });
+
+    it("(d) still promotes after a run cancelled by the system", async () => {
+      const { companyId, agentId, issueId, wakeId } = await setup();
+      await seedCancelledRun(companyId, agentId, issueId, { cancelledByActorType: "system" }, t0());
+      const sweep = await heartbeat.sweepStrandedDeferredWakes();
+      expect(sweep.promoted).toBe(1);
+      expect(await runForWake(wakeId)).toHaveLength(1);
+      await waitForCondition(() => mockAdapterExecute.mock.calls.length > 0);
+    });
+  });
 });
