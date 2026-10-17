@@ -802,6 +802,62 @@ export const SECURITY_POSTURE_COLUMNS = [
     column: "external_credential",
     reason: "Credential reference material fed to resolveVercelCredentialHeaders; an unqualified write transplants one connection's external credential onto every row.",
   },
+  // --- Upstream v2026.1012.0: MCP OAuth, event subscriptions, AI session epoch ---
+  {
+    table: "mcp_oauth_grants",
+    column: "revoked_at",
+    reason: "Grant revocation marker; NULL = grant still honoured, so clearing it resurrects a revoked MCP grant.",
+  },
+  {
+    table: "mcp_oauth_grants",
+    column: "scopes",
+    reason: "Scopes the grant authorizes; a blanket widen hands every token minted from the grant broader MCP access.",
+  },
+  {
+    table: "mcp_oauth_tokens",
+    column: "expires_at",
+    reason: "Access/refresh token expiry; pushing it out lengthens a stolen token's life.",
+  },
+  {
+    table: "mcp_oauth_tokens",
+    column: "used_at",
+    reason: "Refresh-token single-use marker; NULL = redeemable, so clearing it re-arms a spent refresh token and disables reuse detection.",
+  },
+  {
+    table: "mcp_oauth_requests",
+    column: "consumed_at",
+    reason: "Authorization-code single-use marker; NULL = redeemable, so clearing it makes a spent code replayable.",
+  },
+  {
+    table: "mcp_oauth_requests",
+    column: "expires_at",
+    reason: "Authorization-request expiry; pushing it out keeps an intercepted code redeemable.",
+  },
+  {
+    table: "mcp_oauth_device_requests",
+    column: "status",
+    reason: "Device-flow approval state; flattening to approved lets an unapproved device request mint tokens.",
+  },
+  {
+    table: "mcp_oauth_device_requests",
+    column: "expires_at",
+    reason: "Device-code expiry; pushing it out keeps an abandoned device code approvable.",
+  },
+  {
+    table: "mcp_event_subscriptions",
+    column: "stopped_at",
+    reason: "Subscription stop marker; NULL = events keep being delivered, so clearing it restarts delivery to a stopped subscriber.",
+  },
+  {
+    table: "mcp_event_subscriptions",
+    column: "expires_at",
+    reason: "Subscription expiry; pushing it out extends delivery of company events to the subscriber.",
+  },
+  {
+    table: "company_secrets",
+    column: "ai_session_epoch",
+    reason: "Monotonic fence that invalidates AI sessions on rotation; flattening it back revives sessions issued before the rotation.",
+  },
 ] as const satisfies readonly (SecurityPostureColumn & RegisteredPostureColumn)[];
 
 const POSTURE_COLUMNS_BY_TABLE = new Map<string, Set<string>>();

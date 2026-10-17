@@ -149,7 +149,7 @@ function readyPlugin() {
   });
 }
 
-describe.sequential("plugin install and upgrade authz", () => {
+describe("plugin install and upgrade authz", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -577,7 +577,7 @@ describe.sequential("plugin install and upgrade authz", () => {
   }, 20_000);
 });
 
-describe.sequential("scoped plugin API routes", () => {
+describe("scoped plugin API routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -949,7 +949,7 @@ describe.sequential("plugin local folder routes", () => {
   });
 });
 
-describe.sequential("plugin tool and bridge authz", () => {
+describe("plugin tool and bridge authz", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });

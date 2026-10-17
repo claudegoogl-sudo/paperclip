@@ -652,7 +652,7 @@ type SecretConsumerContext = {
   responsibleUserId?: string | null;
   actorType?: "agent" | "user" | "system" | "plugin";
   actorId?: string | null;
-  actorSource?: "local_implicit" | "session" | "board_key" | "agent_key" | "agent_jwt" | "cloud_tenant";
+  actorSource?: "local_implicit" | "session" | "board_key" | "agent_key" | "agent_jwt" | "mcp_oauth" | "cloud_tenant";
   issueId?: string | null;
   heartbeatRunId?: string | null;
   pluginId?: string | null;
@@ -2536,6 +2536,8 @@ export function secretService(db: Db | DbTransaction) {
       expectedLatestVersion?: number;
       // Provenance marker stamped onto the new version row (task_bridge renewer).
       rotationJobId?: string | null;
+      /** Internal authenticated refresh write-back only; never accepted by HTTP schemas. */
+      preserveAiSessionEpoch?: boolean;
     },
     actor?: { userId?: string | null; agentId?: string | null },
   ) {
@@ -2674,6 +2676,7 @@ export function secretService(db: Db | DbTransaction) {
           .update(companySecrets)
           .set({
             latestVersion: nextVersion,
+            aiSessionEpoch: input.preserveAiSessionEpoch ? secret.aiSessionEpoch : sql`${companySecrets.aiSessionEpoch} + 1`,
             externalRef: prepared.externalRef,
             providerConfigId,
             lastRotatedAt: new Date(),
@@ -4736,6 +4739,8 @@ export function secretService(db: Db | DbTransaction) {
          * (correlates with `agent_key_renewal_events`).
          */
         rotationJobId?: string | null;
+      /** Internal authenticated refresh write-back only; never accepted by HTTP schemas. */
+      preserveAiSessionEpoch?: boolean;
       },
       actor?: { userId?: string | null; agentId?: string | null },
     ) => {

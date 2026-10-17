@@ -235,6 +235,10 @@ export function createHttpLogger(baseLogger: pino.Logger) {
       : value;
   },
   customProps(req, res) {
+    if (res.statusCode >= 400 && /^\/mcp\/(?:oauth|paperclip)(?:\/|$)/.test(requestClassificationUrl(req) ?? "")) {
+      const ctx = (res as any).__errorContext;
+      return { reqBody: "[REDACTED]", ...(ctx ? { errorContext: { name: "Error" } } : {}) };
+    }
     if (res.statusCode >= 400 && isPrivateWebhook(req)) {
       // Omit, rather than recursively redact, the entire provider payload —
       // before/after parsing, with or without error context.

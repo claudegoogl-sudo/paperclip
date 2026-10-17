@@ -979,3 +979,16 @@ describe("redactSensitiveText serialized-JSON integrity", () => {
     expect(redactedLeading).not.toContain(KEY);
   });
 });
+
+describe("sync redaction regressions (fork strictness)", () => {
+  it("redacts hash and id style secret key names", () => {
+    const out = sanitizeRecord({ passwordHash: "x1", tokenHash: "x2", secretId: "x3", apiKeyId: "x4" });
+    expect(out).toEqual({ passwordHash: REDACTED_EVENT_VALUE, tokenHash: REDACTED_EVENT_VALUE, secretId: REDACTED_EVENT_VALUE, apiKeyId: REDACTED_EVENT_VALUE });
+  });
+  it("redacts non-eyJ dotted JWT-shaped record values", () => {
+    expect(sanitizeRecord({ note: "aaaaaaaa.bbbbbbbb.cccccccc" }).note).toBe(REDACTED_EVENT_VALUE);
+  });
+  it("keeps finite audit counts visible", () => {
+    expect(sanitizeRecord({ secretsRevoked: 2 })).toEqual({ secretsRevoked: 2 });
+  });
+});

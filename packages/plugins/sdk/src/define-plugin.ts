@@ -1,3 +1,4 @@
+import type { AiConnectionRouterRequest, AiConnectionRouterResult } from "@paperclipai/shared";
 /**
  * `definePlugin` — the top-level helper for authoring a Paperclip plugin.
  *
@@ -346,6 +347,9 @@ export interface PluginDefinition {
    *
    * Requires `external.objects.read`.
    */
+  /** Propose a member from host-authorized candidates. Requires ai.connections.route. */
+  onRouteAiConnection?(params: AiConnectionRouterRequest): Promise<AiConnectionRouterResult>;
+
   onResolveExternalObject?(
     params: ResolveExternalObjectParams,
   ): Promise<PluginExternalObjectResolveResult>;
