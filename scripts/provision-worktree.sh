@@ -48,14 +48,23 @@ if [[ -L "$canonical_base_cwd/.paperclip" && ! -d "$canonical_base_cwd/.papercli
   exit 1
 fi
 source_config_path="$canonical_base_cwd/.paperclip/config.json"
+source_config_origin="base project workspace"
 if [[ ! -e "$source_config_path" && ! -L "$source_config_path" ]]; then
   # A base workspace that is a plain checkout carries no instance config of its own.
   # Fall back to the control plane's own registered instance config, which is process
   # state this workspace cannot rewrite.
   source_config_path="${PAPERCLIP_CONFIG:-$paperclip_home/instances/$paperclip_instance_id/config.json}"
+  source_config_origin="control-plane instance"
 fi
 if [[ ! -f "$source_config_path" || -L "$source_config_path" ]]; then
-  echo "Registered Paperclip seed source config is missing or is not a canonical file: $source_config_path" >&2
+  if [[ ! -e "$source_config_path" && ! -L "$source_config_path" ]]; then
+    echo "Registered Paperclip seed source config is unavailable ($source_config_origin): $source_config_path" >&2
+    echo "For a seeded development instance, configure a canonical config for that registered source before retrying." >&2
+    echo 'Only for a checkout-only worktree, explicitly set workspaceStrategy.provisionCommand to "true". This skips setup; it does not prepare a development runtime.' >&2
+  else
+    echo "Registered Paperclip seed source config is not a canonical file ($source_config_origin): $source_config_path" >&2
+    echo "Repair the registered source path; symlinks and non-regular files are not accepted." >&2
+  fi
   exit 1
 fi
 canonical_source_dir="$(cd "$(dirname "$source_config_path")" && pwd -P)"
@@ -692,6 +701,14 @@ function walk(dir) {
 }
 
 walk(root);
+// package.json is the pnpm 9 patch manifest for this repository. Hash the
+// declared paths, including non-.patch filenames and patches outside patches/.
+const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+for (const patch of Object.values(manifest.pnpm?.patchedDependencies ?? {})) {
+  if (typeof patch !== "string") throw new Error("Invalid pnpm patch path");
+  const file = path.resolve(root, patch);
+  if (!files.includes(file)) files.push(file);
+}
 files.sort((left, right) => path.relative(root, left).localeCompare(path.relative(root, right)));
 
 const hash = crypto.createHash("sha256");
@@ -768,7 +785,7 @@ if [[ -f "$worktree_cwd/package.json" && -f "$worktree_cwd/pnpm-lock.yaml" ]]; t
     }
 
     run_pnpm_install() {
-      local stdout_path stderr_path
+      local stdout_path stderr_path exit_code
       stdout_path="$(mktemp)"
       stderr_path="$(mktemp)"
 
@@ -783,12 +800,13 @@ if [[ -f "$worktree_cwd/package.json" && -f "$worktree_cwd/pnpm-lock.yaml" ]]; t
         cat "$stderr_path" >&2
         rm -f "$stdout_path" "$stderr_path"
         return 0
+      else
+        exit_code=$?
       fi
 
-      local exit_code=$?
       cat "$stdout_path"
       cat "$stderr_path" >&2
-      if grep -q "ERR_PNPM_OUTDATED_LOCKFILE" "$stdout_path" "$stderr_path"; then
+      if grep -Eq "ERR_PNPM_(OUTDATED_LOCKFILE|LOCKFILE_CONFIG_MISMATCH)" "$stdout_path" "$stderr_path"; then
         rm -f "$stdout_path" "$stderr_path"
         return 90
       fi

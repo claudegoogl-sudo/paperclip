@@ -81,59 +81,54 @@ const mockInstanceSettingsService = vi.hoisted(() => ({
   getGeneral: vi.fn(),
 }));
 
-// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
-// registry must be in place before ANY import of the routes module, in every
-// test. createApp concurrently imports middleware and route modules whose
-// graphs both contain services/index.js. With doMock-registered mocks that
-// first evaluation could race the registry under load and bind the REAL
-// services module, rejecting the request under test with a 500 (observed on
-// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
-// to every import graph deterministically.
-vi.mock("../services/agents.js", () => ({
-  agentService: () => mockAgentService,
-}));
+function registerModuleMocks() {
+  vi.doMock("../services/agents.js", () => ({
+    agentService: () => mockAgentService,
+  }));
 
-vi.mock("../services/access.js", () => ({
-  accessService: () => mockAccessService,
-}));
+  vi.doMock("../services/access.js", () => ({
+    accessService: () => mockAccessService,
+  }));
 
-vi.mock("../services/secrets.js", () => ({
-  secretService: () => mockSecretService,
-}));
+  vi.doMock("../services/secrets.js", () => ({
+    secretService: () => mockSecretService,
+  }));
 
-vi.mock("../services/environments.js", () => ({
-  environmentService: () => mockEnvironmentService,
-}));
+  vi.doMock("../services/environments.js", () => ({
+    environmentService: () => mockEnvironmentService,
+  }));
 
-vi.mock("../services/agent-instructions.js", () => ({
-  agentInstructionsService: () => mockAgentInstructionsService,
-  syncInstructionsBundleConfigFromFilePath: mockSyncInstructionsBundleConfigFromFilePath,
-}));
+  vi.doMock("../services/agent-instructions.js", () => ({
+    agentInstructionsService: () => mockAgentInstructionsService,
+    syncInstructionsBundleConfigFromFilePath: mockSyncInstructionsBundleConfigFromFilePath,
+    agentInstructionsBundleMode: () => null as ReturnType<typeof import("../services/agent-instructions.js").agentInstructionsBundleMode>,
+  }));
 
-vi.mock("../services/activity-log.js", () => ({
-  logActivity: mockLogActivity,
-}));
+  vi.doMock("../services/activity-log.js", () => ({
+    logActivity: mockLogActivity,
+  }));
 
-vi.mock("../services/instance-settings.js", () => ({
-  instanceSettingsService: () => mockInstanceSettingsService,
-}));
+  vi.doMock("../services/instance-settings.js", () => ({
+    instanceSettingsService: () => mockInstanceSettingsService,
+  }));
 
-vi.mock("../services/index.js", () => ({
-  agentService: () => mockAgentService,
-  agentInstructionsService: () => mockAgentInstructionsService,
-  accessService: () => mockAccessService,
-  approvalService: () => ({}),
-  companySkillService: () => ({}),
-  budgetService: () => ({}),
-  heartbeatService: () => ({}),
-  issueApprovalService: () => ({}),
-  issueService: () => ({}),
-  logActivity: mockLogActivity,
-  secretService: () => mockSecretService,
-  syncInstructionsBundleConfigFromFilePath: mockSyncInstructionsBundleConfigFromFilePath,
-  workspaceOperationService: () => ({}),
-  environmentService: () => mockEnvironmentService,
-}));
+  vi.doMock("../services/index.js", () => ({
+    agentService: () => mockAgentService,
+    agentInstructionsService: () => mockAgentInstructionsService,
+    accessService: () => mockAccessService,
+    approvalService: () => ({}),
+    companySkillService: () => ({}),
+    budgetService: () => ({}),
+    heartbeatService: () => ({}),
+    issueApprovalService: () => ({}),
+    issueService: () => ({}),
+    logActivity: mockLogActivity,
+    secretService: () => mockSecretService,
+    syncInstructionsBundleConfigFromFilePath: mockSyncInstructionsBundleConfigFromFilePath,
+    workspaceOperationService: () => ({}),
+    environmentService: () => mockEnvironmentService,
+  }));
+}
 
 async function createApp(actor: Record<string, unknown>) {
   const [{ agentRoutes }, { errorHandler }] = await Promise.all([
@@ -182,6 +177,11 @@ async function requestApp(
 
 describe("agent adapterConfig context-injection guard", () => {
   beforeEach(() => {
+    vi.resetModules();
+    vi.doUnmock("../routes/agents.js");
+    vi.doUnmock("../routes/authz.js");
+    vi.doUnmock("../middleware/index.js");
+    registerModuleMocks();
     vi.clearAllMocks();
     mockSyncInstructionsBundleConfigFromFilePath.mockImplementation(
       (_agent: unknown, config: Record<string, unknown>) => config,

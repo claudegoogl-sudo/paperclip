@@ -108,6 +108,8 @@ vi.mock("../services/environments.js", () => ({
 }));
 
 vi.mock("../services/agent-instructions.js", () => ({
+  agentInstructionsBundleMode: () => null,
+  deriveBundleState: () => ({ entryFile: "AGENTS.md" }),
   agentInstructionsService: () => mockAgentInstructionsService,
   syncInstructionsBundleConfigFromFilePath: mockSyncInstructionsBundleConfigFromFilePath,
 }));

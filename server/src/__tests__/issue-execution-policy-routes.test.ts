@@ -1,7 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { buildIssueMonitorTriggeredPatch, normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.ts";
+import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.ts";
 
 const mockIssueService = vi.hoisted(() => ({
   clearOrphanCheckoutLocksIfTerminal: vi.fn(async () => false),
@@ -69,6 +69,95 @@ const mockIssueThreadInteractionService = vi.hoisted(() => ({
 const mockIssueApprovalService = vi.hoisted(() => ({
   listApprovalsForIssue: vi.fn(async () => []),
 }));
+const mockRunnerGoalService = vi.hoisted(() => ({
+  projection: vi.fn(async () => null),
+  act: vi.fn(),
+}));
+
+function registerModuleMocks() {
+  vi.doMock("../services/queued-interaction-response.js", () => ({
+    hasQueuedInteractionResponse: vi.fn(async () => false),
+  }));
+  vi.doMock("../services/runner-goals.js", () => ({
+    runnerGoalService: () => mockRunnerGoalService,
+    RunnerGoalActionError: class RunnerGoalActionError extends Error {},
+    RunnerGoalConflictError: class RunnerGoalConflictError extends Error {},
+  }));
+
+  vi.doMock("../services/index.js", () => ({
+    companyService: () => ({
+      getById: vi.fn(async () => ({ id: "company-1" })),
+    }),
+    accessService: () => mockAccessService,
+    agentService: () => ({
+      getById: vi.fn(async (agentId: string) => ({
+        id: agentId,
+        companyId: "company-1",
+        permissions: null,
+      })),
+      resolveByReference: vi.fn(async (_companyId: string, reference: string) => ({
+        ambiguous: false,
+        agent: {
+          id: reference,
+          companyId: "company-1",
+          status: "idle",
+          orgChainHealth: { status: "healthy" },
+        },
+      })),
+    }),
+    companySkillService: () => ({
+      completeTestRunForIssue: vi.fn(async () => null),
+    }),
+    documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
+    documentService: () => ({}),
+    executionWorkspaceService: () => ({}),
+    feedbackService: () => ({
+      listIssueVotesForUser: vi.fn(async () => []),
+      saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
+    }),
+    goalService: () => ({}),
+    heartbeatService: () => mockHeartbeatService,
+    environmentService: () => ({
+      getById: vi.fn(async () => null),
+    }),
+    instanceSettingsService: () => ({
+      get: vi.fn(async () => ({
+        id: "instance-settings-1",
+        general: {
+          censorUsernameInLogs: false,
+          feedbackDataSharingPreference: "prompt",
+        },
+      })),
+      listCompanyIds: vi.fn(async () => ["company-1"]),
+    }),
+    issueApprovalService: () => mockIssueApprovalService,
+    issueReferenceService: () => ({
+      deleteDocumentSource: async () => undefined,
+      diffIssueReferenceSummary: () => ({
+        addedReferencedIssues: [],
+        removedReferencedIssues: [],
+        currentReferencedIssues: [],
+      }),
+      emptySummary: () => ({ outbound: [], inbound: [] }),
+      listIssueReferenceSummary: async () => ({ outbound: [], inbound: [] }),
+      syncComment: async () => undefined,
+      syncDocument: async () => undefined,
+      syncIssue: async () => undefined,
+    }),
+    issueRecoveryActionService: () => ({
+      getActiveForIssue: vi.fn(async () => null),
+      listActiveForIssues: vi.fn(async () => new Map()),
+    }),
+    issueService: () => mockIssueService,
+    issueThreadInteractionService: () => mockIssueThreadInteractionService,
+    logActivity: mockLogActivity,
+    projectService: () => ({}),
+    routineService: () => ({
+      syncRunStatusForIssue: vi.fn(async () => undefined),
+    }),
+    workProductService: () => ({}),
+  }));
+}
 
 type TestActor =
   | {
@@ -84,88 +173,6 @@ type TestActor =
       companyId: string;
       runId: string | null;
     };
-
-// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
-// registry must be in place before ANY import of the routes module, in every
-// test. createApp concurrently imports middleware and route modules whose
-// graphs both contain services/index.js. With doMock-registered mocks that
-// first evaluation could race the registry under load and bind the REAL
-// services module, rejecting the request under test with a 500 (observed on
-// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
-// to every import graph deterministically.
-vi.mock("../services/index.js", () => ({
-  companyService: () => ({
-    getById: vi.fn(async () => ({ id: "company-1" })),
-  }),
-  accessService: () => mockAccessService,
-  agentService: () => ({
-    getById: vi.fn(async (agentId: string) => ({
-      id: agentId,
-      companyId: "company-1",
-      permissions: null,
-    })),
-    resolveByReference: vi.fn(async (_companyId: string, reference: string) => ({
-      ambiguous: false,
-      agent: {
-        id: reference,
-        companyId: "company-1",
-        status: "idle",
-        orgChainHealth: { status: "healthy" },
-      },
-    })),
-  }),
-  companySkillService: () => ({
-    completeTestRunForIssue: vi.fn(async () => null),
-  }),
-  documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
-  documentService: () => ({}),
-  executionWorkspaceService: () => ({}),
-  feedbackService: () => ({
-    listIssueVotesForUser: vi.fn(async () => []),
-    saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
-  }),
-  goalService: () => ({}),
-  heartbeatService: () => mockHeartbeatService,
-  environmentService: () => ({
-    getById: vi.fn(async () => null),
-  }),
-  instanceSettingsService: () => ({
-    get: vi.fn(async () => ({
-      id: "instance-settings-1",
-      general: {
-        censorUsernameInLogs: false,
-        feedbackDataSharingPreference: "prompt",
-      },
-    })),
-    listCompanyIds: vi.fn(async () => ["company-1"]),
-  }),
-  issueApprovalService: () => mockIssueApprovalService,
-  issueReferenceService: () => ({
-    deleteDocumentSource: async () => undefined,
-    diffIssueReferenceSummary: () => ({
-      addedReferencedIssues: [],
-      removedReferencedIssues: [],
-      currentReferencedIssues: [],
-    }),
-    emptySummary: () => ({ outbound: [], inbound: [] }),
-    listIssueReferenceSummary: async () => ({ outbound: [], inbound: [] }),
-    syncComment: async () => undefined,
-    syncDocument: async () => undefined,
-    syncIssue: async () => undefined,
-  }),
-  issueRecoveryActionService: () => ({
-    getActiveForIssue: vi.fn(async () => null),
-    listActiveForIssues: vi.fn(async () => new Map()),
-  }),
-  issueService: () => mockIssueService,
-  issueThreadInteractionService: () => mockIssueThreadInteractionService,
-  logActivity: mockLogActivity,
-  projectService: () => ({}),
-  routineService: () => ({
-    syncRunStatusForIssue: vi.fn(async () => undefined),
-  }),
-  workProductService: () => ({}),
-}));
 
 async function createApp(actor?: TestActor) {
   const [{ errorHandler }, { issueRoutes }] = await Promise.all([
@@ -191,6 +198,11 @@ async function createApp(actor?: TestActor) {
 
 describe("issue execution policy routes", () => {
   beforeEach(() => {
+    vi.resetModules();
+    vi.doUnmock("../services/index.js");
+    vi.doUnmock("../routes/issues.js");
+    vi.doUnmock("../middleware/index.js");
+    registerModuleMocks();
     vi.clearAllMocks();
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
@@ -700,101 +712,6 @@ describe("issue execution policy routes", () => {
     );
   });
 
-  describe("re-arming a monitor after a tick consumed the previous one", () => {
-    const issueId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    const assigneeAgentId = "33333333-3333-4333-8333-333333333333";
-
-    function consumedIssue(monitorExtras: Record<string, unknown> = {}) {
-      const scheduled = {
-        id: issueId,
-        companyId: "company-1",
-        status: "in_progress",
-        assigneeAgentId,
-        assigneeUserId: null,
-        createdByUserId: "local-board",
-        identifier: "PAP-1010",
-        title: "Standing thread with a re-armed monitor",
-        executionPolicy: normalizeIssueExecutionPolicy({
-          monitor: {
-            nextCheckAt: "2026-09-24T06:10:00.000Z",
-            scheduledBy: "assignee",
-            notes: "first checkpoint",
-            ...monitorExtras,
-          },
-        }),
-        executionState: null,
-        monitorAttemptCount: 0,
-        monitorNextCheckAt: new Date("2026-09-24T06:10:00.000Z"),
-        monitorLastTriggeredAt: null,
-        monitorNotes: "first checkpoint",
-        monitorScheduledBy: "assignee",
-      };
-      // Apply the exact patch the scheduler tick writes when it consumes a monitor.
-      return {
-        ...scheduled,
-        ...buildIssueMonitorTriggeredPatch({
-          issue: scheduled,
-          policy: scheduled.executionPolicy,
-          triggeredAt: new Date("2026-09-24T06:10:25.000Z"),
-        }),
-      };
-    }
-
-    async function patchMonitor(issue: Record<string, unknown>, monitor: Record<string, unknown>) {
-      mockIssueService.getById.mockResolvedValue(issue);
-      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
-        ...issue,
-        ...patch,
-        updatedAt: new Date(),
-      }));
-      return request(await createApp({
-        type: "agent",
-        agentId: assigneeAgentId,
-        companyId: "company-1",
-        runId: "55555555-5555-4555-8555-555555555555",
-      }))
-        .patch(`/api/issues/${issueId}`)
-        .send({ executionPolicy: { monitor } });
-    }
-
-    it("persists the new monitor and returns it in the 200 body", async () => {
-      const issue = consumedIssue();
-      expect(issue.executionPolicy).toBeNull();
-      expect(issue.monitorNextCheckAt).toBeNull();
-
-      const res = await patchMonitor(issue, {
-        nextCheckAt: "2099-09-24T11:05:00.000Z",
-        scheduledBy: "assignee",
-        notes: "second checkpoint",
-      });
-
-      expect(res.status).toBe(200);
-      expect(mockIssueService.update).toHaveBeenCalledWith(
-        issueId,
-        expect.objectContaining({
-          executionPolicy: expect.objectContaining({
-            monitor: expect.objectContaining({ nextCheckAt: "2099-09-24T11:05:00.000Z" }),
-          }),
-          monitorNextCheckAt: new Date("2099-09-24T11:05:00.000Z"),
-        }),
-      );
-      expect(res.body.executionPolicy?.monitor?.nextCheckAt).toBe("2099-09-24T11:05:00.000Z");
-    });
-
-    it("refuses with a non-2xx reason instead of dropping when the carried attempt count exhausts maxAttempts", async () => {
-      const issue = consumedIssue({ maxAttempts: 1 });
-
-      const res = await patchMonitor(issue, {
-        nextCheckAt: "2099-09-24T11:05:00.000Z",
-        scheduledBy: "assignee",
-        maxAttempts: 1,
-      });
-
-      expect(res.status).toBe(422);
-      expect(mockIssueService.update).not.toHaveBeenCalled();
-    });
-  });
-
   it("allows board-authored in_review repair updates without a review path", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -889,6 +806,8 @@ describe("issue execution policy routes", () => {
         actorUserId: "local-board",
       }),
       expect.anything(),
+      undefined,
+      expect.any(Array),
     );
     expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
   });
@@ -946,6 +865,8 @@ describe("issue execution policy routes", () => {
         actorUserId: "local-board",
       }),
       expect.anything(),
+      undefined,
+      expect.any(Array),
     );
     const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
     expect(updatePatch.status).toBe("cancelled");

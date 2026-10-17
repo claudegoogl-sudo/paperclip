@@ -96,11 +96,21 @@ describeEmbeddedPostgres("run liveness probe routes", () => {
   }
 
   async function seedCompany(name: string) {
-    return db.insert(companies).values({
+    const company = await db.insert(companies).values({
       name,
       issuePrefix: `LV${randomUUID().replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
     }).returning().then((rows) => rows[0]!);
+    // Run telemetry reads are authorized against the stored membership, not
+    // only the actor's claimed memberships, so seed the board user's row.
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: "board-user",
+      status: "active",
+      membershipRole: "operator",
+    });
+    return company;
   }
 
   async function seedAgent(companyId: string, name: string, adapterType: string) {

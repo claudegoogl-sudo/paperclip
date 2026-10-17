@@ -89,7 +89,7 @@ describe("plugin manifest UI slot type — v1 floor", () => {
       );
       expect(slotTypeIssue).toBeDefined();
       expect(slotTypeIssue?.message).toBe(
-        `Invalid slot type "${slotType}". v1 supports: dashboardWidget, page`,
+        `Invalid slot type "${slotType}". v1 supports: dashboardWidget, page, organizationSwitcher`,
       );
     },
   );
@@ -319,7 +319,7 @@ describe("plugin managed skill validators", () => {
 // Upstream v2026.525.0 added host-rendered support for `routeSidebar`,
 // `detailTab`, `toolbarButton`, and `companySettingsPage` slots and shipped
 // acceptance tests for them. Our fork's v1 host-rendered floor
-// (PLUGIN_UI_SLOT_TYPES_V1_SUPPORTED = [dashboardWidget, page])
+// (PLUGIN_UI_SLOT_TYPES_V1_SUPPORTED = [dashboardWidget, page, organizationSwitcher])
 // is enforced on the SAME `pluginUiSlotDeclarationSchema`, so it still narrows
 // install-time acceptance to dashboardWidget + page — these upstream slot types
 // are rejected at the manifest validator until the floor is expanded.
@@ -505,6 +505,24 @@ describe("plugin manifest webhook auth declaration", () => {
 });
 
 describe("sandbox provider capability declaration validators", () => {
+  it("preserves a declared acquisition budget and keeps it optional", () => {
+    const parsed = pluginManifestV1Schema.parse(
+      buildSandboxProviderManifest({ defaultAcquireTimeoutMs: 300_000 }),
+    );
+    expect(parsed.environmentDrivers?.[0]?.defaultAcquireTimeoutMs).toBe(300_000);
+    const legacy = pluginManifestV1Schema.parse(buildSandboxProviderManifest({}));
+    expect(legacy.environmentDrivers?.[0]?.defaultAcquireTimeoutMs).toBeUndefined();
+  });
+
+  it.each([0, -1, 1.5, Infinity, NaN, "300000", 86_400_001])(
+    "rejects an invalid acquisition budget: %s",
+    (defaultAcquireTimeoutMs) => {
+      expect(pluginManifestV1Schema.safeParse(
+        buildSandboxProviderManifest({ defaultAcquireTimeoutMs }),
+      ).success).toBe(false);
+    },
+  );
+
   it("test_manifest_accepts_sandbox_capabilities_and_rejects_unknown_capability_keys", () => {
     const parsed = pluginManifestV1Schema.parse(
       buildSandboxProviderManifest({

@@ -203,6 +203,9 @@ vi.mock("../services/index.js", () => ({
 // Agent-authored writes resolve source trust by querying the DB, which the
 // stubbed `{}` db in this suite cannot serve. Stub it to a no-trust result so
 // agent-actor comment POSTs exercise the wake fan-out rather than the db.
+// The 1005.0 issue read computes the execution blocker; the fake db here has no run rows to scan.
+vi.mock("../services/execution-blocker.js", () => ({ getExecutionBlocker: vi.fn(async () => null) }));
+
 vi.mock("../services/source-trust.js", async () => {
   const actual = await vi.importActual<typeof import("../services/source-trust.js")>(
     "../services/source-trust.js",
@@ -377,10 +380,15 @@ describe("cross-company issue access over HTTP", () => {
 
   it("M7: mention fan-out resolves against the ISSUE company only (POST comment and PATCH comment)", async () => {
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
+    // 1005.0 resolves mentions from the persisted comment body, so echo the submitted text back.
+    mockIssueService.addComment.mockImplementation(async (issueId: string, body: string) => ({
+      id: "c1", issueId, companyId: "target-co", body,
+    }));
     await request(await createApp(actor(CONCIERGE))).post(`/api/issues/${ISSUE_ID}/comments`).send({ body: "@home-agent hi" });
     await request(await createApp(actor(CONCIERGE))).patch(`/api/issues/${ISSUE_ID}`).send({ comment: "@home-agent hi" });
     const calls = mockIssueService.findMentionedAgents.mock.calls;
-    expect(calls.length).toBeGreaterThan(0);
+    // 1005.0 dropped the route-level @-mention fan-out, so there may be no lookup at all; if one happens it
+    // must still be scoped to the ISSUE company, and a cross-company comment must never wake anyone.
     for (const c of calls) expect(c[0]).toBe("target-co");
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });

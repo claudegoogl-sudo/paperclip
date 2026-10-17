@@ -56,6 +56,8 @@ import type {
   PluginEnvironmentDestroyLeaseParams,
   PluginEnvironmentExecuteParams,
   PluginEnvironmentExecuteResult,
+  PluginEnvironmentRunnerIngressEndpointParams,
+  PluginEnvironmentRunnerIngressEndpoint,
   PluginEnvironmentSyncInParams,
   PluginEnvironmentSyncOutParams,
   PluginEnvironmentSyncResult,
@@ -74,6 +76,7 @@ import type {
   PluginEnvironmentRealizeWorkspaceParams,
   PluginEnvironmentRealizeWorkspaceResult,
   PluginEnvironmentReleaseLeaseParams,
+  PluginEnvironmentTerminationReceipt,
   PluginEnvironmentResumeLeaseParams,
   PluginEnvironmentValidateConfigParams,
   PluginEnvironmentValidationResult,
@@ -383,12 +386,19 @@ export interface PluginDefinition {
   /** Called when a run finishes and the provider lease can be released. */
   onEnvironmentReleaseLease?(
     params: PluginEnvironmentReleaseLeaseParams,
-  ): Promise<void>;
+  ): Promise<PluginEnvironmentTerminationReceipt | void>;
+
+  /** Stop this exact allocation and retain all files, regardless of release
+   * policy. Throw if stop cannot be confirmed; never destroy as a fallback.
+   * Separate worker discovery lets the host safely defer older providers. */
+  onEnvironmentStopLease?(
+    params: PluginEnvironmentReleaseLeaseParams,
+  ): Promise<PluginEnvironmentTerminationReceipt>;
 
   /** Called when the host needs to force-destroy provider state. */
   onEnvironmentDestroyLease?(
     params: PluginEnvironmentDestroyLeaseParams,
-  ): Promise<void>;
+  ): Promise<PluginEnvironmentTerminationReceipt | void>;
 
   /** Called to materialize the run workspace inside the provider lease. */
   onEnvironmentRealizeWorkspace?(
@@ -399,6 +409,11 @@ export interface PluginDefinition {
   onEnvironmentExecute?(
     params: PluginEnvironmentExecuteParams,
   ): Promise<PluginEnvironmentExecuteResult>;
+
+  /** Return an authenticated private WebSocket ingress for runnerd. */
+  onEnvironmentRunnerIngressEndpoint?(
+    params: PluginEnvironmentRunnerIngressEndpointParams,
+  ): Promise<PluginEnvironmentRunnerIngressEndpoint>;
 
   /**
    * Optional, opt-in: called before execution to place host files/directories at

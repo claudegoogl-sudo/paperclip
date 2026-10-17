@@ -31,14 +31,17 @@ export async function stampSecretBindingAuditActor(
  * no request actor it runs `fn(db)` unchanged (no extra transaction); with one
  * it opens a transaction so the transaction-local GUC covers the write.
  */
-export async function withSecretBindingAuditActor<T>(
-  db: Db,
-  fn: (executor: Db) => Promise<T>,
+export async function withSecretBindingAuditActor<T, D>(
+  db: D,
+  fn: (executor: D) => Promise<T>,
 ): Promise<T> {
   const actor = getAuditActor();
   if (!actor) return fn(db);
-  return db.transaction(async (tx) => {
+  const transactional = db as unknown as {
+    transaction: (run: (tx: unknown) => Promise<T>) => Promise<T>;
+  };
+  return transactional.transaction(async (tx) => {
     await stampSecretBindingAuditActor(tx, actor);
-    return fn(tx as unknown as Db);
+    return fn(tx as unknown as D);
   });
 }
