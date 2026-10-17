@@ -16016,7 +16016,7 @@ export function heartbeatService(
             pid: running.child.pid,
             processGroupId: running.processGroupId,
             // Live in-memory child handle: the pid cannot have been recycled.
-            trustedHandle: running.child.exitCode === null && running.child.signalCode === null,
+            trustedHandle: running.child.exitCode == null && running.child.signalCode == null,
             graceMs: Math.max(1, running.graceSec) * 1000,
           });
         }
@@ -30868,7 +30868,7 @@ export function heartbeatService(
               await terminateHeartbeatRunProcess({
                 pid: running.child.pid,
                 processGroupId: running.processGroupId,
-                trustedHandle: running.child.exitCode === null && running.child.signalCode === null,
+                trustedHandle: running.child.exitCode == null && running.child.signalCode == null,
                 // Codex handles Ctrl-C by cancelling its tool sessions. SIGTERM
                 // can leave commands in their separate process groups alive.
                 signal: !control && agent?.adapterType === "codex_local" ? "SIGINT" : undefined,
@@ -31088,7 +31088,7 @@ export function heartbeatService(
             pid: running.child.pid,
             processGroupId: running.processGroupId,
             // Live in-memory child handle: the pid cannot have been recycled.
-            trustedHandle: running.child.exitCode === null && running.child.signalCode === null,
+            trustedHandle: running.child.exitCode == null && running.child.signalCode == null,
             graceMs: Math.max(1, running.graceSec) * 1000,
           });
         }
