@@ -1,18 +1,5 @@
 import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
-
-describe("explicit diagnostic credential forms", () => {
-  it("masks qualified credential fields while preserving metadata", () => {
-    expect(redactEventPayload({ authorizationHeader: "abcdefghijkl", apiKeyProduction: "sensitivevalue", credentialHandling: "harness", tokenPolicy: "least privilege" }))
-      .toEqual({ authorizationHeader: "***REDACTED***", apiKeyProduction: "***REDACTED***", credentialHandling: "harness", tokenPolicy: "least privilege" });
-  });
-  it("masks standalone bearer values and whitespace-prefixed JSON token headers", () => {
-    const jwt = `${Buffer.from(' {"alg":"HS256","typ":"JWT"}').toString("base64url")}.abcdefghijk.abcdefghijkl`;
-    expect(redactSensitiveText("provider said Bearer abcdefghijkl")).not.toContain("abcdefghijkl");
-    expect(redactEventPayload({ diagnostic: jwt })?.diagnostic).toBe("***REDACTED***");
-    expect(redactSensitiveText("Use bearer authentication and bearer tokens.")).toBe("Use bearer authentication and bearer tokens.");
-  });
-});
 import {
   PRP_V1_EVENT_TYPES,
   PRP_V2_EVENT_TYPES,
@@ -26,22 +13,6 @@ import {
 import { clearRunSecretValues, registerRunSecretValue } from "../run-secret-registry.js";
 
 describe("redaction", () => {
-  it("preserves credential-related prose, metadata, and dotted filenames", () => {
-    const input = {
-      body: "Keep the private key in a secret manager. Document credential handling and token permissions. Use bearer tokens for authentication. Prefer bearer authentication.",
-      tokenPolicy: "least privilege",
-      secretStorage: "vault",
-      credentialHandling: "harness",
-      authorizationRequired: true,
-      path: "deployment.credentials.example.md",
-    };
-    expect(sanitizeRecord(input)).toEqual(input);
-    expect(redactSensitiveText(input.body)).toBe(input.body);
-    expect(sanitizeRecord({ credentials: { provider: "opaque-value" }, passwordValue: "opaque-value", authorization_code: "opaque-value" }))
-      .toEqual({ credentials: REDACTED_EVENT_VALUE, passwordValue: REDACTED_EVENT_VALUE, authorization_code: REDACTED_EVENT_VALUE });
-    expect(redactSensitiveText("--token-budget 4000 SECRET_STORAGE=vault")).toBe("--token-budget 4000 SECRET_STORAGE=vault");
-  });
-
   it("keeps the discriminator allowlist in exact PRP v1 schema parity", () => {
     const schema = JSON.parse(
       readFileSync(
@@ -117,7 +88,7 @@ describe("redaction", () => {
     }
   });
 
-  it("preserves diagnostic PRP discriminators while redacting their credential payloads", () => {
+  it("redacts unknown or mismatched PRP discriminators", () => {
     const unknown = redactEventPayload({
       prpEvent: {
         schema: "paperclip.prp.event.v2",
@@ -126,7 +97,7 @@ describe("redaction", () => {
       },
     });
     expect((unknown?.prpEvent as Record<string, unknown>).eventType).toBe(
-      "session.not-a-real.event",
+      REDACTED_EVENT_VALUE,
     );
 
     const mismatched = redactEventPayload({
@@ -137,7 +108,7 @@ describe("redaction", () => {
       },
     });
     expect((mismatched?.prpEvent as Record<string, unknown>).eventType).toBe(
-      "session.capabilities.updated",
+      REDACTED_EVENT_VALUE,
     );
 
     const secretPayload = redactEventPayload({
@@ -220,7 +191,7 @@ describe("redaction", () => {
     const result = sanitizeRecord(input);
 
     expect(result.session).toBe(REDACTED_EVENT_VALUE);
-    expect(result.opaque).toBe("aaa.bbb.ccc");
+    expect(result.opaque).toBe(REDACTED_EVENT_VALUE);
     expect(result.normal).toBe("plain");
   });
 
@@ -239,7 +210,7 @@ describe("redaction", () => {
       nested: {
         schema: "paperclip.question_response.v1",
         runtimeSchema: "paperclip.runtime_request.v2",
-        arbitraryProviderValue: "paperclip.question_set.v1",
+        arbitraryProviderValue: REDACTED_EVENT_VALUE,
       },
     });
   });
@@ -256,7 +227,7 @@ describe("redaction", () => {
       schema: input.schema,
       nested: {
         runtimeSchema: input.nested.runtimeSchema,
-        providerValue: input.nested.providerValue,
+        providerValue: REDACTED_EVENT_VALUE,
       },
     });
     expect(sanitizeRecord({ schema: "paperclip.native-execution-input.v4", runtimeSchema: "paperclip.native-model-envelope.v2" })).toEqual({
@@ -289,28 +260,28 @@ describe("redaction", () => {
         schemaVersion: 1,
         eventType: "tool.execution.started",
         payload: {
-          eventType: "run.result.accepted",
+          eventType: REDACTED_EVENT_VALUE,
           credential: REDACTED_EVENT_VALUE,
         },
       },
       unrelated: {
-        eventType: "workspace.file.referenced",
+        eventType: REDACTED_EVENT_VALUE,
       },
     });
     expect(redactEventPayload(sanitized)).toEqual(sanitized);
   });
 
-  it("preserves unknown dotted event values instead of treating them as JWTs", () => {
+  it("redacts unknown dotted event values even in a PRP-shaped envelope", () => {
     expect(
       redactEventPayload({
         schema: "paperclip.prp.event.v1",
         schemaVersion: 1,
         eventType: "attacker.supplied.token",
       })?.eventType,
-    ).toBe("attacker.supplied.token");
+    ).toBe(REDACTED_EVENT_VALUE);
   });
 
-  it("preserves dotted schema identifiers without interpreting their authority", () => {
+  it("does not trust discriminators inside a forged unknown schema", () => {
     expect(
       redactEventPayload({
         schema: "paperclip.attacker.control.v1",
@@ -319,14 +290,14 @@ describe("redaction", () => {
         eventType: "tool.execution.started",
       }),
     ).toEqual({
-      schema: "paperclip.attacker.control.v1",
-      runtimeSchema: "paperclip.attacker.runtime.v1",
+      schema: REDACTED_EVENT_VALUE,
+      runtimeSchema: REDACTED_EVENT_VALUE,
       schemaVersion: 1,
-      eventType: "tool.execution.started",
+      eventType: REDACTED_EVENT_VALUE,
     });
   });
 
-  it("preserves native run span identities and ordinary hostnames", () => {
+  it("preserves native run span identities without weakening hostname redaction", () => {
     const spanNames = [
       "environment.workspace.realize",
       "native.coordinator.claim",
@@ -357,7 +328,7 @@ describe("redaction", () => {
         schema: input.schema,
         span,
         parentSpan: "native.session.execute",
-        providerHostname: "api.openai.com",
+        providerHostname: REDACTED_EVENT_VALUE,
       });
       expect(redactEventPayload(sanitized)).toEqual(sanitized);
     }
@@ -367,13 +338,13 @@ describe("redaction", () => {
         schema: "paperclip.run-performance-span.v1",
         span: "api.openai.com",
       })?.span,
-    ).toBe("api.openai.com");
+    ).toBe(REDACTED_EVENT_VALUE);
     expect(
       redactEventPayload({
         schema: "paperclip.run-performance-span.v1",
         span: "runner.example.com",
       })?.span,
-    ).toBe("runner.example.com");
+    ).toBe(REDACTED_EVENT_VALUE);
   });
 
   it("redacts payload objects while preserving null", () => {
@@ -405,7 +376,7 @@ describe("redaction", () => {
         details: [
           "safe context",
           `proxyAuthorization ${REDACTED_EVENT_VALUE}`,
-          "aaa.bbb.ccc",
+          REDACTED_EVENT_VALUE,
           [`Bearer ${REDACTED_EVENT_VALUE}`],
         ],
       },
@@ -1006,5 +977,18 @@ describe("redactSensitiveText serialized-JSON integrity", () => {
     const redactedLeading = redactSensitiveText(leadingWhitespace);
     expect(redactedLeading.startsWith("  ")).toBe(true);
     expect(redactedLeading).not.toContain(KEY);
+  });
+});
+
+describe("sync redaction regressions (fork strictness)", () => {
+  it("redacts hash and id style secret key names", () => {
+    const out = sanitizeRecord({ passwordHash: "x1", tokenHash: "x2", secretId: "x3", apiKeyId: "x4" });
+    expect(out).toEqual({ passwordHash: REDACTED_EVENT_VALUE, tokenHash: REDACTED_EVENT_VALUE, secretId: REDACTED_EVENT_VALUE, apiKeyId: REDACTED_EVENT_VALUE });
+  });
+  it("redacts non-eyJ dotted JWT-shaped record values", () => {
+    expect(sanitizeRecord({ note: "aaaaaaaa.bbbbbbbb.cccccccc" }).note).toBe(REDACTED_EVENT_VALUE);
+  });
+  it("keeps finite audit counts visible", () => {
+    expect(sanitizeRecord({ secretsRevoked: 2 })).toEqual({ secretsRevoked: 2 });
   });
 });
