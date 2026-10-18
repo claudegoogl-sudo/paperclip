@@ -1573,7 +1573,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         await db.insert(environmentLeases).values({ ...identity, status: "active", leasePolicy: "ephemeral" });
         if (scenario === "edited") await db.update(issueComments).set({ body: "Changed after dispatch" }).where(eq(issueComments.id, commentId));
         if (scenario === "no_claim") await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, issueId));
-        if (scenario === "exhausted") await db.update(heartbeatRuns).set({ scheduledRetryAttempt: 2,
+        if (scenario === "exhausted") await db.update(heartbeatRuns).set({ scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
           scheduledRetryReason: "transient_failure" }).where(eq(heartbeatRuns.id, runId));
         if (scenario === "stopped") {
           cancellation = heartbeat.cancelRun(runId, "Operator Stop");
@@ -1648,7 +1648,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
             eq(issueRecoveryActions.cause, "explicit_user_continuation_retry")))).toHaveLength(0);
           if (scenario === "cleanup_pending_edited") await db.update(issueComments).set({ body: "Changed while cleanup waited" })
             .where(eq(issueComments.id, commentId));
-          if (scenario === "cleanup_pending_exhausted") await db.update(heartbeatRuns).set({ scheduledRetryAttempt: 2,
+          if (scenario === "cleanup_pending_exhausted") await db.update(heartbeatRuns).set({ scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
             scheduledRetryReason: "transient_failure" }).where(eq(heartbeatRuns.id, runId));
           cleanupPending = false;
           await heartbeat.releaseEnvironmentLeasesForRun({ runId, companyId, agentId, status: "timed_out" });
