@@ -30,6 +30,12 @@ on:
         type: string
         default: "3100"
 
+concurrency:
+  # A second dispatch for the same version/tag is a redundant smoke run;
+  # queue it behind the first instead of burning a second runner on it.
+  group: fork-release-smoke-${{ inputs.version }}-${{ inputs.tag || inputs.version }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
