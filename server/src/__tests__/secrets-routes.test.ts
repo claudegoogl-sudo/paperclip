@@ -368,14 +368,14 @@ describe("secret routes", () => {
 
   it("hides user-scoped secrets from legacy company secret mutation routes", async () => {
     mockSecretService.getById.mockResolvedValue({
-      id: "secret-1",
+      id: "99999999-9999-4999-8999-999999999999",
       companyId: "company-1",
       scope: "user",
       ownerUserId: "user-2",
       status: "active",
     });
 
-    const res = await request(createApp()).post("/api/secrets/secret-1/rotate").send({
+    const res = await request(createApp()).post("/api/secrets/99999999-9999-4999-8999-999999999999/rotate").send({
       value: "new-secret-value",
     });
 
@@ -942,6 +942,38 @@ describe("secret routes", () => {
     expect(res.status).toBe(404);
     expect(res.body).toEqual({ error: "Secret not found" });
     expect(mockSecretService.listBindingReferences).not.toHaveBeenCalled();
+  });
+
+  describe("malformed secret id", () => {
+    const routes = [
+      ["post", "/api/secrets/x/rotate", { value: "new-secret-value" }],
+      ["patch", "/api/secrets/x", { name: "renamed" }],
+      ["get", "/api/secrets/x/usage", undefined],
+      ["get", "/api/secrets/x/access-events", undefined],
+      ["delete", "/api/secrets/x", undefined],
+      ["get", "/api/secrets/x/renewal-events", undefined],
+      ["get", "/api/secrets/%2077777777-7777-4777-8777-777777777777/usage", undefined],
+    ] as const;
+
+    it.each(routes)("%s %s returns 404 without querying the service", async (method, path, body) => {
+      const req = request(createApp())[method](path);
+      const res = await (body ? req.send(body) : req);
+
+      expect(res.status).toBe(404);
+      expect(res.body).toEqual({ error: "Secret not found" });
+      expect(mockSecretService.getById).not.toHaveBeenCalled();
+    });
+
+    it("still looks up a well-formed secret id", async () => {
+      mockSecretService.getById.mockResolvedValue(null);
+
+      const res = await request(createApp()).get(
+        "/api/secrets/55555555-5555-4555-8555-555555555555/usage",
+      );
+
+      expect(res.status).toBe(404);
+      expect(mockSecretService.getById).toHaveBeenCalledWith("55555555-5555-4555-8555-555555555555");
+    });
   });
 
   it("returns 404 for cross-tenant GET /secrets/:id/access-events without leaking existence", async () => {
