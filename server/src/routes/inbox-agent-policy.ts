@@ -6,6 +6,21 @@ import { validate } from "../middleware/validate.js";
 import { accessService, inboxAgentPolicyService, logActivity } from "../services/index.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 
+/**
+ * Routes for a company user's "inbox agent policy" — which agents may act
+ * on their inbox items on their behalf.
+ *
+ * - `GET/PUT .../users/me/inbox-agent-policy` are self-service: any
+ *   signed-in board user with company access may read or set their own
+ *   policy.
+ * - `GET/PUT .../users/:userId/inbox-agent-policy` are admin routes for
+ *   another user's policy: require `users:manage_permissions` (or
+ *   instance-admin/local-implicit) and that the target user has an active
+ *   company membership.
+ *
+ * Every write logs an `activity_log` row recording the previous and new
+ * policy mode and allowed-agent list.
+ */
 export function inboxAgentPolicyRoutes(db: Db) {
   const router = Router();
   const access = accessService(db);
