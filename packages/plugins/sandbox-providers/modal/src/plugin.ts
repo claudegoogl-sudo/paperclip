@@ -8,7 +8,7 @@ import {
   type Sandbox,
   type SandboxCreateParams,
 } from "modal";
-import { definePlugin } from "@paperclipai/plugin-sdk";
+import { definePlugin, shellQuote, isValidShellEnvKey } from "@paperclipai/plugin-sdk";
 import type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentDestroyLeaseParams,
@@ -201,14 +201,6 @@ function leaseMetadata(input: {
 
 function formatErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'"'"'`)}'`;
-}
-
-function isValidShellEnvKey(value: string): boolean {
-  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
 }
 
 // Modal's `sandbox.exec` takes an argv array and bypasses the shell entirely,

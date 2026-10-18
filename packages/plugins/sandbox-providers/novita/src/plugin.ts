@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { definePlugin } from "@paperclipai/plugin-sdk";
+import { definePlugin, shellQuote, isValidShellEnvKey } from "@paperclipai/plugin-sdk";
 import type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentDestroyLeaseParams,
@@ -92,18 +92,6 @@ function formatErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'"'"'`)}'`;
-}
-
-function singleQuoteForPrintf(value: string): string {
-  return `'${value.replace(/'/g, `'"'"'`)}'`;
-}
-
-function isValidShellEnvKey(value: string): boolean {
-  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
-}
-
 function buildStdinPath(): string {
   return `/tmp/.paperclip-stdin-${randomUUID()}`;
 }
@@ -125,7 +113,7 @@ export function buildShellCommand(input: {
   const exports = envEntries.map(([key, value]) => `export ${key}=${shellQuote(value)};`);
   const argv = [input.command, ...(input.args ?? [])].map(shellQuote).join(" ");
   const stdinPath = typeof input.stdin === "string" ? buildStdinPath() : null;
-  const stdin = stdinPath ? `printf '%s' ${singleQuoteForPrintf(input.stdin ?? "")} > ${shellQuote(stdinPath)}` : "";
+  const stdin = stdinPath ? `printf '%s' ${shellQuote(input.stdin ?? "")} > ${shellQuote(stdinPath)}` : "";
   const cwd = input.cwd?.trim() || "/";
   const commandLines = stdinPath
     ? [

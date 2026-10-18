@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
-import { definePlugin } from "@paperclipai/plugin-sdk";
+import { definePlugin, shellQuote, isValidShellEnvKey } from "@paperclipai/plugin-sdk";
 import type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentDestroyLeaseParams,
@@ -274,14 +274,6 @@ function resolveApiKey(config: ExeDevDriverConfig): string {
     throw new Error("exe.dev environments require an API key in config or EXE_API_KEY.");
   }
   return envApiKey;
-}
-
-function isValidShellEnvKey(value: string): boolean {
-  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
 function formatErrorMessage(error: unknown): string {

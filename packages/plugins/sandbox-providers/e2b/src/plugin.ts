@@ -6,7 +6,7 @@ import {
   SandboxNotFoundError,
   TimeoutError,
 } from "e2b";
-import { definePlugin } from "@paperclipai/plugin-sdk";
+import { definePlugin, shellQuote, isValidShellEnvKey } from "@paperclipai/plugin-sdk";
 import type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentDestroyLeaseParams,
@@ -142,14 +142,6 @@ function leaseMetadata(input: {
     remoteCwd: input.remoteCwd,
     resumedLease: input.resumedLease,
   };
-}
-
-function shellQuote(value: string) {
-  return `'${value.replace(/'/g, `'"'"'`)}'`;
-}
-
-function isValidShellEnvKey(value: string) {
-  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
 }
 
 // Source the user's login profiles before exec so commands run with the same
