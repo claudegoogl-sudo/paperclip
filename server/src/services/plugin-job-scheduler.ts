@@ -417,10 +417,9 @@ export function createPluginJobScheduler(
         }
       }
     } finally {
-      // Remove from active set
-      activeJobs.delete(jobId);
-
-      // 5. Always advance the schedule pointer (even on failure)
+      // 5. Always advance the schedule pointer (even on failure). The job
+      // stays in the active set until this finishes so a manual trigger cannot
+      // start a second run while `nextRunAt` is still stale.
       try {
         await advanceSchedulePointer(job);
       } catch (err) {
@@ -428,6 +427,8 @@ export function createPluginJobScheduler(
           { err: err instanceof Error ? err.message : String(err) },
           "failed to advance schedule pointer",
         );
+      } finally {
+        activeJobs.delete(jobId);
       }
     }
   }
