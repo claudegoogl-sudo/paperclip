@@ -298,6 +298,37 @@ describe("Photon publication receipts", () => {
 });
 
 describe("Photon durable event recovery", () => {
+  it("does not leak an unhandled rejection when the failure reporter also rejects", async () => {
+    const f = photonFixture();
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    const failure = vi.fn(async () => {
+      throw new Error("failure reporter down");
+    });
+    const receiver = new PhotonReceiver({
+      client: f.adapter.client,
+      state: f.state,
+      lineId: "line",
+      allocation: "shared",
+      intakeAfter: 0,
+      assertOwned: async () => {
+        throw new Error("lease lost");
+      },
+      admit: vi.fn(guard),
+      failure,
+    });
+    try {
+      receiver.start();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      await receiver.close();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(failure).toHaveBeenCalledWith(expect.objectContaining({ message: "lease lost" }));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
   it("records preceding events, deduplicates, and does not checkpoint an unadmitted event", async () => {
     const f = photonFixture();
     const events = [photonEvent(1), photonEvent(2)];
