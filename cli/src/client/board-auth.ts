@@ -5,6 +5,7 @@ import pc from "picocolors";
 import type { BoardApiKeyScope } from "@paperclipai/shared";
 import { buildCliCommandLabel } from "./command-label.js";
 import { resolveDefaultCliAuthPath } from "../config/home.js";
+import { ApiRequestError } from "./http.js";
 
 const BOARD_AUTH_REQUEST_TIMEOUT_MS = 30_000;
 
@@ -151,6 +152,15 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const MAX_CONSECUTIVE_POLL_FAILURES = 3;
+
+function isTransientPollError(err: unknown): boolean {
+  if (err instanceof ApiRequestError) {
+    return err.status >= 500 || err.status === 408 || err.status === 429;
+  }
+  return true;
+}
+
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers ?? undefined);
   if (init?.body !== undefined && !headers.has("content-type")) {
@@ -173,7 +183,7 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
       body && typeof body === "object" && typeof (body as { error?: unknown }).error === "string"
         ? (body as { error: string }).error
         : `Request failed: ${response.status}`;
-    throw new Error(message);
+    throw new ApiRequestError(response.status, message);
   }
 
   return response.json() as Promise<T>;
@@ -260,10 +270,23 @@ export async function loginBoardCli(params: {
   const expiresAtMs = Date.parse(challenge.expiresAt);
   const pollMs = Math.max(500, challenge.suggestedPollIntervalMs || 1000);
 
+  let consecutivePollFailures = 0;
+
   while (Number.isFinite(expiresAtMs) ? Date.now() < expiresAtMs : true) {
-    const status = await requestJson<ChallengeStatusResponse>(
-      `${apiBase}/api${challenge.pollPath}?token=${encodeURIComponent(challenge.token)}`,
-    );
+    let status: ChallengeStatusResponse;
+    try {
+      status = await requestJson<ChallengeStatusResponse>(
+        `${apiBase}/api${challenge.pollPath}?token=${encodeURIComponent(challenge.token)}`,
+      );
+      consecutivePollFailures = 0;
+    } catch (err) {
+      consecutivePollFailures += 1;
+      if (!isTransientPollError(err) || consecutivePollFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
+        throw err;
+      }
+      await sleep(pollMs);
+      continue;
+    }
 
     if (status.status === "approved") {
       let me: { userId: string; user?: { id: string } | null };
