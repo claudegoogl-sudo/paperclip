@@ -1084,8 +1084,8 @@ export function AgentDetail() {
         crumbs.push({ label: "Configuration" });
       } else if (activeView === "secrets") {
         crumbs.push({ label: "Secrets" });
-      // } else if (activeView === "skills") { // TODO: bring back later
-      //   crumbs.push({ label: "Skills" });
+      } else if (activeView === "skills") {
+        crumbs.push({ label: "Skills" });
       } else if (activeView === "tools") {
         crumbs.push({ label: "Tools" });
       } else if (activeView === "runs") {
