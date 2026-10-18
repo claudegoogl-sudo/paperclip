@@ -5045,6 +5045,8 @@ export async function runChildProcess(
 
         const stdin = child.stdin;
         if (opts.stdin != null && stdin) {
+          // A child that exits before reading its prompt raises EPIPE here; the exit path reports the failure.
+          stdin.on("error", () => {});
           void spawnPersistPromise.finally(() => {
             if (child.killed || stdin.destroyed) return;
             stdin.write(opts.stdin as string);
