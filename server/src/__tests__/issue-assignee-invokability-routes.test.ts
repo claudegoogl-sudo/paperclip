@@ -6,11 +6,15 @@ const AGENT_ACTOR_ID = "11111111-1111-4111-8111-111111111111";
 const AGENT_RUN_ID = "44444444-4444-4444-8444-444444444444";
 const PAUSED_AGENT_ID = "22222222-2222-4222-8222-222222222222";
 const IDLE_AGENT_ID = "33333333-3333-4333-8333-333333333333";
+const PENDING_APPROVAL_AGENT_ID = "55555555-5555-4555-8555-555555555555";
+const TERMINATED_AGENT_ID = "66666666-6666-4666-8666-666666666666";
 
 const agentStatusById: Record<string, string> = {
   [AGENT_ACTOR_ID]: "idle",
   [PAUSED_AGENT_ID]: "paused",
   [IDLE_AGENT_ID]: "idle",
+  [PENDING_APPROVAL_AGENT_ID]: "pending_approval",
+  [TERMINATED_AGENT_ID]: "terminated",
 };
 
 const mockIssueService = vi.hoisted(() => ({
@@ -258,6 +262,25 @@ describe("issue assignee invokability guard", () => {
     expect(mockIssueService.createChild).not.toHaveBeenCalled();
     expect(mockIssueService.create).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ["pending-approval", PENDING_APPROVAL_AGENT_ID, "pending approval agent"],
+    ["terminated", TERMINATED_AGENT_ID, "terminated agent"],
+  ])(
+    "refuses an agent reassigning an issue to a %s agent",
+    async (_label, targetAgentId, expectedErrorFragment) => {
+      const existing = makeIssue();
+      mockIssueService.getById.mockResolvedValue(existing);
+
+      const res = await request(createApp(agentActor()))
+        .patch(`/api/issues/${existing.id}`)
+        .send({ assigneeAgentId: targetAgentId });
+
+      expect(res.status).toBe(409);
+      expect(res.body.error).toContain(expectedErrorFragment);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    },
+  );
 
   it("still allows an agent to assign to an invokable agent", async () => {
     const existing = makeIssue();
