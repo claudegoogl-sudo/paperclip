@@ -1,9 +1,7 @@
-import { execFile } from "node:child_process";
+import { execFileAsync } from "../lib/exec.js";
 import { setTimeout as delay } from "node:timers/promises";
-import { promisify } from "node:util";
 import { logger } from "../middleware/logger.js";
 
-const execFileAsync = promisify(execFile);
 
 /**
  * Matches only Model Context Protocol server processes that a run spawns as a
