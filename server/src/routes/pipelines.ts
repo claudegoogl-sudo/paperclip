@@ -90,6 +90,7 @@ import {
   computePipelineHealth,
   deriveCaseType,
   envConfigSchema,
+  isUuidLike,
   issueDocumentKeySchema,
   PIPELINE_CASE_BODY_DOCUMENT_KEY,
   pipelineAutomationRetryRequestSchema,
@@ -821,6 +822,9 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     assertPipelineCompanyAccess(req, companyId);
     const pipelineId = typeof req.query.pipelineId === "string" ? req.query.pipelineId : undefined;
     const parentCaseId = typeof req.query.parentCaseId === "string" ? req.query.parentCaseId : undefined;
+    for (const [name, value] of [["pipelineId", pipelineId], ["parentCaseId", parentCaseId]] as const) {
+      if (value && (value !== value.trim() || !isUuidLike(value))) throw badRequest(`${name} must be a UUID`);
+    }
     res.json(await svc.listReviewCases({ companyId, pipelineId, parentCaseId }));
   });
 
