@@ -5,6 +5,7 @@ import { agentAvatarRoutes } from "./routes/agent-avatars.js";
 import { aiConnectionRoutes } from "./routes/ai-connections.js";
 import { projectToolRoutes } from "./routes/project-tools.js";
 import { emailChannelService } from "./services/email-channels.js";
+import { createSingleFlight } from "./services/single-flight.js";
 import { emailRoutes, emailWebhookRoutes } from "./routes/email.js";
 import { toolActionDeliveryService } from "./services/tool-action-delivery.js";
 import { registerAssignedMcpGateway } from "./services/native-runtime/assigned-mcp-tools.js";
@@ -1358,7 +1359,7 @@ export async function createApp(
       feedbackExportTimer = null;
     }
   };
-  const flushPendingFeedbackExports = async () => {
+  const flushPendingFeedbackExports = createSingleFlight(async () => {
     if (feedbackExportShuttingDown) return;
     try {
       await opts.feedbackExportService?.flushPendingFeedbackTraces();
@@ -1373,7 +1374,7 @@ export async function createApp(
       }
       logger.error({ err }, "Failed to flush pending feedback exports");
     }
-  };
+  });
 
   feedbackExportTimer = opts.feedbackExportService
     ? setInterval(() => {
