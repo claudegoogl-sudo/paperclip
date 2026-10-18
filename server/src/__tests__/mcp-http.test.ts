@@ -4,8 +4,44 @@ import {
   MCP_HTTP_ACCEPT,
   MCP_PROTOCOL_VERSION,
   mcpHttpRequestHeaders,
+  mcpToolsListRequestInit,
   parseMcpHttpResponseBody,
+  REMOTE_MCP_CATALOG_TIMEOUT_MS,
 } from "../services/mcp-http.js";
+
+describe("mcpToolsListRequestInit", () => {
+  it("builds a tools/list POST with the Streamable HTTP headers and caller credentials", () => {
+    const init = mcpToolsListRequestInit({ Authorization: "Bearer x" });
+    expect(init.method).toBe("POST");
+    expect(init.headers).toMatchObject({
+      accept: MCP_HTTP_ACCEPT,
+      Authorization: "Bearer x",
+    });
+    expect(JSON.parse(String(init.body))).toEqual({
+      jsonrpc: "2.0",
+      id: "paperclip-catalog-refresh",
+      method: "tools/list",
+      params: {},
+    });
+  });
+
+  it("bounds the probe with an abort signal so a stalled endpoint cannot hang the refresh", () => {
+    expect(REMOTE_MCP_CATALOG_TIMEOUT_MS).toBe(30_000);
+    const init = mcpToolsListRequestInit({});
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+    expect(init.signal?.aborted).toBe(false);
+  });
+
+  it("aborts a fetch that never answers once the timeout elapses", async () => {
+    const hangingFetch = (_url: string, init: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+      });
+    await expect(
+      hangingFetch("https://mcp.example.test/mcp", mcpToolsListRequestInit({}, 20)),
+    ).rejects.toMatchObject({ name: "TimeoutError" });
+  });
+});
 
 describe("mcpHttpRequestHeaders", () => {
   it("advertises both JSON and SSE on every request", () => {
