@@ -1258,6 +1258,22 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockWorkProductService.createForIssue).not.toHaveBeenCalled();
   });
 
+  it("rejects a peer agent deleting a work product on an idle issue owned by another agent", async () => {
+    // DELETE /work-products/:id calls assertAgentIssueMutationAllowed without
+    // the default-open allowVisibleIssueWrite option, so — unlike the main
+    // PATCH /issues/:id route — an idle issue owned by a different agent
+    // still denies this write with the base ownership boundary, not the
+    // run-lock copy and not a visible-write allowance.
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo" }));
+
+    const res = await request(await createApp(peerActor()))
+      .delete(`/api/work-products/product-1`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe("Agent cannot mutate another agent's issue");
+    expect(mockWorkProductService.remove).not.toHaveBeenCalled();
+  });
+
   it.each([
     [
       "work product create",
