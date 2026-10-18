@@ -4,6 +4,9 @@ import {
   SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
+  EXTERNAL_WAIT_MONITOR_MAX_ATTEMPTS,
+  buildExternalWaitFallbackMonitor,
+  detectExternalWait,
   buildFinishSuccessfulRunHandoffIdempotencyKey,
   buildSuccessfulRunHandoffInstruction,
   buildSuccessfulRunHandoffExhaustedNotice,
@@ -641,5 +644,20 @@ describe("isStandbyWakeTargetIssue", () => {
     expect(isStandbyWakeTargetIssue({ executionPolicy: {} } as any)).toBe(false);
     expect(isStandbyWakeTargetIssue({ executionPolicy: { standbyWakeTarget: false } } as any)).toBe(false);
     expect(isStandbyWakeTargetIssue({ executionPolicy: { standbyWakeTarget: "true" } } as any)).toBe(false);
+  });
+});
+
+describe("external-wait exhaustion fallback", () => {
+  it("detects the PLA-10087/10181/10263 waiting-on-CI shape", () => {
+    expect(detectExternalWait("PR opened, CI pending, auto-merge armed. Next: check on next wake")).toBe("github-actions");
+    expect(detectExternalWait("systemd unit running; build in progress")).toBe("build");
+    expect(detectExternalWait("Implemented the parser and wrote docs")).toBeNull();
+  });
+  it("builds a bounded wake_owner monitor and stops at the attempt cap", () => {
+    const now = new Date("2026-01-01T00:00:00Z");
+    const m = buildExternalWaitFallbackMonitor({ serviceName: "github-actions", now, priorAttemptCount: 0 });
+    expect(m).toMatchObject({ kind: "external_service", recoveryPolicy: "wake_owner", maxAttempts: EXTERNAL_WAIT_MONITOR_MAX_ATTEMPTS });
+    expect(m!.nextCheckAt).toBe("2026-01-01T00:30:00.000Z");
+    expect(buildExternalWaitFallbackMonitor({ serviceName: "x", now, priorAttemptCount: EXTERNAL_WAIT_MONITOR_MAX_ATTEMPTS })).toBeNull();
   });
 });

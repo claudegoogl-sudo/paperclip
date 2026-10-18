@@ -139,7 +139,9 @@ import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
+  buildExternalWaitFallbackMonitor,
   buildSuccessfulRunHandoffExhaustedNotice,
+  detectExternalWait,
   isPluginManagedIssueLifecycle,
   isStandbyWakeTargetIssue,
   noticeMetadataReferencesRecoveryAction,
@@ -5785,6 +5787,61 @@ export function recoveryService(
             result.successfulRunHandoffRetried += 1;
             result.issueIds.push(issue.id);
             continue;
+          }
+        }
+
+        // Fallback A: a run that ended while waiting on CI/build/unit gets a bounded
+        // monitor instead of a silent `blocked` dead end.
+        if (issue.assigneeAgentId && !issue.monitorNextCheckAt) {
+          const recentComments = await db
+            .select({ body: issueComments.body })
+            .from(issueComments)
+            .where(and(eq(issueComments.issueId, issue.id), eq(issueComments.authorAgentId, issue.assigneeAgentId)))
+            .orderBy(desc(issueComments.createdAt))
+            .limit(2);
+          const resultText = JSON.stringify(parseObject(latestRun?.resultJson)).slice(0, 4000);
+          const serviceName = detectExternalWait([...recentComments.map((c) => c.body ?? ""), resultText].join("\n"));
+          const monitor = serviceName
+            ? buildExternalWaitFallbackMonitor({
+              serviceName,
+              now: new Date(),
+              priorAttemptCount: issue.monitorAttemptCount ?? 0,
+            })
+            : null;
+          if (monitor) {
+            const policy = parseObject(issue.executionPolicy);
+            const scheduled = await issuesSvc.update(issue.id, {
+              executionPolicy: {
+                mode: "normal",
+                commentRequired: true,
+                stages: [],
+                ...policy,
+                monitor,
+              } as any,
+            });
+            if (scheduled) {
+              await issuesSvc.addComment(
+                issue.id,
+                "Paperclip saw this run end while waiting on an external check, with no disposition. " +
+                  `It scheduled a monitor (${monitor.serviceName}, next check ${monitor.nextCheckAt}) instead of blocking the issue.`,
+                {},
+                { authorType: "system" },
+              );
+              await logActivity(db, {
+                companyId: issue.companyId,
+                actorType: "system",
+                actorId: "system",
+                agentId: null,
+                runId: null,
+                action: "issue.successful_run_handoff_monitor_scheduled",
+                entityType: "issue",
+                entityId: issue.id,
+                details: { identifier: issue.identifier, serviceName: monitor.serviceName, nextCheckAt: monitor.nextCheckAt },
+              });
+              result.issueIds.push(issue.id);
+              result.skipped += 1;
+              continue;
+            }
           }
         }
 
