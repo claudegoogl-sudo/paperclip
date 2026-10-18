@@ -1,10 +1,17 @@
 import { describe, expect, it } from "vitest";
+import type { Request } from "express";
 import {
+  assertNoAgentHostWorkspaceCommandMutation,
+  collectAgentAdapterWorkspaceCommandPaths,
   collectExecutionWorkspaceCommandPaths,
   collectIssueWorkspaceCommandPaths,
   collectProjectExecutionWorkspaceCommandPaths,
   collectProjectWorkspaceCommandPaths,
 } from "../routes/workspace-command-authz.js";
+
+function actorRequest(type: "agent" | "board"): Request {
+  return { actor: { type } } as unknown as Request;
+}
 
 describe("workspace host-command mutation detection", () => {
   it.each([
@@ -66,5 +73,48 @@ describe("workspace host-command mutation detection", () => {
         jobs: [null, "build"],
       },
     })).toEqual([]);
+  });
+
+  it("detects adapterConfig workspaceStrategy commands", () => {
+    expect(
+      collectAgentAdapterWorkspaceCommandPaths({
+        workspaceStrategy: { provisionCommand: "pnpm provision" },
+      }),
+    ).toEqual(["adapterConfig.workspaceStrategy.provisionCommand"]);
+  });
+
+  it("returns no paths for adapterConfig without a workspaceStrategy", () => {
+    expect(collectAgentAdapterWorkspaceCommandPaths({ role: "engineer" })).toEqual([]);
+    expect(collectAgentAdapterWorkspaceCommandPaths(null)).toEqual([]);
+  });
+
+  it("detects the execution workspace cleanupCommand branch", () => {
+    expect(
+      collectExecutionWorkspaceCommandPaths({ config: { cleanupCommand: "rm -rf tmp" } }),
+    ).toEqual(["config.cleanupCommand"]);
+  });
+
+  describe("assertNoAgentHostWorkspaceCommandMutation", () => {
+    it("throws for an agent actor when host-executed command paths were touched", () => {
+      expect(() =>
+        assertNoAgentHostWorkspaceCommandMutation(actorRequest("agent"), [
+          "config.provisionCommand",
+        ]),
+      ).toThrow(/Agent keys cannot modify host-executed workspace commands/);
+    });
+
+    it("does not throw for an agent actor when no command paths were touched", () => {
+      expect(() =>
+        assertNoAgentHostWorkspaceCommandMutation(actorRequest("agent"), []),
+      ).not.toThrow();
+    });
+
+    it("does not throw for a board actor even when command paths were touched", () => {
+      expect(() =>
+        assertNoAgentHostWorkspaceCommandMutation(actorRequest("board"), [
+          "config.provisionCommand",
+        ]),
+      ).not.toThrow();
+    });
   });
 });
