@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { CONNECTION_INTENT_AGENT_GUIDANCE } from "@paperclipai/shared";
 import {
   readPaperclipRuntimeSkillEntries,
@@ -38,6 +38,19 @@ import {
   UNMANAGED_BACKGROUND_TASK_STOP_REASON,
   WATCHDOG_DEFAULT_MANDATE,
 } from "./server-utils.js";
+
+const sshMock = vi.hoisted(() => ({ cleanup: null as null | (() => Promise<void>) }));
+
+vi.mock("./ssh.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./ssh.js")>();
+  return {
+    ...actual,
+    buildSshSpawnTarget: async (...args: Parameters<typeof actual.buildSshSpawnTarget>) => {
+      if (!sshMock.cleanup) return actual.buildSshSpawnTarget(...args);
+      return { args: [], cleanup: sshMock.cleanup };
+    },
+  };
+});
 
 describe("runtime connection tool delivery", () => {
   const access = {
@@ -567,6 +580,61 @@ describe("adapter skill snapshots", () => {
 });
 
 describe("runChildProcess", () => {
+  async function runWithRejectingSpawnTargetCleanup(shebang: string) {
+    const binDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-fake-ssh-"));
+    await fs.writeFile(path.join(binDir, "ssh"), `${shebang}\nexit 0\n`, { mode: 0o755 });
+    const cleanupError = new Error("cleanup failed");
+    sshMock.cleanup = async () => {
+      throw cleanupError;
+    };
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    const logged: Array<{ err: unknown; message: string }> = [];
+    try {
+      const outcome = await runChildProcess(randomUUID(), "echo", [], {
+        cwd: process.cwd(),
+        env: { PATH: binDir },
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+        onLogError: (err, _id, message) => logged.push({ err, message }),
+        remoteExecution: {} as never,
+      }).then(
+        (result) => ({ result }),
+        (error: unknown) => ({ error }),
+      );
+      await new Promise((resolve) => setImmediate(resolve));
+      return { outcome, unhandled, logged, cleanupError };
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+      sshMock.cleanup = null;
+      await fs.rm(binDir, { recursive: true, force: true });
+    }
+  }
+
+  it("logs a rejecting spawn-target cleanup on close instead of leaving it unhandled", async () => {
+    const { outcome, unhandled, logged, cleanupError } =
+      await runWithRejectingSpawnTargetCleanup("#!/bin/sh");
+
+    expect("result" in outcome && outcome.result.exitCode).toBe(0);
+    expect(unhandled).toEqual([]);
+    expect(logged).toEqual([{ err: cleanupError, message: "failed to clean up spawn target" }]);
+  });
+
+  it("logs a rejecting spawn-target cleanup after a spawn error instead of leaving it unhandled", async () => {
+    const { outcome, unhandled, logged, cleanupError } =
+      await runWithRejectingSpawnTargetCleanup("#!/nonexistent/interpreter");
+
+    expect("error" in outcome).toBe(true);
+    expect(unhandled).toEqual([]);
+    // A failed spawn emits both "error" and "close", so cleanup runs on each.
+    expect(logged.length).toBeGreaterThanOrEqual(1);
+    for (const entry of logged) {
+      expect(entry).toEqual({ err: cleanupError, message: "failed to clean up spawn target" });
+    }
+  });
+
   it("does not arm a timeout when timeoutSec is 0", async () => {
     const result = await runChildProcess(
       randomUUID(),
