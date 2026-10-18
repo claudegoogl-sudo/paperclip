@@ -1,7 +1,7 @@
 import express from "express";
 import { EventEmitter } from "node:events";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockGetExperimental = vi.hoisted(() => vi.fn());
 const mockIssueService = vi.hoisted(() => ({
@@ -78,6 +78,86 @@ describe("POST /api/board/chat/stream feature flag guard (PAP-137)", () => {
 
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ error: "companyId and message are required" });
+  });
+
+  describe("request body validation", () => {
+    beforeEach(() => {
+      mockGetExperimental.mockResolvedValue({ enableConferenceRoomChat: true });
+    });
+
+    // Later describes assert on mockSpawn call state; do not leak calls or
+    // the fake process into them.
+    afterEach(() => {
+      mockSpawn.mockReset();
+    });
+
+    it("returns 400 instead of throwing when no body is sent", async () => {
+      const app = await createApp();
+      const res = await request(app).post("/api/board/chat/stream");
+      expect(res.status).toBe(400);
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["object message", { companyId: "company-1", message: { text: "hi" } }],
+      ["array message", { companyId: "company-1", message: ["hi"] }],
+      ["numeric message", { companyId: "company-1", message: 5 }],
+      ["object companyId", { companyId: { id: "company-1" }, message: "hi" }],
+    ])("returns 400 for a %s", async (_label, payload) => {
+      const app = await createApp();
+      const res = await request(app).post("/api/board/chat/stream").send(payload);
+      expect(res.status).toBe(400);
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+      expect(mockSpawn).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["non-UUID string", "not-a-uuid"],
+      ["padded UUID", " aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"],
+      ["number", 7],
+      ["array", ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]],
+    ])("returns 400 for a %s taskId", async (_label, taskId) => {
+      const app = await createApp();
+      const res = await request(app)
+        .post("/api/board/chat/stream")
+        .send({ companyId: "company-1", message: "hello", taskId });
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: "taskId must be a UUID" });
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+      expect(mockSpawn).not.toHaveBeenCalled();
+    });
+
+    it("still admits a valid UUID taskId", async () => {
+      const taskId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+      mockIssueService.addComment.mockResolvedValue({ id: "comment-1" });
+      mockIssueService.listComments.mockResolvedValue([]);
+      const proc = new EventEmitter() as any;
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.stdin = { write: vi.fn(), end: vi.fn() };
+      proc.exitCode = null;
+      proc.kill = vi.fn();
+      mockSpawn.mockReturnValue(proc);
+      const app = await createApp();
+
+      const req = request(app)
+        .post("/api/board/chat/stream")
+        .send({ companyId: "company-1", message: "hello", taskId });
+      const pending = req.then(
+        () => undefined,
+        () => undefined,
+      );
+      await vi.waitFor(() => expect(mockSpawn).toHaveBeenCalled());
+      expect(mockIssueService.addComment).toHaveBeenCalledWith(
+        taskId,
+        expect.anything(),
+        expect.anything(),
+      );
+      req.abort();
+      proc.exitCode = 143;
+      proc.emit("close", 143);
+      await pending;
+    });
   });
 });
 
