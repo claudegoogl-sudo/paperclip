@@ -62,6 +62,7 @@ import {
 } from "../services/company-skill-policy.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import {
+  isUuidLike,
   normalizeSkillPolicySourceLocator,
   type SkillPolicyAction,
   type SkillPolicyDecision,
@@ -103,6 +104,10 @@ export function companySkillRoutes(db: Db) {
   const issues = issueService(db);
   const heartbeat = heartbeatService(db);
   const skillPolicies = companySkillPolicyService(db);
+
+  function isMalformedUuidParam(value: string): boolean {
+    return value !== value.trim() || !isUuidLike(value);
+  }
 
   function asString(value: unknown): string | null {
     if (typeof value !== "string") return null;
@@ -485,6 +490,10 @@ export function companySkillRoutes(db: Db) {
     const skillId = req.params.skillId as string;
     const versionId = req.params.versionId as string;
     assertCompanyAccess(req, companyId);
+    if (isMalformedUuidParam(versionId)) {
+      res.status(404).json({ error: "Skill version not found" });
+      return;
+    }
     const result = await svc.getVersion(companyId, skillId, versionId);
     if (!result) {
       res.status(404).json({ error: "Skill version not found" });
@@ -533,6 +542,10 @@ export function companySkillRoutes(db: Db) {
       const skillId = req.params.skillId as string;
       const inputId = req.params.inputId as string;
       await assertCanMutateCompanySkills(req, companyId, "skills.edit", () => skillPolicyResource({ companyId, skillId }));
+      if (isMalformedUuidParam(inputId)) {
+        res.status(404).json({ error: "Test input not found" });
+        return;
+      }
       const result = await svc.updateTestInput(companyId, skillId, inputId, req.body);
       if (!result) {
         res.status(404).json({ error: "Test input not found" });
@@ -560,6 +573,10 @@ export function companySkillRoutes(db: Db) {
     const skillId = req.params.skillId as string;
     const inputId = req.params.inputId as string;
     await assertCanMutateCompanySkills(req, companyId, "skills.edit", () => skillPolicyResource({ companyId, skillId }));
+    if (isMalformedUuidParam(inputId)) {
+      res.status(404).json({ error: "Test input not found" });
+      return;
+    }
     const result = await svc.deleteTestInput(companyId, skillId, inputId);
     if (!result) {
       res.status(404).json({ error: "Test input not found" });
@@ -618,6 +635,10 @@ export function companySkillRoutes(db: Db) {
       const companyId = req.params.companyId as string;
       const templateId = req.params.templateId as string;
       await assertCanMutateCompanySkills(req, companyId, "skills.edit");
+      if (isMalformedUuidParam(templateId)) {
+        res.status(404).json({ error: "Test run template not found" });
+        return;
+      }
       const result = await svc.updateTestRunTemplate(companyId, templateId, req.body, skillActor(req));
       if (!result) {
         res.status(404).json({ error: "Test run template not found" });
@@ -644,6 +665,10 @@ export function companySkillRoutes(db: Db) {
     const companyId = req.params.companyId as string;
     const templateId = req.params.templateId as string;
     await assertCanMutateCompanySkills(req, companyId, "skills.edit");
+    if (isMalformedUuidParam(templateId)) {
+      res.status(404).json({ error: "Test run template not found" });
+      return;
+    }
     const result = await svc.deleteTestRunTemplate(companyId, templateId);
     if (!result) {
       res.status(404).json({ error: "Test run template not found" });
@@ -680,6 +705,10 @@ export function companySkillRoutes(db: Db) {
     const skillId = req.params.skillId as string;
     const runId = req.params.runId as string;
     assertCompanyAccess(req, companyId);
+    if (isMalformedUuidParam(runId)) {
+      res.status(404).json({ error: "Test run not found" });
+      return;
+    }
     const result = await svc.getTestRunDetail(companyId, skillId, runId);
     if (!result) {
       res.status(404).json({ error: "Test run not found" });
@@ -788,6 +817,10 @@ export function companySkillRoutes(db: Db) {
     const skillId = req.params.skillId as string;
     const runId = req.params.runId as string;
     await assertCanMutateCompanySkills(req, companyId, "skills.test", () => skillPolicyResource({ companyId, skillId }));
+    if (isMalformedUuidParam(runId)) {
+      res.status(404).json({ error: "Test run not found" });
+      return;
+    }
     await assertCanOrchestrateSkillTestHarness(req, companyId, await loadSkillTestRunAssignmentScope(companyId, skillId, runId));
     const actor = getActorInfo(req);
     const result = await svc.cancelTestRun(companyId, skillId, runId, {
@@ -831,6 +864,10 @@ export function companySkillRoutes(db: Db) {
     const skillId = req.params.skillId as string;
     const runId = req.params.runId as string;
     await assertCanMutateCompanySkills(req, companyId, "skills.test", () => skillPolicyResource({ companyId, skillId }));
+    if (isMalformedUuidParam(runId)) {
+      res.status(404).json({ error: "Test run not found" });
+      return;
+    }
     await assertCanOrchestrateSkillTestHarness(req, companyId, await loadSkillTestRunAssignmentScope(companyId, skillId, runId));
     const actor = getActorInfo(req);
     const result = await svc.deleteTestRun(companyId, skillId, runId, {
@@ -1053,6 +1090,10 @@ export function companySkillRoutes(db: Db) {
       const skillId = req.params.skillId as string;
       const commentId = req.params.commentId as string;
       assertCompanyAccess(req, companyId);
+      if (isMalformedUuidParam(commentId)) {
+        res.status(404).json({ error: "Skill comment not found" });
+        return;
+      }
       const result = await svc.updateComment(companyId, skillId, commentId, req.body, skillActor(req));
       const actor = getActorInfo(req);
       await logActivity(db, {
@@ -1076,6 +1117,10 @@ export function companySkillRoutes(db: Db) {
     const skillId = req.params.skillId as string;
     const commentId = req.params.commentId as string;
     assertCompanyAccess(req, companyId);
+    if (isMalformedUuidParam(commentId)) {
+      res.status(404).json({ error: "Skill comment not found" });
+      return;
+    }
     const result = await svc.deleteComment(companyId, skillId, commentId, skillActor(req));
     const actor = getActorInfo(req);
     await logActivity(db, {
