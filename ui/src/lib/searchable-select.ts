@@ -14,28 +14,45 @@ function searchWords(value: string): string[] {
 function fuzzyWordSubsequenceScore(word: string, token: string): number | null {
   if (token.length < 3) return null;
 
-  let tokenIndex = 0;
-  let firstIndex = -1;
-  let lastIndex = -1;
-  let gaps = 0;
+  // Try every occurrence of the token's first character as a possible start,
+  // not just the leftmost one. A single leftmost-match greedy scan can commit
+  // to an early occurrence of token[0], fail to find the rest of the token
+  // within the spread cutoff below, and give up -- even when a later
+  // occurrence of token[0] leads to a tight, valid subsequence match. Scanning
+  // from every candidate start and keeping the best passing score avoids that
+  // false negative.
+  let bestScore: number | null = null;
 
-  for (let wordIndex = 0; wordIndex < word.length && tokenIndex < token.length; wordIndex += 1) {
-    if (word[wordIndex] !== token[tokenIndex]) continue;
-    if (firstIndex === -1) {
-      firstIndex = wordIndex;
-    } else {
+  for (let startIndex = 0; startIndex < word.length; startIndex += 1) {
+    if (word[startIndex] !== token[0]) continue;
+
+    let tokenIndex = 1;
+    let lastIndex = startIndex;
+    let gaps = 0;
+
+    for (
+      let wordIndex = startIndex + 1;
+      wordIndex < word.length && tokenIndex < token.length;
+      wordIndex += 1
+    ) {
+      if (word[wordIndex] !== token[tokenIndex]) continue;
       gaps += wordIndex - lastIndex - 1;
+      lastIndex = wordIndex;
+      tokenIndex += 1;
     }
-    lastIndex = wordIndex;
-    tokenIndex += 1;
+
+    if (tokenIndex !== token.length) continue;
+
+    const spread = lastIndex - startIndex + 1;
+    if (spread > token.length * 2) continue;
+
+    const score = 32 + gaps * 2 + startIndex + Math.max(0, word.length - token.length) * 0.5;
+    if (bestScore === null || score < bestScore) {
+      bestScore = score;
+    }
   }
 
-  if (tokenIndex !== token.length) return null;
-
-  const spread = lastIndex - firstIndex + 1;
-  if (spread > token.length * 2) return null;
-
-  return 32 + gaps * 2 + firstIndex + Math.max(0, word.length - token.length) * 0.5;
+  return bestScore;
 }
 
 function scoreTokenAgainstText(text: string, token: string): number | null {
