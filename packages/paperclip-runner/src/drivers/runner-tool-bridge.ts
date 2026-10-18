@@ -1,3 +1,4 @@
+import { isRecord } from "../guards.js";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import {
   createServer,
@@ -850,6 +851,3 @@ function positiveBoundedInteger(
   return resolved;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
