@@ -6,6 +6,8 @@ import type { BoardApiKeyScope } from "@paperclipai/shared";
 import { buildCliCommandLabel } from "./command-label.js";
 import { resolveDefaultCliAuthPath } from "../config/home.js";
 
+const BOARD_AUTH_REQUEST_TIMEOUT_MS = 30_000;
+
 type RequestedAccess = "board" | "instance_admin_required";
 
 interface BoardAuthCredential {
@@ -158,9 +160,11 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
     headers.set("accept", "application/json");
   }
 
+  const timeoutSignal = AbortSignal.timeout(BOARD_AUTH_REQUEST_TIMEOUT_MS);
   const response = await fetch(url, {
     ...init,
     headers,
+    signal: init?.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal,
   });
 
   if (!response.ok) {

@@ -1,11 +1,12 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   getStoredBoardCredential,
   readBoardAuthStore,
   removeStoredBoardCredential,
+  revokeStoredBoardCredential,
   setStoredBoardCredential,
 } from "../client/board-auth.js";
 
@@ -49,5 +50,34 @@ describe("board auth store", () => {
 
     expect(removeStoredBoardCredential("http://localhost:3100", authPath)).toBe(true);
     expect(getStoredBoardCredential("http://localhost:3100", authPath)).toBeNull();
+  });
+});
+
+describe("board auth requests", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("aborts a stalled request after the default timeout", async () => {
+    const timeout = new AbortController();
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockReturnValue(timeout.signal);
+    const fetchMock = vi.fn(
+      (_url: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = revokeStoredBoardCredential({ apiBase: "http://localhost:3100", token: "token-123" });
+    const settled = expect(pending).rejects.toThrow("aborted");
+    await Promise.resolve();
+
+    expect(timeoutSpy).toHaveBeenCalledWith(30_000);
+    expect(fetchMock.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
+
+    timeout.abort();
+    await settled;
   });
 });
