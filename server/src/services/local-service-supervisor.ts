@@ -1,13 +1,11 @@
-import { execFile } from "node:child_process";
+import { execFileAsync } from "../lib/exec.js";
 import { createHash } from "node:crypto";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { promisify } from "node:util";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 
-const execFileAsync = promisify(execFile);
 
 export interface LocalServiceRegistryRecord {
   version: 1;
