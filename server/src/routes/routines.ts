@@ -5,6 +5,7 @@ import {
   createDocumentAnnotationCommentSchema,
   createDocumentAnnotationThreadSchema,
   createRoutineTriggerSchema,
+  isUuidLike,
   rotateRoutineTriggerSecretSchema,
   runRoutineSchema,
   updateDocumentAnnotationThreadSchema,
@@ -180,7 +181,15 @@ export function routineRoutes(
   router.get("/companies/:companyId/routines", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    const projectId = typeof req.query.projectId === "string" ? req.query.projectId : undefined;
+    const rawProjectId = req.query.projectId;
+    if (rawProjectId !== undefined && typeof rawProjectId !== "string") {
+      throw badRequest("Invalid project ID");
+    }
+    // isUuidLike trims, but PostgreSQL UUID inputs reject surrounding whitespace.
+    if (rawProjectId && (rawProjectId !== rawProjectId.trim() || !isUuidLike(rawProjectId))) {
+      throw badRequest("Invalid project ID");
+    }
+    const projectId = rawProjectId;
     const result = await svc.list(companyId, { projectId });
     res.json(result);
   });

@@ -340,6 +340,61 @@ describe("routine routes", () => {
     expect(mockRoutineService.list).toHaveBeenCalledWith(companyId, { projectId });
   });
 
+  it.each([
+    ["not a UUID", "x"],
+    ["padded UUID", ` ${projectId}`],
+  ])("rejects a routine list projectId that is %s", async (_label, badProjectId) => {
+    mockRoutineService.list.mockClear();
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await request(app)
+      .get(`/api/companies/${companyId}/routines`)
+      .query({ projectId: badProjectId });
+
+    expect(res.status).toBe(400);
+    expect(mockRoutineService.list).not.toHaveBeenCalled();
+  });
+
+  it("rejects a repeated routine list projectId", async () => {
+    mockRoutineService.list.mockClear();
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await request(app).get(
+      `/api/companies/${companyId}/routines?projectId=${projectId}&projectId=${projectId}`,
+    );
+
+    expect(res.status).toBe(400);
+    expect(mockRoutineService.list).not.toHaveBeenCalled();
+  });
+
+  it("lists routines unfiltered when projectId is absent", async () => {
+    mockRoutineService.list.mockClear();
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const res = await request(app).get(`/api/companies/${companyId}/routines`);
+
+    expect(res.status).toBe(200);
+    expect(mockRoutineService.list).toHaveBeenCalledWith(companyId, { projectId: undefined });
+  });
+
   it("lists routine revisions for a board member in newest-first service order", async () => {
     const app = await createApp({
       type: "board",
