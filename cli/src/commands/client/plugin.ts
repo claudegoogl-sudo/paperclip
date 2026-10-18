@@ -9,6 +9,7 @@ import {
 import pc from "picocolors";
 import {
   addCommonClientOptions,
+  buildApiUrl,
   handleCommandError,
   printOutput,
   resolveCommandContext,
@@ -1060,8 +1061,3 @@ async function streamPluginBridge(
   }
 }
 
-function buildApiUrl(apiBase: string, path: string): string {
-  const url = new URL(apiBase);
-  url.pathname = `${url.pathname.replace(/\/+$/, "")}${path.startsWith("/") ? path : `/${path}`}`;
-  return url.toString();
-}

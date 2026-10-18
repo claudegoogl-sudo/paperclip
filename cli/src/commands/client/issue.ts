@@ -30,6 +30,7 @@ import {
 import {
   addCommonClientOptions,
   apiPath,
+  buildApiUrl,
   formatInlineRecord,
   handleCommandError,
   inferContentTypeFromPath,
@@ -1388,12 +1389,6 @@ function filterIssueRows(rows: Issue[], match: string | undefined): Issue[] {
       .toLowerCase();
     return text.includes(needle);
   });
-}
-
-function buildApiUrl(apiBase: string, path: string): string {
-  const url = new URL(apiBase);
-  url.pathname = `${url.pathname.replace(/\/+$/, "")}${path.startsWith("/") ? path : `/${path}`}`;
-  return url.toString();
 }
 
 async function uploadAttachment(
