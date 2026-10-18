@@ -22,7 +22,7 @@ import { admitExplicitNativeContinuation } from "./explicit-native-continuation.
 import { adapterExecutionControls, createAdapterExecutionControl } from "./adapter-execution-control.js";
 import { CONVERSATION_CONTINUATION_POLICY } from "./conversation-continuation.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
-import { heartbeatService, persistHeartbeatRunProcessMetadata, type HeartbeatEnvironmentRuntime } from "./heartbeat.js";
+import { BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS, heartbeatService, persistHeartbeatRunProcessMetadata, type HeartbeatEnvironmentRuntime } from "./heartbeat.js";
 import { getExecutionBlocker } from "./execution-blocker.js";
 import { createDurableChatWakeupRequest } from "./durable-chat-wakeup.js";
 import { recordNativeFinalizationFailure } from "./native-runtime/native-run-finalizer.js";
@@ -476,10 +476,20 @@ const support = await getEmbeddedPostgresTestSupport();
     const receipts = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
     expect(receipts).toHaveLength(3);
     expect(receipts.find(row => row.id === f.receipt.id)?.evidence).toEqual(f.receipt.evidence);
+    // The fork ladder is longer than upstream's two-step ladder: walk it to the end.
+    let lastRunId = second.run.id;
+    for (let attempt = 3; attempt <= BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length; attempt += 1) {
+      await db.update(heartbeatRuns).set({ status: "timed_out", errorCode: "timeout", startedAt: nextNow,
+        finishedAt: nextNow }).where(eq(heartbeatRuns.id, lastRunId));
+      const next = await heartbeat.scheduleBoundedRetry(lastRunId, { now: nextNow });
+      expect(next.outcome).toBe("scheduled");
+      if (next.outcome !== "scheduled") return;
+      lastRunId = next.run.id;
+    }
     await db.update(heartbeatRuns).set({ status: "timed_out", errorCode: "timeout", startedAt: nextNow,
-      finishedAt: nextNow }).where(eq(heartbeatRuns.id, second.run.id));
-    expect(await heartbeat.scheduleBoundedRetry(second.run.id, { now: nextNow })).toMatchObject({ outcome: "retry_exhausted" });
-    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).toHaveLength(3);
+      finishedAt: nextNow }).where(eq(heartbeatRuns.id, lastRunId));
+    expect(await heartbeat.scheduleBoundedRetry(lastRunId, { now: nextNow })).toMatchObject({ outcome: "retry_exhausted" });
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).toHaveLength(1 + BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length);
   });
 
   it("keeps sub-millisecond source ordering when authorizing a timeout retry", async () => {
