@@ -6,6 +6,7 @@ import {
   browserUseSettingsSchema,
   browserUseViewportSchema,
   browserUseViewerSchema,
+  isUuidLike,
 } from "@paperclipai/shared";
 import {
   assertBoard,
@@ -13,16 +14,21 @@ import {
   getActorInfo,
   getAccessibleResource,
 } from "./authz.js";
+import { notFound } from "../errors.js";
 import { browserUseService } from "../services/browser-use.js";
 
 export function browserUseRoutes(db: Db, service = browserUseService(db)) {
   const router = Router();
   router.use("/issues/:issueId/browsers", async (req, res, next) => {
     assertBoard(req);
+    const issueId = req.params.issueId;
+    // PostgreSQL rejects malformed uuid input, and isUuidLike tolerates whitespace.
+    if (!isUuidLike(issueId) || issueId !== issueId.trim())
+      throw notFound("Task not found");
     const [issue] = await db
       .select({ companyId: issues.companyId })
       .from(issues)
-      .where(eq(issues.id, req.params.issueId))
+      .where(eq(issues.id, issueId))
       .limit(1);
     if (!(await getAccessibleResource(req, res, issue, "Task not found")))
       return;
