@@ -7,6 +7,11 @@ on:
 # Always runs from base branch context — never executes PR code.
 # pull_request_target gives access to secrets for untrusted fork PRs.
 
+concurrency:
+  # A new commit on the PR supersedes any review already in flight for it.
+  group: commitperclip-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 permissions:
   pull-requests: write
   checks: write
