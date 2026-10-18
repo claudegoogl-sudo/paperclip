@@ -992,3 +992,10 @@ describe("sync redaction regressions (fork strictness)", () => {
     expect(sanitizeRecord({ secretsRevoked: 2 })).toEqual({ secretsRevoked: 2 });
   });
 });
+
+describe("audit header-name lists", () => {
+  it("keeps credentialHeaderNames visible only for bare header names", () => {
+    expect(sanitizeRecord({ credentialHeaderNames: ["authorization"] })).toEqual({ credentialHeaderNames: ["authorization"] });
+    expect(sanitizeRecord({ credentialHeaderNames: ["Bearer abc.def"] }).credentialHeaderNames).toBe(REDACTED_EVENT_VALUE);
+  });
+});

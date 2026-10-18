@@ -43,6 +43,18 @@ function isAuditCountField(key: string, value: unknown): boolean {
     Number.isFinite(value)
   );
 }
+/**
+ * Tool-gateway receipts list the NAMES of credential headers (never values) under
+ * `credentialHeaderNames`. The unanchored key guard would blank the list, so it
+ * passes only while every entry is a bare header-name token.
+ */
+function isAuditHeaderNameList(key: string, value: unknown): boolean {
+  return (
+    key === "credentialHeaderNames" &&
+    Array.isArray(value) &&
+    value.every((v) => typeof v === "string" && /^[A-Za-z0-9-]{1,64}$/.test(v))
+  );
+}
 const COMMAND_PAYLOAD_KEY_RE =
   /(^command$|^cmd$|command[-_]?line|resolved[-_]?command|PAPERCLIP_RESOLVED_COMMAND)/i;
 const COMMAND_ARGS_PAYLOAD_KEY_RE = /^(commandArgs|command_?args|argv)$/i;
@@ -972,7 +984,8 @@ function sanitizeRecordWithLeaf(
     if (
       (SECRET_PAYLOAD_KEY_RE.test(key) || AUDIT_COUNT_PAYLOAD_KEYS.has(key)) &&
       !AUDIT_REASON_PAYLOAD_KEY_RE.test(key) &&
-      !isAuditCountField(key, value)
+      !isAuditCountField(key, value) &&
+      !isAuditHeaderNameList(key, value)
     ) {
       if (isSecretRefBinding(value)) {
         redacted[redactedKey] = sanitizeValue(value, leaf);
