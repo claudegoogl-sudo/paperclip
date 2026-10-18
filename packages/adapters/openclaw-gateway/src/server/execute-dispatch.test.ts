@@ -213,6 +213,32 @@ describe("openclaw_gateway execute dispatch boundary", () => {
     expect(authorityChangeSettled).toBe(true);
   });
 
+  it("does not leak an unhandled rejection when logging a websocket error fails", async () => {
+    vi.useFakeTimers();
+    websocketState.failConnectAttempts = 1;
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const resultPromise = execute(createContext({
+        onLog: async (_stream, chunk) => {
+          if (chunk.includes("websocket error:")) throw new Error("log sink unavailable");
+        },
+      }));
+      await vi.advanceTimersByTimeAsync(2_000);
+      const result = await resultPromise;
+      vi.useRealTimers();
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(result).toMatchObject({ exitCode: 0 });
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
   it("does not retry after the remote-work boundary has been crossed", async () => {
     websocketState.failAgentRequests = 1;
     const onDispatch = vi.fn();
