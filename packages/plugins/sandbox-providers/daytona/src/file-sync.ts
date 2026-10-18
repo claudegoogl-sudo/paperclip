@@ -15,6 +15,7 @@ import type {
   PluginSyncOperation,
 } from "@paperclipai/plugin-sdk";
 import { getPluginTracer } from "./plugin.js";
+import { shellQuote } from "./shell-quote.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -96,16 +97,6 @@ const SCRATCH_PREFIX = ".paperclip-upload";
 
 function scratchName(suffix = ""): string {
   return `${SCRATCH_PREFIX}-${randomUUID()}${suffix}`;
-}
-
-/**
- * Single-quote a path for safe interpolation into a sandbox shell command. Every
- * path handed to `sandbox.process.executeCommand` (tar extract / `mv -f` rename)
- * MUST pass through this so a path containing shell metacharacters is transferred
- * literally, never interpreted.
- */
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
 /**
