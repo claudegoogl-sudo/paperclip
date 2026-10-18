@@ -1,3 +1,4 @@
+import { readNonEmptyString } from "../lib/objects.js";
 import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -446,12 +447,6 @@ function resolveGoalIds(data: { goalIds?: string[]; goalId?: string | null }): s
     return data.goalId ? [data.goalId] : [];
   }
   return undefined;
-}
-
-function readNonEmptyString(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : null;
 }
 
 function normalizeWorkspaceCwd(value: unknown): string | null {

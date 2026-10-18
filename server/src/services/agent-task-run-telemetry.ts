@@ -1,3 +1,4 @@
+import { readNonEmptyString } from "../lib/objects.js";
 import { and, eq } from "drizzle-orm";
 import { agents, heartbeatRuns, type Db } from "@paperclipai/db";
 import { trackAgentTaskRun } from "@paperclipai/shared/telemetry";
@@ -6,12 +7,6 @@ import { logger } from "../middleware/logger.js";
 import { getTelemetryClient } from "../telemetry.js";
 
 type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
-
-function readNonEmptyString(value: unknown): string | null {
-  return typeof value === "string" && value.trim().length > 0
-    ? value.trim()
-    : null;
-}
 
 function readUsageToken(
   source: Record<string, unknown>,
