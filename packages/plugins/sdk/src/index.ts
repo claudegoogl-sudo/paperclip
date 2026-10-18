@@ -465,3 +465,5 @@ export {
 
 export { PluginEnvironmentCreationCleanupError, environmentCreationCleanupErrorData, readEnvironmentCreationCleanupError } from "./environment-creation-cleanup.js";
 export type { PluginEnvironmentCreationCleanup } from "./environment-creation-cleanup.js";
+
+export { shellQuote, isValidShellEnvKey } from "./shell-quote.js";
