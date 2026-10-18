@@ -239,6 +239,63 @@ describe.sequential("plugin install and upgrade authz", () => {
     expect(mockLifecycle.load).toHaveBeenCalledWith(pluginId);
   }, 20_000);
 
+  it("does not load a capability-parked install and reports capabilities + approvalId", async () => {
+    const pluginId = "11111111-1111-4111-8111-111111111111";
+    const pluginKey = "paperclip.example";
+    mockRegistry.getByKey.mockResolvedValue({
+      id: pluginId,
+      pluginKey,
+      packageName: "paperclip-plugin-example",
+      version: "1.0.0",
+    });
+    mockRegistry.getById.mockResolvedValue({
+      id: pluginId,
+      pluginKey,
+      packageName: "paperclip-plugin-example",
+      version: "1.0.0",
+      status: "upgrade_pending",
+    });
+    mockLifecycle.load.mockResolvedValue(undefined);
+    const { logActivity } = await import("../services/activity-log.js");
+    vi.mocked(logActivity).mockClear();
+
+    const { app } = await createApp(
+      { type: "board", userId: "admin-1", source: "session", isInstanceAdmin: true, companyIds: ["company-1"] },
+      {
+        installPlugin: vi.fn().mockResolvedValue({
+          manifest: { id: pluginKey },
+          installStatus: "upgrade_pending",
+          approvalId: "approval-9",
+          capabilities: ["issues.read", "issues.create"],
+          addedCapabilities: ["issues.create"],
+        }),
+      },
+    );
+
+    const res = await request(app)
+      .post("/api/plugins/install")
+      .send({ packageName: "paperclip-plugin-example" });
+
+    expect(res.status).toBe(200);
+    expect(mockLifecycle.load).not.toHaveBeenCalled();
+    expect(res.body).toMatchObject({
+      status: "upgrade_pending",
+      approvalId: "approval-9",
+      capabilities: ["issues.read", "issues.create"],
+      addedCapabilities: ["issues.create"],
+    });
+    expect(vi.mocked(logActivity)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "plugin.installed",
+        details: expect.objectContaining({
+          capabilities: ["issues.read", "issues.create"],
+          approvalId: "approval-9",
+        }),
+      }),
+    );
+  }, 20_000);
+
   it("rejects plugin upgrades for non-admin board users", async () => {
     const pluginId = "11111111-1111-4111-8111-111111111111";
     const { app } = await createApp({
@@ -623,9 +680,30 @@ describe.sequential("plugin per-tenant config override routes", () => {
                   additionalProperties: false,
                 },
               ],
+              "x-paperclip-scope": "tenant",
             },
-            label: { type: "string" },
+            label: { type: "string", "x-paperclip-scope": "tenant" },
+            artifactRepoUrl: { type: "string", format: "uri", "x-paperclip-scope": "tenant" },
+            operatorOnly: { type: "string" },
+            explicitOperator: { type: "string", "x-paperclip-scope": "operator" },
+            // Nested high-risk formats (separation-of-duties must walk subschemas).
+            nestedEndpoint: {
+              type: "object",
+              properties: { url: { type: "string", format: "uri" } },
+              "x-paperclip-scope": "tenant",
+            },
+            tokenList: {
+              type: "array",
+              items: { type: "string", format: "secret-ref" },
+              "x-paperclip-scope": "tenant",
+            },
+            refUrl: { $ref: "#/$defs/endpointUrl", "x-paperclip-scope": "tenant" },
+            deepCombo: {
+              allOf: [{ anyOf: [{ type: "string", format: "uri" }, { type: "integer" }] }],
+              "x-paperclip-scope": "tenant",
+            },
           },
+          $defs: { endpointUrl: { type: "string", format: "uri" } },
         },
       },
     });
@@ -661,7 +739,7 @@ describe.sequential("plugin per-tenant config override routes", () => {
       companyId: companyB,
       status: "active",
     });
-    const { app } = await createApp(boardActor());
+    const { app } = await createApp(boardActor({ isInstanceAdmin: true }));
     const res = await request(app)
       .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
       .send({
@@ -677,7 +755,7 @@ describe.sequential("plugin per-tenant config override routes", () => {
   it("returns 422 when a referenced secret cannot be found", async () => {
     readyOverridePlugin();
     mockSecretService.getById.mockResolvedValue(null);
-    const { app } = await createApp(boardActor());
+    const { app } = await createApp(boardActor({ isInstanceAdmin: true }));
     const res = await request(app)
       .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
       .send({
@@ -702,7 +780,7 @@ describe.sequential("plugin per-tenant config override routes", () => {
       companyId: companyA,
       settingsJson: { configOverrides: { githubPatSecretId: ownCompanyRef } },
     });
-    const { app } = await createApp(boardActor());
+    const { app } = await createApp(boardActor({ isInstanceAdmin: true }));
     const res = await request(app)
       .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
       .send({ configJson: { githubPatSecretId: ownCompanyRef } });
@@ -717,6 +795,93 @@ describe.sequential("plugin per-tenant config override routes", () => {
       companyA,
       { githubPatSecretId: ownCompanyRef },
     );
+  });
+
+  it("422s an unannotated (operator-plane) override key", async () => {
+    readyOverridePlugin();
+    const { app } = await createApp(boardActor({ isInstanceAdmin: true }));
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson: { label: "ok", operatorOnly: "x" } });
+    expect(res.status).toBe(422);
+    expect(res.body.details.keys).toEqual(["operatorOnly"]);
+    expect(mockRegistry.upsertCompanyConfigOverride).not.toHaveBeenCalled();
+  });
+
+  it("422s an explicitly operator-scoped key and a key absent from the schema", async () => {
+    readyOverridePlugin();
+    const { app } = await createApp(boardActor({ isInstanceAdmin: true }));
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson: { explicitOperator: "x", notInSchema: "y" } });
+    expect(res.status).toBe(422);
+    expect(res.body.details.keys).toEqual(["explicitOperator", "notInSchema"]);
+    expect(mockRegistry.upsertCompanyConfigOverride).not.toHaveBeenCalled();
+  });
+
+  it("403s a tenant-scoped format:uri key for a non-admin board member", async () => {
+    readyOverridePlugin();
+    const { app } = await createApp(boardActor());
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson: { artifactRepoUrl: "https://attacker.example/x" } });
+    expect(res.status).toBe(403);
+    expect(mockRegistry.upsertCompanyConfigOverride).not.toHaveBeenCalled();
+  });
+
+  it("403s a tenant-scoped format:secret-ref key for a non-admin board member", async () => {
+    readyOverridePlugin();
+    const { app } = await createApp(boardActor());
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson: { githubPatSecretId: { type: "secret_ref", secretId: dprSecretId } } });
+    expect(res.status).toBe(403);
+    expect(mockRegistry.upsertCompanyConfigOverride).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["nested object uri", { nestedEndpoint: { url: "https://attacker.example/x" } }],
+    ["array items secret-ref", { tokenList: ["77777777-7777-4777-8777-777777777777"] }],
+    ["$ref -> $defs uri", { refUrl: "https://attacker.example/x" }],
+    ["anyOf inside allOf uri", { deepCombo: "https://attacker.example/x" }],
+  ])("403s a tenant-scoped key with a %s for a non-admin board member", async (_label, configJson) => {
+    readyOverridePlugin();
+    const { app } = await createApp(boardActor());
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson });
+    expect(res.status).toBe(403);
+    expect(mockRegistry.upsertCompanyConfigOverride).not.toHaveBeenCalled();
+  });
+
+  it("200s a tenant-scoped format:uri key for an instance admin", async () => {
+    readyOverridePlugin();
+    mockRegistry.upsertCompanyConfigOverride.mockResolvedValue({
+      id: "row-1",
+      pluginId,
+      companyId: companyA,
+      settingsJson: { configOverrides: { artifactRepoUrl: "https://github.com/o/r" } },
+    });
+    const { app } = await createApp(boardActor({ isInstanceAdmin: true }));
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson: { artifactRepoUrl: "https://github.com/o/r" } });
+    expect(res.status).toBe(200);
+  });
+
+  it("200s a tenant-scoped plain key for a non-admin board member", async () => {
+    readyOverridePlugin();
+    mockRegistry.upsertCompanyConfigOverride.mockResolvedValue({
+      id: "row-1",
+      pluginId,
+      companyId: companyA,
+      settingsJson: { configOverrides: { label: "ok" } },
+    });
+    const { app } = await createApp(boardActor());
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/config-overrides`)
+      .send({ configJson: { label: "ok" } });
+    expect(res.status).toBe(200);
   });
 
   it("clears the override via DELETE", async () => {
@@ -1717,6 +1882,41 @@ describe.sequential("webhook token mint route", () => {
       companyIds: [companyA],
     });
   }
+
+  describe("config-write digest validation", () => {
+    const goodSalt = "s".repeat(16);
+    const goodDigest = "a".repeat(64);
+    const post = async (configJson: Record<string, unknown>) => {
+      mintablePlugin();
+      mockSecretService.syncSecretRefsForTarget.mockResolvedValue([]);
+      mockRegistry.upsertConfig.mockResolvedValue({ id: "c", pluginId, companyId: companyA, configJson });
+      const { app } = await adminApp();
+      return request(app).post(`/api/plugins/${pluginId}/config`).send({ companyId: companyA, configJson });
+    };
+
+    it.each([
+      ["missing salt", { digest: goodDigest }, "salt"],
+      ["short salt", { salt: "short", digest: goodDigest }, "salt"],
+      ["wrong-length digest", { salt: goodSalt, digest: "a".repeat(63) }, "digest"],
+      ["non-hex digest", { salt: goodSalt, digest: "z".repeat(64) }, "digest"],
+    ])("400s on %s and never writes", async (_l, value, word) => {
+      const res = await post({ [digestKey]: value });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain(digestKey);
+      expect(res.body.error).toContain(word);
+      expect(mockRegistry.upsertConfig).not.toHaveBeenCalled();
+    });
+
+    it("accepts a well-formed digest", async () => {
+      const res = await post({ [digestKey]: { salt: goodSalt, digest: goodDigest } });
+      expect(res.status).toBe(200);
+    });
+
+    it("accepts config with the digest key absent", async () => {
+      const res = await post({ other: 1 });
+      expect(res.status).toBe(200);
+    });
+  });
 
   it("rejects a non-instance-admin board user with 403 and never writes config", async () => {
     mintablePlugin();

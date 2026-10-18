@@ -53,7 +53,7 @@ import {
   type PluginWebhookRateLimiter,
   type PluginWebhookRateLimitTier,
 } from "../services/plugin-webhook-rate-limit.js";
-import { isVerifiedWebhookDelivery } from "../services/plugin-webhook-auth.js";
+import { describeTokenDigestDefect, isVerifiedWebhookDelivery } from "../services/plugin-webhook-auth.js";
 import {
   generateWebhookToken,
   isWebhookTokenDigestConfig,
@@ -93,6 +93,7 @@ import {
   getActorInfo,
 } from "./authz.js";
 import { validateInstanceConfig } from "../services/plugin-config-validator.js";
+import { highRiskOverrideKeys, nonTenantOverrideKeys } from "../services/plugin-config-scope.js";
 import {
   findLocalFolderDeclaration,
   getStoredLocalFolders,
@@ -1461,11 +1462,15 @@ export function pluginRoutes(
         return;
       }
 
-      // Transition to ready state
       const existingPlugin = await registry.getByKey(discovered.manifest.id);
       if (existingPlugin) {
-        await lifecycle.load(existingPlugin.id);
-        reconcileWatch(existingPlugin.id);
+        const parked = discovered.installStatus === "upgrade_pending";
+        // A parked install waits for its capability-escalation approval: do
+        // NOT load it. Approve -> the approvals resolver completes it to ready.
+        if (!parked) {
+          await lifecycle.load(existingPlugin.id);
+          reconcileWatch(existingPlugin.id);
+        }
         const updated = await registry.getById(existingPlugin.id);
         await logPluginMutationActivity(req, "plugin.installed", existingPlugin.id, {
           pluginId: existingPlugin.id,
@@ -1473,9 +1478,18 @@ export function pluginRoutes(
           packageName: updated?.packageName ?? existingPlugin.packageName,
           version: updated?.version ?? existingPlugin.version,
           source: isLocalPath ? "local_path" : "npm",
+          capabilities: discovered.capabilities,
+          approvalId: discovered.approvalId,
         });
         publishGlobalLiveEvent({ type: "plugin.ui.updated", payload: { pluginId: existingPlugin.id, action: "installed" } });
-        res.json(updated);
+        res.json({
+          ...updated,
+          // Declared capabilities of the requested package (the stored
+          // manifest of a parked install holds only the granted set).
+          capabilities: discovered.capabilities,
+          addedCapabilities: discovered.addedCapabilities,
+          approvalId: discovered.approvalId,
+        });
       } else {
         // This shouldn't happen since installPlugin already registers in the DB
         res.status(500).json({ error: "Plugin installed but not found in registry" });
@@ -2610,6 +2624,21 @@ export function pluginRoutes(
       }
     }
 
+    // Reject a malformed webhook token digest at write time instead of letting
+    // request-time verification silently degrade. Uses the SAME predicate.
+    for (const hook of plugin.manifestJson?.webhooks ?? []) {
+      const key = hook.auth?.tokenDigestConfigKey;
+      if (!key || !(key in body.configJson)) continue;
+      const defect = describeTokenDigestDefect(body.configJson[key]);
+      if (defect) {
+        res.status(400).json({
+          error: `Config key '${key}' (webhook token digest for endpoint '${hook.endpointKey}') is malformed: ${defect}`,
+          fieldErrors: [{ path: key, message: defect }],
+        });
+        return;
+      }
+    }
+
     try {
       const secretRefs = extractSecretRefBindingsFromConfig(body.configJson, schema);
       await validatePluginSecretRefsForCompany(companyId, secretRefs);
@@ -3531,6 +3560,22 @@ export function pluginRoutes(
     }
 
     const schema = plugin.manifestJson?.instanceConfigSchema;
+
+    // Scope gate. Read ONLY from the host-stored manifest, never from the
+    // worker. A key without `x-paperclip-scope: "tenant"` is operator-plane
+    // and may be set only in the operator-authored plugin_config row.
+    const operatorKeys = nonTenantOverrideKeys(schema as never, body.configJson);
+    if (operatorKeys.length > 0) {
+      res.status(422).json({
+        error: "Config keys are not tenant-overridable",
+        details: { keys: operatorKeys },
+      });
+      return;
+    }
+    // Separation of duties: URL- and secret-ref-shaped keys need instance admin.
+    if (highRiskOverrideKeys(schema as never, body.configJson).length > 0) {
+      assertInstanceAdmin(req);
+    }
     if (schema && Object.keys(schema).length > 0) {
       const validation = validateInstanceConfig(body.configJson, schema);
       if (!validation.valid) {

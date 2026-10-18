@@ -1,5 +1,6 @@
 export {
   createDb,
+  withDedicatedDbConnection,
   closeRegisteredClients,
   getPostgresDataDirectory,
   ensurePostgresDatabase,
@@ -23,9 +24,13 @@ export {
   createQueryCancellationScope,
   type QueryCancellationScope,
 } from "./query-cancellation.js";
+// Re-exported for repo-root scripts (scripts/*.ts), which cannot resolve
+// "drizzle-orm" directly under pnpm's strict node_modules layout.
+export { and, eq, like } from "drizzle-orm";
 export {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
+  EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
   type EmbeddedPostgresTestDatabase,
   type EmbeddedPostgresTestSupport,
 } from "./test-embedded-postgres.js";

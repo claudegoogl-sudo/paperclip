@@ -332,6 +332,34 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  it("matches a target-scoped agents:configure grant only when the request names the target agent", async () => {
+    const company = await createCompany(db, "ScopedAgentConfigure");
+    const concierge = await createAgent(db, company.id);
+    const scanBot = await createAgent(db, company.id);
+    const ceo = await createAgent(db, company.id, { role: "ceo" });
+    await grantAgentPermission(db, company.id, concierge.id, "agents:configure", { targetAgentIds: [scanBot.id] });
+
+    const authz = authorizationService(db);
+    const decideFor = (targetId: string, scope: Record<string, unknown>) => authz.decide({
+      actor: { type: "agent", agentId: concierge.id, companyId: company.id, source: "agent_key" },
+      action: "agent_config:update",
+      resource: { type: "agent", companyId: company.id, agentId: targetId },
+      scope,
+    });
+
+    // Shape produced by routes/agents.ts agentConfigUpdateScope().
+    await expect(decideFor(scanBot.id, { targetAgentId: scanBot.id })).resolves.toMatchObject({ allowed: true });
+    await expect(decideFor(scanBot.id, { requiresChangeGrant: true, targetAgentId: scanBot.id }))
+      .resolves.toMatchObject({ allowed: true });
+    await expect(decideFor(ceo.id, { targetAgentId: ceo.id })).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_scope",
+    });
+    // Regression for the original bug: the pre-fix route sent no targetAgentId,
+    // so a scoped grant could never match (fails closed).
+    await expect(decideFor(scanBot.id, {})).resolves.toMatchObject({ allowed: false });
+  });
+
   it("enforces direct or consented suggest grants for skill configuration changes", async () => {
     const company = await createCompany(db, "SkillChangeGrant");
     const directAgent = await createAgent(db, company.id);
@@ -1462,8 +1490,8 @@ describeEmbeddedPostgres("authorization service", () => {
     })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_membership" });
   });
 
-  it("keeps denying self-gated null-mapped actions for board members", async () => {
-    const company = await createCompany(db, "BoardWakeDenied");
+  it("allows legacy member roles to wake agents while rejecting incomplete task mutation scope", async () => {
+    const company = await createCompany(db, "BoardWake");
     const userId = `user-${randomUUID()}`;
     const targetAgent = await createAgent(db, company.id, { role: "engineer" });
     await db.insert(companyMemberships).values({
@@ -1481,8 +1509,8 @@ describeEmbeddedPostgres("authorization service", () => {
       action: "agent:wake",
       resource: { type: "agent", companyId: company.id, agentId: targetAgent.id },
     })).resolves.toMatchObject({
-      allowed: false,
-      reason: "deny_unsupported_action",
+      allowed: true,
+      reason: "allow_simple_company_member",
     });
     const issue = await createIssue(db, company.id, { title: "Wake denied issue" });
     await expect(authorization.decide({
@@ -1749,6 +1777,25 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  it.each(["session", "cloud_tenant"] as const)("allows %s operators to start agents, without granting hiring rights", async (source) => {
+    const company = await createCompany(db, "wake");
+    const agent = await createAgent(db, company.id);
+    const userId = await createUser(db);
+    await db.insert(companyMemberships).values({ companyId: company.id,
+      principalType: "user", principalId: userId, status: "active", membershipRole: "operator" });
+    const auth = authorizationService(db);
+    const actor = { type: "board" as const, source, userId, companyIds: [company.id] };
+    const resource = { type: "agent" as const, companyId: company.id, agentId: agent.id };
+    expect(await auth.decide({ actor, action: "agent:wake", resource })).toMatchObject({ allowed: true });
+    expect(await auth.decide({ actor, action: "agents:create", resource: { type: "company", companyId: company.id } })).toMatchObject({ allowed: false });
+    await db.update(companyMemberships).set({ membershipRole: "viewer" }).where(eq(companyMemberships.principalId, userId));
+    expect(await auth.decide({ actor, action: "agent:wake", resource })).toMatchObject({ allowed: false });
+    await db.update(companyMemberships).set({ membershipRole: "operator", status: "suspended" }).where(eq(companyMemberships.principalId, userId));
+    expect(await auth.decide({ actor, action: "agent:wake", resource })).toMatchObject({ allowed: false });
+    const otherCompany = await createCompany(db, "other-wake");
+    expect(await auth.decide({ actor, action: "agent:wake", resource: { ...resource, companyId: otherCompany.id } })).toMatchObject({ allowed: false });
+  });
+
   it("limits viewer members to read-only visibility actions", async () => {
     const company = await createCompany(db, "BoardViewerVisibility");
     const userId = `user-${randomUUID()}`;
@@ -1928,6 +1975,71 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  it("grants hire authority through the persisted new-agent default", async () => {
+    const company = await createCompany(db, "DefaultHire");
+    // The service create path persists the create-context default
+    // (canCreateAgents: true for standard trust); enforcement reads it back.
+    const actorAgent = await createAgent(db, company.id, {
+      role: "engineer",
+      permissions: { canCreateAgents: true, canCreateSkills: true },
+    });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "agents:create",
+      resource: { type: "company", companyId: company.id },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: true,
+      reason: "allow_legacy_agent_creator",
+    });
+  });
+
+  it("keeps legacy rows without an explicit canCreateAgents fail-closed", async () => {
+    const company = await createCompany(db, "LegacyRowFailClosed");
+    const actorAgent = await createAgent(db, company.id, { role: "engineer", permissions: {} });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "agents:create",
+      resource: { type: "company", companyId: company.id },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+  });
+
+  it("denies agent creation for a low-trust boundary even with explicit canCreateAgents", async () => {
+    const company = await createCompany(db, "LowTrustHireDenied");
+    const project = await createProject(db, company.id, "Contained");
+    const actorAgent = await createAgent(db, company.id, {
+      permissions: {
+        canCreateAgents: true,
+        trustPreset: LOW_TRUST_REVIEW_PRESET,
+        authorizationPolicy: {
+          trustBoundary: {
+            mode: LOW_TRUST_REVIEW_PRESET,
+            projectIds: [project.id],
+          },
+        },
+      },
+    });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "agents:create",
+      resource: { type: "company", companyId: company.id },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: false,
+      reason: "deny_low_trust_boundary",
+    });
+  });
+
   it("denies active-checkout management outside the CEO caller company scope", async () => {
     const sourceCompany = await createCompany(db, "CheckoutSource");
     const targetCompany = await createCompany(db, "CheckoutTarget");
@@ -2041,6 +2153,82 @@ describeEmbeddedPostgres("authorization service", () => {
     expect(denied).toMatchObject({
       allowed: false,
       reason: "deny_scope",
+    });
+  });
+
+  describe("routines:manage grant", () => {
+    async function decideManage(
+      actorAgentId: string,
+      actorCompanyId: string,
+      targetCompanyId: string,
+      assigneeAgentId: string,
+    ) {
+      return authorizationService(db).decide({
+        actor: { type: "agent", agentId: actorAgentId, companyId: actorCompanyId, source: "agent_key" },
+        action: "routines:manage",
+        resource: { type: "agent", companyId: targetCompanyId, agentId: assigneeAgentId },
+        scope: { targetAgentId: assigneeAgentId },
+      });
+    }
+
+    it("allows an unscoped grant and denies without a grant", async () => {
+      const company = await createCompany(db, "RoutinesManage");
+      const granted = await createAgent(db, company.id);
+      const ungranted = await createAgent(db, company.id);
+      const assignee = await createAgent(db, company.id);
+      await grantAgentPermission(db, company.id, granted.id, "routines:manage");
+
+      await expect(decideManage(granted.id, company.id, company.id, assignee.id))
+        .resolves.toMatchObject({ allowed: true, reason: "allow_explicit_grant" });
+      await expect(decideManage(ungranted.id, company.id, company.id, assignee.id))
+        .resolves.toMatchObject({ allowed: false });
+    });
+
+    it("honours a targetAgentIds-scoped grant (hit and miss)", async () => {
+      const company = await createCompany(db, "RoutinesManageScoped");
+      const actor = await createAgent(db, company.id);
+      const inScope = await createAgent(db, company.id);
+      const outOfScope = await createAgent(db, company.id);
+      await grantAgentPermission(db, company.id, actor.id, "routines:manage", { targetAgentIds: [inScope.id] });
+
+      await expect(decideManage(actor.id, company.id, company.id, inScope.id))
+        .resolves.toMatchObject({ allowed: true, reason: "allow_explicit_grant" });
+      await expect(decideManage(actor.id, company.id, company.id, outOfScope.id))
+        .resolves.toMatchObject({ allowed: false });
+    });
+
+    it("denies cross-company even with a grant in the actor company", async () => {
+      const source = await createCompany(db, "RoutinesManageSrc");
+      const target = await createCompany(db, "RoutinesManageDst");
+      const actor = await createAgent(db, source.id);
+      const foreignAssignee = await createAgent(db, target.id);
+      await grantAgentPermission(db, source.id, actor.id, "routines:manage");
+
+      await expect(decideManage(actor.id, source.id, target.id, foreignAssignee.id))
+        .resolves.toMatchObject({ allowed: false, reason: "deny_company_boundary" });
+    });
+
+    it("denies low-trust agents even with an explicit grant", async () => {
+      const company = await createCompany(db, "RoutinesManageLowTrust");
+      const project = await createProject(db, company.id, "Allowed");
+      const assignee = await createAgent(db, company.id);
+      const actor = await createAgent(db, company.id, {
+        permissions: {
+          trustPreset: LOW_TRUST_REVIEW_PRESET,
+          authorizationPolicy: {
+            trustBoundary: {
+              mode: LOW_TRUST_REVIEW_PRESET,
+              companyId: company.id,
+              projectIds: [project.id],
+              allowedAgentIds: [assignee.id],
+            },
+          },
+        },
+      });
+      await grantAgentPermission(db, company.id, actor.id, "routines:manage");
+
+      await expect(decideManage(actor.id, company.id, company.id, assignee.id))
+        .resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
     });
   });
 

@@ -1,6 +1,9 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
+
+const mockSkillSourceService = vi.hoisted(() => ({ sourceForSkill: vi.fn(), importFromUrl: vi.fn(), discover: vi.fn() }));
 
 const mockAgentService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -129,63 +132,71 @@ function denySkillPolicy(action = "skills.import") {
   };
 }
 
-function registerModuleMocks() {
-  vi.doMock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
+// Hoisted module mocks (not per-test vi.doMock + vi.resetModules): the mock
+// registry must be in place before ANY import of the route module, in every
+// test. createApp concurrently importActual()s middleware and route modules
+// whose graphs share the mocked services, so a load-dependent registry race
+// could bind the REAL services module and 500 the request under test
+// (master Release runs 35877211616 / 35888840397). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("../services/skill-sources.js", () => ({ skillSourceService: () => mockSkillSourceService }));
 
-  vi.doMock("@paperclipai/shared/telemetry", () => ({
+  vi.mock("@paperclipai/shared/telemetry", () => ({
     trackSkillImported: mockTrackSkillImported,
     trackErrorHandlerCrash: vi.fn(),
   }));
 
-  vi.doMock("../telemetry.js", () => ({
+  vi.mock("../telemetry.js", () => ({
     getTelemetryClient: mockGetTelemetryClient,
   }));
 
-  vi.doMock("../services/access.js", () => ({
+  vi.mock("../services/access.js", () => ({
     accessService: () => mockAccessService,
   }));
 
-  vi.doMock("../services/activity-log.js", () => ({
+  vi.mock("../services/activity-log.js", () => ({
+    persistActivity: vi.fn(),
+    publishActivity: vi.fn(),
     logActivity: mockLogActivity,
   }));
 
-  vi.doMock("../services/agents.js", () => ({
+  vi.mock("../services/agents.js", () => ({
     agentService: () => mockAgentService,
   }));
 
-  vi.doMock("../services/company-skills.js", async () => {
+  vi.mock("../services/company-skills.js", async () => {
     const actual = await vi.importActual<typeof import("../services/company-skills.js")>(
-      "../services/company-skills.js",
+  "../services/company-skills.js",
     );
     return {
-      ...actual,
-      companySkillService: () => mockCompanySkillService,
+  ...actual,
+  companySkillService: () => mockCompanySkillService,
     };
   });
 
-  vi.doMock("../services/company-skill-policy.js", async () => {
+  vi.mock("../services/company-skill-policy.js", async () => {
     const actual = await vi.importActual<typeof import("../services/company-skill-policy.js")>(
-      "../services/company-skill-policy.js",
+  "../services/company-skill-policy.js",
     );
     return {
-      ...actual,
-      companySkillPolicyService: () => mockCompanySkillPolicyService,
+  ...actual,
+  companySkillPolicyService: () => mockCompanySkillPolicyService,
     };
   });
 
-  vi.doMock("../services/skills-catalog.js", () => mockCatalogService);
+  vi.mock("../services/skills-catalog.js", () => mockCatalogService);
 
-  vi.doMock("../services/change-consent-gate.js", async () => {
+  vi.mock("../services/change-consent-gate.js", async () => {
     const actual = await vi.importActual<typeof import("../services/change-consent-gate.js")>(
-      "../services/change-consent-gate.js",
+  "../services/change-consent-gate.js",
     );
     return {
-      ...actual,
-      changeConsentGateService: () => mockReflectionCoachMutationGate,
+  ...actual,
+  changeConsentGateService: () => mockReflectionCoachMutationGate,
     };
   });
 
-  vi.doMock("../services/index.js", () => ({
+  vi.mock("../services/index.js", () => ({
     accessService: () => mockAccessService,
     agentService: () => mockAgentService,
     companySkillService: () => mockCompanySkillService,
@@ -193,42 +204,38 @@ function registerModuleMocks() {
     heartbeatService: () => mockHeartbeatService,
     logActivity: mockLogActivity,
   }));
-}
 
-async function createApp(actor: Record<string, unknown>) {
-  const [{ companySkillRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/company-skills.js")>("../routes/company-skills.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
-  const app = express();
-  app.use(express.json());
-  app.use((req, _res, next) => {
-    (req as any).actor = actor;
-    next();
-  });
-  app.use("/api", companySkillRoutes({} as any));
-  app.use(errorHandler);
-  return app;
-}
+// The module mocks above are hoisted vi.mock calls, so they are already
+// registered before any import. hoistModuleGraph still needs a register hook.
+function registerModuleMocks() {}
 
 describe("company skill mutation permissions", () => {
+  const routeModules = hoistModuleGraph(registerModuleMocks, async () => {
+    const [{ companySkillRoutes }, { errorHandler }] = await Promise.all([
+      vi.importActual<typeof import("../routes/company-skills.js")>("../routes/company-skills.js"),
+      vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+    ]);
+    return { companySkillRoutes, errorHandler };
+  });
+
+  function createApp(actor: Record<string, unknown>, onResponse?: (res: express.Response) => void) {
+    const { companySkillRoutes, errorHandler } = routeModules.value;
+    const app = express();
+    app.use(express.json());
+    app.use((req, res, next) => {
+      (req as any).actor = actor;
+      onResponse?.(res);
+      next();
+    });
+    app.use("/api", companySkillRoutes({} as any));
+    app.use(errorHandler);
+    return app;
+  }
+
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("@paperclipai/shared/telemetry");
-    vi.doUnmock("../telemetry.js");
-    vi.doUnmock("../services/access.js");
-    vi.doUnmock("../services/activity-log.js");
-    vi.doUnmock("../services/agents.js");
-    vi.doUnmock("../services/company-skills.js");
-    vi.doUnmock("../services/company-skill-policy.js");
-    vi.doUnmock("../services/skills-catalog.js");
-    vi.doUnmock("../services/change-consent-gate.js");
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../routes/company-skills.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
+    mockSkillSourceService.sourceForSkill.mockResolvedValue(null);
+    mockSkillSourceService.importFromUrl.mockImplementation((companyId, source) => mockCompanySkillService.importFromSource(companyId, source));
     mockGetTelemetryClient.mockReturnValue({ track: vi.fn() });
     mockCompanySkillService.importFromSource.mockResolvedValue({
       imported: [],
@@ -1364,6 +1371,98 @@ describe("company skill mutation permissions", () => {
       sourceType: "github",
       skillRef: "vercel-labs/agent-browser/find-skills",
     });
+  });
+
+  it('streams discovery updates and a final result while retaining JSON compatibility', async () => {
+    const result = { candidates: [], commitSha: 'a'.repeat(40) };
+    mockSkillSourceService.discover.mockImplementation(async (_input, _context, options) => {
+      await options?.onProgress({ type: 'progress', phase: 'listing', totalSkills: null, checkedSkills: 0, currentPath: null, checkedFiles: 0, totalFiles: null });
+      return result;
+    });
+    const app = createApp({ type: 'board', userId: 'board', companyIds: ['company-1'], source: 'local_implicit' });
+    const base = '/api/companies/company-1/skill-sources/discover';
+    const stream = await request(app).post(base).set('Accept', 'application/x-ndjson').send({ repositoryUrl: 'https://github.com/acme/skills' }).expect(200);
+    expect(stream.headers['content-type']).toContain('application/x-ndjson');
+    expect(stream.headers['cache-control']).toBe('no-cache, no-transform');
+    expect(stream.text.trim().split('\n').map((line: string) => JSON.parse(line))).toEqual([
+      expect.objectContaining({ type: 'progress', phase: 'listing' }), { type: 'complete', discovery: result },
+    ]);
+    const json = await request(app).post(base).send({ repositoryUrl: 'https://github.com/acme/skills' }).expect(200);
+    expect(json.body).toEqual(result);
+  });
+  it('terminates failed streams with an error instead of a complete or partial discovery', async () => {
+    mockSkillSourceService.discover.mockImplementation(async (_input, _context, options) => {
+      await options.onProgress({ type: 'progress', phase: 'listing' });
+      throw new Error('Internal credential detail must not leak');
+    });
+    const res = await request(createApp({ type: 'board', userId: 'board', companyIds: ['company-1'], source: 'local_implicit' }))
+      .post('/api/companies/company-1/skill-sources/discover').set('Accept', 'application/x-ndjson').send({ repositoryUrl: 'https://github.com/acme/skills' }).expect(200);
+    const events = res.text.trim().split('\n').map((line: string) => JSON.parse(line));
+    expect(events.at(-1)).toEqual({ type: 'error', error: 'Repository scan interrupted. Try again.', status: 500 });
+    expect(events.some((event: { type: string }) => event.type === 'complete')).toBe(false);
+    expect(res.text).not.toContain('credential detail');
+  });
+  it('aborts discovery and closes a connected client whose progress stream never drains', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    let response: express.Response | undefined;
+    let signal: AbortSignal | undefined;
+    const write = vi.fn(() => false);
+    mockSkillSourceService.discover.mockImplementation(async (_input, _context, options) => {
+      signal = options.signal;
+      await options.onProgress({ type: 'progress', phase: 'downloading' });
+      throw new Error('A stalled scan must abort before continuing');
+    });
+    try {
+      const app = createApp({ type: 'board', userId: 'board', companyIds: ['company-1'], source: 'local_implicit' }, res => {
+        response = res;
+        res.write = write;
+      });
+      const pending = request(app).post('/api/companies/company-1/skill-sources/discover')
+        .set('Accept', 'application/x-ndjson').send({ repositoryUrl: 'https://github.com/acme/skills' })
+        .then(() => null, error => error);
+      await vi.waitFor(() => expect(write).toHaveBeenCalledTimes(1));
+      expect(signal?.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(await pending).toBeTruthy();
+      expect(signal?.aborted).toBe(true);
+      expect(response?.destroyed).toBe(true);
+      expect(response?.listenerCount('drain')).toBe(0);
+      expect(write).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+      response?.destroy();
+    }
+  });
+
+  it("rejects cross-company source reads and mutations for board users and agents", async () => {
+    for (const actor of [
+      { type: "board", userId: "member", companyIds: ["company-1"], isInstanceAdmin: true, source: "session" },
+      { type: "agent", agentId: "agent-1", companyId: "company-1" },
+    ]) {
+      const app = createApp(actor);
+      const base = "/api/companies/company-2/skill-sources";
+      const responses = await Promise.all([
+        request(app).get(base), request(app).get(`${base}/repositories`), request(app).get(`${base}/source-id`),
+        request(app).post(`${base}/discover`).send({ repositoryUrl: "https://github.com/acme/skills" }),
+        request(app).post(`${base}/discover`).set('Accept', 'application/x-ndjson').send({ repositoryUrl: "https://github.com/acme/skills" }),
+        request(app).post(`${base}/preview`).send({ repositoryUrl: "https://github.com/acme/skills", commitSha: "a".repeat(40), skillPath: "SKILL.md", filePath: "SKILL.md" }),
+        request(app).post(base).send({ repositoryUrl: "https://github.com/acme/skills", commitSha: "a".repeat(40), selectedPaths: [] }),
+        request(app).patch(`${base}/source-id`).send({ revision: 0, selectedPaths: [], excludedFolders: [] }),
+        request(app).post(`${base}/source-id/refresh`), request(app).delete(`${base}/source-id`),
+      ]);
+      for (const response of responses) expect(response.status).toBe(403);
+    }
+    expect(mockCompanySkillService.importFromSource).not.toHaveBeenCalled();
+  });
+
+  it("omits source-managed repository identities from import telemetry", async () => {
+    mockCompanySkillService.importFromSource.mockResolvedValue({ imported: [{
+      sourceType: "github", key: "github/private-repo/private-skill-name", slug: "private-skill-name",
+      metadata: { hostname: "github.com", skillSourceId: "source-1" },
+    }], warnings: [] });
+    await request(createApp({ type: "board", userId: "local-board", companyIds: ["company-1"], source: "local_implicit" }))
+      .post("/api/companies/company-1/skills/import").send({ source: "https://github.com/acme/private" }).expect(201);
+    expect(mockTrackSkillImported).toHaveBeenCalledWith(expect.anything(), { sourceType: "github", skillRef: null });
   });
 
   it("does not expose a skill reference for non-public skill imports", async () => {

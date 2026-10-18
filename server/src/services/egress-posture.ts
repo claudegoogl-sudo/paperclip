@@ -29,6 +29,82 @@ export function egressPostureFor(binding: {
   return binding.allowedEgress.length === 0 ? "deny_all" : "enforcing";
 }
 
+/**
+ * Operator-set egress posture of a binding row, carried across a
+ * delete+reinsert sync.
+ *
+ * `company_secret_bindings` rows are re-created — with a fresh id and fresh
+ * `created_at` — every time a config save re-syncs the bindings for a target.
+ * The egress posture (`allowedEgress`, `egressAllowlistEnforced`) is operator
+ * state keyed by the binding identity
+ * `(companyId, targetType, targetId, configPath)`, not by the row id, so a
+ * re-save must carry it onto the new rows instead of silently resetting it to
+ * the column defaults. Resetting in either direction is a defect: an operator
+ * allowlist would be wiped (deny-all while enforcing), or a log-only posture
+ * would be silently re-armed.
+ *
+ * Every delete+reinsert binding sync must route its re-insert posture through
+ * `preservedEgressPosture` — one shared definition, because the syncs drifting
+ * into different semantics is exactly how one of them silently drifted into
+ * wiping operator posture on every config save.
+ */
+export type EgressPostureCarry = {
+  allowedEgress: string[];
+  egressAllowlistEnforced: boolean;
+};
+
+/**
+ * Resolve the egress posture a re-inserted binding row should carry.
+ *
+ * Falls back to the column defaults — empty allowlist, enforcement ON — when
+ * there is no prior row at the same binding identity, so new bindings stay
+ * born enforcing (EG4 secure-by-default) and no path regresses to born-false.
+ */
+export function preservedEgressPosture(
+  existing?:
+    | Pick<EgressPostureCarry, "allowedEgress" | "egressAllowlistEnforced">
+    | null,
+): EgressPostureCarry {
+  return {
+    allowedEgress: existing?.allowedEgress ?? [],
+    egressAllowlistEnforced: existing?.egressAllowlistEnforced ?? true,
+  };
+}
+
+/**
+ * Map key for a carried egress posture. Within one sync the target is fixed,
+ * so the binding identity reduces to `(companyId, configPath)`; the company
+ * component matters for instance-scoped targets whose bindings span several
+ * companies (e.g. environments). NUL-separated so a configPath can never
+ * collide across a companyId/configPath split.
+ */
+export function egressPostureCarryKey(companyId: string, configPath: string): string {
+  return `${companyId}\u0000${configPath}`;
+}
+
+/**
+ * Index the posture of the rows a delete+reinsert sync is about to remove, so
+ * the re-insert can look each row's posture up by binding identity.
+ */
+export function egressPostureCarryIndex(
+  rows: ReadonlyArray<{
+    companyId: string;
+    configPath: string;
+    allowedEgress: string[];
+    egressAllowlistEnforced: boolean;
+  }>,
+): Map<string, EgressPostureCarry> {
+  return new Map(
+    rows.map((row) => [
+      egressPostureCarryKey(row.companyId, row.configPath),
+      {
+        allowedEgress: row.allowedEgress,
+        egressAllowlistEnforced: row.egressAllowlistEnforced,
+      },
+    ]),
+  );
+}
+
 export const EGRESS_POSTURE_DENY_ALL_ACTION = "secret.egress_posture_deny_all";
 
 export const EGRESS_POSTURE_SWEEP_INTERVAL_MS = 15 * 60 * 1000;

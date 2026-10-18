@@ -32,89 +32,6 @@ const mockAccessService = vi.hoisted(() => ({
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 
-function registerRouteMocks() {
-  vi.doMock("@paperclipai/shared/telemetry", () => ({
-    trackAgentTaskCompleted: vi.fn(),
-    trackErrorHandlerCrash: vi.fn(),
-  }));
-
-  vi.doMock("../telemetry.js", () => ({
-    getTelemetryClient: vi.fn(() => ({ track: vi.fn() })),
-  }));
-
-  vi.doMock("../services/issues.js", () => ({
-    issueService: () => mockIssueService,
-  }));
-
-  vi.doMock("../services/activity-log.js", () => ({
-    logActivity: mockLogActivity,
-  }));
-
-  vi.doMock("../services/index.js", () => ({
-    accessService: () => mockAccessService,
-    agentService: () => ({
-      getById: vi.fn(),
-    }),
-    companySkillService: () => ({}),
-    companyService: () => mockCompanyService,
-    documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
-    documentService: () => ({}),
-    executionWorkspaceService: () => ({}),
-    feedbackService: () => ({
-      listIssueVotesForUser: vi.fn(async () => []),
-      saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
-    }),
-    goalService: () => ({}),
-    heartbeatService: () => ({
-      wakeup: vi.fn(async () => undefined),
-      reportRunActivity: vi.fn(async () => undefined),
-      getRun: vi.fn(async () => null),
-      getActiveRunForAgent: vi.fn(async () => null),
-      cancelRun: vi.fn(async () => null),
-    }),
-    instanceSettingsService: () => ({
-      get: vi.fn(async () => ({
-        id: "instance-settings-1",
-        general: {
-          censorUsernameInLogs: false,
-          feedbackDataSharingPreference: "prompt",
-        },
-      })),
-      listCompanyIds: vi.fn(async () => ["company-1"]),
-    }),
-    issueApprovalService: () => ({}),
-    issueReferenceService: () => ({
-      deleteDocumentSource: async () => undefined,
-      diffIssueReferenceSummary: () => ({
-        addedReferencedIssues: [],
-        removedReferencedIssues: [],
-        currentReferencedIssues: [],
-      }),
-      emptySummary: () => ({ outbound: [], inbound: [] }),
-      listIssueReferenceSummary: async () => ({ outbound: [], inbound: [] }),
-      syncComment: async () => undefined,
-      syncDocument: async () => undefined,
-      syncIssue: async () => undefined,
-    }),
-    issueThreadInteractionService: () => ({
-      listForIssue: vi.fn(async () => []),
-      expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
-      expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
-    }),
-    issueRecoveryActionService: () => ({
-      getActiveForIssue: vi.fn(async () => null),
-      listActiveForIssues: vi.fn(async () => new Map()),
-    }),
-    issueService: () => mockIssueService,
-    logActivity: mockLogActivity,
-    projectService: () => ({}),
-    routineService: () => ({
-      syncRunStatusForIssue: vi.fn(async () => undefined),
-    }),
-    workProductService: () => mockWorkProductService,
-  }));
-}
-
 type TestStorageService = StorageService & {
   __calls: {
     putFile?: {
@@ -126,6 +43,95 @@ type TestStorageService = StorageService & {
     };
   };
 };
+
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("@paperclipai/shared/telemetry", () => ({
+  trackAgentTaskCompleted: vi.fn(),
+  trackErrorHandlerCrash: vi.fn(),
+}));
+
+vi.mock("../telemetry.js", () => ({
+  getTelemetryClient: vi.fn(() => ({ track: vi.fn() })),
+}));
+
+vi.mock("../services/issues.js", () => ({
+  issueService: () => mockIssueService,
+}));
+
+vi.mock("../services/activity-log.js", () => ({
+  logActivity: mockLogActivity,
+}));
+
+vi.mock("../services/index.js", () => ({
+  accessService: () => mockAccessService,
+  agentService: () => ({
+    getById: vi.fn(),
+  }),
+  companySkillService: () => ({}),
+  companyService: () => mockCompanyService,
+  documentAnnotationService: () => ({ remapOpenThreadsForDocument: async () => [] }),
+  documentService: () => ({}),
+  executionWorkspaceService: () => ({}),
+  feedbackService: () => ({
+    listIssueVotesForUser: vi.fn(async () => []),
+    saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
+  }),
+  goalService: () => ({}),
+  heartbeatService: () => ({
+    wakeup: vi.fn(async () => undefined),
+    reportRunActivity: vi.fn(async () => undefined),
+    getRun: vi.fn(async () => null),
+    getActiveRunForAgent: vi.fn(async () => null),
+    cancelRun: vi.fn(async () => null),
+  }),
+  instanceSettingsService: () => ({
+    get: vi.fn(async () => ({
+      id: "instance-settings-1",
+      general: {
+        censorUsernameInLogs: false,
+        feedbackDataSharingPreference: "prompt",
+      },
+    })),
+    listCompanyIds: vi.fn(async () => ["company-1"]),
+  }),
+  issueApprovalService: () => ({}),
+  issueReferenceService: () => ({
+    deleteDocumentSource: async () => undefined,
+    diffIssueReferenceSummary: () => ({
+      addedReferencedIssues: [],
+      removedReferencedIssues: [],
+      currentReferencedIssues: [],
+    }),
+    emptySummary: () => ({ outbound: [], inbound: [] }),
+    listIssueReferenceSummary: async () => ({ outbound: [], inbound: [] }),
+    syncComment: async () => undefined,
+    syncDocument: async () => undefined,
+    syncIssue: async () => undefined,
+  }),
+  issueThreadInteractionService: () => ({
+    listForIssue: vi.fn(async () => []),
+    expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
+    expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
+  }),
+  issueRecoveryActionService: () => ({
+    getActiveForIssue: vi.fn(async () => null),
+    listActiveForIssues: vi.fn(async () => new Map()),
+  }),
+  issueService: () => mockIssueService,
+  logActivity: mockLogActivity,
+  projectService: () => ({}),
+  routineService: () => ({
+    syncRunStatusForIssue: vi.fn(async () => undefined),
+  }),
+  workProductService: () => mockWorkProductService,
+}));
 
 function createStorageService(body = Buffer.from("test")): TestStorageService {
   const calls: TestStorageService["__calls"] = {};
@@ -210,6 +216,9 @@ describe("MAX_ATTACHMENT_BYTES", () => {
   it("reads the deployment-level attachment cap from the environment", async () => {
     const previous = process.env.PAPERCLIP_ATTACHMENT_MAX_BYTES;
     process.env.PAPERCLIP_ATTACHMENT_MAX_BYTES = "5";
+    // Fresh module evaluation so attachment-types.js re-reads the env var.
+    // Safe with the hoisted vi.mock above: resetModules clears the module
+    // registry, not the mock registry.
     vi.resetModules();
     try {
       const { MAX_ATTACHMENT_BYTES } = await import("../attachment-types.js");
@@ -220,6 +229,8 @@ describe("MAX_ATTACHMENT_BYTES", () => {
       } else {
         process.env.PAPERCLIP_ATTACHMENT_MAX_BYTES = previous;
       }
+      // Drop the env-specialized module instance so later tests re-read the
+      // real environment.
       vi.resetModules();
     }
   });
@@ -227,16 +238,11 @@ describe("MAX_ATTACHMENT_BYTES", () => {
 
 describe("issue attachment routes", () => {
   beforeEach(() => {
+    // Functional: the env-cap test below re-imports ../attachment-types.js and
+    // needs a fresh module evaluation to re-read the env var. Safe with the
+    // hoisted vi.mock above — resetModules clears the module registry, not the
+    // mock registry, so mocked services can never race back to real ones.
     vi.resetModules();
-    vi.doUnmock("@paperclipai/shared/telemetry");
-    vi.doUnmock("../telemetry.js");
-    vi.doUnmock("../services/issues.js");
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../services/activity-log.js");
-    vi.doUnmock("../routes/issues.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerRouteMocks();
     vi.clearAllMocks();
     mockAccessService.decide.mockResolvedValue({
       allowed: true,
@@ -292,6 +298,60 @@ describe("issue attachment routes", () => {
       }),
     );
     expect(res.body.contentType).toBe("application/zip");
+    // First test in the describe pays the cold transform/import of the large
+    // issues route module after vi.resetModules(); give it headroom.
+  }, 60_000);
+
+  it("removes a newly stored object when attachment registration is rejected", async () => {
+    const storage = createStorageService();
+    const { HttpError } = await vi.importActual<
+      typeof import("../errors.js")
+    >("../errors.js");
+    mockIssueService.createAttachment.mockRejectedValue(
+      new HttpError(422, "Attachment selection limit reached", {
+        code: "chat_attachment_selection_limit_exceeded",
+      }),
+    );
+
+    const app = await createApp(storage);
+    const res = await request(app)
+      .post(
+        "/api/companies/company-1/issues/11111111-1111-4111-8111-111111111111/attachments",
+      )
+      .attach("file", Buffer.from("overflow"), {
+        filename: "overflow.txt",
+        contentType: "text/plain",
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({
+      error: "Attachment selection limit reached",
+      details: { code: "chat_attachment_selection_limit_exceeded" },
+    });
+    expect(storage.deleteObject).toHaveBeenCalledWith(
+      "company-1",
+      "issues/11111111-1111-4111-8111-111111111111/overflow.txt",
+    );
+  });
+
+  it("retains a stored object when attachment registration has an ambiguous server error", async () => {
+    const storage = createStorageService();
+    mockIssueService.createAttachment.mockRejectedValue(
+      new Error("connection lost after commit"),
+    );
+
+    const app = await createApp(storage);
+    await request(app)
+      .post(
+        "/api/companies/company-1/issues/11111111-1111-4111-8111-111111111111/attachments",
+      )
+      .attach("file", Buffer.from("ambiguous"), {
+        filename: "ambiguous.txt",
+        contentType: "text/plain",
+      })
+      .expect(500);
+
+    expect(storage.deleteObject).not.toHaveBeenCalled();
   });
 
   it("accepts default video uploads for issue attachments", async () => {
@@ -463,6 +523,80 @@ describe("issue attachment routes", () => {
     expect(mockCompanyService.getById).not.toHaveBeenCalled();
   });
 
+  it("forces plugin-created csv attachments to download (SE ruling D2)", async () => {
+    const storage = createStorageService(Buffer.from("a,b\n1,2\n"));
+    mockIssueService.getAttachmentById.mockResolvedValue({
+      ...makeAttachment("text/csv", "gerbers.csv"),
+      byteSize: 8,
+      objectKey: "company-1/plugin-artifacts/2026/09/13/uuid-gerbers.csv",
+    });
+
+    const app = await createApp(storage);
+    const res = await request(app)
+      .get("/api/attachments/attachment-1/content")
+      .buffer(true)
+      .parse(parseBinaryResponse);
+
+    expect(res.status).toBe(200);
+    expect(res.headers["content-disposition"]).toBe('attachment; filename="gerbers.csv"');
+    expect(res.headers["x-content-type-options"]).toBe("nosniff");
+  });
+
+  it("forces plugin-created tsv attachments to download even without a spreadsheet filename", async () => {
+    const storage = createStorageService(Buffer.from("a\tb\n"));
+    mockIssueService.getAttachmentById.mockResolvedValue({
+      ...makeAttachment("text/tab-separated-values", "inbound-asset"),
+      objectKey: "company-1/plugin-artifacts/2026/09/13/uuid-inbound-asset",
+    });
+
+    const app = await createApp(storage);
+    const res = await request(app)
+      .get("/api/attachments/attachment-1/content")
+      .buffer(true)
+      .parse(parseBinaryResponse);
+
+    expect(res.status).toBe(200);
+    expect(res.headers["content-disposition"]).toBe('attachment; filename="inbound-asset"');
+  });
+
+  it("forces plugin-created spreadsheet-named attachments to download under a generic content type", async () => {
+    const storage = createStorageService(Buffer.from("binary"));
+    mockIssueService.getAttachmentById.mockResolvedValue({
+      ...makeAttachment("application/octet-stream", "bom.ods"),
+      byteSize: 6,
+      objectKey: "company-1/plugin-artifacts/2026/09/13/uuid-bom.ods",
+    });
+
+    const app = await createApp(storage);
+    const res = await request(app)
+      .get("/api/attachments/attachment-1/content")
+      .buffer(true)
+      .parse(parseBinaryResponse);
+
+    expect(res.status).toBe(200);
+    expect(res.headers["content-disposition"]).toBe('attachment; filename="bom.ods"');
+  });
+
+  it("keeps human-uploaded csv attachments inline (guard is plugin-namespace-scoped)", async () => {
+    const storage = createStorageService(Buffer.from("a,b\n1,2\n"));
+    mockIssueService.getAttachmentById.mockResolvedValue({
+      ...makeAttachment("text/csv", "report.csv"),
+      byteSize: 8,
+    });
+
+    const app = await createApp(storage);
+    const res = await request(app)
+      .get("/api/attachments/attachment-1/content")
+      .buffer(true)
+      .parse(parseBinaryResponse);
+
+    expect(res.status).toBe(200);
+    expect([
+      undefined,
+      'inline; filename="report.csv"',
+    ]).toContain(res.headers["content-disposition"]);
+  });
+
   it("serves html attachments as downloads with nosniff", async () => {
     const storage = createStorageService();
     mockIssueService.getAttachmentById.mockResolvedValue(makeAttachment("text/html", "report.html"));
@@ -539,6 +673,46 @@ describe("issue attachment routes", () => {
       undefined,
       'inline; filename="preview.png"',
     ]).toContain(res.headers["content-disposition"]);
+  });
+
+  it.each([
+    {
+      filename: '猫 "chart"; 100%.png',
+      contentType: "image/png",
+      filenameParameters: String.raw`filename="? \"chart\"; 100%.png"; filename*=UTF-8''%E7%8C%AB%20%22chart%22%3B%20100%25.png`,
+    },
+    {
+      filename: 'report "final"; 100%.pdf',
+      contentType: "application/pdf",
+      filenameParameters: String.raw`filename="report \"final\"; 100%.pdf"`,
+    },
+  ].flatMap((file) => [false, true].flatMap((download) =>
+    [false, true].map((range) => ({ ...file, download, range })),
+  )))("preserves disposition filenames: $filename (download=$download, range=$range)", async ({
+    filename, contentType, filenameParameters, download, range,
+  }) => {
+    const bytes = Buffer.from([0, 255, 128, 10, 13, 42]);
+    const storage = createStorageService(bytes);
+    mockIssueService.getAttachmentById.mockResolvedValue({
+      ...makeAttachment(contentType, filename),
+      byteSize: bytes.length,
+    });
+    const app = await createApp(storage);
+    const downloadRequest = request(app)
+      .get(`/api/attachments/attachment-1/content${download ? "?download=1" : ""}`)
+      .buffer(true)
+      .parse(parseBinaryResponse);
+    if (range) downloadRequest.set("Range", "bytes=1-3");
+    const res = await downloadRequest;
+
+    expect(res.status).toBe(range ? 206 : 200);
+    expect(res.headers["content-disposition"]).toBe(`${download ? "attachment" : "inline"}; ${filenameParameters}`);
+    expect(res.headers["content-type"]).toBe(contentType);
+    expect(res.headers["content-length"]).toBe(String(range ? 3 : bytes.length));
+    expect(res.headers["accept-ranges"]).toBe("bytes");
+    expect(res.headers["content-range"]).toBe(range ? "bytes 1-3/6" : undefined);
+    expect(res.headers["x-content-type-options"]).toBe("nosniff");
+    expect(res.body).toEqual(range ? bytes.subarray(1, 4) : bytes);
   });
 
   it("serves video attachments inline with byte-range support", async () => {

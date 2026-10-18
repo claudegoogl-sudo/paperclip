@@ -1,8 +1,13 @@
 import { z } from "zod";
 import {
+  CONNECTION_REQUEST_TOOL_DESCRIPTION,
+  CONNECTIONS_SEARCH_TOOL_DESCRIPTION,
   addIssueCommentSchema,
   askUserQuestionsPayloadSchema,
   checkoutIssueSchema,
+  connectionRequestInputSchema,
+  connectionsSearchInputSchema,
+  createApprovalRequestSchema,
   createApprovalSchema,
   createIssueInputSchema,
   issueThreadInteractionContinuationPolicySchema,
@@ -49,6 +54,35 @@ function makeTool<TSchema extends z.ZodRawShape>(
 function parseOptionalJson(raw: string | undefined | null): unknown {
   if (!raw || raw.trim().length === 0) return undefined;
   return JSON.parse(raw);
+}
+
+async function callRuntimeConnectionTool(
+  endpointEnv: "PAPERCLIP_RUNTIME_TOOLS_CONNECTIONS_SEARCH_URL" | "PAPERCLIP_RUNTIME_TOOLS_CONNECTION_REQUEST_URL",
+  body: unknown,
+) {
+  const endpoint = process.env[endpointEnv]?.trim();
+  const token = process.env.PAPERCLIP_RUNTIME_TOOLS_TOKEN?.trim();
+  if (!endpoint || !token) {
+    throw new Error("Connection intent tools are available only inside an active Paperclip heartbeat run");
+  }
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  const text = await response.text();
+  const parsed = text ? JSON.parse(text) as unknown : null;
+  if (!response.ok) {
+    const message = parsed && typeof parsed === "object" && "error" in parsed
+      ? String((parsed as { error: unknown }).error)
+      : `Runtime connection tool failed with ${response.status}`;
+    throw new Error(message);
+  }
+  return parsed;
 }
 
 const companyIdOptional = z.string().guid().optional().nullable();
@@ -159,7 +193,7 @@ const createRequestCheckboxConfirmationToolSchema = z.object({
 
 const approvalDecisionSchema = z.object({
   approvalId: approvalIdSchema,
-  action: z.enum(["approve", "reject", "requestRevision", "resubmit"]),
+  action: z.enum(["approve", "reject", "requestRevision", "resubmit", "withdraw"]),
   decisionNote: z.string().optional(),
   payloadJson: z.string().optional(),
 });
@@ -236,6 +270,24 @@ async function getIssueWorkspaceRuntime(client: PaperclipApiClient, issueId: str
 
 export function createToolDefinitions(client: PaperclipApiClient): ToolDefinition[] {
   return [
+    makeTool(
+      "connections_search",
+      CONNECTIONS_SEARCH_TOOL_DESCRIPTION,
+      connectionsSearchInputSchema,
+      async (input) => callRuntimeConnectionTool(
+        "PAPERCLIP_RUNTIME_TOOLS_CONNECTIONS_SEARCH_URL",
+        input,
+      ),
+    ),
+    makeTool(
+      "connection_request",
+      CONNECTION_REQUEST_TOOL_DESCRIPTION,
+      connectionRequestInputSchema,
+      async (input) => callRuntimeConnectionTool(
+        "PAPERCLIP_RUNTIME_TOOLS_CONNECTION_REQUEST_URL",
+        input,
+      ),
+    ),
     makeTool(
       "paperclipMe",
       "Get the current authenticated Paperclip actor details",
@@ -435,12 +487,19 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipCreateApproval",
-      "Create a board approval request, optionally linked to one or more issues",
+      "Create a board approval request, optionally linked to one or more issues. A request_board_approval payload must carry a non-empty title and summary — weaker payloads are rejected here instead of reaching the operator queue",
       createApprovalToolSchema,
-      async ({ companyId, ...body }) =>
-        client.requestJson("POST", `/companies/${client.resolveCompanyId(companyId)}/approvals`, {
+      async ({ companyId, ...body }) => {
+        // Same discriminated payload contract as the server route: an
+        // undecidable card fails at the tool boundary with actionable
+        // feedback, instead of surfacing only as an API 400 after the fact.
+        // Parsed here (not attached to the tool schema) because the MCP server
+        // registers tools from the plain ZodObject `schema.shape`.
+        createApprovalRequestSchema.parse(body);
+        return client.requestJson("POST", `/companies/${client.resolveCompanyId(companyId)}/approvals`, {
           body,
-        }),
+        });
+      },
     ),
     makeTool(
       "paperclipGetApproval",
@@ -594,7 +653,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipApprovalDecision",
-      "Approve, reject, request revision, or resubmit an approval",
+      "Approve, reject, request revision, resubmit, or withdraw an approval. Withdraw removes a pending approval you requested (agents can only withdraw their own pending approvals); the withdrawal is logged, not deleted.",
       approvalDecisionSchema,
       async ({ approvalId, action, decisionNote, payloadJson }) => {
         const path =
@@ -604,7 +663,9 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
               ? `/approvals/${encodeURIComponent(approvalId)}/reject`
               : action === "requestRevision"
                 ? `/approvals/${encodeURIComponent(approvalId)}/request-revision`
-                : `/approvals/${encodeURIComponent(approvalId)}/resubmit`;
+                : action === "withdraw"
+                  ? `/approvals/${encodeURIComponent(approvalId)}/withdraw`
+                  : `/approvals/${encodeURIComponent(approvalId)}/resubmit`;
 
         const body =
           action === "resubmit"

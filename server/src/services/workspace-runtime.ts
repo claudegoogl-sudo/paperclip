@@ -6,7 +6,10 @@ import os from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import type { AdapterRuntimeServiceReport } from "@paperclipai/adapter-utils";
+import {
+  buildAgentGitIdentityEnv,
+  type AdapterRuntimeServiceReport,
+} from "@paperclipai/adapter-utils";
 import type { Db } from "@paperclipai/db";
 import { executionWorkspaces, issueComments, issues, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import {
@@ -157,6 +160,23 @@ export interface ExecutionWorkspaceAgentRef {
   id: string | null;
   name: string;
   companyId: string;
+}
+
+/**
+ * Env block attributing host-executed git operations that create
+ * commits or branches on behalf of a run to the agent that owns the run (same
+ * scheme the adapter process env injects). Read-only git operations ignore
+ * GIT_* env, so only the mutating call sites thread this. Returns undefined
+ * when no agent is known, keeping those call sites behavior-identical.
+ */
+function agentGitInvocationEnv(
+  agent: ExecutionWorkspaceAgentRef | null | undefined,
+): NodeJS.ProcessEnv | undefined {
+  if (!agent?.id) return undefined;
+  return {
+    ...process.env,
+    ...buildAgentGitIdentityEnv({ id: agent.id, name: agent.name, companyId: agent.companyId }),
+  };
 }
 
 export interface RealizedExecutionWorkspace extends ExecutionWorkspaceInput {
@@ -681,6 +701,11 @@ export function sanitizeRuntimeServiceBaseEnv(baseEnv: NodeJS.ProcessEnv): NodeJ
       delete env[key];
     }
   }
+  // These origin settings belong to the parent instance. Letting them leak into a
+  // managed worktree runtime can send auth cookies and OAuth callbacks to the wrong
+  // Paperclip instance. Runtime/service overrides are merged back after sanitizing.
+  delete env.BETTER_AUTH_URL;
+  delete env.BETTER_AUTH_BASE_URL;
   delete env.DATABASE_URL;
   delete env.npm_config_tailscale_auth;
   delete env.npm_config_authenticated_private;
@@ -1712,6 +1737,7 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
   repoRoot: string;
   worktreePath: string;
   expectedBranchName: string;
+  agent?: ExecutionWorkspaceAgentRef | null;
   sourceIssue: ExecutionWorkspaceIssueRef | null;
   executionWorkspaceId: string | null;
   heartbeatRunId: string | null;
@@ -1719,6 +1745,7 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
   phase?: "worktree_prepare" | "workspace_finalize";
   recorder?: WorkspaceOperationRecorder | null;
 }): Promise<DirtyQuarantineRepairResult> {
+  const identityEnv = agentGitInvocationEnv(input.agent);
   const companyId = await readIssueCompanyId(input.db, input.evidence.sourceIssueId);
   if (!companyId) {
     input.evidence.safeRepair.eligible = false;
@@ -1764,6 +1791,7 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
     await recordGitOperation(input.recorder, {
       phase: input.phase ?? "worktree_prepare",
       args: ["checkout", "-b", rescueBranch],
+      env: identityEnv,
       cwd: input.worktreePath,
       metadata: baseMetadata,
       successMessage: `Created rescue branch ${rescueBranch} for dirty git worktree state at ${input.worktreePath}\n`,
@@ -1773,6 +1801,7 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
     await recordGitOperation(input.recorder, {
       phase: input.phase ?? "worktree_prepare",
       args: ["add", "-A"],
+      env: identityEnv,
       cwd: input.worktreePath,
       metadata: baseMetadata,
       successMessage: `Staged dirty git worktree state for rescue branch ${rescueBranch}\n`,
@@ -1793,6 +1822,7 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
           `Fingerprint: ${input.evidence.fingerprint}`,
         ].join("\n"),
       ],
+      env: identityEnv,
       cwd: input.worktreePath,
       metadata: baseMetadata,
       successMessage: `Committed dirty git worktree state to rescue branch ${rescueBranch}\n`,
@@ -1802,6 +1832,7 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
     await recordGitOperation(input.recorder, {
       phase: input.phase ?? "worktree_prepare",
       args: ["checkout", input.expectedBranchName],
+      env: identityEnv,
       cwd: input.worktreePath,
       metadata: {
         ...baseMetadata,
@@ -1825,6 +1856,7 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
       await recordGitOperation(input.recorder, {
         phase: input.phase ?? "worktree_prepare",
         args: quitArgs,
+        env: identityEnv,
         cwd: input.worktreePath,
         metadata: {
           ...baseMetadata,
@@ -2076,6 +2108,7 @@ export async function ensureGitWorktreeBranchCoherent(input: {
   repoRoot: string;
   worktreePath: string;
   expectedBranchName: string | null;
+  agent?: ExecutionWorkspaceAgentRef | null;
   sourceIssue: ExecutionWorkspaceIssueRef | null;
   executionWorkspaceId?: string | null;
   actualBranchName?: string | null;
@@ -2088,6 +2121,7 @@ export async function ensureGitWorktreeBranchCoherent(input: {
 }): Promise<GitWorktreeBranchCoherenceResult> {
   const expectedBranchName = input.expectedBranchName?.trim();
   if (!expectedBranchName) return { branchName: null, reconciledForward: false, warnings: [] };
+  const identityEnv = agentGitInvocationEnv(input.agent);
 
   const currentBranch = input.actualBranchName !== undefined
     ? input.actualBranchName
@@ -2140,6 +2174,7 @@ export async function ensureGitWorktreeBranchCoherent(input: {
       sourceIssue: input.sourceIssue,
       executionWorkspaceId: input.executionWorkspaceId ?? null,
       heartbeatRunId: input.heartbeatRunId ?? null,
+      agent: input.agent ?? null,
       evidence,
       phase: input.reconcileOperationPhase,
       recorder: input.recorder ?? null,
@@ -2289,6 +2324,7 @@ export async function ensureGitWorktreeBranchCoherent(input: {
       await recordGitOperation(input.recorder, {
         phase: "worktree_prepare",
         args: ["checkout", "-B", expectedBranchName, evidence.provenance.actualHeadSha],
+        env: identityEnv,
         cwd: input.worktreePath,
         metadata: {
           repoRoot: input.repoRoot,
@@ -2333,6 +2369,7 @@ export async function ensureGitWorktreeBranchCoherent(input: {
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
       args: ["checkout", expectedBranchName],
+      env: identityEnv,
       cwd: input.worktreePath,
       metadata: {
         repoRoot: input.repoRoot,
@@ -2529,6 +2566,7 @@ async function resolveAuthoritativeBaseRef(
 // after a long planning phase without ever destroying in-progress work. Only
 // remote-tracking bases are eligible; local-only bases keep warn-only drift.
 async function refreshUnstartedWorktreeToBase(input: {
+  env?: NodeJS.ProcessEnv | null;
   repoRoot: string;
   worktreePath: string;
   branchName: string | null;
@@ -2575,6 +2613,7 @@ async function refreshUnstartedWorktreeToBase(input: {
   await recordGitOperation(input.recorder, {
     phase: "worktree_prepare",
     args: ["reset", "--hard", input.currentBaseRefSha],
+    env: input.env ?? undefined,
     cwd: input.worktreePath,
     metadata: {
       repoRoot: input.repoRoot,
@@ -2970,13 +3009,14 @@ async function recordGitOperation(
     phase: WorkspaceOperationPhase;
     args: string[];
     cwd: string;
+    env?: NodeJS.ProcessEnv | null;
     metadata?: Record<string, unknown> | null;
     successMessage?: string | null;
     failureLabel?: string | null;
   },
 ): Promise<string> {
   if (!recorder) {
-    return runGit(input.args, input.cwd);
+    return runGit(input.args, input.cwd, { env: input.env ?? undefined });
   }
 
   let stdout = "";
@@ -2992,6 +3032,7 @@ async function recordGitOperation(
         command: "git",
         args: input.args,
         cwd: input.cwd,
+        env: input.env ?? undefined,
       });
       stdout = result.stdout;
       stderr = result.stderr;
@@ -3236,6 +3277,7 @@ export async function realizeExecutionWorkspace(input: {
   }
 
   const repoRoot = await resolveGitOwnerRepoRoot(input.base.baseCwd);
+  const identityEnv = agentGitInvocationEnv(input.agent);
   let branchName: string;
   if (requestedExistingBranch) {
     // Exact-branch mode: attach the requested pre-existing branch verbatim.
@@ -3312,6 +3354,7 @@ export async function realizeExecutionWorkspace(input: {
     // the unstarted-worktree fast-forward that template-derived reuse gets.
     const refresh = currentBaseRefSha && !requestedExistingBranch
       ? await refreshUnstartedWorktreeToBase({
+          env: identityEnv,
           repoRoot,
           worktreePath: reusablePath,
           branchName: effectiveBranchName,
@@ -3400,6 +3443,7 @@ export async function realizeExecutionWorkspace(input: {
         repoRoot,
         worktreePath: reusablePath,
         expectedBranchName: branchName,
+        agent: input.agent,
         actualBranchName: validation.actualBranchName ?? null,
         sourceIssue: input.issue,
         executionWorkspaceId: null,
@@ -3481,6 +3525,7 @@ export async function realizeExecutionWorkspace(input: {
       await recordGitOperation(input.recorder, {
         phase: "worktree_prepare",
         args: ["worktree", "add", worktreePath, branchName],
+        env: identityEnv,
         cwd: repoRoot,
         metadata: {
           repoRoot,
@@ -3552,6 +3597,7 @@ export async function realizeExecutionWorkspace(input: {
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
       args: ["worktree", "add", "-b", branchName, worktreePath, baseRef],
+      env: identityEnv,
       cwd: repoRoot,
       metadata: {
         repoRoot,
@@ -3572,6 +3618,7 @@ export async function realizeExecutionWorkspace(input: {
       await recordGitOperation(input.recorder, {
         phase: "worktree_prepare",
         args: ["worktree", "add", worktreePath, branchName],
+        env: identityEnv,
         cwd: repoRoot,
         metadata: {
           repoRoot,
@@ -3655,6 +3702,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
 }): Promise<RealizedExecutionWorkspace | null> {
   const cwd = asString(input.workspace.cwd ?? input.workspace.providerRef, "").trim();
   if (!cwd) return null;
+  const identityEnv = agentGitInvocationEnv(input.agent);
 
   const strategy = input.workspace.strategyType === "git_worktree" ? "git_worktree" : "project_primary";
   const realized: RealizedExecutionWorkspace = {
@@ -3720,6 +3768,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         repoRoot,
         worktreePath: reuseWorktreePath,
         expectedBranchName: realized.branchName,
+        agent: input.agent,
         sourceIssue: input.issue,
         executionWorkspaceId: input.workspace.id ?? null,
         heartbeatRunId: input.heartbeatRunId ?? null,
@@ -3763,6 +3812,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     // Never run it for an attached operator-owned ref.
     const refresh = realized.branchCreatedByRuntime && reuseBaseRef && currentBaseRefSha
       ? await refreshUnstartedWorktreeToBase({
+          env: identityEnv,
           repoRoot,
           worktreePath: reuseWorktreePath,
           branchName: realized.branchName,
@@ -3817,6 +3867,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
       args: ["worktree", "add", worktreePath, branchName],
+      env: identityEnv,
       cwd: repoRoot,
       metadata: {
         repoRoot,
@@ -3848,6 +3899,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
     await recordGitOperation(input.recorder, {
       phase: "worktree_prepare",
       args: ["worktree", "add", "-b", branchName, worktreePath, baseRef],
+      env: identityEnv,
       cwd: repoRoot,
       metadata: {
         repoRoot,
@@ -5109,21 +5161,35 @@ export async function waitForRuntimeServiceReadiness(input: {
   const now = input.now ?? Date.now;
   const timeoutSec = resolveWorkspaceRuntimeReadinessTimeoutSec(input.service);
   const intervalMs = Math.max(100, asNumber(readiness.intervalMs, 500));
-  const deadline = now() + timeoutSec * 1000;
+  const startedAt = now();
+  const deadline = startedAt + timeoutSec * 1000;
   let lastError = "service did not become ready";
+  let lastCause: unknown;
+  let probes = 0;
   while (now() < deadline) {
     const probeBudgetMs = Math.max(1, Math.min(RUNTIME_SERVICE_READINESS_PROBE_TIMEOUT_MS, deadline - now()));
+    probes += 1;
     try {
       const response = await fetchImpl(readinessUrl, { signal: AbortSignal.timeout(probeBudgetMs) });
       if (response.ok) return;
       lastError = `received HTTP ${response.status}`;
+      lastCause = undefined;
     } catch (err) {
+      lastCause = err;
       lastError = err instanceof Error ? err.message : String(err);
+      // Node fetch hides connection errors behind "fetch failed". Retain the
+      // transport cause so a refused port is distinguishable from a timeout.
+      if (err instanceof Error && err.cause instanceof Error) {
+        lastError += `: ${err.cause.message}`;
+      }
     }
     if (now() >= deadline) break;
     await delay(Math.min(intervalMs, Math.max(0, deadline - now())));
   }
-  throw new Error(`Readiness check failed for ${readinessUrl}: ${lastError}`);
+  throw new Error(
+    `Readiness check failed for ${readinessUrl}: ${lastError} (${probes} probes over ${now() - startedAt}ms)`,
+    { cause: lastCause },
+  );
 }
 
 async function waitForAllocatedPortBind(input: {
@@ -5182,6 +5248,151 @@ function isPaperclipDevRuntimeService(input: { serviceName?: string | null; comm
     || serviceName === "paperclip-dev-once"
     || (command.includes("dev:once") && command.includes("tailscale-auth"))
   );
+}
+
+export const MANAGED_RUNTIME_PUBLIC_URL_ENV = "PAPERCLIP_MANAGED_RUNTIME_PUBLIC_URL";
+
+const EXPLICIT_RUNTIME_ORIGIN_ENV_KEYS = [
+  "PAPERCLIP_PUBLIC_URL",
+  "PAPERCLIP_AUTH_PUBLIC_BASE_URL",
+  "BETTER_AUTH_URL",
+  "BETTER_AUTH_BASE_URL",
+] as const;
+
+function isLoopbackRuntimeHostname(hostname: string) {
+  const normalized = hostname.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (normalized === "localhost" || normalized.endsWith(".localhost") || normalized === "::1") return true;
+  if (net.isIP(normalized) !== 4) return false;
+  const firstOctet = Number(normalized.split(".")[0]);
+  return firstOctet === 127;
+}
+
+function managedRuntimeOriginError(serviceName: string, reason: string) {
+  return new Error(
+    `Runtime service "${serviceName}" cannot derive a browser-reachable OAuth callback origin: ${reason}. `
+    + "Configure PAPERCLIP_PUBLIC_URL or BETTER_AUTH_URL for this service, or publish an HTTPS expose.urlTemplate "
+    + "that the operator's browser can reach (loopback HTTP is also supported).",
+  );
+}
+
+type TrustedRuntimeHostnameBoundary =
+  | { exactHostname: string; hostnameSuffix?: never }
+  | { exactHostname?: never; hostnameSuffix: string };
+
+function trustedRuntimeHostnameBoundary(
+  urlTemplate: string | null | undefined,
+): TrustedRuntimeHostnameBoundary | null {
+  if (!urlTemplate?.trim()) return null;
+  let markerIndex = 0;
+  const markerPrefix = "paperclip-runtime-template-";
+  const safeTemplate = urlTemplate.replace(
+    /{{\s*([a-zA-Z0-9_.-]+)\s*}}/g,
+    (_match, path: string) => path === "port" ? "443" : `${markerPrefix}${markerIndex++}`,
+  );
+  let parsed: URL;
+  try {
+    parsed = new URL(safeTemplate);
+  } catch {
+    return null;
+  }
+  if (parsed.username || parsed.password) return null;
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+
+  const hostname = parsed.hostname.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  const markers = [...hostname.matchAll(/paperclip-runtime-template-\d+/g)];
+  const lastMarker = markers.at(-1);
+  if (!lastMarker || lastMarker.index === undefined) {
+    return hostname ? { exactHostname: hostname } : null;
+  }
+
+  const hostnameSuffix = hostname.slice(lastMarker.index + lastMarker[0].length);
+  // A dynamic non-loopback hostname needs at least a stable two-label domain
+  // after the final interpolation. This binds rendered branch/workspace values
+  // to the operator-configured domain instead of trusting URL parsing alone.
+  if (!hostnameSuffix.startsWith(".") || !hostnameSuffix.slice(1).includes(".")) return null;
+  return { hostnameSuffix };
+}
+
+/**
+ * Resolve the low-priority public URL hint injected into a managed Paperclip dev
+ * service. Explicit operator origin settings are deliberately left untouched.
+ */
+export function resolveManagedPaperclipRuntimePublicOrigin(input: {
+  serviceName: string;
+  command: string;
+  environment: Record<string, string>;
+  exposedUrl: string | null;
+  exposedUrlTemplate?: string | null;
+}) {
+  if (!isPaperclipDevRuntimeService(input)) return null;
+  if (EXPLICIT_RUNTIME_ORIGIN_ENV_KEYS.some((key) => input.environment[key]?.trim())) return null;
+  if (!input.exposedUrl) {
+    throw managedRuntimeOriginError(input.serviceName, "the managed service does not report an exposed URL");
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(input.exposedUrl);
+  } catch {
+    throw managedRuntimeOriginError(input.serviceName, "the managed service reports an invalid exposed URL");
+  }
+
+  if (parsed.username || parsed.password) {
+    throw managedRuntimeOriginError(input.serviceName, "the exposed URL contains credentials");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw managedRuntimeOriginError(input.serviceName, "the exposed URL must use HTTP or HTTPS");
+  }
+
+  const hostname = parsed.hostname.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  const loopback = isLoopbackRuntimeHostname(hostname);
+  if (!hostname || hostname === "0.0.0.0" || hostname === "::") {
+    throw managedRuntimeOriginError(input.serviceName, "the exposed URL uses a bind-only hostname");
+  }
+  if (
+    !loopback
+    && (
+      (!hostname.includes(".") && net.isIP(hostname) === 0)
+      || hostname.endsWith(".invalid")
+      || hostname.endsWith(".test")
+      || hostname.endsWith(".internal")
+      || hostname.endsWith(".localdomain")
+      || hostname === "example.com"
+      || hostname.endsWith(".example.com")
+      || hostname === "example.net"
+      || hostname.endsWith(".example.net")
+      || hostname === "example.org"
+      || hostname.endsWith(".example.org")
+    )
+  ) {
+    throw managedRuntimeOriginError(
+      input.serviceName,
+      `the exposed hostname "${hostname}" is internal-only or non-resolvable from a normal browser`,
+    );
+  }
+  if (!loopback && parsed.protocol !== "https:") {
+    throw managedRuntimeOriginError(input.serviceName, "non-loopback OAuth callbacks require HTTPS");
+  }
+  if (!loopback) {
+    const boundary = trustedRuntimeHostnameBoundary(input.exposedUrlTemplate);
+    if (!boundary) {
+      throw managedRuntimeOriginError(
+        input.serviceName,
+        "the exposed URL template does not define a stable hostname boundary",
+      );
+    }
+    const withinBoundary = "exactHostname" in boundary
+      ? hostname === boundary.exactHostname
+      : hostname.length > boundary.hostnameSuffix.length && hostname.endsWith(boundary.hostnameSuffix);
+    if (!withinBoundary) {
+      throw managedRuntimeOriginError(
+        input.serviceName,
+        `the exposed hostname "${hostname}" is outside the hostname boundary configured by expose.urlTemplate`,
+      );
+    }
+  }
+
+  return parsed.origin;
 }
 
 function resolveRuntimeServiceHealthUrl(
@@ -5958,12 +6169,26 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
     port === identityPort
       ? identity.serviceCwd
       : resolveConfiguredPath(renderTemplate(asString(input.service.cwd, "."), templateData), input.workspace.cwd);
+  const runtimeEnvOverrides: Record<string, string> = { ...input.adapterEnv };
+  for (const [key, value] of Object.entries(renderRuntimeServiceEnv({ envConfig, templateData }))) {
+    runtimeEnvOverrides[key] = value;
+  }
   const env: Record<string, string> = {
     ...sanitizeRuntimeServiceBaseEnv(process.env),
-    ...input.adapterEnv,
+    ...runtimeEnvOverrides,
   } as Record<string, string>;
-  for (const [key, value] of Object.entries(renderRuntimeServiceEnv({ envConfig, templateData }))) {
-    env[key] = value;
+  // Managed Paperclip worktrees are development environments, so their UI
+  // should track source edits without each project repeating this setting.
+  // An HTTPS profile must publish the companion HMR listener before it can use
+  // this default. Otherwise, leave the value unset so dev-runner keeps its
+  // built-UI safeguard. Keep every explicit service/adapter value.
+  const uiDevMiddlewareHasTransport =
+    !exposureConfig || exposureConfig.includePaperclipViteHmr;
+  if (
+    uiDevMiddlewareHasTransport
+    && isPaperclipDevRuntimeService({ serviceName, command })
+  ) {
+    env.PAPERCLIP_UI_DEV_MIDDLEWARE ??= "true";
   }
   if (port) {
     const portEnvKey = asString(portConfig.envKey, "PORT");
@@ -6013,6 +6238,20 @@ async function spawnLocalRuntimeService(input: StartLocalRuntimeServiceInput): P
   let url = exposureConfig ? null : backendUrl;
   const readinessUrlTemplate = asString(readiness.urlTemplate, "");
   const readinessUrl = readinessUrlTemplate ? renderTemplate(readinessUrlTemplate, templateData) : null;
+  const managedRuntimePublicOrigin = resolveManagedPaperclipRuntimePublicOrigin({
+    serviceName,
+    command,
+    // Includes the trusted public origin injected above for managed HTTPS
+    // exposure. The inherited parent environment was already sanitized, so
+    // any remaining explicit origin is either service-configured or broker-
+    // derived for this exact runtime.
+    environment: env,
+    exposedUrl: url,
+    exposedUrlTemplate: urlTemplate,
+  });
+  if (managedRuntimePublicOrigin) {
+    env[MANAGED_RUNTIME_PUBLIC_URL_ENV] = managedRuntimePublicOrigin;
+  }
   const stopPolicy = parseObject(input.service.stopPolicy);
   const serviceKey = createLocalServiceKey({
     profileKind: "workspace-runtime",
@@ -7328,6 +7567,7 @@ type StartRuntimeServicesForWorkspaceControlInput = {
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   recorder?: WorkspaceOperationRecorder | null;
   serviceIndex?: number | null;
+  runtimeServiceId?: string | null;
   respectDesiredStates?: boolean;
 };
 
@@ -7359,6 +7599,7 @@ async function startRuntimeServicesForWorkspaceControlUnlocked(
   const refs: RuntimeServiceRef[] = [];
   const pendingReadiness: PendingRuntimeServiceReadiness[] = [];
   const startedServiceIds: string[] = [];
+  const requestedRuntimeServiceId = rawServices.length === 1 ? input.runtimeServiceId : null;
 
   for (const service of rawServices) {
     const { scopeType, scopeId } = resolveServiceScopeId({
@@ -7381,7 +7622,7 @@ async function startRuntimeServicesForWorkspaceControlUnlocked(
 
     if (reuseKey) {
       const existing = await findHealthyRunningRuntimeService(reuseKey);
-      if (existing) {
+      if (existing && (!requestedRuntimeServiceId || existing.id === requestedRuntimeServiceId)) {
         const prepared = options?.preparedProvisioning;
         if (prepared?.service === service && prepared.record.id !== existing.id && persistenceDb) {
           await persistenceDb
@@ -7423,6 +7664,7 @@ async function startRuntimeServicesForWorkspaceControlUnlocked(
           : undefined,
       allowFixedPortFallback: options?.allowFixedPortFallback,
       excludedPorts: options?.excludedPorts,
+      runtimeServiceId: requestedRuntimeServiceId ?? undefined,
       reuseKey,
       scopeType,
       scopeId,

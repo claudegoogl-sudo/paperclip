@@ -127,43 +127,50 @@ const mockAnnotationService = vi.hoisted(() => ({
 
 const mockAccessService = vi.hoisted(() => ({
   canUser: vi.fn(),
+  decide: vi.fn(),
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockTrackRoutineCreated = vi.hoisted(() => vi.fn());
 const mockGetTelemetryClient = vi.hoisted(() => vi.fn());
 
-function registerModuleMocks() {
-  vi.doMock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
 
-  vi.doMock("@paperclipai/shared/telemetry", () => ({
-    trackRoutineCreated: mockTrackRoutineCreated,
-    trackErrorHandlerCrash: vi.fn(),
-  }));
+vi.mock("@paperclipai/shared/telemetry", () => ({
+  trackRoutineCreated: mockTrackRoutineCreated,
+  trackErrorHandlerCrash: vi.fn(),
+}));
 
-  vi.doMock("../telemetry.js", () => ({
-    getTelemetryClient: mockGetTelemetryClient,
-  }));
+vi.mock("../telemetry.js", () => ({
+  getTelemetryClient: mockGetTelemetryClient,
+}));
 
-  vi.doMock("../services/access.js", () => ({
-    accessService: () => mockAccessService,
-  }));
+vi.mock("../services/access.js", () => ({
+  accessService: () => mockAccessService,
+}));
 
-  vi.doMock("../services/routines.js", () => ({
-    routineService: () => mockRoutineService,
-  }));
+vi.mock("../services/routines.js", () => ({
+  routineService: () => mockRoutineService,
+}));
 
-  vi.doMock("../services/activity-log.js", () => ({
-    logActivity: mockLogActivity,
-  }));
+vi.mock("../services/activity-log.js", () => ({
+  logActivity: mockLogActivity,
+}));
 
-  vi.doMock("../services/index.js", () => ({
-    accessService: () => mockAccessService,
-    documentAnnotationService: () => mockAnnotationService,
-    logActivity: mockLogActivity,
-    routineService: () => mockRoutineService,
-  }));
-}
+vi.mock("../services/index.js", () => ({
+  accessService: () => mockAccessService,
+  documentAnnotationService: () => mockAnnotationService,
+  logActivity: mockLogActivity,
+  routineService: () => mockRoutineService,
+}));
 
 async function createApp(actor: Record<string, unknown>) {
   const [{ errorHandler }, { routineRoutes }] = await Promise.all([
@@ -171,7 +178,7 @@ async function createApp(actor: Record<string, unknown>) {
     vi.importActual<typeof import("../routes/routines.js")>("../routes/routines.js"),
   ]);
   const app = express();
-  app.use(express.json());
+  app.use(express.json({ verify: (req, _res, buf) => { (req as any).rawBody = buf; } }));
   app.use((req, _res, next) => {
     (req as any).actor = actor;
     next();
@@ -182,18 +189,19 @@ async function createApp(actor: Record<string, unknown>) {
 }
 
 describe("routine routes", () => {
+  it("forwards the Fireflies signature and exact raw JSON to the public handler", async () => {
+    const app = await createApp({ type: "none" });
+    const raw = '{ "event": "meeting.summarized", "meeting_id": "meeting-1", "timestamp": 1780000000000 }';
+    mockRoutineService.firePublicTrigger.mockResolvedValue({ status: "ignored", routineStarted: false });
+    const res = await request(app).post("/api/routine-triggers/public/fireflies-public/fire")
+      .set("Content-Type", "application/json").set("X-Hub-Signature", "sha256=fixture").send(raw);
+    expect(res.status).toBe(202);
+    expect(mockRoutineService.firePublicTrigger).toHaveBeenCalledWith("fireflies-public", expect.objectContaining({
+      firefliesSignatureHeader: "sha256=fixture", rawBody: Buffer.from(raw), payload: JSON.parse(raw),
+    }));
+  });
+
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("@paperclipai/shared/telemetry");
-    vi.doUnmock("../telemetry.js");
-    vi.doUnmock("../services/access.js");
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../services/activity-log.js");
-    vi.doUnmock("../services/routines.js");
-    vi.doUnmock("../routes/routines.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
     mockGetTelemetryClient.mockReturnValue({ track: vi.fn() });
     mockRoutineService.list.mockResolvedValue([routine]);
@@ -215,6 +223,13 @@ describe("routine routes", () => {
       status: "issue_created",
     });
     mockAccessService.canUser.mockResolvedValue(false);
+    mockRoutineService.deleteTrigger.mockResolvedValue({ revision: null });
+    mockAccessService.decide.mockResolvedValue({
+      allowed: false,
+      action: "routines:manage",
+      reason: "deny_missing_grant",
+      explanation: "Missing permission: routines:manage.",
+    });
     mockLogActivity.mockResolvedValue(undefined);
     mockRoutineService.getDescriptionDocument.mockResolvedValue({
       id: "99999999-9999-4999-8999-999999999999",
@@ -726,5 +741,162 @@ describe("routine routes", () => {
       message: "Unrecognized key: \"triggers\"",
     })]);
     expect(mockRoutineService.update).not.toHaveBeenCalled();
+  });
+  describe("routines:manage grant for non-assignee agents", () => {
+    const grantee = { type: "agent", agentId: otherAgentId, companyId, runId: "88888888-8888-4888-8888-888888888888" };
+    const allowManage = () =>
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: input.action === "routines:manage",
+        action: input.action,
+        reason: input.action === "routines:manage" ? "allow_explicit_grant" : "deny_missing_grant",
+        explanation: "test",
+      }));
+
+    const routeCases: Array<{ name: string; send: (app: express.Express) => request.Test }> = [
+      { name: "PATCH /routines/:id", send: (app) => request(app).patch(`/api/routines/${routineId}`).send({ title: "Renamed" }) },
+      { name: "GET /routines/:id/revisions", send: (app) => request(app).get(`/api/routines/${routineId}/revisions`) },
+      { name: "GET /routines/:id/description/annotations", send: (app) => request(app).get(`/api/routines/${routineId}/description/annotations`) },
+      { name: "POST /routines/:id/revisions/:revisionId/restore", send: (app) => request(app).post(`/api/routines/${routineId}/revisions/${revisionId}/restore`).send({}) },
+      { name: "DELETE /routine-triggers/:id", send: (app) => request(app).delete(`/api/routine-triggers/${trigger.id}`) },
+    ];
+
+    for (const routeCase of routeCases) {
+      it(`${routeCase.name}: 403 without grant, passes the gate with grant`, async () => {
+        const app = await createApp(grantee);
+        const denied = await routeCase.send(app);
+        expect(denied.status).toBe(403);
+        expect(denied.body.error).toBe("Agents can only manage routines assigned to themselves");
+
+        allowManage();
+        const allowed = await routeCase.send(app);
+        expect(allowed.status).not.toBe(403);
+        expect(allowed.status).toBeLessThan(500);
+        expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+          action: "routines:manage",
+          resource: { type: "agent", companyId, agentId },
+          scope: { targetAgentId: agentId },
+        }));
+      });
+    }
+
+    it("PATCH returns 200 for a grantee and logs routine.updated with the acting agent", async () => {
+      allowManage();
+      mockRoutineService.update.mockResolvedValue({ ...routine, title: "Renamed" });
+      const app = await createApp(grantee);
+      const res = await request(app).patch(`/api/routines/${routineId}`).send({ title: "Renamed" });
+      expect(res.status).toBe(200);
+      expect(mockRoutineService.update).toHaveBeenCalledWith(routineId, { title: "Renamed" }, expect.objectContaining({
+        agentId: otherAgentId,
+      }));
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: "routine.updated",
+        actorType: "agent",
+        agentId: otherAgentId,
+      }));
+    });
+
+    it("lets a grantee echo the unchanged assignee but never re-assign", async () => {
+      allowManage();
+      mockRoutineService.update.mockResolvedValue(routine);
+      const app = await createApp(grantee);
+      const echo = await request(app).patch(`/api/routines/${routineId}`).send({ assigneeAgentId: agentId });
+      expect(echo.status).toBe(200);
+
+      mockRoutineService.update.mockClear();
+      const toSelf = await request(app).patch(`/api/routines/${routineId}`).send({ assigneeAgentId: otherAgentId });
+      expect(toSelf.status).toBe(403);
+      expect(toSelf.body.error).toBe("Agents can only assign routines to themselves");
+      const third = "99999999-9999-4999-8999-999999999990";
+      const toThird = await request(app).patch(`/api/routines/${routineId}`).send({ assigneeAgentId: third });
+      expect(toThird.status).toBe(403);
+      expect(toThird.body.error).toBe("Agents can only assign routines to themselves");
+      expect(mockRoutineService.update).not.toHaveBeenCalled();
+    });
+
+    it("requires tasks:assign for a grantee to activate another agent's routine", async () => {
+      allowManage();
+      mockRoutineService.get.mockResolvedValue(pausedRoutine);
+      const app = await createApp(grantee);
+      const denied = await request(app).patch(`/api/routines/${routineId}`).send({ status: "active" });
+      expect(denied.status).toBe(403);
+      expect(denied.body.error).toContain("tasks:assign");
+      expect(mockRoutineService.update).not.toHaveBeenCalled();
+
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: true, action: input.action, reason: "allow_explicit_grant", explanation: "test",
+      }));
+      mockRoutineService.update.mockResolvedValue(routine);
+      const allowed = await request(app).patch(`/api/routines/${routineId}`).send({ status: "active" });
+      expect(allowed.status).toBe(200);
+      expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "tasks:assign" }));
+    });
+
+    const startWorkCases: Array<{ name: string; send: (app: express.Express) => request.Test; svcFn: () => ReturnType<typeof vi.fn> }> = [
+      { name: "POST /routines/:id/run", send: (app) => request(app).post(`/api/routines/${routineId}/run`).send({}), svcFn: () => mockRoutineService.runRoutine },
+      { name: "POST /routines/:id/triggers", send: (app) => request(app).post(`/api/routines/${routineId}/triggers`).send({ kind: "schedule", cronExpression: "0 * * * *", timezone: "UTC" }), svcFn: () => mockRoutineService.createTrigger },
+      { name: "PATCH /routine-triggers/:id enabled=true", send: (app) => request(app).patch(`/api/routine-triggers/${trigger.id}`).send({ enabled: true }), svcFn: () => mockRoutineService.updateTrigger },
+      { name: "POST /routine-triggers/:id/rotate-secret", send: (app) => request(app).post(`/api/routine-triggers/${trigger.id}/rotate-secret`).send({}), svcFn: () => mockRoutineService.rotateTriggerSecret },
+    ];
+
+    for (const c of startWorkCases) {
+      it(`${c.name}: grantee without tasks:assign gets 403 and starts no work`, async () => {
+        allowManage();
+        const app = await createApp(grantee);
+        const denied = await c.send(app);
+        expect(denied.status).toBe(403);
+        expect(denied.body.error).toContain("tasks:assign");
+        expect(c.svcFn()).not.toHaveBeenCalled();
+        expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+          action: "tasks:assign",
+          scope: { assigneeAgentId: agentId },
+        }));
+
+        mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+          allowed: true, action: input.action, reason: "allow_explicit_grant", explanation: "test",
+        }));
+        mockRoutineService.createTrigger.mockResolvedValue({
+          trigger,
+          secretMaterial: null,
+          revision: { id: revisionId, revisionNumber: 2, changeSummary: null, snapshot: { triggers: [trigger] } },
+        });
+        mockRoutineService.rotateTriggerSecret.mockResolvedValue({
+          trigger,
+          secretMaterial: { webhookUrl: "https://example.test/hook", webhookSecret: "test-only" },
+          revision: { id: revisionId, revisionNumber: 2, changeSummary: null, snapshot: { triggers: [trigger] } },
+        });
+        const allowed = await c.send(app);
+        expect(allowed.status).not.toBe(403);
+        expect(allowed.status).toBeLessThan(500);
+      });
+    }
+
+    it("PATCH /routine-triggers/:id without enabled=true does not need tasks:assign", async () => {
+      allowManage();
+      const app = await createApp(grantee);
+      const res = await request(app).patch(`/api/routine-triggers/${trigger.id}`).send({ enabled: false });
+      expect(res.status).not.toBe(403);
+      expect(res.status).toBeLessThan(500);
+      expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({ action: "tasks:assign" }));
+    });
+
+    it("does not let a grantee create routines for another agent", async () => {
+      allowManage();
+      const app = await createApp(grantee);
+      const res = await request(app)
+        .post(`/api/companies/${companyId}/routines`)
+        .send({ projectId, title: "Other", assigneeAgentId: agentId });
+      expect(res.status).toBe(403);
+      expect(mockRoutineService.create).not.toHaveBeenCalled();
+    });
+
+    it("stays 403 cross-company even when the grant check would allow", async () => {
+      allowManage();
+      mockRoutineService.get.mockResolvedValue({ ...routine, companyId: "99999999-9999-4999-8999-999999999991" });
+      const app = await createApp(grantee);
+      const res = await request(app).patch(`/api/routines/${routineId}`).send({ title: "x" });
+      expect([403, 404]).toContain(res.status);
+      expect(mockRoutineService.update).not.toHaveBeenCalled();
+      expect(mockAccessService.decide).not.toHaveBeenCalled();
+    });
   });
 });

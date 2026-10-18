@@ -21,7 +21,10 @@ export default defineConfig({
   },
   test: {
     environment: "node",
-    include: ["src/**/*.test.ts"],
+    // The fork's host-wide run ceiling defaults to the vCPU count, so heartbeat suites that start several
+    // runs behave differently on a 4-vCPU CI runner than on a dev host. Pin a runner-independent ceiling.
+    env: { PAPERCLIP_MAX_CONCURRENT_RUNS_HOST: process.env.PAPERCLIP_MAX_CONCURRENT_RUNS_HOST ?? "8" },
+    include: ["src/**/*.test.ts", "scripts/**/*.test.mjs"],
     // Embedded-Postgres suites boot in beforeAll and tear down in afterAll. On a
     // loaded runner both ends can outlast vitest's 10s defaults and redden a
     // passing suite, so the global budget is explicit. Under the loaded serial
@@ -31,6 +34,7 @@ export default defineConfig({
     // genuinely hung hook; teardownTimeout mirrors it. See
     // packages/db/src/test-embedded-postgres.ts for the SIGKILL-escalation path
     // that bounds cleanup() well inside this budget.
+
     hookTimeout: 30000,
     teardownTimeout: 30000,
     // The route/authz suites import very large modules (for example

@@ -1,3 +1,5 @@
+import { Readable } from "node:stream";
+import type { IncomingMessage } from "node:http";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import express from "express";
 import request from "supertest";
@@ -10,26 +12,32 @@ const { createAssetMock, getAssetByIdMock, logActivityMock } = vi.hoisted(() => 
   logActivityMock: vi.fn(),
 }));
 
-function registerModuleMocks() {
-  vi.doMock("../services/activity-log.js", () => ({
-    logActivity: logActivityMock,
-  }));
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("../services/activity-log.js", () => ({
+  logActivity: logActivityMock,
+}));
 
-  vi.doMock("../services/assets.js", () => ({
-    assetService: vi.fn(() => ({
-      create: createAssetMock,
-      getById: getAssetByIdMock,
-    })),
-  }));
+vi.mock("../services/assets.js", () => ({
+  assetService: vi.fn(() => ({
+    create: createAssetMock,
+    getById: getAssetByIdMock,
+  })),
+}));
 
-  vi.doMock("../services/index.js", () => ({
-    assetService: vi.fn(() => ({
-      create: createAssetMock,
-      getById: getAssetByIdMock,
-    })),
-    logActivity: logActivityMock,
-  }));
-}
+vi.mock("../services/index.js", () => ({
+  assetService: vi.fn(() => ({
+    create: createAssetMock,
+    getById: getAssetByIdMock,
+  })),
+  logActivity: logActivityMock,
+}));
 
 function createAsset() {
   const now = new Date("2026-01-01T00:00:00.000Z");
@@ -135,14 +143,6 @@ async function requestApp(
 
 describe("POST /api/companies/:companyId/assets/images", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../services/activity-log.js");
-    vi.doUnmock("../services/assets.js");
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../routes/assets.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
     createAssetMock.mockReset();
     getAssetByIdMock.mockReset();
@@ -276,12 +276,6 @@ describe("POST /api/companies/:companyId/assets/images", () => {
 
 describe("POST /api/companies/:companyId/logo", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../routes/assets.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     vi.clearAllMocks();
     createAssetMock.mockReset();
     getAssetByIdMock.mockReset();
@@ -405,5 +399,207 @@ describe("POST /api/companies/:companyId/logo", () => {
     expect(res.status).toBe(422);
     expect(res.body.error).toBe("SVG could not be sanitized");
     expect(createAssetMock).not.toHaveBeenCalled();
+  });
+});
+
+function parseBinaryResponse(res: IncomingMessage, callback: (error: Error | null, body?: Buffer) => void) {
+  const chunks: Buffer[] = [];
+  res.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+  res.on("end", () => callback(null, Buffer.concat(chunks)));
+  res.on("error", callback);
+}
+
+
+describe("GET /api/assets/:assetId/content", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getAssetByIdMock.mockReset();
+  });
+
+  it("reads only the requested storage range for a large asset", async () => {
+    const storage = createStorageService("text/plain");
+    getAssetByIdMock.mockResolvedValue({ ...createAsset(), contentType: "text/plain", byteSize: 10 * 1024 * 1024 });
+    vi.mocked(storage.getObject).mockImplementation(async (_company, _key, options) => {
+      expect(options).toEqual({ range: { start: 8192, end: 12288 } });
+      return { stream: Readable.from(Buffer.alloc(4097, 65)), contentLength: 4097 };
+    });
+    const res = await requestApp(await createApp(storage), baseUrl => request(baseUrl).get("/api/assets/asset-1/content").set("Range", "bytes=8192-12288"));
+    expect(res.status).toBe(206);
+    expect(res.headers["content-range"]).toBe("bytes 8192-12288/10485760");
+    expect(res.headers["content-length"]).toBe("4097");
+    expect(res.text).toBe("A".repeat(4097));
+  });
+
+  it.each(["bytes=999-1000", "bytes=0-1,3-4", "bytes=1x-3", "bytes=-", "items=0-3"])("rejects invalid asset ranges before storage reads: %s", async range => {
+    const storage = createStorageService();
+    getAssetByIdMock.mockResolvedValue(createAsset());
+    const res = await requestApp(await createApp(storage), baseUrl => request(baseUrl).get("/api/assets/asset-1/content").set("Range", range));
+    expect(res.status).toBe(416);
+    expect(res.headers["content-range"]).toBe("bytes */40");
+    expect(storage.getObject).not.toHaveBeenCalled();
+  });
+
+  it("downloads script-capable HTML with nosniff and a sandbox CSP", async () => {
+    const html = Buffer.from("<script>globalThis.__assetXss = true</script>");
+    const storage = createStorageService("text/html");
+    getAssetByIdMock.mockResolvedValue({
+      ...createAsset(),
+      contentType: "text/html",
+      byteSize: html.byteLength,
+      originalFilename: "proof.html",
+    });
+    vi.mocked(storage.getObject).mockResolvedValue({
+      stream: Readable.from(html),
+      contentType: "text/html",
+      contentLength: html.byteLength,
+    });
+
+    const res = await requestApp(await createApp(storage), (baseUrl) =>
+      request(baseUrl).get("/api/assets/asset-1/content"),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers["content-disposition"]).toBe('attachment; filename="proof.html"');
+    expect(res.headers["x-content-type-options"]).toBe("nosniff");
+    expect(res.headers["content-security-policy"]).toBe("sandbox; default-src 'none'");
+  });
+
+  it("downloads SVG instead of rendering it on the application origin", async () => {
+    const svg = Buffer.from("<svg xmlns='http://www.w3.org/2000/svg'><circle r='4'/></svg>");
+    const storage = createStorageService("image/svg+xml; charset=utf-8");
+    getAssetByIdMock.mockResolvedValue({
+      ...createAsset(),
+      contentType: "image/svg+xml; charset=utf-8",
+      byteSize: svg.byteLength,
+      originalFilename: "logo.svg",
+    });
+    vi.mocked(storage.getObject).mockResolvedValue({
+      stream: Readable.from(svg),
+      contentType: "image/svg+xml; charset=utf-8",
+      contentLength: svg.byteLength,
+    });
+
+    const res = await requestApp(await createApp(storage), (baseUrl) =>
+      request(baseUrl).get("/api/assets/asset-1/content"),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers["content-disposition"]).toBe('attachment; filename="logo.svg"');
+    expect(res.headers["x-content-type-options"]).toBe("nosniff");
+    expect(res.headers["content-security-policy"]).toBe("sandbox; default-src 'none'");
+  });
+
+  it("keeps curated image types inline", async () => {
+    const image = Buffer.from("png-bytes");
+    const storage = createStorageService("image/png");
+    getAssetByIdMock.mockResolvedValue({
+      ...createAsset(),
+      byteSize: image.byteLength,
+    });
+    vi.mocked(storage.getObject).mockResolvedValue({
+      stream: Readable.from(image),
+      contentType: "image/png",
+      contentLength: image.byteLength,
+    });
+
+    const res = await requestApp(await createApp(storage), (baseUrl) =>
+      request(baseUrl).get("/api/assets/asset-1/content"),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers["content-disposition"]).toBe('inline; filename="logo.png"');
+    expect(res.headers["x-content-type-options"]).toBe("nosniff");
+    expect(res.headers).not.toHaveProperty("content-security-policy");
+  });
+});
+
+describe("GET /api/assets/:assetId/content — spreadsheet-bait disposition guard", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    createAssetMock.mockReset();
+    getAssetByIdMock.mockReset();
+    logActivityMock.mockReset();
+  });
+
+  it("forces plugin-created csv assets to download", async () => {
+    const storage = createStorageService();
+    storage.getObject.mockResolvedValue({
+      stream: Readable.from(Buffer.from("a,b\n1,2\n")),
+      contentType: "text/csv",
+      contentLength: 8,
+    });
+    getAssetByIdMock.mockResolvedValue({
+      ...createAsset(),
+      contentType: "text/csv",
+      byteSize: 8,
+      originalFilename: "gerbers.csv",
+      objectKey: "company-1/plugin-artifacts/2026/09/13/uuid-gerbers.csv",
+    });
+
+    const app = await createApp(storage);
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .get("/api/assets/asset-1/content")
+        .buffer(true)
+        .parse(parseBinaryResponse),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers["content-disposition"]).toBe('attachment; filename="gerbers.csv"');
+    expect(res.headers["x-content-type-options"]).toBe("nosniff");
+  });
+
+  it("forces plugin-created spreadsheet-named assets to download even under a generic content type", async () => {
+    const storage = createStorageService();
+    storage.getObject.mockResolvedValue({
+      stream: Readable.from(Buffer.from("binary")),
+      contentType: "application/octet-stream",
+      contentLength: 6,
+    });
+    getAssetByIdMock.mockResolvedValue({
+      ...createAsset(),
+      contentType: "application/octet-stream",
+      byteSize: 6,
+      originalFilename: "bom.xlsx",
+      objectKey: "company-1/plugin-artifacts/2026/09/13/uuid-bom.xlsx",
+    });
+
+    const app = await createApp(storage);
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .get("/api/assets/asset-1/content")
+        .buffer(true)
+        .parse(parseBinaryResponse),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers["content-disposition"]).toBe('attachment; filename="bom.xlsx"');
+  });
+
+  it("keeps human-uploaded csv assets inline (guard is scoped to the plugin-artifacts namespace)", async () => {
+    const storage = createStorageService();
+    storage.getObject.mockResolvedValue({
+      stream: Readable.from(Buffer.from("a,b\n1,2\n")),
+      contentType: "text/csv",
+      contentLength: 8,
+    });
+    getAssetByIdMock.mockResolvedValue({
+      ...createAsset(),
+      contentType: "text/csv",
+      byteSize: 8,
+      originalFilename: "report.csv",
+      objectKey: "assets/general/report.csv",
+    });
+
+    const app = await createApp(storage);
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .get("/api/assets/asset-1/content")
+        .buffer(true)
+        .parse(parseBinaryResponse),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers["content-disposition"]).toBe('inline; filename="report.csv"');
   });
 });

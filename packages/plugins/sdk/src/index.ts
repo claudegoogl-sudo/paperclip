@@ -191,11 +191,14 @@ export type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentResumeLeaseParams,
   PluginEnvironmentReleaseLeaseParams,
+  PluginEnvironmentTerminationReceipt,
   PluginEnvironmentDestroyLeaseParams,
   PluginEnvironmentRealizeWorkspaceParams,
   PluginEnvironmentRealizeWorkspaceResult,
   PluginEnvironmentExecuteParams,
   PluginEnvironmentExecuteResult,
+  PluginEnvironmentRunnerIngressEndpointParams,
+  PluginEnvironmentRunnerIngressEndpoint,
   PluginSyncFileMapping,
   PluginPostUploadCommand,
   PluginSyncOperation,
@@ -264,6 +267,8 @@ export type {
   PluginIssueCheckoutOwnership,
   PluginIssueWakeupResult,
   PluginIssueWakeupBatchResult,
+  PluginIssueWakeupRequest,
+  PluginIssueWakeupRequestListOptions,
   PluginIssueRunSummary,
   PluginIssueApprovalSummary,
   PluginIssueCostSummary,
@@ -295,6 +300,7 @@ export type {
   PluginDataClient,
   PluginActionsClient,
   PluginStreamsClient,
+  StreamDropNotice,
   PluginToolsClient,
   PluginMetricsClient,
   PluginTelemetryClient,
@@ -399,6 +405,12 @@ export type {
   PluginApiRouteMethod,
   PluginEventType,
   PluginBridgeErrorCode,
+  ConnectionIntentInteraction,
+  ConnectionIntentPayload,
+  ConnectionIntentResult,
+  ConnectionIntentSetupOptions,
+  ConnectionRequestResult,
+  ConnectionsSearchResult,
 } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -450,3 +462,6 @@ export {
   MEMBERSHIP_STATUSES,
   PRINCIPAL_TYPES,
 } from "@paperclipai/shared";
+
+export { PluginEnvironmentCreationCleanupError, environmentCreationCleanupErrorData, readEnvironmentCreationCleanupError } from "./environment-creation-cleanup.js";
+export type { PluginEnvironmentCreationCleanup } from "./environment-creation-cleanup.js";

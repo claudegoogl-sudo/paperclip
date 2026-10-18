@@ -7,10 +7,12 @@ import path from "node:path";
 import { Transform } from "node:stream";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
 import {
+  agentCommitIdentityEnv,
   createUnrelatedHistoryGraftCommit,
   GIT_SYNC_COMMIT_IDENTITY_ARGS,
   readSanitizedOriginRemoteUrl,
 } from "./git-workspace-sync.js";
+import type { AgentGitIdentityInput } from "./git-identity.js";
 import type { RunProcessResult } from "./server-utils.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
 import { mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
@@ -20,6 +22,7 @@ import {
   type RuntimeProgressPhase,
   type RuntimeProgressSink,
 } from "./runtime-progress.js";
+import { scrubSigningKeys, scrubbedProcessEnv } from "./child-env-scrub.js";
 
 export interface SshConnectionConfig {
   host: string;
@@ -57,7 +60,7 @@ export function createSshCommandManagedRuntimeRunner(input: {
       const command = commandInput.command.trim();
       const args = commandInput.args ?? [];
       const cwd = commandInput.cwd?.trim() || defaultCwd;
-      const envEntries = Object.entries(commandInput.env ?? {})
+      const envEntries = Object.entries(scrubSigningKeys(commandInput.env ?? {}))
         .filter((entry): entry is [string, string] => typeof entry[1] === "string");
       const envPrefix = envEntries.length > 0
         ? `env ${envEntries.map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ")} `
@@ -195,6 +198,8 @@ async function execFileText(
   options: {
     timeout?: number;
     maxBuffer?: number;
+    /** Full child environment; undefined inherits process.env (execFile default). */
+    env?: NodeJS.ProcessEnv;
   } = {},
 ): Promise<SshCommandResult> {
   return await new Promise<SshCommandResult>((resolve, reject) => {
@@ -202,6 +207,9 @@ async function execFileText(
       file,
       args,
       {
+        // Caller env (e.g. the agent git identity) is honored, but always
+        // passes through the signing-key scrub like every other child spawn.
+        env: options.env ? scrubSigningKeys(options.env) : scrubbedProcessEnv(),
         timeout: options.timeout ?? 15_000,
         maxBuffer: options.maxBuffer ?? 1024 * 128,
       },
@@ -230,6 +238,7 @@ async function spawnText(
 ): Promise<SshCommandResult> {
   return await new Promise<SshCommandResult>((resolve, reject) => {
     const child = spawn(file, args, {
+      env: scrubbedProcessEnv(),
       stdio: [options.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
     });
 
@@ -332,6 +341,7 @@ async function runLocalGit(
   options: {
     timeout?: number;
     maxBuffer?: number;
+    env?: NodeJS.ProcessEnv;
   } = {},
 ): Promise<SshCommandResult> {
   return await execFileText("git", ["-C", localDir, ...args], options);
@@ -414,11 +424,8 @@ function tarExcludeArgs(exclude: string[] | undefined): string[] {
 }
 
 function tarSpawnEnv(): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
-    // Prevent macOS bsdtar from emitting AppleDouble metadata files like ._README.md.
-    COPYFILE_DISABLE: "1",
-  };
+  // Prevent macOS bsdtar from emitting AppleDouble metadata files like ._README.md.
+  return scrubbedProcessEnv({ COPYFILE_DISABLE: "1" });
 }
 
 // Converts a tar `--exclude` pattern into a regexp for the local-size estimate.
@@ -665,6 +672,7 @@ async function streamLocalFileToSsh(input: {
   await new Promise<void>((resolve, reject) => {
     const source = createReadStream(input.localFile);
     const ssh = spawn("ssh", sshArgs, {
+      env: scrubbedProcessEnv(),
       stdio: ["pipe", "ignore", "pipe"],
     });
 
@@ -719,6 +727,7 @@ async function streamSshToLocalFile(input: {
 
   await new Promise<void>((resolve, reject) => {
     const ssh = spawn("ssh", sshArgs, {
+      env: scrubbedProcessEnv(),
       stdio: ["ignore", "pipe", "pipe"],
     });
     const sink = createWriteStream(input.localFile, { mode: 0o600 });
@@ -921,6 +930,8 @@ async function exportGitWorkspaceFromSsh(input: {
 async function integrateImportedGitHead(input: {
   localDir: string;
   importedHead: string;
+  /** Run's agent, when one is known — attributes the merge/graft commit to it. */
+  agent?: AgentGitIdentityInput | null;
 }): Promise<void> {
   const isConcurrentRefUpdateError = (error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
@@ -975,6 +986,7 @@ async function integrateImportedGitHead(input: {
         currentHead,
         importedHead: input.importedHead,
         syncLabel: "Paperclip SSH sync",
+        agent: input.agent,
       });
       try {
         await runLocalGit(input.localDir, ["update-ref", headRef, graftCommit, currentHead], {
@@ -1021,6 +1033,7 @@ async function integrateImportedGitHead(input: {
       {
         timeout: 60_000,
         maxBuffer: 64 * 1024,
+        env: agentCommitIdentityEnv(input.agent),
       },
     );
     try {
@@ -1204,7 +1217,7 @@ export async function runSshCommand(
     const auth = await createSshAuthArgs(config);
     cleanup = auth.cleanup;
     const sshArgs = [...auth.args];
-    const envEntries = Object.entries(options.env ?? {})
+    const envEntries = Object.entries(scrubSigningKeys(options.env ?? {}))
       .filter((entry): entry is [string, string] => typeof entry[1] === "string");
     for (const [key] of envEntries) {
       if (!isValidShellEnvKey(key)) {
@@ -1273,7 +1286,7 @@ export async function buildSshSpawnTarget(input: {
   }
   const auth = await createSshAuthArgs(input.spec);
   const sshArgs = [...auth.args];
-  const envArgs = Object.entries(input.env)
+  const envArgs = Object.entries(scrubSigningKeys(input.env))
     .filter((entry): entry is [string, string] => typeof entry[1] === "string")
     .map(([key, value]) => `${key}=${shellQuote(value)}`);
   const remoteCommandParts = [shellQuote(input.command), ...input.args.map((arg) => shellQuote(arg))].join(" ");
@@ -1366,6 +1379,7 @@ export async function syncDirectoryToSsh(input: {
       env: tarSpawnEnv(),
     });
     const ssh = spawn("ssh", sshArgs, {
+      env: scrubbedProcessEnv(),
       stdio: ["pipe", "ignore", "pipe"],
     });
 
@@ -1477,6 +1491,7 @@ export async function syncDirectoryFromSsh(input: {
   try {
     await new Promise<void>((resolve, reject) => {
       const ssh = spawn("ssh", sshArgs, {
+        env: scrubbedProcessEnv(),
         stdio: ["ignore", "pipe", "pipe"],
       });
       const tar = spawn("tar", ["-xf", "-", "-C", stagingDir], {
@@ -1558,9 +1573,11 @@ export async function prepareWorkspaceForSshExecution(input: {
   localDir: string;
   remoteDir?: string;
   onProgress?: RuntimeProgressSink;
+  workspaceFileMode?: "all";
+  workspaceExclude?: string[];
 }): Promise<{ gitBacked: boolean }> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
-  const gitSnapshot = await readLocalGitWorkspaceSnapshot(input.localDir);
+  const gitSnapshot = input.workspaceFileMode === "all" ? null : await readLocalGitWorkspaceSnapshot(input.localDir);
 
   if (gitSnapshot) {
     await importGitWorkspaceToSsh({
@@ -1595,7 +1612,7 @@ export async function prepareWorkspaceForSshExecution(input: {
     spec: input.spec,
     localDir: input.localDir,
     remoteDir,
-    exclude: [".paperclip-runtime"],
+    exclude: [".paperclip-runtime", ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : [])],
     onProgress: input.onProgress,
     progressLabel: "workspace",
   });
@@ -1608,6 +1625,8 @@ export async function restoreWorkspaceFromSshExecution(input: {
   remoteDir?: string;
   baselineSnapshot?: DirectorySnapshot;
   restoreGitHistory?: boolean;
+  /** Run's agent, when one is known — attributes sync-created commits to it. */
+  agent?: AgentGitIdentityInput | null;
   onProgress?: RuntimeProgressSink;
 }): Promise<void> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
@@ -1646,6 +1665,7 @@ export async function restoreWorkspaceFromSshExecution(input: {
             await integrateImportedGitHead({
               localDir: input.localDir,
               importedHead,
+              agent: input.agent,
             });
           }
           : undefined,
@@ -1947,6 +1967,7 @@ export async function startSshEnvLabFixture(input: {
 
   const child = spawn(sshdPath, ["-D", "-f", sshdConfigPath, "-E", sshdLogPath], {
     detached: true,
+    env: scrubbedProcessEnv(),
     stdio: "ignore",
   });
   child.unref();

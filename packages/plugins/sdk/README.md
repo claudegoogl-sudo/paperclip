@@ -121,6 +121,7 @@ Subscribe in `setup` with `ctx.events.on(name, handler)` or `ctx.events.on(name,
 | `project.workspace_created`, `project.workspace_updated`, `project.workspace_deleted` | project_workspace |
 | `issue.created`, `issue.updated`, `issue.comment.created` | issue |
 | `issue.document.created`, `issue.document.updated`, `issue.document.deleted` | issue |
+| `issue.attachment.created` | issue |
 | `issue.relations.updated`, `issue.checked_out`, `issue.released`, `issue.assignment_wakeup_requested` | issue |
 | `agent.created`, `agent.updated`, `agent.status_changed` | agent |
 | `agent.run.started`, `agent.run.finished`, `agent.run.failed`, `agent.run.cancelled` | run |
@@ -129,6 +130,17 @@ Subscribe in `setup` with `ctx.events.on(name, handler)` or `ctx.events.on(name,
 | `budget.incident.opened`, `budget.incident.resolved` | budget_incident |
 | `cost_event.created` | cost |
 | `activity.logged` | activity |
+
+**Attachment events:** `issue.attachment.created` fires once per attachment when a file is uploaded to an issue (`payload.binding: "upload"`, `commentId` set if the upload named one, else `null`) and when a pre-uploaded asset is bound to a comment (`payload.binding: "bind"`). Payload: `attachmentId`, `issueId`, `commentId`, `contentType`, `byteSize` (metadata only; no content or URLs). The handler runs in the event's company scope, so it can read the file:
+
+```ts
+ctx.events.on("issue.attachment.created", async (event) => {
+  const { issueId, attachmentId } = event.payload as { issueId: string; attachmentId: string };
+  const rows = await ctx.issues.listAttachments(issueId, event.companyId); // needs issue.attachments.read
+  const row = rows.find((r) => r.id === attachmentId);
+  if (row) await ctx.artifacts.fetch(row.assetId);
+});
+```
 
 **Plugin-to-plugin:** Subscribe to `plugin.<pluginId>.<eventName>` (e.g. `plugin.acme.linear.sync-done`). Emit with `ctx.events.emit("sync-done", companyId, payload)`; the host namespaces it automatically.
 
@@ -214,6 +226,7 @@ Slot types describe where a component mounts. Most values also exist as launcher
 | `settingsPage` | Global | — |
 | `dashboardWidget` | Global | — |
 | `globalToolbarButton` | Global | — |
+| `appShellOverlay` (slot only) | Signed-in application shell | — |
 | `detailTab` | Entity | `project`, `issue`, `agent`, `goal`, `run` |
 | `taskDetailView` | Entity | (task/issue context) |
 | `commentAnnotation` | Entity | `comment` |
@@ -309,6 +322,7 @@ Declare in `manifest.capabilities`. Grouped by scope:
 | Scope | Capability |
 |-------|------------|
 | **Company** | `companies.read` |
+| | `companies.cross-read` — default-deny cross-company reads during agent tool calls; also needs operator allowlist `PAPERCLIP_PLUGIN_CROSS_COMPANY_READ_ALLOWLIST` (see PLUGIN_SPEC §15.1.1) |
 | | `projects.read` |
 | | `project.workspaces.read` |
 | | `issues.read` |
@@ -316,6 +330,7 @@ Declare in `manifest.capabilities`. Grouped by scope:
 | | `issue.documents.read` |
 | | `issue.relations.read` |
 | | `issue.subtree.read` |
+| | `issue.wakeups.read` |
 | | `agents.read` |
 | | `goals.read` |
 | | `goals.create` |
@@ -539,6 +554,21 @@ const subtree = await ctx.issues.getSubtree(missionIssueId, companyId, {
 });
 ```
 
+Liveness/watchdog plugins can read pending agent wakeup requests for up to 200
+issues of one company (capability `issue.wakeups.read`, default-deny, not implied
+by `issues.read`). Without options it returns `queued` and
+`deferred_issue_execution` rows; with `since` and no `statuses` it returns rows of
+any status requested at or after `since` (newest first, max 1000 rows). Only
+`id, issueId, agentId, status, reason, source, requestedAt` are returned — never
+the wake payload or context snapshot.
+
+```ts
+const pending = await ctx.issues.listWakeupRequests(issueIds, companyId);
+const recent = await ctx.issues.listWakeupRequests(issueIds, companyId, {
+  since: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+});
+```
+
 Agent-run actions can assert checkout ownership before mutating in-progress work:
 
 ```ts
@@ -603,6 +633,7 @@ Required capabilities:
 | `ctx.issues.relations.get` | `issue.relations.read` |
 | `ctx.issues.relations.setBlockedBy` / `addBlockers` / `removeBlockers` | `issue.relations.write` |
 | `ctx.issues.getSubtree` | `issue.subtree.read` |
+| `ctx.issues.listWakeupRequests` | `issue.wakeups.read` |
 | `ctx.issues.assertCheckoutOwner` | `issues.checkout` |
 | `ctx.issues.createComment` | `issue.comments.create` |
 | `ctx.issues.createComment` with `actorUserId` | `issue.comments.create` + `issue.comments.create_human_attributed` |
@@ -1152,6 +1183,39 @@ const plugin = definePlugin({
 
 Stream notifications are fire-and-forget JSON-RPC messages (no `id` field). They are sent via `notifyHost()` synchronously during handler execution.
 
+### Attribution: emit inside a dispatch, or pin the channel first
+
+The host tenant-verifies every stream notification. A `streams.emit` from an
+async loop, timer, or reconnect callback — code running **outside any
+dispatch** — cannot be attributed on its own, and the host fails closed
+rather than guess the tenant. Two supported shapes:
+
+1. **Open inside a dispatch, emit anywhere.** Call `ctx.streams.open(channel,
+   companyId)` while servicing a dispatch for that company (a tool call, action,
+   or job). The host pins the channel to that company. Later out-of-dispatch
+   `emit`/`close` calls for the channel are verified against the pin and
+   delivered — this is the pattern for status loops seeded by a dispatch.
+2. **Emit inside the dispatch.** Anything emitted while the dispatch is in
+   flight is verified against the dispatch scope directly (and pins the channel
+   as a side effect).
+
+Everything else is dropped. A drop is never silent: the host logs a warning
+(queryable per §26.1) and sends a `streams.dropped` notification back to the
+worker, which this SDK forwards to the plugin log:
+
+```
+[warn] host dropped streams emit (unpinned_channel) channel="status"
+```
+
+Reason codes: `invalid_invocation_scope`, `no_invocation_scope`,
+`company_mismatch`, `unpinned_channel`, `pin_mismatch`.
+
+If your emitter cannot be dispatched first (a pure background poller with no
+triggering call), open the channel from the first attributed dispatch you do
+get — for example the config-apply replay — or fall back to
+`usePluginData` polling from the UI. Workers bundled against SDKs older than
+the `streams.dropped` support ignore the drop signal; rebuild to surface it.
+
 ### UI side
 
 Use the `usePluginStream` hook (see [Hooks reference](#usepluginstreamtchannel-options) above) to subscribe to events from the UI.
@@ -1161,8 +1225,11 @@ Use the `usePluginStream` hook (see [Hooks reference](#usepluginstreamtchannel-o
 The host maintains an in-memory `PluginStreamBus` that fans out worker notifications to connected SSE clients:
 
 1. Worker emits `streams.emit` notification via stdout
-2. Host (`plugin-worker-manager`) receives the notification and publishes to `PluginStreamBus`
+2. Host (`plugin-worker-manager`) tenant-verifies it (invocation scope or channel pin, see above) and publishes to `PluginStreamBus`
 3. SSE endpoint (`GET /api/plugins/:pluginId/bridge/stream/:channel?companyId=...`) subscribes to the bus and writes events to the response
+
+The server wires the manager and the bus to the same instance at startup; a
+stream endpoint without a wired bus responds `501`.
 
 The bus is keyed by `pluginId:channel:companyId`, so multiple UI clients can subscribe to the same stream independently.
 
@@ -1357,3 +1424,10 @@ const server = await startPluginDevServer({ rootDir: process.cwd() });
 Dev server endpoints:
 - `GET /__paperclip__/health` returns `{ ok, rootDir, uiDir }`
 - `GET /__paperclip__/events` streams `reload` SSE events on UI build changes
+
+### Persistent application shell contributions
+
+An `appShellOverlay` slot uses `ui.action.register` and the standard
+`PluginWidgetProps` context. It survives navigation and unmounts on account or
+company changes, sign-out and onboarding. Plugins own panel accessibility and
+request cleanup. See [the distribution and lifecycle contract](../../../doc/plugins/DISTRIBUTION-PLUGINS.md).

@@ -117,7 +117,6 @@ interface AdapterCapabilities {
   supportsSkills: boolean;
   supportsLocalAgentJwt: boolean;
   requiresMaterializedRuntimeSkills: boolean;
-  supportsModelProfiles: boolean;
   supportsAcp: boolean;
   /**
    * The projected login capability. It is present only when the adapter
@@ -184,7 +183,6 @@ export function buildAdapterCapabilities(adapter: ServerAdapterModule): AdapterC
     supportsSkills: Boolean(adapter.listSkills || adapter.syncSkills),
     supportsLocalAgentJwt: adapter.supportsLocalAgentJwt ?? false,
     requiresMaterializedRuntimeSkills: adapter.requiresMaterializedRuntimeSkills ?? false,
-    supportsModelProfiles: Boolean(adapter.modelProfiles?.length || adapter.listModelProfiles),
     supportsAcp: Boolean(adapter.acp),
     ...(login
       ? {

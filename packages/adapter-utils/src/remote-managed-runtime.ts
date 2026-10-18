@@ -1,4 +1,5 @@
 import path from "node:path";
+import type { AgentGitIdentityInput } from "./git-identity.js";
 import { GIT_ARCHIVE_EXCLUDES } from "./git-workspace-sync.js";
 import {
   type SshRemoteExecutionSpec,
@@ -113,9 +114,13 @@ export async function prepareRemoteManagedRuntime(input: {
   workspaceLocalDir: string;
   workspaceRemoteDir?: string;
   syncWorkspace?: boolean;
+  workspaceFileMode?: "all";
+  workspaceExclude?: string[];
   assets?: RemoteManagedRuntimeAsset[];
   /** Referenced (additional) projects to stage as plain, read-only trees. */
   additionalSources?: SandboxAdditionalSource[];
+  /** Run's agent, when one is known — attributes sync-created git commits to it. */
+  agent?: AgentGitIdentityInput | null;
   // Upload progress sink. Threaded for the byte-counting transport rewrite; the
   // child task wires it into the workspace/asset transfers.
   onProgress?: RuntimeProgressSink;
@@ -139,13 +144,15 @@ export async function prepareRemoteManagedRuntime(input: {
         localDir: input.workspaceLocalDir,
         remoteDir: workspaceRemoteDir,
         onProgress: input.onProgress,
+        workspaceFileMode: input.workspaceFileMode,
+        workspaceExclude: input.workspaceExclude,
       })
     : null;
   const baselineSnapshot = preparedWorkspace
     ? await captureDirectorySnapshot(input.workspaceLocalDir, {
         exclude: preparedWorkspace.gitBacked
           ? [...GIT_ARCHIVE_EXCLUDES, ".paperclip-runtime"]
-          : [".paperclip-runtime"],
+          : [".paperclip-runtime", ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : [])],
       })
     : null;
 
@@ -172,6 +179,7 @@ export async function prepareRemoteManagedRuntime(input: {
         remoteDir: workspaceRemoteDir,
         baselineSnapshot,
         restoreGitHistory: preparedWorkspace.gitBacked,
+        agent: input.agent,
         onProgress: input.onProgress,
       });
     }
@@ -239,6 +247,7 @@ export async function prepareRemoteManagedRuntime(input: {
           remoteDir: workspaceRemoteDir,
           baselineSnapshot,
           restoreGitHistory: preparedWorkspace.gitBacked,
+          agent: input.agent,
           onProgress,
         });
       }

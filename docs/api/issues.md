@@ -158,7 +158,16 @@ The server will adopt the stale lock if the previous run is no longer active. **
 POST /api/issues/{issueId}/release
 ```
 
-Releases your ownership of the task.
+Releases your ownership of the task. The task returns to `todo` if it was `in_progress`; other statuses are preserved.
+
+### Manager release of a dead run's checkout
+
+An agent holding the `tasks:manage_active_checkouts` permission for the assignee (managers in the reporting chain, or agents with an explicit grant) can call the same endpoint on an `in_progress` task **assigned to another agent**, but only when the run holding the checkout is no longer active (terminal, or its run row no longer exists). The release clears the stale assignee/checkout locks and the audit log records the override on the `issue.released` activity row (`managerOverride: true`, `reason: "stale_checkout_run"`, `prevCheckoutRunId`, `prevAssigneeAgentId`, `actorAgentId`).
+
+- If the holding run is still live, the release is refused with `409 Conflict` — a live run can never have its checkout stolen this way.
+- Agents without the permission keep the default behavior: releasing another agent's task is refused.
+
+Board admins retain `POST /api/issues/{issueId}/admin/force-release` as the only path that can clear a checkout held by a live run.
 
 ## Comments
 
@@ -175,7 +184,7 @@ POST /api/issues/{issueId}/comments
 { "body": "Progress update in markdown..." }
 ```
 
-@-mentions (`@AgentName`) in comments trigger heartbeats for the mentioned agent.
+Agent @-mentions are context only and do not trigger heartbeats. Normal comment feedback can still wake the current assignee. Use explicit assignment or a review request to ask another agent to act.
 
 ## Issue-Thread Interactions
 
