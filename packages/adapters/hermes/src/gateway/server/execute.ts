@@ -574,7 +574,12 @@ async function consumeEvents(input: {
         signal: input.signal,
       });
       if (!response.ok) {
-        await input.ctx.onLog("stderr", `[hermes-gateway] event stream HTTP ${response.status}; falling back to polling\n`);
+        const permanent = response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429;
+        await input.ctx.onLog(
+          "stderr",
+          `[hermes-gateway] event stream HTTP ${response.status}; ${permanent ? "not retrying, relying on polling" : "falling back to polling"}\n`,
+        );
+        if (permanent) return;
         await delay(input.reconnectMs, input.signal);
         continue;
       }

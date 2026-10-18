@@ -578,6 +578,60 @@ describe("execute", () => {
     expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/v1/runs/run-hermes-1"))).toBe(true);
   });
 
+  describe("event stream HTTP errors", () => {
+    async function runWithEventsStatus(eventsStatus: number) {
+      let polls = 0;
+      let eventRequests = 0;
+      const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/v1/runs")) {
+          return new Response(JSON.stringify({ run_id: "run-hermes-1", status: "started" }), { status: 200 });
+        }
+        if (url.endsWith("/events")) {
+          eventRequests += 1;
+          return new Response("nope", { status: eventsStatus });
+        }
+        polls += 1;
+        return new Response(
+          JSON.stringify(
+            polls < 4
+              ? { status: "running" }
+              : { status: "completed", output: "polled done", session_id: "session-polled" },
+          ),
+          { status: 200 },
+        );
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const result = await execute(makeCtx({
+        apiBaseUrl: "http://127.0.0.1:8642",
+        apiKey: "secret-key",
+        timeoutSec: 10,
+        pollIntervalMs: 250,
+        eventReconnectMs: 250,
+      }));
+      return { result, eventRequests };
+    }
+
+    it("stops requesting the event stream after a permanent 4xx and still finishes by polling", async () => {
+      const { result, eventRequests } = await runWithEventsStatus(404);
+      expect(eventRequests).toBe(1);
+      expect(result.exitCode).toBe(0);
+      expect(result.summary).toBe("polled done");
+    });
+
+    it("keeps retrying the event stream after a transient 503", async () => {
+      const { result, eventRequests } = await runWithEventsStatus(503);
+      expect(eventRequests).toBeGreaterThan(1);
+      expect(result.exitCode).toBe(0);
+      expect(result.summary).toBe("polled done");
+    });
+
+    it("keeps retrying the event stream after a 429", async () => {
+      const { eventRequests } = await runWithEventsStatus(429);
+      expect(eventRequests).toBeGreaterThan(1);
+    });
+  });
+
   it("maps HTTP auth failures", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ error: "bad key" }), { status: 401 })));
     const result = await execute(makeCtx({
