@@ -106,14 +106,14 @@ describeEmbeddedPostgres("GET /companies/:companyId/users/:userSlug/profile", ()
     await tempDb?.cleanup();
   });
 
-  function createApp() {
+  function createApp(actorOverride?: Record<string, unknown>) {
     if (!userProfileRoutes || !errorHandler) {
       throw new Error("user profile route test dependencies were not loaded");
     }
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
-      (req as any).actor = {
+      (req as any).actor = actorOverride ?? {
         type: "board",
         source: "local_implicit",
         userId,
@@ -214,5 +214,29 @@ describeEmbeddedPostgres("GET /companies/:companyId/users/:userSlug/profile", ()
     expect(response.body.recentActivity[0].action).toBe("issue.updated");
     expect(response.body.topAgents[0]).toMatchObject({ agentId, agentName: "Coder", costCents: 42 });
     expect(response.body.topProviders[0]).toMatchObject({ provider: "openai", model: "gpt-test", costCents: 42 });
+  });
+
+  it("404s for a user slug that does not resolve to a company member", async () => {
+    const response = await request(createApp()).get(
+      `/api/companies/${companyId}/users/no-such-user/profile`,
+    );
+
+    expect(response.status).toBe(404);
+    expect(response.body.error).toContain("User not found");
+  });
+
+  it("403s a board actor that does not have access to the target company", async () => {
+    const otherCompanyId = randomUUID();
+
+    const response = await request(
+      createApp({
+        type: "board",
+        source: "cloud_tenant",
+        userId,
+        companyIds: [otherCompanyId],
+      }),
+    ).get(`/api/companies/${companyId}/users/dotta/profile`);
+
+    expect(response.status).toBe(403);
   });
 });
