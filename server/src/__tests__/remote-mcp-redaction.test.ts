@@ -9,7 +9,8 @@ describe("public Executor selectors and secret redaction", () => {
     // Fork hardening: a longer address that only shares the selector's prefix may be a
     // secret, so it is redacted rather than preserved (upstream preserves it).
     expect(redactSensitiveText(`${path}.privateSecretSuffix`)).toContain("REDACTED");
-    expect(redactEventPayload({ path: "arbitrary.provider.path" })?.path).toBe("arbitrary.provider.path");
+    // Fork hardening: any three-segment dotted event value is treated as JWT-shaped (upstream preserves it).
+    expect(redactEventPayload({ path: "arbitrary.provider.path" })?.path).toBe("***REDACTED***");
   });
   it("still redacts secret fields, bearer values, and JWT-shaped strings", () => {
     const value = "executor.coreTools.integrations.list";
