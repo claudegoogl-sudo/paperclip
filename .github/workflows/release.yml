@@ -314,30 +314,28 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  # FORK DELTA (claudegoogl-sudo/paperclip) — keep in sync with
+  # .github/workflows/fork-master-verify-guard.yml.
+  #
+  # Upstream's verify_canary (#13233) gates on github.repository ==
+  # 'paperclipai/paperclip' and delegates to scripts/cloud-source-verification.mjs,
+  # which only has a verdict on the canonical repo. Merging that form into the
+  # fork leaves every push-to-master Release run with all jobs skipped, so a fork
+  # master push never gets a conclusive master verification.
+  #
+  # On the fork, verify_canary must run the real release test matrix for the push
+  # SHA via the reusable release-verify workflow (GitHub-hosted runners), and the
+  # repository gate moves back onto publish_canary so the fork never publishes an
+  # npm canary. The guard workflow fails any PR/push that drops this delta.
   verify_canary:
-    name: Reuse exact-source verification
-    if: github.repository == 'paperclipai/paperclip' && github.event_name == 'push' && github.ref == 'refs/heads/master'
-    runs-on: ubuntu-latest
-    timeout-minutes: 50
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
-        with:
-          node-version: 24
-      - name: Require successful source checks for this exact master push
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          SOURCE_SHA: ${{ github.sha }}
-        run: node scripts/cloud-source-verification.mjs "$SOURCE_SHA"
+    name: Verify master push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    uses: ./.github/workflows/release-verify.yml
+    with:
+      ref: ${{ github.sha }}
 
   publish_canary:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && github.repository == 'paperclipai/paperclip'
     needs: verify_canary
     runs-on: ubuntu-latest
     timeout-minutes: 150
