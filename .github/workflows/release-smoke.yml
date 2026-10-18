@@ -37,6 +37,15 @@ on:
         default: release-smoke
         type: string
 
+concurrency:
+  # Keyed only on this workflow's own inputs (not github.workflow, which
+  # a reusable call resolves to the CALLER's name): release.yml's two
+  # internal calls already pass distinct artifact_name values, and a
+  # direct workflow_dispatch for the same version/artifact queues behind
+  # any run already smoking it instead of racing a redundant second pass.
+  group: release-smoke-${{ inputs.paperclip_version }}-${{ inputs.artifact_name }}
+  cancel-in-progress: false
+
 jobs:
   # The Docker smoke below can never exercise the background-service leg of
   # onboarding: containers have no service manager, so v2026.824.0 shipped a
