@@ -396,6 +396,11 @@ export function boardChatRoutes(
       }
     });
 
+    // A CLI that exits before reading the prompt raises EPIPE on stdin; an
+    // unhandled stream 'error' event would crash the server. The close
+    // handler above already reports the failed run.
+    proc.stdin.on("error", () => {});
+
     // Feed the prompt to the CLI via stdin.
     proc.stdin.write(prompt);
     proc.stdin.end();
