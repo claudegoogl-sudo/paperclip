@@ -25,6 +25,7 @@
  * exposed field rather than as a passthrough of raw arguments.
  */
 
+import { clampText as clamp } from "../guards.js";
 import type { CapabilityJsonValue } from "../mock-core/capability-control-plane-types.js";
 import { CAPABILITY_SEMANTIC_TOOL_CATALOG } from "../semantic-tools/catalog.js";
 
@@ -130,9 +131,6 @@ function asString(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
-function clamp(value: string, limit: number): string {
-  return value.length <= limit ? value : `${value.slice(0, limit)}…`;
-}
 
 function commandPreview(item: Record<string, unknown>): string | null {
   // `unifiedExecStartup` is the Codex app-server's structured shell item. Do

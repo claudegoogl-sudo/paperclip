@@ -41,6 +41,7 @@ import type {
   CapabilityThreadLink,
   CapabilityThreadTurn,
 } from "./types.js";
+import { clampText } from "../guards.js";
 import { CAPABILITY_ISSUE_THREAD_VIEW_SCHEMA } from "./types.js";
 import type { CapabilityJsonValue } from "../mock-core/capability-control-plane-types.js";
 
@@ -81,7 +82,7 @@ const TOOL_RESULT_INNER_KEYS = [
 ] as const;
 
 function clamp(value: string, limit = MAX_DETAIL_CHARS): string {
-  return value.length <= limit ? value : `${value.slice(0, limit)}…`;
+  return clampText(value, limit);
 }
 
 function asRecord(value: CapabilityJsonValue | null): Record<string, CapabilityJsonValue> {
