@@ -7,6 +7,18 @@ import { goalService, logActivity } from "../services/index.js";
 import { assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
 import { getTelemetryClient } from "../telemetry.js";
 
+/**
+ * Goal CRUD routes. `GET/POST .../companies/:companyId/goals` are
+ * company-scoped (require company access); `GET/PATCH/DELETE /goals/:id`
+ * resolve company scoping from the goal itself via `getAccessibleResource`,
+ * which 404s (rather than 403s) when the caller cannot access it.
+ *
+ * Creating, updating, and deleting a goal each write an `activity_log` row.
+ * Creation additionally fires the opt-out `goal_created` Telemetry event
+ * (`trackGoalCreated`) when a Telemetry client is configured — see
+ * AGENTS.md §5.7 for the Telemetry/Observability/run-log distinction before
+ * touching this call site.
+ */
 export function goalRoutes(db: Db) {
   const router = Router();
   const svc = goalService(db);
