@@ -6990,7 +6990,15 @@ export function agentRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     if (!(await assertRunTelemetryReadAllowed(req, res, companyId))) return;
-    const agentId = req.query.agentId as string | undefined;
+    const agentIdParam = req.query.agentId;
+    let agentId: string | undefined;
+    if (agentIdParam !== undefined && agentIdParam !== "") {
+      // isUuidLike accepts surrounding whitespace, but PostgreSQL UUID inputs do not.
+      if (typeof agentIdParam !== "string" || agentIdParam !== agentIdParam.trim() || !isUuidLike(agentIdParam)) {
+        throw badRequest("Invalid agent ID");
+      }
+      agentId = agentIdParam;
+    }
     const limitParam = req.query.limit as string | undefined;
     const limit = limitParam ? Math.max(1, Math.min(1000, parseInt(limitParam, 10) || 200)) : undefined;
     const summary = req.query.summary === "true" || req.query.summary === "1";
