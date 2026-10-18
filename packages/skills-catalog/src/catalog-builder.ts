@@ -24,6 +24,7 @@ const CATALOG_SCHEMA_VERSION = 1;
 const SKILL_ENTRYPOINT = "SKILL.md";
 const CATALOG_REFERENCE_FILE = "catalog-ref.json";
 const MAX_CATALOG_FILE_BYTES = 1024 * 1024;
+const GITHUB_FETCH_TIMEOUT_MS = 30_000;
 const SLUG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const CATALOG_KINDS = new Set<CatalogSkillKind>(["bundled", "optional"]);
 
@@ -615,7 +616,10 @@ async function fetchGitHubTree(
 ): Promise<GitHubTreeEntry[]> {
   const url = `${githubApiBase(source.hostname)}/repos/${source.owner}/${source.repo}/git/trees/${source.commit}?recursive=1`;
   try {
-    const response = await fetch(url, { headers: { accept: "application/vnd.github+json" } });
+    const response = await fetch(url, {
+      headers: { accept: "application/vnd.github+json" },
+      signal: AbortSignal.timeout(GITHUB_FETCH_TIMEOUT_MS),
+    });
     if (!response.ok) {
       errors.push(`${prefix} failed to fetch GitHub tree: HTTP ${response.status}.`);
       return [];
@@ -652,7 +656,7 @@ async function fetchReferencedFileBytes(
   }
   const url = rawGitHubUrl(source, normalizedPath);
   try {
-    const response = await fetch(url);
+    const response = await fetch(url, { signal: AbortSignal.timeout(GITHUB_FETCH_TIMEOUT_MS) });
     if (!response.ok) {
       errors.push(`${prefix}/${normalizedPath} failed to fetch pinned GitHub file: HTTP ${response.status}.`);
       return null;
