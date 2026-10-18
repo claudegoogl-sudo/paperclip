@@ -5,6 +5,7 @@ import {
   apiPath,
   formatInlineRecord,
   handleCommandError,
+  parseJson,
   printOutput,
   resolveCommandContext,
   type BaseClientOptions,
@@ -105,6 +106,3 @@ export function registerActivityCommands(program: Command): void {
   );
 }
 
-function parseJson(value: string): unknown {
-  return JSON.parse(value) as unknown;
-}

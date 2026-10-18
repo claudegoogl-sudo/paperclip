@@ -3,6 +3,7 @@ import {
   addCommonClientOptions,
   apiPath,
   handleCommandError,
+  parseJson,
   printOutput,
   resolveCommandContext,
   type BaseClientOptions,
@@ -322,6 +323,3 @@ function buildApiUrl(apiBase: string, path: string): string {
   return url.toString();
 }
 
-function parseJson(value: string): unknown {
-  return JSON.parse(value) as unknown;
-}

@@ -285,6 +285,14 @@ function readKeyFromProfileEnv(profile: ClientContextProfile): string | undefine
   return process.env[profile.apiKeyEnvVarName]?.trim() || undefined;
 }
 
+export function parseJson(value: string): unknown {
+  try {
+    return JSON.parse(value) as unknown;
+  } catch (error) {
+    throw new Error(`Invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 export function handleCommandError(error: unknown): never {
   if (error instanceof ApiRequestError) {
     const detailSuffix = error.details !== undefined ? ` details=${JSON.stringify(error.details)}` : "";

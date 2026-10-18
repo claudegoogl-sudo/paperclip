@@ -3,6 +3,7 @@ import {
   addCommonClientOptions,
   apiPath,
   handleCommandError,
+  parseJson,
   printOutput,
   resolveCommandContext,
   type BaseClientOptions,
@@ -145,6 +146,3 @@ function addSkillAction(parent: Command, name: string, description: string, suff
   );
 }
 
-function parseJson(value: string): unknown {
-  return JSON.parse(value) as unknown;
-}

@@ -3,6 +3,7 @@ import {
   addCommonClientOptions,
   apiPath,
   handleCommandError,
+  parseJson,
   printOutput,
   resolveCommandContext,
   type BaseClientOptions,
@@ -514,6 +515,3 @@ function addAdminUserPost(parent: Command, name: string, suffix: string): void {
   }));
 }
 
-function parseJson(value: string): unknown {
-  return JSON.parse(value) as unknown;
-}
