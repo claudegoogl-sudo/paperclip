@@ -1255,7 +1255,7 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
  * listener; `kill()` maps to `stop()`. The `write`, `onData`, and `close`
  * members map one to one.
  */
-function adaptDuplexChannelHostSession(
+export function adaptDuplexChannelHostSession(
   session: DuplexChannelHostSession,
 ): CommandManagedDuplexChannel {
   return {
@@ -1269,8 +1269,17 @@ function adaptDuplexChannelHostSession(
       // `wait()` resolves one time with the exit and never rejects, so a single
       // `then` bridges it to the one-time exit listener. The exit carries
       // `transportClosed`, so the broker tells a real exit from a transport close.
+      // A throwing listener must not become an unhandled rejection, which
+      // crashes the server. The caught exception never enters the log.
       void session.wait().then((exit) => {
-        listener(exit);
+        try {
+          listener(exit);
+        } catch {
+          logger.warn(
+            { errorKind: "duplex_channel_exit_listener_failed" },
+            "duplex channel exit listener threw; the exit was dropped",
+          );
+        }
       });
     },
     stop(): void {
