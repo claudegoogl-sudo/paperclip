@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { sanitizeRecord } from "../redaction.js";
+import { isPlainRecord } from "../lib/objects.js";
 
 export type FeedbackRedactionState = {
   redactedFields: Set<string>;
@@ -69,9 +70,6 @@ const FREE_TEXT_PATTERNS: RedactionPattern[] = [
   },
 ];
 
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function increment(state: FeedbackRedactionState, kind: string, count: number) {
   if (count <= 0) return;

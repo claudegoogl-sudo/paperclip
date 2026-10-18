@@ -1,3 +1,4 @@
+import { isPlainRecord } from "../lib/objects.js";
 import fs from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -487,9 +488,6 @@ const BUILT_IN_AGENT_DEFAULT_GRANTS: Record<string, PermissionKey[]> = {
   "reflection-coach": ["agents:suggest-changes", "skills:suggest-changes"],
 };
 
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function nonEmptyString(value: unknown) {
   return typeof value === "string" && value.trim().length > 0;

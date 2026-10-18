@@ -1,3 +1,4 @@
+import { isPlainRecord } from "../lib/objects.js";
 import { verifyAppWebhook } from "./app-webhook.js";
 import { stampSecretBindingAuditActor } from "./secret-binding-audit-actor.js";
 import crypto from "node:crypto";
@@ -376,9 +377,6 @@ function normalizeWebhookTimestampMs(rawTimestamp: string) {
   return parsed > 1e12 ? parsed : parsed * 1000;
 }
 
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function parseBooleanVariableValue(name: string, raw: unknown) {
   if (typeof raw === "boolean") return raw;
