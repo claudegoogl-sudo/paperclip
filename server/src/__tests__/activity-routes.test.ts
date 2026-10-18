@@ -223,6 +223,59 @@ describe.sequential("activity routes", () => {
     });
   });
 
+  describe("company activity list agentId filter", () => {
+    const listUrl = "/api/companies/company-1/activity";
+    const agentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+    it.each(["x", "not-a-uuid", ` ${agentId}`, `${agentId} `])(
+      "rejects malformed agentId %j before listing activity",
+      async (value) => {
+        const app = await createApp();
+        const res = await requestApp(app, (baseUrl) => request(baseUrl).get(listUrl).query({ agentId: value }));
+
+        expect(res.status).toBe(400);
+        expect(res.body).toEqual({ error: "Invalid agent ID" });
+        expect(mockActivityService.list).not.toHaveBeenCalled();
+      },
+    );
+
+    it("rejects a repeated agentId (array) before listing activity", async () => {
+      const app = await createApp();
+      const res = await requestApp(app, (baseUrl) =>
+        request(baseUrl).get(`${listUrl}?agentId=${agentId}&agentId=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb`),
+      );
+
+      expect(res.status).toBe(400);
+      expect(mockActivityService.list).not.toHaveBeenCalled();
+    });
+
+    it("passes a valid agentId through to the list query", async () => {
+      mockActivityService.list.mockResolvedValue([]);
+
+      const app = await createApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl).get(listUrl).query({ agentId }));
+
+      expect(res.status).toBe(200);
+      expect(mockActivityService.list).toHaveBeenCalledWith({
+        companyId: "company-1",
+        agentId,
+        entityType: undefined,
+        entityId: undefined,
+        limit: 100,
+      });
+    });
+
+    it("treats an empty agentId as no filter", async () => {
+      mockActivityService.list.mockResolvedValue([]);
+
+      const app = await createApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`${listUrl}?agentId=`));
+
+      expect(res.status).toBe(200);
+      expect(mockActivityService.list).toHaveBeenCalledWith(expect.objectContaining({ agentId: undefined }));
+    });
+  });
+
   it("caps requested company activity list limits", async () => {
     mockActivityService.list.mockResolvedValue([]);
 
