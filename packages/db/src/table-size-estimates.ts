@@ -11,11 +11,9 @@ export type TableSizeEstimate = LocalTableRowCount & {
   readonly bucket: TableSizeBucket;
 };
 
-export const TABLE_SIZE_ESTIMATE_SOURCE = {
-  collectedAt: "2026-07-06",
-  database: "default local dev embedded Postgres",
-  method: "SELECT count(*) in a read-only transaction",
-} as const;
+// Source of LOCAL_TABLE_ROW_COUNTS below: collected 2026-07-06 from the
+// default local dev embedded Postgres via `SELECT count(*)` in a read-only
+// transaction.
 
 export const TABLE_SIZE_ESTIMATE_FACTOR = 250;
 
@@ -24,7 +22,7 @@ export const TABLE_SIZE_BUCKET_THRESHOLDS = {
   mediumRows: 100_000,
 } as const;
 
-export const LOCAL_TABLE_ROW_COUNTS = [
+const LOCAL_TABLE_ROW_COUNTS = [
   { table: "agent_wakeup_requests", localRows: 52_791 },
   { table: "activity_log", localRows: 22_930 },
   { table: "issue_reference_mentions", localRows: 13_218 },
@@ -159,7 +157,7 @@ export const TABLE_SIZE_ESTIMATES: readonly TableSizeEstimate[] = LOCAL_TABLE_RO
   },
 );
 
-export const TABLE_SIZE_ESTIMATES_BY_TABLE: ReadonlyMap<string, TableSizeEstimate> = new Map(
+const TABLE_SIZE_ESTIMATES_BY_TABLE: ReadonlyMap<string, TableSizeEstimate> = new Map(
   TABLE_SIZE_ESTIMATES.map((estimate) => [estimate.table, estimate]),
 );
 
@@ -167,7 +165,7 @@ export function getTableSizeEstimate(table: string): TableSizeEstimate | undefin
   return TABLE_SIZE_ESTIMATES_BY_TABLE.get(table);
 }
 
-export function getTableSizeBucket(table: string): TableSizeBucket {
+function getTableSizeBucket(table: string): TableSizeBucket {
   return getTableSizeEstimate(table)?.bucket ?? "small";
 }
 

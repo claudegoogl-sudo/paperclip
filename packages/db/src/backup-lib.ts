@@ -419,7 +419,7 @@ export async function verifyGzipUncompressedSize(archivePath: string, expectedSi
  * Verify a pg_dump gzip archive has non-zero content and contains plausible dump markers.
  * No source size to compare against for pg_dump.
  */
-export async function verifyPgDumpArchive(archivePath: string): Promise<void> {
+async function verifyPgDumpArchive(archivePath: string): Promise<void> {
   let byteCount = 0;
   let hasPlausibleContent = false;
 
