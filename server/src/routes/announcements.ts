@@ -8,6 +8,26 @@ import { assertAuthenticated, assertBoard, hasCompanyAccess } from "./authz.js";
 import { announcementService } from "../services/announcements.js";
 import { announcementFeedService, type AnnouncementFeedOptions } from "../services/announcement-feed.js";
 
+/**
+ * Board-only routes under `/announcements/*` for the in-app announcement feed.
+ *
+ * All routes require an authenticated board user (`assertAuthenticated` +
+ * `assertBoard`); none of them are scoped to a single company route param.
+ * Responses are marked `Cache-Control: private, no-store`.
+ *
+ * - `GET /announcements/current` returns the current announcement from
+ *   `options`' feed (or `null` if the caller already dismissed it), and
+ *   registers the announcement's publication ID the first time it is served.
+ * - `GET /announcements/:id/image` and `/:id/animation` stream the
+ *   announcement's static image or sandboxed HTML animation, with
+ *   `X-Content-Type-Options: nosniff` and (for animations) a restrictive
+ *   `Content-Security-Policy`/`Referrer-Policy` to contain untrusted markup.
+ * - `POST /announcements/:id/dismiss` records a per-user dismissal. This is
+ *   an instance-wide user preference, not a company-scoped write — see
+ *   AGENTS.md §5.1's announcement-dismissal exception — but the caller must
+ *   still have read access to the `companyId` supplied in the body, which
+ *   supplies audit context rather than write authority.
+ */
 export function announcementRoutes(db: Db, options: AnnouncementFeedOptions) {
   const router = Router();
   const feed = announcementFeedService(options);
