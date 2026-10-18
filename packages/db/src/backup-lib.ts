@@ -3,6 +3,7 @@ import { basename, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
 import { open as openFile } from "node:fs/promises";
+import type { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createGunzip, createGzip } from "node:zlib";
 import postgres from "postgres";
@@ -356,6 +357,13 @@ function appendCapturedStderr(previous: string, chunk: Buffer | string): string 
   return Buffer.from(next, "utf8").subarray(-BACKUP_CLI_STDERR_BYTES).toString("utf8");
 }
 
+// pipe() does not forward source errors; without this a failed read has no listener and crashes the process.
+function gunzipFrom(raw: Readable) {
+  const gunzip = createGunzip();
+  raw.once("error", (error) => gunzip.destroy(error));
+  return raw.pipe(gunzip);
+}
+
 /**
  * Read the ISIZE field from a gzip archive (last 4 bytes, little-endian).
  * ISIZE is the uncompressed size modulo 2^32.
@@ -396,7 +404,7 @@ export async function verifyGzipUncompressedSize(archivePath: string, expectedSi
   // For files >= 4GB, ISIZE wraps, so stream through byte counter
   let byteCount = 0;
   const raw = createReadStream(archivePath);
-  const stream = raw.pipe(createGunzip());
+  const stream = gunzipFrom(raw);
 
   try {
     for await (const chunk of stream) {
@@ -436,7 +444,7 @@ export async function verifyPgDumpArchive(archivePath: string): Promise<void> {
   ];
 
   const raw = createReadStream(archivePath);
-  const stream = raw.pipe(createGunzip());
+  const stream = gunzipFrom(raw);
   let tailBuffer = "";
 
   try {
@@ -641,7 +649,7 @@ async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: 
   }
 
   const input = opts.backupFile.endsWith(".gz")
-    ? createReadStream(opts.backupFile).pipe(createGunzip())
+    ? gunzipFrom(createReadStream(opts.backupFile))
     : createReadStream(opts.backupFile);
 
   await Promise.all([
@@ -652,7 +660,7 @@ async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: 
 
 async function hasStatementBreakpoints(backupFile: string): Promise<boolean> {
   const raw = createReadStream(backupFile);
-  const stream = backupFile.endsWith(".gz") ? raw.pipe(createGunzip()) : raw;
+  const stream = backupFile.endsWith(".gz") ? gunzipFrom(raw) : raw;
   let text = "";
 
   try {
@@ -670,7 +678,7 @@ async function hasStatementBreakpoints(backupFile: string): Promise<boolean> {
 
 async function* readRestoreStatements(backupFile: string): AsyncGenerator<string> {
   const raw = createReadStream(backupFile);
-  const stream = backupFile.endsWith(".gz") ? raw.pipe(createGunzip()) : raw;
+  const stream = backupFile.endsWith(".gz") ? gunzipFrom(raw) : raw;
   stream.setEncoding("utf8");
   const reader = createInterface({
     input: stream,
