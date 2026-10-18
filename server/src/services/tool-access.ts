@@ -206,6 +206,7 @@ import {
   forgetMcpHttpSessions,
   readMcpHttpResponse,
   mcpHttpRequestHeaders,
+  mcpToolsListRequestInit,
   parseMcpHttpResponseBody,
 } from "./mcp-http.js";
 import {
@@ -7219,18 +7220,7 @@ export function toolAccessService(
   ): Promise<McpToolDescriptor[]> {
     const headers = await resolveCredentialHeaders(connection);
     const endpoint = await assertRemoteEndpointAllowed(configOverride);
-    const response = await fetch(endpoint, {
-      method: "POST",
-      // MCP Streamable HTTP requires advertising that we accept both a JSON body
-      // and an SSE stream; spec-compliant servers 406 without it (see mcp-http.ts).
-      headers: mcpHttpRequestHeaders(headers),
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: "paperclip-catalog-refresh",
-        method: "tools/list",
-        params: {},
-      }),
-    });
+    const response = await fetch(endpoint, mcpToolsListRequestInit(headers));
     if (!response.ok) {
       const authenticate = response.headers.get("www-authenticate") ?? "";
       if (response.status === 401 && /bearer|oauth|authorization/i.test(authenticate)) {
