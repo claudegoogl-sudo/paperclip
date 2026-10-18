@@ -18,6 +18,7 @@ import {
   upsertIssueDocumentSchema,
   linkIssueApprovalSchema,
 } from "@paperclipai/shared";
+import { DEFAULT_MCP_FETCH_TIMEOUT_MS } from "./config.js";
 import { PaperclipApiClient } from "./client.js";
 import { formatErrorResponse, formatTextResponse } from "./format.js";
 
@@ -73,6 +74,7 @@ async function callRuntimeConnectionTool(
       Accept: "application/json",
     },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(DEFAULT_MCP_FETCH_TIMEOUT_MS),
   });
   const text = await response.text();
   const parsed = text ? JSON.parse(text) as unknown : null;
