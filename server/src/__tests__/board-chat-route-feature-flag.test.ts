@@ -166,7 +166,7 @@ describe("board-chat client disconnect", () => {
     const proc = new EventEmitter() as any;
     proc.stdout = new EventEmitter();
     proc.stderr = new EventEmitter();
-    proc.stdin = { write: vi.fn(), end: vi.fn() };
+    proc.stdin = Object.assign(new EventEmitter(), { write: vi.fn(), end: vi.fn() });
     proc.exitCode = null;
     proc.killed = false;
     proc.kill = vi.fn(() => {
@@ -205,6 +205,38 @@ describe("board-chat client disconnect", () => {
     // Let the subprocess close handler run so the slot is released.
     fakeProc.exitCode = 143;
     fakeProc.emit("close", 143);
+    await pending;
+  });
+
+  it("survives an EPIPE on the child stdin when the CLI exits before reading the prompt", async () => {
+    mockGetExperimental.mockResolvedValue({ enableConferenceRoomChat: true });
+    mockIssueService.list.mockResolvedValue([
+      { id: "issue-1", title: "Board Operations", status: "todo" },
+    ]);
+    mockIssueService.addComment.mockResolvedValue({ id: "comment-1" });
+    mockIssueService.listComments.mockResolvedValue([]);
+    const fakeProc = makeFakeProc();
+    mockSpawn.mockReturnValue(fakeProc);
+    const app = await createApp();
+
+    const req = request(app)
+      .post("/api/board/chat/stream")
+      .send({ companyId: "company-1", message: "hello" });
+    const pending = req.then(
+      () => undefined,
+      () => undefined,
+    );
+
+    await vi.waitFor(() => expect(fakeProc.stdin.write).toHaveBeenCalled());
+
+    // Without a stdin 'error' listener, emit() throws the EPIPE as an
+    // uncaught 'error' event, which would crash the server process.
+    const epipe = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+    expect(fakeProc.stdin.listenerCount("error")).toBeGreaterThan(0);
+    expect(() => fakeProc.stdin.emit("error", epipe)).not.toThrow();
+
+    fakeProc.exitCode = 1;
+    fakeProc.emit("close", 1);
     await pending;
   });
 });
