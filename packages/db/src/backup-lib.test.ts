@@ -4,7 +4,7 @@ import path from "node:path";
 import { gunzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
-import { createBufferedTextFileWriter, embeddedSocketConninfo, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import { createBufferedTextFileWriter, embeddedSocketConninfo, runDatabaseBackup, runDatabaseRestore, verifyGzipUncompressedSize, verifyPgDumpArchive } from "./backup-lib.js";
 import { buildEmbeddedPostgresConnectionString } from "./embedded-postgres-auth.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
@@ -72,6 +72,18 @@ describe("createBufferedTextFileWriter", () => {
     await writer.close();
 
     expect(fs.readFileSync(outputPath, "utf8")).toBe(lines.join("\n"));
+  });
+});
+
+describe("gzip archive verification read errors", () => {
+  it("rejects verifyPgDumpArchive for a missing file instead of leaving the read error unhandled", async () => {
+    const missing = path.join(os.tmpdir(), `paperclip-missing-${process.pid}-${Date.now()}.sql.gz`);
+    await expect(verifyPgDumpArchive(missing)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects the streamed size check for a missing file instead of leaving the read error unhandled", async () => {
+    const missing = path.join(os.tmpdir(), `paperclip-missing-${process.pid}-${Date.now()}-big.sql.gz`);
+    await expect(verifyGzipUncompressedSize(missing, 2 ** 32 + 1)).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
 
