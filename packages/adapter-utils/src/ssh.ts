@@ -692,6 +692,7 @@ async function streamLocalFileToSsh(input: {
     });
     source.on("error", fail);
     ssh.on("error", fail);
+    ssh.stdin?.on("error", fail);
     if (input.progress) {
       input.progress.counter.on("error", fail);
       source.pipe(input.progress.counter).pipe(ssh.stdin ?? null);
@@ -1417,6 +1418,7 @@ export async function syncDirectoryToSsh(input: {
       reject(error);
     };
 
+    ssh.stdin?.on("error", fail);
     if (progress) {
       progress.counter.on("error", fail);
       tar.stdout?.pipe(progress.counter).pipe(ssh.stdin ?? null);
@@ -1529,6 +1531,7 @@ export async function syncDirectoryFromSsh(input: {
         reject(error);
       };
 
+      tar.stdin?.on("error", fail);
       if (progress) {
         progress.counter.on("error", fail);
         ssh.stdout?.pipe(progress.counter).pipe(tar.stdin ?? null);
