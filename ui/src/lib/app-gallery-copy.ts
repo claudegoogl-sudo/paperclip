@@ -22,7 +22,14 @@ const BANNED_WORDS = [
   "endpoint",
 ];
 
-const BANNED_RE = new RegExp(`\\b(${BANNED_WORDS.join("|")})s?\\b`, "gi");
+// Most banned words pluralize with a trailing "s" (e.g. "server"/"servers"),
+// but "policy" pluralizes irregularly ("policies"), so match that case
+// explicitly rather than relying on a bare `s?` suffix for every word.
+const BANNED_PATTERNS = BANNED_WORDS.map((word) =>
+  word.endsWith("y") ? `${word.slice(0, -1)}(?:y|ies)` : `${word}s?`,
+);
+
+const BANNED_RE = new RegExp(`\\b(${BANNED_PATTERNS.join("|")})\\b`, "gi");
 
 /**
  * Strip banned vocabulary from a free-text string as a last-resort backstop.
