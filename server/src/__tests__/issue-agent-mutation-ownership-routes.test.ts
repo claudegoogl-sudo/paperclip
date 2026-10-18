@@ -963,6 +963,27 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
+  it("rejects a peer agent's comment when issue:comment is denied even though issue:read is allowed", async () => {
+    // The comment gate is evaluated on its own — a visible issue does not
+    // imply a comment grant. Regression fence for the structured deny this
+    // route returns when `issue:comment` comes back `deny_missing_grant`
+    // with no mention grant and no default-open write in play.
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:read",
+      action: input.action,
+      reason: input.action === "issue:read" ? "allow_company_agent" : "deny_missing_grant",
+      explanation: input.action === "issue:read" ? "Allowed by company-wide read." : "Missing permission.",
+    }));
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "I was not granted comment access." });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.details.code).toBe("issue_write_not_visible");
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
   it("rejects peer agents from listing comments when issue read is outside their boundary", async () => {
     mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
       allowed: false,
