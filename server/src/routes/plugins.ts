@@ -3019,6 +3019,11 @@ export function pluginRoutes(
       return;
     }
 
+    if (!UUID_REGEX.test(jobId)) {
+      res.status(404).json({ error: "Job not found" });
+      return;
+    }
+
     const job = await jobDeps.jobStore.getJobByIdForPlugin(plugin.id, jobId);
     if (!job) {
       res.status(404).json({ error: "Job not found" });
@@ -3064,6 +3069,11 @@ export function pluginRoutes(
     const plugin = await resolvePlugin(registry, pluginId);
     if (!plugin) {
       res.status(404).json({ error: "Plugin not found" });
+      return;
+    }
+
+    if (!UUID_REGEX.test(jobId)) {
+      res.status(404).json({ error: "Job not found" });
       return;
     }
 
