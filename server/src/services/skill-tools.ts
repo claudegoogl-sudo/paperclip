@@ -28,8 +28,9 @@ export async function callCreateSkillTool(input: {
     headers: { Authorization: `Bearer ${input.token}`, "Content-Type": "application/json" },
     body: JSON.stringify(body), signal: AbortSignal.timeout(60_000),
   });
-  const result = await response.json();
-  if (!response.ok) throw new Error(typeof result.error === "string" ? result.error : `Skill creation failed (${response.status})`);
+  const result = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(typeof result?.error === "string" ? result.error : `Skill creation failed (${response.status})`);
+  if (typeof result !== "object" || result === null || Array.isArray(result)) throw new Error("Skill creation returned an invalid response");
   return { id: result.id, name: result.name, slug: result.slug, description: result.description,
     versionId: result.currentVersionId, studioPath: `/skills/studio/${encodeURIComponent(result.id)}` };
 }

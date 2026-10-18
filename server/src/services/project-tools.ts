@@ -49,7 +49,8 @@ export async function callProjectTool(input: {
     ...(body ? { body: JSON.stringify(body) } : {}),
     signal: AbortSignal.timeout(60_000),
   });
-  const result = await response.json();
-  if (!response.ok) throw new Error(typeof result.error === "string" ? result.error : `Project tool failed (${response.status})`);
+  const result = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(typeof result?.error === "string" ? result.error : `Project tool failed (${response.status})`);
+  if (typeof result !== "object" || result === null) throw new Error("Project tool returned an invalid response");
   return input.name === "list_projects" ? { projects: result } : result;
 }
