@@ -220,7 +220,7 @@ const ISSUE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const state = { grant: true, writes: 0 };
 
 function actor(agentId: string) {
-  return { type: "agent", agentId, companyId: "home-co", source: "agent_key", runId: AGENT_RUN_ID };
+  return { type: "agent", agentId, companyId: "home-co", source: "agent_key", runId: AGENT_RUN_ID, keyScope: { kind: "standard" } };
 }
 
 async function createApp(a: Record<string, unknown>) {
@@ -340,7 +340,7 @@ describe("cross-company issue access over HTTP", () => {
   });
 
   it("low-trust-style scoped key and onBehalfOfUser never get the exemption", async () => {
-    expect((await request(await createApp({ ...actor(CONCIERGE), keyScope: "notify_only" })).get(`/api/issues/${ISSUE_ID}`)).status).toBe(404);
+    expect((await request(await createApp({ ...actor(CONCIERGE), keyScope: { kind: "notify_only", issueIds: [] } })).get(`/api/issues/${ISSUE_ID}`)).status).toBe(404);
     expect((await request(await createApp({ ...actor(CONCIERGE), onBehalfOfUserId: "u1" })).get(`/api/issues/${ISSUE_ID}`)).status).toBe(404);
   });
 

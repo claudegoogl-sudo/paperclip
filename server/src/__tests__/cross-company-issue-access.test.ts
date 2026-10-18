@@ -87,6 +87,29 @@ describe("cross-company issue access helper", () => {
     expect(d).toEqual({ allowed: false, reason: "scoped_key" });
   });
 
+  it("standard keyScope (real middleware shape) is ALLOWED for read and comments.list", async () => {
+    const std = req({ keyScope: { kind: "standard" } as never });
+    expect((await decideCrossCompanyIssueAccess(std, TARGET, "issue.read", deps())).allowed).toBe(true);
+    expect((await decideCrossCompanyIssueAccess(std, TARGET, "comments.list" as never, deps())).allowed).toBe(true);
+  });
+
+  it("narrowed scopes notify_only/skill_test/task_bridge are denied scoped_key", async () => {
+    for (const kind of ["notify_only", "skill_test", "task_bridge"]) {
+      expect(await decideCrossCompanyIssueAccess(req({ keyScope: { kind } as never }), TARGET, "issue.read", deps()))
+        .toEqual({ allowed: false, reason: "scoped_key" });
+    }
+  });
+
+  it("standard scope: non-allowlisted, same-company, paused target keep their denials", async () => {
+    const k = { keyScope: { kind: "standard" } as never };
+    const other = "33333333-3333-4333-8333-333333333333";
+    expect(await decideCrossCompanyIssueAccess(req({ ...k, agentId: other }), TARGET, "issue.read", deps({ grants: [[HOME, other]] })))
+      .toEqual({ allowed: false, reason: "not_allowlisted" });
+    expect(await decideCrossCompanyIssueAccess(req(k), HOME, "issue.read", deps())).toEqual({ allowed: false, reason: "same_company" });
+    expect(await decideCrossCompanyIssueAccess(req(k), TARGET, "issue.read", deps({ isTargetCompanyActive: async () => false })))
+      .toEqual({ allowed: false, reason: "target_company_inactive" });
+  });
+
   it("control agent with grant row but not allowlisted => deny", async () => {
     const other = "33333333-3333-4333-8333-333333333333";
     const d = await decideCrossCompanyIssueAccess(req({ agentId: other }), TARGET, "issue.read", deps({ grants: [[HOME, other]] }));
