@@ -2,6 +2,7 @@ import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns, issues, issueWatchdogs } from "@paperclipai/db";
 import { isUuidLike } from "@paperclipai/shared";
+import { isPlainRecord } from "../lib/objects.js";
 
 const MAX_WATCHDOG_SCOPE_ANCESTRY_DEPTH = 100;
 export const TASK_WATCHDOG_ORIGIN_KIND = "task_watchdog";
@@ -31,9 +32,6 @@ export type TaskWatchdogMutationScope =
       stopFingerprint: string | null;
     };
 
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;

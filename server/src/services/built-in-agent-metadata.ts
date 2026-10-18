@@ -1,12 +1,10 @@
+import { isPlainRecord } from "../lib/objects.js";
+
 export const BUILT_IN_AGENT_METADATA_KEY = "paperclipBuiltInAgent";
 
 export interface BuiltInAgentMarker {
   key: string;
   featureKeys: string[];
-}
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function normalizeFeatureKeys(value: unknown): string[] | null {

@@ -1,3 +1,4 @@
+import { isPlainRecord } from "../lib/objects.js";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -208,9 +209,6 @@ function isSimpleAssignableAgentStatus(status: string | null | undefined) {
   return status !== "pending_approval" && status !== "terminated";
 }
 
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function objectIsEmpty(value: Record<string, unknown>) {
   return Object.keys(value).length === 0;
