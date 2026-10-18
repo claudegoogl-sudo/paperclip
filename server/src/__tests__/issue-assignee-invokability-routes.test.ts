@@ -6,11 +6,13 @@ const AGENT_ACTOR_ID = "11111111-1111-4111-8111-111111111111";
 const AGENT_RUN_ID = "44444444-4444-4444-8444-444444444444";
 const PAUSED_AGENT_ID = "22222222-2222-4222-8222-222222222222";
 const IDLE_AGENT_ID = "33333333-3333-4333-8333-333333333333";
+const INVALID_ORG_CHAIN_AGENT_ID = "77777777-7777-4777-8777-777777777777";
 
 const agentStatusById: Record<string, string> = {
   [AGENT_ACTOR_ID]: "idle",
   [PAUSED_AGENT_ID]: "paused",
   [IDLE_AGENT_ID]: "idle",
+  [INVALID_ORG_CHAIN_AGENT_ID]: "idle",
 };
 
 const mockIssueService = vi.hoisted(() => ({
@@ -78,7 +80,10 @@ vi.mock("../services/index.js", () => ({
         id: raw,
         companyId: "company-1",
         status: agentStatusById[raw] ?? "idle",
-        orgChainHealth: { status: "healthy" },
+        orgChainHealth:
+          raw === INVALID_ORG_CHAIN_AGENT_ID
+            ? { status: "invalid_org_chain", repairGuidance: null }
+            : { status: "healthy" },
       },
     })),
   }),
@@ -257,6 +262,19 @@ describe("issue assignee invokability guard", () => {
     expect(res.body.error).toContain("paused agent");
     expect(mockIssueService.createChild).not.toHaveBeenCalled();
     expect(mockIssueService.create).not.toHaveBeenCalled();
+  });
+
+  it("refuses an agent reassigning an issue to an agent with an invalid org chain", async () => {
+    const existing = makeIssue();
+    mockIssueService.getById.mockResolvedValue(existing);
+
+    const res = await request(createApp(agentActor()))
+      .patch(`/api/issues/${existing.id}`)
+      .send({ assigneeAgentId: INVALID_ORG_CHAIN_AGENT_ID });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain("invalid org chains");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
   it("still allows an agent to assign to an invokable agent", async () => {
