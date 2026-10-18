@@ -82,10 +82,6 @@ export function buildFilePatches(file: WorkspaceDiffFile): DiffPatchViewModel[] 
   });
 }
 
-export function buildFilePatch(file: WorkspaceDiffFile): string | null {
-  return buildFilePatches(file).find((patch) => patch.patch)?.patch ?? null;
-}
-
 export function isLongDiffFile(file: Pick<DiffFileViewModel, "lineCount">) {
   return file.lineCount > LONG_DIFF_LINE_THRESHOLD;
 }
