@@ -648,7 +648,7 @@ describe("isStandbyWakeTargetIssue", () => {
 });
 
 describe("external-wait exhaustion fallback", () => {
-  it("detects the PLA-10087/10181/10263 waiting-on-CI shape", () => {
+  it("detects the waiting-on-CI shape", () => {
     expect(detectExternalWait("PR opened, CI pending, auto-merge armed. Next: check on next wake")).toBe("github-actions");
     expect(detectExternalWait("systemd unit running; build in progress")).toBe("build");
     expect(detectExternalWait("Implemented the parser and wrote docs")).toBeNull();
