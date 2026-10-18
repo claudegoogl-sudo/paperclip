@@ -607,6 +607,32 @@ describe("execute", () => {
     expect(result.errorMessage).toContain("host.docker.internal");
   });
 
+  it("bounds the create-run request with a timeout and maps a stalled gateway to a connect failure", async () => {
+    const timeoutController = new AbortController();
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockReturnValue(timeoutController.signal);
+    let createSignal: AbortSignal | undefined;
+    vi.stubGlobal("fetch", vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      createSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("The operation was aborted")));
+      });
+    }));
+
+    const pending = execute(makeCtx({
+      apiBaseUrl: "http://127.0.0.1:8642",
+      apiKey: "secret-key",
+    }));
+    await vi.waitFor(() => expect(createSignal).toBeDefined());
+    expect(timeoutSpy).toHaveBeenCalledWith(30_000);
+    timeoutController.abort();
+    const result = await pending;
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("hermes_gateway_connect_failed");
+    expect(result.errorMessage).toContain("aborted");
+    timeoutSpy.mockRestore();
+  });
+
   it("redacts echoed auth material from HTTP error payloads", async () => {
     vi.stubGlobal(
       "fetch",
