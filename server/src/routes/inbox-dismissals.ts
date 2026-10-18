@@ -45,6 +45,24 @@ function requireBoardUser(req: Request, res: Response) {
   return req.actor.userId;
 }
 
+/**
+ * Per-user, per-company inbox-item dismissal routes. Every route requires
+ * company access plus a signed-in board user (`requireBoardUserId`).
+ *
+ * Items are keyed by a validated `itemKey` of the form
+ * `approval|join|run|attention:<id>` (`ITEM_KEY_RE`).
+ *
+ * - `GET .../inbox-dismissals` lists the caller's dismissals/snoozes.
+ * - `POST .../inbox-dismissals` creates one: `kind: "dismiss"` hides the
+ *   item immediately; `kind: "snooze"` requires a future `snoozedUntil`
+ *   ISO timestamp (validated by the schema's `superRefine`) and re-surfaces
+ *   the item at that time.
+ * - `DELETE .../inbox-dismissals/:itemKey` restores (un-dismisses) an item.
+ *
+ * Create and restore each write an `activity_log` row (`inbox.dismissed`,
+ * `inbox.snoozed`, or `inbox.restored`); restore only logs when a row was
+ * actually removed.
+ */
 export function inboxDismissalRoutes(db: Db) {
   const router = Router();
   const svc = inboxDismissalService(db);
