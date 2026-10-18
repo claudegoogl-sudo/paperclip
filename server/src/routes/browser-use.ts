@@ -15,6 +15,20 @@ import {
 } from "./authz.js";
 import { browserUseService } from "../services/browser-use.js";
 
+/**
+ * Routes for live browser-automation sessions ("Browser Use").
+ *
+ * `/issues/:issueId/browsers*` routes are gated by a per-request middleware
+ * that resolves the issue's `companyId`, requires board access, and checks
+ * the caller can access that resource before any handler runs. They let a
+ * board user list an issue's active browser sessions, open the live viewer
+ * for one, report viewer presence, resize or release the shared viewport,
+ * and send human-takeover control actions (`browserUseControlSchema`).
+ *
+ * `/companies/:companyId/browser-use-cloud/grants/:grantId/*` routes are
+ * company-access-gated admin routes to list the profiles available under a
+ * Browser Use Cloud grant and to read/save that grant's settings.
+ */
 export function browserUseRoutes(db: Db, service = browserUseService(db)) {
   const router = Router();
   router.use("/issues/:issueId/browsers", async (req, res, next) => {
