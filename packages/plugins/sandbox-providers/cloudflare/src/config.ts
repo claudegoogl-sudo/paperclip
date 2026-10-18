@@ -20,7 +20,11 @@ function readInteger(value: unknown, fallback: number): number {
 }
 
 function isLocalBridgeHost(url: URL): boolean {
-  return LOCALHOST_HOSTNAMES.has(url.hostname);
+  // URL#hostname renders an IPv6 host wrapped in brackets (e.g. "[::1]"),
+  // while LOCALHOST_HOSTNAMES stores the bracket-free form. Strip any
+  // enclosing brackets before comparing so IPv6 loopback URLs match.
+  const hostname = url.hostname.replace(/^\[(.*)\]$/, "$1");
+  return LOCALHOST_HOSTNAMES.has(hostname);
 }
 
 export function parseCloudflareDriverConfig(raw: Record<string, unknown>): CloudflareDriverConfig {
