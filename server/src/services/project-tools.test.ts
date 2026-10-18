@@ -16,9 +16,9 @@ describe("project tool API call", () => {
   };
 
   it("returns the project list from the authenticated company route", async () => {
-    const fetchMock = stubFetch(new Response(JSON.stringify([{ id: "project-1" }]), { status: 200 }));
+    const fetchMock = stubFetch(new Response(JSON.stringify({ projects: [{ id: "project-1" }] }), { status: 200 }));
     await expect(callProjectTool(base)).resolves.toEqual({ projects: [{ id: "project-1" }] });
-    expect(fetchMock).toHaveBeenCalledWith("http://localhost:3100/api/companies/company-1/projects",
+    expect(fetchMock).toHaveBeenCalledWith("http://localhost:3100/api/companies/company-1/projects?view=summary&limit=50",
       expect.objectContaining({ method: "GET" }));
   });
 
