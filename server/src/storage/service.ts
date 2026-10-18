@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
+import { Readable } from "node:stream";
 import type { StorageService, StorageProvider, PutFileInput, PutFileResult } from "./types.js";
-import { badRequest, forbidden, unprocessable } from "../errors.js";
+import { forbidden, unprocessable } from "../errors.js";
+import { assertObjectKeyReadable } from "./object-key.js";
 
 const MAX_SEGMENT_LENGTH = 120;
 
@@ -10,9 +12,17 @@ function sanitizeSegment(value: string): string {
     .trim()
     .replace(/[^a-zA-Z0-9._-]+/g, "_")
     .replace(/_{2,}/g, "_")
-    .replace(/^_+|_+$/g, "");
+    // Collapse dot-runs so a segment can never carry a ".." sequence, then
+    // strip leading/trailing dots (after the length slice, which could
+    // otherwise re-expose a trailing dot). The stored filename is assembled
+    // as `${stem}${ext}`; stems never end on a dot and exts start with at
+    // most one dot, so the concatenation stays free of "..".
+    .replace(/\.{2,}/g, ".")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, MAX_SEGMENT_LENGTH)
+    .replace(/^\.+|\.+$/g, "");
   if (!cleaned) return "file";
-  return cleaned.slice(0, MAX_SEGMENT_LENGTH);
+  return cleaned;
 }
 
 function normalizeNamespace(namespace: string): string {
@@ -33,10 +43,13 @@ function splitFilename(filename: string | null): { stem: string; ext: string } {
   const extRaw = path.extname(base);
   const stemRaw = extRaw ? base.slice(0, base.length - extRaw.length) : base;
   const stem = sanitizeSegment(stemRaw);
-  const ext = extRaw
+  // extname() output is "", ".", or ".suffix"; a bare "." (trailing-dot
+  // filenames like "x.") must not survive into the stored filename.
+  const extNormalized = extRaw
     .toLowerCase()
     .replace(/[^a-z0-9.]/g, "")
-    .slice(0, 16);
+    .replace(/\.{2,}/g, ".");
+  const ext = extNormalized === "." ? "" : extNormalized.slice(0, 16);
   return {
     stem,
     ext,
@@ -48,9 +61,8 @@ function ensureCompanyPrefix(companyId: string, objectKey: string): void {
   if (!objectKey.startsWith(expectedPrefix)) {
     throw forbidden("Object does not belong to company");
   }
-  if (objectKey.includes("..")) {
-    throw badRequest("Invalid object key");
-  }
+  // Same predicate the write path asserts — one validity concept, no drift.
+  assertObjectKeyReadable(objectKey);
 }
 
 function hashBuffer(input: Buffer): string {
@@ -79,10 +91,13 @@ function assertPutFileInput(input: PutFileInput): void {
   if (!input.contentType || input.contentType.trim().length === 0) {
     throw unprocessable("contentType is required");
   }
-  if (!(input.body instanceof Buffer)) {
-    throw unprocessable("body must be a Buffer");
+  if (!(input.body instanceof Buffer) && !(input.body instanceof Readable)) {
+    throw unprocessable("body must be a Buffer or Readable");
   }
-  if (input.body.length <= 0) {
+  if (!Buffer.isBuffer(input.body) && (!("byteSize" in input) || !Number.isSafeInteger(input.byteSize) || input.byteSize < 0 || !/^[0-9a-f]{64}$/.test(input.sha256))) {
+    throw unprocessable("Streamed files require an exact byte size and SHA-256");
+  }
+  if (("byteSize" in input ? input.byteSize : input.body.length) <= 0) {
     throw unprocessable("File is empty");
   }
 }
@@ -94,21 +109,30 @@ export function createStorageService(provider: StorageProvider): StorageService 
     async putFile(input: PutFileInput): Promise<PutFileResult> {
       assertPutFileInput(input);
       const objectKey = buildObjectKey(input.companyId, input.namespace, input.originalFilename);
-      const byteSize = input.body.length;
+      // Fail closed: never store a key the read path would refuse.
+      assertObjectKeyReadable(objectKey);
+      const byteSize = "byteSize" in input ? input.byteSize : input.body.length;
       const contentType = input.contentType.trim().toLowerCase();
-      await provider.putObject({
-        objectKey,
-        body: input.body,
-        contentType,
-        contentLength: byteSize,
-      });
+      try {
+        await provider.putObject({
+          objectKey,
+          body: input.body,
+          contentType,
+          contentLength: byteSize,
+        });
+      } catch (error) {
+        await provider.deleteObject({ objectKey }).catch(() => {});
+        throw error;
+      } finally {
+        if (input.body instanceof Readable) input.body.destroy();
+      }
 
       return {
         provider: provider.id,
         objectKey,
         contentType,
         byteSize,
-        sha256: hashBuffer(input.body),
+        sha256: "sha256" in input ? input.sha256 : hashBuffer(input.body),
         originalFilename: input.originalFilename,
       };
     },

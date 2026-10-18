@@ -22,6 +22,7 @@ import {
   rekeyCompanyIssueIdentifiers,
 } from "../services/issue-prefix.js";
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
+import { agentRunWritesRevoked } from "../agent-run-cancellation.js";
 import {
   isAgentApiKeyExpired,
   isUuidLike,
@@ -32,6 +33,7 @@ import {
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { actorProvenanceMiddleware } from "./actor-context.js";
 import { logger } from "./logger.js";
+import { captureRunIdentity } from "../services/run-identity.js";
 import { boardAuthService } from "../services/board-auth.js";
 import { resolveAuthEventSourceIp } from "../services/auth-event-source-ip.js";
 
@@ -66,6 +68,7 @@ import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compa
 import { forbidden, unauthorized, unprocessable } from "../errors.js";
 
 export { isCloudManagedInstance } from "../services/cloud-instance.js";
+import { cloudTenantPrimaryCompanyId } from "../services/cloud-instance.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -151,6 +154,10 @@ async function auditAgentJwtRunHeaderMismatch(
   input: { companyId: string; agentId: string; claimRunId: string; headerRunId: string; method: string; url: string },
 ) {
   try {
+    // F5: actor_source/actor_key_id are NULL here BY CONSTRUCTION, not by omission. This row
+    // audits the *failure* to establish an actor, and it is written from inside actorMiddleware,
+    // which runs before actorProvenanceMiddleware binds any provenance. There is no established
+    // credential provenance to record.
     await db.insert(activityLog).values({
       companyId: input.companyId,
       actorType: "agent",
@@ -305,6 +312,10 @@ async function auditAgentKeyMissingResponsibleUser(
   input: { companyId: string; agentId: string; keyId: string; method: string; url: string },
 ) {
   try {
+    // F5: actor_source/actor_key_id are NULL here BY CONSTRUCTION, not by omission. This row
+    // audits the *failure* to establish an actor, and it is written from inside actorMiddleware,
+    // which runs before actorProvenanceMiddleware binds any provenance. There is no established
+    // credential provenance to record.
     await db.insert(activityLog).values({
       companyId: input.companyId,
       actorType: "agent",
@@ -366,6 +377,10 @@ interface ActorMiddlewareOptions {
   authEventTrustedProxies?: readonly string[];
 }
 
+const publicRoutineWebhookPath = /^\/api\/routine-triggers\/public\/[a-f0-9]{24}\/fire\/?$/i;
+
+const publicMcpGatewayProtocolPath = /^\/mcp\/gateways\/gw_[a-f0-9]{32}\/?$/i;
+
 export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHandler {
   const boardAuth = boardAuthService(db);
   return async (req, _res, next) => {
@@ -381,10 +396,31 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
           }
         : { type: "none", source: "none" };
 
+    // Routine ingress authenticates its own bearer/signature. Never interpret
+    // webhook credentials as agent keys or attach an ambient browser session.
+    if (req.method === "POST" && publicRoutineWebhookPath.test(req.path)) {
+      req.actor = { type: "none", source: "none" };
+      next();
+      return;
+    }
+
     const runIdHeader = req.header("x-paperclip-run-id");
 
     const authHeader = req.header("authorization");
     const hasBearerCredentials = /^bearer(?:\s|$)/i.test(authHeader ?? "");
+
+    // Public MCP gateway protocol requests carry a pcgw_* bearer that is
+    // validated by the gateway service itself. Do not interpret that bearer as
+    // a board key or agent JWT here: doing so rejects the MCP handshake before
+    // the protocol route can verify its run-scoped credential. Keep this bypass
+    // restricted to the unguessable public gateway path; all /api routes retain
+    // the normal actor authentication path below.
+    if (hasBearerCredentials && publicMcpGatewayProtocolPath.test(req.path)) {
+      if (runIdHeader) req.actor.runId = runIdHeader;
+      next();
+      return;
+    }
+
     if (!hasBearerCredentials) {
       if (opts.deploymentMode === "authenticated" && opts.resolveSession) {
         const cloudTenantActor = await resolveCloudTenantActor(db, req);
@@ -566,7 +602,26 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         return;
       }
 
-      const onBehalfOfUserId = claims.responsible_user_id !== undefined
+      const [identityRun] = await db.select({ activeIdentityContextId: heartbeatRuns.activeIdentityContextId,
+        responsibleUserId: heartbeatRuns.responsibleUserId, status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson,
+        contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.id, claims.run_id), eq(heartbeatRuns.companyId, claims.company_id), eq(heartbeatRuns.agentId, claims.sub),
+        ));
+      if (agentRunWritesRevoked(identityRun)
+        && !["GET", "HEAD", "OPTIONS"].includes(req.method)) {
+        const conversation = identityRun?.contextSnapshot?.conversationMode === true;
+        _res.status(403).json({ error: conversation ? "This conversation turn was cancelled" : "This run was cancelled",
+          code: conversation ? "conversation_turn_cancelled" : "agent_run_cancelled" });
+        return;
+      }
+      if (identityRun?.activeIdentityContextId && identityRun.status === "running") {
+        const captured = await captureRunIdentity(db, { companyId: claims.company_id, agentId: claims.sub, runId: claims.run_id });
+        identityRun.activeIdentityContextId = captured.context?.id ?? null;
+        identityRun.responsibleUserId = captured.context?.responsibleUserId ?? null;
+      }
+      const onBehalfOfUserId = identityRun?.activeIdentityContextId
+        ? identityRun.responsibleUserId
+        : claims.responsible_user_id !== undefined
         ? normalizeOptionalString(claims.responsible_user_id)
         : await resolveLegacyRunResponsibleUserId(db, {
             companyId: claims.company_id,
@@ -586,6 +641,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         keyScope: normalizeAgentApiKeyScope(claims.key_scope),
         runId: claims.run_id,
         onBehalfOfUserId,
+        identityContextId: identityRun?.activeIdentityContextId ?? null,
         onBehalfOfMemberships,
         source: "agent_jwt",
       };
@@ -692,6 +748,10 @@ const PLUGIN_OPS_ALLOWED_ROUTES: ReadonlyArray<{
   { method: "GET", pathPattern: /^\/api\/board-api-keys$/ },
   { method: "DELETE", pathPattern: /^\/api\/board-api-keys\/[^/]+$/ },
   { method: "POST", pathPattern: /^\/api\/cli-auth\/revoke-current$/ },
+  // Read-only self identity. The CLI's own login/whoami/connect flows call
+  // this with the key they just received; without it the CLI's default
+  // plugin_ops scope cannot complete its own login.
+  { method: "GET", pathPattern: /^\/api\/cli-auth\/me$/ },
 
   // --- Issue read/comment (operator-readable activity surface) ---
   // Allows GETs on issue detail/list/comments/documents and posting a comment.
@@ -700,6 +760,12 @@ const PLUGIN_OPS_ALLOWED_ROUTES: ReadonlyArray<{
   { method: "GET", pathPattern: /^\/api\/issues(?:\/[^/]+)?(?:\/.*)?$/ },
   { method: "POST", pathPattern: /^\/api\/issues\/[^/]+\/comments$/ },
   { method: "GET", pathPattern: /^\/api\/companies\/[^/]+\/issues(?:\/.*)?$/ },
+
+  // --- Company list (board-read snapshot discovery; reads only) ---
+  // The board-read snapshot timer must enumerate companies before it reads
+  // each company's issues. Exact match on the list path only: company detail
+  // (GET /companies/:id), create, and update stay outside this scope.
+  { method: "GET", pathPattern: /^\/api\/companies$/ },
 ];
 
 /**
@@ -778,6 +844,73 @@ export function enforceBoardKeyScopeMiddleware(): RequestHandler {
 }
 
 /**
+ * Routes a `{ kind: "notify_only" }` agent API key may reach. Each pattern
+ * captures the issue id, which must be one of the key's `issueIds` (UUIDs,
+ * compared case-insensitively; identifiers such as `ABC-1` are not accepted,
+ * so the allow-list check needs no DB lookup). Fail-closed: anything else is
+ * 403 `agent_key_scope_violation`.
+ */
+const NOTIFY_ONLY_ALLOWED_ROUTES: ReadonlyArray<{
+  readonly method: string;
+  readonly pathPattern: RegExp;
+}> = [
+  { method: "GET", pathPattern: /^\/api\/issues\/([^/]+)$/ },
+  { method: "POST", pathPattern: /^\/api\/issues\/([^/]+)\/interactions$/ },
+];
+
+/**
+ * Agent-key scope enforcement for `notify_only` keys. Runs after
+ * actorMiddleware. Every other actor (including every other agent-key scope)
+ * falls through unchanged. A notify_only key never carries a run id: any
+ * `X-Paperclip-Run-Id` header is dropped so run attribution cannot be forged.
+ */
+export function enforceAgentKeyScopeMiddleware(): RequestHandler {
+  return (req, _res, next) => {
+    const actor = req.actor;
+    if (
+      !actor ||
+      actor.type !== "agent" ||
+      actor.keyScope?.kind !== "notify_only"
+    ) {
+      next();
+      return;
+    }
+
+    actor.runId = undefined;
+    const allowed = new Set((actor.keyScope.issueIds ?? []).map((id) => id.toLowerCase()));
+    const method = req.method.toUpperCase();
+    const matched = NOTIFY_ONLY_ALLOWED_ROUTES.some((entry) => {
+      if (method !== entry.method) return false;
+      const m = entry.pathPattern.exec(req.path);
+      if (!m) return false;
+      let issueId: string;
+      try {
+        issueId = decodeURIComponent(m[1] ?? "").toLowerCase();
+      } catch {
+        return false;
+      }
+      return allowed.has(issueId);
+    });
+    if (!matched) {
+      logger.warn(
+        { agentId: actor.agentId, keyId: actor.keyId, method, path: req.path },
+        "agent key scope violation (notify_only)",
+      );
+      next(
+        forbidden("Agent API key scope does not permit this route", {
+          code: "agent_key_scope_violation",
+          scope: "notify_only",
+          method,
+          path: req.path,
+        }),
+      );
+      return;
+    }
+    next();
+  };
+}
+
+/**
  * Registers the actor-resolution + provenance-capture middleware pair on `app`
  * in the one order that works: `actorMiddleware` populates `req.actor`, then
  * `enforceBoardKeyScopeMiddleware` narrows a scoped board key's reachable
@@ -795,6 +928,7 @@ export function registerActorContext(app: Application, db: Db, opts: ActorMiddle
   // run before route handlers so scoped-key requests never reach a route the
   // scope does not permit.
   app.use(enforceBoardKeyScopeMiddleware());
+  app.use(enforceAgentKeyScopeMiddleware());
   app.use(actorProvenanceMiddleware());
 }
 
@@ -846,7 +980,68 @@ export function cloudActorHeaderSourceFromHeaders(
   };
 }
 
+/**
+ * postgres.js codes for connection establishment timing out or for a
+ * connection the server side closed out from under an in-flight query —
+ * a pooled Postgres endpoint recycling or suspending
+ * (observed 2026-09-03 with a managed pooler closing the socket mid-INSERT).
+ * The driver reconnects transparently on the next query; only the statement
+ * that was on the wire is lost.
+ */
+const transientDbConnectionCodes = new Set([
+  "CONNECT_TIMEOUT",
+  "CONNECTION_CLOSED",
+  "CONNECTION_ENDED",
+  "CONNECTION_DESTROYED",
+]);
+
+/**
+ * True when the error chain (drizzle wraps the driver error as `cause`)
+ * carries a postgres.js transient connection code. Exported for tests.
+ */
+export function isTransientDbConnectionError(error: unknown): boolean {
+  for (let current: unknown = error; current instanceof Error; current = current.cause) {
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === "string" && transientDbConnectionCodes.has(code)) return true;
+  }
+  return false;
+}
+
+/**
+ * Runs `run` and retries it up to twice when it fails on a transient
+ * connection error. Two replays, not one: when a pooled endpoint
+ * suspends or recycles, EVERY pooled socket is dead at once, so the first
+ * replay can draw another stale socket from the pool and fail identically
+ * (observed 2026-09-12: retried actor resolution still surfacing
+ * CONNECTION_CLOSED). The short pause gives the driver time to notice and
+ * re-dial. Callers must pass an idempotent operation. Exported for tests.
+ */
+export async function retryOnTransientDbConnectionError<T>(run: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await run();
+    } catch (error) {
+      if (attempt >= 2 || !isTransientDbConnectionError(error)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
+    }
+  }
+}
+
+/**
+ * Trusted-header actor resolution with bounded transient-connection retries.
+ * The tenant sync inside is idempotent end to end — every write is an
+ * upsert/on-conflict/delete and the write debounce records only after the
+ * whole sync succeeds — so replaying it after a dropped connection is safe,
+ * and turns a golden-path authentication 500 into a served request.
+ */
 export async function resolveCloudTenantActor(
+  db: Db,
+  req: CloudActorHeaderSource,
+): Promise<Express.Request["actor"] | null> {
+  return retryOnTransientDbConnectionError(() => resolveCloudTenantActorOnce(db, req));
+}
+
+async function resolveCloudTenantActorOnce(
   db: Db,
   req: CloudActorHeaderSource,
 ): Promise<Express.Request["actor"] | null> {
@@ -1041,11 +1236,7 @@ function constantTimeStringEqual(left: string, right: string): boolean {
 }
 
 function cloudTenantCompanyId(stackId: string): string {
-  const bytes = createHash("sha256").update(`paperclip-cloud-tenant-company:${stackId}`).digest();
-  bytes[6] = (bytes[6] & 0x0f) | 0x50;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  const hex = bytes.subarray(0, 16).toString("hex");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+  return cloudTenantPrimaryCompanyId(stackId);
 }
 
 export function humanizeCloudStackSlug(stackId: string): string {

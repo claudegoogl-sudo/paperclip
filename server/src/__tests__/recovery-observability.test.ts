@@ -12,6 +12,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import {
   classifyRecoveryHandoff,
   evaluateRecoveryRateAlert,
@@ -127,11 +128,9 @@ describeEmbeddedPostgres("recovery observability report", () => {
   }, 20_000);
 
   afterEach(async () => {
-    await db.delete(issueRecoveryActions);
-    await db.delete(heartbeatRuns);
-    await db.delete(issues);
-    await db.delete(agents);
-    await db.delete(companies);
+    // Atomic TRUNCATE ... CASCADE from `companies` clears every per-test table
+    // in one statement instead of an ordered per-table delete chain.
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {

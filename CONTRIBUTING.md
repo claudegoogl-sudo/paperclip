@@ -135,6 +135,10 @@ It does **not** run the PR-only gates, so do not assume `verify_canary` mirrors 
 
 A red `Release` run on `master` is a **P0**: the merged result is broken, and every open PR inherits it. Fix forward or revert — do not wave it through on an unrelated PR. Attribution: the merge that broke `master` is not the PR that displays the breakage, so start bisecting from the last green `Release` run on `master`, not from whichever PR you happen to be looking at.
 
+#### Lockfile ownership and drift
+
+The lockfile is CI-owned: PRs may not commit `pnpm-lock.yaml` (the `policy` job blocks it, with narrow exemptions for `chore/refresh-lockfile`, `sync/upstream-*`, and dependabot). The `policy` job regenerates the lockfile on every PR and decides from the actual lockfile diff whether the tree drifted, not from the PR's changed-file paths. When the tree did drift (a manifest or patch change in the PR, or the same change merged to the base branch without a lockfile refresh), the job uploads the regenerated lockfile as an artifact, and every `--frozen-lockfile` job installs from it. A drifted base branch therefore keeps open PRs green until the refresh-lockfile workflow reconciles `master` with its own PR. A missing required artifact fails the named restore step, not the install.
+
 ### Telemetry Changes
 
 This repo has three separate data paths: Telemetry, Observability, and the run log. See rule 7 in `AGENTS.md` for the full definitions and the review level each path needs.

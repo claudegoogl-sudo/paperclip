@@ -24,6 +24,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   SETUP_TOKEN_SESSION_NOT_FOUND,
   SETUP_TOKEN_PROVIDER_UNSUPPORTED,
+  isTerminalSessionState,
   type SetupTokenCleanupRecord,
   type SetupTokenCleanupStore,
   type SetupTokenLeaseManager,
@@ -65,6 +66,79 @@ const FULL_LOGIN_URL =
 const SANITIZED_LOGIN_URL = "https://claude.com/cai/oauth/authorize";
 
 const SECRET_MARKERS = [BROWSER_CODE, URL_CODE_QUERY, URL_STATE_QUERY, MINTED_TOKEN, "TOKENSECRETxyz789"];
+
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("../services/secrets.js", async () => {
+  const actual = await vi.importActual<typeof import("../services/secrets.js")>(
+    "../services/secrets.js",
+  );
+  return { ...actual, secretService: () => mockSecretService };
+});
+vi.mock("../services/agents.js", () => ({ agentService: () => mockAgentService }));
+vi.mock("../services/environments.js", () => ({
+  environmentService: () => mockEnvironmentService,
+}));
+vi.mock("../services/plugin-environment-driver.js", async () => {
+  const actual = await vi.importActual<typeof import("../services/plugin-environment-driver.js")>(
+    "../services/plugin-environment-driver.js",
+  );
+  return {
+    ...actual,
+    resolvePluginSandboxProviderDriverByKey: mockResolvePluginSandboxProviderDriverByKey,
+  };
+});
+vi.mock("../services/heartbeat.js", () => ({ heartbeatService: () => mockHeartbeatService }));
+vi.mock("../services/instance-settings.js", () => ({
+  instanceSettingsService: () => mockInstanceSettingsService,
+}));
+vi.mock("../services/issues.js", () => ({ issueService: () => mockIssueService }));
+vi.mock("../services/run-secret-redaction.js", () => ({
+  createRunSecretRedactionRegistry: () => mockRunSecretRedactionRegistry,
+}));
+vi.mock("../services/index.js", () => ({
+  agentService: () => mockAgentService,
+  agentInstructionsService: () => ({}),
+  accessService: () => ({
+    canUser: vi.fn(async () => true),
+    decide: vi.fn(async (input: { action?: string }) => ({
+      allowed: true,
+      action: input.action,
+      reason: "allow_explicit_grant",
+      explanation: "Allowed by test grant.",
+    })),
+    hasPermission: vi.fn(async () => true),
+  }),
+  approvalService: () => ({}),
+  builtInAgentService: () => ({ ensureCompanyDefaultAgentGrants: vi.fn() }),
+  companySkillService: () => ({ listRuntimeSkillEntries: vi.fn() }),
+  budgetService: () => ({}),
+  heartbeatService: () => mockHeartbeatService,
+  issueApprovalService: () => ({}),
+  issueService: () => mockIssueService,
+  logActivity: mockLogActivity,
+  secretService: () => ({}),
+  syncInstructionsBundleConfigFromFilePath: vi.fn((_agent: unknown, config: unknown) => config),
+  workspaceOperationService: () => ({}),
+}));
+// The start-route guard reads the login capability from the registry. The
+// `beforeEach` default declares the Claude setup-token capability for
+// `claude_local` and no capability for any other type, so the guard passes for
+// `claude_local` and fails closed for a different adapter through capability
+// data alone.
+vi.mock("../adapters/index.js", () => ({
+  findServerAdapter: vi.fn(),
+  listAdapterModels: vi.fn(),
+  detectAdapterModel: vi.fn(),
+  findActiveServerAdapter: mockFindActiveServerAdapter,
+  requireServerAdapter: vi.fn(),
+}));
 
 function expectNoSecret(text: string): void {
   for (const marker of SECRET_MARKERS) {
@@ -119,74 +193,6 @@ const CLAUDE_LOGIN_CAPABILITY = {
   getCommand: () => "",
   parsePrompt: () => null,
 } as const;
-
-function registerModuleMocks(): void {
-  vi.doMock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
-  vi.doMock("../services/secrets.js", async () => {
-    const actual = await vi.importActual<typeof import("../services/secrets.js")>(
-      "../services/secrets.js",
-    );
-    return { ...actual, secretService: () => mockSecretService };
-  });
-  vi.doMock("../services/agents.js", () => ({ agentService: () => mockAgentService }));
-  vi.doMock("../services/environments.js", () => ({
-    environmentService: () => mockEnvironmentService,
-  }));
-  vi.doMock("../services/plugin-environment-driver.js", async () => {
-    const actual = await vi.importActual<typeof import("../services/plugin-environment-driver.js")>(
-      "../services/plugin-environment-driver.js",
-    );
-    return {
-      ...actual,
-      resolvePluginSandboxProviderDriverByKey: mockResolvePluginSandboxProviderDriverByKey,
-    };
-  });
-  vi.doMock("../services/heartbeat.js", () => ({ heartbeatService: () => mockHeartbeatService }));
-  vi.doMock("../services/instance-settings.js", () => ({
-    instanceSettingsService: () => mockInstanceSettingsService,
-  }));
-  vi.doMock("../services/issues.js", () => ({ issueService: () => mockIssueService }));
-  vi.doMock("../services/run-secret-redaction.js", () => ({
-    createRunSecretRedactionRegistry: () => mockRunSecretRedactionRegistry,
-  }));
-  vi.doMock("../services/index.js", () => ({
-    agentService: () => mockAgentService,
-    agentInstructionsService: () => ({}),
-    accessService: () => ({
-      canUser: vi.fn(async () => true),
-      decide: vi.fn(async (input: { action?: string }) => ({
-        allowed: true,
-        action: input.action,
-        reason: "allow_explicit_grant",
-        explanation: "Allowed by test grant.",
-      })),
-      hasPermission: vi.fn(async () => true),
-    }),
-    approvalService: () => ({}),
-    builtInAgentService: () => ({ ensureCompanyDefaultAgentGrants: vi.fn() }),
-    companySkillService: () => ({ listRuntimeSkillEntries: vi.fn() }),
-    budgetService: () => ({}),
-    heartbeatService: () => mockHeartbeatService,
-    issueApprovalService: () => ({}),
-    issueService: () => mockIssueService,
-    logActivity: mockLogActivity,
-    secretService: () => ({}),
-    syncInstructionsBundleConfigFromFilePath: vi.fn((_agent: unknown, config: unknown) => config),
-    workspaceOperationService: () => ({}),
-  }));
-  // The start-route guard reads the login capability from the registry. The
-  // `beforeEach` default declares the Claude setup-token capability for
-  // `claude_local` and no capability for any other type, so the guard passes for
-  // `claude_local` and fails closed for a different adapter through capability
-  // data alone.
-  vi.doMock("../adapters/index.js", () => ({
-    findServerAdapter: vi.fn(),
-    listAdapterModels: vi.fn(),
-    detectAdapterModel: vi.fn(),
-    findActiveServerAdapter: mockFindActiveServerAdapter,
-    requireServerAdapter: vi.fn(),
-  }));
-}
 
 // The actor the request middleware installs. A test switches the owner id to
 // prove the owner-binding check (SR-3).
@@ -288,6 +294,26 @@ function buildTransport(opts: { onSubmit?: "complete" | "throw" | "pending" } = 
       }
       row.boundAt = Date.now();
       return { ...row };
+    },
+    async cancelDurable(identity, cancellableStates) {
+      const row = rows.get(identity.sessionId);
+      if (!row || !cancellableStates.includes(row.state)) return null;
+      row.state = "cancelled";
+      return { ...row };
+    },
+    async findActiveDurable(key, now) {
+      for (const row of rows.values()) {
+        if (
+          row.companyId === key.companyId &&
+          row.ownerUserId === key.ownerUserId &&
+          row.adapterType === key.adapterType &&
+          !isTerminalSessionState(row.state) &&
+          row.deadline > now
+        ) {
+          return { ...row };
+        }
+      }
+      return null;
     },
   };
   const leases: SetupTokenLeaseManager = {
@@ -445,8 +471,6 @@ async function settle(): Promise<void> {
 }
 
 beforeEach(() => {
-  vi.resetModules();
-  registerModuleMocks();
   vi.clearAllMocks();
   useOwner();
   // The default registry declares the Claude setup-token capability for
@@ -637,6 +661,50 @@ describe("company-and-environment setup-token route — object-level authorizati
     const res = await request(app).get(`${crossCompanyBase}/${sessionId}`).send();
     expect(res.status).toBe(404);
     expect(res.body.error).toBe(SETUP_TOKEN_SESSION_NOT_FOUND);
+  });
+
+  it("returns the caller's active session with no session id in the URL", async () => {
+    const transport = buildTransport({ onSubmit: "pending" });
+    const { app } = await createApp({ transport });
+
+    const startRes = await startCompanySession(app);
+    const sessionId = startRes.body.sessionId as string;
+
+    const active = await request(app).get(`${COMPANY_BASE}/active`).send();
+    expect(active.status, JSON.stringify(active.body)).toBe(200);
+    expect(active.body.sessionId).toBe(sessionId);
+    expect(active.body.status).toBe("waiting_for_user");
+    expect(active.body.panelMode).toBe("submitted_browser_code");
+    // The full login URL rides in this owner response, the same way it rides in
+    // the guarded `.../prompt` response — this is not a public, secret-free
+    // surface, so it is not checked against `expectNoSecret`.
+    expect(active.body.prompt).toEqual({ authorizationUrl: FULL_LOGIN_URL, transportAdvisory: null });
+    expect(active.headers["cache-control"]).toBe("no-store, private");
+  });
+
+  it("returns the identical not-found on the active route for no active session, a cross-owner caller, and a cross-company caller", async () => {
+    const transport = buildTransport({ onSubmit: "pending" });
+    const { app } = await createApp({ transport });
+
+    // No session has started yet.
+    const none = await request(app).get(`${COMPANY_BASE}/active`).send();
+    expect(none.status).toBe(404);
+    expect(none.body.error).toBe(SETUP_TOKEN_SESSION_NOT_FOUND);
+
+    await startCompanySession(app);
+
+    // A different board user in the same company holds no active session.
+    useOwner(OTHER_USER_ID);
+    const otherOwner = await request(app).get(`${COMPANY_BASE}/active`).send();
+    expect(otherOwner.status).toBe(404);
+    expect(otherOwner.body.error).toBe(SETUP_TOKEN_SESSION_NOT_FOUND);
+    useOwner();
+
+    // The same owner under a different company holds no active session there.
+    const crossCompanyBase = `/api/companies/${OTHER_COMPANY_ID}/setup-token-login-sessions`;
+    const otherCompany = await request(app).get(`${crossCompanyBase}/active`).send();
+    expect(otherCompany.status).toBe(404);
+    expect(otherCompany.body.error).toBe(SETUP_TOKEN_SESSION_NOT_FOUND);
   });
 
   it("returns the fixed not-found for a non-member on every action across a company boundary", async () => {

@@ -103,6 +103,15 @@ vi.mock("../services/index.js", () => ({
   workProductService: () => ({}),
 }));
 
+vi.mock("../services/activity-log.js", async () => ({
+  ...await vi.importActual<typeof import("../services/activity-log.js")>("../services/activity-log.js"),
+  persistActivity: async (db: unknown, input: unknown) => {
+    await mockLogActivity(db, input);
+    return { activity: { id: "activity" }, publication: null };
+  },
+  publishActivity: vi.fn(),
+}));
+
 vi.mock("../services/environments.js", () => ({
   environmentService: () => mockEnvironmentService,
 }));
@@ -136,7 +145,7 @@ let issueServer: Server | null = null;
 
 function createProjectApp() {
   projectServer ??= buildApp((expressApp) => {
-    expressApp.use("/api", projectRoutes({} as any));
+    expressApp.use("/api", projectRoutes({ transaction: async (effect: (tx: unknown) => unknown) => effect({}) } as any));
   }).listen(0);
   return projectServer;
 }

@@ -19,6 +19,7 @@ import {
   type SshEnvLabFixtureState,
 } from "./ssh.js";
 import { prepareRemoteManagedRuntime } from "./remote-managed-runtime.js";
+import { deriveAgentGitIdentity } from "./git-identity.js";
 
 const SSH_FIXTURE_TEST_TIMEOUT_MS = 30_000;
 let sshEnvLabUnsupportedReason: string | null = null;
@@ -712,6 +713,28 @@ describe("ssh env-lab fixture", () => {
     expect(result.stdout).toContain("{\"token\":\"secret\"}");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
+  it("clears stale files when plain SSH preparation is retried", async () => {
+    const rootDir = await createFixtureRootDir();
+    const localDir = path.join(rootDir, "plain-local");
+    await mkdir(path.join(localDir, "node_modules"), { recursive: true });
+    await git(localDir, ["init"]);
+    await writeFile(path.join(localDir, ".gitignore"), "node_modules/\n");
+    await writeFile(path.join(localDir, "removed.txt"), "remove on retry");
+    const binary = Buffer.from([0, 255, 1]);
+    await writeFile(path.join(localDir, "node_modules", "personal.bin"), binary);
+    const started = await startSshEnvLabFixtureOrSkip(path.join(rootDir, "state.json"), "SSH plain retry");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const input = { spec: { ...config, remoteCwd: started.workspaceDir }, localDir,
+      remoteDir: started.workspaceDir, workspaceFileMode: "all" as const };
+    expect(await prepareWorkspaceForSshExecution(input)).toEqual({ gitBacked: false });
+    expect(await readFile(path.join(started.workspaceDir, "node_modules", "personal.bin"))).toEqual(binary);
+    await rm(path.join(localDir, "removed.txt"));
+    await prepareWorkspaceForSshExecution(input);
+    await expect(stat(path.join(started.workspaceDir, "removed.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(path.join(started.workspaceDir, "node_modules", "personal.bin"))).toEqual(binary);
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
   it("round-trips a git workspace through the SSH fixture", async () => {
     const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");
@@ -1007,17 +1030,24 @@ describe("ssh env-lab fixture", () => {
       remoteCwd: started.workspaceDir,
     } as const;
 
+    const agent = {
+      id: "558b662c-0f1f-473a-ab7d-d4e56fb3c29b",
+      name: "SSH Fixture Agent",
+      companyId: "d49b266c-50dc-42c5-b45e-308c7f3ffc1f",
+    };
     const preparedA = await prepareRemoteManagedRuntime({
       spec,
       runId: "run-commit-a",
       adapterKey: "test-adapter",
       workspaceLocalDir: localRepo,
+      agent,
     });
     const preparedB = await prepareRemoteManagedRuntime({
       spec,
       runId: "run-commit-b",
       adapterKey: "test-adapter",
       workspaceLocalDir: localRepo,
+      agent,
     });
 
     await runSshCommand(
@@ -1039,6 +1069,10 @@ describe("ssh env-lab fixture", () => {
     await expect(readFile(path.join(localRepo, "run-a.txt"), "utf8")).resolves.toBe("from run a\n");
     await expect(readFile(path.join(localRepo, "run-b.txt"), "utf8")).resolves.toBe("from run b\n");
     expect(await git(localRepo, ["log", "-1", "--pretty=%s"])).toContain("Paperclip SSH sync merge");
+    // The SSH transport threads the run's agent into the sync merge commit.
+    const identity = deriveAgentGitIdentity(agent);
+    expect(await git(localRepo, ["log", "-1", "--pretty=%an|%ae|%cn|%ce"]))
+      .toBe(`${identity.name}|${identity.email}|${identity.name}|${identity.email}`);
 
     const recentSubjects = await git(localRepo, ["log", "--pretty=%s", "-3"]);
     expect(recentSubjects).toContain("remote update a");

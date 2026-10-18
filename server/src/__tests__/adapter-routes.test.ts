@@ -51,14 +51,20 @@ let setOverridePaused: typeof import("../adapters/registry.js").setOverridePause
 let adapterRoutes: typeof import("../routes/adapters.js").adapterRoutes;
 let errorHandler: typeof import("../middleware/index.js").errorHandler;
 
-function registerModuleMocks() {
-  vi.doMock("node:child_process", async () => vi.importActual("node:child_process"));
-  vi.doMock("../adapters/plugin-loader.js", () => mockPluginLoader);
-  vi.doMock("../services/adapter-plugin-store.js", () => mockAdapterPluginStore);
-  vi.doMock("../routes/adapters.js", async () => vi.importActual("../routes/adapters.js"));
-  vi.doMock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
-  vi.doMock("../middleware/index.js", async () => vi.importActual("../middleware/index.js"));
-}
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("node:child_process", async () => vi.importActual("node:child_process"));
+vi.mock("../adapters/plugin-loader.js", () => mockPluginLoader);
+vi.mock("../services/adapter-plugin-store.js", () => mockAdapterPluginStore);
+vi.mock("../routes/adapters.js", async () => vi.importActual("../routes/adapters.js"));
+vi.mock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
+vi.mock("../middleware/index.js", async () => vi.importActual("../middleware/index.js"));
 
 function createApp(
   actorOverrides: Partial<Express.Request["actor"]> = {},
@@ -84,15 +90,6 @@ function createApp(
 
 describe("adapter routes", () => {
   beforeEach(async () => {
-    vi.resetModules();
-    vi.doUnmock("node:child_process");
-    vi.doUnmock("../adapters/registry.js");
-    vi.doUnmock("../adapters/plugin-loader.js");
-    vi.doUnmock("../services/adapter-plugin-store.js");
-    vi.doUnmock("../routes/adapters.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
     mockAdapterPluginStore.listAdapterPlugins.mockReturnValue([]);
     mockAdapterPluginStore.addAdapterPlugin.mockResolvedValue(undefined);
     mockAdapterPluginStore.removeAdapterPlugin.mockReturnValue(false);
@@ -163,8 +160,7 @@ describe("adapter routes", () => {
       .toMatchObject({
         disabled: false,
         capabilities: {
-          supportsInstructionsBundle: false,
-          supportsModelProfiles: false,
+          supportsInstructionsBundle: true,
         },
       });
   });
@@ -332,6 +328,60 @@ describe("adapter routes", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.fields).toEqual([]);
+  });
+
+  it("serves provider-scoped Paperclip Runner configuration fields", async () => {
+    const app = createApp();
+
+    const res = await request(app).get("/api/adapters/paperclip_runner/config-schema");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.fields).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        key: "provider",
+        options: expect.arrayContaining([
+          expect.objectContaining({ value: "codex" }),
+          expect.objectContaining({ value: "opencode" }),
+          expect.objectContaining({ value: "claude_managed" }),
+          expect.objectContaining({ value: "aws_agentcore" }),
+          expect.objectContaining({ value: "acpx" }),
+        ]),
+      }),
+      expect.objectContaining({
+        key: "codexPermissionMode",
+        default: "never",
+        meta: { visibleWhen: { key: "provider", value: "codex" } },
+      }),
+      expect.objectContaining({
+        key: "opencodePermissionMode",
+        default: "allow",
+        meta: { visibleWhen: { key: "provider", value: "opencode" } },
+      }),
+      expect.objectContaining({
+        key: "acpxPermissionMode",
+        default: "approve-all",
+        meta: { visibleWhen: { key: "provider", value: "acpx" } },
+      }),
+      expect.objectContaining({
+        key: "model",
+        meta: { visibleWhen: { key: "provider", value: "opencode" } },
+      }),
+      expect.objectContaining({
+        key: "idleTimeoutMs",
+        meta: { visibleWhen: { key: "lifecycleMode", value: "warm" } },
+      }),
+    ]));
+    const acpxAgent = res.body.fields.find((field: { key?: string }) => field.key === "acpxAgent");
+    expect(acpxAgent).toMatchObject({
+      type: "select",
+      default: "claude",
+      meta: { visibleWhen: { key: "provider", value: "acpx" } },
+      options: [
+        { value: "claude", label: "Claude" },
+        { value: "grok", label: "Grok Build" },
+      ],
+    });
+    expect(JSON.stringify(res.body)).not.toContain("Codex via ACPX");
   });
 
   it("serves the built-in claude_local ACP engine config schema", async () => {

@@ -15,7 +15,7 @@ import { trackRoutineCreated } from "@paperclipai/shared/telemetry";
 import { validate, validateIssueMutationBody } from "../middleware/validate.js";
 import { accessService, documentAnnotationService, logActivity, routineService } from "../services/index.js";
 import { assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
-import { forbidden, unauthorized } from "../errors.js";
+import { badRequest, forbidden, unauthorized, unsupportedMediaType } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
@@ -112,9 +112,40 @@ export function routineRoutes(
     if (req.actor.type === "board") return routine;
     if (req.actor.type !== "agent" || !req.actor.agentId) throw unauthorized();
     if (routine.assigneeAgentId !== req.actor.agentId) {
-      throw forbidden("Agents can only manage routines assigned to themselves");
+      // An explicit `routines:manage` grant (optionally scoped to the routine
+      // assignee via targetAgentIds) lets an agent manage routines assigned to
+      // other agents in its own company. Re-assignment stays self-only (see
+      // PATCH below) and activation still needs tasks:assign.
+      const decision = await access.decide({
+        actor: req.actor,
+        action: "routines:manage",
+        resource: { type: "agent", companyId: routine.companyId, agentId: routine.assigneeAgentId },
+        scope: { targetAgentId: routine.assigneeAgentId },
+      });
+      if (!decision.allowed) {
+        throw forbidden("Agents can only manage routines assigned to themselves");
+      }
     }
     return routine;
+  }
+
+  // A routines:manage grantee that starts work for another agent (activate,
+  // manual run, trigger create, trigger re-enable) also needs task-assignment
+  // authority over that agent. No-op for the assignee itself and for board.
+  async function assertAgentMayStartWorkFor(
+    req: Request,
+    routine: { companyId: string; assigneeAgentId: string | null },
+  ) {
+    if (req.actor.type !== "agent" || routine.assigneeAgentId === req.actor.agentId) return;
+    const assignDecision = await access.decide({
+      actor: req.actor,
+      action: "tasks:assign",
+      resource: { type: "issue", companyId: routine.companyId, assigneeAgentId: routine.assigneeAgentId },
+      scope: { assigneeAgentId: routine.assigneeAgentId },
+    });
+    if (!assignDecision.allowed) {
+      throw forbidden("Missing permission: tasks:assign");
+    }
   }
 
   async function logRoutineRevisionCreated(req: Request, input: {
@@ -378,11 +409,16 @@ export function routineRoutes(
       routine.status !== "active";
     if (statusWillActivate) {
       await assertBoardCanAssignTasks(req, routine.companyId);
+      await assertAgentMayStartWorkFor(req, routine);
     }
     if (
       req.actor.type === "agent" &&
       req.body.assigneeAgentId !== undefined &&
-      req.body.assigneeAgentId !== req.actor.agentId
+      req.body.assigneeAgentId !== routine.assigneeAgentId &&
+      // A routines:manage grantee may echo the unchanged assignee; it may not
+      // move the routine to any agent, itself included. Only the current
+      // assignee may (re)assign to itself, as before.
+      (req.body.assigneeAgentId !== req.actor.agentId || routine.assigneeAgentId !== req.actor.agentId)
     ) {
       throw forbidden("Agents can only assign routines to themselves");
     }
@@ -468,6 +504,7 @@ export function routineRoutes(
       return;
     }
     await assertBoardCanAssignTasks(req, routine.companyId);
+    await assertAgentMayStartWorkFor(req, routine);
     const created = await svc.createTrigger(routine.id, req.body, {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
@@ -509,6 +546,9 @@ export function routineRoutes(
       return;
     }
     await assertBoardCanAssignTasks(req, routine.companyId);
+    if (req.body.enabled === true) {
+      await assertAgentMayStartWorkFor(req, routine);
+    }
     const updated = await svc.updateTrigger(trigger.id, req.body, {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
@@ -522,10 +562,10 @@ export function routineRoutes(
       agentId: actor.agentId,
       runId: actor.runId,
       agentApiKeyId: actor.agentApiKeyId,
-      action: "routine.trigger_updated",
-      entityType: "routine_trigger",
-      entityId: trigger.id,
-      details: { routineId: routine.id, kind: updated?.trigger.kind ?? trigger.kind },
+      action: req.body.archived === true ? "routine.trigger_removed" : req.body.archived === false ? "routine.trigger_restored" : req.body.setupPending === false ? "routine.trigger_setup_finished" : "routine.trigger_updated",
+      entityType: "routine",
+      entityId: routine.id,
+      details: { triggerId: trigger.id, kind: updated?.trigger.kind ?? trigger.kind },
     });
     if (updated) {
       await logRoutineRevisionCreated(req, {
@@ -596,6 +636,9 @@ export function routineRoutes(
         res.status(404).json({ error: "Routine trigger not found" });
         return;
       }
+      // A fresh webhook secret is a capability to fire the trigger (which
+      // starts work for the assignee), so rotation needs tasks:assign too.
+      await assertAgentMayStartWorkFor(req, routine);
       const rotated = await svc.rotateTriggerSecret(trigger.id, {
         agentId: req.actor.type === "agent" ? req.actor.agentId : null,
         userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
@@ -633,6 +676,7 @@ export function routineRoutes(
       return;
     }
     await assertBoardCanAssignTasks(req, routine.companyId);
+    await assertAgentMayStartWorkFor(req, routine);
     const run = await svc.runRoutine(routine.id, req.body, {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? null : null,
@@ -654,12 +698,19 @@ export function routineRoutes(
   });
 
   router.post("/routine-triggers/public/:publicId/fire", async (req, res) => {
+    if (!req.is("application/json")) {
+      throw unsupportedMediaType("Send the webhook payload with Content-Type: application/json");
+    }
+    if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
+      throw badRequest("Webhook payload must be a JSON object");
+    }
     const result = await svc.firePublicTrigger(req.params.publicId as string, {
       authorizationHeader: req.header("authorization"),
       signatureHeader: req.header("x-paperclip-signature"),
       hubSignatureHeader: req.header("x-hub-signature-256"),
+      firefliesSignatureHeader: req.header("x-hub-signature"),
       timestampHeader: req.header("x-paperclip-timestamp"),
-      idempotencyKey: req.header("idempotency-key"),
+      idempotencyKey: req.header("idempotency-key") ?? req.header("x-github-delivery"),
       rawBody: (req as { rawBody?: Buffer }).rawBody ?? null,
       payload: typeof req.body === "object" && req.body !== null ? req.body as Record<string, unknown> : null,
     });

@@ -29,6 +29,7 @@ vi.mock("../middleware/logger.js", () => {
 import { logger } from "../middleware/logger.js";
 import {
   appendStderrExcerpt,
+  createDuplexRouteSlotController,
   createBoundedFrameReader,
   createPluginWorkerHandle,
   createPluginWorkerManager,
@@ -352,6 +353,8 @@ describe("plugin-worker-manager stderr failure context", () => {
             runId: "run-1",
             agentId: "agent-1",
           },
+          // Host-minted from its own dispatch record, never from worker params.
+          invocationDispatchMethod: "performAction",
           serviceScope: { runId: expect.any(String) },
         },
       );
@@ -393,6 +396,7 @@ describe("plugin-worker-manager stderr failure context", () => {
         { companyId: "company-1" },
         {
           invocationScope: { companyId: "company-1" },
+          invocationDispatchMethod: "getData",
           serviceScope: { runId: expect.any(String) },
         },
       );
@@ -1902,24 +1906,21 @@ describe("plugin worker manager setup-token pty route gate", () => {
     }
   }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
 
-  it("permits one active credential pseudo-terminal per worker", async () => {
+  it("permits two concurrent credential pseudo-terminals on one worker", async () => {
     const handle = makeLoginPtyHandle();
     try {
       await handle.start();
+      // Neither open waits on the other. Both return a live route on the same
+      // worker, so a second owner is never blocked by a first owner's session.
       const first = await handle.openLoginPtySession(
-        ptyOpenInput({ mode: "normal" }),
+        ptyOpenInput({ mode: "normal", workerSessionId: "ws-A" }),
       );
-      // A second open while the first route is not closed rejects with one fixed
-      // non-secret error before it reaches the worker.
-      await expect(
-        handle.openLoginPtySession(ptyOpenInput({ mode: "normal" })),
-      ).rejects.toThrow("LOGIN_PTY_ROUTE_BUSY");
-      await first.close();
-      // After the first route closes and the worker acknowledges the close, a new
-      // open is admitted.
       const second = await handle.openLoginPtySession(
-        ptyOpenInput({ mode: "normal" }),
+        ptyOpenInput({ mode: "normal", workerSessionId: "ws-B" }),
       );
+      expect(first).toBeDefined();
+      expect(second).toBeDefined();
+      await first.close();
       await second.close();
     } finally {
       await handle.stop().catch(() => undefined);
@@ -2062,20 +2063,20 @@ describe("plugin worker manager setup-token pty route gate", () => {
     try {
       await handle.start();
       const session = await handle.openLoginPtySession(
-        ptyOpenInput({
-          outputs: [
-            { chunk: "aaaaa" }, // total 5 → delivered
-            { chunk: "bbbbb" }, // total 10 → delivered
-            { chunk: "ccccc" }, // total 15 > 10 → terminalize
-          ],
-        }),
+        ptyOpenInput({ mode: "normal" }),
       );
       const chunks: string[] = [];
       session.onData((chunk) => chunks.push(chunk));
+      // Each empty input produces the five-character `echo:` chunk. Attach the
+      // listener first, then drive exactly two accepted chunks and one overflow
+      // so process scheduling cannot move output ahead of listener registration.
+      session.write("");
+      session.write("");
+      session.write("");
       // The per-route bound terminalizes the route, so the login wait resolves
       // with a null exit code and the third chunk never reaches the listener.
       await expect(session.wait()).resolves.toEqual({ exitCode: null });
-      expect(chunks).toEqual(["aaaaa", "bbbbb"]);
+      expect(chunks).toEqual(["echo:", "echo:"]);
     } finally {
       await handle.stop().catch(() => undefined);
     }
@@ -2219,7 +2220,530 @@ describe("plugin worker manager setup-token pty route gate", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Login pseudo-terminal pre-bind queue (GH #12122 / PAP-5132)
+// Login pseudo-terminal concurrency
+// ---------------------------------------------------------------------------
+// One shared plugin worker now holds more than one live login pseudo-terminal
+// route at once, so a second owner is never blocked by a first owner's
+// session. The host resolves an output or an exit notification by the host
+// route identifier first, then checks the bound worker session identifier,
+// so each route receives only its own data even while another route on the
+// same worker is live.
+
+describe("plugin worker manager login pseudo-terminal concurrency", () => {
+  it("delivers output to each concurrent route only, with no cross-talk", async () => {
+    const handle = makeLoginPtyHandle();
+    try {
+      await handle.start();
+      const routeA = await handle.openLoginPtySession(
+        ptyOpenInput({
+          workerSessionId: "ws-A",
+          outputs: [{ chunk: "a-1" }],
+          exitCode: 0,
+        }),
+      );
+      const routeB = await handle.openLoginPtySession(
+        ptyOpenInput({
+          workerSessionId: "ws-B",
+          outputs: [{ chunk: "b-1" }],
+          exitCode: 0,
+        }),
+      );
+      const aChunks: string[] = [];
+      const bChunks: string[] = [];
+      routeA.onData((chunk) => aChunks.push(chunk));
+      routeB.onData((chunk) => bChunks.push(chunk));
+      await expect(routeA.wait()).resolves.toEqual({ exitCode: 0 });
+      await expect(routeB.wait()).resolves.toEqual({ exitCode: 0 });
+      // The host resolves each notification by its own host route identifier, so
+      // neither route ever sees the other's chunk.
+      expect(aChunks).toEqual(["a-1"]);
+      expect(bChunks).toEqual(["b-1"]);
+      await routeA.close();
+      await routeB.close();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("settles the exit of one route only, while a second concurrent route stays live", async () => {
+    const handle = makeLoginPtyHandle();
+    try {
+      await handle.start();
+      const routeA = await handle.openLoginPtySession(
+        ptyOpenInput({ workerSessionId: "ws-A" }),
+      );
+      const routeB = await handle.openLoginPtySession(
+        ptyOpenInput({ workerSessionId: "ws-B", exitCode: 0 }),
+      );
+      await expect(routeB.wait()).resolves.toEqual({ exitCode: 0 });
+      // Route A never received an exit, so its wait is still pending. Race it
+      // against a short delay to prove it has not settled.
+      const stillPending = await Promise.race([
+        routeA.wait().then(() => "settled"),
+        new Promise((resolve) => setTimeout(() => resolve("pending"), 50)),
+      ]);
+      expect(stillPending).toBe("pending");
+      await routeA.close();
+      await routeB.close();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("drops a swapped (hostRouteId, workerSessionId) notification and delivers it to neither route", async () => {
+    const handle = makeLoginPtyHandle();
+    try {
+      await handle.start();
+      const routeA = await handle.openLoginPtySession(
+        ptyOpenInput({ workerSessionId: "ws-A" }),
+      );
+      // Route B emits one output that carries route A's host route identifier
+      // but route B's own worker session identifier — a swapped pair. The host
+      // resolves route A by the host route identifier, then finds route B's
+      // worker session identifier does not match route A's bound identifier,
+      // so it drops the notification. It never reaches route A, and route B
+      // never sent it under its own host route identifier, so it never
+      // reaches route B either.
+      const routeB = await handle.openLoginPtySession(
+        ptyOpenInput({
+          workerSessionId: "ws-B",
+          outputs: [{ chunk: "swapped", crossRoute: true }],
+        }),
+      );
+      const aChunks: string[] = [];
+      const bChunks: string[] = [];
+      routeA.onData((chunk) => aChunks.push(chunk));
+      routeB.onData((chunk) => bChunks.push(chunk));
+      // Give the swapped notification time to arrive and be dropped.
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      expect(aChunks).toEqual([]);
+      expect(bChunks).toEqual([]);
+      await routeA.close();
+      await routeB.close();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("drops an output notification for an unknown host route identifier", async () => {
+    const handle = makeLoginPtyHandle();
+    try {
+      await handle.start();
+      const session = await handle.openLoginPtySession(
+        ptyOpenInput({
+          workerSessionId: "ws-A",
+          sequence: [
+            { type: "output", chunk: "ghost", hostRouteId: "totally-unknown-route" },
+            { type: "output", chunk: "good" },
+          ],
+        }),
+      );
+      const chunks: string[] = [];
+      session.onData((chunk) => chunks.push(chunk));
+      await vi.waitFor(() => expect(chunks).toContain("good"));
+      // The unknown host route identifier resolves to no route on this worker,
+      // so the host drops it before it can reach any listener.
+      expect(chunks).toEqual(["good"]);
+      await session.close();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("replays a pre-bind output record to its own route while a second route is already open", async () => {
+    const handle = makeLoginPtyHandle();
+    try {
+      await handle.start();
+      const routeA = await handle.openLoginPtySession(
+        ptyOpenInput({ workerSessionId: "ws-A" }),
+      );
+      // Route B's fixture writes its open reply and its output notification in
+      // one stdout write, so the host reads both before route B's bind, while
+      // route A is already open. The bind replays the held record into route
+      // B's own queue; it never reaches route A.
+      const routeB = await handle.openLoginPtySession(
+        ptyOpenInput({
+          batchWithOpenReply: true,
+          workerSessionId: "ws-B",
+          outputs: [{ chunk: "b-batched" }],
+        }),
+      );
+      const aChunks: string[] = [];
+      const bChunks: string[] = [];
+      routeA.onData((chunk) => aChunks.push(chunk));
+      routeB.onData((chunk) => bChunks.push(chunk));
+      expect(aChunks).toEqual([]);
+      expect(bChunks).toEqual(["b-batched"]);
+      await routeA.close();
+      await routeB.close();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("closes one route without affecting a second concurrent route on the same worker", async () => {
+    const handle = makeLoginPtyHandle();
+    try {
+      await handle.start();
+      const routeA = await handle.openLoginPtySession(
+        ptyOpenInput({ workerSessionId: "ws-A" }),
+      );
+      const routeB = await handle.openLoginPtySession(
+        ptyOpenInput({ workerSessionId: "ws-B" }),
+      );
+      await routeA.close();
+      // Route B is still live: writing to it still round-trips through the
+      // worker and back to the listener.
+      const bChunks: string[] = [];
+      routeB.onData((chunk) => bChunks.push(chunk));
+      routeB.write("still-here");
+      await vi.waitFor(() => expect(bChunks).toContain("echo:still-here"));
+      await routeB.close();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("settles both concurrent routes exactly once when the worker exits", async () => {
+    const handle = makeLoginPtyHandle();
+    try {
+      await handle.start();
+      const routeA = await handle.openLoginPtySession(
+        ptyOpenInput({ workerSessionId: "ws-A" }),
+      );
+      const routeB = await handle.openLoginPtySession(
+        ptyOpenInput({ workerSessionId: "ws-B" }),
+      );
+      const waitA = routeA.wait();
+      const waitB = routeB.wait();
+      await handle.stop();
+      // The worker exit closes every route it still holds and resolves each
+      // login wait with the fixed non-secret exit, in one sweep.
+      await expect(waitA).resolves.toEqual({ exitCode: null });
+      await expect(waitB).resolves.toEqual({ exitCode: null });
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("retires the worker on an unconfirmed close, settling every concurrent route and logging no raw output", async () => {
+    const handle = makeLoginPtyHandle({
+      loginPtyLimits: { closeTimeoutMs: 200 },
+    });
+    const secretMarker = "super-secret-login-code-must-never-reach-a-log-line";
+    vi.mocked(logger.warn).mockClear();
+    vi.mocked(logger.error).mockClear();
+    vi.mocked(logger.info).mockClear();
+    vi.mocked(logger.debug).mockClear();
+    try {
+      await handle.start();
+      const exited = new Promise<void>((resolve) => {
+        handle.on("exit", () => resolve());
+      });
+      const routeA = await handle.openLoginPtySession(
+        ptyOpenInput({ workerSessionId: "ws-A", closeMode: "bad-ack" }),
+      );
+      const routeB = await handle.openLoginPtySession(
+        ptyOpenInput({ workerSessionId: "ws-B", outputs: [{ chunk: secretMarker }] }),
+      );
+      const waitB = routeB.wait();
+      await routeA.close();
+      // Route A's close acknowledgement carried a mismatched host route id, so
+      // the host fails closed and retires the whole worker before any reuse.
+      // That retirement settles route B too, even though B's own close was
+      // never called.
+      await exited;
+      await expect(waitB).resolves.toEqual({ exitCode: null });
+      await expect(
+        handle.openLoginPtySession(ptyOpenInput({ mode: "normal" })),
+      ).rejects.toThrow();
+      const loggedText = [
+        ...vi.mocked(logger.warn).mock.calls,
+        ...vi.mocked(logger.error).mock.calls,
+        ...vi.mocked(logger.info).mock.calls,
+        ...vi.mocked(logger.debug).mock.calls,
+      ]
+        .flat()
+        .map((arg) => JSON.stringify(arg))
+        .join("\n");
+      expect(loggedText).not.toContain(secretMarker);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The missing-hostRouteId diagnostic. `hostRouteId` is the routing key the
+// current protocol tags every login pseudo-terminal notification with, but a
+// plugin build old enough to predate it still tags the same notification with
+// the worker session identifier, the sole routing key the previous protocol
+// used. The host warns once about the old build, then still resolves the
+// route by that identifier, so a legacy worker keeps its login output and its
+// exit notification instead of losing them.
+// ---------------------------------------------------------------------------
+
+describe("plugin worker manager login pseudo-terminal missing hostRouteId diagnostic", () => {
+  it("delivers output from a legacy worker with no hostRouteId, resolved by the worker session id, and warns once", async () => {
+    const handle = makeLoginPtyHandle();
+    vi.mocked(logger.warn).mockClear();
+    try {
+      await handle.start();
+      const chunks: string[] = [];
+      const route = await handle.openLoginPtySession(
+        ptyOpenInput({
+          workerSessionId: "ws-A",
+          emitOnInput: true,
+          outputs: [{ chunk: "legacy-output", omitHostRouteId: true }],
+        }),
+      );
+      route.onData((chunk) => chunks.push(chunk));
+      // Legacy notifications require the open reply to bind the worker ID.
+      route.write("emit-scripted-output");
+      await vi.waitFor(() => expect(chunks).toContain("legacy-output"));
+
+      const warnCalls = vi.mocked(logger.warn).mock.calls.flat().map((arg) => JSON.stringify(arg));
+      const matches = warnCalls.filter((call) => call.includes("hostRouteId"));
+      expect(matches).toHaveLength(1);
+      expect(matches[0]).toContain("plugin build is too old");
+      // No identifier and no raw output in the warning.
+      expect(matches[0]).not.toContain("legacy-output");
+      expect(matches[0]).not.toContain("ws-A");
+
+      await route.close();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("settles the login wait on a legacy worker's exit notification with no hostRouteId", async () => {
+    const handle = makeLoginPtyHandle();
+    try {
+      await handle.start();
+      const route = await handle.openLoginPtySession(
+        ptyOpenInput({ workerSessionId: "ws-A", exitCode: 0, omitHostRouteIdOnExit: true, emitOnInput: true }),
+      );
+      route.write("emit-scripted-exit");
+      await expect(route.wait()).resolves.toEqual({ exitCode: 0 });
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("repeats the warning no more than one time for one worker", async () => {
+    const handle = makeLoginPtyHandle();
+    vi.mocked(logger.warn).mockClear();
+    try {
+      await handle.start();
+      const route = await handle.openLoginPtySession(
+        ptyOpenInput({
+          workerSessionId: "ws-A",
+          outputs: [
+            { chunk: "one", omitHostRouteId: true },
+            { chunk: "two", omitHostRouteId: true },
+            { chunk: "three", omitHostRouteId: true },
+          ],
+        }),
+      );
+      // Give every notification time to arrive.
+      await new Promise((resolve) => setTimeout(resolve, 60));
+
+      const warnCalls = vi.mocked(logger.warn).mock.calls.flat().map((arg) => JSON.stringify(arg));
+      const matches = warnCalls.filter((call) => call.includes("hostRouteId"));
+      expect(matches).toHaveLength(1);
+
+      await route.close();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("drops a message with no hostRouteId and no worker session id", async () => {
+    const handle = makeLoginPtyHandle();
+    try {
+      await handle.start();
+      const chunks: string[] = [];
+      const route = await handle.openLoginPtySession(
+        ptyOpenInput({
+          workerSessionId: "ws-A",
+          outputs: [
+            { chunk: "unroutable", omitHostRouteId: true, sid: "" },
+            { chunk: "good" },
+          ],
+        }),
+      );
+      route.onData((chunk) => chunks.push(chunk));
+      await vi.waitFor(() => expect(chunks).toContain("good"));
+      expect(chunks).toEqual(["good"]);
+      await route.close();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("drops a no-hostRouteId message naming a concurrent route's session instead of cross-delivering it", async () => {
+    const handle = makeLoginPtyHandle();
+    try {
+      await handle.start();
+      // Two live routes share this worker. A worker session id alone cannot
+      // prove which route a hostRouteId-less message belongs to once a
+      // second route is live, so the fallback must refuse to guess.
+      const first = await handle.openLoginPtySession(
+        ptyOpenInput({ workerSessionId: "ws-A" }),
+      );
+      const second = await handle.openLoginPtySession(
+        ptyOpenInput({
+          workerSessionId: "ws-B",
+          outputs: [{ chunk: "cross-route", sid: "ws-A", omitHostRouteId: true }],
+        }),
+      );
+      const firstChunks: string[] = [];
+      const secondChunks: string[] = [];
+      first.onData((chunk) => firstChunks.push(chunk));
+      second.onData((chunk) => secondChunks.push(chunk));
+      // Give the ambiguous notification time to arrive and be dropped.
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      expect(firstChunks).toEqual([]);
+      expect(secondChunks).toEqual([]);
+
+      await first.close();
+      await second.close();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The process-wide login pseudo-terminal route ceiling. A host process can
+// run only so many concurrent login pseudo-terminal routes before the
+// underlying resources are exhausted, so the ceiling protects the host
+// process itself, not one user or one worker.
+// ---------------------------------------------------------------------------
+// Every login pseudo-terminal route reserves one slot from the same
+// process-wide aggregate route-slot controller the duplex channel route
+// uses (`createDuplexRouteSlotController`), so the two route types share one
+// ceiling. This is a host-process safety ceiling across every worker in the
+// process, not a per-user or a per-worker quota.
+
+describe("plugin worker manager login pseudo-terminal route ceiling", () => {
+  it("rejects the second open with the fixed capacity error before the worker call, when the process-wide ceiling is full", async () => {
+    // A process-scoped ceiling of one slot. The manager injects one shared
+    // controller into every worker; the test injects a small one directly —
+    // the same controller shape the duplex channel route shares.
+    const handle = makeLoginPtyHandle({
+      duplexRouteSlots: createDuplexRouteSlotController(1),
+      loginPtyLimits: { openTimeoutMs: 300 },
+    });
+    try {
+      await handle.start();
+      const first = await handle.openLoginPtySession(
+        ptyOpenInput({ workerSessionId: "ws-A" }),
+      );
+      const startedAt = Date.now();
+      // The refused open scripts `no-open-reply`: if it wrongly reached the
+      // worker, the promise would only settle after the 300ms open timeout,
+      // and with a different, timeout-shaped error — not the capacity error.
+      // A fast rejection with the exact capacity error proves the worker
+      // never received this open's request.
+      await expect(
+        handle.openLoginPtySession(
+          ptyOpenInput({ workerSessionId: "ws-B", mode: "no-open-reply" }),
+        ),
+      ).rejects.toThrow("LOGIN_PTY_ROUTES_AT_CAPACITY");
+      expect(Date.now() - startedAt).toBeLessThan(150);
+      await first.close();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("admits a later open after the first route closes and releases its slot", async () => {
+    const handle = makeLoginPtyHandle({
+      duplexRouteSlots: createDuplexRouteSlotController(1),
+    });
+    try {
+      await handle.start();
+      const first = await handle.openLoginPtySession(
+        ptyOpenInput({ workerSessionId: "ws-A" }),
+      );
+      await expect(
+        handle.openLoginPtySession(ptyOpenInput({ workerSessionId: "ws-B" })),
+      ).rejects.toThrow("LOGIN_PTY_ROUTES_AT_CAPACITY");
+      // Closing the first route releases its slot, so a later open is admitted.
+      await first.close();
+      const second = await handle.openLoginPtySession(
+        ptyOpenInput({ workerSessionId: "ws-C" }),
+      );
+      await second.close();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("admits a later open on a different worker after a worker exit releases the shared slot", async () => {
+    // One shared controller instance, the same shape the manager injects into
+    // every worker handle, so both handles below draw from the SAME ceiling.
+    const sharedSlots = createDuplexRouteSlotController(1);
+    const handle = makeLoginPtyHandle({ duplexRouteSlots: sharedSlots });
+    const secondHandle = makeLoginPtyHandle({ duplexRouteSlots: sharedSlots });
+    try {
+      await handle.start();
+      const first = await handle.openLoginPtySession(
+        ptyOpenInput({ workerSessionId: "ws-A" }),
+      );
+      const waitResult = first.wait();
+      await handle.stop();
+      // The worker exit settles the route and releases its slot.
+      await expect(waitResult).resolves.toEqual({ exitCode: null });
+      // Before the release, a second worker's open against the same shared
+      // ceiling would have rejected with the capacity error. After the
+      // release, the shared ceiling of one admits a fresh open on a
+      // different worker.
+      await secondHandle.start();
+      const second = await secondHandle.openLoginPtySession(
+        ptyOpenInput({ workerSessionId: "ws-B" }),
+      );
+      await second.close();
+    } finally {
+      await handle.stop().catch(() => undefined);
+      await secondHandle.stop().catch(() => undefined);
+    }
+  });
+
+  it("releases exactly one slot when a route's terminal exit is followed by an explicit close", async () => {
+    // A double release (once on the terminal exit, once on the later close)
+    // would let a third open through a ceiling of one before its true
+    // capacity. This test proves the ceiling still holds after both events.
+    const handle = makeLoginPtyHandle({
+      duplexRouteSlots: createDuplexRouteSlotController(1),
+    });
+    try {
+      await handle.start();
+      const first = await handle.openLoginPtySession(
+        ptyOpenInput({ workerSessionId: "ws-A", exitCode: 0 }),
+      );
+      await expect(first.wait()).resolves.toEqual({ exitCode: 0 });
+      // The terminal exit already released the one slot. A second open now
+      // succeeds, consuming that same slot.
+      const second = await handle.openLoginPtySession(
+        ptyOpenInput({ workerSessionId: "ws-B" }),
+      );
+      // The explicit close on the first (already-exited) route must not
+      // release a second slot it no longer holds.
+      await first.close();
+      await expect(
+        handle.openLoginPtySession(ptyOpenInput({ workerSessionId: "ws-C" })),
+      ).rejects.toThrow("LOGIN_PTY_ROUTES_AT_CAPACITY");
+      await second.close();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Login pseudo-terminal pre-bind queue
 // ---------------------------------------------------------------------------
 // The host reads the worker pipe and `readline` dispatches every line of one
 // chunk synchronously. The route only becomes `open` inside the `await`
@@ -2737,6 +3261,585 @@ describe("plugin worker manager login pseudo-terminal pre-bind queue", () => {
         .map((arg) => JSON.stringify(arg))
         .join("\n");
       expect(loggedText).not.toContain(secretMarker);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stream attribution: pinned out-of-dispatch emits
+// ---------------------------------------------------------------------------
+
+const STREAM_PIN_WORKER_ENTRYPOINT = path.join(FIXTURES_DIR, "plugin-worker-stream-pin.cjs");
+
+/**
+ * performAction with a company-scoped actorContext derives an invocation
+ * scope, so stream notifications the fixture sends while servicing it echo
+ * the host-minted paperclipInvocation and resolve to that company. After the
+ * call settles the invocation is cleared — later fixture notifications are
+ * id-less with nothing in flight (the async-loop shape).
+ */
+function companyAction(params: Record<string, unknown>, companyId: string) {
+  return {
+    key: "probe",
+    params,
+    actorContext: {
+      type: "agent",
+      userId: null,
+      agentId: "agent-1",
+      runId: "run-1",
+      companyId,
+    },
+    renderEnvironment: null,
+  } as unknown as HostToWorkerMethods["performAction"][0];
+}
+
+function streamChannels(callback: ReturnType<typeof vi.fn>) {
+  return callback.mock.calls.map(
+    (call) =>
+      `${call[0]}:${(call[1] as { channel?: string }).channel}:${
+        (call[1] as { companyId?: string }).companyId
+      }`,
+  );
+}
+
+describe("plugin stream attribution: pinned out-of-dispatch emits", () => {
+  function makePinHandle(onStreamNotification: ReturnType<typeof vi.fn>) {
+    return createPluginWorkerHandle("test.plugin", {
+      entrypointPath: STREAM_PIN_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: {},
+      onStreamNotification: onStreamNotification as unknown as (
+        method: string,
+        params: Record<string, unknown>,
+      ) => void,
+    });
+  }
+
+  it("forwards an out-of-dispatch emit for a channel pinned at an attributed open", async () => {
+    const onStreamNotification = vi.fn();
+    const handle = makePinHandle(onStreamNotification);
+    try {
+      await handle.start();
+
+      // Open inside a company-1 dispatch: forwarded and pinned.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "open-in-dispatch", channel: "printer-status", companyId: "company-1" },
+          "company-1",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(streamChannels(onStreamNotification)).toEqual(["streams.open:printer-status:company-1"]);
+
+      // Emit after the dispatch settled (id-less, nothing in flight): the pin
+      // attributes it — the event must LAND, not silently vanish.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "emit", channel: "printer-status", companyId: "company-1", event: { type: "status" } },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(streamChannels(onStreamNotification)).toEqual([
+        "streams.open:printer-status:company-1",
+        "streams.emit:printer-status:company-1",
+      ]);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("drops an out-of-dispatch emit for an unpinned channel with a plugin-visible signal", async () => {
+    const onStreamNotification = vi.fn();
+    const handle = makePinHandle(onStreamNotification);
+    try {
+      await handle.start();
+
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "emit", channel: "never-opened", companyId: "company-1" },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(onStreamNotification).not.toHaveBeenCalled();
+
+      // The drop is reported back to the worker (streams.dropped), never silent.
+      const drops = await handle.call("performAction", companyAction(
+        { scenario: "report-drops" },
+        "",
+      ));
+      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
+        { method: "streams.emit", channel: "never-opened", companyId: "company-1", reason: "unpinned_channel" },
+      ]);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("drops an out-of-dispatch emit whose company mismatches the pin", async () => {
+    const onStreamNotification = vi.fn();
+    const handle = makePinHandle(onStreamNotification);
+    try {
+      await handle.start();
+
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "open-in-dispatch", channel: "printer-status", companyId: "company-1" },
+          "company-1",
+        )),
+      ).resolves.toEqual({ ok: true });
+
+      // Cross-tenant attempt: the channel is pinned to company-1, the emit
+      // claims company-2 — fail closed with a visible signal.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "emit", channel: "printer-status", companyId: "company-2" },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(streamChannels(onStreamNotification)).toEqual(["streams.open:printer-status:company-1"]);
+
+      const drops = await handle.call("performAction", companyAction({ scenario: "report-drops" }, ""));
+      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
+        { method: "streams.emit", channel: "printer-status", companyId: "company-2", reason: "pin_mismatch" },
+      ]);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("clears the pin on close so later emits are dropped with a signal", async () => {
+    const onStreamNotification = vi.fn();
+    const handle = makePinHandle(onStreamNotification);
+    try {
+      await handle.start();
+
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "open-in-dispatch", channel: "printer-status", companyId: "company-1" },
+          "company-1",
+        )),
+      ).resolves.toEqual({ ok: true });
+
+      // Out-of-dispatch close matching the pin: forwarded, pin cleared.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "close", channel: "printer-status", companyId: "company-1" },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(streamChannels(onStreamNotification)).toEqual([
+        "streams.open:printer-status:company-1",
+        "streams.close:printer-status:company-1",
+      ]);
+
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "emit", channel: "printer-status", companyId: "company-1" },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(streamChannels(onStreamNotification)).toHaveLength(2);
+
+      const drops = await handle.call("performAction", companyAction({ scenario: "report-drops" }, ""));
+      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
+        { method: "streams.emit", channel: "printer-status", companyId: "company-1", reason: "unpinned_channel" },
+      ]);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("never pins from an id-less open during another company's dispatch", async () => {
+    const onStreamNotification = vi.fn();
+    const handle = makePinHandle(onStreamNotification);
+    try {
+      await handle.start();
+
+      // Legacy worker shape: the open carries no paperclipInvocationId while a
+      // company-2 dispatch is in flight. The single-in-flight heuristic must
+      // NOT be trusted for pin capture — fail closed.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "open-idless", channel: "legacy-ch", companyId: "company-2" },
+          "company-2",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(onStreamNotification).not.toHaveBeenCalled();
+
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "emit", channel: "legacy-ch", companyId: "company-2" },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(onStreamNotification).not.toHaveBeenCalled();
+
+      const drops = await handle.call("performAction", companyAction({ scenario: "report-drops" }, ""));
+      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
+        { method: "streams.open", channel: "legacy-ch", companyId: "company-2", reason: "invalid_invocation_scope" },
+        { method: "streams.emit", channel: "legacy-ch", companyId: "company-2", reason: "unpinned_channel" },
+      ]);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("never pins or delivers via proactive scope: id-less streams.* naming a proactively configured company drop with a signal", async () => {
+    const onStreamNotification = vi.fn();
+    // The proactive allowlist is the second would-be attribution source the
+    // pin design must not trust: a proactive scope is a timer/loop
+    // authorization, not a host-validated dispatch.
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: STREAM_PIN_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: {},
+      proactiveCompanyScopes: ["proactive-co"],
+      onStreamNotification: onStreamNotification as unknown as (
+        method: string,
+        params: Record<string, unknown>,
+      ) => void,
+    });
+    try {
+      await handle.start();
+
+      // The trap dispatch derives no invocation scope (empty actorContext
+      // companyId), so its host→worker request pends WITHOUT an invocation
+      // while the fixture sends id-less streams.* naming the proactively
+      // configured company. Proactive resolution must not apply to
+      // streams.*: no pin, no publish, every notification dropped loudly.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "pin-proactive-trap", channel: "trap-ch", companyId: "proactive-co" },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(onStreamNotification).not.toHaveBeenCalled();
+
+      const drops = await handle.call("performAction", companyAction({ scenario: "report-drops" }, ""));
+      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
+        { method: "streams.open", channel: "trap-ch", companyId: "proactive-co", reason: "no_invocation_scope" },
+        { method: "streams.emit", channel: "trap-ch", companyId: "proactive-co", reason: "unpinned_channel" },
+        { method: "streams.close", channel: "trap-ch", companyId: "proactive-co", reason: "unpinned_channel" },
+      ]);
+
+      // Nothing was pinned, so a later out-of-dispatch emit stays dropped.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "emit", channel: "trap-ch", companyId: "proactive-co" },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(onStreamNotification).not.toHaveBeenCalled();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("drops a company-agnostic notification on a pinned channel with a signal", async () => {
+    const onStreamNotification = vi.fn();
+    const handle = makePinHandle(onStreamNotification);
+    try {
+      await handle.start();
+
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "open-in-dispatch", channel: "printer-status", companyId: "company-1" },
+          "company-1",
+        )),
+      ).resolves.toEqual({ ok: true });
+
+      // A pinned channel has a host-validated tenant, so a notification that
+      // claims NO company is an unattributable write to a known tenant's
+      // channel — not a wildcard broadcast. Fail closed at the attribution
+      // layer instead of relying on the SSE bridge's empty-companyId assert
+      // downstream.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "emit", channel: "printer-status", companyId: "" },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(streamChannels(onStreamNotification)).toEqual(["streams.open:printer-status:company-1"]);
+
+      const drops = await handle.call("performAction", companyAction({ scenario: "report-drops" }, ""));
+      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
+        { method: "streams.emit", channel: "printer-status", reason: "pin_mismatch" },
+      ]);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("pins from an in-dispatch emit so a seeded loop keeps landing", async () => {
+    const onStreamNotification = vi.fn();
+    const handle = makePinHandle(onStreamNotification);
+    try {
+      await handle.start();
+
+      // First emit happens inside the dispatch (attributed), without an
+      // explicit open — the async-loop seed shape.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "emit", channel: "loop-ch", companyId: "company-1", event: { n: 1 } },
+          "company-1",
+        )),
+      ).resolves.toEqual({ ok: true });
+
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "emit", channel: "loop-ch", companyId: "company-1", event: { n: 2 } },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(streamChannels(onStreamNotification)).toEqual([
+        "streams.emit:loop-ch:company-1",
+        "streams.emit:loop-ch:company-1",
+      ]);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("stamps pluginId when the manager-level onStreamNotification is wired", async () => {
+    const onManagerStreamNotification = vi.fn();
+    const manager = createPluginWorkerManager({
+      onStreamNotification: onManagerStreamNotification,
+    });
+    const handle = await manager.startWorker("pin.plugin", {
+      entrypointPath: STREAM_PIN_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: {},
+      autoRestart: false,
+    });
+
+    try {
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "open-in-dispatch", channel: "printer-status", companyId: "company-1" },
+          "company-1",
+        )),
+      ).resolves.toEqual({ ok: true });
+
+      expect(onManagerStreamNotification).toHaveBeenCalledWith({
+        pluginId: "pin.plugin",
+        method: "streams.open",
+        params: { channel: "printer-status", companyId: "company-1" },
+      });
+    } finally {
+      await manager.stopAll().catch(() => undefined);
+    }
+  });
+
+  it("never pins from an id-less open/emit naming a proactive-allowlisted company", async () => {
+    const onStreamNotification = vi.fn();
+    const handle = makePinHandle(onStreamNotification);
+    try {
+      await handle.start();
+      // The worker is configured (proactive allowlist) for company-2, so an
+      // id-less stream call naming company-2 must still never resolve a scope:
+      // pin capture requires an echoed, host-minted invocation id. While a
+      // company-2 dispatch is in flight, the id-less open+emit ride its pending
+      // request — exactly the traffic the proactive resolver used to see.
+      handle.setProactiveCompanyScopes(["company-2"]);
+
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "open-emit-idless", channel: "allowlist-ch", companyId: "company-2" },
+          "company-2",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(onStreamNotification).not.toHaveBeenCalled();
+
+      // After the dispatch settled there is still nothing pinned to leak
+      // through: the follow-up emit fails closed too.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "emit", channel: "allowlist-ch", companyId: "company-2" },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(onStreamNotification).not.toHaveBeenCalled();
+
+      const drops = await handle.call("performAction", companyAction({ scenario: "report-drops" }, ""));
+      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
+        { method: "streams.open", channel: "allowlist-ch", companyId: "company-2", reason: "invalid_invocation_scope" },
+        { method: "streams.emit", channel: "allowlist-ch", companyId: "company-2", reason: "invalid_invocation_scope" },
+        { method: "streams.emit", channel: "allowlist-ch", companyId: "company-2", reason: "unpinned_channel" },
+      ]);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("fails closed on a pinned channel when a notification carries no company claim", async () => {
+    const onStreamNotification = vi.fn();
+    const handle = makePinHandle(onStreamNotification);
+    try {
+      await handle.start();
+
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "open-in-dispatch", channel: "printer-status", companyId: "company-1" },
+          "company-1",
+        )),
+      ).resolves.toEqual({ ok: true });
+
+      // No companyId claim at all on a pinned channel: the pin checks live in
+      // the companyId branch, so an unclaimed notification must not slip
+      // through unverified — and an unclaimed close must not tear the pin down.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "emit", channel: "printer-status", event: { type: "status" } },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "close", channel: "printer-status" },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+
+      // The pin survived both unclaimed attempts: the claimed emit still lands.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "emit", channel: "printer-status", companyId: "company-1", event: { n: 2 } },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+
+      expect(streamChannels(onStreamNotification)).toEqual([
+        "streams.open:printer-status:company-1",
+        "streams.emit:printer-status:company-1",
+      ]);
+
+      const drops = await handle.call("performAction", companyAction({ scenario: "report-drops" }, ""));
+      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
+        { method: "streams.emit", channel: "printer-status", reason: "pin_mismatch" },
+        { method: "streams.close", channel: "printer-status", reason: "pin_mismatch" },
+      ]);
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("caps pins per worker: oldest pin evicted, reported via streams.dropped, and no longer attributed", async () => {
+    const onStreamNotification = vi.fn();
+    const handle = makePinHandle(onStreamNotification);
+    try {
+      await handle.start();
+
+      // One dispatch opens 130 host-verified channels: the first 128 pin, and
+      // capturing pins 129/130 evicts the two oldest pins (cap-ch-0/1).
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "open-burst", prefix: "cap-ch-", count: 130, companyId: "company-1" },
+          "company-1",
+        )),
+      ).resolves.toEqual({ ok: true });
+
+      // Every open was verified in-dispatch and forwarded to the bus — the
+      // cap limits attribution memory, it does not silently swallow traffic.
+      expect(streamChannels(onStreamNotification)).toHaveLength(130);
+      expect(streamChannels(onStreamNotification)[0]).toBe("streams.open:cap-ch-0:company-1");
+      expect(streamChannels(onStreamNotification)[129]).toBe("streams.open:cap-ch-129:company-1");
+
+      // Both evictions are plugin-visible with the cap reason, oldest first.
+      const drops = await handle.call("performAction", companyAction({ scenario: "report-drops" }, ""));
+      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
+        { method: "streams.open", channel: "cap-ch-0", companyId: "company-1", reason: "pin_cap_exceeded" },
+        { method: "streams.open", channel: "cap-ch-1", companyId: "company-1", reason: "pin_cap_exceeded" },
+      ]);
+
+      // An evicted channel lost out-of-dispatch attribution: fail closed with
+      // the unpinned signal (which the plugin also sees as a drop).
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "emit", channel: "cap-ch-0", companyId: "company-1" },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(streamChannels(onStreamNotification)).toHaveLength(130);
+
+      // A channel still under the cap keeps its pin: the emit lands.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "emit", channel: "cap-ch-129", companyId: "company-1" },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(streamChannels(onStreamNotification)).toHaveLength(131);
+      expect(streamChannels(onStreamNotification)[130]).toBe("streams.emit:cap-ch-129:company-1");
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("refreshes pin recency on re-open so the oldest untouched pin evicts first", async () => {
+    const onStreamNotification = vi.fn();
+    const handle = makePinHandle(onStreamNotification);
+    try {
+      await handle.start();
+
+      // Fill the cap exactly: 128 pinned channels.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "open-burst", prefix: "rec-ch-", count: 128, companyId: "company-1" },
+          "company-1",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(streamChannels(onStreamNotification)).toHaveLength(128);
+
+      // Re-open rec-ch-0 — the re-capture refreshes its recency, so it is no
+      // longer the eviction candidate.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "open-in-dispatch", channel: "rec-ch-0", companyId: "company-1" },
+          "company-1",
+        )),
+      ).resolves.toEqual({ ok: true });
+
+      // One more channel pushes the map over the cap: the oldest UNtouched
+      // pin (rec-ch-1) evicts, not the refreshed rec-ch-0.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "open-in-dispatch", channel: "rec-ch-128", companyId: "company-1" },
+          "company-1",
+        )),
+      ).resolves.toEqual({ ok: true });
+
+      const drops = await handle.call("performAction", companyAction({ scenario: "report-drops" }, ""));
+      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
+        { method: "streams.open", channel: "rec-ch-1", companyId: "company-1", reason: "pin_cap_exceeded" },
+      ]);
+
+      // The refreshed channel kept its pin: the out-of-dispatch emit lands.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "emit", channel: "rec-ch-0", companyId: "company-1" },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(streamChannels(onStreamNotification)).toContain("streams.emit:rec-ch-0:company-1");
+
+      // The evicted channel fails closed.
+      await expect(
+        handle.call("performAction", companyAction(
+          { scenario: "emit", channel: "rec-ch-1", companyId: "company-1" },
+          "",
+        )),
+      ).resolves.toEqual({ ok: true });
+      expect(streamChannels(onStreamNotification)).not.toContain("streams.emit:rec-ch-1:company-1");
     } finally {
       await handle.stop().catch(() => undefined);
     }

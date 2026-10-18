@@ -18,6 +18,7 @@ const mockCompanyService = vi.hoisted(() => ({
 
 const mockAgentService = vi.hoisted(() => ({
   getById: vi.fn(),
+  list: vi.fn(),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
@@ -46,23 +47,28 @@ const mockFeedbackService = vi.hoisted(() => ({
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
 
-function registerCompanyRouteMocks() {
-  vi.doMock("../services/index.js", () => ({
-    accessService: () => mockAccessService,
-    agentService: () => mockAgentService,
-    budgetService: () => mockBudgetService,
-    companyArtifactsService: () => mockCompanyArtifactsService,
-    companyPortabilityService: () => mockCompanyPortabilityService,
-    companyService: () => mockCompanyService,
-    feedbackService: () => mockFeedbackService,
-    logActivity: mockLogActivity,
-  }));
-}
-
 let appImportCounter = 0;
 
+// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
+// registry must be in place before ANY import of the routes module, in every
+// test. createApp concurrently imports middleware and route modules whose
+// graphs both contain services/index.js. With doMock-registered mocks that
+// first evaluation could race the registry under load and bind the REAL
+// services module, rejecting the request under test with a 500 (observed on
+// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
+// to every import graph deterministically.
+vi.mock("../services/index.js", () => ({
+  accessService: () => mockAccessService,
+  agentService: () => mockAgentService,
+  budgetService: () => mockBudgetService,
+  companyArtifactsService: () => mockCompanyArtifactsService,
+  companyPortabilityService: () => mockCompanyPortabilityService,
+  companyService: () => mockCompanyService,
+  feedbackService: () => mockFeedbackService,
+  logActivity: mockLogActivity,
+}));
+
 async function createApp(actor: Record<string, unknown>) {
-  registerCompanyRouteMocks();
   appImportCounter += 1;
   const routeModulePath = `../routes/companies.js?cross-company-authz-${appImportCounter}`;
   const middlewareModulePath = `../middleware/index.js?cross-company-authz-${appImportCounter}`;
@@ -169,6 +175,7 @@ function resetMockDefaults() {
     if (id === ceoAgentId) return { id, companyId: companyAId, role: "ceo" };
     return null;
   });
+  mockAgentService.list.mockResolvedValue([]);
   mockCompanyPortabilityService.exportBundle.mockResolvedValue(exportResult());
   mockCompanyPortabilityService.previewExport.mockResolvedValue(exportPreviewResult());
   mockCompanyPortabilityService.previewImport.mockResolvedValue({ ok: true });
@@ -215,12 +222,86 @@ function boardActor(input: {
 
 describe.sequential("company route cross-company authorization", () => {
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
     vi.clearAllMocks();
     resetMockDefaults();
   });
+
+  it.each(["session", "board_key", "cloud_tenant"])(
+    "limits navigable companies to memberships for a %s instance admin",
+    async (source) => {
+      mockCompanyService.list.mockResolvedValue([createCompany(companyBId), createCompany(companyAId)]);
+      const app = await createApp(boardActor({
+        userId: "owner-a",
+        source,
+        isInstanceAdmin: true,
+        companyIds: [companyAId],
+      }));
+
+      const navigation = await request(app).get("/api/companies?scope=accessible").expect(200);
+      expect(navigation.body.map((company: { id: string }) => company.id)).toEqual([companyAId]);
+      await request(app).get(`/api/companies/${companyAId}`).expect(200);
+      await request(app).get(`/api/companies/${companyBId}`).expect(403);
+
+      // The existing directory remains available for instance administration.
+      const directory = await request(app).get("/api/companies").expect(200);
+      expect(directory.body.map((company: { id: string }) => company.id)).toEqual([companyBId, companyAId]);
+    },
+  );
+
+  it.each([false, true])("returns no navigable companies without memberships (admin=%s)", async (isInstanceAdmin) => {
+    mockCompanyService.list.mockResolvedValue([createCompany(companyAId)]);
+    const app = await createApp(boardActor({ userId: "outsider", isInstanceAdmin }));
+    const res = await request(app).get("/api/companies?scope=accessible").expect(200);
+    expect(res.body).toEqual([]);
+  });
+
+  it.each(["scope=accessible&scope=accessible", "scope=accessible&scope=all", "scope=all", "scope="])(
+    "rejects malformed list scope without loading the directory: %s",
+    async (query) => {
+      const app = await createApp(boardActor({ userId: "admin", isInstanceAdmin: true }));
+      await request(app).get(`/api/companies?${query}`).expect(400);
+      expect(mockCompanyService.list).not.toHaveBeenCalled();
+    },
+  );
+
+  it("includes additional companies where a cloud user has membership", async () => {
+    mockCompanyService.list.mockResolvedValue([createCompany(companyAId), createCompany(companyBId)]);
+    const app = await createApp(boardActor({
+      userId: "owner-of-both",
+      source: "cloud_tenant",
+      companyIds: [companyAId, companyBId],
+    }));
+    const res = await request(app).get("/api/companies?scope=accessible").expect(200);
+    expect(res.body.map((company: { id: string }) => company.id)).toEqual([companyAId, companyBId]);
+    await request(app).get(`/api/companies/${companyBId}`).expect(200);
+  });
+
+  it("projects plugin_ops board keys to discovery fields on scope=accessible", async () => {
+    mockCompanyService.list.mockResolvedValue([createCompany(companyAId)]);
+    const app = await createApp({
+      ...boardActor({ userId: "ops", source: "board_key", companyIds: [companyAId] }),
+      boardKeyScope: { kind: "plugin_ops" },
+    });
+    const res = await request(app).get("/api/companies?scope=accessible").expect(200);
+    expect(res.body).toHaveLength(1);
+    expect(Object.keys(res.body[0]).sort()).toEqual(["id", "issuePrefix", "name", "status"]);
+  });
+
+  it("keeps all companies navigable for the local trusted board", async () => {
+    mockCompanyService.list.mockResolvedValue([createCompany(companyAId), createCompany(companyBId)]);
+    const app = await createApp(boardActor({ userId: "local-board", source: "local_implicit" }));
+    const res = await request(app).get("/api/companies?scope=accessible").expect(200);
+    expect(res.body.map((company: { id: string }) => company.id)).toEqual([companyAId, companyBId]);
+  });
+
+  it.each([{ type: "none", source: "none" }, companyACeoActor()])(
+    "rejects navigation list requests from a $type actor",
+    async (actor) => {
+      const app = await createApp(actor);
+      await request(app).get("/api/companies?scope=accessible").expect(403);
+      expect(mockCompanyService.list).not.toHaveBeenCalled();
+    },
+  );
 
   it.each([
     {

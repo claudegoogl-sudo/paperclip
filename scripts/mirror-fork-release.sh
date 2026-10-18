@@ -39,7 +39,9 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# BASH_SOURCE (not $0) so unit tests can `source` this file: $0 is the
+# caller's argv[0] when sourced, which would send REPO_ROOT to the wrong dir.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 # shellcheck source=./release-lib.sh
 . "$REPO_ROOT/scripts/release-lib.sh"
 
@@ -70,66 +72,6 @@ marker. Re-running on the same tag is safe and converges.
 EOF
 }
 
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --repo) [ $# -ge 2 ] || release_fail "--repo requires a value."; REPO="$2"; shift ;;
-    --mirror-dir) [ $# -ge 2 ] || release_fail "--mirror-dir requires a value."; MIRROR_DIR="$2"; shift ;;
-    --keep) [ $# -ge 2 ] || release_fail "--keep requires a value."; KEEP="$2"; shift ;;
-    --max-ref-depth) [ $# -ge 2 ] || release_fail "--max-ref-depth requires a value."; MAX_REF_DEPTH="$2"; shift ;;
-    --prune) DO_PRUNE=true ;;
-    --no-self-test) DO_SELF_TEST=false ;;
-    -h|--help) usage; exit 0 ;;
-    -*) release_fail "unknown option: $1" ;;
-    *) if [ -n "$TAG" ]; then release_fail "only one tag may be provided."; fi; TAG="$1" ;;
-  esac
-  shift
-done
-
-if [ -z "$TAG" ]; then usage; echo "" >&2; release_fail "a release tag is required (example: v2026.707.0-fork.33)"; fi
-case "$TAG" in v*) ;; *) release_fail "tag must start with 'v' (example: v2026.707.0-fork.33)" ;; esac
-case "$KEEP$MAX_REF_DEPTH" in *[!0-9]*) release_fail "--keep and --max-ref-depth require whole numbers" ;; esac
-
-# Resolve the GitHub repo without depending on a specific remote name: this
-# script also runs from release worktrees whose remote may be named 'fork'.
-resolve_repo() {
-  local r url
-  if [ -n "${RELEASE_REMOTE:-}" ] || [ -n "${PUBLISH_REMOTE:-}" ]; then
-    r="${RELEASE_REMOTE:-${PUBLISH_REMOTE:-}}"
-    github_repo_from_remote "$r" 2>/dev/null && return 0
-  fi
-  for r in fork public-gh public origin upstream; do
-    if git -C "$REPO_ROOT" remote get-url "$r" >/dev/null 2>&1; then
-      github_repo_from_remote "$r" 2>/dev/null && return 0
-    fi
-  done
-  return 1
-}
-
-if [ -z "$REPO" ]; then
-  REPO="$(resolve_repo || true)"
-fi
-[ -n "$REPO" ] || release_fail "could not determine GitHub repository; pass --repo OWNER/REPO"
-
-# Some environments force color even for pipes (CLICOLOR_FORCE/FORCE_COLOR),
-# which corrupts the raw JSON gh api prints. Disable TTY formatting for gh.
-export GH_FORCE_TTY=0
-
-command -v gh >/dev/null 2>&1 || release_fail "gh CLI is required"
-command -v curl >/dev/null 2>&1 || release_fail "curl is required"
-command -v jq >/dev/null 2>&1 || release_fail "jq is required"
-command -v sha256sum >/dev/null 2>&1 || release_fail "sha256sum is required"
-
-MIRROR_DIR="$(mkdir -p "$MIRROR_DIR" && cd "$MIRROR_DIR" && pwd)"
-LOG_FILE="$MIRROR_DIR/mirror.log"
-PRUNE_LOG="$MIRROR_DIR/prune.log"
-
-TAG_OR_CONTEXT="$TAG"
-log() {
-  local line
-  line="$(date -u +%Y-%m-%dT%H:%M:%SZ) [$TAG_OR_CONTEXT] $*"
-  echo "$line"
-  echo "$line" >> "$LOG_FILE"
-}
 
 sha_of() { sha256sum "$1" | awk '{print $1}'; }
 
@@ -221,15 +163,28 @@ assert_twin_structure() { # $1 source script $2 twin
 # Offline simulation of the script's fetch-and-pin path: expand the script's
 # assignments, fetch every mirror URL exactly as the script would (curl),
 # and check the sha pins. Runs no host-mutating step.
+# Value of a simple VAR="value" assignment line, printed on stdout. Inline
+# comments AFTER the closing quote are not part of the value: published
+# rollback scripts carry lines like
+#   TARGET="2026.824.1-fork.42"        # what we restore
+# so the value ends at the closing quote, not at end-of-line. Quoted values
+# in these scripts never contain a '"' character, so first-quote-delimited
+# parsing is exact; anything malformed truncates at the first quote
+# (fail-safe toward the true quoted value).
+assignment_value() { # $1 assignment line -> value on stdout
+  local v="${1#*=\"}"
+  printf '%s' "${v%%\"*}"
+}
+
 assert_twin_resolves() { # $1 twin path
   local twin="$1" tmp bad=0 line k v url sha rb
   tmp="$(mktemp -d)"
   awk -F= '/^[A-Za-z_][A-Za-z0-9_]*="/ { print }' "$twin" > "$tmp/assigns"
   local URL="" SHA="" RB_URL="" BASEURL="" TARGET=""
   while IFS= read -r line; do
-    k="${line%%=*}"; v="${line#*=}"; v="${v%\"}"; v="${v#\"}"
+    k="${line%%=*}"
     case "$k" in
-      URL|SHA|RB_URL|BASEURL|TARGET) printf -v "$k" '%s' "$v" ;;
+      URL|SHA|RB_URL|BASEURL|TARGET) printf -v "$k" '%s' "$(assignment_value "$line")" ;;
     esac
   done < "$tmp/assigns"
   for _ in 1 2 3; do
@@ -586,6 +541,75 @@ prune_mirrors() { # $1 keep
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+# Sourcing hook for scripts/mirror-fork-release.test.mjs: with this variable
+# set, `source`ing the file loads the helper functions above and skips the
+# argument parsing, network access, and mirror mutations entirely. Normal
+# execution never sets it and is unaffected.
+if [ "${MIRROR_FORK_RELEASE_SOURCE_ONLY:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo) [ $# -ge 2 ] || release_fail "--repo requires a value."; REPO="$2"; shift ;;
+    --mirror-dir) [ $# -ge 2 ] || release_fail "--mirror-dir requires a value."; MIRROR_DIR="$2"; shift ;;
+    --keep) [ $# -ge 2 ] || release_fail "--keep requires a value."; KEEP="$2"; shift ;;
+    --max-ref-depth) [ $# -ge 2 ] || release_fail "--max-ref-depth requires a value."; MAX_REF_DEPTH="$2"; shift ;;
+    --prune) DO_PRUNE=true ;;
+    --no-self-test) DO_SELF_TEST=false ;;
+    -h|--help) usage; exit 0 ;;
+    -*) release_fail "unknown option: $1" ;;
+    *) if [ -n "$TAG" ]; then release_fail "only one tag may be provided."; fi; TAG="$1" ;;
+  esac
+  shift
+done
+
+if [ -z "$TAG" ]; then usage; echo "" >&2; release_fail "a release tag is required (example: v2026.707.0-fork.33)"; fi
+case "$TAG" in v*) ;; *) release_fail "tag must start with 'v' (example: v2026.707.0-fork.33)" ;; esac
+case "$KEEP$MAX_REF_DEPTH" in *[!0-9]*) release_fail "--keep and --max-ref-depth require whole numbers" ;; esac
+
+# Resolve the GitHub repo without depending on a specific remote name: this
+# script also runs from release worktrees whose remote may be named 'fork'.
+resolve_repo() {
+  local r url
+  if [ -n "${RELEASE_REMOTE:-}" ] || [ -n "${PUBLISH_REMOTE:-}" ]; then
+    r="${RELEASE_REMOTE:-${PUBLISH_REMOTE:-}}"
+    github_repo_from_remote "$r" 2>/dev/null && return 0
+  fi
+  for r in fork public-gh public origin upstream; do
+    if git -C "$REPO_ROOT" remote get-url "$r" >/dev/null 2>&1; then
+      github_repo_from_remote "$r" 2>/dev/null && return 0
+    fi
+  done
+  return 1
+}
+
+if [ -z "$REPO" ]; then
+  REPO="$(resolve_repo || true)"
+fi
+[ -n "$REPO" ] || release_fail "could not determine GitHub repository; pass --repo OWNER/REPO"
+
+# Some environments force color even for pipes (CLICOLOR_FORCE/FORCE_COLOR),
+# which corrupts the raw JSON gh api prints. Disable TTY formatting for gh.
+export GH_FORCE_TTY=0
+
+command -v gh >/dev/null 2>&1 || release_fail "gh CLI is required"
+command -v curl >/dev/null 2>&1 || release_fail "curl is required"
+command -v jq >/dev/null 2>&1 || release_fail "jq is required"
+command -v sha256sum >/dev/null 2>&1 || release_fail "sha256sum is required"
+
+MIRROR_DIR="$(mkdir -p "$MIRROR_DIR" && cd "$MIRROR_DIR" && pwd)"
+LOG_FILE="$MIRROR_DIR/mirror.log"
+PRUNE_LOG="$MIRROR_DIR/prune.log"
+
+TAG_OR_CONTEXT="$TAG"
+log() {
+  local line
+  line="$(date -u +%Y-%m-%dT%H:%M:%SZ) [$TAG_OR_CONTEXT] $*"
+  echo "$line"
+  echo "$line" >> "$LOG_FILE"
+}
 
 echo "== mirror-fork-release: $TAG from $REPO -> $MIRROR_DIR =="
 # Clean staging leftovers from crashed runs older than a day.

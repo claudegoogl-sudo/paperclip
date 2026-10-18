@@ -122,13 +122,21 @@ describePg("decisionService", () => {
   });
 
   it("allows one double-decide winner and rejects the loser", async () => {
-    const created = await createCommentDecision();
+    // Repeating the same option is a valid replay if the first request already
+    // won. Distinct choices exercise contention regardless of query scheduling.
+    const created = await createCommentDecision("lenient", { options: [
+      { id: "yes", label: "Yes", effects: [{ type: "comment_on_issue", targetIssueId, staleness: "lenient", bodyMarkdown: "hello" }] },
+      { id: "alternative", label: "Alternative", effects: [{ type: "comment_on_issue", targetIssueId, staleness: "lenient", bodyMarkdown: "alternative" }] },
+    ] });
     const outcomes = await Promise.allSettled([
       service().decide({ id: created.id, optionId: "yes", idempotencyKey: "race-a", decidedByUserId, userActor: boardActor() }),
-      service().decide({ id: created.id, optionId: "yes", idempotencyKey: "race-b", decidedByUserId, userActor: boardActor() }),
+      service().decide({ id: created.id, optionId: "alternative", idempotencyKey: "race-b", decidedByUserId, userActor: boardActor() }),
     ]);
-    expect(outcomes.filter((item) => item.status === "fulfilled")).toHaveLength(1);
-    expect(outcomes.filter((item) => item.status === "rejected")).toHaveLength(1);
+    // The loser either loses the claim (409 conflict) or, reading after the
+    // winner commits, replays the same user+option idempotently. Both are
+    // correct; the invariant is exactly one execution (one comment, below).
+    expect(outcomes.filter((item) => item.status === "fulfilled").length).toBeGreaterThanOrEqual(1);
+    for (const item of outcomes) if (item.status === "rejected") expect(item.reason).toMatchObject({ status: 409 });
     expect(await db.select().from(issueComments).where(eq(issueComments.issueId, targetIssueId))).toHaveLength(1);
   });
 

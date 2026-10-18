@@ -30,7 +30,9 @@ describe("redactDiagnosticText", () => {
     const input = '{\\"token\\":\\"opaque-value\\"}';
     const output = redactDiagnosticText(input);
     expect(output).not.toContain("opaque-value");
-    expect(output).toContain(`\\"token\\":\\"${REDACTED_COMMAND_TEXT_VALUE}\\"`);
+    expect(output).toContain(
+      `\\"token\\":\\"${REDACTED_COMMAND_TEXT_VALUE}\\"`,
+    );
   });
 
   it("still redacts a shell KEY=value secret", () => {
@@ -38,6 +40,15 @@ describe("redactDiagnosticText", () => {
     const output = redactDiagnosticText(input);
     expect(output).not.toContain("super-secret-value");
     expect(output).toContain(REDACTED_COMMAND_TEXT_VALUE);
+  });
+
+  it("redacts an escaped quoted assignment across a literal newline", () => {
+    const input = String.raw`authorization=\"Bearer first-line
+second-line\" status=401`;
+    const expected = String.raw`authorization=\"***REDACTED***\" status=401`;
+    const output = redactDiagnosticText(input);
+    expect(output).toBe(expected);
+    expect(redactDiagnosticText(output)).toBe(expected);
   });
 
   it("keeps non-secret text and non-secret JSON fields intact", () => {

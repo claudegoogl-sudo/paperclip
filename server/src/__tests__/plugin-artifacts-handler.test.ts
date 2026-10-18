@@ -657,15 +657,109 @@ describe("plugin-artifacts-handler.create", () => {
     expect(call.details).toMatchObject({ outcome: "denied", deniedReason: "too_large" });
   });
 
-  it("review F2: text/html and text/csv are rejected for plugin artifacts (forbidden)", async () => {
-    for (const mimeType of ["text/html", "text/csv"]) {
+  it("review F2: text/html is still rejected for plugin artifacts (forbidden)", async () => {
+    const { handler, registry, putFileCalls } = buildHandler();
+    registerCtx(registry);
+    await expect(
+      handler.create(createParams({ mimeType: "text/html", contentBase64: makeBytes("x").toString("base64") })),
+    ).rejects.toMatchObject({ code: "forbidden", message: "disallowed mime type: text/html" });
+    expect(putFileCalls).toHaveLength(0);
+  });
+
+  it("ruling D1: a zip artifact drives the gate end-to-end (stored + audited allowed)", async () => {
+    const { handler, registry, putFileCalls } = buildHandler();
+    registerCtx(registry);
+    const zipBytes = Buffer.from("PK\x05\x06empty-archive", "binary");
+    const result = await handler.create(
+      createParams({ mimeType: "application/zip", filename: "gerbers.zip", contentBase64: zipBytes.toString("base64") }),
+    );
+    expect(result.attachmentId).toBe("asset-1");
+    expect(putFileCalls).toHaveLength(1);
+    expect(putFileCalls[0]!.namespace).toBe("plugin-artifacts");
+    const call = vi.mocked(logActivity).mock.calls[0]![1];
+    expect(call.details).toMatchObject({
+      outcome: "allowed",
+      mimeType: "application/zip",
+      byteSize: zipBytes.length,
+    });
+  });
+
+  it("ruling D2: csv and tsv now pass the mime gate and store", async () => {
+    for (const [mimeType, filename] of [
+      ["text/csv", "gerbers.csv"],
+      ["text/tab-separated-values", "bom.tsv"],
+    ] as const) {
+      const { handler, registry, putFileCalls } = buildHandler();
+      registerCtx(registry);
+      const result = await handler.create(
+        createParams({ mimeType, filename, contentBase64: makeBytes("a,b\n1,2\n").toString("base64") }),
+      );
+      expect(result.attachmentId).toBe("asset-1");
+      expect(putFileCalls).toHaveLength(1);
+      const call = vi.mocked(logActivity).mock.calls.at(-1)![1];
+      expect(call.details).toMatchObject({ outcome: "allowed", mimeType });
+    }
+  });
+
+  it("ruling: the other archive/hostile types stay denied with an explicit per-type reason", async () => {
+    for (const mimeType of [
+      "application/x-zip-compressed",
+      "application/x-zip",
+      "application/gzip",
+      "application/x-7z-compressed",
+      "application/x-tar",
+      "application/octet-stream",
+      "text/html",
+      "image/svg+xml",
+    ]) {
       const { handler, registry, putFileCalls } = buildHandler();
       registerCtx(registry);
       await expect(
         handler.create(createParams({ mimeType, contentBase64: makeBytes("x").toString("base64") })),
-      ).rejects.toMatchObject({ code: "forbidden" });
+      ).rejects.toMatchObject({ code: "forbidden", message: `disallowed mime type: ${mimeType}` });
       expect(putFileCalls).toHaveLength(0);
+      const call = vi.mocked(logActivity).mock.calls.at(-1)![1];
+      expect(call.details).toMatchObject({ outcome: "denied", deniedReason: "forbidden", mimeType });
     }
+  });
+
+  it("ruling: an oversize zip trips the base64 length bound BEFORE decode (no decode, no store)", async () => {
+    // Ceiling = MAX_ATTACHMENT_BYTES (25 MiB). The pre-decode bound is
+    // ceiling * 1.4 + 8 ≈ 36.7M chars; a string one char over must be rejected
+    // without Buffer.from ever running. '!' is not valid base64, so a decode
+    // would yield an empty buffer and the "artifact is empty" error instead —
+    // asserting the size message proves the bound fired first.
+    const { handler, registry, putFileCalls } = buildHandler({ companyMaxBytes: MAX_ATTACHMENT_BYTES });
+    registerCtx(registry);
+    const oversizeEncoded = "!".repeat(Math.ceil(MAX_ATTACHMENT_BYTES * 1.4 + 8) + 1);
+    await expect(
+      handler.create(
+        createParams({ mimeType: "application/zip", filename: "huge.zip", contentBase64: oversizeEncoded }),
+      ),
+    ).rejects.toMatchObject({
+      code: "too_large",
+      message: `artifact exceeds maximum size of ${MAX_ATTACHMENT_BYTES} bytes`,
+    });
+    expect(putFileCalls).toHaveLength(0);
+    const call = vi.mocked(logActivity).mock.calls[0]![1];
+    expect(call.details).toMatchObject({ outcome: "denied", deniedReason: "too_large" });
+  });
+
+  it("ruling: an oversize zip whose encoding fits the pre-decode bound still fails the decoded size check", async () => {
+    // 26 MiB of zip bytes → ~35M base64 chars (under the 36.7M bound) → decodes
+    // to 26 MiB > the 25 MiB ceiling → too_large after decode.
+    const { handler, registry, putFileCalls } = buildHandler({ companyMaxBytes: MAX_ATTACHMENT_BYTES });
+    registerCtx(registry);
+    const oversizeZip = Buffer.alloc(26 * 1024 * 1024, 0x50);
+    await expect(
+      handler.create(
+        createParams({ mimeType: "application/zip", filename: "huge.zip", contentBase64: oversizeZip.toString("base64") }),
+      ),
+    ).rejects.toMatchObject({
+      code: "too_large",
+      message: `artifact exceeds maximum size of ${MAX_ATTACHMENT_BYTES} bytes`,
+    });
+    expect(putFileCalls).toHaveLength(0);
   });
 });
 

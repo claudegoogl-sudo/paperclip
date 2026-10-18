@@ -290,6 +290,12 @@ describeEmbeddedPostgres("cross-issue influence guard: contextless runs (routes 
         .send({ body: `Should be rejected: ${label}` });
       expect(res.status, `${label}: ${JSON.stringify(res.body)}`).toBe(403);
       expect(res.body.details).toMatchObject({ code: "cross_issue_influence_run_context_required" });
+      // The run header is present and JWT-matched in every case above, so the
+      // 403 body must name the real run-binding failure (malformed id, or no
+      // matching heartbeat_runs row) — never "send the header and retry".
+      expect(res.body.error).toContain("heartbeat_runs");
+      expect(res.body.error).toContain("malformed");
+      expect(res.body.error).not.toContain("header with your current run");
     }
 
     const comments = await db

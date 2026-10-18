@@ -52,6 +52,7 @@ import type { PluginToolDispatcher } from "./plugin-tool-dispatcher.js";
 import type { PluginLifecycleManager } from "./plugin-lifecycle.js";
 import { pluginDatabaseService } from "./plugin-database.js";
 import { resolveBundledCatalogRoot } from "./bundled-plugins.js";
+import { collectSecretRefPaths } from "./json-schema-secret-refs.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -70,34 +71,47 @@ const moduleLog = logger.child({ service: "plugin-loader" });
 
 /**
  * Load a plugin manifest module via dynamic `import()`, cache-busting on the
- * file's mtime so that rebuilds during install/upgrade are observed without a
- * host restart.
+ * file's content digest so that rebuilds during install/upgrade are observed
+ * without a host restart.
  *
  * Node's ESM loader keys cached modules by absolute specifier (URL). A bare
  * `import('/.../manifest.js')` therefore returns the originally-imported
  * module for the lifetime of the process, even if the file on disk has been
  * rebuilt — every install/upgrade silently uses the stale manifest.
  *
- * Appending `?mtime=<mtimeMs>` to a `file://` URL is an ESM-spec-compliant way
- * to make the specifier change when (and only when) the file changes:
- * unchanged files keep the same URL → the cached import is reused → no perf
- * regression; changed files get a fresh URL → a fresh import → the new
- * manifest contents win.
+ * Appending `?digest=<sha256>` to a `file://` URL is an ESM-spec-compliant
+ * way to make the specifier change when (and only when) the file's bytes
+ * change: unchanged files keep the same URL → the cached import is reused →
+ * no perf regression; changed files get a fresh URL → a fresh import → the
+ * new manifest contents win.
+ *
+ * The key must be content-derived, not mtime-derived. `npm pack` normalizes
+ * every tar entry mtime to a fixed epoch, so an upgrade stage can replace a
+ * module with different bytes that carry the SAME mtime as the file they
+ * replace. An mtime-keyed URL is then identical, Node serves the cached OLD
+ * module, and the upgrade reports the old version as installed. A digest key
+ * makes the cache-bust independent of filesystem timestamp behavior.
  *
  * Returns the raw module's default export (or the module itself if there is
  * no default), unvalidated. Validation is the caller's responsibility.
  *
- * Exported so the regression test in `plugin-loader.test.ts` can exercise the
- * cache-bust property directly without spinning up the full install pipeline.
+ * Exported so the regression tests in `plugin-loader.test.ts` can exercise
+ * the cache-bust properties directly without spinning up the full install
+ * pipeline.
  *
- * Host bug this fixes: plugin manifest re-import hits ESM cache
- * and silently keeps serving the pre-rebuild manifest.
+ * Host bugs this fixes: (1) plugin manifest re-import hits ESM cache and
+ * silently keeps serving the pre-rebuild manifest; (2) an mtime-keyed URL
+ * served the OLD module after an upgrade whose staged files kept the same
+ * (normalized) mtime.
  */
 export async function loadManifestModule(
   manifestPath: string,
 ): Promise<unknown> {
-  const fileStat = await stat(manifestPath);
-  const url = `${pathToFileURL(manifestPath).href}?mtime=${fileStat.mtimeMs}`;
+  // Content digest of the module bytes — see the npm-pack mtime-normalization
+  // note above for why the cache key must not be the mtime.
+  const bytes = await readFile(manifestPath);
+  const digest = createHash("sha256").update(bytes).digest("hex");
+  const url = `${pathToFileURL(manifestPath).href}?digest=${digest}`;
   const mod = (await import(url)) as Record<string, unknown>;
   // The manifest may be the default export or the module namespace itself
   return mod["default"] ?? mod;
@@ -184,6 +198,7 @@ const SANDBOX_PROVIDER_CREDENTIAL_ENV_PASSTHROUGH: Record<
   string,
   { driverKey: string; envVars: readonly string[] }
 > = {
+  "@paperclipai/plugin-createos": { driverKey: "createos", envVars: ["CREATEOS_API_KEY"] },
   "@paperclipai/plugin-daytona": { driverKey: "daytona", envVars: ["DAYTONA_API_KEY"] },
   "@paperclipai/plugin-e2b": { driverKey: "e2b", envVars: ["E2B_API_KEY"] },
   "@paperclipai/plugin-exe-dev": { driverKey: "exe-dev", envVars: ["EXE_API_KEY"] },
@@ -322,6 +337,16 @@ function getDeclaredPageRoutePaths(manifest: PaperclipPluginManifestV1): string[
  * Options for the plugin loader service.
  */
 export interface PluginLoaderOptions {
+  /** Image-owned deployment policy, checked before importing code and starting workers. */
+  assertPackageActivation?: (input: {
+    pluginKey?: string;
+    packageRoot: string;
+    /** Persisted source path, even when package resolution used a fallback. */
+    installedPackagePath?: string | null;
+    manifest?: PaperclipPluginManifestV1;
+    /** Persisted grants, supplied before a runtime manifest refresh is saved. */
+    previousManifest?: PaperclipPluginManifestV1;
+  }) => void;
   /**
    * Path to the local plugin directory to scan.
    * Defaults to ~/.paperclip/plugins/
@@ -363,6 +388,13 @@ export interface PluginLoaderOptions {
    * the approval is filed against.
    */
   escalationGateway?: CapabilityEscalationGateway;
+
+  /**
+   * Capabilities a FRESH install may declare without a board approval when an
+   * escalation gateway is configured. Default empty: any declared capability
+   * parks a fresh install. Ignored when no gateway is configured.
+   */
+  installCapabilityAllowlist?: readonly string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +425,48 @@ export interface CapabilityEscalationRequest {
    * package that declares the same version.
    */
   digest: string;
+  /**
+   * Which entry point parked the plugin. `"upgrade"` (default) = `/upgrade`;
+   * a rejection restores `ready`. `"install"` = install or reinstall; a
+   * rejection leaves the plugin inactive (`uninstalled`).
+   */
+  origin?: CapabilityEscalationOrigin;
+  /** Package name of the approved source (install/reinstall parks). */
+  packageName?: string;
+  /** Local path of the approved source (install/reinstall parks, local only). */
+  packagePath?: string;
+}
+
+/** Entry point that parked a capability escalation. */
+export type CapabilityEscalationOrigin = "upgrade" | "install";
+
+/**
+ * Capabilities present in `next` but not in `prev`. The single escalation
+ * predicate shared by `upgradePlugin` and `installPlugin` (reinstall + fresh).
+ */
+export function diffAddedCapabilities(
+  prev: readonly string[] | null | undefined,
+  next: readonly string[] | null | undefined,
+): string[] {
+  const prevSet = new Set(prev ?? []);
+  return (next ?? []).filter((c) => !prevSet.has(c));
+}
+
+/**
+ * Error thrown when an escalation needs board approval but no escalation
+ * gateway is configured. Shared by `/upgrade` and reinstall so both refuse with
+ * the same message.
+ */
+export function ungovernedEscalationError(
+  pluginRef: string,
+  addedCapabilities: readonly string[],
+  previousCapabilities: readonly string[],
+): Error {
+  return new Error(
+    `Upgrade for "${pluginRef}" introduces new capabilities that require approval: ${addedCapabilities.join(", ")}. ` +
+      `The previous version declared [${previousCapabilities.join(", ")}]. ` +
+      `Please review and approve the capability escalation before upgrading.`,
+  );
 }
 
 /**
@@ -446,6 +520,12 @@ export interface ApprovedUpgrade {
    * before this anchor existed still resolve (version + caps still enforced).
    */
   digest?: string | null;
+  /**
+   * Source the board approved (install/reinstall parks only). A reinstall park
+   * does not write the new source to the row; `completeUpgrade` applies it.
+   */
+  packageName?: string | null;
+  packagePath?: string | null;
 }
 
 /**
@@ -499,7 +579,32 @@ export interface PluginInstallOptions {
    * Defaults to the localPluginDir configured on the service.
    */
   installDir?: string;
+
+  /**
+   * SECURITY-CRITICAL: skip the install-time capability-escalation gate. Only
+   * for host-driven boot provisioning of bundled plugins (env + filesystem
+   * control already equals host control). Never set from an HTTP request.
+   */
+  exemptFromCapabilityGate?: boolean;
 }
+
+/**
+ * Result of `installPlugin`: the discovered package plus the gate outcome.
+ *
+ * - `installStatus: "installed"` — row written as `installed`; the caller moves
+ *   it to `ready`.
+ * - `installStatus: "upgrade_pending"` — the install added capabilities and was
+ *   parked for a board approval (`approvalId`). The caller must NOT load it.
+ */
+export type InstallPluginResult = DiscoveredPlugin & {
+  installStatus: "installed" | "upgrade_pending";
+  /** Capability-escalation approval id when parked, else `null`. */
+  approvalId: string | null;
+  /** Capabilities the installed manifest declares. */
+  capabilities: string[];
+  /** Capabilities that needed approval (empty when not parked). */
+  addedCapabilities: string[];
+};
 
 // ---------------------------------------------------------------------------
 // Runtime options — services needed for initializing loaded plugins
@@ -691,7 +796,7 @@ export interface PluginLoader {
    *
    * @see PLUGIN_SPEC.md §8.3 — Install Process
    */
-  installPlugin(options: PluginInstallOptions): Promise<DiscoveredPlugin>;
+  installPlugin(options: PluginInstallOptions): Promise<InstallPluginResult>;
 
   /**
    * Upgrade an already-installed plugin to a newer version.
@@ -727,7 +832,10 @@ export interface PluginLoader {
    * rejected. Because parking never mutates the version/manifest/capabilities,
    * this only restores the lifecycle status to `ready`. Idempotent.
    */
-  revertPendingUpgrade(pluginId: string): Promise<PluginRecord>;
+  revertPendingUpgrade(
+    pluginId: string,
+    options?: { origin?: CapabilityEscalationOrigin },
+  ): Promise<PluginRecord>;
 
   /**
    * Check whether a plugin API version is supported by this host.
@@ -981,9 +1089,11 @@ function buildStandaloneBundledPluginInstallArgs(
   packageRoot: string,
 ): string[] {
   const packageLockfilePath = path.join(packageRoot, "pnpm-lock.yaml");
-  return existsSync(packageLockfilePath)
-    ? ["install", "--ignore-workspace", "--frozen-lockfile"]
-    : ["install", "--ignore-workspace", "--no-lockfile"];
+  // Never let plugin-supplied workspace settings broaden dependency resolution
+  // or script execution. When a plugin declares a local install policy, disable
+  // dependency lifecycle scripts instead of loading that workspace configuration.
+  const scriptArgs = existsSync(path.join(packageRoot, "pnpm-workspace.yaml")) ? ["--ignore-scripts"] : [];
+  return ["install", "--ignore-workspace", ...scriptArgs, existsSync(packageLockfilePath) ? "--frozen-lockfile" : "--no-lockfile"];
 }
 
 function buildStandaloneBundledPluginInstallCommand(
@@ -1521,6 +1631,128 @@ export function getPluginUiContributionMetadata(
  * @see PLUGIN_SPEC.md §8.3 — Install Process
  * @see PLUGIN_SPEC.md §12 — Process Model
  */
+
+/**
+ * Deliver each configured company's stored config to a (re)started worker via
+ * the same `configChanged` path an operator config-save uses. Shared by the
+ * loader's activation path (step 5b) and the lifecycle manager's bare worker
+ * restart fallback, so every worker start — activation or bounce — receives
+ * its stored config. Best-effort per company; never throws.
+ */
+export async function deliverStoredPluginConfig(input: {
+  workerManager: Pick<PluginWorkerManager, "call">;
+  pluginId: string;
+  pluginKey: string;
+  configRows: ReadonlyArray<{ companyId: string; configJson: unknown }>;
+  log: { warn: (obj: object, msg: string) => void; debug: (obj: object, msg: string) => void; info: (obj: object, msg: string) => void };
+}): Promise<{ delivered: number; failed: number }> {
+  const { workerManager, pluginId, pluginKey, configRows, log } = input;
+  let delivered = 0;
+  let failed = 0;
+  for (const row of configRows) {
+    try {
+      await workerManager.call(pluginId, "configChanged", {
+        config: (row.configJson ?? {}) as Record<string, unknown>,
+        companyId: row.companyId,
+      });
+      delivered += 1;
+    } catch (configErr) {
+      // A single-tenant worker fails closed (CROSS_TENANT_CONFIG) rather
+      // than collapse onto a second company's config — surface that at
+      // warn so the misconfiguration (multiple distinct companies
+      // configured for a single-tenant plugin) is visible, instead of
+      // being lost in the best-effort debug stream.
+      failed += 1;
+      const code = (configErr as { code?: number } | null)?.code;
+      const details = {
+        pluginId,
+        pluginKey,
+        companyId: row.companyId,
+        code,
+        err: configErr instanceof Error ? configErr.message : String(configErr),
+      };
+      if (code === PLUGIN_RPC_ERROR_CODES.CROSS_TENANT_CONFIG) {
+        log.warn(
+          details,
+          "plugin-loader: startup config delivery rejected — single-tenant plugin configured for multiple companies",
+        );
+      } else {
+        log.debug(details, "plugin-loader: startup config delivery skipped for company");
+      }
+    }
+  }
+  log.info(
+    { pluginId, pluginKey, configuredCompanies: configRows.length, delivered, failed },
+    "plugin-loader: startup config delivery complete",
+  );
+  return { delivered, failed };
+}
+
+/**
+ * Key-order-independent JSON serialisation. `plugins.manifest_json` is jsonb,
+ * which re-orders object keys (by length, then bytes), so a plain
+ * `JSON.stringify` compare against an authored manifest reports a difference
+ * when the content is identical. Object keys are sorted recursively; array
+ * order is preserved (it is content). `undefined` members are dropped, as in
+ * `JSON.stringify`.
+ */
+export function canonicalJson(value: unknown): string {
+  const norm = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.map((e) => (e === undefined ? null : norm(e)));
+    if (v && typeof v === "object") {
+      const src = v as Record<string, unknown>;
+      const out: Record<string, unknown> = {};
+      for (const k of Object.keys(src).sort()) {
+        if (src[k] !== undefined) out[k] = norm(src[k]);
+      }
+      return out;
+    }
+    return v;
+  };
+  return JSON.stringify(norm(value)) ?? "undefined";
+}
+
+/**
+ * Privilege-bearing additions between an approved (registry) manifest and a
+ * candidate (on-disk) manifest. Empty = candidate is a privilege subset and
+ * may be applied without the capability-escalation approval gate.
+ */
+export function diffPrivilegeEscalations(
+  approved: PaperclipPluginManifestV1 | null | undefined,
+  candidate: PaperclipPluginManifestV1,
+): string[] {
+  const out: string[] = [];
+  const added = (a: readonly string[] | undefined, b: readonly string[] | undefined) => {
+    const base = new Set(a ?? []);
+    return [...new Set(b ?? [])].filter((x) => !base.has(x)).sort();
+  };
+  const names = (list: unknown, key: string): string[] =>
+    Array.isArray(list)
+      ? list.map((e) => (e && typeof e === "object" ? String((e as Record<string, unknown>)[key] ?? "") : ""))
+      : [];
+  const a = (approved ?? {}) as unknown as Record<string, unknown>;
+  const c = candidate as unknown as Record<string, unknown>;
+  // Reuse the shared escalation predicate used by upgrade/install.
+  const caps = [...new Set(diffAddedCapabilities(a.capabilities as string[] | undefined, c.capabilities as string[] | undefined))].sort();
+  if (caps.length) out.push(`adds capabilities that were not granted: ${caps.join(", ")}`);
+  const tools = added(names(a.tools, "name"), names(c.tools, "name"));
+  if (tools.length) out.push(`adds tools ${tools.join(", ")}`);
+  const hooks = added(names(a.webhooks, "endpointKey"), names(c.webhooks, "endpointKey"));
+  if (hooks.length) out.push(`adds webhooks ${hooks.join(", ")}`);
+  if (c.database !== undefined && canonicalJson(c.database) !== canonicalJson(a.database)) {
+    out.push("changes database declaration");
+  }
+  // Reuse the host's own secret-ref walker (follows properties/items AND
+  // allOf/anyOf/oneOf) so this gate cannot diverge from the binding path.
+  const secretPaths = (schema: unknown): string[] =>
+    schema && typeof schema === "object"
+      ? [...collectSecretRefPaths(schema as Record<string, unknown>)]
+      : [];
+  const secrets = added(secretPaths(a.instanceConfigSchema), secretPaths(c.instanceConfigSchema));
+  if (secrets.length) out.push(`adds secret-ref config fields ${secrets.join(", ")}`);
+  return out;
+}
+
 export function pluginLoader(
   db: Db,
   options: PluginLoaderOptions = {},
@@ -1532,7 +1764,10 @@ export function pluginLoader(
     enableLocalFilesystem = true,
     enableNpmDiscovery = true,
     escalationGateway,
+    assertPackageActivation,
+    installCapabilityAllowlist = [],
   } = options;
+  const installCapabilityAllowSet = new Set(installCapabilityAllowlist);
 
   const registry = pluginRegistryService(db);
   const manifestValidator = pluginManifestValidator();
@@ -1657,6 +1892,7 @@ export function pluginLoader(
 
     // Step 3: Read and validate plugin manifest
     // Note: this.loadManifest (used via current context)
+    assertPackageActivation?.({ packageRoot: resolvedPackagePath });
     const pkgJson = await readPackageJson(resolvedPackagePath);
     if (!pkgJson) throw new Error(`Missing package.json at ${resolvedPackagePath}`);
 
@@ -1675,6 +1911,7 @@ export function pluginLoader(
     }
 
     const manifest = await loadManifestFromPath(manifestPath);
+    assertPackageActivation?.({ packageRoot: resolvedPackagePath, pluginKey: manifest.id, manifest });
 
     // Step 4: Reject incompatible plugin API versions
     if (!manifestValidator.getSupportedVersions().includes(manifest.apiVersion)) {
@@ -1881,9 +2118,38 @@ export function pluginLoader(
       );
     }
 
-    if (JSON.stringify(manifest) === JSON.stringify(plugin.manifestJson)) {
+    assertPackageActivation?.({ packageRoot, installedPackagePath: plugin.packagePath, pluginKey: plugin.pluginKey, manifest, previousManifest: plugin.manifestJson });
+    if (canonicalJson(manifest) === canonicalJson(plugin.manifestJson)) {
       return plugin;
     }
+
+    // SECURITY: activation-time refresh must never widen privilege. Any
+    // privilege-bearing addition must go through POST /api/plugins/:id/upgrade
+    // (capability-escalation approval gate). Fail activation closed instead.
+    const escalations = diffPrivilegeEscalations(
+      plugin.manifestJson as PaperclipPluginManifestV1 | null,
+      manifest,
+    );
+    if (escalations.length > 0) {
+      log.warn(
+        { pluginId: plugin.id, pluginKey: plugin.pluginKey, escalations },
+        "plugin-loader: on-disk manifest escalates privilege — refusing activation-time refresh",
+      );
+      throw new Error(
+        `On-disk manifest for plugin ${plugin.pluginKey} escalates privilege (${escalations.join("; ")}); ` +
+          `refusing to apply outside the approval gate — use POST /api/plugins/${plugin.id}/upgrade`,
+      );
+    }
+
+    log.warn(
+      {
+        pluginId: plugin.id,
+        pluginKey: plugin.pluginKey,
+        fromVersion: plugin.version,
+        toVersion: manifest.version,
+      },
+      "plugin-loader: applying non-escalating on-disk manifest drift outside /upgrade",
+    );
 
     await registry.update(plugin.id, {
       packageName: plugin.packageName,
@@ -1908,6 +2174,7 @@ export function pluginLoader(
     packagePath: string,
     source: PluginSource,
   ): Promise<DiscoveredPlugin | null> {
+    assertPackageActivation?.({ packageRoot: packagePath });
     const pkgJson = await readPackageJson(packagePath);
     if (!pkgJson) return null;
 
@@ -1937,6 +2204,7 @@ export function pluginLoader(
 
     try {
       const manifest = await loadManifestFromPath(manifestPath);
+      assertPackageActivation?.({ packageRoot: packagePath, pluginKey: manifest.id, manifest });
       return {
         packagePath,
         packageName,
@@ -2196,6 +2464,7 @@ export function pluginLoader(
     // -----------------------------------------------------------------------
 
     async loadManifest(packagePath: string): Promise<PaperclipPluginManifestV1 | null> {
+      assertPackageActivation?.({ packageRoot: packagePath });
       const pkgJson = await readPackageJson(packagePath);
       if (!pkgJson) return null;
 
@@ -2210,16 +2479,137 @@ export function pluginLoader(
       const manifestPath = resolveManifestPath(packagePath, pkgJson);
       if (!manifestPath || !existsSync(manifestPath)) return null;
 
-      return loadManifestFromPath(manifestPath);
+      const manifest = await loadManifestFromPath(manifestPath);
+      assertPackageActivation?.({ packageRoot: packagePath, pluginKey: manifest.id, manifest });
+      return manifest;
     },
 
     // -----------------------------------------------------------------------
     // installPlugin
     // -----------------------------------------------------------------------
 
-    async installPlugin(installOptions: PluginInstallOptions): Promise<DiscoveredPlugin> {
+    async installPlugin(installOptions: PluginInstallOptions): Promise<InstallPluginResult> {
       const discovered = await fetchAndValidate(installOptions);
       const manifest = discovered.manifest!;
+      const declaredCapabilities: string[] = [...(manifest.capabilities ?? [])];
+
+      // SECURITY-CRITICAL: install-time capability-escalation gate. Install
+      // must not be a side door around the `/upgrade` approval:
+      // - Reinstall over a soft-uninstalled row reuses the same plugin id and
+      //   all plugin data, so it is diffed against the stored (granted)
+      //   capabilities exactly like an upgrade.
+      // - A fresh install (no row) with a gateway configured parks when it
+      //   declares any capability outside the operator allowlist. Without a
+      //   gateway, fresh installs keep the previous behavior.
+      const existing = (await registry.getByKey(manifest.id)) as PluginRecord | null;
+      let park:
+        | { fromCapabilities: string[]; fromVersion: string; addedCapabilities: string[] }
+        | null = null;
+      if (!installOptions.exemptFromCapabilityGate) {
+        if (existing && existing.status === "uninstalled") {
+          const grantedCapabilities: string[] = [...(existing.manifestJson?.capabilities ?? [])];
+          const addedCapabilities = diffAddedCapabilities(grantedCapabilities, declaredCapabilities);
+          if (addedCapabilities.length > 0) {
+            if (!escalationGateway) {
+              log.warn(
+                { pluginId: existing.id, pluginKey: manifest.id, addedCapabilities },
+                "plugin-loader: reinstall introduces new capabilities and no escalation gateway is configured — refusing",
+              );
+              throw ungovernedEscalationError(manifest.id, addedCapabilities, grantedCapabilities);
+            }
+            park = {
+              fromCapabilities: grantedCapabilities,
+              fromVersion: existing.version,
+              addedCapabilities,
+            };
+          }
+        } else if (!existing && escalationGateway) {
+          const notAllowlisted = declaredCapabilities.filter((c) => !installCapabilityAllowSet.has(c));
+          if (notAllowlisted.length > 0) {
+            // The approval lists ALL declared capabilities: nothing is granted yet.
+            park = { fromCapabilities: [], fromVersion: "", addedCapabilities: declaredCapabilities };
+          }
+        }
+      }
+
+      if (park && escalationGateway) {
+        const gateway = escalationGateway;
+        const gate = park;
+        // Snapshot the verified bytes BEFORE filing (same anchor as /upgrade).
+        if (discovered.source === "local-filesystem") {
+          await ensureUpgradeSnapshot(discovered.packagePath, discovered.digest!);
+        }
+        let pluginId = "";
+        let approvalId = "";
+        // One transaction: the row write and the approval filing succeed
+        // together. If the gateway throws, the row change rolls back — a fresh
+        // install leaves no row and a reinstall stays `uninstalled` (fail closed).
+        // Known gap: the gateway writes on the outer db, so a commit failure
+        // AFTER `file` succeeded leaves an orphan pending approval. Approving it
+        // is a no-op (completeUpgrade requires `upgrade_pending`), so it is
+        // harmless and the board can reject it.
+        await db.transaction(async (tx) => {
+          const txRegistry = pluginRegistryService(tx as unknown as Db);
+          if (existing) {
+            pluginId = existing.id;
+            // Do NOT write the new source to the row. version, manifest,
+            // packageName and packagePath stay the granted contract. The new
+            // source travels in the approval payload, and only
+            // `completeUpgrade` applies it. A rejection then leaves the row on
+            // its previous source.
+          } else {
+            // Store the manifest with NO granted capabilities. `completeUpgrade`
+            // then diffs against [] so the approval must cover every declared
+            // capability, and an operator `enable` on the parked row can never
+            // run the worker with unapproved capabilities.
+            const row = await txRegistry.install(
+              {
+                packageName: discovered.packageName,
+                packagePath: discovered.source === "local-filesystem" ? discovered.packagePath : undefined,
+              },
+              { ...manifest, capabilities: [] },
+            );
+            if (!row) throw new Error(`Plugin install did not return a registry row: ${manifest.id}`);
+            pluginId = row.id;
+          }
+          await txRegistry.updateStatus(pluginId, { status: "upgrade_pending" });
+          approvalId =
+            (await gateway.findPending({ pluginId, toVersion: manifest.version })) ??
+            (await gateway.file({
+              pluginId,
+              pluginKey: manifest.id,
+              fromVersion: gate.fromVersion,
+              toVersion: manifest.version,
+              fromCapabilities: gate.fromCapabilities,
+              toCapabilities: declaredCapabilities,
+              addedCapabilities: gate.addedCapabilities,
+              digest: discovered.digest!,
+              origin: "install",
+              packageName: discovered.packageName,
+              ...(discovered.source === "local-filesystem" ? { packagePath: discovered.packagePath } : {}),
+            }));
+        });
+
+        log.warn(
+          {
+            pluginId,
+            pluginKey: manifest.id,
+            approvalId,
+            reinstall: Boolean(existing),
+            capabilities: declaredCapabilities,
+            addedCapabilities: gate.addedCapabilities,
+          },
+          "plugin-loader: install requires capability approval — parked in upgrade_pending pending board approval",
+        );
+
+        return {
+          ...discovered,
+          installStatus: "upgrade_pending",
+          approvalId,
+          capabilities: declaredCapabilities,
+          addedCapabilities: gate.addedCapabilities,
+        };
+      }
 
       // Step 6: Persist install record and apply plugin-owned schema migrations
       // in one database transaction. If migration validation fails, the plugin
@@ -2260,7 +2650,13 @@ export function pluginLoader(
         "plugin-loader: plugin installed successfully",
       );
 
-      return discovered;
+      return {
+        ...discovered,
+        installStatus: "installed",
+        approvalId: null,
+        capabilities: declaredCapabilities,
+        addedCapabilities: [],
+      };
     },
 
     // -----------------------------------------------------------------------
@@ -2329,7 +2725,7 @@ export function pluginLoader(
       // 3. Detect capability escalation — new capabilities not in the old manifest
       const oldCaps = new Set(oldManifest.capabilities ?? []);
       const newCaps = newManifest.capabilities ?? [];
-      const addedCapabilities = newCaps.filter((c) => !oldCaps.has(c));
+      const addedCapabilities = diffAddedCapabilities(oldManifest.capabilities, newCaps);
 
       if (addedCapabilities.length > 0) {
         // Fail closed when no governance path is wired: never silently escalate.
@@ -2338,11 +2734,7 @@ export function pluginLoader(
             { pluginId, addedCapabilities, oldVersion: oldManifest.version, newVersion: newManifest.version },
             "plugin-loader: upgrade introduces new capabilities and no escalation gateway is configured — refusing",
           );
-          throw new Error(
-            `Upgrade for "${pluginId}" introduces new capabilities that require approval: ${addedCapabilities.join(", ")}. ` +
-              `The previous version declared [${[...oldCaps].join(", ")}]. ` +
-              `Please review and approve the capability escalation before upgrading.`,
-          );
+          throw ungovernedEscalationError(pluginId, addedCapabilities, [...oldCaps]);
         }
 
         // SECURITY-CRITICAL: snapshot the verified bytes to immutable storage
@@ -2402,6 +2794,7 @@ export function pluginLoader(
             addedCapabilities,
             // Anchor the approval to the exact package contents.
             digest: discovered.digest!,
+            origin: "upgrade",
           }));
 
         // Park WITHOUT touching version/manifest/caps. Because nothing else is
@@ -2504,9 +2897,11 @@ export function pluginLoader(
       }
 
       const oldManifest = plugin.manifestJson as PaperclipPluginManifestV1;
+      // An install/reinstall park carries the approved source on the approval;
+      // the row still points at the previous source until this step.
       const {
-        packageName = plugin.packageName,
-        localPath = plugin.packagePath ?? undefined,
+        packageName = approved.packageName ?? plugin.packageName,
+        localPath = approved.packagePath ?? plugin.packagePath ?? undefined,
       } = upgradeOptions;
 
       // Prefer the immutable snapshot captured at park over the
@@ -2556,8 +2951,7 @@ export function pluginLoader(
             `does not match the board-approved version "${approved.toVersion}".`,
         );
       }
-      const oldCaps = new Set(oldManifest.capabilities ?? []);
-      const fetchedAddedCaps = (newManifest.capabilities ?? []).filter((c) => !oldCaps.has(c));
+      const fetchedAddedCaps = diffAddedCapabilities(oldManifest.capabilities, newManifest.capabilities);
       const approvedAddedCaps = new Set(approved.addedCapabilities);
       const unapprovedCaps = fetchedAddedCaps.filter((c) => !approvedAddedCaps.has(c));
       if (unapprovedCaps.length > 0) {
@@ -2624,7 +3018,10 @@ export function pluginLoader(
      * Parking never mutated the version/manifest/caps, so this only restores
      * the lifecycle status to `ready`. Idempotent.
      */
-    async revertPendingUpgrade(pluginId: string): Promise<PluginRecord> {
+    async revertPendingUpgrade(
+      pluginId: string,
+      revertOptions: { origin?: CapabilityEscalationOrigin } = {},
+    ): Promise<PluginRecord> {
       const plugin = (await registry.getById(pluginId)) as PluginRecord | null;
       if (!plugin) throw new Error(`Plugin not found: ${pluginId}`);
 
@@ -2636,11 +3033,15 @@ export function pluginLoader(
         return plugin;
       }
 
-      const updated = await registry.updateStatus(pluginId, { status: "ready" });
+      // An install/reinstall park never had an approved install, so a
+      // rejection leaves it inactive. An /upgrade park restores `ready` at the
+      // still-installed version.
+      const restoreStatus = revertOptions.origin === "install" ? "uninstalled" : "ready";
+      const updated = await registry.updateStatus(pluginId, { status: restoreStatus });
 
       log.info(
-        { pluginId, version: plugin.version },
-        "plugin-loader: parked upgrade rejected and reverted to ready",
+        { pluginId, version: plugin.version, origin: revertOptions.origin ?? "upgrade", restoreStatus },
+        "plugin-loader: parked capability escalation rejected and reverted",
       );
 
       // The rejected upgrade's snapshot (if any) is no longer referenced.
@@ -3046,8 +3447,10 @@ export function pluginLoader(
       // 1. Resolve worker entrypoint
       // ------------------------------------------------------------------
       const packageRoot = resolvePluginPackageRoot(activePlugin, localPluginDir);
+      assertPackageActivation?.({ pluginKey, packageRoot, installedPackagePath: activePlugin.packagePath });
       activePlugin = await refreshPluginManifestFromPackage(activePlugin, packageRoot);
       manifest = activePlugin.manifestJson;
+      assertPackageActivation?.({ pluginKey, packageRoot, installedPackagePath: activePlugin.packagePath, manifest });
       const workerEntrypoint = resolveWorkerEntrypoint(activePlugin, localPluginDir);
 
       // ------------------------------------------------------------------
@@ -3160,36 +3563,7 @@ export function pluginLoader(
       // Reuses the `configRows` loaded in step 4b (which also seeded the
       // worker's proactive company scopes before startup); no second listConfigs
       // round-trip is needed here.
-      for (const row of configRows) {
-        try {
-          await workerManager.call(pluginId, "configChanged", {
-            config: (row.configJson ?? {}) as Record<string, unknown>,
-            companyId: row.companyId,
-          });
-        } catch (configErr) {
-          // A single-tenant worker fails closed (CROSS_TENANT_CONFIG) rather
-          // than collapse onto a second company's config — surface that at
-          // warn so the misconfiguration (multiple distinct companies
-          // configured for a single-tenant plugin) is visible, instead of
-          // being lost in the best-effort debug stream.
-          const code = (configErr as { code?: number } | null)?.code;
-          const details = {
-            pluginId,
-            pluginKey,
-            companyId: row.companyId,
-            code,
-            err: configErr instanceof Error ? configErr.message : String(configErr),
-          };
-          if (code === PLUGIN_RPC_ERROR_CODES.CROSS_TENANT_CONFIG) {
-            log.warn(
-              details,
-              "plugin-loader: startup config delivery rejected — single-tenant plugin configured for multiple companies",
-            );
-          } else {
-            log.debug(details, "plugin-loader: startup config delivery skipped for company");
-          }
-        }
-      }
+      await deliverStoredPluginConfig({ workerManager, pluginId, pluginKey, configRows, log });
 
       // ------------------------------------------------------------------
       // 6. Sync job declarations and register with scheduler

@@ -50,7 +50,10 @@ const OWNER_COMPANY = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const SERVICE_RUN_ID = "00000000-0000-4000-8000-00000000beef";
 const TEST_TOKEN = "TEST-bot-token-not-a-real-secret";
 
-function buildWorld() {
+function buildWorld(
+  opts: { pluginEnabledForOwner?: boolean; resolve?: () => Promise<string> } = {},
+) {
+  const pluginEnabledForOwner = opts.pluginEnabledForOwner ?? true;
   const registry = createPluginRunContextRegistry({
     ttlMs: 60_000,
     sweepIntervalMs: 60_000,
@@ -78,7 +81,15 @@ function buildWorld() {
             }
           : null,
     },
-    resolver: { resolve: async () => TEST_TOKEN },
+    resolver: { resolve: opts.resolve ?? (async () => TEST_TOKEN) },
+    // Mirror host wiring: the per-tenant availability gate is injected by
+    // plugin-host-services. The handler fails closed without it, so the
+    // fixture supplies it explicitly (enabled for the owning company).
+    ensurePluginEnabledForCompany: async (companyId: string) => {
+      if (!pluginEnabledForOwner || companyId !== OWNER_COMPANY) {
+        throw new Error("plugin not enabled for company");
+      }
+    },
   });
 
   // Mirror the host wiring (plugin-host-services): the fork-only
@@ -156,6 +167,22 @@ describe("service-context e2e (messenger getUpdates + onEvent)", () => {
     );
 
     expect(value).toBe(TEST_TOKEN);
+  });
+
+  it("denies the service-context bot-token resolve when the plugin is disabled for the owning company", async () => {
+    const resolve = vi.fn(async () => TEST_TOKEN);
+    const { handlers } = buildWorld({ pluginEnabledForOwner: false, resolve });
+
+    await expect(
+      handlers["secrets.resolveService"](
+        { secretRef: BOT_TOKEN_SECRET_REF } as never,
+        { serviceScope: { runId: SERVICE_RUN_ID } } as never,
+      ),
+    ).rejects.toMatchObject({ code: "not_found" });
+    expect(resolve).not.toHaveBeenCalled();
+
+    const entry = (logActivity as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1];
+    expect(entry?.details).toMatchObject({ outcome: "denied" });
   });
 
   it("denies a bare-serviceScope secrets.resolve (upstream guard restored)", async () => {

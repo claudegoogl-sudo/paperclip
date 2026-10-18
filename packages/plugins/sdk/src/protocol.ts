@@ -61,6 +61,7 @@ import type {
   PluginIssueAttachmentContent,
   PluginIssueWakeupBatchResult,
   PluginIssueWakeupResult,
+  PluginIssueWakeupRequest,
   PluginJobContext,
   PluginExecutionWorkspaceMetadata,
   PluginWorkspace,
@@ -322,6 +323,13 @@ export interface PluginInvocationContext {
  */
 export interface WorkerHostCallContext {
   invocationScope?: PluginInvocationScope | null;
+  /**
+   * SECURITY-CRITICAL: the host→worker method of the host's OWN dispatch record
+   * for the echoed invocation id (e.g. `"executeTool"`). Set only by the host
+   * worker manager alongside `invocationScope`; never read from worker params.
+   * The cross-company read exemption requires `"executeTool"`.
+   */
+  invocationDispatchMethod?: string;
   invalidInvocationScope?: boolean;
   /**
    * The W3C `traceparent` the host minted for the echoed invocation. The host
@@ -675,6 +683,21 @@ export interface PluginEnvironmentLease {
   expiresAt?: string | null;
 }
 
+/** Serializable provider result. The host adds refresh/close lifecycle methods. */
+export interface PluginEnvironmentRunnerIngressEndpoint {
+  kind: "authenticated_websocket";
+  websocketUrl: string;
+  secretHeaders: Array<{ name: string; value: string }>;
+  generation: string;
+}
+
+export interface PluginEnvironmentRunnerIngressEndpointParams
+  extends PluginEnvironmentDriverBaseParams {
+  lease: PluginEnvironmentLease;
+  port: number;
+  path: string;
+}
+
 export interface PluginEnvironmentAcquireLeaseParams extends PluginEnvironmentDriverBaseParams {
   runId: string;
   workspaceMode?: string;
@@ -708,8 +731,21 @@ export interface PluginEnvironmentResumeLeaseParams extends PluginEnvironmentDri
 }
 
 export interface PluginEnvironmentReleaseLeaseParams extends PluginEnvironmentDriverBaseParams {
+  /** Stop the exact allocation while preserving its files, regardless of its
+   * ordinary release policy. A failed stop must throw, never fall back to delete. */
+  resourceDisposition?: "stop_and_retain";
+  /** Explicit operator cancellation: terminate active work instead of waiting
+   * for command/sync activity to drain. Still requires a provider receipt. */
+  cancelActiveWork?: boolean;
   providerLeaseId: string | null;
   leaseMetadata?: Record<string, unknown>;
+}
+
+/** Returned only after the provider confirms that execution has ended. A queued
+ * stop request or successful local cleanup is not a termination receipt. */
+export interface PluginEnvironmentTerminationReceipt {
+  providerLeaseId: string;
+  state: "stopped" | "destroyed";
 }
 
 export interface PluginEnvironmentDestroyLeaseParams extends PluginEnvironmentReleaseLeaseParams {}
@@ -1061,7 +1097,7 @@ export interface PluginRenderCloseEvent {
  * key to a compile-time command. The open request carries no command string, so a
  * caller cannot select or override the command.
  */
-export type PluginLoginCommandKey = "claude" | "codex";
+export type PluginLoginCommandKey = "claude" | "codex" | "grok";
 
 /** The open request for one live login pseudo-terminal. The worker registers the terminal by `hostRouteId`. */
 export interface PluginLoginPtyOpenParams {
@@ -1132,6 +1168,12 @@ export interface PluginLoginPtyCloseResult {
 
 /** The worker→host pseudo-terminal output notification parameters. Modeled on `execute.log`. */
 export interface PluginLoginPtyOutputParams {
+  /**
+   * The host route identifier the open request carried. The worker echoes it,
+   * so the host can hold more than one concurrent login pseudo-terminal per
+   * worker and route each chunk to its own route.
+   */
+  hostRouteId: string;
   /** The worker session identifier that the open reply returned. */
   workerSessionId: string;
   /** The raw terminal output bytes. */
@@ -1140,6 +1182,12 @@ export interface PluginLoginPtyOutputParams {
 
 /** The worker→host pseudo-terminal exit notification parameters. */
 export interface PluginLoginPtyExitParams {
+  /**
+   * The host route identifier the open request carried. The worker echoes it,
+   * so the host can hold more than one concurrent login pseudo-terminal per
+   * worker and resolve the exit against its own route.
+   */
+  hostRouteId: string;
   /** The worker session identifier that the open reply returned. */
   workerSessionId: string;
   /** The child exit code, or null when the child ended with no code. */
@@ -1397,11 +1445,15 @@ export interface HostToWorkerMethods {
   ];
   environmentReleaseLease: [
     params: PluginEnvironmentReleaseLeaseParams,
-    result: void,
+    result: PluginEnvironmentTerminationReceipt | void,
+  ];
+  environmentStopLease: [
+    params: PluginEnvironmentReleaseLeaseParams,
+    result: PluginEnvironmentTerminationReceipt,
   ];
   environmentDestroyLease: [
     params: PluginEnvironmentDestroyLeaseParams,
-    result: void,
+    result: PluginEnvironmentTerminationReceipt | void,
   ];
   environmentRealizeWorkspace: [
     params: PluginEnvironmentRealizeWorkspaceParams,
@@ -1410,6 +1462,10 @@ export interface HostToWorkerMethods {
   environmentExecute: [
     params: PluginEnvironmentExecuteParams,
     result: PluginEnvironmentExecuteResult,
+  ];
+  environmentRunnerIngressEndpoint: [
+    params: PluginEnvironmentRunnerIngressEndpointParams,
+    result: PluginEnvironmentRunnerIngressEndpoint,
   ];
   environmentSyncIn: [
     params: PluginEnvironmentSyncInParams,
@@ -1498,9 +1554,11 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[] 
   "environmentAcquireLease",
   "environmentResumeLease",
   "environmentReleaseLease",
+  "environmentStopLease",
   "environmentDestroyLease",
   "environmentRealizeWorkspace",
   "environmentExecute",
+  "environmentRunnerIngressEndpoint",
   "environmentSyncIn",
   "environmentSyncOut",
   "environmentStartInteractiveSetup",
@@ -2080,6 +2138,16 @@ export interface WorkerToHostMethods {
     },
     result: PluginIssueSubtree,
   ];
+  "issues.listWakeupRequests": [
+    params: {
+      companyId: string;
+      issueIds: string[];
+      statuses?: string[];
+      since?: string;
+      limit?: number;
+    },
+    result: PluginIssueWakeupRequest[],
+  ];
   "issues.requestWakeup": [
     params: {
       issueId: string;
@@ -2520,6 +2588,38 @@ export interface WorkerToHostNotifications {
   "streams.close": {
     channel: string;
     companyId: string;
+  };
+
+  /**
+   * Host→worker feedback: the host DROPPED a `streams.*`
+   * notification because it could not be tenant-verified — no resolvable
+   * invocation scope, no channel pin captured at `streams.open` inside an
+   * attributed dispatch, or a companyId that mismatches the pin.
+   *
+   * This notification is fire-and-forget in both directions: the worker RPC
+   * host forwards it to the plugin log (`level: "warn"`) so out-of-dispatch
+   * emitters are diagnosable instead of silently dead. Reason codes:
+   * `invalid_invocation_scope`, `no_invocation_scope`, `company_mismatch`,
+   * `unpinned_channel`, `pin_mismatch`, `pin_cap_exceeded`.
+   *
+   * `pin_cap_exceeded` is the eviction report: the host bounds the pins it
+   * keeps per worker, so capturing a new pin once the cap is reached evicts
+   * the least-recently captured pin. On eviction `channel`/`companyId` name
+   * the EVICTED pin (not the notification being processed) and `method` is
+   * the capture that triggered the eviction. The channel itself keeps
+   * working in-dispatch; only its out-of-dispatch attribution and exit-time
+   * cleanup are given up. Close channels you are done with to stay under
+   * the cap.
+   */
+  "streams.dropped": {
+    /** The dropped worker→host notification method (`streams.emit`, …). */
+    method: string;
+    /** Channel of the dropped notification, when one was named. */
+    channel?: string;
+    /** Claimed companyId of the dropped notification, when one was sent. */
+    companyId?: string;
+    /** Why the host dropped it. */
+    reason: string;
   };
 
   /**

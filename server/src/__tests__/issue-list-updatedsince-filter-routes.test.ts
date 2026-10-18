@@ -2,11 +2,12 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { companies, companyMemberships, createDb, issues, principalPermissionGrants } from "@paperclipai/db";
+import { companies, companyMemberships, createDb, issues } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
@@ -30,10 +31,9 @@ describeEmbeddedPostgres("issue list routes updatedSince filter", () => {
   }, 20_000);
 
   afterEach(async () => {
-    await db.delete(issues);
-    await db.delete(principalPermissionGrants);
-    await db.delete(companyMemberships);
-    await db.delete(companies);
+    // Atomic TRUNCATE ... CASCADE from `companies` clears every per-test table
+    // in one statement, replacing the ordered per-table deletes this used to run.
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {
