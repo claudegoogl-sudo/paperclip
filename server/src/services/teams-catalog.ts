@@ -1,3 +1,4 @@
+import { readNonEmptyString } from "../lib/objects.js";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -223,12 +224,6 @@ export async function listCatalogTeams(query: CatalogTeamListQuery = {}): Promis
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function readNonEmptyString(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : null;
 }
 
 interface CatalogTeamProvenance {

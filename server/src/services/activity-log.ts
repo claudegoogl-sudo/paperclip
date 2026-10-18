@@ -1,3 +1,4 @@
+import { readNonEmptyString } from "../lib/objects.js";
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -274,10 +275,6 @@ export async function createActivityDetailsRedactor(db: Db) {
 export async function redactActivityDetails(db: Db, details: Record<string, unknown> | null) {
   if (!details) return null;
   return (await createActivityDetailsRedactor(db))(details);
-}
-
-function readNonEmptyString(value: unknown) {
-  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
 export async function resolveResponsibleUserIdForActivity(db: Db, input: LogActivityInput) {
