@@ -6,6 +6,7 @@ import {
   addCommonClientOptions,
   apiPath,
   formatInlineRecord,
+  parseJson,
   printOutput,
   resolveCommandContext,
   type BaseClientOptions,
@@ -689,13 +690,6 @@ async function readJsonFile(file: string): Promise<unknown> {
   return parseJson(await readFile(file, "utf8"));
 }
 
-function parseJson(value: string): unknown {
-  try {
-    return JSON.parse(value) as unknown;
-  } catch (error) {
-    throw new Error(`Invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
-  }
-}
 
 function asObject(value: unknown): JsonObject {
   if (!value || typeof value !== "object" || Array.isArray(value)) {

@@ -26,6 +26,7 @@ import {
   apiPath,
   formatInlineRecord,
   handleCommandError,
+  parseJson,
   printOutput,
   resolveCommandContext,
   type BaseClientOptions,
@@ -875,9 +876,6 @@ function parseJsonObject(value: string | undefined): Record<string, unknown> | u
   return parsed as Record<string, unknown>;
 }
 
-function parseJson(value: string): unknown {
-  return JSON.parse(value) as unknown;
-}
 
 function parseCsv(value: string | undefined): string[] {
   if (!value) return [];

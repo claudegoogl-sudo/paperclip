@@ -3,6 +3,7 @@ import {
   addCommonClientOptions,
   apiPath,
   handleCommandError,
+  parseJson,
   printOutput,
   resolveCommandContext,
   type BaseClientOptions,
@@ -162,6 +163,3 @@ function addCompanyPostJson(parent: Command, name: string, description: string, 
   );
 }
 
-function parseJson(value: string): unknown {
-  return JSON.parse(value) as unknown;
-}

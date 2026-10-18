@@ -37,6 +37,7 @@ import {
   apiPath,
   formatInlineRecord,
   handleCommandError,
+  parseJson,
   printOutput,
   resolveCommandContext,
   type BaseClientOptions,
@@ -2079,6 +2080,3 @@ function addCompanyJsonPost(parent: Command, name: string, description: string, 
   );
 }
 
-function parseJson(value: string): unknown {
-  return JSON.parse(value) as unknown;
-}
