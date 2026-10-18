@@ -109,4 +109,91 @@ describe("llm routes", () => {
     expect(res.text).toContain("http://host.docker.internal:8642");
     expect(res.text).toContain("https://hermes-gateway.example");
   });
+
+  it("404s on an unknown adapter type that has no plugin-only doc", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      companyIds: ["company-1"],
+      source: "local_implicit",
+      isInstanceAdmin: true,
+    });
+
+    const res = await request(app).get("/api/llms/agent-configuration/not_a_real_adapter.txt");
+
+    expect(res.status).toBe(404);
+    expect(res.text).toContain("Unknown adapter type: not_a_real_adapter");
+  });
+
+  it("lists agent icon names for board actors", async () => {
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      companyIds: ["company-1"],
+      source: "local_implicit",
+      isInstanceAdmin: true,
+    });
+
+    const res = await request(app).get("/api/llms/agent-icons.txt");
+
+    expect(res.status).toBe(200);
+    expect(res.text).toContain("# Paperclip Agent Icon Names");
+    expect(res.text).toContain('"name": "SearchOps"');
+  });
+
+  it("rejects an agent actor without permission to read agent configuration", async () => {
+    mockAgentService.getById.mockResolvedValue({ role: "engineer", permissions: null });
+    const app = await createApp({
+      type: "agent",
+      agentId: "agent-1",
+      companyIds: ["company-1"],
+      source: "agent_api_key",
+    });
+
+    const res = await request(app).get("/api/llms/agent-configuration.txt");
+
+    expect(res.status).toBe(403);
+    expect(mockAgentService.getById).toHaveBeenCalledWith("agent-1");
+  });
+
+  it("rejects an agent actor whose agent record cannot be found", async () => {
+    mockAgentService.getById.mockResolvedValue(undefined);
+    const app = await createApp({
+      type: "agent",
+      agentId: "missing-agent",
+      companyIds: ["company-1"],
+      source: "agent_api_key",
+    });
+
+    const res = await request(app).get("/api/llms/agent-icons.txt");
+
+    expect(res.status).toBe(403);
+  });
+
+  it("rejects a non-board, non-agent actor outright", async () => {
+    const app = await createApp({ type: "anonymous" });
+
+    const res = await request(app).get("/api/llms/agent-icons.txt");
+
+    expect(res.status).toBe(403);
+    expect(mockAgentService.getById).not.toHaveBeenCalled();
+  });
+
+  it("allows an agent actor with the canCreateAgents permission to read", async () => {
+    mockAgentService.getById.mockResolvedValue({
+      role: "manager",
+      permissions: { canCreateAgents: true },
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: "agent-1",
+      companyIds: ["company-1"],
+      source: "agent_api_key",
+    });
+
+    const res = await request(app).get("/api/llms/agent-icons.txt");
+
+    expect(res.status).toBe(200);
+    expect(res.text).toContain("# Paperclip Agent Icon Names");
+  });
 });
