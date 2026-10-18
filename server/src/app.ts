@@ -929,7 +929,7 @@ export async function createApp(
   api.use(inboxDismissalRoutes(db));
   api.use(instanceSettingsRoutes(db));
   if (opts.databaseBackupService) {
-    api.use(instanceDatabaseBackupRoutes(opts.databaseBackupService));
+    api.use(instanceDatabaseBackupRoutes(opts.databaseBackupService, db));
   }
   const pluginRegistry = pluginRegistryService(db);
   const eventBus = createPluginEventBus();
@@ -1167,6 +1167,7 @@ export async function createApp(
   );
   api.use(
     adapterRoutes({
+      db,
       getNativeRunnerEnabled: async () =>
         (await instanceSettingsService(db).getExperimental())
           .enableNativeRunner === true,
