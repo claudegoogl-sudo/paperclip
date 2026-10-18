@@ -53,7 +53,7 @@ import {
   type PluginWebhookRateLimiter,
   type PluginWebhookRateLimitTier,
 } from "../services/plugin-webhook-rate-limit.js";
-import { isVerifiedWebhookDelivery } from "../services/plugin-webhook-auth.js";
+import { describeTokenDigestDefect, isVerifiedWebhookDelivery } from "../services/plugin-webhook-auth.js";
 import {
   generateWebhookToken,
   isWebhookTokenDigestConfig,
@@ -93,6 +93,7 @@ import {
   getActorInfo,
 } from "./authz.js";
 import { validateInstanceConfig } from "../services/plugin-config-validator.js";
+import { highRiskOverrideKeys, nonTenantOverrideKeys } from "../services/plugin-config-scope.js";
 import {
   findLocalFolderDeclaration,
   getStoredLocalFolders,
@@ -109,7 +110,22 @@ import {
   isWithinBundledPluginRoot,
 } from "../services/plugin-install-guard.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
+import { getHiddenSettings } from "../services/settings-visibility.js";
 import { badRequest, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
+
+/**
+ * Floor: when the hosting operator hides the Plugins settings surface
+ * (`instance.plugins` in PAPERCLIP_HIDDEN_SETTINGS), plugin lifecycle and
+ * configuration writes are rejected alongside it. Reads stay open — installed
+ * plugins keep running and `/plugins/ui-contributions` still powers their UI.
+ */
+function assertPluginManagementVisible() {
+  if (getHiddenSettings().has("instance.plugins")) {
+    throw forbidden("Plugin management is managed by the hosting operator on this instance", {
+      code: "settings_operator_managed",
+    });
+  }
+}
 
 /** UI slot declaration extracted from plugin manifest */
 type PluginUiSlotDeclaration = NonNullable<NonNullable<PaperclipPluginManifestV1["ui"]>["slots"]>[number];
@@ -1372,6 +1388,7 @@ export function pluginRoutes(
    */
   router.post("/plugins/install", async (req, res) => {
     assertInstanceAdmin(req);
+    assertPluginManagementVisible();
     const { packageName, version, isLocalPath } = req.body as PluginInstallRequest;
 
     // Input validation
@@ -1445,11 +1462,15 @@ export function pluginRoutes(
         return;
       }
 
-      // Transition to ready state
       const existingPlugin = await registry.getByKey(discovered.manifest.id);
       if (existingPlugin) {
-        await lifecycle.load(existingPlugin.id);
-        reconcileWatch(existingPlugin.id);
+        const parked = discovered.installStatus === "upgrade_pending";
+        // A parked install waits for its capability-escalation approval: do
+        // NOT load it. Approve -> the approvals resolver completes it to ready.
+        if (!parked) {
+          await lifecycle.load(existingPlugin.id);
+          reconcileWatch(existingPlugin.id);
+        }
         const updated = await registry.getById(existingPlugin.id);
         await logPluginMutationActivity(req, "plugin.installed", existingPlugin.id, {
           pluginId: existingPlugin.id,
@@ -1457,9 +1478,18 @@ export function pluginRoutes(
           packageName: updated?.packageName ?? existingPlugin.packageName,
           version: updated?.version ?? existingPlugin.version,
           source: isLocalPath ? "local_path" : "npm",
+          capabilities: discovered.capabilities,
+          approvalId: discovered.approvalId,
         });
         publishGlobalLiveEvent({ type: "plugin.ui.updated", payload: { pluginId: existingPlugin.id, action: "installed" } });
-        res.json(updated);
+        res.json({
+          ...updated,
+          // Declared capabilities of the requested package (the stored
+          // manifest of a parked install holds only the granted set).
+          capabilities: discovered.capabilities,
+          addedCapabilities: discovered.addedCapabilities,
+          approvalId: discovered.approvalId,
+        });
       } else {
         // This shouldn't happen since installPlugin already registers in the DB
         res.status(500).json({ error: "Plugin installed but not found in registry" });
@@ -2216,6 +2246,7 @@ export function pluginRoutes(
    */
   router.delete("/plugins/:pluginId", async (req, res) => {
     assertInstanceAdmin(req);
+    assertPluginManagementVisible();
     const { pluginId } = req.params;
     const purge = req.query.purge === "true";
 
@@ -2253,6 +2284,7 @@ export function pluginRoutes(
    */
   router.post("/plugins/:pluginId/enable", async (req, res) => {
     assertInstanceAdmin(req);
+    assertPluginManagementVisible();
     const { pluginId } = req.params;
 
     const plugin = await resolvePlugin(registry, pluginId);
@@ -2292,6 +2324,7 @@ export function pluginRoutes(
    */
   router.post("/plugins/:pluginId/disable", async (req, res) => {
     assertInstanceAdmin(req);
+    assertPluginManagementVisible();
     const { pluginId } = req.params;
     const body = req.body as { reason?: string } | undefined;
     const reason = body?.reason;
@@ -2455,6 +2488,7 @@ export function pluginRoutes(
    */
   router.post("/plugins/:pluginId/upgrade", async (req, res) => {
     assertInstanceAdmin(req);
+    assertPluginManagementVisible();
     const { pluginId } = req.params;
     const body = req.body as { version?: string } | undefined;
     const version = body?.version;
@@ -2550,6 +2584,7 @@ export function pluginRoutes(
    */
   router.post("/plugins/:pluginId/config", async (req, res) => {
     assertInstanceAdmin(req);
+    assertPluginManagementVisible();
     const { pluginId } = req.params;
 
     const plugin = await resolvePlugin(registry, pluginId);
@@ -2584,6 +2619,21 @@ export function pluginRoutes(
         res.status(400).json({
           error: "Configuration does not match the plugin's instanceConfigSchema",
           fieldErrors: validation.errors,
+        });
+        return;
+      }
+    }
+
+    // Reject a malformed webhook token digest at write time instead of letting
+    // request-time verification silently degrade. Uses the SAME predicate.
+    for (const hook of plugin.manifestJson?.webhooks ?? []) {
+      const key = hook.auth?.tokenDigestConfigKey;
+      if (!key || !(key in body.configJson)) continue;
+      const defect = describeTokenDigestDefect(body.configJson[key]);
+      if (defect) {
+        res.status(400).json({
+          error: `Config key '${key}' (webhook token digest for endpoint '${hook.endpointKey}') is malformed: ${defect}`,
+          fieldErrors: [{ path: key, message: defect }],
         });
         return;
       }
@@ -2809,6 +2859,7 @@ export function pluginRoutes(
    */
   router.post("/plugins/:pluginId/config/test", async (req, res) => {
     assertBoardOrgAccess(req);
+    assertPluginManagementVisible();
 
     if (!bridgeDeps) {
       res.status(501).json({ error: "Plugin bridge is not enabled" });
@@ -3380,6 +3431,7 @@ export function pluginRoutes(
 
   router.put("/plugins/:pluginId/companies/:companyId/local-folders/:folderKey", async (req, res) => {
     assertBoardOrgAccess(req);
+    assertPluginManagementVisible();
     const { pluginId, companyId, folderKey } = req.params;
     assertCompanyAccess(req, companyId);
 
@@ -3508,6 +3560,22 @@ export function pluginRoutes(
     }
 
     const schema = plugin.manifestJson?.instanceConfigSchema;
+
+    // Scope gate. Read ONLY from the host-stored manifest, never from the
+    // worker. A key without `x-paperclip-scope: "tenant"` is operator-plane
+    // and may be set only in the operator-authored plugin_config row.
+    const operatorKeys = nonTenantOverrideKeys(schema as never, body.configJson);
+    if (operatorKeys.length > 0) {
+      res.status(422).json({
+        error: "Config keys are not tenant-overridable",
+        details: { keys: operatorKeys },
+      });
+      return;
+    }
+    // Separation of duties: URL- and secret-ref-shaped keys need instance admin.
+    if (highRiskOverrideKeys(schema as never, body.configJson).length > 0) {
+      assertInstanceAdmin(req);
+    }
     if (schema && Object.keys(schema).length > 0) {
       const validation = validateInstanceConfig(body.configJson, schema);
       if (!validation.valid) {

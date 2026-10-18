@@ -61,7 +61,7 @@ const COMPOSE_EXTENSIONS = new Set([".yml", ".yaml"]);
 export const ALLOW_MARKER = "paperclip:allow-literal-secret";
 
 const SECRET_KEY_PATTERN =
-  /(PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIAL)/i;
+  /(PASSWORD|PASSWD|PASSPHRASE|PWD|SALT|SECRET|TOKEN|API_KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIAL|_KEY$)/i;
 
 /**
  * `POSTGRES_PASSWORD_FILE: /run/secrets/pg` is the Docker secrets convention: the
@@ -329,7 +329,24 @@ export function findOffenses(text) {
       });
     }
 
+    // Rule 3: libpq keyword/value DSN (`host=db password=pw`), line-wide.
+    const dsn = /(?:^|[\s"'])password\s*=\s*("[^"]*"|'[^']*'|[^\s"']+)/i.exec(stripComment(line));
+    let dsnFlagged = false;
+    if (dsn) {
+      const val = dsn[1].replace(/^["']|["']$/g, "");
+      if (val !== "" && maskInterpolations(val).replaceAll(INTERPOLATION_MASK, "") !== "") {
+        dsnFlagged = true;
+        offenses.push({
+          lineNumber: index + 1,
+          key: null,
+          reason: "libpq DSN carries a literal `password=` value; interpolate it from a required variable.",
+          line: line.trim(),
+        });
+      }
+    }
+
     for (const entry of entriesForLine(line)) {
+      if (dsnFlagged && /^password$/i.test(entry.key)) continue;
       const result = classifyEntry(entry.key, entry.value);
       // De-dup: when the per-entry pass reports the same URL offense the
       // line-wide pass already recorded (an ordinary `DATABASE_URL: postgres://…`

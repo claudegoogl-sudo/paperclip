@@ -94,6 +94,64 @@ export function pluginRegistryService(db: Db) {
     return (result[0]?.maxOrder ?? 0) + 1;
   }
 
+  async function readBaseCompanyConfig(
+    pluginId: string,
+    companyId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const row = await db
+      .select({ configJson: pluginConfig.configJson })
+      .from(pluginConfig)
+      .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
+      .then((rows) => rows[0] ?? null);
+    return (row?.configJson as Record<string, unknown> | undefined) ?? null;
+  }
+
+  async function readCompanyConfigOverride(
+    pluginId: string,
+    companyId: string,
+  ): Promise<Record<string, unknown> | null> {
+    const row = await db
+      .select({ settingsJson: pluginCompanySettings.settingsJson })
+      .from(pluginCompanySettings)
+      .where(and(
+        eq(pluginCompanySettings.pluginId, pluginId),
+        eq(pluginCompanySettings.companyId, companyId),
+      ))
+      .then((rows) => rows[0] ?? null);
+    const overrides = (row?.settingsJson as Record<string, unknown> | undefined)?.configOverrides;
+    return overrides && typeof overrides === "object" && !Array.isArray(overrides)
+      ? (overrides as Record<string, unknown>)
+      : null;
+  }
+
+  /**
+   * Single binding-sync path for a company's plugin config layers.
+   *
+   * The base `plugin_config` row and the tenant `configOverrides` subtree
+   * share ONE binding key per (companyId, plugin, configPath). Diffing either
+   * layer alone lets a write to one layer revoke a binding the other layer
+   * still needs (e.g. "save base, then clear override" dropped the base
+   * binding). Every layer write therefore reconciles the EFFECTIVE config
+   * (base shallow-merged with override, override wins — same precedence as
+   * the runtime merge) before vs. after the write.
+   */
+  async function syncEffectiveCompanyBindings(
+    plugin: { id: string; manifestJson: unknown },
+    companyId: string,
+    previous: { base: Record<string, unknown> | null; override: Record<string, unknown> | null },
+    next: { base: Record<string, unknown> | null; override: Record<string, unknown> | null },
+  ) {
+    const merge = (layers: typeof previous): Record<string, unknown> | null =>
+      layers.base || layers.override ? { ...(layers.base ?? {}), ...(layers.override ?? {}) } : null;
+    return secretService(db).syncPluginSecretBindings({
+      pluginId: plugin.id,
+      companyId,
+      instanceConfigSchema: instanceConfigSchemaOf(plugin),
+      previousConfig: merge(previous),
+      nextConfig: merge(next),
+    });
+  }
+
   // -----------------------------------------------------------------------
   // Public API
   // -----------------------------------------------------------------------
@@ -205,9 +263,10 @@ export function pluginRegistryService(db: Db) {
       id: string,
       data: {
         packageName?: string;
+        packagePath?: string;
+        status?: "upgrade_pending";
         version?: string;
         manifest?: PaperclipPluginManifestV1;
-        packagePath?: string;
       },
     ) => {
       const plugin = await getById(id);
@@ -217,8 +276,12 @@ export function pluginRegistryService(db: Db) {
         updatedAt: new Date(),
       };
       if (data.packageName !== undefined) setClause.packageName = data.packageName;
-      if (data.version !== undefined) setClause.version = data.version;
       if (data.packagePath !== undefined) setClause.packagePath = data.packagePath;
+      if (data.status !== undefined) {
+        setClause.status = data.status;
+        setClause.lastError = null;
+      }
+      if (data.version !== undefined) setClause.version = data.version;
       if (data.manifest !== undefined) {
         setClause.manifestJson = data.manifest;
         setClause.apiVersion = data.manifest.apiVersion;
@@ -357,13 +420,11 @@ export function pluginRegistryService(db: Db) {
       // Maintain company_secret_bindings for any secret-ref fields. Adapted to
       // upstream's company-scoped plugin_config: the config row is per-company,
       // so the binding sync runs in that company's scope.
-      await secretService(db).syncPluginSecretBindings({
-        pluginId,
-        companyId,
-        instanceConfigSchema: instanceConfigSchemaOf(plugin),
-        previousConfig: existing?.configJson ?? null,
-        nextConfig: input.configJson,
-      });
+      const override = await readCompanyConfigOverride(pluginId, companyId);
+      await syncEffectiveCompanyBindings(plugin, companyId,
+        { base: existing?.configJson ?? null, override },
+        { base: input.configJson, override },
+      );
 
       return row;
     },
@@ -410,13 +471,11 @@ export function pluginRegistryService(db: Db) {
       // Maintain company_secret_bindings for any secret-ref fields. Adapted to
       // upstream's company-scoped plugin_config: the config row is per-company,
       // so the binding sync runs in that company's scope.
-      await secretService(db).syncPluginSecretBindings({
-        pluginId,
-        companyId,
-        instanceConfigSchema: instanceConfigSchemaOf(plugin),
-        previousConfig: existing?.configJson ?? null,
-        nextConfig,
-      });
+      const override = await readCompanyConfigOverride(pluginId, companyId);
+      await syncEffectiveCompanyBindings(plugin, companyId,
+        { base: existing?.configJson ?? null, override },
+        { base: nextConfig, override },
+      );
 
       return row;
     },
@@ -614,13 +673,14 @@ export function pluginRegistryService(db: Db) {
 
       // Reconcile bindings on the configOverrides sub-tree (where the
       // manifest's secret-ref paths actually live), scoped to this tenant.
-      await secretService(db).syncPluginSecretBindings({
-        pluginId,
-        instanceConfigSchema: instanceConfigSchemaOf(plugin),
-        previousConfig: previousOverride,
-        nextConfig: configJson,
-        companyId,
-      });
+      // Sync against the EFFECTIVE config (base plugin_config ⊕ override):
+      // base and override share one binding key per (company, path), so an
+      // override-only diff would revoke a binding the base still needs.
+      const base = await readBaseCompanyConfig(pluginId, companyId);
+      await syncEffectiveCompanyBindings(plugin, companyId,
+        { base, override: previousOverride },
+        { base, override: configJson },
+      );
 
       return row;
     },
@@ -669,13 +729,13 @@ export function pluginRegistryService(db: Db) {
         .returning()
         .then((rows) => rows[0]) as PluginCompanySettings;
 
-      await secretService(db).syncPluginSecretBindings({
-        pluginId,
-        instanceConfigSchema: instanceConfigSchemaOf(plugin),
-        previousConfig: previousOverride,
-        nextConfig: null,
-        companyId,
-      });
+      // Effective-config sync: a path still referenced by the base
+      // plugin_config keeps (or is repointed to) the base binding.
+      const base = await readBaseCompanyConfig(pluginId, companyId);
+      await syncEffectiveCompanyBindings(plugin, companyId,
+        { base, override: previousOverride },
+        { base, override: null },
+      );
 
       return row;
     },

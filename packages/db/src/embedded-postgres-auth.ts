@@ -419,8 +419,11 @@ export function resolveEmbeddedPostgresPasswordForStartup(
   }
   // Fresh initdb: generate the password now and persist it BEFORE initdb runs
   // so a crash between generation and persistence cannot leave the cluster
-  // with an unknown password.
+  // with an unknown password. The data dir may not exist yet (upstream's
+  // reseed flow boots the current worktree's database without pre-creating
+  // it), so create it here rather than assuming the caller did.
   const generated = generateEmbeddedPostgresPassword();
+  mkdirSync(dataDir, { recursive: true });
   writeEmbeddedPostgresCredential(dataDir, generated);
   return { password: generated, source: "generated" };
 }

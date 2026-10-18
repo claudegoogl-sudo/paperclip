@@ -9,6 +9,7 @@ import {
   workspaceGitSchedulerOptionsFromEnv,
   type WorkspaceGitRunner,
 } from "./workspace-git-operation-scheduler.js";
+import { WORKSPACE_GIT_SCAN_SATURATED_CODE } from "@paperclipai/adapter-utils/git-workspace-sync";
 
 const tempPaths: string[] = [];
 
@@ -43,6 +44,55 @@ function scanInput(workspacePath: string, suffix: string, fairnessKeys: string[]
 afterEach(async () => {
   vi.restoreAllMocks();
   await Promise.all(tempPaths.splice(0).map((tempPath) => fs.rm(tempPath, { recursive: true, force: true })));
+});
+
+it("streams with backpressure and waits for an active sink before releasing cancellation", async () => {
+  const workspace = await makeWorkspace();
+  const entered = deferred();
+  const release = deferred();
+  const scheduler = createWorkspaceGitOperationScheduler({
+    gitBinary: process.execPath,
+    gitArgsPrefix: ["-e", "process.stdout.write(Buffer.alloc(1024*1024)); setInterval(()=>{},1000)", "--"],
+    concurrency: 1,
+    killGraceMs: 10,
+  });
+  const controller = new AbortController();
+  let settled = false;
+  const pending = scheduler.run({
+    ...scanInput(workspace, "stream"), signal: controller.signal, maxStdoutBytes: 1,
+    onStdout: async (chunk) => {
+      expect(chunk.length).toBeLessThanOrEqual(64 * 1024);
+      entered.resolve();
+      await release.promise;
+    },
+  });
+  const observed = pending.catch((error) => { settled = true; return error; });
+  await entered.promise;
+  controller.abort();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(settled).toBe(false);
+  expect(scheduler.snapshot().activeCount).toBe(1);
+  release.resolve();
+  expect(await observed).toMatchObject({ code: WORKSPACE_GIT_SCAN_ERROR_CODES.cancelled });
+  expect(scheduler.snapshot()).toMatchObject({ activeCount: 0, inFlightCount: 0 });
+});
+
+it("does not coalesce or cache caller-owned streaming sinks and fails on a sink error", async () => {
+  const workspace = await makeWorkspace();
+  const scheduler = createWorkspaceGitOperationScheduler({
+    gitBinary: process.execPath, gitArgsPrefix: ["-e", "process.stdout.write('path\\0')", "--"], concurrency: 1,
+  });
+  const bytes = [0, 0];
+  await Promise.all(bytes.map((_, index) => scheduler.run({
+    ...scanInput(workspace, "same"), cacheTtlMs: 10000, maxStdoutBytes: 1,
+    onStdout: (chunk) => { bytes[index] += chunk.length; },
+  })));
+  expect(bytes).toEqual([5, 5]);
+  expect(scheduler.snapshot()).toMatchObject({ cacheEntryCount: 0, totals: { started: 2, singleFlightJoins: 0 } });
+  await expect(scheduler.run({
+    ...scanInput(workspace, "same"), onStdout: () => { throw new Error("disk full"); },
+  })).rejects.toMatchObject({ code: WORKSPACE_GIT_SCAN_ERROR_CODES.failed });
+  expect(scheduler.snapshot()).toMatchObject({ activeCount: 0, inFlightCount: 0 });
 });
 
 describe("WorkspaceGitOperationScheduler", () => {
@@ -165,14 +215,21 @@ describe("WorkspaceGitOperationScheduler", () => {
     const scheduler = createWorkspaceGitOperationScheduler({ runner, defaultCacheTtlMs: 0 });
 
     const first = scheduler.run(scanInput(workspace, "same"));
+    // Wait for the first request to register as the single-flight leader before
+    // the alias request starts. Both requests call fs.realpath concurrently, so
+    // without this barrier the symlink alias can resolve first and become the
+    // leader. That race makes the leader and joiner order non-deterministic.
+    await vi.waitFor(() => expect(scheduler.snapshot().inFlightCount).toBe(1));
     const joined = scheduler.run(scanInput(alias, "same"));
     await vi.waitFor(() => expect(scheduler.snapshot().totals.singleFlightJoins).toBe(1));
     expect(calls).toBe(1);
     gate.resolve();
-    await expect(Promise.all([first, joined])).resolves.toEqual([
-      expect.objectContaining({ stdout: "shared", singleFlightJoined: false }),
-      expect.objectContaining({ stdout: "shared", singleFlightJoined: true }),
+    const results = await Promise.all([first, joined]);
+    expect(results).toEqual([
+      expect.objectContaining({ stdout: "shared" }),
+      expect.objectContaining({ stdout: "shared" }),
     ]);
+    expect(results.map((result) => result.singleFlightJoined).sort()).toEqual([false, true]);
 
     shouldFail = true;
     await expect(scheduler.run(scanInput(workspace, "failure"))).rejects.toMatchObject({
@@ -420,5 +477,15 @@ describe("WorkspaceGitOperationScheduler", () => {
 
     expect({ calls, peakActive }).toEqual({ calls: 2, peakActive: 2 });
     expect(scheduler.snapshot()).toMatchObject({ activeCount: 0, queuedCount: 0, inFlightCount: 0 });
+  });
+});
+
+describe("WORKSPACE_GIT_SCAN_SATURATED_CODE parity", () => {
+  it("stays equal to WORKSPACE_GIT_SCAN_ERROR_CODES.saturated", () => {
+    // `adapter-utils` cannot import this module (the reverse direction is
+    // allowed, not this one), so `resolveReferencedSourceIgnore` declares its
+    // own copy of the saturation code to key its retry off. This test is the
+    // one place both literals meet, so the two copies cannot drift apart.
+    expect(WORKSPACE_GIT_SCAN_SATURATED_CODE).toBe(WORKSPACE_GIT_SCAN_ERROR_CODES.saturated);
   });
 });

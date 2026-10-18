@@ -121,6 +121,11 @@ vi.mock("../telemetry.js", () => ({
   getTelemetryClient: vi.fn(() => ({ track: vi.fn() })),
 }));
 
+// The 1005.0 comment path reads the runner goal projection; this suite's fake db has no goal rows.
+vi.mock("../services/runner-goals.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/runner-goals.js")>()),
+  runnerGoalService: () => ({ projection: async () => null, act: async () => undefined }),
+}));
 vi.mock("../services/access.js", () => ({ accessService: () => mockAccessService }));
 vi.mock("../services/activity-log.js", () => ({ logActivity: mockLogActivity }));
 vi.mock("../services/agents.js", () => ({ agentService: () => mockAgentService }));

@@ -360,6 +360,7 @@ export interface PaperclipPluginManifestV1 {
         | "sidebarPanel"
         | "projectSidebarItem"
         | "globalToolbarButton"
+        | "appShellOverlay"
         | "toolbarButton"
         | "contextMenuItem"
         | "commentAnnotation"
@@ -495,6 +496,7 @@ If a worker fails:
 - keep the rest of the instance running
 - retry start with bounded backoff
 - do not drop other plugins or core services
+- a bundled plugin (shipped with the release image) that is still `error` at the next server boot is moved back to `ready` once per boot, so the startup loader gets a fresh activation attempt; an operator-`disabled` plugin is never touched
 
 ## 12.5 Graceful Shutdown Policy
 
@@ -580,6 +582,16 @@ Delivery semantics:
 - plugin must be idempotent
 - no global ordering guarantee across all event types
 - per-entity ordering is best effort but not guaranteed after retries
+
+Wire shape: the host sends `onEvent` as a JSON-RPC request and does not wait
+for the result. The worker replies when the handler settles. The event's
+company scope is live only while the handler runs. The cap is 15 minutes for
+a worker that declared `echoesInvocationId` and has echoed at least one valid
+invocation id in this process. For every other worker the cap is 30 seconds
+(or the configured rpc timeout if lower). After the reply, a worker call from
+a job or timer is resolved as if no event is in flight. Above 256 in-flight
+events per worker, the host sends the event as a notification with the same
+cap.
 
 ### 13.6 `runJob`
 
@@ -822,6 +834,7 @@ Relation and read helpers:
 - `ctx.issues.relations.addBlockers(issueId, blockerIssueIds, companyId)`
 - `ctx.issues.relations.removeBlockers(issueId, blockerIssueIds, companyId)`
 - `ctx.issues.getSubtree(issueId, companyId, options)`
+- `ctx.issues.listWakeupRequests(issueIds, companyId, options)` — pending/recent wakeup requests, allow-listed fields (`issue.wakeups.read`)
 - `ctx.issues.summaries.getOrchestration({ issueId, companyId, includeSubtree, billingCode })`
 
 Governance helpers:
@@ -922,12 +935,42 @@ The host enforces capabilities in the SDK layer and refuses calls outside the gr
 - `issue.documents.read`
 - `issue.relations.read`
 - `issue.subtree.read`
+- `issue.wakeups.read`
 - `agents.read`
 - `goals.read`
 - `activity.read`
 - `costs.read`
 - `issues.orchestration.read`
 - `database.namespace.read`
+- `companies.cross-read` (default-deny, operator opt-in; see §15.1.1)
+
+#### 15.1.1 `companies.cross-read`
+
+By default every plugin→host call is pinned to the company of the current
+dispatch. `companies.cross-read` lets a plugin read **other** companies, but
+only when **all** of these hold:
+
+1. The manifest declares `companies.cross-read` (plus the normal read
+   capability for the method, e.g. `issues.read`).
+2. The operator lists the plugin key in the instance environment variable
+   `PAPERCLIP_PLUGIN_CROSS_COMPANY_READ_ALLOWLIST` (comma-separated plugin
+   keys). Empty or unset = no plugin may cross-read. The manifest alone grants
+   nothing.
+3. The worker echoes an invocation id that the host resolves to its own
+   `executeTool` (agent tool) dispatch. Actions, data/stream handlers, events,
+   jobs, webhooks, `setup()` loops, service-scope calls, legacy id-less calls,
+   and unknown or expired ids never qualify.
+4. The method is in the frozen host-side set: `companies.list` (returned
+   unfiltered), `companies.get`, `issues.list`, `issues.get`, `agents.list`,
+   `agents.get`. No other method (no writes, no comments) is affected.
+
+Row-level checks still run: `issues.get` with company A and an issue of
+company B returns not found. Each admitted foreign read writes a
+`plugin.cross_company_read` activity row to the **target** company (an
+unfiltered `companies.list` is recorded on the caller's company) with the
+plugin key, method, calling agent and run id. Bodies are never logged.
+
+Example (operator): `PAPERCLIP_PLUGIN_CROSS_COMPANY_READ_ALLOWLIST=platform.fleet-reader`
 
 ### Data Write
 
@@ -977,6 +1020,19 @@ The host enforces capabilities in the SDK layer and refuses calls outside the gr
 - `http.outbound`
 - `secrets.read-ref`
 - `environment.drivers.register`
+
+#### `http.outbound` destination rules
+
+`ctx.http.fetch` resolves the host once, then connects to the pinned IP. The host parses every resolved address and denies by default:
+
+- Loopback, unspecified, link-local (includes `169.254.169.254`), RFC 1918, ULA, multicast, documentation, benchmarking, discard and other reserved ranges are denied.
+- IPv6 forms that embed an IPv4 address (`::ffff:7f00:1`, `::127.0.0.1`, `64:ff9b::7f00:1`) are unwrapped. The inner IPv4 is classified.
+- 6to4 (`2002::/16`), Teredo (`2001::/32`) and local-use NAT64 (`64:ff9b:1::/48`) are denied.
+- Addresses of the host's own network interfaces are always denied.
+- CGNAT (`100.64.0.0/10`) is controlled by `PAPERCLIP_PLUGIN_FETCH_CGNAT`: `deny` (default; also used for any unknown value) blocks it unless the instance admin opted the exact origin in for the plugin; `allow-legacy` (explicit rollback switch, kept for one release) allows it and logs `plugin.http_fetch.cgnat_legacy_allowed` (plugin id, scheme, IP, port only).
+- Redirects are not followed. The worker receives the 30x response.
+
+Example: `http://[::ffff:127.0.0.1]:3100/` fails with `All resolved IPs for ... are in private/reserved ranges`.
 
 ### Agent Tools
 
@@ -1655,6 +1711,41 @@ manage `company_secret_bindings` directly:
   Each ref must belong to `:companyId`; a cross-company ref is rejected with
   `422` rather than silently skipped.
 
+#### Override key scope (`x-paperclip-scope`)
+
+A per-company override may set only keys the manifest marks tenant-scoped:
+
+```json
+"instanceConfigSchema": {
+  "type": "object",
+  "properties": {
+    "label":       { "type": "string", "x-paperclip-scope": "tenant" },
+    "baseUrl":     { "type": "string", "format": "uri", "x-paperclip-scope": "tenant" },
+    "internalUrl": { "type": "string", "format": "uri" }
+  }
+}
+```
+
+- No annotation (or `"operator"`) means **operator** scope. The override
+  route rejects such keys with `422` (`details.keys` lists them). Set them in
+  the operator-authored `plugin_config` row instead (`POST .../config`).
+- A tenant key whose schema declares `format: "uri"` or `format: "secret-ref"`
+  anywhere in its subschema tree (nested `properties`, `items`/`prefixItems`,
+  `additionalProperties`, `oneOf`/`anyOf`/`allOf` at any depth, `if`/`then`/`else`,
+  `not`, local `$ref` targets, ...) needs instance-admin authority (`403`
+  otherwise). An unresolvable or non-local `$ref`, or a schema nested deeper than
+  16 levels, is treated as high-risk (fail-closed). The gate restricts *who* may
+  set the value, not the value.
+- Scope is read from **top-level** properties only. An `x-paperclip-scope`
+  annotation on a nested property is ignored: overrides merge shallowly, so a
+  tenant may replace the whole top-level value.
+- At read time (`config.getForServiceScope`) the host drops any stored override
+  key that is not tenant-scoped, and logs
+  `plugin.config_override.ignored_non_tenant_keys` with the dropped key names.
+  So an override row written before this gate cannot shadow an operator key.
+- The host reads the scope from its stored manifest only. Existing plugins need
+  no rebuild; unannotated plugins simply have no tenant-overridable keys.
+
 A secret ref that points at a missing secret (orphan), or — on the
 per-company path — at another company's secret, is persisted to config but
 produces **no** binding. The host logs a `warn` at config time
@@ -1833,6 +1924,8 @@ Log storage rules:
 
 - Plugin logs are stored in a `plugin_logs` table or appended to a log file under the plugin's data directory.
 - Each log entry includes: plugin ID, timestamp, level, message, and optional structured metadata.
+- The host redacts secret-shaped content (credential and token patterns) from the persisted message and metadata before storage.
+- The host stores a normalised level: `debug`, `info`, `warn`, `error`, or `metric` (metrics written through `ctx.metrics.write`). Any other value is stored as `info`.
 - Logs are queryable from the plugin settings page in the UI.
 - Logs have a configurable retention period (default: 7 days).
 - The host captures `stdout` and `stderr` from the worker process as fallback logs even if the worker does not use `ctx.logger`.
@@ -1904,6 +1997,8 @@ For developing a plugin against a running Paperclip instance:
 
 - The operator installs the plugin from a local path: `npx paperclipai plugin install ./path/to/plugin`
 - The host watches the plugin directory for changes and restarts the worker on rebuild.
+- Local-path plugin hot reload (the dev watcher) is opt-in. Set `PAPERCLIP_PLUGIN_DEV_WATCH=1` to enable it. It is off by default.
+- On every activation (boot, enable, worker restart, hot reload) the host re-reads the on-disk manifest. If that manifest adds capabilities, tools, webhooks, secret-ref config fields, or changes the `database` declaration, activation fails closed and the registry keeps the approved manifest. Use `POST /api/plugins/:pluginId/upgrade` so the change goes through the capability-escalation approval gate. Removals and non-privilege changes still apply automatically, with a warning log line.
 - `devUiUrl` in plugin config can point to a local Vite dev server for UI hot-reload.
 - The plugin settings page shows real-time logs from the worker for debugging.
 

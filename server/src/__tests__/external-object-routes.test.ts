@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const issueId = "11111111-1111-4111-8111-111111111111";
 const companyId = "22222222-2222-4222-8222-222222222222";
@@ -32,27 +32,33 @@ const mockInstanceSettingsService = vi.hoisted(() => ({
   getExperimental: vi.fn(),
 }));
 
-function registerRouteMocks() {
-  vi.doMock("../services/external-objects.js", () => ({
+// Hoisted module mocks (not per-test vi.doMock + vi.resetModules): the mock
+// registry must be in place before ANY import of the route module, in every
+// test. createApp concurrently importActual()s middleware and route modules
+// whose graphs share the mocked services, so a load-dependent registry race
+// could bind the REAL services module and 500 the request under test
+// (master Release runs 35877211616 / 35888840397). A hoisted vi.mock applies
+// to every import graph deterministically.
+  vi.mock("../services/external-objects.js", () => ({
     externalObjectService: () => mockExternalObjectsService,
   }));
 
-  vi.doMock("../services/instance-settings.js", () => ({
+  vi.mock("../services/instance-settings.js", () => ({
     instanceSettingsService: () => mockInstanceSettingsService,
   }));
 
-  vi.doMock("../services/task-watchdog-scope.js", () => ({
+  vi.mock("../services/task-watchdog-scope.js", () => ({
     TASK_WATCHDOG_ORIGIN_KIND: "task_watchdog",
     resolveTaskWatchdogMutationScope: vi.fn(async () => ({ kind: "none" })),
     taskWatchdogScopeAllowsIssueMutation: vi.fn(async () => ({ kind: "none" })),
   }));
 
-  vi.doMock("../services/index.js", () => ({
+  vi.mock("../services/index.js", () => ({
     accessService: () => mockAccessService,
     agentService: () => mockAgentService,
     companySkillService: () => ({}),
     companyService: () => ({
-      getById: vi.fn(async () => null),
+  getById: vi.fn(async () => null),
     }),
     companySearchService: () => ({}),
     documentAnnotationService: () => ({}),
@@ -61,16 +67,16 @@ function registerRouteMocks() {
     feedbackService: () => ({}),
     goalService: () => ({}),
     heartbeatService: () => ({
-      wakeup: vi.fn(async () => undefined),
-      reportRunActivity: vi.fn(async () => undefined),
-      getRun: vi.fn(async () => null),
-      getActiveRunForAgent: vi.fn(async () => null),
-      cancelRun: vi.fn(async () => null),
+  wakeup: vi.fn(async () => undefined),
+  reportRunActivity: vi.fn(async () => undefined),
+  getRun: vi.fn(async () => null),
+  getActiveRunForAgent: vi.fn(async () => null),
+  cancelRun: vi.fn(async () => null),
     }),
     issueApprovalService: () => ({}),
     issueRecoveryActionService: () => ({}),
     issueReferenceService: () => ({
-      listIssueReferenceSummary: async () => ({ outbound: [], inbound: [] }),
+  listIssueReferenceSummary: async () => ({ outbound: [], inbound: [] }),
     }),
     issueService: () => mockIssueService,
     issueThreadInteractionService: () => ({}),
@@ -79,7 +85,7 @@ function registerRouteMocks() {
     routineService: () => ({}),
     workProductService: () => ({}),
   }));
-}
+
 
 function makeIssue(overrides: Record<string, unknown> = {}) {
   return {
@@ -158,12 +164,16 @@ function peerActor(): Express.Request["actor"] {
 }
 
 describe("external object routes", () => {
+  // Load the real route and middleware modules once before the tests run. The
+  // first import transforms a large module graph. Under the loaded serial shard
+  // (maxWorkers=1) that cold cost crossed the 5s testTimeout of the first test.
+  // The hook has a 30s budget, so it absorbs the transform cost and every later
+  // createApp() call hits the cached modules.
+  beforeAll(async () => {
+    await createApp(boardActor());
+  });
+
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../routes/issues.js");
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../services/external-objects.js");
-    registerRouteMocks();
     vi.resetAllMocks();
     mockIssueService.getById.mockResolvedValue(makeIssue());
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });

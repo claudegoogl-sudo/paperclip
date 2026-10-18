@@ -10,12 +10,15 @@ import {
   instanceUserRoles,
 } from "@paperclipai/db";
 import {
+  BOARD_API_KEY_STANDARD_SCOPE_MAX_TTL_HOURS,
   normalizeBoardApiKeyScope,
   type BoardApiKeyScope,
 } from "@paperclipai/shared";
 import { conflict, forbidden, notFound } from "../errors.js";
 
 export const BOARD_API_KEY_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+export const BOARD_API_KEY_STANDARD_SCOPE_TTL_MS =
+  BOARD_API_KEY_STANDARD_SCOPE_MAX_TTL_HOURS * 60 * 60 * 1000;
 export const CLI_AUTH_CHALLENGE_TTL_MS = 10 * 60 * 1000;
 const BOARD_API_KEY_TOUCH_DEBOUNCE_MS = 60_000;
 const BOARD_API_KEY_TOUCH_CACHE_MAX = 1_000;
@@ -40,8 +43,25 @@ export function createCliAuthSecret() {
   return `pcp_cli_auth_${randomBytes(24).toString("hex")}`;
 }
 
-export function boardApiKeyExpiresAt(nowMs: number = Date.now()) {
-  return new Date(nowMs + BOARD_API_KEY_TTL_MS);
+type BoardApiKeyScopeInput = { kind?: string } | null | undefined;
+
+/**
+ * Default key lifetime for a scope. `standard` keys carry full board
+ * authority, so they get the same 24h cap that POST /api/board-api-keys
+ * enforces. Every server-side mint path that picks its own expiry must use
+ * this helper. A null/unknown scope is treated as `standard` (the
+ * broadest kind `normalizeBoardApiKeyScope` maps it to), so it fails closed
+ * to the short TTL.
+ */
+export function boardApiKeyTtlMsForScope(scope: BoardApiKeyScopeInput) {
+  return scope?.kind === "plugin_ops" ? BOARD_API_KEY_TTL_MS : BOARD_API_KEY_STANDARD_SCOPE_TTL_MS;
+}
+
+export function boardApiKeyExpiresAtForScope(
+  scope: BoardApiKeyScopeInput,
+  nowMs: number = Date.now(),
+) {
+  return new Date(nowMs + boardApiKeyTtlMsForScope(scope));
 }
 
 export function cliAuthChallengeExpiresAt(nowMs: number = Date.now()) {
@@ -164,6 +184,30 @@ export function boardAuthService(db: Db) {
         ),
       )
       .then((rows) => rows.find((row) => !row.expiresAt || row.expiresAt.getTime() > now.getTime()) ?? null);
+  }
+
+  // Same lookup as findBoardApiKeyByToken, but never discards a match on
+  // revoked/expired -- it classifies WHY the attempt failed so the caller
+  // can log a real authentication-event outcome instead of a bare "no key
+  // found". bad_key covers both an unknown token and a token that
+  // never existed; nothing here differentiates those on purpose (doing so
+  // would let an attacker learn key-existence from failure text).
+  async function findBoardApiKeyForAuthEvent(
+    token: string,
+  ): Promise<{
+    key: typeof boardApiKeys.$inferSelect | null;
+    outcome: "success" | "expired" | "revoked" | "bad_key";
+  }> {
+    const tokenHash = hashBearerToken(token);
+    const row = await db
+      .select()
+      .from(boardApiKeys)
+      .where(eq(boardApiKeys.keyHash, tokenHash))
+      .then((rows) => rows[0] ?? null);
+    if (!row) return { key: null, outcome: "bad_key" };
+    if (row.revokedAt) return { key: row, outcome: "revoked" };
+    if (row.expiresAt && row.expiresAt.getTime() <= Date.now()) return { key: row, outcome: "expired" };
+    return { key: row, outcome: "success" };
   }
 
   async function touchBoardApiKey(id: string) {
@@ -373,6 +417,10 @@ export function boardAuthService(db: Db) {
       approvedAt: challenge.approvedAt?.toISOString() ?? null,
       cancelledAt: challenge.cancelledAt?.toISOString() ?? null,
       expiresAt: challenge.expiresAt.toISOString(),
+      // What the approver is granting: the key's scope kind and its lifetime
+      // from approval. Uses the same defaults as the mint site below.
+      keyScope: (challenge.pendingKeyScopeConfig ?? { kind: "plugin_ops" }).kind ?? "standard",
+      keyTtlMs: boardApiKeyTtlMsForScope(challenge.pendingKeyScopeConfig ?? { kind: "plugin_ops" }),
       approvedByUser: approvedBy
         ? {
             id: approvedBy.id,
@@ -409,6 +457,7 @@ export function boardAuthService(db: Db) {
 
       let boardKeyId = challenge.boardApiKeyId;
       if (!boardKeyId) {
+        const scopeConfig = challenge.pendingKeyScopeConfig ?? { kind: "plugin_ops" };
         const createdKey = await tx
           .insert(boardApiKeys)
           .values({
@@ -420,8 +469,8 @@ export function boardAuthService(db: Db) {
             // mint a full-authority key by default. `normalizeBoardApiKeyScope(null)`
             // maps null to the `standard` (full board) kind, so the narrowest
             // scope is the only safe default here.
-            scopeConfig: challenge.pendingKeyScopeConfig ?? { kind: "plugin_ops" },
-            expiresAt: boardApiKeyExpiresAt(),
+            scopeConfig,
+            expiresAt: boardApiKeyExpiresAtForScope(scopeConfig),
           })
           .returning()
           .then((rows) => rows[0]);
@@ -481,6 +530,7 @@ export function boardAuthService(db: Db) {
   return {
     resolveBoardAccess,
     findBoardApiKeyByToken,
+    findBoardApiKeyForAuthEvent,
     touchBoardApiKey,
     revokeBoardApiKey,
     createNamedBoardApiKey,

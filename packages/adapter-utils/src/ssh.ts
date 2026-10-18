@@ -6,7 +6,13 @@ import os from "node:os";
 import path from "node:path";
 import { Transform } from "node:stream";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
-import { readSanitizedOriginRemoteUrl } from "./git-workspace-sync.js";
+import {
+  agentCommitIdentityEnv,
+  createUnrelatedHistoryGraftCommit,
+  GIT_SYNC_COMMIT_IDENTITY_ARGS,
+  readSanitizedOriginRemoteUrl,
+} from "./git-workspace-sync.js";
+import type { AgentGitIdentityInput } from "./git-identity.js";
 import type { RunProcessResult } from "./server-utils.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
 import { mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
@@ -16,6 +22,7 @@ import {
   type RuntimeProgressPhase,
   type RuntimeProgressSink,
 } from "./runtime-progress.js";
+import { scrubSigningKeys, scrubbedProcessEnv } from "./child-env-scrub.js";
 
 export interface SshConnectionConfig {
   host: string;
@@ -53,7 +60,7 @@ export function createSshCommandManagedRuntimeRunner(input: {
       const command = commandInput.command.trim();
       const args = commandInput.args ?? [];
       const cwd = commandInput.cwd?.trim() || defaultCwd;
-      const envEntries = Object.entries(commandInput.env ?? {})
+      const envEntries = Object.entries(scrubSigningKeys(commandInput.env ?? {}))
         .filter((entry): entry is [string, string] => typeof entry[1] === "string");
       const envPrefix = envEntries.length > 0
         ? `env ${envEntries.map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ")} `
@@ -191,6 +198,8 @@ async function execFileText(
   options: {
     timeout?: number;
     maxBuffer?: number;
+    /** Full child environment; undefined inherits process.env (execFile default). */
+    env?: NodeJS.ProcessEnv;
   } = {},
 ): Promise<SshCommandResult> {
   return await new Promise<SshCommandResult>((resolve, reject) => {
@@ -198,6 +207,9 @@ async function execFileText(
       file,
       args,
       {
+        // Caller env (e.g. the agent git identity) is honored, but always
+        // passes through the signing-key scrub like every other child spawn.
+        env: options.env ? scrubSigningKeys(options.env) : scrubbedProcessEnv(),
         timeout: options.timeout ?? 15_000,
         maxBuffer: options.maxBuffer ?? 1024 * 128,
       },
@@ -226,6 +238,7 @@ async function spawnText(
 ): Promise<SshCommandResult> {
   return await new Promise<SshCommandResult>((resolve, reject) => {
     const child = spawn(file, args, {
+      env: scrubbedProcessEnv(),
       stdio: [options.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
     });
 
@@ -328,6 +341,7 @@ async function runLocalGit(
   options: {
     timeout?: number;
     maxBuffer?: number;
+    env?: NodeJS.ProcessEnv;
   } = {},
 ): Promise<SshCommandResult> {
   return await execFileText("git", ["-C", localDir, ...args], options);
@@ -410,11 +424,8 @@ function tarExcludeArgs(exclude: string[] | undefined): string[] {
 }
 
 function tarSpawnEnv(): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
-    // Prevent macOS bsdtar from emitting AppleDouble metadata files like ._README.md.
-    COPYFILE_DISABLE: "1",
-  };
+  // Prevent macOS bsdtar from emitting AppleDouble metadata files like ._README.md.
+  return scrubbedProcessEnv({ COPYFILE_DISABLE: "1" });
 }
 
 // Converts a tar `--exclude` pattern into a regexp for the local-size estimate.
@@ -661,6 +672,7 @@ async function streamLocalFileToSsh(input: {
   await new Promise<void>((resolve, reject) => {
     const source = createReadStream(input.localFile);
     const ssh = spawn("ssh", sshArgs, {
+      env: scrubbedProcessEnv(),
       stdio: ["pipe", "ignore", "pipe"],
     });
 
@@ -715,6 +727,7 @@ async function streamSshToLocalFile(input: {
 
   await new Promise<void>((resolve, reject) => {
     const ssh = spawn("ssh", sshArgs, {
+      env: scrubbedProcessEnv(),
       stdio: ["ignore", "pipe", "pipe"],
     });
     const sink = createWriteStream(input.localFile, { mode: 0o600 });
@@ -917,6 +930,8 @@ async function exportGitWorkspaceFromSsh(input: {
 async function integrateImportedGitHead(input: {
   localDir: string;
   importedHead: string;
+  /** Run's agent, when one is known — attributes the merge/graft commit to it. */
+  agent?: AgentGitIdentityInput | null;
 }): Promise<void> {
   const isConcurrentRefUpdateError = (error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
@@ -931,10 +946,18 @@ async function integrateImportedGitHead(input: {
     if (!currentHead || currentHead === input.importedHead) return;
 
     const headRef = snapshot.branchName ? `refs/heads/${snapshot.branchName}` : "HEAD";
+    // `git merge-base` exits 1 when the commits share no ancestor — the only
+    // outcome that authorizes the graft fallback below. Every other failure
+    // (timeout, missing object, repository error) must keep failing the
+    // integration instead of silently rewriting the tip.
+    let noCommonAncestor = false;
     const mergeBase = await runLocalGit(input.localDir, ["merge-base", currentHead, input.importedHead], {
       timeout: 10_000,
       maxBuffer: 16 * 1024,
-    }).catch(() => null);
+    }).catch((error: unknown) => {
+      noCommonAncestor = (error as { code?: unknown } | null)?.code === 1;
+      return null;
+    });
     const mergeBaseHead = mergeBase?.stdout.trim() ?? "";
 
     if (mergeBaseHead === input.importedHead) {
@@ -944,6 +967,29 @@ async function integrateImportedGitHead(input: {
     if (mergeBaseHead === currentHead) {
       try {
         await runLocalGit(input.localDir, ["update-ref", headRef, input.importedHead, currentHead], {
+          timeout: 10_000,
+          maxBuffer: 16 * 1024,
+        });
+        return;
+      } catch (error) {
+        if (isConcurrentRefUpdateError(error) && attempt < 4) continue;
+        throw error;
+      }
+    }
+
+    if (noCommonAncestor) {
+      // No common ancestor — merging is impossible and failing here would
+      // discard the imported work. Graft it onto the current head instead;
+      // see createUnrelatedHistoryGraftCommit.
+      const graftCommit = await createUnrelatedHistoryGraftCommit({
+        localDir: input.localDir,
+        currentHead,
+        importedHead: input.importedHead,
+        syncLabel: "Paperclip SSH sync",
+        agent: input.agent,
+      });
+      try {
+        await runLocalGit(input.localDir, ["update-ref", headRef, graftCommit, currentHead], {
           timeout: 10_000,
           maxBuffer: 16 * 1024,
         });
@@ -974,6 +1020,7 @@ async function integrateImportedGitHead(input: {
     const mergeCommit = await runLocalGit(
       input.localDir,
       [
+        ...GIT_SYNC_COMMIT_IDENTITY_ARGS,
         "commit-tree",
         mergedTreeId,
         "-p",
@@ -986,6 +1033,7 @@ async function integrateImportedGitHead(input: {
       {
         timeout: 60_000,
         maxBuffer: 64 * 1024,
+        env: agentCommitIdentityEnv(input.agent),
       },
     );
     try {
@@ -1169,7 +1217,7 @@ export async function runSshCommand(
     const auth = await createSshAuthArgs(config);
     cleanup = auth.cleanup;
     const sshArgs = [...auth.args];
-    const envEntries = Object.entries(options.env ?? {})
+    const envEntries = Object.entries(scrubSigningKeys(options.env ?? {}))
       .filter((entry): entry is [string, string] => typeof entry[1] === "string");
     for (const [key] of envEntries) {
       if (!isValidShellEnvKey(key)) {
@@ -1238,7 +1286,7 @@ export async function buildSshSpawnTarget(input: {
   }
   const auth = await createSshAuthArgs(input.spec);
   const sshArgs = [...auth.args];
-  const envArgs = Object.entries(input.env)
+  const envArgs = Object.entries(scrubSigningKeys(input.env))
     .filter((entry): entry is [string, string] => typeof entry[1] === "string")
     .map(([key, value]) => `${key}=${shellQuote(value)}`);
   const remoteCommandParts = [shellQuote(input.command), ...input.args.map((arg) => shellQuote(arg))].join(" ");
@@ -1331,6 +1379,7 @@ export async function syncDirectoryToSsh(input: {
       env: tarSpawnEnv(),
     });
     const ssh = spawn("ssh", sshArgs, {
+      env: scrubbedProcessEnv(),
       stdio: ["pipe", "ignore", "pipe"],
     });
 
@@ -1442,6 +1491,7 @@ export async function syncDirectoryFromSsh(input: {
   try {
     await new Promise<void>((resolve, reject) => {
       const ssh = spawn("ssh", sshArgs, {
+        env: scrubbedProcessEnv(),
         stdio: ["ignore", "pipe", "pipe"],
       });
       const tar = spawn("tar", ["-xf", "-", "-C", stagingDir], {
@@ -1523,9 +1573,11 @@ export async function prepareWorkspaceForSshExecution(input: {
   localDir: string;
   remoteDir?: string;
   onProgress?: RuntimeProgressSink;
+  workspaceFileMode?: "all";
+  workspaceExclude?: string[];
 }): Promise<{ gitBacked: boolean }> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
-  const gitSnapshot = await readLocalGitWorkspaceSnapshot(input.localDir);
+  const gitSnapshot = input.workspaceFileMode === "all" ? null : await readLocalGitWorkspaceSnapshot(input.localDir);
 
   if (gitSnapshot) {
     await importGitWorkspaceToSsh({
@@ -1560,7 +1612,7 @@ export async function prepareWorkspaceForSshExecution(input: {
     spec: input.spec,
     localDir: input.localDir,
     remoteDir,
-    exclude: [".paperclip-runtime"],
+    exclude: [".paperclip-runtime", ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : [])],
     onProgress: input.onProgress,
     progressLabel: "workspace",
   });
@@ -1573,6 +1625,8 @@ export async function restoreWorkspaceFromSshExecution(input: {
   remoteDir?: string;
   baselineSnapshot?: DirectorySnapshot;
   restoreGitHistory?: boolean;
+  /** Run's agent, when one is known — attributes sync-created commits to it. */
+  agent?: AgentGitIdentityInput | null;
   onProgress?: RuntimeProgressSink;
 }): Promise<void> {
   const remoteDir = input.remoteDir ?? input.spec.remoteCwd;
@@ -1611,6 +1665,7 @@ export async function restoreWorkspaceFromSshExecution(input: {
             await integrateImportedGitHead({
               localDir: input.localDir,
               importedHead,
+              agent: input.agent,
             });
           }
           : undefined,
@@ -1669,31 +1724,152 @@ export async function ensureSshWorkspaceReady(
   };
 }
 
+const SSH_ENV_LAB_FIXTURE_PATH_FIELDS = [
+  "rootDir",
+  "workspaceDir",
+  "statePath",
+  "clientPrivateKeyPath",
+  "clientPublicKeyPath",
+  "hostPrivateKeyPath",
+  "hostPublicKeyPath",
+  "authorizedKeysPath",
+  "knownHostsPath",
+  "sshdConfigPath",
+  "sshdLogPath",
+] as const satisfies readonly (keyof SshEnvLabFixtureState)[];
+
+// True when candidate is an absolute path equal to rootDir or nested under
+// it. Used to reject a state file whose paths point outside the fixture
+// root it was read from.
+function isPathRootedAt(candidate: string, rootDir: string): boolean {
+  if (!path.isAbsolute(candidate)) return false;
+  if (candidate === rootDir) return true;
+  const relative = path.relative(rootDir, candidate);
+  return (
+    relative.length > 0 &&
+    relative !== ".." &&
+    !relative.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(relative)
+  );
+}
+
+// The state file is untrusted input: any local process running as the same
+// user can write one. A forged pid or an empty sshdConfigPath would weaken
+// isSshEnvLabFixtureProcess's identity check — an empty string is a
+// substring of every command line, so it would match any running process.
+// Reject a state file that fails this check before any identity check or
+// signal runs against it.
+function isValidSshEnvLabFixtureState(
+  raw: SshEnvLabFixtureState,
+  expectedRootDir: string,
+): boolean {
+  if (!Number.isSafeInteger(raw.pid) || raw.pid <= 0) return false;
+  if (raw.rootDir !== expectedRootDir) return false;
+
+  for (const field of SSH_ENV_LAB_FIXTURE_PATH_FIELDS) {
+    const value = raw[field];
+    if (typeof value !== "string" || !isPathRootedAt(value, expectedRootDir)) {
+      return false;
+    }
+  }
+
+  const expectedSshdConfigPath = path.join(expectedRootDir, "sshd_config");
+  if (raw.sshdConfigPath.length === 0 || raw.sshdConfigPath !== expectedSshdConfigPath) {
+    return false;
+  }
+
+  return true;
+}
+
 export async function readSshEnvLabFixtureState(
   statePath: string,
 ): Promise<SshEnvLabFixtureState | null> {
   try {
-    const raw = JSON.parse(await fs.readFile(statePath, "utf8")) as SshEnvLabFixtureState;
+    // Resolve a relative statePath against the current working directory
+    // before use. The state validator below only accepts absolute paths, and
+    // a relative statePath must resolve to the same absolute directory every
+    // time a caller reads it, no matter the process working directory.
+    const resolvedStatePath = path.resolve(statePath);
+    const raw = JSON.parse(await fs.readFile(resolvedStatePath, "utf8")) as SshEnvLabFixtureState;
     if (!raw || raw.kind !== "ssh_openbsd") return null;
+    if (!isValidSshEnvLabFixtureState(raw, path.dirname(resolvedStatePath))) return null;
     return raw;
   } catch {
     return null;
   }
 }
 
-export async function stopSshEnvLabFixture(statePath: string): Promise<boolean> {
-  const state = await readSshEnvLabFixtureState(statePath);
+async function waitUntilFixtureProcessExits(
+  state: Pick<SshEnvLabFixtureState, "pid" | "sshdConfigPath">,
+  timeoutMs: number,
+  intervalMs = 100,
+): Promise<boolean> {
+  const timeoutAt = Date.now() + timeoutMs;
+  while (true) {
+    if (!(await isSshEnvLabFixtureProcess(state))) return true;
+    if (Date.now() >= timeoutAt) return false;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
+
+// Sends a signal to a pid and treats an already-dead process as success.
+// The identity check that runs before this call is not free: it spawns
+// `ps`, which opens a real gap between the check and the signal. If the
+// process exits inside that gap, `process.kill` throws ESRCH even though
+// the outcome the caller wants (the process is gone) already holds. Any
+// other error, such as EPERM for a pid that belongs to another user, must
+// still propagate.
+function signalFixtureProcess(pid: number, signal: NodeJS.Signals): boolean {
+  try {
+    process.kill(pid, signal);
+    return true;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ESRCH") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+// Bounded shutdown escalation shared by every caller that must stop a
+// fixture process: send SIGTERM, wait, re-check process identity (the pid
+// can be reused in the gap between two signals), then SIGKILL, then wait
+// again. Returns true only when the listener is confirmed gone.
+async function escalateSshEnvLabFixtureShutdown(
+  state: Pick<SshEnvLabFixtureState, "pid" | "sshdConfigPath">,
+): Promise<boolean> {
+  if (!(await isSshEnvLabFixtureProcess(state))) return true;
+
+  if (!signalFixtureProcess(state.pid, "SIGTERM")) return true;
+  if (await waitUntilFixtureProcessExits(state, 5_000)) return true;
+
+  if (!(await isSshEnvLabFixtureProcess(state))) return true;
+  if (!signalFixtureProcess(state.pid, "SIGKILL")) return true;
+  if (await waitUntilFixtureProcessExits(state, 2_000)) return true;
+
+  return !(await isSshEnvLabFixtureProcess(state));
+}
+
+// Accepts a state path or an already-read state so a caller that already
+// holds the fixture state in memory does not have to depend on the state
+// file, which a teardown step may have already removed.
+export async function stopSshEnvLabFixture(
+  stateOrPath: string | SshEnvLabFixtureState,
+): Promise<boolean> {
+  const state = typeof stateOrPath === "string"
+    ? await readSshEnvLabFixtureState(stateOrPath)
+    : stateOrPath;
   if (!state) return false;
 
-  if (await isSshEnvLabFixtureProcess(state)) {
-    process.kill(state.pid, "SIGTERM");
-    await waitForCondition(async () => {
-      if (await isSshEnvLabFixtureProcess(state)) {
-        throw new Error("SSH fixture process is still running.");
-      }
-    }, { timeoutMs: 5_000, intervalMs: 100 });
+  if (!(await escalateSshEnvLabFixtureShutdown(state))) {
+    throw new Error(
+      `SSH env-lab fixture did not stop: pid ${state.pid} on port ${state.port} is still running after SIGKILL.`,
+    );
   }
 
+  // Remove the root directory only after the listener process is confirmed
+  // gone. Removing it earlier would delete the state file the process needs
+  // for a later stop attempt to find and signal it.
   await fs.rm(state.rootDir, { recursive: true, force: true }).catch(() => undefined);
   return true;
 }
@@ -1702,8 +1878,17 @@ export async function startSshEnvLabFixture(input: {
   statePath: string;
   bindHost?: string;
   host?: string;
+  // Test-only. Shortens the readiness wait below its 10 second default, so
+  // a regression test can force the start-failure cleanup path without a
+  // real 10 second wait.
+  readinessTimeoutMs?: number;
 }): Promise<SshEnvLabFixtureState> {
-  const existing = await readSshEnvLabFixtureState(input.statePath);
+  // Resolve a relative statePath against the current working directory once,
+  // up front. Every derived path (rootDir and the persisted statePath field)
+  // must be absolute, so the state validator in readSshEnvLabFixtureState
+  // accepts the file that this function writes.
+  const statePath = path.resolve(input.statePath);
+  const existing = await readSshEnvLabFixtureState(statePath);
   if (existing && await isSshEnvLabFixtureProcess(existing)) {
     return existing;
   }
@@ -1722,7 +1907,7 @@ export async function startSshEnvLabFixture(input: {
 
   const bindHost = input.bindHost ?? "127.0.0.1";
   const host = input.host ?? bindHost;
-  const rootDir = path.dirname(input.statePath);
+  const rootDir = path.dirname(statePath);
   await fs.mkdir(rootDir, { recursive: true });
 
   const username = os.userInfo().username;
@@ -1782,6 +1967,7 @@ export async function startSshEnvLabFixture(input: {
 
   const child = spawn(sshdPath, ["-D", "-f", sshdConfigPath, "-E", sshdLogPath], {
     detached: true,
+    env: scrubbedProcessEnv(),
     stdio: "ignore",
   });
   child.unref();
@@ -1794,7 +1980,7 @@ export async function startSshEnvLabFixture(input: {
     username,
     rootDir,
     workspaceDir,
-    statePath: input.statePath,
+    statePath,
     pid: child.pid ?? 0,
     createdAt: new Date().toISOString(),
     clientPrivateKeyPath,
@@ -1819,14 +2005,28 @@ export async function startSshEnvLabFixture(input: {
       }
       const config = await buildSshEnvLabFixtureConfig(state);
       await ensureSshWorkspaceReady(config);
-    }, { timeoutMs: 10_000, intervalMs: 250 });
-    await fs.writeFile(input.statePath, JSON.stringify(state, null, 2), { mode: 0o600 });
+    }, { timeoutMs: input.readinessTimeoutMs ?? 10_000, intervalMs: 250 });
+    await fs.writeFile(statePath, JSON.stringify(state, null, 2), { mode: 0o600 });
     return state;
   } catch (error) {
-    if (await isPidRunning(state.pid)) {
-      process.kill(state.pid, "SIGTERM");
+    // No state file exists on this path yet, so a later stopSshEnvLabFixture
+    // call can never find this pid. Escalate and wait for exit here, the
+    // same way stopSshEnvLabFixture does, before the root directory goes
+    // away — otherwise a slow-to-exit sshd survives as an orphan with its
+    // root directory already gone.
+    const stopped = await escalateSshEnvLabFixtureShutdown(state);
+    if (stopped) {
+      await fs.rm(rootDir, { recursive: true, force: true }).catch(() => undefined);
+    } else {
+      const survivalNote =
+        `SSH env-lab fixture pid ${state.pid} on port ${state.port} is still running after SIGKILL. ` +
+        `Kept ${rootDir} for inspection; no state file exists to target it with a later stop call.`;
+      if (error instanceof Error) {
+        error.message = `${error.message}\n${survivalNote}`;
+      } else {
+        console.error(survivalNote);
+      }
     }
-    await fs.rm(rootDir, { recursive: true, force: true }).catch(() => undefined);
     throw error;
   }
 }

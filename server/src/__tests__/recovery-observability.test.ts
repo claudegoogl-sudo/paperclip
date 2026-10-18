@@ -12,6 +12,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import {
   classifyRecoveryHandoff,
   evaluateRecoveryRateAlert,
@@ -127,11 +128,9 @@ describeEmbeddedPostgres("recovery observability report", () => {
   }, 20_000);
 
   afterEach(async () => {
-    await db.delete(issueRecoveryActions);
-    await db.delete(heartbeatRuns);
-    await db.delete(issues);
-    await db.delete(agents);
-    await db.delete(companies);
+    // Atomic TRUNCATE ... CASCADE from `companies` clears every per-test table
+    // in one statement instead of an ordered per-table delete chain.
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {
@@ -394,5 +393,29 @@ describeEmbeddedPostgres("recovery observability report", () => {
     expect(report.window.since).toBe(report.weekly[0]?.weekStart);
     expect(report.window.since).not.toContain("T");
     expect(report.weekly).toHaveLength(MAX_WINDOW_WEEKS);
+  });
+
+  it("counts an active board recovery action without reporting an active takeover", async () => {
+    const { companyId, coderId } = await seedBaseline();
+    await seedRecoveryAction({
+      companyId,
+      n: 101,
+      createdAt: latestWeek,
+      cause: "process_lost",
+      errorCode: "process_lost",
+      status: "active",
+      outcome: null,
+      ownerAgentId: null,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: coderId,
+      finalIssueStatus: "blocked",
+    });
+
+    const report = await recoveryObservabilityService(db).report(companyId, { now, weeks: 8 });
+
+    expect(report.handoff).toMatchObject({ boardOwned: 1, activeTakeovers: 0 });
+    expect(report.perCauseRouting.find((entry) => entry.cause === "process_lost")).toMatchObject({
+      active: 1,
+    });
   });
 });

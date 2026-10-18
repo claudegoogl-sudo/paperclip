@@ -19,6 +19,8 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { issueService } from "../services/issues.ts";
+import { setPluginEventBus } from "../services/activity-log.ts";
+import type { PluginEvent } from "@paperclipai/plugin-sdk";
 
 // End-to-end coverage for the upload → comment attachment-bind contract at the
 // HTTP layer: the multipart upload route creates an unbound issue_attachments
@@ -227,6 +229,97 @@ describeEmbeddedPostgres("issue attachment comment-bind routes", () => {
     expect(listRes.status).toBe(200);
     const row = listRes.body.find((item: { assetId: string }) => item.assetId === assetId);
     expect(row?.issueCommentId).toBe(commentId);
+  });
+
+  describe("issue.attachment.created plugin event", () => {
+    const emitted: PluginEvent[] = [];
+    beforeAll(() => {
+      setPluginEventBus({
+        emit: async (event: PluginEvent) => {
+          emitted.push(event);
+          return { errors: [] };
+        },
+      } as never);
+    });
+    afterEach(() => {
+      emitted.length = 0;
+    });
+    const attachmentEvents = async () => {
+      await new Promise((r) => setTimeout(r, 20));
+      return emitted.filter((e) => e.eventType === "issue.attachment.created");
+    };
+    const FORBIDDEN_KEYS = ["body", "content", "contentPath", "url", "signedUrl", "objectKey", "sha256"];
+
+    it("shape (a): upload with a commentId bound at upload time emits one event carrying that commentId", async () => {
+      const { companyId, issueId } = await seedCompanyWithIssue("upload bound at upload");
+      const commentRes = await postComment(issueId, { body: "comment first" });
+      expect(commentRes.status).toBe(201);
+      const commentId = commentRes.body.id as string;
+      emitted.length = 0;
+
+      const uploadRes = await request(app)
+        .post(`/api/companies/${companyId}/issues/${issueId}/attachments`)
+        .field("issueCommentId", commentId)
+        .attach("file", Buffer.from("late media", "utf8"), { filename: "late.txt", contentType: "text/plain" });
+      expect(uploadRes.status).toBe(201);
+
+      const events = await attachmentEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0].companyId).toBe(companyId);
+      expect(events[0].payload).toMatchObject({
+        attachmentId: uploadRes.body.id,
+        issueId,
+        commentId,
+        contentType: "text/plain",
+        byteSize: "late media".length,
+        binding: "upload",
+      });
+      for (const key of FORBIDDEN_KEYS) expect(events[0].payload).not.toHaveProperty(key);
+    });
+
+    it("unbound upload emits the event with commentId null", async () => {
+      const { issueId, companyId } = await seedCompanyWithIssue("unbound upload");
+      const uploadRes = await uploadAsset(companyId, issueId, "free.txt", "free");
+      expect(uploadRes.status).toBe(201);
+      const events = await attachmentEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0].payload).toMatchObject({ attachmentId: uploadRes.body.id, commentId: null });
+    });
+
+    it("shape (b): upload first, then bind via the comment route, emits a bind event with the commentId", async () => {
+      const { companyId, issueId } = await seedCompanyWithIssue("upload then bind");
+      const uploadRes = await uploadAsset(companyId, issueId, "bind.txt", "bind me");
+      expect(uploadRes.status).toBe(201);
+      const assetId = uploadRes.body.assetId as string;
+      emitted.length = 0;
+
+      const commentRes = await postComment(issueId, { attachmentIds: [assetId] });
+      expect(commentRes.status).toBe(201);
+
+      const events = await attachmentEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0].companyId).toBe(companyId);
+      expect(events[0].payload).toMatchObject({
+        attachmentId: uploadRes.body.id,
+        issueId,
+        commentId: commentRes.body.id,
+        contentType: "text/plain",
+        byteSize: "bind me".length,
+        binding: "bind",
+      });
+      for (const key of FORBIDDEN_KEYS) expect(events[0].payload).not.toHaveProperty(key);
+    });
+
+    it("an idempotent re-bind to the same comment emits nothing (retries converge)", async () => {
+      const { companyId, issueId } = await seedCompanyWithIssue("rebind no event");
+      const assetId = await createStandaloneAsset(companyId, "rebind.bin");
+      const commentRes = await postComment(issueId, { body: "seed" });
+      const commentId = commentRes.body.id as string;
+      const first = await svc.attachAssetsToComment({ issueId, issueCommentId: commentId, assetIds: [assetId] });
+      expect(first).toHaveLength(1);
+      const second = await svc.attachAssetsToComment({ issueId, issueCommentId: commentId, assetIds: [assetId] });
+      expect(second).toEqual([]);
+    });
   });
 
   it("binds a standalone artifacts.create asset to the comment that references it", async () => {

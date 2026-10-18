@@ -3,7 +3,10 @@ import { eq } from "drizzle-orm";
 import { heartbeatRuns, type Db } from "@paperclipai/db";
 import {
   addApprovalCommentSchema,
+  createApprovalRequestSchema,
   createApprovalSchema,
+  APPROVAL_PAYLOAD_EMPTY_CODE,
+  APPROVAL_PAYLOAD_EMPTY_MESSAGE,
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
   resubmitApprovalSchema,
@@ -37,15 +40,18 @@ function redactApprovalPayload<T extends { payload: Record<string, unknown> }>(a
   };
 }
 
-function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
+function isStatusOnlyRecoveryContext(contextSnapshot: unknown) {
   if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
   const context = contextSnapshot as Record<string, unknown>;
-  return context.modelProfile === "cheap" &&
-    context.recoveryIntent === "status_only" &&
+  return context.recoveryIntent === "status_only" &&
     context.allowDeliverableWork === false &&
     context.allowDocumentUpdates === false &&
     context.resumeRequiresNormalModel === true;
 }
+
+// Approval creation parses through the shared createApprovalRequestSchema
+// (discriminated payload refinement): a schema probe or half-built payload is
+// a 400 before any row is written, instead of a permanently pending empty card.
 
 export function approvalRoutes(
   db: Db,
@@ -240,14 +246,13 @@ export function approvalRoutes(
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
     if (!run || run.companyId !== companyId || run.agentId !== req.actor.agentId) return true;
-    if (!isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return true;
+    if (!isStatusOnlyRecoveryContext(run.contextSnapshot)) return true;
 
     res.status(403).json({
-      error: "Cheap status-only recovery runs cannot create or modify approvals",
+      error: "Status-only recovery runs cannot create or modify approvals",
       details: {
         companyId,
         runId: run.id,
-        modelProfile: "cheap",
         recoveryIntent: "status_only",
         resumeRequiresNormalModel: true,
       },
@@ -277,6 +282,25 @@ export function approvalRoutes(
     assertCompanyAccess(req, companyId);
     if (!(await assertApprovalAccessAllowed(req, res, companyId))) return;
     if (!(await assertApprovalMutationAllowedByRunContext(req, res, companyId))) return;
+    // Content checks run after access checks so callers without access learn
+    // nothing about payload contracts. One shared validator (also used by the
+    // MCP tool); the empty-payload issue keeps its dedicated 422 contract.
+    const parsedRequest = createApprovalRequestSchema.safeParse(req.body);
+    if (!parsedRequest.success) {
+      if (
+        parsedRequest.error.issues.some(
+          (issue) =>
+            issue.code === "custom" &&
+            (issue.params as { code?: string } | undefined)?.code === APPROVAL_PAYLOAD_EMPTY_CODE,
+        )
+      ) {
+        res.status(422).json({ error: APPROVAL_PAYLOAD_EMPTY_MESSAGE, code: APPROVAL_PAYLOAD_EMPTY_CODE });
+        return;
+      }
+      res.status(400).json({ error: "Validation error", details: parsedRequest.error.issues });
+      return;
+    }
+    req.body = parsedRequest.data;
     const rawIssueIds = req.body.issueIds;
     const issueIds = Array.isArray(rawIssueIds)
       ? rawIssueIds.filter((value: unknown): value is string => typeof value === "string")
@@ -637,6 +661,52 @@ export function approvalRoutes(
       details: { type: approval.type },
     });
     res.json(redactApprovalPayload(approval));
+  });
+
+  router.post("/approvals/:id/withdraw", async (req, res) => {
+    const id = req.params.id as string;
+    // Fold existence into the access gate (missing vs cross-tenant must both be
+    // 404) so the withdraw route does not leak approval-id existence across
+    // companies — see the cross-tenant existence oracle guard test.
+    const approval = await requireApprovalAccess(req, id);
+    if (!approval) {
+      res.status(404).json({ error: "Approval not found" });
+      return;
+    }
+    if (!(await assertApprovalMutationAllowedByRunContext(req, res, approval.companyId))) return;
+
+    if (req.actor.type !== "agent" || !req.actor.agentId) {
+      res.status(403).json({ error: "Only the requesting agent can withdraw this approval" });
+      return;
+    }
+    // Another agent gets the same 404 as a missing approval: withdraw is not
+    // an oracle for which agent owns which approval id.
+    if (req.actor.agentId !== approval.requestedByAgentId) {
+      res.status(404).json({ error: "Approval not found" });
+      return;
+    }
+
+    const actor = getActorInfo(req);
+    const { approval: updated, applied } = await svc.withdraw(id, {
+      agentId: actor.agentId as string,
+      runId: actor.runId,
+    });
+
+    if (applied) {
+      await logActivity(db, {
+        companyId: approval.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "approval.withdrawn",
+        entityType: "approval",
+        entityId: approval.id,
+        details: { type: updated.type, requestedByAgentId: updated.requestedByAgentId },
+      });
+    }
+
+    res.json(redactApprovalPayload(updated));
   });
 
   router.get("/approvals/:id/comments", async (req, res) => {
