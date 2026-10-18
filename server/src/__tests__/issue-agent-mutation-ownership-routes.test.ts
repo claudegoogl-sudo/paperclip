@@ -915,6 +915,21 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
+  it("rejects an agent setting structured comment presentation or metadata", async () => {
+    // assertStructuredCommentFieldsAllowed is board-only, evaluated after the
+    // issue:comment access decision succeeds — so this is a distinct guard
+    // from the comment-access boundary itself, fenced independently here.
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "styled note", presentation: { kind: "system_notice" } });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe(
+      "Only board users may set structured comment presentation or metadata",
+    );
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
   it("keeps visible peer comments agent-class even when authorType tries to smuggle user wake privilege", async () => {
     mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
       allowed: input.action === "issue:read" || input.action === "issue:comment",
