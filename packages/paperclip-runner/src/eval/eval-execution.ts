@@ -1,3 +1,4 @@
+import { isRecord } from "../guards.js";
 import { capabilityFixtureRunCapabilities } from "../scenarios/fixture-run-capabilities.js";
 import {
   CapabilityMockControlPlaneAdapter,
@@ -734,9 +735,6 @@ function semanticRefs(value: unknown): Array<{
   });
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 /**
  * Executes the eight requested behaviors and their red counterparts against the

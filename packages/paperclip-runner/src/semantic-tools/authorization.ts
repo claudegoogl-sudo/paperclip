@@ -1,3 +1,4 @@
+import { isRecord } from "../guards.js";
 import type { PaperclipSemanticActionDescriptor } from "../catalog/semantic-action-types.js";
 import type {
   PaperclipSemanticAuthorizationDecision,
@@ -197,9 +198,6 @@ function isBoundedString(value: unknown): value is string {
   return typeof value === "string" && value.length >= 1 && value.length <= 240;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function intersectClaims(
   actorClaims: readonly string[],

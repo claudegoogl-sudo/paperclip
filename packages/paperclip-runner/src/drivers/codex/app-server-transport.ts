@@ -1,3 +1,4 @@
+import { isRecord } from "../../guards.js";
 import type { NativeTurnControlCapabilities } from "../../contracts/types.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { HarnessRuntimeRequestResolution } from "../../contracts/harness-driver.js";
@@ -773,9 +774,6 @@ export class ProcessCodexAppServerTransport implements CodexAppServerTransport {
   }
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function positiveLimit(value: number | undefined, fallback: number): number {
   return Number.isSafeInteger(value) && (value ?? 0) > 0 ? value! : fallback;

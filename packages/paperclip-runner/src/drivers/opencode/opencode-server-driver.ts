@@ -1,3 +1,4 @@
+import { isRecord } from "../../guards.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
@@ -2627,9 +2628,6 @@ function bounded(value: unknown): Record<string, unknown> {
 
 function record(value: unknown): Record<string, unknown> {
   return isRecord(value) ? value : {};
-}
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function text(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
