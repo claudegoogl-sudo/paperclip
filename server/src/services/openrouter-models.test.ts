@@ -16,6 +16,19 @@ it("lists and caches public OpenRouter models without sending credentials", asyn
   expect(fetch).toHaveBeenCalledTimes(2);
 });
 
+it("reports an invalid catalog when a 200 response is not JSON, then allows retry", async () => {
+  const fetch = vi.fn()
+    .mockResolvedValueOnce({ ok: true, json: async () => { throw new SyntaxError("Unexpected token '<'"); } })
+    .mockResolvedValueOnce({ ok: true, json: async () => null })
+    .mockResolvedValueOnce({ ok: true, json: async () => ({ data: [] }) });
+  vi.stubGlobal("fetch", fetch);
+  const { listOpenRouterModels } = await import("./openrouter-models.js");
+  await expect(listOpenRouterModels()).rejects.toThrow("OpenRouter returned an invalid model catalog.");
+  await expect(listOpenRouterModels()).rejects.toThrow("OpenRouter returned an invalid model catalog.");
+  await expect(listOpenRouterModels()).resolves.toEqual([]);
+  expect(fetch).toHaveBeenCalledTimes(3);
+});
+
 it("allows retry after a public catalog failure", async () => {
   const fetch = vi.fn().mockResolvedValueOnce({ ok: false }).mockResolvedValueOnce({ ok: true, json: async () => ({ data: [] }) });
   vi.stubGlobal("fetch", fetch);

@@ -340,6 +340,30 @@ describe("routine routes", () => {
     expect(mockRoutineService.list).toHaveBeenCalledWith(companyId, { projectId });
   });
 
+  it.each([
+    ["1.5", 1],
+    ["7.9", 7],
+    ["25", 25],
+    ["abc", 50],
+    [undefined, 50],
+  ])("passes an integer run limit to the routine runs service (limit=%s)", async (rawLimit, expected) => {
+    mockRoutineService.listRuns.mockResolvedValue([]);
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      source: "session",
+      isInstanceAdmin: true,
+      companyIds: [companyId],
+    });
+
+    const req = request(app).get(`/api/routines/${routineId}/runs`);
+    const res = await (rawLimit === undefined ? req : req.query({ limit: rawLimit }));
+
+    expect(res.status).toBe(200);
+    expect(mockRoutineService.listRuns).toHaveBeenCalledWith(routineId, expected);
+    expect(Number.isInteger(mockRoutineService.listRuns.mock.calls.at(-1)?.[1])).toBe(true);
+  });
+
   it("lists routine revisions for a board member in newest-first service order", async () => {
     const app = await createApp({
       type: "board",

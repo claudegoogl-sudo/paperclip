@@ -68,6 +68,14 @@ export function runtimeConnectionIntentRoutes(db: Db) {
     // run before initialize/list as well as before an actual tool call so an
     // ended heartbeat cannot keep probing the endpoint with a once-valid token.
     await service.validate(claims);
+    if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
+      res.status(400).json({
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32600, message: "Invalid Request: expected a JSON object body" },
+      });
+      return;
+    }
     const request = req.body as { jsonrpc?: string; id?: unknown; method?: string; params?: unknown };
     const id = request.id ?? null;
     if (request.method === "initialize") {

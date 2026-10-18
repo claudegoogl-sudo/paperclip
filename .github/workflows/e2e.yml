@@ -8,6 +8,13 @@ on:
         type: boolean
         default: true
 
+concurrency:
+  # Only ever runs against the default branch (the authorize job enforces
+  # that); a second dispatch should queue behind the first, not run a
+  # second paid-LLM pass in parallel.
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   authorize:
     name: Authorize optional paid E2E

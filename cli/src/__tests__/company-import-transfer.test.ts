@@ -15,6 +15,7 @@ import {
   resolveChunkedImportZip,
   uploadCompanyImportTransfer,
 } from "../commands/client/company.js";
+import { ApiRequestError } from "../client/http.js";
 import { createStoredZipArchive } from "./helpers/zip.js";
 
 const ORIGINAL_ENV = { ...process.env };
@@ -303,6 +304,25 @@ describe("uploadCompanyImportTransfer", () => {
     const { api } = fakeApi({ putRaw });
 
     await expect(uploadCompanyImportTransfer(api, zipBytes)).rejects.toThrow("socket hang up");
+    expect(putRaw).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([401, 403, 404, 409, 413, 422])(
+    "does not re-send a part after a permanent %i response",
+    async (status) => {
+      const putRaw = vi.fn().mockRejectedValue(new ApiRequestError(status, `status ${status}`));
+      const { api } = fakeApi({ putRaw });
+
+      await expect(uploadCompanyImportTransfer(api, zipBytes)).rejects.toThrow(`status ${status}`);
+      expect(putRaw).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([408, 429, 502, 503])("still retries a part after a transient %i response", async (status) => {
+    const putRaw = vi.fn().mockRejectedValue(new ApiRequestError(status, `status ${status}`));
+    const { api } = fakeApi({ putRaw });
+
+    await expect(uploadCompanyImportTransfer(api, zipBytes)).rejects.toThrow(`status ${status}`);
     expect(putRaw).toHaveBeenCalledTimes(3);
   });
 

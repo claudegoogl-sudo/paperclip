@@ -1013,6 +1013,17 @@ export const EXISTING_COMPANY_CHUNKED_IMPORT_THRESHOLD_BYTES = 8 * 1024 * 1024;
 export const IMPORT_TRANSFER_PART_SIZE_BYTES = 32 * 1024 * 1024;
 const IMPORT_TRANSFER_PART_ATTEMPTS = 3;
 
+// A 4xx other than 408/429 cannot succeed on a re-send, so do not re-upload a part of up to 32 MB.
+function isPermanentClientError(err: unknown): boolean {
+  return (
+    err instanceof ApiRequestError &&
+    err.status >= 400 &&
+    err.status < 500 &&
+    err.status !== 408 &&
+    err.status !== 429
+  );
+}
+
 // ── Inline request size estimation ───────────────────────────────────
 //
 // Mirrors `estimateInlineImportBytes` in ui/src/lib/import-preflight.ts (the
@@ -1186,6 +1197,7 @@ export async function uploadCompanyImportTransfer(
         uploaded = true;
       } catch (err) {
         lastError = err;
+        if (isPermanentClientError(err)) break;
       }
     }
     if (!uploaded) {

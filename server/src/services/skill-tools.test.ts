@@ -35,6 +35,24 @@ describe("create skill tool", () => {
     expect(JSON.parse(fetcher.mock.calls[0]![1].body)).toEqual(input);
     expect(result).toEqual({ id: "skill-1", name: input.name, slug: input.name, description: input.description, versionId: "version-1", studioPath: "/skills/studio/skill-1" });
   });
+
+  const call = (fetcher: typeof fetch) => callCreateSkillTool({ arguments: input,
+    apiUrl: "http://localhost:3100", token: "test-token", companyId: "company-1" }, fetcher);
+
+  it("reports the status when a proxy returns a non-JSON error page", async () => {
+    const fetcher = vi.fn().mockResolvedValue(new Response("<html>bad gateway</html>", { status: 502 }));
+    await expect(call(fetcher)).rejects.toThrow("Skill creation failed (502)");
+  });
+
+  it("keeps the API error message when the error body is JSON", async () => {
+    const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: "Skill already exists" }), { status: 409 }));
+    await expect(call(fetcher)).rejects.toThrow("Skill already exists");
+  });
+
+  it.each(["null", "[]", "\"text\"", "<html>ok</html>"])("rejects a successful response with an invalid body (%s)", async (body) => {
+    const fetcher = vi.fn().mockResolvedValue(new Response(body, { status: 201 }));
+    await expect(call(fetcher)).rejects.toThrow("Skill creation returned an invalid response");
+  });
 });
 
 describe("update skill tool", () => {

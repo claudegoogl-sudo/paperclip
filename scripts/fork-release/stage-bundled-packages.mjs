@@ -67,7 +67,15 @@ function packBundledPackage({ dir, name }, outDir) {
     throw new Error(`staging failed for ${name} (prepare-bundled-package exit ${prepare.status})`);
   }
 
-  const pack = spawnSync("npm", ["pack", "--pack-destination", outDir], {
+  // --ignore-scripts: the staged dir only carries the package's `files`
+  // entries (already built by the outer fork-release build) plus the
+  // bundled deps' node_modules — never the repo's root `scripts/` dir or
+  // devDependencies. A package whose prepack re-invokes its build (e.g.
+  // @paperclipai/server's `prepare:ui-dist` running
+  // `bash ../scripts/prepare-server-ui-dist.sh`) cannot find that script
+  // from here and fails `npm pack` outright; prepare-bundled-package.mjs's
+  // own `npm install` above skips scripts for the same reason.
+  const pack = spawnSync("npm", ["pack", "--ignore-scripts", "--pack-destination", outDir], {
     cwd: stageDir,
     stdio: "inherit",
   });

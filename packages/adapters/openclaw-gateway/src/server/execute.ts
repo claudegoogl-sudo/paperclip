@@ -684,7 +684,7 @@ class GatewayWsClient {
 
     ws.on("error", (err) => {
       const message = err instanceof Error ? err.message : String(err);
-      void this.opts.onLog("stderr", `[openclaw-gateway] websocket error: ${message}\n`);
+      void this.opts.onLog("stderr", `[openclaw-gateway] websocket error: ${message}\n`).catch(() => undefined);
     });
 
     await withTimeout(

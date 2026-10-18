@@ -77,7 +77,12 @@ export class PhotonReceiver {
       }
     })()
       .catch(async (error) => {
-        if (!this.stopped) await this.options.failure(error);
+        if (this.stopped) return;
+        try {
+          await this.options.failure(error);
+        } catch {
+          // A failing failure reporter must not leave this.running rejected.
+        }
       })
       .finally(() => {
         this.running = undefined;

@@ -37,6 +37,15 @@ on:
         default: release-smoke
         type: string
 
+concurrency:
+  # Keyed only on this workflow's own inputs (not github.workflow, which
+  # a reusable call resolves to the CALLER's name): release.yml's two
+  # internal calls already pass distinct artifact_name values, and a
+  # direct workflow_dispatch for the same version/artifact queues behind
+  # any run already smoking it instead of racing a redundant second pass.
+  group: release-smoke-${{ inputs.paperclip_version }}-${{ inputs.artifact_name }}
+  cancel-in-progress: false
+
 jobs:
   # The Docker smoke below can never exercise the background-service leg of
   # onboarding: containers have no service manager, so v2026.824.0 shipped a
@@ -50,7 +59,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
@@ -110,7 +119,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v6

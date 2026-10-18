@@ -80,8 +80,9 @@ async function handleMcp(
   const { server } = createKvDemoMcpServer(store);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on("close", () => {
-    void transport.close();
-    void server.close();
+    // Cleanup after the response closed; a failing close must not crash the process.
+    transport.close().catch(() => {});
+    server.close().catch(() => {});
   });
   await server.connect(transport);
   await transport.handleRequest(req, res, parsedBody);

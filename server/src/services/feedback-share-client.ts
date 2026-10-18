@@ -3,6 +3,7 @@ import type { FeedbackTraceBundle } from "@paperclipai/shared";
 import type { Config } from "../config.js";
 
 const DEFAULT_FEEDBACK_EXPORT_BACKEND_URL = "https://telemetry.paperclip.ing";
+export const FEEDBACK_SHARE_UPLOAD_TIMEOUT_MS = 60_000;
 
 function buildFeedbackShareObjectKey(bundle: FeedbackTraceBundle, exportedAt: Date) {
   const year = String(exportedAt.getUTCFullYear());
@@ -41,6 +42,7 @@ export function createFeedbackTraceShareClientFromConfig(
           encoding: "gzip+base64+json",
           payload: gzipSync(requestBody).toString("base64"),
         }),
+        signal: AbortSignal.timeout(FEEDBACK_SHARE_UPLOAD_TIMEOUT_MS),
       });
 
       if (!response.ok) {

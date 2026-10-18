@@ -10,8 +10,8 @@ export async function listOpenRouterModels(refresh = false): Promise<AdapterMode
   pending = (async () => {
     const response = await fetch("https://openrouter.ai/api/v1/models", { signal: AbortSignal.timeout(10_000) });
     if (!response.ok) throw new Error("Could not load OpenRouter models. Retry or enter a model ID manually.");
-    const body = await response.json() as { data?: Array<{ id?: unknown; name?: unknown }> };
-    if (!Array.isArray(body.data)) throw new Error("OpenRouter returned an invalid model catalog.");
+    const body = await response.json().catch(() => null) as { data?: Array<{ id?: unknown; name?: unknown }> } | null;
+    if (!Array.isArray(body?.data)) throw new Error("OpenRouter returned an invalid model catalog.");
     const models = body.data.flatMap(model => typeof model.id === "string" && model.id.includes("/")
       ? [{ id: `openrouter/${model.id}`, label: typeof model.name === "string" ? model.name : model.id }]
       : []).sort((a, b) => a.label.localeCompare(b.label));

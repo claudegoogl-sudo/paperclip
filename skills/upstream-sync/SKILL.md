@@ -78,6 +78,31 @@ When `git merge upstream/<tag>` reports conflicts,
 3. **`docs/**.md`, `README*`** — take theirs when both sides only added prose
    (no deletions on either side). Upstream is canonical for prose docs.
 
+### 3a. Protected fork deltas — `.github/workflows/release.yml`
+
+`.github/workflows/` conflicts always route to the `escalation` bucket, so a
+release.yml delta must be re-applied by hand. One delta is **load-bearing** and
+must survive every sync:
+
+- `verify_canary` stays **push-triggered** and calls the reusable
+  `./.github/workflows/release-verify.yml` for `github.sha`.
+- `publish_canary` keeps the upstream gate
+  `github.repository == 'paperclipai/paperclip'` so the fork never publishes an
+  npm canary.
+
+Upstream `verify_canary` (#13233) instead gates on
+`github.repository == 'paperclipai/paperclip'` and delegates to
+`scripts/cloud-source-verification.mjs`, which has no verdict on the fork.
+Merging that form leaves every push-to-master Release run with all jobs
+skipped, so a fork master push gets no conclusive verification — this is
+exactly what happened on the v2026.1005.0 sync and left master HEAD unverified.
+
+`.github/workflows/fork-master-verify-guard.yml` runs
+`scripts/fork-release/check-fork-master-verify.mjs` on every PR/push that
+touches `release.yml` and **fails** when the delta is missing. A sync PR that
+drops it cannot merge until the delta is restored; the guard is the durable
+enforcement, not this prose.
+
 Everything else stays with conflict markers and routes into one of three
 buckets in the routine's escalation report:
 

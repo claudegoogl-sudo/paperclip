@@ -2352,7 +2352,7 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await onLog("stderr", `[paperclip] ACP process session bridge poll failed: ${message}\n`);
+      logFailureWithoutWaiting(`[paperclip] ACP process session bridge poll failed: ${message}\n`);
       deliverRemoteEvent({ type: "error", message });
       return;
     } finally {
@@ -4725,7 +4725,9 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
             }
             const lossClass = anyStreamDispatched ? "post_dispatch" : "pre_dispatch";
             duplexObservability.recordLoss(lossClass, reason);
-            void onLog("stderr", `[paperclip] Sandbox HTTP/2 channel lost (${reason}). The run fails.\n`);
+            void onLog("stderr", `[paperclip] Sandbox HTTP/2 channel lost (${reason}). The run fails.\n`).catch(
+              () => undefined,
+            );
           };
 
           // The forward handler applies the real host token and the run id

@@ -302,6 +302,46 @@ describe("skills catalog manifest", () => {
     expect(result.manifest.skills[0]?.files.map((file) => file.path)).toEqual(["SKILL.md"]);
   });
 
+  it("bounds GitHub tree and pinned file fetches with a timeout signal", async () => {
+    const packageDir = await createCatalogPackage();
+    await writeReference(packageDir, "optional", "research", "remote-research", {
+      source: {
+        type: "github",
+        hostname: "github.com",
+        owner: "example",
+        repo: "remote-skill",
+        ref: "v1.0.0",
+        commit: "0123456789abcdef0123456789abcdef01234567",
+        path: "skills/remote-research",
+      },
+      files: ["SKILL.md"],
+      recommendedForRoles: ["researcher"],
+      tags: ["research"],
+    });
+    const timeoutSpy = vi
+      .spyOn(AbortSignal, "timeout")
+      .mockImplementation(() => AbortSignal.abort(new Error("request timed out")));
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      if (!init?.signal) return Promise.reject(new Error("fetch called without a timeout signal"));
+      return Promise.reject(init.signal.reason);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const result = await buildCatalogManifest({
+        packageDir,
+        generatedAt: "2026-05-26T00:00:00.000Z",
+      });
+
+      expect(fetchMock).toHaveBeenCalled();
+      expect(timeoutSpy).toHaveBeenCalledWith(30_000);
+      expect(result.errors.some((error) => error.includes("failed to fetch GitHub tree: request timed out"))).toBe(true);
+      expect(result.errors.some((error) => error.includes("failed to fetch pinned GitHub file: request timed out"))).toBe(true);
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+  });
+
   it("reports frontmatter, directory, uniqueness, and inventory errors together", async () => {
     const packageDir = await createCatalogPackage();
     await writeSkill(packageDir, "bundled", "Bad_Category", "duplicate", {
