@@ -1,5 +1,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createGoogleSheetsMcpHttpServer, type GoogleSheetsMcpHttpServer } from "./http.js";
 import type { GoogleSheetsMcpConfig } from "./config.js";
@@ -126,6 +128,48 @@ describe("Google Sheets MCP HTTP server", () => {
       ]);
     } finally {
       await client.close();
+    }
+  });
+
+  it("handles rejections from per-request cleanup", async () => {
+    const closeError = new Error("close failed");
+    // Each stubbed close() returns a rejected promise that the test itself already
+    // handles, so the process stays safe; the spy then records whether the
+    // production code attached its own catch handler.
+    const tracked = (): { impl: () => Promise<void>; catches: Array<ReturnType<typeof vi.spyOn>> } => {
+      const catches: Array<ReturnType<typeof vi.spyOn>> = [];
+      return {
+        catches,
+        impl: () => {
+          const rejected = Promise.reject(closeError);
+          rejected.catch(() => {});
+          catches.push(vi.spyOn(rejected, "catch"));
+          return rejected;
+        },
+      };
+    };
+    const transport = tracked();
+    const server = tracked();
+    const transportClose = vi
+      .spyOn(StreamableHTTPServerTransport.prototype, "close")
+      .mockImplementation(transport.impl);
+    const serverClose = vi.spyOn(McpServer.prototype, "close").mockImplementation(server.impl);
+
+    try {
+      const { base } = await startServer();
+      const client = await mcpClient(base);
+      await client.listTools();
+      await client.close();
+      await vi.waitFor(() => {
+        expect(transportClose).toHaveBeenCalled();
+        expect(serverClose).toHaveBeenCalled();
+      });
+
+      expect(transport.catches.some((spy) => spy.mock.calls.length > 0)).toBe(true);
+      expect(server.catches.some((spy) => spy.mock.calls.length > 0)).toBe(true);
+    } finally {
+      transportClose.mockRestore();
+      serverClose.mockRestore();
     }
   });
 

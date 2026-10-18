@@ -1,6 +1,8 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { afterEach, describe, expect, it } from "vitest";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createKvDemoHttpServer, type KvDemoHttpServer } from "./http.js";
 import type { KvStateSnapshot } from "./store.js";
 
@@ -58,6 +60,48 @@ describe("kv demo HTTP server", () => {
     const html = await res.text();
     expect(html).toContain("fruit");
     expect(html).toContain("mango");
+  });
+
+  it("handles rejections from per-request cleanup", async () => {
+    const closeError = new Error("close failed");
+    // Each stubbed close() returns a rejected promise that the test itself already
+    // handles, so the process stays safe; the spy then records whether the
+    // production code attached its own catch handler.
+    const tracked = (): { impl: () => Promise<void>; catches: Array<ReturnType<typeof vi.spyOn>> } => {
+      const catches: Array<ReturnType<typeof vi.spyOn>> = [];
+      return {
+        catches,
+        impl: () => {
+          const rejected = Promise.reject(closeError);
+          rejected.catch(() => {});
+          catches.push(vi.spyOn(rejected, "catch"));
+          return rejected;
+        },
+      };
+    };
+    const transport = tracked();
+    const server = tracked();
+    const transportClose = vi
+      .spyOn(StreamableHTTPServerTransport.prototype, "close")
+      .mockImplementation(transport.impl);
+    const serverClose = vi.spyOn(McpServer.prototype, "close").mockImplementation(server.impl);
+
+    try {
+      const { base } = await startServer();
+      const client = await mcpClient(base);
+      await client.listTools();
+      await client.close();
+      await vi.waitFor(() => {
+        expect(transportClose).toHaveBeenCalled();
+        expect(serverClose).toHaveBeenCalled();
+      });
+
+      expect(transport.catches.some((spy) => spy.mock.calls.length > 0)).toBe(true);
+      expect(server.catches.some((spy) => spy.mock.calls.length > 0)).toBe(true);
+    } finally {
+      transportClose.mockRestore();
+      serverClose.mockRestore();
+    }
   });
 
   it("requires KV_DEMO_TOKEN on data routes without exposing it in URLs", async () => {
