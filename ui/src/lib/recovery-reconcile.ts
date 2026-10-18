@@ -31,7 +31,12 @@ export function canBoardManageRuntime(
     (item) => item.companyId === companyId && item.status === "active",
   );
   if (!membership) return false;
-  return membership.membershipRole !== "viewer" && membership.membershipRole !== null;
+  // A null membershipRole is a legitimate active-membership shape: the server's `runtime:manage`
+  // gate (see `normalizeHumanRole` in server/src/services/company-member-roles.ts and the
+  // `membership.membershipRole !== "viewer"` check in server/src/services/authorization.ts)
+  // treats a null role as defaulting to a non-viewer role, not as a denial. Only "viewer" is
+  // excluded here so this mirror matches that server behavior.
+  return membership.membershipRole !== "viewer";
 }
 
 /**
