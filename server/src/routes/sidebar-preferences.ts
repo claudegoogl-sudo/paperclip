@@ -14,6 +14,20 @@ function requireBoardUserId(req: Request, res: Response): string | null {
   return req.actor.userId;
 }
 
+/**
+ * Per-board-user sidebar ordering preferences. Every route requires a
+ * signed-in board user (`requireBoardUserId`); the company-scoped routes
+ * additionally require company access.
+ *
+ * - `GET/PUT /sidebar-preferences/me` read/write the caller's global
+ *   company-sidebar order.
+ * - `GET/PUT .../sidebar-preferences/me` (company-scoped) read/write the
+ *   caller's project order within that company.
+ *
+ * Only the company-scoped project-order write logs an `activity_log` row;
+ * the global company-order write does not, since it has no single company
+ * to log the entry against.
+ */
 export function sidebarPreferenceRoutes(db: Db) {
   const router = Router();
   const svc = sidebarPreferenceService(db);
