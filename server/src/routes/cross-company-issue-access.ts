@@ -171,7 +171,7 @@ export async function decideCrossCompanyIssueAccess(
     decision = { allowed: false, reason: "not_agent" };
   } else if (actor.companyId === targetCompanyId) {
     decision = { allowed: false, reason: "same_company" };
-  } else if (actor.keyScope) {
+  } else if (actor.keyScope && actor.keyScope.kind !== "standard") {
     // notify_only / skill_test / task_bridge keys are narrowed on purpose.
     decision = { allowed: false, reason: "scoped_key" };
   } else if (actor.onBehalfOfUserId?.trim()) {
