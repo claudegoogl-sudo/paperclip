@@ -215,6 +215,7 @@ export const sandboxProviderCapabilitiesSchema = z.object({
   incrementalSessionOutput: z.boolean().optional(),
   concurrentSyncOperations: z.boolean().optional(),
   duplexCommandStream: z.boolean().optional(),
+  runnerWebSocketIngress: z.boolean().optional(),
 }).strict();
 
 export type SandboxProviderCapabilitiesInput = z.infer<typeof sandboxProviderCapabilitiesSchema>;
@@ -230,6 +231,7 @@ export const pluginEnvironmentDriverDeclarationSchema = z.object({
   kind: z.enum(["environment_driver", "sandbox_provider"]).optional(),
   displayName: z.string().min(1).max(100),
   description: z.string().max(500).optional(),
+  defaultAcquireTimeoutMs: z.number().int().positive().max(86_400_000).optional(),
   supportsReusableLeases: z.boolean().optional(),
   sandboxCapabilities: sandboxProviderCapabilitiesSchema.optional(),
   supportsInteractiveSetup: z.boolean().optional(),
@@ -427,7 +429,7 @@ export type PluginManagedSkillDeclarationInput = z.infer<typeof pluginManagedSki
  * Tracked as part of the UI stability contract. Expand this list
  * as additional slot types reach the v1 host-rendered floor.
  */
-const PLUGIN_UI_SLOT_TYPES_V1_SUPPORTED = ["dashboardWidget", "page"] as const;
+const PLUGIN_UI_SLOT_TYPES_V1_SUPPORTED = ["dashboardWidget", "page", "organizationSwitcher"] as const;
 
 /**
  * Validates a {@link PluginUiSlotDeclaration} — a UI extension slot the plugin

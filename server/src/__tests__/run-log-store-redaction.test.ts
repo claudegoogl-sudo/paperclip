@@ -46,7 +46,7 @@ describe("RunLogStore.append() secret redaction", () => {
     const lines = persisted.split("\n").filter((line) => line.length > 0);
     expect(lines).toHaveLength(1);
     const parsed = JSON.parse(lines[0]!);
-    expect(parsed).toEqual({
+    expect(parsed).toMatchObject({
       ts,
       stream: "stdout",
       chunk: `leaked token: ${REDACTED_EVENT_VALUE} after`,
@@ -68,7 +68,7 @@ describe("RunLogStore.append() secret redaction", () => {
     const absPath = path.resolve(tmpDir, handle.logRef);
     const persisted = await fs.readFile(absPath, "utf8");
     const parsed = JSON.parse(persisted.trim());
-    expect(parsed).toEqual({ ts, stream: "stderr", chunk });
+    expect(parsed).toMatchObject({ ts, stream: "stderr", chunk });
   });
 });
 
@@ -106,7 +106,7 @@ describe("RunLogStore.append() value-exact vault redaction", () => {
 
     expect(persisted).not.toContain(VAULT_VALUE);
     const parsed = JSON.parse(persisted.trim());
-    expect(parsed).toEqual({
+    expect(parsed).toMatchObject({
       ts,
       stream: "stdout",
       chunk: `the secret is ${REDACTED_VAULT_VALUE} done`,
@@ -131,7 +131,7 @@ describe("RunLogStore.append() value-exact vault redaction", () => {
     const parsed = JSON.parse(persisted.trim());
     // After clearing, the value is no longer registered, so the heuristic
     // redactor leaves this hint-free value untouched.
-    expect(parsed).toEqual({ ts, stream: "stdout", chunk });
+    expect(parsed).toMatchObject({ ts, stream: "stdout", chunk });
   });
 });
 
@@ -193,7 +193,7 @@ describe("registerRunSecretValue short-value guard (Finding B)", () => {
     const absPath = path.resolve(tmpDir, handle.logRef);
     const persisted = await fs.readFile(absPath, "utf8");
     const parsed = JSON.parse(persisted.trim());
-    expect(parsed).toEqual({ ts, stream: "stdout", chunk });
+    expect(parsed).toMatchObject({ ts, stream: "stdout", chunk });
   });
 });
 

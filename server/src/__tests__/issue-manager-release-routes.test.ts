@@ -92,6 +92,7 @@ describeEmbeddedPostgres("manager release of dead-run checkout locks", () => {
       {
         id: assigneeAgentId,
         companyId,
+        reportsTo: managerAgentId,
         name: "CodexCoder",
         role: "engineer",
         status: "active",
@@ -101,7 +102,8 @@ describeEmbeddedPostgres("manager release of dead-run checkout locks", () => {
         permissions: {},
       },
       {
-        // Legacy agent-creator authority grants tasks:manage_active_checkouts.
+        // The manager chain (assignee reportsTo manager) grants tasks:manage_active_checkouts;
+        // canCreateAgents deliberately does not (upstream 1005.0 hardening).
         id: managerAgentId,
         companyId,
         name: "TeamLead",

@@ -53,7 +53,7 @@ test("findOpenSyncPr returns the open PR for the tag (acceptance #1)", async () 
   assert.equal(pr.html_url, "https://github.com/claudegoogl-sudo/paperclip/pull/42");
   assert.match(requestedUrl, /state=open/);
   assert.match(requestedUrl, /base=master/);
-  assert.match(requestedUrl, /head=claudegoogl-sudo%3Async%2Fupstream-v2026\.525\.0/);
+  assert.match(requestedUrl, /per_page=100/);
 });
 
 test("findOpenSyncPr returns null when no PR is open (acceptance #2 path → real sync proceeds)", async () => {
@@ -218,4 +218,11 @@ test("classifyMerge reports a clean merge when the merge succeeds", () => {
   };
   const res = classifyMerge({ tag: TAG, base: BASE, git: gitImpl });
   assert.deepEqual(res, { escalate: false, mergeFailed: false });
+});
+
+test("pickOpenSyncPr matches open fold-round heads -rN (no-op) but not closed/unrelated", () => {
+  assert.ok(pickOpenSyncPr([openPr(`${BRANCH}-r7`)], BRANCH));
+  assert.equal(pickOpenSyncPr([openPr(`${BRANCH}-r7`, { state: "closed" })], BRANCH), null);
+  assert.equal(pickOpenSyncPr([openPr("sync/upstream-v2026.1005.0-r7")], BRANCH), null);
+  assert.equal(pickOpenSyncPr([openPr(`${BRANCH}-rx`), openPr(`${BRANCH}-r`), openPr(`${BRANCH}0-r1`)], BRANCH), null);
 });

@@ -19,7 +19,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { heartbeatService } from "../services/heartbeat.js";
+import { appendHeartbeatRunEvent } from "../services/heartbeat-run-events.js";
 import {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
@@ -27,42 +27,12 @@ import {
   recoveryService,
 } from "../services/recovery/service.js";
 
-const mockAdapterExecute = vi.hoisted(() =>
-  vi.fn(async () => ({
-    exitCode: 0,
-    signal: null,
-    timedOut: false,
-    errorMessage: null,
-    summary: "Acknowledged stale-run evaluation.",
-    provider: "test",
-    model: "test-model",
-  })),
-);
-
-vi.mock("../telemetry.ts", () => ({
-  getTelemetryClient: () => ({ track: vi.fn() }),
-}));
-
-vi.mock("@paperclipai/shared/telemetry", async () => {
-  const actual = await vi.importActual<typeof import("@paperclipai/shared/telemetry")>(
-    "@paperclipai/shared/telemetry",
-  );
-  return {
-    ...actual,
-    trackAgentFirstHeartbeat: vi.fn(),
-  };
+vi.mock("../services/heartbeat-run-events.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/heartbeat-run-events.js")>();
+  return { ...actual, appendHeartbeatRunEvent: vi.fn(actual.appendHeartbeatRunEvent) };
 });
 
-vi.mock("../adapters/index.ts", async () => {
-  const actual = await vi.importActual<typeof import("../adapters/index.ts")>("../adapters/index.ts");
-  return {
-    ...actual,
-    getServerAdapter: vi.fn(() => ({
-      supportsLocalAgentJwt: false,
-      execute: mockAdapterExecute,
-    })),
-  };
-});
+const mockedAppendHeartbeatRunEvent = vi.mocked(appendHeartbeatRunEvent);
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -106,6 +76,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
   }, 30_000);
 
   afterEach(async () => {
+    mockedAppendHeartbeatRunEvent.mockClear();
     await truncateCompaniesWithDeadlockRetry(db);
   });
 
@@ -259,55 +230,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     expect(manager?.status).toBe("idle");
   }
 
-  it.each([
-    {
-      level: "suspicious" as const,
-      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
-    },
-    {
-      level: "critical" as const,
-      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
-    },
-  ])("files $level silence review work through the watchdog scan", async ({ level, ageMs }) => {
-    const now = new Date("2026-04-22T20:00:00.000Z");
-    const seeded = await seedRunningRun({ now, ageMs });
-    const { recovery } = createRecovery();
-
-    await expect(recovery.buildRunOutputSilence(
-      (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId)))[0]!,
-      now,
-    )).resolves.toMatchObject({
-      level,
-      silenceAgeMs: ageMs,
-      suspicionThresholdMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS,
-      criticalThresholdMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
-      evaluationIssueId: null,
-      evaluationIssueIdentifier: null,
-      evaluationIssueAssigneeAgentId: null,
-    });
-
-    // Fork semantics: the watchdog FILES a review issue for silent runs
-    // (upstream only surfaces the summary) — first scan creates, second is a
-    // dedup hit on the open evaluation.
-    const first = await recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId });
-    const second = await recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId });
-    expect(first).toMatchObject({ scanned: 1, created: 1, existing: 0, skipped: 0 });
-    expect(second).toMatchObject({ scanned: 1, created: 0, existing: 1, skipped: 0 });
-    expect(first.evaluationIssueIds).toHaveLength(1);
-    const evaluations = await db
-      .select()
-      .from(issues)
-      .where(and(eq(issues.companyId, seeded.companyId), eq(issues.originKind, "stale_active_run_evaluation")));
-    expect(evaluations).toHaveLength(1);
-    expect(evaluations[0]?.priority).toBe(level === "critical" ? "high" : "medium");
-    const decisions = await db
-      .select()
-      .from(heartbeatRunWatchdogDecisions)
-      .where(eq(heartbeatRunWatchdogDecisions.runId, seeded.runId));
-    expect(decisions).toHaveLength(0);
-  });
-
-  it("keeps blocked and recovery-origin sources artifact-free", async () => {
+  it.each(["stale_active_run_evaluation", "issue_productivity_review"])("keeps blocked and %s sources artifact-free", async (originKind) => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const blocked = await seedRunningRun({
       now,
@@ -317,7 +240,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     const recursive = await seedRunningRun({
       now,
       ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
-      sourceOriginKind: "stale_active_run_evaluation",
+      sourceOriginKind: originKind,
     });
     const { enqueueWakeup, recovery } = createRecovery();
 
@@ -336,110 +259,135 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
-  it("stores board snooze decisions directly on the run", async () => {
+  it("scopes candidates, readers, and writers to one company", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const companyA = await seedRunningRun({ now, ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000 });
+    const companyB = await seedRunningRun({ now, ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000 });
+    const healthyRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: healthyRunId,
+      companyId: companyA.companyId,
+      agentId: companyA.coderId,
+      status: "running",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt: now,
+      processStartedAt: now,
+      lastOutputAt: now,
+      lastOutputSeq: 1,
+      lastOutputStream: "stdout",
+      contextSnapshot: {},
+      logBytes: 0,
+    });
+    const { recovery } = createRecovery();
+
+    const result = await recovery.scanSilentActiveRuns({ now, companyId: companyA.companyId });
+
+    // The company filter, the SQL timestamp expression, and the healthy-run
+    // exclusion together keep the scan to the one silent run in company A.
+    expect(result.scanned).toBe(1);
+
+    const evaluationIssueIdInCompanyB = randomUUID();
+    await db.insert(issues).values({
+      id: evaluationIssueIdInCompanyB,
+      companyId: companyB.companyId,
+      title: "Evaluation issue in the other company",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: companyB.managerId,
+      issueNumber: 2,
+      identifier: `${companyB.issuePrefix}-2`,
+      originKind: "stale_active_run_evaluation",
+      originId: companyB.runId,
+      originRunId: companyB.runId,
+      originFingerprint: `stale_active_run:${companyB.companyId}:${companyB.runId}`,
+    });
+
+    await expect(recovery.recordWatchdogDecision({
+      runId: companyA.runId,
+      actor: { type: "agent", agentId: companyA.managerId },
+      decision: "continue",
+      evaluationIssueId: evaluationIssueIdInCompanyB,
+      reason: "Cross-company evaluation issue must be rejected",
+      now,
+    })).rejects.toMatchObject({ status: 404 });
+
+    await expect(recovery.recordWatchdogDecision({
+      runId: companyA.runId,
+      actor: { type: "board" },
+      decision: "continue",
+      reason: "Cross-company createdByRunId must be rejected",
+      createdByRunId: companyB.runId,
+      now,
+    })).rejects.toMatchObject({ status: 403 });
+  });
+
+  it("leaves no partial state when the fold transaction fails", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const seeded = await seedRunningRun({
       now,
       ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
+      sourceStatus: "done",
+      sameRunTerminalEvidence: true,
+    });
+    const evaluationIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: evaluationIssueId,
+      companyId: seeded.companyId,
+      title: "Existing stale evaluation",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: seeded.managerId,
+      issueNumber: 2,
+      identifier: `${seeded.issuePrefix}-2`,
+      originKind: "stale_active_run_evaluation",
+      originId: seeded.runId,
+      originRunId: seeded.runId,
+      originFingerprint: `stale_active_run:${seeded.companyId}:${seeded.runId}`,
+    });
+    await db.insert(issueRecoveryActions).values({
+      companyId: seeded.companyId,
+      sourceIssueId: seeded.issueId,
+      recoveryIssueId: evaluationIssueId,
+      kind: "active_run_watchdog",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: seeded.managerId,
+      cause: "active_run_watchdog",
+      fingerprint: `active-run-watchdog:${seeded.companyId}:${seeded.runId}:${seeded.issueId}`,
+      evidence: { runId: seeded.runId },
+      nextAction: "Review stale active run",
     });
     const { recovery } = createRecovery();
-    const snoozedUntil = new Date(now.getTime() + 60 * 60 * 1000);
+    mockedAppendHeartbeatRunEvent.mockRejectedValueOnce(new Error("injected fold transaction fault"));
 
-    const decision = await recovery.recordWatchdogDecision({
-      runId: seeded.runId,
-      actor: { type: "board" },
-      decision: "snooze",
-      snoozedUntil,
-      reason: "Known quiet compile",
-      now,
-    });
-    expect(decision).toMatchObject({
-      runId: seeded.runId,
-      evaluationIssueId: null,
-      decision: "snooze",
-      snoozedUntil,
-    });
-    await expect(buildSummary(seeded.runId, now)).resolves.toMatchObject({
-      level: "snoozed",
-      snoozedUntil,
-      evaluationIssueId: null,
-    });
-    await expect(buildSummary(seeded.runId, new Date(snoozedUntil.getTime() + 1))).resolves.toMatchObject({
-      level: "critical",
-      snoozedUntil: null,
-    });
-    await expectNoReviewArtifacts(seeded);
+    await expect(recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId }))
+      .rejects.toThrow("injected fold transaction fault");
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+    expect(run?.status).toBe("running");
+    expect(await db.select().from(heartbeatRunWatchdogDecisions).where(eq(
+      heartbeatRunWatchdogDecisions.runId,
+      seeded.runId,
+    ))).toHaveLength(0);
+    expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, seeded.runId))).toHaveLength(0);
+    // The seed itself planted one activity-log row as the fake same-run
+    // terminal evidence; the fold must not add a second one.
+    expect(await db.select().from(activityLog).where(eq(activityLog.runId, seeded.runId))).toHaveLength(1);
+    const [source] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    const [evaluation] = await db.select().from(issues).where(eq(issues.id, evaluationIssueId));
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, seeded.issueId));
+    expect(source?.executionRunId).toBe(seeded.runId);
+    expect(evaluation?.status).toBe("todo");
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, evaluationIssueId))).toHaveLength(0);
+    expect(action).toMatchObject({ status: "active", outcome: null });
+    const [agent] = await db.select().from(agents).where(eq(agents.id, seeded.coderId));
+    expect(agent?.status).toBe("running");
   });
 
-  it("re-arms board continue decisions after 30 minutes without creating artifacts", async () => {
-    const now = new Date("2026-04-22T20:00:00.000Z");
-    const seeded = await seedRunningRun({
-      now,
-      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
-    });
-    const { enqueueWakeup, recovery } = createRecovery();
-    const decision = await recovery.recordWatchdogDecision({
-      runId: seeded.runId,
-      actor: { type: "board" },
-      decision: "continue",
-      reason: "Keep watching this run",
-      now,
-    });
-    const rearmAt = new Date(now.getTime() + ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS);
-
-    expect(decision.evaluationIssueId).toBeNull();
-    expect(decision.snoozedUntil?.toISOString()).toBe(rearmAt.toISOString());
-    await expect(buildSummary(seeded.runId, new Date(rearmAt.getTime() - 1))).resolves.toMatchObject({
-      level: "snoozed",
-      evaluationIssueId: null,
-    });
-    await expect(buildSummary(seeded.runId, new Date(rearmAt.getTime() + 1))).resolves.toMatchObject({
-      level: "suspicious",
-      evaluationIssueId: null,
-    });
-    await expect(recovery.scanSilentActiveRuns({ now: new Date(rearmAt.getTime() - 1), companyId: seeded.companyId }))
-      .resolves.toMatchObject({ snoozed: 1, created: 0 });
-    // Fork semantics: after the continue decision re-arms, the next scan
-    // files the review issue (upstream would stay artifact-free).
-    const postRearm = await recovery.scanSilentActiveRuns({ now: new Date(rearmAt.getTime() + 1), companyId: seeded.companyId });
-    expect(postRearm).toMatchObject({ created: 1, skipped: 0 });
-    expect(await db.select().from(issues).where(and(
-      eq(issues.companyId, seeded.companyId),
-      eq(issues.originKind, "stale_active_run_evaluation"),
-    ))).toHaveLength(1);
-  });
-
-  it("permanently suppresses a run after a board false-positive decision", async () => {
-    const now = new Date("2026-04-22T20:00:00.000Z");
-    const seeded = await seedRunningRun({
-      now,
-      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
-    });
-    const { enqueueWakeup, recovery } = createRecovery();
-
-    const decision = await recovery.recordWatchdogDecision({
-      runId: seeded.runId,
-      actor: { type: "board" },
-      decision: "dismissed_false_positive",
-      reason: "This run is expected to remain quiet",
-      now,
-    });
-    expect(decision.evaluationIssueId).toBeNull();
-    await expect(buildSummary(seeded.runId, now)).resolves.toMatchObject({
-      level: "not_applicable",
-      snoozedUntil: null,
-      evaluationIssueId: null,
-    });
-    const muchLater = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-    await expect(buildSummary(seeded.runId, muchLater)).resolves.toMatchObject({
-      level: "not_applicable",
-      snoozedUntil: null,
-    });
-    await expect(recovery.scanSilentActiveRuns({ now: muchLater, companyId: seeded.companyId }))
-      .resolves.toMatchObject({ created: 0, skipped: 1 });
-    expect(enqueueWakeup).not.toHaveBeenCalled();
-    await expectNoReviewArtifacts(seeded);
-  });
 
   it("folds a terminal source with same-run evidence without creating review work", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
@@ -476,28 +424,24 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, seeded.companyId))).toHaveLength(0);
   });
 
-  it("still files review work for a terminal source without same-run evidence", async () => {
+  it("does not fold or create review work for a terminal source without same-run evidence", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const seeded = await seedRunningRun({
       now,
       ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
       sourceStatus: "done",
     });
-    const { recovery } = createRecovery();
+    const { enqueueWakeup, recovery } = createRecovery();
 
-    // Fork semantics: a done source without same-run durable evidence still
-    // gets a review issue (the run itself never signalled completion) — this
-    // mirrors master's "still escalates terminal source issues" behavior.
     await expect(recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId }))
-      .resolves.toMatchObject({ created: 1, folded: 0 });
+      .resolves.toMatchObject({ created: 0, folded: 0, skipped: 1 });
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
     expect(run?.status).toBe("running");
-    const [evaluation] = await db.select().from(issues).where(and(
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect(await db.select().from(issues).where(and(
       eq(issues.companyId, seeded.companyId),
       eq(issues.originKind, "stale_active_run_evaluation"),
-    ));
-    expect(evaluation?.originId).toBe(seeded.runId);
-    expect(evaluation?.parentId).toBeNull();
+    ))).toHaveLength(0);
   });
 
   it("folds existing legacy evaluation and recovery rows idempotently", async () => {
@@ -559,13 +503,14 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, seeded.runId))).toHaveLength(1);
   });
 
-  it("escalates an open evaluation to high priority at critical silence", async () => {
+  it("keeps open legacy evaluations readable without refreshing or reprioritizing them", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const seeded = await seedRunningRun({
       now,
       ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
     });
     const evaluationIssueId = randomUUID();
+    const evaluationUpdatedAt = new Date("2026-04-20T12:00:00.000Z");
     await db.insert(issues).values({
       id: evaluationIssueId,
       companyId: seeded.companyId,
@@ -579,14 +524,24 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       originId: seeded.runId,
       originRunId: seeded.runId,
       originFingerprint: `stale_active_run:${seeded.companyId}:${seeded.runId}`,
+      updatedAt: evaluationUpdatedAt,
     });
-    const { recovery } = createRecovery();
+    const { enqueueWakeup, recovery } = createRecovery();
 
+    await expect(buildSummary(seeded.runId, now)).resolves.toMatchObject({
+      level: "critical",
+      evaluationIssueId,
+      evaluationIssueIdentifier: `${seeded.issuePrefix}-2`,
+      evaluationIssueAssigneeAgentId: seeded.managerId,
+    });
     await expect(recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId }))
-      .resolves.toMatchObject({ created: 0, existing: 0, escalated: 1 });
+      .resolves.toMatchObject({ created: 0, existing: 1, escalated: 0 });
     const [evaluation] = await db.select().from(issues).where(eq(issues.id, evaluationIssueId));
-    expect(evaluation).toMatchObject({ status: "todo", priority: "high", assigneeAgentId: seeded.managerId });
-    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, evaluationIssueId))).toHaveLength(1);
+    expect(evaluation).toMatchObject({ status: "todo", priority: "medium", assigneeAgentId: seeded.managerId });
+    expect(evaluation?.updatedAt.toISOString()).toBe(evaluationUpdatedAt.toISOString());
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, evaluationIssueId))).toHaveLength(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, seeded.companyId))).toHaveLength(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
 
     await expect(recovery.recordWatchdogDecision({
       runId: seeded.runId,
@@ -606,7 +561,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     })).rejects.toMatchObject({ status: 403 });
   });
 
-  it("auto-dismisses a closed legacy evaluation without recreating it", async () => {
+  it("does not recreate or auto-dismiss a closed legacy evaluation", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
     const seeded = await seedRunningRun({
       now,
@@ -631,741 +586,11 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
 
     await expect(recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId }))
       .resolves.toMatchObject({ created: 0, existing: 0, skipped: 1 });
-    // No recreation...
     expect(await db.select().from(issues).where(eq(issues.companyId, seeded.companyId))).toHaveLength(2);
-    // ...and fork semantics auto-record the suppression so future scans skip
-    // cheaply instead of re-firing every cycle.
-    const decisions = await db.select().from(heartbeatRunWatchdogDecisions).where(eq(
+    expect(await db.select().from(heartbeatRunWatchdogDecisions).where(eq(
       heartbeatRunWatchdogDecisions.runId,
       seeded.runId,
-    ));
-    expect(decisions).toHaveLength(1);
-    expect(decisions[0]?.decision).toBe("dismissed_false_positive");
+    ))).toHaveLength(0);
   });
 
-  it("ignores healthy runs that produced recent output", async () => {
-    const now = new Date("2026-04-22T20:00:00.000Z");
-    const seeded = await seedRunningRun({
-      now,
-      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
-      withOutput: true,
-    });
-    const { recovery } = createRecovery();
-
-    await expect(buildSummary(seeded.runId, now)).resolves.toMatchObject({ level: "ok" });
-    await expect(recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId }))
-      .resolves.toMatchObject({ scanned: 0, created: 0 });
-  });
-
-  async function withAutoTeardown<T>(
-    env: { enabled?: boolean; silenceMs?: number },
-    fn: () => Promise<T>,
-  ): Promise<T> {
-    const prevEnabled = process.env.WATCHDOG_AUTO_TEARDOWN_ENABLED;
-    const prevSilence = process.env.WATCHDOG_AUTO_TEARDOWN_SILENCE_MS;
-    if (env.enabled !== undefined) {
-      process.env.WATCHDOG_AUTO_TEARDOWN_ENABLED = env.enabled ? "true" : "false";
-    }
-    if (env.silenceMs !== undefined) {
-      process.env.WATCHDOG_AUTO_TEARDOWN_SILENCE_MS = String(env.silenceMs);
-    }
-    try {
-      return await fn();
-    } finally {
-      if (prevEnabled === undefined) delete process.env.WATCHDOG_AUTO_TEARDOWN_ENABLED;
-      else process.env.WATCHDOG_AUTO_TEARDOWN_ENABLED = prevEnabled;
-      if (prevSilence === undefined) delete process.env.WATCHDOG_AUTO_TEARDOWN_SILENCE_MS;
-      else process.env.WATCHDOG_AUTO_TEARDOWN_SILENCE_MS = prevSilence;
-    }
-  }
-
-  it("auto-tears-down a silent run past the teardown threshold and releases the lock when enabled", async () => {
-    const now = new Date("2026-04-22T20:00:00.000Z");
-    const { companyId, coderId, issueId, runId } = await seedRunningRun({
-      now,
-      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
-    });
-    const heartbeat = heartbeatService(db);
-
-    const result = await withAutoTeardown({ enabled: true }, () =>
-      heartbeat.scanSilentActiveRuns({ now, companyId }),
-    );
-
-    expect(result).toMatchObject({ tornDown: 1, created: 0 });
-
-    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
-    expect(run?.status).toBe("failed");
-    expect(run?.errorCode).toBe("watchdog_auto_teardown");
-    expect(run?.finishedAt?.toISOString()).toBe(now.toISOString());
-    expect(run?.resultJson).toMatchObject({
-      watchdogAutoTeardown: {
-        trigger: "watchdog_auto",
-        sourceIssueId: issueId,
-        cleanup: { outcome: "no_process_metadata" },
-      },
-    });
-
-    const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
-    expect(source?.executionRunId).toBeNull();
-    expect(source?.executionAgentNameKey).toBeNull();
-    expect(source?.executionLockedAt).toBeNull();
-
-    const [agent] = await db.select().from(agents).where(eq(agents.id, coderId));
-    expect(agent?.status).toBe("idle");
-
-    const decisions = await db
-      .select()
-      .from(heartbeatRunWatchdogDecisions)
-      .where(eq(heartbeatRunWatchdogDecisions.runId, runId));
-    expect(decisions).toHaveLength(1);
-    expect(decisions[0]?.decision).toBe("terminate");
-
-    const activity = await db
-      .select()
-      .from(activityLog)
-      .where(and(eq(activityLog.runId, runId), eq(activityLog.action, "heartbeat.watchdog_torn_down")));
-    expect(activity).toHaveLength(1);
-
-    const comments = await db
-      .select()
-      .from(issueComments)
-      .where(eq(issueComments.issueId, issueId));
-    expect(comments.some((c) => c.body.includes("watchdog auto-teardown"))).toBe(true);
-
-    const [event] = await db
-      .select()
-      .from(heartbeatRunEvents)
-      .where(eq(heartbeatRunEvents.runId, runId));
-    expect(event?.message).toContain("Watchdog auto-teardown");
-  });
-
-  it("does not tear down when the feature flag is disabled (detection-only default)", async () => {
-    const now = new Date("2026-04-22T20:00:00.000Z");
-    const { companyId, issueId, runId } = await seedRunningRun({
-      now,
-      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
-    });
-    const heartbeat = heartbeatService(db);
-
-    const result = await withAutoTeardown({ enabled: false }, () =>
-      heartbeat.scanSilentActiveRuns({ now, companyId }),
-    );
-
-    expect(result).toMatchObject({ tornDown: 0, created: 1 });
-    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
-    expect(run?.status).toBe("running");
-    const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
-    expect(source?.executionRunId).toBe(runId);
-  });
-
-  it("never tears down a run with a live snooze decision", async () => {
-    const now = new Date("2026-04-22T20:00:00.000Z");
-    const { companyId, runId, issueId } = await seedRunningRun({
-      now,
-      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
-    });
-    const heartbeat = heartbeatService(db);
-    await db.insert(heartbeatRunWatchdogDecisions).values({
-      companyId,
-      runId,
-      decision: "snooze",
-      snoozedUntil: new Date(now.getTime() + 60 * 60 * 1000),
-      reason: "operator asked to keep watching",
-    });
-
-    const result = await withAutoTeardown({ enabled: true }, () =>
-      heartbeat.scanSilentActiveRuns({ now, companyId }),
-    );
-
-    expect(result).toMatchObject({ tornDown: 0, snoozed: 1 });
-    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
-    expect(run?.status).toBe("running");
-    const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
-    expect(source?.executionRunId).toBe(runId);
-  });
-
-  it("never tears down a run with a live continue decision", async () => {
-    const now = new Date("2026-04-22T20:00:00.000Z");
-    const { companyId, runId } = await seedRunningRun({
-      now,
-      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
-    });
-    const heartbeat = heartbeatService(db);
-    await db.insert(heartbeatRunWatchdogDecisions).values({
-      companyId,
-      runId,
-      decision: "continue",
-      snoozedUntil: new Date(now.getTime() + ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS),
-      reason: "current evidence acceptable",
-    });
-
-    const result = await withAutoTeardown({ enabled: true }, () =>
-      heartbeat.scanSilentActiveRuns({ now, companyId }),
-    );
-
-    expect(result).toMatchObject({ tornDown: 0, snoozed: 1 });
-    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
-    expect(run?.status).toBe("running");
-  });
-
-  it("is idempotent across repeated scans (tears down once, no duplicate decisions or comments)", async () => {
-    const now = new Date("2026-04-22T20:00:00.000Z");
-    const { companyId, runId, issueId } = await seedRunningRun({
-      now,
-      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
-    });
-    const heartbeat = heartbeatService(db);
-
-    const first = await withAutoTeardown({ enabled: true }, () =>
-      heartbeat.scanSilentActiveRuns({ now, companyId }),
-    );
-    const second = await withAutoTeardown({ enabled: true }, () =>
-      heartbeat.scanSilentActiveRuns({ now: new Date(now.getTime() + 5 * 60_000), companyId }),
-    );
-
-    expect(first.tornDown).toBe(1);
-    // The run is no longer `running`, so it is not a candidate on the second scan.
-    expect(second.scanned).toBe(0);
-    expect(second.tornDown).toBe(0);
-
-    const decisions = await db
-      .select()
-      .from(heartbeatRunWatchdogDecisions)
-      .where(eq(heartbeatRunWatchdogDecisions.runId, runId));
-    expect(decisions).toHaveLength(1);
-
-    const teardownComments = await db
-      .select()
-      .from(issueComments)
-      .where(eq(issueComments.issueId, issueId));
-    expect(teardownComments.filter((c) => c.body.includes("watchdog auto-teardown"))).toHaveLength(1);
-  });
-
-  it("tears down below the detection floor when a lower teardown threshold widens the window", async () => {
-    const now = new Date("2026-04-22T20:00:00.000Z");
-    // Run silent for 40m: below the 60m detection floor, above a configured 35m teardown threshold.
-    const { companyId, runId } = await seedRunningRun({ now, ageMs: 40 * 60_000 });
-    const heartbeat = heartbeatService(db);
-
-    const result = await withAutoTeardown({ enabled: true, silenceMs: 35 * 60_000 }, () =>
-      heartbeat.scanSilentActiveRuns({ now, companyId }),
-    );
-
-    expect(result).toMatchObject({ tornDown: 1, created: 0 });
-    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
-    expect(run?.status).toBe("failed");
-  });
-
-  it("floors the teardown threshold at 30m so a misconfigured tiny value cannot nuke briefly-quiet runs", async () => {
-    const now = new Date("2026-04-22T20:00:00.000Z");
-    // Run silent for only 20m with a misconfigured 1m threshold: the 30m floor keeps it out of scope.
-    const { companyId, runId } = await seedRunningRun({ now, ageMs: 20 * 60_000 });
-    const heartbeat = heartbeatService(db);
-
-    const result = await withAutoTeardown({ enabled: true, silenceMs: 60_000 }, () =>
-      heartbeat.scanSilentActiveRuns({ now, companyId }),
-    );
-
-    expect(result).toMatchObject({ scanned: 0, tornDown: 0 });
-    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
-    expect(run?.status).toBe("running");
-  });
-
-  it("performs an authorized manual terminate via recordWatchdogDecision regardless of the feature flag", async () => {
-    const now = new Date("2026-04-22T20:00:00.000Z");
-    const { companyId, coderId, issueId, runId } = await seedRunningRun({
-      now,
-      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
-    });
-    const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
-
-    // Feature flag OFF: a manual board terminate is an explicit authorized override.
-    const decision = await withAutoTeardown({ enabled: false }, () =>
-      recovery.recordWatchdogDecision({
-        runId,
-        actor: { type: "board", userId: "operator-1" },
-        decision: "terminate",
-        reason: "operator confirmed the run is wedged",
-        now,
-      }),
-    );
-
-    expect(decision).toMatchObject({ runId, decision: "terminate", createdByUserId: "operator-1" });
-
-    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
-    expect(run?.status).toBe("failed");
-    expect(run?.errorCode).toBe("watchdog_auto_teardown");
-    const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
-    expect(source?.executionRunId).toBeNull();
-    const [agent] = await db.select().from(agents).where(eq(agents.id, coderId));
-    expect(agent?.status).toBe("idle");
-  });
-
-  it("records an audit-only terminate decision when the run already reached a terminal state", async () => {
-    const now = new Date("2026-04-22T20:00:00.000Z");
-    const { companyId, runId, issueId } = await seedRunningRun({
-      now,
-      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
-    });
-    const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
-
-    // Run finishes on its own before the operator's terminate lands.
-    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: now }).where(eq(heartbeatRuns.id, runId));
-
-    const decision = await recovery.recordWatchdogDecision({
-      runId,
-      actor: { type: "board", userId: "operator-1" },
-      decision: "terminate",
-      reason: "operator clicked terminate late",
-      now,
-    });
-
-    expect(decision).toMatchObject({ runId, decision: "terminate" });
-    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
-    // Not re-terminated: still the status it reached on its own.
-    expect(run?.status).toBe("succeeded");
-    // No teardown activity-log entry, only the audit decision.
-    const teardownActivity = await db
-      .select()
-      .from(activityLog)
-      .where(and(eq(activityLog.runId, runId), eq(activityLog.action, "heartbeat.watchdog_torn_down")));
-    expect(teardownActivity).toHaveLength(0);
-    // Lock left untouched by the no-op terminate (a separate sweeper handles terminal-run locks).
-    const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
-    expect(source?.executionRunId).toBe(runId);
-  });
-
-  it("auto-resolves open evaluations whose run has since terminated, idempotently", async () => {
-    const now = new Date("2026-04-22T20:00:00.000Z");
-    const { companyId, runId } = await seedRunningRun({
-      now,
-      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
-    });
-    const heartbeat = heartbeatService(db);
-
-    const first = await heartbeat.scanSilentActiveRuns({ now, companyId });
-    expect(first.created).toBe(1);
-
-    // The run finishes on its own after the alert fired — the exact false-positive
-    // shape this sweep owns: the run drops out of the scan's running-only candidate
-    // set, so nothing else would ever revisit the already-open evaluation issue.
-    await db
-      .update(heartbeatRuns)
-      .set({ status: "succeeded", finishedAt: new Date(now.getTime() + 60_000) })
-      .where(eq(heartbeatRuns.id, runId));
-
-    const later = new Date(now.getTime() + 5 * 60_000);
-    const second = await heartbeat.scanSilentActiveRuns({ now: later, companyId });
-    expect(second.autoResolvedTerminated).toBe(1);
-
-    const evaluations = await db
-      .select()
-      .from(issues)
-      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
-    expect(evaluations).toHaveLength(1);
-    expect(evaluations[0]?.status).toBe("done");
-    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, evaluations[0]!.id));
-    const autoComment = comments.find((comment) => comment.body.startsWith("Auto-resolved: the flagged run has terminated."));
-    expect(autoComment).toBeDefined();
-    expect(autoComment?.body).toContain("`succeeded`");
-
-    // Re-running the sweep must not double-close or double-comment.
-    const third = await heartbeat.scanSilentActiveRuns({ now: later, companyId });
-    expect(third.autoResolvedTerminated).toBe(0);
-    const commentsAfter = await db.select().from(issueComments).where(eq(issueComments.issueId, evaluations[0]!.id));
-    expect(commentsAfter.filter((comment) => comment.body.startsWith("Auto-resolved:"))).toHaveLength(1);
-  });
-
-  it("auto-resolves with the failure outcome recorded when the run failed", async () => {
-    const now = new Date("2026-04-22T20:00:00.000Z");
-    const { companyId, runId } = await seedRunningRun({
-      now,
-      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
-    });
-    const heartbeat = heartbeatService(db);
-    expect((await heartbeat.scanSilentActiveRuns({ now, companyId })).created).toBe(1);
-
-    await db
-      .update(heartbeatRuns)
-      .set({
-        status: "failed",
-        finishedAt: new Date(now.getTime() + 60_000),
-        errorCode: "adapter_failed",
-      })
-      .where(eq(heartbeatRuns.id, runId));
-
-    const later = new Date(now.getTime() + 5 * 60_000);
-    const second = await heartbeat.scanSilentActiveRuns({ now: later, companyId });
-    expect(second.autoResolvedTerminated).toBe(1);
-    const evaluations = await db
-      .select()
-      .from(issues)
-      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
-    expect(evaluations).toHaveLength(1);
-    expect(evaluations[0]?.status).toBe("done");
-    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, evaluations[0]!.id));
-    const autoComment = comments.find((comment) => comment.body.startsWith("Auto-resolved:"));
-    expect(autoComment).toBeDefined();
-    expect(autoComment?.body).toContain("`failed`");
-    expect(autoComment?.body).toContain("`adapter_failed`");
-  });
-
-  it("does not auto-resolve while the run is merely queued or retried", async () => {
-    const now = new Date("2026-04-22T20:00:00.000Z");
-    const { companyId, runId } = await seedRunningRun({
-      now,
-      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
-    });
-    const heartbeat = heartbeatService(db);
-    expect((await heartbeat.scanSilentActiveRuns({ now, companyId })).created).toBe(1);
-
-    // scheduled_retry is NOT terminal — the run has not produced its outcome yet.
-    await db
-      .update(heartbeatRuns)
-      .set({ status: "scheduled_retry" })
-      .where(eq(heartbeatRuns.id, runId));
-
-    const later = new Date(now.getTime() + 5 * 60_000);
-    const second = await heartbeat.scanSilentActiveRuns({ now: later, companyId });
-    expect(second.autoResolvedTerminated).toBe(0);
-    const evaluations = await db
-      .select()
-      .from(issues)
-      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
-    expect(evaluations).toHaveLength(1);
-    expect(evaluations[0]?.status).not.toBe("done");
-  });
-
-  it("does not file an evaluation for a ghost run row with no live signal", async () => {
-    const now = new Date("2026-04-22T20:00:00.000Z");
-    const { companyId, coderId } = await seedRunningRun({
-      now,
-      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
-    });
-    // Nothing is alive behind the run row: the agent went idle, no in-memory
-    // child handle exists, and no pid/process-group metadata was ever recorded.
-    // The run row still says "running", but it is a ghost, not an active run.
-    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, coderId));
-
-    const heartbeat = heartbeatService(db);
-    const result = await heartbeat.scanSilentActiveRuns({ now, companyId });
-    expect(result.created).toBe(0);
-
-    const evaluations = await db
-      .select()
-      .from(issues)
-      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
-    expect(evaluations).toHaveLength(0);
-    const gates = await db
-      .select()
-      .from(activityLog)
-      .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "heartbeat.output_stale_run_not_live")));
-    expect(gates).toHaveLength(1);
-  });
-
-  it("persists the terminal lifecycle event when a queued run executes end to end", async () => {
-    const companyId = randomUUID();
-    const agentId = randomUUID();
-    await db.insert(companies).values({
-      id: companyId,
-      name: `Terminal Event Co ${companyId.slice(0, 8)}`,
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-      defaultResponsibleUserId: "responsible-user",
-    });
-    await db.insert(agents).values({
-      id: agentId,
-      companyId,
-      name: `Agent${agentId.slice(0, 8)}`,
-      role: "engineer",
-      status: "active",
-      adapterType: "claude_local",
-      adapterConfig: {},
-      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 20 } },
-      permissions: {},
-    });
-    const runId = randomUUID();
-    await db.insert(heartbeatRuns).values({
-      id: runId,
-      companyId,
-      agentId,
-      status: "queued",
-      contextSnapshot: {},
-    });
-
-    const heartbeat = heartbeatService(db);
-    const claimed = await heartbeat.startNextQueuedRunForAgent(agentId);
-    expect(claimed).toHaveLength(1);
-    await heartbeat.drainActiveRunExecutions();
-
-    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
-    expect(run?.status).toBe("succeeded");
-    // The terminal lifecycle event must come from the run finalization path
-    // itself. This assertion fails if the emit is removed from execution, which
-    // is exactly the silent-terminal telemetry this suite guards.
-    const events = await db
-      .select()
-      .from(heartbeatRunEvents)
-      .where(and(eq(heartbeatRunEvents.runId, runId), eq(heartbeatRunEvents.eventType, "lifecycle")));
-    const messages = events.map((event) => event.message);
-    expect(messages).toContain("run started");
-    expect(messages).toContain("run succeeded");
-  });
-  async function seedMultiRunCompany(opts: {
-    now: Date;
-    runs: Array<{ startedAt: Date }>;
-  }) {
-    const companyId = randomUUID();
-    const managerId = randomUUID();
-    const coderId = randomUUID();
-    const issuePrefix = `W${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Correlation Co",
-      issuePrefix,
-      defaultResponsibleUserId: "responsible-user",
-      requireBoardApprovalForNewAgents: false,
-    });
-    await db.insert(agents).values([
-      {
-        id: managerId,
-        companyId,
-        name: "CTO",
-        role: "cto",
-        status: "idle",
-        adapterType: "codex_local",
-        adapterConfig: {},
-        runtimeConfig: {},
-        permissions: {},
-      },
-      {
-        id: coderId,
-        companyId,
-        name: "Coder",
-        role: "engineer",
-        status: "running",
-        reportsTo: managerId,
-        adapterType: "codex_local",
-        adapterConfig: {},
-        runtimeConfig: {},
-        permissions: {},
-      },
-    ]);
-    const runIds: string[] = [];
-    for (const [index, run] of opts.runs.entries()) {
-      const runId = randomUUID();
-      const issueId = randomUUID();
-      await db.insert(issues).values({
-        id: issueId,
-        companyId,
-        title: `Correlation run ${index}`,
-        status: "in_progress",
-        priority: "medium",
-        assigneeAgentId: coderId,
-        issueNumber: index + 1,
-        identifier: `${issuePrefix}-${index + 1}`,
-        originKind: "manual",
-        updatedAt: run.startedAt,
-        createdAt: run.startedAt,
-      });
-      await db.insert(heartbeatRuns).values({
-        id: runId,
-        companyId,
-        agentId: coderId,
-        status: "running",
-        invocationSource: "assignment",
-        triggerDetail: "system",
-        startedAt: run.startedAt,
-        processStartedAt: run.startedAt,
-        lastOutputAt: null,
-        lastOutputSeq: 0,
-        lastOutputStream: null,
-        contextSnapshot: { issueId },
-        logBytes: 0,
-      });
-      await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
-      runIds.push(runId);
-    }
-    return { companyId, coderId, runIds };
-  }
-
-  it("correlates runs silenced by the same stall into ONE evaluation with per-run bookkeeping", async () => {
-    const now = new Date("2026-04-22T20:00:00.000Z");
-    const base = now.getTime() - (ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000);
-    const seeded = await seedMultiRunCompany({
-      now,
-      runs: [{ startedAt: new Date(base) }, { startedAt: new Date(base + 5_000) }, { startedAt: new Date(now.getTime() - 10 * 60 * 1000) }],
-    });
-    const { recovery } = createRecovery();
-
-    const first = await recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId });
-    expect(first).toMatchObject({ scanned: 2, created: 1, correlated: 1, existing: 0 });
-
-    const evaluations = await db
-      .select()
-      .from(issues)
-      .where(and(eq(issues.companyId, seeded.companyId), eq(issues.originKind, "stale_active_run_evaluation")));
-    expect(evaluations).toHaveLength(1);
-    const evaluation = evaluations[0]!;
-    expect(evaluation.originId).toBe(seeded.runIds[0]);
-
-    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, evaluation.id));
-    expect(comments).toHaveLength(1);
-    expect(comments[0]!.body).toContain("Correlated silent run");
-    expect(comments[0]!.body).toContain(seeded.runIds[1]);
-
-    const decisions = await db
-      .select()
-      .from(heartbeatRunWatchdogDecisions)
-      .where(eq(heartbeatRunWatchdogDecisions.runId, seeded.runIds[1]));
-    expect(decisions).toHaveLength(1);
-    expect(decisions[0]).toMatchObject({ decision: "correlated", evaluationIssueId: evaluation.id });
-
-    // Re-scan: A anchored by its own evaluation, B anchored by the correlated
-    // decision row — no duplicate comments or decision rows.
-    const second = await recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId });
-    expect(second).toMatchObject({ scanned: 2, created: 0, correlated: 1, existing: 1 });
-    const commentsAfter = await db.select().from(issueComments).where(eq(issueComments.issueId, evaluation.id));
-    expect(commentsAfter).toHaveLength(1);
-    const decisionsAfter = await db
-      .select()
-      .from(heartbeatRunWatchdogDecisions)
-      .where(eq(heartbeatRunWatchdogDecisions.runId, seeded.runIds[1]));
-    expect(decisionsAfter).toHaveLength(1);
-
-    // Per-run decisions still work against the shared evaluation for the
-    // correlated run (the watchdog's own correlation row is the binding).
-    await expect(recovery.recordWatchdogDecision({
-      runId: seeded.runIds[1],
-      actor: { type: "board" },
-      decision: "dismissed_false_positive",
-      evaluationIssueId: evaluation.id,
-      reason: "Shared stall, handled once",
-      now,
-    })).resolves.toMatchObject({ decision: "dismissed_false_positive", evaluationIssueId: evaluation.id });
-
-    // A run with neither its own evaluation nor a correlated row is still rejected.
-    await expect(recovery.recordWatchdogDecision({
-      runId: seeded.runIds[2],
-      actor: { type: "board" },
-      decision: "dismissed_false_positive",
-      evaluationIssueId: evaluation.id,
-      now,
-    })).rejects.toThrow();
-  });
-
-  it("keeps far-apart silences separate (no false merges)", async () => {
-    const now = new Date("2026-04-22T20:00:00.000Z");
-    const base = now.getTime() - (ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000);
-    const seeded = await seedMultiRunCompany({
-      now,
-      runs: [{ startedAt: new Date(base) }, { startedAt: new Date(base - 29 * 60 * 1000) }],
-    });
-    const { recovery } = createRecovery();
-
-    const first = await recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId });
-    expect(first).toMatchObject({ scanned: 2, created: 2, correlated: 0, existing: 0 });
-    const evaluations = await db
-      .select()
-      .from(issues)
-      .where(and(eq(issues.companyId, seeded.companyId), eq(issues.originKind, "stale_active_run_evaluation")));
-    expect(evaluations).toHaveLength(2);
-  });
-
-  it("does not correlate into an evaluation older than the 10-minute freshness window", async () => {
-    const now = new Date("2026-04-22T20:00:00.000Z");
-    const base = now.getTime() - (ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000);
-    // A goes silent first; its evaluation ages past the freshness window before
-    // B (silence start within the +/-60s window) first becomes a scan candidate.
-    const seeded = await seedMultiRunCompany({ now, runs: [{ startedAt: new Date(base) }] });
-    const { recovery } = createRecovery();
-    const first = await recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId });
-    expect(first).toMatchObject({ scanned: 1, created: 1, correlated: 0 });
-    const evaluations = await db
-      .select()
-      .from(issues)
-      .where(and(eq(issues.companyId, seeded.companyId), eq(issues.originKind, "stale_active_run_evaluation")));
-    expect(evaluations).toHaveLength(1);
-    await db
-      .update(issues)
-      .set({ createdAt: new Date(now.getTime() - 11 * 60 * 1000) })
-      .where(eq(issues.id, evaluations[0]!.id));
-
-    // B: silence start 30s after A's - passes the +/-60s window, fails freshness.
-    const runBId = randomUUID();
-    const issueBId = randomUUID();
-    await db.insert(issues).values({
-      id: issueBId,
-      companyId: seeded.companyId,
-      title: "Correlation run B",
-      status: "in_progress",
-      priority: "medium",
-      assigneeAgentId: seeded.coderId,
-      issueNumber: 9,
-      identifier: "CORR-9",
-      originKind: "manual",
-      updatedAt: new Date(base + 30_000),
-      createdAt: new Date(base + 30_000),
-    });
-    await db.insert(heartbeatRuns).values({
-      id: runBId,
-      companyId: seeded.companyId,
-      agentId: seeded.coderId,
-      status: "running",
-      invocationSource: "assignment",
-      triggerDetail: "system",
-      startedAt: new Date(base + 30_000),
-      processStartedAt: new Date(base + 30_000),
-      lastOutputAt: null,
-      lastOutputSeq: 0,
-      lastOutputStream: null,
-      contextSnapshot: { issueId: issueBId },
-      logBytes: 0,
-    });
-    await db.update(issues).set({ executionRunId: runBId }).where(eq(issues.id, issueBId));
-
-    const second = await recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId });
-    expect(second).toMatchObject({ scanned: 2, created: 1, correlated: 0, existing: 1 });
-    const evaluationsAfter = await db
-      .select()
-      .from(issues)
-      .where(and(eq(issues.companyId, seeded.companyId), eq(issues.originKind, "stale_active_run_evaluation")));
-    expect(evaluationsAfter).toHaveLength(2);
-    const ownEvaluation = evaluationsAfter.find((issue) => issue.originId === runBId);
-    expect(ownEvaluation).toBeDefined();
-  });
-
-  it("re-alerts a correlated run on its own evaluation once the shared evaluation closes", async () => {
-    const now = new Date("2026-04-22T20:00:00.000Z");
-    const base = now.getTime() - (ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000);
-    const seeded = await seedMultiRunCompany({
-      now,
-      runs: [{ startedAt: new Date(base) }, { startedAt: new Date(base + 5_000) }],
-    });
-    const { recovery } = createRecovery();
-
-    await recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId });
-    const evaluations = await db
-      .select()
-      .from(issues)
-      .where(and(eq(issues.companyId, seeded.companyId), eq(issues.originKind, "stale_active_run_evaluation")));
-    expect(evaluations).toHaveLength(1);
-    await db
-      .update(issues)
-      .set({ status: "done", completedAt: now })
-      .where(eq(issues.id, evaluations[0]!.id));
-
-    const second = await recovery.scanSilentActiveRuns({ now, companyId: seeded.companyId });
-    expect(second).toMatchObject({ scanned: 2, created: 1, correlated: 0, existing: 0, skipped: 1 });
-    const openEvaluations = await db
-      .select()
-      .from(issues)
-      .where(and(
-        eq(issues.companyId, seeded.companyId),
-        eq(issues.originKind, "stale_active_run_evaluation"),
-        eq(issues.status, "todo"),
-      ));
-    expect(openEvaluations).toHaveLength(1);
-    expect(openEvaluations[0]!.originId).toBe(seeded.runIds[1]);
-  });
 });

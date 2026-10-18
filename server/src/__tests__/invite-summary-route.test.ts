@@ -6,17 +6,11 @@ const mockStorage = vi.hoisted(() => ({
   headObject: vi.fn(),
 }));
 
-// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
-// registry must be in place before ANY import of the routes module, in every
-// test. createApp concurrently imports middleware and route modules whose
-// graphs both contain services/index.js. With doMock-registered mocks that
-// first evaluation could race the registry under load and bind the REAL
-// services module, rejecting the request under test with a 500 (observed on
-// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
-// to every import graph deterministically.
-vi.mock("../storage/index.js", () => ({
-  getStorageService: () => mockStorage,
-}));
+function registerModuleMocks() {
+  vi.doMock("../storage/index.js", () => ({
+    getStorageService: () => mockStorage,
+  }));
+}
 
 function createSelectChain(rows: unknown[]) {
   const query = {
@@ -51,14 +45,18 @@ function createDbStub(...selectResponses: unknown[][]) {
   };
 }
 
+function loadAppModules() {
+  return Promise.all([
+    vi.importActual<typeof import("../routes/access.js")>("../routes/access.js"),
+    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+  ]);
+}
+
 async function createApp(
   db: Record<string, unknown>,
   actor: Record<string, unknown> = { type: "anon" },
 ) {
-  const [{ accessRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/access.js")>("../routes/access.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-  ]);
+  const [{ accessRoutes }, { errorHandler }] = await loadAppModules();
   const app = express();
   app.use((req, _res, next) => {
     (req as any).actor = actor;
@@ -78,9 +76,17 @@ async function createApp(
 }
 
 describe("GET /invites/:token", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    vi.resetModules();
+    vi.doUnmock("../storage/index.js");
+    vi.doUnmock("../routes/access.js");
+    vi.doUnmock("../middleware/index.js");
+    registerModuleMocks();
     mockStorage.headObject.mockReset();
     mockStorage.headObject.mockResolvedValue({ exists: true, contentLength: 3, contentType: "image/png" });
+    // Transform the route's large dependency graph under the setup budget,
+    // rather than spending the first request test's timeout on module loading.
+    await loadAppModules();
   });
 
   it("returns company branding in the invite summary response", async () => {

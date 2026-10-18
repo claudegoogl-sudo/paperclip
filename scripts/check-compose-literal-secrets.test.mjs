@@ -290,3 +290,21 @@ test("Fix B regression: trailing comment with marker still exempts its own line"
   const sameLine = `POSTGRES_PASSWORD: fixture-only # ${ALLOW_MARKER}: throwaway test fixture`;
   assert.deepEqual(findOffenses(composeWith(sameLine)), []);
 });
+
+test("widened key pattern flags bare *_KEY, PASSPHRASE, PWD, SALT literals", () => {
+  for (const key of ["PAPERCLIP_ENCRYPTION_KEY", "SESSION_KEY", "SIGNING_SALT", "DB_PASSPHRASE", "MYSQL_PWD"]) {
+    assert.equal(findOffenses(composeWith(`${key}: abc123`)).length, 1, key);
+  }
+});
+
+test("libpq keyword/value DSN with literal password is rejected", () => {
+  const o = findOffenses(composeWith('DATABASE_URL: "host=db user=paperclip password=paperclip sslmode=disable"'));
+  assert.equal(o.length, 1);
+  assert.match(o[0].reason, /libpq/);
+});
+
+test("interpolated libpq password and *_KEY_ID keys are not flagged", () => {
+  assert.equal(findOffenses(composeWith('DATABASE_URL: "host=db password=${PGPASSWORD}"')).length, 0);
+  assert.equal(findOffenses(composeWith("AWS_KEY_ID: abc")).length, 0);
+  assert.equal(findOffenses(composeWith("STRICT_KEY_CHECKING: no")).length, 0);
+});

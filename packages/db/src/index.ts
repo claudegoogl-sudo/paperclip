@@ -1,5 +1,6 @@
 export {
   createDb,
+  withDedicatedDbConnection,
   closeRegisteredClients,
   getPostgresDataDirectory,
   ensurePostgresDatabase,
@@ -29,6 +30,7 @@ export { and, eq, like } from "drizzle-orm";
 export {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
+  EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
   type EmbeddedPostgresTestDatabase,
   type EmbeddedPostgresTestSupport,
 } from "./test-embedded-postgres.js";
