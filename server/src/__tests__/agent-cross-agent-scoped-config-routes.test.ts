@@ -38,7 +38,7 @@ const baseAgent = {
   status: "idle",
   reportsTo: null,
   capabilities: null,
-  adapterType: "process",
+  adapterType: "codex_local",
   adapterConfig: {},
   runtimeConfig: {},
   budgetMonthlyCents: 0,
@@ -272,7 +272,7 @@ describe("cross-agent PATCH /agents/:id: scoped agents:configure + model-only al
 
   it("AC5: self-update by an agent is unchanged (non-model fields allowed)", async () => {
     mockAccessService.decide.mockResolvedValue({ allowed: true, reason: "allow_self", explanation: "self" });
-    const res = await patch(conciergeId, { title: "New title", adapterConfig: { command: "x" } }, conciergeActor());
+    const res = await patch(conciergeId, { title: "New title", adapterConfig: { model: "x" } }, conciergeActor());
     expect(res.status, JSON.stringify(res.body)).toBe(200);
   });
 

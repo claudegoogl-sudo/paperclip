@@ -485,7 +485,9 @@ describe.skipIf(!support.supported)("public MCP OAuth and tool boundary", () => 
     app.use(actorMiddleware(db, { deploymentMode: "authenticated", resolveSession: async () => null }));
     app.get("/api/actor", (req, res) => res.json(req.actor));
     const response = await request(app).get("/api/actor").set("Authorization", `Bearer ${f.tokens.access_token}`);
-    expect(response.status).toBe(401);
+    // Fork semantic: an unrecognized bearer falls through unauthenticated
+    // (actor "none"); the route's own auth then rejects it.
+    expect(response.body).toMatchObject({ type: "none" });
     expect(response.body).not.toHaveProperty("type", "board");
     expect(response.body).not.toHaveProperty("type", "agent");
   });

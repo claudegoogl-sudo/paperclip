@@ -38,7 +38,14 @@ const AUDIT_COUNT_PAYLOAD_KEYS = new Set([
   "postTokens",
 ]);
 
+// Gateway audit list of header NAMES (never values) that carried credentials.
+// Passes only as an array of plain HTTP header-name tokens.
+const HEADER_NAME_TOKEN_RE = /^[A-Za-z0-9-]{1,128}$/;
+
 function isAuditCountField(key: string, value: unknown): boolean {
+  if (key === "credentialHeaderNames") {
+    return Array.isArray(value) && value.every((v) => typeof v === "string" && HEADER_NAME_TOKEN_RE.test(v));
+  }
   return (
     AUDIT_COUNT_PAYLOAD_KEYS.has(key) &&
     typeof value === "number" &&
