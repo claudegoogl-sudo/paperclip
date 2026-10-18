@@ -28,6 +28,12 @@ on:
       - ".github/workflows/fork-release.yml"
       - ".github/workflows/fork-release-gate-check.yml"
 
+concurrency:
+  # A new push to the same PR, or a new master push, supersedes the gate
+  # check already running for it.
+  group: fork-release-gate-check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
