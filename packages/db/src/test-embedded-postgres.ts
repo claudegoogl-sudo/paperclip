@@ -27,7 +27,7 @@ export const EMBEDDED_POSTGRES_TEST_TIMEOUT_MS = 90_000;
 // inside the symmetric 20s hookTimeout that server/vitest.config.ts now sets.
 export const EMBEDDED_POSTGRES_GRACEFUL_STOP_TIMEOUT_MS = 10_000;
 export const EMBEDDED_POSTGRES_SIGKILL_REAP_TIMEOUT_MS = 5_000;
-export const EMBEDDED_POSTGRES_SIGKILL_POLL_INTERVAL_MS = 100;
+const EMBEDDED_POSTGRES_SIGKILL_POLL_INTERVAL_MS = 100;
 
 type EmbeddedPostgresInstance = {
   initialise(): Promise<void>;
