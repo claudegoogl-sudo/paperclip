@@ -94,7 +94,18 @@ export function formatLearningEvent(event: PipelineCompanyCaseEvent): LearningEv
 export function learningDayKey(value: string | Date) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "Unknown";
-  return date.toISOString().slice(0, 10);
+  // Build the key from local calendar-day components, not date.toISOString()
+  // (which is UTC). learningDayLabel (below) buckets "Today"/"Yesterday"
+  // using the local calendar day, and groupLearningEventsByDay uses this key
+  // to decide which events share a group. Keying by UTC day while labeling
+  // by local day let events that fall on the same local calendar day land in
+  // two different groups (or vice versa) near local midnight in any
+  // non-UTC timezone. Keeping both on the local day keeps grouping and
+  // labeling consistent.
+  const year = date.getFullYear();
+  const month = `${date.getMonth() + 1}`.padStart(2, "0");
+  const day = `${date.getDate()}`.padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 export function learningDayLabel(value: string | Date) {
