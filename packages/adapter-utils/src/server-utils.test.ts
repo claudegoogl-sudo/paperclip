@@ -567,6 +567,34 @@ describe("adapter skill snapshots", () => {
 });
 
 describe("runChildProcess", () => {
+  it("survives a child that exits before reading its stdin (EPIPE)", async () => {
+    const uncaught: unknown[] = [];
+    const onUncaught = (err: unknown) => uncaught.push(err);
+    process.on("uncaughtException", onUncaught);
+    try {
+      const result = await runChildProcess(
+        randomUUID(),
+        process.execPath,
+        ["-e", "process.exit(0);"],
+        {
+          cwd: process.cwd(),
+          env: {},
+          stdin: "x".repeat(8 * 1024 * 1024),
+          timeoutSec: 5,
+          graceSec: 1,
+          onLog: async () => {},
+        },
+      );
+      // Give the stdin 'error' event a chance to fire after the child exits.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      expect(result.exitCode).toBe(0);
+      expect(uncaught).toEqual([]);
+    } finally {
+      process.off("uncaughtException", onUncaught);
+    }
+  });
+
   it("does not arm a timeout when timeoutSec is 0", async () => {
     const result = await runChildProcess(
       randomUUID(),
