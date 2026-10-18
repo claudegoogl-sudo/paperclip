@@ -26,6 +26,7 @@ const mockIssueService = vi.hoisted(() => ({
   addComment: vi.fn(),
   assertCheckoutOwner: vi.fn(),
   clearOrphanCheckoutLocksIfTerminal: vi.fn(async () => false),
+  count: vi.fn(),
   create: vi.fn(),
   createChild: vi.fn(),
   decomposeAcceptedPlan: vi.fn(),
@@ -528,6 +529,7 @@ describe("agent issue mutation checkout ownership", () => {
     });
     mockIssueService.getRelationSummaries.mockReset();
     mockIssueService.getWakeableParentAfterChildCompletion.mockReset();
+    mockIssueService.count.mockReset();
     mockIssueService.list.mockReset();
     mockIssueService.listAttachments.mockReset();
     mockIssueService.listComments.mockReset();
@@ -841,6 +843,80 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({
       action: "issue:read",
     }));
+  });
+
+  describe("issue list uuid filters", () => {
+    const uuidFilterNames = [
+      "participantAgentId",
+      "projectId",
+      "workspaceId",
+      "executionWorkspaceId",
+      "parentId",
+      "parentIssueId",
+      "descendantOf",
+      "labelId",
+    ];
+    const validFilterId = "55555555-5555-4555-8555-555555555555";
+
+    it.each(uuidFilterNames)("rejects a non-UUID %s on the list route before querying", async (name) => {
+      const res = await request(await createApp(boardActor()))
+        .get(`/api/companies/${companyId}/issues`)
+        .query({ [name]: "not-a-uuid" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.error).toBe(`${name} must be a UUID`);
+      expect(mockIssueService.list).not.toHaveBeenCalled();
+    });
+
+    it.each(uuidFilterNames)("rejects a non-UUID %s on the count route before querying", async (name) => {
+      const res = await request(await createApp(boardActor()))
+        .get(`/api/companies/${companyId}/issues/count`)
+        .query({ attention: "blocked", [name]: "not-a-uuid" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.error).toBe(`${name} must be a UUID`);
+      expect(mockIssueService.count).not.toHaveBeenCalled();
+      expect(mockIssueService.list).not.toHaveBeenCalled();
+    });
+
+    it("rejects padded and repeated filter values", async () => {
+      const app = await createApp(boardActor());
+      const padded = await request(app)
+        .get(`/api/companies/${companyId}/issues`)
+        .query({ projectId: ` ${validFilterId}` });
+      const repeated = await request(app).get(
+        `/api/companies/${companyId}/issues?labelId=${validFilterId}&labelId=${validFilterId}`,
+      );
+
+      expect(padded.status).toBe(422);
+      expect(repeated.status).toBe(422);
+      expect(mockIssueService.list).not.toHaveBeenCalled();
+    });
+
+    it("passes valid UUID filters through to the list query", async () => {
+      const res = await request(await createApp(boardActor()))
+        .get(`/api/companies/${companyId}/issues`)
+        .query({ projectId: validFilterId, labelId: validFilterId, descendantOf: validFilterId });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.list).toHaveBeenCalledWith(
+        companyId,
+        expect.objectContaining({
+          projectId: validFilterId,
+          labelId: validFilterId,
+          descendantOf: validFilterId,
+        }),
+      );
+    });
+
+    it("ignores empty filter values", async () => {
+      const res = await request(await createApp(boardActor()))
+        .get(`/api/companies/${companyId}/issues`)
+        .query({ projectId: "" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.list).toHaveBeenCalled();
+    });
   });
 
   it.each([

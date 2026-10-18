@@ -716,6 +716,30 @@ function readNonEmptyString(value: unknown): string | null {
     : null;
 }
 
+// These query filters are compared with uuid columns. createdFromIssueId is
+// validated in the service and assigneeAgentId in the handler.
+const ISSUE_LIST_UUID_FILTERS = [
+  "participantAgentId",
+  "projectId",
+  "workspaceId",
+  "executionWorkspaceId",
+  "parentId",
+  "parentIssueId",
+  "descendantOf",
+  "labelId",
+] as const;
+
+function findMalformedIssueUuidFilter(query: Record<string, unknown>): string | null {
+  for (const name of ISSUE_LIST_UUID_FILTERS) {
+    const value = query[name];
+    if (value === undefined || value === "") continue;
+    if (typeof value !== "string" || value !== value.trim() || !isUuidLike(value)) {
+      return name;
+    }
+  }
+  return null;
+}
+
 function readObject(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -7994,6 +8018,11 @@ export function issueRoutes(
         .json({ error: "sortDir must be 'asc' or 'desc' when provided" });
       return;
     }
+    const malformedUuidFilter = findMalformedIssueUuidFilter(req.query);
+    if (malformedUuidFilter) {
+      res.status(422).json({ error: `${malformedUuidFilter} must be a UUID` });
+      return;
+    }
     if (hasPlanDocument === null) {
       res
         .status(400)
@@ -8264,6 +8293,11 @@ export function issueRoutes(
       res
         .status(400)
         .json({ error: "hasPlanDocument must be true or false when provided" });
+      return;
+    }
+    const malformedUuidFilter = findMalformedIssueUuidFilter(req.query);
+    if (malformedUuidFilter) {
+      res.status(422).json({ error: `${malformedUuidFilter} must be a UUID` });
       return;
     }
 
