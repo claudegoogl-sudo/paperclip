@@ -14,6 +14,8 @@ import {
 } from "./git-workspace-sync.js";
 import type { AgentGitIdentityInput } from "./git-identity.js";
 import type { RunProcessResult } from "./server-utils.js";
+import { shellQuote } from "./shell-quote.js";
+export { shellQuote };
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
 import { mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
 import {
@@ -152,10 +154,6 @@ interface LocalGitWorkspaceSnapshot {
   headCommit: string;
   branchName: string | null;
   deletedPaths: string[];
-}
-
-export function shellQuote(value: string) {
-  return `'${value.replace(/'/g, `'\"'\"'`)}'`;
 }
 
 function isValidShellEnvKey(value: string) {
