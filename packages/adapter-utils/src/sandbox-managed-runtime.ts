@@ -599,17 +599,17 @@ export interface AdditionalSourceStagingFailure {
   error: string;
 }
 
-function asObject(value: unknown): Record<string, unknown> {
+export function asObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {};
 }
 
-function asString(value: unknown): string {
+export function asString(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
-function asNumber(value: unknown): number {
+export function asNumber(value: unknown): number {
   return typeof value === "number" ? value : Number(value);
 }
 
