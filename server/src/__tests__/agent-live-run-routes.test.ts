@@ -18,6 +18,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   readLog: vi.fn(),
   wakeup: vi.fn(),
   getRun: vi.fn(),
+  list: vi.fn(),
 }));
 
 const mockIssueService = vi.hoisted(() => ({
@@ -393,6 +394,52 @@ describe("agent live run routes", () => {
       created: 0,
       skipped: 0,
       skipReasons: [],
+    });
+  });
+
+  describe("company heartbeat run list agentId filter", () => {
+    const listUrl = "/api/companies/company-1/heartbeat-runs";
+
+    beforeEach(() => {
+      mockHeartbeatService.list.mockReset();
+      mockHeartbeatService.list.mockResolvedValue([]);
+    });
+
+    it.each(["x", "not-a-uuid", " aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"])(
+      "rejects malformed agentId %j before listing runs",
+      async (agentId) => {
+        const response = await requestApp(await createApp(), (url) =>
+          request(url).get(listUrl).query({ agentId }),
+        );
+        expect(response.status).toBe(400);
+        expect(response.body).toEqual({ error: "Invalid agent ID" });
+        expect(mockHeartbeatService.list).not.toHaveBeenCalled();
+      },
+    );
+
+    it("rejects a repeated agentId (array) before listing runs", async () => {
+      const response = await requestApp(await createApp(), (url) =>
+        request(url).get(
+          `${listUrl}?agentId=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa&agentId=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb`,
+        ),
+      );
+      expect(response.status).toBe(400);
+      expect(mockHeartbeatService.list).not.toHaveBeenCalled();
+    });
+
+    it("passes a valid agentId through to the list query", async () => {
+      const agentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+      const response = await requestApp(await createApp(), (url) =>
+        request(url).get(listUrl).query({ agentId }),
+      );
+      expect(response.status).toBe(200);
+      expect(mockHeartbeatService.list).toHaveBeenCalledWith("company-1", agentId, undefined, { summary: false });
+    });
+
+    it("keeps the list unfiltered when agentId is absent", async () => {
+      const response = await requestApp(await createApp(), (url) => request(url).get(listUrl));
+      expect(response.status).toBe(200);
+      expect(mockHeartbeatService.list).toHaveBeenCalledWith("company-1", undefined, undefined, { summary: false });
     });
   });
 
