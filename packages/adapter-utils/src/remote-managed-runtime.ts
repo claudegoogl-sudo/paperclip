@@ -1,6 +1,7 @@
 import path from "node:path";
 import type { AgentGitIdentityInput } from "./git-identity.js";
 import { GIT_ARCHIVE_EXCLUDES } from "./git-workspace-sync.js";
+import { shellQuote } from "./shell-quote.js";
 import {
   type SshRemoteExecutionSpec,
   prepareWorkspaceForSshExecution,
@@ -69,10 +70,6 @@ function asString(value: unknown): string {
 
 function asNumber(value: unknown): number {
   return typeof value === "number" ? value : Number(value);
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
 async function readRemoteFile(spec: SshRemoteExecutionSpec, remotePath: string): Promise<Buffer> {

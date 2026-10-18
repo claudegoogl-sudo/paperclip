@@ -18,6 +18,7 @@ import {
 import type { AgentGitIdentityInput } from "./git-identity.js";
 import { preferredShellForSandbox, shellCommandArgs } from "./sandbox-shell.js";
 import type { RunProcessResult } from "./server-utils.js";
+import { shellQuote } from "./shell-quote.js";
 import type { RuntimeProgressSink, RuntimeStatusSink } from "./runtime-progress.js";
 import type { RuntimeSpanRunner } from "./acpx-engine/startup-timing.js";
 import type { GitWorkspaceSnapshot } from "./git-workspace-sync.js";
@@ -137,10 +138,6 @@ export interface CommandManagedRuntimeSpec {
 }
 
 export type CommandManagedRuntimeAsset = SandboxManagedRuntimeAsset;
-
-function shellQuote(value: string) {
-  return `'${value.replace(/'/g, `'"'"'`)}'`;
-}
 
 function mergeRuntimeExcludes(entries: string[] | undefined): string[] {
   return [...new Set([".paperclip-runtime", ...(entries ?? [])])];

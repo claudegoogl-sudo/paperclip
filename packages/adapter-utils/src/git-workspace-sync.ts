@@ -7,6 +7,7 @@ import { buildAgentGitIdentityEnv, type AgentGitIdentityInput } from "./git-iden
 import { scrubSigningKeys } from "./child-env-scrub.js";
 import { createWorkspaceManifest, workspacePaths, WorkspaceNulParser, type WorkspacePaths } from "./workspace-manifest.js";
 import { runWorkspaceGitProcess } from "./workspace-git-stream.js";
+import { shellQuote } from "./shell-quote.js";
 
 export interface GitCommandResult {
   stdout: string;
@@ -108,10 +109,6 @@ export function agentCommitIdentityEnv(
 ): NodeJS.ProcessEnv | undefined {
   if (!agent?.id) return undefined;
   return { ...process.env, ...buildAgentGitIdentityEnv(agent) };
-}
-
-function shellQuote(value: string) {
-  return `'${value.replace(/'/g, `'\"'\"'`)}'`;
 }
 
 export async function runLocalGit(

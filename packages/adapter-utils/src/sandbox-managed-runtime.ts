@@ -27,6 +27,7 @@ import {
   withShallowGitWorkspaceClone,
   WORKSPACE_GIT_SCAN_SATURATED_CODE,
 } from "./git-workspace-sync.js";
+import { shellQuote } from "./shell-quote.js";
 import {
   captureDirectorySnapshot,
   disposeDirectorySnapshot,
@@ -611,10 +612,6 @@ function asString(value: unknown): string {
 
 function asNumber(value: unknown): number {
   return typeof value === "number" ? value : Number(value);
-}
-
-function shellQuote(value: string) {
-  return `'${value.replace(/'/g, `'\"'\"'`)}'`;
 }
 
 function buildDefaultExtractRuntimeAssetCommand(input: {

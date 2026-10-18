@@ -12,6 +12,7 @@ import {
   type SandboxCallbackBridgeBody,
 } from "./sandbox-callback-bridge-body.js";
 import type { BridgeBodyReservation } from "./http2-bridge-server.js";
+import { shellQuote } from "./shell-quote.js";
 
 import {
   runWithoutActiveStep,
@@ -299,10 +300,6 @@ export interface StartedSandboxCallbackBridgeServer {
   pid: number;
   directories: SandboxCallbackBridgeDirectories;
   stop(): Promise<void>;
-}
-
-function shellQuote(value: string) {
-  return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
 function normalizeMethod(value: string | null | undefined): string {
