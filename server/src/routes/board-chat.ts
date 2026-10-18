@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Db } from "@paperclipai/db";
-import type { DeploymentMode } from "@paperclipai/shared";
+import { isUuidLike, type DeploymentMode } from "@paperclipai/shared";
 import { instanceSettingsService, issueService } from "../services/index.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 
@@ -120,16 +120,27 @@ export function boardChatRoutes(
       return;
     }
 
-    const { companyId, message, taskId } = req.body as {
-      companyId?: string;
-      message?: string;
-      taskId?: string;
-    };
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const { companyId, message } = body;
+    const rawTaskId = body.taskId;
 
     if (!companyId || !message) {
       res.status(400).json({ error: "companyId and message are required" });
       return;
     }
+    if (typeof companyId !== "string" || typeof message !== "string") {
+      res.status(400).json({ error: "companyId and message must be strings" });
+      return;
+    }
+    const hasTaskId = rawTaskId !== undefined && rawTaskId !== null && rawTaskId !== "";
+    if (
+      hasTaskId &&
+      (typeof rawTaskId !== "string" || rawTaskId !== rawTaskId.trim() || !isUuidLike(rawTaskId))
+    ) {
+      res.status(400).json({ error: "taskId must be a UUID" });
+      return;
+    }
+    const taskId = hasTaskId ? (rawTaskId as string) : undefined;
 
     // The body-supplied companyId must belong to the authenticated actor —
     // it scopes issue reads/writes below and is exported to the subprocess.
