@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { Readable } from "node:stream";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { promises as fs } from "node:fs";
@@ -40,6 +42,27 @@ describe("local disk storage provider", () => {
 
     expect(fetchedBody.toString("utf8")).toBe("hello image bytes");
     expect(stored.sha256).toHaveLength(64);
+  });
+
+  it("writes streamed files with exact metadata", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-storage-"));
+    tempRoots.push(root);
+    const service = createStorageService(createLocalDiskStorageProvider(root));
+    const bytes = Buffer.from("streamed response");
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    const stored = await service.putFile({ companyId: "company-1", namespace: "runner-api", originalFilename: "response.txt",
+      contentType: "text/plain", body: Readable.from([bytes.subarray(0, 4), bytes.subarray(4)]), byteSize: bytes.length, sha256 });
+    expect(stored).toMatchObject({ byteSize: bytes.length, sha256 });
+    expect(await readStreamToBuffer((await service.getObject("company-1", stored.objectKey)).stream)).toEqual(bytes);
+  });
+
+  it("removes partial local uploads when their source fails", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-storage-"));
+    tempRoots.push(root);
+    const provider = createLocalDiskStorageProvider(root);
+    const body = Readable.from((async function* () { yield Buffer.from("partial"); throw new Error("source failed"); })());
+    await expect(provider.putObject({ objectKey: "company-1/failed", contentType: "text/plain", contentLength: 20, body })).rejects.toThrow("source failed");
+    expect(await fs.readdir(path.join(root, "company-1"))).toEqual([]);
   });
 
   it("streams only requested byte ranges", async () => {
@@ -94,5 +117,56 @@ describe("local disk storage provider", () => {
     await service.deleteObject("company-1", stored.objectKey);
     await service.deleteObject("company-1", stored.objectKey);
     await expect(service.getObject("company-1", stored.objectKey)).rejects.toMatchObject({ status: 404 });
+  });
+});
+
+describe("local disk provider object-key normalization", () => {
+  const tempRoots: string[] = [];
+
+  afterEach(async () => {
+    await Promise.all(tempRoots.map((root) => fs.rm(root, { recursive: true, force: true })));
+    tempRoots.length = 0;
+  });
+
+  async function makeProvider() {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-storage-"));
+    tempRoots.push(root);
+    return { root, provider: createLocalDiskStorageProvider(root) };
+  }
+
+  it("rejects traversal-shaped object keys on write", async () => {
+    const { provider } = await makeProvider();
+    const body = Buffer.from("evil", "utf8");
+    for (const objectKey of [
+      "company-1/a/../b",
+      "company-1/../escape",
+      "company-1/./x",
+      "company-1/a\\..\\b",
+      "/company-1/x",
+    ]) {
+      await expect(provider.putObject({ objectKey, body, contentType: "text/plain", contentLength: body.length }))
+        .rejects.toMatchObject({ status: 400 });
+    }
+  });
+
+  it("rejects traversal-shaped object keys on read", async () => {
+    const { provider } = await makeProvider();
+    const body = Buffer.from("hello", "utf8");
+    await provider.putObject({ objectKey: "company-1/ok.txt", body, contentType: "text/plain", contentLength: body.length });
+    for (const objectKey of [
+      "company-1/../company-1/ok.txt",
+      "company-1/ok.txt/..",
+      "company-1/./ok.txt",
+      "..",
+      ".",
+    ]) {
+      await expect(provider.getObject({ objectKey })).rejects.toMatchObject({ status: 400 });
+      await expect(provider.headObject({ objectKey })).rejects.toMatchObject({ status: 400 });
+    }
+    // A segment merely containing a dot-run is confinement-safe at the
+    // provider level (no traversal escape) but unreadable through the
+    // service guard — covered in storage-object-key.test.ts. Here the object
+    // does not exist, so the provider reports notFound rather than 400.
+    await expect(provider.getObject({ objectKey: "company-1/ok..txt" })).rejects.toMatchObject({ status: 404 });
   });
 });

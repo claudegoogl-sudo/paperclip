@@ -15,17 +15,7 @@ The server reads its configuration from environment variables:
 - `PAPERCLIP_AGENT_ID` - optional default agent for checkout helpers
 - `PAPERCLIP_RUN_ID` - optional run id forwarded on mutating requests
 
-## Timeouts
-
-Every tool call is bounded so a non-returning request cannot hang the host:
-
-- `PAPERCLIP_MCP_FETCH_TIMEOUT_MS` - hard wall-clock ceiling for a single
-  outbound `/api` request. On expiry the request is aborted and surfaced as a
-  `504` tool error. Default `60000` (60s).
-- `PAPERCLIP_MCP_TOOL_TIMEOUT_MS` - hard wall-clock ceiling for a single MCP
-  tool-call dispatch. On expiry the call resolves to a clear tool error instead
-  of hanging. A tool's optional per-call `timeoutSeconds` extends (never
-  shortens) this deadline. Default `120000` (120s).
+Inside an active heartbeat, Paperclip also injects `PAPERCLIP_RUNTIME_TOOLS_*` variables. They enable the run-scoped `connections_search` and `connection_request` tools and expire with the run.
 
 ## Usage
 
@@ -41,6 +31,11 @@ node packages/mcp-server/dist/stdio.js
 ```
 
 ## Tool Surface
+
+Run-scoped connection tools:
+
+- `connections_search`
+- `connection_request`
 
 Read tools:
 

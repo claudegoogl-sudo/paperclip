@@ -31,7 +31,7 @@ const fullRoutinePayload = {
 };
 
 describe("routine validators", () => {
-  it("accepts versioned routine revision snapshots with safe trigger metadata", () => {
+  it.each(["bearer", "app_webhook", "fireflies_hmac"])("accepts versioned routine revision snapshots with %s trigger metadata", (signingMode) => {
     const parsed = routineRevisionSnapshotV1Schema.parse({
       version: 1,
       routine: {
@@ -57,7 +57,7 @@ describe("routine validators", () => {
         cronExpression: null,
         timezone: null,
         publicId: "routine_webhook_123",
-        signingMode: "bearer",
+        signingMode,
         replayWindowSec: 300,
       }],
     });
@@ -107,9 +107,9 @@ describe("routine validators", () => {
     });
 
     expect(result.success).toBe(false);
-    const issue = result.error!.errors[0]!;
+    const issue = result.error!.issues[0]!;
     expect(issue.code).toBe("unrecognized_keys");
-    expect(issue.message).toBe("Unrecognized key(s) in object: 'triggers'");
+    expect(issue.message).toBe('Unrecognized key: "triggers"');
   });
 
   // updateRoutineSchema is derived via .partial().extend(), neither of which is
@@ -121,9 +121,9 @@ describe("routine validators", () => {
     });
 
     expect(result.success).toBe(false);
-    const issue = result.error!.errors[0]!;
+    const issue = result.error!.issues[0]!;
     expect(issue.code).toBe("unrecognized_keys");
-    expect(issue.message).toBe("Unrecognized key(s) in object: 'triggers'");
+    expect(issue.message).toBe('Unrecognized key: "triggers"');
   });
 
   it("still accepts every documented field on create and update", () => {

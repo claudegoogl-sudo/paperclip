@@ -1,3 +1,4 @@
+import { environmentCreationCleanupErrorData } from "./environment-creation-cleanup.js";
 /**
  * Worker-side RPC host — runs inside the child process spawned by the host.
  *
@@ -19,7 +20,8 @@
  *   |--- request(initialize) ------------->  |  → calls plugin.setup(ctx)
  *   |<-- response(ok:true) ----------------  |
  *   |                                        |
- *   |--- notification(onEvent) ----------->  |  → dispatches to registered handler
+ *   |--- request(onEvent) ---------------->  |  → dispatches to registered handler
+ *   |<-- response(void) ------------------  |    (host clears the event scope)
  *   |                                        |
  *   |<-- request(state.get) ---------------  |  ← SDK client call from plugin code
  *   |--- response(result) ---------------->  |
@@ -68,6 +70,7 @@ import type {
   EventFilter,
   AgentSessionEvent,
   EnvSecretRefBinding,
+  StreamDropNotice,
 } from "./types.js";
 import type {
   JsonRpcId,
@@ -91,6 +94,7 @@ import type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentDestroyLeaseParams,
   PluginEnvironmentExecuteParams,
+  PluginEnvironmentRunnerIngressEndpointParams,
   PluginEnvironmentSyncInParams,
   PluginEnvironmentSyncOutParams,
   PluginEnvironmentRealizeWorkspaceParams,
@@ -103,17 +107,23 @@ import type {
   PluginEnvironmentCaptureTemplateParams,
   PluginEnvironmentCancelInteractiveSetupParams,
   PluginEnvironmentDeleteTemplateParams,
-  PluginSetupTokenPtyOpenParams,
-  PluginSetupTokenPtyInputParams,
-  PluginSetupTokenPtyStopParams,
-  PluginSetupTokenPtyCloseParams,
+  PluginLoginPtyOpenParams,
+  PluginLoginPtyInputParams,
+  PluginLoginPtyStopParams,
+  PluginLoginPtyCloseParams,
+  PluginDuplexChannelOpenParams,
+  PluginDuplexChannelWriteParams,
+  PluginDuplexChannelStopParams,
+  PluginDuplexChannelCloseParams,
   PluginInvocationContext,
   WorkerToHostMethodName,
   WorkerToHostMethods,
 } from "./protocol.js";
 import {
-  SETUP_TOKEN_PTY_OUTPUT_NOTIFICATION,
-  SETUP_TOKEN_PTY_EXIT_NOTIFICATION,
+  LOGIN_PTY_OUTPUT_NOTIFICATION,
+  LOGIN_PTY_EXIT_NOTIFICATION,
+  DUPLEX_CHANNEL_DATA_NOTIFICATION,
+  DUPLEX_CHANNEL_EXIT_NOTIFICATION,
   JSONRPC_VERSION,
   JSONRPC_ERROR_CODES,
   PLUGIN_RPC_ERROR_CODES,
@@ -130,6 +140,7 @@ import {
   isJsonRpcErrorResponse,
   JsonRpcParseError,
   JsonRpcCallError,
+  encodeChannelBytes,
 } from "./protocol.js";
 
 // ---------------------------------------------------------------------------
@@ -408,6 +419,12 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
 
   // Agent session event callbacks (populated by sendMessage, cleared by close)
   const sessionEventCallbacks = new Map<string, (event: AgentSessionEvent) => void>();
+
+  // Subscribers to host `streams.dropped` feedback (registered via
+  // `ctx.streams.onDropped`). The drop notification is fire-and-forget: each
+  // handler runs in its own try/catch so a throwing plugin handler can never
+  // break the host notification loop.
+  const streamDropHandlers = new Set<(notice: StreamDropNotice) => void>();
 
   // Pending outbound (worker→host) requests
   const pendingRequests = new Map<string | number, {
@@ -1042,6 +1059,16 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           });
         },
 
+        async listWakeupRequests(issueIds: string[], companyId: string, options) {
+          return callHost("issues.listWakeupRequests", {
+            companyId,
+            issueIds,
+            statuses: options?.statuses,
+            since: options?.since,
+            limit: options?.limit,
+          });
+        },
+
         async requestWakeup(issueId: string, companyId: string, options) {
           return callHost("issues.requestWakeup", {
             issueId,
@@ -1568,6 +1595,12 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             channelCompanyMap.delete(channel);
             notifyHost("streams.close", { channel, companyId });
           },
+          onDropped(handler: (notice: StreamDropNotice) => void): () => void {
+            streamDropHandlers.add(handler);
+            return () => {
+              streamDropHandlers.delete(handler);
+            };
+          },
         };
       })(),
 
@@ -1584,26 +1617,73 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
         },
       },
 
-      setupTokenPty: {
-        output(workerSessionId: string, chunk: string): void {
+      loginPty: {
+        output(hostRouteId: string, workerSessionId: string, chunk: string): void {
           // Forward one raw output chunk of a live login pseudo-terminal. The
-          // notification carries the worker session identifier, so the host binds
-          // the chunk to the open route by that identifier while the route is
-          // open. The host drops an unknown or a mismatched identifier and never
-          // logs the raw bytes. This notification carries no invocation id,
-          // because it fires after the open reply returns.
+          // notification echoes the host route identifier and the worker session
+          // identifier, so the host can hold more than one concurrent login
+          // pseudo-terminal per worker and binds the chunk to its own route
+          // while that route is open. The host drops an unknown, a stale, or a
+          // mismatched identifier and never logs the raw bytes. This
+          // notification carries no invocation id, because it fires after the
+          // open reply returns.
+          if (typeof hostRouteId !== "string" || hostRouteId.length === 0) return;
           if (typeof workerSessionId !== "string" || workerSessionId.length === 0) return;
           if (typeof chunk !== "string" || chunk.length === 0) return;
-          notifyHost(SETUP_TOKEN_PTY_OUTPUT_NOTIFICATION, { workerSessionId, chunk });
+          notifyHost(LOGIN_PTY_OUTPUT_NOTIFICATION, { hostRouteId, workerSessionId, chunk });
         },
-        exit(workerSessionId: string, exitCode: number | null): void {
+        exit(hostRouteId: string, workerSessionId: string, exitCode: number | null): void {
           // Forward the child exit of a live login pseudo-terminal. The host
-          // resolves the open route's wait promise by the worker session
-          // identifier while the route is open.
+          // resolves its own route's wait promise by the host route identifier
+          // and the bound worker session identifier while that route is open.
+          if (typeof hostRouteId !== "string" || hostRouteId.length === 0) return;
           if (typeof workerSessionId !== "string" || workerSessionId.length === 0) return;
-          notifyHost(SETUP_TOKEN_PTY_EXIT_NOTIFICATION, {
+          notifyHost(LOGIN_PTY_EXIT_NOTIFICATION, {
+            hostRouteId,
             workerSessionId,
             exitCode: typeof exitCode === "number" ? exitCode : null,
+          });
+        },
+      },
+
+      duplexChannel: {
+        data(hostRouteId: string, workerSessionId: string, chunk: Uint8Array): void {
+          // Forward one raw data chunk of a persistent duplex channel. The
+          // notification echoes the host route identifier and the worker session
+          // identifier, so the host routes the chunk to the exact live pair while
+          // the route is open. The host drops an unknown or a mismatched pair and
+          // never logs the raw bytes. This notification carries no invocation id,
+          // because it fires after the open reply returns.
+          //
+          // JSON-RPC travels as JSON text, which carries no binary type, so this
+          // is the one point where the chunk crosses from `Uint8Array` to the
+          // wire-safe base64 form. See `ChannelBytesWireValue` in protocol.ts.
+          if (typeof hostRouteId !== "string" || hostRouteId.length === 0) return;
+          if (typeof workerSessionId !== "string" || workerSessionId.length === 0) return;
+          if (!(chunk instanceof Uint8Array) || chunk.byteLength === 0) return;
+          notifyHost(DUPLEX_CHANNEL_DATA_NOTIFICATION, {
+            hostRouteId,
+            workerSessionId,
+            chunk: encodeChannelBytes(chunk),
+          });
+        },
+        exit(
+          hostRouteId: string,
+          workerSessionId: string,
+          exitCode: number | null,
+          transportClosed?: boolean,
+        ): void {
+          // Forward the child exit of a persistent duplex channel. The host
+          // resolves the open route's wait promise by the exact live pair while
+          // the route is open. `transportClosed` carries the exit discriminator, so
+          // the host tells a real process exit from a reason-less transport close.
+          if (typeof hostRouteId !== "string" || hostRouteId.length === 0) return;
+          if (typeof workerSessionId !== "string" || workerSessionId.length === 0) return;
+          notifyHost(DUPLEX_CHANNEL_EXIT_NOTIFICATION, {
+            hostRouteId,
+            workerSessionId,
+            exitCode: typeof exitCode === "number" ? exitCode : null,
+            transportClosed: transportClosed === true,
           });
         },
       },
@@ -1728,7 +1808,9 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
           ? (err as any).code
           : PLUGIN_RPC_ERROR_CODES.WORKER_ERROR;
 
-      sendMessage(createErrorResponse(id, errorCode, errorMessage));
+      sendMessage(createErrorResponse(id, errorCode, errorMessage,
+        method === "environmentAcquireLease" || method === "environmentDestroyLease"
+          ? environmentCreationCleanupErrorData(err) : undefined));
     }
   }
 
@@ -1793,6 +1875,9 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
 
       case "environmentReleaseLease":
         return handleEnvironmentReleaseLease(params as PluginEnvironmentReleaseLeaseParams);
+      case "environmentStopLease":
+        if (!plugin.definition.onEnvironmentStopLease) throw methodNotImplemented("environmentStopLease");
+        return plugin.definition.onEnvironmentStopLease(params as PluginEnvironmentReleaseLeaseParams);
 
       case "environmentDestroyLease":
         return handleEnvironmentDestroyLease(params as PluginEnvironmentDestroyLeaseParams);
@@ -1802,6 +1887,11 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
 
       case "environmentExecute":
         return handleEnvironmentExecute(params as PluginEnvironmentExecuteParams);
+
+      case "environmentRunnerIngressEndpoint":
+        return handleEnvironmentRunnerIngressEndpoint(
+          params as PluginEnvironmentRunnerIngressEndpointParams,
+        );
 
       case "environmentSyncIn":
         return handleEnvironmentSyncIn(params as PluginEnvironmentSyncInParams);
@@ -1824,17 +1914,29 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       case "environmentDeleteTemplate":
         return handleEnvironmentDeleteTemplate(params as PluginEnvironmentDeleteTemplateParams);
 
-      case "setupTokenPtyOpen":
-        return handleSetupTokenPtyOpen(params as PluginSetupTokenPtyOpenParams);
+      case "loginPtyOpen":
+        return handleLoginPtyOpen(params as PluginLoginPtyOpenParams);
 
-      case "setupTokenPtyInput":
-        return handleSetupTokenPtyInput(params as PluginSetupTokenPtyInputParams);
+      case "loginPtyInput":
+        return handleLoginPtyInput(params as PluginLoginPtyInputParams);
 
-      case "setupTokenPtyStop":
-        return handleSetupTokenPtyStop(params as PluginSetupTokenPtyStopParams);
+      case "loginPtyStop":
+        return handleLoginPtyStop(params as PluginLoginPtyStopParams);
 
-      case "setupTokenPtyClose":
-        return handleSetupTokenPtyClose(params as PluginSetupTokenPtyCloseParams);
+      case "loginPtyClose":
+        return handleLoginPtyClose(params as PluginLoginPtyCloseParams);
+
+      case "duplexChannelOpen":
+        return handleDuplexChannelOpen(params as PluginDuplexChannelOpenParams);
+
+      case "duplexChannelWrite":
+        return handleDuplexChannelWrite(params as PluginDuplexChannelWriteParams);
+
+      case "duplexChannelStop":
+        return handleDuplexChannelStop(params as PluginDuplexChannelStopParams);
+
+      case "duplexChannelClose":
+        return handleDuplexChannelClose(params as PluginDuplexChannelCloseParams);
 
       default:
         throw Object.assign(
@@ -1877,9 +1979,13 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     if (plugin.definition.onEnvironmentAcquireLease) supportedMethods.push("environmentAcquireLease");
     if (plugin.definition.onEnvironmentResumeLease) supportedMethods.push("environmentResumeLease");
     if (plugin.definition.onEnvironmentReleaseLease) supportedMethods.push("environmentReleaseLease");
+    if (plugin.definition.onEnvironmentStopLease) supportedMethods.push("environmentStopLease");
     if (plugin.definition.onEnvironmentDestroyLease) supportedMethods.push("environmentDestroyLease");
     if (plugin.definition.onEnvironmentRealizeWorkspace) supportedMethods.push("environmentRealizeWorkspace");
     if (plugin.definition.onEnvironmentExecute) supportedMethods.push("environmentExecute");
+    if (plugin.definition.onEnvironmentRunnerIngressEndpoint) {
+      supportedMethods.push("environmentRunnerIngressEndpoint");
+    }
     if (plugin.definition.onEnvironmentSyncIn) supportedMethods.push("environmentSyncIn");
     if (plugin.definition.onEnvironmentSyncOut) supportedMethods.push("environmentSyncOut");
     if (plugin.definition.onEnvironmentStartInteractiveSetup) supportedMethods.push("environmentStartInteractiveSetup");
@@ -1887,10 +1993,14 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     if (plugin.definition.onEnvironmentCaptureTemplate) supportedMethods.push("environmentCaptureTemplate");
     if (plugin.definition.onEnvironmentCancelInteractiveSetup) supportedMethods.push("environmentCancelInteractiveSetup");
     if (plugin.definition.onEnvironmentDeleteTemplate) supportedMethods.push("environmentDeleteTemplate");
-    if (plugin.definition.onSetupTokenPtyOpen) supportedMethods.push("setupTokenPtyOpen");
-    if (plugin.definition.onSetupTokenPtyInput) supportedMethods.push("setupTokenPtyInput");
-    if (plugin.definition.onSetupTokenPtyStop) supportedMethods.push("setupTokenPtyStop");
-    if (plugin.definition.onSetupTokenPtyClose) supportedMethods.push("setupTokenPtyClose");
+    if (plugin.definition.onLoginPtyOpen) supportedMethods.push("loginPtyOpen");
+    if (plugin.definition.onLoginPtyInput) supportedMethods.push("loginPtyInput");
+    if (plugin.definition.onLoginPtyStop) supportedMethods.push("loginPtyStop");
+    if (plugin.definition.onLoginPtyClose) supportedMethods.push("loginPtyClose");
+    if (plugin.definition.onDuplexChannelOpen) supportedMethods.push("duplexChannelOpen");
+    if (plugin.definition.onDuplexChannelWrite) supportedMethods.push("duplexChannelWrite");
+    if (plugin.definition.onDuplexChannelStop) supportedMethods.push("duplexChannelStop");
+    if (plugin.definition.onDuplexChannelClose) supportedMethods.push("duplexChannelClose");
 
     // This SDK threads `paperclipInvocationId` through
     // AsyncLocalStorage on every worker→host call made inside a dispatch, so an
@@ -2252,6 +2362,15 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     return plugin.definition.onEnvironmentExecute(params);
   }
 
+  async function handleEnvironmentRunnerIngressEndpoint(
+    params: PluginEnvironmentRunnerIngressEndpointParams,
+  ) {
+    if (!plugin.definition.onEnvironmentRunnerIngressEndpoint) {
+      throw methodNotImplemented("environmentRunnerIngressEndpoint");
+    }
+    return plugin.definition.onEnvironmentRunnerIngressEndpoint(params);
+  }
+
   async function handleEnvironmentSyncIn(params: PluginEnvironmentSyncInParams) {
     if (!plugin.definition.onEnvironmentSyncIn) {
       throw methodNotImplemented("environmentSyncIn");
@@ -2301,32 +2420,60 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     return plugin.definition.onEnvironmentDeleteTemplate(params);
   }
 
-  async function handleSetupTokenPtyOpen(params: PluginSetupTokenPtyOpenParams) {
-    if (!plugin.definition.onSetupTokenPtyOpen) {
-      throw methodNotImplemented("setupTokenPtyOpen");
+  async function handleLoginPtyOpen(params: PluginLoginPtyOpenParams) {
+    if (!plugin.definition.onLoginPtyOpen) {
+      throw methodNotImplemented("loginPtyOpen");
     }
-    return plugin.definition.onSetupTokenPtyOpen(params);
+    return plugin.definition.onLoginPtyOpen(params);
   }
 
-  async function handleSetupTokenPtyInput(params: PluginSetupTokenPtyInputParams) {
-    if (!plugin.definition.onSetupTokenPtyInput) {
-      throw methodNotImplemented("setupTokenPtyInput");
+  async function handleLoginPtyInput(params: PluginLoginPtyInputParams) {
+    if (!plugin.definition.onLoginPtyInput) {
+      throw methodNotImplemented("loginPtyInput");
     }
-    return plugin.definition.onSetupTokenPtyInput(params);
+    return plugin.definition.onLoginPtyInput(params);
   }
 
-  async function handleSetupTokenPtyStop(params: PluginSetupTokenPtyStopParams) {
-    if (!plugin.definition.onSetupTokenPtyStop) {
-      throw methodNotImplemented("setupTokenPtyStop");
+  async function handleLoginPtyStop(params: PluginLoginPtyStopParams) {
+    if (!plugin.definition.onLoginPtyStop) {
+      throw methodNotImplemented("loginPtyStop");
     }
-    return plugin.definition.onSetupTokenPtyStop(params);
+    return plugin.definition.onLoginPtyStop(params);
   }
 
-  async function handleSetupTokenPtyClose(params: PluginSetupTokenPtyCloseParams) {
-    if (!plugin.definition.onSetupTokenPtyClose) {
-      throw methodNotImplemented("setupTokenPtyClose");
+  async function handleLoginPtyClose(params: PluginLoginPtyCloseParams) {
+    if (!plugin.definition.onLoginPtyClose) {
+      throw methodNotImplemented("loginPtyClose");
     }
-    return plugin.definition.onSetupTokenPtyClose(params);
+    return plugin.definition.onLoginPtyClose(params);
+  }
+
+  async function handleDuplexChannelOpen(params: PluginDuplexChannelOpenParams) {
+    if (!plugin.definition.onDuplexChannelOpen) {
+      throw methodNotImplemented("duplexChannelOpen");
+    }
+    return plugin.definition.onDuplexChannelOpen(params);
+  }
+
+  async function handleDuplexChannelWrite(params: PluginDuplexChannelWriteParams) {
+    if (!plugin.definition.onDuplexChannelWrite) {
+      throw methodNotImplemented("duplexChannelWrite");
+    }
+    return plugin.definition.onDuplexChannelWrite(params);
+  }
+
+  async function handleDuplexChannelStop(params: PluginDuplexChannelStopParams) {
+    if (!plugin.definition.onDuplexChannelStop) {
+      throw methodNotImplemented("duplexChannelStop");
+    }
+    return plugin.definition.onDuplexChannelStop(params);
+  }
+
+  async function handleDuplexChannelClose(params: PluginDuplexChannelCloseParams) {
+    if (!plugin.definition.onDuplexChannelClose) {
+      throw methodNotImplemented("duplexChannelClose");
+    }
+    return plugin.definition.onDuplexChannelClose(params);
   }
 
   // -----------------------------------------------------------------------
@@ -2440,6 +2587,32 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             message: `Failed to handle event notification: ${err instanceof Error ? err.message : String(err)}`,
           });
         });
+      } else if (notif.method === "streams.dropped" && notif.params) {
+        // Host feedback: a `streams.*` notification was dropped because it
+        // could not be tenant-verified. Surface it on the plugin
+        // log so out-of-dispatch emitters are diagnosable instead of silently
+        // dead, and hand the same notice to `ctx.streams.onDropped`
+        // subscribers so plugin code can repair local bookkeeping that
+        // assumed delivery. Fire-and-forget — never throw into the readline
+        // loop.
+        const drop = notif.params as StreamDropNotice;
+        notifyHost("log", {
+          level: "warn",
+          message: `host dropped streams ${drop.method ?? "notification"} (${
+            drop.reason ?? "unknown"
+          })${drop.channel ? ` channel="${drop.channel}"` : ""}`,
+          meta: { streamDropReason: drop.reason ?? "unknown", channel: drop.channel },
+        });
+        for (const handler of streamDropHandlers) {
+          try {
+            handler(drop);
+          } catch (err) {
+            notifyHost("log", {
+              level: "error",
+              message: `streams.dropped handler failed: ${err instanceof Error ? err.message : String(err)}`,
+            });
+          }
+        }
       }
     }
   }

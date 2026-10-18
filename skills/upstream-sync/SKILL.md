@@ -14,8 +14,8 @@ Pulls upstream `paperclipai/paperclip` releases into the
 sibling task and lives outside this skill.
 
 > **Direction matters.** This is the inverse of `release_via_fork_install_request`:
-> we pull upstream changes inward, then the board lands them on the fork via
-> the existing fork-install flow.
+> we pull upstream changes inward, then merge them on the fork after Security
+> review, and the install flows through the existing fork-install flow.
 
 ## 1. Where things live
 
@@ -26,7 +26,7 @@ sibling task and lives outside this skill.
 | PR body formatter | `scripts/format-sync-pr-body.mjs` |
 | Plugin-activation soak | `scripts/plugin-activation-soak.mjs` |
 | Routine state (lastSyncedTag, ETag) | `.paperclip/upstream-sync.json` |
-| CI gate | `.github/workflows/pr.yml` (must be green before approval) |
+| CI gate | `.github/workflows/pr.yml` (must be green before merge) |
 
 The fork has two remotes:
 
@@ -68,6 +68,11 @@ When `git merge upstream/<tag>` reports conflicts,
    to regenerate a lockfile genuinely owned by the sync branch.
    The fork's `pr.yml` lockfile-block carves out only `chore/refresh-lockfile`,
    not sync branches, so the lockfile change must look authored by this branch.
+   The regen is skipped (with a `LOCKFILE-REGEN-SKIPPED` line, resolver exit 2)
+   when a manifest pnpm parses at install time (`package.json`,
+   `pnpm-workspace.yaml`) is still conflicted — installing then would crash
+   with `ERR_PNPM_JSON_PARSE` instead of escalating. The lockfile stays
+   staged-as-theirs for the conflict train to re-resolve explicitly.
 2. **`CHANGELOG*`** — concatenate upstream + fork sides with a divider; never
    prefer one.
 3. **`docs/**.md`, `README*`** — take theirs when both sides only added prose
@@ -108,7 +113,7 @@ addressed) should advance `.paperclip/upstream-sync.json`.
 - `lastSyncedTag` is a defense-in-depth check: even if the ETag has rotated
   but `tag_name` is unchanged, the routine refreshes the ETag and exits 0.
 - `pendingPrUrl` carries the draft PR URL between the merge commit and the
-  board approval, so a re-run can detect "PR already open for this tag" and
+  Security review and merge, so a re-run can detect "PR already open for this tag" and
   skip re-creating it. (Sibling B will wire the dedup; the scaffold leaves
   the slot.)
 
@@ -118,7 +123,7 @@ addressed) should advance `.paperclip/upstream-sync.json`.
 |---|---|
 | `escalation` bucket from the routine | New child issue under the sync routine's parent task, board-visible, includes JSON report verbatim and the upstream tag |
 | `reviewable` bucket from the routine | Same parent task, labelled for the calling agent to handle inline |
-| PR CI failure on `pr.yml` | Treated as P0 per `public_pr_ci_clean_gate`; fix or close before requesting approval |
+| PR CI failure on `pr.yml` | Treated as P0 per `public_pr_ci_clean_gate`; fix or close before requesting Security review |
 | Upstream API 5xx | Routine exits non-zero with the body; retry on next tick is fine |
 
 ## 5b. Plugin-activation soak gate
@@ -153,16 +158,27 @@ tarballs) come from the surrounding build/release step. If they are missing the
 soak exits non-zero and the gate aborts the tick — a missing soak is treated as
 a failure, never a silent pass.
 
-## 6. Board-gated landing
+## 6. Security-gated landing
 
-The routine **never** auto-merges. After the draft PR is green:
+The routine never merges before both gates pass. The gates are green CI and
+a SecurityEngineer review. No operator approval card is needed. The PR stays
+fork-only; never open a PR against `paperclipai/*`.
 
-1. Agent posts the PR URL on the sync routine's parent task (or the sync
-   sub-issue), with the dry-run output as evidence.
-2. Board approves the merge into `claudegoogl-sudo/paperclip:master`.
-3. CTO routes a fork-install request to CEO per
-   `release_via_fork_install_request`, and the new fork version reaches this
-   instance through the existing fork-merge → build → install flow.
+1. Agent posts the PR URL on the sync routine's parent task, with the dry-run
+   output as evidence.
+2. SecurityEngineer reviews the PR. CI on `pr.yml` must be green.
+3. When both gates pass, merge into `claudegoogl-sudo/paperclip:master`
+   through the normal merge queue.
+4. Verify the landing. The PR state must be `MERGED`, and
+   `git merge-base --is-ancestor <sha> origin/master` must succeed. Do not
+   report landed on the merge command's exit code alone.
+5. Post one comment that starts with `[[operator-deliver]]` and ends with the
+   footer `— <Agent> · <ISSUE-KEY>`. It holds three blocks: Install, Verify,
+   and Rollback. Each block has one command, with no backslashes and no
+   multi-line commands. These Telegram commands are the safety layer if the
+   merge goes wrong.
+6. Install on this instance still follows `release_via_fork_install_request`.
+   This rule does not change the plugin-release or host-install gates.
 
 ## 7. Common failure modes
 

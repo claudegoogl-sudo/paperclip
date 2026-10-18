@@ -204,8 +204,8 @@ export const pluginEnvironmentTemplateConfigBindingSchema = z.object({
 
 // The nested sandbox capability declaration is `.strict()` so an unknown
 // capability key is a validation error, not a silently dropped field. The outer
-// driver schema below is non-strict and drops unknown top-level keys, so the
-// declaration itself is the gate that a typo in a capability name cannot pass.
+// driver schema below is also `.strict()`, so a typo in a top-level capability
+// name cannot pass either.
 export const sandboxProviderCapabilitiesSchema = z.object({
   reusableLeases: z.boolean().optional(),
   nativeSyncIn: z.boolean().optional(),
@@ -213,10 +213,16 @@ export const sandboxProviderCapabilitiesSchema = z.object({
   persistentProcessSessions: z.boolean().optional(),
   independentControlCommands: z.boolean().optional(),
   incrementalSessionOutput: z.boolean().optional(),
+  concurrentSyncOperations: z.boolean().optional(),
+  duplexCommandStream: z.boolean().optional(),
+  runnerWebSocketIngress: z.boolean().optional(),
 }).strict();
 
 export type SandboxProviderCapabilitiesInput = z.infer<typeof sandboxProviderCapabilitiesSchema>;
 
+// The driver declaration schema is `.strict()` so an unknown top-level key is a
+// validation error, not a silently dropped field. A misspelled capability name
+// (for example `supportsLoginPTY`) fails validation instead of dropping.
 export const pluginEnvironmentDriverDeclarationSchema = z.object({
   driverKey: z.string().min(1).regex(
     /^[a-z0-9][a-z0-9._-]*$/,
@@ -225,6 +231,7 @@ export const pluginEnvironmentDriverDeclarationSchema = z.object({
   kind: z.enum(["environment_driver", "sandbox_provider"]).optional(),
   displayName: z.string().min(1).max(100),
   description: z.string().max(500).optional(),
+  defaultAcquireTimeoutMs: z.number().int().positive().max(86_400_000).optional(),
   supportsReusableLeases: z.boolean().optional(),
   sandboxCapabilities: sandboxProviderCapabilitiesSchema.optional(),
   supportsInteractiveSetup: z.boolean().optional(),
@@ -234,8 +241,38 @@ export const pluginEnvironmentDriverDeclarationSchema = z.object({
   templateConfigBinding: pluginEnvironmentTemplateConfigBindingSchema.optional(),
   templateIdentityPaths: z.array(z.string().min(1).max(200)).max(20).optional(),
   supportsTemplateDelete: z.boolean().optional(),
+  // The neutral transport capability: does the provider host an interactive
+  // login on a real pseudo-terminal? Validate a literal boolean only.
+  supportsLoginPty: z.boolean().optional(),
+  // Deprecated alias for `supportsLoginPty`. It exists only so an external
+  // plugin manifest that declares the old name still loads. Validate a literal
+  // boolean only. The transform below canonicalizes it onto `supportsLoginPty`
+  // and drops it, so every downstream reader reads only the canonical field.
   supportsSetupTokenLogin: z.boolean().optional(),
   configSchema: jsonSchemaSchema,
+}).strict().superRefine((driver, ctx) => {
+  // Reject a manifest that carries both the alias and the canonical field with
+  // different values. Matching values pass. A single field passes.
+  if (
+    driver.supportsLoginPty !== undefined
+    && driver.supportsSetupTokenLogin !== undefined
+    && driver.supportsLoginPty !== driver.supportsSetupTokenLogin
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        "supportsSetupTokenLogin is a deprecated alias for supportsLoginPty; the two flags must not carry different values",
+      path: ["supportsLoginPty"],
+    });
+  }
+}).transform((driver) => {
+  // Canonicalize before any authorization or projection reads the value. The
+  // canonical field wins; the alias fills it in when only the alias is present.
+  // Drop the alias so every downstream reader reads only `supportsLoginPty`. An
+  // undefined value is omitted on JSON serialization, so a driver that declares
+  // neither field carries no login flag.
+  const { supportsSetupTokenLogin, ...rest } = driver;
+  return { ...rest, supportsLoginPty: rest.supportsLoginPty ?? supportsSetupTokenLogin };
 });
 
 export type PluginEnvironmentDriverDeclarationInput = z.infer<
@@ -263,7 +300,7 @@ export const pluginManagedAgentDeclarationSchema = z.object({
   instructions: z.object({
     entryFile: z.string().min(1).max(200).optional(),
     content: z.string().max(200_000).optional(),
-    files: z.record(z.string().max(200_000)).optional(),
+    files: z.record(z.string(), z.string().max(200_000)).optional(),
     assetPath: z.string().min(1).max(500).optional(),
   }).optional(),
 });
@@ -299,7 +336,7 @@ export const pluginManagedRoutineDeclarationSchema = z.object({
   description: z.string().max(10_000).nullable().optional(),
   assigneeRef: pluginManagedResourceRefSchema.extend({ resourceKind: z.literal("agent") }).nullable().optional(),
   projectRef: pluginManagedResourceRefSchema.extend({ resourceKind: z.literal("project") }).nullable().optional(),
-  goalId: z.string().uuid().nullable().optional(),
+  goalId: z.string().guid().nullable().optional(),
   status: z.enum(ROUTINE_STATUSES).optional(),
   priority: z.enum(ISSUE_PRIORITIES).optional(),
   concurrencyPolicy: z.enum(ROUTINE_CONCURRENCY_POLICIES).optional(),
@@ -392,7 +429,7 @@ export type PluginManagedSkillDeclarationInput = z.infer<typeof pluginManagedSki
  * Tracked as part of the UI stability contract. Expand this list
  * as additional slot types reach the v1 host-rendered floor.
  */
-const PLUGIN_UI_SLOT_TYPES_V1_SUPPORTED = ["dashboardWidget", "page"] as const;
+const PLUGIN_UI_SLOT_TYPES_V1_SUPPORTED = ["dashboardWidget", "page", "organizationSwitcher"] as const;
 
 /**
  * Validates a {@link PluginUiSlotDeclaration} — a UI extension slot the plugin
@@ -402,13 +439,14 @@ const PLUGIN_UI_SLOT_TYPES_V1_SUPPORTED = ["dashboardWidget", "page"] as const;
  * @see PLUGIN_SPEC.md §19 — UI Extension Model
  */
 export const pluginUiSlotDeclarationSchema = z.object({
-  type: z.enum(PLUGIN_UI_SLOT_TYPES).refine(
-    (value) =>
-      (PLUGIN_UI_SLOT_TYPES_V1_SUPPORTED as readonly string[]).includes(value),
-    (value) => ({
-      message: `Invalid slot type "${value}". v1 supports: ${PLUGIN_UI_SLOT_TYPES_V1_SUPPORTED.join(", ")}`,
-    }),
-  ),
+  type: z.enum(PLUGIN_UI_SLOT_TYPES).superRefine((value, ctx) => {
+    if (!(PLUGIN_UI_SLOT_TYPES_V1_SUPPORTED as readonly string[]).includes(value)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Invalid slot type "${value}". v1 supports: ${PLUGIN_UI_SLOT_TYPES_V1_SUPPORTED.join(", ")}`,
+      });
+    }
+  }),
   id: z.string().min(1),
   displayName: z.string().min(1),
   exportName: z.string().min(1),
@@ -1273,7 +1311,7 @@ export type InstallPlugin = z.infer<typeof installPluginSchema>;
  * the plugin's instanceConfigSchema is done at the service layer.
  */
 export const upsertPluginConfigSchema = z.object({
-  companyId: z.string().uuid(),
+  companyId: z.string().guid(),
   configJson: z.record(z.string(), z.unknown()),
 });
 
@@ -1284,7 +1322,7 @@ export type UpsertPluginConfig = z.infer<typeof upsertPluginConfigSchema>;
  * Allows a partial merge of config values.
  */
 export const patchPluginConfigSchema = z.object({
-  companyId: z.string().uuid(),
+  companyId: z.string().guid(),
   configJson: z.record(z.string(), z.unknown()),
 });
 

@@ -1,0 +1,24 @@
+name: Release Verify Dispatch
+
+# Dispatchable wrapper around the release-verify reusable workflow: runs the
+# full release test matrix (typecheck + general shards + serialized + build)
+# against ANY ref, without publishing anything. Used to certify a release cut
+# (pin the exact commit SHA) when the cut commit itself never landed on a
+# branch that triggers verification on push.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit SHA, branch, or tag to verify
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    uses: ./.github/workflows/release-verify.yml
+    with:
+      ref: ${{ inputs.ref }}

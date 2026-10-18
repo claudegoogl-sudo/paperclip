@@ -7,6 +7,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -27,11 +28,9 @@ describeEmbeddedPostgres("export fidelity counts", () => {
   }, 20_000);
 
   afterEach(async () => {
-    await db.delete(issueLabels);
-    await db.delete(issueRelations);
-    await db.delete(labels);
-    await db.delete(issues);
-    await db.delete(companies);
+    // Atomic TRUNCATE ... CASCADE from `companies` clears every per-test table
+    // in a single statement instead of an order-sensitive per-table delete chain.
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {

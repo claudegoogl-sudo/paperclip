@@ -266,3 +266,32 @@ test("runCheck: exits 1 with a usage error when refs are missing", () => {
   assert.equal(code, 1);
   assert.ok(errors[0].includes("baseRef and headRef are required"));
 });
+
+test("tailnet-url: hosts under example.ts.net are documentation placeholders, not findings", () => {
+  const findings = scanAddedLinesForForbiddenIds([
+    {
+      file: "server/src/services/workspace-runtime-exposure.test.ts",
+      lineNumber: 436,
+      content: "    expect(runtime.url).toBe(`https://runner.tail123.example.ts.net:${pinnedPort}`);",
+    },
+    {
+      file: "server/src/services/workspace-runtime-exposure.test.ts",
+      lineNumber: 437,
+      content: '      publicUrl: "https://paperclip-dev.example.ts.net:42012",',
+    },
+  ]);
+  assert.deepEqual(findings, []);
+});
+
+test("tailnet-url: any other *.ts.net host is still a finding", () => {
+  const findings = scanAddedLinesForForbiddenIds([
+    {
+      file: "server/src/services/workspace-runtime-exposure.test.ts",
+      lineNumber: 436,
+      content: "    expect(runtime.url).toBe(`https://runner.tail123.ts.net:${pinnedPort}`);",
+    },
+  ]);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].patternName, "tailnet-url");
+  assert.equal(findings[0].match, "tail123.ts.net");
+});

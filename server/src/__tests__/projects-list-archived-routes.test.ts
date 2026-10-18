@@ -7,6 +7,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import { errorHandler } from "../middleware/index.js";
 import { projectRoutes } from "../routes/projects.js";
 
@@ -54,8 +55,10 @@ describeEmbeddedPostgres("project list archived route defaults", () => {
   }, 20_000);
 
   afterEach(async () => {
-    await db.delete(projects);
-    await db.delete(companies);
+    // Atomic TRUNCATE ... CASCADE from `companies` clears every per-test table
+    // in one statement; see resetEmbeddedPostgresTestDatabase for why this
+    // replaces the ordered per-table deletes.
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {

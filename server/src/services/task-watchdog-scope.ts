@@ -1,6 +1,7 @@
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns, issues, issueWatchdogs } from "@paperclipai/db";
+import { isUuidLike } from "@paperclipai/shared";
 
 const MAX_WATCHDOG_SCOPE_ANCESTRY_DEPTH = 100;
 export const TASK_WATCHDOG_ORIGIN_KIND = "task_watchdog";
@@ -57,6 +58,12 @@ export async function resolveTaskWatchdogMutationScope(
   const runId = readString(actor.runId);
   const actorCompanyId = readString(actor.companyId);
   if (!agentId || !runId) return { kind: "none" };
+  // The API key controls the run header, so a malformed value is not a
+  // watchdog-shaped run. Scope out (none) before the UUID equality can turn
+  // the untrusted string into a PostgreSQL cast error and a 500; attribution
+  // enforcement for such headers stays with the run-cap guard, which fails
+  // closed on non-UUID run ids.
+  if (!isUuidLike(runId)) return { kind: "none" };
 
   const run = await db
     .select({

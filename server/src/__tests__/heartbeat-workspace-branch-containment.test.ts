@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -8,24 +8,15 @@ import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
-  agentRuntimeState,
   agentWakeupRequests,
   agents,
   companies,
-  companySkills,
   createDb,
-  documentRevisions,
-  documents,
-  environmentLeases,
-  environments,
   executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
-  issueDocuments,
-  issuePlanDecompositions,
   issueRecoveryActions,
-  issueRelations,
   issues,
   projects,
   projectWorkspaces,
@@ -36,6 +27,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/index.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
@@ -105,7 +97,6 @@ vi.mock("../adapters/index.js", () => ({
     execute: adapterExecute,
     supportsLocalAgentJwt: false,
   }),
-  listAdapterModelProfiles: async () => [],
   runningProcesses: new Map(),
 }));
 
@@ -131,7 +122,9 @@ async function readGit(cwd: string, args: string[]) {
 }
 
 async function createGitRepo() {
-  const repoRoot = await mkdtemp(path.join(os.tmpdir(), "paperclip-branch-containment-repo-"));
+  // realpath: on macOS os.tmpdir() is a symlink (/tmp -> /private/tmp) and the
+  // runtime persists resolved worktree paths, so unresolved fixtures never match.
+  const repoRoot = await realpath(await mkdtemp(path.join(os.tmpdir(), "paperclip-branch-containment-repo-")));
   await runGit(repoRoot, ["init"]);
   await runGit(repoRoot, ["config", "user.email", "paperclip-test@example.com"]);
   await runGit(repoRoot, ["config", "user.name", "Paperclip Test"]);
@@ -170,22 +163,6 @@ async function waitForRunToFinish(heartbeat: Heartbeat, runId: string, timeoutMs
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   return heartbeat.getRun(runId);
-}
-
-async function deleteHeartbeatRunsForCleanup(db: Db) {
-  let lastError: unknown = null;
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    await db.delete(heartbeatRunEvents);
-    await db.delete(activityLog);
-    try {
-      await db.delete(heartbeatRuns);
-      return;
-    } catch (error) {
-      lastError = error;
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-  }
-  throw lastError;
 }
 
 async function waitForContainmentSideEffects(input: {
@@ -408,6 +385,10 @@ async function seedBranchContainmentRun(
       branchName: expectedBranch,
       providerType: "git_worktree",
       providerRef: worktreePath,
+      metadata: {
+        createdByRuntime: true,
+        gitBranchOwnershipVersion: 1,
+      },
       lastUsedAt: now,
       openedAt: now,
       createdAt: now,
@@ -640,6 +621,8 @@ async function expectContainedWorkspaceBranchFailure(input: {
     executionRunId: null,
     checkoutRunId: null,
   });
+  const sourceAssigneeAgentId = issueById.get(input.sourceIssueId)?.assigneeAgentId;
+  expect(sourceAssigneeAgentId).toEqual(expect.any(String));
   expect(issueById.get(input.sameWorkspaceSiblingId)).toMatchObject({
     status: "in_progress",
     executionRunId: null,
@@ -658,6 +641,11 @@ async function expectContainedWorkspaceBranchFailure(input: {
     kind: "workspace_validation",
     cause: "workspace_validation_failed",
     status: "active",
+    ownerType: "board",
+    ownerAgentId: null,
+    ownerUserId: null,
+    previousOwnerAgentId: sourceAssigneeAgentId,
+    returnOwnerAgentId: sourceAssigneeAgentId,
     fingerprint: expect.stringContaining(String(workspaceValidation.fingerprint)),
     attemptCount: 1,
     evidence: expect.objectContaining({
@@ -665,6 +653,7 @@ async function expectContainedWorkspaceBranchFailure(input: {
       latestRunId: input.runId,
       latestRunErrorCode: "workspace_validation_failed",
       recoveryCause: "workspace_validation_failed",
+      routingPolicy: "board_escalation_no_takeover_v1",
       workspaceValidation: expect.objectContaining({
         fingerprint: workspaceValidation.fingerprint,
         expectedBranch: input.expectedBranch,
@@ -680,9 +669,9 @@ async function expectContainedWorkspaceBranchFailure(input: {
     }),
     nextAction: expect.stringContaining("choose a new execution workspace"),
     wakePolicy: expect.objectContaining({
-      type: "wake_owner",
-      reason: "source_scoped_recovery_action",
-      ownerAgentId: expect.any(String),
+      type: "board_escalation",
+      reason: "workspace_validation_failed",
+      preservesSourceAssignee: true,
     }),
   });
 
@@ -861,20 +850,6 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
   }, 20_000);
 
   afterEach(async () => {
-        // Await every in-flight background heartbeat run to quiescence before the
-        // deletes below. resumeQueuedRuns claims a run and dispatches its execution
-        // fire-and-forget, and the containment path can dispatch a follow-up
-        // recovery wakeup, so a run or wakeup can still write heartbeat_runs and
-        // issues rows when teardown starts. The shared drain also awaits an
-        // in-flight wakeup that is still before run registration, which a plain run
-        // table status poll cannot see.
-        await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
-        // Quiescence period: heartbeatRunEvents may be written after run status transitions
-        // to terminal (e.g., appendRunEvent at heartbeat.ts:10288 after setRunStatus).
-        // The shared drain awaits runs and in-flight wakeups but not post-terminal event
-        // writes, so we still wait a bit for post-status-change async side effects to
-        // complete before teardown.
-        await new Promise((resolve) => setTimeout(resolve, 150));
     adapterExecute.mockReset();
     adapterExecute.mockImplementation(async () => ({
       exitCode: 0,
@@ -888,30 +863,10 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
       const root = tempRoots.pop();
       if (root) await rm(root, { recursive: true, force: true }).catch(() => undefined);
     }
-    await db.delete(issueRecoveryActions);
-    await db.delete(issueRelations);
-    await db.delete(issuePlanDecompositions);
-    await db.delete(issueDocuments);
-    await db.delete(documentRevisions);
-    await db.delete(documents);
-    await db.delete(environmentLeases);
-    await db.delete(activityLog);
-    await db.delete(heartbeatRunEvents);
-    // Heartbeat failure/finalization paths can emit run-linked events and
-    // activity after the first cleanup pass observes all runs as non-active.
-    await deleteHeartbeatRunsForCleanup(db);
-    await db.delete(issueComments);
-    await db.delete(issues);
-    await db.delete(projectWorkspaces);
-    await db.delete(projects);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(agents);
-    await db.delete(workspaceOperations);
-    await db.delete(executionWorkspaces);
-    await db.delete(environments);
-    await db.delete(companySkills);
-    await db.delete(companies);
+    // Wait for in-flight background heartbeat runs and wakeups to finish, then reset
+    // every table atomically (TRUNCATE ... CASCADE) so late writes cannot race the teardown.
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {

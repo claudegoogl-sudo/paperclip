@@ -8,7 +8,6 @@ type InviteSummary = {
   companyId: string | null;
   companyName?: string | null;
   companyLogoUrl?: string | null;
-  companyBrandColor?: string | null;
   inviteType: "company_join" | "bootstrap_ceo";
   allowedJoinTypes: "human" | "agent" | "both";
   humanRole?: HumanCompanyRole | null;
@@ -84,6 +83,10 @@ type CliAuthChallengeStatus = {
   approvedAt: string | null;
   cancelledAt: string | null;
   expiresAt: string;
+  /** Scope kind of the key minted on approval (`standard` = full board authority). */
+  keyScope?: string;
+  /** Lifetime of the minted key from approval, in milliseconds. */
+  keyTtlMs?: number;
   approvedByUser: { id: string; name: string; email: string } | null;
   requiresSignIn: boolean;
   canApprove: boolean;

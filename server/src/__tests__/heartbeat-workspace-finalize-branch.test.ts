@@ -9,22 +9,13 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   activityLog,
   agentRuntimeState,
-  agentTaskSessions,
   agentWakeupRequests,
   agents,
   companies,
-  companySkills,
   createDb,
-  documentRevisions,
-  documents,
-  environmentLeases,
-  environments,
   executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
-  issueComments,
-  issueDocuments,
-  issuePlanDecompositions,
   issues,
   projects,
   projectWorkspaces,
@@ -35,6 +26,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 
@@ -62,7 +54,6 @@ vi.mock("../adapters/index.js", () => ({
     execute: adapterExecute,
     supportsLocalAgentJwt: false,
   }),
-  listAdapterModelProfiles: async () => [],
   runningProcesses: new Map(),
 }));
 
@@ -114,23 +105,6 @@ async function waitForRuntimeStateLastRun(db: Db, agentId: string, runId: string
     if (state?.lastRunId === runId) return;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-}
-
-async function deleteHeartbeatRowsAfterActivityLogDrains(db: Db) {
-  let lastError: unknown = null;
-  for (let attempt = 0; attempt < 10; attempt += 1) {
-    await db.delete(activityLog);
-    await db.delete(heartbeatRunEvents);
-    try {
-      await db.delete(heartbeatRuns);
-      await db.delete(agentWakeupRequests);
-      return;
-    } catch (error) {
-      lastError = error;
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-  }
-  throw lastError;
 }
 
 function readAdapterWorkspace(input: unknown) {
@@ -267,20 +241,6 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
   }, 20_000);
 
   afterEach(async () => {
-    // Await every in-flight background heartbeat run to quiescence before the
-    // deletes below. A wakeup claims a run and dispatches its execution
-    // fire-and-forget, and finalization success can dispatch a follow-up
-    // wakeup, so a run or wakeup can still write heartbeat_runs and issues rows
-    // when teardown starts. The shared drain also awaits an in-flight wakeup
-    // that is still before run registration, which a plain run table status
-    // poll cannot see.
-    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
-    // Quiescence period: heartbeatRunEvents may be written after run status transitions
-    // to terminal (e.g., appendRunEvent at heartbeat.ts:10288 after setRunStatus).
-    // The shared drain awaits runs and in-flight wakeups but not post-terminal event
-    // writes, so we still wait a bit for post-status-change async side effects to
-    // complete before teardown.
-    await new Promise((resolve) => setTimeout(resolve, 150));
     adapterExecute.mockReset();
     adapterExecute.mockImplementation(async () => ({
       exitCode: 0,
@@ -294,25 +254,10 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
       const root = tempRoots.pop();
       if (root) await rm(root, { recursive: true, force: true }).catch(() => undefined);
     }
-    await db.delete(issuePlanDecompositions);
-    await db.delete(issueDocuments);
-    await db.delete(documentRevisions);
-    await db.delete(documents);
-    await db.delete(agentTaskSessions);
-    await db.delete(environmentLeases);
-    await db.delete(workspaceOperations);
-    await deleteHeartbeatRowsAfterActivityLogDrains(db);
-    await db.delete(issueComments);
-    await db.delete(issues);
-    await db.delete(projectWorkspaces);
-    await db.delete(projects);
-    await db.delete(agentWakeupRequests);
-    await db.delete(agentRuntimeState);
-    await db.delete(agents);
-    await db.delete(executionWorkspaces);
-    await db.delete(environments);
-    await db.delete(companySkills);
-    await db.delete(companies);
+    // Wait for in-flight background heartbeat runs and wakeups to finish, then reset
+    // every table atomically (TRUNCATE ... CASCADE) so late writes cannot race the teardown.
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+    await resetEmbeddedPostgresTestDatabase(db);
   });
 
   afterAll(async () => {

@@ -1,4 +1,5 @@
 import os from "node:os";
+import { classifyEgressIp } from "./services/plugin-egress-ip-classifier.js";
 
 function normalizeHost(value: string | null | undefined): string {
   return (value ?? "").trim();
@@ -15,11 +16,11 @@ function isWildcardHost(host: string): boolean {
 }
 
 function isLinkLocalHost(host: string): boolean {
-  const normalized = normalizeHost(host).toLowerCase();
-  if (normalized.startsWith("169.254.")) return true;
-  // IPv6 link-local block is fe80::/10 (fe80:: through febf::)
-  if (/^fe[89ab][0-9a-f]:/.test(normalized)) return true;
-  return false;
+  // Range check on the canonical form (shared classifier) instead of string
+  // prefixes, so embedded-IPv4 forms (::ffff:a9fe:a14) are caught too.
+  // 169.254.0.0/16 and fe80::/10. Empty interface source: ranges only.
+  const c = classifyEgressIp(normalizeHost(host), { interfaces: () => ({}) });
+  return c.reason === "link-local";
 }
 
 function formatOrigin(protocol: string, host: string, port: number): string {
@@ -78,6 +79,56 @@ export function choosePrimaryRuntimeApiUrl(input: {
   }
 
   return formatOrigin("http:", "localhost", input.port);
+}
+
+/**
+ * Base URL handed to agent runs as PAPERCLIP_API_URL.
+ *
+ * Separate from the runtime/public base on purpose: the public base
+ * (authPublicBaseUrl) is for browsers and off-host clients and may sit behind
+ * an interactive access proxy that answers API calls with an HTML login page.
+ * Local agent runs execute on the same host as the server, so they default to
+ * the loopback listen origin whenever the server binds loopback or a wildcard.
+ *
+ * Precedence: explicit PAPERCLIP_AGENT_API_URL > loopback listen origin (bind
+ * host loopback or wildcard) > fallbackApiUrl (the runtime/public base).
+ */
+export function chooseAgentApiUrl(input: {
+  explicitAgentApiUrl?: string | null;
+  bindHost: string;
+  port: number;
+  fallbackApiUrl: string;
+}): string {
+  const explicit = input.explicitAgentApiUrl?.trim();
+  if (explicit) {
+    try {
+      const parsed = new URL(explicit);
+      // Only http(s) origins are usable API bases ("file:" etc. yield "null").
+      if (parsed.protocol === "http:" || parsed.protocol === "https:") return parsed.origin;
+    } catch {
+      // Malformed override: fall through to the derived default.
+    }
+  }
+  const bindHost = normalizeHost(input.bindHost).toLowerCase();
+  if (!bindHost || bindHost === "0.0.0.0" || bindHost === "localhost" || bindHost === "127.0.0.1") {
+    return formatOrigin("http:", "127.0.0.1", input.port);
+  }
+  if (bindHost === "::" || bindHost === "::1") {
+    return formatOrigin("http:", "::1", input.port);
+  }
+  return input.fallbackApiUrl;
+}
+
+/** True when an agent API base is cleartext http to a non-loopback host. */
+export function isInsecureNonLoopbackApiUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:") return false;
+    const host = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    return !(host === "localhost" || host === "::1" || /^127\./.test(host));
+  } catch {
+    return false;
+  }
 }
 
 export function collectReachableInterfaceHosts(input: {

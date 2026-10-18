@@ -25,6 +25,7 @@ const mockIssueService = vi.hoisted(() => ({
   clearOrphanCheckoutLocksIfTerminal: vi.fn(async () => false),
   getById: vi.fn(),
   listReviewAttention: vi.fn(),
+  addComment: vi.fn(),
 }));
 
 const mockInteractionService = vi.hoisted(() => ({
@@ -41,12 +42,27 @@ const mockInteractionService = vi.hoisted(() => ({
   answerQuestions: vi.fn(),
   submitItemVerdicts: vi.fn(),
   cancelQuestions: vi.fn(),
+  skipInteraction: vi.fn(),
   withdrawInteraction: vi.fn(),
   supersedeInteractionById: vi.fn(),
+  recordSecretProposalExecutionResult: vi.fn(),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
   wakeup: vi.fn(async () => undefined),
+  cancelRun: vi.fn(async () => null),
+}));
+const mockRequestNativeQuestionRunCancellation = vi.hoisted(() =>
+  vi.fn(async () => null as string | null)
+);
+
+vi.mock("../services/native-runtime/native-question-bridge.js", () => ({
+  deliverNativeQuestionResponse: vi.fn(async () => "not_native"),
+  requestNativeQuestionRunCancellation: mockRequestNativeQuestionRunCancellation,
+  validateNativeQuestionResponseInput: vi.fn(),
+}));
+const mockQuestionResponseDeliveries = vi.hoisted(() => ({
+  deliver: vi.fn(async () => null),
 }));
 const mockResolveTaskWatchdogMutationScope = vi.hoisted(() => vi.fn(async () => ({ kind: "none" })));
 const mockResolveCoreTrustPreset = vi.hoisted(() => vi.fn(() => ({ kind: "standard" })));
@@ -146,9 +162,12 @@ vi.mock("../services/trust-preset-resolver.js", () => ({
 }));
 
 function registerModuleMocks() {
+  vi.doMock("../services/question-response-delivery.js", () => ({
+    questionResponseDeliveryService: () => mockQuestionResponseDeliveries,
+  }));
   vi.doMock("../services/index.js", () => ({
     companyService: () => ({
-      getById: vi.fn(async () => ({ id: "company-1", attachmentMaxBytes: 10 * 1024 * 1024 })),
+      getById: vi.fn(async () => ({ id: "company-1" })),
     }),
     accessService: () => ({
       canUser: vi.fn(async () => true),
@@ -248,6 +267,13 @@ function createIssue(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function loadAppModules() {
+  return Promise.all([
+    import("../routes/issues.js"),
+    import("../middleware/index.js"),
+  ]);
+}
+
 async function createApp(actor: Record<string, unknown> = {
   type: "board",
   userId: "local-board",
@@ -263,10 +289,7 @@ async function createApp(actor: Record<string, unknown> = {
       responsibleUserId: actor.onBehalfOfUserId ?? null,
     };
   }
-  const [{ issueRoutes }, { errorHandler }] = await Promise.all([
-    import("../routes/issues.js"),
-    import("../middleware/index.js"),
-  ]);
+  const [{ issueRoutes }, { errorHandler }] = await loadAppModules();
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -278,19 +301,48 @@ async function createApp(actor: Record<string, unknown> = {
   return app;
 }
 
+async function resolveMockInteraction(
+  args: unknown[],
+  interaction: Record<string, unknown>,
+) {
+  const mutationOptions = args[4] as {
+    afterResolveInTransaction?: (
+      tx: Record<string, unknown>,
+      resolved: Record<string, unknown>,
+    ) => Promise<void>;
+  } | undefined;
+  await mutationOptions?.afterResolveInTransaction?.({}, interaction);
+  return interaction;
+}
+
 describe.sequential("issue thread interaction routes", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("../routes/issues.js");
     vi.doUnmock("../routes/authz.js");
     vi.doUnmock("../middleware/index.js");
     vi.doUnmock("../services/index.js");
     registerModuleMocks();
-    vi.clearAllMocks();
-    mockInteractionService.getForIssue.mockReset();
-    mockResolveTaskWatchdogMutationScope.mockReset();
-    mockResolveCoreTrustPreset.mockReset();
-    mockAccessDecide.mockReset();
+    // Every mock here is a vi.hoisted() singleton. All 70+ tests share it.
+    // A queued mockResolvedValueOnce() value can outlive its own test and
+    // leak into a later, unrelated test. vi.resetAllMocks() drains that
+    // queue for every mock in one call. It also keeps each mock's
+    // constructor-provided vi.fn(impl) default. So the code below only
+    // sets values that must differ from that default.
+    // vi.clearAllMocks() clears call history only. It does not drain the
+    // queue. That gap once let a leftover queued value deny an unrelated
+    // later test.
+    vi.resetAllMocks();
+    // mockRunAttribution.value is a plain object, not a vi.fn().
+    // resetAllMocks() does not reset it. createApp() overwrites it for an
+    // agent actor. A board actor leaves whatever value a prior test set here.
+    mockRunAttribution.value = {
+      companyId: "company-1",
+      agentId: CREATED_AGENT_ID,
+      responsibleUserId: null,
+    };
+    mockQuestionResponseDeliveries.deliver.mockResolvedValue(null);
+    mockRequestNativeQuestionRunCancellation.mockResolvedValue(null);
     mockResolveTaskWatchdogMutationScope.mockResolvedValue({ kind: "none" });
     mockResolveCoreTrustPreset.mockReturnValue({ kind: "standard" });
     mockAccessDecide.mockImplementation(async (input: { action?: string }) => ({
@@ -315,7 +367,7 @@ describe.sequential("issue thread interaction routes", () => {
       status: "pending",
       payload: { version: 1, questions: [] },
     });
-    mockInteractionService.withdrawInteraction.mockResolvedValue({
+    mockInteractionService.withdrawInteraction.mockImplementation((...args) => resolveMockInteraction(args, {
       id: "interaction-withdraw",
       companyId: "company-1",
       issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -325,7 +377,28 @@ describe.sequential("issue thread interaction routes", () => {
       continuationPolicy: "wake_assignee",
       payload: { version: 1, prompt: "Proceed?" },
       result: { version: 1, outcome: "withdrawn", reason: "Replanning" },
-    });
+    }));
+    mockInteractionService.recordSecretProposalExecutionResult.mockImplementation(
+      async (_issue, _interactionId, _proposalId, execution) => ({
+        ...(await mockInteractionService.acceptInteraction.mock.results.at(-1)?.value)?.interaction,
+        id: _interactionId,
+        companyId: "company-1",
+        issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        kind: "request_confirmation",
+        status: "accepted",
+        continuationPolicy: "wake_assignee",
+        payload: {
+          version: 1,
+          prompt: "Create the binding?",
+          secretProposal: {
+            version: 1,
+            proposalId: _proposalId,
+            configPath: "access.NEW_ALIAS",
+          },
+        },
+        result: { version: 1, outcome: "accepted", secretProposal: { version: 1, ...execution } },
+      }),
+    );
     mockInteractionService.create.mockResolvedValue({
       id: "interaction-1",
       companyId: "company-1",
@@ -467,7 +540,7 @@ describe.sequential("issue thread interaction routes", () => {
       },
       newlyResolvedItemIds: ["docs"],
     });
-    mockInteractionService.cancelQuestions.mockResolvedValue({
+    mockInteractionService.cancelQuestions.mockImplementation((...args) => resolveMockInteraction(args, {
       id: "interaction-2",
       companyId: "company-1",
       issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -496,7 +569,7 @@ describe.sequential("issue thread interaction routes", () => {
       createdAt: "2026-04-20T12:00:00.000Z",
       updatedAt: "2026-04-20T12:05:00.000Z",
       resolvedAt: "2026-04-20T12:05:00.000Z",
-    });
+    }));
     mockInteractionService.getById.mockResolvedValue({
       id: "interaction-3",
       companyId: "company-1",
@@ -548,7 +621,9 @@ describe.sequential("issue thread interaction routes", () => {
     mockCrossIssueInfluence.sourceIssueId = ISSUE_ID;
     mockCrossIssueInfluence.priorCount = 0;
     mockCrossIssueInfluence.inserted.length = 0;
-  });
+    // Keep cold route imports in setup rather than the HTTP assertion timeout.
+    await loadAppModules();
+  }, 60_000);
 
   it("creates board-authored interactions", async () => {
     const app = await createApp();
@@ -766,7 +841,7 @@ describe.sequential("issue thread interaction routes", () => {
     );
   });
 
-  it("answers questions and emits a continuation wake", async () => {
+  it("answers questions through the durable delivery service", async () => {
     const app = await createApp();
 
     const res = await request(app)
@@ -777,25 +852,64 @@ describe.sequential("issue thread interaction routes", () => {
 
     expect(res.status).toBe(200);
     expect(mockInteractionService.answerQuestions).toHaveBeenCalled();
-    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
-      ASSIGNEE_AGENT_ID,
-      expect.objectContaining({
-        reason: "issue_commented",
-        payload: expect.objectContaining({
-          interactionId: "interaction-2",
-          interactionKind: "ask_user_questions",
-          interactionStatus: "answered",
-          sourceCommentId: "comment-2",
-          sourceRunId: RUN_2,
-        }),
-      }),
+    expect(mockQuestionResponseDeliveries.deliver).toHaveBeenCalledWith(
+      "interaction-2",
     );
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
         action: "issue.thread_interaction_answered",
       }),
     );
+  });
+
+  it.each(["paperclip-id:chat-owner", "chat-owner", "paperclip-id:another-user"])("keeps chat response delivery limited to the exact owner: %s", async (userId) => {
+    const issue = createIssue({ conversationAgentId: ASSIGNEE_AGENT_ID, conversationUserId: "paperclip-id:chat-owner" });
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockInteractionService.getForIssue.mockResolvedValue({
+      id: "interaction-2", kind: "ask_user_questions", status: "pending",
+      requestedResolverPolicy: "human_only", effectiveResolverPolicy: "human_only",
+      addresseeUserId: "paperclip-id:chat-owner", continuationPolicy: "wake_assignee",
+      payload: { version: 1, questions: [] },
+    });
+    const app = await createApp({ type: "board", userId, source: "cloud_tenant", companyIds: ["company-1"] });
+    const response = await request(app).post(`/api/issues/${ISSUE_ID}/interactions/interaction-2/respond`)
+      .send({ answers: [{ questionId: "scope", optionIds: ["phase-1"] }] });
+    if (userId === "paperclip-id:chat-owner") {
+      expect(response.status).toBe(200);
+      expect(mockInteractionService.answerQuestions).toHaveBeenCalledWith(expect.anything(), "interaction-2", expect.anything(), expect.objectContaining({ userId }));
+      expect(mockQuestionResponseDeliveries.deliver).toHaveBeenCalledWith("interaction-2");
+    } else {
+      expect(response.status).toBe(403);
+      expect(mockInteractionService.answerQuestions).not.toHaveBeenCalled();
+      expect(mockQuestionResponseDeliveries.deliver).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    }
+  });
+
+  it("routes wake-on-accept question answers through the same causal delivery service", async () => {
+    mockInteractionService.answerQuestions.mockResolvedValueOnce({
+      id: "interaction-2",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "ask_user_questions",
+      status: "answered",
+      continuationPolicy: "wake_assignee_on_accept",
+      sourceCommentId: "comment-2",
+      sourceRunId: RUN_2,
+      payload: { version: 1, questions: [] },
+      result: { version: 1, answers: [{ questionId: "scope", optionIds: ["phase-1"] }] },
+    });
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/respond")
+      .send({ answers: [{ questionId: "scope", optionIds: ["phase-1"] }] });
+
+    expect(res.status).toBe(200);
+    expect(mockQuestionResponseDeliveries.deliver).toHaveBeenCalledWith("interaction-2");
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
   it("submits item verdicts and emits one continuation wake with resolved item ids", async () => {
@@ -872,6 +986,7 @@ describe.sequential("issue thread interaction routes", () => {
       "interaction-withdraw",
       { reason: "Replanning" },
       expect.objectContaining({ userId: "local-board" }),
+      expect.objectContaining({ afterResolveInTransaction: expect.any(Function) }),
     );
     expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(ASSIGNEE_AGENT_ID, expect.objectContaining({
       payload: expect.objectContaining({ interactionStatus: "cancelled" }),
@@ -879,6 +994,71 @@ describe.sequential("issue thread interaction routes", () => {
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       action: "issue.thread_interaction_withdrawn",
     }));
+  });
+
+  it("cancels the bound native run when its question is withdrawn", async () => {
+    mockInteractionService.withdrawInteraction.mockImplementationOnce((...args) => resolveMockInteraction(args, {
+      id: "interaction-withdraw",
+      companyId: "company-1",
+      issueId: ISSUE_ID,
+      kind: "ask_user_questions",
+      createdByAgentId: CREATED_AGENT_ID,
+      sourceRunId: RUN_1,
+      status: "cancelled",
+      continuationPolicy: "none",
+      payload: { version: 1, questions: [] },
+      result: { version: 1, answers: [], cancelled: true },
+    }));
+    mockRequestNativeQuestionRunCancellation.mockResolvedValueOnce(RUN_1);
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${ISSUE_ID}/interactions/interaction-withdraw/withdraw`)
+      .send({ reason: "No longer needed" });
+
+    expect(res.status).toBe(200);
+    expect(mockRequestNativeQuestionRunCancellation).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ id: "interaction-withdraw", sourceRunId: RUN_1 }),
+      { kind: "interaction_withdrawn", interactionId: "interaction-withdraw" },
+    );
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+      RUN_1,
+      "Question withdrawn while waiting for operator input",
+      expect.objectContaining({
+        resultJson: expect.objectContaining({
+          withdrawnInteractionId: "interaction-withdraw",
+          withdrawnByActorType: "user",
+        }),
+      }),
+    );
+  });
+
+  it("keeps a durable withdrawal intent when immediate native cancellation fails", async () => {
+    mockInteractionService.withdrawInteraction.mockImplementationOnce((...args) => resolveMockInteraction(args, {
+      id: "interaction-withdraw",
+      companyId: "company-1",
+      issueId: ISSUE_ID,
+      kind: "ask_user_questions",
+      createdByAgentId: CREATED_AGENT_ID,
+      sourceRunId: RUN_1,
+      status: "cancelled",
+      continuationPolicy: "none",
+      payload: { version: 1, questions: [] },
+      result: { version: 1, answers: [], cancelled: true },
+    }));
+    mockRequestNativeQuestionRunCancellation.mockResolvedValueOnce(RUN_1);
+    mockHeartbeatService.cancelRun.mockRejectedValueOnce(new Error("process unavailable"));
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${ISSUE_ID}/interactions/interaction-withdraw/withdraw`)
+      .send({ reason: "No longer needed" });
+
+    expect(res.status).toBe(200);
+    expect(mockRequestNativeQuestionRunCancellation).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ id: "interaction-withdraw" }),
+      { kind: "interaction_withdrawn", interactionId: "interaction-withdraw" },
+    );
   });
 
   it("allows the creator agent to withdraw and wakes a different assignee", async () => {
@@ -938,6 +1118,7 @@ describe.sequential("issue thread interaction routes", () => {
       "interaction-withdraw",
       {},
       expect.objectContaining({ agentId: ASSIGNEE_AGENT_ID, runId: RUN_WATCHDOG }),
+      expect.objectContaining({ afterResolveInTransaction: expect.any(Function) }),
     );
     expect(res.status).toBe(200);
   });
@@ -967,6 +1148,7 @@ describe.sequential("issue thread interaction routes", () => {
       "interaction-2",
       {},
       expect.objectContaining({ userId: "local-board" }),
+      expect.objectContaining({ afterResolveInTransaction: expect.any(Function) }),
     );
     expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
       ASSIGNEE_AGENT_ID,
@@ -1052,7 +1234,27 @@ describe.sequential("issue thread interaction routes", () => {
     expect(mockInteractionService.supersedeInteractionById).not.toHaveBeenCalled();
   });
 
-  it("accepts request confirmations and wakes the current assignee when configured for accept-only wakeups", async () => {
+  it("durably marks a board-cancelled native question before cancelling its run", async () => {
+    mockRequestNativeQuestionRunCancellation.mockResolvedValueOnce(RUN_2);
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${ISSUE_ID}/interactions/interaction-2/cancel`)
+      .send({});
+
+    expect(res.status).toBe(200);
+    expect(mockRequestNativeQuestionRunCancellation).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ id: "interaction-2", sourceRunId: RUN_2 }),
+      { kind: "interaction_cancelled", interactionId: "interaction-2" },
+    );
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+      RUN_2,
+      "Cancelled while waiting for operator input",
+      expect.objectContaining({
+        resultJson: expect.objectContaining({ cancelledInteractionId: "interaction-2" }),
+      }),
+    );
+  });  it("accepts request confirmations and wakes the current assignee when configured for accept-only wakeups", async () => {
     mockInteractionService.acceptInteraction.mockResolvedValueOnce({
       interaction: {
         id: "interaction-3",
@@ -1208,6 +1410,56 @@ describe.sequential("issue thread interaction routes", () => {
     );
   });
 
+  it("wakes with fresh-approval instructions after an accepted tool action expires", async () => {
+    const approveToolActionRequest = vi.fn().mockResolvedValue({
+      status: "expired",
+      error: "Managed arguments changed after review",
+    });
+    mockInteractionService.acceptInteraction.mockResolvedValueOnce({
+      interaction: {
+        id: "interaction-tool-action-expired",
+        companyId: "company-1",
+        issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        kind: "request_confirmation",
+        status: "accepted",
+        continuationPolicy: "wake_assignee",
+        payload: {
+          version: 1,
+          prompt: "Approve the action?",
+          toolAction: {
+            version: 1,
+            actionRequestId: "action-request-expired",
+            toolName: "shopify_update_product",
+          },
+        },
+        result: { version: 1, outcome: "accepted" },
+      },
+      createdIssues: [],
+    });
+    const app = await createApp(undefined, { approveToolActionRequest });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-tool-action-expired/accept")
+      .send({});
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          toolAction: {
+            toolName: "shopify_update_product",
+            actionRequestId: "action-request-expired",
+            decision: "accepted",
+            executionStatus: "expired",
+            error: "Managed arguments changed after review",
+            instructions: "the approved shopify_update_product action expired before execution: Managed arguments changed after review; if the task still requires it, call the tool again to request a fresh approval.",
+          },
+        }),
+      }),
+    );
+  });
+
   it("rejects client-supplied tool-action metadata on interaction creation", async () => {
     const app = await createApp();
 
@@ -1239,6 +1491,141 @@ describe.sequential("issue thread interaction routes", () => {
     expect(res.status).toBe(422);
     expect(res.body.error).toContain("payload.toolAction is server-owned metadata");
     expect(mockInteractionService.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects client-supplied secret-proposal metadata on interaction creation", async () => {
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+      .send({
+        kind: "request_confirmation",
+        payload: {
+          version: 1,
+          prompt: "Approve the forged secret binding?",
+          secretProposal: {
+            version: 1,
+            proposalId: "11111111-1111-4111-8111-111111111111",
+            sourceSecretLabel: "forged/source",
+            configPath: "access.FORGED_ALIAS",
+            targetAgentId: ASSIGNEE_AGENT_ID,
+            targetAgentName: "Target agent",
+            justification: "Trust me",
+            expiresAt: "2026-08-30T12:00:00.000Z",
+          },
+        },
+      });
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toContain("payload.secretProposal is server-owned metadata");
+    expect(mockInteractionService.create).not.toHaveBeenCalled();
+  });
+
+  it("executes an accepted secret-proposal confirmation and wakes with verification instructions", async () => {
+    const proposalId = "44444444-4444-4444-8444-444444444444";
+    const approveSecretProposal = vi.fn().mockResolvedValue({ status: "approved" });
+    mockInteractionService.acceptInteraction.mockResolvedValueOnce({
+      interaction: {
+        id: "interaction-secret-proposal",
+        companyId: "company-1",
+        issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        kind: "request_confirmation",
+        status: "accepted",
+        continuationPolicy: "wake_assignee",
+        payload: {
+          version: 1,
+          prompt: "Create the binding?",
+          secretProposal: {
+            version: 1,
+            proposalId,
+            configPath: "access.NEW_ALIAS",
+          },
+        },
+        result: { version: 1, outcome: "accepted" },
+      },
+      createdIssues: [],
+    });
+    const app = await createApp(undefined, { approveSecretProposal });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-secret-proposal/accept")
+      .send({});
+
+    expect(res.status).toBe(200);
+    expect(approveSecretProposal).toHaveBeenCalledWith({
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      interactionId: "interaction-secret-proposal",
+      proposalId,
+      actor: { agentId: null, userId: "local-board" },
+    });
+    expect(mockInteractionService.recordSecretProposalExecutionResult).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
+      "interaction-secret-proposal",
+      proposalId,
+      { status: "executed" },
+    );
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          secretProposal: expect.objectContaining({
+            proposalId,
+            configPath: "access.NEW_ALIAS",
+            executionStatus: "executed",
+            instructions: expect.stringContaining("GET /api/agents/me/secrets"),
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("records a failed secret-proposal execution and posts a thread comment", async () => {
+    const proposalId = "55555555-5555-4555-8555-555555555555";
+    const approveSecretProposal = vi.fn().mockRejectedValue(new Error("binding failed"));
+    mockInteractionService.acceptInteraction.mockResolvedValueOnce({
+      interaction: {
+        id: "interaction-secret-proposal-failed",
+        companyId: "company-1",
+        issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        kind: "request_confirmation",
+        status: "accepted",
+        continuationPolicy: "wake_assignee",
+        payload: {
+          version: 1,
+          prompt: "Create the binding?",
+          secretProposal: {
+            version: 1,
+            proposalId,
+            configPath: "access.NEW_ALIAS",
+          },
+        },
+        result: { version: 1, outcome: "accepted" },
+      },
+      createdIssues: [],
+    });
+    const app = await createApp(undefined, { approveSecretProposal });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-secret-proposal-failed/accept")
+      .send({});
+
+    expect(res.status).toBe(200);
+    expect(mockInteractionService.recordSecretProposalExecutionResult).toHaveBeenCalledWith(
+      expect.anything(),
+      "interaction-secret-proposal-failed",
+      proposalId,
+      { status: "failed", errorCode: "secret_proposal_execution_failed" },
+    );
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      expect.stringContaining("Binding created: **no**"),
+      { userId: "local-board" },
+    );
+    expect(res.body.result.secretProposal).toMatchObject({
+      status: "failed",
+      errorCode: "secret_proposal_execution_failed",
+    });
   });
 
   it("forwards plan-document confirmations to the interaction service for revision validation", async () => {
@@ -1422,7 +1809,11 @@ describe.sequential("issue thread interaction routes", () => {
     );
   });
 
-  it("forces a fresh workspace-aware session when accepting a planning confirmation", async () => {
+  it.each([
+    { label: "explicit", targetIssueId: ISSUE_ID },
+    { label: "omitted", targetIssueId: undefined },
+    { label: "null", targetIssueId: null },
+  ])("forces a fresh workspace-aware session when accepting a planning confirmation with $label issueId", async ({ targetIssueId }) => {
     mockIssueService.getById.mockResolvedValueOnce(createIssue({ workMode: "planning" }));
     mockInteractionService.acceptInteraction.mockResolvedValueOnce({
       interaction: {
@@ -1440,7 +1831,7 @@ describe.sequential("issue thread interaction routes", () => {
           prompt: "Approve this plan?",
           target: {
             type: "issue_document",
-            issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            ...(targetIssueId !== undefined ? { issueId: targetIssueId } : {}),
             documentId: "document-plan",
             key: "plan",
             revisionId: "revision-plan",
@@ -1456,6 +1847,13 @@ describe.sequential("issue thread interaction routes", () => {
         resolvedAt: "2026-04-20T12:05:00.000Z",
       },
       createdIssues: [],
+      continuationIssue: {
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        assigneeAgentId: ASSIGNEE_AGENT_ID,
+        assigneeUserId: null,
+        status: "todo",
+        workMode: "standard",
+      },
     });
     const app = await createApp();
 
@@ -1494,6 +1892,56 @@ describe.sequential("issue thread interaction routes", () => {
         }),
       }),
     );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.updated",
+        details: expect.objectContaining({
+          source: "request_confirmation_accept",
+          workMode: "standard",
+          _previous: expect.objectContaining({ workMode: "planning" }),
+        }),
+      }),
+    );
+  });
+
+  it("does not project an explicitly different issue's approved plan into the current issue wake", async () => {
+    mockInteractionService.acceptInteraction.mockResolvedValueOnce({
+      interaction: {
+        id: "interaction-other-plan",
+        companyId: "company-1",
+        issueId: ISSUE_ID,
+        kind: "request_confirmation",
+        status: "accepted",
+        continuationPolicy: "wake_assignee_on_accept",
+        sourceRunId: RUN_1,
+        payload: {
+          version: 1,
+          prompt: "Approve the other issue's plan?",
+          target: {
+            type: "issue_document",
+            issueId: OTHER_ISSUE_ID,
+            key: "plan",
+            revisionId: "other-revision",
+            revisionNumber: 2,
+          },
+        },
+        result: { version: 1, outcome: "accepted" },
+      },
+      createdIssues: [],
+    });
+    const response = await request(await createApp())
+      .post(`/api/issues/${ISSUE_ID}/interactions/interaction-other-plan/accept`)
+      .send({});
+    expect(response.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+    const wake = mockHeartbeatService.wakeup.mock.calls[0]?.[1] as unknown as {
+      contextSnapshot: Record<string, unknown>;
+      payload: Record<string, unknown>;
+    };
+    expect(wake.contextSnapshot).not.toHaveProperty("planReviewInteraction");
+    expect(wake.payload).not.toHaveProperty("planReviewInteraction");
+    expect(wake.contextSnapshot).not.toHaveProperty("forceFreshSession");
   });
 
   it("forces a fresh workspace-aware session when accepting a plan document confirmation on a standard-work issue", async () => {
@@ -1661,6 +2109,175 @@ describe.sequential("issue thread interaction routes", () => {
 
     expect(res.status).toBe(200);
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("wakes the assignee to revise a rejected plan even when its policy is accept-only", async () => {
+    mockInteractionService.rejectInteraction.mockResolvedValueOnce({
+      id: "interaction-rejected-plan",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_confirmation",
+      status: "rejected",
+      continuationPolicy: "wake_assignee_on_accept",
+      idempotencyKey: "confirmation:issue:plan:revision-2",
+      sourceCommentId: null,
+      sourceRunId: RUN_3,
+      payload: {
+        version: 1,
+        prompt: "Approve this plan?",
+        target: {
+          type: "issue_document",
+          issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          documentId: "document-plan",
+          key: "plan",
+          revisionId: "revision-2",
+          revisionNumber: 2,
+        },
+      },
+      result: {
+        version: 1,
+        outcome: "rejected",
+        reason: "Keep the API smaller and add a Unicode test.",
+      },
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:05:00.000Z",
+      resolvedAt: "2026-04-20T12:05:00.000Z",
+    });
+
+    const res = await request(await createApp())
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-rejected-plan/reject")
+      .send({ reason: "Keep the API smaller and add a Unicode test." });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          planReviewInteraction: expect.objectContaining({
+            id: "interaction-rejected-plan",
+            status: "rejected",
+            target: expect.objectContaining({
+              key: "plan",
+              revisionId: "revision-2",
+            }),
+            result: expect.objectContaining({
+              outcome: "rejected",
+              reason: "Keep the API smaller and add a Unicode test.",
+            }),
+          }),
+        }),
+        contextSnapshot: expect.objectContaining({
+          planReviewInteraction: expect.objectContaining({ status: "rejected" }),
+        }),
+      }),
+    );
+  });
+
+  it("delivers generic confirmation rejection feedback as the next turn message", async () => {
+    mockInteractionService.rejectInteraction.mockResolvedValueOnce({
+      id: "interaction-warm-turn",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_confirmation",
+      status: "rejected",
+      continuationPolicy: "wake_assignee",
+      idempotencyKey: "warm-turn-1",
+      sourceCommentId: null,
+      sourceRunId: RUN_3,
+      payload: {
+        version: 1,
+        prompt: "Continue to turn two?",
+        target: {
+          type: "custom",
+          key: "warm_turn_1",
+          revisionId: "turn-1",
+        },
+      },
+      result: {
+        version: 1,
+        outcome: "rejected",
+        reason: "Read T1, append T2, and verify both lines.",
+      },
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:05:00.000Z",
+      resolvedAt: "2026-04-20T12:05:00.000Z",
+    });
+
+    const res = await request(await createApp())
+      .post(
+        "/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-warm-turn/reject",
+      )
+      .send({ reason: "Read T1, append T2, and verify both lines." });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          paperclipAgentMessage: {
+            text: "Read T1, append T2, and verify both lines.",
+            source: "interaction_rejection",
+            sessionId: "interaction-warm-turn",
+          },
+        }),
+        contextSnapshot: expect.objectContaining({
+          paperclipAgentMessage: expect.objectContaining({
+            text: "Read T1, append T2, and verify both lines.",
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("returns a rejected native completion review with a narrow reviewer-reason continuation", async () => {
+    const issue = createIssue({ status: "in_review" });
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockInteractionService.rejectInteraction.mockResolvedValueOnce({
+      id: "interaction-native-completion-review",
+      companyId: "company-1",
+      issueId: issue.id,
+      kind: "request_confirmation",
+      status: "rejected",
+      continuationPolicy: "wake_assignee",
+      idempotencyKey: null,
+      sourceCommentId: null,
+      sourceRunId: RUN_3,
+      payload: {
+        version: 1,
+        prompt: "Approve completion?",
+        target: { type: "custom", key: "native_completion_review", revisionId: "decision-29" },
+      },
+      result: {
+        version: 1,
+        outcome: "rejected",
+        reason: "Run the external verification and report only that result.",
+      },
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:05:00.000Z",
+      resolvedAt: "2026-04-20T12:05:00.000Z",
+    });
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${issue.id}/interactions/interaction-native-completion-review/reject`)
+      .send({ reason: "Run the external verification and report only that result." });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          nativeCompletionReview: expect.objectContaining({
+            decisionId: "decision-29",
+            outcome: "rejected",
+            reviewerReason: "Run the external verification and report only that result.",
+            instruction: expect.stringContaining("do not redo completed implementation"),
+          }),
+        }),
+        contextSnapshot: expect.objectContaining({
+          nativeCompletionReview: expect.objectContaining({ reviewerReason: expect.any(String) }),
+        }),
+      }),
+    );
   });
 
   it("overrides accept-only continuation when rejection consumes the last review path", async () => {
@@ -1847,10 +2464,8 @@ describe.sequential("issue thread interaction routes", () => {
       expect.anything(),
       expect.objectContaining({ agentId: ASSIGNEE_AGENT_ID, runId: RUN_2, userId: null }),
     );
-    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
-      ASSIGNEE_AGENT_ID,
-      expect.objectContaining({ idempotencyKey: "interaction:interaction-2:answered" }),
-    );
+    expect(mockQuestionResponseDeliveries.deliver).toHaveBeenCalledWith("interaction-2");
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       actorType: "agent",
       agentId: ASSIGNEE_AGENT_ID,
@@ -2272,6 +2887,12 @@ describe.sequential("issue thread interaction routes", () => {
       effectiveResolverPolicy: "board_or_agents",
       payload: { version: 1, questions: [] },
     };
+    mockInteractionService.answerQuestions.mockImplementationOnce(async (_issue, interactionId) => ({
+      ...addressed,
+      id: interactionId,
+      status: "answered",
+      result: { version: 1, answers: [] },
+    }));
     mockInteractionService.getForIssue
       .mockResolvedValueOnce(addressed)
       .mockResolvedValueOnce(addressed)
@@ -2291,10 +2912,8 @@ describe.sequential("issue thread interaction routes", () => {
       .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-addressed/respond")
       .send({ answers: [] });
     expect(addressee.status).toBe(200);
-    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
-      ASSIGNEE_AGENT_ID,
-      expect.objectContaining({ idempotencyKey: "interaction:interaction-2:answered" }),
-    );
+    expect(mockQuestionResponseDeliveries.deliver).toHaveBeenCalledWith("interaction-addressed");
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
 
     const unrelatedApp = await createApp({
       type: "agent",

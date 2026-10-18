@@ -7,6 +7,19 @@ import { accessApi } from "../api/access";
 import { authApi } from "../api/auth";
 import { queryKeys } from "../lib/queryKeys";
 
+export function describeKeyScope(scope: string | undefined) {
+  if (scope === "plugin_ops") return "Plugin operations (plugin_ops)";
+  if (scope === "standard") return "Full board authority (standard)";
+  return scope ? `Unknown (${scope}) - treat as full board authority` : "Unknown";
+}
+
+export function describeKeyTtl(ttlMs: number | undefined) {
+  if (typeof ttlMs !== "number" || !Number.isFinite(ttlMs) || ttlMs <= 0) return "unknown";
+  const hours = Math.round(ttlMs / (60 * 60 * 1000));
+  if (hours < 48) return `${hours} h`;
+  return `${Math.round(hours / 24)} days`;
+}
+
 export function CliAuthPage() {
   const queryClient = useQueryClient();
   const params = useParams();
@@ -131,6 +144,16 @@ export function CliAuthPage() {
             <div className="text-muted-foreground">Command</div>
             <div className="font-mono text-foreground">{challenge.command}</div>
           </div>
+          <div data-testid="cli-auth-key-scope">
+            <div className="text-muted-foreground">Key scope</div>
+            <div
+              className={
+                challenge.keyScope === "plugin_ops" ? "text-foreground" : "font-semibold text-destructive"
+              }
+            >
+              {describeKeyScope(challenge.keyScope)} · expires in {describeKeyTtl(challenge.keyTtlMs)}
+            </div>
+          </div>
           <div>
             <div className="text-muted-foreground">Client</div>
             <div className="text-foreground">{challenge.clientName ?? "paperclipai cli"}</div>
@@ -143,7 +166,7 @@ export function CliAuthPage() {
           </div>
           {challenge.requestedCompanyName && (
             <div>
-              <div className="text-muted-foreground">Requested company</div>
+              <div className="text-muted-foreground">Requested organization</div>
               <div className="text-foreground">{challenge.requestedCompanyName}</div>
             </div>
           )}

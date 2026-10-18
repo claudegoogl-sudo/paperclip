@@ -1,11 +1,14 @@
 import { describe, it, expect } from "vitest";
 import {
   DEFAULT_ALLOWED_TYPES,
+  formatAttachmentSize,
   INLINE_ATTACHMENT_TYPES,
   inferOfficeAttachmentContentTypeFromFilename,
   isAllowedPluginArtifactMimeType,
   isInlineAttachmentContentType,
+  isSpreadsheetBaitPluginArtifact,
   matchesContentType,
+  MAX_ATTACHMENT_BYTES,
   normalizeContentType,
   normalizeUploadAttachmentContentType,
   parseAllowedTypes,
@@ -113,11 +116,34 @@ describe("matchesContentType", () => {
       expect(matchesContentType(contentType, [...DEFAULT_ALLOWED_TYPES])).toBe(true);
     }
   });
+
+  it("allows common chat audio types by default", () => {
+    for (const contentType of [
+      "audio/mpeg",
+      "audio/mp4",
+      "audio/ogg",
+      "audio/wav",
+      "audio/webm",
+    ]) {
+      expect(matchesContentType(contentType, [...DEFAULT_ALLOWED_TYPES])).toBe(
+        true,
+      );
+    }
+  });
 });
 
 describe("normalizeContentType", () => {
   it("lowercases and trims explicit types", () => {
     expect(normalizeContentType(" Application/Zip ")).toBe("application/zip");
+  });
+
+  it("normalizes provider Content-Type header parameters to the MIME essence", () => {
+    expect(normalizeContentType(" Text/Plain ; charset=utf-8 ")).toBe(
+      "text/plain",
+    );
+    expect(normalizeContentType("image/svg+xml; charset=utf-8")).toBe(
+      "image/svg+xml",
+    );
   });
 
   it("falls back to octet-stream when the type is missing", () => {
@@ -242,9 +268,8 @@ describe("isAllowedPluginArtifactMimeType", () => {
     expect(isAllowedPluginArtifactMimeType("Application/VND.MS-PKI.STL")).toBe(true);
   });
 
-  it("keeps the F2 exclusions (text/html, text/csv) rejected", () => {
+  it("keeps text/html rejected on the plugin path", () => {
     expect(isAllowedPluginArtifactMimeType("text/html")).toBe(false);
-    expect(isAllowedPluginArtifactMimeType("text/csv")).toBe(false);
   });
 
   it("never allows executables", () => {
@@ -258,16 +283,119 @@ describe("isAllowedPluginArtifactMimeType", () => {
     }
   });
 
-  it("leaves SVG and archive types gated until SecurityEngineer rules", () => {
+  it("leaves SVG and the remaining archive types gated (the SE ruling admitted zip only)", () => {
     for (const ct of [
       "image/svg+xml",
-      "application/zip",
+      "application/x-zip-compressed",
+      "application/x-zip",
       "application/gzip",
       "application/x-7z-compressed",
       "application/x-tar",
+      "application/octet-stream",
     ]) {
       expect(isAllowedPluginArtifactMimeType(ct)).toBe(false);
     }
+  });
+
+  it("admits zip, csv and tsv for opaque storage per the SE ruling", () => {
+    for (const ct of ["application/zip", "text/csv", "text/tab-separated-values"]) {
+      expect(isAllowedPluginArtifactMimeType(ct)).toBe(true);
+    }
+  });
+
+  it("admits the inert KiCad exchange types per the SE ruling", () => {
+    for (const ct of ["application/x-kicad-pcb", "application/x-kicad-schematic"]) {
+      expect(isAllowedPluginArtifactMimeType(ct)).toBe(true);
+    }
+  });
+
+  it("matches the newly admitted types case-insensitively", () => {
+    expect(isAllowedPluginArtifactMimeType("Application/ZIP")).toBe(true);
+    expect(isAllowedPluginArtifactMimeType("TEXT/CSV")).toBe(true);
+    expect(isAllowedPluginArtifactMimeType("Text/Tab-Separated-Values")).toBe(true);
+    expect(isAllowedPluginArtifactMimeType("Application/X-KiCad-PCB")).toBe(true);
+    expect(isAllowedPluginArtifactMimeType("Application/X-KiCad-Schematic")).toBe(true);
+  });
+});
+
+describe("isSpreadsheetBaitPluginArtifact", () => {
+  const base = {
+    companyId: "company-1",
+    objectKey: "company-1/plugin-artifacts/2026/09/13/uuid-gerbers.csv",
+    contentType: "text/csv",
+    originalFilename: "gerbers.csv",
+  };
+
+  it("forces attachment for plugin-created csv/tsv assets (by type)", () => {
+    expect(isSpreadsheetBaitPluginArtifact(base)).toBe(true);
+    expect(
+      isSpreadsheetBaitPluginArtifact({
+        ...base,
+        contentType: "text/tab-separated-values",
+        originalFilename: "bom.tsv",
+        objectKey: "company-1/plugin-artifacts/2026/09/13/uuid-bom.tsv",
+      }),
+    ).toBe(true);
+    // Alias x-zip-compressed style case variance on the type is normalized.
+    expect(
+      isSpreadsheetBaitPluginArtifact({ ...base, contentType: "TEXT/CSV" }),
+    ).toBe(true);
+  });
+
+  it("forces attachment for plugin-created spreadsheet-named assets even under a generic type", () => {
+    for (const filename of ["bom.ods", "bom.xls", "bom.xlsx", "bom.xlsm", "data.tsv"]) {
+      expect(
+        isSpreadsheetBaitPluginArtifact({
+          ...base,
+          contentType: "application/octet-stream",
+          originalFilename: filename,
+          objectKey: `company-1/plugin-artifacts/2026/09/13/uuid-${filename}`,
+        }),
+      ).toBe(true);
+    }
+  });
+
+  it("leaves human-uploaded spreadsheet-bait serving unchanged (namespace-scoped)", () => {
+    expect(
+      isSpreadsheetBaitPluginArtifact({
+        ...base,
+        objectKey: "issues/issue-1/gerbers.csv",
+      }),
+    ).toBe(false);
+    expect(
+      isSpreadsheetBaitPluginArtifact({
+        ...base,
+        objectKey: "assets/general/gerbers.csv",
+      }),
+    ).toBe(false);
+  });
+
+  it("leaves non-spreadsheet plugin assets alone", () => {
+    expect(
+      isSpreadsheetBaitPluginArtifact({
+        ...base,
+        contentType: "image/png",
+        originalFilename: "preview.png",
+        objectKey: "company-1/plugin-artifacts/2026/09/13/uuid-preview.png",
+      }),
+    ).toBe(false);
+    expect(
+      isSpreadsheetBaitPluginArtifact({
+        ...base,
+        contentType: "image/png",
+        originalFilename: null,
+        objectKey: "company-1/plugin-artifacts/2026/09/13/uuid-noname",
+      }),
+    ).toBe(false);
+  });
+
+  it("does not match a different company's plugin-artifacts namespace", () => {
+    expect(
+      isSpreadsheetBaitPluginArtifact({
+        ...base,
+        objectKey: "company-2/plugin-artifacts/2026/09/13/uuid-gerbers.csv",
+      }),
+    ).toBe(false);
   });
 });
 
@@ -282,5 +410,43 @@ describe("isInlineAttachmentContentType", () => {
     expect(INLINE_ATTACHMENT_TYPES).not.toContain("text/html");
     expect(isInlineAttachmentContentType("text/html")).toBe(false);
     expect(isInlineAttachmentContentType("application/zip")).toBe(false);
+  });
+});
+
+describe("formatAttachmentSize", () => {
+  it("renders the default deployment cap as a round megabyte figure", () => {
+    // The fork deliberately raised the shared default 10 MiB -> 25 MiB so a
+    // fresh install accepts ~15-20 MiB STL relays without env tuning; keep
+    // upstream's shape check but assert the fork's default.
+    expect(MAX_ATTACHMENT_BYTES).toBe(25 * 1024 * 1024);
+    expect(formatAttachmentSize(MAX_ATTACHMENT_BYTES)).toBe("25 MB");
+  });
+
+  it("keeps one decimal place for fractional sizes and drops a trailing .0", () => {
+    expect(formatAttachmentSize(10.5 * 1024 * 1024)).toBe("10.5 MB");
+    expect(formatAttachmentSize(1024 * 1024)).toBe("1 MB");
+    expect(formatAttachmentSize(2.25 * 1024 * 1024)).toBe("2.3 MB");
+  });
+
+  it("renders sub-megabyte values in kilobytes", () => {
+    expect(formatAttachmentSize(1024)).toBe("1 KB");
+    expect(formatAttachmentSize(512 * 1024)).toBe("512 KB");
+    expect(formatAttachmentSize(1536)).toBe("1.5 KB");
+  });
+
+  it("steps up to gigabytes for very large caps", () => {
+    expect(formatAttachmentSize(2 * 1024 * 1024 * 1024)).toBe("2 GB");
+  });
+
+  it("keeps sub-kilobyte values in bytes rather than collapsing to 0 KB", () => {
+    expect(formatAttachmentSize(10)).toBe("10 bytes");
+    expect(formatAttachmentSize(1)).toBe("1 byte");
+    expect(formatAttachmentSize(1023)).toBe("1023 bytes");
+  });
+
+  it("never renders a nonsense figure for a degenerate input", () => {
+    expect(formatAttachmentSize(0)).toBe("0 bytes");
+    expect(formatAttachmentSize(-1)).toBe("0 bytes");
+    expect(formatAttachmentSize(Number.NaN)).toBe("0 bytes");
   });
 });

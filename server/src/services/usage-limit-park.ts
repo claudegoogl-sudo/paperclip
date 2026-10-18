@@ -4,6 +4,19 @@ import { eq, sql } from "drizzle-orm";
 
 const DEFAULT_SINGLETON_KEY = "default";
 
+// Hard ceiling on how far ahead the instance-wide park may ever reach. Equal to
+// the 5h ceiling `buildNoOpDispatchRetrySchedule` uses for the per-agent retry
+// ladder (the longest real Claude usage-limit cycle). The adapter's reset parser
+// rolls a dated reset whose day already passed to NEXT YEAR, so an unbounded park
+// could freeze every agent in every company for ~365 days with no exit. A park
+// clamped below the real reset is harmless: the fleet re-arms it on the next
+// limit result.
+export const USAGE_LIMIT_PARK_MAX_HORIZON_MS = 5 * 60 * 60 * 1000;
+
+export function clampUsageLimitParkUntil(parkedUntil: Date, now: Date): Date {
+  return new Date(Math.min(parkedUntil.getTime(), now.getTime() + USAGE_LIMIT_PARK_MAX_HORIZON_MS));
+}
+
 export interface UsageLimitParkState {
   parked: boolean;
   parkedUntil: Date | null;
@@ -52,10 +65,25 @@ export function usageLimitParkService(db: Db) {
       .then((rows) => rows[0] ?? null);
   }
 
-  return {
-    getState: async (now = new Date()): Promise<UsageLimitParkState> => toState(await getRow(), now),
+  // Caps a stored parkedUntil that is beyond the horizon (e.g. written by a
+  // build without the clamp). Idempotent: a second call finds nothing to cap.
+  async function getBoundedRow(now: Date) {
+    const row = await getRow();
+    if (!row?.parkedUntil) return row;
+    const capped = clampUsageLimitParkUntil(row.parkedUntil, now);
+    if (capped.getTime() >= row.parkedUntil.getTime()) return row;
+    const [updated] = await db
+      .update(usageLimitParks)
+      .set({ parkedUntil: capped, updatedAt: now })
+      .where(eq(usageLimitParks.singletonKey, DEFAULT_SINGLETON_KEY))
+      .returning();
+    return updated ?? row;
+  }
 
-    isParked: async (now = new Date()): Promise<boolean> => (await toState(await getRow(), now)).parked,
+  return {
+    getState: async (now = new Date()): Promise<UsageLimitParkState> => toState(await getBoundedRow(now), now),
+
+    isParked: async (now = new Date()): Promise<boolean> => (await toState(await getBoundedRow(now), now)).parked,
 
     // Extends the park rather than shortening it: a raced/duplicate limit hit
     // reporting an earlier (e.g. undated fallback) reset must never pull the
@@ -67,11 +95,14 @@ export function usageLimitParkService(db: Db) {
       sourceRunId: string | null;
     }): Promise<UsageLimitParkState> => {
       const now = new Date();
+      const ceilingIso = new Date(now.getTime() + USAGE_LIMIT_PARK_MAX_HORIZON_MS).toISOString();
+      const parkedUntil = clampUsageLimitParkUntil(input.parkedUntil, now);
+      const parkedUntilIso = parkedUntil.toISOString();
       const [row] = await db
         .insert(usageLimitParks)
         .values({
           singletonKey: DEFAULT_SINGLETON_KEY,
-          parkedUntil: input.parkedUntil,
+          parkedUntil,
           reason: input.reason,
           rawLimitText: input.rawLimitText,
           sourceRunId: input.sourceRunId,
@@ -86,7 +117,8 @@ export function usageLimitParkService(db: Db) {
             // bare `Date` here reaches postgres.js as an unencoded object
             // (`TypeError: ... Received an instance of Date`). Pass the ISO
             // string explicitly and cast it at the SQL level instead.
-            parkedUntil: sql`greatest(coalesce(${usageLimitParks.parkedUntil}, ${input.parkedUntil.toISOString()}::timestamptz), ${input.parkedUntil.toISOString()}::timestamptz)`,
+            // least(..., ceiling) also caps a far-future value already stored.
+            parkedUntil: sql`least(greatest(coalesce(${usageLimitParks.parkedUntil}, ${parkedUntilIso}::timestamptz), ${parkedUntilIso}::timestamptz), ${ceilingIso}::timestamptz)`,
             reason: input.reason,
             rawLimitText: input.rawLimitText,
             sourceRunId: input.sourceRunId,
@@ -100,15 +132,18 @@ export function usageLimitParkService(db: Db) {
     // Clears the park early — called on the first successful run so a stale
     // park set from an earlier (possibly mis-parsed) reset time cannot outlive
     // the real limit. A no-op if nothing is currently parked.
-    clear: async (input: { reason: string }): Promise<void> => {
-      await db
+    clear: async (input: { reason: string }): Promise<UsageLimitParkState> => {
+      const now = new Date();
+      const [row] = await db
         .update(usageLimitParks)
         .set({
           parkedUntil: null,
           reason: input.reason,
-          updatedAt: new Date(),
+          updatedAt: now,
         })
-        .where(eq(usageLimitParks.singletonKey, DEFAULT_SINGLETON_KEY));
+        .where(eq(usageLimitParks.singletonKey, DEFAULT_SINGLETON_KEY))
+        .returning();
+      return toState(row ?? null, now);
     },
   };
 }

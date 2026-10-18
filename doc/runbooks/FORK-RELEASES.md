@@ -112,6 +112,16 @@ the published script (only the URL lines may differ) and then fetches and
 checksums every artifact the twin would download, from the mirror alone,
 with no GitHub access.
 
+Published scripts may carry trailing inline comments on assignment lines
+(`TARGET="2026.824.1-fork.42"   # what we restore`, as shipped on
+v2026.907.1-fork.43). The resolver takes only the quoted value, so comments
+never leak into resolved artifact names. Reference discovery is
+deliberately an over-approximation: every release-download URL in a script
+counts as a reference, including URLs inside comments (a comment URL
+pointing at the script's own release is skipped as a self-reference).
+Unit tests: `node --test scripts/mirror-fork-release.test.mjs` (also run in
+CI on every PR).
+
 ## Rollback when GitHub is down or the release was deleted
 
 This is the scenario the mirror exists for.

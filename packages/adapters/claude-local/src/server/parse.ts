@@ -29,7 +29,7 @@ const CLAUDE_TRANSIENT_UPSTREAM_RE =
 // alternative covers gateway phrasings like "Weekly/Monthly Limit Exhausted"
 // where no specific limit word directly precedes "limit".
 const CLAUDE_EXTRA_USAGE_RESET_RE =
-  /(?:out\s+of\s+extra\s+usage|extra\s+usage|claude\s+usage\s+limit(?:\s+reached)?|usage\s+cap(?:\s+reached)?|(?:5[-\s]?hour|weekly|session|usage)\s+limit(?:\s+reached)?|\blimit\s+exhausted\b)[\s\S]{0,80}?\bresets?\s+(?:at\s+)?([^\n()]+?)(?:\s*\(([^)]+)\))?(?:[.!]|\n|$)/i;
+  /(?:you(?:'|’)ve\s+hit\s+your\s+(?:\w+\s+)?limit|out\s+of\s+extra\s+usage|extra\s+usage|claude\s+usage\s+limit(?:\s+reached)?|usage\s+cap(?:\s+reached)?|(?:5[-\s]?hour|weekly|session|usage)\s+limit(?:\s+reached)?|\blimit\s+exhausted\b)[\s\S]{0,80}?\bresets?\s+(?:at\s+)?([^\n()]+?)(?:\s*\(([^)]+)\))?(?:[.!]|\n|$)/i;
 // GLM/z.ai-style gateways state the reset as an absolute wall-clock timestamp
 // ("Weekly/Monthly Limit Exhausted ... limit will reset at 2026-08-27 12:31:10")
 // instead of Anthropic's "resets Jul 31, 8am (UTC)" clock phrasing. The
@@ -41,7 +41,7 @@ const CLAUDE_ABSOLUTE_LIMIT_RESET_RE =
   /\b(?:limit|quota|cap|usage)[\s\S]{0,120}?\b(?:will\s+)?resets?\s+(?:at\s+)?(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\s*(?:Z|UTC))?)/i;
 
 const CLAUDE_PROVIDER_QUOTA_RE =
-  /(?:you(?:'|’)ve\s+hit\s+your\s+session\s+limit|session\s+limit\s+(?:reached|exceeded)|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached|servicequotaexceededexception)/i;
+  /(?:you(?:'|’)ve\s+hit\s+your\s+(?:\w+\s+)?limit|session\s+limit\s+(?:reached|exceeded)|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached|servicequotaexceededexception)/i;
 const CLAUDE_MODEL_NOT_FOUND_RE =
   /(?:\b404\b[\s\S]{0,120})?(?:model[\s_-]*(?:not[\s_-]*found|does not exist|unknown|invalid)|unknown[\s_-]*model)/i;
 

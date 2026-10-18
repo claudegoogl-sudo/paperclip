@@ -43,6 +43,7 @@
             "pages": [
               "guides/board-operator/dashboard",
               "guides/board-operator/creating-a-company",
+              "guides/board-operator/editing-first-task-texts",
               "guides/board-operator/managing-agents",
               "guides/board-operator/org-structure",
               "guides/board-operator/managing-tasks",
@@ -58,6 +59,7 @@
               "guides/board-operator/activity-log",
               "guides/board-operator/secret-egress-allowlists",
               "guides/board-operator/task-bridge-keys",
+              "guides/board-operator/notify-only-keys",
               "guides/board-operator/importing-and-exporting"
             ]
           },
@@ -65,6 +67,7 @@
             "group": "Agent Developer",
             "pages": [
               "guides/agent-developer/how-agents-work",
+              "guides/agent-developer/agent-git-identity",
               "guides/agent-developer/heartbeat-protocol",
               "guides/agent-developer/writing-a-skill",
               "guides/agent-developer/skills-store",
@@ -90,7 +93,10 @@
               "deploy/database",
               "deploy/secrets",
               "deploy/storage",
-              "deploy/environment-variables"
+              "deploy/environment-variables",
+              "deploy/manual-run-row-reap-runbook",
+              "deploy/instance-admission-hold",
+              "deploy/usage-limit-park"
             ]
           }
         ]
