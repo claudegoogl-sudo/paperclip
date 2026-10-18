@@ -11,6 +11,19 @@ function optionalQueryString(value: unknown, field: string) {
   return value.trim();
 }
 
+/**
+ * Board-only `GET /companies/:companyId/attention` route: a cursor-paginated
+ * feed of items needing the signed-in board user's attention for the given
+ * company (requires company access plus a signed-in board user; `assertBoard`
+ * + `req.actor.userId`).
+ *
+ * Query filters: `includeDismissed`/`archived`/`all` toggle which items are
+ * eligible; `activitySince`/`activityUntil` bound the feed by activity time;
+ * `queue` filters to a named queue; `sort` is `"activity"` or `"decide"`
+ * (rejected otherwise); `cursor`/`limit` page the results. `all=true` also
+ * lifts the service's default per-user scoping (`allowUnscopedAll`), so the
+ * feed can return items not owned by the caller.
+ */
 export function attentionRoutes(db: Db) {
   const router = Router();
   const svc = attentionService(db);
