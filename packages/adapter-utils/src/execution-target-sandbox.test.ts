@@ -4537,6 +4537,66 @@ describe("sandbox adapter execution targets", () => {
     }
   }, 20000);
 
+  it("does not leak an unhandled rejection when onLog rejects while reporting a lost channel", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-http2-loss-onlog-"));
+    cleanupDirs.push(rootDir);
+    const remoteCwd = path.join(rootDir, "workspace");
+    await mkdir(remoteCwd, { recursive: true });
+    const api = await startRecordingApiServer();
+    const sessionRef: { current: http2.ClientHttp2Session | null } = { current: null };
+    let emitExit: (() => void) | null = null;
+    const { runner } = makeHttp2SelectionRunner((ctx) => {
+      emitExit = ctx.emitExit;
+      ctx.emitReady();
+      sessionRef.current = ctx.connectHttp2();
+    });
+    const target: AdapterSandboxExecutionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "daytona",
+      remoteCwd,
+      timeoutMs: 30_000,
+      runner,
+      effectiveCapabilities: duplexCapabilities(true),
+    };
+    const lossLogs: string[] = [];
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+
+    const bridge = await startAdapterExecutionTargetPaperclipBridge({
+      runId: "run-loss-onlog",
+      target,
+      runtimeRootDir: path.join(remoteCwd, ".paperclip-runtime", "codex"),
+      adapterKey: "codex",
+      hostApiToken: "real-run-jwt",
+      hostApiUrl: api.origin,
+      enableSandboxDuplexBridge: true,
+      onLog: async (_stream, chunk) => {
+        if (chunk.includes("HTTP/2 channel lost")) {
+          lossLogs.push(chunk);
+          throw new Error("onLog sink failed");
+        }
+      },
+    });
+    try {
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("http2_v1");
+      await waitForCondition(() => sessionRef.current !== null, "the http2 client session to open", 4000);
+      emitExit!();
+      await waitForCondition(() => lossLogs.length > 0, "the host to log the channel loss", 4000);
+      // Give a leaked rejection time to surface on the process.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+      sessionRef.current?.close();
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 20000);
+
   it("keeps serving the request path when the telemetry recorder throws", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-http2-guard-"));
     cleanupDirs.push(rootDir);
