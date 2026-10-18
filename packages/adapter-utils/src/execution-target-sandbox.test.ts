@@ -611,6 +611,49 @@ describe("sandbox adapter execution targets", () => {
     }
   }, 10_000);
 
+  it("does not raise an unhandled rejection when onLog rejects while reporting a poll failure", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-poll-onlog-reject-"));
+    cleanupDirs.push(rootDir);
+    const delegate = createLocalSandboxRunner();
+    let failPolls = false;
+    let failedPolls = 0;
+    let onLogCalls = 0;
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", onUnhandled);
+    const bridge = await startAdapterExecutionTargetProcessSessionBridge({
+      runId: "poll-onlog-reject", adapterKey: "acpx", runtimeRootDir: rootDir,
+      target: {
+        kind: "remote", transport: "sandbox", providerKey: "local-test", remoteCwd: rootDir,
+        runner: { execute: async (input) => {
+          if (failPolls && !input.useSession) {
+            failedPolls += 1;
+            throw new Error("sandbox exec failed");
+          }
+          return delegate.execute(input);
+        } },
+      },
+      command: process.execPath, args: [], cwd: rootDir, env: {}, timeoutSec: 5,
+      onLog: async () => {
+        if (!failPolls) return;
+        onLogCalls += 1;
+        throw new Error("run log persistence failed");
+      },
+    });
+    try {
+      failPolls = true;
+      await waitForCondition(() => onLogCalls >= 1, "poll failure should be reported through onLog", 3000);
+      // Give a would-be unhandled rejection time to surface on the event loop.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(failedPolls).toBeGreaterThanOrEqual(1);
+      expect(unhandled).toEqual([]);
+    } finally {
+      failPolls = false;
+      process.off("unhandledRejection", onUnhandled);
+      await bridge?.stop();
+    }
+  }, 10_000);
+
   it("removes an incomplete private command payload when upload fails", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-payload-upload-error-"));
     cleanupDirs.push(rootDir);

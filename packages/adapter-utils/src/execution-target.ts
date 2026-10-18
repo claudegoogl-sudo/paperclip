@@ -2355,7 +2355,7 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await onLog("stderr", `[paperclip] ACP process session bridge poll failed: ${message}\n`);
+      logFailureWithoutWaiting(`[paperclip] ACP process session bridge poll failed: ${message}\n`);
       deliverRemoteEvent({ type: "error", message });
       return;
     } finally {
