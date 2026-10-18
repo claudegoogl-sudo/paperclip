@@ -1,0 +1,48 @@
+name: Fork Master Verify Guard
+
+# Guards the fork's push-to-master Release verification against silent upstream
+# drift. Upstream release.yml gates verify_canary on
+# github.repository == 'paperclipai/paperclip', which is always false on this
+# fork; merging that form leaves every push-to-master Release run with all jobs
+# skipped, so a fork master push gets no conclusive verification. This happened
+# on the v2026.1005.0 sync (master HEAD left unverified; see the fork master CI
+# watchdog).
+#
+# scripts/fork-release/fork-master-verify.mjs asserts the fork delta is
+# intact: verify_canary is push-triggered and calls release-verify.yml, and
+# publish_canary keeps the upstream repository gate. A sync PR that reverts the
+# delta fails here and must restore it before merging.
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - ".github/workflows/fork-master-verify-guard.yml"
+      - "scripts/fork-release/fork-master-verify.mjs"
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/release.yml"
+      - "scripts/fork-release/fork-master-verify.mjs"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Fork release verify delta intact
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Check fork master verify delta
+        run: node scripts/fork-release/fork-master-verify.mjs .github/workflows/release.yml
