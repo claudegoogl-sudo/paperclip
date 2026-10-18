@@ -5056,7 +5056,11 @@ export async function runChildProcess(
           if (timeout) clearTimeout(timeout);
           clearTerminalCleanupTimers();
           runningProcesses.delete(runId);
-          void target.cleanup?.();
+          void Promise.resolve()
+            .then(() => target.cleanup?.())
+            .catch((cleanupErr) =>
+              onLogError(cleanupErr, runId, "failed to clean up spawn target"),
+            );
           const errno = (err as NodeJS.ErrnoException).code;
           const pathValue = mergedEnv.PATH ?? mergedEnv.Path ?? "";
           const msg =
@@ -5079,6 +5083,9 @@ export async function runChildProcess(
             void logChain.finally(() => {
               void Promise.resolve()
                 .then(() => target.cleanup?.())
+                .catch((cleanupErr) =>
+                  onLogError(cleanupErr, runId, "failed to clean up spawn target"),
+                )
                 .finally(() => {
                   resolve({
                     exitCode: code,
