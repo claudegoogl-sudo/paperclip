@@ -493,7 +493,7 @@ export function routineRoutes(
     const routine = await getAccessibleResource(req, res, svc.get(req.params.id as string), "Routine not found");
     if (!routine) return;
     const limit = Number(req.query.limit ?? 50);
-    const result = await svc.listRuns(routine.id, Number.isFinite(limit) ? limit : 50);
+    const result = await svc.listRuns(routine.id, Number.isFinite(limit) ? Math.floor(limit) : 50);
     res.json(result);
   });
 
