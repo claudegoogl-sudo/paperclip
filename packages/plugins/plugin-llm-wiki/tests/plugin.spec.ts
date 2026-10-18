@@ -3717,6 +3717,52 @@ Duplicate headings receive stable suffixes.
     )).toBe(true);
   });
 
+  it("logs instead of leaking unhandled rejections when query terminal-event host calls fail", async () => {
+    const harness = createTestHarness({ manifest });
+    harness.seed({ agents: [wikiMaintainerAgent()] });
+    await plugin.definition.setup(harness.ctx);
+
+    const result = await harness.performAction<{ sessionId: string; runId: string }>("start-query", {
+      companyId: COMPANY_ID,
+      question: "Which files own wiki behavior?",
+    });
+
+    harness.ctx.db.execute = async () => {
+      throw new Error("db unavailable");
+    };
+    harness.ctx.issues.createComment = async () => {
+      throw new Error("comment failed");
+    };
+    harness.ctx.issues.update = async () => {
+      throw new Error("issue gone");
+    };
+
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      harness.simulateSessionEvent(result.sessionId, {
+        runId: result.runId,
+        seq: 1,
+        eventType: "done",
+        stream: "system",
+        message: "Run completed",
+        payload: null,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+
+    expect(unhandled).toEqual([]);
+    const steps = harness.logs
+      .filter((entry) => entry.level === "warn" && entry.message === "LLM Wiki query terminal step failed")
+      .map((entry) => (entry.meta as { step: string }).step);
+    expect(steps.sort()).toEqual(["comment on issue", "mark operation", "update issue", "update query session"]);
+  });
+
   it("files a streamed query answer as a page through a hidden file-as-page operation", async () => {
     const harness = createTestHarness({ manifest });
     harness.seed({ agents: [wikiMaintainerAgent()] });
