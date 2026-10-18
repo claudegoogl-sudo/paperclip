@@ -14,6 +14,13 @@ on:
         required: true
         default: "dev"
 
+concurrency:
+  # One build/sign/push per resolved image version at a time: a second push
+  # or dispatch for the same version must queue behind it, not race it onto
+  # the same registry tag mid-sign.
+  group: agent-runtime-images-${{ github.event.inputs.version || format('git-{0}', github.sha) }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
   packages: write
@@ -36,6 +43,7 @@ jobs:
     # commitperclip review job in pr.yml.)
     if: github.repository == 'paperclipai/paperclip'
     runs-on: ubuntu-22.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
