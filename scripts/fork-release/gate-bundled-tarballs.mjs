@@ -49,7 +49,9 @@ function readJson(path) {
 }
 
 function tarEntries(tarballPath) {
-  const list = spawnSync("tar", ["-tzf", tarballPath], { encoding: "utf8" });
+  // The server tarball listing exceeds the 1 MB default maxBuffer; an overflow
+  // makes spawnSync fail with an empty message.
+  const list = spawnSync("tar", ["-tzf", tarballPath], { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
   if (list.status !== 0) throw new Error(`tar -tzf failed for ${tarballPath}: ${list.stderr}`);
   return list.stdout.split("\n").filter((line) => line.length > 0);
 }

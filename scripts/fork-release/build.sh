@@ -39,6 +39,12 @@ done
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
 SCRIPT_DIR="$REPO_ROOT/scripts/fork-release"
+# Normalise --out to a path relative to the repo root: later steps join it as
+# "$REPO_ROOT/$OUT", so an absolute path would be nested under the repo and
+# npm pack would fail with ENOENT.
+case "$OUT" in
+  /*) OUT="$(realpath -m --relative-to="$REPO_ROOT" "$OUT")" ;;
+esac
 
 echo "===== fork-release build $VERSION ====="
 echo "HEAD: $(git rev-parse HEAD)"
