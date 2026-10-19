@@ -40,7 +40,10 @@ const {
     // only invoked lazily by the tool-health sweep probe, so a stub suffices.
     app: Object.assign((_: unknown, __: unknown) => {}, {
       locals: {
-        toolGateway: { sweepActionReviews: vi.fn(async () => ({ scanned: 0 })) },
+        toolGateway: {
+          sweepActionReviews: vi.fn(async () => ({ scanned: 0 })),
+          cleanupExpiredSessions: vi.fn(async () => ({ deletedCount: 0 })),
+        },
         toolActionDeliveries: { sweepPending: vi.fn(async () => ({ scanned: 0, delivered: 0 })) },
       },
     }),

@@ -24,10 +24,10 @@ describe("loadDefaultAgentInstructionsBundle", () => {
     expect(bundle["AGENTS.md"]!.length).toBeGreaterThan(0);
   });
 
-  it("loads all four files of the ceo bundle with non-empty content", async () => {
+  it("loads the ceo bundle (AGENTS.md only, per upstream #14985) with non-empty content", async () => {
     const bundle = await loadDefaultAgentInstructionsBundle("ceo");
     expect(Object.keys(bundle).sort()).toEqual(
-      ["AGENTS.md", "HEARTBEAT.md", "SOUL.md", "TOOLS.md"].sort(),
+      ["AGENTS.md"],
     );
     for (const fileName of Object.keys(bundle)) {
       expect(bundle[fileName]!.length).toBeGreaterThan(0);

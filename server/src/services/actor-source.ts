@@ -11,7 +11,7 @@ import { forbidden } from "../errors.js";
  * validate the source it was actually authenticated with and deny otherwise —
  * the most privileged sources are never a fallback.
  */
-export const BOARD_ACTOR_SOURCES = ["local_implicit", "session", "board_key", "cloud_tenant"] as const;
+export const BOARD_ACTOR_SOURCES = ["local_implicit", "session", "board_key", "cloud_tenant", "mcp_oauth"] as const;
 export const AGENT_ACTOR_SOURCES = ["agent_key", "agent_jwt"] as const;
 
 export type BoardActorSource = (typeof BOARD_ACTOR_SOURCES)[number];
@@ -26,7 +26,7 @@ export function requireBoardActorSource(source: unknown): BoardActorSource {
     if (source === candidate) return candidate;
   }
   throw forbidden(
-    "Board actor source is required for actor synthesis and must be one of: local_implicit, session, board_key, cloud_tenant",
+    "Board actor source is required for actor synthesis and must be one of: local_implicit, session, board_key, cloud_tenant, mcp_oauth",
   );
 }
 
