@@ -5790,6 +5790,27 @@ export function recoveryService(
           }
         }
 
+        // Routine-created issues: a successful run that left the issue unset is done.
+        if (issue.originKind === "routine_execution") {
+          const closed = await issuesSvc.update(issue.id, { status: "done" });
+          if (closed) {
+            await logActivity(db, {
+              companyId: issue.companyId,
+              actorType: "system",
+              actorId: "system",
+              agentId: null,
+              runId: null,
+              action: "issue.successful_run_handoff_routine_auto_closed",
+              entityType: "issue",
+              entityId: issue.id,
+              details: { identifier: issue.identifier },
+            });
+            result.issueIds.push(issue.id);
+            result.skipped += 1;
+            continue;
+          }
+        }
+
         // Fallback A: a run that ended while waiting on CI/build/unit gets a bounded
         // monitor instead of a silent `blocked` dead end.
         if (issue.assigneeAgentId && !issue.monitorNextCheckAt) {
