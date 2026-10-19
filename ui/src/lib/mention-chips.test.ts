@@ -146,19 +146,19 @@ describe("mentionChipInlineStyle", () => {
     });
   });
 
-  it("sets an icon mask CSS var for an agent mention", () => {
-    const style = mentionChipInlineStyle({ kind: "agent", agentId: "agent-1", icon: "rocket" });
+  it("sets an avatar image CSS var for an agent mention", () => {
+    const style = mentionChipInlineStyle({ kind: "agent", agentId: "agent-1", icon: "code" });
     expect(style).toBeDefined();
-    const iconMask = (style as Record<string, unknown>)["--paperclip-mention-icon-mask"];
-    expect(typeof iconMask).toBe("string");
-    expect(iconMask as string).toMatch(/^url\("data:image\/svg\+xml,/);
+    const avatar = (style as Record<string, unknown>)["--paperclip-mention-avatar-image"];
+    expect(typeof avatar).toBe("string");
+    expect(avatar as string).toMatch(/^url\("/);
   });
 
-  it("still produces an icon mask for an agent mention with an unknown/null icon (falls back to default icon)", () => {
+  it("still produces an avatar image for an agent mention with an unknown/null icon", () => {
     const style = mentionChipInlineStyle({ kind: "agent", agentId: "agent-1", icon: null });
     expect(style).toBeDefined();
     expect(
-      typeof (style as Record<string, unknown>)["--paperclip-mention-icon-mask"],
+      typeof (style as Record<string, unknown>)["--paperclip-mention-avatar-image"],
     ).toBe("string");
   });
 });
