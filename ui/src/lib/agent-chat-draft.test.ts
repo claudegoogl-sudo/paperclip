@@ -104,7 +104,7 @@ describe("agentChatDraft", () => {
     expect(first.labels).not.toBe(second.labels);
     expect(first.documentSummaries).not.toBe(second.documentSummaries);
 
-    first.labels.push({ id: "l1", companyId: "company-1", name: "x", color: "#000" } as never);
+    first.labels!.push({ id: "l1", companyId: "company-1", name: "x", color: "#000" } as never);
     expect(second.labels).toEqual([]);
   });
 });

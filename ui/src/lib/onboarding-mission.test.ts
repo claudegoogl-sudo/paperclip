@@ -25,7 +25,7 @@ function makeGoal(overrides: Partial<Goal> & { id: string }): Goal {
 describe("selectExistingCompanyMission", () => {
   it("returns an empty mission when there is no company-level goal", () => {
     const goals: Goal[] = [
-      makeGoal({ id: "g1", level: "project", title: "Ship the thing" }),
+      makeGoal({ id: "g1", level: "task", title: "Ship the thing" }),
     ];
 
     expect(selectExistingCompanyMission(goals)).toEqual({ goalId: null, goalInput: "" });
