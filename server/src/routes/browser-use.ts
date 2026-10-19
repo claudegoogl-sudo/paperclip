@@ -6,7 +6,6 @@ import {
   browserUseSettingsSchema,
   browserUseViewportSchema,
   browserUseViewerSchema,
-  isUuidLike,
 } from "@paperclipai/shared";
 import {
   assertBoard,
@@ -17,13 +16,16 @@ import {
 import { notFound } from "../errors.js";
 import { browserUseService } from "../services/browser-use.js";
 
+// Any canonical PostgreSQL uuid (incl. v7 and nil); shared isUuidLike only accepts v1-5.
+const CANONICAL_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export function browserUseRoutes(db: Db, service = browserUseService(db)) {
   const router = Router();
   router.use("/issues/:issueId/browsers", async (req, res, next) => {
     assertBoard(req);
     const issueId = req.params.issueId;
     // PostgreSQL rejects malformed uuid input, and isUuidLike tolerates whitespace.
-    if (!isUuidLike(issueId) || issueId !== issueId.trim())
+    if (!CANONICAL_UUID_RE.test(issueId))
       throw notFound("Task not found");
     const [issue] = await db
       .select({ companyId: issues.companyId })
