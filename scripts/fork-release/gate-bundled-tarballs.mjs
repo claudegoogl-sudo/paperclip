@@ -28,13 +28,33 @@ const repoRoot = resolve(scriptDir, "..", "..");
 // `test(tarballEntryReader)` receives the bundled dep's directory inside the
 // extracted package and must throw if the patch content is missing.
 const PATCH_MARKERS = {
-  acpx: (readEntry) => {
+  acpx: (readEntry, listEntries) => {
     // The persisted-key-policy exemption that fixes the fork.37
-    // claude_local ensure_session outage (sessionOptions.env).
-    const checkpoint = readEntry("dist/live-checkpoint-ClPCSdrW.js");
-    if (!/MAP_OBJECT_PATHS = \/\* @__PURE__ \*\/ new Set\(\[[^\]]*"acpx\.session_options\.env"/.test(checkpoint)) {
-      throw new Error("bundled acpx dist/live-checkpoint-ClPCSdrW.js is missing the acpx.session_options.env persisted-key-policy exemption (pristine registry copy?)");
+    // claude_local ensure_session outage (sessionOptions.env). The chunk file
+    // name carries a content hash that changes per acpx release, so find it.
+    const checkpoint = listEntries().find((name) => /^dist\/live-checkpoint-[^/]+\.js$/.test(name));
+    if (!checkpoint) throw new Error("bundled acpx has no dist/live-checkpoint-*.js chunk");
+    if (!/MAP_OBJECT_PATHS = \/\* @__PURE__ \*\/ new Set\(\[[^\]]*"acpx\.session_options\.env"/.test(readEntry(checkpoint))) {
+      throw new Error(`bundled acpx ${checkpoint} is missing the acpx.session_options.env persisted-key-policy exemption (pristine registry copy?)`);
     }
+  },
+  "@chat-adapter/discord": (readEntry) => {
+    if (!readEntry("dist/index.d.ts").includes("modalToDiscordPayload")) throw new Error("bundled @chat-adapter/discord is missing the modalToDiscordPayload patch marker (pristine registry copy?)");
+  },
+  "@chat-adapter/github": (readEntry) => {
+    if (!readEntry("dist/index.js").includes("safeGitHubMarkdownUrl")) throw new Error("bundled @chat-adapter/github is missing the safeGitHubMarkdownUrl patch marker (pristine registry copy?)");
+  },
+  "@chat-adapter/slack": (readEntry) => {
+    if (!readEntry("dist/index.js").includes("Paperclip received this command.")) throw new Error("bundled @chat-adapter/slack is missing the slash-command patch marker (pristine registry copy?)");
+  },
+  "@chat-adapter/teams": (readEntry) => {
+    if (!readEntry("dist/index.js").includes("function teamsErrorRecord")) throw new Error("bundled @chat-adapter/teams is missing the teamsErrorRecord patch marker (pristine registry copy?)");
+  },
+  "@chat-adapter/telegram": (readEntry) => {
+    if (!readEntry("dist/index.js").includes("TELEGRAM_API_TIMEOUT_MS")) throw new Error("bundled @chat-adapter/telegram is missing the TELEGRAM_API_TIMEOUT_MS patch marker (pristine registry copy?)");
+  },
+  "@discordjs/ws": (readEntry) => {
+    if (!readEntry("dist/defaultWorker.js").includes("connectionEpoch")) throw new Error("bundled @discordjs/ws is missing the connectionEpoch patch marker (pristine registry copy?)");
   },
   "embedded-postgres": (readEntry) => {
     const index = readEntry("dist/index.js");
@@ -49,7 +69,9 @@ function readJson(path) {
 }
 
 function tarEntries(tarballPath) {
-  const list = spawnSync("tar", ["-tzf", tarballPath], { encoding: "utf8" });
+  // The server tarball listing exceeds the 1 MB default maxBuffer; an overflow
+  // makes spawnSync fail with an empty message.
+  const list = spawnSync("tar", ["-tzf", tarballPath], { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
   if (list.status !== 0) throw new Error(`tar -tzf failed for ${tarballPath}: ${list.stderr}`);
   return list.stdout.split("\n").filter((line) => line.length > 0);
 }
@@ -129,7 +151,7 @@ export function checkBundledTarballs({ outDir, version, manifestPath, repoRoot: 
           const full = `${prefix}${relative}`;
           if (!entries.includes(full)) throw new Error(`bundled ${dep} is missing ${relative}`);
           return readTarballEntry(tarballPath, full);
-        });
+        }, () => bundledEntries.map((name) => name.slice(prefix.length)));
       } catch (error) {
         violations.push(`${pkg.name}: ${error.message}`);
       }
