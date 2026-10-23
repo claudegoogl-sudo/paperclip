@@ -121,7 +121,7 @@ make_twin() { # $1 source script $2 twin path
     echo "#"
     cat "$src"
   } > "$dst.tmp"
-  sed -E 's#^([A-Za-z_][A-Za-z0-9_]*)(="https://github\.com/[^"]+/releases/download/)([^/"]+)"$#\1="file://'"$MIRROR_DIR"'/\3/assets"#' \
+  sed -E 's#^([A-Za-z_][A-Za-z0-9_]*)(="https://github\.com/[^"]+/releases/download/)([^/"]+)(/[^"]*)?"$#\1="file://'"$MIRROR_DIR"'/\3/assets\4"#' \
     "$dst.tmp" > "$dst"
   rm -f "$dst.tmp"
 }
