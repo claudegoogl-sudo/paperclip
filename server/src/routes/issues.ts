@@ -556,6 +556,13 @@ function applyCreateIssueStatusDefault(
     return;
   }
 
+  // Idempotent: the cross-company create route falls through (next("route"))
+  // to the standard handler, which re-runs this middleware. Keep the first
+  // resolution so the defaulted reason is not rewritten as "explicit".
+  if (res.locals.createIssueStatusDefault) {
+    next();
+    return;
+  }
   const resolution = resolveCreateIssueStatusDefault(
     req.body as Record<string, unknown>,
   );
@@ -5172,7 +5179,7 @@ export function issueRoutes(
           });
         }
       } else {
-        const isWrite = op === "comment.create" || op === "issue.update";
+        const isWrite = op === "comment.create" || op === "issue.update" || op === "issue.create";
         if (isWrite) {
           // M10: write caps counted from the audit rows.
           const cap = await checkCrossCompanyWriteCap(crossCompanyDeps, decision.agentId, req.actor.runId ?? null);
@@ -11667,6 +11674,99 @@ export function issueRoutes(
     res.json({ ok: true });
   });
 
+  // Cross-company issue CREATE (double key). Only handles a foreign-company
+  // agent caller; everything else falls through to the standard handler below.
+  router.post(
+    "/companies/:companyId/issues",
+    applyCreateIssueStatusDefault,
+    validateIssueMutationBody(createIssueSchema),
+    async (req, res, next) => {
+      const companyId = req.params.companyId as string;
+      if (req.actor.type !== "agent" || hasCompanyAccess(req, companyId)) {
+        next("route");
+        return;
+      }
+      const decision = await decideCrossCompanyIssueAccess(req, companyId, "issue.create", crossCompanyDeps);
+      const newIssueId = randomUUID();
+      const auditBase = {
+        targetCompanyId: companyId,
+        homeCompanyId: req.actor.companyId ?? "",
+        agentId: req.actor.agentId ?? "",
+        runId: req.actor.runId ?? null,
+        issueId: newIssueId,
+        op: "issue.create" as const,
+        method: req.method,
+        route: req.route?.path ?? req.path,
+      };
+      if (!decision.allowed) {
+        // Standard handler produces the normal forbidden response.
+        if (
+          req.actor.agentId && req.actor.companyId &&
+          decision.reason !== "not_allowlisted" && decision.reason !== "same_company" && decision.reason !== "not_agent"
+        ) {
+          await recordCrossCompanyIssueAccess((row) => logActivity(db, row), {
+            ...auditBase, outcome: "denied", reason: decision.reason,
+          });
+        }
+        next("route");
+        return;
+      }
+      const cap = await checkCrossCompanyWriteCap(crossCompanyDeps, decision.agentId, req.actor.runId ?? null);
+      if (!cap.ok) {
+        await recordCrossCompanyIssueAccess((row) => logActivity(db, row), {
+          ...auditBase, outcome: "denied", reason: `rate_limited:${cap.scope}`,
+        });
+        res.status(429).json({ error: "Cross-company write limit reached", scope: cap.scope });
+        return;
+      }
+      if (!assertNoSecretPatternInWritePayload(req, res, [
+        { name: "title", value: req.body.title },
+        { name: "description", value: req.body.description },
+      ], { companyId })) return;
+      const body = req.body as Record<string, unknown>;
+      // Strip schema defaults the client did not choose; any non-default value
+      // of these (or any other field) still hits the allowlist guard below.
+      for (const [k, v] of [["workMode", "standard"], ["requestDepth", 0], ["allowDuplicate", false]] as const) {
+        if (body[k] === v) delete body[k];
+      }
+      const guard = await checkCrossCompanyPatch(body, companyId, decision.agentId, crossCompanyPatchLookups);
+      if (!guard.ok) {
+        await recordCrossCompanyIssueAccess((row) => logActivity(db, row), {
+          ...auditBase, outcome: "denied", reason: `invalid_field:${guard.field}`,
+        });
+        res.status(guard.status).json({ error: guard.error, field: guard.field });
+        return;
+      }
+      const d = await crossCompanyDeps.describeActor(decision.agentId, decision.homeCompanyId);
+      const marker = crossCompanyMarker(d.agentName, d.homeKey, req.actor.runId ?? null);
+      const description = withCrossCompanyMarker(marker, typeof body.description === "string" ? body.description : "");
+      const createInput: Record<string, unknown> = {};
+      for (const k of guard.changedFields) createInput[k] = body[k];
+      const issue = await svc.create(companyId, {
+        ...createInput,
+        description,
+        id: newIssueId,
+        createdByAgentId: decision.agentId,
+        createdByUserId: null,
+        originRunId: req.actor.runId ?? null,
+        actorRunId: req.actor.runId ?? null,
+      } as Parameters<typeof svc.create>[1]);
+      await recordCrossCompanyIssueAccess((row) => logActivity(db, row), {
+        ...auditBase, issueId: issue.id, outcome: "allowed", changedFields: guard.changedFields,
+      });
+      void queueIssueAssignmentWakeup({
+        heartbeat,
+        issue,
+        reason: "issue_assigned",
+        mutation: "create",
+        contextSource: "issue.create",
+        requestedByActorType: "agent",
+        requestedByActorId: decision.agentId,
+      });
+      res.status(201).json(issue);
+    },
+  );
+
   router.post(
     "/companies/:companyId/issues",
     applyCreateIssueStatusDefault,
@@ -13546,7 +13646,7 @@ export function issueRoutes(
         });
       }
       if (assigneeWillChange && !transition.workflowControlledAssignment) {
-        if (!isAgentReturningIssueToCreator) {
+        if (!isAgentReturningIssueToCreator && !crossCompanyPatch) {
           await assertCanAssignTasks(req, existing.companyId, {
             issueId: existing.id,
             projectId: await resolveAssignmentProjectId({
