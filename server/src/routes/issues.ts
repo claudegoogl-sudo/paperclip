@@ -556,6 +556,13 @@ function applyCreateIssueStatusDefault(
     return;
   }
 
+  // Idempotent: the cross-company create route falls through (next("route"))
+  // to the standard handler, which re-runs this middleware. Keep the first
+  // resolution so the defaulted reason is not rewritten as "explicit".
+  if (res.locals.createIssueStatusDefault) {
+    next();
+    return;
+  }
   const resolution = resolveCreateIssueStatusDefault(
     req.body as Record<string, unknown>,
   );

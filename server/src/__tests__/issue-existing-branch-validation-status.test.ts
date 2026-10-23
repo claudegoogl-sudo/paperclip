@@ -203,9 +203,11 @@ describe("existingBranch issue mutation route registrations", () => {
           source.matchAll(new RegExp(`\\b(validate(?:IssueMutationBody)?)\\(${schema}\\)`, "g")),
           (match) => match[1],
         );
-        expect(validators, `${schema} must use validateIssueMutationBody at every route registration`).toEqual([
-          "validateIssueMutationBody",
-        ]);
+        expect(validators.length, `${schema} must be registered at least once`).toBeGreaterThan(0);
+        expect(
+          validators.every((v) => v === "validateIssueMutationBody"),
+          `${schema} must use validateIssueMutationBody at every route registration`,
+        ).toBe(true);
       }
     }
   });
