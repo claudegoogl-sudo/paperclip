@@ -772,6 +772,8 @@ const SERVICE_SCOPE_COMPANY_METHODS: ReadonlySet<WorkerToHostMethodName> = new S
   "state.get",
   "state.set",
   "state.delete",
+  "issues.get",
+  "issues.update",
   "issues.createComment",
   "issues.resolveInteraction",
   "artifacts.create",
@@ -1398,7 +1400,19 @@ export function createHostClientHandlers(
     "issues.create": gated("issues.create", async (params) => {
       return services.issues.create(params);
     }),
-    "issues.update": gated("issues.update", async (params) => {
+    "issues.update": gated("issues.update", async (params, context) => {
+      // Service-scope (no host-pinned dispatch company) callers may only change
+      // `status`; every other field needs a dispatch-pinned invocation scope.
+      if (!readNonEmptyString(context?.invocationScope?.companyId)) {
+        const keys = isRecord(params.patch) ? Object.keys(params.patch) : [];
+        if (keys.length === 0 || keys.some((k) => k !== "status")) {
+          throw new InvocationScopeDeniedError(
+            pluginId,
+            "issues.update",
+            "service-scope issues.update is limited to a status-only patch",
+          );
+        }
+      }
       return services.issues.update(params);
     }),
     "issues.relations.get": gated("issues.relations.get", async (params) => {

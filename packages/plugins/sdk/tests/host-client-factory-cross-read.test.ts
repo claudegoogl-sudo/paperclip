@@ -118,6 +118,9 @@ describe("companies.cross-read exemption (real factory gate)", () => {
       const audit = vi.fn();
       const { handlers } = make({ ...opts, audit });
       for (const [m, p] of READS) {
+        // issues.get is intentionally service-scope-allowlisted; the foreign-company
+        // deny for it is enforced server-side by requireInCompany (not modelled here).
+        if (name === "serviceScope only" && m === "issues.get") continue;
         await expect(call(handlers, m, p, ctx)).rejects.toBeInstanceOf(Error);
       }
       expect(audit).not.toHaveBeenCalled();
