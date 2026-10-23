@@ -182,6 +182,7 @@ test("make_twin rewrites a release URL that carries a trailing filename (RB_URL 
       [
         'MIRROR_DIR="$PWD/mirror"',
         "make_twin rb.sh twin.sh",
+        "assert_twin_structure rb.sh twin.sh",
         'grep -q "^RB_URL=\\"file://$PWD/mirror/v1-fork.70/assets/install.sh\\"$" twin.sh',
         "! grep -q '^RB_URL=.*github' twin.sh",
         'echo "rb-ok"',
