@@ -334,6 +334,18 @@ describe("cross-company issue access over HTTP", () => {
     expect((await request(await createApp(actor(CONCIERGE))).post(`/api/issues/${ISSUE_ID}/comments`).send({ body: "hi", reopen: true })).status).toBe(422);
   });
 
+  it("POST comment on a foreign issue assigned to another agent: 201 for allowlisted, 404 for control", async () => {
+    for (const status of ["in_progress", "done"]) {
+      const assigned = () => ({ ...foreign(), status, assigneeAgentId: "77777777-7777-4777-8777-777777777777" });
+      mockIssueService.getById.mockResolvedValue(assigned());
+      mockIssueService.getByIdForUpdate.mockImplementation(async () => assigned());
+      const ok = await request(await createApp(actor(CONCIERGE))).post(`/api/issues/${ISSUE_ID}/comments`).send({ body: "hi" });
+      if (ok.status !== 201) console.log("ASSIGNEDBODY", status, JSON.stringify(ok.body));
+      expect(ok.status).toBe(201);
+      expect((await request(await createApp(actor(CONTROL))).post(`/api/issues/${ISSUE_ID}/comments`).send({ body: "hi" })).status).toBe(404);
+    }
+  });
+
   it("PATCH: allowed with both keys, denied otherwise", async () => {
     const pr = await request(await createApp(actor(CONCIERGE))).patch(`/api/issues/${ISSUE_ID}`).send({ title: "n" });
     if (pr.status !== 200) console.log("PATCHBODY", JSON.stringify(pr.body));
