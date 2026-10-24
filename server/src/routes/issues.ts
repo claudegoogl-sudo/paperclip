@@ -17930,7 +17930,8 @@ export function issueRoutes(
         req.actor.type === "agent" &&
         issue.assigneeAgentId !== null &&
         issue.assigneeAgentId !== req.actor.agentId &&
-        !crossIssueCommentOnlyGrant
+        !crossIssueCommentOnlyGrant &&
+        !crossCompanyComment
       ) {
         if (
           !(await assertAgentIssueMutationAllowed(req, res, issue, {
