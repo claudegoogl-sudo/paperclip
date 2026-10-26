@@ -34,6 +34,19 @@ export type SecurityPostureRejection = {
  * plausibly re-litigate, carried over from the sweep in
  * `doc/SECURITY-POSTURE-COLUMN-SWEEP.md`), then the table-level blocks.
  */
+
+// ---------------------------------------------------------------------------
+// Upstream v2026.1023.0 sync: columns that arrived with the sync and have NOT
+// had a per-column security-posture review. They are listed here only so the
+// totality check (assertSchemaColumnsClassified) stays enforceable for every
+// FUTURE column. This is NOT a security finding that none is a predicate:
+// a SecurityEngineer review must promote any column that gates authorization
+// or execution into SECURITY_POSTURE_COLUMNS. Review is tracked on the sync
+// issue; do not copy this reason onto new entries.
+// ---------------------------------------------------------------------------
+const UNREVIEWED_REASON =
+  "Arrived with the upstream v2026.1023.0 sync; not yet reviewed for use as a security predicate. Pending SecurityEngineer review (default-unreviewed, not a claim that it is safe).";
+
 export const SECURITY_POSTURE_REJECTIONS = [
   {
     table: "agents",
@@ -5573,5 +5586,245 @@ export const SECURITY_POSTURE_REJECTIONS = [
      "agent_instructions",
     ],
     reason: "agent_instructions is saved free-text delivered to authorized agent turns; it is content, not an access gate, and delivery is authorized separately.",
+  },
+  {
+    table: "accounting_runtime_baselines",
+    columns: ["agent_id", "cached_input_tokens", "company_id", "cost_cents", "created_at", "input_tokens", "output_tokens"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "agent_commentary",
+    columns: ["agent_id", "body", "company_id", "created_at", "id", "idempotency_key", "issue_id", "kind", "payload_hash", "run_id"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "agent_identity_keys",
+    columns: ["agent_id", "algorithm", "company_id", "created_at", "key_id", "private_key_material", "public_key_pem"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "agents",
+    columns: ["lifecycle_error", "lifecycle_holds", "lifecycle_operation", "lifecycle_required_plugin_ids", "lifecycle_state", "lifecycle_version", "spend_month_utc"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "ai_subscription_connections",
+    columns: ["company_id", "connection_id", "credential_key", "grant_id", "id", "subscription_id"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "ai_subscription_prices",
+    columns: ["amount_cents", "cadence", "company_id", "currency", "effective_at", "id", "plan", "revision", "source", "source_url", "status", "subscription_id"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "ai_subscriptions",
+    columns: ["account_key", "company_id", "created_at", "detected_plan", "id", "identity_verified", "last_checked_at", "merged_into_id", "name", "observed_at", "owner_user_ids", "provider", "refresh_status", "revision", "shared"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "billing_invoice_lines",
+    columns: ["amount_cents", "company_id", "cost_event_id", "external_id", "id", "invoice_id", "kind", "model", "occurred_at", "pricing", "provider_request_id", "run_id"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "billing_invoices",
+    columns: ["biller", "company_id", "created_at", "currency", "external_id", "id", "imported_by", "receipt_hash"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "budget_policies",
+    columns: ["enforcement_delivered_version", "enforcement_version", "reservation_cents", "unpriced_usage_policy"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "budget_reservations",
+    columns: ["agent_id", "amount_cents", "company_id", "created_at", "decision_invocation_id", "fast_response_request_id", "id", "project_id", "provider_started_at", "run_id", "settled_at", "state"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "chat_endpoints",
+    columns: ["require_at_mention"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "chat_github_registrations",
+    columns: ["app_name", "handoff", "owner_login", "owner_type"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "chat_slack_registrations",
+    columns: ["app_id", "bot_user_id", "callback_uri", "client_id", "company_id", "created_at", "created_by_user_id", "endpoint_id", "error_code", "manifest", "manifest_hash", "request_id", "secret_ids", "status", "updated_at", "workspace_id"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "chat_voice_callbacks",
+    columns: ["company_id", "enabled", "endpoint_id", "id", "phone_number", "updated_at", "user_id"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "chat_voice_inbound_calls",
+    columns: ["approval_code", "approved_by_user_id", "caller_authority", "company_id", "created_at", "credential_fingerprint", "endpoint_id", "expires_at", "generation", "id", "intake_issue_id", "provider_session_id", "request_fingerprint", "requested_issue_id", "session_id", "state", "tool_token_hash", "updated_at"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "chat_voice_phone_lines",
+    columns: ["company_id", "enabled", "endpoint_id", "guest_intake", "low_trust_environment_id", "phone_number", "provider_number_id", "updated_at"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "chat_voice_replies",
+    columns: ["company_id", "created_at", "cursor", "delivered_at", "id", "publication_id", "session_id", "spoken_at"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "chat_voice_reports",
+    columns: ["attempts", "company_id", "cost_micro_usd", "duration_seconds", "next_check_at", "provider_updated_at", "session_id", "status", "transcript", "updated_at"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "chat_voice_sessions",
+    columns: ["approved_by_user_id", "assigned_agent_id", "caller_authority", "caller_id", "company_id", "conversation_id", "created_at", "credential_fingerprint", "ended_at", "endpoint_id", "error_code", "expires_at", "generation", "id", "idempotency_key", "issue_id", "mode", "provider_session_id", "reply_cursor", "request_fingerprint", "state", "tool_token_hash", "updated_at"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "chat_voice_tool_calls",
+    columns: ["company_id", "created_at", "delivery_id", "fingerprint", "id", "provider_tool_call_id", "response", "session_id", "tool", "webhook_id"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "companies",
+    columns: ["spend_month_utc"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "company_decision_models",
+    columns: ["allow_background", "company_id", "connection_id", "enabled", "grant_id", "model", "provider", "updated_at"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "company_fast_responses",
+    columns: ["allow_sponsored", "company_id", "connection_id", "enabled", "grant_id", "model", "provider", "updated_at"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "cost_adjustments",
+    columns: ["actor_id", "company_id", "corrected_cents", "cost_event_id", "created_at", "id", "idempotency_key", "invoice_line_id", "previous_cents", "previous_pricing", "previous_status", "pricing", "reason", "receipt_hash"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "cost_events",
+    columns: ["idempotency_key", "pricing_provenance", "provider_request_id", "receipt_hash", "reported_cost_cents", "responsible_user_id", "subscription_id", "usage_kind"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "decision_invocations",
+    columns: ["actor_id", "actor_type", "agent_id", "company_id", "connection_id", "cost_event_id", "duration_ms", "error_code", "feature", "finished_at", "grant_id", "id", "identity_context_id", "input_tokens", "issue_id", "model", "output_tokens", "project_id", "provider", "provider_request_id", "question_types", "responsible_user_id", "run_id", "started_at", "status"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "dot_agent_bindings",
+    columns: ["agent_id", "challenge_expires_at", "challenge_hash", "company_id", "created_at", "dot_url", "generation", "grant_id", "id", "operator_id", "pairing_code_hash", "pairing_expires_at", "ready_at", "revoked_at", "status", "updated_at"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "dot_mailbox_items",
+    columns: ["assignment_id", "binding_generation", "binding_id", "company_id", "created_at", "id", "kind", "references", "source_event_id"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "dot_runner_assignments",
+    columns: ["accept_by", "accepted_at", "agent_id", "binding_generation", "binding_id", "catalog_digest", "company_id", "controller_generation", "created_at", "expires_at", "id", "last_activity_at", "normalized_session_id", "projection", "revision", "run_id", "settled_at", "status", "turn_id"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "dot_runner_operations",
+    columns: ["assignment_id", "command", "company_id", "created_at", "digest", "id", "outcome", "request_id", "source_event_id", "status", "updated_at"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "fast_response_requests",
+    columns: ["accepted_at", "agent_id", "comment_id", "company_id", "connection_id", "conversation_id", "cost_event_id", "delivery_id", "duration_ms", "endpoint_id", "error_code", "expires_at", "finished_at", "grant_id", "id", "input_tokens", "issue_id", "model", "output_tokens", "project_id", "provider", "provider_request_id", "publication_status", "responsible_user_id", "session_generation", "source_comment_id", "source_key", "sponsored", "started_at", "status"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "finance_events",
+    columns: ["idempotency_key", "receipt_hash"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "heartbeat_runs",
+    columns: ["accounting_attempt_count", "accounting_last_attempt_at", "accounting_last_error", "accounting_projection_version", "cost_accounted_at", "cost_accounting_pending", "issue_id", "scope_kind"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "issue_access_grants",
+    columns: ["created_at", "granted_by_agent_id", "granted_by_user_id", "id", "issue_id", "revoked_at", "source", "subject_id", "subject_type"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "issue_comments",
+    columns: ["fast_response_request_id", "origin"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "issues",
+    columns: ["privacy_parent_issue_id", "privacy_root_issue_id", "visibility"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "mcp_attachment_uploads",
+    columns: ["arguments_hash", "attachment_id", "byte_size", "cleaned_at", "company_id", "content_type", "created_at", "expires_at", "id", "object_key", "original_filename", "request_id", "sha256", "storage_provider", "task_id", "user_id"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "mcp_event_deliveries",
+    columns: ["mailbox_item_id"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "mcp_event_subscriptions",
+    columns: ["binding_id"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "mcp_file_tickets",
+    columns: ["attachment_id", "company_id", "created_at", "expires_at", "grant_id", "token_hash", "upload_id"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "mcp_oauth_grants",
+    columns: ["agent_id", "purpose"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "plugin_lifecycle_acknowledgments",
+    columns: ["acknowledged_at", "event_id", "plugin_id"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "project_access_members",
+    columns: ["company_id", "created_at", "id", "project_id", "subject_id", "subject_type"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "projects",
+    columns: ["personal_owner_user_id", "privacy_owner_user_id", "visibility"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "provider_billing_snapshots",
+    columns: ["account_id", "amount_cents", "company_id", "day", "id", "provider", "revision", "scope_id", "updated_at"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "run_usage_receipts",
+    columns: ["company_id", "complete", "created_at", "id", "receipt_hash", "receipt_json", "received_at", "run_id", "sequence", "source_id"],
+    reason: UNREVIEWED_REASON,
+  },
+  {
+    table: "user_company_preferences",
+    columns: ["company_id", "created_at", "id", "primary_agent_id", "primary_agent_initialized", "updated_at", "user_id"],
+    reason: UNREVIEWED_REASON,
   },
 ];
