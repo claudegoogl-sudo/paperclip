@@ -560,6 +560,7 @@ function migrationVersionEnvOverride(): string | null {
 async function ensureMigrationIdentityTable(
   sql: SqlExecutor,
   migrationTableSchema: string,
+  options: { deferWatermark?: boolean } = {},
 ): Promise<string> {
   const identityTable = `${quoteIdentifier(migrationTableSchema)}.${quoteIdentifier(MIGRATION_IDENTITY_TABLE)}`;
   await sql.unsafe(
@@ -569,7 +570,7 @@ async function ensureMigrationIdentityTable(
       `first_recorded_at timestamptz NOT NULL DEFAULT now()` +
       `)`,
   );
-  await ensureMigrationIdentityWatermark(sql, migrationTableSchema);
+  if (!options.deferWatermark) await ensureMigrationIdentityWatermark(sql, migrationTableSchema);
   return identityTable;
 }
 
@@ -777,7 +778,13 @@ async function applyPendingMigrationsManually(
       }
       const { migrationTableSchema, columnNames } = await ensureMigrationJournalTable(sql);
       const qualifiedTable = `${quoteIdentifier(migrationTableSchema)}.${quoteIdentifier(DRIZZLE_MIGRATIONS_TABLE)}`;
-      const identityTable = await ensureMigrationIdentityTable(sql, migrationTableSchema);
+      // Empty journal = first-ever application of the full set: every file is
+      // about to get an identity, so the legacy-applied watermark must be taken
+      // AFTER the loop (count = all files). Freezing it at 0 here would classify
+      // a later-scrubbed identity row as "genuinely new" instead of unverifiable.
+      const journalRows = await sql.unsafe<{ count: number }[]>(`SELECT count(*)::int AS count FROM ${qualifiedTable}`);
+      const freshJournal = (journalRows[0]?.count ?? 0) === 0;
+      const identityTable = await ensureMigrationIdentityTable(sql, migrationTableSchema, { deferWatermark: freshJournal });
       const appliedMigrations: Array<{ migrationFile: string; hash: string }> = [];
 
       for (const migrationFile of orderedPendingMigrations) {
@@ -839,6 +846,7 @@ async function applyPendingMigrationsManually(
         }
         appliedMigrations.push({ migrationFile, hash });
       }
+      if (freshJournal) await ensureMigrationIdentityWatermark(sql, migrationTableSchema);
       await recordMigrationApplyAudit(sql, migrationTableSchema, appliedMigrations, source);
     } finally {
       try {

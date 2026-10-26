@@ -456,6 +456,11 @@ export async function verifyPgDumpArchive(archivePath: string): Promise<void> {
       byteCount += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk));
       const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
 
+      // Keep last few KB to check for dump tail markers. Update this before
+      // the early exit below: a small single-chunk archive would otherwise
+      // leave the tail buffer empty and fail the tail check it satisfies.
+      tailBuffer = (tailBuffer + text).slice(-8192);
+
       // Check for plausible pg_dump markers
       for (const marker of plausibleMarkers) {
         if (text.toUpperCase().includes(marker)) {
@@ -464,9 +469,6 @@ export async function verifyPgDumpArchive(archivePath: string): Promise<void> {
         }
       }
       if (hasPlausibleContent) break;
-
-      // Keep last few KB to check for dump tail markers
-      tailBuffer = (tailBuffer + text).slice(-8192);
     }
   } finally {
     stream.destroy();
