@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { withBuiltInAgentMarker } from "./built-in-agent-metadata.js";
+import { withBuiltInAgentMarker } from "../lib/built-in-agent-metadata.js";
 import { resolvePortableExportAgentSelection } from "./company-portability-agent-selection.js";
 
 const researchBot = { id: "a1", name: "Research Bot", status: "active", metadata: {} };
