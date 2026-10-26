@@ -95,15 +95,6 @@ diff --git a/dist/live-checkpoint-ClPCSdrW.js b/dist/live-checkpoint-ClPCSdrW.js
  		};
  	}
  	logAgentLaunch(plan) {
-@@ -4919,7 +4939,7 @@ function persistedSessionOptions(options) {
- 		allowed_tools: Array.isArray(options.allowedTools) ? [...options.allowedTools] : void 0,
- 		max_turns: typeof options.maxTurns === "number" ? options.maxTurns : void 0,
- 		system_prompt: normalizeSystemPromptOption(options.systemPrompt),
--		env: storedEnvRecord(options.env)
-+		env: storedEnvRecord(options.persistedEnv ?? options.env)
- 	};
- 	return hasPersistedSessionOptions(next) ? next : void 0;
- }
 @@ -4729,6 +4749,9 @@
  			return await this.filesystem.readTextFile(params);
  		} catch (error) {
@@ -114,6 +105,15 @@ diff --git a/dist/live-checkpoint-ClPCSdrW.js b/dist/live-checkpoint-ClPCSdrW.js
  			throw error;
  		}
  	}
+@@ -4919,7 +4942,7 @@ function persistedSessionOptions(options) {
+ 		allowed_tools: Array.isArray(options.allowedTools) ? [...options.allowedTools] : void 0,
+ 		max_turns: typeof options.maxTurns === "number" ? options.maxTurns : void 0,
+ 		system_prompt: normalizeSystemPromptOption(options.systemPrompt),
+-		env: storedEnvRecord(options.env)
++		env: storedEnvRecord(options.persistedEnv ?? options.env)
+ 	};
+ 	return hasPersistedSessionOptions(next) ? next : void 0;
+ }
 @@ -6070,6 +6093,27 @@
  //#region src/runtime/engine/prompt-turn.ts
  const SESSION_REPLY_IDLE_MS = 1e3;
