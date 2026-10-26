@@ -2403,7 +2403,6 @@ export async function startAdapterExecutionTargetProcessSessionBridge(input: {
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      logFailureWithoutWaiting(`[paperclip] ACP process session bridge poll failed: ${message}\n`);
       // A stuck log sink must not strand the adapter waiting for this failure.
       deliverRemoteEvent({ type: "error", message }, "output_poll");
       return;
