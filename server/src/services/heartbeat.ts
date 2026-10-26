@@ -534,6 +534,9 @@ import {
 import { USAGE_LIMIT_PARK_MAX_HORIZON_MS, usageLimitParkService } from "./usage-limit-park.js";
 import { highCommentVolumeAlertService } from "./high-comment-volume-alert.js";
 import { instanceAdmissionHoldService } from "./instance-admission-hold.js";
+import { decisionModelService } from "./decision-models.js";
+import { createCostAccountingReconciler } from "./run-cost-accounting.js";
+import { agentExecutionsHaveStopped } from "./agent-execution-stop.js";
 import {
   evaluateExecutionAllowlist,
   isExecutionForcedToKubernetes,
@@ -32791,6 +32794,24 @@ export function heartbeatService(
 
     cancelInvocationsForAgents: (agentIds: string[], reason: string) =>
       cancelInvocationsForAgentsInternal(agentIds, reason),
+
+    // Upstream-sync shims: callers added upstream (agent lifecycle driver,
+    // startup recovery) expect these on the heartbeat service.
+    resumeQueuedRunsForAgent: async (companyId: string, agentId: string) => {
+      const agent = await getAgent(agentId);
+      if (!agent || agent.companyId !== companyId) return [];
+      return startNextQueuedRunForAgent(agentId);
+    },
+
+    stopInvocationsForAgents: async (agentIds: string[], reason: string) => {
+      await cancelInvocationsForAgentsInternal(agentIds, reason);
+      return agentExecutionsHaveStopped(db, agentIds);
+    },
+
+    reconcileCostAccounting: async () => {
+      await decisionModelService(db, { budgetHooks }).recoverInterrupted();
+      return createCostAccountingReconciler(db, budgetHooks)();
+    },
 
     cancelBudgetScopeWork,
 
