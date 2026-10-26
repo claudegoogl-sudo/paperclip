@@ -1634,6 +1634,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
         status: issues.status,
         assigneeAgentId: issues.assigneeAgentId,
         assigneeUserId: issues.assigneeUserId,
+        executionPolicy: issues.executionPolicy,
         executionState: issues.executionState,
         monitorNextCheckAt: issues.monitorNextCheckAt,
         projectId: issues.projectId,

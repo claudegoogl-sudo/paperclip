@@ -535,6 +535,7 @@ import { USAGE_LIMIT_PARK_MAX_HORIZON_MS, usageLimitParkService } from "./usage-
 import { highCommentVolumeAlertService } from "./high-comment-volume-alert.js";
 import { instanceAdmissionHoldService } from "./instance-admission-hold.js";
 import { decisionModelService } from "./decision-models.js";
+export { normalizeAdapterRunUsage } from "./heartbeat/run-state.js";
 import { readTaskDrain, computeTaskDrain, applyTaskDrain, startTaskDrain, stopTaskDrain } from "./task-admission.js";
 import { createCostAccountingReconciler } from "./run-cost-accounting.js";
 import { agentExecutionsHaveStopped } from "./agent-execution-stop.js";
@@ -22804,7 +22805,11 @@ export function heartbeatService(
         !nativeChatWorkspaceMatches({
           scope: nativeChatWorkspaceScope,
           expectedCwd: nativeChatExpectedCwd,
-          execution: persistedNativeExecutionInput,
+          // Sync note: the vendored runner's NativeExecutionInput type differs from
+          // the minimal shape this check reads (binding ids + workspace.cwd).
+          execution: persistedNativeExecutionInput as unknown as Parameters<
+            typeof nativeChatWorkspaceMatches
+          >[0]["execution"],
         })
       ) {
         // Never rewrite an admitted provider input or release ownership of an
