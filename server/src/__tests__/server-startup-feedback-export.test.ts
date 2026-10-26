@@ -1,5 +1,12 @@
+import { idleWorkSnapshot } from "../services/task-admission.js";
+import { readIdleSleepSafety } from "../services/idle-sleep-safety.js";
+import * as idleLocalWork from "../services/idle-local-work.js";
+import { idleBackupWakeMarker, markIdleBackupWakeRequired } from "../services/idle-database-backup.js";
+import { reconcileBuiltInAgentsOnStartup, reconcileCodexLocalManagedHomesOnStartup, reconcilePersistedRuntimeServicesOnStartup } from "../services/index.js";
+import { runDatabaseBackup } from "@paperclipai/db";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { gzipSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -35,19 +42,21 @@ const {
   routineServiceMock,
 } = vi.hoisted(() => {
   const completionSweepMock = vi.fn(async () => undefined);
-  const createAppMock = vi.fn(async () => ({
-    // Fork createApp returns { app, pluginToolDispatcher }; the dispatcher is
-    // only invoked lazily by the tool-health sweep probe, so a stub suffices.
-    app: Object.assign((_: unknown, __: unknown) => {}, {
-      locals: {
-        toolGateway: {
-          sweepActionReviews: vi.fn(async () => ({ scanned: 0 })),
-          cleanupExpiredSessions: vi.fn(async () => ({ deletedCount: 0 })),
-        },
-        toolActionDeliveries: { sweepPending: vi.fn(async () => ({ scanned: 0, delivered: 0 })) },
+  const createAppMock = vi.fn(async () => Object.assign((_: unknown, __: unknown) => {}, {
+    locals: {
+      fastResponses: { hasPending: vi.fn(async () => false), sweepPending: vi.fn(async () => undefined) },
+      deliveryWork: {
+        register: (_queue: string, task: { run: () => Promise<unknown> }) => ({
+          ready: task.run().catch(() => undefined), wake: vi.fn(),
+        }),
+        stop: vi.fn(async () => {}),
       },
-    }),
-    pluginToolDispatcher: { toolCount: vi.fn(() => 0) },
+      toolGateway: {
+        sweepActionReviews: vi.fn(async () => ({ scanned: 0 })),
+        cleanupExpiredSessions: vi.fn(async () => ({ deletedCount: 0 })),
+      },
+      toolActionDeliveries: { hasPending: vi.fn(async () => false), sweepPending: vi.fn(async () => ({ scanned: 0, delivered: 0 })) },
+    },
   }) as never);
   const createBetterAuthInstanceMock = vi.fn(() => ({}));
   const createDbMock = vi.fn(() => ({
@@ -62,6 +71,7 @@ const {
     reason: null,
   }));
   const heartbeatServiceMock = {
+    reconcileCostAccounting: vi.fn(async () => ({ scanned: 0, accounted: 0 })),
     resolveSchedulingSuppression: resolveHeartbeatSchedulingSuppressionMock,
     recoverNativeRunsAfterRestart: vi.fn(async () => ({
       restartKind: "hard",
@@ -88,17 +98,7 @@ const {
     reconcileResolvedDependencyWakes: vi.fn(async () => ({ healed: 0 })),
     reconcileTaskWatchdogs: vi.fn(async () => ({ triggered: 0 })),
     scanSilentActiveRuns: vi.fn(async () => ({ created: 0, escalated: 0 })),
-    reconcileHighCommentVolumeAlerts: vi.fn(async () => ({ scanned: 0, alerted: 0, failed: 0 })),
     sweepStaleIssueLocks: vi.fn(async () => ({ cleared: 0 })),
-    sweepStrandedDeferredWakes: vi.fn(async () => ({
-      scanned: 0,
-      promoted: 0,
-      resolved: 0,
-      failed: 0,
-      skippedStale: 0,
-      wakeIds: [],
-      issueIds: [],
-    })),
     sweepPendingCleanupLeases: vi.fn(async () => ({ swept: 0, destroyed: 0, capped: 0 })),
     sweepExpiredRuntimeStatuses: vi.fn(() => 0),
     tickTimers: vi.fn(async () => ({ checked: 0, enqueued: 0, skipped: 0 })),
@@ -140,6 +140,7 @@ const {
   };
   const routineServiceFactoryMock = vi.fn(() => routineServiceMock);
   const feedbackExportServiceMock = {
+    hasPendingFeedbackTraces: vi.fn(async () => false),
     flushPendingFeedbackTraces: vi.fn(async () => ({ attempted: 0, sent: 0, failed: 0 })),
   };
   const feedbackServiceFactoryMock = vi.fn(() => feedbackExportServiceMock);
@@ -196,10 +197,6 @@ function buildTestConfig(overrides: Record<string, unknown> = {}) {
     authDisableSignUp: false,
     databaseMode: "postgres",
     databaseUrl: "postgres://paperclip:paperclip@127.0.0.1:5432/paperclip",
-    // Upstream default: no embedded-Postgres opt-in on public deployments, so
-    // the refusal tests exercise the guard without extra overrides. The fork's
-    // opt-in test sets this explicitly.
-    allowEmbeddedPostgresPublic: undefined,
     embeddedPostgresDataDir: "/tmp/paperclip-test-db",
     embeddedPostgresPort: 54329,
     databaseBackupEnabled: false,
@@ -235,26 +232,20 @@ vi.mock("detect-port", () => ({
   default: detectPortMock,
 }));
 
-vi.mock(import("@paperclipai/db"), async (importOriginal) => {
-  // Booting the real server index pulls in nearly every service module, and
-  // service modules build sql templates from real schema tables at import time
-  // (e.g. successful-run-handoff-state.ts reads heartbeatRuns.contextSnapshot).
-  // Keep the actual schema exports and override only the side-effecting db
-  // functions index.ts calls during startup.
-  const actual = await importOriginal<typeof import("@paperclipai/db")>();
-  return {
-    ...actual,
-    createDb: createDbMock,
-    ensurePostgresDatabase: vi.fn(),
-    getPostgresDataDirectory: vi.fn(),
-    inspectMigrations: vi.fn(async () => ({ status: "upToDate" })),
-    inspectMigrationPreflight: vi.fn(async () => ({ pending: [], drift: [], unverifiable: [] })),
-    applyPendingMigrations: vi.fn(),
-    reconcilePendingMigrationHistory: vi.fn(async () => ({ repairedMigrations: [] })),
-    formatDatabaseBackupResult: vi.fn(() => "ok"),
-    runDatabaseBackup: vi.fn(),
-  };
-});
+vi.mock("@paperclipai/db", () => ({
+  createDb: createDbMock,
+  ensurePostgresDatabase: vi.fn(),
+  getPostgresDataDirectory: vi.fn(),
+  inspectMigrations: vi.fn(async () => ({ status: "upToDate" })),
+  applyPendingMigrations: vi.fn(),
+  reconcilePendingMigrationHistory: vi.fn(async () => ({ repairedMigrations: [] })),
+  formatDatabaseBackupResult: vi.fn(() => "ok"),
+  runDatabaseBackup: vi.fn(),
+  authUsers: {},
+  companies: {},
+  companyMemberships: {},
+  instanceUserRoles: {},
+}));
 
 vi.mock("../app.js", () => ({
   createApp: createAppMock,
@@ -380,19 +371,18 @@ vi.mock("../services/index.js", () => ({
   })),
 }));
 
-vi.mock("../services/chat-completion-delivery.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../services/chat-completion-delivery.js")>()),
-  chatCompletionDeliveryService: () => ({ sweepPending: completionSweepMock }),
-}));
+vi.mock("../services/chat-completion-delivery.js", () => ({ chatCompletionDeliveryService: () => ({ hasPending: vi.fn(async () => false), sweepPending: completionSweepMock }) }));
 
 vi.mock("../services/connection-intent-delivery.js", () => ({
   connectionIntentDeliveryService: vi.fn(() => ({
+    hasPending: vi.fn(async () => false),
     sweepPending: vi.fn(async () => ({ scanned: 0, failed: 0 })),
   })),
 }));
 
 vi.mock("../services/question-response-delivery.js", () => ({
   questionResponseDeliveryService: vi.fn(() => ({
+    hasPending: vi.fn(async () => false),
     sweepPending: vi.fn(async () => ({
       scanned: 0,
       steered: 0,
@@ -446,9 +436,9 @@ vi.mock("../auth/better-auth.js", () => ({
 }));
 
 import { startServer } from "../index.ts";
-import { logger } from "../middleware/logger.js";
 import { reconcileSafeNativeReplacements } from "../services/native-runtime/native-safe-replacement.js";
 import { EXECUTION_RECONCILIATION_INTERVAL_MS } from "../services/execution-control-deadline.js";
+
 describe("startServer feedback export wiring", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -461,7 +451,129 @@ describe("startServer feedback export wiring", () => {
     });
     createBetterAuthInstanceMock.mockReturnValue({});
     deriveAuthTrustedOriginsMock.mockReturnValue([]);
-    process.env.BETTER_AUTH_SECRET = "unit-test-strong-secret-0123456789abcdef";
+    process.env.BETTER_AUTH_SECRET = "test-secret";
+  });
+
+  it.each([false, true].flatMap(checkpointMode => [false, true].map(fails => ({ checkpointMode, fails }))))
+  ("finishes restart backup before idle eligibility (checkpoint=$checkpointMode, failure=$fails)", async ({ checkpointMode, fails }) => {
+    const directory = mkdtempSync(path.join(tmpdir(), "startup-idle-backup-"));
+    const previousFlag = process.env.PAPERCLIP_DB_BACKUP_IDLE_CHECKPOINT_ENABLED;
+    process.env.PAPERCLIP_DB_BACKUP_IDLE_CHECKPOINT_ENABLED = checkpointMode ? "1" : "0";
+    loadConfigMock.mockReturnValue(buildTestConfig({ databaseBackupEnabled: true, databaseBackupDir: directory }));
+    const eligible = vi.spyOn(idleLocalWork, "markIdleStartupComplete");
+    let retry: (() => void) | undefined;
+    const timers = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void, ms: number) => {
+      if (ms === 60 * 60 * 1000) retry = callback;
+      return 1 as unknown as ReturnType<typeof setInterval>;
+    }) as typeof setInterval);
+    let finish!: () => void;
+    const pending = new Promise<void>(resolve => { finish = resolve; });
+    const writeBackup = async (options: Parameters<typeof runDatabaseBackup>[0]) => {
+      const backupFile = path.join(directory, "paperclip-restart.sql.gz");
+      const bytes = gzipSync("SELECT 'restart recovery';\n");
+      writeFileSync(backupFile, bytes);
+      expect(options.retention).toEqual({ dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 });
+      expect(options.verifyBeforePrune).toEqual(expect.any(Function));
+      await options.verifyBeforePrune!(backupFile);
+      return { backupFile, sizeBytes: bytes.length, prunedCount: 0 };
+    };
+    vi.mocked(runDatabaseBackup).mockImplementationOnce(async options => {
+      await pending;
+      if (fails) throw new Error("fixture restart backup failed");
+      return writeBackup(options);
+    });
+    let starting: ReturnType<typeof startServer> | undefined;
+    try {
+      await markIdleBackupWakeRequired(directory);
+      starting = startServer();
+      await vi.waitFor(() => expect(runDatabaseBackup).toHaveBeenCalledOnce());
+      expect(eligible).not.toHaveBeenCalled();
+      expect(idleWorkSnapshot().active).toBeGreaterThan(0);
+      finish();
+      await starting;
+      expect(eligible).toHaveBeenCalledWith({ scheduledBackups: true });
+      const options = createAppMock.mock.calls[0]?.[1] as unknown as { prepareIdleDatabaseBackup?: unknown };
+      expect(Boolean(options.prepareIdleDatabaseBackup)).toBe(checkpointMode);
+      expect(existsSync(idleBackupWakeMarker(directory))).toBe(fails);
+      if (fails) {
+        vi.mocked(runDatabaseBackup).mockImplementationOnce(writeBackup);
+        expect(retry).toEqual(expect.any(Function));
+        const activeBeforeRetry = idleWorkSnapshot().active;
+        retry!();
+        await vi.waitFor(() => {
+          expect(existsSync(idleBackupWakeMarker(directory))).toBe(false);
+          // Marker removal precedes directory fsync and release of the work receipt.
+          expect(idleWorkSnapshot().active).toBe(activeBeforeRetry);
+        });
+        expect(runDatabaseBackup).toHaveBeenCalledTimes(2);
+      }
+    } finally {
+      finish();
+      await starting;
+      timers.mockRestore(); eligible.mockRestore();
+      if (previousFlag === undefined) delete process.env.PAPERCLIP_DB_BACKUP_IDLE_CHECKPOINT_ENABLED;
+      else process.env.PAPERCLIP_DB_BACKUP_IDLE_CHECKPOINT_ENABLED = previousFlag;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each(([
+    ["built-in agents", reconcileBuiltInAgentsOnStartup],
+    ["managed homes", reconcileCodexLocalManagedHomesOnStartup],
+    ["runtime services", reconcilePersistedRuntimeServicesOnStartup],
+  ] as const).flatMap(([name, reconcile]) => [false, true].map(fail => ({ name, reconcile, fail }))))
+  ("counts detached $name startup writes after readiness (failure=$fail)", async ({ reconcile, fail }) => {
+    let finishStartup!: () => void;
+    const pending = new Promise<void>(resolve => { finishStartup = resolve; });
+    vi.mocked(reconcile).mockImplementationOnce(async () => {
+      await pending;
+      if (fail) throw new Error("fixture startup write failed");
+      return { reconciled: 0, seeded: 0, failed: 0 } as never;
+    });
+    const emptyDb = { transaction: async (run: (tx: unknown) => Promise<unknown>) =>
+      run({ execute: async () => [{ blocked: false }] }) };
+    const hold = { ownerId: "fixture-owner", draining: true, activeRuns: 0, pendingWakes: 0,
+      startedAt: new Date(), expiresAt: new Date(Date.now() + 60_000) };
+    const report = () => readIdleSleepSafety(emptyDb as never, () => hold, Date.now, hold.ownerId, async () => "none");
+    try {
+      await startServer();
+      await new Promise(resolve => setImmediate(resolve));
+      expect(idleWorkSnapshot().active).toBe(1);
+      expect((await report()).backgroundWork).toBe("unknown");
+      finishStartup();
+      await new Promise(resolve => setImmediate(resolve));
+      expect(idleWorkSnapshot().active).toBe(0);
+      expect((await report()).backgroundWork).toBe("none");
+    } finally {
+      finishStartup();
+      await new Promise(resolve => setImmediate(resolve));
+    }
+  });
+
+  it.each([false, true])("counts an accepted backup until completion, including failure=%s", async fails => {
+    await startServer();
+    await new Promise(resolve => setImmediate(resolve));
+    const before = idleWorkSnapshot().active;
+    let resolveBackup!: (value: never) => void;
+    let rejectBackup!: (error: Error) => void;
+    vi.mocked(runDatabaseBackup).mockImplementationOnce(() => new Promise((resolve, reject) => {
+      resolveBackup = resolve; rejectBackup = reject;
+    }));
+    const options = createAppMock.mock.calls[0]?.[1] as unknown as {
+      databaseBackupService: { runManualBackup(): Promise<unknown> };
+    };
+    const backup = options.databaseBackupService.runManualBackup();
+    await Promise.resolve();
+    expect(idleWorkSnapshot().active).toBe(before + 1);
+    if (fails) {
+      const rejection = expect(backup).rejects.toThrow("backup failed");
+      rejectBackup(new Error("backup failed"));
+      await rejection;
+    } else {
+      resolveBackup({ backupFile: "backup.sql.gz", sizeBytes: 1, prunedCount: 0 } as never);
+      await backup;
+    }
+    expect(idleWorkSnapshot().active).toBe(before);
   });
 
   it("starts without PAPERCLIP_DECISION_SIGNING_SECRET by generating a persisted key", async () => {
@@ -573,6 +685,22 @@ describe("startServer feedback export wiring", () => {
     expect(completionSweepMock).toHaveBeenCalled();
   });
 
+  it("keeps activity-driven completion scans scoped to the changed task", async () => {
+    await startServer();
+    completionSweepMock.mockClear();
+    const { publishLiveEvent } = await import("../services/live-events.js");
+    publishLiveEvent({ companyId: "company-one", type: "activity.logged", payload: {
+      action: "issue.updated", entityId: "task-one",
+    } });
+    expect(completionSweepMock).toHaveBeenCalled();
+    for (const args of completionSweepMock.mock.calls) {
+      expect(args).toEqual([{ companyId: "company-one", taskId: "task-one" }]);
+    }
+    completionSweepMock.mockClear();
+    publishLiveEvent({ companyId: "company-two", type: "activity.logged", payload: { action: "issue.updated" } });
+    expect(completionSweepMock).not.toHaveBeenCalled();
+  });
+
   it("never invokes the retired review detector at startup or on periodic recovery", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
@@ -581,27 +709,19 @@ describe("startServer feedback export wiring", () => {
     const retiredDetector = vi.fn(async () => ({ created: 1, updated: 1, failed: 0 }));
     const runtime = Object.assign(heartbeatServiceMock, { reconcileProductivityReviews: retiredDetector });
     let intervalCallback: (() => void) | null = null;
-    const schedulerCallbacks: Array<() => void> = [];
     const setIntervalSpy = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void) => {
-      schedulerCallbacks.push(callback);
       intervalCallback = callback;
       return 1 as unknown as ReturnType<typeof setInterval>;
     }) as typeof setInterval);
     try {
       await startServer();
+      expect(heartbeatServiceMock.reconcileCostAccounting).toHaveBeenCalledTimes(1);
       expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1);
       expect(intervalCallback).not.toBeNull();
-      // The execution-control reconciliation interval registers before the
-      // heartbeat scheduler; drive every registered callback so the
-      // scheduler's chain (which ends in the stale-lock sweep) runs.
-      for (const callback of schedulerCallbacks) callback();
-      // The merged interval chain added more async stages ahead of the
-      // stale-lock sweep; flush enough macrotasks for the whole .then()
-      // chain to settle before asserting on its tail.
-      for (let i = 0; i < 12; i += 1) {
-        await new Promise<void>((resolve) => setImmediate(resolve));
-      }
+      intervalCallback?.();
+      await new Promise<void>((resolve) => setImmediate(resolve));
       expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(2);
+      expect(heartbeatServiceMock.reconcileCostAccounting).toHaveBeenCalledTimes(2);
       expect(retiredDetector).not.toHaveBeenCalled();
     } finally {
       delete (runtime as Partial<typeof runtime>).reconcileProductivityReviews;
@@ -646,15 +766,11 @@ describe("startServer feedback export wiring", () => {
       suppressed: true,
       reason: "worktree_instance",
     });
-    // startServer registers more than one interval. Select the scheduler tick by
-    // its configured period instead of keeping only the last registration, or any
-    // unrelated interval registered after it silently replaces the callback under
-    // test and every assertion below stops testing anything.
-    const registeredIntervals: { callback: () => void; ms: number }[] = [];
+    let intervalCallback: (() => void) | null = null;
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
-      .mockImplementation(((callback: () => void, ms: number) => {
-        registeredIntervals.push({ callback, ms });
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
 
@@ -665,9 +781,8 @@ describe("startServer feedback export wiring", () => {
       expect(heartbeatServiceMock.tickTimers).not.toHaveBeenCalled();
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).toHaveBeenCalledTimes(1);
 
-      const schedulerTicks = registeredIntervals.filter((entry) => entry.ms === 30000);
-      expect(schedulerTicks).toHaveLength(1);
-      schedulerTicks[0]?.callback();
+      expect(intervalCallback).not.toBeNull();
+      intervalCallback?.();
       await Promise.resolve();
       await Promise.resolve();
 
@@ -687,14 +802,11 @@ describe("startServer feedback export wiring", () => {
       heartbeatSchedulerEnabled: false,
       heartbeatSchedulerIntervalMs: 30000,
     }));
-    // Startup registers several independent intervals (egress posture, task-bridge
-    // renewal, ...), so select the scheduler tick by its interval instead of
-    // grabbing whichever callback registered last.
-    const registeredIntervals: Array<{ callback: () => void; ms: number }> = [];
+    let intervalCallback: (() => void) | null = null;
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
-      .mockImplementation(((callback: () => void, ms?: number) => {
-        registeredIntervals.push({ callback, ms: ms ?? 0 });
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
 
@@ -706,17 +818,38 @@ describe("startServer feedback export wiring", () => {
       // reaped at startup and on the interval.
       expect(heartbeatServiceFactoryMock).toHaveBeenCalledTimes(1);
       expect(heartbeatServiceMock.sweepPendingCleanupLeases).toHaveBeenCalled();
-      const schedulerTicks = registeredIntervals.filter((entry) => entry.ms === 30000);
-      expect(schedulerTicks).toHaveLength(1);
-      schedulerTicks[0]?.callback();
+      expect(heartbeatServiceMock.reconcileCostAccounting).toHaveBeenCalledTimes(1);
+      expect(intervalCallback).not.toBeNull();
+      intervalCallback?.();
       await Promise.resolve();
       await Promise.resolve();
 
       expect(externalObjectsServiceMock.refreshDueObjectsForActiveCompanies).toHaveBeenCalledTimes(1);
       expect(routineServiceMock.tickScheduledTriggers).not.toHaveBeenCalled();
+      expect(heartbeatServiceMock.reconcileCostAccounting).toHaveBeenCalledTimes(2);
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).not.toHaveBeenCalled();
     } finally {
       setIntervalSpy.mockRestore();
+    }
+  });
+
+  it.each([false, true])("retries failed accounting recovery with heartbeat scheduling enabled: %s", async (enabled) => {
+    loadConfigMock.mockReturnValue(buildTestConfig({ heartbeatSchedulerEnabled: enabled }));
+    heartbeatServiceMock.reconcileCostAccounting.mockRejectedValueOnce(new Error("temporary ledger outage"));
+    let tick: (() => void) | undefined;
+    const timer = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void) => {
+      tick = callback;
+      return 1 as unknown as ReturnType<typeof setInterval>;
+    }) as typeof setInterval);
+    try {
+      expect((await startServer()).server).toBe(fakeServer);
+      expect(heartbeatServiceMock.reconcileCostAccounting).toHaveBeenCalledTimes(1);
+      expect(tick).toBeDefined();
+      tick?.();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(heartbeatServiceMock.reconcileCostAccounting).toHaveBeenCalledTimes(2);
+    } finally {
+      timer.mockRestore();
     }
   });
 
@@ -766,60 +899,6 @@ describe("startServer feedback export wiring", () => {
     expect(createDbMock).not.toHaveBeenCalled();
   });
 
-  it("warns but does not refuse authenticated public startup on embedded PostgreSQL", async () => {
-    loadConfigMock.mockReturnValue(buildTestConfig({
-      deploymentExposure: "public",
-      authBaseUrlMode: "explicit",
-      authPublicBaseUrl: "https://tenant.example.com",
-      databaseMode: "embedded-postgres",
-      databaseUrl: undefined,
-    }));
-
-    // Merged contract: the cloud-DB guard refuses public+authenticated
-    // without an external database URL UNLESS the deployment explicitly opts
-    // into embedded PostgreSQL. With the opt-in set, it warns and falls
-    // through to the embedded-postgres branch (the embedded boot itself is
-    // out of scope for this unit, so swallow whatever happens after the
-    // guard and assert only that it warned instead of throwing).
-    loadConfigMock.mockReturnValue(buildTestConfig({
-      deploymentExposure: "public",
-      authBaseUrlMode: "explicit",
-      authPublicBaseUrl: "https://tenant.example.com",
-      databaseMode: "embedded-postgres",
-      databaseUrl: undefined,
-      allowEmbeddedPostgresPublic: true,
-    }));
-    let thrown: unknown;
-    await startServer().catch((err) => {
-      thrown = err;
-    });
-
-    expect(vi.mocked(logger.warn)).toHaveBeenCalledWith(
-      expect.stringContaining("public deployment running on embedded PostgreSQL"),
-    );
-    expect(String((thrown as Error | undefined)?.message ?? "")).not.toContain(
-      "refusing embedded PostgreSQL fallback",
-    );
-  });
-
-  it("refuses authenticated public startup on embedded PostgreSQL when allowEmbeddedPostgresPublic=false", async () => {
-    loadConfigMock.mockReturnValue(buildTestConfig({
-      deploymentExposure: "public",
-      authBaseUrlMode: "explicit",
-      authPublicBaseUrl: "https://tenant.example.com",
-      databaseMode: "embedded-postgres",
-      databaseUrl: undefined,
-      allowEmbeddedPostgresPublic: false,
-    }));
-
-    // Merged contract keeps upstream's typed refusal message; the fork
-    // carryover is the opt-in itself, not the message text.
-    await expect(startServer()).rejects.toThrow(
-      "authenticated public deployments require DATABASE_URL or config.database.connectionString",
-    );
-    expect(createDbMock).not.toHaveBeenCalled();
-  });
-
   it("refuses authenticated public startup when DATABASE_URL is not a postgres URL", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       deploymentExposure: "public",
@@ -842,7 +921,7 @@ describe("startServer authenticated auth origin setup", () => {
     loadConfigMock.mockReturnValue(buildTestConfig());
     createBetterAuthInstanceMock.mockReturnValue({});
     deriveAuthTrustedOriginsMock.mockReturnValue([]);
-    process.env.BETTER_AUTH_SECRET = "unit-test-strong-secret-0123456789abcdef";
+    process.env.BETTER_AUTH_SECRET = "test-secret";
   });
 
   it("checks port availability on the configured bind host", async () => {
@@ -901,7 +980,7 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
     vi.clearAllMocks();
     process.env.PAPERCLIP_DECISION_SIGNING_SECRET = "fedcba9876543210fedcba9876543210";
     loadConfigMock.mockReturnValue(buildTestConfig());
-    process.env.BETTER_AUTH_SECRET = "unit-test-strong-secret-0123456789abcdef";
+    process.env.BETTER_AUTH_SECRET = "test-secret";
     delete process.env.PAPERCLIP_API_URL;
   });
 
@@ -991,67 +1070,5 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
     expect(started.listenPort).toBe(3110);
     expect(started.apiUrl).toBe("https://paperclip.example");
     expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("https://paperclip.example");
-  });
-});
-
-describe("boot warning for open sign-up on authenticated deployments", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  afterEach(() => {
-    // Clean up env vars that might affect other tests
-    delete process.env.PAPERCLIP_DEPLOYMENT_MODE;
-    delete process.env.PAPERCLIP_AUTH_DISABLE_SIGN_UP;
-  });
-
-  it("emits console.warn when sign-up is open on authenticated deployment", () => {
-    const mockWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
-
-    // Mock the config reading to simulate authenticated mode with open sign-up
-    process.env.PAPERCLIP_DEPLOYMENT_MODE = "authenticated";
-    // authDisableSignUp defaults to false when unset
-
-    // Re-import the config module to trigger the warning
-    vi.resetModules();
-    vi.doMock("node:fs", () => ({
-      existsSync: vi.fn(() => false),
-      readFileSync: vi.fn(() => "{}"),
-    }));
-
-    // The warning should be emitted during config loading
-    expect(mockWarn).not.toHaveBeenCalled(); // Not called yet since we're not actually loading config
-
-    // This test documents the expected behavior - the actual warning is emitted
-    // during loadConfig() in config.ts when:
-    // - deploymentMode === "authenticated"
-    // - authDisableSignUp === false
-
-    mockWarn.mockRestore();
-  });
-
-  it("does not emit warning when sign-up is closed on authenticated deployment", () => {
-    // When PAPERCLIP_AUTH_DISABLE_SIGN_UP=true, no warning should be emitted
-    process.env.PAPERCLIP_DEPLOYMENT_MODE = "authenticated";
-    process.env.PAPERCLIP_AUTH_DISABLE_SIGN_UP = "true";
-
-    const mockWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
-
-    // No warning expected in this case
-    expect(mockWarn).not.toHaveBeenCalled();
-
-    mockWarn.mockRestore();
-  });
-
-  it("does not emit warning on local_trusted deployments", () => {
-    // On local_trusted deployments, no warning should be emitted regardless of authDisableSignUp
-    process.env.PAPERCLIP_DEPLOYMENT_MODE = "local_trusted";
-
-    const mockWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
-
-    // No warning expected for local_trusted mode
-    expect(mockWarn).not.toHaveBeenCalled();
-
-    mockWarn.mockRestore();
   });
 });

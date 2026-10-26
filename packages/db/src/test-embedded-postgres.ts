@@ -1,16 +1,15 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { applyPendingMigrations, closeRegisteredClients, ensurePostgresDatabase } from "./client.js";
 import {
-  EMBEDDED_POSTGRES_HOST,
-  buildEmbeddedPostgresConnectionString,
-  buildEmbeddedPostgresConstructorOptions,
-  resolveEmbeddedPostgresPasswordForStartup,
-  rotateEmbeddedPostgresAuthIfNeeded,
-  socketDirectoryPathFor,
-} from "./embedded-postgres-auth.js";
+  createEmbeddedPostgresLogBuffer,
+  formatEmbeddedPostgresError,
+} from "./embedded-postgres-error.js";
 import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
 
 // Time budget (ms) for a vitest test in the embedded-Postgres cost class: a
@@ -20,14 +19,6 @@ import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native
 // gives about 10x headroom over the clean time, so a contended run still
 // passes while a genuine hang still fails fast.
 export const EMBEDDED_POSTGRES_TEST_TIMEOUT_MS = 90_000;
-// Bound the teardown path centrally. On a loaded CI runner, embedded-postgres's
-// stop() (which does SIGINT + awaits the postmaster exit event) can take longer
-// than vitest's 10s default hookTimeout. The escalation path below caps total
-// cleanup at gracefulTimeoutMs + sigkillReapTimeoutMs (15s by default), well
-// inside the symmetric 20s hookTimeout that server/vitest.config.ts now sets.
-export const EMBEDDED_POSTGRES_GRACEFUL_STOP_TIMEOUT_MS = 10_000;
-export const EMBEDDED_POSTGRES_SIGKILL_REAP_TIMEOUT_MS = 5_000;
-export const EMBEDDED_POSTGRES_SIGKILL_POLL_INTERVAL_MS = 100;
 
 type EmbeddedPostgresInstance = {
   initialise(): Promise<void>;
@@ -41,9 +32,7 @@ type EmbeddedPostgresCtor = new (opts: {
   password: string;
   port: number;
   persistent: boolean;
-  authMethod?: "scram-sha-256" | "password" | "md5";
   initdbFlags?: string[];
-  postgresFlags?: string[];
   onLog?: (message: unknown) => void;
   onError?: (message: unknown) => void;
 }) => EmbeddedPostgresInstance;
@@ -73,10 +62,27 @@ function getReservedTestPorts(): Set<number> {
   return new Set(configuredPorts.filter((port) => Number.isInteger(port) && port > 0 && port <= 65535));
 }
 
-async function getEmbeddedPostgresCtor(): Promise<EmbeddedPostgresCtor> {
+type EmbeddedPostgresCtorProvider = () => Promise<EmbeddedPostgresCtor>;
+
+async function loadEmbeddedPostgresCtor(): Promise<EmbeddedPostgresCtor> {
   const mod = await import("embedded-postgres");
   await prepareEmbeddedPostgresNativeRuntime();
   return mod.default as EmbeddedPostgresCtor;
+}
+
+let embeddedPostgresCtorProvider: EmbeddedPostgresCtorProvider = loadEmbeddedPostgresCtor;
+
+// Test seam. Replace the embedded-postgres constructor provider so a test can
+// simulate a failed start without the native runtime. Pass `null` to restore
+// the default provider. This module is test support only, so the seam is safe.
+export function __setEmbeddedPostgresCtorProviderForTests(
+  provider: EmbeddedPostgresCtorProvider | null,
+): void {
+  embeddedPostgresCtorProvider = provider ?? loadEmbeddedPostgresCtor;
+}
+
+async function getEmbeddedPostgresCtor(): Promise<EmbeddedPostgresCtor> {
+  return await embeddedPostgresCtorProvider();
 }
 
 async function getAvailablePort(): Promise<number> {
@@ -110,267 +116,551 @@ async function getAvailablePort(): Promise<number> {
   );
 }
 
-const MAX_RECENT_STARTUP_LOG_LINES = 40;
-
-function recordStartupLogLine(recentLogs: string[], message: unknown): void {
-  const text = typeof message === "string" ? message : String(message ?? "");
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    recentLogs.push(line);
-    if (recentLogs.length > MAX_RECENT_STARTUP_LOG_LINES) recentLogs.shift();
-  }
-}
+const EMBEDDED_POSTGRES_USER = "paperclip";
+const EMBEDDED_POSTGRES_PASSWORD = "paperclip";
+const EMBEDDED_POSTGRES_INITDB_FLAGS = ["--encoding=UTF8", "--locale=C", "--lc-messages=C"];
 
 async function createEmbeddedPostgresTestInstance(tempDirPrefix: string) {
-  sweepOrphanedEmbeddedPostgresDataDirs();
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), tempDirPrefix));
-  fs.writeFileSync(ownerPidMarkerPath(dataDir), String(process.pid));
+  return await createEmbeddedPostgresTestInstanceAt(dataDir);
+}
+
+// Wraps an embedded-postgres instance around `dataDir`. The caller decides
+// whether the directory still needs `initialise()` (a fresh cluster) or already
+// holds a copied cluster that only needs `start()`.
+async function createEmbeddedPostgresTestInstanceAt(dataDir: string) {
   const port = await getAvailablePort();
   const EmbeddedPostgres = await getEmbeddedPostgresCtor();
-  const recentLogs: string[] = [];
-  const startupPasswordResolution = resolveEmbeddedPostgresPasswordForStartup(dataDir);
-  const instance = new EmbeddedPostgres(
-    buildEmbeddedPostgresConstructorOptions({
-      dataDir,
-      port,
-      password: startupPasswordResolution.password,
-      // Production kills the TCP listener (listen_addresses=""); the test
-      // harness re-enables loopback TCP so the broad DB suites can keep using
-      // bare `postgres(127.0.0.1:port)` connection strings without threading
-      // unix-socket options through every call site. The killed-TCP posture is
-      // covered directly by embedded-postgres-auth.test.ts.
-      listenAddresses: EMBEDDED_POSTGRES_HOST,
-      onLog: (message) => recordStartupLogLine(recentLogs, message),
-      onError: (message) => recordStartupLogLine(recentLogs, message),
-    }),
-  );
+  // Postgres writes the true reason for a failed start to its output, for
+  // example `could not bind IPv4 address "127.0.0.1": Address already in use`.
+  // The `start()` rejection carries an empty message, so we capture the output
+  // in a bounded buffer and surface it in the thrown error.
+  const logBuffer = createEmbeddedPostgresLogBuffer();
+  const instance = new EmbeddedPostgres({
+    databaseDir: dataDir,
+    user: EMBEDDED_POSTGRES_USER,
+    password: EMBEDDED_POSTGRES_PASSWORD,
+    port,
+    persistent: true,
+    initdbFlags: EMBEDDED_POSTGRES_INITDB_FLAGS,
+    onLog: (message) => logBuffer.append(message),
+    onError: (message) => logBuffer.append(message),
+  });
 
-  return { dataDir, port, instance, recentLogs, startupPasswordResolution };
+  return { dataDir, port, instance, getRecentLogs: () => logBuffer.getRecentLogs() };
+}
+
+function adminConnectionStringFor(port: number): string {
+  return `postgres://${EMBEDDED_POSTGRES_USER}:${EMBEDDED_POSTGRES_PASSWORD}@127.0.0.1:${port}/postgres`;
+}
+
+function databaseConnectionStringFor(port: number): string {
+  return `postgres://${EMBEDDED_POSTGRES_USER}:${EMBEDDED_POSTGRES_PASSWORD}@127.0.0.1:${port}/paperclip`;
 }
 
 function cleanupEmbeddedPostgresTestDirs(dataDir: string) {
   fs.rmSync(dataDir, { recursive: true, force: true });
-  fs.rmSync(ownerPidMarkerPath(dataDir), { force: true });
-  fs.rmSync(socketDirectoryPathFor(dataDir), { recursive: true, force: true });
 }
 
-// A killed run (SIGKILL mid-suite, the routine way a heartbeat run ends here)
-// never gets to run cleanup(), so it leaks the ~170MB datadir. There is no
-// run-lifecycle signal to hook, so instead every new datadir starts with a
-// startup sweep of os.tmpdir() that reclaims *any* leftover Postgres datadir
-// (identified by the PG_VERSION marker, regardless of which caller's
-// tempDirPrefix produced it) whose owning pid is no longer alive.
-const EMBEDDED_POSTGRES_VERSION_MARKER = "PG_VERSION";
+// Upper bound (ms) on how long we wait for the embedded Postgres cluster to
+// stop gracefully before abandoning the wait and returning from the hook.
+const EMBEDDED_POSTGRES_STOP_TIMEOUT_MS = 5000;
 
-function ownerPidMarkerPath(dataDir: string): string {
-  return `${dataDir}.owner-pid`;
-}
-
-function parsePidFileContents(contents: string): number | null {
-  const firstLine = contents.split(/\r?\n/, 1)[0]?.trim();
-  if (!firstLine) return null;
-  const pid = Number.parseInt(firstLine, 10);
-  return Number.isInteger(pid) && pid > 0 ? pid : null;
-}
-
-function readPidFile(filePath: string): number | null {
+// `embedded-postgres@18.1.0-beta.16` exposes only `stop(): Promise<void>` — no
+// shutdown-mode argument. Internally it SIGINTs the postgres process (already
+// PostgreSQL "fast shutdown") and resolves *only* on the child's `exit` event,
+// with no time bound of its own. Under the loaded serial server shard a slow
+// shutdown checkpoint can push that past vitest's hookTimeout and hang the
+// afterAll hook. So we bound the graceful stop: if it overruns, we stop waiting
+// and return so the hook completes. The SIGINT has already been delivered, so
+// the abandoned process still exits on its own (and again when the runner exits).
+// Errors are swallowed, matching prior behavior.
+//
+// `cleanupFn` (data-dir reclaim) is chained on the raw `stop()` promise, not on
+// the timeout race, so the disposable data dir is removed *only after* `stop()`
+// actually settles — i.e. once the child Postgres process has exited. Removing
+// it on the timeout path would pull the data files out from under a still-running
+// cluster and provoke checkpoint / WAL I/O errors. In the fast path `cleanupFn`
+// has run by the time this resolves; in the timeout path it runs asynchronously
+// once the abandoned process finally exits.
+async function stopEmbeddedPostgresBounded(
+  instance: EmbeddedPostgresInstance | null,
+  cleanupFn?: () => void,
+): Promise<void> {
+  if (!instance) {
+    cleanupFn?.();
+    return;
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const stopped = instance
+    .stop()
+    .catch(() => {
+      // Swallow shutdown errors — the data dir is reclaimed regardless.
+    })
+    .finally(() => {
+      try {
+        cleanupFn?.();
+      } catch {
+        // Best-effort reclaim; ignore removal errors.
+      }
+    });
   try {
-    return parsePidFileContents(fs.readFileSync(filePath, "utf8"));
-  } catch {
-    return null;
+    await Promise.race([
+      stopped,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, EMBEDDED_POSTGRES_STOP_TIMEOUT_MS);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
-// Exact liveness, not a guess: process.kill(pid, 0) sends no signal, it only
-// probes whether the pid exists. ESRCH means it's gone. Anything else (alive,
-// EPERM because it's owned by another user, or an unexpected error) fails
-// closed as "alive" so we never remove a datadir we're unsure about.
-export function isPidAlive(pid: number): boolean {
+// Upper bound on start attempts. `getAvailablePort` uses a check-then-use probe:
+// it binds port 0, reads the assigned port, closes the probe, then Postgres binds
+// that port. Under load another process can take the port in that window, so the
+// bind fails with "Address already in use" and `start()` rejects. Each retry uses
+// a fresh port and a fresh data directory, so a transient collision clears.
+const EMBEDDED_POSTGRES_START_MAX_ATTEMPTS = 5;
+
+// Start one embedded Postgres cluster with a bounded retry. Each attempt gets a
+// fresh port and a fresh data directory. On a failed attempt we stop the cluster
+// and remove its data directory before the next attempt. After the last attempt
+// we throw with the real Postgres output so the failure is loud and diagnosable.
+async function startEmbeddedPostgresWithRetry(tempDirPrefix: string): Promise<{
+  port: number;
+  dataDir: string;
+  instance: EmbeddedPostgresInstance;
+}> {
+  let lastError = new Error("embedded Postgres startup failed");
+
+  for (let attempt = 1; attempt <= EMBEDDED_POSTGRES_START_MAX_ATTEMPTS; attempt += 1) {
+    const created = await createEmbeddedPostgresTestInstance(tempDirPrefix);
+    try {
+      await created.instance.initialise();
+      await created.instance.start();
+      return { port: created.port, dataDir: created.dataDir, instance: created.instance };
+    } catch (error) {
+      lastError = formatEmbeddedPostgresError(error, {
+        fallbackMessage: "embedded Postgres startup failed",
+        recentLogs: created.getRecentLogs(),
+      });
+      // Stop the failed cluster and remove its data directory. The next attempt
+      // allocates a fresh port and a fresh data directory.
+      await stopEmbeddedPostgresBounded(created.instance, () =>
+        cleanupEmbeddedPostgresTestDirs(created.dataDir),
+      );
+    }
+  }
+
+  throw new Error(
+    `Failed to start embedded PostgreSQL test database after ${EMBEDDED_POSTGRES_START_MAX_ATTEMPTS} attempts: ${lastError.message}`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Template cluster cache
+//
+// Every suite that calls `startEmbeddedPostgresTestDatabase` used to pay for
+// `initdb`, a cluster start, and all pending migrations (331 files at the time
+// of writing) before its first test ran, and the `getEmbeddedPostgresTestSupport`
+// probe started and stopped a second throwaway cluster per test file. On the
+// serial CI shards that was 5-6s per suite plus 2.5-3s per probe; measured
+// locally it is 3.2s per suite plus 0.75s per probe.
+//
+// A cluster data directory that was shut down cleanly can be copied and started
+// again as an independent cluster. So the first caller on a host builds one
+// fully migrated cluster, stops it, and publishes the data directory as a
+// template under the OS temp directory. Every later caller copies the template
+// (about 90 MB, ~0.2s) and starts Postgres on the copy (~0.05s), then still runs
+// `ensurePostgresDatabase` and `applyPendingMigrations` so the returned database
+// is exactly what the fresh path produces; both are no-ops on a template copy.
+//
+// The template key hashes everything that determines the cluster's contents:
+// the embedded-postgres package version, the initdb flags, the user, and the
+// name and content of every migration file plus the journal. A changed
+// migration therefore builds a new template instead of reusing a stale one.
+// Publishing is a rename, which is atomic on the same filesystem, so a
+// concurrent builder either wins the rename or discards its copy and uses the
+// winner's; a template that exists is always complete.
+//
+// A template is a Postgres data directory, and starting one executes its
+// configuration (for example `shared_preload_libraries`). The cache root is
+// therefore private to the current OS user: its name carries the user id, it
+// is created with mode 0700, and it is only used when it is a real directory
+// (not a symlink) owned by this user with no group or world write bit. Each
+// template is checked the same way before it is copied. On a host with a
+// shared temp directory another user can pre-create the predictable path, and
+// those checks reject it. Windows has no uid; its temp directory is already
+// per user, so the ownership and mode checks are skipped there.
+//
+// Set PAPERCLIP_TEST_POSTGRES_TEMPLATE=0 to bypass the cache and run the fresh
+// path for every suite. Any failure on the template path (root checks, build,
+// copy, start, or publish) falls back to the fresh path, so a broken cache can
+// make a suite slower but never fail it or skip it: the fresh path still
+// reports a migration that cannot apply or a cluster that cannot start.
+// ---------------------------------------------------------------------------
+
+const TEMPLATE_ROOT_DIR_NAME = "paperclip-embedded-postgres-templates";
+// Templates whose key no longer matches are pruned once they have not been
+// used for this long. Every reuse refreshes the template's timestamp.
+const TEMPLATE_PRUNE_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+// Publishing a template requires the builder cluster to have exited for real,
+// so its data files are quiescent before the rename. Give that stop more room
+// than the per-suite bounded stop; a template build happens once per host.
+const TEMPLATE_BUILD_STOP_TIMEOUT_MS = 30_000;
+
+export type EmbeddedPostgresStartMode = "template" | "fresh";
+
+function isTemplateCacheDisabled(): boolean {
+  return process.env.PAPERCLIP_TEST_POSTGRES_TEMPLATE === "0";
+}
+
+function migrationsDirectory(): string {
+  return fileURLToPath(new URL("./migrations/", import.meta.url));
+}
+
+function embeddedPostgresPackageVersion(): string {
   try {
-    process.kill(pid, 0);
-    return true;
+    const require = createRequire(import.meta.url);
+    const manifest = require("embedded-postgres/package.json") as { version?: unknown };
+    return typeof manifest.version === "string" ? manifest.version : "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+// Hash of everything that determines the contents of a migrated cluster. Reads
+// every migration file, which costs a few milliseconds per process.
+export function computeEmbeddedPostgresTemplateKey(
+  migrationsDir: string = migrationsDirectory(),
+  input: { packageVersion?: string; initdbFlags?: string[]; user?: string } = {},
+): string {
+  const hash = createHash("sha256");
+  hash.update(`embedded-postgres=${input.packageVersion ?? embeddedPostgresPackageVersion()}\n`);
+  hash.update(`initdb=${(input.initdbFlags ?? EMBEDDED_POSTGRES_INITDB_FLAGS).join(" ")}\n`);
+  hash.update(`user=${input.user ?? EMBEDDED_POSTGRES_USER}\n`);
+  const journalPath = path.join(migrationsDir, "meta", "_journal.json");
+  if (fs.existsSync(journalPath)) {
+    hash.update(`journal\n`);
+    hash.update(fs.readFileSync(journalPath));
+    hash.update(`\n`);
+  }
+  const migrationFiles = fs
+    .readdirSync(migrationsDir)
+    .filter((name) => name.endsWith(".sql"))
+    .sort((a, b) => a.localeCompare(b));
+  for (const name of migrationFiles) {
+    hash.update(`${name}\n`);
+    hash.update(fs.readFileSync(path.join(migrationsDir, name)));
+    hash.update(`\n`);
+  }
+  return hash.digest("hex").slice(0, 24);
+}
+
+// The uid on POSIX, else the user name. Part of the cache root's name so two
+// users on one host never share a root.
+function templateOwnerTag(): string {
+  const uid = process.getuid?.();
+  if (uid !== undefined) return String(uid);
+  let username = "user";
+  try {
+    username = os.userInfo().username;
+  } catch {
+    // Fall through to the generic tag.
+  }
+  return username.replace(/[^A-Za-z0-9_.-]/g, "_");
+}
+
+function templateRootDir(): string {
+  return path.join(os.tmpdir(), `${TEMPLATE_ROOT_DIR_NAME}-${templateOwnerTag()}`);
+}
+
+// Why `dir` cannot be trusted as a private directory of the current user, or
+// null when it can. Uses `lstat` so a symlink planted at the path is rejected
+// rather than followed. On Windows (no uid) only the directory check applies.
+function describePrivateDirectoryProblem(dir: string): string | null {
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(dir);
   } catch (error) {
-    return (error as NodeJS.ErrnoException)?.code !== "ESRCH";
+    return `cannot be inspected (${(error as NodeJS.ErrnoException).code ?? "unknown error"})`;
   }
+  if (stat.isSymbolicLink()) return "is a symbolic link";
+  if (!stat.isDirectory()) return "is not a directory";
+  const uid = process.getuid?.();
+  if (uid === undefined) return null;
+  if (stat.uid !== uid) return `is owned by uid ${stat.uid}, not the current user (uid ${uid})`;
+  if ((stat.mode & 0o022) !== 0) {
+    return `is writable by group or others (mode ${(stat.mode & 0o777).toString(8)})`;
+  }
+  return null;
 }
 
-export type StopEmbeddedPostgresOptions = {
-  gracefulTimeoutMs?: number;
-  sigkillReapTimeoutMs?: number;
-  sigkillPollIntervalMs?: number;
-  // Injection seams for the regression test: a fake clock and a fake killer
-  // let us assert timing + escalation without spawning real processes that
-  // would slow down the suite or trip the very hookTimeout this fix targets.
-  now?: () => number;
-  sleep?: (ms: number) => Promise<void>;
-  sendSignal?: (pid: number, signal: NodeJS.Signals) => void;
-  probeIsPidAlive?: (pid: number) => boolean;
-};
-
-async function defaultSleep(ms: number): Promise<void> {
-  await new Promise<void>((resolve) => {
-    const handle = setTimeout(resolve, ms);
-    handle.unref?.();
-  });
-}
-
-// Bound teardown so a loaded CI runner can't overrun vitest's hookTimeout on
-// cleanup. Graceful shutdown (instance.stop() = SIGINT + await postmaster
-// exit) is bounded by gracefulTimeoutMs; if it doesn't settle in time we read
-// postmaster.pid out of the datadir, SIGKILL the postmaster, then poll for the
-// pid to actually be gone (the kernel reaping is asynchronous). Total worst
-// case is gracefulTimeoutMs + sigkillReapTimeoutMs, which must remain under
-// the hookTimeout set in server/vitest.config.ts (20s today) plus headroom.
-//
-// Returns true if graceful stop completed within budget, false if we had to
-// escalate to SIGKILL (so callers / tests can distinguish the two paths).
-export async function stopEmbeddedPostgresBounded(
-  instance: EmbeddedPostgresInstance,
-  dataDir: string | null,
-  options: StopEmbeddedPostgresOptions = {},
-): Promise<boolean> {
-  const gracefulTimeoutMs = options.gracefulTimeoutMs ?? EMBEDDED_POSTGRES_GRACEFUL_STOP_TIMEOUT_MS;
-  const sigkillReapTimeoutMs = options.sigkillReapTimeoutMs ?? EMBEDDED_POSTGRES_SIGKILL_REAP_TIMEOUT_MS;
-  const sigkillPollIntervalMs = options.sigkillPollIntervalMs ?? EMBEDDED_POSTGRES_SIGKILL_POLL_INTERVAL_MS;
-  const now = options.now ?? Date.now;
-  const sleep = options.sleep ?? defaultSleep;
-  const sendSignal = options.sendSignal ?? ((pid, signal) => process.kill(pid, signal));
-  const probeIsPidAlive = options.probeIsPidAlive ?? isPidAlive;
-
-  const gracefulSettled = await Promise.race([
-    instance.stop().then(
-      () => true,
-      () => false,
-    ),
-    new Promise<boolean>((resolve) => {
-      const handle = setTimeout(() => resolve(false), gracefulTimeoutMs);
-      handle.unref?.();
-    }),
-  ]);
-  if (gracefulSettled) return true;
-  if (!dataDir) return false;
-
-  const postmasterPid = readPidFile(path.join(dataDir, "postmaster.pid"));
-  if (postmasterPid === null || !probeIsPidAlive(postmasterPid)) return false;
-
+// Creates the cache root with mode 0700 and verifies it is private to the
+// current user. Returns null, after one warning, when it is not: the cache is
+// then unused for this process and every suite takes the fresh path.
+function prepareTemplateRootDir(): string | null {
+  const rootDir = templateRootDir();
   try {
-    sendSignal(postmasterPid, "SIGKILL");
-  } catch {
-    return false;
-  }
-
-  const deadline = now() + sigkillReapTimeoutMs;
-  while (now() < deadline) {
-    if (!probeIsPidAlive(postmasterPid)) return false;
-    await sleep(sigkillPollIntervalMs);
-  }
-  return false;
-}
-
-export type ReclaimableDataDirCandidate = {
-  hasVersionMarker: boolean;
-  postmasterPid: number | null;
-  ownerPid: number | null;
-};
-
-// Pure decision function, unit-testable without touching a real cluster:
-// hand it what a directory listing says about one entry (does it look like a
-// Postgres datadir, and which pid(s) claim to own it) plus a liveness probe.
-//
-// postmasterPid (written by Postgres itself once it finishes booting) is
-// preferred when present. Most of the orphans this exists to clean up never
-// get that far - they're killed mid-initdb, before Postgres ever writes
-// postmaster.pid - so we fall back to ownerPid, a marker this module writes
-// itself immediately after mkdtemp naming the creating process. If neither
-// marker is present at all, there is no owner on record, so it's an orphan
-// from before this fix (or the exceedingly narrow window between mkdtemp and
-// the marker write) and it's safe to reclaim.
-export function isReclaimableEmbeddedPostgresDataDir(
-  candidate: ReclaimableDataDirCandidate,
-  probeIsPidAlive: (pid: number) => boolean = isPidAlive,
-): boolean {
-  if (!candidate.hasVersionMarker) return false;
-  const ownerPid = candidate.postmasterPid ?? candidate.ownerPid;
-  if (ownerPid === null) return true;
-  return !probeIsPidAlive(ownerPid);
-}
-
-function readReclaimCandidate(entryPath: string): ReclaimableDataDirCandidate | null {
-  let hasVersionMarker: boolean;
-  try {
-    hasVersionMarker = fs.statSync(path.join(entryPath, EMBEDDED_POSTGRES_VERSION_MARKER)).isFile();
-  } catch {
+    fs.mkdirSync(rootDir, { recursive: true, mode: 0o700 });
+    const problem = describePrivateDirectoryProblem(rootDir);
+    if (problem !== null) {
+      warnTemplateOnce("root", `template cache root ${rootDir} ${problem}; using fresh clusters`);
+      return null;
+    }
+    // A root created by an earlier version may be wider than 0700. It is
+    // ours (checked above), so narrow it.
+    if (process.getuid !== undefined && (fs.lstatSync(rootDir).mode & 0o777) !== 0o700) {
+      fs.chmodSync(rootDir, 0o700);
+    }
+    return rootDir;
+  } catch (error) {
+    warnTemplateOnce(
+      "root",
+      `template cache root ${rootDir} could not be prepared: ${(error as Error).message}; using fresh clusters`,
+    );
     return null;
   }
-  if (!hasVersionMarker) return null;
-
-  return {
-    hasVersionMarker,
-    postmasterPid: readPidFile(path.join(entryPath, "postmaster.pid")),
-    ownerPid: readPidFile(ownerPidMarkerPath(entryPath)),
-  };
 }
 
-// Best-effort only: a failure to reclaim orphaned datadirs must never fail a
-// test run that would otherwise pass, so every layer of this degrades to a
-// no-op rather than throwing into the caller.
-export function sweepOrphanedEmbeddedPostgresDataDirs(tmpDir: string = os.tmpdir()): void {
+// A template is usable when it is a private directory of the current user
+// that holds a cleanly stopped cluster: `PG_VERSION` present, no
+// `postmaster.pid`. The ownership check repeats the root's check so a
+// template is never copied from a directory this user does not own.
+function isUsableTemplate(dir: string): boolean {
+  if (describePrivateDirectoryProblem(dir) !== null) return false;
+  return fs.existsSync(path.join(dir, "PG_VERSION")) && !fs.existsSync(path.join(dir, "postmaster.pid"));
+}
+
+// Records a use of the template so `pruneStaleTemplates` measures idle time,
+// not age. Best effort.
+function touchTemplate(dir: string): void {
+  try {
+    const now = new Date();
+    fs.utimesSync(dir, now, now);
+  } catch {
+    // The template still works without the refreshed timestamp.
+  }
+}
+
+const warnedTemplateTopics = new Set<string>();
+
+function warnTemplateOnce(topic: string, message: string): void {
+  if (warnedTemplateTopics.has(topic)) return;
+  warnedTemplateTopics.add(topic);
+  console.warn(`[embedded-postgres] ${message}`);
+}
+
+// Best-effort removal of templates for other keys that have not been used for
+// a week, plus abandoned build directories. Every reuse refreshes a template's
+// timestamp, so a template that any process resolved in the last week stays.
+// A suite never depends on the template after its copy is made, so pruning
+// can only affect a process that resolved the path and has not copied yet;
+// that process then rebuilds the template instead of failing. Never throws.
+function pruneStaleTemplates(rootDir: string, keepDir: string): void {
   let entries: fs.Dirent[];
   try {
-    entries = fs.readdirSync(tmpDir, { withFileTypes: true });
+    entries = fs.readdirSync(rootDir, { withFileTypes: true });
   } catch {
     return;
   }
-
+  const now = Date.now();
   for (const entry of entries) {
+    const entryPath = path.join(rootDir, entry.name);
+    if (entryPath === keepDir || !entry.isDirectory()) continue;
     try {
-      if (!entry.isDirectory()) continue;
-      const entryPath = path.join(tmpDir, entry.name);
-      const candidate = readReclaimCandidate(entryPath);
-      if (!candidate || !isReclaimableEmbeddedPostgresDataDir(candidate)) continue;
-      fs.rmSync(entryPath, { recursive: true, force: true });
-      fs.rmSync(ownerPidMarkerPath(entryPath), { force: true });
+      const age = now - fs.statSync(entryPath).mtimeMs;
+      if (age > TEMPLATE_PRUNE_AGE_MS) fs.rmSync(entryPath, { recursive: true, force: true });
     } catch {
-      // Leave this entry for the next sweep rather than failing the caller.
+      // Another process may be using or removing it; leave it alone.
     }
   }
 }
 
-function formatEmbeddedPostgresError(error: unknown): string {
-  if (error instanceof Error && error.message.length > 0) return error.message;
-  if (typeof error === "string" && error.length > 0) return error;
-  return "embedded Postgres startup failed";
+// Waits for the raw `stop()` so the builder cluster has really exited before
+// its data directory is published. Returns false if the stop overran.
+async function stopForTemplatePublish(instance: EmbeddedPostgresInstance): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      instance.stop().then(() => true, () => false),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), TEMPLATE_BUILD_STOP_TIMEOUT_MS);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+// Builds a migrated cluster and publishes its data directory at `templateDir`.
+// Throws when the cluster cannot start or a migration cannot apply. Returns
+// false when the cluster started but the template could not be published;
+// callers then use the fresh path for this process.
+async function buildEmbeddedPostgresTemplate(templateDir: string): Promise<boolean> {
+  const rootDir = path.dirname(templateDir);
+  const { port, dataDir, instance } = await startEmbeddedPostgresWithRetry(
+    "paperclip-embedded-postgres-template-build-",
+  );
+  let published = false;
+  try {
+    await ensurePostgresDatabase(adminConnectionStringFor(port), "paperclip");
+    await applyPendingMigrations(databaseConnectionStringFor(port));
+    const stopped = await stopForTemplatePublish(instance);
+    if (!stopped || !isUsableTemplate(dataDir)) return false;
+    try {
+      fs.renameSync(dataDir, templateDir);
+      published = true;
+    } catch (error) {
+      // Another process published the same key first. Use theirs.
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EEXIST" || code === "ENOTEMPTY" || code === "EPERM") {
+        return isUsableTemplate(templateDir);
+      }
+      throw error;
+    }
+    pruneStaleTemplates(rootDir, templateDir);
+    return true;
+  } finally {
+    if (!published) {
+      await stopEmbeddedPostgresBounded(instance, () => cleanupEmbeddedPostgresTestDirs(dataDir));
+    }
+  }
+}
+
+let templateDirPromise: Promise<string | null> | null = null;
+
+// Resolves the template data directory for this host, building it on first
+// use. Resolves null when the cache is disabled, the cache root is not private
+// to this user, or the template could not be built or published; every caller
+// then takes the fresh path, which reports the real error itself (a cluster
+// that cannot start, a migration that cannot apply). Never rejects, so a
+// broken cache can never turn into `supported: false` and skip a suite.
+async function getEmbeddedPostgresTemplateDir(): Promise<string | null> {
+  if (isTemplateCacheDisabled()) return null;
+  if (!templateDirPromise) {
+    templateDirPromise = (async () => {
+      const rootDir = prepareTemplateRootDir();
+      if (rootDir === null) return null;
+      const templateDir = path.join(rootDir, computeEmbeddedPostgresTemplateKey());
+      if (isUsableTemplate(templateDir)) {
+        touchTemplate(templateDir);
+        return templateDir;
+      }
+      try {
+        const built = await buildEmbeddedPostgresTemplate(templateDir);
+        return built && isUsableTemplate(templateDir) ? templateDir : null;
+      } catch (error) {
+        warnTemplateOnce(
+          "build",
+          `template build failed, using fresh clusters: ${(error as Error).message}`,
+        );
+        return null;
+      }
+    })();
+  }
+  return await templateDirPromise;
+}
+
+// Forgets the resolved template so the next caller in this process checks the
+// cache again. Used after a template start failed, for example because the
+// template was pruned by another process after this one resolved its path.
+function resetTemplateDirCache(): void {
+  templateDirPromise = null;
+}
+
+// Copies the template and starts a cluster on the copy. Each attempt uses a
+// fresh copy and a fresh port, mirroring `startEmbeddedPostgresWithRetry`. A
+// template that is no longer usable (pruned, or no longer private) is not
+// retried: the caller falls back and the next caller rebuilds it.
+async function startEmbeddedPostgresFromTemplateWithRetry(
+  templateDir: string,
+  tempDirPrefix: string,
+): Promise<{ port: number; dataDir: string; instance: EmbeddedPostgresInstance }> {
+  let lastError = new Error("embedded Postgres startup from template failed");
+
+  for (let attempt = 1; attempt <= EMBEDDED_POSTGRES_START_MAX_ATTEMPTS; attempt += 1) {
+    if (!isUsableTemplate(templateDir)) {
+      throw new Error(`embedded Postgres template ${templateDir} is no longer usable`);
+    }
+    const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), tempDirPrefix));
+    const dataDir = path.join(rootDir, "data");
+    let created: Awaited<ReturnType<typeof createEmbeddedPostgresTestInstanceAt>> | null = null;
+    try {
+      fs.cpSync(templateDir, dataDir, { recursive: true });
+      // Postgres refuses a data directory that is group or world accessible.
+      fs.chmodSync(dataDir, 0o700);
+      created = await createEmbeddedPostgresTestInstanceAt(dataDir);
+      await created.instance.start();
+      return { port: created.port, dataDir: rootDir, instance: created.instance };
+    } catch (error) {
+      lastError = formatEmbeddedPostgresError(error, {
+        fallbackMessage: "embedded Postgres startup from template failed",
+        recentLogs: created?.getRecentLogs(),
+      });
+      await stopEmbeddedPostgresBounded(created?.instance ?? null, () =>
+        cleanupEmbeddedPostgresTestDirs(rootDir),
+      );
+    }
+  }
+
+  throw new Error(
+    `Failed to start embedded PostgreSQL from template after ${EMBEDDED_POSTGRES_START_MAX_ATTEMPTS} attempts: ${lastError.message}`,
+  );
+}
+
+let templateFallbackWarned = false;
+let lastStartMode: EmbeddedPostgresStartMode | null = null;
+
+// Test-only accessors. Production callers use `startEmbeddedPostgresTestDatabase`
+// or `getEmbeddedPostgresTestSupport`. A test drives the bounded retry directly
+// so it does not need a real Postgres connection.
+export const __startEmbeddedPostgresWithRetryForTests = startEmbeddedPostgresWithRetry;
+export const __embeddedPostgresStartMaxAttemptsForTests = EMBEDDED_POSTGRES_START_MAX_ATTEMPTS;
+export const __embeddedPostgresTemplateRootDirForTests = templateRootDir;
+export const __isUsableEmbeddedPostgresTemplateForTests = isUsableTemplate;
+export function __lastEmbeddedPostgresStartModeForTests(): EmbeddedPostgresStartMode | null {
+  return lastStartMode;
+}
+// Forgets the support probe result, the resolved template, and the one-time
+// warnings so a test can drive the probe and the cache again in one process.
+export function __resetEmbeddedPostgresTemplateStateForTests(): void {
+  embeddedPostgresSupportPromise = null;
+  templateDirPromise = null;
+  templateFallbackWarned = false;
+  warnedTemplateTopics.clear();
+  lastStartMode = null;
 }
 
 async function probeEmbeddedPostgresSupport(): Promise<EmbeddedPostgresTestSupport> {
-  let dataDir: string | null = null;
-  let instance: EmbeddedPostgresInstance | null = null;
+  // A published template proves this host can run the cluster: it was built
+  // here. Reusing it makes the probe free for every file after the first.
+  // Building it costs one cluster start, the same as the throwaway probe did.
+  // When the template cannot be built or used, the throwaway probe below
+  // decides, so only a cluster that cannot start reports `supported: false`;
+  // a migration that cannot apply fails the suite loudly on the fresh path.
+  if ((await getEmbeddedPostgresTemplateDir()) !== null) return { supported: true };
+
+  let started: { dataDir: string; instance: EmbeddedPostgresInstance } | null = null;
 
   try {
-    const created = await createEmbeddedPostgresTestInstance(
-      "paperclip-embedded-postgres-probe-",
-    );
-    dataDir = created.dataDir;
-    instance = created.instance;
-    await instance.initialise();
-    await instance.start();
-    await rotateEmbeddedPostgresAuthIfNeeded({
-      dataDir,
-      port: created.port,
-      currentPassword: created.startupPasswordResolution.password,
-    });
+    started = await startEmbeddedPostgresWithRetry("paperclip-embedded-postgres-probe-");
     return { supported: true };
   } catch (error) {
     return {
       supported: false,
-      reason: formatEmbeddedPostgresError(error),
+      reason: formatEmbeddedPostgresError(error, {
+        fallbackMessage: "embedded Postgres startup failed",
+      }).message,
     };
   } finally {
-    if (instance) {
-      await stopEmbeddedPostgresBounded(instance, dataDir).catch(() => {});
+    if (started) {
+      const { dataDir, instance } = started;
+      await stopEmbeddedPostgresBounded(instance, () => cleanupEmbeddedPostgresTestDirs(dataDir));
     }
-    if (dataDir) cleanupEmbeddedPostgresTestDirs(dataDir);
   }
 }
 
@@ -381,89 +671,70 @@ export async function getEmbeddedPostgresTestSupport(): Promise<EmbeddedPostgres
   return await embeddedPostgresSupportPromise;
 }
 
-const MAX_PORT_COLLISION_ATTEMPTS = 5;
-const PORT_COLLISION_LOG_PATTERN = /address already in use/i;
+// Starts the cluster for one suite: from the host template when one is
+// available, otherwise a fresh `initdb`. Template failures fall back to the
+// fresh path so the cache can only make a suite faster, never fail it.
+async function startEmbeddedPostgresClusterForSuite(
+  tempDirPrefix: string,
+): Promise<{ port: number; dataDir: string; instance: EmbeddedPostgresInstance; mode: EmbeddedPostgresStartMode }> {
+  const templateDir = await getEmbeddedPostgresTemplateDir();
 
-// getAvailablePort() closes its probe socket before initialise()/start() ever
-// binds it, so a concurrent test worker can grab the same port in between
-// (TOCTOU). When that happens, embedded-postgres's start() rejects with no
-// error object at all (it settles via a bare `reject()` on early process
-// exit) - the only signal is the "Address already in use" line it hands to
-// onLog. Detect that in the captured startup log rather than the thrown error.
-function isLikelyPortCollision(recentLogs: string[]): boolean {
-  return recentLogs.some((line) => PORT_COLLISION_LOG_PATTERN.test(line));
+  if (templateDir !== null) {
+    try {
+      const started = await startEmbeddedPostgresFromTemplateWithRetry(templateDir, tempDirPrefix);
+      return { ...started, mode: "template" };
+    } catch (error) {
+      // The next caller in this process re-resolves the template: if it was
+      // pruned it is rebuilt, instead of retrying a path that is gone.
+      resetTemplateDirCache();
+      if (!templateFallbackWarned) {
+        templateFallbackWarned = true;
+        console.warn(
+          `[embedded-postgres] template start failed, using a fresh cluster: ${(error as Error).message}`,
+        );
+      }
+    }
+  }
+
+  // The bounded retry hardens the cluster start against the port race. It throws
+  // with the real Postgres output if every attempt fails.
+  const started = await startEmbeddedPostgresWithRetry(tempDirPrefix);
+  return { ...started, mode: "fresh" };
 }
 
 export async function startEmbeddedPostgresTestDatabase(
   tempDirPrefix: string,
 ): Promise<EmbeddedPostgresTestDatabase> {
-  let lastError: unknown;
+  const { port, dataDir, instance, mode } = await startEmbeddedPostgresClusterForSuite(tempDirPrefix);
+  lastStartMode = mode;
 
-  for (let attempt = 1; attempt <= MAX_PORT_COLLISION_ATTEMPTS; attempt += 1) {
-    let dataDir: string | null = null;
-    let instance: EmbeddedPostgresInstance | null = null;
-    let recentLogs: string[] = [];
+  try {
+    // Both calls are no-ops on a template copy and keep the returned database
+    // identical to the fresh path even if the template were ever stale.
+    await ensurePostgresDatabase(adminConnectionStringFor(port), "paperclip");
+    const connectionString = databaseConnectionStringFor(port);
+    await applyPendingMigrations(connectionString);
 
-    try {
-      const created = await createEmbeddedPostgresTestInstance(tempDirPrefix);
-      dataDir = created.dataDir;
-      instance = created.instance;
-      recentLogs = created.recentLogs;
-      const { port } = created;
-      await instance.initialise();
-      await instance.start();
-
-      const rotation = await rotateEmbeddedPostgresAuthIfNeeded({
-        dataDir,
-        port,
-        currentPassword: created.startupPasswordResolution.password,
-      });
-      const adminConnectionString = buildEmbeddedPostgresConnectionString({
-        port,
-        database: "postgres",
-        password: rotation.password,
-      });
-      // The harness keeps loopback TCP enabled (see listenAddresses above), so
-      // the TCP-shaped connection strings below connect directly — no socket
-      // routing needed here.
-      await ensurePostgresDatabase(adminConnectionString, "paperclip");
-      const connectionString = buildEmbeddedPostgresConnectionString({
-        port,
-        database: "paperclip",
-        password: rotation.password,
-      });
-      await applyPendingMigrations(connectionString);
-
-      return {
-        connectionString,
-        cleanup: async () => {
-          // End every client a caller created against this cluster first (upstream
-          // semantics): a still-registered client whose stop kills its socket can crash
-          // the process when a queued write fires later.
-          await closeRegisteredClients(connectionString).catch(() => {});
-          if (instance) {
-            await stopEmbeddedPostgresBounded(instance, dataDir).catch(() => {});
-          }
-          if (dataDir) cleanupEmbeddedPostgresTestDirs(dataDir);
-        },
-      };
-    } catch (error) {
-      if (instance) {
-        await stopEmbeddedPostgresBounded(instance, dataDir).catch(() => {});
-      }
-      if (dataDir) cleanupEmbeddedPostgresTestDirs(dataDir);
-
-      const canRetry = attempt < MAX_PORT_COLLISION_ATTEMPTS && isLikelyPortCollision(recentLogs);
-      if (!canRetry) {
-        throw new Error(
-          `Failed to start embedded PostgreSQL test database: ${formatEmbeddedPostgresError(error)}`,
-        );
-      }
-      lastError = error;
-    }
+    return {
+      connectionString,
+      cleanup: async () => {
+        // End every client a caller created against this cluster first. A
+        // client that still holds a reserved connection when the cluster
+        // stops can crash the process: the stop kills the backend socket,
+        // but a queued write on that connection still fires later and finds
+        // a null socket.
+        await closeRegisteredClients(connectionString);
+        await stopEmbeddedPostgresBounded(instance, () => cleanupEmbeddedPostgresTestDirs(dataDir));
+      },
+    };
+  } catch (error) {
+    await stopEmbeddedPostgresBounded(instance, () => cleanupEmbeddedPostgresTestDirs(dataDir));
+    throw new Error(
+      `Failed to start embedded PostgreSQL test database: ${
+        formatEmbeddedPostgresError(error, {
+          fallbackMessage: "embedded Postgres startup failed",
+        }).message
+      }`,
+    );
   }
-
-  throw new Error(
-    `Failed to start embedded PostgreSQL test database: ${formatEmbeddedPostgresError(lastError)}`,
-  );
 }

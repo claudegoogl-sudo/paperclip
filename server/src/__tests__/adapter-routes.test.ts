@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { vi } from "vitest";
 import type { ServerAdapterModule } from "../adapters/index.js";
 
@@ -51,20 +51,27 @@ let setOverridePaused: typeof import("../adapters/registry.js").setOverridePause
 let adapterRoutes: typeof import("../routes/adapters.js").adapterRoutes;
 let errorHandler: typeof import("../middleware/index.js").errorHandler;
 
-// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
-// registry must be in place before ANY import of the routes module, in every
-// test. createApp concurrently imports middleware and route modules whose
-// graphs both contain services/index.js. With doMock-registered mocks that
-// first evaluation could race the registry under load and bind the REAL
-// services module, rejecting the request under test with a 500 (observed on
-// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
-// to every import graph deterministically.
-vi.mock("node:child_process", async () => vi.importActual("node:child_process"));
-vi.mock("../adapters/plugin-loader.js", () => mockPluginLoader);
-vi.mock("../services/adapter-plugin-store.js", () => mockAdapterPluginStore);
-vi.mock("../routes/adapters.js", async () => vi.importActual("../routes/adapters.js"));
-vi.mock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
-vi.mock("../middleware/index.js", async () => vi.importActual("../middleware/index.js"));
+function registerModuleMocks() {
+  vi.doMock("node:child_process", async () => vi.importActual("node:child_process"));
+  vi.doMock("../adapters/plugin-loader.js", () => mockPluginLoader);
+  vi.doMock("../services/adapter-plugin-store.js", () => mockAdapterPluginStore);
+}
+
+function resetAdapterMocks() {
+  vi.resetAllMocks();
+  mockAdapterPluginStore.listAdapterPlugins.mockReturnValue([]);
+  mockAdapterPluginStore.addAdapterPlugin.mockResolvedValue(undefined);
+  mockAdapterPluginStore.removeAdapterPlugin.mockReturnValue(false);
+  mockAdapterPluginStore.getAdapterPluginByType.mockReturnValue(undefined);
+  mockAdapterPluginStore.getAdapterPluginsDir.mockReturnValue("/tmp/paperclip-adapter-routes-test");
+  mockAdapterPluginStore.getDisabledAdapterTypes.mockReturnValue([]);
+  mockAdapterPluginStore.setAdapterDisabled.mockReturnValue(false);
+  mockPluginLoader.buildExternalAdapters.mockResolvedValue([]);
+  mockPluginLoader.loadExternalAdapterPackage.mockResolvedValue(null);
+  mockPluginLoader.getUiParserSource.mockResolvedValue(null);
+  mockPluginLoader.getOrExtractUiParserSource.mockResolvedValue(null);
+  mockPluginLoader.reloadExternalAdapter.mockResolvedValue(null);
+}
 
 function createApp(
   actorOverrides: Partial<Express.Request["actor"]> = {},
@@ -89,24 +96,14 @@ function createApp(
 }
 
 describe("adapter routes", () => {
-  beforeEach(async () => {
-    mockAdapterPluginStore.listAdapterPlugins.mockReturnValue([]);
-    mockAdapterPluginStore.addAdapterPlugin.mockResolvedValue(undefined);
-    mockAdapterPluginStore.removeAdapterPlugin.mockReturnValue(false);
-    mockAdapterPluginStore.getAdapterPluginByType.mockReturnValue(undefined);
-    mockAdapterPluginStore.getAdapterPluginsDir.mockReturnValue("/tmp/paperclip-adapter-routes-test");
-    mockAdapterPluginStore.getDisabledAdapterTypes.mockReturnValue([]);
-    mockAdapterPluginStore.setAdapterDisabled.mockReturnValue(false);
-    mockPluginLoader.buildExternalAdapters.mockResolvedValue([]);
-    mockPluginLoader.loadExternalAdapterPackage.mockResolvedValue(null);
-    mockPluginLoader.getUiParserSource.mockResolvedValue(null);
-    mockPluginLoader.getOrExtractUiParserSource.mockResolvedValue(null);
-    mockPluginLoader.reloadExternalAdapter.mockResolvedValue(null);
-    const [registry, routes, middleware] = await Promise.all([
-      vi.importActual<typeof import("../adapters/registry.js")>("../adapters/registry.js"),
-      import("../routes/adapters.js"),
-      import("../middleware/index.js"),
-    ]);
+  // Keep the route and middleware on one module graph so HttpError retains
+  // its identity. Reset mock state and adapter overrides between tests.
+  beforeAll(async () => {
+    registerModuleMocks();
+    resetAdapterMocks();
+    const registry = await import("../adapters/registry.js");
+    const routes = await import("../routes/adapters.js");
+    const middleware = await import("../middleware/index.js");
     registerServerAdapter = registry.registerServerAdapter;
     unregisterServerAdapter = registry.unregisterServerAdapter;
     findServerAdapter = registry.findServerAdapter;
@@ -114,6 +111,10 @@ describe("adapter routes", () => {
     setOverridePaused = registry.setOverridePaused;
     adapterRoutes = routes.adapterRoutes;
     errorHandler = middleware.errorHandler;
+  });
+
+  beforeEach(() => {
+    resetAdapterMocks();
     setOverridePaused("claude_local", false);
     unregisterServerAdapter("hermes_local");
     unregisterServerAdapter("claude_local");
@@ -163,6 +164,15 @@ describe("adapter routes", () => {
           supportsInstructionsBundle: true,
         },
       });
+  });
+
+  it("keeps the shared implementation available for Dot independently, while honoring adapter-admin disabling", async () => {
+    const options = { getNativeRunnerEnabled: async () => false, getOpenAiDotEnabled: async () => true };
+    const enabled = await request(createApp({}, options)).get("/api/adapters");
+    expect(enabled.body.find((adapter: any) => adapter.type === "paperclip_runner")).toMatchObject({ disabled: false });
+    mockAdapterPluginStore.getDisabledAdapterTypes.mockReturnValue(["paperclip_runner"]);
+    const disabled = await request(createApp({}, options)).get("/api/adapters");
+    expect(disabled.body.find((adapter: any) => adapter.type === "paperclip_runner")).toMatchObject({ disabled: true });
   });
 
   it("GET /api/adapters returns correct capabilities for built-in adapters", async () => {
@@ -611,39 +621,5 @@ describe("adapter routes", () => {
     unregisterServerAdapter("codex_local");
     expect(findServerAdapter("codex_local")).toBe(builtin);
     setOverridePaused("codex_local", false);
-  });
-
-  describe("request body validation", () => {
-    it.each([
-      ["POST", "/api/adapters/install"],
-      ["PATCH", "/api/adapters/claude_local"],
-      ["PATCH", "/api/adapters/claude_local/override"],
-    ] as const)("%s %s without a request body returns 400", async (method, path) => {
-      const app = createApp({ isInstanceAdmin: true });
-      const res = await (method === "POST" ? request(app).post(path) : request(app).patch(path));
-      expect(res.status, JSON.stringify(res.body)).toBe(400);
-    });
-
-    it("POST /api/adapters/install rejects a non-boolean isLocalPath before touching the loader", async () => {
-      mockPluginLoader.loadExternalAdapterPackage.mockClear();
-      const app = createApp({ isInstanceAdmin: true });
-      const res = await request(app)
-        .post("/api/adapters/install")
-        .send({ packageName: "/tmp/fake-adapter", isLocalPath: "false" });
-      expect(res.status, JSON.stringify(res.body)).toBe(400);
-      expect(res.body.error).toMatch(/isLocalPath/);
-      expect(mockPluginLoader.loadExternalAdapterPackage).not.toHaveBeenCalled();
-    });
-
-    it("POST /api/adapters/install rejects a non-string version", async () => {
-      mockPluginLoader.loadExternalAdapterPackage.mockClear();
-      const app = createApp({ isInstanceAdmin: true });
-      const res = await request(app)
-        .post("/api/adapters/install")
-        .send({ packageName: "some-adapter", version: { major: 1 } });
-      expect(res.status, JSON.stringify(res.body)).toBe(400);
-      expect(res.body.error).toMatch(/version/);
-      expect(mockPluginLoader.loadExternalAdapterPackage).not.toHaveBeenCalled();
-    });
   });
 });

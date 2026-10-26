@@ -1,11 +1,9 @@
 import { createHash } from "node:crypto";
 import { drizzle as drizzlePg } from "drizzle-orm/postgres-js";
-import { migrate as migratePg } from "drizzle-orm/postgres-js/migrator";
 import { readFile, readdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import postgres from "postgres";
-import { resolveEmbeddedPostgresConnection } from "./embedded-postgres-auth.js";
-import { enableQueryCancellation } from "./query-cancellation.js";
+import { installDatabaseWorkSignals } from "./work-signals.js";
 import * as schema from "./schema/index.js";
 
 const MIGRATIONS_FOLDER = fileURLToPath(new URL("./migrations", import.meta.url));
@@ -13,8 +11,7 @@ const DRIZZLE_MIGRATIONS_TABLE = "__drizzle_migrations";
 const MIGRATIONS_JOURNAL_JSON = fileURLToPath(new URL("./migrations/meta/_journal.json", import.meta.url));
 
 function createUtilitySql(url: string) {
-  const { connectionString, sqlOptions } = resolveEmbeddedPostgresConnection(url);
-  return postgres(connectionString, { max: 1, onnotice: () => {}, ...sqlOptions });
+  return postgres(url, { max: 1, onnotice: () => {} });
 }
 
 type RegisteredPostgresClient = ReturnType<typeof postgres>;
@@ -257,29 +254,6 @@ export function postgresJsOptions(options: DatabaseClientOptions): Record<string
   return driverOptions;
 }
 
-export const DEFAULT_DB_POOL_MAX = 20;
-export const DEFAULT_DB_STATEMENT_TIMEOUT_MS = 60_000;
-
-function readIntEnv(name: string, fallback: number, { min }: { min: number }): number {
-  const raw = process.env[name];
-  if (raw === undefined || raw.trim() === "") return fallback;
-  const parsed = Number(raw.trim());
-  if (!Number.isInteger(parsed) || parsed < min) return fallback;
-  return parsed;
-}
-
-export function resolveDbPoolOptions(): { max: number; statementTimeoutMs: number } {
-  return {
-    max: readIntEnv("PAPERCLIP_DB_POOL_MAX", DEFAULT_DB_POOL_MAX, { min: 1 }),
-    // 0 disables the timeout, matching Postgres' own statement_timeout semantics.
-    statementTimeoutMs: readIntEnv(
-      "PAPERCLIP_DB_STATEMENT_TIMEOUT_MS",
-      DEFAULT_DB_STATEMENT_TIMEOUT_MS,
-      { min: 0 },
-    ),
-  };
-}
-
 // A long advisory-lock transaction must not borrow the normal pool that its
 // work needs for progress writes. Keep connection configuration private to the
 // originating Db lifetime; callers receive neither URLs nor credentials.
@@ -295,35 +269,21 @@ export async function withDedicatedDbConnection<T>(db: Db, action: (dedicated: D
 
 export function createDb(url: string, options?: DatabaseClientOptions) {
   const resolved = resolveDatabaseClientOptions(options ?? databaseClientOptionsFromEnv());
-  // Pool-size precedence (fork carryover over upstream 824.1): explicit
-  // options win, then the upstream DATABASE_POOL_MAX variable, then the fork's
-  // PAPERCLIP_DB_POOL_MAX, then the fork default. Upstream's options refactor
-  // stopped feeding resolveDbPoolOptions().max to the driver, which silently
-  // retired PAPERCLIP_DB_POOL_MAX and shrank the default pool from
-  // DEFAULT_DB_POOL_MAX to the driver default — restored here so existing
-  // deployments keep their configured sizing.
-  const maxConnections =
-    resolved.maxConnections
-    ?? envPositiveInteger(process.env, "DATABASE_POOL_MAX")
-    ?? resolveDbPoolOptions().max;
-  const { statementTimeoutMs } = resolveDbPoolOptions();
-  const { connectionString, sqlOptions } = resolveEmbeddedPostgresConnection(url);
-  const driverOptions = postgresJsOptions({ ...resolved, maxConnections });
-  const driverConnection = (driverOptions.connection ?? {}) as Record<string, unknown>;
-  const sql = postgres(connectionString, {
-    ...driverOptions,
-    connection: { ...driverConnection, statement_timeout: statementTimeoutMs },
-    ...sqlOptions,
-  });
+  return createDbClient(url, resolved);
+}
+
+function createDbClient(url: string, resolved: DatabaseClientOptions, owner?: object) {
+  const sql = postgres(url, postgresJsOptions(resolved));
   const key = hostPortKeyOrNull(url);
   if (key) registerClient(key, sql);
-  // Queries created inside a request scope are cancelled when that scope
-  // aborts. No transient-write replay: a disconnect can lose the response after
-  // a statement has committed, so retries are left to idempotent callers.
-  const db = drizzlePg(enableQueryCancellation(sql), { schema });
-  dedicatedDbFactories.set(db, () => createDb(url, {
+  // A disconnect can lose the response after a statement has committed.
+  // postgres.js calls that error "write CONNECTION_CLOSED" too, so the
+  // message cannot establish that replay is safe. Leave retries to callers
+  // that know the complete operation is idempotent.
+  const db = installDatabaseWorkSignals(drizzlePg(sql, { schema }), owner);
+  dedicatedDbFactories.set(db, () => createDbClient(url, {
     ...resolved, maxConnections: 1, applicationName: "paperclip-workspace-finalization-lock",
-  }));
+  }, db));
   return db;
 }
 
@@ -381,20 +341,6 @@ async function listJournalMigrationEntries(): Promise<JournalMigrationEntry[]> {
 async function listJournalMigrationFiles(): Promise<string[]> {
   const entries = await listJournalMigrationEntries();
   return entries.map((entry) => entry.fileName);
-}
-
-// Journal file names in the order migrations are applied, which is also the
-// order rows are appended to __drizzle_migrations. Used to correlate a recorded
-// row to its migration file by ordinal when the table has no `name` column.
-async function listOrderedJournalMigrationFiles(): Promise<string[]> {
-  const entries = await listJournalMigrationEntries();
-  return [...entries]
-    .sort((left, right) =>
-      left.order === right.order
-        ? left.fileName.localeCompare(right.fileName)
-        : left.order - right.order,
-    )
-    .map((entry) => entry.fileName);
 }
 
 async function readMigrationFileContent(migrationFile: string): Promise<string> {
@@ -521,229 +467,17 @@ async function recordMigrationHistoryEntry(
   );
 }
 
-const MIGRATION_AUDIT_TABLE = "migration_apply_audit";
-const MIGRATION_IDENTITY_TABLE = "migration_file_identity";
-const MIGRATION_IDENTITY_WATERMARK_TABLE = "migration_identity_watermark";
-
-let cachedPackageVersion: string | null = null;
-
-// The version recorded in the package that shipped these migration files. The
-// defining feature of the incident this guards against was an *unchanged*
-// version string, so the on-disk package.json version is the most trustworthy
-// attribution available; an operator-supplied PAPERCLIP_VERSION is recorded
-// separately (env_version_override) rather than trusted as the identity, since
-// preferring it would make attribution spoofable via the environment.
-async function resolvePackageMigrationVersion(): Promise<string> {
-  if (cachedPackageVersion !== null) return cachedPackageVersion;
-  try {
-    const raw = await readFile(new URL("../package.json", import.meta.url), "utf8");
-    const parsed = JSON.parse(raw) as { version?: unknown };
-    cachedPackageVersion = typeof parsed.version === "string" ? parsed.version : "unknown";
-  } catch {
-    cachedPackageVersion = "unknown";
-  }
-  return cachedPackageVersion;
-}
-
-function migrationVersionEnvOverride(): string | null {
-  const value = process.env.PAPERCLIP_VERSION?.trim();
-  return value ? value : null;
-}
-
-// Binds a migration file name to the content hash it carried when first
-// recorded as applied. Kept in a table separate from __drizzle_migrations and
-// entirely out of the dedup path (migrationHistoryEntryExists) so it can never
-// mask a legitimate re-apply, and so a scrubbed drizzle journal row cannot erase
-// the identity we compare against. First write wins: a later swapped re-apply
-// must not overwrite the original hash, or the drift would become invisible.
-async function ensureMigrationIdentityTable(
-  sql: SqlExecutor,
-  migrationTableSchema: string,
-): Promise<string> {
-  const identityTable = `${quoteIdentifier(migrationTableSchema)}.${quoteIdentifier(MIGRATION_IDENTITY_TABLE)}`;
-  await sql.unsafe(
-    `CREATE TABLE IF NOT EXISTS ${identityTable} (` +
-      `name text PRIMARY KEY, ` +
-      `hash text NOT NULL, ` +
-      `first_recorded_at timestamptz NOT NULL DEFAULT now()` +
-      `)`,
-  );
-  await ensureMigrationIdentityWatermark(sql, migrationTableSchema);
-  return identityTable;
-}
-
-// The number of journal rows present at the instant identity tracking began on
-// this cluster. Files below it were applied before any identity could be bound
-// and are permanently unverifiable; files at or above it are expected to carry
-// one. Frozen on first write, because the live `count(*)` shrinks when a journal
-// row is deleted — which silently reclassifies the most recently applied files
-// as "not yet applied" and hides a swap of exactly the file most likely to be
-// swapped.
-async function ensureMigrationIdentityWatermark(
-  sql: SqlExecutor,
-  migrationTableSchema: string,
-): Promise<void> {
-  const watermarkTable = `${quoteIdentifier(migrationTableSchema)}.${quoteIdentifier(MIGRATION_IDENTITY_WATERMARK_TABLE)}`;
-  const journalTable = `${quoteIdentifier(migrationTableSchema)}.${quoteIdentifier(DRIZZLE_MIGRATIONS_TABLE)}`;
-  await sql.unsafe(
-    `CREATE TABLE IF NOT EXISTS ${watermarkTable} (` +
-      `singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton), ` +
-      `legacy_applied_count integer NOT NULL, ` +
-      `recorded_at timestamptz NOT NULL DEFAULT now()` +
-      `)`,
-  );
-  await sql.unsafe(
-    `INSERT INTO ${watermarkTable} (singleton, legacy_applied_count) ` +
-      `SELECT true, count(*)::int FROM ${journalTable} ` +
-      `ON CONFLICT (singleton) DO NOTHING`,
-  );
-}
-
-// Returns null when no watermark is recorded, i.e. identity tracking has not
-// started (or the table was removed) and no pending file can be shown clean.
-async function loadMigrationIdentityWatermark(
-  sql: SqlExecutor,
-  migrationTableSchema: string,
-): Promise<number | null> {
-  const watermarkTable = `${quoteIdentifier(migrationTableSchema)}.${quoteIdentifier(MIGRATION_IDENTITY_WATERMARK_TABLE)}`;
-  try {
-    const rows = await sql.unsafe<{ legacy_applied_count: number | null }[]>(
-      `SELECT legacy_applied_count FROM ${watermarkTable} LIMIT 1`,
-    );
-    const value = rows[0]?.legacy_applied_count;
-    return typeof value === "number" ? value : null;
-  } catch {
-    return null;
-  }
-}
-
-async function recordMigrationFileIdentity(
-  sql: SqlExecutor,
-  identityTable: string,
-  migrationFile: string,
-  hash: string,
-): Promise<void> {
-  await sql.unsafe(
-    `INSERT INTO ${identityTable} (name, hash) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING`,
-    [migrationFile, hash],
-  );
-}
-
-// Recorded file identities as a name -> first-applied-hash map. Returns null
-// (distinct from an empty map) when the identity table does not exist, i.e. the
-// cluster predates identity tracking and drift cannot be attributed from it.
-async function loadMigrationFileIdentities(
-  sql: SqlExecutor,
-  migrationTableSchema: string,
-): Promise<Map<string, string> | null> {
-  const identityTable = `${quoteIdentifier(migrationTableSchema)}.${quoteIdentifier(MIGRATION_IDENTITY_TABLE)}`;
-  try {
-    const rows = await sql.unsafe<{ name: string | null; hash: string | null }[]>(
-      `SELECT name, hash FROM ${identityTable}`,
-    );
-    const identities = new Map<string, string>();
-    for (const row of rows) {
-      if (typeof row.name === "string" && typeof row.hash === "string") {
-        identities.set(row.name, row.hash);
-      }
-    }
-    return identities;
-  } catch {
-    return null;
-  }
-}
-
-// Durable record of what a boot-time migration actually applied. Lives in the
-// same schema as __drizzle_migrations (the drizzle bookkeeping schema, not the
-// application `public` schema) so it never affects migration-state detection or
-// the source-tree populated-cluster guard, both of which count `public` tables.
-async function recordMigrationApplyAudit(
-  sql: SqlExecutor,
-  migrationTableSchema: string,
-  appliedMigrations: Array<{ migrationFile: string; hash: string }>,
-  source: string,
-): Promise<void> {
-  if (appliedMigrations.length === 0) return;
-  const auditTable = `${quoteIdentifier(migrationTableSchema)}.${quoteIdentifier(MIGRATION_AUDIT_TABLE)}`;
-  try {
-    await sql.unsafe(
-      `CREATE TABLE IF NOT EXISTS ${auditTable} (` +
-        `id SERIAL PRIMARY KEY, ` +
-        `applied_at timestamptz NOT NULL DEFAULT now(), ` +
-        `binary_version text NOT NULL, ` +
-        `env_version_override text, ` +
-        `migration_count integer NOT NULL, ` +
-        `migrations jsonb NOT NULL, ` +
-        `source text` +
-        `)`,
-    );
-    const version = await resolvePackageMigrationVersion();
-    const envOverride = migrationVersionEnvOverride();
-    const migrationsPayload = appliedMigrations.map((entry) => ({
-      file: entry.migrationFile,
-      hash: entry.hash,
-    }));
-    // Parameter-bind the payload rather than concatenating it into the SQL text:
-    // removes the injection class entirely instead of relying on the server's
-    // standard_conforming_strings GUC staying at its default. Identifiers cannot
-    // be bound, but they are validated by quoteIdentifier above. The payload is
-    // passed as a JS array (not a pre-stringified string): postgres.js JSON-
-    // encodes it into the jsonb column, whereas binding a string to `$n::jsonb`
-    // would store a double-encoded jsonb *string* scalar instead of an array.
-    await sql.unsafe(
-      `INSERT INTO ${auditTable} ` +
-        `(binary_version, env_version_override, migration_count, migrations, source) ` +
-        `VALUES ($1, $2, $3, $4, $5)`,
-      [version, envOverride, appliedMigrations.length, migrationsPayload, source],
-    );
-  } catch (error) {
-    // Best-effort: the migrations themselves already committed, so a failure to
-    // write the audit row must not crash a server that has otherwise migrated.
-    // Surface it, though — a silently swallowed logging failure (e.g. a
-    // permissions problem) would hide the very attribution gap the audit exists
-    // to close.
-    console.warn(
-      `Failed to record migration apply audit (${appliedMigrations.length} migration(s), source=${source}): ` +
-        `${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
-}
-
-// Records file identity and a durable audit row for migrations applied through
-// drizzle's own bootstrap migrator on an empty database, which otherwise leaves
-// no identity binding and no audit trail for the first-ever application of the
-// full migration set. Only ever called after a fresh bootstrap, so the on-disk
-// content is by definition the original — safe to record as the identity. Never
-// call this against a populated legacy cluster, where the on-disk content may
-// already be swapped and recording it would permanently mask the drift.
-async function recordBootstrapMigrationProvenance(url: string, source: string): Promise<void> {
-  const state = await inspectMigrations(url);
-  const appliedFiles = state.appliedMigrations;
-  if (appliedFiles.length === 0) return;
-
-  const sql = createUtilitySql(url);
-  try {
-    const migrationTableSchema = await discoverMigrationTableSchema(sql);
-    if (!migrationTableSchema) return;
-    const identityTable = await ensureMigrationIdentityTable(sql, migrationTableSchema);
-    const applied: Array<{ migrationFile: string; hash: string }> = [];
-    for (const migrationFile of appliedFiles) {
-      const hash = createHash("sha256")
-        .update(await readMigrationFileContent(migrationFile))
-        .digest("hex");
-      await recordMigrationFileIdentity(sql, identityTable, migrationFile, hash);
-      applied.push({ migrationFile, hash });
-    }
-    await recordMigrationApplyAudit(sql, migrationTableSchema, applied, source);
-  } finally {
-    await sql.end();
-  }
-}
+// These idempotent migrations require top-level statements for batch commits
+// or concurrent index builds. History is recorded only after completion.
+const MIGRATIONS_WITH_TOP_LEVEL_STATEMENTS = new Set([
+  "0313_private_task_access.sql",
+  "0314_private_task_draft_assets.sql",
+  "0332_little_night_nurse.sql",
+]);
 
 async function applyPendingMigrationsManually(
   url: string,
   pendingMigrations: string[],
-  source = "apply-pending-migrations",
 ): Promise<void> {
   if (pendingMigrations.length === 0) return;
 
@@ -753,50 +487,87 @@ async function applyPendingMigrationsManually(
     journalEntries.map((entry) => [entry.fileName, normalizeFolderMillis(entry.folderMillis)]),
   );
 
-  const sql = createUtilitySql(url);
-  const appliedMigrations: Array<{ migrationFile: string; hash: string }> = [];
+  const pool = createUtilitySql(url);
   try {
-    const { migrationTableSchema, columnNames } = await ensureMigrationJournalTable(sql);
-    const qualifiedTable = `${quoteIdentifier(migrationTableSchema)}.${quoteIdentifier(DRIZZLE_MIGRATIONS_TABLE)}`;
-    const identityTable = await ensureMigrationIdentityTable(sql, migrationTableSchema);
+    const sql = await pool.reserve();
+    try {
+      // A session lock survives each batch COMMIT. Reserve the connection so
+      // pool rotation cannot release it while another migrator is waiting.
+      // A blocking lock SELECT retains its statement snapshot while waiting.
+      // A partial concurrent index build can wait for that snapshot, forming a
+      // deadlock with this lock. Each failed try ends its snapshot before sleep.
+      while (!(await sql<{ locked: boolean }[]>`
+        SELECT pg_try_advisory_lock(hashtextextended('paperclip:migrations', 0)) AS locked`)[0]?.locked) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      const { migrationTableSchema, columnNames } = await ensureMigrationJournalTable(sql);
+      const qualifiedTable = `${quoteIdentifier(migrationTableSchema)}.${quoteIdentifier(DRIZZLE_MIGRATIONS_TABLE)}`;
 
-    for (const migrationFile of orderedPendingMigrations) {
-      const migrationContent = await readMigrationFileContent(migrationFile);
-      const hash = createHash("sha256").update(migrationContent).digest("hex");
-      const existingEntry = await migrationHistoryEntryExists(
-        sql,
-        qualifiedTable,
-        columnNames,
-        migrationFile,
-        hash,
-      );
-      if (existingEntry) continue;
-
-      await runInTransaction(sql, async () => {
-        for (const statement of splitMigrationStatements(migrationContent)) {
-          await sql.unsafe(statement);
-        }
-
-        await recordMigrationHistoryEntry(
+      for (const migrationFile of orderedPendingMigrations) {
+        const migrationContent = await readMigrationFileContent(migrationFile);
+        const hash = createHash("sha256").update(migrationContent).digest("hex");
+        const existingEntry = await migrationHistoryEntryExists(
           sql,
           qualifiedTable,
           columnNames,
           migrationFile,
           hash,
-          folderMillisByFileName.get(migrationFile) ?? Date.now(),
         );
+        if (existingEntry) continue;
 
-        // Same transaction as the journal entry: bind this file's name to the
-        // content hash applied now, so a later out-of-band swap is detectable
-        // even if the journal row is subsequently scrubbed.
-        await recordMigrationFileIdentity(sql, identityTable, migrationFile, hash);
-      });
-      appliedMigrations.push({ migrationFile, hash });
+        const applyMigration = async () => {
+          for (const statement of splitMigrationStatements(migrationContent)) {
+            if (MIGRATIONS_WITH_TOP_LEVEL_STATEMENTS.has(migrationFile)) {
+              // A cancelled concurrent build leaves an invalid index. IF NOT
+              // EXISTS alone would skip it on retry and journal an incomplete index.
+              const index = statement.replace(/^\s*--.*$/gm, "").trim()
+                .match(/^CREATE (?:UNIQUE )?INDEX CONCURRENTLY IF NOT EXISTS "([A-Za-z_][A-Za-z0-9_]*)"/i);
+              if (index) {
+                const invalid = await sql<{ invalid: boolean }[]>`
+                  SELECT NOT i.indisvalid AS invalid FROM pg_index i
+                  JOIN pg_class c ON c.oid = i.indexrelid
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                  WHERE n.nspname = 'public' AND c.relname = ${index[1]}`;
+                if (invalid[0]?.invalid) {
+                  await sql.unsafe(`DROP INDEX CONCURRENTLY ${quoteIdentifier("public")}.${quoteIdentifier(index[1])}`);
+                }
+              }
+            }
+            // Older dev schemas can lack a replaced constraint. Preserve the
+            // published SQL/hash while allowing the harmless drop to proceed.
+            const executable = statement.replace(
+              /^(\s*ALTER TABLE "[^"]+" DROP CONSTRAINT) (?!IF EXISTS\b)/i,
+              "$1 IF EXISTS ",
+            );
+            await sql.unsafe(executable);
+          }
+
+          await recordMigrationHistoryEntry(
+            sql,
+            qualifiedTable,
+            columnNames,
+            migrationFile,
+            hash,
+            folderMillisByFileName.get(migrationFile) ?? Date.now(),
+          );
+        };
+        if (MIGRATIONS_WITH_TOP_LEVEL_STATEMENTS.has(migrationFile)) {
+          await applyMigration();
+        } else {
+          await runInTransaction(sql, applyMigration);
+        }
+      }
+    } finally {
+      try {
+        await sql`SELECT pg_advisory_unlock(hashtextextended('paperclip:migrations', 0))`;
+      } catch {
+        // Preserve the migration error if the session died; PostgreSQL releases
+        // its lock on disconnect, and pool.end() closes any remaining connection.
+      }
+      sql.release();
     }
-
-    await recordMigrationApplyAudit(sql, migrationTableSchema, appliedMigrations, source);
   } finally {
-    await sql.end();
+    await pool.end();
   }
 }
 
@@ -1316,205 +1087,15 @@ export async function inspectMigrations(url: string): Promise<MigrationState> {
   }
 }
 
-export type PendingMigrationDigest = { migrationFile: string; hash: string };
-
-// A pending migration whose file name was first recorded as applied under a
-// *different* content hash than the file now on disk. This is the signature of a
-// migration file whose contents were swapped underneath an unchanged version —
-// the runner would otherwise re-apply it in complete silence.
-export type MigrationIdentityDriftEntry = {
-  migrationFile: string;
-  recordedHash: string;
-  currentHash: string;
-};
-
-export type MigrationPreflight = {
-  pending: PendingMigrationDigest[];
-  drift: MigrationIdentityDriftEntry[];
-  // Pending files the journal shows were already applied but which cannot be
-  // checked for drift because this cluster records no file identity for them
-  // (it predates identity tracking). Undecidable — surfaced separately rather
-  // than folded into a clean (empty-drift) result, which must not be mistaken
-  // for "verified clean".
-  unverifiable: string[];
-};
-
-// Drift is an exact per-file lookup against the recorded identity, with no
-// ordinals and no orphan heuristics, so it survives a scrubbed drizzle journal
-// row (deleting a row shifts no comparison). A pending file with no recorded
-// identity is either genuinely new (beyond the applied range — fine) or a
-// previously-applied file on a cluster that predates identity tracking
-// (undecidable — reported as unverifiable).
-async function detectMigrationDrift(
-  sql: SqlExecutor,
-  migrationTableSchema: string,
-  pendingMigrations: string[],
-  orderedJournalFiles: string[],
-): Promise<{ drift: MigrationIdentityDriftEntry[]; unverifiable: string[] }> {
-  if (pendingMigrations.length === 0) return { drift: [], unverifiable: [] };
-
-  const identities = await loadMigrationFileIdentities(sql, migrationTableSchema);
-  // No identity table at all: nothing on this cluster is attributable, so no
-  // pending file can be shown clean. Report every one of them rather than
-  // inferring anything from ordinals. Self-limiting — the next apply creates
-  // the table and the watermark below takes over.
-  if (identities === null) {
-    return { drift: [], unverifiable: [...pendingMigrations] };
-  }
-  const legacyAppliedCount = await loadMigrationIdentityWatermark(sql, migrationTableSchema);
-
-  const drift: MigrationIdentityDriftEntry[] = [];
-  const unverifiable: string[] = [];
-  for (const migrationFile of pendingMigrations) {
-    const currentHash = createHash("sha256")
-      .update(await readMigrationFileContent(migrationFile))
-      .digest("hex");
-    const recordedHash = identities.get(migrationFile);
-    if (recordedHash !== undefined) {
-      if (recordedHash !== currentHash) {
-        drift.push({ migrationFile, recordedHash, currentHash });
-      }
-      continue;
-    }
-    // No recorded identity for this pending file. If it predates identity
-    // tracking (its ordinal is below the frozen watermark) we cannot decide
-    // whether its content was swapped. A migration authored after tracking
-    // began sits at or above the watermark and is genuinely new, not flagged.
-    // A missing watermark leaves nothing to decide against, so fail closed.
-    const ordinal = orderedJournalFiles.indexOf(migrationFile);
-    if (legacyAppliedCount === null || (ordinal >= 0 && ordinal < legacyAppliedCount)) {
-      unverifiable.push(migrationFile);
-    }
-  }
-  return { drift, unverifiable };
-}
-
-// Read-only report of what applying migrations would do: the pending files with
-// their content hashes, any identity-drift entries, and any pending files whose
-// drift status cannot be determined. Callers log this before applying so an
-// out-of-band content swap is loud instead of silent.
-export async function inspectMigrationPreflight(url: string): Promise<MigrationPreflight> {
-  const state = await inspectMigrations(url);
-  const pendingFiles = state.status === "needsMigrations" ? state.pendingMigrations : [];
-  const pending: PendingMigrationDigest[] = await Promise.all(
-    pendingFiles.map(async (migrationFile) => ({
-      migrationFile,
-      hash: createHash("sha256")
-        .update(await readMigrationFileContent(migrationFile))
-        .digest("hex"),
-    })),
-  );
-
-  let drift: MigrationIdentityDriftEntry[] = [];
-  let unverifiable: string[] = [];
-  if (pendingFiles.length > 0) {
-    const sql = createUtilitySql(url);
-    try {
-      const migrationTableSchema = await discoverMigrationTableSchema(sql);
-      if (migrationTableSchema) {
-        const orderedJournalFiles = await listOrderedJournalMigrationFiles();
-        ({ drift, unverifiable } = await detectMigrationDrift(
-          sql,
-          migrationTableSchema,
-          pendingFiles,
-          orderedJournalFiles,
-        ));
-      }
-    } finally {
-      await sql.end();
-    }
-  }
-
-  return { pending, drift, unverifiable };
-}
-
-// The database name embedded in a postgres connection string, used to scope the
-// production-migration opt-in to one specific cluster.
-function extractDatabaseName(connectionString: string): string | null {
-  try {
-    const parsed = new URL(connectionString);
-    const name = decodeURIComponent(parsed.pathname.replace(/^\//, "")).trim();
-    return name.length > 0 ? name : null;
-  } catch {
-    return null;
-  }
-}
-
-export type SourceTreeMigrationTarget = {
-  mode: "postgres" | "embedded-postgres";
-  connectionString: string;
-};
-
-// Guards the source-tree *apply* entrypoint (pnpm db:migrate) against silently
-// migrating an unintended external cluster. Only an explicitly configured
-// external postgres target can be production; the instance-local embedded
-// cluster is the ordinary dev loop and is never guarded, so routine work never
-// trips this. Read-only inspectors (db:status, --dry-run) are not gated at all.
-// For an external target a populated cluster is refused and fails closed unless
-// PAPERCLIP_ALLOW_PROD_MIGRATE names that exact database — a bare truthy value is
-// deliberately not accepted, so a grant left in a shell profile cannot later
-// authorise a different cluster.
-export async function assertSourceTreeMigrationAllowed(
-  target: SourceTreeMigrationTarget,
-): Promise<void> {
-  if (target.mode !== "postgres") return;
-
-  const databaseName = extractDatabaseName(target.connectionString);
-  const optIn = process.env.PAPERCLIP_ALLOW_PROD_MIGRATE?.trim();
-  if (optIn && databaseName && optIn === databaseName) return;
-
-  const sql = createUtilitySql(target.connectionString);
-  try {
-    const rows = await sql<{ count: number }[]>`
-      select count(*)::int as count
-      from information_schema.tables
-      where table_schema = 'public'
-        and table_type = 'BASE TABLE'
-    `;
-    const tableCount = rows[0]?.count ?? 0;
-    if (tableCount > 0) {
-      const scope = databaseName ?? "<database-name>";
-      throw new Error(
-        `Refusing to migrate the external database "${databaseName ?? target.connectionString}" from a source tree: ` +
-          `it already holds ${tableCount} application table(s) and may be a production cluster. ` +
-          `Set PAPERCLIP_ALLOW_PROD_MIGRATE=${scope} to authorise migrating this specific database.`,
-      );
-    }
-  } finally {
-    await sql.end();
-  }
-}
-
 export async function applyPendingMigrations(url: string): Promise<void> {
   const initialState = await inspectMigrations(url);
   if (initialState.status === "upToDate") return;
 
   if (initialState.reason === "no-migration-journal-empty-db") {
-    const sql = createUtilitySql(url);
-    try {
-      const db = drizzlePg(sql);
-      await migratePg(db, { migrationsFolder: MIGRATIONS_FOLDER });
-    } finally {
-      await sql.end();
-    }
-
-    // drizzle's bootstrap migrator writes journal rows but no file identity and
-    // no audit trail; record both for the first-ever application of the full set
-    // so an empty-db boot is attributable and future drift is detectable.
-    await recordBootstrapMigrationProvenance(url, "bootstrap-empty-db");
-
-    let bootstrappedState = await inspectMigrations(url);
-    if (bootstrappedState.status === "upToDate") return;
-    if (bootstrappedState.reason === "pending-migrations") {
-      const repair = await reconcilePendingMigrationHistory(url);
-      if (repair.repairedMigrations.length > 0) {
-        bootstrappedState = await inspectMigrations(url);
-      }
-      if (bootstrappedState.status === "needsMigrations" && bootstrappedState.reason === "pending-migrations") {
-        await applyPendingMigrationsManually(url, bootstrappedState.pendingMigrations);
-        bootstrappedState = await inspectMigrations(url);
-      }
-    }
+    // Use the same per-file executor for bootstrap and upgrades: Drizzle wraps
+    // the whole journal in one transaction and cannot run committing backfills.
+    await applyPendingMigrationsManually(url, initialState.pendingMigrations);
+    const bootstrappedState = await inspectMigrations(url);
     if (bootstrappedState.status === "upToDate") return;
     throw new Error(
       `Failed to bootstrap migrations: ${bootstrappedState.pendingMigrations.join(", ")}`,
@@ -1578,13 +1159,7 @@ export async function migratePostgresIfEmpty(url: string): Promise<MigrationBoot
       return { migrated: false, reason: "not-empty-no-migration-journal", tableCount };
     }
 
-    const db = drizzlePg(sql);
-    await migratePg(db, { migrationsFolder: MIGRATIONS_FOLDER });
-
-    // Record identity + audit for the freshly bootstrapped set so this empty-db
-    // application is attributable and later content swaps are detectable. Uses a
-    // fresh connection since this one is closed in the finally below.
-    await recordBootstrapMigrationProvenance(url, "bootstrap-empty-db");
+    await applyPendingMigrationsManually(url, await listMigrationFiles());
 
     return { migrated: true, reason: "migrated-empty-db", tableCount: 0 };
   } finally {

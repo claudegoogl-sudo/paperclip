@@ -9,6 +9,7 @@ import { resolveDefaultLogsDir, resolveHomeAwarePath } from "../home-paths.js";
 import {
   isPrivateWebhookHttpRequest,
   isSecretSensitiveHttpRequest,
+  isPrivateAgentCommentaryHttpRequest,
   shouldSilenceHttpSuccessLog,
 } from "./http-log-policy.js";
 import { redactSecretsForLog, redactSecretsDeepForLog } from "../secret-patterns.js";
@@ -170,6 +171,9 @@ export function createHttpLogger(baseLogger: pino.Logger) {
   //    res serializer emits status only), so there is nothing to scrub there.
     serializers: {
       req(req: Record<string, unknown> & { url?: unknown; method?: unknown; id?: unknown }) {
+        if (isPrivateAgentCommentaryHttpRequest(typeof req.url === "string" ? req.url : undefined)) {
+          return { id: req.id, method: req.method, url: stripSecretBearingUrlParts(req.url as string) };
+        }
         if (
           isPrivateWebhook({
             method: typeof req.method === "string" ? req.method : undefined,
@@ -196,7 +200,9 @@ export function createHttpLogger(baseLogger: pino.Logger) {
           raw?: { req?: { method?: string; originalUrl?: unknown; url?: unknown } };
         },
       ) {
-        return res.raw?.req && isPrivateWebhook(res.raw.req)
+        // A provider error may also be reflected in response headers. Keep the
+        // same content-free contract on both sides of a webhook request.
+        return res.raw?.req && (isPrivateWebhook(res.raw.req) || isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(res.raw.req)))
           ? { statusCode: res.statusCode }
           : res;
       },
@@ -237,18 +243,77 @@ export function createHttpLogger(baseLogger: pino.Logger) {
   customProps(req, res) {
     if (res.statusCode >= 400 && /^\/mcp\/(?:oauth|paperclip)(?:\/|$)/.test(requestClassificationUrl(req) ?? "")) {
       const ctx = (res as any).__errorContext;
-      return { reqBody: "[REDACTED]", ...(ctx ? { errorContext: { name: "Error" } } : {}) };
-    }
-    if (res.statusCode >= 400 && isPrivateWebhook(req)) {
-      // Omit, rather than recursively redact, the entire provider payload —
-      // before/after parsing, with or without error context.
-      return {
-        reqBody: "[REDACTED]",
-        ...((res as any).__errorContext || (res as any).err ? { errorContext: { name: "Error" } } : {}),
-      };
-    }
-    return redactSecretsDeepForLog(buildHttpLogProps(req, res));
-  },
+      const errMsg =
+        ctx?.error?.message ||
+        err?.message ||
+        (res as any).err?.message ||
+        "unknown error";
+      return `${req.method} ${stripSecretBearingUrlParts(req.url ?? "")} ${res.statusCode} — ${errMsg}`;
+    },
+    customErrorObject(req, _res, _err, value) {
+      if (isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req))) {
+        return { ...value, err: { type: "Error", message: "Feedback request failed" } };
+      }
+      // pino-http serializes res.err independently of customProps/errorContext.
+      // Do not rely on a particular error handler having sanitized an SDK Error.
+      return isPrivateWebhook(req)
+        ? {
+            ...value,
+            err: { type: "Error", message: "Chat webhook request failed" },
+          }
+        : value;
+    },
+    customProps(req, res) {
+      if (res.statusCode >= 400) {
+        const ctx = (res as any).__errorContext;
+        if (/^\/mcp\/(?:oauth|paperclip)(?:\/|$)/.test(requestClassificationUrl(req) ?? "")) {
+          return { reqBody: "[REDACTED]", ...(ctx ? { errorContext: { name: "Error" } } : {}) };
+        }
+        if (isPrivateWebhook(req) || isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req))) {
+          // Omit, rather than recursively redact, the entire provider payload.
+          // This applies equally before/after parsing and with/without context.
+          return {
+            reqBody: "[REDACTED]",
+            ...(ctx || (res as any).err
+              ? { errorContext: { name: "Error" } }
+              : {}),
+          };
+        }
+        if (ctx) {
+          const secretSensitiveRoute = isSecretSensitiveHttpRequest(
+            req.method,
+            requestClassificationUrl(req),
+          );
+          return {
+            // Provider SDK and validation errors sometimes echo the supplied
+            // credential in their prose. Keep only a non-sensitive type marker
+            // for setup routes; the status, route, and redacted body remain.
+            errorContext: secretSensitiveRoute
+              ? { name: "Error" }
+              : redactSensitive(ctx.error),
+            reqBody: redactSensitive(ctx.reqBody),
+            reqParams: redactSensitive(ctx.reqParams),
+          };
+        }
+        const props: Record<string, unknown> = {};
+        const { body, params } = req as any;
+        if (body && typeof body === "object" && Object.keys(body).length > 0) {
+          props.reqBody = redactSensitive(body);
+        }
+        if (
+          params &&
+          typeof params === "object" &&
+          Object.keys(params).length > 0
+        ) {
+          props.reqParams = redactSensitive(params);
+        }
+        if ((req as any).route?.path) {
+          props.routePath = (req as any).route.path;
+        }
+        return props;
+      }
+      return {};
+    },
   });
 }
 

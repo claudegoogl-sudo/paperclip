@@ -3,6 +3,10 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { heartbeatRuns as heartbeatRunsTable } from "@paperclipai/db";
 
+vi.mock("../services/fast-responses.js", () => ({
+  enqueueFastResponse: vi.fn(async () => undefined),
+}));
+
 // Booting the route graph pulls in nearly every server service module; since the
 // v2026.824.1 merge that cold import alone can exceed the 5s default test
 // timeout, which killed the first tests in this file (the route module is cached

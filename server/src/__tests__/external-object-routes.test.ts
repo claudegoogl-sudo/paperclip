@@ -168,8 +168,10 @@ describe("external object routes", () => {
   // first import transforms a large module graph. Under the loaded serial shard
   // (maxWorkers=1) that cold cost crossed the 5s testTimeout of the first test.
   // The hook has a 30s budget, so it absorbs the transform cost and every later
-  // createApp() call hits the cached modules.
+  // createApp() call hits the cached modules. Install mocks before warming the
+  // graph and reset their state between tests instead of reloading the modules.
   beforeAll(async () => {
+    registerRouteMocks();
     await createApp(boardActor());
   });
 
@@ -228,11 +230,13 @@ describe("external object routes", () => {
     const app = await createApp(ownerActor());
 
     const summary = await request(app).get(`/api/issues/${issueId}/external-object-summary`);
-    expect(summary.status).toBe(403);
+    expect(summary.status).toBe(404);
+    expect(summary.body.error).toBe("Issue not found");
     expect(mockExternalObjectsService.getIssueSummary).not.toHaveBeenCalled();
 
     const list = await request(app).get(`/api/issues/${issueId}/external-objects`);
-    expect(list.status).toBe(403);
+    expect(list.status).toBe(404);
+    expect(list.body.error).toBe("Issue not found");
     expect(mockExternalObjectsService.listForIssue).not.toHaveBeenCalled();
   });
 
