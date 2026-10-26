@@ -12334,7 +12334,7 @@ export function issueRoutes(
       const body = req.body as Record<string, unknown>;
       // Strip schema defaults the client did not choose; any non-default value
       // of these (or any other field) still hits the allowlist guard below.
-      for (const [k, v] of [["workMode", "standard"], ["requestDepth", 0], ["allowDuplicate", false]] as const) {
+      for (const [k, v] of [["workMode", "standard"], ["requestDepth", 0], ["allowDuplicate", false], ["visibility", "open"]] as const) {
         if (body[k] === v) delete body[k];
       }
       const guard = await checkCrossCompanyPatch(body, companyId, decision.agentId, crossCompanyPatchLookups);
