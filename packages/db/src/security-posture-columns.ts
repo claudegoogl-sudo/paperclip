@@ -858,6 +858,456 @@ export const SECURITY_POSTURE_COLUMNS = [
     column: "ai_session_epoch",
     reason: "Monotonic fence that invalidates AI sessions on rotation; flattening it back revives sessions issued before the rotation.",
   },
+  {
+    table: "agent_identity_keys",
+    column: "private_key_material",
+    reason: "private_key_material is agent signing-key secret material; public_key_pem is the verification key. Clearing or overwriting either breaks or substitutes agent identity.",
+  },
+  {
+    table: "agent_identity_keys",
+    column: "public_key_pem",
+    reason: "private_key_material is agent signing-key secret material; public_key_pem is the verification key. Clearing or overwriting either breaks or substitutes agent identity.",
+  },
+  {
+    table: "agents",
+    column: "lifecycle_state",
+    reason: "Agent lifecycle gates (state, holds, required plugins) decide whether the agent may run; spend_month_utc anchors the monthly budget window. Clearing any silently re-enables a held agent or resets spend accounting.",
+  },
+  {
+    table: "agents",
+    column: "lifecycle_holds",
+    reason: "Agent lifecycle gates (state, holds, required plugins) decide whether the agent may run; spend_month_utc anchors the monthly budget window. Clearing any silently re-enables a held agent or resets spend accounting.",
+  },
+  {
+    table: "agents",
+    column: "lifecycle_required_plugin_ids",
+    reason: "Agent lifecycle gates (state, holds, required plugins) decide whether the agent may run; spend_month_utc anchors the monthly budget window. Clearing any silently re-enables a held agent or resets spend accounting.",
+  },
+  {
+    table: "agents",
+    column: "spend_month_utc",
+    reason: "Agent lifecycle gates (state, holds, required plugins) decide whether the agent may run; spend_month_utc anchors the monthly budget window. Clearing any silently re-enables a held agent or resets spend accounting.",
+  },
+  {
+    table: "ai_subscription_connections",
+    column: "grant_id",
+    reason: "Links a subscription to a credential grant and key; changes which secret is used.",
+  },
+  {
+    table: "ai_subscription_connections",
+    column: "credential_key",
+    reason: "Links a subscription to a credential grant and key; changes which secret is used.",
+  },
+  {
+    table: "ai_subscriptions",
+    column: "owner_user_ids",
+    reason: "Ownership and sharing of a subscription credential and whether its identity was verified.",
+  },
+  {
+    table: "ai_subscriptions",
+    column: "shared",
+    reason: "Ownership and sharing of a subscription credential and whether its identity was verified.",
+  },
+  {
+    table: "ai_subscriptions",
+    column: "identity_verified",
+    reason: "Ownership and sharing of a subscription credential and whether its identity was verified.",
+  },
+  {
+    table: "budget_policies",
+    column: "reservation_cents",
+    reason: "Budget enforcement parameters: reservation size and what happens to usage that cannot be priced. Resetting to default weakens spend caps.",
+  },
+  {
+    table: "budget_policies",
+    column: "unpriced_usage_policy",
+    reason: "Budget enforcement parameters: reservation size and what happens to usage that cannot be priced. Resetting to default weakens spend caps.",
+  },
+  {
+    table: "budget_reservations",
+    column: "state",
+    reason: "Reservation ledger that gates run admission against budget; state/settled_at decide whether reserved spend counts.",
+  },
+  {
+    table: "budget_reservations",
+    column: "amount_cents",
+    reason: "Reservation ledger that gates run admission against budget; state/settled_at decide whether reserved spend counts.",
+  },
+  {
+    table: "budget_reservations",
+    column: "settled_at",
+    reason: "Reservation ledger that gates run admission against budget; state/settled_at decide whether reserved spend counts.",
+  },
+  {
+    table: "chat_endpoints",
+    column: "require_at_mention",
+    reason: "When true, inbound chat only triggers an agent when mentioned; clearing lets any message trigger agent execution.",
+  },
+  {
+    table: "chat_slack_registrations",
+    column: "secret_ids",
+    reason: "Binds a Slack app to an endpoint: secret_ids reference the credentials, status gates activation, workspace_id scopes who may message.",
+  },
+  {
+    table: "chat_slack_registrations",
+    column: "status",
+    reason: "Binds a Slack app to an endpoint: secret_ids reference the credentials, status gates activation, workspace_id scopes who may message.",
+  },
+  {
+    table: "chat_slack_registrations",
+    column: "workspace_id",
+    reason: "Binds a Slack app to an endpoint: secret_ids reference the credentials, status gates activation, workspace_id scopes who may message.",
+  },
+  {
+    table: "chat_voice_callbacks",
+    column: "enabled",
+    reason: "Enables outbound voice callbacks to a number; clearing enabled/phone_number changes who is called.",
+  },
+  {
+    table: "chat_voice_callbacks",
+    column: "phone_number",
+    reason: "Enables outbound voice callbacks to a number; clearing enabled/phone_number changes who is called.",
+  },
+  {
+    table: "chat_voice_inbound_calls",
+    column: "approval_code",
+    reason: "Inbound-call authorization record: approval, caller authority, expiry, state and the hashed tool token that authorizes tool calls.",
+  },
+  {
+    table: "chat_voice_inbound_calls",
+    column: "approved_by_user_id",
+    reason: "Inbound-call authorization record: approval, caller authority, expiry, state and the hashed tool token that authorizes tool calls.",
+  },
+  {
+    table: "chat_voice_inbound_calls",
+    column: "caller_authority",
+    reason: "Inbound-call authorization record: approval, caller authority, expiry, state and the hashed tool token that authorizes tool calls.",
+  },
+  {
+    table: "chat_voice_inbound_calls",
+    column: "expires_at",
+    reason: "Inbound-call authorization record: approval, caller authority, expiry, state and the hashed tool token that authorizes tool calls.",
+  },
+  {
+    table: "chat_voice_inbound_calls",
+    column: "state",
+    reason: "Inbound-call authorization record: approval, caller authority, expiry, state and the hashed tool token that authorizes tool calls.",
+  },
+  {
+    table: "chat_voice_inbound_calls",
+    column: "tool_token_hash",
+    reason: "Inbound-call authorization record: approval, caller authority, expiry, state and the hashed tool token that authorizes tool calls.",
+  },
+  {
+    table: "chat_voice_inbound_calls",
+    column: "credential_fingerprint",
+    reason: "Inbound-call authorization record: approval, caller authority, expiry, state and the hashed tool token that authorizes tool calls.",
+  },
+  {
+    table: "chat_voice_phone_lines",
+    column: "enabled",
+    reason: "Phone-line admission policy: enablement, whether unauthenticated guests may open intake, and the low-trust execution environment.",
+  },
+  {
+    table: "chat_voice_phone_lines",
+    column: "guest_intake",
+    reason: "Phone-line admission policy: enablement, whether unauthenticated guests may open intake, and the low-trust execution environment.",
+  },
+  {
+    table: "chat_voice_phone_lines",
+    column: "low_trust_environment_id",
+    reason: "Phone-line admission policy: enablement, whether unauthenticated guests may open intake, and the low-trust execution environment.",
+  },
+  {
+    table: "chat_voice_phone_lines",
+    column: "phone_number",
+    reason: "Phone-line admission policy: enablement, whether unauthenticated guests may open intake, and the low-trust execution environment.",
+  },
+  {
+    table: "chat_voice_sessions",
+    column: "approved_by_user_id",
+    reason: "Live voice session authorization: approver, caller authority, expiry, state, tool-token hash, and the agent it may drive.",
+  },
+  {
+    table: "chat_voice_sessions",
+    column: "caller_authority",
+    reason: "Live voice session authorization: approver, caller authority, expiry, state, tool-token hash, and the agent it may drive.",
+  },
+  {
+    table: "chat_voice_sessions",
+    column: "expires_at",
+    reason: "Live voice session authorization: approver, caller authority, expiry, state, tool-token hash, and the agent it may drive.",
+  },
+  {
+    table: "chat_voice_sessions",
+    column: "state",
+    reason: "Live voice session authorization: approver, caller authority, expiry, state, tool-token hash, and the agent it may drive.",
+  },
+  {
+    table: "chat_voice_sessions",
+    column: "tool_token_hash",
+    reason: "Live voice session authorization: approver, caller authority, expiry, state, tool-token hash, and the agent it may drive.",
+  },
+  {
+    table: "chat_voice_sessions",
+    column: "assigned_agent_id",
+    reason: "Live voice session authorization: approver, caller authority, expiry, state, tool-token hash, and the agent it may drive.",
+  },
+  {
+    table: "chat_voice_sessions",
+    column: "credential_fingerprint",
+    reason: "Live voice session authorization: approver, caller authority, expiry, state, tool-token hash, and the agent it may drive.",
+  },
+  {
+    table: "chat_voice_sessions",
+    column: "mode",
+    reason: "Live voice session authorization: approver, caller authority, expiry, state, tool-token hash, and the agent it may drive.",
+  },
+  {
+    table: "companies",
+    column: "spend_month_utc",
+    reason: "Anchors the company monthly budget window; clearing resets spend accounting and re-opens a tripped budget.",
+  },
+  {
+    table: "company_decision_models",
+    column: "enabled",
+    reason: "Gates background model invocations and which credential grant/connection they spend.",
+  },
+  {
+    table: "company_decision_models",
+    column: "allow_background",
+    reason: "Gates background model invocations and which credential grant/connection they spend.",
+  },
+  {
+    table: "company_decision_models",
+    column: "grant_id",
+    reason: "Gates background model invocations and which credential grant/connection they spend.",
+  },
+  {
+    table: "company_decision_models",
+    column: "connection_id",
+    reason: "Gates background model invocations and which credential grant/connection they spend.",
+  },
+  {
+    table: "company_fast_responses",
+    column: "enabled",
+    reason: "Gates fast-response model calls, sponsored spend, and the credential grant/connection used.",
+  },
+  {
+    table: "company_fast_responses",
+    column: "allow_sponsored",
+    reason: "Gates fast-response model calls, sponsored spend, and the credential grant/connection used.",
+  },
+  {
+    table: "company_fast_responses",
+    column: "grant_id",
+    reason: "Gates fast-response model calls, sponsored spend, and the credential grant/connection used.",
+  },
+  {
+    table: "company_fast_responses",
+    column: "connection_id",
+    reason: "Gates fast-response model calls, sponsored spend, and the credential grant/connection used.",
+  },
+  {
+    table: "dot_agent_bindings",
+    column: "challenge_hash",
+    reason: "Pairing/auth state of a dot runner binding: hashed secrets, expiries, revocation, status, generation fencing and credential grant.",
+  },
+  {
+    table: "dot_agent_bindings",
+    column: "pairing_code_hash",
+    reason: "Pairing/auth state of a dot runner binding: hashed secrets, expiries, revocation, status, generation fencing and credential grant.",
+  },
+  {
+    table: "dot_agent_bindings",
+    column: "status",
+    reason: "Pairing/auth state of a dot runner binding: hashed secrets, expiries, revocation, status, generation fencing and credential grant.",
+  },
+  {
+    table: "dot_agent_bindings",
+    column: "revoked_at",
+    reason: "Pairing/auth state of a dot runner binding: hashed secrets, expiries, revocation, status, generation fencing and credential grant.",
+  },
+  {
+    table: "dot_agent_bindings",
+    column: "generation",
+    reason: "Pairing/auth state of a dot runner binding: hashed secrets, expiries, revocation, status, generation fencing and credential grant.",
+  },
+  {
+    table: "dot_agent_bindings",
+    column: "grant_id",
+    reason: "Pairing/auth state of a dot runner binding: hashed secrets, expiries, revocation, status, generation fencing and credential grant.",
+  },
+  {
+    table: "dot_agent_bindings",
+    column: "pairing_expires_at",
+    reason: "Pairing/auth state of a dot runner binding: hashed secrets, expiries, revocation, status, generation fencing and credential grant.",
+  },
+  {
+    table: "dot_agent_bindings",
+    column: "challenge_expires_at",
+    reason: "Pairing/auth state of a dot runner binding: hashed secrets, expiries, revocation, status, generation fencing and credential grant.",
+  },
+  {
+    table: "dot_mailbox_items",
+    column: "binding_generation",
+    reason: "Generation fence binding a mailbox item to a binding; clearing lets stale items be delivered.",
+  },
+  {
+    table: "dot_runner_assignments",
+    column: "status",
+    reason: "Assignment lease and generation fencing: a stale generation or expired lease must not execute.",
+  },
+  {
+    table: "dot_runner_assignments",
+    column: "expires_at",
+    reason: "Assignment lease and generation fencing: a stale generation or expired lease must not execute.",
+  },
+  {
+    table: "dot_runner_assignments",
+    column: "accept_by",
+    reason: "Assignment lease and generation fencing: a stale generation or expired lease must not execute.",
+  },
+  {
+    table: "dot_runner_assignments",
+    column: "binding_generation",
+    reason: "Assignment lease and generation fencing: a stale generation or expired lease must not execute.",
+  },
+  {
+    table: "dot_runner_assignments",
+    column: "controller_generation",
+    reason: "Assignment lease and generation fencing: a stale generation or expired lease must not execute.",
+  },
+  {
+    table: "fast_response_requests",
+    column: "sponsored",
+    reason: "Per-request spend authorization: sponsorship, expiry and credential grant/connection.",
+  },
+  {
+    table: "fast_response_requests",
+    column: "expires_at",
+    reason: "Per-request spend authorization: sponsorship, expiry and credential grant/connection.",
+  },
+  {
+    table: "fast_response_requests",
+    column: "grant_id",
+    reason: "Per-request spend authorization: sponsorship, expiry and credential grant/connection.",
+  },
+  {
+    table: "fast_response_requests",
+    column: "connection_id",
+    reason: "Per-request spend authorization: sponsorship, expiry and credential grant/connection.",
+  },
+  {
+    table: "issue_access_grants",
+    column: "revoked_at",
+    reason: "Per-issue access grants: revoked_at disables a grant, subject identifies the grantee.",
+  },
+  {
+    table: "issue_access_grants",
+    column: "subject_id",
+    reason: "Per-issue access grants: revoked_at disables a grant, subject identifies the grantee.",
+  },
+  {
+    table: "issue_access_grants",
+    column: "subject_type",
+    reason: "Per-issue access grants: revoked_at disables a grant, subject identifies the grantee.",
+  },
+  {
+    table: "issues",
+    column: "visibility",
+    reason: "Issue privacy: visibility and privacy-root linkage decide who can read the issue.",
+  },
+  {
+    table: "issues",
+    column: "privacy_parent_issue_id",
+    reason: "Issue privacy: visibility and privacy-root linkage decide who can read the issue.",
+  },
+  {
+    table: "issues",
+    column: "privacy_root_issue_id",
+    reason: "Issue privacy: visibility and privacy-root linkage decide who can read the issue.",
+  },
+  {
+    table: "mcp_attachment_uploads",
+    column: "expires_at",
+    reason: "Upload authorization: owner, expiry, content hash and storage key bound to an upload ticket.",
+  },
+  {
+    table: "mcp_attachment_uploads",
+    column: "sha256",
+    reason: "Upload authorization: owner, expiry, content hash and storage key bound to an upload ticket.",
+  },
+  {
+    table: "mcp_attachment_uploads",
+    column: "object_key",
+    reason: "Upload authorization: owner, expiry, content hash and storage key bound to an upload ticket.",
+  },
+  {
+    table: "mcp_attachment_uploads",
+    column: "user_id",
+    reason: "Upload authorization: owner, expiry, content hash and storage key bound to an upload ticket.",
+  },
+  {
+    table: "mcp_attachment_uploads",
+    column: "cleaned_at",
+    reason: "Upload authorization: owner, expiry, content hash and storage key bound to an upload ticket.",
+  },
+  {
+    table: "mcp_file_tickets",
+    column: "token_hash",
+    reason: "Bearer file-ticket: hashed token, expiry, grant and the upload it authorizes.",
+  },
+  {
+    table: "mcp_file_tickets",
+    column: "expires_at",
+    reason: "Bearer file-ticket: hashed token, expiry, grant and the upload it authorizes.",
+  },
+  {
+    table: "mcp_file_tickets",
+    column: "grant_id",
+    reason: "Bearer file-ticket: hashed token, expiry, grant and the upload it authorizes.",
+  },
+  {
+    table: "mcp_file_tickets",
+    column: "upload_id",
+    reason: "Bearer file-ticket: hashed token, expiry, grant and the upload it authorizes.",
+  },
+  {
+    table: "mcp_oauth_grants",
+    column: "purpose",
+    reason: "Scopes an OAuth grant to a purpose and agent; clearing widens what the grant may do.",
+  },
+  {
+    table: "mcp_oauth_grants",
+    column: "agent_id",
+    reason: "Scopes an OAuth grant to a purpose and agent; clearing widens what the grant may do.",
+  },
+  {
+    table: "project_access_members",
+    column: "subject_id",
+    reason: "Project ACL membership: identifies who has access.",
+  },
+  {
+    table: "project_access_members",
+    column: "subject_type",
+    reason: "Project ACL membership: identifies who has access.",
+  },
+  {
+    table: "projects",
+    column: "visibility",
+    reason: "Project privacy: visibility and owner columns decide who can read it.",
+  },
+  {
+    table: "projects",
+    column: "personal_owner_user_id",
+    reason: "Project privacy: visibility and owner columns decide who can read it.",
+  },
+  {
+    table: "projects",
+    column: "privacy_owner_user_id",
+    reason: "Project privacy: visibility and owner columns decide who can read it.",
+  },
 ] as const satisfies readonly (SecurityPostureColumn & RegisteredPostureColumn)[];
 
 const POSTURE_COLUMNS_BY_TABLE = new Map<string, Set<string>>();

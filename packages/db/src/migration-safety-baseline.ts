@@ -171,6 +171,15 @@ export const MIGRATION_SAFETY_BASELINE = [
       "Upstream one-time backfill executed in the same migration that introduces the column: auth_kind is derived from the connection's own config/credential refs, not from any external input.",
   },
   {
+    // Upstream v2026.1023.0 migration; baselined by SecurityEngineer review PLA-11141.
+    id: "67273458ce389886",
+    rule: "unqualified-mutation-security-posture-column",
+    migration: "0320_daily_onslaught.sql",
+    table: "agents",
+    reason:
+      "One-time backfill in the same migration that ADDs agents.lifecycle_state/lifecycle_holds (plain ADD COLUMN, no IF NOT EXISTS, so it cannot re-run on an applied DB). It derives the new columns from agents.status (pending_approval/paused/terminated map 1:1; paused gets a hold), preserving the existing posture rather than resetting it. Reviewed on those terms; any NEW unqualified write to these columns must fail CI.",
+  },
+  {
     // id recomputed for the 2026.916.0 sync: the fork-migration renumber
     // 0233_* -> 0282_* feeds findingId (rule + migration filename + table +
     // normalized statement). Prior ids: 7b32e0d28820baba (0138_* name),
