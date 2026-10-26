@@ -171,7 +171,7 @@ export const MIGRATION_SAFETY_BASELINE = [
       "Upstream one-time backfill executed in the same migration that introduces the column: auth_kind is derived from the connection's own config/credential refs, not from any external input.",
   },
   {
-    // Upstream v2026.1023.0 migration; baselined by SecurityEngineer review PLA-11141.
+    // Upstream v2026.1023.0 migration; baselined by SecurityEngineer review.
     id: "67273458ce389886",
     rule: "unqualified-mutation-security-posture-column",
     migration: "0320_daily_onslaught.sql",
