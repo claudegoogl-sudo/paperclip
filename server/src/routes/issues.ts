@@ -53,6 +53,7 @@ import {
   executionWorkspaces,
   heartbeatRuns,
   issueApprovals,
+  issueAttachments,
   issueAccessGrants,
   issueComments,
   issueDocuments,
@@ -104,6 +105,7 @@ import {
   issueDocumentKeySchema,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   ISSUE_WATCHDOG_DISCOVERY_KINDS,
+  OPERATOR_DELIVER_MARKER,
   TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND,
   ONBOARDING_FIRST_TASK_ORIGIN_KIND,
   rejectIssueThreadInteractionSchema,
@@ -190,6 +192,7 @@ import {
   documentAnnotationService,
   logActivity,
   publishActivity,
+  projectInteractionForPluginEvent,
   projectService,
   routineService,
   workProductService,
@@ -231,23 +234,23 @@ import type {
   taskWatchdogService,
 } from "../services/task-watchdogs.js";
 import { logger } from "../middleware/logger.js";
-import {
-  badRequest,
-  conflict,
-  forbidden,
-  HttpError,
-  notFound,
-  unauthorized,
-  unprocessable,
-} from "../errors.js";
+import { firstSecretMatch } from "../secret-patterns.js";
+import { retryOnTransientPgError } from "../services/pg-retry.js";
+import { badRequest, conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
 import { privateJsonEtag } from "../middleware/private-json-etag.js";
 import { createRequestPromiseMemo } from "../lib/request-promise-memo.js";
+import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import {
-  assertBoard,
-  assertCompanyAccess,
-  getAccessibleResource,
-  getActorInfo,
-} from "./authz.js";
+  decideCrossCompanyIssueAccess,
+  dbCrossCompanyDeps,
+  recordCrossCompanyIssueAccess,
+  checkCrossCompanyPatch,
+  checkCrossCompanyWriteCap,
+  crossCompanyMarker,
+  withCrossCompanyMarker,
+  type CrossCompanyIssueOp,
+  dbCrossCompanyPatchLookups,
+} from "./cross-company-issue-access.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectIssueWorkspaceCommandPaths,
@@ -257,6 +260,7 @@ import {
   formatAttachmentSize,
   GENERIC_ATTACHMENT_CONTENT_TYPES,
   isInlineAttachmentContentType,
+  isSpreadsheetBaitPluginArtifact,
   MAX_ATTACHMENT_BYTES,
   normalizeContentType,
   normalizeUploadAttachmentContentType,
@@ -293,6 +297,7 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_LOOKBACK_DAYS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
+  attachmentBoundActivityDetails,
   readAcceptedPlanConfirmationTarget,
   type IssuePostCommitAction,
 } from "../services/issues.js";
@@ -371,6 +376,37 @@ import {
 } from "../services/issue-queued-comment-queue.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
+
+/**
+ * Per-key create cap for run-less `notify_only` agent keys: a leaked pager key
+ * must not be able to flood an operator with cards. Sliding one-hour window,
+ * in-process (a restart resets it, which only ever loosens by one window).
+ */
+export const NOTIFY_ONLY_CREATE_LIMIT_PER_HOUR = 10;
+const NOTIFY_ONLY_CREATE_WINDOW_MS = 60 * 60 * 1000;
+const notifyOnlyCreateLog = new Map<string, number[]>();
+
+export function consumeNotifyOnlyCreateQuota(keyId: string, now: number = Date.now()): boolean {
+  const cutoff = now - NOTIFY_ONLY_CREATE_WINDOW_MS;
+  const recent = (notifyOnlyCreateLog.get(keyId) ?? []).filter((t) => t > cutoff);
+  if (recent.length >= NOTIFY_ONLY_CREATE_LIMIT_PER_HOUR) {
+    notifyOnlyCreateLog.set(keyId, recent);
+    return false;
+  }
+  recent.push(now);
+  notifyOnlyCreateLog.set(keyId, recent);
+  // Bound memory: drop keys whose window is empty.
+  if (notifyOnlyCreateLog.size > 1000) {
+    for (const [k, ts] of notifyOnlyCreateLog) {
+      if (!ts.some((t) => t > cutoff)) notifyOnlyCreateLog.delete(k);
+    }
+  }
+  return true;
+}
+
+export function resetNotifyOnlyCreateQuotaForTests(): void {
+  notifyOnlyCreateLog.clear();
+}
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
@@ -538,6 +574,13 @@ function applyCreateIssueStatusDefault(
     return;
   }
 
+  // Idempotent: the cross-company create route falls through (next("route"))
+  // to the standard handler, which re-runs this middleware. Keep the first
+  // resolution so the defaulted reason is not rewritten as "explicit".
+  if (res.locals.createIssueStatusDefault) {
+    next();
+    return;
+  }
   const resolution = resolveCreateIssueStatusDefault(
     req.body as Record<string, unknown>,
   );
@@ -3136,14 +3179,15 @@ function issueListActorIdentity(req: Request, companyId: string) {
   return { actorType: "none", key, hash: shortHash(key) };
 }
 
-function issueListClientIdentity(req: Request) {
-  const forwardedFor = Array.isArray(req.headers["x-forwarded-for"])
-    ? req.headers["x-forwarded-for"][0]
-    : req.headers["x-forwarded-for"];
+/**
+ * Client identity for issue-list request logging. Uses `req.ip` only, so
+ * `X-Forwarded-For` is honoured solely through the express `trust proxy`
+ * setting (see middleware/trust-proxy.ts). Never read the raw header here:
+ * its left-most entry is attacker-controlled text.
+ */
+export function issueListClientIdentity(req: Request) {
   const client = [
-    String(forwardedFor ?? req.ip ?? "unknown-ip")
-      .split(",")[0]
-      ?.trim() ?? "unknown-ip",
+    req.ip ?? "unknown-ip",
     req.header("user-agent") ?? "unknown-agent",
   ].join(":");
   return { key: client, hash: shortHash(client) };
@@ -3689,8 +3733,10 @@ export function issueRoutes(
 
     // The counter transaction locks and validates the persisted run before it
     // derives the source issue. Never trust the API-key run header by itself.
+    // The run row lives in the ACTOR's company. For same-company writes that equals
+    // issue.companyId; for audited cross-company access it is the home company.
     const decision = await observeCrossIssueInfluence(db, {
-      companyId: issue.companyId,
+      companyId: req.actor.companyId ?? issue.companyId,
       runId: req.actor.runId,
       agentId: req.actor.agentId,
       responsibleUserId: req.actor.onBehalfOfUserId ?? null,
@@ -5482,6 +5528,82 @@ export function issueRoutes(
     })) as T[];
   }
 
+  // Cross-company issue access (double key). Used ONLY by the four routes
+  // GET /issues/:id, GET/POST /issues/:id/comments, PATCH /issues/:id.
+  // Same-company callers take the unchanged getAccessibleResource path.
+  // A denied foreign issue gets the exact missing-issue 404.
+  const crossCompanyDeps = dbCrossCompanyDeps(db, async (req, companyId) => {
+    try {
+      return await actorIsLowTrustReview(req, companyId);
+    } catch {
+      return true;
+    }
+  });
+
+  const crossCompanyPatchLookups = dbCrossCompanyPatchLookups(db);
+
+  async function getIssueWithCrossCompany(
+    req: Request,
+    res: Response,
+    id: string,
+    op: CrossCompanyIssueOp,
+  ): Promise<{ issue: NonNullable<Awaited<ReturnType<typeof getIssueById>>>; crossCompany: boolean; marker?: string } | null> {
+    const issue = await getIssueById(req, id);
+    if (issue && hasCompanyAccess(req, issue.companyId)) {
+      assertCompanyAccess(req, issue.companyId);
+      return { issue, crossCompany: false };
+    }
+    if (issue && req.actor.type === "agent") {
+      const decision = await decideCrossCompanyIssueAccess(req, issue.companyId, op, crossCompanyDeps);
+      const auditBase = {
+        targetCompanyId: issue.companyId,
+        homeCompanyId: req.actor.companyId ?? "",
+        agentId: req.actor.agentId ?? "",
+        runId: req.actor.runId ?? null,
+        issueId: issue.id,
+        op,
+        method: req.method,
+        route: req.route?.path ?? req.path,
+      };
+      if (!decision.allowed) {
+        // M9: audited denies in both companies. `not_allowlisted` / `same_company`
+        // are ordinary-agent noise and intentionally NOT written to the DB.
+        if (
+          req.actor.agentId && req.actor.companyId &&
+          decision.reason !== "not_allowlisted" && decision.reason !== "same_company" && decision.reason !== "not_agent"
+        ) {
+          await recordCrossCompanyIssueAccess((row) => logActivity(db, row), {
+            ...auditBase, outcome: "denied", reason: decision.reason,
+          });
+        }
+      } else {
+        const isWrite = op === "comment.create" || op === "issue.update" || op === "issue.create";
+        if (isWrite) {
+          // M10: write caps counted from the audit rows.
+          const cap = await checkCrossCompanyWriteCap(crossCompanyDeps, decision.agentId, req.actor.runId ?? null);
+          if (!cap.ok) {
+            await recordCrossCompanyIssueAccess((row) => logActivity(db, row), {
+              ...auditBase, outcome: "denied", reason: `rate_limited:${cap.scope}`,
+            });
+            res.status(429).json({ error: "Cross-company write limit reached", scope: cap.scope });
+            return null;
+          }
+        }
+        if (op === "issue.read" || op === "comments.list" || op === "comment.create") {
+          await recordCrossCompanyIssueAccess((row) => logActivity(db, row), { ...auditBase, outcome: "allowed" });
+        }
+        let marker: string | undefined;
+        if (isWrite) {
+          const d = await crossCompanyDeps.describeActor(decision.agentId, decision.homeCompanyId);
+          marker = crossCompanyMarker(d.agentName, d.homeKey, req.actor.runId ?? null);
+        }
+        return { issue, crossCompany: true, marker };
+      }
+    }
+    res.status(404).json({ error: "Issue not found" });
+    return null;
+  }
+
   async function assertIssueWriteInfluenceAllowed(
     req: Request,
     res: Response,
@@ -6663,6 +6785,10 @@ export function issueRoutes(
     if (req.actor.type !== "agent") return null;
     const runId = req.actor.runId?.trim();
     if (!runId) return null;
+    // The run header is caller-controlled; a malformed value is unknown, not
+    // an error. Treat it as missing so the untrusted string never reaches a
+    // UUID equality (PostgreSQL would cast-error into a 500).
+    if (!isUuidLike(runId)) return null;
     const run = await db
       .select({
         id: heartbeatRuns.id,
@@ -6880,6 +7006,54 @@ export function issueRoutes(
       details: { issueId: issue.id, holdId: hold.holdId, rootIssueId: hold.rootIssueId },
     });
     return false;
+  }
+
+  /**
+   * SECURITY-CRITICAL: Pre-submit secret-pattern denylist (locked spec). Scans
+   * the named write-side fields against the shared pattern set
+   * (../secret-patterns.js — the same module the HTTP logger redactor uses, so
+   * the two cannot drift). On a hit it BLOCKS the write with a structured 422
+   * naming the matched pattern class and the offending field — it does NOT
+   * silently strip, and it never echoes the matched value back. An
+   * operator-facing log line is emitted carrying only the class label + actor
+   * + issue id (no token bytes). JWT/`PAPERCLIP_API_KEY` overlap is handled
+   * inside the shared matcher via Option A (allow `iss=paperclip`).
+   */
+  function assertNoSecretPatternInWritePayload(
+    req: Request,
+    res: Response,
+    fields: Array<{ name: string; value: unknown }>,
+    context: { issueId?: string | null; companyId?: string | null },
+  ): boolean {
+    for (const field of fields) {
+      const match = firstSecretMatch(field.value);
+      if (!match) continue;
+      const actor = getActorInfo(req);
+      logger.warn(
+        {
+          event: "secret_pattern_blocked",
+          blockedPattern: match.label,
+          surface: field.name,
+          actorType: actor.actorType,
+          agentId: actor.agentId,
+          issueId: context.issueId ?? null,
+          companyId: context.companyId ?? null,
+        },
+        `Blocked write containing secret pattern (${match.label}) in field "${field.name}"`,
+      );
+      res.status(422).json({
+        error:
+          `Request field "${field.name}" matches a blocked secret pattern (${match.label}). ` +
+          `Remove or redact the secret and resubmit — the value was not stored.`,
+        blockedPattern: match.label,
+        surface: field.name,
+        details: {
+          securityPrinciples: ["Secure Defaults", "Fail Closed"],
+        },
+      });
+      return false;
+    }
+    return true;
   }
 
   async function assertExplicitResumeIntentAllowed(
@@ -9242,14 +9416,10 @@ export function issueRoutes(
   router.get("/issues/:id", async (req, res) => {
     const timing = createIssueReadTiming();
     const id = req.params.id as string;
-    const issue = await getAccessibleResource(
-      req,
-      res,
-      timing.time("lookup", () => getIssueById(req, id)),
-      "Issue not found",
-    );
-    if (!issue) return;
-    if (!(await timing.time("authorization", () => assertIssueReadAllowed(req, res, issue, { allowBreakGlass: true })))) return;
+    const resolved = await timing.time("lookup", () => getIssueWithCrossCompany(req, res, id, "issue.read"));
+    if (!resolved) return;
+    const { issue } = resolved;
+    if (!resolved.crossCompany && !(await timing.time("authorization", () => assertIssueReadAllowed(req, res, issue, { allowBreakGlass: true })))) return;
     const inboxArchiveFieldsPromise =
       req.actor.type === "board" && req.actor.userId
         ? timing.time("inbox", () => svc.getActiveInboxArchiveFields(issue, req.actor.userId!))
@@ -12112,6 +12282,99 @@ export function issueRoutes(
     res.json({ ok: true });
   });
 
+  // Cross-company issue CREATE (double key). Only handles a foreign-company
+  // agent caller; everything else falls through to the standard handler below.
+  router.post(
+    "/companies/:companyId/issues",
+    applyCreateIssueStatusDefault,
+    validateIssueMutationBody(createIssueSchema),
+    async (req, res, next) => {
+      const companyId = req.params.companyId as string;
+      if (req.actor.type !== "agent" || hasCompanyAccess(req, companyId)) {
+        next("route");
+        return;
+      }
+      const decision = await decideCrossCompanyIssueAccess(req, companyId, "issue.create", crossCompanyDeps);
+      const newIssueId = randomUUID();
+      const auditBase = {
+        targetCompanyId: companyId,
+        homeCompanyId: req.actor.companyId ?? "",
+        agentId: req.actor.agentId ?? "",
+        runId: req.actor.runId ?? null,
+        issueId: newIssueId,
+        op: "issue.create" as const,
+        method: req.method,
+        route: req.route?.path ?? req.path,
+      };
+      if (!decision.allowed) {
+        // Standard handler produces the normal forbidden response.
+        if (
+          req.actor.agentId && req.actor.companyId &&
+          decision.reason !== "not_allowlisted" && decision.reason !== "same_company" && decision.reason !== "not_agent"
+        ) {
+          await recordCrossCompanyIssueAccess((row) => logActivity(db, row), {
+            ...auditBase, outcome: "denied", reason: decision.reason,
+          });
+        }
+        next("route");
+        return;
+      }
+      const cap = await checkCrossCompanyWriteCap(crossCompanyDeps, decision.agentId, req.actor.runId ?? null);
+      if (!cap.ok) {
+        await recordCrossCompanyIssueAccess((row) => logActivity(db, row), {
+          ...auditBase, outcome: "denied", reason: `rate_limited:${cap.scope}`,
+        });
+        res.status(429).json({ error: "Cross-company write limit reached", scope: cap.scope });
+        return;
+      }
+      if (!assertNoSecretPatternInWritePayload(req, res, [
+        { name: "title", value: req.body.title },
+        { name: "description", value: req.body.description },
+      ], { companyId })) return;
+      const body = req.body as Record<string, unknown>;
+      // Strip schema defaults the client did not choose; any non-default value
+      // of these (or any other field) still hits the allowlist guard below.
+      for (const [k, v] of [["workMode", "standard"], ["requestDepth", 0], ["allowDuplicate", false]] as const) {
+        if (body[k] === v) delete body[k];
+      }
+      const guard = await checkCrossCompanyPatch(body, companyId, decision.agentId, crossCompanyPatchLookups);
+      if (!guard.ok) {
+        await recordCrossCompanyIssueAccess((row) => logActivity(db, row), {
+          ...auditBase, outcome: "denied", reason: `invalid_field:${guard.field}`,
+        });
+        res.status(guard.status).json({ error: guard.error, field: guard.field });
+        return;
+      }
+      const d = await crossCompanyDeps.describeActor(decision.agentId, decision.homeCompanyId);
+      const marker = crossCompanyMarker(d.agentName, d.homeKey, req.actor.runId ?? null);
+      const description = withCrossCompanyMarker(marker, typeof body.description === "string" ? body.description : "");
+      const createInput: Record<string, unknown> = {};
+      for (const k of guard.changedFields) createInput[k] = body[k];
+      const issue = await svc.create(companyId, {
+        ...createInput,
+        description,
+        id: newIssueId,
+        createdByAgentId: decision.agentId,
+        createdByUserId: null,
+        originRunId: req.actor.runId ?? null,
+        actorRunId: req.actor.runId ?? null,
+      } as Parameters<typeof svc.create>[1]);
+      await recordCrossCompanyIssueAccess((row) => logActivity(db, row), {
+        ...auditBase, issueId: issue.id, outcome: "allowed", changedFields: guard.changedFields,
+      });
+      void queueIssueAssignmentWakeup({
+        heartbeat,
+        issue,
+        reason: "issue_assigned",
+        mutation: "create",
+        contextSource: "issue.create",
+        requestedByActorType: "agent",
+        requestedByActorId: decision.agentId,
+      });
+      res.status(201).json(issue);
+    },
+  );
+
   router.post(
     "/companies/:companyId/issues",
     applyCreateIssueStatusDefault,
@@ -12119,6 +12382,10 @@ export function issueRoutes(
     async (req, res) => {
       const companyId = req.params.companyId as string;
       assertCompanyAccess(req, companyId);
+      if (!assertNoSecretPatternInWritePayload(req, res, [
+        { name: "title", value: req.body.title },
+        { name: "description", value: req.body.description },
+      ], { companyId })) return;
       if (isSkillTestScopedActor(req)) {
         res.status(403).json({
           error: "Skill-test run tokens cannot create issues.",
@@ -13540,14 +13807,44 @@ export function issueRoutes(
         throw unprocessable("expectedExecutionPolicy requires a policy-only update");
       }
       const id = req.params.id as string;
-      const existing = await getAccessibleResource(
-        req,
-        res,
-        svc.getById(id),
-        "Issue not found",
-      );
-      if (!existing) return;
-      if (!(await assertIssueReadAllowed(req, res, existing))) return;
+      const resolvedPatch = await getIssueWithCrossCompany(req, res, id, "issue.update");
+      if (!resolvedPatch) return;
+      const existing = resolvedPatch.issue;
+      const crossCompanyPatch = resolvedPatch.crossCompany;
+      if (crossCompanyPatch) {
+        const guard = await checkCrossCompanyPatch(
+          req.body as Record<string, unknown>,
+          existing.companyId,
+          req.actor.agentId!,
+          crossCompanyPatchLookups,
+        );
+        await recordCrossCompanyIssueAccess((row) => logActivity(db, row), {
+          targetCompanyId: existing.companyId,
+          homeCompanyId: req.actor.companyId!,
+          agentId: req.actor.agentId!,
+          runId: req.actor.runId ?? null,
+          issueId: existing.id,
+          op: "issue.update",
+          method: req.method,
+          route: "/issues/:id",
+          outcome: guard.ok ? "allowed" : "denied",
+          reason: guard.ok ? undefined : `field:${guard.field}`,
+          changedFields: guard.ok ? guard.changedFields : [guard.field],
+        });
+        if (!guard.ok) {
+          res.status(422).json({ error: guard.error, field: guard.field });
+          return;
+        }
+        // M8: host-written marker on the PATCH comment; client text is never trusted.
+        if (typeof req.body.comment === "string" && req.body.comment.length > 0 && resolvedPatch.marker) {
+          req.body.comment = withCrossCompanyMarker(resolvedPatch.marker, req.body.comment);
+        }
+      }
+      if (!assertNoSecretPatternInWritePayload(req, res, [
+        { name: "description", value: req.body.description },
+        { name: "comment", value: req.body.comment },
+        { name: "title", value: req.body.title },
+      ], { issueId: existing.id, companyId: existing.companyId })) return;
       if (req.body.parentId) {
         const parent = await svc.getById(req.body.parentId);
         if (!parent || parent.companyId !== existing.companyId || !(await assertIssueReadAllowed(req, res, parent))) {
@@ -13584,16 +13881,22 @@ export function issueRoutes(
         );
         return;
       }
-      const issueMutationAccess = await assertAgentIssueMutationAllowed(
-        req,
-        res,
-        existing,
-        { allowVisibleIssueWrite: true },
-      );
+      // Cross-company: the double-key helper + field guard above ARE the
+      // authorization. assertAgentIssueMutationAllowed / decide() hard-deny any
+      // foreign-company agent (deny_company_boundary), so they are skipped here.
+      const issueMutationAccess = crossCompanyPatch
+        ? true
+        : await assertAgentIssueMutationAllowed(
+            req,
+            res,
+            existing,
+            { allowVisibleIssueWrite: true },
+          );
       if (!issueMutationAccess) return;
       if (req.body.comment && !(await assertBoardCommentNotPaused(req, res, existing))) return;
-      const issueMutationAuthorizationReason =
-        req.actor.type === "agent"
+      const issueMutationAuthorizationReason = crossCompanyPatch
+        ? issueWriteAuthorizationReason(req, true)
+        : req.actor.type === "agent"
           ? issueWriteAuthorizationReason(
               req,
               await decideIssueAccess(req, existing, "issue:mutate"),
@@ -14222,7 +14525,7 @@ export function issueRoutes(
         });
       }
       if (assigneeWillChange && !transition.workflowControlledAssignment) {
-        if (!isAgentReturningIssueToCreator) {
+        if (!isAgentReturningIssueToCreator && !crossCompanyPatch) {
           await assertCanAssignTasks(req, existing.companyId, {
             issueId: existing.id,
             projectId: await resolveAssignmentProjectId({
@@ -14938,6 +15241,10 @@ export function issueRoutes(
             entityId: issue.id,
             details: {
               identifier: issue.identifier,
+              // Status of the dependent before this request. The resolved-dependency
+              // backstop uses it to tell a removal on an already-blocked issue (a real
+              // readiness edge) from a same-request park/replace (not an edge).
+              dependentStatusBefore: existing.status,
               blockedByIssueIds: req.body.blockedByIssueIds,
               addedBlockedByIssueIds,
               removedBlockedByIssueIds,
@@ -15605,11 +15912,19 @@ export function issueRoutes(
           }
         }
 
+        const restoreRemovedBlockerCount = Array.isArray(req.body.blockedByIssueIds)
+          ? (existingRelations?.blockedBy ?? []).filter(
+              (relation) => !(req.body.blockedByIssueIds as string[]).includes(relation.id),
+            ).length
+          : 0;
         const restoredBlockedReadyDependency =
           issue.status === "blocked" &&
           issue.assigneeAgentId &&
-          (existing.status !== "blocked" ||
-            Array.isArray(req.body.blockedByIssueIds) ||
+          // Edge rule (same as the resolved-dependency backstop): only wake when the
+          // issue was ALREADY blocked and this request removed >=1 blocker, or when the
+          // assignee changed. Parking into `blocked` onto done blockers, or an add-only
+          // change, is a deliberate park and must not self-wake.
+          ((existing.status === "blocked" && restoreRemovedBlockerCount > 0) ||
             existing.assigneeAgentId !== issue.assigneeAgentId);
         if (
           restoredBlockedReadyDependency &&
@@ -16002,6 +16317,14 @@ export function issueRoutes(
 
   router.post("/issues/:id/release", async (req, res) => {
     const id = req.params.id as string;
+    // Capture lock holders BEFORE the orphan guard nulls them, so the manager
+    // override audit row records whose lock / which dead run was released
+    // (the guard's own clear is silent). Agent actors only; only used after
+    // the access checks below pass.
+    const preGuard =
+      req.actor.type === "agent" ? await svc.getById(id).catch(() => null) : null;
+    // See PATCH route — back-fill orphan-checkout state up front.
+    await svc.clearOrphanCheckoutLocksIfTerminal(id);
     const existing = await getAccessibleResource(
       req,
       res,
@@ -16013,10 +16336,30 @@ export function issueRoutes(
     const actorRunId = requireAgentRunId(req, res);
     if (req.actor.type === "agent" && !actorRunId) return;
 
+    // Manager checkout-management override: the mutation boundary
+    // above already admits agents holding tasks:manage_active_checkouts for the
+    // assignee; surface that fact to the service, which re-verifies the data
+    // preconditions (in_progress + terminal-or-missing holding run) on the
+    // locked row. Board force-release remains the only live-run override.
+    let managerOverride = false;
+    if (
+      req.actor.type === "agent" &&
+      req.actor.agentId &&
+      existing.assigneeAgentId &&
+      existing.assigneeAgentId !== req.actor.agentId
+    ) {
+      managerOverride = await hasActiveCheckoutManagementOverride(
+        req.actor.agentId,
+        existing.companyId,
+        existing.assigneeAgentId,
+      );
+    }
+
     const released = await svc.release(
       id,
       req.actor.type === "agent" ? req.actor.agentId : undefined,
       actorRunId,
+      { managerOverride },
     );
     if (!released) {
       res.status(404).json({ error: "Issue not found" });
@@ -16034,7 +16377,21 @@ export function issueRoutes(
       action: "issue.released",
       entityType: "issue",
       entityId: released.issue.id,
-      details: { status: released.issue.status, _previous: { status: existing.status } },
+      details: {
+        status: released.issue.status,
+        _previous: { status: existing.status },
+        ...(released.managerOverride
+          ? {
+              managerOverride: true,
+              reason: "stale_checkout_run",
+              prevCheckoutRunId:
+                preGuard?.checkoutRunId ?? released.previous.checkoutRunId ?? null,
+              prevAssigneeAgentId:
+                preGuard?.assigneeAgentId ?? released.previous.assigneeAgentId ?? null,
+              actorAgentId: actor.agentId ?? null,
+            }
+          : {}),
+      },
     });
 
     res.json(released.issue);
@@ -16090,14 +16447,10 @@ export function issueRoutes(
 
   router.get("/issues/:id/comments", async (req, res) => {
     const id = req.params.id as string;
-    const issue = await getAccessibleResource(
-      req,
-      res,
-      getIssueById(req, id),
-      "Issue not found",
-    );
-    if (!issue) return;
-    if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    const resolved = await getIssueWithCrossCompany(req, res, id, "comments.list");
+    if (!resolved) return;
+    const { issue } = resolved;
+    if (!resolved.crossCompany && !(await assertIssueReadAllowed(req, res, issue))) return;
     const afterCommentId =
       typeof req.query.after === "string" && req.query.after.trim().length > 0
         ? req.query.after.trim()
@@ -16654,63 +17007,63 @@ export function issueRoutes(
     "/issues/:id/interactions",
     validate(createIssueThreadInteractionSchema),
     async (req, res) => {
-      const id = req.params.id as string;
-      const issue = await getAccessibleResource(
-        req,
-        res,
-        svc.getById(id),
-        "Issue not found",
-      );
-      if (!issue) return;
-      if (req.actor.type === "agent") {
-        if (
-          !(await assertAgentIssueMutationAllowed(req, res, issue, {
-            allowVisibleIssueWrite: true,
-          }))
-        )
-          return;
-        if (
-          await assertLowTrustControlPlaneDenied(
-            req,
-            res,
-            issue.companyId,
-            issue,
-          )
-        )
-          return;
-      } else {
-        assertBoard(req);
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    // notify_only agent keys are run-less by design: the issue allow-list (also
+    // enforced by enforceAgentKeyScopeMiddleware) is their whole authorization,
+    // and the card is stored with sourceRunId = null.
+    const notifyOnlyScope = req.actor.type === "agent" && req.actor.keyScope?.kind === "notify_only"
+      ? req.actor.keyScope
+      : null;
+    if (notifyOnlyScope) {
+      if (!notifyOnlyScope.issueIds.some((allowedId) => allowedId.toLowerCase() === issue.id.toLowerCase())) {
+        res.status(403).json({ error: "Agent API key scope does not permit this issue", code: "agent_key_scope_violation" });
+        return;
       }
+      // A pager only asks for acknowledgement: no task suggestions or questions.
+      if (req.body.kind !== "request_confirmation") {
+        res.status(403).json({
+          error: "notify_only keys may only create request_confirmation interactions",
+          code: "agent_key_scope_violation",
+        });
+        return;
+      }
+      if (!consumeNotifyOnlyCreateQuota(req.actor.keyId ?? `agent:${req.actor.agentId}`)) {
+        logger.warn(
+          { agentId: req.actor.agentId, keyId: req.actor.keyId, issueId: issue.id },
+          "notify_only interaction create rate limit exceeded",
+        );
+        res.status(429).json({
+          error: "notify_only interaction create rate limit exceeded",
+          code: "agent_key_rate_limited",
+        });
+        return;
+      }
+      if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
+    } else if (req.actor.type === "agent") {
+      if (!(await assertAgentIssueMutationAllowed(req, res, issue, { allowVisibleIssueWrite: true }))) return;
+      if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
+    } else {
+      assertBoard(req);
+    }
 
-      const actor = getActorInfo(req);
-      const agentSourceRunId =
-        req.actor.type === "agent" ? requireAgentRunId(req, res) : null;
-      if (req.actor.type === "agent" && !agentSourceRunId) return;
-      if (
-        req.body.kind === "request_confirmation" &&
-        req.body.addresseeAgentId &&
-        req.body.payload?.toolAction !== undefined
-      ) {
-        throw badRequest(
-          "Tool-action confirmations cannot be addressed to agents",
-        );
-      }
-      if (
-        req.body.kind === "request_confirmation" &&
-        req.body.payload?.toolAction !== undefined
-      ) {
-        throw unprocessable(
-          "payload.toolAction is server-owned metadata and cannot be supplied when creating an interaction",
-        );
-      }
-      if (
-        req.body.kind === "request_confirmation" &&
-        req.body.payload?.secretProposal !== undefined
-      ) {
-        throw unprocessable(
-          "payload.secretProposal is server-owned metadata and cannot be supplied when creating an interaction",
-        );
-      }
+    const actor = getActorInfo(req);
+    const agentSourceRunId = req.actor.type === "agent" && !notifyOnlyScope ? requireAgentRunId(req, res) : null;
+    if (req.actor.type === "agent" && !notifyOnlyScope && !agentSourceRunId) return;
+    if (
+      req.body.kind === "request_confirmation"
+      && req.body.addresseeAgentId
+      && req.body.payload?.toolAction !== undefined
+    ) {
+      throw badRequest("Tool-action confirmations cannot be addressed to agents");
+    }
+    if (req.body.kind === "request_confirmation" && req.body.payload?.toolAction !== undefined) {
+      throw unprocessable("payload.toolAction is server-owned metadata and cannot be supplied when creating an interaction");
+    }
+    if (req.body.kind === "request_confirmation" && req.body.payload?.secretProposal !== undefined) {
+      throw unprocessable("payload.secretProposal is server-owned metadata and cannot be supplied when creating an interaction");
+    }
 
       // Plan-document confirmation targets are validated authoritatively inside
       // issueThreadInteractionService.create, which re-reads the plan document's
@@ -17726,6 +18079,80 @@ export function issueRoutes(
     },
   );
 
+  // Agent self-service supersede of an interaction it AUTHORED.
+  // Unlike the board-only accept/reject/cancel routes above, an agent may retire
+  // a pending interaction here IFF createdByAgentId === caller (least-privilege:
+  // author-only, never blanket resolution authority). Board actors keep full
+  // authority. Terminal state is "expired" (no continuation wake).
+  router.post(
+    "/issues/:id/interactions/:interactionId/supersede",
+    validate(cancelIssueThreadInteractionSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const interactionId = req.params.interactionId as string;
+      const issue = await svc.getById(id);
+      // Two-step existence-oracle gate (see hasCompanyAccess in routes/authz.ts):
+      // the access check is folded into the existence check so a cross-tenant
+      // issue id returns the same 404 as a missing one — no 403-versus-404 oracle.
+      if (!issue || !hasCompanyAccess(req, issue.companyId)) {
+        res.status(404).json({ error: "Issue not found" });
+        return;
+      }
+      assertCompanyAccess(req, issue.companyId);
+
+      const interactionSvc = issueThreadInteractionService(db);
+      if (req.actor.type === "agent") {
+        if (
+          req.actor.runId
+          && !(await assertTaskWatchdogIssueMutationAllowed(req, res, issue, { allowWatchdogIssue: false }))
+        ) {
+          return;
+        }
+        const existing = await interactionSvc.getById(interactionId);
+        if (!existing || existing.companyId !== issue.companyId || existing.issueId !== issue.id) {
+          res.status(404).json({ error: "Interaction not found" });
+          return;
+        }
+        if (existing.createdByAgentId !== req.actor.agentId) {
+          res.status(403).json({ error: "Agents can only supersede interactions they authored" });
+          return;
+        }
+      } else {
+        assertBoard(req);
+      }
+
+      const actor = getActorInfo(req);
+      const interaction = await interactionSvc.supersedeInteractionById(
+        issue,
+        interactionId,
+        { reason: req.body?.reason ?? null },
+        {
+          agentId: actor.agentId,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        },
+      );
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.thread_interaction_superseded",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          interactionId: interaction.id,
+          interactionKind: interaction.kind,
+          interactionStatus: interaction.status,
+          supersededByActorType: actor.actorType,
+        },
+      });
+
+      res.json(interaction);
+    },
+  );
+
   router.get("/issues/:id/comments/:commentId", async (req, res) => {
     const id = req.params.id as string;
     const commentId = req.params.commentId as string;
@@ -18109,18 +18536,125 @@ export function issueRoutes(
     });
   }
 
+  router.get("/companies/:companyId/search/extract", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const companyScopeDecision = await access.decide({
+      actor: req.actor,
+      action: "company_scope:read",
+      resource: { type: "company", companyId },
+    });
+    if (!companyScopeDecision.allowed) {
+      res.status(403).json({
+        error: "Company search is outside this actor's authorization boundary",
+      });
+      return;
+    }
+    const parsedQuery = companySearchExtractQuerySchema.safeParse(req.query);
+    if (!parsedQuery.success) {
+      res.status(400).json({
+        error:
+          parsedQuery.error.issues[0]?.message ??
+          "Invalid extract search query",
+      });
+      return;
+    }
+    const rateLimit = searchRateLimiter.consume(
+      companySearchRateLimitActor(req, companyId),
+    );
+    res.setHeader("X-RateLimit-Limit", String(rateLimit.limit));
+    res.setHeader("X-RateLimit-Remaining", String(rateLimit.remaining));
+    if (!rateLimit.allowed) {
+      res.setHeader("Retry-After", String(rateLimit.retryAfterSeconds));
+      res.status(429).json({
+        error: "Search rate limit exceeded",
+        retryAfterSeconds: rateLimit.retryAfterSeconds,
+      });
+      return;
+    }
+    const result = await getSearchService().extract(
+      companyId,
+      parsedQuery.data,
+    );
+    res.json(result);
+  });
+
+  router.get("/companies/:companyId/search", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const companyScopeDecision = await access.decide({
+      actor: req.actor,
+      action: "company_scope:read",
+      resource: { type: "company", companyId },
+    });
+    if (!companyScopeDecision.allowed) {
+      res.status(403).json({
+        error: "Company search is outside this actor's authorization boundary",
+      });
+      return;
+    }
+    const parsedQuery = companySearchQuerySchema.safeParse(req.query);
+    if (!parsedQuery.success) {
+      res.status(400).json({
+        error: parsedQuery.error.issues[0]?.message ?? "Invalid search query",
+      });
+      return;
+    }
+    let query = parsedQuery.data;
+    if (query.assigneeUserId === "me") {
+      if (req.actor.type !== "board" || !req.actor.userId) {
+        res
+          .status(403)
+          .json({ error: "assigneeUserId=me requires board authentication" });
+        return;
+      }
+      query = { ...query, assigneeUserId: req.actor.userId };
+    }
+    const rateLimit = searchRateLimiter.consume(
+      companySearchRateLimitActor(req, companyId),
+    );
+    res.setHeader("X-RateLimit-Limit", String(rateLimit.limit));
+    res.setHeader("X-RateLimit-Remaining", String(rateLimit.remaining));
+    if (!rateLimit.allowed) {
+      res.setHeader("Retry-After", String(rateLimit.retryAfterSeconds));
+      res.status(429).json({
+        error: "Search rate limit exceeded",
+        retryAfterSeconds: rateLimit.retryAfterSeconds,
+      });
+      return;
+    }
+    const result = await getSearchService().search(companyId, query);
+    res.json(result);
+  });
+
   router.post(
     "/issues/:id/comments",
     validate(addIssueCommentSchema),
     async (req, res) => {
       const id = req.params.id as string;
-      const issue = await getAccessibleResource(
-        req,
-        res,
-        svc.getById(id),
-        "Issue not found",
-      );
-      if (!issue) return;
+      // See PATCH route — back-fill orphan-checkout state up front.
+      await svc.clearOrphanCheckoutLocksIfTerminal(id);
+      const resolvedComment = await getIssueWithCrossCompany(req, res, id, "comment.create");
+      if (!resolvedComment) return;
+      const issue = resolvedComment.issue;
+      const crossCompanyComment = resolvedComment.crossCompany;
+      if (crossCompanyComment) {
+        // Cross-company comments are plain comments only: no reopen/resume/
+        // interrupt, no attachment binding, no implicit status move.
+        if (
+          req.body.reopen === true ||
+          req.body.resume === true ||
+          req.body.interrupt === true ||
+          (Array.isArray(req.body.attachmentIds) && req.body.attachmentIds.length > 0)
+        ) {
+          res.status(422).json({ error: "Cross-company comments cannot reopen, resume, interrupt or attach assets" });
+          return;
+        }
+      }
+      if (crossCompanyComment && resolvedComment.marker && typeof req.body.body === "string") {
+        // M8: host-written marker on every cross-company comment.
+        req.body.body = withCrossCompanyMarker(resolvedComment.marker, req.body.body);
+      }
       if (issue.conversationAgentId && req.actor.type === "board") {
         if (!(await instanceSettings.getExperimental()).enableAgentChat) throw notFound("Agent Chat is disabled");
         if (!req.actor.userId) throw forbidden("Board user access required");
@@ -18173,11 +18707,17 @@ export function issueRoutes(
         );
         return;
       }
-      const commentAccessDecision = await assertAgentIssueCommentAllowed(
-        req,
-        res,
-        issue,
-      );
+      if (!assertNoSecretPatternInWritePayload(req, res, [
+        { name: "body", value: req.body.body },
+      ], { issueId: issue.id, companyId: issue.companyId })) return;
+      // Cross-company: double-key helper is the authorization (decide() hard-denies foreign agents).
+      const commentAccessDecision = crossCompanyComment
+        ? true
+        : await assertAgentIssueCommentAllowed(
+            req,
+            res,
+            issue,
+          );
       if (!commentAccessDecision) return;
       if (!(await assertBoardCommentNotPaused(req, res, issue))) return;
       const commentAuthorizationReason = issueWriteAuthorizationReason(
@@ -18195,6 +18735,70 @@ export function issueRoutes(
         await getClosedIssueExecutionWorkspace(issue);
 
       const actor = getActorInfo(req);
+
+      // Guard A: reject operator-delivery comments that are not agent-authored.
+      // The messenger relay only forwards agent-authored comments to the operator;
+      // a host/board/user-token marked comment is silently dropped by the relay yet
+      // still persisted, so the thread looks delivered while nobody was paged.
+      // Reject at write time (before any persistence or wake) so the sender is
+      // forced onto the agent-token path, which both relays correctly and (via the
+      // wake fan-out guard below) does not echo. Keyed off the leading marker prefix
+      // on the trimmed body, matching the documented placement on the first line.
+      if (
+        typeof req.body.body === "string" &&
+        req.body.body.trimStart().startsWith(OPERATOR_DELIVER_MARKER) &&
+        actor.actorType !== "agent"
+      ) {
+        res.status(422).json({
+          error:
+            `Operator-delivery comments (body beginning with "${OPERATOR_DELIVER_MARKER}") must be authored by an agent token. ` +
+            "The messenger relay only forwards agent-authored comments to the operator; host/board/user-token deliveries are dropped by the relay and would never reach the operator. Post this comment with an agent token instead.",
+        });
+        // Reject means reject: without this return the request falls through to
+        // persistence and the wake fan-out, so a "rejected" marker comment still
+        // paged the assignee — the exact silent-echo the guard exists to prevent.
+        return;
+      }
+      // Parse + preflight attachment binds BEFORE any comment row exists, so a
+      // conflicting attachmentIds list fails the POST with an explicit error
+      // instead of creating a comment whose attachments silently did not bind.
+      // attachAssetsToComment re-checks inside its transaction (races).
+      // Callers may reference attachments by ASSET id (upload route,
+      // artifacts.create) or by attachment ROW id (native runner handoff,
+      // which re-references the row createAttachment returned); normalize
+      // row ids onto their asset id before the asset-keyed pipeline.
+      const requestedAttachmentIds = Array.isArray(req.body.attachmentIds)
+        ? req.body.attachmentIds.filter(
+            (attachmentId: unknown): attachmentId is string =>
+              typeof attachmentId === "string" && attachmentId.length > 0,
+          )
+        : [];
+      const rowReferencedAssetIds = requestedAttachmentIds.length
+        ? await db
+            .select({
+              rowId: issueAttachments.id,
+              assetId: issueAttachments.assetId,
+            })
+            .from(issueAttachments)
+            .where(
+              and(
+                eq(issueAttachments.companyId, issue.companyId),
+                eq(issueAttachments.issueId, issue.id),
+                inArray(issueAttachments.id, requestedAttachmentIds),
+              ),
+            )
+            .then((rows) => new Map(rows.map((row) => [row.rowId, row.assetId])))
+        : new Map<string, string>();
+      const commentAttachmentIds: string[] = (requestedAttachmentIds as string[]).map(
+        (attachmentId: string) => rowReferencedAssetIds.get(attachmentId) ?? attachmentId,
+      );
+      if (commentAttachmentIds.length > 0) {
+        await svc.validateAssetsBindableToIssue({
+          issueId: issue.id,
+          assetIds: commentAttachmentIds,
+          replayRunId: actor.runId ?? null,
+        });
+      }
       const commentPresentation =
         req.body.presentation ??
         (await deriveRecoveryCommentPresentation(
@@ -18228,7 +18832,8 @@ export function issueRoutes(
         req.actor.type === "agent" &&
         issue.assigneeAgentId !== null &&
         issue.assigneeAgentId !== req.actor.agentId &&
-        !crossIssueCommentOnlyGrant
+        !crossIssueCommentOnlyGrant &&
+        !crossCompanyComment
       ) {
         if (
           !(await assertAgentIssueMutationAllowed(req, res, issue, {
@@ -18275,6 +18880,7 @@ export function issueRoutes(
           actorId: actor.actorId,
         });
       const effectiveMoveToTodoRequested =
+        !crossCompanyComment &&
         !assigneeSelfCommentOnTerminal &&
         (explicitMoveToTodoRequested ||
           shouldImplicitlyMoveCommentedIssueToTodo({
@@ -18528,7 +19134,7 @@ export function issueRoutes(
             (actor.actorType === "agent" ? "agent" : "user"),
           presentation: commentPresentation,
           metadata: req.body.metadata ?? null,
-          attachmentIds: req.body.attachmentIds,
+          attachmentIds: commentAttachmentIds.length > 0 ? commentAttachmentIds : req.body.attachmentIds,
           clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
           mirrorToSlack: actor.actorType === "user",
           sourceTrust,
@@ -18641,7 +19247,7 @@ export function issueRoutes(
             (actor.actorType === "agent" ? "agent" : "user"),
           presentation: commentPresentation,
           metadata: req.body.metadata ?? null,
-          attachmentIds: req.body.attachmentIds,
+          attachmentIds: commentAttachmentIds.length > 0 ? commentAttachmentIds : req.body.attachmentIds,
           clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
           mirrorToSlack: actor.actorType === "user",
           authorizationReason: commentAuthorizationReason,
@@ -18676,6 +19282,51 @@ export function issueRoutes(
         await db.transaction(tx => enqueueFastResponse(tx as unknown as Db, { companyId: currentIssue.companyId, issueId: currentIssue.id, agentId: currentIssue.assigneeAgentId,
           responsibleUserId: actor.actorId, sourceCommentId: comment.id, sourceKey: `comment:${comment.id}`, acceptedAt: new Date(comment.createdAt) }))
           .catch(() => logger.warn({ issueId: currentIssue.id }, "fast response admission unavailable"));
+      }
+
+      // Bind pre-uploaded assets to this comment before any downstream
+      // `comment.created` fan-out, so a media relay reading attachments at
+      // comment-created time sees them (no attach-after-post race). Binding is
+      // conflict-aware: unbound rows on this issue are adopted, already-bound
+      // same-comment binds are idempotent, and genuine conflicts throw 409
+      // (pre-checked above, re-checked in-transaction here). Mirrors the host
+      // bridge path.
+      if (commentAttachmentIds.length > 0) {
+        await svc.attachAssetsToComment({
+          issueId: currentIssue.id,
+          issueCommentId: comment.id,
+          assetIds: commentAttachmentIds,
+        });
+        // addComment binds pre-existing attachment rows inline, so
+        // attachAssetsToComment only reports standalone assets. The comment is
+        // new, so every row now bound to it was bound by this request: emit
+        // one issue.attachment_bound per row (plugin issue.attachment.created).
+        const bound = (
+          await svc.listAttachments(currentIssue.id, currentIssue.companyId)
+        )
+          .filter((row) => row.issueCommentId === comment.id)
+          .map((row) => ({
+            companyId: row.companyId,
+            issueId: row.issueId,
+            attachmentId: row.id,
+            commentId: comment.id,
+            contentType: row.contentType ?? null,
+            byteSize: row.byteSize ?? null,
+          }));
+        for (const row of bound) {
+          await logActivity(db, {
+            companyId: currentIssue.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+            action: "issue.attachment_bound",
+            entityType: "issue",
+            entityId: currentIssue.id,
+            details: attachmentBoundActivityDetails(row),
+          });
+        }
       }
 
       await issueReferencesSvc.syncComment(comment.id);
@@ -18759,6 +19410,7 @@ export function issueRoutes(
           bodySnippet: comment.body.slice(0, 120),
           identifier: currentIssue.identifier,
           issueTitle: currentIssue.title,
+          ...(commentAttachmentIds.length > 0 ? { attachmentCount: commentAttachmentIds.length } : {}),
           authorizationReason: commentAuthorizationReason,
           ...(isDirectParentReportDecision(commentAccessDecision)
             ? { directParentReportGrant: true }
@@ -18964,7 +19616,23 @@ export function issueRoutes(
           reopened,
           currentStatus: wakeIssueSnapshot.status,
         });
-        if (assigneeId && !goalCommentSteered && shouldWakeAssigneeForComment) {
+        // Guard B: outbound operator-delivery comments (body begins with the marker)
+        // are outbound-to-operator by definition and are never an inbound task for
+        // the assignee, so an assignee wake would just echo our own message back as
+        // fake inbound operator input. Guard A above has already rejected any
+        // non-agent-authored marked comment, so the marked comments that reach here
+        // are agent-authored (relayed to the operator by messenger). Suppress ONLY
+        // the non-reopen `issue_commented` assignee wake; the reopen and @mention
+        // paths below are untouched. Keyed off the body prefix so it holds regardless
+        // of which agent posted.
+        const isOperatorDeliverComment =
+          comment.body.trimStart().startsWith(OPERATOR_DELIVER_MARKER);
+        if (
+          assigneeId &&
+          !goalCommentSteered &&
+          shouldWakeAssigneeForComment &&
+          !(isOperatorDeliverComment && !reopened)
+        ) {
           if (reopened) {
             addWakeup(assigneeId, {
               source: "automation",
@@ -19163,106 +19831,6 @@ export function issueRoutes(
       res.status(201).json(comment);
     },
   );
-
-  router.post(
-    "/issues/:id/feedback-votes",
-    validate(upsertIssueFeedbackVoteSchema),
-    async (req, res) => {
-      const id = req.params.id as string;
-      const issue = await getAccessibleResource(
-        req,
-        res,
-        svc.getById(id),
-        "Issue not found",
-      );
-      if (!issue) return;
-      if (req.actor.type !== "board") {
-        res
-          .status(403)
-          .json({ error: "Only board users can vote on AI feedback" });
-        return;
-      }
-
-      const actor = getActorInfo(req);
-      const result = await feedback.saveIssueVote({
-        issueId: id,
-        targetType: req.body.targetType,
-        targetId: req.body.targetId,
-        vote: req.body.vote,
-        reason: req.body.reason,
-        authorUserId: req.actor.userId ?? "local-board",
-        allowSharing: req.body.allowSharing === true,
-      });
-
-      await logActivity(db, {
-        companyId: issue.companyId,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        agentId: actor.agentId,
-        runId: actor.runId,
-        agentApiKeyId: actor.agentApiKeyId,
-        action: "issue.feedback_vote_saved",
-        entityType: "issue",
-        entityId: issue.id,
-        details: {
-          identifier: issue.identifier,
-          targetType: result.vote.targetType,
-          targetId: result.vote.targetId,
-          vote: result.vote.vote,
-          hasReason: Boolean(result.vote.reason),
-          sharingEnabled: result.sharingEnabled,
-        },
-      });
-
-      if (result.consentEnabledNow) {
-        await logActivity(db, {
-          companyId: issue.companyId,
-          actorType: actor.actorType,
-          actorId: actor.actorId,
-          agentId: actor.agentId,
-          runId: actor.runId,
-          agentApiKeyId: actor.agentApiKeyId,
-          action: "company.feedback_data_sharing_updated",
-          entityType: "company",
-          entityId: issue.companyId,
-          details: {
-            feedbackDataSharingEnabled: true,
-            source: "issue_feedback_vote",
-          },
-        });
-      }
-
-      if (result.persistedSharingPreference) {
-        const settings = await instanceSettings.get();
-        const companyIds = await instanceSettings.listCompanyIds();
-        await Promise.all(
-          companyIds.map((companyId) =>
-            logActivity(db, {
-              companyId,
-              actorType: actor.actorType,
-              actorId: actor.actorId,
-              agentId: actor.agentId,
-              runId: actor.runId,
-              agentApiKeyId: actor.agentApiKeyId,
-              action: "instance.settings.general_updated",
-              entityType: "instance_settings",
-              entityId: settings.id,
-              details: {
-                general: settings.general,
-                changedKeys: ["feedbackDataSharingPreference"],
-                source: "issue_feedback_vote",
-              },
-            }),
-          ),
-        );
-      }
-
-      // saveIssueVote has committed the export and notified its worker.
-      // Return the saved vote without waiting for an upload or backlog.
-      res.status(201).json(result.vote);
-    },
-  );
-
   router.get("/issues/:id/attachments", async (req, res) => {
     const issueId = req.params.id as string;
     const issue = await getAccessibleResource(
@@ -19404,9 +19972,12 @@ export function issueRoutes(
         entityId: issueId,
         details: {
           attachmentId: attachment.id,
+          issueId,
+          commentId: attachment.issueCommentId ?? null,
           originalFilename: attachment.originalFilename,
           contentType: attachment.contentType,
           byteSize: attachment.byteSize,
+          binding: "upload",
         },
       });
 
@@ -19500,11 +20071,25 @@ export function issueRoutes(
         "sandbox; default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'",
       );
     }
-    const disposition = parseBooleanQuery(req.query.download)
-      ? "attachment"
-      : isInlineAttachmentContentType(responseContentType)
-        ? "inline"
-        : "attachment";
+    // SE ruling (D2): plugin-created spreadsheet-bait assets (csv/tsv content
+    // type or spreadsheet filename under the plugin-artifacts namespace) are
+    // pinned to download — a browser must never render them inline.
+    const disposition =
+      parseBooleanQuery(req.query.download) ||
+      isSpreadsheetBaitPluginArtifact({
+        companyId: attachment.companyId,
+        objectKey: attachment.objectKey,
+        contentType: responseContentType,
+        originalFilename: attachment.originalFilename,
+      })
+        ? "attachment"
+        : isInlineAttachmentContentType(responseContentType)
+          ? "inline"
+          : "attachment";
+    // res.attachment above already set an escaped, standards-correct
+    // Content-Disposition (upstream shape: keep it, swap only the disposition
+    // token) so quoted/Unicode filenames survive byte-for-byte instead of
+    // having their quote characters stripped.
     res.setHeader(
       "Content-Disposition",
       String(res.getHeader("Content-Disposition")).replace(/^attachment;/, `${disposition};`),
@@ -19583,6 +20168,104 @@ export function issueRoutes(
 
     res.json({ ok: true });
   });
+
+
+  router.post(
+    "/issues/:id/feedback-votes",
+    validate(upsertIssueFeedbackVoteSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const issue = await getAccessibleResource(
+        req,
+        res,
+        svc.getById(id),
+        "Issue not found",
+      );
+      if (!issue) return;
+      if (req.actor.type !== "board") {
+        res
+          .status(403)
+          .json({ error: "Only board users can vote on AI feedback" });
+        return;
+      }
+
+      const actor = getActorInfo(req);
+      const result = await feedback.saveIssueVote({
+        issueId: id,
+        targetType: req.body.targetType,
+        targetId: req.body.targetId,
+        vote: req.body.vote,
+        reason: req.body.reason,
+        authorUserId: req.actor.userId ?? "local-board",
+        allowSharing: req.body.allowSharing === true,
+      });
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.feedback_vote_saved",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          identifier: issue.identifier,
+          targetType: result.vote.targetType,
+          targetId: result.vote.targetId,
+          vote: result.vote.vote,
+          hasReason: Boolean(result.vote.reason),
+          sharingEnabled: result.sharingEnabled,
+        },
+      });
+
+      if (result.consentEnabledNow) {
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "company.feedback_data_sharing_updated",
+          entityType: "company",
+          entityId: issue.companyId,
+          details: {
+            feedbackDataSharingEnabled: true,
+            source: "issue_feedback_vote",
+          },
+        });
+      }
+
+      if (result.persistedSharingPreference) {
+        const settings = await instanceSettings.get();
+        const companyIds = await instanceSettings.listCompanyIds();
+        await Promise.all(
+          companyIds.map((companyId) =>
+            logActivity(db, {
+              companyId,
+              actorType: actor.actorType,
+              actorId: actor.actorId,
+              agentId: actor.agentId,
+              runId: actor.runId,
+              agentApiKeyId: actor.agentApiKeyId,
+              action: "instance.settings.general_updated",
+              entityType: "instance_settings",
+              entityId: settings.id,
+              details: {
+                general: settings.general,
+                changedKeys: ["feedbackDataSharingPreference"],
+                source: "issue_feedback_vote",
+              },
+            }),
+          ),
+        );
+      }
+
+            res.status(201).json(result.vote);
+    },
+  );
 
   return router;
 }
