@@ -46,6 +46,19 @@ function profileInput(value: unknown): RemoteAgentProfileInput {
   };
 }
 
+/**
+ * Company-scoped routes for "remote agent" connection profiles — currently
+ * only the `aws_bedrock_agentcore_harness` service is supported (rejected
+ * otherwise). Every route requires board access plus company access.
+ *
+ * - `GET .../remote-agent-profiles` lists profiles, optionally filtered by
+ *   `service`.
+ * - `POST .../remote-agent-profiles` upserts a profile. Profiles use AWS
+ *   workload identity rather than a stored secret — a body containing
+ *   `credentialSecretId` is rejected — and carry a `qualification` record
+ *   plus a `retentionAcknowledged` flag. The upsert writes an
+ *   `activity_log` row.
+ */
 export function remoteAgentProfileRoutes(db: Db) {
   const router = Router();
   const profiles = remoteAgentProfileService(db);
