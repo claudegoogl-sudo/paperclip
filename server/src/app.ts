@@ -684,7 +684,40 @@ export async function createApp(
   // agent API key. Every request revalidates the active heartbeat row.
   app.use(runtimeConnectionIntentRoutes(db));
   const hostServicesDisposers = new Map<string, () => void>();
-  const workerManager = opts.pluginWorkerManager ?? createPluginWorkerManager();
+  // pluginId -> pluginKey, populated as each plugin's host handlers are
+  // built. Lets the event-relay probe resolve the bus key (which is the plugin
+  // key) for the running workers reported by the worker manager.
+  // Shared run-context registry tying the dispatching agent's
+  // identity to (pluginDbId, runId) for the duration of each tool call, so the
+  // worker's `artifacts.fetch`/`secrets.resolve` callbacks can be authorized
+  // server-side. Also holds each worker's worker-lifetime service
+  // run-context (system actor) for background secret resolution — created
+  // before the worker manager so the manager can register on worker start.
+  // When the caller injects a pre-built pluginWorkerManager (index.ts
+  // does, so it can also drive heartbeat/routine services), it MUST inject the
+  // registry that manager was built with. Otherwise app would create a second,
+  // disjoint registry: the manager's registerService would write to its own
+  // registry while the secrets host-handler reads this one, so service/setup()
+  // run-contexts would never be found (Gate 1 → runcontext_invalid).
+  const pluginRunContextRegistry =
+    opts.pluginRunContextRegistry ?? createPluginRunContextRegistry();
+  // The SSE bridge needs BOTH halves wired to the same manager — a
+  // publisher (manager onStreamNotification → bus) and the bus itself
+  // (bridgeDeps.streamBus). Build the bus here and wire the internal-manager
+  // path; an injected manager must pair with the bus it publishes to.
+  const pluginStreamBus = opts.pluginStreamBus ?? createPluginStreamBus();
+  const workerManager =
+    opts.pluginWorkerManager ??
+    createPluginWorkerManager({
+      runContextRegistry: pluginRunContextRegistry,
+      // Worker ctx.logger notifications persist to plugin_logs on the same
+      // buffered path as the logger.log host service (§26.1), so the operator
+      // logs panel can show plugin errors.
+      workerLogPersist: (entry) => bufferPluginLogEntry({ db, ...entry }),
+      onStreamNotification: ({ pluginId, method, params }) => {
+        publishWorkerStreamNotification(pluginStreamBus, pluginId, method, params);
+      },
+    });
   let lifecyclePluginsReady = false;
   const agentLifecycle = startAgentLifecycle(db, createLifecycleDriver(db, workerManager), () => lifecyclePluginsReady && !isWarmStandby() && !isIdleTaskDrainActive());
   const connectionIntentHeartbeat = heartbeatService(db, {
