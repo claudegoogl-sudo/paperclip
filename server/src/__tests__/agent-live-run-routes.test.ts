@@ -16,6 +16,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getActiveRunIssueSummaryForAgent: vi.fn(),
   getRunLogAccess: vi.fn(),
   readLog: vi.fn(),
+  listEvents: vi.fn(),
   wakeup: vi.fn(),
   getRun: vi.fn(),
 }));
@@ -366,6 +367,7 @@ describe("agent live run routes", () => {
       content: "chunk",
       nextOffset: 5,
     });
+    mockHeartbeatService.listEvents.mockResolvedValue([]);
     mockHeartbeatService.wakeup.mockResolvedValue({
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       companyId: "company-1",
@@ -614,6 +616,64 @@ describe("agent live run routes", () => {
       logRef: "logs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.ndjson",
       content: "chunk",
       nextOffset: 5,
+    });
+  });
+
+  describe("strict integer query parsing", () => {
+    const runPath = "/api/heartbeat-runs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+    it.each([
+      ["events afterSeq", `${runPath}/events?afterSeq=1.5`],
+      ["events afterSeq", `${runPath}/events?afterSeq=-1`],
+      ["events limit", `${runPath}/events?limit=abc`],
+      ["events limit", `${runPath}/events?limit=1.5`],
+      ["events limit", `${runPath}/events?limit=1e20`],
+      ["run log offset", `${runPath}/log?offset=1.5`],
+      ["run log offset", `${runPath}/log?offset=-1`],
+      ["run log offset", `${runPath}/log?offset=1e20`],
+      ["run log offset", `${runPath}/log?offset=abc`],
+      ["workspace log offset", "/api/workspace-operations/operation-1/log?offset=1.5"],
+      ["workspace log offset", "/api/workspace-operations/operation-1/log?offset=-1"],
+      ["workspace log offset", "/api/workspace-operations/operation-1/log?offset=1e20"],
+    ])("rejects malformed %s with 400: %s", async (_label, path) => {
+      const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl).get(path));
+      expect(res.status, JSON.stringify(res.body)).toBe(400);
+      expect(mockHeartbeatService.listEvents).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.readLog).not.toHaveBeenCalled();
+      expect(mockWorkspaceOperationService.readLog).not.toHaveBeenCalled();
+    });
+
+    it("passes valid numeric events params through and defaults when absent", async () => {
+      const app = await createApp();
+      const explicit = await requestApp(app, (baseUrl) =>
+        request(baseUrl).get(`${runPath}/events?afterSeq=7&limit=25`),
+      );
+      expect(explicit.status, JSON.stringify(explicit.body)).toBe(200);
+      expect(mockHeartbeatService.listEvents).toHaveBeenLastCalledWith(
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        7,
+        25,
+      );
+
+      const defaults = await requestApp(app, (baseUrl) => request(baseUrl).get(`${runPath}/events`));
+      expect(defaults.status, JSON.stringify(defaults.body)).toBe(200);
+      expect(mockHeartbeatService.listEvents).toHaveBeenLastCalledWith(
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        0,
+        200,
+      );
+    });
+
+    it("passes a valid workspace operation log offset through", async () => {
+      mockWorkspaceOperationService.readLog.mockResolvedValue({ content: "", nextOffset: 0 });
+      const res = await requestApp(await createApp(), (baseUrl) =>
+        request(baseUrl).get("/api/workspace-operations/operation-1/log?offset=9&limitBytes=32"),
+      );
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockWorkspaceOperationService.readLog).toHaveBeenCalledWith("operation-1", {
+        offset: 9,
+        limitBytes: 32,
+      });
     });
   });
 
