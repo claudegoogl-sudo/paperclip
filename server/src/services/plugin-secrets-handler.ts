@@ -1,3 +1,4 @@
+import { isPlainRecord } from "../lib/objects.js";
 /**
  * SECURITY-CRITICAL: plugin secrets host-side handler — resolves secret
  * references through the Paperclip secret provider system with enforced
@@ -138,9 +139,6 @@ function requireCompanyId(companyId: unknown): string {
   return companyId.trim();
 }
 
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function parseSecretRefBinding(value: unknown): EnvSecretRefBinding | null {
   const parsed = envBindingSecretRefSchema.safeParse(value);
