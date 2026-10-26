@@ -13,6 +13,22 @@ import { badRequest, forbidden } from "../errors.js";
 import { folderService, logActivity } from "../services/index.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 
+/**
+ * Company-scoped CRUD for the folder tree used to organize skills, routines,
+ * and other foldered items. All routes require company access.
+ *
+ * - `GET .../folders` lists folders of a given `kind` (required query param).
+ * - `POST .../folders` creates a folder; `.../folders/ensure-my` ensures the
+ *   signed-in board user's personal skill folder exists (board user
+ *   required) and is idempotent.
+ * - `PATCH .../folders/:folderId` renames/updates a folder;
+ *   `POST .../folders/:folderId/move` moves a folder to a new parent/
+ *   position; `POST .../folders/items/move` moves an item (skill or
+ *   routine) between folders; `DELETE .../folders/:folderId` deletes one.
+ *
+ * Every mutation writes an `activity_log` row naming the folder/item kind
+ * and the resulting path/position.
+ */
 export function folderRoutes(db: Db) {
   const router = Router();
   const svc = folderService(db);
