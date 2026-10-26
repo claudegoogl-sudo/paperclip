@@ -13,6 +13,7 @@ import {
   setBindingEgressAllowlistSchema,
   setBindingAutoRenewPolicySchema,
   enforceBindingEgressSchema,
+  isUuidLike,
   updateSecretProviderConfigSchema,
   updateSecretSchema,
   updateUserSecretDefinitionSchema,
@@ -38,6 +39,11 @@ type SecretRoutesDeps = {
   heartbeat?: IssueAssignmentWakeupDeps;
   issues?: Pick<ReturnType<typeof issueService>, "getById" | "addComment">;
 };
+
+// isUuidLike tolerates surrounding whitespace, but Postgres uuid input does not.
+function assertSecretIdFormat(id: string) {
+  if (id !== id.trim() || !isUuidLike(id)) throw notFound("Secret not found");
+}
 
 const DEFAULT_PROPOSAL_LIST_LIMIT = 100;
 const MAX_PROPOSAL_LIST_LIMIT = 200;
@@ -996,6 +1002,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
   router.post("/secrets/:id/rotate", validate(rotateSecretSchema), async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
+    assertSecretIdFormat(id);
     const fetched = await svc.getById(id);
     const existing = await getAccessibleResource(
       req,
@@ -1036,6 +1043,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
   router.patch("/secrets/:id", validate(updateSecretSchema), async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
+    assertSecretIdFormat(id);
     const fetched = await svc.getById(id);
     const existing = await getAccessibleResource(
       req,
@@ -1080,6 +1088,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
   router.get("/secrets/:id/usage", async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
+    assertSecretIdFormat(id);
     const fetched = await svc.getById(id);
     const existing = await getAccessibleResource(
       req,
@@ -1095,6 +1104,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
   router.get("/secrets/:id/access-events", async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
+    assertSecretIdFormat(id);
     const fetched = await svc.getById(id);
     const existing = await getAccessibleResource(
       req,
@@ -1110,6 +1120,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
   router.delete("/secrets/:id", async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
+    assertSecretIdFormat(id);
     const fetched = await svc.getById(id);
     const existing = await getAccessibleResource(
       req,
@@ -1373,6 +1384,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
   router.get("/secrets/:id/renewal-events", async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
+    assertSecretIdFormat(id);
     const existing = await svc.getById(id);
     // Two-step existence-oracle gate (see hasCompanyAccess in routes/authz.ts):
     // the access check is folded into the existence check so a cross-tenant
