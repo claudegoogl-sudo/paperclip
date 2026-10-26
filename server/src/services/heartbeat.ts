@@ -4168,6 +4168,16 @@ interface WakeupOptions {
   /** Exact failed run selected by an authenticated board Retry request. */
   failedRunId?: string | null;
   durableChatRequest?: DurableChatWakeupRequest;
+  /** Server-owned Dot admission receipt; never accepted from API payloads. */
+  durableDotRequest?: {
+    id: string;
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    requestId: string;
+    idempotencyKey: string;
+    requestedAt: Date;
+  };
   source?: "timer" | "assignment" | "on_demand" | "automation";
   triggerDetail?: "manual" | "ping" | "callback" | "system";
   reason?: string | null;
@@ -28526,18 +28536,35 @@ export function heartbeatService(
     if (durableRequest?.failedRunRetry) {
       opts = { ...opts, allowRunCoalescing: false };
     }
-    const durableReceiptFields = durableRequest
-      ? { id: durableRequest.id, requestedAt: durableRequest.requestedAt }
+    const dotRequest = opts.durableDotRequest;
+    if (dotRequest && (durableRequest || dotRequest.agentId !== agentId ||
+        dotRequest.companyId !== agent.companyId || dotRequest.issueId !== issueId ||
+        dotRequest.requestId !== payload?.dotRequestId || source !== "assignment" ||
+        opts.requestedByActorType !== "agent" || opts.requestedByActorId !== agentId ||
+        agent.adapterType !== "paperclip_runner" || parseObject(agent.adapterConfig).provider !== "openai_dot" ||
+        opts.idempotencyKey !== dotRequest.idempotencyKey)) {
+      throw conflict("Dot work request does not match its admission authority.");
+    }
+    const receiptRequest = durableRequest ?? dotRequest;
+    const durableReceiptFields = receiptRequest
+      ? { id: receiptRequest.id, requestedAt: receiptRequest.requestedAt }
       : {};
     const existingDurableReceipt = async (queryDb: Db) => {
-      if (!durableRequest) return null;
+      if (!receiptRequest) return null;
       const receipt = await queryDb
         .select()
         .from(agentWakeupRequests)
-        .where(eq(agentWakeupRequests.id, durableRequest.id))
+        .where(eq(agentWakeupRequests.id, receiptRequest.id))
         .limit(1)
         .then((rows) => rows[0] ?? null);
-      if (receipt) assertDurableChatWakeupReceipt(durableRequest, receipt);
+      if (receipt && durableRequest) assertDurableChatWakeupReceipt(durableRequest, receipt);
+      if (receipt && dotRequest && (receipt.companyId !== dotRequest.companyId ||
+          receipt.agentId !== dotRequest.agentId || receipt.source !== "assignment" ||
+          receipt.requestedByActorType !== "agent" || receipt.requestedByActorId !== dotRequest.agentId ||
+          receipt.idempotencyKey !== dotRequest.idempotencyKey || receipt.payload?.issueId !== dotRequest.issueId ||
+          receipt.payload?.dotRequestId !== dotRequest.requestId)) {
+        throw conflict("requestId was reused for another task.");
+      }
       return receipt;
     };
     const priorReceipt = await existingDurableReceipt(db);
