@@ -8951,7 +8951,7 @@ export function issueRoutes(
         .listReviewAttention(issue.companyId, [issue])
         .then((map) => map.get(issue.id) ?? null),
       svc.getCurrentScheduledRetry(issue.id),
-      svc.listAttachments(issue.id),
+      svc.listAttachments(issue.id, issue.companyId),
       documentsSvc.getIssueDocumentByKey(
         issue.id,
         ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
@@ -15810,7 +15810,7 @@ export function issueRoutes(
     );
     if (!existing) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
-    const attachments = await svc.listAttachments(id);
+    const attachments = await svc.listAttachments(id, existing.companyId);
 
     const issue = await svc.remove(id);
     if (!issue) {
@@ -16025,7 +16025,7 @@ export function issueRoutes(
 
     const actor = getActorInfo(req);
     await logActivity(db, {
-      companyId: released.companyId,
+      companyId: released.issue.companyId,
       actorType: actor.actorType,
       actorId: actor.actorId,
       agentId: actor.agentId,
@@ -16033,11 +16033,11 @@ export function issueRoutes(
       agentApiKeyId: actor.agentApiKeyId,
       action: "issue.released",
       entityType: "issue",
-      entityId: released.id,
-      details: { status: released.status, _previous: { status: existing.status } },
+      entityId: released.issue.id,
+      details: { status: released.issue.status, _previous: { status: existing.status } },
     });
 
-    res.json(released);
+    res.json(released.issue);
   });
 
   router.post("/issues/:id/admin/force-release", async (req, res) => {
@@ -19273,7 +19273,7 @@ export function issueRoutes(
     );
     if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
-    const attachments = await svc.listAttachments(issueId);
+    const attachments = await svc.listAttachments(issueId, issue.companyId);
     res.json(attachments.map(withContentPath));
   });
 

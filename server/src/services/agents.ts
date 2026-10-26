@@ -3,7 +3,7 @@ import { type BudgetServiceHooks } from "./budgets.js";
 import { and, desc, eq, inArray, ne } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, agentConfigRevisions, agentApiKeys, heartbeatRuns } from "@paperclipai/db";
-import { isUuidLike, normalizeAgentApiKeyScope, normalizeAgentUrlKey, type AgentApiKeyScope } from "@paperclipai/shared";
+import { computeAgentKeyExpiresAt, isUuidLike, normalizeAgentApiKeyScope, normalizeAgentUrlKey, type AgentApiKeyScope } from "@paperclipai/shared";
 
 import { conflict, notFound, unprocessable } from "../errors.js";
 
@@ -113,7 +113,11 @@ export function agentService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
       id: string,
       name: string,
       scope: AgentApiKeyScope = { kind: "standard" },
-      options?: { responsibleUserId?: string | null },
+      options?: {
+        responsibleUserId?: string | null;
+        ttlSeconds?: number | null;
+        expiresAt?: Date | string | null;
+      },
     ) => {
       const existing = await getById(id);
       if (!existing) throw notFound("Agent not found");
@@ -123,6 +127,12 @@ export function agentService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
       if (existing.status === "terminated") {
         throw conflict("Cannot create keys for terminated agents");
       }
+
+      const expiresAt = computeAgentKeyExpiresAt({
+        scope,
+        ttlSeconds: options?.ttlSeconds ?? null,
+        expiresAt: options?.expiresAt ?? null,
+      });
 
       const token = createToken();
       const keyHash = hashToken(token);
@@ -135,6 +145,7 @@ export function agentService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           keyHash,
           responsibleUserId: options?.responsibleUserId?.trim() || null,
           scopeConfig: scope.kind === "standard" ? null : scope,
+          expiresAt,
         })
         .returning()
         .then((rows) => rows[0]);
@@ -146,6 +157,7 @@ export function agentService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
         responsibleUserId: created.responsibleUserId,
         token,
         createdAt: created.createdAt,
+        expiresAt: created.expiresAt,
       };
     },
 
