@@ -1,5 +1,5 @@
-import { Table, getTableColumns, getTableName, is } from "drizzle-orm";
 import * as schema from "./schema/index.js";
+import { buildSchemaColumnIndex } from "./schema-column-index.js";
 
 export type TenancyBindingKey = {
   readonly table: string;
@@ -237,29 +237,6 @@ export function matchedTenancyKeys(
     }
   }
   return [...result].sort();
-}
-
-/** Database column names per database table name, both lowercased. */
-export type SchemaColumnIndex = ReadonlyMap<string, ReadonlySet<string>>;
-
-/**
- * Index the drizzle tables in `tables` by their *database* names.
- *
- * Copied from security-posture-columns.ts for the same purpose: verifying
- * that registry entries still resolve against the schema.
- */
-export function buildSchemaColumnIndex(tables: Record<string, unknown>): SchemaColumnIndex {
-  const index = new Map<string, Set<string>>();
-  for (const value of Object.values(tables)) {
-    if (!is(value, Table)) continue;
-    const table = getTableName(value).toLowerCase();
-    const columns = index.get(table) ?? new Set<string>();
-    for (const column of Object.values(getTableColumns(value))) {
-      columns.add(column.name.toLowerCase());
-    }
-    index.set(table, columns);
-  }
-  return index;
 }
 
 /**
