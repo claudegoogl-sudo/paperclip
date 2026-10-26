@@ -26,6 +26,8 @@ import { hasStopOnlyCleanup, settleStopOnlyCleanup } from "./sandbox-stop-and-re
 import { applyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-result";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { externalConversationStateSql, nonIdleSlackIssueCondition } from "./slack-conversation-state.js";
+import { TASK_QUESTION_GUIDANCE } from "./issue-question-context.js";
+import { slackChatAgentGuidance } from "./connectors/slack/agent-guidance.js";
 import { settleSlackConversation } from "./slack-conversation-lifecycle.js";
 import { publicChatTaskUrl } from "./chat-task-url.js";
 import { toolActionDeliveryService } from "./tool-action-delivery.js";
@@ -9127,6 +9129,7 @@ export function buildPaperclipTaskMarkdown(input: {
     body: string;
   } | null;
   externalChatProvider?: string | null;
+  slackCommand?: string | null;
   nativeRunner?: boolean;
   // false builds the compact variant used for resume deltas, where the session
   // already received the description with the assignment.
@@ -9204,6 +9207,9 @@ export function buildPaperclipTaskMarkdown(input: {
           ]),
     );
   }
+  if (input.externalChatProvider === "slack") {
+    lines.push(...slackChatAgentGuidance(input.nativeRunner === true, input.slackCommand));
+  }
   if (input.externalChatProvider && input.nativeRunner) {
     lines.push(
       "",
@@ -9249,6 +9255,7 @@ export function buildPaperclipTaskMarkdown(input: {
     }
   };
   if (issue) {
+    lines.push("", "Task question guidance:", TASK_QUESTION_GUIDANCE);
     lines.push(
       `- Issue: ${quoteTaskScalar(issue.identifier || issue.id)}`,
       `- Title: ${quoteTaskScalar(issue.title)}`,
@@ -11367,6 +11374,7 @@ export function heartbeatService(
       .select({
         chatCommunicationGuidance: chatConversations.communicationGuidance,
         chatAssignedAgentId: chatEndpoints.assignedAgentId,
+        chatSlackCommand: sql<string | null>`case when ${chatEndpoints.provider} = 'slack' and ${chatEndpoints.status} in ('active', 'verifying') then ${chatEndpoints.setup}->>'command' end`,
         externalConversationState: externalConversationStateSql(),
         conversationAgentId: issues.conversationAgentId,
         conversationUserId: issues.conversationUserId,
@@ -22474,6 +22482,9 @@ export function heartbeatService(
         wakeComments: safeWakeComments,
         attachmentOmissions: paperclipWakePayload?.attachmentOmissions,
         externalChatProvider: paperclipWakePayload?.externalChatProvider,
+        slackCommand: issueContext?.chatAssignedAgentId === agent.id
+          ? issueContext.chatSlackCommand
+          : null,
         nativeRunner: agent.adapterType === "paperclip_runner",
         interaction: {
           kind: readNonEmptyString(context.interactionKind),
