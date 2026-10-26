@@ -1087,6 +1087,96 @@ export async function inspectMigrations(url: string): Promise<MigrationState> {
   }
 }
 
+export type PendingMigrationDigest = { migrationFile: string; hash: string };
+
+export type MigrationIdentityDriftEntry = {
+  migrationFile: string;
+  recordedHash: string;
+  currentHash: string;
+};
+
+export type MigrationPreflight = {
+  pending: PendingMigrationDigest[];
+  drift: MigrationIdentityDriftEntry[];
+  unverifiable: string[];
+};
+
+// Read-only report of what applying migrations would do. NOTE (upstream sync):
+// the fork's per-file identity/watermark tracking is not ported onto upstream's
+// rewritten applier yet, so drift cannot be decided. Every pending file that the
+// journal may have applied is reported as unverifiable (fail closed), never as
+// a clean empty-drift result.
+export async function inspectMigrationPreflight(url: string): Promise<MigrationPreflight> {
+  const state = await inspectMigrations(url);
+  const pendingFiles = state.status === "needsMigrations" ? state.pendingMigrations : [];
+  const pending: PendingMigrationDigest[] = await Promise.all(
+    pendingFiles.map(async (migrationFile) => ({
+      migrationFile,
+      hash: createHash("sha256")
+        .update(await readMigrationFileContent(migrationFile))
+        .digest("hex"),
+    })),
+  );
+  return { pending, drift: [], unverifiable: [...pendingFiles] };
+}
+
+// The database name embedded in a postgres connection string, used to scope the
+// production-migration opt-in to one specific cluster.
+function extractDatabaseName(connectionString: string): string | null {
+  try {
+    const parsed = new URL(connectionString);
+    const name = decodeURIComponent(parsed.pathname.replace(/^\//, "")).trim();
+    return name.length > 0 ? name : null;
+  } catch {
+    return null;
+  }
+}
+
+export type SourceTreeMigrationTarget = {
+  mode: "postgres" | "embedded-postgres";
+  connectionString: string;
+};
+
+// Guards the source-tree *apply* entrypoint (pnpm db:migrate) against silently
+// migrating an unintended external cluster. Only an explicitly configured
+// external postgres target can be production; the instance-local embedded
+// cluster is the ordinary dev loop and is never guarded, so routine work never
+// trips this. Read-only inspectors (db:status, --dry-run) are not gated at all.
+// For an external target a populated cluster is refused and fails closed unless
+// PAPERCLIP_ALLOW_PROD_MIGRATE names that exact database — a bare truthy value is
+// deliberately not accepted, so a grant left in a shell profile cannot later
+// authorise a different cluster.
+export async function assertSourceTreeMigrationAllowed(
+  target: SourceTreeMigrationTarget,
+): Promise<void> {
+  if (target.mode !== "postgres") return;
+
+  const databaseName = extractDatabaseName(target.connectionString);
+  const optIn = process.env.PAPERCLIP_ALLOW_PROD_MIGRATE?.trim();
+  if (optIn && databaseName && optIn === databaseName) return;
+
+  const sql = createUtilitySql(target.connectionString);
+  try {
+    const rows = await sql<{ count: number }[]>`
+      select count(*)::int as count
+      from information_schema.tables
+      where table_schema = 'public'
+        and table_type = 'BASE TABLE'
+    `;
+    const tableCount = rows[0]?.count ?? 0;
+    if (tableCount > 0) {
+      const scope = databaseName ?? "<database-name>";
+      throw new Error(
+        `Refusing to migrate the external database "${databaseName ?? target.connectionString}" from a source tree: ` +
+          `it already holds ${tableCount} application table(s) and may be a production cluster. ` +
+          `Set PAPERCLIP_ALLOW_PROD_MIGRATE=${scope} to authorise migrating this specific database.`,
+      );
+    }
+  } finally {
+    await sql.end();
+  }
+}
+
 export async function applyPendingMigrations(url: string): Promise<void> {
   const initialState = await inspectMigrations(url);
   if (initialState.status === "upToDate") return;
