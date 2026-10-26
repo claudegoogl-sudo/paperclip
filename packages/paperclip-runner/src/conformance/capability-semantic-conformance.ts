@@ -1,3 +1,4 @@
+import { isRecord } from "../guards.js";
 import {
   CapabilityMockControlPlaneAdapter,
 } from "../mock-core/capability-mock-control-plane-adapter.js";
@@ -380,9 +381,6 @@ function idempotencyKeyFrom(value: unknown): string | null {
     : null;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function mockWorld(
   id: string,

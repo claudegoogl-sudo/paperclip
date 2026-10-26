@@ -1,3 +1,5 @@
+import { isRecord } from "../guards.js";
+
 export type SemanticConformanceAuthorization =
   | { readonly outcome: "allowed" }
   | { readonly outcome: "denied"; readonly code: string };
@@ -259,9 +261,6 @@ function normalizedDiff(expected: unknown, actual: unknown, path = "$"): Semanti
   return [{ path, expected: structuredCloneSafe(expected), actual: structuredCloneSafe(actual) }];
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function structuredCloneSafe(value: unknown): unknown {
   return value === undefined ? "<missing>" : structuredClone(value);

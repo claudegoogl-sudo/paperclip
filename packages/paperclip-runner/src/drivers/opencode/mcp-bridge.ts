@@ -1,3 +1,4 @@
+import { isRecord } from "../../guards.js";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { Ajv2020, type ValidateFunction } from "ajv/dist/2020.js";
@@ -353,6 +354,3 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value) ?? "undefined";
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}

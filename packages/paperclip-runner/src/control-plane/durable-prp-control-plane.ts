@@ -1,3 +1,4 @@
+import { isRecord } from "../guards.js";
 import { spawn } from "node:child_process";
 import {
   createCipheriv,
@@ -555,9 +556,6 @@ function validStoredWarmTransition(state: StoredCoreState): boolean {
   }
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function unsettledSemanticInput(
   event: DurableRecoveryCommittedEvent,
