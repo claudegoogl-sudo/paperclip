@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  buildFilePatch,
   buildFilePatches,
   diffSummary,
   initialExpandedFileSet,
@@ -46,7 +45,6 @@ describe("workspace diff UI model", () => {
     });
     const diff = diffResponse({ files: [file], truncated: true, warnings: [warning] });
 
-    expect(buildFilePatch(file)).toBeNull();
     expect(toFileViewModels(diff)[0]?.warnings).toEqual([warning]);
     expect(diffSummary(diff)).toMatchObject({
       warningCount: 1,
@@ -128,7 +126,6 @@ describe("workspace diff UI model", () => {
     const patches = buildFilePatches(file);
     const viewModel = toFileViewModels(diffResponse({ files: [file] }))[0];
 
-    expect(buildFilePatch(file)).toBe(stagedPatch.trimEnd());
     expect(patches.map((patch) => patch.kind)).toEqual(["staged", "unstaged"]);
     expect(patches.map((patch) => patch.patch?.match(/^diff --git/gm)?.length ?? 0)).toEqual([1, 1]);
     expect(viewModel?.patches).toHaveLength(2);
