@@ -48,7 +48,6 @@ export function createFeedbackTraceShareClientFromConfig(
           encoding: "gzip+base64+json",
           payload: gzipSync(requestBody).toString("base64"),
         }),
-        signal: AbortSignal.timeout(FEEDBACK_SHARE_UPLOAD_TIMEOUT_MS),
       });
 
       if (!response.ok) {

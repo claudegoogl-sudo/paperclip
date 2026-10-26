@@ -3713,11 +3713,7 @@ export function buildHostServices(
       async listPending(params: { companyId: string }) {
         const companyId = ensureCompanyId(params.companyId);
         await requirePluginEnabledForCompany(companyId);
-        const rows = await approvalSvc.list(
-          companyId,
-          "pending",
-          RECONCILE_LIST_LIMIT,
-        );
+        const rows = (await approvalSvc.list(companyId, "pending")).slice(0, RECONCILE_LIST_LIMIT);
         if (rows.length >= RECONCILE_LIST_LIMIT) {
           logger.warn(
             { companyId, limit: RECONCILE_LIST_LIMIT, status: "pending" },
