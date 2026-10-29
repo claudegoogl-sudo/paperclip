@@ -10,6 +10,7 @@ import pc from "picocolors";
 import {
   addCommonClientOptions,
   handleCommandError,
+  parseJson,
   printOutput,
   resolveCommandContext,
   type BaseClientOptions,
@@ -1008,9 +1009,6 @@ function addPluginLocalFolderKeyPut(parent: Command, name: string, description: 
   );
 }
 
-function parseJson(value: string): unknown {
-  return JSON.parse(value) as unknown;
-}
 
 function parseOptionalInt(value: string | undefined): number | undefined {
   if (value === undefined) return undefined;

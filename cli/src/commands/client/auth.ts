@@ -9,6 +9,7 @@ import {
   addCommonClientOptions,
   apiPath,
   handleCommandError,
+  parseJson,
   printOutput,
   resolveCommandContext,
   type BaseClientOptions,
@@ -186,9 +187,6 @@ export function registerClientAuthCommands(auth: Command): void {
   }
 }
 
-function parseJson(value: string): unknown {
-  return JSON.parse(value) as unknown;
-}
 
 function resolveChallengeToken(opts: AuthChallengeOptions): string {
   const token = opts.token?.trim();

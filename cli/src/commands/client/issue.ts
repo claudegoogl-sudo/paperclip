@@ -33,6 +33,7 @@ import {
   formatInlineRecord,
   handleCommandError,
   inferContentTypeFromPath,
+  parseJson,
   printOutput,
   resolveCommandContext,
   type BaseClientOptions,
@@ -1359,9 +1360,6 @@ function addIssuePostDeleteMarkerCommand(
   );
 }
 
-function parseJson(value: string): unknown {
-  return JSON.parse(value) as unknown;
-}
 
 function parseOptionalInt(value: string | undefined): number | undefined {
   if (value === undefined) return undefined;

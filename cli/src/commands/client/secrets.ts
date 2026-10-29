@@ -16,6 +16,7 @@ import {
   apiPath,
   formatInlineRecord,
   handleCommandError,
+  parseJson,
   printOutput,
   resolveCommandContext,
   type BaseClientOptions,
@@ -885,6 +886,3 @@ function addSecretProviderConfigDelete(parent: Command, name: string, descriptio
   );
 }
 
-function parseJson(value: string): unknown {
-  return JSON.parse(value) as unknown;
-}
