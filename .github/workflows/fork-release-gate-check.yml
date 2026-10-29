@@ -28,6 +28,12 @@ on:
       - ".github/workflows/fork-release.yml"
       - ".github/workflows/fork-release-gate-check.yml"
 
+concurrency:
+  # A new push to the same PR, or a new master push, supersedes the gate
+  # check already running for it.
+  group: fork-release-gate-check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -40,7 +46,7 @@ jobs:
       GATE_VERSION: 0.0.${{ github.run_number }}-gatecheck
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v6

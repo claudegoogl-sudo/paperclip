@@ -8,7 +8,7 @@ const ANONYMOUS_USER_ID = "anonymous";
 
 export type ProjectSidebarSortMode = "top" | "alphabetical" | "recent";
 
-type ProjectOrderUpdatedDetail = {
+export type ProjectOrderUpdatedDetail = {
   storageKey: string;
   orderedIds: string[];
 };

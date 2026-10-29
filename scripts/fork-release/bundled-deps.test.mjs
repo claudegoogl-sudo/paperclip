@@ -352,3 +352,32 @@ test("staged package metadata leaves no license behind when neither package nor 
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("the gate lists a tarball whose entry listing exceeds the default spawnSync buffer", () => {
+  const root = makeFakeRepo([{ dir: "packages/adapter-utils", name: "@paperclipai/adapter-utils" }]);
+  const outDir = join(root, "out");
+  mkdirSync(outDir, { recursive: true });
+  const files = {
+    "node_modules/acpx/dist/live-checkpoint-HashXyz.js":
+      'const MAP_OBJECT_PATHS = /* @__PURE__ */ new Set(["acpx.session_options.env"]);',
+    "LICENSE": "MIT License\n",
+  };
+  // ~12k entries with long names push `tar -tzf` stdout past 1 MiB (the spawnSync default).
+  const pad = "x".repeat(90);
+  for (let i = 0; i < 12000; i += 1) files[`filler/${pad}-${i}.txt`] = "";
+  makeFakeTarball(outDir, {
+    name: "@paperclipai/adapter-utils",
+    version: "9.9.9-test",
+    deps: { acpx: "0.12.0" },
+    bundled: ["acpx"],
+    files,
+  });
+  const markers = {
+    acpx: (readEntry, listEntries) => {
+      const chunk = listEntries().find((n) => /^dist\/live-checkpoint-[^/]+\.js$/.test(n));
+      if (!chunk || !readEntry(chunk).includes("acpx.session_options.env")) throw new Error("marker missing");
+    },
+  };
+  const { violations } = checkBundledTarballs({ repoRoot: root, outDir, version: "9.9.9-test", markers });
+  assert.deepEqual(violations, []);
+});

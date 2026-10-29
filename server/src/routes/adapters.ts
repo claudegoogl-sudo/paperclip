@@ -305,10 +305,20 @@ export function adapterRoutes(options: {
     assertAdapterCodeInstallAllowed();
     assertAdapterManagementVisible();
 
-    const { packageName, isLocalPath = false, version } = req.body as AdapterInstallRequest;
+    const { packageName, isLocalPath = false, version } = (req.body ?? {}) as AdapterInstallRequest;
 
     if (!packageName || typeof packageName !== "string") {
       res.status(400).json({ error: "packageName is required and must be a string." });
+      return;
+    }
+
+    if (version !== undefined && typeof version !== "string") {
+      res.status(400).json({ error: "version must be a string if provided." });
+      return;
+    }
+
+    if (typeof isLocalPath !== "boolean") {
+      res.status(400).json({ error: "isLocalPath must be a boolean if provided." });
       return;
     }
 
@@ -454,7 +464,7 @@ export function adapterRoutes(options: {
     assertAdapterManagementVisible();
 
     const adapterType = req.params.type;
-    const { disabled } = req.body as { disabled?: boolean };
+    const { disabled } = (req.body ?? {}) as { disabled?: boolean };
 
     if (typeof disabled !== "boolean") {
       res.status(400).json({ error: "Request body must include { \"disabled\": true|false }." });
@@ -491,7 +501,7 @@ export function adapterRoutes(options: {
     assertAdapterManagementVisible();
 
     const adapterType = req.params.type;
-    const { paused } = req.body as { paused?: boolean };
+    const { paused } = (req.body ?? {}) as { paused?: boolean };
 
     if (typeof paused !== "boolean") {
       res.status(400).json({ error: "\"paused\" (boolean) is required in request body." });

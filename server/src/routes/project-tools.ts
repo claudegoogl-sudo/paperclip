@@ -11,7 +11,11 @@ export function projectToolRoutes(db: Db) {
   router.post("/mcp/project-tools", async (req, res) => {
     const context = await projectToolContext(db, req.actor);
     assertCompanyAccess(req, context.run.companyId);
-    const { id = null, method, params } = req.body;
+    const body: unknown = req.body;
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      return res.status(400).json({ jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } });
+    }
+    const { id = null, method, params } = body as { id?: unknown; method?: unknown; params?: any };
     const send = (result: unknown) => res.json({ jsonrpc: "2.0", id, result });
     if (method === "initialize") return send({ protocolVersion: "2025-03-26", capabilities: { tools: { listChanged: false } }, serverInfo: { name: "paperclip-project-tools", version: "1" } });
     if (method === "notifications/initialized") return res.status(202).end();

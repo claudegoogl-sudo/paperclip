@@ -1,4 +1,4 @@
-import { lt, sql } from "drizzle-orm";
+import { asc, inArray, lt } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { pluginLogs } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
@@ -32,9 +32,15 @@ export async function prunePluginLogs(
 
   // Delete in batches to avoid long-running transactions
   while (iterations < MAX_ITERATIONS) {
+    const batch = db
+      .select({ id: pluginLogs.id })
+      .from(pluginLogs)
+      .where(lt(pluginLogs.createdAt, cutoff))
+      .orderBy(asc(pluginLogs.createdAt))
+      .limit(DELETE_BATCH_SIZE);
     const deleted = await db
       .delete(pluginLogs)
-      .where(lt(pluginLogs.createdAt, cutoff))
+      .where(inArray(pluginLogs.id, batch))
       .returning({ id: pluginLogs.id })
       .then((rows) => rows.length);
 
@@ -71,16 +77,26 @@ export function startPluginLogRetention(
   intervalMs: number = 60 * 60 * 1_000,
   retentionDays: number = DEFAULT_RETENTION_DAYS,
 ): () => void {
-  const timer = setInterval(() => {
-    prunePluginLogs(db, retentionDays).catch((err) => {
-      logger.warn({ err }, "Plugin log retention sweep failed");
-    });
-  }, intervalMs);
+  let running = false;
+
+  const sweep = () => {
+    // Skip rather than overlap: a slow sweep must not stack a second one.
+    if (running) return;
+    running = true;
+    void prunePluginLogs(db, retentionDays)
+      .catch((err) => {
+        logger.warn({ err }, "Plugin log retention sweep failed");
+      })
+      .finally(() => {
+        running = false;
+      });
+  };
+
+  const timer = setInterval(sweep, intervalMs);
+  timer.unref?.();
 
   // Run once immediately on startup
-  prunePluginLogs(db, retentionDays).catch((err) => {
-    logger.warn({ err }, "Initial plugin log retention sweep failed");
-  });
+  sweep();
 
   return () => clearInterval(timer);
 }

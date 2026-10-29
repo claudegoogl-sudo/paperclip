@@ -230,7 +230,7 @@ export function getActorInfo(req: Request): (
     agentId: null;
     runId: string | null;
     agentApiKeyId: null;
-    actorSource: "local_implicit" | "session" | "board_key" | "cloud_tenant";
+    actorSource: "local_implicit" | "session" | "board_key" | "mcp_oauth" | "cloud_tenant";
   }
 ) {
   assertAuthenticated(req);
@@ -248,7 +248,7 @@ export function getActorInfo(req: Request): (
 
   const actorSource = req.actor.source === "session"
     ? "session"
-    : (req.actor.source ?? "local_implicit") as "local_implicit" | "session" | "board_key" | "cloud_tenant";
+    : (req.actor.source ?? "local_implicit") as "local_implicit" | "session" | "board_key" | "cloud_tenant" | "mcp_oauth";
 
   return {
     actorType: "user" as const,
@@ -273,7 +273,7 @@ export type ActorSecretContext = {
   consumerId: string;
   actorType: "agent" | "user";
   actorId: string | null;
-  actorSource: "local_implicit" | "session" | "board_key" | "agent_key" | "agent_jwt" | "cloud_tenant";
+  actorSource: "local_implicit" | "session" | "board_key" | "agent_key" | "agent_jwt" | "mcp_oauth" | "cloud_tenant";
   responsibleUserId: string | null;
 };
 

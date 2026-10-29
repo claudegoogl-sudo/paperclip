@@ -36,7 +36,7 @@ const baseAgent = {
   status: "idle",
   reportsTo: null,
   capabilities: null,
-  adapterType: "process",
+  adapterType: "codex_local",
   adapterConfig: {},
   runtimeConfig: {},
   budgetMonthlyCents: 0,

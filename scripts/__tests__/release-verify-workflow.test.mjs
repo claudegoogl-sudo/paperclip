@@ -36,16 +36,14 @@ test("chaos verification isolates callers that verify the same source commit", (
   assert.match(chaosWorkflow, /cancel-in-progress: true/);
 });
 
-test("canary reuses exact-source proof while stable keeps full verification", () => {
+test("canary delegates to full release verification on the fork, matching stable", () => {
   const releaseWorkflow = readWorkflow("release.yml");
   const canary = releaseWorkflow.split("  verify_canary:\n")[1].split("\n  publish_canary:")[0];
-  assert.match(canary, /github\.repository == 'paperclipai\/paperclip' && github\.event_name == 'push' && github\.ref == 'refs\/heads\/master'/);
-  assert.match(canary, /actions: read/);
+  assert.match(canary, /github\.event_name == 'push' && github\.ref == 'refs\/heads\/master'/);
+  assert.match(canary, /uses: \.\/\.github\/workflows\/release-verify\.yml/);
   assert.match(canary, /ref: \$\{\{ github\.sha \}\}/);
-  assert.match(canary, /SOURCE_SHA: \$\{\{ github\.sha \}\}/);
-  assert.match(canary, /run: node scripts\/cloud-source-verification\.mjs "\$SOURCE_SHA"/);
-  assert.doesNotMatch(canary, /release-verify\.yml|continue-on-error|always\(\)/);
-  assert.match(releaseWorkflow, /publish_canary:\n\s+if: github\.event_name == 'push'\n\s+needs: verify_canary/);
+  assert.doesNotMatch(canary, /continue-on-error|always\(\)/);
+  assert.match(releaseWorkflow, /publish_canary:\n\s+if: github\.event_name == 'push' && github\.repository == 'paperclipai\/paperclip'\n\s+needs: verify_canary/);
   // The stable lane is gated on the stable channel since the nightly lane
   // was added; a `needs:` line (for example a preflight job) may sit between
   // the gate and the delegation.

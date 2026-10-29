@@ -69,8 +69,12 @@ describe("cross-company issue access helper", () => {
   });
 
   it("excludes onBehalfOfUserId, board, low-trust, inactive target, same company", async () => {
-    expect(await decideCrossCompanyIssueAccess(req({ onBehalfOfUserId: "u1" }), TARGET, "issue.update", deps()))
-      .toEqual({ allowed: false, reason: "on_behalf_of_user" });
+    // on_behalf_of_user no longer denies an allowlisted+granted agent...
+    expect((await decideCrossCompanyIssueAccess(req({ onBehalfOfUserId: "u1" }), TARGET, "issue.update", deps())).allowed).toBe(true);
+    expect((await decideCrossCompanyIssueAccess(req({ onBehalfOfUserId: "u1" }), TARGET, "issue.create", deps())).allowed).toBe(true);
+    // ...but a non-allowlisted agent running for a user is still denied.
+    expect(await decideCrossCompanyIssueAccess(req({ onBehalfOfUserId: "u1" }), TARGET, "issue.read", deps({ allowlist: () => new Set() })))
+      .toEqual({ allowed: false, reason: "not_allowlisted" });
     expect(await decideCrossCompanyIssueAccess(req({ type: "board", userId: "u" }), TARGET, "issue.read", deps()))
       .toEqual({ allowed: false, reason: "not_agent" });
     expect(await decideCrossCompanyIssueAccess(req({}), TARGET, "issue.read", deps({ isLowTrust: async () => true })))

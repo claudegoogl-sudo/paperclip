@@ -411,7 +411,7 @@ export class ScenarioChatDemoRuntime {
     const now = this.now();
     if (now - record.lastActiveAt >= SESSION_IDLE_MS || now - record.createdAt >= SESSION_LIFETIME_MS) {
       this.sessions.delete(record.id);
-      void record.chat.close();
+      void record.chat.close().catch(() => undefined);
       throw new RequestFailure(404, "session_not_found", "Session was not found.");
     }
     record.lastActiveAt = now;

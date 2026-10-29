@@ -722,6 +722,20 @@ export function pluginLifecycleManager(
         // Loader already parked the row + filed the approval; worker stays
         // stopped pending the board decision. Surface the domain event.
         const parked = await requirePlugin(pluginId);
+        // Keep the PREVIOUS version running while approval is pending (the
+        // approval notice may travel through this very plugin). Best-effort.
+        try {
+          await pluginLoaderInstance.loadSingle(pluginId, { allowUpgradePending: true });
+          log.info(
+            { pluginId, pluginKey: parked.pluginKey, version: parked.version },
+            "plugin lifecycle: upgrade parked — previous version kept running pending approval",
+          );
+        } catch (err) {
+          log.warn(
+            { pluginId, pluginKey: parked.pluginKey, err: String(err) },
+            "plugin lifecycle: upgrade parked and previous version failed to restart",
+          );
+        }
         emitDomain("plugin.upgrade_pending", {
           pluginId,
           pluginKey: parked.pluginKey,

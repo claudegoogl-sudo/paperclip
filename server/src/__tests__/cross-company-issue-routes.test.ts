@@ -21,6 +21,7 @@ const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
   getByIdForUpdate: vi.fn(),
   update: vi.fn(),
+  create: vi.fn(),
   addComment: vi.fn(),
   findMentionedAgents: vi.fn(),
   getRelationSummaries: vi.fn(),
@@ -235,7 +236,7 @@ async function createApp(a: Record<string, unknown>) {
     const n = (table as Record<symbol, string | undefined> | null | undefined)?.[Symbol.for("drizzle:Name")];
     if (n === "principal_permission_grants") return state.grant ? [{ id: "g1" }] : [];
     if (n === "companies") return [{ status: "active", key: "HOME" }];
-    if (n === "agents") return [{ name: "Concierge" }];
+    if (n === "agents") return [{ name: "Concierge", companyId: "target-co", status: "idle" }];
     if (n === "activity_log") return [{ n: state.writes }];
     if (n === "heartbeat_runs") return [{ id: AGENT_RUN_ID, companyId: "home-co", agentId: a.agentId, responsibleUserId: null, contextSnapshot: { issueId: ISSUE_ID } }];
     if (n !== "instance_settings") return [];
@@ -286,6 +287,9 @@ describe("cross-company issue access over HTTP", () => {
     (mockIssueService as any).getCommentCursor = vi.fn(async () => ({ totalComments: 0, latestCommentId: null }));
     mockIssueService.addComment.mockResolvedValue({ id: "c1", issueId: ISSUE_ID, companyId: "target-co", body: "hi" });
     mockIssueService.update.mockResolvedValue(foreign());
+    mockIssueService.create.mockImplementation(async (companyId: string, input: Record<string, unknown>) => ({
+      ...foreign(), ...input, companyId,
+    }));
   });
 
   const missing = async () => {
@@ -330,6 +334,18 @@ describe("cross-company issue access over HTTP", () => {
     expect((await request(await createApp(actor(CONCIERGE))).post(`/api/issues/${ISSUE_ID}/comments`).send({ body: "hi", reopen: true })).status).toBe(422);
   });
 
+  it("POST comment on a foreign issue assigned to another agent: 201 for allowlisted, 404 for control", async () => {
+    for (const status of ["in_progress", "done"]) {
+      const assigned = () => ({ ...foreign(), status, assigneeAgentId: "77777777-7777-4777-8777-777777777777" });
+      mockIssueService.getById.mockResolvedValue(assigned());
+      mockIssueService.getByIdForUpdate.mockImplementation(async () => assigned());
+      const ok = await request(await createApp(actor(CONCIERGE))).post(`/api/issues/${ISSUE_ID}/comments`).send({ body: "hi" });
+      if (ok.status !== 201) console.log("ASSIGNEDBODY", status, JSON.stringify(ok.body));
+      expect(ok.status).toBe(201);
+      expect((await request(await createApp(actor(CONTROL))).post(`/api/issues/${ISSUE_ID}/comments`).send({ body: "hi" })).status).toBe(404);
+    }
+  });
+
   it("PATCH: allowed with both keys, denied otherwise", async () => {
     const pr = await request(await createApp(actor(CONCIERGE))).patch(`/api/issues/${ISSUE_ID}`).send({ title: "n" });
     if (pr.status !== 200) console.log("PATCHBODY", JSON.stringify(pr.body));
@@ -339,9 +355,51 @@ describe("cross-company issue access over HTTP", () => {
     expect((await request(await createApp(actor(CONCIERGE))).patch(`/api/issues/${ISSUE_ID}`).send({ title: "n" })).status).toBe(404);
   });
 
-  it("low-trust-style scoped key and onBehalfOfUser never get the exemption", async () => {
+  it("PATCH assigneeAgentId to a foreign-company agent works (existing path)", async () => {
+    const r = await request(await createApp(actor(CONCIERGE))).patch(`/api/issues/${ISSUE_ID}`)
+      .send({ assigneeAgentId: "99999999-9999-4999-8999-999999999999" });
+    if (r.status !== 200) console.log("ASSIGNBODY", JSON.stringify(r.body));
+    expect(r.status).toBe(200);
+  });
+
+  it("onBehalfOfUser allowlisted agent is allowed on all routes; non-allowlisted still denied", async () => {
+    const onBehalf = { ...actor(CONCIERGE), onBehalfOfUserId: "u1" };
+    expect((await request(await createApp(onBehalf)).get(`/api/issues/${ISSUE_ID}`)).status).toBe(200);
+    expect((await request(await createApp(onBehalf)).get(`/api/issues/${ISSUE_ID}/comments`)).status).toBe(200);
+    expect((await request(await createApp(onBehalf)).post(`/api/issues/${ISSUE_ID}/comments`).send({ body: "hi" })).status).toBe(201);
+    expect((await request(await createApp({ ...actor(CONTROL), onBehalfOfUserId: "u1" })).get(`/api/issues/${ISSUE_ID}`)).status).toBe(404);
+  });
+
+  it("CREATE: cross-company issue create with double key, marker, audit rows; denied otherwise", async () => {
+    const onBehalf = { ...actor(CONCIERGE), onBehalfOfUserId: "u1" };
+    const ok = await request(await createApp(onBehalf)).post("/api/companies/target-co/issues")
+      .send({ title: "research", description: "do it", status: "todo" });
+    if (ok.status !== 201) console.log("CREATEBODY", JSON.stringify(ok.body));
+    expect(ok.status).toBe(201);
+    const [companyArg, input] = mockIssueService.create.mock.calls[0] as [string, Record<string, any>];
+    expect(companyArg).toBe("target-co");
+    expect(input.description.startsWith(MARK)).toBe(true);
+    expect(input.description.endsWith("do it")).toBe(true);
+    expect(input.createdByAgentId).toBe(CONCIERGE);
+    const rows = (mockedLogActivity as any).mock.calls.map((c: any[]) => c[1]).filter((x: any) => x.action === "issue.cross_company_access");
+    expect(rows.map((x: any) => x.companyId).sort()).toEqual(["home-co", "target-co"]);
+    expect(rows.every((x: any) => x.details.op === "issue.create" && x.details.outcome === "allowed")).toBe(true);
+    // cancelled / foreign refs / disallowed fields rejected
+    expect((await request(await createApp(onBehalf)).post("/api/companies/target-co/issues").send({ title: "x", status: "cancelled" })).status).toBe(422);
+    expect((await request(await createApp(onBehalf)).post("/api/companies/target-co/issues").send({ title: "x", projectId: "99999999-9999-4999-8999-999999999999" })).status).toBe(422);
+    // not allowlisted / no grant / write cap
+    mockIssueService.create.mockClear();
+    expect((await request(await createApp(actor(CONTROL))).post("/api/companies/target-co/issues").send({ title: "x" })).status).toBe(403);
+    state.grant = false;
+    expect((await request(await createApp(onBehalf)).post("/api/companies/target-co/issues").send({ title: "x" })).status).toBe(403);
+    state.grant = true;
+    state.writes = 10;
+    expect((await request(await createApp(onBehalf)).post("/api/companies/target-co/issues").send({ title: "x" })).status).toBe(429);
+    expect(mockIssueService.create).not.toHaveBeenCalled();
+  });
+
+  it("scoped key never gets the exemption", async () => {
     expect((await request(await createApp({ ...actor(CONCIERGE), keyScope: { kind: "notify_only", issueIds: [] } })).get(`/api/issues/${ISSUE_ID}`)).status).toBe(404);
-    expect((await request(await createApp({ ...actor(CONCIERGE), onBehalfOfUserId: "u1" })).get(`/api/issues/${ISSUE_ID}`)).status).toBe(404);
   });
 
   it("negative control: other issue routes still deny the foreign agent", async () => {
@@ -438,7 +496,7 @@ describe("cross-company issue access over HTTP", () => {
   it("M11: table-driven — every other issue/company route still denies the foreign agent", async () => {
     const a = await createApp(actor(CONCIERGE));
     const routes: Array<[string, string]> = [
-      ["post", `/api/companies/target-co/issues`], ["delete", `/api/issues/${ISSUE_ID}`],
+      ["delete", `/api/issues/${ISSUE_ID}`],
       ["post", `/api/issues/${ISSUE_ID}/checkout`], ["post", `/api/issues/${ISSUE_ID}/release`],
       ["get", `/api/issues/${ISSUE_ID}/documents`], ["post", `/api/issues/${ISSUE_ID}/attachments`],
       ["get", `/api/issues/${ISSUE_ID}/attachments`], ["get", `/api/issues/${ISSUE_ID}/interactions`],
@@ -455,7 +513,7 @@ describe("cross-company issue access over HTTP", () => {
 
   it("M11: helper has exactly one route call site and exactly four ops", () => {
     const src = readFileSync(new URL("../routes/issues.ts", import.meta.url), "utf8");
-    expect(src.match(/decideCrossCompanyIssueAccess\(/g)).toHaveLength(1);
+    expect(src.match(/decideCrossCompanyIssueAccess\(/g)).toHaveLength(2);
     const ops = new Set([...src.matchAll(/getIssueWithCrossCompany\(\s*req,\s*res,\s*\w+,\s*"([^"]+)"/g)].map((m) => m[1]));
     expect([...ops].sort()).toEqual(["comment.create", "comments.list", "issue.read", "issue.update"]);
     const other = ["routes/agents.ts", "routes/companies.ts", "routes/secrets.ts", "routes/authz.ts"].map((f) => {

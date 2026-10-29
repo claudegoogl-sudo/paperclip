@@ -27,7 +27,7 @@ import { logger } from "../middleware/logger.js";
 export const CROSS_COMPANY_ISSUE_PERMISSION = "issues:cross_company_access" as const;
 export const CROSS_COMPANY_ISSUE_ENV = "PAPERCLIP_CROSS_COMPANY_ISSUE_AGENT_IDS";
 
-export type CrossCompanyIssueOp = "issue.read" | "comments.list" | "comment.create" | "issue.update";
+export type CrossCompanyIssueOp = "issue.read" | "comments.list" | "comment.create" | "issue.update" | "issue.create";
 
 export type CrossCompanyDenyReason =
   | "not_agent"
@@ -114,7 +114,7 @@ export function dbCrossCompanyDeps(
         gte(activityLog.createdAt, since),
         sql`${activityLog.details}->>'outcome' = 'allowed'`,
         sql`${activityLog.details}->>'mirror' = 'false'`,
-        sql`${activityLog.details}->>'op' in ('comment.create','issue.update')`,
+        sql`${activityLog.details}->>'op' in ('comment.create','issue.update','issue.create')`,
       ];
       if (runId) conds.push(eq(activityLog.runId, runId));
       const rows = await db.select({ n: sql<number>`count(*)::int` }).from(activityLog).where(and(...conds));
@@ -174,8 +174,9 @@ export async function decideCrossCompanyIssueAccess(
   } else if (actor.keyScope && actor.keyScope.kind !== "standard") {
     // notify_only / skill_test / task_bridge keys are narrowed on purpose.
     decision = { allowed: false, reason: "scoped_key" };
-  } else if (actor.onBehalfOfUserId?.trim()) {
-    decision = { allowed: false, reason: "on_behalf_of_user" };
+  // on_behalf_of_user is NOT a deny: allowlisted+granted operator-delegate
+  // agents (e.g. Concierge) always run for a responsible user. The allowlist,
+  // grant, active-company and low-trust guards below still apply.
   } else if (!(deps.allowlist ?? getCrossCompanyAllowlist)().has(actor.agentId.toLowerCase())) {
     decision = { allowed: false, reason: "not_allowlisted" };
   } else if (!(await deps.hasHomeGrant(actor.companyId, actor.agentId))) {

@@ -50,6 +50,9 @@ export default defineConfig({
     maxConcurrency: 1,
     maxWorkers: resolveServerTestMaxWorkers(),
     pool: "forks",
+    // Server suites share process state and one embedded Postgres instance,
+    // so tests inside a file must run one at a time. Do not set
+    // sequence.concurrent to true.
     sequence: {
       concurrent: false,
       hooks: "list",

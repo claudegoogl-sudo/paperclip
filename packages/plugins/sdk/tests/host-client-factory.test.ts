@@ -1482,3 +1482,67 @@ describe("createHostClientHandlers reconcile reads", () => {
     expect(approvalsList).not.toHaveBeenCalled();
   });
 });
+
+describe("createHostClientHandlers service-scope issues.get / issues.update", () => {
+  const svc = { serviceScope: { runId: "service-run-1" } };
+  function make() {
+    const get = vi.fn(async () => ({ id: "i1" }));
+    const update = vi.fn(async () => ({ id: "i1" }));
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["issues.read", "issues.update"],
+      services: { issues: { get, update } } as unknown as HostServices,
+    });
+    return { handlers, get, update };
+  }
+
+  it("allows scope-less issues.get under serviceScope", async () => {
+    const { handlers, get } = make();
+    await handlers["issues.get"]({ issueId: "i1", companyId: "c1" } as never, svc);
+    expect(get).toHaveBeenCalledTimes(1);
+  });
+
+  it("denies issues.get with no scope at all", async () => {
+    const { handlers, get } = make();
+    await expect(handlers["issues.get"]({ issueId: "i1", companyId: "c1" } as never, {})).rejects.toThrow();
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it("denies cross-company issues.get under a pinned dispatch", async () => {
+    const { handlers, get } = make();
+    await expect(
+      handlers["issues.get"]({ issueId: "i1", companyId: "c2" } as never, {
+        invocationScope: { companyId: "c1", runId: "r" },
+      }),
+    ).rejects.toThrow();
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it("allows status-only issues.update under serviceScope", async () => {
+    const { handlers, update } = make();
+    await handlers["issues.update"](
+      { issueId: "i1", companyId: "c1", patch: { status: "todo" } } as never,
+      svc,
+    );
+    expect(update).toHaveBeenCalledTimes(1);
+  });
+
+  it("denies non-status fields (and empty patch) under serviceScope", async () => {
+    const { handlers, update } = make();
+    for (const patch of [{ title: "x" }, { status: "todo", assigneeAgentId: "a" }, {}]) {
+      await expect(
+        handlers["issues.update"]({ issueId: "i1", companyId: "c1", patch } as never, svc),
+      ).rejects.toThrow(/status-only/);
+    }
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it("still allows non-status patch under a pinned dispatch", async () => {
+    const { handlers, update } = make();
+    await handlers["issues.update"](
+      { issueId: "i1", companyId: "c1", patch: { title: "x" } } as never,
+      { invocationScope: { companyId: "c1", runId: "r" } },
+    );
+    expect(update).toHaveBeenCalledTimes(1);
+  });
+});

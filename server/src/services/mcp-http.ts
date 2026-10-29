@@ -36,6 +36,27 @@ export function mcpHttpRequestHeaders(extra?: Record<string, string>): Record<st
   };
 }
 
+/** Upper bound for a remote MCP `tools/list` catalog probe. */
+export const REMOTE_MCP_CATALOG_TIMEOUT_MS = 30_000;
+
+/** Request init for a remote MCP `tools/list` probe; aborts if the endpoint stalls. */
+export function mcpToolsListRequestInit(
+  headers: Record<string, string>,
+  timeoutMs: number = REMOTE_MCP_CATALOG_TIMEOUT_MS,
+): RequestInit {
+  return {
+    method: "POST",
+    headers: mcpHttpRequestHeaders(headers),
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: "paperclip-catalog-refresh",
+      method: "tools/list",
+      params: {},
+    }),
+    signal: AbortSignal.timeout(timeoutMs),
+  };
+}
+
 export class McpHttpInitializationError extends Error {
   constructor(
     message: string,

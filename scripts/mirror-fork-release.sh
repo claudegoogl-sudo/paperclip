@@ -121,7 +121,7 @@ make_twin() { # $1 source script $2 twin path
     echo "#"
     cat "$src"
   } > "$dst.tmp"
-  sed -E 's#^([A-Za-z_][A-Za-z0-9_]*)(="https://github\.com/[^"]+/releases/download/)([^/"]+)"$#\1="file://'"$MIRROR_DIR"'/\3/assets"#' \
+  sed -E 's#^([A-Za-z_][A-Za-z0-9_]*)(="https://github\.com/[^"]+/releases/download/)([^/"]+)(/[^"]*)?"$#\1="file://'"$MIRROR_DIR"'/\3/assets\4"#' \
     "$dst.tmp" > "$dst"
   rm -f "$dst.tmp"
 }
@@ -137,10 +137,10 @@ assert_twin_structure() { # $1 source script $2 twin
   removed="$(grep -E '^< ' "$d" | sed 's/^< //')"
   added="$(grep -E '^> ' "$d" | sed 's/^> //')"
   if [ -n "$removed" ] && printf '%s\n' "$removed" \
-      | grep -qvE '^[A-Za-z_][A-Za-z0-9_]*="https://github\.com/[^"]+/releases/download/[^/"]+"$'; then
+      | grep -qvE '^[A-Za-z_][A-Za-z0-9_]*="https://github\.com/[^"]+/releases/download/[^/"]+(/[^"]*)?"$'; then
     echo "  STRUCTURE FAIL: twin changes more than release URLs in $(basename "$src"):" >&2
     printf '%s\n' "$removed" \
-      | grep -vE '^[A-Za-z_][A-Za-z0-9_]*="https://github\.com/[^"]+/releases/download/[^/"]+"' >&2
+      | grep -vE '^[A-Za-z_][A-Za-z0-9_]*="https://github\.com/[^"]+/releases/download/[^/"]+(/[^"]*)?"' >&2
     rc=1
   fi
   if [ -n "$added" ] && printf '%s\n' "$added" \

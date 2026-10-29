@@ -1,5 +1,6 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PaperclipApiClient } from "./client.js";
+import { DEFAULT_MCP_FETCH_TIMEOUT_MS } from "./config.js";
 import { createToolDefinitions } from "./tools.js";
 
 function makeClient() {
@@ -466,5 +467,48 @@ describe("paperclip MCP tools", () => {
     });
 
     expect(response.content[0]?.text).toContain("must not contain '..'");
+  });
+
+  describe("runtime connection tools", () => {
+    const searchUrl = "http://localhost:3100/runtime/connections/search";
+    const requestUrl = "http://localhost:3100/runtime/connections/request";
+
+    beforeEach(() => {
+      vi.stubEnv("PAPERCLIP_RUNTIME_TOOLS_TOKEN", "runtime-token");
+      vi.stubEnv("PAPERCLIP_RUNTIME_TOOLS_CONNECTIONS_SEARCH_URL", searchUrl);
+      vi.stubEnv("PAPERCLIP_RUNTIME_TOOLS_CONNECTION_REQUEST_URL", requestUrl);
+    });
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    it.each([
+      ["connections_search", searchUrl, { query: "slack" }],
+      ["connection_request", requestUrl, { service: "slack" }],
+    ])("bounds the %s request with a timeout signal", async (toolName, expectedUrl, input) => {
+      const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
+      const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse({ ok: true }));
+      vi.stubGlobal("fetch", fetchMock);
+
+      await getTool(toolName).execute(input);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(url).toBe(expectedUrl);
+      expect(init.signal).toBeInstanceOf(AbortSignal);
+      expect(timeoutSpy).toHaveBeenCalledWith(DEFAULT_MCP_FETCH_TIMEOUT_MS);
+    });
+
+    it("reports an aborted runtime connection request as a tool error", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockRejectedValue(new DOMException("The operation timed out.", "TimeoutError")),
+      );
+
+      const response = await getTool("connections_search").execute({ query: "slack" });
+
+      expect(response.content[0]?.text).toContain("timed out");
+    });
   });
 });
