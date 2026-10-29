@@ -1362,8 +1362,9 @@ describe("plugin tool and bridge authz", () => {
 
   it("allows manual job triggers for instance admins", async () => {
     readyPlugin();
-    const scheduler = { triggerJob: vi.fn().mockResolvedValue({ runId: "run-1", jobId: "job-1" }) };
-    const jobStore = { getJobByIdForPlugin: vi.fn().mockResolvedValue({ id: "job-1" }) };
+    const jobId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const scheduler = { triggerJob: vi.fn().mockResolvedValue({ runId: "run-1", jobId }) };
+    const jobStore = { getJobByIdForPlugin: vi.fn().mockResolvedValue({ id: jobId }) };
     const { app } = await createApp(boardActor({
       userId: "admin-1",
       isInstanceAdmin: true,
@@ -1373,12 +1374,75 @@ describe("plugin tool and bridge authz", () => {
     });
 
     const res = await request(app)
-      .post(`/api/plugins/${pluginId}/jobs/job-1/trigger`)
+      .post(`/api/plugins/${pluginId}/jobs/${jobId}/trigger`)
       .send({});
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ runId: "run-1", jobId: "job-1" });
-    expect(scheduler.triggerJob).toHaveBeenCalledWith("job-1", "manual");
+    expect(res.body).toEqual({ runId: "run-1", jobId });
+    expect(scheduler.triggerJob).toHaveBeenCalledWith(jobId, "manual");
+  });
+
+  it("returns 404 for a non-UUID job id on manual trigger without querying the store", async () => {
+    readyPlugin();
+    const scheduler = { triggerJob: vi.fn() };
+    const jobStore = { getJobByIdForPlugin: vi.fn() };
+    const { app } = await createApp(boardActor({
+      userId: "admin-1",
+      isInstanceAdmin: true,
+      companyIds: [],
+    }), {}, {
+      jobDeps: { scheduler, jobStore },
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/jobs/x/trigger`)
+      .send({});
+
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ error: "Job not found" });
+    expect(jobStore.getJobByIdForPlugin).not.toHaveBeenCalled();
+    expect(scheduler.triggerJob).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 for a non-UUID job id when listing job runs without querying the store", async () => {
+    readyPlugin();
+    const jobStore = { getJobByIdForPlugin: vi.fn(), listRunsByJob: vi.fn() };
+    const { app } = await createApp(boardActor({
+      userId: "admin-1",
+      isInstanceAdmin: true,
+      companyIds: [],
+    }), {}, {
+      jobDeps: { scheduler: { triggerJob: vi.fn() }, jobStore },
+    });
+
+    const res = await request(app).get(`/api/plugins/${pluginId}/jobs/x/runs`);
+
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ error: "Job not found" });
+    expect(jobStore.getJobByIdForPlugin).not.toHaveBeenCalled();
+    expect(jobStore.listRunsByJob).not.toHaveBeenCalled();
+  });
+
+  it("lists job runs for a valid UUID job id", async () => {
+    readyPlugin();
+    const jobId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const jobStore = {
+      getJobByIdForPlugin: vi.fn().mockResolvedValue({ id: jobId }),
+      listRunsByJob: vi.fn().mockResolvedValue([{ id: "run-1" }]),
+    };
+    const { app } = await createApp(boardActor({
+      userId: "admin-1",
+      isInstanceAdmin: true,
+      companyIds: [],
+    }), {}, {
+      jobDeps: { scheduler: { triggerJob: vi.fn() }, jobStore },
+    });
+
+    const res = await request(app).get(`/api/plugins/${pluginId}/jobs/${jobId}/runs`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([{ id: "run-1" }]);
+    expect(jobStore.listRunsByJob).toHaveBeenCalledWith(jobId, 25);
   });
 
   // ─── Agent JWT tool execution (cherry-picked from #5549) ─────────────────────
