@@ -1896,6 +1896,26 @@ export async function resolveExecutionRunAdapterConfig(input: {
   trustedEnvProjection?: Record<string, string>;
   trustedEnvSecretKeys?: string[];
 }) {
+  // The runner marks configured env keys itself; a user- or bindings-supplied
+  // value for the reserved marker must never reach resolution or the process.
+  const stripConfiguredEnvMarker = (value: unknown): unknown => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+    if (!Object.prototype.hasOwnProperty.call(value, "PAPERCLIP_CONFIGURED_ENV_KEYS")) return value;
+    const { PAPERCLIP_CONFIGURED_ENV_KEYS: _marker, ...rest } = value as Record<string, unknown>;
+    return rest;
+  };
+  input = {
+    ...input,
+    environmentEnv: stripConfiguredEnvMarker(input.environmentEnv),
+    projectEnv: stripConfiguredEnvMarker(input.projectEnv),
+    routineEnv: stripConfiguredEnvMarker(input.routineEnv),
+    executionRunConfig: {
+      ...input.executionRunConfig,
+      ...(input.executionRunConfig?.env !== undefined
+        ? { env: stripConfiguredEnvMarker(input.executionRunConfig.env) }
+        : {}),
+    },
+  };
   const executionRunConfig = stripForbiddenEnvFromAdapterConfig(
     input.executionRunConfig,
     input.managedGitHubCredentials,
@@ -2294,6 +2314,13 @@ export async function resolveExecutionRunAdapterConfig(input: {
   }
   return {
     resolvedConfig,
+    // Resolved task values captured before provider credential injection or
+    // host inheritance (consumed by native dispatch launch-limit checks).
+    configuredTaskEnvironment: Object.fromEntries(
+      Object.entries(parseObject(resolvedConfig.env)).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string",
+      ),
+    ),
     secretKeys,
     // Typed outcome of the sanctioned task_bridge credential resolution, for
     // the run-start consumer surface (run log + wake context). `null` means
