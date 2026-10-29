@@ -32948,3 +32948,5 @@ export function heartbeatService(
     },
   };
 }
+
+export { postNativeModelFallbackWarning } from "./heartbeat/runtime-selection.js";
