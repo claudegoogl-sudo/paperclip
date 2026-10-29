@@ -30,7 +30,7 @@ import type { PluginEvent } from "@paperclipai/plugin-sdk";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported
-  ? describe.sequential
+  ? describe
   : describe.skip;
 
 if (!embeddedPostgresSupport.supported) {
