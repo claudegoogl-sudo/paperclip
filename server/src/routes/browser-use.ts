@@ -13,16 +13,24 @@ import {
   getActorInfo,
   getAccessibleResource,
 } from "./authz.js";
+import { notFound } from "../errors.js";
 import { browserUseService } from "../services/browser-use.js";
+
+const CANONICAL_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function browserUseRoutes(db: Db, service = browserUseService(db)) {
   const router = Router();
   router.use("/issues/:issueId/browsers", async (req, res, next) => {
     assertBoard(req);
+    const issueId = req.params.issueId;
+    // PostgreSQL accepts any canonical 8-4-4-4-12 hex uuid (including v7 and nil),
+    // so do not use isUuidLike, whose version/variant nibbles reject them.
+    if (!CANONICAL_UUID_RE.test(issueId))
+      throw notFound("Task not found");
     const [issue] = await db
       .select({ companyId: issues.companyId })
       .from(issues)
-      .where(eq(issues.id, req.params.issueId))
+      .where(eq(issues.id, issueId))
       .limit(1);
     if (!(await getAccessibleResource(req, res, issue, "Task not found")))
       return;

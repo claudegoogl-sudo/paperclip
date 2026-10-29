@@ -612,4 +612,38 @@ describe("adapter routes", () => {
     expect(findServerAdapter("codex_local")).toBe(builtin);
     setOverridePaused("codex_local", false);
   });
+
+  describe("request body validation", () => {
+    it.each([
+      ["POST", "/api/adapters/install"],
+      ["PATCH", "/api/adapters/claude_local"],
+      ["PATCH", "/api/adapters/claude_local/override"],
+    ] as const)("%s %s without a request body returns 400", async (method, path) => {
+      const app = createApp({ isInstanceAdmin: true });
+      const res = await (method === "POST" ? request(app).post(path) : request(app).patch(path));
+      expect(res.status, JSON.stringify(res.body)).toBe(400);
+    });
+
+    it("POST /api/adapters/install rejects a non-boolean isLocalPath before touching the loader", async () => {
+      mockPluginLoader.loadExternalAdapterPackage.mockClear();
+      const app = createApp({ isInstanceAdmin: true });
+      const res = await request(app)
+        .post("/api/adapters/install")
+        .send({ packageName: "/tmp/fake-adapter", isLocalPath: "false" });
+      expect(res.status, JSON.stringify(res.body)).toBe(400);
+      expect(res.body.error).toMatch(/isLocalPath/);
+      expect(mockPluginLoader.loadExternalAdapterPackage).not.toHaveBeenCalled();
+    });
+
+    it("POST /api/adapters/install rejects a non-string version", async () => {
+      mockPluginLoader.loadExternalAdapterPackage.mockClear();
+      const app = createApp({ isInstanceAdmin: true });
+      const res = await request(app)
+        .post("/api/adapters/install")
+        .send({ packageName: "some-adapter", version: { major: 1 } });
+      expect(res.status, JSON.stringify(res.body)).toBe(400);
+      expect(res.body.error).toMatch(/version/);
+      expect(mockPluginLoader.loadExternalAdapterPackage).not.toHaveBeenCalled();
+    });
+  });
 });

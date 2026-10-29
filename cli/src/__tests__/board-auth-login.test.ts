@@ -92,3 +92,88 @@ describe("loginBoardCli with the default plugin_ops scope", () => {
     expect(fs.existsSync(store)).toBe(false);
   });
 });
+
+describe("loginBoardCli poll failure tolerance", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  // pollResults: each entry is a status code to answer the poll with (200 = approved)
+  // "pending" for a still-waiting challenge, or "network" to make fetch itself throw.
+  function pollServer(pollResults: Array<number | "network" | "pending">) {
+    let pollCalls = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        const u = new URL(url);
+        const method = (init?.method ?? "GET").toUpperCase();
+        if (method === "POST" && u.pathname === "/api/cli-auth/challenges") {
+          return json(201, {
+            id: "ch-1", token: "poll-token", boardApiToken: MINTED,
+            approvalPath: "/cli-auth/ch-1", approvalUrl: null, pollPath: "/cli-auth/challenges/ch-1",
+            expiresAt: new Date(Date.now() + 600_000).toISOString(), suggestedPollIntervalMs: 500,
+          });
+        }
+        if (method === "GET" && u.pathname === "/api/cli-auth/challenges/ch-1") {
+          const next = pollResults[Math.min(pollCalls, pollResults.length - 1)];
+          pollCalls += 1;
+          if (next === "network") throw new TypeError("fetch failed");
+          if (next === "pending") return json(200, { status: "pending" });
+          return next === 200
+            ? json(200, { status: "approved" })
+            : json(next, { error: `poll failed ${next}` });
+        }
+        if (method === "GET" && u.pathname === "/api/cli-auth/me") {
+          return json(200, { userId: "user-1", user: { id: "user-1" } });
+        }
+        return json(404, { error: "not found" });
+      }),
+    );
+    return { pollCalls: () => pollCalls };
+  }
+
+  async function runLogin() {
+    vi.useFakeTimers();
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const outcome = loginBoardCli({
+      apiBase: API, requestedAccess: "board", storePath: tmpStore(), openBrowser: false,
+    }).then(
+      (value) => ({ ok: true as const, value }),
+      (error: Error) => ({ ok: false as const, error }),
+    );
+    await vi.advanceTimersByTimeAsync(10_000);
+    const result = await outcome;
+    errSpy.mockRestore();
+    return result;
+  }
+
+  it("keeps polling through two transient failures and still logs in", async () => {
+    const server = pollServer([503, "network", 200]);
+    const result = await runLogin();
+    expect(result.ok).toBe(true);
+    expect(server.pollCalls()).toBe(3);
+  });
+
+  it("gives up after three consecutive transient failures", async () => {
+    const server = pollServer([502, 502, 502, 200]);
+    const result = await runLogin();
+    expect(result.ok).toBe(false);
+    expect(server.pollCalls()).toBe(3);
+  });
+
+  it("resets the failure count after a successful poll", async () => {
+    const server = pollServer([503, 503, "pending", 503, 503, 200]);
+    const result = await runLogin();
+    expect(result.ok).toBe(true);
+    expect(server.pollCalls()).toBe(6);
+  });
+
+  it("rethrows a permanent 4xx poll error immediately without retrying", async () => {
+    const server = pollServer([403, 200]);
+    const result = await runLogin();
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.message).toMatch(/poll failed 403/);
+    expect(server.pollCalls()).toBe(1);
+  });
+});

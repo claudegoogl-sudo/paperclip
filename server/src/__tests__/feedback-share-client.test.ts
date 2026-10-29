@@ -1,6 +1,9 @@
 import { gunzipSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createFeedbackTraceShareClientFromConfig } from "../services/feedback-share-client.js";
+import {
+  FEEDBACK_SHARE_UPLOAD_TIMEOUT_MS,
+  createFeedbackTraceShareClientFromConfig,
+} from "../services/feedback-share-client.js";
 
 describe("feedback trace share client", () => {
   beforeEach(() => {
@@ -97,5 +100,62 @@ describe("feedback trace share client", () => {
     expect(parsed.objectKey).toContain("feedback-traces/company-1/");
     expect(parsed.objectKey.endsWith("/export-1.json")).toBe(true);
     expect(parsed.bundle.envelope).toEqual({ hello: "world" });
+  });
+
+  describe("upload timeout", () => {
+    const bundle = {
+      traceId: "trace-1",
+      exportId: "export-1",
+      companyId: "company-1",
+      issueId: "issue-1",
+      issueIdentifier: "PAP-1",
+      adapterType: "codex_local",
+      captureStatus: "full",
+      notes: [],
+      envelope: {},
+      surface: null,
+      paperclipRun: null,
+      rawAdapterTrace: null,
+      normalizedAdapterTrace: null,
+      privacy: null,
+      integrity: {},
+      files: [],
+    } as const;
+
+    it("passes an abort signal to the upload request", async () => {
+      const client = createFeedbackTraceShareClientFromConfig({
+        feedbackExportBackendUrl: undefined,
+        feedbackExportBackendToken: undefined,
+      });
+
+      await client.uploadTraceBundle(bundle as never);
+
+      const init = vi.mocked(fetch).mock.calls[0]?.[1];
+      expect(init?.signal).toBeInstanceOf(AbortSignal);
+    });
+
+    it("rejects when the backend does not answer within the timeout", async () => {
+      const realTimeout = AbortSignal.timeout.bind(AbortSignal);
+      const timeoutSpy = vi
+        .spyOn(AbortSignal, "timeout")
+        .mockImplementation(() => realTimeout(10));
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((_url: string, init?: RequestInit) =>
+          new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+          }),
+        ),
+      );
+      const client = createFeedbackTraceShareClientFromConfig({
+        feedbackExportBackendUrl: undefined,
+        feedbackExportBackendToken: undefined,
+      });
+
+      await expect(client.uploadTraceBundle(bundle as never)).rejects.toMatchObject({
+        name: "TimeoutError",
+      });
+      expect(timeoutSpy).toHaveBeenCalledWith(FEEDBACK_SHARE_UPLOAD_TIMEOUT_MS);
+    });
   });
 });

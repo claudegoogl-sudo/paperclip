@@ -333,6 +333,37 @@ describe("Scenario chat deployment boundary", () => {
     });
   });
 
+  it("handles a failing close of an expired session instead of leaking a rejection", async () => {
+    let clock = 1_000_000;
+    let close: ReturnType<typeof vi.spyOn> | undefined;
+    let rejection: Promise<void> | undefined;
+    let catchSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      await withHttpRuntime(async ({ request }) => {
+        const created = await createSession(request, "alice@example.com");
+        close = vi.spyOn(CapabilityChatSession.prototype, "close").mockImplementation(() => {
+          rejection = Promise.reject(new Error("close failed"));
+          catchSpy = vi.spyOn(rejection, "catch");
+          return rejection;
+        });
+        clock += 31 * 60_000;
+        const response = await request(`/api/capability/sessions/${created.id}/replay`, {
+          method: "POST",
+          headers: { ...mutationHeaders("alice@example.com"), cookie: created.cookie },
+          body: "{}",
+        });
+        expect(response).toMatchObject({
+          status: 404,
+          body: { error: { code: "session_not_found", message: "Session was not found." } },
+        });
+        expect(close).toHaveBeenCalledTimes(1);
+        expect(catchSpy).toHaveBeenCalled();
+      }, { now: () => clock });
+    } finally {
+      close?.mockRestore();
+    }
+  });
+
   it("returns stable redacted internal errors and security headers", async () => {
     await withHttpRuntime(async ({ request }) => {
       const first = await request("/%", { headers: proxyHeaders() });
@@ -395,6 +426,7 @@ function mutationHeaders(identity = "alice@example.com"): Record<string, string>
 
 async function withHttpRuntime(
   run: (context: { runtime: ScenarioChatDemoRuntime; request: HttpRequest }) => Promise<void>,
+  options: { now?: () => number } = {},
 ): Promise<void> {
   const runtime = new ScenarioChatDemoRuntime({
     publicOrigin: PUBLIC_ORIGIN,
@@ -402,6 +434,7 @@ async function withHttpRuntime(
     commitSha: "deadbeef",
     packageRoot,
     log: () => undefined,
+    ...options,
   });
   await runtime.initialize();
   const server = runtime.createServer();

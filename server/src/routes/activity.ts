@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
-import { normalizeIssueIdentifier } from "@paperclipai/shared";
+import { isUuidLike, normalizeIssueIdentifier } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import { activityService, normalizeActivityLimit } from "../services/activity.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, getAccessibleResource, hasCompanyAccess } from "./authz.js";
@@ -225,9 +225,19 @@ export function activityRoutes(db: Db) {
     assertCompanyAccess(req, companyId);
     if (!(await assertCompanyScopeReadAllowed(req, res, companyId))) return;
 
+    const agentIdParam = req.query.agentId;
+    let agentId: string | undefined;
+    if (agentIdParam !== undefined && agentIdParam !== "") {
+      // isUuidLike accepts surrounding whitespace, but PostgreSQL uuid inputs do not.
+      if (typeof agentIdParam !== "string" || agentIdParam !== agentIdParam.trim() || !isUuidLike(agentIdParam)) {
+        throw badRequest("Invalid agent ID");
+      }
+      agentId = agentIdParam;
+    }
+
     const filters = {
       companyId,
-      agentId: req.query.agentId as string | undefined,
+      agentId,
       entityType: req.query.entityType as string | undefined,
       entityId: req.query.entityId as string | undefined,
       limit: normalizeActivityLimit(Number(req.query.limit)),

@@ -30,6 +30,12 @@ on:
         type: string
         default: "3100"
 
+concurrency:
+  # A second dispatch for the same version/tag is a redundant smoke run;
+  # queue it behind the first instead of burning a second runner on it.
+  group: fork-release-smoke-${{ inputs.version }}-${{ inputs.tag || inputs.version }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -46,7 +52,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout repository (release tooling scripts)
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Node.js
         uses: actions/setup-node@v6

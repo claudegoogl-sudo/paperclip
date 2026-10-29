@@ -10,6 +10,7 @@ import {
   buildRuntimeToolsEnv,
   parseObject,
   readPaperclipIssueWorkModeFromContext,
+  hydrateFreshSessionHandoff,
   selectPaperclipPromptSections,
   selectInitialCommunicationGuidance,
   joinPromptSections,
@@ -683,7 +684,7 @@ class GatewayWsClient {
 
     ws.on("error", (err) => {
       const message = err instanceof Error ? err.message : String(err);
-      void this.opts.onLog("stderr", `[openclaw-gateway] websocket error: ${message}\n`);
+      void this.opts.onLog("stderr", `[openclaw-gateway] websocket error: ${message}\n`).catch(() => undefined);
     });
 
     await withTimeout(
@@ -1106,6 +1107,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const paperclipEnv = buildPaperclipEnvForWake(ctx, wakePayload);
   // No heartbeat prompt template is sent over the gateway, so the wake prompt
   // must carry the execution contract itself.
+  await hydrateFreshSessionHandoff(ctx, { resumedSession: Boolean(ctx.runtime?.sessionId) });
   const { taskContextNote, wakePrompt: structuredWakePrompt } = selectPaperclipPromptSections(ctx.context, {
     resumedSession: Boolean(ctx.runtime?.sessionId),
     includeExecutionContract: true,

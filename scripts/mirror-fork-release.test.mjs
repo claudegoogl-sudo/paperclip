@@ -170,3 +170,24 @@ test("offline twin of a comment-bearing rollback script resolves from the mirror
     assert.match(out, /twin-ok/);
   });
 });
+
+test("make_twin rewrites a release URL that carries a trailing filename (RB_URL form)", () => {
+  withTempDir((dir) => {
+    writeFileSync(
+      path.join(dir, "rb.sh"),
+      '#!/usr/bin/env bash\n# curl https://github.com/o/r/releases/download/v1-fork.70/rb.sh\nRB_URL="https://github.com/o/r/releases/download/v1-fork.70/install.sh"\n',
+    );
+    const out = runSourced(
+      dir,
+      [
+        'MIRROR_DIR="$PWD/mirror"',
+        "make_twin rb.sh twin.sh",
+        "assert_twin_structure rb.sh twin.sh",
+        'grep -q "^RB_URL=\\"file://$PWD/mirror/v1-fork.70/assets/install.sh\\"$" twin.sh',
+        "! grep -q '^RB_URL=.*github' twin.sh",
+        'echo "rb-ok"',
+      ].join("\n"),
+    );
+    assert.match(out, /rb-ok/);
+  });
+});

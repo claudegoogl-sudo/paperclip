@@ -16,9 +16,13 @@ export function resolveRawGitHubUrl(hostname: string, owner: string, repo: strin
     : `https://${hostname}/raw/${owner}/${repo}/${ref}/${p}`;
 }
 
+export const GH_FETCH_TIMEOUT_MS = 30_000;
+
 export async function ghFetch(url: string, init?: RequestInit): Promise<Response> {
+  const timeout = AbortSignal.timeout(GH_FETCH_TIMEOUT_MS);
+  const signal = init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
   try {
-    return await fetch(url, init);
+    return await fetch(url, { ...init, signal });
   } catch {
     throw unprocessable(`Could not connect to ${new URL(url).hostname} — ensure the URL points to a GitHub or GitHub Enterprise instance`);
   }

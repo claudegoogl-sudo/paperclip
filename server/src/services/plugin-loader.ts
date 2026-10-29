@@ -686,6 +686,8 @@ export interface PluginLoadResult {
 }
 
 export interface PluginLoadSingleOptions {
+  /** Allow restarting the previous version of a plugin parked in `upgrade_pending`. */
+  allowUpgradePending?: boolean;
   /**
    * When false, activation failures are reported to the caller but do not
    * transition the shared plugin row to `error`. Partially-registered local
@@ -3274,7 +3276,10 @@ export function pluginLoader(
         };
       }
 
-      if (plugin.status !== "ready") {
+      // A parked upgrade never mutated version/manifest/caps, so the previous
+      // version may keep running while the capability approval is pending.
+      const parkedOk = options.allowUpgradePending === true && plugin.status === "upgrade_pending";
+      if (plugin.status !== "ready" && !parkedOk) {
         throw new Error(
           `Cannot load plugin in status '${plugin.status}'. ` +
             `Plugin must be in 'installed' or 'ready' status.`,

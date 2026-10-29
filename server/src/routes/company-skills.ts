@@ -7,7 +7,7 @@ import { once } from "node:events";
 import type { SkillSourceDiscoveryEvent } from "@paperclipai/shared";
 import { createHash } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import { activityLog } from "@paperclipai/db";
+import { activityLog, companySkills } from "@paperclipai/db";
 import { persistActivity, publishActivity } from "../services/activity-log.js";
 import { projectToolContext } from "../services/project-tool-context.js";
 import { Router, type Request } from "express";
@@ -62,6 +62,7 @@ import {
 } from "../services/company-skill-policy.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import {
+  isUuidLike,
   normalizeSkillPolicySourceLocator,
   type SkillPolicyAction,
   type SkillPolicyDecision,
@@ -103,6 +104,10 @@ export function companySkillRoutes(db: Db) {
   const issues = issueService(db);
   const heartbeat = heartbeatService(db);
   const skillPolicies = companySkillPolicyService(db);
+
+  function isMalformedUuidParam(value: string): boolean {
+    return value !== value.trim() || !isUuidLike(value);
+  }
 
   function asString(value: unknown): string | null {
     if (typeof value !== "string") return null;
@@ -485,6 +490,10 @@ export function companySkillRoutes(db: Db) {
     const skillId = req.params.skillId as string;
     const versionId = req.params.versionId as string;
     assertCompanyAccess(req, companyId);
+    if (isMalformedUuidParam(versionId)) {
+      res.status(404).json({ error: "Skill version not found" });
+      return;
+    }
     const result = await svc.getVersion(companyId, skillId, versionId);
     if (!result) {
       res.status(404).json({ error: "Skill version not found" });
@@ -533,6 +542,10 @@ export function companySkillRoutes(db: Db) {
       const skillId = req.params.skillId as string;
       const inputId = req.params.inputId as string;
       await assertCanMutateCompanySkills(req, companyId, "skills.edit", () => skillPolicyResource({ companyId, skillId }));
+      if (isMalformedUuidParam(inputId)) {
+        res.status(404).json({ error: "Test input not found" });
+        return;
+      }
       const result = await svc.updateTestInput(companyId, skillId, inputId, req.body);
       if (!result) {
         res.status(404).json({ error: "Test input not found" });
@@ -560,6 +573,10 @@ export function companySkillRoutes(db: Db) {
     const skillId = req.params.skillId as string;
     const inputId = req.params.inputId as string;
     await assertCanMutateCompanySkills(req, companyId, "skills.edit", () => skillPolicyResource({ companyId, skillId }));
+    if (isMalformedUuidParam(inputId)) {
+      res.status(404).json({ error: "Test input not found" });
+      return;
+    }
     const result = await svc.deleteTestInput(companyId, skillId, inputId);
     if (!result) {
       res.status(404).json({ error: "Test input not found" });
@@ -618,6 +635,10 @@ export function companySkillRoutes(db: Db) {
       const companyId = req.params.companyId as string;
       const templateId = req.params.templateId as string;
       await assertCanMutateCompanySkills(req, companyId, "skills.edit");
+      if (isMalformedUuidParam(templateId)) {
+        res.status(404).json({ error: "Test run template not found" });
+        return;
+      }
       const result = await svc.updateTestRunTemplate(companyId, templateId, req.body, skillActor(req));
       if (!result) {
         res.status(404).json({ error: "Test run template not found" });
@@ -644,6 +665,10 @@ export function companySkillRoutes(db: Db) {
     const companyId = req.params.companyId as string;
     const templateId = req.params.templateId as string;
     await assertCanMutateCompanySkills(req, companyId, "skills.edit");
+    if (isMalformedUuidParam(templateId)) {
+      res.status(404).json({ error: "Test run template not found" });
+      return;
+    }
     const result = await svc.deleteTestRunTemplate(companyId, templateId);
     if (!result) {
       res.status(404).json({ error: "Test run template not found" });
@@ -680,6 +705,10 @@ export function companySkillRoutes(db: Db) {
     const skillId = req.params.skillId as string;
     const runId = req.params.runId as string;
     assertCompanyAccess(req, companyId);
+    if (isMalformedUuidParam(runId)) {
+      res.status(404).json({ error: "Test run not found" });
+      return;
+    }
     const result = await svc.getTestRunDetail(companyId, skillId, runId);
     if (!result) {
       res.status(404).json({ error: "Test run not found" });
@@ -788,6 +817,10 @@ export function companySkillRoutes(db: Db) {
     const skillId = req.params.skillId as string;
     const runId = req.params.runId as string;
     await assertCanMutateCompanySkills(req, companyId, "skills.test", () => skillPolicyResource({ companyId, skillId }));
+    if (isMalformedUuidParam(runId)) {
+      res.status(404).json({ error: "Test run not found" });
+      return;
+    }
     await assertCanOrchestrateSkillTestHarness(req, companyId, await loadSkillTestRunAssignmentScope(companyId, skillId, runId));
     const actor = getActorInfo(req);
     const result = await svc.cancelTestRun(companyId, skillId, runId, {
@@ -831,6 +864,10 @@ export function companySkillRoutes(db: Db) {
     const skillId = req.params.skillId as string;
     const runId = req.params.runId as string;
     await assertCanMutateCompanySkills(req, companyId, "skills.test", () => skillPolicyResource({ companyId, skillId }));
+    if (isMalformedUuidParam(runId)) {
+      res.status(404).json({ error: "Test run not found" });
+      return;
+    }
     await assertCanOrchestrateSkillTestHarness(req, companyId, await loadSkillTestRunAssignmentScope(companyId, skillId, runId));
     const actor = getActorInfo(req);
     const result = await svc.deleteTestRun(companyId, skillId, runId, {
@@ -1053,6 +1090,10 @@ export function companySkillRoutes(db: Db) {
       const skillId = req.params.skillId as string;
       const commentId = req.params.commentId as string;
       assertCompanyAccess(req, companyId);
+      if (isMalformedUuidParam(commentId)) {
+        res.status(404).json({ error: "Skill comment not found" });
+        return;
+      }
       const result = await svc.updateComment(companyId, skillId, commentId, req.body, skillActor(req));
       const actor = getActorInfo(req);
       await logActivity(db, {
@@ -1076,6 +1117,10 @@ export function companySkillRoutes(db: Db) {
     const skillId = req.params.skillId as string;
     const commentId = req.params.commentId as string;
     assertCompanyAccess(req, companyId);
+    if (isMalformedUuidParam(commentId)) {
+      res.status(404).json({ error: "Skill comment not found" });
+      return;
+    }
     const result = await svc.deleteComment(companyId, skillId, commentId, skillActor(req));
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -1219,13 +1264,66 @@ export function companySkillRoutes(db: Db) {
       const companyId = req.params.companyId as string;
       const skillId = req.params.skillId as string;
       await assertCanMutateCompanySkills(req, companyId, "skills.edit", () => skillPolicyResource({ companyId, skillId }));
+      const { idempotencyKey, expectedVersionId, ...input } = req.body;
+      if (idempotencyKey) {
+        const actor = getActorInfo(req);
+        const runContext = req.actor.type === "agent" && req.actor.source === "agent_jwt" && req.actor.runId
+          ? await projectToolContext(db, req.actor, true, "Skill") : null;
+        const receiptKey = `skill-file:${companyId}:${actor.actorId}:${runContext?.issue.id ?? "board"}:${skillId}:${idempotencyKey}`;
+        const fingerprint = createHash("sha256").update(JSON.stringify({ ...input, expectedVersionId })).digest("hex");
+        const rollbackState: { current: { restore: () => Promise<void>; versionId: string | null } | null } = { current: null };
+        const outcome = await db.transaction(async tx => {
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${receiptKey}, 0))`);
+          if (runContext) await projectToolContext(tx as unknown as Db, req.actor, true, "Skill");
+          const [prior] = await tx.select().from(activityLog).where(and(
+            eq(activityLog.companyId, companyId), eq(activityLog.action, "company.skill_file_updated"),
+            sql`${activityLog.details}->>'idempotencyKey' = ${receiptKey}`,
+          ));
+          if (prior) {
+            if (prior.details?.fingerprint !== fingerprint) throw conflict("Skill file idempotency key was used with different inputs");
+            return { receipt: prior.details?.receipt, publication: null };
+          }
+          let publication: ActivityPublication | null = null;
+          let receipt: { skillId: string; path: string; versionId: string | null; studioPath: string } | null = null;
+          await companySkillService(tx as unknown as Db).updateFile(companyId, skillId, input.path, input.content, skillActor(req), {
+            encoding: input.encoding, executable: input.executable, expectedVersionId,
+            onRollback: (restore, versionId) => { rollbackState.current = { restore, versionId }; },
+            afterUpdate: async (versionId) => {
+              receipt = { skillId, path: input.path, versionId, studioPath: `/skills/studio/${encodeURIComponent(skillId)}` };
+              const activity = await persistActivity(tx as unknown as Db, {
+                companyId, actorType: actor.actorType, actorId: actor.actorId, agentId: actor.agentId,
+                runId: actor.runId, agentApiKeyId: actor.agentApiKeyId, issueId: runContext?.issue.id,
+                action: "company.skill_file_updated", entityType: "company_skill", entityId: skillId,
+                details: { path: input.path, markdown: input.path === "SKILL.md", versionId,
+                  sourceIssueId: runContext?.issue.id ?? null, idempotencyKey: receiptKey, fingerprint, receipt },
+              });
+              publication = activity.publication;
+            },
+          });
+          return { receipt, publication };
+        }).catch(async (error) => {
+          if (rollbackState.current) {
+            const { restore, versionId } = rollbackState.current;
+            await db.transaction(async tx => {
+              await tx.execute(sql`select ${companySkills.id} from ${companySkills} where ${companySkills.id} = ${skillId} and ${companySkills.companyId} = ${companyId} for update`);
+              const [current] = await tx.select({ versionId: companySkills.currentVersionId }).from(companySkills)
+                .where(and(eq(companySkills.id, skillId), eq(companySkills.companyId, companyId)));
+              if (current && current.versionId === versionId) await restore();
+            });
+          }
+          throw error;
+        });
+        if (outcome.publication) publishActivity(outcome.publication);
+        res.json(outcome.receipt);
+        return;
+      }
       const result = await svc.updateFile(
         companyId,
         skillId,
         String(req.body.path ?? ""),
         String(req.body.content ?? ""),
         skillActor(req),
-        { encoding: req.body.encoding, executable: req.body.executable },
+        { encoding: req.body.encoding, executable: req.body.executable, expectedVersionId },
       );
 
       const actor = getActorInfo(req);

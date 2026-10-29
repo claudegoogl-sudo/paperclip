@@ -220,7 +220,7 @@ function boardActor(input: {
   };
 }
 
-describe.sequential("company route cross-company authorization", () => {
+describe("company route cross-company authorization", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetMockDefaults();

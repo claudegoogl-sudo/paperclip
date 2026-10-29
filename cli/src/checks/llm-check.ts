@@ -1,6 +1,8 @@
 import type { PaperclipConfig } from "../config/schema.js";
 import type { CheckResult } from "./index.js";
 
+export const LLM_CHECK_TIMEOUT_MS = 10_000;
+
 export async function llmCheck(config: PaperclipConfig): Promise<CheckResult> {
   if (!config.llm) {
     return {
@@ -32,6 +34,7 @@ export async function llmCheck(config: PaperclipConfig): Promise<CheckResult> {
           max_tokens: 1,
           messages: [{ role: "user", content: "hi" }],
         }),
+        signal: AbortSignal.timeout(LLM_CHECK_TIMEOUT_MS),
       });
       if (res.ok || res.status === 400) {
         return { name: "LLM provider", status: "pass", message: "Claude API key is valid" };
@@ -53,6 +56,7 @@ export async function llmCheck(config: PaperclipConfig): Promise<CheckResult> {
     } else {
       const res = await fetch("https://api.openai.com/v1/models", {
         headers: { Authorization: `Bearer ${config.llm.apiKey}` },
+        signal: AbortSignal.timeout(LLM_CHECK_TIMEOUT_MS),
       });
       if (res.ok) {
         return { name: "LLM provider", status: "pass", message: "OpenAI API key is valid" };

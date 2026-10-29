@@ -3,9 +3,11 @@ import type { Db } from "@paperclipai/db";
 import type { DeploymentExposure, DeploymentMode } from "@paperclipai/shared";
 import {
   createSmokeRunSchema,
+  isUuidLike,
   recordSmokeRunStepSchema,
   updateSmokeRunSchema,
 } from "@paperclipai/shared";
+import { notFound } from "../errors.js";
 import { validate } from "../middleware/validate.js";
 import { assertBoard, assertBoardOrAgent, assertCompanyAccess, getActorInfo } from "./authz.js";
 import { logActivity, smokeLabService } from "../services/index.js";
@@ -53,6 +55,13 @@ export function smokeLabRoutes(db: Db, options: {
 
   async function assertSmokeLabEnabled() {
     await svc.assertEnabled();
+  }
+
+  // PostgreSQL rejects non-UUID text (and padded UUIDs) on a uuid column with a 500,
+  // so answer with the same 404 the service gives for an unknown run.
+  async function assertSmokeRunId(runId: string) {
+    await assertSmokeLabEnabled();
+    if (!isUuidLike(runId) || runId !== runId.trim()) throw notFound("Smoke run not found");
   }
 
   router.get("/companies/:companyId/smoke-lab/oauth/authorize", async (req, res) => {
@@ -220,6 +229,7 @@ export function smokeLabRoutes(db: Db, options: {
     assertBoardOrAgent(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    await assertSmokeRunId(req.params.runId as string);
     res.json(await svc.getRun(companyId, req.params.runId as string));
   });
 
@@ -227,6 +237,7 @@ export function smokeLabRoutes(db: Db, options: {
     assertBoardOrAgent(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    await assertSmokeRunId(req.params.runId as string);
     const run = await svc.updateRun(companyId, req.params.runId as string, req.body);
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -248,6 +259,7 @@ export function smokeLabRoutes(db: Db, options: {
     assertBoardOrAgent(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    await assertSmokeRunId(req.params.runId as string);
     const result = await svc.recordStep(companyId, req.params.runId as string, req.body);
     const actor = getActorInfo(req);
     await logActivity(db, {

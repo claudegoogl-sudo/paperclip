@@ -18,7 +18,7 @@ const {
     signal: null,
     timedOut: false,
     stdout: args.includes("--version")
-      ? "2.1.280 (Claude Code)\n"
+      ? "2.1.284 (Claude Code)\n"
       : [
           JSON.stringify({ type: "system", subtype: "init", session_id: "claude-session-1", model: "claude-sonnet" }),
           JSON.stringify({ type: "assistant", session_id: "claude-session-1", message: { content: [{ type: "text", text: "hello" }] } }),
@@ -308,11 +308,11 @@ describe("claude remote execution", () => {
           cwd: managedRemoteWorkspace,
           // Stored sessions must carry a prompt-bundle pin to be resume-eligible
           // (see the missing-pin bust in execute.ts). This is the bundle key for
-          // an empty adapterConfig as of the v2026.831.1 merge: no instructions,
+          // an empty adapterConfig as of the v2026.1012.0 merge: no instructions,
           // no configured skills, but the operational skill is always mounted for
           // legacy adapters (upstream's resolveLegacyPaperclipDesiredSkillNames)
           // and its library manifest participates in the bundle hash.
-          promptBundleKey: "ea18ddd4ec351ddfa6381795b8b2504ad963cb155167f173678c42cd40c692c8",
+          promptBundleKey: "ebf6237a701826e12f927e26bde1291f4fa4fe6860c0f89e4132d1c8215a0644",
           remoteExecution: {
             transport: "ssh",
             host: "127.0.0.1",
@@ -474,7 +474,7 @@ describe("claude remote execution", () => {
       return { args: call?.[2] ?? [], result };
     }
 
-    it.each(["claude-fable-5-1", "claude-opus-5-5"])("passes %s as --model on the CLI lane", async (model) => {
+    it.each(["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5"])("passes %s as --model on the CLI lane", async (model) => {
       const { args } = await executeWithModel("paperclip-claude-model-direct-", {
         model,
       });
@@ -507,6 +507,7 @@ describe("claude remote execution", () => {
     it.each([
       ["claude-fable-5-1", "2.1.251", "2.1.247"],
       ["claude-opus-5-5", "2.1.280", "2.1.279"],
+      ["claude-sonnet-5-5", "2.1.284", "2.1.283"],
     ])("rejects %s before launch below CLI %s", async (model, minimumVersion, detectedVersion) => {
       runChildProcess.mockResolvedValueOnce({
         exitCode: 0,
@@ -593,7 +594,7 @@ describe("claude remote execution", () => {
       },
       runtime: {
         sessionId: "12345678-1234-4abc-9def-123456789012",
-        sessionParams: { sessionId: "12345678-1234-4abc-9def-123456789012", cwd: workspaceDir, promptBundleKey: "ea18ddd4ec351ddfa6381795b8b2504ad963cb155167f173678c42cd40c692c8" },
+        sessionParams: { sessionId: "12345678-1234-4abc-9def-123456789012", cwd: workspaceDir, promptBundleKey: "ebf6237a701826e12f927e26bde1291f4fa4fe6860c0f89e4132d1c8215a0644" },
         sessionDisplayId: "12345678-1234-4abc-9def-123456789012",
         taskKey: null,
       },

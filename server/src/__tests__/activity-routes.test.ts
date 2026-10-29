@@ -102,7 +102,7 @@ async function requestApp(
   }
 }
 
-describe.sequential("activity routes", () => {
+describe("activity routes", () => {
   beforeEach(() => {
     for (const mock of Object.values(mockActivityService)) mock.mockReset();
     for (const mock of Object.values(mockHeartbeatService)) mock.mockReset();
@@ -223,6 +223,59 @@ describe.sequential("activity routes", () => {
     });
   });
 
+  describe("company activity list agentId filter", () => {
+    const listUrl = "/api/companies/company-1/activity";
+    const agentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+    it.each(["x", "not-a-uuid", ` ${agentId}`, `${agentId} `])(
+      "rejects malformed agentId %j before listing activity",
+      async (value) => {
+        const app = await createApp();
+        const res = await requestApp(app, (baseUrl) => request(baseUrl).get(listUrl).query({ agentId: value }));
+
+        expect(res.status).toBe(400);
+        expect(res.body).toEqual({ error: "Invalid agent ID" });
+        expect(mockActivityService.list).not.toHaveBeenCalled();
+      },
+    );
+
+    it("rejects a repeated agentId (array) before listing activity", async () => {
+      const app = await createApp();
+      const res = await requestApp(app, (baseUrl) =>
+        request(baseUrl).get(`${listUrl}?agentId=${agentId}&agentId=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb`),
+      );
+
+      expect(res.status).toBe(400);
+      expect(mockActivityService.list).not.toHaveBeenCalled();
+    });
+
+    it("passes a valid agentId through to the list query", async () => {
+      mockActivityService.list.mockResolvedValue([]);
+
+      const app = await createApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl).get(listUrl).query({ agentId }));
+
+      expect(res.status).toBe(200);
+      expect(mockActivityService.list).toHaveBeenCalledWith({
+        companyId: "company-1",
+        agentId,
+        entityType: undefined,
+        entityId: undefined,
+        limit: 100,
+      });
+    });
+
+    it("treats an empty agentId as no filter", async () => {
+      mockActivityService.list.mockResolvedValue([]);
+
+      const app = await createApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`${listUrl}?agentId=`));
+
+      expect(res.status).toBe(200);
+      expect(mockActivityService.list).toHaveBeenCalledWith(expect.objectContaining({ agentId: undefined }));
+    });
+  });
+
   it("caps requested company activity list limits", async () => {
     mockActivityService.list.mockResolvedValue([]);
 
@@ -276,6 +329,26 @@ describe.sequential("activity routes", () => {
 
     expect(res.status).toBe(403);
     expect(mockActivityService.create).not.toHaveBeenCalled();
+  });
+
+  it.each([null, { id: "issue-uuid-1", companyId: "company-2" }])(
+    "does not start run reads or retries for a missing or cross-company task", async (issue) => {
+      mockIssueService.getByIdentifier.mockResolvedValue(issue);
+      const app = await createApp();
+      const res = await request(app).get("/api/issues/TEST-1/runs");
+      expect(res.status).toBe(404);
+      expect(res.body).toEqual({ error: "Issue not found" });
+      expect(mockActivityService.runsForIssue).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not start run reads or retries when task read authorization is denied", async () => {
+    mockIssueService.getByIdentifier.mockResolvedValue({ id: "issue-uuid-1", companyId: "company-1" });
+    mockAccessService.decide.mockResolvedValue({ allowed: false, reason: "denied", explanation: "Denied by test policy." });
+    const app = await createApp();
+    const res = await request(app).get("/api/issues/TEST-1/runs");
+    expect(res.status).toBe(403);
+    expect(mockActivityService.runsForIssue).not.toHaveBeenCalled();
   });
 
   it("returns 200 [] (not 404) when listing issues for another company's run, preserving API contract and the cross-tenant oracle", async () => {

@@ -2415,4 +2415,69 @@ describe("company skill mutation permissions", () => {
     expect(mockCompanySkillService.deleteSkill).toHaveBeenCalledWith("company-1", "skill-1");
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
+
+  const malformedIdRoutes: Array<[string, "get" | "patch" | "delete" | "post", string, Record<string, unknown> | undefined, string, string]> = [
+    ["version", "get", "/api/companies/company-1/skills/skill-1/versions/x", undefined, "Skill version not found", "getVersion"],
+    ["test input patch", "patch", "/api/companies/company-1/skills/skill-1/test-inputs/x", { name: "n" }, "Test input not found", "updateTestInput"],
+    ["test input delete", "delete", "/api/companies/company-1/skills/skill-1/test-inputs/x", undefined, "Test input not found", "deleteTestInput"],
+    ["template patch", "patch", "/api/companies/company-1/skill-test-run-templates/x", { name: "n" }, "Test run template not found", "updateTestRunTemplate"],
+    ["template delete", "delete", "/api/companies/company-1/skill-test-run-templates/x", undefined, "Test run template not found", "deleteTestRunTemplate"],
+    ["test run detail", "get", "/api/companies/company-1/skills/skill-1/test-runs/x", undefined, "Test run not found", "getTestRunDetail"],
+    ["test run cancel", "post", "/api/companies/company-1/skills/skill-1/test-runs/x/cancel", undefined, "Test run not found", "cancelTestRun"],
+    ["test run delete", "delete", "/api/companies/company-1/skills/skill-1/test-runs/x", undefined, "Test run not found", "deleteTestRun"],
+    ["comment patch", "patch", "/api/companies/company-1/skills/skill-1/comments/x", { body: "b" }, "Skill comment not found", "updateComment"],
+    ["comment delete", "delete", "/api/companies/company-1/skills/skill-1/comments/x", undefined, "Skill comment not found", "deleteComment"],
+  ];
+
+  it.each(malformedIdRoutes)(
+    "returns 404 for a malformed %s id before reaching the service",
+    async (_label, method, path, body, message, serviceMethod) => {
+      const app = await createApp({
+        type: "board",
+        userId: "local-board",
+        companyIds: ["company-1"],
+        source: "local_implicit",
+        isInstanceAdmin: false,
+      });
+
+      const res = body === undefined ? await request(app)[method](path) : await request(app)[method](path).send(body);
+
+      expect(res.status, JSON.stringify(res.body)).toBe(404);
+      expect(res.body).toEqual({ error: message });
+      expect(mockCompanySkillService[serviceMethod as keyof typeof mockCompanySkillService]).not.toHaveBeenCalled();
+      expect(mockCompanySkillService.getTestRunDetail).not.toHaveBeenCalled();
+    },
+  );
+
+  it("returns 404 for a whitespace-padded UUID because Postgres rejects it", async () => {
+    const res = await request(await createApp({
+      type: "board",
+      userId: "local-board",
+      companyIds: ["company-1"],
+      source: "local_implicit",
+      isInstanceAdmin: false,
+    }))
+      .get("/api/companies/company-1/skills/skill-1/versions/%2011111111-1111-4111-8111-111111111111");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(404);
+    expect(mockCompanySkillService.getVersion).not.toHaveBeenCalled();
+  });
+
+  it("still looks up a well-formed version id", async () => {
+    const res = await request(await createApp({
+      type: "board",
+      userId: "local-board",
+      companyIds: ["company-1"],
+      source: "local_implicit",
+      isInstanceAdmin: false,
+    }))
+      .get("/api/companies/company-1/skills/skill-1/versions/33333333-3333-4333-8333-333333333333");
+
+    expect(res.status, JSON.stringify(res.body)).toBe(404);
+    expect(mockCompanySkillService.getVersion).toHaveBeenCalledWith(
+      "company-1",
+      "skill-1",
+      "33333333-3333-4333-8333-333333333333",
+    );
+  });
 });
