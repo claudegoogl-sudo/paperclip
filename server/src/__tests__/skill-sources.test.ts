@@ -164,7 +164,7 @@ describe.skipIf(!support.supported)('skill source persistence', () => {
       { companyId: legacyCompany, key: 'legacy/custom', slug: 'original-slug', name: 'Original name', markdown: md('legacy'), sourceType: 'github', sourceRef: sha, metadata: { hostname: 'github.com', owner: 'acme', repo: 'skills', trackingRef: 'legacy', repoSkillDir: 'legacy' } },
       { companyId: legacyCompany, key: 'paperclipai/paperclip/bundled', slug: 'bundled', name: 'Bundled', markdown: md('bundled'), sourceType: 'github', metadata: { hostname: 'github.com', owner: 'acme', repo: 'skills', sourceKind: 'paperclip_bundled' } },
     ]).returning();
-    const migration = await fs.readFile(new URL('../../../packages/db/src/migrations/0312_conscious_secret_warriors.sql', import.meta.url), 'utf8');
+    const migration = await fs.readFile(new URL('../../../packages/db/src/migrations/0291_conscious_secret_warriors.sql', import.meta.url), 'utf8');
     await db.execute(sql.raw(migration.slice(migration.indexOf('DO $$', migration.indexOf('-- Adopt only')))));
     await db.execute(sql.raw(migration.slice(migration.indexOf('DO $$', migration.indexOf('-- Adopt only')))));
     const service = skillSourceService(db);
@@ -197,7 +197,7 @@ describe.skipIf(!support.supported)('skill source persistence', () => {
       { companyId: legacyCompany, key: 'legacy/missing-ref', slug: 'old', name: 'Old', markdown: md('old'), sourceType: 'github', sourceRef: sha, metadata: { owner: 'acme', repo: 'skills', ref: sha, repoSkillDir: 'old' } },
       { companyId: legacyCompany, key: 'legacy/pinned', slug: 'pinned', name: 'Pinned', markdown: md('pinned'), sourceType: 'github', sourceRef: sha, metadata: { owner: 'acme', repo: 'skills', ref: sha, trackingRef: sha, repoSkillDir: 'pinned' } },
     ]).returning();
-    const migration = await fs.readFile(new URL('../../../packages/db/src/migrations/0312_conscious_secret_warriors.sql', import.meta.url), 'utf8');
+    const migration = await fs.readFile(new URL('../../../packages/db/src/migrations/0291_conscious_secret_warriors.sql', import.meta.url), 'utf8');
     await db.execute(sql.raw(migration.slice(migration.indexOf('DO $$', migration.indexOf('-- Adopt only')))));
     const service = skillSourceService(db);
     const adopted = (await service.sourceForSkill(legacyCompany, legacy!.id))!;
@@ -222,7 +222,7 @@ describe.skipIf(!support.supported)('skill source persistence', () => {
       { companyId: legacyCompany, key: 'legacy/implicit', slug: 'implicit', name: 'Implicit', markdown: md('old'), sourceType: 'github', sourceRef: sha, metadata: { owner: 'acme', repo: 'skills', ref: sha, repoSkillDir: 'one' } },
       { companyId: legacyCompany, key: 'legacy/explicit', slug: 'explicit', name: 'Explicit', markdown: md('old'), sourceType: 'github', sourceRef: sha, metadata: { owner: 'acme', repo: 'skills', trackingRef: 'main', repoSkillDir: 'one' } },
     ]).returning();
-    const migration = await fs.readFile(new URL('../../../packages/db/src/migrations/0312_conscious_secret_warriors.sql', import.meta.url), 'utf8');
+    const migration = await fs.readFile(new URL('../../../packages/db/src/migrations/0291_conscious_secret_warriors.sql', import.meta.url), 'utf8');
     await db.execute(sql.raw(migration.slice(migration.indexOf('DO $$', migration.indexOf('-- Adopt only')))));
     const service = skillSourceService(db);
     files = { 'one/SKILL.md': md('updated') }; commit = 'e'.repeat(40);
