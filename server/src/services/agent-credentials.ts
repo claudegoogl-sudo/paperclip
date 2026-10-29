@@ -16,12 +16,32 @@ export function agentCredentialService(db: Db) {
     actor: RevisionMetadata = {},
   ) {
     const scopedSecretsSvc = dbClient === db ? secretsSvc : secretService(dbClient);
-    await syncAgentAdapterEnvBindings({
+    const { refusedConfigPaths } = await syncAgentAdapterEnvBindings({
       secretsSvc: scopedSecretsSvc,
       companyId: agent.companyId,
       agentId: agent.id,
       adapterConfig: agent.adapterConfig,
+      previousAdapterConfig,
     });
+    if (refusedConfigPaths.length > 0) {
+      // Preserve-on-ambiguity: an incoming config with zero secret refs whose
+      // previous config referenced secrets at now-absent keys is
+      // indistinguishable from a form that dropped `env`. Keep the bindings
+      // and leave an operator-visible trail (ids/paths only, no values).
+      await logActivity(dbClient, {
+        companyId: agent.companyId,
+        actorType: "system",
+        actorId: "secret-binding-guard",
+        action: "secret.binding_wipe_refused",
+        entityType: "agent",
+        entityId: agent.id,
+        agentId: agent.id,
+        details: {
+          refusedConfigPaths,
+          reason: "incoming adapter config has zero secret refs while persisted config still referenced secrets at these paths",
+        },
+      });
+    }
     const previousRefs = new Set([
       ...collectSecretRefs(previousAdapterConfig).map((ref) => `secret:${ref.secretId}:${ref.configPath}`),
       ...collectUserSecretRefs(previousAdapterConfig).map((ref) => `user:${ref.definitionKey}:${ref.configPath}`),
