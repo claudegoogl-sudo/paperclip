@@ -22,7 +22,7 @@ const EXISTING_BRANCH_SETTINGS_PATH = [
   "existingBranch",
 ] as const;
 
-export function isExistingBranchSemanticsZodIssue(issue: Pick<ZodIssue, "path">): boolean {
+function isExistingBranchSemanticsZodIssue(issue: Pick<ZodIssue, "path">): boolean {
   const pathOffset = issue.path.length - EXISTING_BRANCH_SETTINGS_PATH.length;
   return (
     pathOffset >= 0 &&

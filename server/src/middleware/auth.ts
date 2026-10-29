@@ -970,7 +970,7 @@ async function resolveOwnerInstanceAdmin(
  * trusted-header authentication must work identically for upgrades — a
  * cloud-proxied browser has no local Better Auth session to fall back on.
  */
-export interface CloudActorHeaderSource {
+interface CloudActorHeaderSource {
   header(name: string): string | undefined;
 }
 
