@@ -46,6 +46,7 @@ export type {
 } from "./login-pty.js";
 
 import { sendPtyInputInChunks } from "./pty-chunked-input.js";
+import { shellQuote } from "./shell-quote.js";
 
 /**
  * A live duplex channel session for one command. The session allocates a real
@@ -121,16 +122,6 @@ const DUPLEX_CHANNEL_PTY_ROWS = 30;
  * the carriage return as the Enter key, so the shell runs the wrapper line.
  */
 const PTY_COMMAND_TERMINATOR = "\r";
-
-/**
- * Quotes one value for a POSIX shell. The result is one single-quoted word, so
- * the shell reads it as literal text and never expands or splits it. The function
- * closes the quote, adds an escaped single quote, and reopens the quote for each
- * single quote in the value.
- */
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'"'"'`)}'`;
-}
 
 /**
  * Builds the launch wrapper input line for the duplex channel. `command` is an

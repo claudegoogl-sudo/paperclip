@@ -46,6 +46,7 @@ import type {
 } from "@paperclipai/plugin-sdk";
 import { performSyncIn, performSyncOut, withProviderSpan } from "./file-sync.js";
 import { DEFAULT_DAYTONA_OPERATION_TIMEOUT_MS } from "./manifest.js";
+import { shellQuote } from "./shell-quote.js";
 
 // The Claude `setup-token` login pseudo-terminal (PTY) session for this provider.
 // The session runs the login command on a real pseudo-terminal, streams the
@@ -693,10 +694,6 @@ function leaseMetadata(input: {
     ...(input.config.gpu != null ? { gpu: input.config.gpu } : {}),
     ...(input.workspaceSentinel ? { workspaceSentinel: input.workspaceSentinel } : {}),
   };
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
 function resolveConnectionExpiresInMinutes(value: number | null | undefined): number {
