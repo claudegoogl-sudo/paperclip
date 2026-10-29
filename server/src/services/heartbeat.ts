@@ -17446,6 +17446,13 @@ export function heartbeatService(
           kind: "workspace_wait",
           providerWorkStarted: false,
         },
+        cancellation: {
+          source: "control_plane",
+          expected: true,
+          initiator: { type: "system" },
+          reason: "Waiting for the shared project workspace",
+          recordedAt: now.toISOString(),
+        },
         workspaceBusy: {
           projectWorkspaceId: deferral.projectWorkspaceId,
           holderRunId: deferral.holder.runId,
