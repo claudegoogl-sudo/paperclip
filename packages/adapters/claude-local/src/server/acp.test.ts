@@ -1709,7 +1709,7 @@ describe("claude_local ACP ignored command override warning", () => {
     const commandPath = path.join(root, "bin", "claude-agent-acp");
     await fs.mkdir(path.dirname(commandPath), { recursive: true });
     await fs.writeFile(commandPath, "#!/usr/bin/env sh\n", "utf8");
-    setNodeVersion("v22.12.0");
+    setNodeVersion("v24.11.0");
 
     const result = await testClaudeAcpEnvironment({
       adapterType: "claude_local",
