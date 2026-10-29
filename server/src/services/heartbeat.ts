@@ -9980,10 +9980,11 @@ export async function cancelHeartbeatNativeRun(input: {
   runId: string;
   reason: string;
   runtimeMode: string | null;
+  cancellationRequestId?: string;
   cancel?: (
     runId: string,
     reason: string,
-    options: { db: Db; scope: "run" },
+    options: { db: Db; scope: "run"; cancellationRequestId?: string },
   ) => Promise<{ decision: unknown | null; auditId: string | null }>;
 }) {
   if (input.runtimeMode !== "native") {
@@ -9993,10 +9994,12 @@ export async function cancelHeartbeatNativeRun(input: {
     ? await input.cancel(input.runId, input.reason, {
         db: input.db,
         scope: "run",
+        ...(input.cancellationRequestId ? { cancellationRequestId: input.cancellationRequestId } : {}),
       })
     : await cancelNativeSession(input.runId, input.reason, {
         db: input.db,
         scope: "run",
+        ...(input.cancellationRequestId ? { cancellationRequestId: input.cancellationRequestId } : {}),
       });
   if (!cancellation.decision || !cancellation.auditId) {
     throw new Error("native_cancellation_outcome_not_audited");
