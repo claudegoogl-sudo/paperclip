@@ -4,6 +4,7 @@ import { ApiRequestError } from "../../client/http.js";
 import {
   addCommonClientOptions,
   apiPath,
+  buildApiUrl,
   handleCommandError,
   inferContentTypeFromPath,
   printOutput,
@@ -130,12 +131,6 @@ async function parseFetchResponse(response: Response): Promise<unknown> {
     throw new ApiRequestError(response.status, message, undefined, parsed);
   }
   return parsed;
-}
-
-function buildApiUrl(apiBase: string, path: string): string {
-  const url = new URL(apiBase);
-  url.pathname = `${url.pathname.replace(/\/+$/, "")}${path.startsWith("/") ? path : `/${path}`}`;
-  return url.toString();
 }
 
 function safeJson(text: string): unknown {
