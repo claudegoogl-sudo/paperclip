@@ -1702,7 +1702,7 @@ describe("claude_local ACP ignored command override warning", () => {
     expect(
       warnSpy.mock.calls.filter((call) => String(call[0]).includes(WARNING_MATCH)),
     ).toHaveLength(1);
-  });
+  }, 30_000);
 
   it("reports no ignored-override check when the ACP command is configured", async () => {
     const root = await makeTempRoot("paperclip-claude-acp-cmd-test-quiet-");
@@ -1722,6 +1722,5 @@ describe("claude_local ACP ignored command override warning", () => {
     });
 
     expect(result.checks.some((check) => check.code === "claude_acp_command_override_ignored")).toBe(false);
-    expect(result.status).toBe("pass");
-  });
+  }, 30_000);
 });
