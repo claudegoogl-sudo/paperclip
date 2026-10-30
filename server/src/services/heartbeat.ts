@@ -221,6 +221,7 @@ import {
 import { createHostDuplexObservabilityRecorder } from "./duplex-observability-recorder.js";
 import { incrementToolRuntimeMetricCounter } from "./tool-runtime-metrics.js";
 import { logger } from "../middleware/logger.js";
+import { createAuthCircuitBreaker } from "./auth-circuit-breaker.js";
 import {
   createGitRemoteAuthProvider,
   resolveManagedGitHubIdentitySelection,
@@ -13634,6 +13635,7 @@ export function heartbeatService(
       });
       publishRunLifecyclePluginEvent(updated);
       emitTerminalAgentTaskRun(updated, previousStatus?.status ?? null);
+      void recordAuthBreakerOutcome(updated);
     }
 
     return updated;
@@ -18501,6 +18503,31 @@ export function heartbeatService(
     }
   }
 
+  const authBreaker = createAuthCircuitBreaker();
+  async function recordAuthBreakerOutcome(run: typeof heartbeatRuns.$inferSelect) {
+    try {
+      if (run.status !== "failed" && run.status !== "succeeded") return;
+      const row = await db.select({ adapterType: agents.adapterType }).from(agents).where(eq(agents.id, run.agentId)).then((r) => r[0] ?? null);
+      if (!row) return;
+      const t = authBreaker.recordOutcome(row.adapterType, { status: run.status, errorCode: run.errorCode, error: run.error });
+      if (!t) return;
+      logger.warn({ provider: row.adapterType, transition: t }, "auth circuit breaker transition");
+      await logActivity(db, {
+        companyId: run.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: run.agentId,
+        runId: run.id,
+        action: t === "opened" ? "provider.dispatch_paused" : "provider.dispatch_resumed",
+        entityType: "agent",
+        entityId: run.agentId,
+        details: { adapterType: row.adapterType, reason: "claude_auth_required" },
+      });
+    } catch (err) {
+      logger.warn({ err }, "auth circuit breaker bookkeeping failed");
+    }
+  }
+
   async function claimQueuedRun(
     run: typeof heartbeatRuns.$inferSelect,
     companyAgents?: AgentOrgRow[],
@@ -18516,6 +18543,7 @@ export function heartbeatService(
     }
     // Keep accepted work in the durable queue until setup completes.
     if (isAgentAwaitingSetup(agent as any)) return null;
+    if (authBreaker.shouldHold(agent.adapterType)) return null; // breaker open: leave queued
     const invokability = companyAgents
       ? evaluateAgentInvokability(toAgentOrgRow(agent), companyAgents)
       : await getAgentInvokability(agent);

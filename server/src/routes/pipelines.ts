@@ -1135,6 +1135,17 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
       moveCasesToStageId: typeof req.query.moveCasesToStageId === "string" ? req.query.moveCasesToStageId : null,
       actor,
     });
+    await logActivity(db, {
+      companyId,
+      ...activityActorForPipelineRoute(actor),
+      action: "pipeline.stage_deleted",
+      entityType: "pipeline",
+      entityId: pipelineId,
+      details: {
+        stageId,
+        moveCasesToStageId: typeof req.query.moveCasesToStageId === "string" ? req.query.moveCasesToStageId : null,
+      },
+    });
     res.json(result);
   });
 
@@ -1142,7 +1153,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     const pipelineId = req.params.pipelineId as string;
     const companyId = await assertPipelineAccess(db, req, pipelineId);
     await assertPipelineWriteAccess(req, { access, companyId, pipelineId });
-    actorForMutation(req);
+    const transitionsActor = actorForMutation(req);
     const byKey = await getStagesByKey(db, pipelineId);
     const transitions = req.body.transitions.map((edge: z.infer<typeof replaceTransitionsSchema>["transitions"][number]) => {
       const from = byKey.get(edge.fromStageKey);
@@ -1157,6 +1168,17 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
           .where(and(eq(pipelines.id, pipelineId), eq(pipelines.companyId, companyId)));
       }
       return transitions.length ? tx.insert(pipelineTransitions).values(transitions).returning() : [];
+    });
+    await logActivity(db, {
+      companyId,
+      ...activityActorForPipelineRoute(transitionsActor),
+      action: "pipeline.transitions_replaced",
+      entityType: "pipeline",
+      entityId: pipelineId,
+      details: {
+        transitionCount: result.length,
+        enforceTransitions: req.body.enforceTransitions ?? null,
+      },
     });
     res.json({ transitions: result });
   });

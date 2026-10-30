@@ -19,13 +19,21 @@ export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 
 /** Error families describe availability, not whether earlier actions happened. */
 export function legacyExecutionNeedsReconciliation(
-  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot">>,
+  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "error" | "startedAt" | "processPid" | "processGroupId" | "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot">>,
 ): boolean {
   if (
     run.runtimeMode === "native" ||
     !["failed", "timed_out", "interrupted", "cancelled"].includes(run.status)
   )
     return false;
+  // A run cancelled by the stale-run gate that never started cannot have side
+  // effects; minting another hold would feed the hold loop.
+  if (run.status === "cancelled" && run.errorCode === "execution_reconciliation_required" &&
+      !run.startedAt && !run.processPid && !run.processGroupId) return false;
+  // Provider-unreachable outage class: the provider never ran, nothing to reconcile.
+  if (run.errorCode === "adapter_failed" && typeof run.error === "string" &&
+      /^(No API key for provider|spawn E2BIG)/.test(run.error) &&
+      !(run.resultJson as Record<string, unknown> | null | undefined)?.toolCallCount) return false;
   // A fresh model turn cannot repair or verify unrestored files.
   if (run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive" || hasRequiredWorkspaceRecovery(run.resultJson)) return true;
   // A fresh conversation turn lets the agent decide what remains. The retry

@@ -760,6 +760,8 @@ const PLUGIN_OPS_ALLOWED_ROUTES: ReadonlyArray<{
   },
   { method: "GET", pathPattern: /^\/api\/plugins(?:\/[^/]+)?$/ },
   { method: "GET", pathPattern: /^\/api\/plugins\/[^/]+\/config$/ },
+  // Read-only per-company config overrides (host checkers). Writes stay denied.
+  { method: "GET", pathPattern: /^\/api\/plugins\/[^/]+\/companies\/[^/]+\/config-overrides$/ },
   { method: "GET", pathPattern: /^\/api\/plugins\/examples$/ },
   { method: "GET", pathPattern: /^\/api\/plugins\/ui-contributions$/ },
 

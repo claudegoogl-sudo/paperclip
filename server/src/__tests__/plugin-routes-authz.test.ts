@@ -1291,6 +1291,19 @@ describe("plugin tool and bridge authz", () => {
       },
       renderEnvironment: null,
     });
+
+    // Dispatch audit: single company-scoped row, action key only, no params.
+    const { logActivity: logAct } = await import("../services/activity-log.js");
+    const dispatchRows = vi.mocked(logAct).mock.calls
+      .map((c) => c[1])
+      .filter((r) => r.action === "plugin.action.dispatched");
+    expect(dispatchRows.length).toBeGreaterThanOrEqual(2);
+    for (const row of dispatchRows) {
+      expect(row.companyId).toBe(companyA);
+      expect(row.actorType).toBe("agent");
+      expect(row.details).toEqual(expect.objectContaining({ actionKey: "sync" }));
+      expect(JSON.stringify(row.details)).not.toContain("spoofed-agent");
+    }
   });
 
   it("rejects agent plugin actions outside the authenticated company scope", async () => {
@@ -1367,7 +1380,7 @@ describe("plugin tool and bridge authz", () => {
     const { app } = await createApp(boardActor({
       userId: "admin-1",
       isInstanceAdmin: true,
-      companyIds: [],
+      companyIds: [companyA],
     }), {}, {
       jobDeps: { scheduler, jobStore },
     });
@@ -1379,6 +1392,15 @@ describe("plugin tool and bridge authz", () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ runId: "run-1", jobId: "job-1" });
     expect(scheduler.triggerJob).toHaveBeenCalledWith("job-1", "manual");
+    const { logActivity: logAct } = await import("../services/activity-log.js");
+    expect(vi.mocked(logAct)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "plugin.job.triggered",
+        entityType: "plugin",
+        details: expect.objectContaining({ jobId: "job-1" }),
+      }),
+    );
   });
 
   // ─── Agent JWT tool execution (cherry-picked from #5549) ─────────────────────

@@ -2055,6 +2055,30 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect((released[0]?.details as { reason?: string })?.reason).toBe("runless_issue");
   });
 
+  it("auto-cancels a stale blocked tick with no blocker so it stops suppressing ticks", async () => {
+    const { routine, strandedIssueId, svc } = await seedRunlessExecutionIssue();
+    await db
+      .update(issues)
+      .set({ status: "blocked", updatedAt: new Date(Date.now() - 7 * 60 * 60 * 1000) })
+      .where(eq(issues.id, strandedIssueId));
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    await expect(
+      db.select({ status: issues.status }).from(issues).where(eq(issues.id, strandedIssueId)),
+    ).resolves.toEqual([{ status: "cancelled" }]);
+    expect(run.linkedIssueId).not.toBe(strandedIssueId);
+  });
+
+  it("keeps a recently blocked tick", async () => {
+    const { routine, strandedIssueId, svc } = await seedRunlessExecutionIssue();
+    await db.update(issues).set({ status: "blocked", updatedAt: new Date() }).where(eq(issues.id, strandedIssueId));
+    await svc.runRoutine(routine.id, { source: "schedule" });
+    await expect(
+      db.select({ status: issues.status }).from(issues).where(eq(issues.id, strandedIssueId)),
+    ).resolves.toEqual([{ status: "blocked" }]);
+  });
+
   // `in_review` is open with no live run too, but it means an agent deliberately parked
   // the issue waiting on an operator — cancelling that would throw away a pending interaction.
   // Only `in_progress` is unambiguously a run that died mid-work.
