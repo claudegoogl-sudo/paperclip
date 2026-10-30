@@ -944,7 +944,7 @@ async function isGitCheckout(cwd: string | null | undefined) {
     .catch(() => false);
 }
 
-async function probeGitWorktreeBase(cwd: string) {
+export async function probeGitWorktreeBase(cwd: string) {
   try {
     const result = await execFile("git", ["rev-parse", "--show-toplevel"], {
       cwd,

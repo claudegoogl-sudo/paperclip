@@ -74,6 +74,9 @@ export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot, disposeGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
+import { readConnectionFailure, type GitConnectionFailure } from "@paperclipai/adapter-utils/connection-failure";
+import { classifyGitCloneFailure, GitConnectionFailureError, readGitConnectionFailure } from "./git-connection-failure.js";
+import { probeGitWorktreeBase } from "./heartbeat/workspaces.js";
 import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
 import { captureDirectorySnapshot, disposeDirectorySnapshot, mergeDirectoryWithBaseline } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { initializeRunIdentity, explicitOperatorRunIdentity } from "./run-identity.js";
@@ -2910,6 +2913,7 @@ async function materializeManagedProjectWorkspace(
     : null;
   const cloneTmpDir = await fs.mkdtemp(`${cwd}.clone-`);
   try {
+    try {
     await execFile(
       "git",
       [...(auth?.configArgs ?? []), "clone", "--no-hardlinks", "--", input.localSource ?? input.repoUrl, cloneTmpDir],
@@ -2926,6 +2930,13 @@ async function materializeManagedProjectWorkspace(
         timeout: MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS,
       },
     );
+    } catch (error) {
+      const connectionFailure = !input.localSource ? classifyGitCloneFailure(input.repoUrl, error) : null;
+      if (connectionFailure) throw new GitConnectionFailureError(
+        error instanceof Error ? error.message : "Git clone failed", connectionFailure,
+      );
+      throw error;
+    }
     if (input.localSource) {
       const snapshot = await readGitWorkspaceSnapshot(input.localSource, false);
       if (!snapshot) throw new Error("Configured repository folder is not a Git checkout");
@@ -2956,6 +2967,8 @@ async function materializeManagedProjectWorkspace(
     // Preserve the closed failure code without copying subprocess output or
     // credentials into the durable run. Setup recovery needs the actual cause.
     if (isWorkspaceGitScanError(error)) throw new WorkspaceGitScanError(error.code, message);
+    const connectionFailure = readGitConnectionFailure(error);
+    if (connectionFailure) throw new GitConnectionFailureError(message, connectionFailure);
     throw new Error(message);
   }
 
@@ -3365,6 +3378,8 @@ export async function assertGitWorktreeBaseWorkspaceReady(input: {
   anchor?: {
     baseCwdFallback?: boolean;
     materializationFailures?: WorkspaceMaterializationFailure[];
+    /** Selected database workspace is an explicit local path with no repository URL. */
+    localPathOnlyWorkspace?: boolean;
   } | null;
 }) {
   if (!input.issue) return;
@@ -3388,8 +3403,10 @@ export async function assertGitWorktreeBaseWorkspaceReady(input: {
     reason: string,
     message: string,
     extra: Record<string, unknown> = {},
+    connectionFailure?: GitConnectionFailure,
   ) => {
     throw new WorkspaceValidationFailure(message, {
+      ...(connectionFailure ? { connectionFailure } : {}),
       workspaceValidation: {
         reason,
         issueId: input.issue!.id,
@@ -3426,17 +3443,31 @@ export async function assertGitWorktreeBaseWorkspaceReady(input: {
   const materializationFailures = input.anchor?.materializationFailures ?? [];
   if (input.anchor?.baseCwdFallback && materializationFailures.length > 0) {
     const failureDetail = `: ${materializationFailures[0].error.replace(/\s+/g, " ")}`;
+    const connections = materializationFailures.map((failure) => readConnectionFailure(failure.connectionFailure));
+    // Mixed connection/local failures must retain their application-error report.
+    const connectionFailure = connections.every((failure) => failure?.provider === "git")
+      ? connections[0] as GitConnectionFailure : undefined;
     fail(
       "git_worktree_base_materialization_failed",
       `Issue ${issueLabel} requested ${input.requestedExecutionWorkspaceMode} with git_worktree, but the project workspace checkout could not be prepared${failureDetail}. Repair the project workspace repository URL, clone access, or configured local cwd, then retry.`,
       { baseCwdFallback: true, materializationFailures },
+      connectionFailure,
     );
   }
 
-  if (!(await isGitCheckout(input.base.baseCwd))) {
+  const checkoutProbe = await probeGitWorktreeBase(input.base.baseCwd);
+  if (!checkoutProbe.isCheckout) {
+    const knownLocalPathMismatch = checkoutProbe.notRepository &&
+      input.anchor?.localPathOnlyWorkspace === true &&
+      input.anchor.baseCwdFallback === false && materializationFailures.length === 0 &&
+      input.base.source === "project_primary" && Boolean(input.base.projectId) &&
+      Boolean(input.base.workspaceId) && !readNonEmptyString(input.base.repoUrl);
     fail(
       "git_worktree_base_not_git_checkout",
       `Issue ${issueLabel} requested ${input.requestedExecutionWorkspaceMode} with git_worktree, but base workspace "${input.base.baseCwd}" is not a git checkout. ${remediation}`,
+      knownLocalPathMismatch
+        ? { configurationReason: "local_path_requires_git_checkout" }
+        : {},
     );
   }
 
@@ -4224,6 +4255,7 @@ export type WorkspaceMaterializationFailure = {
   projectWorkspaceId: string | null;
   repoUrl: string | null;
   error: string;
+  connectionFailure?: GitConnectionFailure;
 };
 
 export type ResolvedWorkspaceForRun = {
@@ -4249,6 +4281,8 @@ export type ResolvedWorkspaceForRun = {
   baseCwdFallback: boolean;
   /** Failed materialization attempts behind {@link baseCwdFallback}; empty when every candidate resolved or none was attempted. */
   materializationFailures: WorkspaceMaterializationFailure[];
+  /** True only for an explicitly configured local project path without a repository URL. */
+  localPathOnlyWorkspace?: boolean;
   /**
    * Read-only referenced (mentioned) project workspaces for this run, one per authorized
    * additional project. The array is empty unless the multi-project workspace-sync flag is on
@@ -13139,12 +13173,14 @@ export function heartbeatService(
             error instanceof Error ? error.message : String(error),
           );
           const workspaceRepoUrl = readNonEmptyString(workspace.repoUrl);
+          const connectionFailure = readGitConnectionFailure(error);
           materializationFailures.push({
             projectWorkspaceId: workspace.id,
             repoUrl: workspaceRepoUrl
               ? scrubGitCredentialText(workspaceRepoUrl)
               : null,
             error: scrubbedError,
+            ...(connectionFailure ? { connectionFailure } : {}),
           });
           if (preferredWorkspace?.id === workspace.id) {
             preferredWorkspaceWarning = scrubbedError;
@@ -13171,6 +13207,10 @@ export function heartbeatService(
             ].filter((value): value is string => Boolean(value)),
             baseCwdFallback: false,
             materializationFailures,
+            localPathOnlyWorkspace:
+              (workspace.sourceType === "local_path" || workspace.sourceType === "non_git_path") &&
+              Boolean(readNonEmptyString(workspace.cwd)) && workspace.cwd !== REPO_ONLY_CWD_SENTINEL &&
+              !readNonEmptyString(workspace.repoUrl),
           };
         }
         if (preferredWorkspace?.id === workspace.id) {
@@ -23450,6 +23490,7 @@ export function heartbeatService(
         anchor: {
           baseCwdFallback: resolvedWorkspace.baseCwdFallback,
           materializationFailures: resolvedWorkspace.materializationFailures,
+          localPathOnlyWorkspace: resolvedWorkspace.localPathOnlyWorkspace,
         },
       });
       const workspaceStrategyForFingerprint = parseObject(
