@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import { agentWakeupRequests, type Db } from "@paperclipai/db";
+import { agentWakeupRequests, issueComments, type Db } from "@paperclipai/db";
+
+export const EXECUTION_HOLD_ALERT_THRESHOLD = 5;
 
 type WakeRequest = typeof agentWakeupRequests.$inferInsert;
 
@@ -36,13 +38,21 @@ export async function recordExecutionWait(
         sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
       )).limit(1);
     if (existing) {
-      await tx.update(agentWakeupRequests).set({
+      const [bumped] = await tx.update(agentWakeupRequests).set({
         coalescedCount: sql`${agentWakeupRequests.coalescedCount} + 1`,
         updatedAt: new Date(),
       }).where(and(
         eq(agentWakeupRequests.companyId, request.companyId),
         eq(agentWakeupRequests.id, existing.id),
-      ));
+      )).returning({ coalescedCount: agentWakeupRequests.coalescedCount });
+      // Make a silently held issue visible: one board-visible alert at the Nth skipped wake.
+      if (request.reason === "execution_reconciliation_required" &&
+          bumped?.coalescedCount === EXECUTION_HOLD_ALERT_THRESHOLD) {
+        await tx.insert(issueComments).values({
+          companyId: request.companyId, issueId, authorType: "system",
+          body: `Wakes on this issue have been skipped ${EXECUTION_HOLD_ALERT_THRESHOLD} times because a recovery hold (execution_reconciliation_required) is open. Resolve the recovery action to resume agent work.`,
+        });
+      }
       return { created: false };
     }
   }
