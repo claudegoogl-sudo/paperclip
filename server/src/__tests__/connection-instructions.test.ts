@@ -166,7 +166,7 @@ async function createRemoteMcpToolFixture(db: ReturnType<typeof createDb>, compa
   it("backfills existing template connections without replacing custom text or opt-outs", async () => {
     const f = await fixture();
     await db.update(toolConnections).set({ agentInstructions: null, config: { ...f.connection.config, sourceTemplateKey: "mem0" } }).where(eq(toolConnections.id, f.connection.id));
-    const migration = await readFile(new URL("../../../packages/db/src/migrations/0320_connection_agent_instructions.sql", import.meta.url), "utf8");
+    const migration = await readFile(new URL("../../../packages/db/src/migrations/0298_connection_agent_instructions.sql", import.meta.url), "utf8");
     await db.$client.unsafe(migration);
     const populated = await f.service.getConnection(f.connection.id);
     expect(populated.agentInstructions).toMatchObject({ enabled: true, template: { id: "mem0.usage", version: 1 } });

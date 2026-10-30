@@ -57,7 +57,7 @@ if (!support.supported) console.warn(`Managed-account database tests unavailable
     const f = await fixture();
     await sync(f);
     const before = await db.select().from(toolConnectionAppSnapshots).where(eq(toolConnectionAppSnapshots.connectionId, f.connection.id));
-    for (const name of ["0317_public_captain_cross", "0318_stiff_thaddeus_ross"]) {
+    for (const name of ["0295_public_captain_cross", "0296_stiff_thaddeus_ross"]) {
       const migration = await readFile(new URL(`../../../packages/db/src/migrations/${name}.sql`, import.meta.url), "utf8");
       for (const statement of migration.split("--> statement-breakpoint")) await db.execute(sql.raw(statement));
     }

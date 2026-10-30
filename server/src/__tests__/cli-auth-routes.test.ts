@@ -97,17 +97,8 @@ async function createApp(actor: any, db: any = {} as any) {
 }
 
 describe("cli auth routes", () => {
-  beforeEach(async () => {
-    vi.resetModules();
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../routes/access.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
+  beforeEach(() => {
     vi.resetAllMocks();
-    // Cold route transforms are fixture setup, not HTTP request latency.
-    // Use the hook budget while preserving the request tests' normal timeout.
-    await Promise.all([import("../routes/access.js"), import("../middleware/index.js")]);
   });
 
   it("creates a CLI auth challenge with approval metadata", async () => {
@@ -379,7 +370,7 @@ describe("cli auth routes", () => {
     );
   });
 
-  it.sequential("creates a named board API key and logs audit activity", async () => {
+  it("creates a named board API key and logs audit activity", async () => {
     // Computed, not hard-coded: expiry must be in the future for the schema.
     const successorExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
     mockBoardAuthService.createNamedBoardApiKey.mockResolvedValue({
