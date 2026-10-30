@@ -4,6 +4,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { errorHandler } from "../middleware/index.js";
 import { authRoutes } from "../routes/auth.js";
 
+const mockLogInstanceActivity = vi.hoisted(() => vi.fn(async () => {}));
+vi.mock("../routes/instance-activity.js", () => ({ logInstanceActivity: mockLogInstanceActivity }));
+
 function createSelectChain(rows: unknown[]) {
   return {
     from() {
@@ -265,6 +268,19 @@ describe("auth routes", () => {
       email: "jane@example.com",
       image: null,
     });
+  });
+
+  it("audits profile updates with changed keys only (no PII values)", async () => {
+    mockLogInstanceActivity.mockClear();
+    const app = createApp({ type: "board", userId: "user-1", source: "local_implicit" }, baseUser);
+    const res = await request(app).patch("/api/auth/profile").send({ name: "Secret Name" });
+    expect(res.status).toBe(200);
+    expect(mockLogInstanceActivity).toHaveBeenCalledTimes(1);
+    const input = (mockLogInstanceActivity.mock.calls[0] as unknown[])[2] as Record<string, any>;
+    expect(input.action).toBe("auth.profile.updated");
+    expect(input.entityId).toBe("user-1");
+    expect(input.details).toEqual({ changedKeys: ["name"] });
+    expect(JSON.stringify(input)).not.toContain("Secret Name");
   });
 
   it("preserves the existing avatar when updating only the profile name", async () => {

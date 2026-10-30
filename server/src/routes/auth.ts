@@ -9,6 +9,7 @@ import {
 } from "@paperclipai/shared";
 import { unauthorized } from "../errors.js";
 import { validate } from "../middleware/validate.js";
+import { logInstanceActivity } from "./instance-activity.js";
 import { resolveSentryDsns } from "../sentry-dsn.js";
 
 async function loadCurrentUserProfile(db: Db, userId: string) {
@@ -95,6 +96,15 @@ export function authRoutes(db: Db) {
     if (!updated) {
       throw unauthorized("Signed-in user not found");
     }
+
+    // Audit: board-gated write to authUsers. Never log name/image values (PII);
+    // record only which fields changed.
+    await logInstanceActivity(db, req, {
+      action: "auth.profile.updated",
+      entityType: "auth_user",
+      entityId: updated.id,
+      details: { changedKeys: Object.keys(patch).sort() },
+    });
 
     res.json(currentUserProfileSchema.parse({
       id: updated.id,
