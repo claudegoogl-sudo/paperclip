@@ -7,6 +7,16 @@ import path from "node:path";
 import { test } from "node:test";
 import { stageRunnerBinary } from "./stage-runner-binary.mjs";
 
+// A shell-script fixture instead of /bin/sleep: on runners where sleep is a
+// multicall binary (uutils/busybox) the copy named paperclip-runnerd exits
+// immediately because it dispatches on argv[0].
+async function sleepFixture() {
+  const dir = await mkdtemp(path.join(tmpdir(), "runnerd-stage-src-"));
+  const file = path.join(dir, "sleeper");
+  await writeFile(file, "#!/bin/sh\nexec sleep \"$1\"\n", { mode: 0o755 });
+  return file;
+}
+
 async function withOwnedChildren(root, action) {
   const owned = [];
   const start = (command, args) => {
@@ -36,11 +46,11 @@ test("atomically publishes while the previous executable is running", { skip: pr
   const root = await mkdtemp(path.join(tmpdir(), "runnerd-stage-test-"));
   const destination = path.join(root, "paperclip-runnerd");
   await withOwnedChildren(root, async start => {
-    await stageRunnerBinary("/bin/sleep", destination);
+    await stageRunnerBinary(await sleepFixture(), destination);
     const previous = await stat(destination);
     const old = start(destination, ["30"]);
     await old.spawned;
-    await stageRunnerBinary("/bin/sleep", destination);
+    await stageRunnerBinary(await sleepFixture(), destination);
     const published = await stat(destination);
     assert.notEqual(published.ino, previous.ino);
     assert.equal(published.mode & 0o777, 0o755);
@@ -57,7 +67,7 @@ test("a second spawn error still retires the live old child and removes its fixt
   const root = await mkdtemp(path.join(tmpdir(), "runnerd-stage-spawn-failure-"));
   let old;
   await assert.rejects(withOwnedChildren(root, async start => {
-    old = start("/bin/sleep", ["30"]); await old.spawned;
+    old = start(await sleepFixture(), ["30"]); await old.spawned;
     const failed = start(path.join(root, "missing-executable"), []);
     await failed.spawned;
   }), { code: "ENOENT" });
