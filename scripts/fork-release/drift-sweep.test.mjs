@@ -135,24 +135,11 @@ test("sweepOnce keeps state untouched when the board post fails, so retries conv
   }
 });
 
-test("resolveBoardToken prefers env, falls back to the credential file, leaks nothing in errors", () => {
-  const env = { PAPERCLIP_API_KEY: "env-token" };
-  assert.deepEqual(resolveBoardToken({ env, credentialPath: "/no/such/file", apiBase: "http://127.0.0.1:3100/api" }),
-    { token: "env-token", source: "env" });
-
-  const dir = mkdtempSync(path.join(tmpdir(), "drift-sweep-cred-"));
-  try {
-    const credPath = path.join(dir, "auth.json");
-    writeFileSync(credPath, JSON.stringify({
-      credentials: {
-        "http://localhost:3100": { apiBase: "http://localhost:3100", token: "file-token" },
-      },
-    }));
-    const resolved = resolveBoardToken({ env: {}, credentialPath: credPath, apiBase: "http://127.0.0.1:3100/api" });
-    assert.deepEqual(resolved, { token: "file-token", source: "credential-file" });
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+test("resolveBoardToken requires the env key and never reads auth.json", () => {
+  assert.deepEqual(resolveBoardToken({ env: { PAPERCLIP_API_KEY: "env-token" } }), { token: "env-token", source: "env" });
+  const missing = resolveBoardToken({ env: {} });
+  assert.match(missing.error, /PAPERCLIP_API_KEY is not set/);
+  assert.equal(missing.token, undefined);
 });
 
 test("acquireLock skips an active lock and clears a stale one", () => {

@@ -209,8 +209,9 @@ via `grep`.
 
 Same ledger code path as drift-check, posted to a tracker issue when the
 missing-commit set CHANGES (retries and re-runs converge; no spam). Board
-credential is read in-process from `~/.paperclip/auth.json` (or
-`$PAPERCLIP_API_KEY`) and never logged. Every post carries an agent-provenance
+credential is a scoped `$PAPERCLIP_API_KEY` (comment-only on the tracker
+issue) supplied via the EnvironmentFile and never logged; the host
+`~/.paperclip/auth.json` is never read. Every post carries an agent-provenance
 banner and records no operator decision. Control failures fail the service
 and post nothing — never a fabricated ledger.
 

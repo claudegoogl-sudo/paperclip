@@ -8,9 +8,9 @@
  * silent, so re-runs, retries and timer restarts converge instead of
  * spamming the tracker.
  *
- * Credentials: uses $PAPERCLIP_API_KEY when set; otherwise loads the host
- * board credential from ~/.paperclip/auth.json IN-PROCESS and uses it as a
- * bearer header. The credential value is never logged, echoed, or written
+ * Credentials: requires a scoped $PAPERCLIP_API_KEY (comment-only on the
+ * tracker issue); the host board credential in ~/.paperclip/auth.json is never
+ * read. The key is used as a bearer header and its value is never logged, echoed, or written
  * anywhere — only HTTP status codes and response metadata reach the log.
  * Board-key writes carry an agent-provenance banner (Platform decision-
  * provenance policy): automated ledger, never an operator decision.
@@ -98,34 +98,15 @@ function parseArgs(argv) {
 }
 
 /**
- * Resolve the board bearer token WITHOUT exposing it: env key wins; otherwise
- * read the host credential file in-process and return only the token string.
- * Never log the return value.
+ * Resolve the bearer token WITHOUT exposing it. Only $PAPERCLIP_API_KEY is
+ * accepted: use a scoped key that can only comment on the tracker issue
+ * (supplied through the EnvironmentFile). The host board credential in
+ * ~/.paperclip/auth.json is deliberately NOT read. Never log the return value.
  */
-export function resolveBoardToken({ env = process.env, credentialPath = join(homedir(), ".paperclip", "auth.json"), apiBase } = {}) {
+export function resolveBoardToken({ env = process.env } = {}) {
   const fromEnv = env.PAPERCLIP_API_KEY;
   if (fromEnv) return { token: fromEnv, source: "env" };
-  if (!existsSync(credentialPath)) {
-    return { error: `no $PAPERCLIP_API_KEY and no credential file at ${credentialPath}` };
-  }
-  let parsed;
-  try {
-    parsed = JSON.parse(readFileSync(credentialPath, "utf8"));
-  } catch (err) {
-    return { error: `credential file unreadable: ${err.message}` };
-  }
-  const entries = Object.values(parsed?.credentials ?? {});
-  if (entries.length === 0) {
-    return { error: "credential file carries no credentials" };
-  }
-  const match = entries.find((entry) => {
-    const base = String(entry?.apiBase ?? "").replace(/\/$/, "");
-    return base !== "" && apiBase.startsWith(base);
-  }) ?? entries[0];
-  if (typeof match?.token !== "string" || match.token.length === 0) {
-    return { error: "credential entry carries no token" };
-  }
-  return { token: match.token, source: "credential-file" };
+  return { error: "$PAPERCLIP_API_KEY is not set (a scoped comment-only key is required; the host auth.json is never read)" };
 }
 
 /** Acquire a simple stale-aware lock so timer overlap converges instead of racing. */
@@ -326,7 +307,7 @@ async function main() {
     const outcome = await sweepOnce({
       args,
       ghApiFn: ghApi,
-      boardToken: resolveBoardToken({ apiBase: args.apiBase }),
+      boardToken: resolveBoardToken(),
     });
     log(`${outcome.outcome}: ${outcome.detail}`);
     process.exit({
