@@ -660,6 +660,37 @@ describe("adapter routes", () => {
       expect(res.body.error).toMatch(/version/);
       expect(mockPluginLoader.loadExternalAdapterPackage).not.toHaveBeenCalled();
     });
+  });
+
+  it("POST /api/adapters/install still returns 201 when the audit write fails after a successful install", async () => {
+    const AUDIT_TYPE = "audit_failsoft_test";
+    mockPluginLoader.loadExternalAdapterPackage.mockResolvedValue({
+      type: AUDIT_TYPE,
+      execute: async () => ({ exitCode: 0, signal: null, timedOut: false }),
+      testEnvironment: async () => ({ adapterType: AUDIT_TYPE, status: "pass", checks: [], testedAt: new Date(0).toISOString() }),
+    } satisfies ServerAdapterModule);
+    mockLogActivity.mockRejectedValue(new Error("db down"));
+    const res = await request(createApp({ isInstanceAdmin: true }))
+      .post("/api/adapters/install")
+      .send({ packageName: "/tmp/fake-failsoft-adapter", isLocalPath: true });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    // exactly one attempt: no second "failed" row is written for a successful install
+    expect(mockLogActivity).toHaveBeenCalledTimes(1);
+  });
+
+  it("POST /api/adapters/install bounds and redacts the failureReason in the audit row", async () => {
+    mockPluginLoader.loadExternalAdapterPackage.mockRejectedValue(
+      new Error(`fetch https://user:secret@registry.example/x failed ${"x".repeat(1000)}`),
+    );
+    const res = await request(createApp({ isInstanceAdmin: true }))
+      .post("/api/adapters/install")
+      .send({ packageName: "some-adapter" });
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    const details = mockLogActivity.mock.calls[0][1].details as { failureReason: string };
+    expect(details.failureReason.length).toBeLessThanOrEqual(301);
+    expect(details.failureReason).not.toContain("secret@");
+  });
+
   it("POST /api/adapters/install writes an instance.adapter.installed activity row naming the actor", async () => {
     const AUDIT_TYPE = "audit_install_test";
     const externalModule: ServerAdapterModule = {

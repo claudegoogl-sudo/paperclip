@@ -21,7 +21,43 @@ export interface InstanceActivityInput {
  * listCompanyIds() returning empty would silently drop the row, so that case
  * emits a warn to keep the audit gap visible instead of silent.
  */
+const MAX_FAILURE_REASON_CHARS = 300;
+
+/** Bound free-text error fields and strip credentials embedded in URLs. */
+function sanitizeDetails(details: Record<string, unknown> | undefined): Record<string, unknown> | null {
+  if (!details) return null;
+  const out: Record<string, unknown> = { ...details };
+  const reason = out.failureReason;
+  if (typeof reason === "string") {
+    const redacted = reason.replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi, "$1***@");
+    out.failureReason =
+      redacted.length > MAX_FAILURE_REASON_CHARS
+        ? `${redacted.slice(0, MAX_FAILURE_REASON_CHARS)}…`
+        : redacted;
+  }
+  return out;
+}
+
+/**
+ * Best-effort: an audit write failure is logged and swallowed so it can never
+ * turn an already-applied instance mutation into a reported failure.
+ */
 export async function logInstanceActivity(
+  db: Db,
+  req: Request,
+  input: InstanceActivityInput,
+): Promise<void> {
+  try {
+    await writeInstanceActivity(db, req, input);
+  } catch (err) {
+    logger.error(
+      { err, event: "instance_activity_write_failed", action: input.action, entityId: input.entityId },
+      "failed to write instance activity_log row",
+    );
+  }
+}
+
+async function writeInstanceActivity(
   db: Db,
   req: Request,
   input: InstanceActivityInput,
@@ -53,7 +89,7 @@ export async function logInstanceActivity(
         action: input.action,
         entityType: input.entityType,
         entityId: input.entityId,
-        details: input.details ?? null,
+        details: sanitizeDetails(input.details),
       }),
     ),
   );
