@@ -113,6 +113,10 @@ export function redactHeartbeatRunListRow<T extends Record<string, unknown> & { 
     usage?.costUsd,
     usage?.cost_usd,
     usage?.total_cost_usd,
+    // Summary list rows carry the projected scalar cost columns instead.
+    (row as Record<string, unknown>).resultCostUsdCamel,
+    (row as Record<string, unknown>).resultCostUsd,
+    (row as Record<string, unknown>).resultTotalCostUsd,
   );
 
   return {

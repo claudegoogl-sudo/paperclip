@@ -3793,7 +3793,18 @@ const heartbeatRunListColumns = {
 
 const heartbeatRunSummaryListColumns = {
   ...heartbeatRunListColumns,
-  usageJson: sql<Record<string, unknown> | null>`NULL`.as("usageJson"),
+  // Token counts and cost stay available to summary rows (they feed budget
+  // oversight and the locked stubs for private runs); nothing else of usageJson.
+  usageJson: sql<Record<string, unknown> | null>`case when ${heartbeatRuns.usageJson} is null then null else jsonb_strip_nulls(jsonb_build_object(
+    'inputTokens', ${heartbeatRuns.usageJson} -> 'inputTokens',
+    'cachedInputTokens', ${heartbeatRuns.usageJson} -> 'cachedInputTokens',
+    'outputTokens', ${heartbeatRuns.usageJson} -> 'outputTokens',
+    'totalTokens', ${heartbeatRuns.usageJson} -> 'totalTokens',
+    'costUsd', ${heartbeatRuns.usageJson} -> 'costUsd'
+  )) end`.as("usageJson"),
+  resultTotalCostUsd: sql<string | null>`${heartbeatRuns.resultJson} ->> 'total_cost_usd'`.as("resultTotalCostUsd"),
+  resultCostUsd: sql<string | null>`${heartbeatRuns.resultJson} ->> 'cost_usd'`.as("resultCostUsd"),
+  resultCostUsdCamel: sql<string | null>`${heartbeatRuns.resultJson} ->> 'costUsd'`.as("resultCostUsdCamel"),
   sessionIdBefore: sql<string | null>`NULL`.as("sessionIdBefore"),
   sessionIdAfter: sql<string | null>`NULL`.as("sessionIdAfter"),
   logStore: sql<string | null>`NULL`.as("logStore"),
@@ -32595,6 +32606,15 @@ export function heartbeatService(
 
         return {
           ...rest,
+          ...(summary
+            ? {
+                costUsd: (() => {
+                  const raw = resultCostUsdCamel ?? resultCostUsd ?? resultTotalCostUsd;
+                  const parsed = raw == null ? NaN : Number(raw);
+                  return Number.isFinite(parsed) ? parsed : null;
+                })(),
+              }
+            : {}),
           contextSnapshot: summarizeHeartbeatRunContextSnapshot({
             issueId: contextIssueId,
             taskId: contextTaskId,
