@@ -1,3 +1,4 @@
+import { dispatchCapabilityEscalationResolution } from "./plugin-capability-escalation.js";
 import { approvalResolutionRecords, resolvableApprovalStatuses as resolvableStatuses } from "../lib/approval-records.js";
 import { budgetService } from "./budgets.js";
 import { notifyHireApproved } from "./hire-hook.js";
@@ -227,7 +228,17 @@ export function approvalService(db: Db) {
       const result = await decideHire({ approvalId: id }, status, userId, note);
       return { approval: result!.approval!, applied: result!.applied };
     }
-    return resolveApproval(id, status, userId, note);
+    const result = await resolveApproval(id, status, userId, note);
+    if (result.applied) {
+      // Apply (approved) or revert (rejected) a parked plugin capability
+      // escalation. No-op for payloads that are not escalations.
+      await dispatchCapabilityEscalationResolution({
+        payload: result.approval.payload,
+        outcome: status === "approved" ? "approved" : "rejected",
+        approvalId: result.approval.id,
+      });
+    }
+    return result;
   }
   return { ...records,
     approveHire: (agentId: string, userId: string, note?: string | null) => decideHire(agentId, "approved", userId, note),

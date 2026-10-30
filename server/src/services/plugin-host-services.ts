@@ -3234,7 +3234,10 @@ export function buildHostServices(
       async listAttachments(params) {
         const companyId = ensureCompanyId(params.companyId);
         await noPluginAvailabilityGate(companyId);
-        if (!inCompany(await issues.getById(params.issueId), companyId)) return [];
+        const attachmentIssue = await issues.getById(params.issueId);
+        if (!inCompany(attachmentIssue, companyId)) return [];
+        // Private issues are invisible to a plugin that is not a member.
+        if (!attachmentIssue || !(await pluginCanReadIssue(attachmentIssue))) return [];
         // Narrow the host row to the plugin-facing projection:
         // raw storage addressing (provider, objectKey, sha256) and creator identity
         // are deliberately withheld so a worker cannot reach the blob store directly
