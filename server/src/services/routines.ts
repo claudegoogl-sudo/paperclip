@@ -19,6 +19,7 @@ import {
   goals,
   heartbeatRuns,
   issueInboxArchives,
+  issueRelations,
   issues,
   pluginManagedResources,
   plugins,
@@ -1661,6 +1662,8 @@ export function routineService(
   // an operator answer or a sibling issue — and cancelling those destroys real state. Only
   // `in_progress` with a terminal execution run is unambiguously a run that died mid-work with
   // nothing left to wake it.
+  const STALE_BLOCKED_TICK_MS = 6 * 60 * 60 * 1000;
+
   async function findRunlessExecutionIssue(
     routine: typeof routines.$inferSelect,
     executor: Db,
@@ -1676,9 +1679,20 @@ export function routineService(
           eq(issues.companyId, routine.companyId),
           eq(issues.originKind, origin.kind),
           origin.id ? eq(issues.originId, origin.id) : sql`false`,
-          eq(issues.status, "in_progress"),
+          or(
+            and(eq(issues.status, "in_progress"), isNotNull(issues.executionRunId)),
+            // Stale blocked tick with no blocker edge: nothing can ever unblock it (auth-outage
+            // shape, 181 of them Oct 26-29). Auto-cancel so it stops piling up.
+            and(
+              eq(issues.status, "blocked"),
+              lte(issues.updatedAt, new Date(Date.now() - STALE_BLOCKED_TICK_MS)),
+              sql`not exists (
+                select 1 from ${issueRelations} ir
+                where ir.related_issue_id = ${issues.id} and ir.type = 'blocks'
+              )`,
+            ),
+          ),
           isNull(issues.hiddenAt),
-          isNotNull(issues.executionRunId),
           ...(fingerprintCondition ? [fingerprintCondition] : []),
           // Belt and braces against a run appearing between findLiveExecutionIssue and here: if
           // anything non-terminal is attached, this is not a runless issue and must not be reaped.
@@ -1880,7 +1894,7 @@ export function routineService(
     const claimed = await db
       .update(issues)
       .set({ status: "cancelled", updatedAt: input.now })
-      .where(and(eq(issues.id, input.issue.id), eq(issues.status, "in_progress")))
+      .where(and(eq(issues.id, input.issue.id), eq(issues.status, input.issue.status as "in_progress" | "blocked")))
       .returning({ id: issues.id });
 
     if (claimed.length === 0) {
