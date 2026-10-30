@@ -47,6 +47,7 @@ export function retainRunnerQualificationPackages({ repo, output, sourceRevision
     writeFileSync(join(plugin, 'package.json'), JSON.stringify({ ...pluginManifest, version: releaseVersion }));
     mkdirSync(join(staging, 'scripts'));
     cpSync(join(repo, 'scripts/generate-plugin-package-json.mjs'), join(staging, 'scripts/generate-plugin-package-json.mjs'));
+    cpSync(join(repo, 'scripts/source-commit.mjs'), join(staging, 'scripts/source-commit.mjs'));
     mkdirSync(join(staging, 'packages/plugins/sdk'), { recursive: true });
     const sdk = JSON.parse(readFileSync(join(repo, 'packages/plugins/sdk/package.json')));
     writeFileSync(join(staging, 'packages/plugins/sdk/package.json'), JSON.stringify({ ...sdk, version: releaseVersion }));
