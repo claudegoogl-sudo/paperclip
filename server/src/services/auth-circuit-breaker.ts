@@ -1,5 +1,5 @@
 /**
- * Auth-failure circuit breaker (PLA-11434). Per-adapter-type, in-memory.
+ * Auth-failure circuit breaker. Per-adapter-type, in-memory.
  * After N consecutive auth failures the breaker opens: new dispatch is held.
  * One probe run is allowed per cooldown (half-open). First success closes it.
  */
