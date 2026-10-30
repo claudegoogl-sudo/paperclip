@@ -48,6 +48,8 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { resolveSourceCommit } from "./source-commit.mjs";
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, "..");
 const ROOTS = ["packages", "server", "ui", "cli"];
@@ -136,6 +138,18 @@ function sortTopologically(packages) {
 }
 
 /**
+ * Stamp the source commit onto a publish manifest. Exported pure for tests:
+ * pass the resolved commit explicitly there.
+ *
+ * @param {{ gitHead?: string }} pkg manifest about to be packed
+ * @param {{ commit: string } | null} sourceCommit result of resolveSourceCommit()
+ */
+export function applyCommitStamp(pkg, sourceCommit) {
+  if (!sourceCommit) return pkg;
+  return { ...pkg, gitHead: sourceCommit.commit };
+}
+
+/**
  * Apply publishConfig to a package.json the same way `npm publish` would:
  * deep-merge each key from publishConfig into the top-level manifest, then
  * remove the publishConfig block from the published view.
@@ -207,7 +221,7 @@ function usage() {
   );
 }
 
-function packOne(pkg, outDir, packer) {
+function packOne(pkg, outDir, packer, sourceCommit) {
   const backupPath = `${pkg.pkgPath}.pack-backup`;
   copyFileSync(pkg.pkgPath, backupPath);
 
@@ -231,7 +245,7 @@ function packOne(pkg, outDir, packer) {
   });
 
   try {
-    const published = applyPublishConfig(pkg.pkg);
+    const published = applyCommitStamp(applyPublishConfig(pkg.pkg), sourceCommit);
     writeJson(pkg.pkgPath, published);
 
     const packArgs = ["pack", "--pack-destination", resolve(outDir)];
@@ -270,10 +284,17 @@ function main() {
     process.exit(1);
   }
 
+  const sourceCommit = resolveSourceCommit();
+  if (sourceCommit) {
+    process.stdout.write(`==> Source commit stamp: ${sourceCommit.commit}\n`);
+  } else {
+    process.stdout.write(`==> No source commit resolvable - packed manifests will carry no gitHead stamp\n`);
+  }
+
   process.stdout.write(`==> Packing ${targets.length} public package(s) into ${outDir}\n`);
   for (const pkg of targets) {
     process.stdout.write(`  - ${pkg.name}@${pkg.version}\n`);
-    packOne(pkg, outDir, args.packer);
+    packOne(pkg, outDir, args.packer, sourceCommit);
   }
   process.stdout.write(`==> Done. Tarballs in ${outDir}\n`);
 }

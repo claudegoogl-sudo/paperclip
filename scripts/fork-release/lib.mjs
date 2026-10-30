@@ -298,3 +298,45 @@ export function coreChainClosure({ assetsDir, coreTarballName }) {
   }
   return chain;
 }
+
+/**
+ * Provenance gate: every tarball in the release set must carry a `gitHead`
+ * stamp equal to the commit the release was cut from.
+ *
+ * The stamp is what install-time and scheduled drift checks resolve the
+ * running release's commit from. A tarball without it silently degrades the
+ * drift ledger to the indirect version -> release-tag lookup (which breaks
+ * when a tag is re-cut mid-build), so the build fails loudly here instead.
+ *
+ * @param {{ assetsDir: string, expectedCommit: string }} args
+ * @returns {{ ok: boolean, violations: Array<{ asset: string, problem: string, expected?: string, actual?: string }> }}
+ */
+export function verifyCommitStamp({ assetsDir, expectedCommit }) {
+  if (!/^[0-9a-f]{40}$/.test(expectedCommit)) {
+    throw new Error(`expectedCommit must be a full 40-hex sha, got: ${JSON.stringify(expectedCommit)}`);
+  }
+  const violations = [];
+  for (const tarballPath of listTarballs(assetsDir)) {
+    const asset = path.basename(tarballPath);
+    let manifest;
+    try {
+      manifest = readPackedManifest(tarballPath);
+    } catch (err) {
+      violations.push({ asset, problem: `unreadable manifest: ${err.message}` });
+      continue;
+    }
+    if (typeof manifest.gitHead !== "string" || manifest.gitHead.length === 0) {
+      violations.push({ asset, problem: "no gitHead stamp" });
+      continue;
+    }
+    if (manifest.gitHead !== expectedCommit) {
+      violations.push({
+        asset,
+        problem: "gitHead stamp does not match the released source commit",
+        expected: expectedCommit,
+        actual: manifest.gitHead,
+      });
+    }
+  }
+  return { ok: violations.length === 0, violations };
+}
