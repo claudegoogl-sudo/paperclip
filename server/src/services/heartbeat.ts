@@ -78,6 +78,7 @@ import { readConnectionFailure, type GitConnectionFailure } from "@paperclipai/a
 import { classifyGitCloneFailure, GitConnectionFailureError, readGitConnectionFailure } from "./git-connection-failure.js";
 import { probeGitWorktreeBase } from "./heartbeat/workspaces.js";
 import { createHeartbeatScheduling } from "./heartbeat/scheduling.js";
+import { isAgentAwaitingSetup } from "../modules/agent-lifecycle/index.js";
 import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
 import { captureDirectorySnapshot, disposeDirectorySnapshot, mergeDirectoryWithBaseline } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { initializeRunIdentity, explicitOperatorRunIdentity } from "./run-identity.js";
@@ -18500,6 +18501,8 @@ export function heartbeatService(
       );
       return null;
     }
+    // Keep accepted work in the durable queue until setup completes.
+    if (isAgentAwaitingSetup(agent as any)) return null;
     const invokability = companyAgents
       ? evaluateAgentInvokability(toAgentOrgRow(agent), companyAgents)
       : await getAgentInvokability(agent);
@@ -21307,6 +21310,8 @@ export function heartbeatService(
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
       if (!agent) return [];
+      // Accepted work stays queued while the agent is still being set up.
+      if (isAgentAwaitingSetup(agent as any)) return [];
       const invokability = await getAgentInvokability(agent);
       if (!invokability.invokable) {
         if (shouldCancelRunsForNonInvokableAgent(invokability)) {
@@ -28936,7 +28941,8 @@ export function heartbeatService(
       });
     }
 
-    const invokability = await getAgentInvokability(agent);
+    // Setup delays execution, but must not discard work accepted by a caller.
+    const invokability = await getAgentInvokability(isAgentAwaitingSetup(agent as any) ? { ...agent, status: "idle" } : agent);
     if (!invokability.invokable) {
       if (opts.requestedByActorType !== "user" || executionWaitRequestId) {
         await writeSkippedRequest("agent.not_invokable", {
