@@ -33,6 +33,13 @@ export type EnvironmentCustomImageTerminalPayloadValidationResult =
       message: string;
     };
 
+export interface EnvironmentCustomImageTerminalMintActor {
+  actorType: "agent" | "user";
+  actorId: string;
+  agentId: string | null;
+  runId: string | null;
+}
+
 export interface EnvironmentCustomImageTerminalSessionRecord {
   id: string;
   setupSessionId: string;
@@ -42,6 +49,8 @@ export interface EnvironmentCustomImageTerminalSessionRecord {
   connectionType: "ssh";
   ssh: ParsedCustomImageSetupSshCommand;
   hostKeySha256: string | null;
+  /** Actor that minted the token (from the logged mint request); used to attribute WS audit rows. */
+  mintedBy: EnvironmentCustomImageTerminalMintActor | null;
   createdAt: Date;
   connectExpiresAt: Date;
   sessionExpiresAt: Date;
@@ -190,6 +199,7 @@ export class EnvironmentCustomImageTerminalSessionStore {
     ssh: ParsedCustomImageSetupSshCommand;
     setupExpiresAt: Date | string;
     connectionExpiresAt?: Date | string | null;
+    mintedBy?: EnvironmentCustomImageTerminalMintActor | null;
     now?: Date;
   }): MintedEnvironmentCustomImageTerminalSession {
     const now = input.now ?? new Date();
@@ -216,6 +226,7 @@ export class EnvironmentCustomImageTerminalSessionStore {
       connectionType: "ssh",
       ssh: input.ssh,
       hostKeySha256: null,
+      mintedBy: input.mintedBy ?? null,
       createdAt: now,
       connectExpiresAt,
       sessionExpiresAt: setupExpiresAt,

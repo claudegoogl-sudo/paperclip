@@ -4,6 +4,7 @@ import type { Duplex } from "node:stream";
 import type { Db } from "@paperclipai/db";
 import { conflict, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+import { logActivity, type LogActivityInput } from "../services/activity-log.js";
 import {
   readCustomImageSetupSessionCompanyId,
   requireFutureCustomImageSetupExpiry,
@@ -490,6 +491,7 @@ export function setupEnvironmentCustomImageTerminalWebSocketServer(
     sessionStore?: EnvironmentCustomImageTerminalSessionStore;
     connectionRegistry?: EnvironmentCustomImageTerminalConnectionRegistry;
     sshConnector?: EnvironmentCustomImageSshConnector;
+    logActivity?: (input: LogActivityInput) => Promise<unknown>;
   } = {},
 ) {
   const wss = new WebSocketServer({ noServer: true });
@@ -499,6 +501,42 @@ export function setupEnvironmentCustomImageTerminalWebSocketServer(
   const sessionStore = opts.sessionStore ?? environmentCustomImageTerminalSessionStore;
   const connectionRegistry = opts.connectionRegistry ?? environmentCustomImageTerminalConnectionRegistry;
   const sshConnector = opts.sshConnector ?? createSsh2EnvironmentCustomImageSshConnector();
+  const writeActivity = opts.logActivity ?? ((input: LogActivityInput) => logActivity(db, input));
+
+  // Best-effort audit row. Never includes keystrokes, output, or commands: only
+  // that a session existed, who minted it, and how it ended.
+  const auditTerminal = (
+    session: EnvironmentCustomImageTerminalSessionRecord,
+    action: "environment.custom_image_terminal_session.opened" | "environment.custom_image_terminal_session.closed",
+    extra: Record<string, unknown>,
+  ) => {
+    const minter = session.mintedBy;
+    void Promise.resolve()
+      .then(() => writeActivity({
+        companyId: session.companyId,
+        actorType: minter?.actorType ?? "system",
+        actorId: minter?.actorId ?? "unknown",
+        agentId: minter?.agentId ?? null,
+        runId: minter?.runId ?? null,
+        action,
+        entityType: "environment",
+        entityId: session.environmentId,
+        details: {
+          terminalSessionId: session.id,
+          setupSessionId: session.setupSessionId,
+          provider: session.provider,
+          connectionType: session.connectionType,
+          attributedFrom: "environment.custom_image_terminal_session_token.created",
+          ...extra,
+        },
+      }))
+      .catch((err) => {
+        logger.error(
+          { err, event: "terminal_session_activity_write_failed", action, terminalSessionId: session.id },
+          "failed to write terminal session activity_log row",
+        );
+      });
+  };
 
   wss.on("connection", (socket: TerminalWsSocket, req: IncomingMessage) => {
     const upgradeContext = (req as IncomingMessageWithTerminalContext).paperclipTerminalUpgradeContext;
@@ -517,6 +555,7 @@ export function setupEnvironmentCustomImageTerminalWebSocketServer(
     let expiryTimer: ReturnType<typeof setTimeout> | null = null;
     let authTimer: ReturnType<typeof setTimeout> | null = null;
     let cleanedUp = false;
+    let openedAt: number | null = null;
 
     const cleanup = (reason: string) => {
       if (cleanedUp) return;
@@ -526,6 +565,13 @@ export function setupEnvironmentCustomImageTerminalWebSocketServer(
       cleanupRegistry?.();
       cleanupRegistry = null;
       const terminalSessionId = authenticatedContext?.terminalSession.id ?? upgradeContext.terminalSessionId;
+      if (authenticatedContext && openedAt !== null) {
+        auditTerminal(authenticatedContext.terminalSession, "environment.custom_image_terminal_session.closed", {
+          reason,
+          clean: reason === "client_closed" || reason === "ssh_closed" || reason === "expired" || reason === "server_shutdown",
+          durationMs: Date.now() - openedAt,
+        });
+      }
       if (authenticatedContext) {
         sessionStore.delete(authenticatedContext.terminalSession.id);
       }
@@ -585,6 +631,8 @@ export function setupEnvironmentCustomImageTerminalWebSocketServer(
             return;
           }
           shell = connectedShell;
+          openedAt = Date.now();
+          auditTerminal(context.terminalSession, "environment.custom_image_terminal_session.opened", {});
           if (pendingResize) {
             shell.resize(pendingResize.cols, pendingResize.rows);
             pendingResize = null;

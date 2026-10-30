@@ -181,10 +181,12 @@ describe("custom image terminal websocket bridge", () => {
     getSessionById: ReturnType<typeof vi.fn>;
     refreshSetupSession: ReturnType<typeof vi.fn>;
   };
+  let auditLog: ReturnType<typeof vi.fn>;
   let connector: EnvironmentCustomImageSshConnector & { connect: ReturnType<typeof vi.fn> };
 
   beforeEach(() => {
     servers = [];
+    auditLog = vi.fn(async () => undefined);
     sessionStore = new EnvironmentCustomImageTerminalSessionStore();
     connectionRegistry = new EnvironmentCustomImageTerminalConnectionRegistry();
     fakeShell = new FakeSshShell();
@@ -219,6 +221,7 @@ describe("custom image terminal websocket bridge", () => {
       sessionStore,
       connectionRegistry,
       sshConnector: connector,
+      logActivity: auditLog,
     });
     const port = await listen(server);
     return { server, port };
@@ -535,6 +538,62 @@ describe("custom image terminal websocket bridge", () => {
     await closePromise;
     expect(sessionStore.get({ id: minted.session.id, token: minted.token })).toBeNull();
     expect(fakeShell.closeCalls).toBeGreaterThan(0);
+  });
+
+  describe("audit rows", () => {
+    async function openSession() {
+      const { port } = await startHarness();
+      const minted = sessionStore.create({
+        setupSessionId: "session-1",
+        companyId: "company-1",
+        environmentId: "env-1",
+        provider: "daytona",
+        ssh: { username: "t", host: "example.test", port: 22 },
+        setupExpiresAt: futureDate(),
+        mintedBy: { actorType: "user", actorId: "user-1", agentId: null, runId: null },
+      });
+      const ws = new WebSocket(terminalUrl(port, { terminalSessionId: minted.session.id }));
+      const ready = waitForJsonMessage(ws, (frame) => frame.type === "ready");
+      await waitForOpen(ws);
+      sendTerminalAuth(ws, minted.token);
+      await ready;
+      return { ws, minted };
+    }
+    const actions = () => auditLog.mock.calls.map((c) => (c[0] as { action: string }).action);
+
+    it("writes opened then closed (clean) attributed to the minting actor, without terminal content", async () => {
+      const { ws, minted } = await openSession();
+      ws.send(JSON.stringify({ type: "input", data: "secret-command\r" }));
+      await waitForAssertion(() => expect(actions()).toEqual(["environment.custom_image_terminal_session.opened"]));
+      const closed = waitForClose(ws);
+      ws.close();
+      await closed;
+      await waitForAssertion(() => expect(actions()).toHaveLength(2));
+      const [open, close] = auditLog.mock.calls.map((c) => c[0] as Record<string, any>);
+      expect(open).toMatchObject({ companyId: "company-1", actorType: "user", actorId: "user-1", entityId: "env-1" });
+      expect(open.details).toMatchObject({ terminalSessionId: minted.session.id, setupSessionId: "session-1" });
+      expect(close.action).toBe("environment.custom_image_terminal_session.closed");
+      expect(close.details).toMatchObject({ reason: "client_closed", clean: true });
+      expect(JSON.stringify(auditLog.mock.calls)).not.toContain("secret-command");
+    });
+
+    it("writes a closed row flagged unclean on abnormal ssh error", async () => {
+      const { ws } = await openSession();
+      const closed = waitForClose(ws);
+      fakeShell.emitSshError(new Error("boom"));
+      await closed;
+      await waitForAssertion(() => expect(actions()).toHaveLength(2));
+      expect((auditLog.mock.calls[1][0] as any).details).toMatchObject({ reason: "ssh_error", clean: false });
+    });
+
+    it("does not break the session when the audit write fails", async () => {
+      auditLog.mockRejectedValue(new Error("db down"));
+      const { ws } = await openSession();
+      const closed = waitForClose(ws);
+      ws.close();
+      await closed;
+      await waitForAssertion(() => expect(auditLog).toHaveBeenCalledTimes(2));
+    });
   });
 
   it("closes active terminal sessions on server shutdown", async () => {
