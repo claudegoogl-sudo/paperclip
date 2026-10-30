@@ -154,7 +154,7 @@ async function createAgentApp(options: { agentId?: string; runId?: string } = {}
       agentId,
       companyId: "company-1",
       runId: options.runId ?? "run-1",
-      source: "api_key",
+      source: "agent_key",
       isInstanceAdmin: false,
     };
     next();

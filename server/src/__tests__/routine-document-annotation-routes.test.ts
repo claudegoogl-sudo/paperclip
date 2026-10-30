@@ -142,6 +142,7 @@ async function createApp(actor: "board" | "agent" = "board", actorCompanyId = co
     (req as any).actor = actor === "agent"
       ? {
         type: "agent",
+        source: "agent_key",
         agentId,
         companyId: actorCompanyId,
         runId: "88888888-8888-4888-8888-888888888888",

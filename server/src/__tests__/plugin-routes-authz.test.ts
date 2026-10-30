@@ -2,6 +2,14 @@ import express from "express";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+// Production middleware always stamps `source`; fixtures that hand-build an
+// actor without one must get the provenance the middleware would have set,
+// because getActorInfo now denies an unset source.
+function withActorSource<T extends Record<string, any>>(actor: T): T {
+  if (actor.source) return actor;
+  return { ...actor, source: actor.type === "agent" ? "agent_key" : "local_implicit" };
+}
+
 const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
   getByKey: vi.fn(),
@@ -81,7 +89,7 @@ async function createApp(
     });
   }
   app.use((req, _res, next) => {
-    req.actor = actor as typeof req.actor;
+    req.actor = withActorSource(actor as any) as typeof req.actor;
     next();
   });
   app.use("/api", pluginRoutes(
