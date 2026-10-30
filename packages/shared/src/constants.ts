@@ -713,6 +713,25 @@ export const APPROVAL_STATUSES = [
 ] as const;
 export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
 
+// Sliding window for the per-agent burst cap on approval-card creation
+// (POST /companies/:companyId/approvals). Approval asks are human-cadence
+// work — an agent files a handful per heartbeat at most — so one minute of
+// burst budget is ample for legitimate loops while bounding how fast a
+// compromised or looping agent can flood the board with cards.
+export const APPROVAL_CREATE_RATE_LIMIT_WINDOW_MS = 60_000;
+
+// Approval cards one agent may create per sliding window, enforced at the
+// route boundary for agent actors only (board/user callers are exempt:
+// trusted origin). ~an order of magnitude above observed legitimate agent
+// behaviour, so the cap should never bind outside abuse.
+export const APPROVAL_CREATE_RATE_LIMIT_MAX_PER_AGENT = 10;
+
+// Maximum simultaneously open (status "pending") approval cards attributed
+// to one agent. Withdrawing (where available) or resolving an existing card
+// frees budget; a full row of pending asks is already a runaway-agent
+// signal, so this caps how many unattended decisions one agent can stack.
+export const APPROVAL_CREATE_PENDING_CARD_CAP_PER_AGENT = 5;
+
 export const SECRET_PROVIDERS = [
   "local_encrypted",
   "aws_secrets_manager",
