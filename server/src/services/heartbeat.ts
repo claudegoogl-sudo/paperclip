@@ -1,3 +1,5 @@
+import { agentIdentityService, supportsManagedAgentIdentity } from "./agent-identity.js";
+import { createAgentIdentityRedactor } from "./agent-identity-redaction.js";
 import {
   ACTOR_PROVENANCE_PAYLOAD_KEY,
   captureActorProvenance,
@@ -26436,12 +26438,42 @@ export function heartbeatService(
             if (managedMcpConfig) {
               adapterContext.paperclipManagedMcp = managedMcpConfig;
             }
+            // Managed agent identity: provision lazily, hand the key to the
+            // adapter, and redact its material from everything it emits.
+            const managedAgentIdentity = supportsManagedAgentIdentity(
+              agent.adapterType,
+              agent.adapterConfig as { provider?: unknown },
+              undefined,
+            )
+              ? await agentIdentityService(db).ensureAgentIdentity(agent.companyId, agent.id)
+              : undefined;
+            if (managedAgentIdentity) secretKeys.add("PAPERCLIP_AGENT_PRIVATE_KEY");
+            const identityRedactor = createAgentIdentityRedactor(managedAgentIdentity?.privateKeyPem);
+            const identityRedactedOnLog = async (stream: "stdout" | "stderr", chunk: string) => {
+              const safe = identityRedactor.chunk(stream, chunk);
+              if (safe) await onLog(stream, safe);
+            };
+            const identityRedactedOnMeta = (meta: AdapterInvocationMeta) =>
+              onAdapterMeta(identityRedactor.redact(meta));
+            const identityRedactedOnEvent = (event: AdapterRuntimeEvent) =>
+              onAdapterEvent(identityRedactor.redact(event));
+            const executeWithIdentityFlush: typeof adapter.execute = async (input) => {
+              try {
+                return identityRedactor.redact(await adapter.execute(input));
+              } finally {
+                for (const stream of ["stdout", "stderr"] as const) {
+                  const tail = identityRedactor.finish(stream);
+                  if (tail) await onLog(stream, tail);
+                }
+              }
+            };
             const guardedDispatch =
               await dispatchResolvedInteractionContinuationWithAtomicGate(
                 (markDispatchStarted) => {
                   legacyAdapterEntered = true;
-                  return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
+                  return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => executeWithIdentityFlush({
                     getFreshSessionHandoff,
+                    agentIdentity: managedAgentIdentity,
                     runId: run.id,
                     agent,
                     runtime: runtimeForAdapter,
@@ -26461,9 +26493,9 @@ export function heartbeatService(
                       : undefined,
                     runtimeMcp,
                     runtimeTools,
-                    onLog,
-                    onMeta: onAdapterMeta,
-                    onEvent: onAdapterEvent,
+                    onLog: identityRedactedOnLog,
+                    onMeta: identityRedactedOnMeta,
+                    onEvent: identityRedactedOnEvent,
                     onExecutionPhase: executionControl.phases.enter,
                     startupTraceContext: getStartupTraceContext(),
                     onRuntimeProgress: async (progress) => {

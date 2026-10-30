@@ -133,7 +133,8 @@ describe("customer-success read authority", () => {
     const [header, payload] = bearer.split(".");
     const input = `${header}.${payload}`;
     const legacy = `${input}.${createHmac("sha256", "inspection-local-fixture").update(input).digest("base64url")}`;
-    expect(verifyLocalAgentJwt(legacy)).not.toBeNull();
+    // Fork policy (security review): no legacy master-secret fallback at all.
+    expect(verifyLocalAgentJwt(legacy)).toBeNull();
     expect(verifyLocalAgentJwt(legacy, { strictRunAuthority: true })).toBeNull();
     vi.stubEnv("PAPERCLIP_INSTANCE_ID", "development-clone");
     const foreign = createLocalAgentJwt(agentId, companyId, "process", runId)!;
