@@ -19,11 +19,7 @@ const runner: CommandManagedRuntimeRunner = {
       exitCode: error ? (typeof error.code === "number" ? error.code : 1) : 0,
       signal: error?.signal ?? null, timedOut: error?.killed ?? false, stdout, stderr,
     }));
-    // Git probes may exit without consuming stdin; their exit status remains
-    // authoritative. Surface unexpected pipe errors instead of masking them.
-    child.stdin?.on("error", (error: NodeJS.ErrnoException) => {
-      if (error.code !== "EPIPE") reject(error);
-    });
+    child.stdin?.on("error", () => {});
     child.stdin?.end(input.stdin ?? "");
   }),
 };
