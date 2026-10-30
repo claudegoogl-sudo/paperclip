@@ -73,6 +73,10 @@ describeEmbeddedPostgres("board API key scope enforcement", () => {
       return res.json({ ok: true, route: `plugins.${action}` });
     });
 
+    app.get("/api/plugins/:id/companies/:companyId/config-overrides", (_req, res) => res.json({ ok: true, route: "overrides.get" }));
+    app.post("/api/plugins/:id/companies/:companyId/config-overrides", (_req, res) => res.json({ ok: true, route: "overrides.post" }));
+    app.patch("/api/plugins/:id/companies/:companyId/config-overrides", (_req, res) => res.json({ ok: true, route: "overrides.patch" }));
+
     // CLI self identity (and a neighbour that must stay blocked) — the CLI's
     // login/whoami/connect flows read /cli-auth/me with the fresh key.
     app.get("/api/cli-auth/me", (_req, res) => res.json({ ok: true, route: "cli-auth.me" }));
@@ -217,6 +221,16 @@ describeEmbeddedPostgres("board API key scope enforcement", () => {
       expect(res.status).toBe(200);
       expect(res.body).toMatchObject({ route: `plugins.${action}` });
     }
+  });
+
+  it("a plugin_ops-scoped key can GET config-overrides but not POST/PATCH", async () => {
+    const app = buildApp();
+    const key = await createKey("plugin_ops");
+    const auth = { authorization: `Bearer ${key.token}` };
+    const url = `/api/plugins/${pluginId}/companies/c1/config-overrides`;
+    expect((await request(app).get(url).set(auth)).status).toBe(200);
+    expect((await request(app).post(url).set(auth).send({})).status).toBe(403);
+    expect((await request(app).patch(url).set(auth).send({})).status).toBe(403);
   });
 
   it("a plugin_ops-scoped key reaches GET /api/cli-auth/me (CLI login/whoami self identity) and nothing wider", async () => {
