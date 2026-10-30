@@ -77,6 +77,7 @@ import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot, disposeGitWorkspace
 import { readConnectionFailure, type GitConnectionFailure } from "@paperclipai/adapter-utils/connection-failure";
 import { classifyGitCloneFailure, GitConnectionFailureError, readGitConnectionFailure } from "./git-connection-failure.js";
 import { probeGitWorktreeBase } from "./heartbeat/workspaces.js";
+import { createHeartbeatScheduling } from "./heartbeat/scheduling.js";
 import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
 import { captureDirectorySnapshot, disposeDirectorySnapshot, mergeDirectoryWithBaseline } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { initializeRunIdentity, explicitOperatorRunIdentity } from "./run-identity.js";
@@ -4208,6 +4209,9 @@ interface WakeupOptions {
     statuses: string[];
     assigneeAgentId: string;
     statusVersion?: number;
+    /** Monitor fence: the wake is only valid for this exact claimed schedule. */
+    monitorNextCheckAt?: string;
+    monitorWakeRequestedAt?: string;
   };
   /** Keep causally distinct external chat continuations out of an existing run. */
   allowRunCoalescing?: boolean;
@@ -29259,6 +29263,9 @@ export function heartbeatService(
               executionWorkspacePreference: issues.executionWorkspacePreference,
               executionWorkspaceSettings: issues.executionWorkspaceSettings,
               assigneeAgentId: issues.assigneeAgentId,
+              assigneeUserId: issues.assigneeUserId,
+              monitorNextCheckAt: issues.monitorNextCheckAt,
+              monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
               executionRunId: issues.executionRunId,
               executionAgentNameKey: issues.executionAgentNameKey,
               createdAt: issues.createdAt,
@@ -29489,12 +29496,25 @@ export function heartbeatService(
           }))) return deferBlockedExecution(executionBlocker);
 
           const issueStateGuard = opts.issueStateGuard;
+          const activeMonitorRun = issueStateGuard?.monitorNextCheckAt === undefined ? null
+            : await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.nativeIssueId, issue.id),
+              eq(heartbeatRuns.runtimeMode, "native"), inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+            )).limit(1).then((rows) => rows[0] ?? null);
           if (
             issueStateGuard &&
             (!issueStateGuard.statuses.includes(issue.status) ||
               issue.assigneeAgentId !== issueStateGuard.assigneeAgentId ||
-              (issueStateGuard.statusVersion !== undefined && issue.statusVersion !== issueStateGuard.statusVersion))
+              (issueStateGuard.statusVersion !== undefined && issue.statusVersion !== issueStateGuard.statusVersion) ||
+              (issueStateGuard.monitorNextCheckAt !== undefined && (
+                activeMonitorRun !== null || issue.assigneeUserId !== null ||
+                issue.monitorNextCheckAt?.toISOString() !== issueStateGuard.monitorNextCheckAt ||
+                issue.monitorWakeRequestedAt?.toISOString() !== issueStateGuard.monitorWakeRequestedAt
+              )))
           ) {
+            // A deferred monitor retains its schedule; do not create a receipt
+            // that could suppress its next admission attempt.
+            if (issueStateGuard.monitorNextCheckAt !== undefined) return { kind: "skipped" as const };
             await tx.insert(agentWakeupRequests).values({
               ...durableReceiptFields,
               companyId: agent.companyId,
@@ -32386,6 +32406,22 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
     return row ? buildRunLivenessProbe(row) : null;
   }
+  // Monitor admission/consumption (claim fencing, monitor-only dispatch patch)
+  // lives in the extracted scheduling module; the fork delegates to it so the
+  // fenced two-phase semantics match upstream.
+  const scheduling = createHeartbeatScheduling(db, {
+    issuesSvc: issuesSvc as any,
+    enqueueWakeup: enqueueWakeup as any,
+    getRun: getRun as any,
+    getAgent: getAgent as any,
+    scheduleBoundedRetryForRun: scheduleBoundedRetryForRun as any,
+    getSchedulingSuppression,
+    getWorktreeExecutionCutoff: getWorktreeExecutionCutoff as any,
+    toAgentOrgRow: toAgentOrgRow as any,
+    groupAgentOrgRowsByCompany: groupAgentOrgRowsByCompany as any,
+    parseHeartbeatPolicy: parseHeartbeatPolicy as any,
+    claimDueTimerHeartbeat: claimDueTimerHeartbeat as any,
+  });
   return {
     waitForRunExecutionDrain: async (
       runId: string,
@@ -32692,7 +32728,7 @@ export function heartbeatService(
 
     wakeup: trackWakeup,
     dispatchPendingNativeStatusWakeups,
-    triggerIssueMonitor,
+    triggerIssueMonitor: scheduling.triggerIssueMonitor,
 
     reportRunActivity: clearDetachedRunWarning,
 
@@ -32772,92 +32808,7 @@ export function heartbeatService(
     buildRunLivenessProbe,
     getRunLivenessProbe,
 
-    tickTimers: async (now = new Date()) => {
-      if ((await getSchedulingSuppression()).suppressed) {
-        return {
-          checked: 0,
-          enqueued: 0,
-          skipped: 0,
-        };
-      }
-      const cutoff = await getWorktreeExecutionCutoff();
-
-      const allAgents = await db
-        .select({ ...getTableColumns(agents) })
-        .from(agents)
-        .innerJoin(companies, eq(companies.id, agents.companyId))
-        .where(eq(companies.status, "active"));
-      const agentsByCompany = groupAgentOrgRowsByCompany(
-        allAgents.map(toAgentOrgRow),
-      );
-      let checked = 0;
-      let enqueued = 0;
-      let skipped = 0;
-
-      for (const agent of allAgents) {
-        const invokability = evaluateAgentInvokability(
-          toAgentOrgRow(agent),
-          agentsByCompany.get(agent.companyId) ?? [],
-        );
-        if (!invokability.invokable) continue;
-        const policy = parseHeartbeatPolicy(agent);
-        if (!policy.enabled || policy.intervalSec <= 0) continue;
-
-        if (cutoff) {
-          const eligibleIssue = await db
-            .select({ id: issues.id })
-            .from(issues)
-            .where(
-              and(
-                eq(issues.companyId, agent.companyId),
-                eq(issues.assigneeAgentId, agent.id),
-                inArray(issues.status, ["todo", "in_progress"]),
-                gte(issues.createdAt, cutoff),
-              ),
-            )
-            .limit(1)
-            .then((rows) => rows[0] ?? null);
-          if (!eligibleIssue) continue;
-        }
-
-        checked += 1;
-        const baseline = new Date(
-          agent.lastHeartbeatAt ?? agent.createdAt,
-        ).getTime();
-        const elapsedMs = now.getTime() - baseline;
-        if (elapsedMs < policy.intervalSec * 1000) continue;
-        const timerClaim = await claimDueTimerHeartbeat(
-          agent,
-          now,
-          policy.intervalSec,
-        );
-        if (!timerClaim) continue;
-
-        const run = await enqueueWakeup(agent.id, {
-          source: "timer",
-          triggerDetail: "system",
-          reason: "heartbeat_timer",
-          requestedByActorType: "system",
-          requestedByActorId: "heartbeat_scheduler",
-          contextSnapshot: {
-            source: "scheduler",
-            reason: "interval_elapsed",
-            now: now.toISOString(),
-            timerClaimWasFirstHeartbeat: timerClaim.wasFirstHeartbeat,
-          },
-        });
-        if (run) enqueued += 1;
-        else skipped += 1;
-      }
-
-      const issueMonitors = await tickDueIssueMonitors(now);
-
-      return {
-        checked: checked + issueMonitors.checked,
-        enqueued: enqueued + issueMonitors.triggered,
-        skipped: skipped + issueMonitors.skipped,
-      };
-    },
+    tickTimers: (now = new Date()) => scheduling.tickTimers(now),
 
     cancelRun: (runId: string, reason?: string, options?: CancelRunOptions) =>
       cancelRunInternal(runId, reason, options),
