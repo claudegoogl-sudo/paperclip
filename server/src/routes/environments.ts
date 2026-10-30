@@ -859,6 +859,12 @@ export function environmentRoutes(
         now,
       });
       const actor = getActorInfo(req);
+      minted.session.mintedBy = {
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+      };
       await logEnvironmentCustomImageActivity({
         actor,
         companyId,
