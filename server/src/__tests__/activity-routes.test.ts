@@ -265,13 +265,14 @@ describe("activity routes", () => {
       const res = await requestApp(app, (baseUrl) => request(baseUrl).get(listUrl).query({ agentId }));
 
       expect(res.status).toBe(200);
-      expect(mockActivityService.list).toHaveBeenCalledWith({
+      // readCondition is the synced private-issue read filter added by upstream.
+      expect(mockActivityService.list).toHaveBeenCalledWith(expect.objectContaining({
         companyId: "company-1",
         agentId,
         entityType: undefined,
         entityId: undefined,
         limit: 100,
-      });
+      }));
     });
 
     it("treats an empty agentId as no filter", async () => {

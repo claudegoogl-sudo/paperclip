@@ -202,11 +202,7 @@ async function createApp(actor: "board" | "agent" = "board", actorCompanyId = co
 }
 
 describe("document annotation routes", () => {
-  beforeEach(async () => {
-    vi.resetModules();
-    vi.doUnmock("../routes/issues.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
+  beforeEach(() => {
     vi.clearAllMocks();
     mockIssueService.getById.mockResolvedValue({
       id: issueId,
@@ -241,11 +237,6 @@ describe("document annotation routes", () => {
     mockAnnotationService.addComment.mockResolvedValue(annotationComment);
     mockAnnotationService.updateThread.mockResolvedValue({ ...annotationThread, status: "resolved" });
     mockAnnotationService.remapOpenThreadsForDocument.mockResolvedValue([]);
-    // Cold route transforms belong to fixture setup, not the request timeout.
-    await Promise.all([
-      vi.importActual("../routes/issues.js"),
-      vi.importActual("../middleware/index.js"),
-    ]);
   });
 
   it("includes compact open annotations without comment bodies by default for agent document reads", async () => {
