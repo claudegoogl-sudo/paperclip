@@ -825,6 +825,44 @@ export function pluginRoutes(
       })));
   }
 
+  /**
+   * Coarse-grain audit row for plugin dispatch (action/job). Records the plugin
+   * and action/job key only - never params or results - so write volume is one
+   * row per dispatch. Company-scoped calls write a single row; instance-scoped
+   * calls fan out like the other plugin mutations. Best-effort: an audit write
+   * failure never fails the dispatch.
+   */
+  async function logPluginDispatchActivity(
+    req: Request,
+    action: string,
+    plugin: { id: string; pluginKey: string },
+    companyId: string | undefined,
+    details: Record<string, unknown>,
+  ): Promise<void> {
+    const full = { pluginKey: plugin.pluginKey, ...details };
+    try {
+      if (!companyId) {
+        await logPluginMutationActivity(req, action, plugin.id, full);
+        return;
+      }
+      const actor = getActorInfo(req);
+      await logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action,
+        entityType: "plugin",
+        entityId: plugin.id,
+        details: full,
+      });
+    } catch (err) {
+      logger.error({ err, action, pluginId: plugin.id }, "failed to write plugin dispatch activity_log row");
+    }
+  }
+
   function assertPluginBridgeScope(req: Request, companyId: unknown): string | undefined {
     if (companyId === undefined || companyId === null) {
       assertInstanceAdmin(req);
@@ -1791,6 +1829,11 @@ export function pluginRoutes(
 
     const companyId = assertPluginBridgeScope(req, body.companyId);
 
+    await logPluginDispatchActivity(req, "plugin.action.dispatched", plugin, companyId, {
+      actionKey: body.key,
+      via: "bridge/action",
+    });
+
     try {
       const result = await bridgeDeps.workerManager.call(
         plugin.id,
@@ -1974,6 +2017,11 @@ export function pluginRoutes(
     } | undefined;
 
     const companyId = assertPluginBridgeScope(req, body?.companyId);
+
+    await logPluginDispatchActivity(req, "plugin.action.dispatched", plugin, companyId, {
+      actionKey: key,
+      via: "actions/:key",
+    });
 
     try {
       const result = await bridgeDeps.workerManager.call(
@@ -3072,6 +3120,10 @@ export function pluginRoutes(
       res.status(404).json({ error: "Job not found" });
       return;
     }
+
+    await logPluginDispatchActivity(req, "plugin.job.triggered", plugin, undefined, {
+      jobId,
+    });
 
     try {
       const result = await jobDeps.scheduler.triggerJob(jobId, "manual");
