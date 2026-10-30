@@ -114,7 +114,7 @@ export function registerApprovalCommands(program: Command): void {
       .requiredOption("-C, --company-id <id>", "Company ID")
       .requiredOption("--type <type>", "Approval type (hire_agent|approve_ceo_strategy)")
       .requiredOption("--payload <json>", "Approval payload as JSON object")
-      .option("--requested-by-agent-id <id>", "Requesting agent ID")
+      .option("--requested-by-agent-id <id>", "Requesting agent ID (agent callers only, must equal the authenticated agent; board/user callers must omit it — the server rejects it with 400)")
       .option("--issue-ids <csv>", "Comma-separated linked issue IDs")
       .action(async (opts: ApprovalCreateOptions) => {
         try {
