@@ -3,6 +3,14 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
 
+// Production middleware always stamps `source`; fixtures that hand-build an
+// actor without one must get the provenance the middleware would have set,
+// because getActorInfo now denies an unset source.
+function withActorSource<T extends Record<string, any>>(actor: T): T {
+  if (actor.source) return actor;
+  return { ...actor, source: actor.type === "agent" ? "agent_key" : "local_implicit" };
+}
+
 const mockIssueService = vi.hoisted(() => ({
   clearOrphanCheckoutLocksIfTerminal: vi.fn(async () => false),
   getById: vi.fn(),
@@ -234,13 +242,13 @@ async function installActor(
     import("../middleware/index.js"),
   ]);
   app.use((req, _res, next) => {
-    (req as any).actor = actor ?? {
+    (req as any).actor = withActorSource(actor ?? {
       type: "board",
       userId: "local-board",
       companyIds: ["company-1"],
       source: "local_implicit",
       isInstanceAdmin: false,
-    };
+    });
     next();
   });
   app.use("/api", issueRoutes(mockDb as any, {} as any));
