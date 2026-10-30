@@ -8590,6 +8590,11 @@ export async function buildPaperclipWakePayload(input: {
   const executionAlreadyReconciled =
     recoveryAction?.status === "resolved" &&
     Boolean(recoveryEvidence.executionReconciliation);
+  // A restored task resumes its deliverable, not the completed repair. A
+  // referenced settled/missing action must not fall back to a stale cause.
+  const recoveryStillActive = recoveryAction
+    ? ["active", "escalated"].includes(recoveryAction.status)
+    : !recoveryActionId && Boolean(recoveryCause);
   const originalAssigneeId =
     recoveryAction?.returnOwnerAgentId ??
     recoveryAction?.previousOwnerAgentId ??
@@ -8671,7 +8676,7 @@ export async function buildPaperclipWakePayload(input: {
     attachmentOmissions,
     externalChatProvider,
     recovery:
-      !executionAlreadyReconciled && (recoveryAction || recoveryCause)
+      !executionAlreadyReconciled && recoveryStillActive && (recoveryAction || recoveryCause)
         ? {
             cause: recoveryAction?.cause ?? recoveryCause,
             failureSummary: readNonEmptyString(recoveryEvidence.failureSummary),
@@ -17471,7 +17476,13 @@ export function heartbeatService(
     const now = new Date();
     const cancelled = await setRunStatusIfRunning(run.id, "cancelled", {
       error: error.message, errorCode: AI_CONNECTION_BUSY_RETRY_REASON, finishedAt: now,
-      resultJson: { executionRecovery: { kind: "ai_connection_wait", providerWorkStarted: false } },
+      resultJson: {
+        executionRecovery: { kind: "ai_connection_wait", providerWorkStarted: false },
+        cancellation: {
+          source: "control_plane", expected: true, initiator: { type: "system" },
+          reason: "Waiting for shared AI credentials", recordedAt: now.toISOString(),
+        },
+      },
       contextSnapshot: {
         ...parseObject(run.contextSnapshot),
         aiConnectionBusyDeferredWhileAssignee: wasIssueAssignee,
