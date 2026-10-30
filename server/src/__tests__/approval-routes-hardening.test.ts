@@ -167,7 +167,7 @@ async function createAgentApp(options: { agentId?: string; runId?: string } = {}
 function agentPost(app: express.Express, body: Record<string, unknown>) {
   return request(app)
     .post("/api/companies/company-1/approvals")
-    .send({ type: "request_board_approval", payload: { title: "Approve hosting spend" }, ...body });
+    .send({ type: "request_board_approval", payload: { title: "Approve hosting spend", summary: "Hosting spend for the quarter" }, ...body });
 }
 
 describe("approval create attribution", () => {
