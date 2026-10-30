@@ -853,8 +853,8 @@ console.log(JSON.stringify({ type: "result", subtype: "success", result: "hello"
     const app = express();
     app.use((req, _res, next) => {
       req.actor = req.header("x-agent")
-        ? { type: "agent", agentId, companyId, companyIds: [companyId], onBehalfOfUserId: owner }
-        : { type: "board", userId: req.header("x-test-user") ?? owner, companyIds: [companyId] };
+        ? { type: "agent", source: "agent_key", agentId, companyId, companyIds: [companyId], onBehalfOfUserId: owner }
+        : { type: "board", source: "session", userId: req.header("x-test-user") ?? owner, companyIds: [companyId] };
       next();
     });
     app.use("/api", aiConnectionRoutes(db));

@@ -249,6 +249,7 @@ async function createApp(actor: Record<string, unknown>) {
   app.use(express.json());
   app.use((req, _res, next) => {
     (req as any).actor = {
+      source: actor.type === "agent" ? "agent_key" : "session",
       ...actor,
       companyIds: Array.isArray(actor.companyIds) ? [...actor.companyIds] : actor.companyIds,
     };

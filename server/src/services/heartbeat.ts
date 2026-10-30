@@ -3793,15 +3793,13 @@ const heartbeatRunListColumns = {
 
 const heartbeatRunSummaryListColumns = {
   ...heartbeatRunListColumns,
-  // Token counts and cost stay available to summary rows (they feed budget
-  // oversight and the locked stubs for private runs); nothing else of usageJson.
-  usageJson: sql<Record<string, unknown> | null>`case when ${heartbeatRuns.usageJson} is null then null else jsonb_strip_nulls(jsonb_build_object(
-    'inputTokens', ${heartbeatRuns.usageJson} -> 'inputTokens',
-    'cachedInputTokens', ${heartbeatRuns.usageJson} -> 'cachedInputTokens',
-    'outputTokens', ${heartbeatRuns.usageJson} -> 'outputTokens',
-    'totalTokens', ${heartbeatRuns.usageJson} -> 'totalTokens',
-    'costUsd', ${heartbeatRuns.usageJson} -> 'costUsd'
-  )) end`.as("usageJson"),
+  usageJson: sql<Record<string, unknown> | null>`NULL`.as("usageJson"),
+  // Scalar token counts keep private-run stubs budget-visible without
+  // shipping the full usageJson on summary rows.
+  usageInputTokens: sql<string | null>`${heartbeatRuns.usageJson} ->> 'inputTokens'`.as("usageInputTokens"),
+  usageCachedInputTokens: sql<string | null>`${heartbeatRuns.usageJson} ->> 'cachedInputTokens'`.as("usageCachedInputTokens"),
+  usageOutputTokens: sql<string | null>`${heartbeatRuns.usageJson} ->> 'outputTokens'`.as("usageOutputTokens"),
+  usageTotalTokens: sql<string | null>`${heartbeatRuns.usageJson} ->> 'totalTokens'`.as("usageTotalTokens"),
   resultTotalCostUsd: sql<string | null>`${heartbeatRuns.resultJson} ->> 'total_cost_usd'`.as("resultTotalCostUsd"),
   resultCostUsd: sql<string | null>`${heartbeatRuns.resultJson} ->> 'cost_usd'`.as("resultCostUsd"),
   resultCostUsdCamel: sql<string | null>`${heartbeatRuns.resultJson} ->> 'costUsd'`.as("resultCostUsdCamel"),

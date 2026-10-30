@@ -64,7 +64,7 @@ async function createApp(actorOverrides: Record<string, unknown> = {}) {
       type: "board",
       userId: "user-1",
       companyIds: ["company-1"],
-      source: "session",
+      source: (actorOverrides as any).type === "agent" ? "agent_key" : "session",
       isInstanceAdmin: false,
       ...actorOverrides,
     };
@@ -101,7 +101,7 @@ async function createAgentApp(options: { runId?: string; agentId?: string } = {}
     agentId: options.agentId ?? "agent-1",
     companyId: "company-1",
     runId: options.runId ?? "run-1",
-    source: "api_key",
+    source: "agent_key",
     isInstanceAdmin: false,
   });
 }

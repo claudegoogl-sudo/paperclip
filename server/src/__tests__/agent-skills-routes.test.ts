@@ -189,7 +189,7 @@ async function createApp(db: Record<string, unknown> = createDb(), actor?: Recor
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = actor ?? {
+    (req as any).actor = (actor && !actor.source ? { ...actor, source: actor.type === "agent" ? "agent_key" : "local_implicit" } : actor) ?? {
       type: "board",
       userId: "local-board",
       companyIds: ["company-1"],

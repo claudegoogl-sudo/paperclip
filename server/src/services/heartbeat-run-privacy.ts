@@ -134,10 +134,10 @@ export function redactHeartbeatRunListRow<T extends Record<string, unknown> & { 
     durationMs: runDurationMs(row),
     costUsd,
     usageJson: pickTokenUsage(row.usageJson ?? {
-      inputTokens: row.inputTokens,
-      cachedInputTokens: row.cachedInputTokens,
-      outputTokens: row.outputTokens,
-      totalTokens: row.totalTokens,
+      inputTokens: row.inputTokens ?? (row as Record<string, unknown>).usageInputTokens,
+      cachedInputTokens: row.cachedInputTokens ?? (row as Record<string, unknown>).usageCachedInputTokens,
+      outputTokens: row.outputTokens ?? (row as Record<string, unknown>).usageOutputTokens,
+      totalTokens: row.totalTokens ?? (row as Record<string, unknown>).usageTotalTokens,
     }),
     redacted: true,
   };

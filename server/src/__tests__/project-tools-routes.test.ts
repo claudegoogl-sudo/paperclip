@@ -27,7 +27,7 @@ async function createApp() {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = { type: "agent", agentId: "agent-1", companyId: "company-1", runId: "run-1" };
+    (req as any).actor = { type: "agent", source: "agent_key", agentId: "agent-1", companyId: "company-1", runId: "run-1" };
     next();
   });
   app.use("/api", projectToolRoutes({} as never));

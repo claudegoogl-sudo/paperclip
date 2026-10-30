@@ -74,7 +74,7 @@ beforeAll(async () => {
       agentId: "agent-1",
       companyId: "company-1",
       runId: "run-1",
-      source: "api_key",
+      source: "agent_key",
       isInstanceAdmin: false,
     };
     next();

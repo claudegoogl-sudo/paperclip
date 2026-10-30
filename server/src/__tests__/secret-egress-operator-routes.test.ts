@@ -104,7 +104,7 @@ describeDb("operator egress routes", () => {
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
-      req.actor = actor;
+      req.actor = (actor.source ? actor : { ...actor, source: actor.type === "agent" ? "agent_key" : "local_implicit" }) as typeof actor;
       next();
     });
     app.use("/api", secretRoutes(db));
