@@ -12883,15 +12883,21 @@ export function heartbeatService(
         : 0;
 
     let reason: string | null = null;
+    let promptInputTokens = 0;
     if (policy.maxSessionRuns > 0 && runs.length > policy.maxSessionRuns) {
       reason = `session exceeded ${policy.maxSessionRuns} runs`;
     } else if (
       policy.maxRawInputTokens > 0 &&
       latestRawUsage &&
-      latestRawUsage.inputTokens >= policy.maxRawInputTokens
+      // Adapters that report cache reads separately from input (flagged by
+      // rawInputIncludesCached === false) still pay for them in the prompt.
+      (promptInputTokens = latestRawUsage.inputTokens +
+        (parseObject(latestRun?.usageJson).rawInputIncludesCached === false
+          ? latestRawUsage.cachedInputTokens
+          : 0)) >= policy.maxRawInputTokens
     ) {
       reason =
-        `session raw input reached ${formatCount(latestRawUsage.inputTokens)} tokens ` +
+        `session raw input reached ${formatCount(promptInputTokens)} tokens ` +
         `(threshold ${formatCount(policy.maxRawInputTokens)})`;
     } else if (
       policy.maxSessionAgeHours > 0 &&
@@ -27004,6 +27010,7 @@ export function heartbeatService(
                 ...(rawUsage
                   ? {
                       rawInputTokens: rawUsage.inputTokens,
+                      rawInputIncludesCached: false,
                       rawCachedInputTokens: rawUsage.cachedInputTokens,
                       rawOutputTokens: rawUsage.outputTokens,
                     }
