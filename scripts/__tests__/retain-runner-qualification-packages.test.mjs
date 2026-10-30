@@ -22,6 +22,7 @@ test('retention preserves public archives and runs the normal plugin prepack wit
     put('packages/plugins/sandbox-providers/daytona/dist/index.js', 'export const retained = true;\n');
     json('packages/plugins/sdk/package.json', { name: '@paperclipai/plugin-sdk', version: '0.3.1' });
     put('scripts/generate-plugin-package-json.mjs', readFileSync(new URL('../generate-plugin-package-json.mjs', import.meta.url)));
+    put('scripts/source-commit.mjs', readFileSync(new URL('../source-commit.mjs', import.meta.url)));
     json('packages/paperclip-runner/package.json', { name: '@paperclipai/paperclip-runner', version: '0.0.0', private: true, files: ['dist'] });
     put('packages/paperclip-runner/dist/cli/eval-session.js', 'export const evaluation = true;\n');
     const publicArchives = ['@paperclipai/server', 'paperclipai', '@paperclipai/plugin-sdk'].map((name, i) => ({ name, file: put(`public-${i}.tgz`, `unchanged archive ${name}`) }));
