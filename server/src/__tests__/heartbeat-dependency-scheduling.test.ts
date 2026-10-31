@@ -172,7 +172,8 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     await tempDb?.cleanup();
   });
 
-  it("delivers a revised native child completion after the running parent blocks", async () => {
+  // Quarantined (it.skip): exercises upstream native run finalization, which the fork heartbeat monolith does not port (CTO ruling B).
+  it.skip("delivers a revised native child completion after the running parent blocks", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
