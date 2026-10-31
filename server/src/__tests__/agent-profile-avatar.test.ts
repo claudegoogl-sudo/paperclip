@@ -54,7 +54,7 @@ function appFor(actor: Request["actor"]) {
 
 it("uploads, normalizes, serves privately, retries without duplication, and resets the avatar", async () => {
   const f = await fixture();
-  const app = appFor({ type: "agent", agentId: f.agent.id, companyId: f.company.id });
+  const app = appFor({ type: "agent", source: "agent_key", agentId: f.agent.id, companyId: f.company.id });
   const path = `/api/companies/${f.company.id}/agents/${f.agent.id}/avatar`;
   const upload = await request(app).put(path).send({ imageBase64 }).expect(200);
   expect(upload.body.appearance.paletteId).toBe(f.agent.appearance?.paletteId);
@@ -84,7 +84,7 @@ it("rejects other agents, companies, viewers, and foreign asset references", asy
   await request(appFor({ type: "none" })).put(path).send({ imageBase64 }).expect(401);
   const foreign = await setAgentProfileAvatar(db, storage, other.company.id, other.agent.id, { imageBase64 }, other.actor);
   await expect(agentService(db).update(f.agent.id, { appearance: foreign.appearance })).rejects.toThrow("avatar upload");
-  await request(appFor({ type: "agent", agentId: f.agent.id, companyId: f.company.id })).get(foreign.avatarUrl).expect(404);
+  await request(appFor({ type: "agent", source: "agent_key", agentId: f.agent.id, companyId: f.company.id })).get(foreign.avatarUrl).expect(404);
 });
 
 it("requires an agent configuration grant for board avatar changes", async () => {
@@ -109,7 +109,7 @@ it.each([
   { kind: "skill_test" as const, issueId: randomUUID() },
 ])("rejects profile changes by restricted %s credentials", async keyScope => {
   const f = await fixture();
-  const app = appFor({ type: "agent", agentId: f.agent.id, companyId: f.company.id, keyScope });
+  const app = appFor({ type: "agent", source: "agent_key", agentId: f.agent.id, companyId: f.company.id, keyScope });
   const path = `/api/companies/${f.company.id}/agents/${f.agent.id}/avatar`;
   await request(app).put(path).send({ imageBase64 }).expect(403);
   await request(app).put(path).send({ imageBase64: null }).expect(403);
@@ -125,7 +125,7 @@ it("rejects URLs, SVG, corrupt and oversized images, unsupported fields and inac
   const tooManyPixels = await sharp({ create: { width: 5000, height: 5000, channels: 3, background: "white" } }).png().toBuffer();
   await expect(normalizeAgentAvatar(tooManyPixels.toString("base64"))).rejects.toThrow("16 megapixels");
   const f = await fixture();
-  const app = appFor({ type: "agent", agentId: f.agent.id, companyId: f.company.id });
+  const app = appFor({ type: "agent", source: "agent_key", agentId: f.agent.id, companyId: f.company.id });
   await request(app).put(`/api/companies/${f.company.id}/agents/${f.agent.id}/avatar`).send({ imageBase64, agentId: randomUUID() }).expect(400);
   await db.update(agents).set({ status: "pending_approval" }).where(eq(agents.id, f.agent.id));
   await expect(setAgentProfileAvatar(db, storage, f.company.id, f.agent.id, { imageBase64 }, f.actor)).rejects.toThrow("current state");
