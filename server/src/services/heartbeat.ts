@@ -32623,13 +32623,11 @@ export function heartbeatService(
         return {
           ...rest,
           ...(summary
-            ? {
-                costUsd: (() => {
-                  const raw = resultCostUsdCamel ?? resultCostUsd ?? resultTotalCostUsd;
-                  const parsed = raw == null ? NaN : Number(raw);
-                  return Number.isFinite(parsed) ? parsed : null;
-                })(),
-              }
+            ? (() => {
+                const raw = resultCostUsdCamel ?? resultCostUsd ?? resultTotalCostUsd;
+                const parsed = raw == null ? NaN : Number(raw);
+                return Number.isFinite(parsed) ? { costUsd: parsed } : {};
+              })()
             : {}),
           contextSnapshot: summarizeHeartbeatRunContextSnapshot({
             issueId: contextIssueId,
