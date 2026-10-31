@@ -7024,6 +7024,7 @@ function buildSessionConfigCategoryValues(input: {
   secretManifest: readonly EffectiveRunConfigSecretManifestEntry[];
   runtimeSkills: unknown;
   agentConfigRevision: unknown;
+  agentIdentityKeyId?: string;
 }) {
   const sanitizedSecretManifest = sanitizeSecretManifestForConfigFingerprint(
     input.secretManifest,
@@ -7045,6 +7046,7 @@ function buildSessionConfigCategoryValues(input: {
   return {
     adapter: {
       adapterType: input.adapterType,
+      ...(input.agentIdentityKeyId ? { agentIdentityKeyId: input.agentIdentityKeyId } : {}),
       agentConfigRevision: input.agentConfigRevision,
     },
     adapterConfig: input.effectiveAdapterConfig,
@@ -7077,6 +7079,7 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
   secretManifest?: readonly EffectiveRunConfigSecretManifestEntry[];
   runtimeSkills: unknown;
   agentConfigRevision?: unknown;
+  agentIdentityKeyId?: string;
 }): Promise<EffectiveRunSessionConfigMetadata> {
   const secretManifest = input.secretManifest ?? [];
   const instructions = await resolveInstructionsConfigFingerprintMetadata(
@@ -7096,6 +7099,7 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
     secretManifest,
     runtimeSkills: input.runtimeSkills,
     agentConfigRevision: input.agentConfigRevision ?? null,
+    agentIdentityKeyId: input.agentIdentityKeyId,
   });
   const fingerprints = createEffectiveRunConfigFingerprints({
     session: categoryValues,
@@ -23288,7 +23292,11 @@ export function heartbeatService(
         agent.companyId,
         agent.id,
       );
+      const sessionIdentityKeyId = supportsManagedAgentIdentity(agent.adapterType, agent.adapterConfig as { provider?: unknown }, undefined)
+        ? (await agentIdentityService(db).ensureAgentIdentity(agent.companyId, agent.id)).keyId
+        : undefined;
       const sessionConfigMetadataInput = {
+          agentIdentityKeyId: sessionIdentityKeyId,
           adapterType: agent.adapterType,
           effectiveAdapterConfig: runtimeConfig,
           managedAiHome: managedAiRuntime?.home,
@@ -23387,7 +23395,7 @@ export function heartbeatService(
         compatibleConfigMetadata,
         wakeResetReason: wakeSessionResetReason,
         preserveLegacySessionWithoutConfigMetadata:
-          acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision,
+          acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision && !sessionIdentityKeyId,
       });
       const resetTaskSession =
         shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
