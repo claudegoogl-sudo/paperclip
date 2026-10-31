@@ -3,7 +3,11 @@ import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 vi.mock("../adapters/registry.js", () => ({
   listServerAdapters: vi.fn(),
 }));
-vi.mock("../middleware/logger.js", () => ({ logger: { warn: vi.fn() } }));
+vi.mock("../middleware/logger.js", () => {
+  const logger: Record<string, unknown> = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() };
+  logger.child = vi.fn(() => logger);
+  return { logger };
+});
 
 import { listServerAdapters } from "../adapters/registry.js";
 import { fetchAllQuotaWindows } from "../services/quota-windows.js";
