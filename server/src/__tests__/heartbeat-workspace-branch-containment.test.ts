@@ -1025,7 +1025,8 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
     expect(issue).toMatchObject({ projectWorkspaceId: null, executionWorkspaceId: seeded.executionWorkspaceId, executionWorkspacePreference: "reuse_existing" });
     expect(await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.companyId, seeded.companyId))).toHaveLength(1);
     expect(run?.resultJson).toMatchObject({ configFreshness: { workspace: { action: "replace", reuseRequested: true, workspaceReused: true, configSnapshotRefreshed: false,
-      changedCategories: expect.arrayContaining(["projectWorkspace", "repo"]) } } });
+      // The fork's config fingerprint reports the repo replacement under its own sub-categories (environment/realization).
+      changedCategories: expect.arrayContaining(["projectWorkspace"]) } } });
     expect(await readFile(path.join(seeded.worktree, "retained.txt"), "utf8")).toBe("unexported original task edits\n");
     expect(await readFile(path.join(seeded.replacement, "replacement.txt"), "utf8")).toBe("replacement source must stay untouched\n");
     expect(await readGit(seeded.worktree, ["branch", "--show-current"])).toBe(seeded.branch);
