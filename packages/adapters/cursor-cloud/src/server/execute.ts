@@ -116,6 +116,11 @@ function buildWakeEnv(ctx: AdapterExecutionContext, configEnv: Record<string, st
     ...buildRuntimeToolsEnv(ctx.runtimeTools),
     PAPERCLIP_RUN_ID: runId,
   };
+  // An explicitly empty configured GIT_* value opts out of the agent's default git
+  // attribution (empty values are never forwarded to the cloud environment).
+  for (const [key, value] of Object.entries(configEnv)) {
+    if (key.startsWith("GIT_") && value === "") delete env[key];
+  }
   // PAPERCLIP_API_KEY is never accepted from config — the harness-minted run
   // token is the only source of Paperclip API identity.
   delete env.PAPERCLIP_API_KEY;
