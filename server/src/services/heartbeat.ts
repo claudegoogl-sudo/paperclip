@@ -3816,6 +3816,10 @@ const heartbeatRunSummaryListColumns = {
 } as const;
 
 const heartbeatRunListContextColumns = {
+  // Run-privacy binding: the list route decides per row whether the actor may
+  // read the full run or only a redacted stub, and needs the stored scope.
+  scopeKind: heartbeatRuns.scopeKind,
+  issueId: sql<string | null>`coalesce(${heartbeatRuns.issueId}::text, ${heartbeatRuns.contextSnapshot} ->> 'issueId')`.as("issueId"),
   contextIssueId: sql<
     string | null
   >`${heartbeatRuns.contextSnapshot} ->> 'issueId'`.as("contextIssueId"),
