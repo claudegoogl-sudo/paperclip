@@ -22410,7 +22410,7 @@ export function heartbeatService(
           if (error instanceof AiConnectionPoolExhausted && !routerHasPersistedInput) {
             const now = new Date();
             context.aiConnectionBusyDeferredWhileAssignee = issueContext?.assigneeAgentId === agent.id;
-            const cancelled = await setRunStatusIfRunning(run.id, "cancelled", { error: error.message, errorCode: error.code, finishedAt: now, resultJson: { executionRecovery: { kind: "ai_connection_wait", providerWorkStarted: false }, retryAt: error.retryAt }, contextSnapshot: context });
+            const cancelled = await setRunStatusIfRunning(run.id, "cancelled", { error: error.message, errorCode: error.code, finishedAt: now, resultJson: { executionRecovery: { kind: "ai_connection_wait", providerWorkStarted: false }, cancellation: { source: "control_plane", expected: true, initiator: { type: "system" }, reason: "Waiting for an AI connection pool account", recordedAt: now.toISOString() }, retryAt: error.retryAt }, contextSnapshot: context });
             if (cancelled.updated) {
               await setWakeupStatus(run.wakeupRequestId, "cancelled", { finishedAt: now, error: error.message });
               const retry = await scheduleBoundedRetryForRun(cancelled.run ?? run, agent, { now, retryReason: AI_CONNECTION_POOL_WAIT_RETRY_REASON, wakeReason: "ai_connection_pool_retry", maxAttempts: (run.scheduledRetryAttempt ?? 0) + 1, delayMs: Math.max(1000, Date.parse(error.retryAt) - Date.now()) });
