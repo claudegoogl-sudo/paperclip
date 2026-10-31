@@ -78,7 +78,7 @@ import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-uti
 import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot, disposeGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
 import { readConnectionFailure, type GitConnectionFailure } from "@paperclipai/adapter-utils/connection-failure";
 import { classifyGitCloneFailure, GitConnectionFailureError, readGitConnectionFailure } from "./git-connection-failure.js";
-import { probeGitWorktreeBase } from "./heartbeat/workspaces.js";
+import { probeGitWorktreeBase, createHeartbeatWorkspaceResolver } from "./heartbeat/workspaces.js";
 import { createHeartbeatScheduling } from "./heartbeat/scheduling.js";
 import { isAgentAwaitingSetup } from "../modules/agent-lifecycle/index.js";
 import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
@@ -23513,6 +23513,24 @@ export function heartbeatService(
             {
               useProjectWorkspace:
                 requestedExecutionWorkspaceMode !== "agent_default",
+              // A reused git worktree must prove its original source repository
+              // (scope, registration, replaced-repo) before anything is rebound.
+              anchorWorkspace: requestedShouldReuseExisting && reusableExistingExecutionWorkspace?.strategyType === "git_worktree"
+                ? await createHeartbeatWorkspaceResolver(db).resolveReusedGitWorkspaceAnchor({
+                    agent,
+                    workspace: reusableExistingExecutionWorkspace,
+                    responsibleUserId,
+                    immutableNativeBinding: Boolean(nativeRecoveryExecutionWorkspaceId),
+                    projectId: nativeRecoveryExecutionWorkspaceId
+                      ? reusableExistingExecutionWorkspace.projectId
+                      : issueRef?.projectId ?? readNonEmptyString(context.projectId),
+                    explicitProjectWorkspaceId: nativeRecoveryExecutionWorkspaceId
+                      ? reusableExistingExecutionWorkspace.projectWorkspaceId
+                      : readNonEmptyString(context.projectWorkspaceId),
+                    issueId,
+                    runId: run.id,
+                  })
+                : undefined,
               // Thread the selected environment driver so run-workspace resolution can tell a local
               // target from a remote one, and a confined sandbox target from an unconfined remote
               // target. A remote run resolves referenced projects only for the confined sandbox
