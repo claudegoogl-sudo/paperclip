@@ -3264,15 +3264,18 @@ describe("agent issue mutation checkout ownership", () => {
 
       const app = await createApp(thirdActor());
       const read = await request(app).get(`/api/issues/${issueId}`);
-      expect(read.status, JSON.stringify(read.body)).toBe(403);
-      expect(read.body.error).toBe("Issue is outside this actor's authorization boundary");
+      // Upstream now hides an out-of-visibility issue behind 404 on reads.
+      expect(read.status, JSON.stringify(read.body)).toBe(404);
+      expect(read.body.error).toBe("Issue not found");
 
       const res = await request(app)
         .patch(`/api/issues/${issueId}`)
         .send({ assigneeAgentId: thirdAgentId, status: "cancelled" });
 
-      expect(res.status, JSON.stringify(res.body)).toBe(403);
-      expect(res.body.details.code).toBe("issue_write_not_visible");
+      // The write is still denied (nothing is updated); the denial now surfaces as
+      // the same not-found response that hides the issue's existence.
+      expect(res.status, JSON.stringify(res.body)).toBe(404);
+      expect(res.body.error).toBe("Issue not found");
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
   });
