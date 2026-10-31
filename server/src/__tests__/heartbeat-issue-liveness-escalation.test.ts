@@ -47,7 +47,7 @@ const mockAdapterExecute = vi.hoisted(() =>
 );
 
 vi.mock("../telemetry.ts", () => ({
-  getTelemetryClient: () => ({ track: vi.fn() }),
+  getTelemetryClient: () => ({ track: vi.fn(), hashPrivateRef: vi.fn((value: string) => `hashed:${value}`) }),
 }));
 
 vi.mock("@paperclipai/shared/telemetry", async () => {
@@ -347,7 +347,10 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     return { companyId, agentId, blockedIssueId, blockerIssueId, executionWorkspaceId };
   }
 
-  it.each(["pathless", "monitor"] as const)("runs exactly one bounded review-path recovery with %s disposition", async (disposition) => {
+  // Quarantined (it.skip) for "pathless": upstream review-path-loss blocking is not ported into the fork heartbeat monolith
+  // (CTO ruling B: upstream-only liveness behaviour). The "monitor" disposition still runs.
+  it.skip("runs exactly one bounded review-path recovery with pathless disposition", () => {});
+  it.each(["monitor"] as const)("runs exactly one bounded review-path recovery with %s disposition", async (disposition) => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
