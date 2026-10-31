@@ -1,3 +1,4 @@
+import { executionFailureRetryCount } from "../execution-recovery-attempt.js";
 import {
   issues,
   issueComments,
@@ -655,7 +656,15 @@ export function createHeartbeatScheduling(
             "Native execution recovery owns this provider failure; a quota monitor cannot start a replacement.",
           );
         }
-        if (await legacyExecutionNeedsReconciliationWithEvidence(db, sourceRun)) {
+        // A quota monitor replays only while the source run retains retry
+        // budget; once the two-attempt hold is spent, escalate to operator
+        // reconciliation instead of replaying forever.
+        const quotaReplayBudgetExhausted =
+          executionFailureRetryCount(sourceRun) >= 2;
+        if (
+          quotaReplayBudgetExhausted ||
+          await legacyExecutionNeedsReconciliationWithEvidence(db, sourceRun)
+        ) {
           await terminalizeLegacyExecution({
             db,
             run: sourceRun,
