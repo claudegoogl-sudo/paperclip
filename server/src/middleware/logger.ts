@@ -9,6 +9,7 @@ import { resolveDefaultLogsDir, resolveHomeAwarePath } from "../home-paths.js";
 import {
   isPrivateWebhookHttpRequest,
   isSecretSensitiveHttpRequest,
+  isPrivateAgentCommentaryHttpRequest,
   shouldSilenceHttpSuccessLog,
 } from "./http-log-policy.js";
 import { redactSecretsForLog, redactSecretsDeepForLog } from "../secret-patterns.js";
@@ -170,6 +171,9 @@ export function createHttpLogger(baseLogger: pino.Logger) {
   //    res serializer emits status only), so there is nothing to scrub there.
     serializers: {
       req(req: Record<string, unknown> & { url?: unknown; method?: unknown; id?: unknown }) {
+        if (isPrivateAgentCommentaryHttpRequest(typeof req.url === "string" ? req.url : undefined)) {
+          return { id: req.id, method: req.method, url: stripSecretBearingUrlParts(req.url as string) };
+        }
         if (
           isPrivateWebhook({
             method: typeof req.method === "string" ? req.method : undefined,
@@ -196,7 +200,9 @@ export function createHttpLogger(baseLogger: pino.Logger) {
           raw?: { req?: { method?: string; originalUrl?: unknown; url?: unknown } };
         },
       ) {
-        return res.raw?.req && isPrivateWebhook(res.raw.req)
+        // A provider error may also be reflected in response headers. Keep the
+        // same content-free contract on both sides of a webhook request.
+        return res.raw?.req && (isPrivateWebhook(res.raw.req) || isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(res.raw.req)))
           ? { statusCode: res.statusCode }
           : res;
       },
@@ -225,6 +231,9 @@ export function createHttpLogger(baseLogger: pino.Logger) {
     return redactSecretsForLog(`${req.method} ${requestLogUrl(req)} ${res.statusCode} — ${errMsg}`);
   },
   customErrorObject(req, _res, _err, value) {
+    if (isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req))) {
+      return { ...value, err: { type: "Error", message: "Feedback request failed" } };
+    }
     // pino-http serializes res.err independently of customProps/errorContext.
     // Do not rely on a particular error handler having sanitized an SDK Error.
     return isPrivateWebhook(req)
@@ -239,7 +248,7 @@ export function createHttpLogger(baseLogger: pino.Logger) {
       const ctx = (res as any).__errorContext;
       return { reqBody: "[REDACTED]", ...(ctx ? { errorContext: { name: "Error" } } : {}) };
     }
-    if (res.statusCode >= 400 && isPrivateWebhook(req)) {
+    if (res.statusCode >= 400 && (isPrivateWebhook(req) || isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req)))) {
       // Omit, rather than recursively redact, the entire provider payload —
       // before/after parsing, with or without error context.
       return {

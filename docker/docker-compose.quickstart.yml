@@ -16,6 +16,8 @@ services:
     # backstop if something leaks anyway — the container hits its own limit and
     # dies visibly rather than starving the host of pids.
     pids_limit: 2048
+    # Includes the shared 30s adapter-settlement window and final cleanup.
+    stop_grace_period: 90s
     ports:
       # Loopback by default: UFW/iptables INPUT rules do not filter
       # Docker-published ports, so this bind address is the effective control.

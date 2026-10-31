@@ -21,6 +21,7 @@ import {
   isPaperclipExternalChatTurn,
   materializePaperclipSkillCopy,
   PAPERCLIP_OPERATIONAL_SKILL_KEY,
+  PAPERCLIP_FEEDBACK_SKILL_KEYS,
   refreshPaperclipWorkspaceEnvForExecution,
   renderPaperclipWakePrompt,
   resolveLegacyPaperclipDesiredSkillNames,
@@ -31,6 +32,8 @@ import {
   runningProcesses,
   runChildProcess,
   sanitizeSshRemoteEnv,
+  sanitizeInheritedPaperclipEnv,
+  isForbiddenConfigEnvKey,
   signalRunningProcess,
   shapePaperclipWorkspaceEnvForExecution,
   rewriteWorkspaceCwdEnvVarsForExecution,
@@ -51,6 +54,13 @@ vi.mock("./ssh.js", async (importOriginal) => {
       return { args: [], cleanup: sshMock.cleanup };
     },
   };
+});
+
+it("reserves identity credentials even for mixed-case inherited or configured keys", () => {
+  const keys = ["PAPERCLIP_AGENT_KEY_ID", "Paperclip_Agent_Public_Key", "paperclip_agent_private_key"];
+  const inherited = Object.fromEntries(keys.map(key => [key, "host-override"]));
+  expect(sanitizeInheritedPaperclipEnv({ ...inherited, PATH: "/usr/bin" })).toEqual({ PATH: "/usr/bin" });
+  for (const key of keys) expect(isForbiddenConfigEnvKey(key)).toBe(true);
 });
 
 describe("runtime connection tool delivery", () => {
@@ -155,6 +165,17 @@ describe("legacy adapter skill selection", () => {
     expect(resolvePaperclipDesiredSkillNames({}, [operationalEntry])).toEqual(
       [],
     );
+  });
+
+  it("makes feedback available to existing legacy agents without opting native agents into API skills", () => {
+    const inventory = [operationalEntry, ...PAPERCLIP_FEEDBACK_SKILL_KEYS.map((key) => ({ key }))];
+    for (const config of [{}, { paperclipSkillSync: { desiredSkills: [] } }]) {
+      expect(resolveLegacyPaperclipDesiredSkillNames(config, inventory)).toEqual([
+        PAPERCLIP_OPERATIONAL_SKILL_KEY, ...PAPERCLIP_FEEDBACK_SKILL_KEYS,
+      ]);
+      expect(resolvePaperclipDesiredSkillNames(config, inventory)).toEqual([]);
+    }
+    expect(resolveLegacyPaperclipDesiredSkillNames({}, inventory.slice(1))).toEqual([]);
   });
 });
 
@@ -1038,6 +1059,20 @@ describe("runChildProcess", () => {
 });
 
 describe("renderPaperclipWakePrompt", () => {
+  it.each([false, true])("renders the runtime checkout flag for ordinary task wakes (resume=%s)", resumedSession => {
+    const payload = { reason: "issue_assigned", issue: { id: "issue-1", status: "in_progress" },
+      comments: [], commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+      fallbackFetchNeeded: false };
+    const claimed = renderPaperclipWakePrompt({ ...payload, checkedOutByHarness: true }, { resumedSession });
+    expect(claimed).toContain(resumedSession ? "checkout: already claimed by the harness for this run" :
+      "The harness already checked out this issue for the current run.");
+    for (const checkedOutByHarness of [false, undefined]) {
+      const unclaimed = renderPaperclipWakePrompt({ ...payload, checkedOutByHarness }, { resumedSession });
+      expect(unclaimed).not.toContain("checkout: already claimed");
+      expect(unclaimed).not.toContain("The harness already checked out this issue for the current run.");
+    }
+  });
+
   it("leaves conversation disposition and accepted-plan handoff to the injected chat policy", () => {
     const payload = {
       reason: "issue_commented",
@@ -1234,10 +1269,14 @@ describe("renderPaperclipWakePrompt", () => {
       );
       expect(prompt).toContain("server-authenticated github chat turn");
       expect(prompt).toContain("Make zero Paperclip API calls");
+      expect(prompt).toContain("text answer that does not require structured human input");
       expect(prompt).toContain("answer directly");
       expect(prompt).toContain("exactly one semantic completion");
       expect(prompt).toContain("summary is the user-visible final answer");
       expect(prompt).toContain("Private progress commentary is not delivered");
+      expect(prompt).toContain("periodically edit that same comment with update_comment");
+      expect(prompt).toContain("semantic completion remains internal to Paperclip");
+      expect(prompt).toContain("do not post progress or completion comments");
       expect(prompt).toContain("any actionable file-access or delivery limitation");
       expect(prompt).toContain(
         "Keep wait and review dispositions in the semantic control fields",
@@ -3883,7 +3922,7 @@ describe("buildPaperclipEnv", () => {
         PAPERCLIP_RUNTIME_API_URL: "https://paperclip.example.com",
       },
       () => {
-        const env = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" }, { apiBase: "agent" });
+        const env = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" }, undefined, { apiBase: "agent" });
         expect(env.PAPERCLIP_API_URL).toBe("http://127.0.0.1:3100");
       },
     );
@@ -3898,7 +3937,7 @@ describe("buildPaperclipEnv", () => {
       () => {
         const env = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" });
         expect(env.PAPERCLIP_API_URL).toBe("https://paperclip.example.com");
-        const explicit = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" }, { apiBase: "runtime" });
+        const explicit = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" }, undefined, { apiBase: "runtime" });
         expect(explicit.PAPERCLIP_API_URL).toBe("https://paperclip.example.com");
       },
     );

@@ -69,7 +69,7 @@ ALTER TABLE "agent_instruction_working_copies" ADD CONSTRAINT "agent_instruction
 CREATE INDEX "agent_instruction_copies_pending_idx" ON "agent_instruction_working_copies" USING btree ("state","next_attempt_at");--> statement-breakpoint
 CREATE INDEX "agent_instruction_copies_agent_idx" ON "agent_instruction_working_copies" USING btree ("company_id","agent_id","created_at");` },
 ];
-const migration = await readFile(new URL("./migrations/0308_serious_tinkerer.sql", import.meta.url), "utf8");
+const migration = await readFile(new URL("./migrations/0287_serious_tinkerer.sql", import.meta.url), "utf8");
 const migrationHash = createHash("sha256").update(migration).digest("hex");
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -118,7 +118,7 @@ describePostgres("instruction revision migrations", () => {
       const before = await snapshot();
       expect(before.relations).toHaveLength(3);
       expect(await inspectMigrations(database.connectionString)).toMatchObject({
-        status: "needsMigrations", pendingMigrations: ["0308_serious_tinkerer.sql"],
+        status: "needsMigrations", pendingMigrations: ["0287_serious_tinkerer.sql"],
       });
       await applyPendingMigrations(database.connectionString);
       const upgraded = await snapshot();

@@ -33,25 +33,20 @@ const mockAccessService = vi.hoisted(() => ({
   decide: vi.fn(),
 }));
 
-// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
-// registry must be in place before ANY import of the routes module, in every
-// test. createApp concurrently imports middleware and route modules whose
-// graphs both contain services/index.js. With doMock-registered mocks that
-// first evaluation could race the registry under load and bind the REAL
-// services module, rejecting the request under test with a 500 (observed on
-// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
-// to every import graph deterministically.
-vi.mock("../services/index.js", () => ({
-  accessService: () => mockAccessService,
-  approvalService: () => mockApprovalService,
-  heartbeatService: () => mockHeartbeatService,
-  issueApprovalService: () => mockIssueApprovalService,
-  logActivity: mockLogActivity,
-  secretService: () => mockSecretService,
-}));
-
-// The services mock is hoisted above; hoistModuleGraph needs no extra doMock.
-function registerModuleMocks() {}
+function registerModuleMocks() {
+  vi.doMock("../services/authorization.js", async (importActual) => ({
+    ...await importActual<typeof import("../services/authorization.js")>(),
+    canActorReadApproval: async () => true,
+  }));
+  vi.doMock("../services/index.js", () => ({
+    accessService: () => mockAccessService,
+    approvalService: () => mockApprovalService,
+    heartbeatService: () => mockHeartbeatService,
+    issueApprovalService: () => mockIssueApprovalService,
+    logActivity: mockLogActivity,
+    secretService: () => mockSecretService,
+  }));
+}
 
 const routeModules = hoistModuleGraph(registerModuleMocks, async () => {
   const { errorHandler } = await import("../middleware/index.js");
@@ -334,7 +329,7 @@ describe("approval routes idempotent retries", () => {
       requestedByAgentId: "agent-1",
       requestedByUserId: null,
       status: "pending",
-      payload: { title: "Approve hosting spend" },
+      payload: { title: "Approve hosting spend", summary: "Hosting spend needs board approval" },
       decisionNote: null,
       decidedByUserId: null,
       decidedAt: null,
@@ -347,7 +342,7 @@ describe("approval routes idempotent retries", () => {
       .send({
         type: "request_board_approval",
         issueIds: ["00000000-0000-0000-0000-000000000001"],
-        payload: { title: "Approve hosting spend", summary: "Hosting renewal is due; approve the annual plan." },
+        payload: { title: "Approve hosting spend", summary: "Hosting spend needs board approval" },
       });
 
     expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
@@ -387,7 +382,7 @@ describe("approval routes idempotent retries", () => {
       .post("/api/companies/company-1/approvals")
       .send({
         type: "request_board_approval",
-        payload: { title: "Approve hosting spend", summary: "Hosting renewal is due; approve the annual plan." },
+        payload: { title: "Approve hosting spend", summary: "Hosting spend needs board approval" },
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);

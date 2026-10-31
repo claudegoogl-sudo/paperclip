@@ -163,6 +163,7 @@ vi.mock("../services/company-skills.js", () => ({
 
 vi.mock("../services/budgets.js", () => ({
   budgetService: () => mockBudgetService,
+  policyBlocks: vi.fn(async () => false),
 }));
 
 vi.mock("../services/heartbeat.js", () => ({
@@ -285,7 +286,7 @@ async function requestApp(
   }
 }
 
-describe.sequential("agent permission routes", () => {
+describe("agent permission routes", () => {
   // Warm the route module graph once; the cold import exceeds the per-test timeout.
   beforeAll(async () => {
     await Promise.all([import("../middleware/index.js"), import("../routes/agents.js")]);

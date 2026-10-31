@@ -651,7 +651,7 @@ describe("scoped plugin API routes", () => {
   }, 20_000);
 });
 
-describe.sequential("plugin per-tenant config override routes", () => {
+describe("plugin per-tenant config override routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockRegistry.getCompanyConfigOverride.mockResolvedValue(null);
@@ -902,7 +902,7 @@ describe.sequential("plugin per-tenant config override routes", () => {
   });
 });
 
-describe.sequential("plugin local folder routes", () => {
+describe("plugin local folder routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockRegistry.getCompanySettings.mockResolvedValue(null);
@@ -1552,7 +1552,7 @@ describe("plugin tool and bridge authz", () => {
   });
 });
 
-describe.sequential("plugin tool dispatch for agent actors", () => {
+describe("plugin tool dispatch for agent actors", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -1870,7 +1870,7 @@ describe.sequential("plugin tool dispatch for agent actors", () => {
   });
 });
 
-describe.sequential("webhook token mint route", () => {
+describe("webhook token mint route", () => {
   const endpointKey = "telegram";
   const digestKey = "webhookTokenDigest";
 
@@ -2069,7 +2069,7 @@ describe.sequential("webhook token mint route", () => {
   });
 });
 
-describe.sequential("operator-hidden plugin management floor", () => {
+describe("operator-hidden plugin management floor", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     process.env.PAPERCLIP_HIDDEN_SETTINGS = "instance.plugins";

@@ -1,3 +1,4 @@
+import { createAgentLifecycle } from "../services/agent-lifecycle.js";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -20,15 +21,17 @@ describe("persisted agent personas", () => {
   afterAll(async () => { await database?.cleanup(); });
   it("randomizes once, accepts a saved draft and preserves identity across edits and revision rollback", async () => {
     const service = agentService(db);
-    const random = await service.create(companyId, { name: "Random", role: "engineer", adapterType: "process" });
+    const serviceLifecycle = createAgentLifecycle(db);
+    const random = await serviceLifecycle.requestHire(companyId, { name: "Random", role: "engineer", adapterType: "process" });
     expect(agentAppearanceSchema.safeParse(random.appearance).success).toBe(true);
     const appearance = appearanceForPalette("arctic-blue");
-    const original = await service.create(companyId, { name: "Draft", role: "engineer", adapterType: "process", appearance });
+    const original = await serviceLifecycle.requestHire(companyId, { name: "Draft", role: "engineer", adapterType: "process", appearance });
     expect(original.appearance).toEqual(appearance);
     const updated = await service.update(original.id, { name: "Renamed" }, { recordRevision: { source: "test" } });
     expect(updated?.appearance).toEqual(appearance);
     const [revision] = await service.listConfigRevisions(original.id);
-    await service.update(original.id, { name: "Changed again", status: "paused" });
+    await service.update(original.id, { name: "Changed again" });
+    await serviceLifecycle.pauseAgent(original.id);
     const restored = await service.rollbackConfigRevision(original.id, revision.id, {});
     expect(restored?.appearance).toEqual(appearance);
     expect((await agentService(db).getById(original.id))?.avatarUrl).toContain("/arctic-blue/rest.png?size=512");
@@ -38,7 +41,7 @@ describe("persisted agent personas", () => {
   it("backfills legacy IDs with exactly the same persisted identity as the runtime fallback", async () => {
     const ids = Array.from({ length: 20 }, () => randomUUID());
     await db.insert(agents).values(ids.map((id, i) => ({ id, companyId, name: `Legacy ${i}`, role: "engineer", appearance: null, icon: "bot" })));
-    const migration = await readFile(new URL("../../../packages/db/src/migrations/0300_unique_genesis.sql", import.meta.url), "utf8");
+    const migration = await readFile(new URL("../../../packages/db/src/migrations/0280_unique_genesis.sql", import.meta.url), "utf8");
     // Replaying the entire migration must preserve saved choices and tolerate
     // an already-created column from an earlier worktree migration number.
     for (let replay = 0; replay < 2; replay++) {

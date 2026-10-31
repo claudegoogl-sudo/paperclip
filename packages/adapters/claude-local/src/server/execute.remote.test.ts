@@ -285,6 +285,34 @@ describe("claude remote execution", () => {
     expect(call?.[2]).not.toContain("--resume");
   });
 
+  it("explains a remote-to-local session reset even when the cwd matches", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-local-reset-"));
+    cleanupDirs.push(rootDir);
+    vi.stubEnv("PAPERCLIP_HOME", rootDir);
+    const onLog = vi.fn(async () => {});
+
+    await execute({
+      runId: "run-local-reset",
+      agent: { id: "agent-1", companyId: "company-1", name: "Claude Coder", adapterType: "claude_local", adapterConfig: {} },
+      runtime: {
+        sessionId: "12345678-1234-4abc-9def-123456789012",
+        sessionParams: {
+          cwd: rootDir,
+          remoteExecution: { transport: "ssh", host: "remote.test", port: 22, username: "fixture", remoteCwd: rootDir },
+        },
+        sessionDisplayId: null,
+        taskKey: null,
+      },
+      config: { engine: "cli", command: "claude", cwd: rootDir, paperclipRuntimeSkills: [] },
+      context: {},
+      onLog,
+    });
+
+    expect(runChildProcess.mock.calls[0]?.[2]).not.toContain("--resume");
+    expect(onLog).toHaveBeenCalledWith("stdout", expect.stringContaining("does not match the current execution target"));
+    expect(onLog).not.toHaveBeenCalledWith("stdout", expect.stringContaining("was saved for cwd"));
+  });
+
   it("resumes saved Claude sessions for remote SSH execution when the remote identity matches", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-remote-resume-match-"));
     cleanupDirs.push(rootDir);
@@ -312,7 +340,7 @@ describe("claude remote execution", () => {
           // no configured skills, but the operational skill is always mounted for
           // legacy adapters (upstream's resolveLegacyPaperclipDesiredSkillNames)
           // and its library manifest participates in the bundle hash.
-          promptBundleKey: "ebf6237a701826e12f927e26bde1291f4fa4fe6860c0f89e4132d1c8215a0644",
+          promptBundleKey: "94a42440a8a57bce7460dc06381fd0b1131b3b442cbdd42555321a98c2f086c2",
           remoteExecution: {
             transport: "ssh",
             host: "127.0.0.1",
@@ -594,7 +622,7 @@ describe("claude remote execution", () => {
       },
       runtime: {
         sessionId: "12345678-1234-4abc-9def-123456789012",
-        sessionParams: { sessionId: "12345678-1234-4abc-9def-123456789012", cwd: workspaceDir, promptBundleKey: "ebf6237a701826e12f927e26bde1291f4fa4fe6860c0f89e4132d1c8215a0644" },
+        sessionParams: { sessionId: "12345678-1234-4abc-9def-123456789012", cwd: workspaceDir, promptBundleKey: "94a42440a8a57bce7460dc06381fd0b1131b3b442cbdd42555321a98c2f086c2" },
         sessionDisplayId: "12345678-1234-4abc-9def-123456789012",
         taskKey: null,
       },

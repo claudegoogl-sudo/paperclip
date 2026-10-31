@@ -1,3 +1,5 @@
+import { agentIdentityService, supportsManagedAgentIdentity } from "./agent-identity.js";
+import { createAgentIdentityRedactor } from "./agent-identity-redaction.js";
 import {
   ACTOR_PROVENANCE_PAYLOAD_KEY,
   captureActorProvenance,
@@ -26,6 +28,8 @@ import { hasStopOnlyCleanup, settleStopOnlyCleanup } from "./sandbox-stop-and-re
 import { applyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-result";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { externalConversationStateSql, nonIdleSlackIssueCondition } from "./slack-conversation-state.js";
+import { TASK_QUESTION_GUIDANCE } from "./issue-question-context.js";
+import { slackChatAgentGuidance } from "./connectors/slack/agent-guidance.js";
 import { settleSlackConversation } from "./slack-conversation-lifecycle.js";
 import { publicChatTaskUrl } from "./chat-task-url.js";
 import { toolActionDeliveryService } from "./tool-action-delivery.js";
@@ -72,6 +76,12 @@ export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot, disposeGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
+import { readConnectionFailure, type GitConnectionFailure } from "@paperclipai/adapter-utils/connection-failure";
+import { classifyGitCloneFailure, GitConnectionFailureError, readGitConnectionFailure } from "./git-connection-failure.js";
+import { spekoToolsForSession } from "./voice/speko-agent-tools.js";
+import { probeGitWorktreeBase, createHeartbeatWorkspaceResolver } from "./heartbeat/workspaces.js";
+import { createHeartbeatScheduling } from "./heartbeat/scheduling.js";
+import { isAgentAwaitingSetup } from "../modules/agent-lifecycle/index.js";
 import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
 import { captureDirectorySnapshot, disposeDirectorySnapshot, mergeDirectoryWithBaseline } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { initializeRunIdentity, explicitOperatorRunIdentity } from "./run-identity.js";
@@ -535,6 +545,11 @@ import {
 import { USAGE_LIMIT_PARK_MAX_HORIZON_MS, usageLimitParkService } from "./usage-limit-park.js";
 import { highCommentVolumeAlertService } from "./high-comment-volume-alert.js";
 import { instanceAdmissionHoldService } from "./instance-admission-hold.js";
+import { decisionModelService } from "./decision-models.js";
+export { normalizeAdapterRunUsage } from "./heartbeat/run-state.js";
+import { readTaskDrain, computeTaskDrain, applyTaskDrain, startTaskDrain, stopTaskDrain } from "./task-admission.js";
+import { createCostAccountingReconciler } from "./run-cost-accounting.js";
+import { agentExecutionsHaveStopped } from "./agent-execution-stop.js";
 import {
   evaluateExecutionAllowlist,
   isExecutionForcedToKubernetes,
@@ -1536,55 +1551,9 @@ const nativeSessionResumeDispatchTimers = new Map<
 // module scope like activeRunExecutions above, so both the pure
 // resolveHeartbeatSchedulingSuppression() check and every heartbeatService()
 // instance see the same drain.
-let taskDrainState: { startedAt: Date; expiresAt: Date | null } | null = null;
-
-function readTaskDrain(
-  now: Date,
-): { startedAt: Date; expiresAt: Date | null } | null {
-  if (
-    taskDrainState &&
-    taskDrainState.expiresAt !== null &&
-    taskDrainState.expiresAt.getTime() <= now.getTime()
-  ) {
-    taskDrainState = null;
-  }
-  return taskDrainState;
-}
-
-/** Compute the drain a start call would apply, without changing state. */
-export function computeTaskDrain(opts: { ttlMs?: number | null } = {}): {
-  startedAt: Date;
-  expiresAt: Date | null;
-} {
-  const startedAt = new Date();
-  const ttlMs = opts.ttlMs ?? null;
-  const expiresAt =
-    ttlMs === null ? null : new Date(startedAt.getTime() + ttlMs);
-  return { startedAt, expiresAt };
-}
-
-/** Assign the given drain as the current task-drain state. */
-export function applyTaskDrain(drain: {
-  startedAt: Date;
-  expiresAt: Date | null;
-}): void {
-  taskDrainState = drain;
-}
-
-export function startTaskDrain(opts: { ttlMs?: number | null } = {}): {
-  startedAt: Date;
-  expiresAt: Date | null;
-} {
-  const drain = computeTaskDrain(opts);
-  applyTaskDrain(drain);
-  return drain;
-}
-
-export function stopTaskDrain(): { wasActive: boolean } {
-  const wasActive = readTaskDrain(new Date()) !== null;
-  taskDrainState = null;
-  return { wasActive };
-}
+// Shared with HTTP admission so an idle hold fences work before inspection.
+// (Upstream sync: state lives in task-admission.ts.)
+export { computeTaskDrain, applyTaskDrain, startTaskDrain, stopTaskDrain } from "./task-admission.js";
 
 /**
  * Report the task-drain state for this process only. `activeRuns` and
@@ -1599,11 +1568,13 @@ export function getTaskDrainStatus(): {
   activeRuns: number;
   pendingWakes: number;
   quiescent: boolean;
+  ownerId?: string;
 } {
   const state = readTaskDrain(new Date());
   const activeRuns = activeRunExecutionPromises.size;
   const pendingWakes = activeWakeupPromises.size;
   return {
+    ...(state?.ownerId ? { ownerId: state.ownerId } : {}),
     draining: state !== null,
     startedAt: state?.startedAt ?? null,
     expiresAt: state?.expiresAt ?? null,
@@ -1934,6 +1905,26 @@ export async function resolveExecutionRunAdapterConfig(input: {
   trustedEnvProjection?: Record<string, string>;
   trustedEnvSecretKeys?: string[];
 }) {
+  // The runner marks configured env keys itself; a user- or bindings-supplied
+  // value for the reserved marker must never reach resolution or the process.
+  const stripConfiguredEnvMarker = (value: unknown): unknown => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+    if (!Object.prototype.hasOwnProperty.call(value, "PAPERCLIP_CONFIGURED_ENV_KEYS")) return value;
+    const { PAPERCLIP_CONFIGURED_ENV_KEYS: _marker, ...rest } = value as Record<string, unknown>;
+    return rest;
+  };
+  input = {
+    ...input,
+    environmentEnv: stripConfiguredEnvMarker(input.environmentEnv),
+    projectEnv: stripConfiguredEnvMarker(input.projectEnv),
+    routineEnv: stripConfiguredEnvMarker(input.routineEnv),
+    executionRunConfig: {
+      ...input.executionRunConfig,
+      ...(input.executionRunConfig?.env !== undefined
+        ? { env: stripConfiguredEnvMarker(input.executionRunConfig.env) }
+        : {}),
+    },
+  };
   const executionRunConfig = stripForbiddenEnvFromAdapterConfig(
     input.executionRunConfig,
     input.managedGitHubCredentials,
@@ -2332,6 +2323,13 @@ export async function resolveExecutionRunAdapterConfig(input: {
   }
   return {
     resolvedConfig,
+    // Resolved task values captured before provider credential injection or
+    // host inheritance (consumed by native dispatch launch-limit checks).
+    configuredTaskEnvironment: Object.fromEntries(
+      Object.entries(parseObject(resolvedConfig.env)).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string",
+      ),
+    ),
     secretKeys,
     // Typed outcome of the sanctioned task_bridge credential resolution, for
     // the run-start consumer surface (run log + wake context). `null` means
@@ -2921,6 +2919,7 @@ async function materializeManagedProjectWorkspace(
     : null;
   const cloneTmpDir = await fs.mkdtemp(`${cwd}.clone-`);
   try {
+    try {
     await execFile(
       "git",
       [...(auth?.configArgs ?? []), "clone", "--no-hardlinks", "--", input.localSource ?? input.repoUrl, cloneTmpDir],
@@ -2937,6 +2936,13 @@ async function materializeManagedProjectWorkspace(
         timeout: MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS,
       },
     );
+    } catch (error) {
+      const connectionFailure = !input.localSource ? classifyGitCloneFailure(input.repoUrl, error) : null;
+      if (connectionFailure) throw new GitConnectionFailureError(
+        error instanceof Error ? error.message : "Git clone failed", connectionFailure,
+      );
+      throw error;
+    }
     if (input.localSource) {
       const snapshot = await readGitWorkspaceSnapshot(input.localSource, false);
       if (!snapshot) throw new Error("Configured repository folder is not a Git checkout");
@@ -2967,6 +2973,8 @@ async function materializeManagedProjectWorkspace(
     // Preserve the closed failure code without copying subprocess output or
     // credentials into the durable run. Setup recovery needs the actual cause.
     if (isWorkspaceGitScanError(error)) throw new WorkspaceGitScanError(error.code, message);
+    const connectionFailure = readGitConnectionFailure(error);
+    if (connectionFailure) throw new GitConnectionFailureError(message, connectionFailure);
     throw new Error(message);
   }
 
@@ -3376,6 +3384,8 @@ export async function assertGitWorktreeBaseWorkspaceReady(input: {
   anchor?: {
     baseCwdFallback?: boolean;
     materializationFailures?: WorkspaceMaterializationFailure[];
+    /** Selected database workspace is an explicit local path with no repository URL. */
+    localPathOnlyWorkspace?: boolean;
   } | null;
 }) {
   if (!input.issue) return;
@@ -3399,8 +3409,10 @@ export async function assertGitWorktreeBaseWorkspaceReady(input: {
     reason: string,
     message: string,
     extra: Record<string, unknown> = {},
+    connectionFailure?: GitConnectionFailure,
   ) => {
     throw new WorkspaceValidationFailure(message, {
+      ...(connectionFailure ? { connectionFailure } : {}),
       workspaceValidation: {
         reason,
         issueId: input.issue!.id,
@@ -3437,17 +3449,31 @@ export async function assertGitWorktreeBaseWorkspaceReady(input: {
   const materializationFailures = input.anchor?.materializationFailures ?? [];
   if (input.anchor?.baseCwdFallback && materializationFailures.length > 0) {
     const failureDetail = `: ${materializationFailures[0].error.replace(/\s+/g, " ")}`;
+    const connections = materializationFailures.map((failure) => readConnectionFailure(failure.connectionFailure));
+    // Mixed connection/local failures must retain their application-error report.
+    const connectionFailure = connections.every((failure) => failure?.provider === "git")
+      ? connections[0] as GitConnectionFailure : undefined;
     fail(
       "git_worktree_base_materialization_failed",
       `Issue ${issueLabel} requested ${input.requestedExecutionWorkspaceMode} with git_worktree, but the project workspace checkout could not be prepared${failureDetail}. Repair the project workspace repository URL, clone access, or configured local cwd, then retry.`,
       { baseCwdFallback: true, materializationFailures },
+      connectionFailure,
     );
   }
 
-  if (!(await isGitCheckout(input.base.baseCwd))) {
+  const checkoutProbe = await probeGitWorktreeBase(input.base.baseCwd);
+  if (!checkoutProbe.isCheckout) {
+    const knownLocalPathMismatch = checkoutProbe.notRepository &&
+      input.anchor?.localPathOnlyWorkspace === true &&
+      input.anchor.baseCwdFallback === false && materializationFailures.length === 0 &&
+      input.base.source === "project_primary" && Boolean(input.base.projectId) &&
+      Boolean(input.base.workspaceId) && !readNonEmptyString(input.base.repoUrl);
     fail(
       "git_worktree_base_not_git_checkout",
       `Issue ${issueLabel} requested ${input.requestedExecutionWorkspaceMode} with git_worktree, but base workspace "${input.base.baseCwd}" is not a git checkout. ${remediation}`,
+      knownLocalPathMismatch
+        ? { configurationReason: "local_path_requires_git_checkout" }
+        : {},
     );
   }
 
@@ -3769,6 +3795,15 @@ const heartbeatRunListColumns = {
 const heartbeatRunSummaryListColumns = {
   ...heartbeatRunListColumns,
   usageJson: sql<Record<string, unknown> | null>`NULL`.as("usageJson"),
+  // Scalar token counts keep private-run stubs budget-visible without
+  // shipping the full usageJson on summary rows.
+  usageInputTokens: sql<string | null>`${heartbeatRuns.usageJson} ->> 'inputTokens'`.as("usageInputTokens"),
+  usageCachedInputTokens: sql<string | null>`${heartbeatRuns.usageJson} ->> 'cachedInputTokens'`.as("usageCachedInputTokens"),
+  usageOutputTokens: sql<string | null>`${heartbeatRuns.usageJson} ->> 'outputTokens'`.as("usageOutputTokens"),
+  usageTotalTokens: sql<string | null>`${heartbeatRuns.usageJson} ->> 'totalTokens'`.as("usageTotalTokens"),
+  resultTotalCostUsd: sql<string | null>`${heartbeatRuns.resultJson} ->> 'total_cost_usd'`.as("resultTotalCostUsd"),
+  resultCostUsd: sql<string | null>`${heartbeatRuns.resultJson} ->> 'cost_usd'`.as("resultCostUsd"),
+  resultCostUsdCamel: sql<string | null>`${heartbeatRuns.resultJson} ->> 'costUsd'`.as("resultCostUsdCamel"),
   sessionIdBefore: sql<string | null>`NULL`.as("sessionIdBefore"),
   sessionIdAfter: sql<string | null>`NULL`.as("sessionIdAfter"),
   logStore: sql<string | null>`NULL`.as("logStore"),
@@ -4166,6 +4201,16 @@ interface WakeupOptions {
   /** Exact failed run selected by an authenticated board Retry request. */
   failedRunId?: string | null;
   durableChatRequest?: DurableChatWakeupRequest;
+  /** Server-owned Dot admission receipt; never accepted from API payloads. */
+  durableDotRequest?: {
+    id: string;
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    requestId: string;
+    idempotencyKey: string;
+    requestedAt: Date;
+  };
   source?: "timer" | "assignment" | "on_demand" | "automation";
   triggerDetail?: "manual" | "ping" | "callback" | "system";
   reason?: string | null;
@@ -4178,6 +4223,9 @@ interface WakeupOptions {
     statuses: string[];
     assigneeAgentId: string;
     statusVersion?: number;
+    /** Monitor fence: the wake is only valid for this exact claimed schedule. */
+    monitorNextCheckAt?: string;
+    monitorWakeRequestedAt?: string;
   };
   /** Keep causally distinct external chat continuations out of an existing run. */
   allowRunCoalescing?: boolean;
@@ -4225,6 +4273,7 @@ export type WorkspaceMaterializationFailure = {
   projectWorkspaceId: string | null;
   repoUrl: string | null;
   error: string;
+  connectionFailure?: GitConnectionFailure;
 };
 
 export type ResolvedWorkspaceForRun = {
@@ -4250,6 +4299,8 @@ export type ResolvedWorkspaceForRun = {
   baseCwdFallback: boolean;
   /** Failed materialization attempts behind {@link baseCwdFallback}; empty when every candidate resolved or none was attempted. */
   materializationFailures: WorkspaceMaterializationFailure[];
+  /** True only for an explicitly configured local project path without a repository URL. */
+  localPathOnlyWorkspace?: boolean;
   /**
    * Read-only referenced (mentioned) project workspaces for this run, one per authorized
    * additional project. The array is empty unless the multi-project workspace-sync flag is on
@@ -5021,6 +5072,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
   );
   const [runIdentity] = await input.db
     .select({
+      contextSnapshot: heartbeatRuns.contextSnapshot,
       responsibleUserId: heartbeatRuns.responsibleUserId,
       activeIdentityContextId: heartbeatRuns.activeIdentityContextId,
     })
@@ -5078,6 +5130,15 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     .map(({ id, name }) => ({ id, name }))
     .sort((a, b) => a.name.localeCompare(b.name));
   const githubBotConnectionIds = await githubBotConnectionIdsForRun(input.db, input.agent.companyId, input.agent.id, input.runId);
+  const spekoConnectionIds = effective.installedConnections.some(connection => connection.transport === "voice")
+    ? new Set((await spekoToolsForSession(input.db, {
+        companyId: input.agent.companyId,
+        agentId: input.agent.id,
+        runId: input.runId,
+        issueId: readNonEmptyString(runIdentity?.contextSnapshot?.issueId ?? runIdentity?.contextSnapshot?.taskId),
+        identityContextId: runIdentity?.activeIdentityContextId,
+      })).map(tool => tool.connectionId))
+    : new Set<string>();
   const assignedConnections = resolvedInstalledConnections.filter(
     (connection) =>
       permittedConnectionIds.has(connection.id) &&
@@ -5089,7 +5150,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
         connection.credentialPolicy === "per_user" ||
         !isToolConnectionAttentionHealth(connection.healthStatus)) &&
       (connection.transport === "mcp_remote" ||
-        connection.transport === "local_stdio" || isBrowserUseConnection(connection) || githubBotConnectionIds.has(connection.id)),
+        connection.transport === "local_stdio" || isBrowserUseConnection(connection) || githubBotConnectionIds.has(connection.id) || spekoConnectionIds.has(connection.id)),
   );
   const assignedConnectionIds = new Set(
     assignedConnections.map((connection) => connection.id),
@@ -6974,6 +7035,7 @@ function buildSessionConfigCategoryValues(input: {
   secretManifest: readonly EffectiveRunConfigSecretManifestEntry[];
   runtimeSkills: unknown;
   agentConfigRevision: unknown;
+  agentIdentityKeyId?: string;
 }) {
   const sanitizedSecretManifest = sanitizeSecretManifestForConfigFingerprint(
     input.secretManifest,
@@ -6995,6 +7057,7 @@ function buildSessionConfigCategoryValues(input: {
   return {
     adapter: {
       adapterType: input.adapterType,
+      ...(input.agentIdentityKeyId ? { agentIdentityKeyId: input.agentIdentityKeyId } : {}),
       agentConfigRevision: input.agentConfigRevision,
     },
     adapterConfig: input.effectiveAdapterConfig,
@@ -7027,6 +7090,7 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
   secretManifest?: readonly EffectiveRunConfigSecretManifestEntry[];
   runtimeSkills: unknown;
   agentConfigRevision?: unknown;
+  agentIdentityKeyId?: string;
 }): Promise<EffectiveRunSessionConfigMetadata> {
   const secretManifest = input.secretManifest ?? [];
   const instructions = await resolveInstructionsConfigFingerprintMetadata(
@@ -7046,6 +7110,7 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
     secretManifest,
     runtimeSkills: input.runtimeSkills,
     agentConfigRevision: input.agentConfigRevision ?? null,
+    agentIdentityKeyId: input.agentIdentityKeyId,
   });
   const fingerprints = createEffectiveRunConfigFingerprints({
     session: categoryValues,
@@ -8550,6 +8615,11 @@ export async function buildPaperclipWakePayload(input: {
   const executionAlreadyReconciled =
     recoveryAction?.status === "resolved" &&
     Boolean(recoveryEvidence.executionReconciliation);
+  // A restored task resumes its deliverable, not the completed repair. A
+  // referenced settled/missing action must not fall back to a stale cause.
+  const recoveryStillActive = recoveryAction
+    ? ["active", "escalated"].includes(recoveryAction.status)
+    : !recoveryActionId && Boolean(recoveryCause);
   const originalAssigneeId =
     recoveryAction?.returnOwnerAgentId ??
     recoveryAction?.previousOwnerAgentId ??
@@ -8631,7 +8701,7 @@ export async function buildPaperclipWakePayload(input: {
     attachmentOmissions,
     externalChatProvider,
     recovery:
-      !executionAlreadyReconciled && (recoveryAction || recoveryCause)
+      !executionAlreadyReconciled && recoveryStillActive && (recoveryAction || recoveryCause)
         ? {
             cause: recoveryAction?.cause ?? recoveryCause,
             failureSummary: readNonEmptyString(recoveryEvidence.failureSummary),
@@ -9157,6 +9227,7 @@ export function buildPaperclipTaskMarkdown(input: {
     body: string;
   } | null;
   externalChatProvider?: string | null;
+  slackCommand?: string | null;
   nativeRunner?: boolean;
   // false builds the compact variant used for resume deltas, where the session
   // already received the description with the assignment.
@@ -9234,6 +9305,9 @@ export function buildPaperclipTaskMarkdown(input: {
           ]),
     );
   }
+  if (input.externalChatProvider === "slack") {
+    lines.push(...slackChatAgentGuidance(input.nativeRunner === true, input.slackCommand));
+  }
   if (input.externalChatProvider && input.nativeRunner) {
     lines.push(
       "",
@@ -9279,6 +9353,7 @@ export function buildPaperclipTaskMarkdown(input: {
     }
   };
   if (issue) {
+    lines.push("", "Task question guidance:", TASK_QUESTION_GUIDANCE);
     lines.push(
       `- Issue: ${quoteTaskScalar(issue.identifier || issue.id)}`,
       `- Title: ${quoteTaskScalar(issue.title)}`,
@@ -9976,10 +10051,11 @@ export async function cancelHeartbeatNativeRun(input: {
   runId: string;
   reason: string;
   runtimeMode: string | null;
+  cancellationRequestId?: string;
   cancel?: (
     runId: string,
     reason: string,
-    options: { db: Db; scope: "run" },
+    options: { db: Db; scope: "run"; cancellationRequestId?: string },
   ) => Promise<{ decision: unknown | null; auditId: string | null }>;
 }) {
   if (input.runtimeMode !== "native") {
@@ -9989,10 +10065,12 @@ export async function cancelHeartbeatNativeRun(input: {
     ? await input.cancel(input.runId, input.reason, {
         db: input.db,
         scope: "run",
+        ...(input.cancellationRequestId ? { cancellationRequestId: input.cancellationRequestId } : {}),
       })
     : await cancelNativeSession(input.runId, input.reason, {
         db: input.db,
         scope: "run",
+        ...(input.cancellationRequestId ? { cancellationRequestId: input.cancellationRequestId } : {}),
       });
   if (!cancellation.decision || !cancellation.auditId) {
     throw new Error("native_cancellation_outcome_not_audited");
@@ -11397,6 +11475,7 @@ export function heartbeatService(
       .select({
         chatCommunicationGuidance: chatConversations.communicationGuidance,
         chatAssignedAgentId: chatEndpoints.assignedAgentId,
+        chatSlackCommand: sql<string | null>`case when ${chatEndpoints.provider} = 'slack' and ${chatEndpoints.status} in ('active', 'verifying') then ${chatEndpoints.setup}->>'command' end`,
         externalConversationState: externalConversationStateSql(),
         conversationAgentId: issues.conversationAgentId,
         conversationUserId: issues.conversationUserId,
@@ -12837,15 +12916,21 @@ export function heartbeatService(
         : 0;
 
     let reason: string | null = null;
+    let promptInputTokens = 0;
     if (policy.maxSessionRuns > 0 && runs.length > policy.maxSessionRuns) {
       reason = `session exceeded ${policy.maxSessionRuns} runs`;
     } else if (
       policy.maxRawInputTokens > 0 &&
       latestRawUsage &&
-      latestRawUsage.inputTokens >= policy.maxRawInputTokens
+      // Adapters that report cache reads separately from input (flagged by
+      // rawInputIncludesCached === false) still pay for them in the prompt.
+      (promptInputTokens = latestRawUsage.inputTokens +
+        (parseObject(latestRun?.usageJson).rawInputIncludesCached === false
+          ? latestRawUsage.cachedInputTokens
+          : 0)) >= policy.maxRawInputTokens
     ) {
       reason =
-        `session raw input reached ${formatCount(latestRawUsage.inputTokens)} tokens ` +
+        `session raw input reached ${formatCount(promptInputTokens)} tokens ` +
         `(threshold ${formatCount(policy.maxRawInputTokens)})`;
     } else if (
       policy.maxSessionAgeHours > 0 &&
@@ -13131,12 +13216,14 @@ export function heartbeatService(
             error instanceof Error ? error.message : String(error),
           );
           const workspaceRepoUrl = readNonEmptyString(workspace.repoUrl);
+          const connectionFailure = readGitConnectionFailure(error);
           materializationFailures.push({
             projectWorkspaceId: workspace.id,
             repoUrl: workspaceRepoUrl
               ? scrubGitCredentialText(workspaceRepoUrl)
               : null,
             error: scrubbedError,
+            ...(connectionFailure ? { connectionFailure } : {}),
           });
           if (preferredWorkspace?.id === workspace.id) {
             preferredWorkspaceWarning = scrubbedError;
@@ -13163,6 +13250,10 @@ export function heartbeatService(
             ].filter((value): value is string => Boolean(value)),
             baseCwdFallback: false,
             materializationFailures,
+            localPathOnlyWorkspace:
+              (workspace.sourceType === "local_path" || workspace.sourceType === "non_git_path") &&
+              Boolean(readNonEmptyString(workspace.cwd)) && workspace.cwd !== REPO_ONLY_CWD_SENTINEL &&
+              !readNonEmptyString(workspace.repoUrl),
           };
         }
         if (preferredWorkspace?.id === workspace.id) {
@@ -17411,7 +17502,13 @@ export function heartbeatService(
     const now = new Date();
     const cancelled = await setRunStatusIfRunning(run.id, "cancelled", {
       error: error.message, errorCode: AI_CONNECTION_BUSY_RETRY_REASON, finishedAt: now,
-      resultJson: { executionRecovery: { kind: "ai_connection_wait", providerWorkStarted: false } },
+      resultJson: {
+        executionRecovery: { kind: "ai_connection_wait", providerWorkStarted: false },
+        cancellation: {
+          source: "control_plane", expected: true, initiator: { type: "system" },
+          reason: "Waiting for shared AI credentials", recordedAt: now.toISOString(),
+        },
+      },
       contextSnapshot: {
         ...parseObject(run.contextSnapshot),
         aiConnectionBusyDeferredWhileAssignee: wasIssueAssignee,
@@ -17468,6 +17565,13 @@ export function heartbeatService(
         executionRecovery: {
           kind: "workspace_wait",
           providerWorkStarted: false,
+        },
+        cancellation: {
+          source: "control_plane",
+          expected: true,
+          initiator: { type: "system" },
+          reason: "Waiting for the shared project workspace",
+          recordedAt: now.toISOString(),
         },
         workspaceBusy: {
           projectWorkspaceId: deferral.projectWorkspaceId,
@@ -18461,6 +18565,8 @@ export function heartbeatService(
       );
       return null;
     }
+    // Keep accepted work in the durable queue until setup completes.
+    if (isAgentAwaitingSetup(agent as any)) return null;
     if (authBreaker.shouldHold(agent.adapterType)) return null; // breaker open: leave queued
     const invokability = companyAgents
       ? evaluateAgentInvokability(toAgentOrgRow(agent), companyAgents)
@@ -21269,6 +21375,8 @@ export function heartbeatService(
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
       if (!agent) return [];
+      // Accepted work stays queued while the agent is still being set up.
+      if (isAgentAwaitingSetup(agent as any)) return [];
       const invokability = await getAgentInvokability(agent);
       if (!invokability.invokable) {
         if (shouldCancelRunsForNonInvokableAgent(invokability)) {
@@ -22317,7 +22425,7 @@ export function heartbeatService(
           if (error instanceof AiConnectionPoolExhausted && !routerHasPersistedInput) {
             const now = new Date();
             context.aiConnectionBusyDeferredWhileAssignee = issueContext?.assigneeAgentId === agent.id;
-            const cancelled = await setRunStatusIfRunning(run.id, "cancelled", { error: error.message, errorCode: error.code, finishedAt: now, resultJson: { executionRecovery: { kind: "ai_connection_wait", providerWorkStarted: false }, retryAt: error.retryAt }, contextSnapshot: context });
+            const cancelled = await setRunStatusIfRunning(run.id, "cancelled", { error: error.message, errorCode: error.code, finishedAt: now, resultJson: { executionRecovery: { kind: "ai_connection_wait", providerWorkStarted: false }, cancellation: { source: "control_plane", expected: true, initiator: { type: "system" }, reason: "Waiting for an AI connection pool account", recordedAt: now.toISOString() }, retryAt: error.retryAt }, contextSnapshot: context });
             if (cancelled.updated) {
               await setWakeupStatus(run.wakeupRequestId, "cancelled", { finishedAt: now, error: error.message });
               const retry = await scheduleBoundedRetryForRun(cancelled.run ?? run, agent, { now, retryReason: AI_CONNECTION_POOL_WAIT_RETRY_REASON, wakeReason: "ai_connection_pool_retry", maxAttempts: (run.scheduledRetryAttempt ?? 0) + 1, delayMs: Math.max(1000, Date.parse(error.retryAt) - Date.now()) });
@@ -22531,6 +22639,9 @@ export function heartbeatService(
         wakeComments: safeWakeComments,
         attachmentOmissions: paperclipWakePayload?.attachmentOmissions,
         externalChatProvider: paperclipWakePayload?.externalChatProvider,
+        slackCommand: issueContext?.chatAssignedAgentId === agent.id
+          ? issueContext.chatSlackCommand
+          : null,
         nativeRunner: agent.adapterType === "paperclip_runner",
         interaction: {
           kind: readNonEmptyString(context.interactionKind),
@@ -22862,7 +22973,11 @@ export function heartbeatService(
         !nativeChatWorkspaceMatches({
           scope: nativeChatWorkspaceScope,
           expectedCwd: nativeChatExpectedCwd,
-          execution: persistedNativeExecutionInput,
+          // Sync note: the vendored runner's NativeExecutionInput type differs from
+          // the minimal shape this check reads (binding ids + workspace.cwd).
+          execution: persistedNativeExecutionInput as unknown as Parameters<
+            typeof nativeChatWorkspaceMatches
+          >[0]["execution"],
         })
       ) {
         // Never rewrite an admitted provider input or release ownership of an
@@ -23188,7 +23303,11 @@ export function heartbeatService(
         agent.companyId,
         agent.id,
       );
+      const sessionIdentityKeyId = supportsManagedAgentIdentity(agent.adapterType, agent.adapterConfig as { provider?: unknown }, undefined)
+        ? (await agentIdentityService(db).ensureAgentIdentity(agent.companyId, agent.id)).keyId
+        : undefined;
       const sessionConfigMetadataInput = {
+          agentIdentityKeyId: sessionIdentityKeyId,
           adapterType: agent.adapterType,
           effectiveAdapterConfig: runtimeConfig,
           managedAiHome: managedAiRuntime?.home,
@@ -23287,7 +23406,7 @@ export function heartbeatService(
         compatibleConfigMetadata,
         wakeResetReason: wakeSessionResetReason,
         preserveLegacySessionWithoutConfigMetadata:
-          acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision,
+          acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision && !sessionIdentityKeyId,
       });
       const resetTaskSession =
         shouldResetTaskSessionForWake(context) || sessionConfigFreshness.reset;
@@ -23413,6 +23532,24 @@ export function heartbeatService(
             {
               useProjectWorkspace:
                 requestedExecutionWorkspaceMode !== "agent_default",
+              // A reused git worktree must prove its original source repository
+              // (scope, registration, replaced-repo) before anything is rebound.
+              anchorWorkspace: requestedShouldReuseExisting && reusableExistingExecutionWorkspace?.strategyType === "git_worktree"
+                ? await createHeartbeatWorkspaceResolver(db).resolveReusedGitWorkspaceAnchor({
+                    agent,
+                    workspace: reusableExistingExecutionWorkspace,
+                    responsibleUserId,
+                    immutableNativeBinding: Boolean(nativeRecoveryExecutionWorkspaceId),
+                    projectId: nativeRecoveryExecutionWorkspaceId
+                      ? reusableExistingExecutionWorkspace.projectId
+                      : issueRef?.projectId ?? readNonEmptyString(context.projectId),
+                    explicitProjectWorkspaceId: nativeRecoveryExecutionWorkspaceId
+                      ? reusableExistingExecutionWorkspace.projectWorkspaceId
+                      : readNonEmptyString(context.projectWorkspaceId),
+                    issueId,
+                    runId: run.id,
+                  })
+                : undefined,
               // Thread the selected environment driver so run-workspace resolution can tell a local
               // target from a remote one, and a confined sandbox target from an unconfined remote
               // target. A remote run resolves referenced projects only for the confined sandbox
@@ -23455,6 +23592,7 @@ export function heartbeatService(
         anchor: {
           baseCwdFallback: resolvedWorkspace.baseCwdFallback,
           materializationFailures: resolvedWorkspace.materializationFailures,
+          localPathOnlyWorkspace: resolvedWorkspace.localPathOnlyWorkspace,
         },
       });
       const workspaceStrategyForFingerprint = parseObject(
@@ -26385,12 +26523,42 @@ export function heartbeatService(
             if (managedMcpConfig) {
               adapterContext.paperclipManagedMcp = managedMcpConfig;
             }
+            // Managed agent identity: provision lazily, hand the key to the
+            // adapter, and redact its material from everything it emits.
+            const managedAgentIdentity = supportsManagedAgentIdentity(
+              agent.adapterType,
+              agent.adapterConfig as { provider?: unknown },
+              undefined,
+            )
+              ? await agentIdentityService(db).ensureAgentIdentity(agent.companyId, agent.id)
+              : undefined;
+            if (managedAgentIdentity) secretKeys.add("PAPERCLIP_AGENT_PRIVATE_KEY");
+            const identityRedactor = createAgentIdentityRedactor(managedAgentIdentity?.privateKeyPem);
+            const identityRedactedOnLog = async (stream: "stdout" | "stderr", chunk: string) => {
+              const safe = identityRedactor.chunk(stream, chunk);
+              if (safe) await onLog(stream, safe);
+            };
+            const identityRedactedOnMeta = (meta: AdapterInvocationMeta) =>
+              onAdapterMeta(identityRedactor.redact(meta));
+            const identityRedactedOnEvent = (event: AdapterRuntimeEvent) =>
+              onAdapterEvent(identityRedactor.redact(event));
+            const executeWithIdentityFlush: typeof adapter.execute = async (input) => {
+              try {
+                return identityRedactor.redact(await adapter.execute(input));
+              } finally {
+                for (const stream of ["stdout", "stderr"] as const) {
+                  const tail = identityRedactor.finish(stream);
+                  if (tail) await onLog(stream, tail);
+                }
+              }
+            };
             const guardedDispatch =
               await dispatchResolvedInteractionContinuationWithAtomicGate(
                 (markDispatchStarted) => {
                   legacyAdapterEntered = true;
-                  return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
+                  return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => executeWithIdentityFlush({
                     getFreshSessionHandoff,
+                    agentIdentity: managedAgentIdentity,
                     runId: run.id,
                     agent,
                     runtime: runtimeForAdapter,
@@ -26410,9 +26578,9 @@ export function heartbeatService(
                       : undefined,
                     runtimeMcp,
                     runtimeTools,
-                    onLog,
-                    onMeta: onAdapterMeta,
-                    onEvent: onAdapterEvent,
+                    onLog: identityRedactedOnLog,
+                    onMeta: identityRedactedOnMeta,
+                    onEvent: identityRedactedOnEvent,
                     onExecutionPhase: executionControl.phases.enter,
                     startupTraceContext: getStartupTraceContext(),
                     onRuntimeProgress: async (progress) => {
@@ -26964,6 +27132,7 @@ export function heartbeatService(
                 ...(rawUsage
                   ? {
                       rawInputTokens: rawUsage.inputTokens,
+                      rawInputIncludesCached: false,
                       rawCachedInputTokens: rawUsage.cachedInputTokens,
                       rawOutputTokens: rawUsage.outputTokens,
                     }
@@ -28551,18 +28720,35 @@ export function heartbeatService(
     if (durableRequest?.failedRunRetry) {
       opts = { ...opts, allowRunCoalescing: false };
     }
-    const durableReceiptFields = durableRequest
-      ? { id: durableRequest.id, requestedAt: durableRequest.requestedAt }
+    const dotRequest = opts.durableDotRequest;
+    if (dotRequest && (durableRequest || dotRequest.agentId !== agentId ||
+        dotRequest.companyId !== agent.companyId || dotRequest.issueId !== issueId ||
+        dotRequest.requestId !== payload?.dotRequestId || source !== "assignment" ||
+        opts.requestedByActorType !== "agent" || opts.requestedByActorId !== agentId ||
+        agent.adapterType !== "paperclip_runner" || parseObject(agent.adapterConfig).provider !== "openai_dot" ||
+        opts.idempotencyKey !== dotRequest.idempotencyKey)) {
+      throw conflict("Dot work request does not match its admission authority.");
+    }
+    const receiptRequest = durableRequest ?? dotRequest;
+    const durableReceiptFields = receiptRequest
+      ? { id: receiptRequest.id, requestedAt: receiptRequest.requestedAt }
       : {};
     const existingDurableReceipt = async (queryDb: Db) => {
-      if (!durableRequest) return null;
+      if (!receiptRequest) return null;
       const receipt = await queryDb
         .select()
         .from(agentWakeupRequests)
-        .where(eq(agentWakeupRequests.id, durableRequest.id))
+        .where(eq(agentWakeupRequests.id, receiptRequest.id))
         .limit(1)
         .then((rows) => rows[0] ?? null);
-      if (receipt) assertDurableChatWakeupReceipt(durableRequest, receipt);
+      if (receipt && durableRequest) assertDurableChatWakeupReceipt(durableRequest, receipt);
+      if (receipt && dotRequest && (receipt.companyId !== dotRequest.companyId ||
+          receipt.agentId !== dotRequest.agentId || receipt.source !== "assignment" ||
+          receipt.requestedByActorType !== "agent" || receipt.requestedByActorId !== dotRequest.agentId ||
+          receipt.idempotencyKey !== dotRequest.idempotencyKey || receipt.payload?.issueId !== dotRequest.issueId ||
+          receipt.payload?.dotRequestId !== dotRequest.requestId)) {
+        throw conflict("requestId was reused for another task.");
+      }
       return receipt;
     };
     const priorReceipt = await existingDurableReceipt(db);
@@ -28872,7 +29058,8 @@ export function heartbeatService(
       });
     }
 
-    const invokability = await getAgentInvokability(agent);
+    // Setup delays execution, but must not discard work accepted by a caller.
+    const invokability = await getAgentInvokability(isAgentAwaitingSetup(agent as any) ? { ...agent, status: "idle" } : agent);
     if (!invokability.invokable) {
       if (opts.requestedByActorType !== "user" || executionWaitRequestId) {
         await writeSkippedRequest("agent.not_invokable", {
@@ -29206,6 +29393,9 @@ export function heartbeatService(
               executionWorkspacePreference: issues.executionWorkspacePreference,
               executionWorkspaceSettings: issues.executionWorkspaceSettings,
               assigneeAgentId: issues.assigneeAgentId,
+              assigneeUserId: issues.assigneeUserId,
+              monitorNextCheckAt: issues.monitorNextCheckAt,
+              monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
               executionRunId: issues.executionRunId,
               executionAgentNameKey: issues.executionAgentNameKey,
               createdAt: issues.createdAt,
@@ -29436,12 +29626,25 @@ export function heartbeatService(
           }))) return deferBlockedExecution(executionBlocker);
 
           const issueStateGuard = opts.issueStateGuard;
+          const activeMonitorRun = issueStateGuard?.monitorNextCheckAt === undefined ? null
+            : await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.nativeIssueId, issue.id),
+              eq(heartbeatRuns.runtimeMode, "native"), inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+            )).limit(1).then((rows) => rows[0] ?? null);
           if (
             issueStateGuard &&
             (!issueStateGuard.statuses.includes(issue.status) ||
               issue.assigneeAgentId !== issueStateGuard.assigneeAgentId ||
-              (issueStateGuard.statusVersion !== undefined && issue.statusVersion !== issueStateGuard.statusVersion))
+              (issueStateGuard.statusVersion !== undefined && issue.statusVersion !== issueStateGuard.statusVersion) ||
+              (issueStateGuard.monitorNextCheckAt !== undefined && (
+                activeMonitorRun !== null || issue.assigneeUserId !== null ||
+                issue.monitorNextCheckAt?.toISOString() !== issueStateGuard.monitorNextCheckAt ||
+                issue.monitorWakeRequestedAt?.toISOString() !== issueStateGuard.monitorWakeRequestedAt
+              )))
           ) {
+            // A deferred monitor retains its schedule; do not create a receipt
+            // that could suppress its next admission attempt.
+            if (issueStateGuard.monitorNextCheckAt !== undefined) return { kind: "skipped" as const };
             await tx.insert(agentWakeupRequests).values({
               ...durableReceiptFields,
               companyId: agent.companyId,
@@ -32333,6 +32536,22 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
     return row ? buildRunLivenessProbe(row) : null;
   }
+  // Monitor admission/consumption (claim fencing, monitor-only dispatch patch)
+  // lives in the extracted scheduling module; the fork delegates to it so the
+  // fenced two-phase semantics match upstream.
+  const scheduling = createHeartbeatScheduling(db, {
+    issuesSvc: issuesSvc as any,
+    enqueueWakeup: enqueueWakeup as any,
+    getRun: getRun as any,
+    getAgent: getAgent as any,
+    scheduleBoundedRetryForRun: scheduleBoundedRetryForRun as any,
+    getSchedulingSuppression,
+    getWorktreeExecutionCutoff: getWorktreeExecutionCutoff as any,
+    toAgentOrgRow: toAgentOrgRow as any,
+    groupAgentOrgRowsByCompany: groupAgentOrgRowsByCompany as any,
+    parseHeartbeatPolicy: parseHeartbeatPolicy as any,
+    claimDueTimerHeartbeat: claimDueTimerHeartbeat as any,
+  });
   return {
     waitForRunExecutionDrain: async (
       runId: string,
@@ -32422,6 +32641,13 @@ export function heartbeatService(
 
         return {
           ...rest,
+          ...(summary
+            ? (() => {
+                const raw = resultCostUsdCamel ?? resultCostUsd ?? resultTotalCostUsd;
+                const parsed = raw == null ? NaN : Number(raw);
+                return Number.isFinite(parsed) ? { costUsd: parsed } : {};
+              })()
+            : {}),
           contextSnapshot: summarizeHeartbeatRunContextSnapshot({
             issueId: contextIssueId,
             taskId: contextTaskId,
@@ -32639,7 +32865,7 @@ export function heartbeatService(
 
     wakeup: trackWakeup,
     dispatchPendingNativeStatusWakeups,
-    triggerIssueMonitor,
+    triggerIssueMonitor: scheduling.triggerIssueMonitor,
 
     reportRunActivity: clearDetachedRunWarning,
 
@@ -32719,92 +32945,7 @@ export function heartbeatService(
     buildRunLivenessProbe,
     getRunLivenessProbe,
 
-    tickTimers: async (now = new Date()) => {
-      if ((await getSchedulingSuppression()).suppressed) {
-        return {
-          checked: 0,
-          enqueued: 0,
-          skipped: 0,
-        };
-      }
-      const cutoff = await getWorktreeExecutionCutoff();
-
-      const allAgents = await db
-        .select({ ...getTableColumns(agents) })
-        .from(agents)
-        .innerJoin(companies, eq(companies.id, agents.companyId))
-        .where(eq(companies.status, "active"));
-      const agentsByCompany = groupAgentOrgRowsByCompany(
-        allAgents.map(toAgentOrgRow),
-      );
-      let checked = 0;
-      let enqueued = 0;
-      let skipped = 0;
-
-      for (const agent of allAgents) {
-        const invokability = evaluateAgentInvokability(
-          toAgentOrgRow(agent),
-          agentsByCompany.get(agent.companyId) ?? [],
-        );
-        if (!invokability.invokable) continue;
-        const policy = parseHeartbeatPolicy(agent);
-        if (!policy.enabled || policy.intervalSec <= 0) continue;
-
-        if (cutoff) {
-          const eligibleIssue = await db
-            .select({ id: issues.id })
-            .from(issues)
-            .where(
-              and(
-                eq(issues.companyId, agent.companyId),
-                eq(issues.assigneeAgentId, agent.id),
-                inArray(issues.status, ["todo", "in_progress"]),
-                gte(issues.createdAt, cutoff),
-              ),
-            )
-            .limit(1)
-            .then((rows) => rows[0] ?? null);
-          if (!eligibleIssue) continue;
-        }
-
-        checked += 1;
-        const baseline = new Date(
-          agent.lastHeartbeatAt ?? agent.createdAt,
-        ).getTime();
-        const elapsedMs = now.getTime() - baseline;
-        if (elapsedMs < policy.intervalSec * 1000) continue;
-        const timerClaim = await claimDueTimerHeartbeat(
-          agent,
-          now,
-          policy.intervalSec,
-        );
-        if (!timerClaim) continue;
-
-        const run = await enqueueWakeup(agent.id, {
-          source: "timer",
-          triggerDetail: "system",
-          reason: "heartbeat_timer",
-          requestedByActorType: "system",
-          requestedByActorId: "heartbeat_scheduler",
-          contextSnapshot: {
-            source: "scheduler",
-            reason: "interval_elapsed",
-            now: now.toISOString(),
-            timerClaimWasFirstHeartbeat: timerClaim.wasFirstHeartbeat,
-          },
-        });
-        if (run) enqueued += 1;
-        else skipped += 1;
-      }
-
-      const issueMonitors = await tickDueIssueMonitors(now);
-
-      return {
-        checked: checked + issueMonitors.checked,
-        enqueued: enqueued + issueMonitors.triggered,
-        skipped: skipped + issueMonitors.skipped,
-      };
-    },
+    tickTimers: (now = new Date()) => scheduling.tickTimers(now),
 
     cancelRun: (runId: string, reason?: string, options?: CancelRunOptions) =>
       cancelRunInternal(runId, reason, options),
@@ -32819,6 +32960,41 @@ export function heartbeatService(
 
     cancelInvocationsForAgents: (agentIds: string[], reason: string) =>
       cancelInvocationsForAgentsInternal(agentIds, reason),
+
+    // Upstream-sync shims: callers added upstream (agent lifecycle driver,
+    // startup recovery) expect these on the heartbeat service.
+    resumeQueuedRunsForAgent: async (companyId: string, agentId: string) => {
+      const agent = await getAgent(agentId);
+      if (!agent || agent.companyId !== companyId) return [];
+      return startNextQueuedRunForAgent(agentId);
+    },
+
+    stopInvocationsForAgents: async (agentIds: string[], reason: string) => {
+      await cancelInvocationsForAgentsInternal(agentIds, reason);
+      const runs = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
+      const leasesToRelease = await db.select({ runId: environmentLeases.heartbeatRunId }).from(environmentLeases)
+        .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, environmentLeases.heartbeatRunId))
+        .where(and(inArray(heartbeatRuns.agentId, agentIds),
+          or(and(eq(heartbeatRuns.status, "cancelled"), inArray(environmentLeases.status, ["active", "pending_cleanup"])),
+            and(eq(environmentLeases.status, "retained"), eq(environmentLeases.cleanupStatus, "failed")))));
+      const needsRelease = new Set(leasesToRelease.map((lease) => lease.runId));
+      for (const run of runs) {
+        if (!isHeartbeatRunTerminalStatus(run.status) || liveRunExecutions.has(run.id) ||
+            adapterExecutionControls.has(run.id) || processRunCancellationSettlements.has(run.id) ||
+            (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date())) return false;
+        if (needsRelease.has(run.id)) {
+          // Retry incomplete cleanup after a run becomes terminal.
+          await releaseEnvironmentLeasesForRun({ runId: run.id, companyId: run.companyId,
+            agentId: run.agentId, status: run.status, providerResourceDisposition: "destroy" });
+        }
+      }
+      return agentExecutionsHaveStopped(db, agentIds);
+    },
+
+    reconcileCostAccounting: async () => {
+      await decisionModelService(db, { budgetHooks }).recoverInterrupted();
+      return createCostAccountingReconciler(db, budgetHooks)();
+    },
 
     cancelBudgetScopeWork,
 
@@ -32918,3 +33094,5 @@ export function heartbeatService(
     },
   };
 }
+
+export { postNativeModelFallbackWarning } from "./heartbeat/runtime-selection.js";

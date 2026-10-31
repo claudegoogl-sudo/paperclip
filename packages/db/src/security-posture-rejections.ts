@@ -34,6 +34,7 @@ export type SecurityPostureRejection = {
  * plausibly re-litigate, carried over from the sweep in
  * `doc/SECURITY-POSTURE-COLUMN-SWEEP.md`), then the table-level blocks.
  */
+
 export const SECURITY_POSTURE_REJECTIONS = [
   {
     table: "agents",
@@ -5573,5 +5574,220 @@ export const SECURITY_POSTURE_REJECTIONS = [
      "agent_instructions",
     ],
     reason: "agent_instructions is saved free-text delivered to authorized agent turns; it is content, not an access gate, and delivery is authorized separately.",
+  },
+  {
+    table: "accounting_runtime_baselines",
+    columns: ["agent_id", "cached_input_tokens", "company_id", "cost_cents", "created_at", "input_tokens", "output_tokens"],
+    reason: "Token/cost accounting baseline counters; metrics, not read as an authorization or execution gate.",
+  },
+  {
+    table: "agent_commentary",
+    columns: ["agent_id", "body", "company_id", "created_at", "id", "idempotency_key", "issue_id", "kind", "payload_hash", "run_id"],
+    reason: "Agent-authored commentary content and idempotency/audit metadata; content, not an access gate (visibility inherits from the issue).",
+  },
+  {
+    table: "agent_identity_keys",
+    columns: ["agent_id", "algorithm", "company_id", "created_at", "key_id"],
+    reason: "Non-predicate columns of agent_identity_keys: identifiers, timestamps and bookkeeping; the gating columns of this table are registered in SECURITY_POSTURE_COLUMNS.",
+  },
+  {
+    table: "agents",
+    columns: ["lifecycle_error", "lifecycle_operation", "lifecycle_version"],
+    reason: "Non-predicate columns of agents: identifiers, timestamps and bookkeeping; the gating columns of this table are registered in SECURITY_POSTURE_COLUMNS.",
+  },
+  {
+    table: "ai_subscription_connections",
+    columns: ["company_id", "connection_id", "id", "subscription_id"],
+    reason: "Non-predicate columns of ai_subscription_connections: identifiers, timestamps and bookkeeping; the gating columns of this table are registered in SECURITY_POSTURE_COLUMNS.",
+  },
+  {
+    table: "ai_subscription_prices",
+    columns: ["amount_cents", "cadence", "company_id", "currency", "effective_at", "id", "plan", "revision", "source", "source_url", "status", "subscription_id"],
+    reason: "Price catalogue data for cost display/estimation; not an authorization input.",
+  },
+  {
+    table: "ai_subscriptions",
+    columns: ["account_key", "company_id", "created_at", "detected_plan", "id", "last_checked_at", "merged_into_id", "name", "observed_at", "provider", "refresh_status", "revision"],
+    reason: "Non-predicate columns of ai_subscriptions: identifiers, timestamps and bookkeeping; the gating columns of this table are registered in SECURITY_POSTURE_COLUMNS.",
+  },
+  {
+    table: "billing_invoice_lines",
+    columns: ["amount_cents", "company_id", "cost_event_id", "external_id", "id", "invoice_id", "kind", "model", "occurred_at", "pricing", "provider_request_id", "run_id"],
+    reason: "Imported invoice line data; accounting record only.",
+  },
+  {
+    table: "billing_invoices",
+    columns: ["biller", "company_id", "created_at", "currency", "external_id", "id", "imported_by", "receipt_hash"],
+    reason: "Imported invoice header data; accounting record only.",
+  },
+  {
+    table: "budget_policies",
+    columns: ["enforcement_delivered_version", "enforcement_version"],
+    reason: "Non-predicate columns of budget_policies: identifiers, timestamps and bookkeeping; the gating columns of this table are registered in SECURITY_POSTURE_COLUMNS.",
+  },
+  {
+    table: "budget_reservations",
+    columns: ["agent_id", "company_id", "created_at", "decision_invocation_id", "fast_response_request_id", "id", "project_id", "provider_started_at", "run_id"],
+    reason: "Non-predicate columns of budget_reservations: identifiers, timestamps and bookkeeping; the gating columns of this table are registered in SECURITY_POSTURE_COLUMNS.",
+  },
+  {
+    table: "chat_github_registrations",
+    columns: ["app_name", "handoff", "owner_login", "owner_type"],
+    reason: "GitHub app registration display/handoff metadata; credentials are referenced elsewhere (secret bindings).",
+  },
+  {
+    table: "chat_slack_registrations",
+    columns: ["app_id", "bot_user_id", "callback_uri", "client_id", "company_id", "created_at", "created_by_user_id", "endpoint_id", "error_code", "manifest", "manifest_hash", "request_id", "updated_at"],
+    reason: "Non-predicate columns of chat_slack_registrations: identifiers, timestamps and bookkeeping; the gating columns of this table are registered in SECURITY_POSTURE_COLUMNS.",
+  },
+  {
+    table: "chat_voice_callbacks",
+    columns: ["company_id", "endpoint_id", "id", "updated_at", "user_id"],
+    reason: "Non-predicate columns of chat_voice_callbacks: identifiers, timestamps and bookkeeping; the gating columns of this table are registered in SECURITY_POSTURE_COLUMNS.",
+  },
+  {
+    table: "chat_voice_inbound_calls",
+    columns: ["company_id", "created_at", "endpoint_id", "generation", "id", "intake_issue_id", "provider_session_id", "request_fingerprint", "requested_issue_id", "session_id", "updated_at"],
+    reason: "Non-predicate columns of chat_voice_inbound_calls: identifiers, timestamps and bookkeeping; the gating columns of this table are registered in SECURITY_POSTURE_COLUMNS.",
+  },
+  {
+    table: "chat_voice_phone_lines",
+    columns: ["company_id", "endpoint_id", "provider_number_id", "updated_at"],
+    reason: "Non-predicate columns of chat_voice_phone_lines: identifiers, timestamps and bookkeeping; the gating columns of this table are registered in SECURITY_POSTURE_COLUMNS.",
+  },
+  {
+    table: "chat_voice_replies",
+    columns: ["company_id", "created_at", "cursor", "delivered_at", "id", "publication_id", "session_id", "spoken_at"],
+    reason: "Reply delivery cursor/timestamps; delivery bookkeeping.",
+  },
+  {
+    table: "chat_voice_reports",
+    columns: ["attempts", "company_id", "cost_micro_usd", "duration_seconds", "next_check_at", "provider_updated_at", "session_id", "status", "transcript", "updated_at"],
+    reason: "Post-call report/transcript/cost data; retry bookkeeping, not a gate.",
+  },
+  {
+    table: "chat_voice_sessions",
+    columns: ["caller_id", "company_id", "conversation_id", "created_at", "ended_at", "endpoint_id", "error_code", "generation", "id", "idempotency_key", "issue_id", "provider_session_id", "reply_cursor", "request_fingerprint", "updated_at"],
+    reason: "Non-predicate columns of chat_voice_sessions: identifiers, timestamps and bookkeeping; the gating columns of this table are registered in SECURITY_POSTURE_COLUMNS.",
+  },
+  {
+    table: "chat_voice_tool_calls",
+    columns: ["company_id", "created_at", "delivery_id", "fingerprint", "id", "provider_tool_call_id", "response", "session_id", "tool", "webhook_id"],
+    reason: "Idempotency/response log for tool calls; authorization is by the session tool_token_hash, which is registered.",
+  },
+  {
+    table: "company_decision_models",
+    columns: ["company_id", "model", "provider", "updated_at"],
+    reason: "Non-predicate columns of company_decision_models: identifiers, timestamps and bookkeeping; the gating columns of this table are registered in SECURITY_POSTURE_COLUMNS.",
+  },
+  {
+    table: "company_fast_responses",
+    columns: ["company_id", "model", "provider", "updated_at"],
+    reason: "Non-predicate columns of company_fast_responses: identifiers, timestamps and bookkeeping; the gating columns of this table are registered in SECURITY_POSTURE_COLUMNS.",
+  },
+  {
+    table: "cost_adjustments",
+    columns: ["actor_id", "company_id", "corrected_cents", "cost_event_id", "created_at", "id", "idempotency_key", "invoice_line_id", "previous_cents", "previous_pricing", "previous_status", "pricing", "reason", "receipt_hash"],
+    reason: "Append-only cost correction audit record.",
+  },
+  {
+    table: "cost_events",
+    columns: ["idempotency_key", "pricing_provenance", "provider_request_id", "receipt_hash", "reported_cost_cents", "responsible_user_id", "subscription_id", "usage_kind"],
+    reason: "Cost/usage attribution and idempotency metadata; accounting only.",
+  },
+  {
+    table: "decision_invocations",
+    columns: ["actor_id", "actor_type", "agent_id", "company_id", "connection_id", "cost_event_id", "duration_ms", "error_code", "feature", "finished_at", "grant_id", "id", "identity_context_id", "input_tokens", "issue_id", "model", "output_tokens", "project_id", "provider", "provider_request_id", "question_types", "responsible_user_id", "run_id", "started_at", "status"],
+    reason: "Audit log of decision-model invocations; the gating columns live in company_decision_models.",
+  },
+  {
+    table: "dot_agent_bindings",
+    columns: ["agent_id", "company_id", "created_at", "dot_url", "id", "operator_id", "ready_at", "updated_at"],
+    reason: "Non-predicate columns of dot_agent_bindings: identifiers, timestamps and bookkeeping; the gating columns of this table are registered in SECURITY_POSTURE_COLUMNS.",
+  },
+  {
+    table: "dot_mailbox_items",
+    columns: ["assignment_id", "binding_id", "company_id", "created_at", "id", "kind", "references", "source_event_id"],
+    reason: "Non-predicate columns of dot_mailbox_items: identifiers, timestamps and bookkeeping; the gating columns of this table are registered in SECURITY_POSTURE_COLUMNS.",
+  },
+  {
+    table: "dot_runner_assignments",
+    columns: ["accepted_at", "agent_id", "binding_id", "catalog_digest", "company_id", "created_at", "id", "last_activity_at", "normalized_session_id", "projection", "revision", "run_id", "settled_at", "turn_id"],
+    reason: "Non-predicate columns of dot_runner_assignments: identifiers, timestamps and bookkeeping; the gating columns of this table are registered in SECURITY_POSTURE_COLUMNS.",
+  },
+  {
+    table: "dot_runner_operations",
+    columns: ["assignment_id", "command", "company_id", "created_at", "digest", "id", "outcome", "request_id", "source_event_id", "status", "updated_at"],
+    reason: "Operation log with idempotency digests; fencing is done by registered dot_runner_assignments generation columns.",
+  },
+  {
+    table: "fast_response_requests",
+    columns: ["accepted_at", "agent_id", "comment_id", "company_id", "conversation_id", "cost_event_id", "delivery_id", "duration_ms", "endpoint_id", "error_code", "finished_at", "id", "input_tokens", "issue_id", "model", "output_tokens", "project_id", "provider", "provider_request_id", "publication_status", "responsible_user_id", "session_generation", "source_comment_id", "source_key", "started_at", "status"],
+    reason: "Non-predicate columns of fast_response_requests: identifiers, timestamps and bookkeeping; the gating columns of this table are registered in SECURITY_POSTURE_COLUMNS.",
+  },
+  {
+    table: "finance_events",
+    columns: ["idempotency_key", "receipt_hash"],
+    reason: "Idempotency/receipt hash for ledger events; accounting only.",
+  },
+  {
+    table: "heartbeat_runs",
+    columns: ["accounting_attempt_count", "accounting_last_attempt_at", "accounting_last_error", "accounting_projection_version", "cost_accounted_at", "cost_accounting_pending", "issue_id", "scope_kind"],
+    reason: "Cost-accounting retry bookkeeping and scope tagging; not read as an execution gate.",
+  },
+  {
+    table: "issue_access_grants",
+    columns: ["created_at", "granted_by_agent_id", "granted_by_user_id", "id", "issue_id", "source"],
+    reason: "Non-predicate columns of issue_access_grants: identifiers, timestamps and bookkeeping; the gating columns of this table are registered in SECURITY_POSTURE_COLUMNS.",
+  },
+  {
+    table: "issue_comments",
+    columns: ["fast_response_request_id", "origin"],
+    reason: "Origin tag and link to a fast-response request; display/provenance only.",
+  },
+  {
+    table: "mcp_attachment_uploads",
+    columns: ["arguments_hash", "attachment_id", "byte_size", "company_id", "content_type", "created_at", "id", "original_filename", "request_id", "storage_provider", "task_id"],
+    reason: "Non-predicate columns of mcp_attachment_uploads: identifiers, timestamps and bookkeeping; the gating columns of this table are registered in SECURITY_POSTURE_COLUMNS.",
+  },
+  {
+    table: "mcp_event_deliveries",
+    columns: ["mailbox_item_id"],
+    reason: "Delivery bookkeeping reference.",
+  },
+  {
+    table: "mcp_event_subscriptions",
+    columns: ["binding_id"],
+    reason: "Subscription reference to a binding; authorization is on the binding.",
+  },
+  {
+    table: "mcp_file_tickets",
+    columns: ["attachment_id", "company_id", "created_at"],
+    reason: "Non-predicate columns of mcp_file_tickets: identifiers, timestamps and bookkeeping; the gating columns of this table are registered in SECURITY_POSTURE_COLUMNS.",
+  },
+  {
+    table: "plugin_lifecycle_acknowledgments",
+    columns: ["acknowledged_at", "event_id", "plugin_id"],
+    reason: "Acknowledgment audit timestamps.",
+  },
+  {
+    table: "project_access_members",
+    columns: ["company_id", "created_at", "id", "project_id"],
+    reason: "Non-predicate columns of project_access_members: identifiers, timestamps and bookkeeping; the gating columns of this table are registered in SECURITY_POSTURE_COLUMNS.",
+  },
+  {
+    table: "provider_billing_snapshots",
+    columns: ["account_id", "amount_cents", "company_id", "day", "id", "provider", "revision", "scope_id", "updated_at"],
+    reason: "Provider billing snapshot data; reporting only.",
+  },
+  {
+    table: "run_usage_receipts",
+    columns: ["company_id", "complete", "created_at", "id", "receipt_hash", "receipt_json", "received_at", "run_id", "sequence", "source_id"],
+    reason: "Usage receipt records and hashes; accounting only.",
+  },
+  {
+    table: "user_company_preferences",
+    columns: ["company_id", "created_at", "id", "primary_agent_id", "primary_agent_initialized", "updated_at", "user_id"],
+    reason: "UI preference (primary agent selection); not an authorization input.",
   },
 ];
