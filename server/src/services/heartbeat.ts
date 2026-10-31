@@ -78,6 +78,7 @@ import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-uti
 import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot, disposeGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
 import { readConnectionFailure, type GitConnectionFailure } from "@paperclipai/adapter-utils/connection-failure";
 import { classifyGitCloneFailure, GitConnectionFailureError, readGitConnectionFailure } from "./git-connection-failure.js";
+import { spekoToolsForSession } from "./voice/speko-agent-tools.js";
 import { probeGitWorktreeBase, createHeartbeatWorkspaceResolver } from "./heartbeat/workspaces.js";
 import { createHeartbeatScheduling } from "./heartbeat/scheduling.js";
 import { isAgentAwaitingSetup } from "../modules/agent-lifecycle/index.js";
@@ -5071,6 +5072,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
   );
   const [runIdentity] = await input.db
     .select({
+      contextSnapshot: heartbeatRuns.contextSnapshot,
       responsibleUserId: heartbeatRuns.responsibleUserId,
       activeIdentityContextId: heartbeatRuns.activeIdentityContextId,
     })
@@ -5128,6 +5130,15 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     .map(({ id, name }) => ({ id, name }))
     .sort((a, b) => a.name.localeCompare(b.name));
   const githubBotConnectionIds = await githubBotConnectionIdsForRun(input.db, input.agent.companyId, input.agent.id, input.runId);
+  const spekoConnectionIds = effective.installedConnections.some(connection => connection.transport === "voice")
+    ? new Set((await spekoToolsForSession(input.db, {
+        companyId: input.agent.companyId,
+        agentId: input.agent.id,
+        runId: input.runId,
+        issueId: readNonEmptyString(runIdentity?.contextSnapshot?.issueId ?? runIdentity?.contextSnapshot?.taskId),
+        identityContextId: runIdentity?.activeIdentityContextId,
+      })).map(tool => tool.connectionId))
+    : new Set<string>();
   const assignedConnections = resolvedInstalledConnections.filter(
     (connection) =>
       permittedConnectionIds.has(connection.id) &&
@@ -5139,7 +5150,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
         connection.credentialPolicy === "per_user" ||
         !isToolConnectionAttentionHealth(connection.healthStatus)) &&
       (connection.transport === "mcp_remote" ||
-        connection.transport === "local_stdio" || isBrowserUseConnection(connection) || githubBotConnectionIds.has(connection.id)),
+        connection.transport === "local_stdio" || isBrowserUseConnection(connection) || githubBotConnectionIds.has(connection.id) || spekoConnectionIds.has(connection.id)),
   );
   const assignedConnectionIds = new Set(
     assignedConnections.map((connection) => connection.id),
