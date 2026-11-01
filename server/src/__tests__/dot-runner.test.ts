@@ -43,7 +43,7 @@ describe("durable Dot Runner integration", () => {
   let root: string;
   beforeAll(async () => {
     const runnerRoot = fileURLToPath(new URL("../../../packages/paperclip-runner/", import.meta.url));
-    execFileSync("cargo", ["build", "--release", "--locked", "--manifest-path", join(runnerRoot, "runner/Cargo.toml"), "-p", "paperclip-runner-core", "--bin", "paperclip-runnerd"], { cwd: runnerRoot, stdio: "inherit", timeout: 300000 });
+    execFileSync("cargo", ["build", "--release", "--locked", "--manifest-path", join(runnerRoot, "runner/Cargo.toml"), "-p", "paperclip-runner-core", "--bin", "paperclip-runnerd"], { cwd: runnerRoot, stdio: "inherit", timeout: 840000 });
     temporary = await startEmbeddedPostgresTestDatabase("paperclip-dot-runner-");
     db = createDb(temporary.connectionString);
     root = await mkdtemp(join(tmpdir(), "paperclip-dot-state-"));
@@ -52,7 +52,7 @@ describe("durable Dot Runner integration", () => {
     vi.stubEnv("PAPERCLIP_RUNNER_STATE_DIR", join(root, "runner-state"));
     vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", randomBytes(32).toString("base64"));
     await instanceSettingsService(db).updateExperimental({ enablePublicMcp: true, enableOpenAiDot: true, enableNativeRunner: false });
-  }, 360000);
+  }, 900000);
   afterAll(async () => {
     try {
       await temporary?.cleanup();
