@@ -1,14 +1,13 @@
 {
-  "lastSyncedTag": "v2026.831.1",
-  "lastSyncedSha": "65ec059bde30d98c92165b24a30a540800dd1f6f",
-  "lastSyncedAt": "2026-09-08T13:40:58Z",
-  "etag": "\"af3d74f58350e46052ec5a93682e10c28aebb48ff58855adcc54864423cfd945\"",
-  "lastCheckedAt": "2026-09-08T13:40:58Z",
+  "lastSyncedTag": "v2026.1023.0",
+  "lastSyncedSha": "1b4c803816e82b0265c8422e1a804327a7ed8c54",
+  "lastSyncedAt": "2026-11-02T11:11:49Z",
+  "lastCheckedAt": "2026-11-02T11:11:49Z",
   "pendingPrUrl": null,
   "lastConflictBuckets": {
     "clean": 0,
     "reviewable": 0,
-    "escalation": 1
+    "escalation": 0
   },
-  "_syncNote": "v2026.831.1 cursor reconcile. Upstream release v2026.831.1 (tag commit 65ec059bde30d98c92165b24a30a540800dd1f6f, published 2026-09-02) reached fork master out-of-band via the conflict-resolution train: the weekly upstream-sync tick of 2026-09-07T19:15Z hit the escalation bucket (34 both-modified files / ~122 hunks / 1 delete-edit) and its trivial-conflict resolver crashed the lockfile regen on still-conflicted package.json files (hardening noted on the routine's lockfile-integrity backlog ticket); the routine's escalation child delegated a fresh 13-pass re-merge on branch sync/upstream-v2026.831.1-merge13, opened as PR #320 and refiled as PR #322 after master drift, merged 2026-09-08 as 62b44d5ae behind the operator-approved merge-gate card. All upstream releases through v2026.831.1 are contained via ancestry (65ec059bde verified ancestor of master). lastSyncedSha pins the UPSTREAM tag commit per the established marker convention; the fork-master landing is PR #322. lastConflictBuckets.escalation=1 records the tick's initial conflict report that triggered the escalation. Host release for the train is already cut and published (v2026.908.1-fork.44, 2026-09-08T12:31Z, built from 7dc170dc8 = workflow-only delta over 0a60fe33b; operator install pending on the release thread). This commit advances the durable cursor to reality so future ticks 304/no-op instead (established cursor-reconcile pattern; mirrors the v2026.618.0->v2026.626.0, v2026.626.0->v2026.707.0 and v2026.707.0->v2026.824.1 reconciles). No content change here - pure bookkeeping. Supersedes the v2026.824.1 cursor note.\n"
+  "_syncNote": "v2026.1023.0 cursor reconcile. Release reached fork master via PR #702 (merge 804a0f72fb). No content change, pure bookkeeping. lastSyncedSha is the upstream tag commit. etag dropped so the next tick refreshes it."
 }
