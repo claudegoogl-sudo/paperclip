@@ -106,6 +106,8 @@ export function createPiJsonlParser() {
 
       if (eventType === "auto_retry_end") {
         const succeeded = event.success === true;
+        // A successful retry means earlier transient provider errors are resolved.
+        if (succeeded) result.errors.length = 0;
         if (!succeeded) {
           const finalError = asString(event.finalError, "").trim();
           result.errors.push(finalError || "Pi exhausted automatic retries without producing a response.");
