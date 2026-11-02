@@ -61,6 +61,7 @@ function makeCtx(overrides: Record<string, unknown> = {}) {
       },
       config: {
         command: "/usr/bin/hermes",
+        provider: "anthropic",
         timeoutSec: 60,
         graceSec: 5,
         ...overrides,
