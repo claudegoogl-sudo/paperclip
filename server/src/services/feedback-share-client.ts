@@ -2,6 +2,8 @@ import { gzipSync } from "node:zlib";
 import type { FeedbackTraceBundle } from "@paperclipai/shared";
 import type { Config } from "../config.js";
 
+export const FEEDBACK_UPLOAD_TIMEOUT_MS = 30_000;
+
 const DEFAULT_FEEDBACK_EXPORT_BACKEND_URL = "https://telemetry.paperclip.ing";
 export const FEEDBACK_SHARE_UPLOAD_TIMEOUT_MS = 60_000;
 
@@ -13,7 +15,7 @@ function buildFeedbackShareObjectKey(bundle: FeedbackTraceBundle, exportedAt: Da
 }
 
 export interface FeedbackTraceShareClient {
-  uploadTraceBundle(bundle: FeedbackTraceBundle): Promise<{ objectKey: string }>;
+  uploadTraceBundle(bundle: FeedbackTraceBundle, signal?: AbortSignal): Promise<{ objectKey: string }>;
 }
 
 export function createFeedbackTraceShareClientFromConfig(
@@ -24,7 +26,10 @@ export function createFeedbackTraceShareClientFromConfig(
   const endpoint = new URL("/feedback-traces", baseUrl).toString();
 
   return {
-    async uploadTraceBundle(bundle) {
+    async uploadTraceBundle(bundle, shutdownSignal) {
+      const deadline = AbortSignal.timeout(FEEDBACK_UPLOAD_TIMEOUT_MS);
+      const signal = shutdownSignal ? AbortSignal.any([shutdownSignal, deadline]) : deadline;
+      signal.throwIfAborted();
       const exportedAt = new Date();
       const objectKey = buildFeedbackShareObjectKey(bundle, exportedAt);
       const requestBody = JSON.stringify({
@@ -34,6 +39,7 @@ export function createFeedbackTraceShareClientFromConfig(
       });
       const response = await fetch(endpoint, {
         method: "POST",
+        signal,
         headers: {
           "content-type": "application/json",
           ...(token ? { authorization: `Bearer ${token}` } : {}),
@@ -42,7 +48,6 @@ export function createFeedbackTraceShareClientFromConfig(
           encoding: "gzip+base64+json",
           payload: gzipSync(requestBody).toString("base64"),
         }),
-        signal: AbortSignal.timeout(FEEDBACK_SHARE_UPLOAD_TIMEOUT_MS),
       });
 
       if (!response.ok) {
@@ -51,6 +56,8 @@ export function createFeedbackTraceShareClientFromConfig(
       }
 
       const payload = await response.json().catch(() => null) as { objectKey?: unknown } | null;
+      // A timed-out response body is not a successful upload acknowledgement.
+      signal.throwIfAborted();
       return {
         objectKey: typeof payload?.objectKey === "string" && payload.objectKey.trim().length > 0
           ? payload.objectKey

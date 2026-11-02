@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import {
+  costEvents,
   agents,
   agentRuntimeState,
   companies,

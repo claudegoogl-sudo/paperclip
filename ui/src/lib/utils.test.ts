@@ -89,7 +89,8 @@ describe("formatCents", () => {
   });
 
   it("formats negative amounts", () => {
-    expect(formatCents(-500)).toBe("$-5.00");
+    // ICU versions differ on sign placement.
+    expect(formatCents(-500)).toMatch(/^(-\$5\.00|\$-5\.00)$/);
   });
 
   it("formats sub-dollar amounts", () => {

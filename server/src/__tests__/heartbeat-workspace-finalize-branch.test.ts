@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { and, asc, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  costEvents,
   activityLog,
   agentRuntimeState,
   agentWakeupRequests,
@@ -105,6 +106,24 @@ async function waitForRuntimeStateLastRun(db: Db, agentId: string, runId: string
     if (state?.lastRunId === runId) return;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
+}
+
+async function deleteHeartbeatRowsAfterActivityLogDrains(db: Db) {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    await db.delete(activityLog);
+    await db.delete(heartbeatRunEvents);
+    try {
+      await db.delete(costEvents);
+      await db.delete(heartbeatRuns);
+      await db.delete(agentWakeupRequests);
+      return;
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  throw lastError;
 }
 
 function readAdapterWorkspace(input: unknown) {

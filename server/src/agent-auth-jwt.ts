@@ -152,7 +152,12 @@ export function createLocalAgentJwt(
   return `${signingInput}.${signature}`;
 }
 
-export function verifyLocalAgentJwt(token: string): LocalAgentJwtClaims | null {
+export function verifyLocalAgentJwt(
+  token: string,
+  // Accepted for call-site compatibility. This fork never had a legacy
+  // master-secret fallback, so verification is always strict.
+  _options?: { strictRunAuthority?: boolean },
+): LocalAgentJwtClaims | null {
   if (!token) return null;
   const config = jwtConfig();
   if (!config) return null;

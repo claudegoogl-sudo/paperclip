@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import {
+  costEvents,
+  activityLog,
   agents,
   agentWakeupRequests,
   agentRuntimeState,
@@ -45,6 +47,7 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
       await db.delete(heartbeatRunEvents);
       await db.delete(activityLog);
       try {
+        await db.delete(costEvents);
         await db.delete(heartbeatRuns);
         return;
       } catch (error) {

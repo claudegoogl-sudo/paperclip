@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
+  costEvents,
   agents,
   agentWakeupRequests,
   companies,

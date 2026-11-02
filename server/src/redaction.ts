@@ -60,6 +60,11 @@ const JWT_VALUE_RE =
 // Public protocol discriminators are retained verbatim. A dotted identifier
 // alone is not a credential; JWT detection requires an encoded JSON header.
 const PAPERCLIP_SCHEMA_FIELDS = new Set(["schema", "runtimeSchema"]);
+// Receipt schema ids are public text wherever they appear (not only in schema fields).
+const PUBLIC_RECEIPT_TEXT_IDS = new Set([
+  "paperclip.semantic_tool_receipt.v1",
+  "paperclip.semantic_tool_receipt.v2",
+]);
 export const PAPERCLIP_PUBLIC_SCHEMA_IDS = new Set([
   "paperclip.artifact.generated.v1",
   "paperclip.artifact.viewed.v1",
@@ -98,6 +103,8 @@ export const PAPERCLIP_PUBLIC_SCHEMA_IDS = new Set([
   "paperclip.model.verification.v1",
   "paperclip.native-cancellation.v1",
   "paperclip.native-execution-input.v1",
+  "paperclip.semantic_tool_receipt.v1",
+  "paperclip.semantic_tool_receipt.v2",
   "paperclip.native-execution-input.v2",
   "paperclip.native-execution-input.v3",
   "paperclip.native-execution-input.v4",
@@ -854,7 +861,8 @@ function sanitizeValue(value: unknown, leaf: LeafTextRedactor): unknown {
   // value is always redacted outright.
   if (typeof value === "string") {
     return (JWT_VALUE_RE.test(value) || looksLikeCredentialJwt(value)) &&
-      !isPublicExecutorToolSelector(value)
+      !isPublicExecutorToolSelector(value) &&
+      !PUBLIC_RECEIPT_TEXT_IDS.has(value)
       ? REDACTED_EVENT_VALUE
       : leaf(value);
   }
@@ -1020,6 +1028,7 @@ function sanitizeRecordWithLeaf(
       typeof value === "string" &&
       (JWT_VALUE_RE.test(value) || looksLikeCredentialJwt(value)) &&
       !isPublicExecutorToolSelector(value) &&
+      !PUBLIC_RECEIPT_TEXT_IDS.has(value) &&
       !isPaperclipSchemaDiscriminator(key, value)
     ) {
       redacted[redactedKey] = REDACTED_EVENT_VALUE;

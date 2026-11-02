@@ -2,12 +2,20 @@ import { randomUUID } from "node:crypto";
 import { and, desc, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  costEvents,
   activityLog,
+  agentRuntimeState,
   agentWakeupRequests,
   agents,
   companies,
+  companySkills,
   createDb,
+  environmentLeases,
+  environments,
+  executionWorkspaces,
+  heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   issues,
 } from "@paperclipai/db";
 import {
@@ -16,7 +24,6 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
-import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import { runningProcesses } from "../adapters/index.ts";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -64,10 +71,41 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
 
   afterEach(async () => {
     runningProcesses.clear();
-    // Wait for in-flight background heartbeat runs and wakeups to finish, then reset
-    // every table atomically (TRUNCATE ... CASCADE) so late writes cannot race the teardown.
-    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
-    await resetEmbeddedPostgresTestDatabase(db);
+    // Await every in-flight background heartbeat run to quiescence before the
+    // deletes below. A wakeup claims a run and dispatches its execution
+    // fire-and-forget, and that run can dispatch a follow-up wakeup, so a run or
+    // wakeup can still write heartbeat_runs and issues rows when teardown starts
+    // and would race the deletes (a heartbeat_runs delete deadlocks on the ON
+    // DELETE SET NULL cascade to issues). The shared drain also awaits an
+    // in-flight wakeup that is still before run registration, which a plain run
+    // table status poll cannot see.
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    // Post-run bookkeeping (run-event records, follow-up wake scheduling) can
+    // still write for a moment after a run reaches a terminal status, so a
+    // single delete sweep can hit a foreign-key violation when a late insert
+    // lands between two deletes. Retry the sweep until it goes through clean.
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await db.delete(environmentLeases);
+        await db.delete(issueComments);
+        await db.delete(issues);
+        await db.delete(heartbeatRunEvents);
+        await db.delete(activityLog);
+        await db.delete(costEvents);
+        await db.delete(heartbeatRuns);
+        await db.delete(agentWakeupRequests);
+        await db.delete(agentRuntimeState);
+        await db.delete(agents);
+        await db.delete(environments);
+        await db.delete(executionWorkspaces);
+        await db.delete(companySkills);
+        await db.delete(companies);
+        break;
+      } catch (error) {
+        if (attempt >= 4) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
   });
 
   afterAll(async () => {

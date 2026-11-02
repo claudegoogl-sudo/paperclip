@@ -3,6 +3,10 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
 
+vi.mock("../services/fast-responses.js", () => ({
+  enqueueFastResponse: vi.fn(async () => undefined),
+}));
+
 // Production middleware always stamps `source`; fixtures that hand-build an
 // actor without one must get the provenance the middleware would have set,
 // because getActorInfo now denies an unset source.
@@ -835,7 +839,7 @@ describe("issue comment reopen routes", () => {
     });
     mockAccessService.decide.mockImplementation(
       async (input: { action?: string }) => {
-        const allowed = input.action === "issue:comment";
+        const allowed = input.action === "issue:read" || input.action === "issue:comment";
         return {
           allowed,
           action: input.action,
@@ -883,7 +887,7 @@ describe("issue comment reopen routes", () => {
       });
       mockAccessService.decide.mockImplementation(
         async (input: { action?: string }) => {
-          const allowed = input.action === "issue:comment";
+          const allowed = input.action === "issue:read" || input.action === "issue:comment";
           return {
             allowed,
             action: input.action,
@@ -1449,7 +1453,7 @@ describe("issue comment reopen routes", () => {
         metadata,
         sourceTrust: null,
       },
-      mockDb,
+      mockTx,
     );
   });
 
@@ -3434,7 +3438,8 @@ describe("issue comment reopen routes", () => {
       .send({ body: reviewBody });
 
     expect(res.status).toBe(201);
-    expect(mockDb.transaction).not.toHaveBeenCalled();
+    // The human comment and optional receipt commit together; no approval update occurs.
+    expect(mockDb.transaction).toHaveBeenCalledTimes(1);
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
       expect.any(String),

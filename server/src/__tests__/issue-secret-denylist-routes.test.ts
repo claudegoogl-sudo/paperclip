@@ -219,7 +219,7 @@ function makeIssue() {
   };
 }
 
-describe.sequential("issue write-block secret denylist routes", () => {
+describe("issue write-block secret denylist routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockIssueService.clearOrphanCheckoutLocksIfTerminal.mockResolvedValue(false);

@@ -34,6 +34,14 @@ const mockAccessService = vi.hoisted(() => ({
 }));
 
 function registerModuleMocks() {
+  // Upstream's router.param("id") read gate queries the db; these tests use a
+  // minimal fake db, so the read gate is stubbed open (company scoping is still
+  // enforced by the route's own access checks).
+  vi.doMock("../services/authorization.js", async () => ({
+    ...(await vi.importActual<object>("../services/authorization.js")),
+    canActorReadApproval: async () => true,
+    approvalReadSqlCondition: async () => undefined,
+  }));
   vi.doMock("../services/index.js", () => ({
     accessService: () => mockAccessService,
     approvalService: () => mockApprovalService,
@@ -119,8 +127,11 @@ function pendingApproval(overrides: Record<string, unknown> = {}) {
 describe("approval creation payload validation", () => {
   // Pay the cold module-graph transform cost once, outside the per-test budget.
   beforeAll(async () => {
+    // Warm the graph with the same mocks the tests use, so the first test does
+    // not bind a real accessService from the pre-warmed module cache.
+    registerModuleMocks();
     await createApp();
-  }, 30_000);
+  }, 60_000);
 
   beforeEach(() => {
     vi.resetModules();

@@ -7,7 +7,7 @@ import { assertInstanceAdmin } from "./authz.js";
 import { logInstanceActivity } from "./instance-activity.js";
 import { logger } from "../middleware/logger.js";
 
-export type InstanceDatabaseBackupTrigger = "manual" | "scheduled";
+export type InstanceDatabaseBackupTrigger = "manual" | "scheduled" | "idle";
 
 export type InstanceDatabaseBackupRunResult = RunDatabaseBackupResult & {
   trigger: InstanceDatabaseBackupTrigger;

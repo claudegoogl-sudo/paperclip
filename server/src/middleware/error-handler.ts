@@ -1,3 +1,4 @@
+import { AgentLifecycleConflict } from "../modules/agent-lifecycle/index.js";
 import type { Request, Response, NextFunction } from "express";
 import type { Db } from "@paperclipai/db";
 import { ZodError } from "zod";
@@ -15,6 +16,7 @@ import {
   redactSensitiveValueOccurrences,
 } from "./redact-sensitive.js";
 import { recordResponsibleUserDenialOnActiveRun } from "../services/responsible-user-denial-run-outcomes.js";
+import { isExpectedMcpConnectionFailure } from "../services/mcp-connection-failure.js";
 
 export interface ErrorContext {
   error: {
@@ -99,10 +101,10 @@ function extractNumericStatus(err: unknown): number | undefined {
 }
 
 /** Report a server-side crash to every error sink. */
-function reportCrash(error: Error): void {
+function reportCrash(error: Error, reportToSentry = true): void {
   const tc = getTelemetryClient();
   if (tc) trackErrorHandlerCrash(tc, { errorCode: error.name });
-  captureException(error);
+  if (reportToSentry) captureException(error);
 }
 
 function getPaperclipDb(req: Request): Db | null {
@@ -142,6 +144,7 @@ export function errorHandler(
   res: Response,
   _next: NextFunction,
 ) {
+  if (err instanceof AgentLifecycleConflict) { res.status(409).json({ error: err.message }); return; }
   if (err instanceof HttpError) {
     const details =
       err.details &&
@@ -190,7 +193,7 @@ export function errorHandler(
             },
         reportableError,
       );
-      reportCrash(reportableError);
+      reportCrash(reportableError, !isExpectedMcpConnectionFailure(err));
     }
     const secretSensitiveServerError =
       err.status >= 500 &&

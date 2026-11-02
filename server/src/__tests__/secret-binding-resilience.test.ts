@@ -1,3 +1,4 @@
+import { createAgentLifecycle } from "../services/agent-lifecycle.js";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
@@ -97,13 +98,13 @@ describeEmbeddedPostgres("secret binding resilience", () => {
     adapterConfig: Record<string, unknown>,
     status = "idle",
   ) {
-    const created = await agentService(db).create(companyId, {
+    const created = await createAgentLifecycle(db).requestHire(companyId, {
       name: `agent-${randomUUID().slice(0, 8)}`,
       role: "engineer",
       adapterType: "codex_local",
       adapterConfig,
       status,
-    } as Parameters<ReturnType<typeof agentService>["create"]>[1]);
+    } as Parameters<ReturnType<typeof createAgentLifecycle>["requestHire"]>[1]);
     return created;
   }
 
@@ -327,8 +328,8 @@ describeEmbeddedPostgres("secret binding resilience", () => {
     // Activation is a status-only patch. It must NOT re-run the binding sync:
     // the re-sync would redo the delete-and-reinsert reconcile with no
     // previous config and silently drop the row the guard just preserved.
-    const result = await agentService(db).activatePendingApproval(agent.id);
-    expect(result?.activated).toBe(true);
+    const result = await createAgentLifecycle(db).approveHire(agent.id);
+    expect(result).toBeTruthy();
 
     const bindings = await bindingsFor(agent.id);
     expect(bindings).toHaveLength(1);

@@ -33,6 +33,8 @@ services:
     # this container hits its own ceiling and dies visibly rather than starving
     # the whole host of pids.
     pids_limit: 2048
+    # Includes the shared 30s adapter-settlement window and final cleanup.
+    stop_grace_period: 90s
     ports:
       # Loopback by default: UFW/iptables INPUT rules do not filter
       # Docker-published ports, so this bind address is the effective control.

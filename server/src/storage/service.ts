@@ -108,7 +108,8 @@ export function createStorageService(provider: StorageProvider): StorageService 
 
     async putFile(input: PutFileInput): Promise<PutFileResult> {
       assertPutFileInput(input);
-      const objectKey = buildObjectKey(input.companyId, input.namespace, input.originalFilename);
+      const objectKey = input.objectKey ?? buildObjectKey(input.companyId, input.namespace, input.originalFilename);
+      ensureCompanyPrefix(input.companyId, objectKey);
       // Fail closed: never store a key the read path would refuse.
       assertObjectKeyReadable(objectKey);
       const byteSize = "byteSize" in input ? input.byteSize : input.body.length;
