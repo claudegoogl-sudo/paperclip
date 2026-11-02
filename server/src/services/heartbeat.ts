@@ -126,6 +126,7 @@ import {
   or,
   sql,
 } from "drizzle-orm";
+import { sessionIdLookupCandidates } from "./session-id-lookup.js";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -6299,6 +6300,13 @@ export function filterZombieCoalesceTarget<
   return target && isZombieRun(target, tracked) ? null : target;
 }
 
+function sessionIdAfterMatches(sessionId: string) {
+  const ids = sessionIdLookupCandidates(sessionId);
+  return ids.length === 1
+    ? eq(heartbeatRuns.sessionIdAfter, ids[0])
+    : inArray(heartbeatRuns.sessionIdAfter, ids);
+}
+
 export function describeSessionResetReason(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
@@ -11940,7 +11948,7 @@ export function heartbeatService(
   ) {
     const conditions = [
       eq(heartbeatRuns.agentId, agentId),
-      eq(heartbeatRuns.sessionIdAfter, sessionId),
+      sessionIdAfterMatches(sessionId),
     ];
     if (opts?.excludeRunId) {
       conditions.push(sql`${heartbeatRuns.id} <> ${opts.excludeRunId}`);
@@ -12805,7 +12813,7 @@ export function heartbeatService(
       .where(
         and(
           eq(heartbeatRuns.agentId, agentId),
-          eq(heartbeatRuns.sessionIdAfter, sessionId),
+          sessionIdAfterMatches(sessionId),
         ),
       )
       .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
@@ -12888,7 +12896,7 @@ export function heartbeatService(
       .where(
         and(
           eq(heartbeatRuns.agentId, agent.id),
-          eq(heartbeatRuns.sessionIdAfter, sessionId),
+          sessionIdAfterMatches(sessionId),
         ),
       )
       .orderBy(desc(heartbeatRuns.createdAt))
