@@ -92,7 +92,7 @@
     "dev": "tsc --watch",
     "lint": "eslint src/",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "vitest run && node --test scripts/prepare-publish-package.test.mjs",
     "test:command-resolution": "vitest run src/server/command-resolution.test.ts",
     "prepack": "node scripts/prepare-publish-package.mjs",
     "postpack": "node scripts/restore-dev-package.mjs",
