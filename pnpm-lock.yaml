@@ -40,7 +40,7 @@ patchedDependencies:
     hash: vbylpnnxt5av2zdnuqmf6hjyjy
     path: patches/@discordjs__ws@1.2.3.patch
   acpx@0.12.0:
-    hash: vd7yjsirzglmfodiiuscqdnmqm
+    hash: vy6fb6n55os5u5npip6zprge7q
     path: patches/acpx@0.12.0.patch
   acpx@0.13.1:
     hash: j4huaoi2baejrlq7vdcgzlx54m
@@ -161,7 +161,7 @@ importers:
         version: link:../shared
       acpx:
         specifier: 0.12.0
-        version: 0.12.0(patch_hash=vd7yjsirzglmfodiiuscqdnmqm)
+        version: 0.12.0(patch_hash=vy6fb6n55os5u5npip6zprge7q)
       picocolors:
         specifier: ^1.1.1
         version: 1.1.1
@@ -186,7 +186,7 @@ importers:
         version: 0.12.0
       acpx:
         specifier: 0.12.0
-        version: 0.12.0(patch_hash=vd7yjsirzglmfodiiuscqdnmqm)
+        version: 0.12.0(patch_hash=vy6fb6n55os5u5npip6zprge7q)
       picocolors:
         specifier: ^1.1.1
         version: 1.1.1
@@ -4989,6 +4989,7 @@ packages:
   '@smithy/core@3.35.1':
     resolution: {integrity: sha512-i4YPS4B6ts7bjn7UwLnGjiZdprOvHvgGobFZsYK3GIY3E5hIqtj0rReU69BcTpGp+fvtraSNXeG1l+jtJvF55w==}
     engines: {node: '>=18.0.0'}
+    deprecated: Deprecated due to a bug in custom logger data redaction. See https://github.com/aws/aws-sdk-js-v3/issues/8393.
 
   '@smithy/credential-provider-imds@4.5.2':
     resolution: {integrity: sha512-A9uSdn72ozbRUSit0eib0TW7nXuNPlaeM0zcGkJ+nE6tFcSDbnmtwoxbTCFBukVQcszDAyvsd7+rTduPTXpygg==}
@@ -7960,6 +7961,7 @@ packages:
 
   opencode-ai@1.18.34:
     resolution: {integrity: sha512-9WUS2T0t4HHDVzXvuwTHF0nvhXvZ9mQ0r+ozCvKdJu0LVoQpOzqAW4qWTC3ygNc5Oedcc7j+Oct24JYlQYnySA==}
+    cpu: [arm64, x64]
     os: [darwin, linux, win32]
     hasBin: true
 
@@ -13815,7 +13817,7 @@ snapshots:
 
   acorn@8.18.0: {}
 
-  acpx@0.12.0(patch_hash=vd7yjsirzglmfodiiuscqdnmqm):
+  acpx@0.12.0(patch_hash=vy6fb6n55os5u5npip6zprge7q):
     dependencies:
       '@agentclientprotocol/sdk': 1.4.0(zod@4.6.5)
       commander: 15.0.0
