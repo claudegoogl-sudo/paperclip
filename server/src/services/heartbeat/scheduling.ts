@@ -33,6 +33,7 @@ import {
   asc,
   getTableColumns,
   gte,
+  gt,
 } from "drizzle-orm";
 import { RECOVERY_ORIGIN_KINDS } from "../recovery/index.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
@@ -590,6 +591,36 @@ export function createHeartbeatScheduling(
     }
   }
 
+  function parseSkipMonitorWhenNoActivity(agent: { runtimeConfig: unknown }) {
+    const runtimeConfig = parseObject(agent.runtimeConfig);
+    return runtimeConfig.skipMonitorWhenNoActivity === true;
+  }
+
+  // Activity = any comment, or any non-monitor activity-log entry on the issue,
+  // after the monitor last fired. Monitor bookkeeping rows do not count.
+  async function issueHasActivitySince(issueId: string, companyId: string, since: Date) {
+    const [comment] = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(and(eq(issueComments.issueId, issueId), gt(issueComments.createdAt, since)))
+      .limit(1);
+    if (comment) return true;
+    const [event] = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issueId),
+          gt(activityLog.createdAt, since),
+          sql`${activityLog.action} not like 'issue.monitor%'`,
+        ),
+      )
+      .limit(1);
+    return Boolean(event);
+  }
+
   async function dispatchClaimedIssueMonitor(
     claimed: IssueMonitorDispatchRow,
     input: {
@@ -645,6 +676,51 @@ export function createHeartbeatScheduling(
       : claimed.assigneeAgentId;
     if (!targetAgentId) {
       throw conflict("Issue monitor has no agent target");
+    }
+    if (input.source === "automation" && !isProviderQuotaReviewMonitor) {
+      const skipAgent = await getAgent(targetAgentId);
+      if (
+        skipAgent &&
+        parseSkipMonitorWhenNoActivity(skipAgent) &&
+        !clearReason &&
+        !monitor?.serviceName &&
+        claimed.monitorLastTriggeredAt &&
+        !(await issueHasActivitySince(claimed.id, claimed.companyId, claimed.monitorLastTriggeredAt))
+      ) {
+        const skipped = await db
+          .update(issues)
+          .set({
+            ...buildIssueMonitorClearedPatch({
+              issue: claimed,
+              policy,
+              clearReason: "dispatch_skipped",
+              clearedAt: input.now,
+            }),
+            updatedAt: new Date(),
+          })
+          .where(issueMonitorClaimCondition(claimed))
+          .returning({ id: issues.id });
+        if (skipped.length === 0) return { outcome: "skipped" as const, reason: "monitor_replaced" };
+        await logActivity(db, {
+          companyId: claimed.companyId,
+          actorType: input.actorType,
+          actorId: input.actorId,
+          agentId: input.agentId,
+          runId: input.runId,
+          action: "issue.monitor_skipped",
+          entityType: "issue",
+          entityId: claimed.id,
+          details: {
+            identifier: claimed.identifier,
+            nextCheckAt: scheduledAtIso,
+            attemptCount: nextAttemptCount,
+            notes: claimed.monitorNotes ?? null,
+            reason: "no_activity_since_last_run",
+            source: input.activitySource,
+          },
+        });
+        return { outcome: "skipped" as const, reason: "no_activity_since_last_run" };
+      }
     }
     const wakeReason = isProviderQuotaReviewMonitor
       ? EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON
