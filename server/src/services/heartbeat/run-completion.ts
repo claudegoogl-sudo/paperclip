@@ -2,7 +2,7 @@ import { measureRunPhase } from "../execution-preparation-timing.js";
 import { pendingCaseHandoffForRun } from "./case-handoff-lifecycle.js";
 import { NON_RETRYABLE_PREFLIGHT_FAILURE_CODES, isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
 import { ChatControlRecoveryUnresolvedError } from "./queue.js";
-import { readTransientRecoveryContractFromRun, readHeartbeatRunErrorFamily, isTransientWorkspaceGitScanCode } from "./retries.js";
+import { readTransientRetryNotBeforeFromRun, readTransientRecoveryContractFromRun, readHeartbeatRunErrorFamily, isTransientWorkspaceGitScanCode } from "./retries.js";
 import { type RunSessionOutcome, resolveNextSessionState, normalizeUsageTotals, resolveCacheAdjustedCostUsd, resolveLedgerBiller, resolveLedgerCostStatus, normalizeLedgerBillingType } from "./run-state.js";
 import { readGitConnectionFailure } from "../git-connection-failure.js";
 import { CONFIGURATION_INCOMPLETE_FAILURE_CODE, ConfigurationIncompleteFailure } from "./run-preparation.js";
@@ -34,6 +34,8 @@ import { MAX_TURN_CONTINUATION_RETRY_REASON } from "../../modules/run-dispatch/i
 import { redactCurrentUserText } from "../../log-redaction.js";
 import type { createHeartbeatLifecycle } from "./run-lifecycle.js";
 import type { createHeartbeatRunPreparation } from "./run-preparation.js";
+import { resolveUsageLimitParkTarget, shouldParkForUsageLimit } from "./usage-limit-park-policy.js";
+import type { usageLimitParkService } from "../usage-limit-park.js";
 import type { createHeartbeatRetries, HeartbeatRetryDependencies } from "./retries.js";
 import type { createHeartbeatQueue } from "./queue.js";
 import type { createHeartbeatRunControl, HeartbeatRunControlDependencies } from "./run-control.js";
@@ -69,6 +71,7 @@ export interface HeartbeatRunCompletionDependencies extends Pick<RunState,
   Pick<ReturnType<typeof createHeartbeatRunControl>, "releaseIssueExecutionAndPromote">,
   Pick<HeartbeatRetryDependencies, "finalizeAgentStatus">,
   Pick<ReturnType<typeof createHeartbeatQueue>, "enqueueWakeup"> {
+  usageLimitPark?: Pick<ReturnType<typeof usageLimitParkService>, "park" | "clear">;
   issuesSvc: Pick<ReturnType<typeof issueService>, "addComment">;
   recovery: Pick<ReturnType<typeof recoveryService>, "reconcileLegacyContinuation" | "reconcileResolvedDependencyWakeBackstop">;
   getCurrentUserRedactionOptions: () => Promise<CurrentUserRedactionOptions>;
@@ -366,6 +369,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     handleSuccessfulRunHandoff,
     updateRuntimeState,
     scheduleBoundedRetryForRun,
+    usageLimitPark,
     scheduleInteractionContinuationInfrastructureRetryIfEligible,
     timerClaimWasFirstHeartbeat,
     releaseIssueExecutionAndPromote,
@@ -419,6 +423,11 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       outcome = "succeeded";
     } else {
       outcome = "failed";
+    }
+
+    // Clear early on the first successful dispatch so a stale park never outlives a recovered quota.
+    if (outcome === "succeeded") {
+      await usageLimitPark?.clear({ reason: "run_succeeded" });
     }
 
     const nextSessionState = resolveNextSessionState({
@@ -945,6 +954,22 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           livenessRun,
           agent,
         );
+      }
+      // Zero-work usage-limit hit (never billed, never reached the model, carries a
+      // limit-signal string) parks every agent until the advertised reset.
+      {
+        const failedResultJson = parseObject(livenessRun.resultJson);
+        if (shouldParkForUsageLimit(outcome, failedResultJson)) {
+          await usageLimitPark?.park({
+            parkedUntil: resolveUsageLimitParkTarget({
+              now: new Date(),
+              retryNotBefore: readTransientRetryNotBeforeFromRun(livenessRun),
+            }),
+            reason: readNonEmptyString(livenessRun.errorCode) ?? "usage_limit_zero_work",
+            rawLimitText: readNonEmptyString(failedResultJson.result),
+            sourceRunId: livenessRun.id,
+          });
+        }
       }
       const issueCommentPolicyResult = await finalizeIssueCommentPolicy(
         livenessRun,

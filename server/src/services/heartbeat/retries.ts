@@ -258,7 +258,7 @@ export function readHeartbeatRunErrorFamily(
   return null;
 }
 
-function readTransientRetryNotBeforeFromRun(
+export function readTransientRetryNotBeforeFromRun(
   run: Pick<typeof heartbeatRuns.$inferSelect, "resultJson">,
 ) {
   const resultJson = parseObject(run.resultJson);

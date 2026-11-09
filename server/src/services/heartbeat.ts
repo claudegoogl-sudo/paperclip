@@ -641,6 +641,13 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
+export {
+  NO_OP_DISPATCH_RETRY_SAFETY_MARGIN_MS,
+  isZeroWorkUsageLimitResult,
+  resolveUsageLimitParkTarget,
+  shouldParkForUsageLimit,
+} from "./heartbeat/usage-limit-park-policy.js";
+
 export function formatRuntimeWorkspaceWarningLog(warning: string) {
   return {
     stream: "stdout" as const,
@@ -925,6 +932,10 @@ export function heartbeatService(
     }
     return cachedWorktreeRunExecutionOverride;
   };
+  const usageLimitPark = usageLimitParkService(db);
+  const instanceAdmissionHold = instanceAdmissionHoldService(db);
+  const isAdmissionBlocked = async () =>
+    (await usageLimitPark.isParked()) || (await instanceAdmissionHold.isHeld());
   const getSchedulingSuppression = async () => {
     const override = await resolveWorktreeRunExecutionOverride();
     return resolveHeartbeatSchedulingSuppression(runtimeEnv, {
@@ -1285,6 +1296,7 @@ export function heartbeatService(
     isHeartbeatRunTerminalStatus,
     liveRunExecutions,
     getSchedulingSuppression,
+    isAdmissionBlocked,
     resumeExecutionWaitComments,
     getWorktreeExecutionCutoff,
     resumeQueuedCommentInterrupt,
@@ -1734,6 +1746,7 @@ export function heartbeatService(
   }
 
   const runCompletion = createHeartbeatRunCompletion(db, {
+    usageLimitPark,
     getRun,
     getAgent,
     resolveNormalizedUsageForSession,
@@ -1806,6 +1819,9 @@ export function heartbeatService(
     if (run.status !== "queued" && run.status !== "running") return;
 
     if (run.status === "queued") {
+      // Defense-in-depth: a second, independently reachable path into a claim. A run that
+      // is already running is never stopped by a park that began after dispatch.
+      if (await isAdmissionBlocked()) return;
       const claimed = await claimQueuedRun(run);
       if (!claimed) {
         // claimQueuedRun can also leave the run queued when dependencies are unresolved.
@@ -3980,8 +3996,6 @@ export function heartbeatService(
     return agentExecutionsHaveStopped(db, agentIds);
   }
 
-  const usageLimitPark = usageLimitParkService(db);
-  const instanceAdmissionHold = instanceAdmissionHoldService(db);
 
   // Publish the queued-run live event for each run and kick every involved
   // agent once, so promoted deferred-wake runs (possibly across sibling issues
@@ -4668,6 +4682,7 @@ export function heartbeatService(
     reconcileHighCommentVolumeAlerts,
     buildRunLivenessProbe,
     getRunLivenessProbe,
+    startNextQueuedRunForAgent,
     getUsageLimitParkState: (now?: Date) => usageLimitPark.getState(now),
     clearUsageLimitPark: async (input: { actorType: string | null }) => {
       const state = await usageLimitPark.clear({ reason: "manual_unpark" });
