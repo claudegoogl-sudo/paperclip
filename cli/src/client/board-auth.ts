@@ -268,14 +268,28 @@ export async function loginBoardCli(params: {
   const pollMs = Math.max(500, challenge.suggestedPollIntervalMs || 1000);
   if (!Number.isFinite(expiresAtMs)) throw new Error("CLI auth challenge returned an invalid expiry.");
 
+  const MAX_CONSECUTIVE_POLL_FAILURES = 3;
+  let consecutivePollFailures = 0;
   while (Number.isFinite(expiresAtMs) ? Date.now() < expiresAtMs : true) {
     let status: ChallengeStatusResponse;
     try {
       status = await requestJson<ChallengeStatusResponse>(
         `${apiBase}/api${challenge.pollPath}?token=${encodeURIComponent(challenge.token)}`,
       );
+      consecutivePollFailures = 0;
     } catch (error) {
-      if (!(error instanceof BoardAuthRequestError) || error.status !== 429) throw error;
+      const isRequestError = error instanceof BoardAuthRequestError;
+      // Transient = network failure or 5xx. Tolerate up to 3 consecutive, then give up.
+      // Permanent 4xx (other than 429) is rethrown immediately.
+      if (!isRequestError || error.status >= 500) {
+        consecutivePollFailures += 1;
+        if (consecutivePollFailures >= MAX_CONSECUTIVE_POLL_FAILURES) throw error;
+        const remaining = expiresAtMs - Date.now();
+        if (remaining <= 0) break;
+        await sleep(Math.min(pollMs, remaining));
+        continue;
+      }
+      if (error.status !== 429) throw error;
       const remainingMs = expiresAtMs - Date.now();
       if (remainingMs <= 0) break;
       await sleep(Math.min(Math.max(pollMs, error.retryAfterMs ?? pollMs), remainingMs));

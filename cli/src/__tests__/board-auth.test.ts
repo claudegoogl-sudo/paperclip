@@ -158,9 +158,9 @@ describe("board CLI polling backoff", () => {
     } finally { f.cleanup(); }
   });
 
-  it("does not retry other HTTP failures", async () => {
-    const f = harness([{ status: 503, body: { error: "Unavailable" } }]);
-    try { expect(await f.outcome).toHaveProperty("error.message", "Unavailable"); expect(f.counts()).toEqual({ creates: 1, polls: 1 }); }
+  it("does not retry permanent HTTP failures (4xx); 5xx is covered by the poll-failure tolerance tests", async () => {
+    const f = harness([{ status: 403, body: { error: "Forbidden" } }]);
+    try { expect(await f.outcome).toHaveProperty("error.message", "Forbidden"); expect(f.counts()).toEqual({ creates: 1, polls: 1 }); }
     finally { f.cleanup(); }
   });
 });
