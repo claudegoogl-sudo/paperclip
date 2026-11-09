@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   classifyMerge,
+  loadBaseline,
   findOpenSyncPr,
   isUnrelatedHistoriesError,
   mergeBaseOrEmpty,
@@ -225,4 +226,19 @@ test("pickOpenSyncPr matches open fold-round heads -rN (no-op) but not closed/un
   assert.equal(pickOpenSyncPr([openPr(`${BRANCH}-r7`, { state: "closed" })], BRANCH), null);
   assert.equal(pickOpenSyncPr([openPr("sync/upstream-v2026.1005.0-r7")], BRANCH), null);
   assert.equal(pickOpenSyncPr([openPr(`${BRANCH}-rx`), openPr(`${BRANCH}-r`), openPr(`${BRANCH}0-r1`)], BRANCH), null);
+});
+
+test("loadBaseline reads origin/master and reports tag+sha+ref", () => {
+  const remote = { lastSyncedTag: "v1", lastSyncedSha: "abc" };
+  const git = (a) => (a[0] === "show" ? JSON.stringify(remote) : a[0] === "rev-parse" ? "deadbeef" : "");
+  const r = loadBaseline(git, "/nonexistent/state.json");
+  assert.deepEqual(r.baseline, { tag: "v1", sha: "abc", sourceRef: "origin/master", sourceRefSha: "deadbeef" });
+});
+
+test("loadBaseline refuses when the local file disagrees with origin/master", async () => {
+  const fs = await import("node:fs");
+  const f = "/tmp/us12284-local.json";
+  fs.writeFileSync(f, JSON.stringify({ lastSyncedTag: "old", lastSyncedSha: "x" }));
+  const git = (a) => (a[0] === "show" ? JSON.stringify({ lastSyncedTag: "v1", lastSyncedSha: "abc" }) : "h");
+  assert.throws(() => loadBaseline(git, f), /baseline mismatch/);
 });
