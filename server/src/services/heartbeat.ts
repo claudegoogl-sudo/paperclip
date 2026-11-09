@@ -136,9 +136,13 @@ import {
   configuredPaperclipApiBaseUrl,
   createHeartbeatRunPreparation,
 } from "./heartbeat/run-preparation.js";
+export { SANCTIONED_BRIDGE_ENV_KEY } from "./task-bridge-keys.js";
+export { terminateHeartbeatRunProcess };
 export {
   ConfigurationIncompleteFailure,
   resolveExecutionRunAdapterConfig,
+  resolveSanctionedBridgeEnvBinding,
+  type SanctionedBridgeKeyResolution,
   extractMentionedSkillIdsFromSources,
   applyRunScopedMentionedSkillKeys,
   revokeHeartbeatRunGatewayTokens,

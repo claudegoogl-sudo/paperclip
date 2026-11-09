@@ -11,6 +11,7 @@ import { readPaperclipSkillSyncPreference, resolvePaperclipDesiredSkillNames, re
   writePaperclipSkillSyncPreference } from "@paperclipai/adapter-utils/server-utils";
 import { parseObject } from "../../adapters/utils.js";
 import { logger } from "../../middleware/logger.js";
+import { formatBridgeKeyRefusalLine } from "@paperclipai/shared";
 import { AI_CONNECTION_BUSY_RETRY_REASON, extractWakeCommentIds, isNonAssigneeWorkspaceBusyRetry } from "../../modules/run-dispatch/index.js";
 import { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
 import { agentIdentityService, supportsManagedAgentIdentity } from "../agent-identity.js";
@@ -154,7 +155,7 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
       selectedEnvironmentForConfig?.driver ?? "local",
     );
 
-  const { resolvedConfig, configuredTaskEnvironment, secretKeys, secretManifest } =
+  const { resolvedConfig, configuredTaskEnvironment, secretKeys, secretManifest, bridgeKey } =
     await time("configuration_secrets", () => resolveExecutionRunAdapterConfig({
       managedAiCredentials: Boolean(aiBinding),
       managedGitHubCredentials: !useHostGitHub,
@@ -174,7 +175,17 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
       routineEnv: aiBinding ? stripAiAuthBindings(routineEnvContext.env) : routineEnvContext.env,
       secretsSvc,
       trustPreset,
+      // Same as fork master: boardGatedAgentEnv / verifyTaskBridgeKey are not wired here, so bridge delivery stays fail-closed (binding_absent).
     }));
+  // Surface a typed bridge refusal (not the common binding_absent) as one log line + a wake-context field.
+  const bridgeKeyRefusal = bridgeKey?.status === "refused" ? bridgeKey.refusal : null;
+  if (bridgeKeyRefusal && bridgeKeyRefusal.code !== "binding_absent") {
+    const bridgeKeyLine = formatBridgeKeyRefusalLine(bridgeKeyRefusal);
+    logger.warn({ companyId: agent.companyId, agentId: agent.id, refusalCode: bridgeKeyRefusal.code, ...(bridgeKeyRefusal.keyId ? { keyId: bridgeKeyRefusal.keyId } : {}), ...(bridgeKeyRefusal.expiresAt ? { expiresAt: bridgeKeyRefusal.expiresAt } : {}) }, bridgeKeyLine);
+    context.paperclipBridgeKeyStatus = { ...bridgeKeyRefusal, message: bridgeKeyLine };
+  } else {
+    delete context.paperclipBridgeKeyStatus;
+  }
   onFailureSecretsResolved(() => collectRunFailureSecretValues(resolvedConfig.env, secretKeys));
   if (aiBinding) {
     try {

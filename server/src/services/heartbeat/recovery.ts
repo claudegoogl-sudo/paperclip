@@ -122,7 +122,12 @@ export interface HeartbeatRecoveryDependencies extends Pick<HeartbeatRetryDepend
     pid: number | null | undefined;
     processGroupId: number | null | undefined;
     graceMs?: number;
-  }) => Promise<void>;
+    signal?: NodeJS.Signals;
+    trustedHandle?: boolean;
+    identityMode?: "process" | "descendant-group";
+    expectedProcessStartedAt?: Date | number | null;
+    runId?: string;
+  }) => Promise<unknown>;
   setRunStatus: (runId: string, status: string, patch?: Partial<typeof heartbeatRuns.$inferInsert>) => Promise<HeartbeatRun | null>;
   setRunStatusFromLive: (runId: string, status: string, fromStatuses: string[], patch?: Partial<typeof heartbeatRuns.$inferInsert>) => Promise<{
     updated: boolean;
@@ -1185,6 +1190,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           await terminateHeartbeatRunProcess({
             pid: running.child.pid,
             processGroupId: running.processGroupId,
+            // Live in-memory child handle: the pid cannot have been recycled.
+            trustedHandle: running.child.exitCode == null && running.child.signalCode == null,
             graceMs: Math.max(1, running.graceSec) * 1000,
           });
         }
