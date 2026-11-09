@@ -90,8 +90,11 @@ describe("feedback redaction", () => {
     };
 
     expect(sanitizeFeedbackValue(input, state, "bundle", 10_000)).toEqual({
-      ...input,
-      nested: [{ apiKey: "***REDACTED***", path: "deployment.credentials.example.md" }],
+      // Fork-strict key matching (kept over upstream 1106, which preserved
+      // tokenPolicy/path): credential-qualified keys are masked, free text is not.
+      body: input.body,
+      tokenPolicy: "***REDACTED***",
+      nested: [{ apiKey: "***REDACTED***", path: "***REDACTED***" }],
     });
   });
 });

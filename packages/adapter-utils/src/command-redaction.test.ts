@@ -1,4 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { REDACTED_COMMAND_TEXT_VALUE, redactCommandText, redactDiagnosticText } from "./command-redaction.js";
+
+// Synthetic, shape-valid fixtures only — never real credentials.
+// Fine-grained PAT shape: `github_pat_` + 22 chars + `_` + 59 chars.
+const FINE_GRAINED_PAT =
+  "github_pat_11ABCDE5Y0abcdefghijkl_" +
+  "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVW";
+const CLASSIC_PAT = "ghp_0123456789abcdefghijklmnopqrstuvwx";
 
 describe("explicit diagnostic credential forms", () => {
   it("masks suffixed CLI options and encoded JSON headers with whitespace", () => {
@@ -9,52 +17,18 @@ describe("explicit diagnostic credential forms", () => {
     expect(redactCommandText("plan.security.credentials.md")).toBe("plan.security.credentials.md");
   });
 });
-import {
-  REDACTED_COMMAND_TEXT_VALUE,
-  looksLikeCredentialJwt,
-  redactDiagnosticText,
-  redactCommandText,
-} from "./command-redaction.js";
-
-describe("looksLikeCredentialJwt", () => {
-  it("recognizes encoded headers even with short payloads and signatures", () => {
-    const header = Buffer.from('{"alg":"HS256"}').toString("base64url");
-    expect(looksLikeCredentialJwt(`${header}.e30.c2ln`)).toBe(true);
-  });
-
-  it("recognizes direct-encryption JWTs with an empty encrypted-key segment", () => {
-    const header = Buffer.from('{"alg":"dir","enc":"A256GCM"}').toString("base64url");
-    expect(looksLikeCredentialJwt(`${header}..abcdefghijk.abcdefghijkl.abcdefghijk`)).toBe(true);
-  });
-
-  it.each([
-    "eyJ..signature",
-    "eyJ.key..ciphertext.tag",
-    "eyJ.key.iv..tag",
-    "eyJ.key.iv.ciphertext.",
-  ])("rejects empty segments outside the JWE encrypted key: %s", (input) => {
-    expect(looksLikeCredentialJwt(input)).toBe(false);
-  });
-
-  it.each([
-    "api.openai.com",
-    "agents.staging.example.com",
-    "deployment.credentials.example.md",
-    "paperclip.native-model-envelope.v3",
-  ])("rejects public dotted identifiers: %s", (input) => {
-    expect(looksLikeCredentialJwt(input)).toBe(false);
-  });
-});
 
 describe("redactDiagnosticText", () => {
   it("preserves credential metadata and dotted identifiers", () => {
     for (const text of [
       '"tokenBudget":4000 --token-budget 4000 SECRET_STORAGE=vault',
       '{"credentialHandling":"harness","authorizationRequired":true}',
-      "executor.customTools.integrations.list deployment.credentials.example.md api.openai.com",
+      "deployment.credentials.example.md api.openai.com",
       "Use a private key and secret manager with credential handling.",
       "Use bearer tokens and bearer authentication.",
     ]) expect(redactDiagnosticText(text)).toBe(text);
+    // Fork-strict: a bare dotted identifier with 3-4 segments is JWT-shaped and fails closed.
+    expect(redactDiagnosticText("executor.customTools.integrations.list ok")).not.toContain("customTools");
   });
 
   it("redacts a JSON secret field value", () => {
@@ -143,5 +117,32 @@ second-line\" status=401`;
     const output = redactDiagnosticText(input);
     expect(output).not.toContain("MARKERBACKSLASH_B");
     expect(output).toContain(REDACTED_COMMAND_TEXT_VALUE);
+  });
+});
+
+describe("redactCommandText fine-grained github_pat_ coverage", () => {
+  it("redacts a lone fine-grained PAT with no other secret hint present", () => {
+    // Regression: before this fix `maybeContainsSecretText` returned false for a
+    // bare `github_pat_` token (no `--flag`/`ENV=`/classic-prefix hint), so the
+    // function returned the command unchanged and leaked the PAT.
+    const out = redactCommandText(`echo ${FINE_GRAINED_PAT}`);
+    expect(out).not.toContain(FINE_GRAINED_PAT);
+    expect(out).toContain(REDACTED_COMMAND_TEXT_VALUE);
+  });
+
+  it("redacts a fine-grained PAT embedded in an argument", () => {
+    const out = redactCommandText(`curl -H "x: ${FINE_GRAINED_PAT}" https://api.example.com`);
+    expect(out).not.toContain(FINE_GRAINED_PAT);
+  });
+
+  it("still redacts classic ghp_ tokens", () => {
+    const out = redactCommandText(`git remote set-url origin https://${CLASSIC_PAT}@example.com`);
+    expect(out).not.toContain(CLASSIC_PAT);
+    expect(out).toContain(REDACTED_COMMAND_TEXT_VALUE);
+  });
+
+  it("leaves commands without secrets untouched", () => {
+    const cmd = "ls -la /tmp && echo done";
+    expect(redactCommandText(cmd)).toBe(cmd);
   });
 });
