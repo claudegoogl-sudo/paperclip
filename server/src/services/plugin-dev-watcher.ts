@@ -332,9 +332,8 @@ export function createPluginDevWatcher(
     if (pluginWatcher) {
       void pluginWatcher.watcher.close();
       watchers.delete(pluginId);
-      watchedPaths.delete(pluginId);
       log.info(
-        { pluginId, packagePath },
+        { pluginId, packagePath: pluginWatcher.packagePath },
         "plugin-dev-watcher: unwatched local plugin",
       );
     }

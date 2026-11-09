@@ -315,7 +315,7 @@ databaseSuite("CLI challenge authority and transitions (real PostgreSQL)", () =>
     app.use(actorMiddleware(db, { deploymentMode: "authenticated", resolveSession: async req => (req.header("X-Test-Session") === f.userId || req.header("X-Test-Session") === foreign.userId)
       ? { session: { id: "synthetic-session" }, user: { id: req.header("X-Test-Session"), name: "CLI owner", email: "owner@example.invalid" } } as any : null }));
     app.use("/api", accessRoutes(db, { deploymentMode: "authenticated", deploymentExposure: "private", bindHost: "127.0.0.1", allowedHostnames: [] })); app.use("/api", activityRoutes(db)); app.use(errorHandler);
-    const foreignKey = await f.service.createNamedBoardApiKey({ userId: foreign.userId, name: "Synthetic foreign operator" });
+    const foreignKey = await f.service.createNamedBoardApiKey({ userId: foreign.userId, name: "Synthetic foreign operator", scope: { kind: "standard" }, expiresAt: new Date(Date.now() + 60 * 60 * 1000) });
     const forged = await request(app).post(`/api/companies/${foreign.companyId}/activity`).set("Authorization", `Bearer ${foreignKey.token}`).send({
       actorType: "user", actorId: f.userId, action: "board_api_key.created", entityType: "user", entityId: f.userId,
       responsibleUserId: f.userId, responsible_user_id: f.userId, details: { boardApiKeyId: keyId, responsibleUserId: f.userId },
@@ -350,7 +350,7 @@ databaseSuite("CLI challenge authority and transitions (real PostgreSQL)", () =>
       .send({ name: "Synthetic named key", requestedCompanyId: f.companyId });
     expect(created.status).toBe(201);
     expect(await db.select().from(cliAuthChallenges).where(eq(cliAuthChallenges.boardApiKeyId, created.body.id))).toHaveLength(0);
-    const foreignKey = await f.service.createNamedBoardApiKey({ userId: foreign.userId, name: "Synthetic foreign operator" });
+    const foreignKey = await f.service.createNamedBoardApiKey({ userId: foreign.userId, name: "Synthetic foreign operator", scope: { kind: "standard" }, expiresAt: new Date(Date.now() + 60 * 60 * 1000) });
     const forged = await request(app).post(`/api/companies/${foreign.companyId}/activity`).set("Authorization", `Bearer ${foreignKey.token}`).send({
       actorType: "user", actorId: f.userId, action: "board_api_key.created", entityType: "user", entityId: f.userId,
       responsibleUserId: f.userId, details: { boardApiKeyId: created.body.id, responsibleUserId: f.userId },

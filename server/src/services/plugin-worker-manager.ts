@@ -4399,7 +4399,7 @@ export function createPluginWorkerHandle(
           ),
         );
       }
-      return callInternal(method, params, timeoutMs, executeLogSink, onWorkerSettled);
+      return callInternal(method, params, timeoutMs, executeLogSink, false, undefined, onWorkerSettled);
     },
 
     openLoginPtySession(input: LoginPtyOpenInput) {

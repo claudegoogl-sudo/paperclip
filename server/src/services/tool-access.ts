@@ -141,10 +141,14 @@ import { createToolRuntimeSupervisor } from "./tool-runtime-supervisor.js";
 import { appWithPaperclipCloudConnectorAvailability, paperclipCloudConnectorCapabilitiesFromEnv, createPaperclipCloudConnector, isPaperclipCloudConnectorStrategy, paperclipCloudConnectorConfigFromEnv, type PaperclipCloudConnector } from "./paperclip-cloud-connector.js";
 import { createVercelConnectClient, deriveVercelConnectSubject, vercelConnectIntegrationStatus, type VercelConnectClient } from "./vercel-connect.js";
 
+/** Plugin tool runtime probe, keyed by plugin KEY (not the DB uuid): number of registered tools, or null when unknown. Health fails closed when unwired. */
+export type PluginToolRuntimeProbe = (input: { pluginKey: string }) => Promise<number | null> | number | null;
+
 type ToolAccessServiceOptions = {
   deploymentMode?: DeploymentMode;
   deploymentExposure?: DeploymentExposure;
   trustedLocalStdioRuntimeHost?: string | null;
+  pluginToolRuntimeProbe?: PluginToolRuntimeProbe;
   now?: () => Date;
   /** How long persisted remote MCP action discovery remains fresh. */
   catalogCacheTtlMs?: number;
@@ -794,7 +798,7 @@ export function toolAccessService(
   const defaultCatalogAccess = createCatalogDefaultAccess(db);
   const { enableCatalogEntriesByDefault, upsertAskFirstPolicies } = defaultCatalogAccess;
   const catalogDiscovery = createToolCatalogDiscovery(db, { now, audit, secrets, credentials: credentialAccess, vercel: vercelCredentials, vercelConnect, setupPolicy, requestRemoteHttpEndpoint, resolveOAuthGrantSecret, discoverOAuthEndpoints, localTools });
-  const connectionHealth = createConnectionHealth(db, { now, audit, getConnectionRow, discovery: catalogDiscovery, setupPolicy, resolveCredentialHeaders, refreshManagedGitHubGrantAccess, ensureRuntimeSlot, stdioTemplateId });
+  const connectionHealth = createConnectionHealth(db, { now, audit, getConnectionRow, discovery: catalogDiscovery, setupPolicy, resolveCredentialHeaders, refreshManagedGitHubGrantAccess, ensureRuntimeSlot, stdioTemplateId, pluginToolRuntimeProbe: options.pluginToolRuntimeProbe });
   const { updateConnectionHealth, checkConnectionHealth, sweepConnectionHealth } = connectionHealth;
   const refreshCatalog = createToolCatalogPublication(db, { now, audit, getConnectionRow, discoverTools: catalogDiscovery.discoverTools, assertConnectorConnectionSetupEnabled, updateConnectionHealth, vaultGrantForConnection, ensureRuntimeSlot, enableCatalogEntriesByDefault });
   const catalogReader = createToolCatalogReader(db, options, now, getConnectionRow, refreshCatalog, toCatalogEntryForConnection);
