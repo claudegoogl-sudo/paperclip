@@ -478,6 +478,7 @@ if (invokedDirectly) {
 }
 
 export {
+  loadBaseline,
   findOpenSyncPr,
   pickOpenSyncPr,
   remoteBranchExists,
