@@ -232,6 +232,7 @@ function assignedAgentActor() {
     agentId: "55555555-5555-4555-8555-555555555555",
     companyId: "company-1",
     runId: "run-1",
+    source: "agent_key",
   };
 }
 
@@ -1358,7 +1359,7 @@ describe("company skill mutation permissions", () => {
   it("rejects cross-company source reads and mutations for board users and agents", async () => {
     for (const actor of [
       { type: "board", userId: "member", companyIds: ["company-1"], isInstanceAdmin: true, source: "session" },
-      { type: "agent", agentId: "agent-1", companyId: "company-1" },
+      { type: "agent", agentId: "agent-1", companyId: "company-1", source: "agent_key" },
     ]) {
       const app = createApp(actor);
       const base = "/api/companies/company-2/skill-sources";
@@ -1799,6 +1800,7 @@ describe("company skill mutation permissions", () => {
       agentId: "reflection-coach",
       companyId: "company-1",
       runId: "run-apply",
+      source: "agent_key",
     }))
       .post("/api/companies/company-1/skills")
       .send({ name: "Reflection Draft", slug: "reflection-draft", markdown: "# Draft" });
@@ -1875,6 +1877,7 @@ describe("company skill mutation permissions", () => {
       agentId: "agent-1",
       companyId: "company-1",
       runId: "run-1",
+      source: "agent_key",
     }))
       .post("/api/companies/company-1/skills/import")
       .send({ source: "https://github.com/vercel-labs/agent-browser" });
