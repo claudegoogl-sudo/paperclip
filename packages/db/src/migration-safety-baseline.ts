@@ -198,7 +198,7 @@ export const MIGRATION_SAFETY_BASELINE = [
     // 8d8eaa2bca851a5f (0233_* name).
     id: "bd780345c9c728dc",
     rule: "unqualified-mutation-security-posture-column",
-    migration: "0336_secret_binding_egress_allowlist.sql",
+    migration: "0377_secret_binding_egress_allowlist.sql",
     table: "company_secret_bindings",
     reason:
       "Rollout UPDATE for the EG4 egress-enforcement flag, wrapped in a DO block gated on whether this run created the column, so re-application is a no-op and live rows keep their applied state (fork 0138, renumbered 0233, 0282, then 0336 in the v2026.1023.0 sync). The UPDATE is still textually unqualified, so the rule fires by design — it recognises a selective WHERE, not an arbitrary PL/pgSQL guard, because a guard that is subtly wrong is invisible to a static check. This guard was reviewed on those terms. Baselined for this migration only — any NEW unqualified write to a posture column must fail CI.",

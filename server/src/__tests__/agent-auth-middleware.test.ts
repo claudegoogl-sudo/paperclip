@@ -31,15 +31,8 @@ function createSelectChain(rowsForTable: (table: unknown) => unknown[]) {
 }
 
 function createDbState(input: {
-  agent: { id: string; companyId: string; status?: string };
-  agentKey?: {
-    id: string;
-    agentId: string;
-    companyId: string;
-    keyHash: string;
-    responsibleUserId?: string | null;
-    expiresAt?: Date | null;
-  };
+  agent: { id: string; companyId: string; status?: string; lifecycleHolds?: string[] };
+  agentKey?: { id: string; agentId: string; companyId: string; keyHash: string; responsibleUserId?: string | null };
   run?: { id: string; companyId: string; agentId: string; responsibleUserId?: string | null;
     status?: string; contextSnapshot?: Record<string, unknown>; resultJson?: Record<string, unknown> };
 }) {
@@ -48,6 +41,7 @@ function createDbState(input: {
     id: input.agent.id,
     companyId: input.agent.companyId,
     status: input.agent.status ?? "active",
+    lifecycleHolds: input.agent.lifecycleHolds ?? [],
   };
   const keyRow = input.agentKey
     ? {
@@ -58,7 +52,6 @@ function createDbState(input: {
         responsibleUserId: input.agentKey.responsibleUserId ?? null,
         revokedAt: null,
         scopeConfig: null,
-        expiresAt: input.agentKey.expiresAt ?? null,
       }
     : null;
   const runRow = input.run
@@ -226,7 +219,10 @@ describe("agent auth middleware", () => {
     expect(res.body).toMatchObject({ type: "board", userId: "local-board", runId });
   });
 
-  it("rejects an empty bearer token instead of retaining the implicit local-board actor", async () => {
+  it.each([
+    ["empty bearer token", "Bearer   ", "Empty bearer token"],
+    ["unverified token", "Bearer not-a-token", "Agent token did not verify"],
+  ])("rejects %s instead of retaining the implicit local-board actor", async (_label, authorization, error) => {
     const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
     let commentWrites = 0;
     const app = createApp(db, "local_trusted");
@@ -235,31 +231,11 @@ describe("agent auth middleware", () => {
       res.status(201).json({ ok: true });
     });
 
-    const res = await request(app).post("/comments").set("Authorization", "Bearer   ").send({ body: "reply" });
+    const res = await request(app).post("/comments").set("Authorization", authorization).send({ body: "reply" });
 
     expect(res.status).toBe(401);
-    expect(res.body.error).toContain("Empty bearer token");
+    expect(res.body.error).toContain(error);
     expect(commentWrites).toBe(0);
-  });
-
-  // Fork divergence from upstream (PR #294 posture, kept through the v2026.831.1
-  // merge): a bearer that is neither a valid agent key nor a verifying agent JWT
-  // falls through unauthenticated so the route's own auth decides. Upstream
-  // fail-closes these with a 401; the fork must not hard-reject stale or revoked
-  // board tokens on routes that can decide for themselves.
-  it("falls an unverified bearer through to the route instead of fail-closing", async () => {
-    const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
-    let commentWrites = 0;
-    const app = createApp(db, "local_trusted");
-    app.post("/comments", (_req, res) => {
-      commentWrites += 1;
-      res.status(201).json({ ok: true });
-    });
-
-    const res = await request(app).post("/comments").set("Authorization", "Bearer not-a-token").send({ body: "reply" });
-
-    expect(res.status).toBe(201);
-    expect(commentWrites).toBe(1);
   });
 
   it.each(["authenticated", "local_trusted"] as const)(
@@ -280,33 +256,11 @@ describe("agent auth middleware", () => {
     "/api/routine-triggers/public/not-a-public-id/fire",
     `/api/routine-triggers/public/${"a".repeat(24)}/fire/extra`,
   ])("does not bypass actor authentication for %s", async (path) => {
-    // Fork divergence (see the fall-through test above): an unverified bearer
-    // is not rejected with 401 here, so prove the bypass did not apply by
-    // observing that the middleware actually tried to resolve the bearer.
     const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
-    let selects = 0;
-    const select = db.select;
-    db.select = (...args: unknown[]) => {
-      selects += 1;
-      return select(...args);
-    };
-    await request(createApp(db)).post(path).set("Authorization", "Bearer routine-secret");
-    expect(selects).toBeGreaterThan(0);
+    const res = await request(createApp(db)).post(path).set("Authorization", "Bearer routine-secret");
+    expect(res.status).toBe(401);
   });
 
-  it("skips bearer resolution entirely on the public routine webhook path", async () => {
-    const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
-    let selects = 0;
-    const select = db.select;
-    db.select = (...args: unknown[]) => {
-      selects += 1;
-      return select(...args);
-    };
-    await request(createApp(db))
-      .post(`/api/routine-triggers/public/${"a".repeat(24)}/fire`)
-      .set("Authorization", "Bearer routine-secret");
-    expect(selects).toBe(0);
-  });
   it("leaves public MCP gateway bearers for the gateway protocol to validate", async () => {
     const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
     const publicId = `gw_${"a".repeat(32)}`;
@@ -320,10 +274,7 @@ describe("agent auth middleware", () => {
     expect(res.body).toMatchObject({ reachedGatewayProtocol: true });
   });
 
-  // Fork carryover: an unverifiable bearer falls through unauthenticated so the
-  // route's own auth decides (board-key auth-event log semantics). Upstream's
-  // fail-closed 401 is not adopted in the sync; revisit with security review.
-  it.skip("does not bypass actor authentication for lookalike MCP gateway paths", async () => {
+  it("does not bypass actor authentication for lookalike MCP gateway paths", async () => {
     const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
 
     const res = await request(createApp(db, "local_trusted"))
@@ -351,6 +302,19 @@ describe("agent auth middleware", () => {
 
     expect(res.status).toBe(401);
     expect(res.body.error).toContain(error);
+  });
+
+  it.each(["key", "jwt"])("rejects unfinished setup authentication with a %s", async kind => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const token = kind === "jwt" ? createLocalAgentJwt(agentId, companyId, "codex_local", randomUUID(), "user-1") : "pcp_setup-test-token";
+    const { db } = createDbState({
+      agent: { id: agentId, companyId, status: "paused", lifecycleHolds: ["setup"] },
+      ...(kind === "key" ? { agentKey: { id: randomUUID(), agentId, companyId, keyHash: hashToken(token), responsibleUserId: "user-1" } } : {}),
+    });
+    const res = await request(createApp(db, "local_trusted")).get("/actor").set("Authorization", `Bearer ${token}`);
+    expect(res.status).toBe(401);
+    expect(res.body.error).toContain("setup is incomplete");
   });
 
   it("rejects an agent JWT when the agent record belongs to another company", async () => {
@@ -382,15 +346,12 @@ describe("agent auth middleware", () => {
       expiresInSeconds: -1,
     });
 
-    // Fork semantics: an expired agent JWT does not verify, so it falls through
-    // like any other unknown bearer and the local-trusted app resolves the
-    // implicit local actor (upstream fail-closes with "Expired agent token").
     const res = await request(createApp(db, "local_trusted"))
       .get("/actor")
       .set("Authorization", `Bearer ${token}`);
 
-    expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ type: "board", userId: "local-board" });
+    expect(res.status).toBe(401);
+    expect(res.body.error).toContain("Expired agent token");
   });
 
   it("uses the signed responsible_user_id claim and keeps the signed run id authoritative", async () => {
@@ -479,6 +440,38 @@ describe("agent auth middleware", () => {
     });
   });
 
+  it("audits a run header mismatch even when the claimed run does not exist", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const claimedRunId = randomUUID();
+    const spoofedRunId = randomUUID();
+    const { db, activity } = createDbState({
+      agent: { id: agentId, companyId },
+    });
+    const token = createLocalAgentJwt(agentId, companyId, "codex_local", claimedRunId, "user-claim");
+
+    const res = await request(createApp(db))
+      .get("/actor")
+      .set("Authorization", `Bearer ${token}`)
+      .set("X-Paperclip-Run-Id", spoofedRunId);
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("agent_jwt_run_id_mismatch");
+    expect(activity).toHaveLength(1);
+    expect(activity[0]).toMatchObject({
+      companyId,
+      actorType: "agent",
+      actorId: agentId,
+      action: "auth.agent_jwt_run_header_mismatch",
+      entityType: "heartbeat_run",
+      entityId: claimedRunId,
+      details: { claimRunId: claimedRunId, headerRunId: spoofedRunId },
+    });
+    // run_id carries a real FK to heartbeat_runs; a nonexistent claim must not
+    // be written into it or the whole audit row is lost to the FK violation.
+    expect(activity[0].runId).toBeUndefined();
+  });
+
   it("falls back to the run row responsible user for legacy claim-less agent JWTs", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -565,68 +558,6 @@ describe("agent auth middleware", () => {
       onBehalfOfUserId: "user-key",
       source: "agent_key",
     });
-  });
-
-  it("rejects an agent key past its expiresAt even when revokedAt is null, and audits it", async () => {
-    const companyId = randomUUID();
-    const agentId = randomUUID();
-    const keyId = randomUUID();
-    const token = "pcp_test_expired_agent_key";
-    // revokedAt stays null (see createDbState); the key is live except for its
-    // expiry — this is exactly the missed-revoke failure mode we are guarding.
-    const { db, activity } = createDbState({
-      agent: { id: agentId, companyId },
-      agentKey: {
-        id: keyId,
-        agentId,
-        companyId,
-        keyHash: hashToken(token),
-        responsibleUserId: "user-key",
-        expiresAt: new Date(Date.now() - 60_000),
-      },
-    });
-
-    const res = await request(createApp(db))
-      .get(`/companies/${companyId}/protected`)
-      .set("Authorization", `Bearer ${token}`);
-
-    // Fail-closed: the expired key never becomes an actor, so company access is
-    // denied (401 unauthorized, not 403 forbidden).
-    expect(res.status).toBe(401);
-    expect(activity).toHaveLength(1);
-    expect(activity[0]).toMatchObject({
-      companyId,
-      actorType: "agent",
-      actorId: agentId,
-      action: "auth.agent_key_expired",
-      entityType: "agent_api_key",
-      entityId: keyId,
-      details: { method: "GET", url: `/companies/${companyId}/protected` },
-    });
-  });
-
-  it("accepts an agent key whose expiresAt is still in the future", async () => {
-    const companyId = randomUUID();
-    const agentId = randomUUID();
-    const token = "pcp_test_unexpired_agent_key";
-    const { db } = createDbState({
-      agent: { id: agentId, companyId },
-      agentKey: {
-        id: randomUUID(),
-        agentId,
-        companyId,
-        keyHash: hashToken(token),
-        responsibleUserId: "user-key",
-        expiresAt: new Date(Date.now() + 3_600_000),
-      },
-    });
-
-    const res = await request(createApp(db))
-      .get("/actor")
-      .set("Authorization", `Bearer ${token}`);
-
-    expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ type: "agent", agentId, companyId, source: "agent_key" });
   });
 
   it("rejects agent keys that lack a responsible user binding and audits the denial", async () => {

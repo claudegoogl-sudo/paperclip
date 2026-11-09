@@ -88,11 +88,26 @@ export interface Config {
   pluginWebhookDeliveryFailedRetentionDays: number;
   pluginWebhookDeliveryMaxRows: number;
   pluginWebhookDeliveryRetentionIntervalMinutes: number;
-  workspaceReaperCooldownDays: number;
   boardApiKeyAuthEventRetentionEnabled: boolean;
   boardApiKeyAuthEventRetentionDays: number;
   boardApiKeyAuthEventMaxRows: number;
   boardApiKeyAuthEventRetentionIntervalMinutes: number;
+  gitCacheExpirationEnabled: boolean;
+  gitBaseExpirationEnabled: boolean;
+  gitCacheExpirationDryRun: boolean;
+  workspaceReaperCooldownDays: number;
+  workspaceCompactionDelayHours: number | null;
+  skillVersionRetentionEnabled: boolean;
+  skillVersionRetentionDryRun: boolean;
+  skillVersionRetentionKeepNewest: number;
+  skillVersionRetentionGraceMinutes: number;
+  nativeHarnessBackupExpirationEnabled: boolean;
+  nativeHarnessBackupExpirationDryRun: boolean;
+  nativeHarnessBackupExpirationDays: number;
+  gitRestorePointRetentionDays: number;
+  gitRestorePointsEnabled: boolean;
+  gitRestorePointTerminalDelayDays: number;
+  gitRestorePointIdleDays: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -333,8 +348,10 @@ export function loadConfig(): Config {
   // becomes terminal before it archives the workspace. A person can reopen the
   // work inside this window. A value of 0 disables the cooldown and restores
   // immediate reaping. A negative or non-numeric value falls back to the
-  // default. The day granularity and the default of 7 obey the
-  // PAPERCLIP_DB_BACKUP_RETENTION_DAYS precedent above.
+  // default. The day granularity obeys the PAPERCLIP_DB_BACKUP_RETENTION_DAYS
+  // precedent above. The default is 1 day: regenerable files are compacted
+  // after a few hours anyway, so a longer hold only keeps source checkouts of
+  // delivered work, and a recurring task produces one workspace per run.
   const workspaceReaperCooldownDaysEnv =
     process.env.PAPERCLIP_WORKSPACE_REAPER_COOLDOWN_DAYS?.trim();
   const workspaceReaperCooldownDaysRaw = Number(workspaceReaperCooldownDaysEnv);
@@ -343,7 +360,42 @@ export function loadConfig(): Config {
       && Number.isFinite(workspaceReaperCooldownDaysRaw)
       && workspaceReaperCooldownDaysRaw >= 0
       ? workspaceReaperCooldownDaysRaw
-      : 7;
+      : 1;
+  // The terminal-workspace reaper removes regenerable files (installed
+  // dependencies, build output, tool caches) from a terminal workspace this
+  // many hours after its issue tree becomes terminal. The worktree and every
+  // source file stay; a resumed task regenerates the files when its workspace
+  // is provisioned again. 0 compacts on the next sweep. A negative, empty, or
+  // non-numeric value falls back to the default of 1 hour.
+  // PAPERCLIP_WORKSPACE_COMPACTION_ENABLED=false turns compaction off.
+  const workspaceCompactionDelayHoursEnv =
+    process.env.PAPERCLIP_WORKSPACE_COMPACTION_DELAY_HOURS?.trim();
+  const workspaceCompactionDelayHoursRaw = Number(workspaceCompactionDelayHoursEnv);
+  const workspaceCompactionDelayHours =
+    process.env.PAPERCLIP_WORKSPACE_COMPACTION_ENABLED?.trim().toLowerCase() === "false"
+      ? null
+      : workspaceCompactionDelayHoursEnv
+          && Number.isFinite(workspaceCompactionDelayHoursRaw)
+          && workspaceCompactionDelayHoursRaw >= 0
+        ? workspaceCompactionDelayHoursRaw
+        : 1;
+  // Skill version retention removes materialized version directories under
+  // `skills/<companyId>/__versions__/` that no current version, agent pin, or
+  // live run uses. It keeps this many newest versions per skill as a warm
+  // cache. A version directory used within the grace window also stays. A
+  // removed directory is written again from its version row on next use.
+  // Negative, empty, or non-numeric values fall back to the defaults.
+  const nonNegativeIntegerEnv = (name: string, fallback: number) => {
+    const raw = process.env[name]?.trim();
+    const value = Number(raw);
+    return raw && Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
+  };
+  const skillVersionRetentionKeepNewest = nonNegativeIntegerEnv("PAPERCLIP_SKILL_VERSION_RETENTION_KEEP", 0);
+  const skillVersionRetentionGraceMinutes = nonNegativeIntegerEnv("PAPERCLIP_SKILL_VERSION_RETENTION_GRACE_MINUTES", 60);
+  const nativeHarnessBackupExpirationDays = Math.max(1, nonNegativeIntegerEnv("PAPERCLIP_NATIVE_HARNESS_BACKUP_EXPIRATION_DAYS", 7));
+  const gitRestorePointRetentionDays = Math.max(1, nonNegativeIntegerEnv("PAPERCLIP_GIT_RESTORE_POINT_RETENTION_DAYS", 90));
+  const gitRestorePointTerminalDelayDays = nonNegativeIntegerEnv("PAPERCLIP_GIT_RESTORE_POINT_TERMINAL_DELAY_DAYS", 3);
+  const gitRestorePointIdleDays = nonNegativeIntegerEnv("PAPERCLIP_GIT_RESTORE_POINT_IDLE_DAYS", 7);
   const boardApiKeyAuthEventRetentionEnabled =
     process.env.PAPERCLIP_BOARD_KEY_AUTH_EVENT_RETENTION_ENABLED !== "false";
   // Auth events: 90 days. A quarter's look-back outlives the audit cycle that
@@ -430,11 +482,26 @@ export function loadConfig(): Config {
     pluginWebhookDeliveryFailedRetentionDays,
     pluginWebhookDeliveryMaxRows,
     pluginWebhookDeliveryRetentionIntervalMinutes,
-    workspaceReaperCooldownDays,
     boardApiKeyAuthEventRetentionEnabled,
     boardApiKeyAuthEventRetentionDays,
     boardApiKeyAuthEventMaxRows,
     boardApiKeyAuthEventRetentionIntervalMinutes,
+    gitCacheExpirationEnabled: process.env.PAPERCLIP_GIT_CACHE_EXPIRATION_ENABLED === "true",
+    gitBaseExpirationEnabled: process.env.PAPERCLIP_GIT_BASE_EXPIRATION_ENABLED === "true",
+    gitCacheExpirationDryRun: process.env.PAPERCLIP_GIT_CACHE_EXPIRATION_DRY_RUN !== "false",
+    workspaceReaperCooldownDays,
+    workspaceCompactionDelayHours,
+    skillVersionRetentionEnabled: process.env.PAPERCLIP_SKILL_VERSION_RETENTION_ENABLED !== "false",
+    skillVersionRetentionDryRun: process.env.PAPERCLIP_SKILL_VERSION_RETENTION_DRY_RUN === "true",
+    skillVersionRetentionKeepNewest,
+    skillVersionRetentionGraceMinutes,
+    nativeHarnessBackupExpirationEnabled: process.env.PAPERCLIP_NATIVE_HARNESS_BACKUP_EXPIRATION_ENABLED !== "false",
+    nativeHarnessBackupExpirationDryRun: process.env.PAPERCLIP_NATIVE_HARNESS_BACKUP_EXPIRATION_DRY_RUN === "true",
+    nativeHarnessBackupExpirationDays,
+    gitRestorePointRetentionDays,
+    gitRestorePointsEnabled: process.env.PAPERCLIP_GIT_RESTORE_POINTS_ENABLED === "true",
+    gitRestorePointTerminalDelayDays,
+    gitRestorePointIdleDays,
     serveUi:
       process.env.SERVE_UI !== undefined
         ? process.env.SERVE_UI === "true"

@@ -33,6 +33,20 @@ Operational fields:
 - timeoutSec (number, optional): run timeout in seconds
 - graceSec (number, optional): SIGTERM grace period in seconds
 - providerWaitGuard (object, optional): bounds silent provider waits. When the CLI produces no output at all (for example while blocked on the provider), the guard emits a one-time stderr diagnostic naming the best-effort wait class (auth, rate_limit, network, or unknown), periodic progress lines while the silence lasts, and after maxWaitSec of total silence terminates the stalled CLI process so the run fails with the distinct provider_wait_timeout error code. Fields: enabled (bool, default false), idleDiagnosticSec (number, default 900), progressSec (number, default 300), maxWaitSec (number, default 3600; 0 makes the guard observe-only: diagnostics without termination). Environment overrides: PAPERCLIP_PI_WAIT_GUARD, PAPERCLIP_PI_WAIT_IDLE_DIAGNOSTIC_SEC, PAPERCLIP_PI_WAIT_PROGRESS_SEC, PAPERCLIP_PI_WAIT_MAX_SEC (config values win over env). Not armed for sandbox execution targets, which already carry their own wall-clock backstop.
+- stdoutLogMode (string, optional, default "compact"): controls how Pi --mode json stdout is
+  compacted before entering the Paperclip run log. Pi emits cumulative state
+  in every message_update event, which makes run logs grow ~quadratically.
+  Modes:
+  - "raw": legacy passthrough, no filtering (full transcript; large logs).
+  - "compact" (default): strips cumulative copies (message_update.message,
+    assistantMessageEvent.partial), converts tool_execution_update to a
+    throttled content-free Paperclip progress event. Streaming deltas are
+    preserved — parsePiJsonl output and live UI typing are unchanged.
+  In compact mode, if a run is terminated before tool_execution_end, its
+  partial tool output is not retained; use "raw" when full forensic output is required.
+  Oversized individual lines are handled by the server's run-log pipeline
+  (redaction + head/tail cap) regardless of mode. Invalid explicit mode values
+  fail safe to "raw" rather than enabling a lossy transformation.
 
 Notes:
 - Pi supports multiple providers and models. Use \`pi --list-models\` to list available options.
