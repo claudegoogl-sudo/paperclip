@@ -39,6 +39,13 @@ If `upstream` is missing on a fresh checkout, add it:
 git remote add upstream https://github.com/paperclipai/paperclip.git
 ```
 
+**Run in a fresh worktree of `origin/master`, never the shared checkout.** The shared checkout can be dirty and stale (it once reported `v2026.707.0` while master had `v2026.1023.0`). The script reads the baseline from `origin/master`, prints `{"baseline":{tag,sha,sourceRef}}`, and refuses to run if the local state file disagrees.
+
+```bash
+git fetch origin master && git worktree add /tmp/upstream-sync-tick origin/master
+cd /tmp/upstream-sync-tick && node scripts/upstream-sync.mjs ; cd - && git worktree remove --force /tmp/upstream-sync-tick
+```
+
 ## 2. Waking the routine manually
 
 ```bash
