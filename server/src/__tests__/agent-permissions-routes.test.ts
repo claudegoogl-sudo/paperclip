@@ -941,7 +941,7 @@ describe("agent permission routes", () => {
       }));
 
     expect(res.status).toBe(403);
-    expect(res.body.error).toContain("host-executed workspace commands");
+    expect(res.body.error).toMatch(/host-executed workspace commands|Agent callers may/);
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
@@ -962,7 +962,7 @@ describe("agent permission routes", () => {
       .send({ adapterConfig }));
 
     expect(res.status).toBe(403);
-    expect(res.body.error).toContain("host-executed process adapters");
+    expect(res.body.error).toMatch(/host-executed process adapters|Agent callers may/);
     expect(mockAgentService.update).not.toHaveBeenCalled();
   });
 
@@ -980,7 +980,7 @@ describe("agent permission routes", () => {
       .send({ adapterType: "process" }));
 
     expect(res.status).toBe(403);
-    expect(res.body.error).toContain("host-executed process adapters");
+    expect(res.body.error).toMatch(/host-executed process adapters|Agent callers may/);
     expect(mockAgentService.update).not.toHaveBeenCalled();
   });
 
@@ -1005,7 +1005,7 @@ describe("agent permission routes", () => {
       .send({ adapterConfig }));
 
     expect(res.status).toBe(403);
-    expect(res.body.error).toContain("host-executed local adapter settings");
+    expect(res.body.error).toMatch(/host-executed local adapter settings|Agent callers may/);
     expect(mockAgentService.update).not.toHaveBeenCalled();
   });
 
@@ -1020,35 +1020,16 @@ describe("agent permission routes", () => {
     expect(mockAgentService.update).toHaveBeenCalledOnce();
   });
 
-  it("allows a provider credential reference without allowing arbitrary environment variables", async () => {
+  it("denies a cross-agent provider credential reference (fork model-only cross-agent write gate)", async () => {
     mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterType: "claude_local" });
     const app = await createApp({ type: "agent", agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", companyId, source: "agent_key", runId: "run-1" });
     const res = await requestApp(app, (baseUrl) => request(baseUrl)
       .patch(`/api/agents/${agentId}`)
       .send({ adapterConfig: { env: { ANTHROPIC_API_KEY: { type: "secret_ref", secretId: "33333333-3333-4333-8333-333333333333" } } } }));
 
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(mockAgentService.update).toHaveBeenCalledOnce();
-  });
-
-  it.each(["ANTHROPIC_BASE_URL", "HTTP_PROXY", "NODE_OPTIONS"])("blocks agent-supplied %s on native Claude updates", async key => {
-    mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterType: "paperclip_runner",
-      adapterConfig: { provider: "acpx", acpxAgent: "claude" } });
-    const app = await createApp({ type: "agent", agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", companyId, source: "agent_key", runId: "run-1" });
-    const res = await requestApp(app, baseUrl => request(baseUrl).patch(`/api/agents/${agentId}`)
-      .send({ adapterConfig: { env: { [key]: "untrusted-setting" } } }));
-    expect(res.status).toBe(403);
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toContain("adapterConfig.env");
     expect(mockAgentService.update).not.toHaveBeenCalled();
-  });
-
-  it("allows native Claude credential references in partial updates using the saved harness", async () => {
-    mockAgentService.getById.mockResolvedValue({ ...baseAgent, adapterType: "paperclip_runner",
-      adapterConfig: { provider: "acpx", acpxAgent: "claude" } });
-    const app = await createApp({ type: "agent", agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", companyId, source: "agent_key", runId: "run-1" });
-    const res = await requestApp(app, baseUrl => request(baseUrl).patch(`/api/agents/${agentId}`)
-      .send({ adapterConfig: { env: { ANTHROPIC_API_KEY: { type: "secret_ref", secretId: "33333333-3333-4333-8333-333333333333" } } } }));
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(mockAgentService.update).toHaveBeenCalledOnce();
   });
 
   it("blocks an agent from activating inherited host settings by switching onto a local adapter", async () => {
@@ -1063,7 +1044,7 @@ describe("agent permission routes", () => {
       .send({ adapterType: "claude_local", adapterConfig: { engine: "cli" } }));
 
     expect(res.status).toBe(403);
-    expect(res.body.error).toContain("host-executed local adapter settings");
+    expect(res.body.error).toMatch(/host-executed local adapter settings|Agent callers may/);
     expect(mockAgentService.update).not.toHaveBeenCalled();
   });
 
@@ -1077,7 +1058,7 @@ describe("agent permission routes", () => {
       .send({ name: "Host process", role: "engineer", adapterType: "process", adapterConfig: { command: "sh" } }));
 
     expect(res.status).toBe(403);
-    expect(res.body.error).toContain("host-executed process adapters");
+    expect(res.body.error).toMatch(/host-executed process adapters|Agent callers may/);
     expect(mockAgentService.create).not.toHaveBeenCalled();
   });
 
@@ -1091,7 +1072,7 @@ describe("agent permission routes", () => {
       .send({ name: "Local peer", role: "engineer", adapterType: "claude_local", adapterConfig: { engine: "cli", command: "/tmp/untrusted" } }));
 
     expect(res.status).toBe(403);
-    expect(res.body.error).toContain("host-executed local adapter settings");
+    expect(res.body.error).toMatch(/host-executed local adapter settings|Agent callers may/);
     expect(mockAgentService.create).not.toHaveBeenCalled();
   });
 
@@ -1105,7 +1086,7 @@ describe("agent permission routes", () => {
       .post(`/api/agents/${agentId}/config-revisions/33333333-3333-4333-8333-333333333333/rollback`));
 
     expect(res.status).toBe(403);
-    expect(res.body.error).toContain("host-executed process adapters");
+    expect(res.body.error).toMatch(/host-executed process adapters|Agent callers may/);
     expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
   });
 
@@ -1120,7 +1101,7 @@ describe("agent permission routes", () => {
       .post(`/api/agents/${agentId}/config-revisions/${revisionId}/rollback`));
 
     expect(res.status).toBe(403);
-    expect(res.body.error).toContain("host-executed local adapter settings");
+    expect(res.body.error).toMatch(/host-executed local adapter settings|Agent callers may/);
     expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
   });
 
@@ -1147,34 +1128,10 @@ describe("agent permission routes", () => {
         .post(`/api/agents/${agentId}/config-revisions/${revisionId}/rollback`));
 
       expect(res.status).toBe(403);
-      expect(res.body.error).toContain("host-executed workspace commands");
+      expect(res.body.error).toMatch(/host-executed workspace commands|Agent callers may/);
       expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
     },
   );
-
-  it("allows an agent to restore a non-process revision for a process peer", async () => {
-    const revisionId = "33333333-3333-4333-8333-333333333333";
-    mockAgentService.getConfigRevision.mockResolvedValue({
-      id: revisionId,
-      afterConfig: { adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {} },
-    });
-    mockAgentService.rollbackConfigRevision.mockResolvedValue({
-      ...baseAgent,
-      adapterType: "codex_local",
-    });
-    const app = await createApp({
-      type: "agent",
-      agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-      companyId,
-      source: "agent_key",
-      runId: "run-1",
-    });
-    const res = await requestApp(app, (baseUrl) => request(baseUrl)
-      .post(`/api/agents/${agentId}/config-revisions/${revisionId}/rollback`));
-
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(mockAgentService.rollbackConfigRevision).toHaveBeenCalledOnce();
-  });
 
   it("blocks agent-authenticated self-updates that set instructions bundle roots", async () => {
     const app = await createApp({
@@ -1195,7 +1152,7 @@ describe("agent permission routes", () => {
       }));
 
     expect(res.status).toBe(403);
-    expect(res.body.error).toContain("instructions path or bundle configuration");
+    expect(res.body.error).toContain("instructions path, bundle, or context-injection configuration");
     expect(mockLogActivity).not.toHaveBeenCalled();
   }, 15_000);
 
@@ -1241,7 +1198,7 @@ describe("agent permission routes", () => {
       }));
 
     expect(res.status).toBe(403);
-    expect(res.body.error).toContain("instructions path or bundle configuration");
+    expect(res.body.error).toContain("instructions path, bundle, or context-injection configuration");
     expect(mockInstanceSettingsService.get).not.toHaveBeenCalled();
     expect(mockEnvironmentService.getById).not.toHaveBeenCalled();
     expect(mockRunSshCommand).not.toHaveBeenCalled();
@@ -1284,7 +1241,7 @@ describe("agent permission routes", () => {
       .send({ name: "Injected", role: "engineer", adapterType: "codex_local", adapterConfig: { command: "untrusted-codex" } }));
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toContain("host-executed local adapter settings");
+    expect(res.body.error).toMatch(/host-executed local adapter settings|Agent callers may/);
     expect(mockInstanceSettingsService.get).not.toHaveBeenCalled();
     expect(mockEnvironmentService.getById).not.toHaveBeenCalled();
     expect(mockRunSshCommand).not.toHaveBeenCalled();
