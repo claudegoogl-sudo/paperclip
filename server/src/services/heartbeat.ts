@@ -33,6 +33,7 @@ import {
   createHeartbeatScheduling,
   formatIssueIdentifierLink,
 } from "./heartbeat/scheduling.js";
+import { createHostRunAdmission } from "./heartbeat/host-admission.js";
 import { canApplyTaskWorkspaceSelectionAtAdmission, taskWorkspaceRuntimeSelectionEnabled } from "./execution-workspace-policy.js";
 import { agentExecutionsHaveStopped } from "./agent-execution-stop.js";
 import {
@@ -1269,7 +1270,13 @@ export function heartbeatService(
     },
   });
 
+  const hostRunAdmission = createHostRunAdmission({
+    db,
+    runtimeEnv,
+    runOccupiesHostSlot: (row) => runOccupiesHostSlot(row),
+  });
   const heartbeatQueue = createHeartbeatQueue(db, {
+    hostRunAdmission,
     canStartNewExternalBotWork: async agent => {
       if (agent.adapterType !== "paperclip_runner" || agent.adapterConfig.provider !== "grok_bot") return true;
       const aiConnection = aiRuntimeConnectionBindingSchema.safeParse(agent.runtimeConfig?.aiConnection);
@@ -1792,6 +1799,7 @@ export function heartbeatService(
     runOptions: {
       nativeLeaseOwner?: string;
       nativeRestartRecovery?: NativeRestartRecoveryClaim;
+      hostReservationHeld?: boolean;
     } = {},
   ) {
     return withRunExecutionTiming(runId, () => executeRunAttempt(runId, runOptions));
@@ -1799,131 +1807,173 @@ export function heartbeatService(
 
   async function executeRunAttempt(
     runId: string,
-    runOptions: { nativeLeaseOwner?: string; nativeRestartRecovery?: NativeRestartRecoveryClaim },
+    runOptions: { nativeLeaseOwner?: string; nativeRestartRecovery?: NativeRestartRecoveryClaim; hostReservationHeld?: boolean },
   ) {
     const attemptStartedAtMs = Date.now();
     let attestedQuestionResponseAtMs: number | null = null;
-    if ((await getSchedulingSuppression()).suppressed) {
-      try {
-        await releaseRunClaimedJustBeforeSuppression(runId);
-      } catch (err) {
-        logger.error(
-          { err, runId },
-          "failed to release run claimed just before task-drain suppression; the run row stays running, and the orphan reaper finalizes it and releases the issue lock on its next cycle",
-        );
-      }
-      return;
-    }
-
+    // A run claimed by `startNextQueuedRunForAgent` arrives still holding the host admission
+    // reservation made during claim. It is handed back the instant the run registers
+    // in-process below (where it counts toward the host-wide running count on its own), or on
+    // any early return/throw before registration, so the slot is never leaked.
+    let heldHostReservation = runOptions.hostReservationHeld ?? false;
+    const releaseHeldHostReservation = () => {
+      if (!heldHostReservation) return;
+      heldHostReservation = false;
+      hostRunAdmission.release();
+    };
     let legacyAdapterEntered = false;
     let legacyLocalAdapterEntered = false;
     let persistUsageCaptureFailure: (() => Promise<void>) | undefined;
-    let run = await getRun(runId);
-    if (!run) return;
-    if (run.status !== "queued" && run.status !== "running") return;
-
-    if (run.status === "queued") {
-      // Defense-in-depth: a second, independently reachable path into a claim. A run that
-      // is already running is never stopped by a park that began after dispatch.
-      if (await isAdmissionBlocked()) return;
-      const claimed = await claimQueuedRun(run);
-      if (!claimed) {
-        // claimQueuedRun can also leave the run queued when dependencies are unresolved.
+    let prologueRun: typeof heartbeatRuns.$inferSelect;
+    try {
+      if ((await getSchedulingSuppression()).suppressed) {
+        try {
+          await releaseRunClaimedJustBeforeSuppression(runId);
+        } catch (err) {
+          logger.error(
+            { err, runId },
+            "failed to release prologueRun claimed just before task-drain suppression; the prologueRun row stays running, and the orphan reaper finalizes it and releases the issue lock on its next cycle",
+          );
+        }
         return;
       }
-      run = claimed;
-    }
 
-    const releaseInstructionCopy = createHeartbeatInstructionCopyRelease(run, instructionCopies, appendRunEvent);
+      const fetchedRun = await getRun(runId);
+      if (!fetchedRun) return;
+      prologueRun = fetchedRun;
+      if (prologueRun.status !== "queued" && prologueRun.status !== "running") return;
 
-    if (
-      runOptions.nativeLeaseOwner &&
-      run.runtimeMode === "native" &&
-      runOptions.nativeRestartRecovery?.kind !== "reattach_existing_runner" &&
-      runOptions.nativeRestartRecovery?.kind !== "reattach_remote_runner"
-    ) {
-      // A numeric PID or process-group ID is a liveness signal, never an
-      // ownership capability: the OS may have recycled it after the service
-      // restart. A still-active in-memory child handle is also insufficient to
-      // authorize recovery to kill it. Any live or active-looking process
-      // therefore blocks replacement recovery without receiving a signal.
-      const tracked = runningProcesses.get(run.id);
-      const trackedChildIsActive =
-        !!tracked &&
-        tracked.child.exitCode === null &&
-        tracked.child.signalCode === null;
-      const trackedPid = tracked?.child.pid ?? null;
-      const trackedProcessGroupId = tracked?.processGroupId ?? null;
-      const trackedPidAlive = trackedPid ? isProcessAlive(trackedPid) : false;
-      const trackedProcessGroupAlive = trackedProcessGroupId
-        ? isProcessGroupAlive(trackedProcessGroupId)
-        : false;
-      const persistedPidAlive =
-        !!run.processPid && isProcessAlive(run.processPid);
-      const persistedProcessGroupAlive =
-        !!run.processGroupId && isProcessGroupAlive(run.processGroupId);
-      if (
-        trackedChildIsActive ||
-        trackedPidAlive ||
-        trackedProcessGroupAlive ||
-        persistedPidAlive ||
-        persistedProcessGroupAlive
-      ) {
-        await markNativeOwnershipUnverified(run, {
-          reason: "live_process_identifier",
-          processPidAlive: trackedPidAlive || persistedPidAlive,
-          processGroupAlive:
-            trackedProcessGroupAlive || persistedProcessGroupAlive,
-        });
-        throw new Error(NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE);
+      if (prologueRun.status === "queued") {
+        // Defense-in-depth: a second, independently reachable path into a claim. A prologueRun that
+        // is already running is never stopped by a park that began after dispatch.
+        if (await isAdmissionBlocked()) return;
+        // Same defense-in-depth for the host ceiling: this is a second, independently reachable
+        // path into a claim. The run stays queued when the ceiling or memory gate refuses.
+        const reservation = await hostRunAdmission.reserve();
+        if (!reservation.granted) {
+          hostRunAdmission.recordDeferral(
+            prologueRun.agentId,
+            {
+              companyId: prologueRun.companyId,
+              runId: prologueRun.id,
+              hostRunningCount: reservation.hostRunningCount,
+              path: "execute_run",
+              ...hostRunAdmission.memoryPressureDeferralDetails(reservation),
+            },
+            reservation.reason === "memory_pressure"
+              ? { message: "heartbeat dispatch deferred by cgroup memory pressure" }
+              : undefined,
+          );
+          return;
+        }
+        let claimed: Awaited<ReturnType<typeof claimQueuedRun>>;
+        try {
+          claimed = await claimQueuedRun(prologueRun);
+        } finally {
+          hostRunAdmission.release();
+        }
+        if (!claimed) {
+          // claimQueuedRun can also leave the prologueRun queued when dependencies are unresolved.
+          return;
+        }
+        prologueRun = claimed;
       }
-      runningProcesses.delete(run.id);
-      if (run.processPid || run.processGroupId || run.processStartedAt) {
-        const cleared = await db.transaction(async tx => {
-          const cleared = await tx
-            .update(heartbeatRuns)
-            .set({
-              processPid: null,
-              processGroupId: null,
-              processStartedAt: null,
-              updatedAt: new Date(),
-            })
-            .where(
-              and(
-                eq(heartbeatRuns.id, run.id),
-                eq(heartbeatRuns.runtimeMode, "native"),
-                run.processPid === null
-                  ? isNull(heartbeatRuns.processPid)
-                  : eq(heartbeatRuns.processPid, run.processPid),
-                run.processGroupId === null
-                  ? isNull(heartbeatRuns.processGroupId)
-                  : eq(heartbeatRuns.processGroupId, run.processGroupId),
-                run.processStartedAt === null
-                  ? isNull(heartbeatRuns.processStartedAt)
-                  : eq(heartbeatRuns.processStartedAt, run.processStartedAt),
-              ),
-            )
-            .returning()
-            .then((rows) => rows[0] ?? null);
-          if (cleared) await recordNativeLocalProcessStop(tx as unknown as Db, run);
-          return cleared;
-        });
-        if (!cleared) {
-          const current = await getRun(run.id);
-          if (current) {
-            await markNativeOwnershipUnverified(current, {
-              reason: "live_process_identifier",
-            });
-          }
+
+      if (
+        runOptions.nativeLeaseOwner &&
+        prologueRun.runtimeMode === "native" &&
+        runOptions.nativeRestartRecovery?.kind !== "reattach_existing_runner" &&
+        runOptions.nativeRestartRecovery?.kind !== "reattach_remote_runner"
+      ) {
+        // A numeric PID or process-group ID is a liveness signal, never an
+        // ownership capability: the OS may have recycled it after the service
+        // restart. A still-active in-memory child handle is also insufficient to
+        // authorize recovery to kill it. Any live or active-looking process
+        // therefore blocks replacement recovery without receiving a signal.
+        const tracked = runningProcesses.get(prologueRun.id);
+        const trackedChildIsActive =
+          !!tracked &&
+          tracked.child.exitCode === null &&
+          tracked.child.signalCode === null;
+        const trackedPid = tracked?.child.pid ?? null;
+        const trackedProcessGroupId = tracked?.processGroupId ?? null;
+        const trackedPidAlive = trackedPid ? isProcessAlive(trackedPid) : false;
+        const trackedProcessGroupAlive = trackedProcessGroupId
+          ? isProcessGroupAlive(trackedProcessGroupId)
+          : false;
+        const persistedPidAlive =
+          !!prologueRun.processPid && isProcessAlive(prologueRun.processPid);
+        const persistedProcessGroupAlive =
+          !!prologueRun.processGroupId && isProcessGroupAlive(prologueRun.processGroupId);
+        if (
+          trackedChildIsActive ||
+          trackedPidAlive ||
+          trackedProcessGroupAlive ||
+          persistedPidAlive ||
+          persistedProcessGroupAlive
+        ) {
+          await markNativeOwnershipUnverified(prologueRun, {
+            reason: "live_process_identifier",
+            processPidAlive: trackedPidAlive || persistedPidAlive,
+            processGroupAlive:
+              trackedProcessGroupAlive || persistedProcessGroupAlive,
+          });
           throw new Error(NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE);
         }
-        run = cleared;
+        runningProcesses.delete(prologueRun.id);
+        if (prologueRun.processPid || prologueRun.processGroupId || prologueRun.processStartedAt) {
+          const cleared = await db.transaction(async tx => {
+            const cleared = await tx
+              .update(heartbeatRuns)
+              .set({
+                processPid: null,
+                processGroupId: null,
+                processStartedAt: null,
+                updatedAt: new Date(),
+              })
+              .where(
+                and(
+                  eq(heartbeatRuns.id, prologueRun.id),
+                  eq(heartbeatRuns.runtimeMode, "native"),
+                  prologueRun.processPid === null
+                    ? isNull(heartbeatRuns.processPid)
+                    : eq(heartbeatRuns.processPid, prologueRun.processPid),
+                  prologueRun.processGroupId === null
+                    ? isNull(heartbeatRuns.processGroupId)
+                    : eq(heartbeatRuns.processGroupId, prologueRun.processGroupId),
+                  prologueRun.processStartedAt === null
+                    ? isNull(heartbeatRuns.processStartedAt)
+                    : eq(heartbeatRuns.processStartedAt, prologueRun.processStartedAt),
+                ),
+              )
+              .returning()
+              .then((rows) => rows[0] ?? null);
+            if (cleared) await recordNativeLocalProcessStop(tx as unknown as Db, prologueRun);
+            return cleared;
+          });
+          if (!cleared) {
+            const current = await getRun(prologueRun.id);
+            if (current) {
+              await markNativeOwnershipUnverified(current, {
+                reason: "live_process_identifier",
+              });
+            }
+            throw new Error(NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE);
+          }
+          prologueRun = cleared;
+        }
       }
-    }
 
-    if (run.runtimeMode === "legacy" && run.controllerBootId &&
-        run.controllerBootId !== legacyControllerBootId) return;
-    activeRunExecutions.add(run.id);
+      if (prologueRun.runtimeMode === "legacy" && prologueRun.controllerBootId &&
+          prologueRun.controllerBootId !== legacyControllerBootId) return;
+      activeRunExecutions.add(prologueRun.id);
+      releaseHeldHostReservation();
+    } finally {
+      releaseHeldHostReservation();
+    }
+    let run: typeof heartbeatRuns.$inferSelect = prologueRun;
+    const releaseInstructionCopy = createHeartbeatInstructionCopyRelease(run, instructionCopies, appendRunEvent);
+
     const timePreparation = createHeartbeatPreparationTiming(run.id);
     const executionControl = createAdapterExecutionControl();
     // This coarse scope also covers host finalization after the adapter returns.
@@ -4687,6 +4737,7 @@ export function heartbeatService(
     buildRunLivenessProbe,
     getRunLivenessProbe,
     startNextQueuedRunForAgent,
+    getHostRunCeilingState: () => hostRunAdmission.getState(),
     getUsageLimitParkState: (now?: Date) => usageLimitPark.getState(now),
     clearUsageLimitPark: async (input: { actorType: string | null }) => {
       const state = await usageLimitPark.clear({ reason: "manual_unpark" });
