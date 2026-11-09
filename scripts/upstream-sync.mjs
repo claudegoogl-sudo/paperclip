@@ -50,11 +50,37 @@ const stateFile = path.join(repoRoot, ".paperclip", "upstream-sync.json");
 const args = new Set(process.argv.slice(2));
 const dryRun = args.has("--dry-run");
 
-function readState() {
-  if (!existsSync(stateFile)) {
-    throw new Error(`missing state file: ${stateFile} (bootstrap with .paperclip/upstream-sync.json)`);
+const STATE_PATH_IN_REPO = ".paperclip/upstream-sync.json";
+
+/**
+ * Read the sync baseline from `${FORK_REMOTE}/${FORK_BASE_BRANCH}` (never from
+ * the working tree). Refuses to run when the local file disagrees, so a stale
+ * checkout fails loudly instead of reporting a wrong baseline.
+ * `gitFn` is injectable for tests.
+ */
+function loadBaseline(gitFn = git, localFile = stateFile) {
+  const ref = `${FORK_REMOTE}/${FORK_BASE_BRANCH}`;
+  gitFn(["fetch", FORK_REMOTE, FORK_BASE_BRANCH]);
+  const sha = gitFn(["rev-parse", ref]);
+  const remote = JSON.parse(gitFn(["show", `${ref}:${STATE_PATH_IN_REPO}`]));
+  if (existsSync(localFile)) {
+    const local = JSON.parse(readFileSync(localFile, "utf8"));
+    if (local.lastSyncedTag !== remote.lastSyncedTag || local.lastSyncedSha !== remote.lastSyncedSha) {
+      throw new Error(
+        `baseline mismatch: local ${local.lastSyncedTag}@${local.lastSyncedSha} vs ${ref} ${remote.lastSyncedTag}@${remote.lastSyncedSha}; run from a fresh worktree of ${ref}, not the shared checkout`,
+      );
+    }
   }
-  return JSON.parse(readFileSync(stateFile, "utf8"));
+  return {
+    state: remote,
+    baseline: { tag: remote.lastSyncedTag, sha: remote.lastSyncedSha, sourceRef: ref, sourceRefSha: sha },
+  };
+}
+
+function readState() {
+  const { state, baseline } = loadBaseline();
+  console.log(JSON.stringify({ baseline }));
+  return state;
 }
 
 function writeState(next) {
