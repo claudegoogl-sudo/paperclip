@@ -19,6 +19,8 @@ export function describeKeyTtl(ttlMs: number | undefined) {
   const hours = Math.round(ttlMs / (60 * 60 * 1000));
   if (hours < 48) return `${hours} h`;
   return `${Math.round(hours / 24)} days`;
+}
+
 function cliAuthRetryDelay(error: unknown): number {
   const body = error instanceof ApiError && error.body && typeof error.body === "object"
     ? error.body as { details?: unknown } : null;
