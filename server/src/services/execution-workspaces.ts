@@ -42,7 +42,6 @@ import type { Db } from "@paperclipai/db";
 import {
   agents,
   executionWorkspaces,
-  agents,
   heartbeatRuns,
   nativeRunFinalizations,
   environmentLeases,
