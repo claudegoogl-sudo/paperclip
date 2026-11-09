@@ -4,6 +4,7 @@ import express from "express";
 import request from "supertest";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { StorageService } from "../storage/types.js";
+import { formatAttachmentSize, MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -501,13 +502,14 @@ describe("issue attachment routes", () => {
     const app = await createApp(storage);
     const res = await request(app)
       .post("/api/companies/company-1/issues/11111111-1111-4111-8111-111111111111/attachments")
-      .attach("file", Buffer.alloc(10 * 1024 * 1024 + 1), {
+      .attach("file", Buffer.alloc(MAX_ATTACHMENT_BYTES + 1), {
         filename: "large.bin",
         contentType: "application/octet-stream",
       });
 
     expect(res.status).toBe(422);
-    expect(res.body.error).toBe("Attachment is larger than the 10 MB limit");
+    // The route wording is fixed; the size renders the fork's 25 MiB deployment ceiling.
+    expect(res.body.error).toBe(`Attachment is larger than the ${formatAttachmentSize(MAX_ATTACHMENT_BYTES)} limit`);
     expect(storage.__calls.putFile).toBeUndefined();
     // The deployment cap is the only limit left. The route no longer reads a
     // per-company override, so it never loads the company to size an upload.

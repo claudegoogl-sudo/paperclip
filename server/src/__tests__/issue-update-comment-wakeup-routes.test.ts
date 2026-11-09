@@ -12,6 +12,7 @@ const MENTIONED_AGENT_ID = "33333333-3333-4333-8333-333333333333";
 const SOURCE_RUN_ID = "44444444-4444-4444-8444-444444444444";
 
 const mockIssueService = vi.hoisted(() => ({
+  clearOrphanCheckoutLocksIfTerminal: vi.fn(async () => false),
   getById: vi.fn(),
   getByIdentifier: vi.fn(),
   getByIdForUpdate: vi.fn(),
