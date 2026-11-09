@@ -1265,7 +1265,7 @@ export async function createApp(
       return plugin?.status === "ready" ? plugin.packagePath ?? null : null;
     },
     undefined,
-    { restartWorker: (pluginId) => devWatcherRestartLifecycle.restartWorker(pluginId) },
+    { restartWorker: (pluginId) => devWatcherRestartLifecycle.restartWorker(pluginId), unwatchedRoots: [bundledCatalogRoot] },
   ) : null;
   api.use(
     pluginRoutes(
@@ -1613,13 +1613,6 @@ export async function createApp(
   void toolDispatcher.initialize().catch((err) => {
     logger.error({ err }, "Failed to initialize plugin tool dispatcher");
   });
-  const devWatcher = createPluginDevWatcher(
-    lifecycle,
-    async (pluginId) =>
-      (await pluginRegistry.getById(pluginId))?.packagePath ?? null,
-    undefined,
-    { unwatchedRoots: [bundledCatalogRoot] },
-  );
   // Auto-provision bundled plugins so their providers are registered for
   // agent runs. Bundles are excluded from the pnpm
   // workspace and built standalone into the image (see Dockerfile), then

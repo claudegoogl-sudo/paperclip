@@ -2452,7 +2452,7 @@ export function buildHostServices(
     projects: {
       async getInstanceSecrets(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return projectInstanceSecretService(db, pluginId).read(companyId, params.projectId);
       },
       async list(params) {
@@ -3871,7 +3871,7 @@ export function buildHostServices(
     agents: {
       async getRuntime(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await ensurePluginAvailableForCompany(companyId);
+        await noPluginAvailabilityGate(companyId);
         return pluginAgentRuntimeState(db, pluginId, companyId, params.agentId);
       },
       async list(params) {

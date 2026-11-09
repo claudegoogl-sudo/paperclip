@@ -2233,14 +2233,6 @@ export function routineService(
         }
         if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
           const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
-          if (manualRunnerUserId) {
-            await touchIssueForUserInbox(txDb, {
-              companyId: input.routine.companyId,
-              issueId: activeIssue.id,
-              userId: manualRunnerUserId,
-              touchedAt: triggeredAt,
-            });
-          }
           const pinDescription = describePinningRuns(pinningRuns, triggeredAt);
           const updated = await finalizeRun(createdRun.id, {
             status,
@@ -2327,14 +2319,6 @@ export function routineService(
           });
           if (existingIssue) {
             const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
-            if (manualRunnerUserId) {
-              await touchIssueForUserInbox(txDb, {
-                companyId: input.routine.companyId,
-                issueId: existingIssue.id,
-                userId: manualRunnerUserId,
-                touchedAt: triggeredAt,
-              });
-            }
             const pinDescription = describePinningRuns(await loadPinningRuns(existingIssue, txDb), triggeredAt);
             const updated = await finalizeRun(createdRun.id, {
               status,
