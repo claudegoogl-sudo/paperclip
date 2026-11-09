@@ -97,4 +97,12 @@ describe("feedback redaction", () => {
       nested: [{ apiKey: "***REDACTED***", path: "***REDACTED***" }],
     });
   });
+
+  it.each(["abc12345.def67890.ghi13579", "a.b.c", "opaque1.session2.signed3"])(
+    "redacts opaque dotted token by default: %s",
+    (token) => {
+      const state = createFeedbackRedactionState();
+      expect(sanitizeFeedbackText(`token ${token}`, state, "body", 10_000)).toBe("token [REDACTED_JWT]");
+    },
+  );
 });
