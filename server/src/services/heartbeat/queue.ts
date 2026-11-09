@@ -166,6 +166,7 @@ import type { createHeartbeatRunPreparation } from "./run-preparation.js";
 import type { HeartbeatRetryDependencies } from "./retries.js";
 import type { HeartbeatRecoveryDependencies, createHeartbeatRecovery } from "./recovery.js";
 import type { issueService } from "../issues.js";
+import { ACTOR_PROVENANCE_PAYLOAD_KEY, captureActorProvenance } from "../../middleware/actor-context.js";
 import type { issueTreeControlService } from "../issue-tree-control.js";
 import type { budgetService } from "../budgets.js";
 import type { instanceSettingsService } from "../instance-settings.js";
@@ -2199,6 +2200,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     };
     const reason = opts.reason ?? null;
     let payload = opts.payload ? { ...opts.payload } : null;
+    // Reserved provenance key is always stripped from caller input so it cannot be forged.
+    if (payload) delete payload[ACTOR_PROVENANCE_PAYLOAD_KEY];
+    // Persist the enqueuing request's credential provenance ({source, keyId} only) so a later
+    // timer drain (outside the request ALS) can restore it. No request context => no key.
+    const enqueueProvenance = captureActorProvenance();
+    if (enqueueProvenance) payload = { ...payload, [ACTOR_PROVENANCE_PAYLOAD_KEY]: enqueueProvenance };
     // Only the board queue route can record interruption authority on an
     // existing receipt. Never accept this internal marker from a wake caller.
     if (payload) {

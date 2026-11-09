@@ -520,6 +520,7 @@ import { USAGE_LIMIT_PARK_MAX_HORIZON_MS, usageLimitParkService } from "./usage-
 import { highCommentVolumeAlertService } from "./high-comment-volume-alert.js";
 import { instanceAdmissionHoldService } from "./instance-admission-hold.js";
 import { asc, desc } from "drizzle-orm";
+import { ACTOR_PROVENANCE_PAYLOAD_KEY, parseActorProvenance, runWithRestoredActorProvenance } from "../middleware/actor-context.js";
 import { evaluateAgentInvokability } from "./agent-invokability.js";
 import { isVerifiedIssueTreeControlInteractionWake } from "./issue-tree-control.js";
 import { enrichWakeContextSnapshot } from "./heartbeat/run-preparation.js";
@@ -1802,7 +1803,24 @@ export function heartbeatService(
       hostReservationHeld?: boolean;
     } = {},
   ) {
-    return withRunExecutionTiming(runId, () => executeRunAttempt(runId, runOptions));
+    // Restore enqueue-time actor provenance from the wakeup payload so timer/reconcile drains
+    // (outside the request ALS) attribute correctly. Null explicitly clears ambient context.
+    let provenance: ReturnType<typeof parseActorProvenance> = null;
+    try {
+      const row = await db
+        .select({ payload: agentWakeupRequests.payload })
+        .from(heartbeatRuns)
+        .innerJoin(agentWakeupRequests, eq(heartbeatRuns.wakeupRequestId, agentWakeupRequests.id))
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      const p = row?.payload as Record<string, unknown> | null | undefined;
+      provenance = parseActorProvenance(p?.[ACTOR_PROVENANCE_PAYLOAD_KEY]);
+    } catch {
+      provenance = null;
+    }
+    return runWithRestoredActorProvenance(provenance, () =>
+      withRunExecutionTiming(runId, () => executeRunAttempt(runId, runOptions)),
+    );
   }
 
   async function executeRunAttempt(
