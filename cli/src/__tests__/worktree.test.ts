@@ -27,6 +27,11 @@ import {
   routines,
   routineTriggers,
   workspaceRuntimeServices,
+  buildEmbeddedPostgresConnectionString,
+  buildEmbeddedPostgresConstructorOptions,
+  readEmbeddedPostgresCredential,
+  resolveEmbeddedPostgresPasswordForStartup,
+  socketDirectoryPathFor,
 } from "@paperclipai/db";
 import {
   copyGitHooksToWorktreeGitDir,
@@ -311,6 +316,18 @@ function initializeTestRepo(repoRoot: string): void {
   fs.writeFileSync(path.join(repoRoot, "README.md"), "# temp\n", "utf8");
   execFileSync("git", ["add", "README.md"], { cwd: repoRoot, stdio: "ignore" });
   execFileSync("git", ["commit", "-m", "Initial commit"], { cwd: repoRoot, stdio: "ignore" });
+}
+
+// The fork's target clusters run socket-only with a per-install credential file;
+// resolve the real password and connect over the unix socket (not the legacy literal).
+function targetPgFixture(dataDir: string, port: number, onLog: (m: unknown) => void) {
+  const cred = readEmbeddedPostgresCredential(dataDir);
+  const password = cred?.password ?? resolveEmbeddedPostgresPasswordForStartup(dataDir).password;
+  const options = buildEmbeddedPostgresConstructorOptions({ dataDir, port, password, onLog, onError: onLog });
+  const url = buildEmbeddedPostgresConnectionString({
+    port, database: "paperclip", password, socketDir: socketDirectoryPathFor(dataDir),
+  });
+  return { options, url };
 }
 
 describe("worktree helpers", () => {
@@ -1615,23 +1632,17 @@ describe("worktree helpers", () => {
         targetPgLogs = Buffer.alloc(tail.length);
         tail.copy(targetPgLogs);
       };
-      const targetPg = new EmbeddedPostgres({
-        databaseDir: targetConfig.database.embeddedPostgresDataDir,
-        user: "paperclip",
-        password: "paperclip",
-        port: targetConfig.database.embeddedPostgresPort,
-        persistent: true,
-        initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
-        onLog: captureTargetPgLog,
-        onError: captureTargetPgLog,
-      });
+      let targetFx!: ReturnType<typeof targetPgFixture>;
+      const targetPg = new EmbeddedPostgres(
+        (targetFx = targetPgFixture(targetConfig.database.embeddedPostgresDataDir, targetConfig.database.embeddedPostgresPort, captureTargetPgLog)).options,
+      );
 
       try {
         await targetPg.start();
         targetPgStartupResolved = true;
         onTestFinished(() => targetPg.stop());
         const targetDb = createDb(
-          `postgres://paperclip:paperclip@127.0.0.1:${targetConfig.database.embeddedPostgresPort}/paperclip`,
+          targetFx.url,
         );
         const [seededLocalBoard] = await targetDb
           .select({ id: authUsers.id })
@@ -1804,21 +1815,15 @@ describe("worktree helpers", () => {
       expect(manifestText).not.toContain("fixture-password-hash");
       expect(manifestText).not.toContain("source-master-key");
       const { default: EmbeddedPostgres } = await import("embedded-postgres");
-      const targetPg = new EmbeddedPostgres({
-        databaseDir: targetConfig.database.embeddedPostgresDataDir,
-        user: "paperclip",
-        password: "paperclip",
-        port: targetConfig.database.embeddedPostgresPort,
-        persistent: true,
-        initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
-        onLog: () => {},
-        onError: () => {},
-      });
+      let targetFx!: ReturnType<typeof targetPgFixture>;
+      const targetPg = new EmbeddedPostgres(
+        (targetFx = targetPgFixture(targetConfig.database.embeddedPostgresDataDir, targetConfig.database.embeddedPostgresPort, () => {})).options,
+      );
 
       await targetPg.start();
       onTestFinished(() => targetPg.stop());
       const targetDb = createDb(
-        `postgres://paperclip:paperclip@127.0.0.1:${targetConfig.database.embeddedPostgresPort}/paperclip`,
+        targetFx.url,
       );
       const seededUsers = await targetDb.select().from(authUsers);
       expect(seededUsers.some((row) => row.email === "existing@paperclip.ing")).toBe(true);
