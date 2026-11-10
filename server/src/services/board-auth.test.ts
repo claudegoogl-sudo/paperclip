@@ -347,7 +347,7 @@ databaseSuite("CLI challenge authority and transitions (real PostgreSQL)", () =>
     app.use("/api", accessRoutes(db, { deploymentMode: "authenticated", deploymentExposure: "private", bindHost: "127.0.0.1", allowedHostnames: [] }));
     app.use("/api", activityRoutes(db)); app.use(errorHandler);
     const created = await request(app).post("/api/board-api-keys").set("Authorization", `Bearer ${f.pendingBoardToken}`)
-      .send({ name: "Synthetic named key", requestedCompanyId: f.companyId });
+      .send({ name: "Synthetic named key", requestedCompanyId: f.companyId, expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(), scope: { kind: "plugin_ops" } });
     expect(created.status).toBe(201);
     expect(await db.select().from(cliAuthChallenges).where(eq(cliAuthChallenges.boardApiKeyId, created.body.id))).toHaveLength(0);
     const foreignKey = await f.service.createNamedBoardApiKey({ userId: foreign.userId, name: "Synthetic foreign operator", scope: { kind: "standard" }, expiresAt: new Date(Date.now() + 60 * 60 * 1000) });
