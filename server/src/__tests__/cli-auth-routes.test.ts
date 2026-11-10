@@ -472,6 +472,7 @@ describe("cli auth routes", () => {
         name: "external-admin",
         requestedCompanyId: "11111111-1111-4111-8111-111111111111",
         expiresAt: "2026-06-23T12:00:00.000Z",
+        scope: { kind: "plugin_ops" },
       });
 
     expect(res.status, res.text || JSON.stringify(res.body)).toBe(201);
@@ -485,6 +486,7 @@ describe("cli auth routes", () => {
       userId: "user-1",
       name: "external-admin",
       expiresAt: new Date("2026-06-23T12:00:00.000Z"),
+      scope: { kind: "plugin_ops" },
     });
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
