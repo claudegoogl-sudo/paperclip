@@ -96,6 +96,7 @@ const {
     })),
     reconcileHotRestartAdoption: vi.fn(async () => ({ mode: "none" })),
     reapOrphanedRuns: vi.fn(async () => ({ reaped: 0, runIds: [] })),
+    reconcileHighCommentVolumeAlerts: vi.fn(async () => ({ alerted: 0, failed: 0 })),
     sweepStrandedDeferredWakes: vi.fn(async () => ({ promoted: 0, resolved: 0 })),
     promoteDueScheduledRetries: vi.fn(async () => ({ promoted: 0, runIds: [] })),
     resumeQueuedRuns: vi.fn(async () => undefined),
