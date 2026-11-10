@@ -43,7 +43,10 @@ import type { AdapterPluginRecord } from "../services/adapter-plugin-store.js";
 import type { ServerAdapterModule, AdapterConfigSchema } from "../adapters/types.js";
 import { loadExternalAdapterPackage, getUiParserSource, getOrExtractUiParserSource, reloadExternalAdapter } from "../adapters/plugin-loader.js";
 import { logger } from "../middleware/logger.js";
-import { assertBoardOrgAccess, assertInstanceAdmin } from "./authz.js";
+import type { Db } from "@paperclipai/db";
+import { instanceSettingsService } from "../services/instance-settings.js";
+import { logActivity } from "../services/activity-log.js";
+import { assertBoardOrgAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
 import { BUILTIN_ADAPTER_TYPES } from "../adapters/builtin-adapter-types.js";
 
 const execFileAsync = promisify(execFile);
@@ -187,7 +190,34 @@ function registerWithSessionManagement(adapter: ServerAdapterModule): void {
 // Router
 // ---------------------------------------------------------------------------
 
-export function adapterRoutes() {
+export function adapterRoutes(db?: Db) {
+  // Instance-level audit: activity_log is company-scoped, so fan out to every company.
+  async function auditAdapterChange(
+    req: Parameters<typeof getActorInfo>[0],
+    action: "adapter.installed" | "adapter.removed",
+    adapterType: string,
+    details: Record<string, unknown>,
+  ) {
+    if (!db) return;
+    try {
+      const actor = getActorInfo(req);
+      const companyIds = await instanceSettingsService(db).listCompanyIds();
+      await Promise.all(companyIds.map((companyId) => logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action,
+        entityType: "adapter",
+        entityId: adapterType,
+        details,
+      })));
+    } catch (err) {
+      logger.error({ err, action, adapterType }, "Failed to write adapter activity log");
+    }
+  }
+
   const router = Router();
 
   /**
@@ -328,6 +358,13 @@ export function adapterRoutes() {
         { type: adapterModule.type, packageName: canonicalName },
         "External adapter installed and registered",
       );
+
+      await auditAdapterChange(req, "adapter.installed", adapterModule.type, {
+        packageName: canonicalName,
+        version: installedVersion ?? explicitVersion ?? null,
+        isLocalPath,
+        isReinstall,
+      });
 
       res.status(201).json({
         type: adapterModule.type,
@@ -500,6 +537,9 @@ export function adapterRoutes() {
 
     logger.info({ type: adapterType }, "External adapter unregistered and removed");
 
+    await auditAdapterChange(req, "adapter.removed", adapterType, {
+      packageName: externalRecord.packageName,
+    });
     res.json({ type: adapterType, removed: true });
   });
 

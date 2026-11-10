@@ -432,7 +432,7 @@ export async function createApp(
       { reconciler: devWatcher },
     ),
   );
-  api.use(adapterRoutes());
+  api.use(adapterRoutes(db));
   api.use(
     accessRoutes(db, {
       deploymentMode: opts.deploymentMode,

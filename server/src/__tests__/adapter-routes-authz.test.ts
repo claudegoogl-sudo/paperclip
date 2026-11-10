@@ -59,7 +59,16 @@ vi.mock("../adapters/plugin-loader.js", () => ({
   reloadExternalAdapter: mocks.reloadExternalAdapter,
 }));
 
+const auditMocks = vi.hoisted(() => ({
+  logActivity: vi.fn(async () => undefined),
+  listCompanyIds: vi.fn(async () => ["company-a", "company-b"]),
+}));
+
 function registerRouteMocks() {
+  vi.doMock("../services/activity-log.js", () => ({ logActivity: auditMocks.logActivity }));
+  vi.doMock("../services/instance-settings.js", () => ({
+    instanceSettingsService: () => ({ listCompanyIds: auditMocks.listCompanyIds }),
+  }));
   vi.doMock("node:child_process", () => ({
     execFile: mocks.execFile,
   }));
@@ -113,7 +122,7 @@ function installedRecord(type = EXTERNAL_ADAPTER_TYPE) {
   };
 }
 
-function createApp(actor: Express.Request["actor"]) {
+function createApp(actor: Express.Request["actor"], db?: unknown) {
   if (!adapterRoutes || !errorHandler) {
     throw new Error("adapter route test dependencies were not loaded");
   }
@@ -130,7 +139,7 @@ function createApp(actor: Express.Request["actor"]) {
     } as Express.Request["actor"];
     next();
   });
-  app.use("/api", adapterRoutes());
+  app.use("/api", adapterRoutes(db as never));
   app.use(errorHandler);
   return app;
 }
@@ -293,6 +302,28 @@ describe.sequential("adapter management route authorization", () => {
       const res = await sendMutatingRequest(app, routeName);
 
       expect(res.status, `${routeName}: ${JSON.stringify(res.body)}`).toBe(403);
+    }
+  });
+
+  it("writes adapter.installed / adapter.removed activity rows with actor provenance", async () => {
+    auditMocks.logActivity.mockClear();
+    resetInstalledExternalAdapterState();
+    const db = {};
+    const installRes = await sendMutatingRequest(createApp(instanceAdmin, db), "install");
+    expect(installRes.status).toBe(201);
+    seedInstalledExternalAdapter();
+    const delRes = await sendMutatingRequest(createApp(instanceAdmin, db), "delete");
+    expect(delRes.status).toBe(200);
+    const calls = auditMocks.logActivity.mock.calls.map((c) => c[1] as Record<string, unknown>);
+    expect(calls.map((c) => c.action).sort()).toEqual([
+      "adapter.installed", "adapter.installed", "adapter.removed", "adapter.removed",
+    ]);
+    for (const c of calls) {
+      expect(c.entityType).toBe("adapter");
+      expect(c.entityId).toBe(EXTERNAL_ADAPTER_TYPE);
+      expect(c.actorType).toBe("user");
+      expect(typeof c.actorId).toBe("string");
+      expect(["company-a", "company-b"]).toContain(c.companyId);
     }
   });
 
