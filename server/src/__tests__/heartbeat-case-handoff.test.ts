@@ -21,6 +21,9 @@ import { appendHeartbeatRunEvent } from "../services/heartbeat-run-events.js";
 import { createAgentIdentityRedactor } from "../services/agent-identity-redaction.js";
 import { createHeartbeatRunOutput } from "../services/heartbeat/run-output.js";
 
+// Leaked "running" occupying rows accumulate across this file's tests; the fork vitest config caps the host ceiling at 8.
+process.env.PAPERCLIP_MAX_CONCURRENT_RUNS_HOST = "1000";
+
 describe("durable case handoff queue admission", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
