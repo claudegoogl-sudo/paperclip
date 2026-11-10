@@ -5,6 +5,7 @@ import {
   agentRuntimeState,
   agentTaskSessions,
   agents,
+  authUsers,
   companies,
   companyMemberships,
   createDb,
@@ -116,6 +117,15 @@ describeEmbeddedPostgres("heartbeat system-session prompt-bundle resume params",
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-sys-session-");
     db = createDb(tempDb.connectionString);
     heartbeat = heartbeatService(db);
+    const now = new Date();
+    await db.insert(authUsers).values({
+      id: "responsible-user",
+      name: "Responsible User",
+      email: "responsible-user@example.test",
+      emailVerified: true,
+      createdAt: now,
+      updatedAt: now,
+    });
   }, 20_000);
 
   afterEach(async () => {
