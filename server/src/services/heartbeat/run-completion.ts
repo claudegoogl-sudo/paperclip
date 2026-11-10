@@ -42,6 +42,7 @@ import type { createHeartbeatQueue } from "./queue.js";
 import type { createHeartbeatRunControl, HeartbeatRunControlDependencies } from "./run-control.js";
 import type { issueService } from "../issues.js";
 import type { recoveryService } from "../recovery/index.js";
+import type { createHeartbeatRecovery } from "./recovery.js";
 import type { BudgetServiceHooks } from "../budgets.js";
 import type { providerTraceStore } from "../provider-trace-store.js";
 import type { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
@@ -74,7 +75,8 @@ export interface HeartbeatRunCompletionDependencies extends Pick<RunState,
   Pick<ReturnType<typeof createHeartbeatQueue>, "enqueueWakeup"> {
   usageLimitPark?: Pick<ReturnType<typeof usageLimitParkService>, "park" | "clear">;
   issuesSvc: Pick<ReturnType<typeof issueService>, "addComment">;
-  recovery: Pick<ReturnType<typeof recoveryService>, "reconcileLegacyContinuation" | "reconcileResolvedDependencyWakeBackstop" | "enqueueProcessLossRetry">;
+  recovery: Pick<ReturnType<typeof recoveryService>, "reconcileLegacyContinuation" | "reconcileResolvedDependencyWakeBackstop"> &
+    Pick<ReturnType<typeof createHeartbeatRecovery>, "enqueueProcessLossRetry">;
   getCurrentUserRedactionOptions: () => Promise<CurrentUserRedactionOptions>;
   budgetHooks: BudgetServiceHooks;
   runLogStore: Pick<ReturnType<typeof getRunLogStore>, "finalize">;
