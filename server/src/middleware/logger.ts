@@ -234,11 +234,20 @@ export function createHttpLogger(baseLogger: pino.Logger) {
     if (isSecretSensitiveHttpRequest(req.method, requestClassificationUrl(req))) {
       return redactSecretsForLog(`${req.method} ${requestLogUrl(req)} ${res.statusCode} — request failed`);
     }
+    if (isPrivateMuseHttpRequest(requestClassificationUrl(req)) || isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req))) {
+      return `${req.method} ${requestLogUrl(req)} ${res.statusCode} — request failed`;
+    }
     const ctx = (res as any).__errorContext;
     const errMsg = ctx?.error?.message || err?.message || (res as any).err?.message || "unknown error";
     return redactSecretsForLog(`${req.method} ${requestLogUrl(req)} ${res.statusCode} — ${errMsg}`);
   },
   customErrorObject(req, _res, _err, value) {
+    if (isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req))) {
+      return { ...value, err: { type: "Error", message: "Agent observability request failed" } };
+    }
+    if (isPrivateMuseHttpRequest(requestClassificationUrl(req))) {
+      return { ...value, err: { type: "Error", message: "External agent request failed" } };
+    }
     if (isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req))) {
       return { ...value, err: { type: "Error", message: "Feedback request failed" } };
     }
