@@ -16031,7 +16031,19 @@ export function issueRoutes(
           }
         }
 
-        const restoredBlockedReadyDependency = shouldWakeOnRestoredBlockedDependency({
+        // Fork reversal of upstream #8943: edge rule. Only wake when the issue was
+        // ALREADY blocked and this request removed >=1 blocker, or when the assignee
+        // changed. Parking into `blocked` onto done blockers, or an add-only change,
+        // is a deliberate park and must not self-wake.
+        const restoreRemovedBlockerCount = Array.isArray(req.body.blockedByIssueIds)
+          ? (existingRelations?.blockedBy ?? []).filter(
+              (relation) => !(req.body.blockedByIssueIds as string[]).includes(relation.id),
+            ).length
+          : 0;
+        const restoreEdgeRuleMet =
+          (existing.status === "blocked" && restoreRemovedBlockerCount > 0) ||
+          existing.assigneeAgentId !== issue.assigneeAgentId;
+        const restoredBlockedReadyDependency = restoreEdgeRuleMet && shouldWakeOnRestoredBlockedDependency({
           previousStatus: existing.status,
           nextStatus: issue.status,
           previousAssigneeAgentId: existing.assigneeAgentId ?? null,
