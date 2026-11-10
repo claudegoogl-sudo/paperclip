@@ -37,6 +37,10 @@ export function legacyExecutionNeedsReconciliation(
   if (run.errorCode === "adapter_failed" && typeof run.error === "string" &&
       /^(No API key for provider|spawn E2BIG)/.test(run.error) &&
       !(run.resultJson as Record<string, unknown> | null | undefined)?.toolCallCount) return false;
+  // Fork carryover: our own shutdown (SIGTERM wave) killed the process; the restart
+  // retry ladder owns recovery, not an action-outcome hold.
+  if (run.status === "interrupted" && run.errorCode === "server_shutdown_interrupted" &&
+      !(run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive" || hasRequiredWorkspaceRecovery(run.resultJson))) return false;
   // A fresh model turn cannot repair or verify unrestored files.
   if (run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive" || hasRequiredWorkspaceRecovery(run.resultJson)) return true;
   // A fresh conversation turn lets the agent decide what remains. The retry
