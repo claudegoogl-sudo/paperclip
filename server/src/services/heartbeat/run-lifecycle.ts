@@ -2984,7 +2984,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     agent: typeof agents.$inferSelect,
     run: typeof heartbeatRuns.$inferSelect,
     result: AdapterExecutionResult,
-    session: { legacySessionId: string | null },
+    session: { legacySessionId: string | null; sessionParamsJson?: Record<string, unknown> | null },
     normalizedUsage?: UsageTotals | null,
   ) {
     await ensureRuntimeState(agent);
@@ -2993,6 +2993,9 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       .set({
         adapterType: agent.adapterType,
         sessionId: session.legacySessionId,
+        // Fork: system/heartbeat sessions (no task key) keep their resume params
+        // here; undefined leaves per-issue runs' column untouched.
+        ...(session.sessionParamsJson !== undefined ? { sessionParamsJson: session.sessionParamsJson } : {}),
         lastRunId: run.id,
         lastRunStatus: run.status,
         lastError: run.error ?? null,

@@ -2760,7 +2760,7 @@ export function heartbeatService(
       const preparedSession = await timePreparation("session", () => prepareHeartbeatSession(db, {
         run, agent,
         task: { context, issueRef, issueContext, taskProjectContext, workspaceProjectContext, wakeCommentId, acceptedPlanContinuationWake, acceptedPlanWakeRoutingDecision },
-        session: { taskSession, taskSessionDecodedParams, explicitResumeSessionParams, explicitResumeSessionDisplayId, sessionCodec },
+        session: { taskSession, taskSessionDecodedParams, explicitResumeSessionParams, explicitResumeSessionDisplayId, sessionCodec, systemSessionParamsJson: taskKey ? null : ((runtime.sessionParamsJson as Record<string, unknown> | null) ?? null) },
         config: {
           runtimeConfig, agentIdentity, issueAssigneeOverrides, originalAiIssueOverrides,
           managedAiRuntime, aiBinding, requestedAiBinding, secretManifest, runtimeSkillEntries, routineEnvContext,

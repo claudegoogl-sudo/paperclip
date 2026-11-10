@@ -500,7 +500,21 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         agent,
         finalizedRun,
         adapterResult,
-        { legacySessionId: nextSessionState.legacySessionId },
+        {
+          legacySessionId: nextSessionState.legacySessionId,
+          ...(taskKey
+            ? {}
+            : {
+                sessionParamsJson:
+                  adapterResult.clearSession || !nextSessionState.params
+                    ? null
+                    : attachPaperclipSessionMetadataToSessionParams(
+                        nextSessionState.params,
+                        configuredModel,
+                        sessionConfigMetadata,
+                      ),
+              }),
+        },
         normalizedUsage,
       );
       if (!taskKey) return;

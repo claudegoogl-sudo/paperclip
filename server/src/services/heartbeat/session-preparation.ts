@@ -46,6 +46,8 @@ export interface HeartbeatSessionPreparationInput {
     explicitResumeSessionParams: Record<string, unknown> | null;
     explicitResumeSessionDisplayId: string | null;
     sessionCodec: SessionCodec;
+    /** agent_runtime_state.session_params_json, only for system sessions (no task key). */
+    systemSessionParamsJson?: Record<string, unknown> | null;
   };
   config: {
     runtimeConfig: Record<string, unknown>;
@@ -190,6 +192,8 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
   const sessionResetReason =
     sessionConfigFreshness.reasons.join("; ") || null;
   const taskSessionForRun = resetTaskSession ? null : taskSession;
+  // Fork: system/heartbeat sessions (no taskKey) keep resume params on agent_runtime_state.
+  const systemSessionParamsJson = !resetTaskSession ? (input.session.systemSessionParamsJson ?? null) : null;
   const getFreshSessionHandoff = issueRef ? createNativeSessionHandoffLoader({
     db, companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id, before: run.createdAt,
     throughCommentId: readNonEmptyString(context.conversationReplayThroughCommentId) ?? (context.interactionKind ? null : wakeCommentId),
@@ -206,7 +210,7 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
       agent.adapterType,
       stripPaperclipSessionMetadataFromSessionParams(
         sessionCodec.deserialize(
-          taskSessionForRun?.sessionParamsJson ?? null,
+          taskSessionForRun?.sessionParamsJson ?? systemSessionParamsJson,
         ),
       ),
     );
