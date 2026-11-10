@@ -1053,6 +1053,7 @@ export function heartbeatService(
     reapOrphanedRuns,
     sweepOrphanedActiveLeases,
     drainRunningRunsForShutdown,
+    enqueueProcessLossRetry,
   } = createHeartbeatRecovery(db, {
     pluginWorkerManager: options.pluginWorkerManager,
     enterShutdown: () => { shutdownInProgress = true; },
@@ -1788,7 +1789,11 @@ export function heartbeatService(
     finalizeAgentStatus,
     enqueueWakeup,
     issuesSvc,
-    recovery,
+    recovery: {
+      reconcileLegacyContinuation: recovery.reconcileLegacyContinuation,
+      reconcileResolvedDependencyWakeBackstop: recovery.reconcileResolvedDependencyWakeBackstop,
+      enqueueProcessLossRetry,
+    },
     getCurrentUserRedactionOptions,
     budgetHooks,
     runLogStore,
