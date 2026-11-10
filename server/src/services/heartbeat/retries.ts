@@ -440,6 +440,20 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     run: typeof heartbeatRuns.$inferSelect,
     details: { retryReason: string; attempt: number; maxAttempts: number; giveUpReason: string },
   ) {
+    // Releasing the routine issue is best-effort: a failure here must never block
+    // exhaustion bookkeeping or the plan-resume escalation that follows.
+    try {
+      return await releaseRoutineExecutionIssueAfterRetryGiveUpUnsafe(run, details);
+    } catch (err) {
+      logger.warn({ err, runId: run.id }, "failed to release routine execution issue after retry give-up");
+      return { released: false as const, reason: "release_failed" as const };
+    }
+  }
+
+  async function releaseRoutineExecutionIssueAfterRetryGiveUpUnsafe(
+    run: typeof heartbeatRuns.$inferSelect,
+    details: { retryReason: string; attempt: number; maxAttempts: number; giveUpReason: string },
+  ) {
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
     if (!issueId) return { released: false as const, reason: "no_issue" as const };
