@@ -17,6 +17,7 @@ import {
   companySecrets,
   companySkills,
   companies,
+  companyMemberships,
   costEvents,
   documentAnnotationAnchorSnapshots,
   documentAnnotationComments,
@@ -524,6 +525,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       defaultResponsibleUserId: "responsible-user",
       requireBoardApprovalForNewAgents: false,
     });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "responsible-user",
+      status: "active",
+      membershipRole: "member",
+    });
 
     await db.insert(agents).values({
       id: agentId,
@@ -660,6 +668,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       defaultResponsibleUserId: "responsible-user",
       requireBoardApprovalForNewAgents: false,
     });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "responsible-user",
+      status: "active",
+      membershipRole: "member",
+    });
 
     await db.insert(agents).values({
       id: agentId,
@@ -787,6 +802,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       defaultResponsibleUserId: "responsible-user",
       requireBoardApprovalForNewAgents: false,
     });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "responsible-user",
+      status: "active",
+      membershipRole: "member",
+    });
 
     await db.insert(agents).values({
       id: agentId,
@@ -879,6 +901,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       issuePrefix,
       defaultResponsibleUserId: "responsible-user",
       requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "responsible-user",
+      status: "active",
+      membershipRole: "member",
     });
 
     await db.insert(agents).values({
@@ -1050,6 +1079,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       issuePrefix,
       defaultResponsibleUserId: "responsible-user",
       requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "responsible-user",
+      status: "active",
+      membershipRole: "member",
     });
 
     await db.insert(agents).values({
