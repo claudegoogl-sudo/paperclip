@@ -57,7 +57,7 @@ function callbacks(db: Db) {
     finalizeAgentStatus: vi.fn<Dependencies["finalizeAgentStatus"]>(async () => undefined),
     enqueueWakeup: vi.fn<Dependencies["enqueueWakeup"]>(),
     issuesSvc: { addComment: vi.fn<Dependencies["issuesSvc"]["addComment"]>() },
-    recovery: { reconcileLegacyContinuation: vi.fn<Dependencies["recovery"]["reconcileLegacyContinuation"]>(), reconcileResolvedDependencyWakeBackstop: vi.fn<Dependencies["recovery"]["reconcileResolvedDependencyWakeBackstop"]>() },
+    recovery: { reconcileLegacyContinuation: vi.fn<Dependencies["recovery"]["reconcileLegacyContinuation"]>(), reconcileResolvedDependencyWakeBackstop: vi.fn<Dependencies["recovery"]["reconcileResolvedDependencyWakeBackstop"]>(), enqueueProcessLossRetry: vi.fn<Dependencies["recovery"]["enqueueProcessLossRetry"]>() },
     getCurrentUserRedactionOptions: lifecycleDeps.getCurrentUserRedactionOptions,
     budgetHooks: {},
     runLogStore: { finalize: vi.fn<Dependencies["runLogStore"]["finalize"]>(async () => ({ bytes: 123, sha256: "log-hash", compressed: true })) },
