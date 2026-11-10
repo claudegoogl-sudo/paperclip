@@ -137,6 +137,9 @@ export function sanitizeHttpFailure(error: unknown): {
         code: "secret_missing",
       };
     }
+    if (typeof code === "string" && code.startsWith("mcp_remote_plugin_")) {
+      return { status: "error", message: error.message, code };
+    }
     return { status: "error", message: error.message, code: "paperclip_error" };
   }
   if (error instanceof Error) {
