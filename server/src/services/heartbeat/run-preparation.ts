@@ -21,6 +21,7 @@ import {
   eq,
   inArray,
   isNull,
+  ne,
   sql,
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -2437,6 +2438,9 @@ export async function buildPaperclipWakePayload(input: {
   // Experimental: agents write user-interaction content in ASD-STE100
   // Simplified Technical English (rendered as a prompt directive downstream).
   simplifiedEnglishInteractions?: boolean;
+  // The run that will receive this payload: enables the run-start stamp and
+  // the same-issue sibling-run list (metadata only).
+  currentRun?: { id: string; startedAt?: Date | string | null } | null;
 }) {
   const executionStage = parseObject(input.contextSnapshot.executionStage);
   const commentIds = extractWakeCommentIds(input.contextSnapshot);
@@ -2828,6 +2832,36 @@ export async function buildPaperclipWakePayload(input: {
           notice: externalAttachmentOmissionNotice(omission),
         }))
     : [];
+  const currentRun = input.currentRun ?? null;
+  const runStartedAt = (() => {
+    if (!currentRun?.startedAt) return null;
+    const parsed = currentRun.startedAt instanceof Date ? currentRun.startedAt : new Date(currentRun.startedAt);
+    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+  })();
+  const siblingRuns =
+    issueId && currentRun
+      ? await input.db
+          .select({ runId: heartbeatRuns.id, agentName: agents.name, startedAt: heartbeatRuns.startedAt })
+          .from(heartbeatRuns)
+          .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, input.companyId),
+              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+              ne(heartbeatRuns.id, currentRun.id),
+              inArray(heartbeatRuns.status, ["queued", "running"]),
+            ),
+          )
+          .orderBy(desc(heartbeatRuns.createdAt))
+          .limit(5)
+          .then((rows) =>
+            rows.map((row) => ({
+              runId: row.runId,
+              agentName: row.agentName,
+              startedAt: row.startedAt ? row.startedAt.toISOString() : null,
+            })),
+          )
+      : [];
   const payload = {
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
     executionContinuation: input.contextSnapshot.executionContinuation ?? null,
@@ -3002,6 +3036,8 @@ export async function buildPaperclipWakePayload(input: {
     },
     truncated: payloadTruncated,
     fallbackFetchNeeded: payloadTruncated || missingCommentCount > 0,
+    runStartedAt,
+    siblingRuns,
   };
   return issueId
     ? createRunSecretRedactionRegistry(input.db).redactForIssue(

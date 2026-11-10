@@ -22,7 +22,7 @@ type RunPreparation = ReturnType<typeof createHeartbeatRunPreparation>;
 type IssueContext = NonNullable<Awaited<ReturnType<RunPreparation["getIssueExecutionContext"]>>>;
 
 export interface HeartbeatTaskContextInput {
-  run: Pick<typeof heartbeatRuns.$inferSelect, "id">;
+  run: Pick<typeof heartbeatRuns.$inferSelect, "id"> & Partial<Pick<typeof heartbeatRuns.$inferSelect, "startedAt" | "createdAt">>;
   agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "adapterType">;
   task: {
     issueRef: Pick<IssueContext,
@@ -124,6 +124,7 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
     companyId: agent.companyId,
     agentId: agent.id,
     runId: run.id,
+    currentRun: { id: run.id, startedAt: run.startedAt ?? run.createdAt ?? null },
     contextSnapshot: context,
     continuationSummary,
     issueSummary: issueRef

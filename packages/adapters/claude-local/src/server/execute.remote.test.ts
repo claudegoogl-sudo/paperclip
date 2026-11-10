@@ -316,6 +316,7 @@ describe("claude remote execution", () => {
   it("resumes saved Claude sessions for remote SSH execution when the remote identity matches", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-remote-resume-match-"));
     cleanupDirs.push(rootDir);
+    const diagLogs: string[] = [];
     const workspaceDir = path.join(rootDir, "workspace");
     const managedRemoteWorkspace = "/remote/workspace/.paperclip-runtime/runs/run-ssh-resume/workspace";
     await mkdir(workspaceDir, { recursive: true });
@@ -374,12 +375,12 @@ describe("claude remote execution", () => {
           strictHostKeyChecking: true,
         },
       },
-      onLog: async () => {},
+      onLog: async (_s: string, m: string) => { diagLogs.push(m); },
     });
 
     expect(runChildProcess.mock.calls.filter(call => !call[2].includes("--version"))).toHaveLength(1);
     const call = runChildProcess.mock.calls.find(call => !call[2].includes("--version")) as unknown as [string, string, string[]] | undefined;
-    expect(call?.[2]).toContain("--resume");
+    expect(call?.[2], diagLogs.join("")).toContain("--resume");
     expect(call?.[2]).toContain("12345678-1234-4abc-9def-123456789012");
   });
 
