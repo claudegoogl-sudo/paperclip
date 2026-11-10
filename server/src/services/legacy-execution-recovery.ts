@@ -77,8 +77,14 @@ export function legacyExecutionNeedsReconciliation(
 /** Admission-wait receipts are only exempt after retained execution evidence agrees.
  * The synchronous classifier stays conservative for callers without a DB proof. */
 export async function legacyExecutionNeedsReconciliationWithEvidence(db: Db, run: Run): Promise<boolean> {
+  // The synchronous stale-gate exemption (fork #706) trusts the receipt alone. With a
+  // DB available, the exemption must come from verified evidence (review or execution
+  // wait predicate), so conflicting or incomplete evidence keeps the hold.
+  const staleGateReceipt = run.status === "cancelled" && run.errorCode === "execution_reconciliation_required" &&
+    !run.startedAt && !run.processPid && !run.processGroupId;
+  const classified = staleGateReceipt ? { ...run, startedAt: new Date(0) } : run;
   return await hasUnrestoredRemoteWorkspace(db, run) ||
-    (legacyExecutionNeedsReconciliation(run) && !(await isPreDispatchReviewWaitVerified(db, run))
+    (legacyExecutionNeedsReconciliation(classified) && !(await isPreDispatchReviewWaitVerified(db, run))
       && !(await isPreDispatchExecutionWaitVerified(db, run)));
 }
 
