@@ -256,7 +256,7 @@ export function createHttpLogger(baseLogger: pino.Logger) {
       const ctx = (res as any).__errorContext;
       return { reqBody: "[REDACTED]", ...(ctx ? { errorContext: { name: "Error" } } : {}) };
     }
-    if (res.statusCode >= 400 && (isPrivateWebhook(req) || isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req)))) {
+    if (res.statusCode >= 400 && (isPrivateWebhook(req) || isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req)) || isPrivateMuseHttpRequest(requestClassificationUrl(req)) || isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req)))) {
       // Omit, rather than recursively redact, the entire provider payload —
       // before/after parsing, with or without error context.
       return {
