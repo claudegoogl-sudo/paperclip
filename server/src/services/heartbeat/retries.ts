@@ -1,5 +1,4 @@
 import { deriveTaskKeyWithHeartbeatFallback } from "./run-state.js";
-import { infrastructureRetryDelayMs } from "../system-recovery-state.js";
 import {
   WORKSPACE_VALIDATION_FAILURE_CODE,
   isWorkspaceValidationFailedRun,
@@ -390,7 +389,9 @@ export function computeBoundedTransientHeartbeatRetrySchedule(
   if (!Number.isInteger(attempt) || attempt <= 0) return null;
   const baseDelayMs = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS[attempt - 1];
   if (typeof baseDelayMs !== "number") return null;
-  const delayMs = infrastructureRetryDelayMs(attempt, random());
+  const sample = Math.min(1, Math.max(0, random()));
+  const jitterMultiplier = 1 + (sample * 2 - 1) * 0.25;
+  const delayMs = Math.max(1_000, Math.round(baseDelayMs * jitterMultiplier));
   return {
     attempt,
     baseDelayMs,
