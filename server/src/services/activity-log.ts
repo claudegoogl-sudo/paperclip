@@ -397,7 +397,7 @@ export async function persistActivity(db: Db, input: LogActivityInput) {
     actorKeyId,
     details: redactedDetails,
   }).returning({ id: activityLog.id });
-  const [activity] = input.entityType === "issue"
+  const [activity] = input.entityType === "issue" && typeof (db as { transaction?: unknown }).transaction === "function"
     ? await db.transaction(async tx => {
       await notifyDeliveryWork(tx, DELIVERY_QUEUES.mcpEvents, `task:${input.entityId}`);
       return insert(tx as unknown as Db);

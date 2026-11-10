@@ -12,7 +12,7 @@ const SECRET_PAYLOAD_KEY_RE = new RegExp(SECRET_FIELD_NAME_PATTERN, "i");
 // remain visible in audit receipts even though the field name contains
 // "authorization". JWT-shaped values are still caught by the value guard below.
 // authorizingUserId is a user id (audit attribution), not a credential.
-const AUDIT_REASON_PAYLOAD_KEY_RE = /^(?:authorizationReason|authorizingUserId)$/;
+const AUDIT_REASON_PAYLOAD_KEY_RE = /^(?:authorizationReason|authorizing(?:User|Person)Id)$/;
 const AUDIT_SURFACE_PAYLOAD_KEY_RE = /^surface$/;
 /**
  * Cleanup counts on a connection-removal receipt (PAP-17119). Their names name
