@@ -448,6 +448,7 @@ describe("cli auth routes", () => {
   });
 
   it("creates a named board API key and logs audit activity", async () => {
+    const keyExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
     mockBoardAuthService.createNamedBoardApiKey.mockResolvedValue({
       id: "board-key-4",
       name: "external-admin",
@@ -455,7 +456,7 @@ describe("cli auth routes", () => {
       createdAt: new Date("2026-05-23T12:00:00.000Z"),
       lastUsedAt: null,
       revokedAt: null,
-      expiresAt: new Date("2026-06-23T12:00:00.000Z"),
+      expiresAt: keyExpiresAt,
     });
     mockBoardAuthService.resolveBoardActivityCompanyIds.mockResolvedValue(["11111111-1111-4111-8111-111111111111"]);
 
@@ -471,7 +472,7 @@ describe("cli auth routes", () => {
       .send({
         name: "external-admin",
         requestedCompanyId: "11111111-1111-4111-8111-111111111111",
-        expiresAt: "2026-06-23T12:00:00.000Z",
+        expiresAt: keyExpiresAt.toISOString(),
         scope: { kind: "plugin_ops" },
       });
 
@@ -480,12 +481,12 @@ describe("cli auth routes", () => {
       id: "board-key-4",
       name: "external-admin",
       token: "pcp_board_plaintext",
-      expiresAt: "2026-06-23T12:00:00.000Z",
+      expiresAt: keyExpiresAt.toISOString(),
     });
     expect(mockBoardAuthService.createNamedBoardApiKey).toHaveBeenCalledWith({
       userId: "user-1",
       name: "external-admin",
-      expiresAt: new Date("2026-06-23T12:00:00.000Z"),
+      expiresAt: keyExpiresAt,
       scope: { kind: "plugin_ops" },
     });
     expect(mockLogActivity).toHaveBeenCalledWith(
