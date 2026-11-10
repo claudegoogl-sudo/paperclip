@@ -122,7 +122,7 @@ function installedRecord(type = EXTERNAL_ADAPTER_TYPE) {
   };
 }
 
-function createApp(actor: Express.Request["actor"], db?: unknown) {
+function createApp(actor: Express.Request["actor"], db: unknown = {}) {
   if (!adapterRoutes || !errorHandler) {
     throw new Error("adapter route test dependencies were not loaded");
   }

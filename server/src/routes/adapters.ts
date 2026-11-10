@@ -190,7 +190,7 @@ function registerWithSessionManagement(adapter: ServerAdapterModule): void {
 // Router
 // ---------------------------------------------------------------------------
 
-export function adapterRoutes(db?: Db) {
+export function adapterRoutes(db: Db) {
   // Instance-level audit: activity_log is company-scoped, so fan out to every company.
   async function auditAdapterChange(
     req: Parameters<typeof getActorInfo>[0],
@@ -198,7 +198,6 @@ export function adapterRoutes(db?: Db) {
     adapterType: string,
     details: Record<string, unknown>,
   ) {
-    if (!db) return;
     try {
       const actor = getActorInfo(req);
       const companyIds = await instanceSettingsService(db).listCompanyIds();

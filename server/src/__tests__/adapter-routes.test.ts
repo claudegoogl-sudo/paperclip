@@ -74,7 +74,7 @@ function createApp(actorOverrides: Partial<Express.Request["actor"]> = {}) {
     };
     next();
   });
-  app.use("/api", adapterRoutes());
+  app.use("/api", adapterRoutes({} as never));
   app.use(errorHandler);
   return app;
 }
