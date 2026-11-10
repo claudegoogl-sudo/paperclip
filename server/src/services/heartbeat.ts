@@ -647,6 +647,8 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
+export { NO_OP_DISPATCH_RETRY_MAX_ATTEMPTS, TRANSIENT_RETRY_NOT_BEFORE_MAX_DELAY_MS } from "./heartbeat/retries.js";
+
 export {
   NO_OP_DISPATCH_RETRY_SAFETY_MARGIN_MS,
   isZeroWorkUsageLimitResult,

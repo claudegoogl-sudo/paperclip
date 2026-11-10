@@ -118,6 +118,36 @@ export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
 ] as const;
 
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
+// Fork no-op dispatch retry budget: a dispatch that never reached the model gets its own cap.
+export const NO_OP_DISPATCH_RETRY_MAX_ATTEMPTS = 8;
+const NO_OP_DISPATCH_RETRY_FALLBACK_DELAY_MS = 10 * 60 * 1000;
+const NO_OP_DISPATCH_RETRY_MIN_DELAY_MS = 60 * 1000;
+const NO_OP_DISPATCH_RETRY_MAX_DELAY_MS = 5 * 60 * 60 * 1000;
+const NO_OP_DISPATCH_RETRY_SAFETY_MARGIN_MS_LOCAL = 60 * 1000;
+// Bound a single provider-stated transient wait so a pathological timestamp cannot strand the run.
+export const TRANSIENT_RETRY_NOT_BEFORE_MAX_DELAY_MS = 7 * 24 * 60 * 60 * 1000;
+
+function resolveNoOpDispatchRetry(input: { run: { resultJson?: unknown; contextSnapshot?: unknown }; retryReason: string }) {
+  const isNoOp =
+    input.retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON &&
+    parseObject(input.run.resultJson).noOpDispatch === true;
+  const prev = parseObject(input.run.contextSnapshot).noOpDispatchRetryAttempt;
+  const prevAttempt = typeof prev === "number" && Number.isInteger(prev) && prev > 0 ? prev : 0;
+  const attempt = isNoOp ? prevAttempt + 1 : 0;
+  const exhausted = isNoOp && attempt > NO_OP_DISPATCH_RETRY_MAX_ATTEMPTS;
+  return { attempt, exhausted, active: isNoOp && !exhausted, maxAttempts: NO_OP_DISPATCH_RETRY_MAX_ATTEMPTS };
+}
+
+function buildNoOpDispatchRetrySchedule(input: { now: Date; attempt: number; maxAttempts: number; retryNotBefore: Date | null }) {
+  const target = input.retryNotBefore
+    ? input.retryNotBefore.getTime() + NO_OP_DISPATCH_RETRY_SAFETY_MARGIN_MS_LOCAL
+    : input.now.getTime() + NO_OP_DISPATCH_RETRY_FALLBACK_DELAY_MS;
+  const delayMs = Math.min(
+    NO_OP_DISPATCH_RETRY_MAX_DELAY_MS,
+    Math.max(NO_OP_DISPATCH_RETRY_MIN_DELAY_MS, target - input.now.getTime()),
+  );
+  return { attempt: input.attempt, baseDelayMs: delayMs, delayMs, dueAt: new Date(input.now.getTime() + delayMs), maxAttempts: input.maxAttempts };
+}
 
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
 
@@ -433,8 +463,9 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
         opts?.maxAttempts ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
       ),
     );
+    const noOpDispatchRetry = resolveNoOpDispatchRetry({ run, retryReason });
     const consumedAttempts = executionRetryAttemptCount(run, retryReason);
-    const nextAttempt = consumedAttempts + 1;
+    const nextAttempt = consumedAttempts + (noOpDispatchRetry.active ? 0 : 1);
     const computedBaseSchedule =
       opts?.delayMs != null
         ? nextAttempt <= maxAttempts
@@ -455,9 +486,6 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
               opts?.random,
             )
           : null;
-    const baseSchedule = computedBaseSchedule
-      ? { ...computedBaseSchedule, maxAttempts }
-      : null;
     const transientRecovery =
       retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON
         ? readTransientRecoveryContractFromRun(run)
@@ -468,6 +496,13 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
         ? resolveCodexTransientFallbackMode(nextAttempt)
         : null;
     const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
+    const baseSchedule = noOpDispatchRetry.exhausted
+      ? null
+      : noOpDispatchRetry.active
+        ? buildNoOpDispatchRetrySchedule({ now, attempt: nextAttempt, maxAttempts, retryNotBefore: transientRetryNotBefore })
+        : computedBaseSchedule
+          ? { ...computedBaseSchedule, maxAttempts }
+          : null;
     const contextSnapshot = parseObject(run.contextSnapshot);
     // A retry inherits the durable authorization scope of its source run. Do
     // not promote an untrusted or legacy contextSnapshot.issueId into a new
@@ -479,12 +514,17 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
         retryReason,
         scheduledRetryAttempt: consumedAttempts,
         maxAttempts,
+        ...(noOpDispatchRetry.exhausted
+          ? { noOpDispatchRetryAttempt: noOpDispatchRetry.attempt, noOpDispatchMaxAttempts: noOpDispatchRetry.maxAttempts }
+          : {}),
       };
       await appendRunEvent(run, {
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
-        message: `Bounded retry exhausted after ${consumedAttempts} scheduled attempts; no further automatic retry will be queued`,
+        message: `${noOpDispatchRetry.exhausted
+          ? `No-op dispatch retries exhausted after ${noOpDispatchRetry.maxAttempts} attempts that never reached the model`
+          : `Bounded retry exhausted after ${consumedAttempts} scheduled attempts`}; no further automatic retry will be queued`,
         payload: exhaustion,
         retryExhaustion: exhaustion,
       });
@@ -548,16 +588,23 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
       }
     }
 
+    // The cap applies to the transient_upstream family only; provider-quota
+    // reset horizons are the account's real reset clock and are honored exactly.
+    const capApplies = transientRecovery?.errorFamily !== "provider_quota";
+    const honoredNotBeforeMs =
+      transientRetryNotBefore !== null
+        ? capApplies
+          ? Math.min(transientRetryNotBefore.getTime(), now.getTime() + TRANSIENT_RETRY_NOT_BEFORE_MAX_DELAY_MS)
+          : transientRetryNotBefore.getTime()
+        : null;
     const schedule =
-      transientRetryNotBefore &&
-      transientRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
+      !noOpDispatchRetry.active &&
+      honoredNotBeforeMs !== null &&
+      honoredNotBeforeMs > baseSchedule.dueAt.getTime()
         ? {
             ...baseSchedule,
-            dueAt: transientRetryNotBefore,
-            delayMs: Math.max(
-              0,
-              transientRetryNotBefore.getTime() - now.getTime(),
-            ),
+            dueAt: new Date(honoredNotBeforeMs),
+            delayMs: Math.max(0, honoredNotBeforeMs - now.getTime()),
           }
         : baseSchedule;
 
@@ -659,6 +706,8 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
           : {}),
         scheduledRetryAttempt: schedule.attempt,
         scheduledRetryAt: schedule.dueAt.toISOString(),
+        noOpDispatchRetryAttempt: noOpDispatchRetry.attempt,
+        ...(noOpDispatchRetry.active ? { noOpDispatchRetry: true } : {}),
         ...(transientRetryNotBefore
           ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() }
           : {}),
@@ -1261,8 +1310,13 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
       eventType: "lifecycle",
       stream: "system",
       level: "warn",
-      message: `Scheduled bounded retry ${schedule.attempt}/${schedule.maxAttempts} for ${schedule.dueAt.toISOString()}`,
+      message: noOpDispatchRetry.active
+        ? `Scheduled no-op dispatch retry ${noOpDispatchRetry.attempt}/${noOpDispatchRetry.maxAttempts} for ${schedule.dueAt.toISOString()} without consuming bounded retry attempt ${schedule.attempt}`
+        : `Scheduled bounded retry ${schedule.attempt}/${schedule.maxAttempts} for ${schedule.dueAt.toISOString()}`,
       payload: {
+        ...(noOpDispatchRetry.active
+          ? { noOpDispatchRetry: true, noOpDispatchRetryAttempt: noOpDispatchRetry.attempt, noOpDispatchMaxAttempts: noOpDispatchRetry.maxAttempts }
+          : {}),
         retryRunId: retryRun.id,
         retryReason,
         ...(transientRecovery
