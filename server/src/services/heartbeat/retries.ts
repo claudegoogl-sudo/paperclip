@@ -631,7 +631,9 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
         payload: exhaustion,
         retryExhaustion: exhaustion,
       });
-      await releaseRoutineExecutionIssueAfterRetryGiveUp(run, {
+      // Interaction-continuation retries resume a plan approval, never a routine tick;
+      // they have no routine execution issue to release (and must not query for one).
+      if (retryReason !== INTERACTION_CONTINUATION_INFRA_RETRY_REASON) await releaseRoutineExecutionIssueAfterRetryGiveUp(run, {
         retryReason,
         attempt: nextAttempt,
         maxAttempts,
