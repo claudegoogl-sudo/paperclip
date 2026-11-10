@@ -748,6 +748,20 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
             .returning()
             .then((rows) => rows[0] ?? null);
           if (lateWrite) {
+            await appendRunEvent(lateWrite, {
+              eventType: "lifecycle",
+              stream: "system",
+              level: "info",
+              message: `completed after reap: exit ${adapterResult.exitCode ?? "unknown"}`,
+              payload: {
+                reapedStatus: "interrupted",
+                reapedErrorCode: reaped.errorCode ?? null,
+                completionStatus: status,
+                exitCode: adapterResult.exitCode,
+              },
+            }).catch((err) => {
+              logger.warn({ err, runId: run.id }, "failed to append completed-after-reap provenance event");
+            });
             await classifyAndPersistRunLiveness(lateWrite, persistedResultJson);
             await finalizeAgentStatus(agent.id, outcome, null, {
               keepIdleOnFailure: false,
