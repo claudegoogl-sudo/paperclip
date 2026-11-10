@@ -422,9 +422,12 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     // Native sessions have their own fenced same-run controller. Legacy
     // bootstrap recovery shares the durable delay and incident counter with
     // transient retries; process loss must not open a second retry budget.
-    if (run.runtimeMode === "native" || await legacyExecutionNeedsReconciliationWithEvidence(db, run))
+    if (run.runtimeMode === "native" || await legacyExecutionNeedsReconciliationWithEvidence(db, run)) {
+      console.error("DIAGSCHED early null runtimeMode=" + run.runtimeMode);
       return null;
+    }
     const scheduled = await scheduleBoundedRetryForRun(run, agent, { now });
+    if (scheduled.outcome !== "scheduled") console.error("DIAGSCHED " + JSON.stringify(scheduled));
     return scheduled.outcome === "scheduled" ? scheduled.run : null;
   }
 
