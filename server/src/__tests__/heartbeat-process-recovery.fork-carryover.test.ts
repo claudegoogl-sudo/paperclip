@@ -1302,6 +1302,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .where(eq(heartbeatRuns.retryOfRunId, runId))
         .then((rows) => rows[0] ?? null);
       // 1005.0 schedules process-loss retries durably on the shared bounded ladder.
+      if (!retry) {
+        const evs = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
+        throw new Error("DIAG events: " + JSON.stringify(evs.map((e) => [e.eventType, e.message, e.payload])));
+      }
       expect(retry).toMatchObject({ status: "scheduled_retry", scheduledRetryAttempt: 1 });
 
       const wakeup = await db
