@@ -40,6 +40,7 @@ export function legacyExecutionNeedsReconciliation(
   // Fork carryover: our own shutdown (SIGTERM wave) killed the process; the restart
   // retry ladder owns recovery, not an action-outcome hold.
   if (run.status === "interrupted" && run.errorCode === "server_shutdown_interrupted" &&
+      typeof run.error === "string" && run.error.includes("process lost across the shutdown boundary") &&
       !(run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive" || hasRequiredWorkspaceRecovery(run.resultJson))) return false;
   // A fresh model turn cannot repair or verify unrestored files.
   if (run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive" || hasRequiredWorkspaceRecovery(run.resultJson)) return true;
