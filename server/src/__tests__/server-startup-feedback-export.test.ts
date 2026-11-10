@@ -255,6 +255,7 @@ vi.mock("@paperclipai/db", async (importOriginal) => ({
   ensurePostgresDatabase: vi.fn(),
   getPostgresDataDirectory: vi.fn(),
   inspectMigrations: vi.fn(async () => ({ status: "upToDate" })),
+  inspectMigrationPreflight: vi.fn(async () => ({ pending: [], drift: [], unverifiable: [] })),
   applyPendingMigrations: vi.fn(),
   reconcilePendingMigrationHistory: vi.fn(async () => ({ repairedMigrations: [] })),
   formatDatabaseBackupResult: vi.fn(() => "ok"),
