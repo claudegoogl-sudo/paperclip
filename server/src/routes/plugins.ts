@@ -30,6 +30,7 @@ import { Router } from "express";
 import type { Request, Response } from "express";
 import { and, desc, eq, gte } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { checkToolGrant, dbGrantLookup } from "../services/plugin-tool-grants.js";
 import {
   agents,
   companies,
@@ -1369,6 +1370,34 @@ export function pluginRoutes(
       return;
     }
 
+    // Complete mediation (phase 1): tools flagged requiresGrant need an
+    // unexpired exact-key grant for (company, agent). Fail closed + audit deny.
+    const grantDecision = await checkToolGrant({
+      lookup: dbGrantLookup(db),
+      companyId: runContext.companyId,
+      agentId: runContext.agentId,
+      namespacedTool: tool,
+    });
+    if (!grantDecision.allowed) {
+      try {
+        await logActivity(db, {
+          companyId: runContext.companyId,
+          actorType: "agent",
+          actorId: runContext.agentId,
+          agentId: runContext.agentId,
+          runId: runContext.runId,
+          action: "plugin_tool.denied",
+          entityType: "plugin_tool",
+          entityId: tool,
+          details: { tool, reason: grantDecision.reason },
+        });
+      } catch (err) {
+        logger.error({ err, tool }, "plugin_tool.denied audit write failed");
+      }
+      res.status(403).json({ error: `Tool "${tool}" requires a grant`, code: "TOOL_GRANT_REQUIRED" });
+      return;
+    }
+
     // Enforce the host-side per-dispatcher rate limit and write
     // exactly one audit row for this authorized dispatch BEFORE handing the
     // call to the plugin worker. A breach fails closed with a 429.
@@ -1379,6 +1408,7 @@ export function pluginRoutes(
         runContext,
         parameters,
         rateLimiter: toolDispatchRateLimiter,
+        grant: grantDecision.required ? { grantId: grantDecision.grantId } : undefined,
       });
     } catch (err) {
       if (err instanceof RateLimitExceededError) {

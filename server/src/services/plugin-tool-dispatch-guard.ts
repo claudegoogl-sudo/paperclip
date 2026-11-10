@@ -175,8 +175,10 @@ export function buildDispatchAuditInput(
   runContext: ToolRunContext,
   parameters: unknown,
   policy?: ToolDispatchPolicy,
+  grant?: { grantId?: string },
 ): LogActivityInput {
   const details: Record<string, unknown> = { tool: namespacedTool };
+  if (grant) details.grantId = grant.grantId ?? null;
   const param = policy?.auditNameParam;
   if (param && parameters && typeof parameters === "object") {
     const raw = (parameters as Record<string, unknown>)[param];
@@ -215,6 +217,8 @@ export async function guardAndAuditToolDispatch(opts: {
   runContext: ToolRunContext;
   parameters: unknown;
   rateLimiter: ToolDispatchRateLimiter;
+  /** Set when the tool required (and had) a grant. */
+  grant?: { grantId?: string };
   /** Injectable for tests; defaults to the real {@link logActivity}. */
   logActivityFn?: (db: Db, input: LogActivityInput) => Promise<void>;
 }): Promise<void> {
@@ -233,5 +237,5 @@ export async function guardAndAuditToolDispatch(opts: {
   }
 
   const writeActivity = opts.logActivityFn ?? logActivity;
-  await writeActivity(db, buildDispatchAuditInput(namespacedTool, runContext, parameters, policy));
+  await writeActivity(db, buildDispatchAuditInput(namespacedTool, runContext, parameters, policy, opts.grant));
 }
