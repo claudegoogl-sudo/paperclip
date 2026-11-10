@@ -6,6 +6,7 @@ import {
   agentTaskSessions,
   agents,
   companies,
+  companyMemberships,
   createDb,
   heartbeatRuns,
   issues,
@@ -153,6 +154,13 @@ describeEmbeddedPostgres("heartbeat system-session prompt-bundle resume params",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       defaultResponsibleUserId: "responsible-user",
       requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "responsible-user",
+      status: "active",
+      membershipRole: "member",
     });
     await db.insert(agents).values({
       id: agentId,
