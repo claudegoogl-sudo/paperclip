@@ -472,6 +472,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       await db.delete(companySecretBindings);
       await db.delete(companySecrets);
       try {
+        await db.delete(companyMemberships);
         await db.delete(companies);
         break;
       } catch (error) {
