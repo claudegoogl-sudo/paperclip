@@ -11720,9 +11720,12 @@ export function issueService(db: Db) {
         // PLA-12409: the durable handoff marker commits with the assignment, so a
         // failed update leaves no marker and the stopped run keeps its hold.
         if (handoffCommit && updated.assigneeAgentId === handoffCommit.toAgentId) {
-          await tx.update(heartbeatRuns).set({
+          const [markedRun] = await tx.update(heartbeatRuns).set({
             resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({ handoffCommitted: { ...handoffCommit, at: new Date().toISOString() } })}::jsonb`,
-          }).where(and(eq(heartbeatRuns.id, handoffCommit.runId), eq(heartbeatRuns.companyId, updated.companyId)));
+          }).where(and(eq(heartbeatRuns.id, handoffCommit.runId), eq(heartbeatRuns.companyId, updated.companyId)))
+            .returning({ resultJson: heartbeatRuns.resultJson });
+          const runEvidence = (markedRun?.resultJson ?? {}) as Record<string, unknown>;
+          if (!runEvidence.workspaceRestoreFailure && !runEvidence.workspaceRestoreRecovery)
           // A hold minted after the grace window but before this commit is the
           // stop's own hold; retire it unless it carries workspace-repair evidence.
           await tx.update(issueRecoveryActions).set({

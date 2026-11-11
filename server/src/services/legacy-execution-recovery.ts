@@ -147,6 +147,8 @@ export async function terminalizeLegacyExecution(input: {
     )).for("update");
     if (!current || current.runtimeMode !== "legacy" ||
         (!input.recordRestoreFailureOnly && !(input.fromStatuses ?? [run.status]).includes(current.status))) return null;
+    // Recheck under the run lock: a concurrent request may have committed the handoff.
+    if (input.dropHandoffPending && (current.resultJson as Record<string, unknown> | null)?.handoffCommitted) return current;
     if (input.dropHandoffPending) {
       const { handoffPending: _p, ...locked } = (current.resultJson ?? {}) as Record<string, unknown>;
       patch = { ...patch, resultJson: locked };
@@ -154,7 +156,7 @@ export async function terminalizeLegacyExecution(input: {
     // A late finalization snapshot must not erase the same-transaction commit marker.
     const committedMarker = (current.resultJson as Record<string, unknown> | null)?.handoffCommitted;
     if (committedMarker && patch?.resultJson !== undefined && !(patch.resultJson as Record<string, unknown>).handoffCommitted)
-      patch = { ...patch, resultJson: { ...patch.resultJson, handoffCommitted: committedMarker } };
+      patch = { ...patch, resultJson: { ...(patch.resultJson ?? {}), handoffCommitted: committedMarker } };
     if (patch?.resultJson !== undefined) patch = { ...patch,
       resultJson: preserveWorkspaceRestoreRecoveryMetadata(current.resultJson,
         input.recordRestoreFailureOnly ? { ...current.resultJson, ...patch.resultJson } : patch.resultJson),
