@@ -11723,6 +11723,19 @@ export function issueService(db: Db) {
           await tx.update(heartbeatRuns).set({
             resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({ handoffCommitted: { ...handoffCommit, at: new Date().toISOString() } })}::jsonb`,
           }).where(and(eq(heartbeatRuns.id, handoffCommit.runId), eq(heartbeatRuns.companyId, updated.companyId)));
+          // A hold minted after the grace window but before this commit is the
+          // stop's own hold; retire it unless it carries workspace-repair evidence.
+          await tx.update(issueRecoveryActions).set({
+            status: "resolved", outcome: "cancelled", resolvedAt: new Date(), updatedAt: new Date(),
+            resolutionNote: "The run was stopped by its own committed handoff; the new participant owns the issue.",
+          }).where(and(
+            eq(issueRecoveryActions.companyId, updated.companyId),
+            eq(issueRecoveryActions.sourceIssueId, updated.id),
+            inArray(issueRecoveryActions.status, ["active", "escalated"]),
+            eq(issueRecoveryActions.fingerprint, `legacy-execution:${handoffCommit.runId}`),
+            sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' is null`,
+            sql`${issueRecoveryActions.evidence}->'workspaceRestoreRecovery' is null`,
+          ));
         }
         if (issueData.description !== undefined) await attachOwnedDraftImages(tx, updated, updated.description,
           { userId: actorUserId, agentId: actorAgentId });

@@ -96,9 +96,8 @@ export function handoffSuppressesHold(
 
 /** The handoff update failed: drop the pending marker and mint the normal hold. */
 export async function releaseFailedHandoffHold(db: Db, run: Run) {
-  const { handoffPending: _drop, ...rest } = (run.resultJson ?? {}) as Record<string, unknown>;
   return terminalizeLegacyExecution({ db, run, status: "cancelled", fromStatuses: ["cancelled"],
-    reconcileIfNeeded: true, patch: { resultJson: rest } });
+    reconcileIfNeeded: true, dropHandoffPending: true });
 }
 
 /** Review-wait receipts are only exempt after retained execution evidence agrees.
@@ -120,6 +119,8 @@ export async function terminalizeLegacyExecution(input: {
   /** Adapter settlement records a copy-back failure before host finalization. */
   recordRestoreFailureOnly?: boolean;
   workspaceRestoreSource?: LegacyWorkspaceRestoreSource;
+  /** Drop resultJson.handoffPending from the LOCKED run row (PLA-12409). */
+  dropHandoffPending?: boolean;
 }) {
   const { db, run, status } = input;
   let patch = input.patch;
@@ -146,6 +147,14 @@ export async function terminalizeLegacyExecution(input: {
     )).for("update");
     if (!current || current.runtimeMode !== "legacy" ||
         (!input.recordRestoreFailureOnly && !(input.fromStatuses ?? [run.status]).includes(current.status))) return null;
+    if (input.dropHandoffPending) {
+      const { handoffPending: _p, ...locked } = (current.resultJson ?? {}) as Record<string, unknown>;
+      patch = { ...patch, resultJson: locked };
+    }
+    // A late finalization snapshot must not erase the same-transaction commit marker.
+    const committedMarker = (current.resultJson as Record<string, unknown> | null)?.handoffCommitted;
+    if (committedMarker && patch?.resultJson !== undefined && !(patch.resultJson as Record<string, unknown>).handoffCommitted)
+      patch = { ...patch, resultJson: { ...patch.resultJson, handoffCommitted: committedMarker } };
     if (patch?.resultJson !== undefined) patch = { ...patch,
       resultJson: preserveWorkspaceRestoreRecoveryMetadata(current.resultJson,
         input.recordRestoreFailureOnly ? { ...current.resultJson, ...patch.resultJson } : patch.resultJson),
