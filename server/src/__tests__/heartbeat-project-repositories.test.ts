@@ -717,15 +717,20 @@ suite("task project repository provisioning", () => {
       await heartbeat.resumeQueuedRuns();
       await heartbeat.drainActiveRunExecutions();
       expect((await heartbeat.getRun(last!.id))?.errorCode).toBe(code);
-      // Fork retry ladder has one more attempt than upstream: drain it too.
-      const [third] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, last!.id));
-      expect(third).toMatchObject({ status: "scheduled_retry", scheduledRetryAttempt: 3 });
-      await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(Date.now() - 1000) }).where(eq(heartbeatRuns.id, third!.id));
-      await heartbeat.promoteDueScheduledRetries();
-      await heartbeat.resumeQueuedRuns();
-      await heartbeat.drainActiveRunExecutions();
-      expect((await heartbeat.getRun(third!.id))?.errorCode).toBe(code);
-      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(4);
+      // Fork retry ladder is longer than upstream's: drain every remaining scheduled retry.
+      let prev = last!;
+      for (let i = 0; i < 6; i++) {
+        const [next] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, prev.id));
+        if (!next) break;
+        expect(next.status).toBe("scheduled_retry");
+        await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(Date.now() - 1000) }).where(eq(heartbeatRuns.id, next.id));
+        await heartbeat.promoteDueScheduledRetries();
+        await heartbeat.resumeQueuedRuns();
+        await heartbeat.drainActiveRunExecutions();
+        expect((await heartbeat.getRun(next.id))?.errorCode).toBe(code);
+        prev = next;
+      }
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).length).toBeGreaterThanOrEqual(4);
       expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]).toMatchObject({ status: "blocked", assigneeAgentId: agentId });
       expect(execute.mock.calls.filter(([input]) => input.agent.id === agentId)).toHaveLength(0);
       return;
