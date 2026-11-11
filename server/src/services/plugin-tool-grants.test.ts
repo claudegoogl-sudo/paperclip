@@ -51,7 +51,7 @@ describe("plugin tool grants", () => {
   });
   it("reports grant entries that match no registered tool", () => {
     expect(unmatchedGrantRequirements([
-      "platform.cad:cad.run_script", "platform.cad:cad.export", "platform.vault:vault.read",
+      "platform.cad:cad.run_script", "platform.cad:cad.export", "platform.vault:vault.read", "platform.vault:vault.list",
     ])).toEqual([]);
     expect(unmatchedGrantRequirements(["platform.cad:cad.run_script"])).toContain("platform.vault:*");
   });
