@@ -30,6 +30,7 @@ import { Router } from "express";
 import type { Request, Response } from "express";
 import { and, desc, eq, gte } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { checkToolGrant, dbGrantLookup, unmatchedGrantRequirements } from "../services/plugin-tool-grants.js";
 import {
   agents,
   companies,
@@ -1193,6 +1194,12 @@ export function pluginRoutes(
 
     const filter = pluginId ? { pluginId } : undefined;
     const tools = toolDeps.toolDispatcher.listToolsForAgent(filter);
+    if (!pluginId) {
+      const missing = unmatchedGrantRequirements(
+        (tools as unknown as Array<{ name?: string }>).map((t) => t.name ?? ""),
+      );
+      if (missing.length > 0) logger.warn({ missing }, "plugin tool grant requirements match no registered tool");
+    }
     res.json(tools);
   });
 
@@ -1333,6 +1340,35 @@ export function pluginRoutes(
       return;
     }
 
+    // Complete mediation (phase 1): tools flagged requiresGrant need an
+    // unexpired exact-key grant for (company, agent). Fail closed + audit deny.
+    const auditActor = getActorInfo(req);
+    const grantDecision = await checkToolGrant({
+      lookup: dbGrantLookup(db),
+      companyId: runContext.companyId,
+      agentId: runContext.agentId,
+      namespacedTool: tool,
+    });
+    if (!grantDecision.allowed) {
+      try {
+        await logActivity(db, {
+          companyId: runContext.companyId,
+          actorType: auditActor?.actorType ?? "agent",
+          actorId: auditActor?.actorId ?? runContext.agentId,
+          agentId: runContext.agentId,
+          runId: runContext.runId,
+          action: "plugin_tool.denied",
+          entityType: "plugin_tool",
+          entityId: tool,
+          details: { tool, reason: grantDecision.reason },
+        });
+      } catch (err) {
+        logger.error({ err, tool }, "plugin_tool.denied audit write failed");
+      }
+      res.status(403).json({ error: `Tool "${tool}" requires a grant`, code: "TOOL_GRANT_REQUIRED" });
+      return;
+    }
+
     if (req.actor.type === "agent" && toolGatewayDeps) {
       try {
         const result = await toolGatewayDeps.toolGateway.executePluginTool({
@@ -1379,6 +1415,7 @@ export function pluginRoutes(
         runContext,
         parameters,
         rateLimiter: toolDispatchRateLimiter,
+        grant: grantDecision.required ? { grantId: grantDecision.grantId } : undefined,
       });
     } catch (err) {
       if (err instanceof RateLimitExceededError) {

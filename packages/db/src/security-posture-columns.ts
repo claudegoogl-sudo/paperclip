@@ -86,6 +86,26 @@ type RegisteredPostureColumn = AnySchemaTable extends infer T
  * write look innocuous in review.
  */
 export const SECURITY_POSTURE_COLUMNS = [
+  {
+    table: "plugin_tool_grants",
+    column: "expires_at",
+    reason: "Grant TTL: the tool dispatcher denies when expires_at <= now, so flattening it to a far-future value makes every plugin-tool grant permanent.",
+  },
+  {
+    table: "plugin_tool_grants",
+    column: "tool_key",
+    reason: "Exact namespaced tool key compared by equality at dispatch; rewriting it changes which tool a grant authorizes.",
+  },
+  {
+    table: "plugin_tool_grants",
+    column: "agent_id",
+    reason: "Grant principal: dispatch matches (company, agent, tool_key); rewriting it hands the grant to another agent.",
+  },
+  {
+    table: "plugin_tool_grants",
+    column: "company_id",
+    reason: "Grant tenant scope: dispatch matches company_id; rewriting it moves a grant across companies.",
+  },
   // --- Egress (the columns migration `0138` flattened) ---
   {
     table: "company_secret_bindings",
