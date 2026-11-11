@@ -1179,35 +1179,6 @@ export function pluginRoutes(
     }
 
     const pluginId = req.query.pluginId as string | undefined;
-    // Complete mediation (phase 1): tools flagged requiresGrant need an
-    // unexpired exact-key grant for (company, agent). Fail closed + audit deny.
-    const auditActor = getActorInfo(req);
-    const grantDecision = await checkToolGrant({
-      lookup: dbGrantLookup(db),
-      companyId: runContext.companyId,
-      agentId: runContext.agentId,
-      namespacedTool: tool,
-    });
-    if (!grantDecision.allowed) {
-      try {
-        await logActivity(db, {
-          companyId: runContext.companyId,
-          actorType: auditActor?.actorType ?? "agent",
-          actorId: auditActor?.actorId ?? runContext.agentId,
-          agentId: runContext.agentId,
-          runId: runContext.runId,
-          action: "plugin_tool.denied",
-          entityType: "plugin_tool",
-          entityId: tool,
-          details: { tool, reason: grantDecision.reason },
-        });
-      } catch (err) {
-        logger.error({ err, tool }, "plugin_tool.denied audit write failed");
-      }
-      res.status(403).json({ error: `Tool "${tool}" requires a grant`, code: "TOOL_GRANT_REQUIRED" });
-      return;
-    }
-
     if (req.actor.type === "agent" && toolGatewayDeps) {
       if (!req.actor.companyId || !req.actor.agentId) {
         res.status(401).json({ error: "Agent identity is required" });
@@ -1360,6 +1331,35 @@ export function pluginRoutes(
     }
     if (scopeError) {
       res.status(403).json({ error: scopeError });
+      return;
+    }
+
+    // Complete mediation (phase 1): tools flagged requiresGrant need an
+    // unexpired exact-key grant for (company, agent). Fail closed + audit deny.
+    const auditActor = getActorInfo(req);
+    const grantDecision = await checkToolGrant({
+      lookup: dbGrantLookup(db),
+      companyId: runContext.companyId,
+      agentId: runContext.agentId,
+      namespacedTool: tool,
+    });
+    if (!grantDecision.allowed) {
+      try {
+        await logActivity(db, {
+          companyId: runContext.companyId,
+          actorType: auditActor?.actorType ?? "agent",
+          actorId: auditActor?.actorId ?? runContext.agentId,
+          agentId: runContext.agentId,
+          runId: runContext.runId,
+          action: "plugin_tool.denied",
+          entityType: "plugin_tool",
+          entityId: tool,
+          details: { tool, reason: grantDecision.reason },
+        });
+      } catch (err) {
+        logger.error({ err, tool }, "plugin_tool.denied audit write failed");
+      }
+      res.status(403).json({ error: `Tool "${tool}" requires a grant`, code: "TOOL_GRANT_REQUIRED" });
       return;
     }
 

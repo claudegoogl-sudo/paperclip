@@ -14,7 +14,3 @@ ALTER TABLE "plugin_tool_grants" ADD CONSTRAINT "plugin_tool_grants_company_id_c
 ALTER TABLE "plugin_tool_grants" ADD CONSTRAINT "plugin_tool_grants_agent_id_agents_id_fk" FOREIGN KEY ("agent_id") REFERENCES "public"."agents"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 CREATE UNIQUE INDEX "plugin_tool_grants_company_agent_tool_uq" ON "plugin_tool_grants" USING btree ("company_id","agent_id","tool_key");--> statement-breakpoint
 CREATE INDEX "plugin_tool_grants_expires_idx" ON "plugin_tool_grants" USING btree ("expires_at");
---> statement-breakpoint
--- DOWN (manual rollback, run BOTH or neither; dropping the table alone leaves 0397 recorded as applied and grant lookups then fail closed):
---   DROP TABLE IF EXISTS "plugin_tool_grants";
---   DELETE FROM drizzle.__drizzle_migrations WHERE hash = '<sha256 of this file>';
