@@ -678,15 +678,24 @@ export function createHeartbeatScheduling(
       throw conflict("Issue monitor has no agent target");
     }
     if (input.source === "automation" && !isProviderQuotaReviewMonitor) {
-      const skipAgent = await getAgent(targetAgentId);
-      if (
-        skipAgent &&
-        parseSkipMonitorWhenNoActivity(skipAgent) &&
-        !clearReason &&
-        !monitor?.serviceName &&
-        claimed.monitorLastTriggeredAt &&
-        !(await issueHasActivitySince(claimed.id, claimed.companyId, claimed.monitorLastTriggeredAt))
-      ) {
+      let shouldSkip = false;
+      try {
+        const skipAgent = await getAgent(targetAgentId);
+        shouldSkip = Boolean(
+          skipAgent &&
+            parseSkipMonitorWhenNoActivity(skipAgent) &&
+            !clearReason &&
+            !monitor?.serviceName &&
+            claimed.monitorLastTriggeredAt &&
+            !(await issueHasActivitySince(claimed.id, claimed.companyId, claimed.monitorLastTriggeredAt)),
+        );
+      } catch (err) {
+        // Release the claim so the monitor is not stuck, then surface the error.
+        await db.update(issues).set({ monitorWakeRequestedAt: null, updatedAt: input.now })
+          .where(issueMonitorClaimCondition(claimed));
+        throw err;
+      }
+      if (shouldSkip) {
         const skipped = await db
           .update(issues)
           .set({
@@ -698,7 +707,12 @@ export function createHeartbeatScheduling(
             }),
             updatedAt: new Date(),
           })
-          .where(issueMonitorClaimCondition(claimed))
+          .where(and(
+            issueMonitorClaimCondition(claimed),
+            // Do not overwrite a policy/state change made after the claim.
+            sql`${issues.executionPolicy} is not distinct from ${claimed.executionPolicy === null || claimed.executionPolicy === undefined ? null : JSON.stringify(claimed.executionPolicy)}::jsonb`,
+            sql`${issues.executionState} is not distinct from ${claimed.executionState === null || claimed.executionState === undefined ? null : JSON.stringify(claimed.executionState)}::jsonb`,
+          ))
           .returning({ id: issues.id });
         if (skipped.length === 0) return { outcome: "skipped" as const, reason: "monitor_replaced" };
         await logActivity(db, {
