@@ -545,6 +545,12 @@ export function createHeartbeatScheduling(
       eq(issues.monitorWakeRequestedAt, claimed.monitorWakeRequestedAt!));
   }
 
+  // Release only our own claim; tolerate status/assignee changes after the claim.
+  function issueMonitorOwnClaimCondition(claimed: IssueMonitorDispatchRow) {
+    return and(eq(issues.id, claimed.id), eq(issues.companyId, claimed.companyId),
+      eq(issues.monitorWakeRequestedAt, claimed.monitorWakeRequestedAt!));
+  }
+
   async function releaseIssueMonitorWithDiagnostic(
     claimed: IssueMonitorDispatchRow,
     input: Parameters<typeof dispatchClaimedIssueMonitor>[1],
@@ -692,7 +698,7 @@ export function createHeartbeatScheduling(
       } catch (err) {
         // Release the claim so the monitor is not stuck, then surface the error.
         await db.update(issues).set({ monitorWakeRequestedAt: null, updatedAt: input.now })
-          .where(issueMonitorClaimCondition(claimed));
+          .where(issueMonitorOwnClaimCondition(claimed));
         throw err;
       }
       if (shouldSkip) {
@@ -717,7 +723,7 @@ export function createHeartbeatScheduling(
         if (skipped.length === 0) {
           // Snapshot or monitor changed after the claim: release our claim if we still hold it.
           await db.update(issues).set({ monitorWakeRequestedAt: null, updatedAt: new Date() })
-            .where(issueMonitorClaimCondition(claimed));
+            .where(issueMonitorOwnClaimCondition(claimed));
           return { outcome: "skipped" as const, reason: "monitor_replaced" };
         }
         await logActivity(db, {
