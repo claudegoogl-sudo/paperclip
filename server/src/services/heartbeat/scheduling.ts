@@ -714,7 +714,12 @@ export function createHeartbeatScheduling(
             sql`${issues.executionState} is not distinct from ${claimed.executionState === null || claimed.executionState === undefined ? null : JSON.stringify(claimed.executionState)}::jsonb`,
           ))
           .returning({ id: issues.id });
-        if (skipped.length === 0) return { outcome: "skipped" as const, reason: "monitor_replaced" };
+        if (skipped.length === 0) {
+          // Snapshot or monitor changed after the claim: release our claim if we still hold it.
+          await db.update(issues).set({ monitorWakeRequestedAt: null, updatedAt: new Date() })
+            .where(issueMonitorClaimCondition(claimed));
+          return { outcome: "skipped" as const, reason: "monitor_replaced" };
+        }
         await logActivity(db, {
           companyId: claimed.companyId,
           actorType: input.actorType,
