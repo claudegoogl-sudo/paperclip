@@ -36,6 +36,11 @@ export type SecurityPostureRejection = {
  */
 
 export const SECURITY_POSTURE_REJECTIONS = [
+  {
+    table: "plugin_tool_grants",
+    columns: ["created_at", "created_by", "id", "review_due", "reviewed_by"],
+    reason: "Row identity and audit metadata (who created/reviewed, when review is due, creation time); the dispatcher does not read them as an authorization predicate. The gating columns are registered in SECURITY_POSTURE_COLUMNS.",
+  },
   // --- upstream v2026.1106.0 sync: provisional, pending security review ---
   {
     table: "agents",
