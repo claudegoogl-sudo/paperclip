@@ -1,3 +1,4 @@
+import { releaseFailedHandoffHold } from "../services/legacy-execution-recovery.js";
 import { parseObject } from "../adapters/utils.js";
 import { enqueueFastResponse } from "../services/fast-responses.js";
 import { hasRequiredWorkspaceRecovery, LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "../services/workspace-restore-recovery-state.js";
@@ -14153,6 +14154,7 @@ export function issueRoutes(
           .json({ error: "Issue follow-up blocked by unresolved blockers" });
         return;
       }
+      let handoffStop: { runId: string; stopId: string; toAgentId: string } | null = null;
       let interruptedRunId: string | null = null;
       const closedExecutionWorkspace =
         await getClosedIssueExecutionWorkspace(existing);
@@ -14563,7 +14565,14 @@ export function issueRoutes(
             "Cancelled before issue reassignment",
             {
               errorCode: "issue_reassigned",
-              resultJson: { reassignmentStopConfirmed: true, issueMutationStopId },
+              resultJson: {
+                reassignmentStopConfirmed: true,
+                issueMutationStopId,
+                ...(nextAssigneeAgentId && nextAssigneeAgentId !== existing.assigneeAgentId
+                  ? { handoffPending: { runId: runToStopForReassignment.id, stopId: issueMutationStopId,
+                      toAgentId: nextAssigneeAgentId, at: new Date().toISOString() } }
+                  : {}),
+              },
               eventMessage: "run cancelled before issue reassignment",
               eventPayload: { issueId: existing.id },
             },
@@ -14578,6 +14587,9 @@ export function issueRoutes(
             );
           }
           interruptedRunId = cancelled.id;
+          if (nextAssigneeAgentId && nextAssigneeAgentId !== existing.assigneeAgentId) {
+            handoffStop = { runId: cancelled.id, stopId: issueMutationStopId, toAgentId: nextAssigneeAgentId };
+          }
         }
       }
 
@@ -14659,6 +14671,7 @@ export function issueRoutes(
         actorAgentId: actor.agentId ?? null,
         actorRunId: actor.agentId ? actor.runId : null,
         actorRunStopId: actor.agentId && interruptedRunId === actor.runId ? issueMutationStopId : null,
+        handoffCommit: handoffStop,
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
       };
       const shouldCollectCompletionPublication =
@@ -14812,6 +14825,16 @@ export function issueRoutes(
         shouldRelayStop ||
         persistReviewActivityTransactionally ||
         reviewPolicySensitiveMutationRequested;
+      const releaseHandoffHold = async () => {
+        if (!handoffStop) return;
+        const [stopped] = await db.select().from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.id, handoffStop.runId), eq(heartbeatRuns.companyId, existing.companyId))).limit(1);
+        if (stopped) {
+          const rj = (stopped.resultJson ?? {}) as Record<string, unknown>;
+          if (!rj.handoffCommitted) await releaseFailedHandoffHold(db, stopped).catch((e) =>
+            logger.warn({ err: e, runId: stopped.id }, "handoff hold release failed"));
+        }
+      };
       try {
         if (shouldUseTransactionalIssueUpdate) {
           issue = await db.transaction(async (tx) => {
@@ -14879,7 +14902,9 @@ export function issueRoutes(
         } else {
           issue = await updateIssue();
         }
+        if (!issue) await releaseHandoffHold();
       } catch (err) {
+        await releaseHandoffHold();
         if (err instanceof HttpError && err.status === 422) {
           logger.warn(
             {

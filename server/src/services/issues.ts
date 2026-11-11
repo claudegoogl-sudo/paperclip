@@ -11266,6 +11266,7 @@ export function issueService(db: Db) {
         actorAgentId?: string | null;
         actorRunId?: string | null;
         actorRunStopId?: string | null;
+        handoffCommit?: { runId: string; stopId: string; toAgentId: string } | null;
         actorUserId?: string | null;
         companyGuard?: string;
         expectedExecutionPolicy?: typeof issues.$inferInsert.executionPolicy;
@@ -11314,6 +11315,7 @@ export function issueService(db: Db) {
         actorAgentId,
         actorRunId,
         actorRunStopId,
+        handoffCommit,
         actorUserId,
         companyGuard,
         expectedExecutionPolicy,
@@ -11715,6 +11717,13 @@ export function issueService(db: Db) {
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;
+        // PLA-12409: the durable handoff marker commits with the assignment, so a
+        // failed update leaves no marker and the stopped run keeps its hold.
+        if (handoffCommit && updated.assigneeAgentId === handoffCommit.toAgentId) {
+          await tx.update(heartbeatRuns).set({
+            resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({ handoffCommitted: { ...handoffCommit, at: new Date().toISOString() } })}::jsonb`,
+          }).where(and(eq(heartbeatRuns.id, handoffCommit.runId), eq(heartbeatRuns.companyId, updated.companyId)));
+        }
         if (issueData.description !== undefined) await attachOwnedDraftImages(tx, updated, updated.description,
           { userId: actorUserId, agentId: actorAgentId });
         if (changesPrivacy && updated.visibility === "private") {

@@ -71,6 +71,36 @@ export function legacyExecutionNeedsReconciliation(
   return true;
 }
 
+export const HANDOFF_PENDING_GRACE_MS = 5 * 60_000;
+
+/**
+ * A run the server stopped for its own handoff (PLA-12409) carries
+ * resultJson.handoffPending {runId, stopId, toAgentId, at}. No hold is minted
+ * while the handoff is committed (handoffCommitted, written in the same
+ * transaction as the assignment) or still inside the grace window. After the
+ * grace without a commit marker (failed update, crash) the normal hold applies.
+ */
+export function handoffSuppressesHold(
+  run: Pick<Run, "id" | "resultJson">, now: Date = new Date(),
+): boolean {
+  const rj = run.resultJson as Record<string, unknown> | null | undefined;
+  const p = rj?.handoffPending as Record<string, unknown> | undefined;
+  if (!p || p.runId !== run.id || typeof p.stopId !== "string" || typeof p.toAgentId !== "string" ||
+      p.stopId !== rj?.issueMutationStopId || typeof p.at !== "string") return false;
+  if (hasRequiredWorkspaceRecovery(rj) || hasWorkspaceRestoreFailure(rj)) return false;
+  const c = rj?.handoffCommitted as Record<string, unknown> | undefined;
+  if (c && c.runId === run.id && c.stopId === p.stopId && c.toAgentId === p.toAgentId) return true;
+  const at = Date.parse(p.at);
+  return Number.isFinite(at) && now.getTime() - at < HANDOFF_PENDING_GRACE_MS;
+}
+
+/** The handoff update failed: drop the pending marker and mint the normal hold. */
+export async function releaseFailedHandoffHold(db: Db, run: Run) {
+  const { handoffPending: _drop, ...rest } = (run.resultJson ?? {}) as Record<string, unknown>;
+  return terminalizeLegacyExecution({ db, run, status: "cancelled", fromStatuses: ["cancelled"],
+    reconcileIfNeeded: true, patch: { resultJson: rest } });
+}
+
 /** Review-wait receipts are only exempt after retained execution evidence agrees.
  * The synchronous classifier stays conservative for callers without a DB proof. */
 export async function legacyExecutionNeedsReconciliationWithEvidence(db: Db, run: Run): Promise<boolean> {
@@ -203,6 +233,7 @@ export async function terminalizeLegacyExecution(input: {
       review.currentParticipant?.type === "agent" && review.currentParticipant.agentId === run.agentId;
     if (
       task &&
+      !(retainedLeaseIds.length === 0 && handoffSuppressesHold(updated)) &&
       !isSupersededConversationRun(task, updated) &&
       (task.assigneeAgentId === run.agentId || isCurrentReviewer) &&
       (!["done", "cancelled"].includes(task.status) || retainedLeaseIds.length > 0)
