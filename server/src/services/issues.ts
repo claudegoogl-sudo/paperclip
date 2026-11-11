@@ -11260,6 +11260,7 @@ export function issueService(db: Db) {
         /** Server-owned transfer being applied; never accepted from HTTP input. */
         caseHandoffId?: string;
         actorRunStopId?: string | null;
+        handoffCommit?: { runId: string; stopId: string; toAgentId: string } | null;
         actorUserId?: string | null;
         companyGuard?: string;
         workspaceSelectionActor?: AuthorizationActor;
@@ -11311,6 +11312,7 @@ export function issueService(db: Db) {
         actorRunId,
         caseHandoffId,
         actorRunStopId,
+        handoffCommit,
         actorUserId,
         companyGuard,
         workspaceSelectionActor,
@@ -11739,6 +11741,13 @@ export function issueService(db: Db) {
           await executionWorkspaceService(db).assertTaskWorkspaceUpdateAccess({
             task: updated, actor: workspaceSelectionActor,
           }, tx);
+        }
+        // PLA-12409: the durable handoff marker commits with the assignment, so a
+        // failed update leaves no marker and the stopped run keeps its hold.
+        if (handoffCommit && updated.assigneeAgentId === handoffCommit.toAgentId) {
+          await tx.update(heartbeatRuns).set({
+            resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({ handoffCommitted: { ...handoffCommit, at: new Date().toISOString() } })}::jsonb`,
+          }).where(and(eq(heartbeatRuns.id, handoffCommit.runId), eq(heartbeatRuns.companyId, updated.companyId)));
         }
         if (issueData.description !== undefined) await attachOwnedDraftImages(tx, updated, updated.description,
           { userId: actorUserId, agentId: actorAgentId });
