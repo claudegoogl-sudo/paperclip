@@ -10,6 +10,8 @@ import {
   isPrivateWebhookHttpRequest,
   isSecretSensitiveHttpRequest,
   isPrivateAgentCommentaryHttpRequest,
+  isPrivateAgentObservabilityHttpRequest,
+  isPrivateMuseHttpRequest,
   shouldSilenceHttpSuccessLog,
 } from "./http-log-policy.js";
 import { redactSecretsForLog, redactSecretsDeepForLog } from "../secret-patterns.js";
@@ -137,6 +139,8 @@ function requestLogUrl(req: {
   originalUrl?: unknown;
   url?: unknown;
 }) {
+  if(isPrivateMuseHttpRequest(requestClassificationUrl(req)))return "/api/muse/:protocol";
+  if (isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req))) return "/api/companies/:companyId/observability";
   return isPrivateWebhook(req)
     ? privateWebhookLogUrl(requestClassificationUrl(req))
     : stripSecretBearingUrlParts(typeof req.url === "string" ? req.url : "");
@@ -171,6 +175,10 @@ export function createHttpLogger(baseLogger: pino.Logger) {
   //    res serializer emits status only), so there is nothing to scrub there.
     serializers: {
       req(req: Record<string, unknown> & { url?: unknown; method?: unknown; id?: unknown }) {
+        if (isPrivateAgentObservabilityHttpRequest(typeof req.url === "string" ? req.url : undefined)) {
+          return { id: req.id, method: req.method, url: "/api/companies/:companyId/observability" };
+        }
+        if(isPrivateMuseHttpRequest(typeof req.url === "string" ? req.url : undefined))return {id:req.id,method:req.method,url:"/api/muse/:protocol"};
         if (isPrivateAgentCommentaryHttpRequest(typeof req.url === "string" ? req.url : undefined)) {
           return { id: req.id, method: req.method, url: stripSecretBearingUrlParts(req.url as string) };
         }
@@ -202,7 +210,7 @@ export function createHttpLogger(baseLogger: pino.Logger) {
       ) {
         // A provider error may also be reflected in response headers. Keep the
         // same content-free contract on both sides of a webhook request.
-        return res.raw?.req && (isPrivateWebhook(res.raw.req) || isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(res.raw.req)))
+        return res.raw?.req && (isPrivateWebhook(res.raw.req) || isPrivateMuseHttpRequest(requestClassificationUrl(res.raw.req)) || isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(res.raw.req)) || isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(res.raw.req)))
           ? { statusCode: res.statusCode }
           : res;
       },
@@ -226,11 +234,20 @@ export function createHttpLogger(baseLogger: pino.Logger) {
     if (isSecretSensitiveHttpRequest(req.method, requestClassificationUrl(req))) {
       return redactSecretsForLog(`${req.method} ${requestLogUrl(req)} ${res.statusCode} — request failed`);
     }
+    if (isPrivateMuseHttpRequest(requestClassificationUrl(req)) || isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req))) {
+      return `${req.method} ${requestLogUrl(req)} ${res.statusCode} — request failed`;
+    }
     const ctx = (res as any).__errorContext;
     const errMsg = ctx?.error?.message || err?.message || (res as any).err?.message || "unknown error";
     return redactSecretsForLog(`${req.method} ${requestLogUrl(req)} ${res.statusCode} — ${errMsg}`);
   },
   customErrorObject(req, _res, _err, value) {
+    if (isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req))) {
+      return { ...value, err: { type: "Error", message: "Agent observability request failed" } };
+    }
+    if (isPrivateMuseHttpRequest(requestClassificationUrl(req))) {
+      return { ...value, err: { type: "Error", message: "External agent request failed" } };
+    }
     if (isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req))) {
       return { ...value, err: { type: "Error", message: "Feedback request failed" } };
     }
@@ -248,7 +265,7 @@ export function createHttpLogger(baseLogger: pino.Logger) {
       const ctx = (res as any).__errorContext;
       return { reqBody: "[REDACTED]", ...(ctx ? { errorContext: { name: "Error" } } : {}) };
     }
-    if (res.statusCode >= 400 && (isPrivateWebhook(req) || isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req)))) {
+    if (res.statusCode >= 400 && (isPrivateWebhook(req) || isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req)) || isPrivateMuseHttpRequest(requestClassificationUrl(req)) || isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req)))) {
       // Omit, rather than recursively redact, the entire provider payload —
       // before/after parsing, with or without error context.
       return {

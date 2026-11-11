@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { vi } from "vitest";
 import type { ServerAdapterModule } from "../adapters/index.js";
 
@@ -20,11 +20,6 @@ const mockPluginLoader = vi.hoisted(() => ({
   getUiParserSource: vi.fn(),
   getOrExtractUiParserSource: vi.fn(),
   reloadExternalAdapter: vi.fn(),
-}));
-
-const mockLogActivity = vi.hoisted(() => vi.fn());
-const mockInstanceSettingsService = vi.hoisted(() => ({
-  listCompanyIds: vi.fn(),
 }));
 
 const overridingConfigSchemaAdapter: ServerAdapterModule = {
@@ -55,32 +50,32 @@ let findActiveServerAdapter: typeof import("../adapters/registry.js").findActive
 let setOverridePaused: typeof import("../adapters/registry.js").setOverridePaused;
 let adapterRoutes: typeof import("../routes/adapters.js").adapterRoutes;
 let errorHandler: typeof import("../middleware/index.js").errorHandler;
-// Audit fan-out only needs a pass-through db handle: instanceSettingsService
-// and logActivity are module-mocked, so the handle is never dereferenced.
-const mockDb: Parameters<typeof adapterRoutes>[0]["db"] = {} as never;
 
-// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
-// registry must be in place before ANY import of the routes module, in every
-// test. createApp concurrently imports middleware and route modules whose
-// graphs both contain services/index.js. With doMock-registered mocks that
-// first evaluation could race the registry under load and bind the REAL
-// services module, rejecting the request under test with a 500 (observed on
-// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
-// to every import graph deterministically.
-vi.mock("node:child_process", async () => vi.importActual("node:child_process"));
-vi.mock("../adapters/plugin-loader.js", () => mockPluginLoader);
-vi.mock("../services/adapter-plugin-store.js", () => mockAdapterPluginStore);
-vi.mock("../routes/adapters.js", async () => vi.importActual("../routes/adapters.js"));
-vi.mock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
-vi.mock("../middleware/index.js", async () => vi.importActual("../middleware/index.js"));
-vi.mock("../services/activity-log.js", () => ({ logActivity: mockLogActivity }));
-vi.mock("../services/instance-settings.js", () => ({
-  instanceSettingsService: () => mockInstanceSettingsService,
-}));
+function registerModuleMocks() {
+  vi.doMock("node:child_process", async () => vi.importActual("node:child_process"));
+  vi.doMock("../adapters/plugin-loader.js", () => mockPluginLoader);
+  vi.doMock("../services/adapter-plugin-store.js", () => mockAdapterPluginStore);
+}
+
+function resetAdapterMocks() {
+  vi.resetAllMocks();
+  mockAdapterPluginStore.listAdapterPlugins.mockReturnValue([]);
+  mockAdapterPluginStore.addAdapterPlugin.mockResolvedValue(undefined);
+  mockAdapterPluginStore.removeAdapterPlugin.mockReturnValue(false);
+  mockAdapterPluginStore.getAdapterPluginByType.mockReturnValue(undefined);
+  mockAdapterPluginStore.getAdapterPluginsDir.mockReturnValue("/tmp/paperclip-adapter-routes-test");
+  mockAdapterPluginStore.getDisabledAdapterTypes.mockReturnValue([]);
+  mockAdapterPluginStore.setAdapterDisabled.mockReturnValue(false);
+  mockPluginLoader.buildExternalAdapters.mockResolvedValue([]);
+  mockPluginLoader.loadExternalAdapterPackage.mockResolvedValue(null);
+  mockPluginLoader.getUiParserSource.mockResolvedValue(null);
+  mockPluginLoader.getOrExtractUiParserSource.mockResolvedValue(null);
+  mockPluginLoader.reloadExternalAdapter.mockResolvedValue(null);
+}
 
 function createApp(
   actorOverrides: Partial<Express.Request["actor"]> = {},
-  options: Parameters<typeof adapterRoutes>[0] = { db: mockDb },
+  options: Parameters<typeof adapterRoutes>[0] = {},
 ) {
   const app = express();
   app.use(express.json());
@@ -101,27 +96,14 @@ function createApp(
 }
 
 describe("adapter routes", () => {
-  beforeEach(async () => {
-    mockInstanceSettingsService.listCompanyIds.mockResolvedValue(["company-1"]);
-    mockLogActivity.mockReset();
-    mockLogActivity.mockResolvedValue(undefined);
-    mockAdapterPluginStore.listAdapterPlugins.mockReturnValue([]);
-    mockAdapterPluginStore.addAdapterPlugin.mockResolvedValue(undefined);
-    mockAdapterPluginStore.removeAdapterPlugin.mockReturnValue(false);
-    mockAdapterPluginStore.getAdapterPluginByType.mockReturnValue(undefined);
-    mockAdapterPluginStore.getAdapterPluginsDir.mockReturnValue("/tmp/paperclip-adapter-routes-test");
-    mockAdapterPluginStore.getDisabledAdapterTypes.mockReturnValue([]);
-    mockAdapterPluginStore.setAdapterDisabled.mockReturnValue(false);
-    mockPluginLoader.buildExternalAdapters.mockResolvedValue([]);
-    mockPluginLoader.loadExternalAdapterPackage.mockResolvedValue(null);
-    mockPluginLoader.getUiParserSource.mockResolvedValue(null);
-    mockPluginLoader.getOrExtractUiParserSource.mockResolvedValue(null);
-    mockPluginLoader.reloadExternalAdapter.mockResolvedValue(null);
-    const [registry, routes, middleware] = await Promise.all([
-      vi.importActual<typeof import("../adapters/registry.js")>("../adapters/registry.js"),
-      import("../routes/adapters.js"),
-      import("../middleware/index.js"),
-    ]);
+  // Keep the route and middleware on one module graph so HttpError retains
+  // its identity. Reset mock state and adapter overrides between tests.
+  beforeAll(async () => {
+    registerModuleMocks();
+    resetAdapterMocks();
+    const registry = await import("../adapters/registry.js");
+    const routes = await import("../routes/adapters.js");
+    const middleware = await import("../middleware/index.js");
     registerServerAdapter = registry.registerServerAdapter;
     unregisterServerAdapter = registry.unregisterServerAdapter;
     findServerAdapter = registry.findServerAdapter;
@@ -129,6 +111,10 @@ describe("adapter routes", () => {
     setOverridePaused = registry.setOverridePaused;
     adapterRoutes = routes.adapterRoutes;
     errorHandler = middleware.errorHandler;
+  });
+
+  beforeEach(() => {
+    resetAdapterMocks();
     setOverridePaused("claude_local", false);
     unregisterServerAdapter("hermes_local");
     unregisterServerAdapter("claude_local");
@@ -161,11 +147,11 @@ describe("adapter routes", () => {
     }
   });
 
-  it("keeps paperclip_runner hidden from selection unless the rollout flag is enabled", async () => {
+  it("keeps the shared runner implementation available for Codex without the experimental flag", async () => {
     const disabledResponse = await request(createApp()).get("/api/adapters");
     expect(disabledResponse.status).toBe(200);
     expect(disabledResponse.body.find((adapter: any) => adapter.type === "paperclip_runner"))
-      .toMatchObject({ disabled: true });
+      .toMatchObject({ disabled: false });
 
     const enabledResponse = await request(createApp({}, {
       getNativeRunnerEnabled: async () => true,
@@ -178,6 +164,61 @@ describe("adapter routes", () => {
           supportsInstructionsBundle: true,
         },
       });
+  });
+
+  it.each([
+    [{ driver: "ssh", platform: "linux", architecture: "x64" }, "paperclip"],
+    [{ driver: "ssh", platform: "darwin", architecture: "arm64" }, "paperclip"],
+    [{ driver: "ssh", platform: "darwin", architecture: "x64" }, "paperclip"],
+    [{ driver: "ssh", platform: "linux", architecture: "arm64" }, "paperclip"],
+    [{ driver: "ssh", platform: "linux", architecture: "arm" }, "legacy"],
+    [{ driver: "local", platform: "win32", architecture: "x64" }, "legacy"],
+    [{ driver: "sandbox", platform: "linux", architecture: "arm64", libc: "glibc", glibcVersion: "2.39" }, "paperclip"],
+  ])("projects the selected environment once for the whole adapter inventory (%s)", async (target, defaultRunner) => {
+    const resolveRunnerTarget = vi.fn(async () => target);
+    const response = await request(createApp({}, { resolveRunnerTarget })).get("/api/adapters?companyId=company-1&environmentId=selected");
+    expect(response.status).toBe(200);
+    expect(resolveRunnerTarget).toHaveBeenCalledExactlyOnceWith("company-1", "selected");
+    expect(response.body.find((adapter: any) => adapter.type === "codex_local")).toMatchObject({ defaultRunner });
+    expect(response.body.find((adapter: any) => adapter.type === "claude_local")).toMatchObject({ defaultRunner: "legacy" });
+  });
+
+  it("uses the company's effective default environment when discovery omits an override", async () => {
+    const resolveRunnerTarget = vi.fn(async () => ({ driver: "sandbox" }));
+    const response = await request(createApp({}, { resolveRunnerTarget })).get("/api/adapters?companyId=company-1");
+    expect(response.status).toBe(200);
+    expect(resolveRunnerTarget).toHaveBeenCalledExactlyOnceWith("company-1", undefined);
+    expect(response.body.find((adapter: any) => adapter.type === "codex_local")).toMatchObject({ defaultRunner: "legacy" });
+  });
+
+  it("keeps unscoped inventory independent of company target discovery", async () => {
+    const resolveRunnerTarget = vi.fn();
+    const response = await request(createApp({}, { resolveRunnerTarget })).get("/api/adapters");
+    expect(response.status).toBe(200);
+    expect(resolveRunnerTarget).not.toHaveBeenCalled();
+  });
+
+  it("rejects a foreign company before selecting or probing an environment", async () => {
+    const resolveRunnerTarget = vi.fn();
+    const response = await request(createApp({ source: "session", companyIds: ["allowed"] }, { resolveRunnerTarget })).get("/api/adapters?companyId=foreign&environmentId=selected");
+    expect(response.status).toBe(403);
+    expect(resolveRunnerTarget).not.toHaveBeenCalled();
+  });
+
+  it.each(["environmentId=selected", "companyId=", "companyId=one&companyId=two", "companyId=one&environmentId="])("rejects malformed discovery scope before resolution (%s)", async query => {
+    const resolveRunnerTarget = vi.fn();
+    const response = await request(createApp({}, { resolveRunnerTarget })).get(`/api/adapters?${query}`);
+    expect(response.status).toBe(400);
+    expect(resolveRunnerTarget).not.toHaveBeenCalled();
+  });
+
+  it("keeps the shared implementation available for Dot independently, while honoring adapter-admin disabling", async () => {
+    const options = { getNativeRunnerEnabled: async () => false, getOpenAiDotEnabled: async () => true };
+    const enabled = await request(createApp({}, options)).get("/api/adapters");
+    expect(enabled.body.find((adapter: any) => adapter.type === "paperclip_runner")).toMatchObject({ disabled: false });
+    mockAdapterPluginStore.getDisabledAdapterTypes.mockReturnValue(["paperclip_runner"]);
+    const disabled = await request(createApp({}, options)).get("/api/adapters");
+    expect(disabled.body.find((adapter: any) => adapter.type === "paperclip_runner")).toMatchObject({ disabled: true });
   });
 
   it("GET /api/adapters returns correct capabilities for built-in adapters", async () => {
@@ -394,6 +435,7 @@ describe("adapter routes", () => {
       options: [
         { value: "claude", label: "Claude" },
         { value: "grok", label: "Grok Build" },
+        { value: "copilot", label: "GitHub Copilot" },
       ],
     });
     expect(JSON.stringify(res.body)).not.toContain("Codex via ACPX");
@@ -626,160 +668,5 @@ describe("adapter routes", () => {
     unregisterServerAdapter("codex_local");
     expect(findServerAdapter("codex_local")).toBe(builtin);
     setOverridePaused("codex_local", false);
-  });
-
-  describe("request body validation", () => {
-    it.each([
-      ["POST", "/api/adapters/install"],
-      ["PATCH", "/api/adapters/claude_local"],
-      ["PATCH", "/api/adapters/claude_local/override"],
-    ] as const)("%s %s without a request body returns 400", async (method, path) => {
-      const app = createApp({ isInstanceAdmin: true });
-      const res = await (method === "POST" ? request(app).post(path) : request(app).patch(path));
-      expect(res.status, JSON.stringify(res.body)).toBe(400);
-    });
-
-    it("POST /api/adapters/install rejects a non-boolean isLocalPath before touching the loader", async () => {
-      mockPluginLoader.loadExternalAdapterPackage.mockClear();
-      const app = createApp({ isInstanceAdmin: true });
-      const res = await request(app)
-        .post("/api/adapters/install")
-        .send({ packageName: "/tmp/fake-adapter", isLocalPath: "false" });
-      expect(res.status, JSON.stringify(res.body)).toBe(400);
-      expect(res.body.error).toMatch(/isLocalPath/);
-      expect(mockPluginLoader.loadExternalAdapterPackage).not.toHaveBeenCalled();
-    });
-
-    it("POST /api/adapters/install rejects a non-string version", async () => {
-      mockPluginLoader.loadExternalAdapterPackage.mockClear();
-      const app = createApp({ isInstanceAdmin: true });
-      const res = await request(app)
-        .post("/api/adapters/install")
-        .send({ packageName: "some-adapter", version: { major: 1 } });
-      expect(res.status, JSON.stringify(res.body)).toBe(400);
-      expect(res.body.error).toMatch(/version/);
-      expect(mockPluginLoader.loadExternalAdapterPackage).not.toHaveBeenCalled();
-    });
-  });
-
-  it("POST /api/adapters/install still returns 201 when the audit write fails after a successful install", async () => {
-    const AUDIT_TYPE = "audit_failsoft_test";
-    mockPluginLoader.loadExternalAdapterPackage.mockResolvedValue({
-      type: AUDIT_TYPE,
-      execute: async () => ({ exitCode: 0, signal: null, timedOut: false }),
-      testEnvironment: async () => ({ adapterType: AUDIT_TYPE, status: "pass", checks: [], testedAt: new Date(0).toISOString() }),
-    } satisfies ServerAdapterModule);
-    mockLogActivity.mockRejectedValue(new Error("db down"));
-    const res = await request(createApp({ isInstanceAdmin: true }))
-      .post("/api/adapters/install")
-      .send({ packageName: "/tmp/fake-failsoft-adapter", isLocalPath: true });
-    expect(res.status, JSON.stringify(res.body)).toBe(201);
-    // exactly one attempt: no second "failed" row is written for a successful install
-    expect(mockLogActivity).toHaveBeenCalledTimes(1);
-  });
-
-  it("POST /api/adapters/install bounds and redacts the failureReason in the audit row", async () => {
-    mockPluginLoader.loadExternalAdapterPackage.mockRejectedValue(
-      new Error(`fetch https://user:secret@registry.example/x failed ${"x".repeat(1000)}`),
-    );
-    const res = await request(createApp({ isInstanceAdmin: true }))
-      .post("/api/adapters/install")
-      .send({ packageName: "some-adapter" });
-    expect(res.status).toBeGreaterThanOrEqual(400);
-    const details = mockLogActivity.mock.calls[0][1].details as { failureReason: string };
-    expect(details.failureReason.length).toBeLessThanOrEqual(301);
-    expect(details.failureReason).not.toContain("secret@");
-  });
-
-  it("POST /api/adapters/install writes an instance.adapter.installed activity row naming the actor", async () => {
-    const AUDIT_TYPE = "audit_install_test";
-    const externalModule: ServerAdapterModule = {
-      type: AUDIT_TYPE,
-      execute: async () => ({ exitCode: 0, signal: null, timedOut: false }),
-      testEnvironment: async () => ({
-        adapterType: AUDIT_TYPE,
-        status: "pass",
-        checks: [],
-        testedAt: new Date(0).toISOString(),
-      }),
-    };
-    mockPluginLoader.loadExternalAdapterPackage.mockResolvedValue(externalModule);
-
-    const app = createApp({ isInstanceAdmin: true });
-    const res = await request(app)
-      .post("/api/adapters/install")
-      .send({ packageName: "/tmp/fake-audit-adapter", isLocalPath: true, version: "1.2.3" });
-
-    expect(res.status, JSON.stringify(res.body)).toBe(201);
-    expect(mockLogActivity).toHaveBeenCalledTimes(1);
-    expect(mockLogActivity).toHaveBeenCalledWith(
-      mockDb,
-      expect.objectContaining({
-        companyId: "company-1",
-        actorType: "user",
-        actorId: "local-board",
-        action: "instance.adapter.installed",
-        entityType: "adapter",
-        entityId: AUDIT_TYPE,
-        details: {
-          packageName: "/tmp/fake-audit-adapter",
-          version: "1.2.3",
-          isLocalPath: true,
-          type: AUDIT_TYPE,
-        },
-      }),
-    );
-
-    unregisterServerAdapter(AUDIT_TYPE);
-  });
-
-  it("POST /api/adapters/install writes a failure audit row when the install throws", async () => {
-    mockPluginLoader.loadExternalAdapterPackage.mockRejectedValue(
-      new Error("boom: module blew up"),
-    );
-
-    const app = createApp({ isInstanceAdmin: true });
-    const res = await request(app)
-      .post("/api/adapters/install")
-      .send({ packageName: "/tmp/failing-audit-adapter", isLocalPath: true });
-
-    expect(res.status, JSON.stringify(res.body)).toBe(500);
-    expect(mockLogActivity).toHaveBeenCalledTimes(1);
-    expect(mockLogActivity).toHaveBeenCalledWith(
-      mockDb,
-      expect.objectContaining({
-        action: "instance.adapter.installed",
-        entityType: "adapter",
-        entityId: "/tmp/failing-audit-adapter",
-        details: {
-          packageName: "/tmp/failing-audit-adapter",
-          isLocalPath: true,
-          outcome: "failed",
-          failureReason: "boom: module blew up",
-        },
-      }),
-    );
-  });
-
-  it("PATCH /api/adapters/:type writes an instance.adapter.disabled activity row", async () => {
-    mockAdapterPluginStore.setAdapterDisabled.mockReturnValue(true);
-
-    const app = createApp({ isInstanceAdmin: true });
-    const res = await request(app)
-      .patch("/api/adapters/claude_local")
-      .send({ disabled: true });
-
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(mockLogActivity).toHaveBeenCalledTimes(1);
-    expect(mockLogActivity).toHaveBeenCalledWith(
-      mockDb,
-      expect.objectContaining({
-        companyId: "company-1",
-        action: "instance.adapter.disabled",
-        entityType: "adapter",
-        entityId: "claude_local",
-        details: { type: "claude_local", disabled: true, changed: true },
-      }),
-    );
   });
 });

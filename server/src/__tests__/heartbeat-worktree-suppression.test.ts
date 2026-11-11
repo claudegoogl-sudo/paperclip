@@ -5,11 +5,20 @@ import {
   costEvents,
   activityLog,
   agents,
+  authUsers,
   agentWakeupRequests,
   agentRuntimeState,
+  companySkills,
   companies,
+  companyMemberships,
   createDb,
+  documentRevisions,
+  documents,
+  heartbeatRunEvents,
   heartbeatRuns,
+  instanceSettings,
+  issueComments,
+  issueDocuments,
   issues,
 } from "@paperclipai/db";
 import {
@@ -17,7 +26,6 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
-import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import { heartbeatService, resolveHeartbeatSchedulingSuppression } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 
@@ -60,28 +68,33 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("heartbeat-worktree-suppression-");
     db = createDb(tempDb.connectionString);
+    await db.insert(authUsers).values(["responsible-user", "operator"].map(id => ({ id, name: `Worktree fixture ${id}`,
+      email: `worktree-${id}@example.test`, createdAt: new Date(), updatedAt: new Date() })));
   }, 20_000);
 
-  // The "still creates live-plane assignment runs" case below deliberately lets
-  // heartbeatService dispatch a real run, which keeps writing agent_runtime_state
-  // (and friends) in the background after the test function returns. An ordered
-  // per-table DELETE chain races that write burst and intermittently trips an FK
-  // violation on whichever table gets deleted out from under a still-in-flight
-  // insert — this is the same race reproduced in another suite; see resetEmbeddedPostgresTestDatabase for why
-  // an atomic TRUNCATE ... CASCADE doesn't have that race.
   afterEach(async () => {
-        // Await every in-flight background heartbeat run to quiescence before the
-        // deletes below. A live wakeup claims a run and dispatches its execution
-        // fire-and-forget, so a run or wakeup can still write heartbeat_runs and
-        // issues rows when teardown starts and would race the deletes. The heartbeat
-        // service tracks in-flight run and wakeup promises in module state shared
-        // across service instances, so a fresh instance here drains the runs the
-        // per-test instances dispatched.
-        await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
-        // Atomic TRUNCATE ... CASCADE from `companies` clears every per-test table
-        // (including the tables the ordered deletes above used to enumerate) without
-        // racing background writes.
-        await resetEmbeddedPostgresTestDatabase(db);
+    // Await every in-flight background heartbeat run to quiescence before the
+    // deletes below. A live wakeup claims a run and dispatches its execution
+    // fire-and-forget, so a run or wakeup can still write heartbeat_runs and
+    // issues rows when teardown starts and would race the deletes. The heartbeat
+    // service tracks in-flight run and wakeup promises in module state shared
+    // across service instances, so a fresh instance here drains the runs the
+    // per-test instances dispatched.
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+    await db.delete(issueComments);
+    await db.delete(issueDocuments);
+    await db.delete(documentRevisions);
+    await db.delete(documents);
+    await db.delete(activityLog);
+    await deleteHeartbeatRunsWithDependents();
+    await db.delete(agentWakeupRequests);
+    await db.delete(issues);
+    await db.delete(agentRuntimeState);
+    await db.delete(companySkills);
+    await db.delete(agents);
+    await db.delete(companyMemberships);
+    await db.delete(companies);
+    await db.delete(instanceSettings);
   });
 
   afterAll(async () => {
@@ -101,6 +114,8 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
     });
+    await db.insert(companyMemberships).values(["responsible-user", "operator"].map(principalId => ({ companyId,
+      principalType: "user", principalId, membershipRole: "operator", status: "active" })));
 
     await db.insert(agents).values({
       id: agentId,

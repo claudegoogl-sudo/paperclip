@@ -5,7 +5,9 @@ import {
   activityLog,
   agentWakeupRequests,
   agents,
+  authUsers,
   companies,
+  companyMemberships,
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -115,6 +117,13 @@ describeEmbeddedPostgres("deferred issue-execution wake promotion", () => {
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(authUsers).values({
+      id: "responsible-user", name: "Responsible User", email: "responsible-user@example.test",
+      emailVerified: true, createdAt: new Date(), updatedAt: new Date(),
+    }).onConflictDoNothing();
+    await db.insert(companyMemberships).values({
+      companyId, principalType: "user", principalId: "responsible-user", status: "active", membershipRole: "member",
     });
     return companyId;
   }

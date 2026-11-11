@@ -28,6 +28,7 @@ import type {
   PluginWebhookDeliveryStatus,
 } from "@paperclipai/shared";
 import { conflict, notFound } from "../errors.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { secretService } from "./secrets.js";
 
 /** Read the manifest's `instanceConfigSchema` off a persisted plugins row. */
@@ -71,8 +72,8 @@ export function pluginRegistryService(db: Db) {
   // Internal helpers
   // -----------------------------------------------------------------------
 
-  async function getById(id: string) {
-    return db
+  async function getById(id: string, database: Db = db) {
+    return database
       .select()
       .from(plugins)
       .where(eq(plugins.id, id))
@@ -94,11 +95,16 @@ export function pluginRegistryService(db: Db) {
     return (result[0]?.maxOrder ?? 0) + 1;
   }
 
+  // -----------------------------------------------------------------------
+  // Public API
+  // -----------------------------------------------------------------------
+
   async function readBaseCompanyConfig(
     pluginId: string,
     companyId: string,
+    database: Db = db,
   ): Promise<Record<string, unknown> | null> {
-    const row = await db
+    const row = await database
       .select({ configJson: pluginConfig.configJson })
       .from(pluginConfig)
       .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
@@ -109,8 +115,9 @@ export function pluginRegistryService(db: Db) {
   async function readCompanyConfigOverride(
     pluginId: string,
     companyId: string,
+    database: Db = db,
   ): Promise<Record<string, unknown> | null> {
-    const row = await db
+    const row = await database
       .select({ settingsJson: pluginCompanySettings.settingsJson })
       .from(pluginCompanySettings)
       .where(and(
@@ -140,10 +147,11 @@ export function pluginRegistryService(db: Db) {
     companyId: string,
     previous: { base: Record<string, unknown> | null; override: Record<string, unknown> | null },
     next: { base: Record<string, unknown> | null; override: Record<string, unknown> | null },
+    database: Db = db,
   ) {
     const merge = (layers: typeof previous): Record<string, unknown> | null =>
       layers.base || layers.override ? { ...(layers.base ?? {}), ...(layers.override ?? {}) } : null;
-    return secretService(db).syncPluginSecretBindings({
+    return secretService(database).syncPluginSecretBindings({
       pluginId: plugin.id,
       companyId,
       instanceConfigSchema: instanceConfigSchemaOf(plugin),
@@ -152,9 +160,6 @@ export function pluginRegistryService(db: Db) {
     });
   }
 
-  // -----------------------------------------------------------------------
-  // Public API
-  // -----------------------------------------------------------------------
 
   return {
     // ----- Read -----------------------------------------------------------
@@ -387,17 +392,20 @@ export function pluginRegistryService(db: Db) {
      * otherwise a new row is inserted.
      */
     upsertConfig: async (pluginId: string, companyId: string, input: UpsertPluginConfig) => {
-      const plugin = await getById(pluginId);
-      if (!plugin) throw notFound("Plugin not found");
+      return db.transaction(async tx => {
+        const db = tx as unknown as Db;
+        await notifyDeliveryWork(db, DELIVERY_QUEUES.pluginLifecycle);
+        const plugin = await getById(pluginId, db);
+        if (!plugin) throw notFound("Plugin not found");
 
-      const existing = await db
-        .select()
-        .from(pluginConfig)
-        .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
-        .then((rows) => rows[0] ?? null);
+        const existing = await db
+          .select()
+          .from(pluginConfig)
+          .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
+          .then((rows) => rows[0] ?? null);
 
-      const row = existing
-        ? await db
+        if (existing) {
+          const row = await db
             .update(pluginConfig)
             .set({
               configJson: input.configJson,
@@ -406,27 +414,33 @@ export function pluginRegistryService(db: Db) {
             })
             .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
             .returning()
-            .then((rows) => rows[0])
-        : await db
-            .insert(pluginConfig)
-            .values({
-              pluginId,
-              companyId,
-              configJson: input.configJson,
-            })
-            .returning()
             .then((rows) => rows[0]);
+          const override = await readCompanyConfigOverride(pluginId, companyId, db);
+          await syncEffectiveCompanyBindings(plugin, companyId,
+            { base: existing?.configJson ?? null, override },
+            { base: input.configJson, override },
+            db,
+          );
+          return row;
+        }
 
-      // Maintain company_secret_bindings for any secret-ref fields. Adapted to
-      // upstream's company-scoped plugin_config: the config row is per-company,
-      // so the binding sync runs in that company's scope.
-      const override = await readCompanyConfigOverride(pluginId, companyId);
-      await syncEffectiveCompanyBindings(plugin, companyId,
-        { base: existing?.configJson ?? null, override },
-        { base: input.configJson, override },
-      );
-
-      return row;
+        const row = await db
+          .insert(pluginConfig)
+          .values({
+            pluginId,
+            companyId,
+            configJson: input.configJson,
+          })
+          .returning()
+          .then((rows) => rows[0]);
+        const override = await readCompanyConfigOverride(pluginId, companyId, db);
+        await syncEffectiveCompanyBindings(plugin, companyId,
+          { base: null, override },
+          { base: input.configJson, override },
+          db,
+        );
+        return row;
+      });
     },
 
     /**
@@ -434,50 +448,56 @@ export function pluginRegistryService(db: Db) {
      * If no config row exists yet one is created with the supplied values.
      */
     patchConfig: async (pluginId: string, companyId: string, input: PatchPluginConfig) => {
-      const plugin = await getById(pluginId);
-      if (!plugin) throw notFound("Plugin not found");
+      return db.transaction(async tx => {
+        const db = tx as unknown as Db;
+        await notifyDeliveryWork(db, DELIVERY_QUEUES.pluginLifecycle);
+        const plugin = await getById(pluginId, db);
+        if (!plugin) throw notFound("Plugin not found");
 
-      const existing = await db
-        .select()
-        .from(pluginConfig)
-        .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
-        .then((rows) => rows[0] ?? null);
+        const existing = await db
+          .select()
+          .from(pluginConfig)
+          .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
+          .then((rows) => rows[0] ?? null);
 
-      const nextConfig = existing
-        ? { ...existing.configJson, ...input.configJson }
-        : input.configJson;
-
-      const row = existing
-        ? await db
+        if (existing) {
+          const merged = { ...existing.configJson, ...input.configJson };
+          const row = await db
             .update(pluginConfig)
             .set({
-              configJson: nextConfig,
+              configJson: merged,
               lastError: null,
               updatedAt: new Date(),
             })
             .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
             .returning()
-            .then((rows) => rows[0])
-        : await db
-            .insert(pluginConfig)
-            .values({
-              pluginId,
-              companyId,
-              configJson: nextConfig,
-            })
-            .returning()
             .then((rows) => rows[0]);
+          const override = await readCompanyConfigOverride(pluginId, companyId, db);
+          await syncEffectiveCompanyBindings(plugin, companyId,
+            { base: existing?.configJson ?? null, override },
+            { base: merged, override },
+            db,
+          );
+          return row;
+        }
 
-      // Maintain company_secret_bindings for any secret-ref fields. Adapted to
-      // upstream's company-scoped plugin_config: the config row is per-company,
-      // so the binding sync runs in that company's scope.
-      const override = await readCompanyConfigOverride(pluginId, companyId);
-      await syncEffectiveCompanyBindings(plugin, companyId,
-        { base: existing?.configJson ?? null, override },
-        { base: nextConfig, override },
-      );
-
-      return row;
+        const row = await db
+          .insert(pluginConfig)
+          .values({
+            pluginId,
+            companyId,
+            configJson: input.configJson,
+          })
+          .returning()
+          .then((rows) => rows[0]);
+        const override = await readCompanyConfigOverride(pluginId, companyId, db);
+        await syncEffectiveCompanyBindings(plugin, companyId,
+          { base: null, override },
+          { base: input.configJson, override },
+          db,
+        );
+        return row;
+      });
     },
 
     /**
@@ -518,6 +538,73 @@ export function pluginRegistryService(db: Db) {
         ))
         .then((rows) => rows[0] ?? null) as Promise<PluginCompanySettings | null>,
 
+    /** Create or replace company-scoped plugin settings. */
+    upsertCompanySettings: async (
+      pluginId: string,
+      companyId: string,
+      input: { enabled?: boolean; settingsJson: Record<string, unknown>; lastError?: string | null },
+    ): Promise<PluginCompanySettings> => {
+      return db.transaction(async tx => {
+        const db = tx as unknown as Db;
+        await notifyDeliveryWork(db, DELIVERY_QUEUES.pluginLifecycle);
+        const plugin = await getById(pluginId, db);
+        if (!plugin) throw notFound("Plugin not found");
+
+        const existing = await db
+          .select()
+          .from(pluginCompanySettings)
+          .where(and(
+            eq(pluginCompanySettings.pluginId, pluginId),
+            eq(pluginCompanySettings.companyId, companyId),
+          ))
+          .then((rows) => rows[0] ?? null);
+
+        if (existing) {
+          const row = await db
+            .update(pluginCompanySettings)
+            .set({
+              enabled: input.enabled ?? existing.enabled,
+              settingsJson: input.settingsJson,
+              lastError: input.lastError ?? null,
+              updatedAt: new Date(),
+            })
+            .where(eq(pluginCompanySettings.id, existing.id))
+            .returning()
+            .then((rows) => rows[0]) as PluginCompanySettings;
+          // Per-company scope: only secrets owned by THIS company are bound.
+          await secretService(db).syncPluginSecretBindings({
+            pluginId,
+            instanceConfigSchema: instanceConfigSchemaOf(plugin),
+            previousConfig: (existing?.settingsJson as Record<string, unknown> | undefined) ?? null,
+            nextConfig: input.settingsJson,
+            companyId,
+          });
+          return row;
+        }
+
+        const row = await db
+          .insert(pluginCompanySettings)
+          .values({
+            pluginId,
+            companyId,
+            enabled: input.enabled ?? true,
+            settingsJson: input.settingsJson,
+            lastError: input.lastError ?? null,
+          })
+          .returning()
+          .then((rows) => rows[0]) as PluginCompanySettings;
+        // Per-company scope: only secrets owned by THIS company are bound.
+        await secretService(db).syncPluginSecretBindings({
+          pluginId,
+          instanceConfigSchema: instanceConfigSchemaOf(plugin),
+          previousConfig: null,
+          nextConfig: input.settingsJson,
+          companyId,
+        });
+        return row;
+      });
+    },
+
     /**
      * Every ENABLED company-settings row for a plugin, across all
      * companies. Used by the config-key egress allowlist chokepoint to compute
@@ -535,60 +622,6 @@ export function pluginRegistryService(db: Db) {
           eq(pluginCompanySettings.enabled, true),
         )) as Promise<PluginCompanySettings[]>,
 
-    /** Create or replace company-scoped plugin settings. */
-    upsertCompanySettings: async (
-      pluginId: string,
-      companyId: string,
-      input: { enabled?: boolean; settingsJson: Record<string, unknown>; lastError?: string | null },
-    ): Promise<PluginCompanySettings> => {
-      const plugin = await getById(pluginId);
-      if (!plugin) throw notFound("Plugin not found");
-
-      const existing = await db
-        .select()
-        .from(pluginCompanySettings)
-        .where(and(
-          eq(pluginCompanySettings.pluginId, pluginId),
-          eq(pluginCompanySettings.companyId, companyId),
-        ))
-        .then((rows) => rows[0] ?? null);
-
-      const row = (existing
-        ? await db
-            .update(pluginCompanySettings)
-            .set({
-              enabled: input.enabled ?? existing.enabled,
-              settingsJson: input.settingsJson,
-              lastError: input.lastError ?? null,
-              updatedAt: new Date(),
-            })
-            .where(eq(pluginCompanySettings.id, existing.id))
-            .returning()
-            .then((rows) => rows[0])
-        : await db
-            .insert(pluginCompanySettings)
-            .values({
-              pluginId,
-              companyId,
-              enabled: input.enabled ?? true,
-              settingsJson: input.settingsJson,
-              lastError: input.lastError ?? null,
-            })
-            .returning()
-            .then((rows) => rows[0])) as PluginCompanySettings;
-
-      // Maintain company_secret_bindings for any secret-ref fields.
-      // Per-company scope: only secrets owned by THIS company are bound.
-      await secretService(db).syncPluginSecretBindings({
-        pluginId,
-        instanceConfigSchema: instanceConfigSchemaOf(plugin),
-        previousConfig: (existing?.settingsJson as Record<string, unknown> | undefined) ?? null,
-        nextConfig: input.settingsJson,
-        companyId,
-      });
-
-      return row;
-    },
 
     /**
      * Per-tenant plugin config overrides.

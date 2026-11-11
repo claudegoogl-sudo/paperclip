@@ -16,6 +16,16 @@ import type { Plugin } from "vite";
  */
 
 export const SERVICE_WORKER_BUILD_ID_PLACEHOLDER = "__PAPERCLIP_BUILD_ID__";
+export const SERVICE_WORKER_OFFLINE_STYLES_PLACEHOLDER = "__PAPERCLIP_OFFLINE_STYLES__";
+
+export function embedServiceWorkerOfflineStyles(source: string, css: string): string {
+  const styles = css.match(/\/\* offline-recovery:start \*\/([\s\S]*?)\/\* offline-recovery:end \*\//)?.[1].trim();
+  const placeholder = JSON.stringify(SERVICE_WORKER_OFFLINE_STYLES_PLACEHOLDER);
+  if (!styles || !source.includes(placeholder)) {
+    throw new Error("service worker offline styles or placeholder are missing");
+  }
+  return source.replace(placeholder, () => JSON.stringify(styles));
+}
 
 /**
  * Replace the build-id placeholder in a service-worker source string.
@@ -57,11 +67,13 @@ export function serviceWorkerBuildIdPlugin(
   let buildId: string | null = null;
   let sawMainBundle = false;
   let outDir = "dist";
+  let root = "";
 
   return {
     name: "paperclip-sw-build-id",
     apply: "build",
     configResolved(config) {
+      root = config.root;
       outDir = config.build.outDir;
     },
     generateBundle(_options, bundle) {
@@ -74,7 +86,7 @@ export function serviceWorkerBuildIdPlugin(
       }
     },
     closeBundle() {
-      const swPath = path.resolve(outDir, serviceWorkerFileName);
+      const swPath = path.resolve(root, outDir, serviceWorkerFileName);
       // Rolldown-based Vite runs closeBundle once per emitted bundle, and
       // sub-builds (web-worker chunks, lib passes) close before the main
       // bundle's assets land in the outDir. Those passes saw no entry chunk,
@@ -88,7 +100,10 @@ export function serviceWorkerBuildIdPlugin(
         );
       }
       const source = fs.readFileSync(swPath, "utf8");
-      const stamped = stampServiceWorkerBuildId(source, buildId ?? "build");
+      const css = fs.readFileSync(path.resolve(root, "src/index.css"), "utf8");
+      const stamped = stampServiceWorkerBuildId(
+        embedServiceWorkerOfflineStyles(source, css), buildId ?? "build",
+      );
       fs.writeFileSync(swPath, stamped);
     },
   };

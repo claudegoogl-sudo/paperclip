@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isPublicExecutorToolSelector, looksLikeCredentialJwt } from "@paperclipai/adapter-utils/command-redaction";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { sanitizeRecord } from "../redaction.js";
 
@@ -21,6 +22,15 @@ type RedactionPattern = {
 const SECRET_ASSIGNMENT_RE =
   /\b(api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)\s*[:=]\s*([^\s,;]+)/gi;
 
+// Redact dotted tokens by default (fork-strict); exempt only known false
+// positives: public tool selectors, paperclip schema ids, hostnames, file names.
+const DOTTED_NON_SECRET_TAIL_RE = /\.(?:com|org|net|io|ai|dev|de|md|txt|json|ts|js|yaml|yml)$/i;
+function isKnownDottedNonSecret(value: string) {
+  return isPublicExecutorToolSelector(value)
+    || value.startsWith("paperclip.")
+    || DOTTED_NON_SECRET_TAIL_RE.test(value);
+}
+
 const FREE_TEXT_PATTERNS: RedactionPattern[] = [
   {
     kind: "pem_block",
@@ -34,7 +44,7 @@ const FREE_TEXT_PATTERNS: RedactionPattern[] = [
   },
   {
     kind: "bearer_token",
-    regex: /Bearer\s+[A-Za-z0-9._~+/-]+=*/gi,
+    regex: /\bBearer\s+(?!(?:tokens?|authentication|authorization|credentials?|schemes?|flows?)[.,;:!?]?(?:\s|[)\]}]|$))[A-Za-z0-9._~+/-]+=*/gi,
     replacement: "Bearer [REDACTED_TOKEN]",
   },
   {
@@ -49,8 +59,14 @@ const FREE_TEXT_PATTERNS: RedactionPattern[] = [
   },
   {
     kind: "jwt",
-    regex: /\b[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?\b/g,
-    replacement: "[REDACTED_JWT]",
+    regex: /\b[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b/g,
+    replacement: (match, ...rest) => {
+      // The regex may match only a prefix of a longer dotted address; judge the whole address.
+      const offset = rest[rest.length - 2] as unknown as number;
+      const source = rest[rest.length - 1] as unknown as string;
+      const address = source.slice(offset).match(/^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*/)?.[0] ?? match;
+      return isKnownDottedNonSecret(address) && !looksLikeCredentialJwt(match) ? match : "[REDACTED_JWT]";
+    },
   },
   {
     kind: "dsn",
@@ -84,12 +100,14 @@ function recordField(state: FeedbackRedactionState, fieldPath: string) {
 }
 
 function applyPattern(input: string, pattern: RedactionPattern) {
-  const matches = Array.from(input.matchAll(pattern.regex)).length;
-  if (matches === 0) {
-    pattern.regex.lastIndex = 0;
-    return { output: input, matches: 0 };
-  }
-  const output = input.replace(pattern.regex, pattern.replacement as never);
+  let matches = 0;
+  const output = input.replace(pattern.regex, (match: string, ...args: string[]) => {
+    const replacement = typeof pattern.replacement === "function"
+      ? pattern.replacement(match, ...args)
+      : pattern.replacement;
+    if (replacement !== match) matches += 1;
+    return replacement;
+  });
   pattern.regex.lastIndex = 0;
   return { output, matches };
 }

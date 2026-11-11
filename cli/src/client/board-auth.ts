@@ -5,7 +5,6 @@ import pc from "picocolors";
 import type { BoardApiKeyScope } from "@paperclipai/shared";
 import { buildCliCommandLabel } from "./command-label.js";
 import { resolveDefaultCliAuthPath } from "../config/home.js";
-import { ApiRequestError } from "./http.js";
 
 const BOARD_AUTH_REQUEST_TIMEOUT_MS = 30_000;
 
@@ -152,13 +151,8 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-const MAX_CONSECUTIVE_POLL_FAILURES = 3;
-
-function isTransientPollError(err: unknown): boolean {
-  if (err instanceof ApiRequestError) {
-    return err.status >= 500 || err.status === 408 || err.status === 429;
-  }
-  return true;
+class BoardAuthRequestError extends Error {
+  constructor(message: string, readonly status: number, readonly retryAfterMs: number | null) { super(message); }
 }
 
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
@@ -183,7 +177,10 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
       body && typeof body === "object" && typeof (body as { error?: unknown }).error === "string"
         ? (body as { error: string }).error
         : `Request failed: ${response.status}`;
-    throw new ApiRequestError(response.status, message);
+    const retryAfter = response.headers.get("retry-after")?.trim();
+    const seconds = retryAfter && /^\d+(?:\.\d+)?$/.test(retryAfter) ? Number(retryAfter) : null;
+    const delay = seconds === null ? Date.parse(retryAfter ?? "") - Date.now() : seconds * 1000;
+    throw new BoardAuthRequestError(message, response.status, Number.isFinite(delay) && delay > 0 ? delay : null);
   }
 
   return response.json() as Promise<T>;
@@ -269,9 +266,10 @@ export async function loginBoardCli(params: {
 
   const expiresAtMs = Date.parse(challenge.expiresAt);
   const pollMs = Math.max(500, challenge.suggestedPollIntervalMs || 1000);
+  if (!Number.isFinite(expiresAtMs)) throw new Error("CLI auth challenge returned an invalid expiry.");
 
+  const MAX_CONSECUTIVE_POLL_FAILURES = 3;
   let consecutivePollFailures = 0;
-
   while (Number.isFinite(expiresAtMs) ? Date.now() < expiresAtMs : true) {
     let status: ChallengeStatusResponse;
     try {
@@ -279,12 +277,22 @@ export async function loginBoardCli(params: {
         `${apiBase}/api${challenge.pollPath}?token=${encodeURIComponent(challenge.token)}`,
       );
       consecutivePollFailures = 0;
-    } catch (err) {
-      consecutivePollFailures += 1;
-      if (!isTransientPollError(err) || consecutivePollFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
-        throw err;
+    } catch (error) {
+      const isRequestError = error instanceof BoardAuthRequestError;
+      // Transient = network failure or 5xx. Tolerate up to 3 consecutive, then give up.
+      // Permanent 4xx (other than 429) is rethrown immediately.
+      if (!isRequestError || error.status >= 500) {
+        consecutivePollFailures += 1;
+        if (consecutivePollFailures >= MAX_CONSECUTIVE_POLL_FAILURES) throw error;
+        const remaining = expiresAtMs - Date.now();
+        if (remaining <= 0) break;
+        await sleep(Math.min(pollMs, remaining));
+        continue;
       }
-      await sleep(pollMs);
+      if (error.status !== 429) throw error;
+      const remainingMs = expiresAtMs - Date.now();
+      if (remainingMs <= 0) break;
+      await sleep(Math.min(Math.max(pollMs, error.retryAfterMs ?? pollMs), remainingMs));
       continue;
     }
 

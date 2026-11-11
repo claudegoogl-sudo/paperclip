@@ -11,7 +11,10 @@ const SECRET_PAYLOAD_KEY_RE = new RegExp(SECRET_FIELD_NAME_PATTERN, "i");
 // Authorization reasons are policy decision codes, not credentials. They must
 // remain visible in audit receipts even though the field name contains
 // "authorization". JWT-shaped values are still caught by the value guard below.
-const AUDIT_REASON_PAYLOAD_KEY_RE = /^authorizationReason$/;
+// authorizationAt is an audit timestamp, not a credential.
+// authorizingUserId is a user id (audit attribution), not a credential.
+// boardApiKeyId is a key row UUID used to correlate create/revoke audit rows; never key material.
+const AUDIT_REASON_PAYLOAD_KEY_RE = /^(?:authorizationReason|authorizationAt|authorizing(?:User|Person)Id|boardApiKeyId)$/;
 const AUDIT_SURFACE_PAYLOAD_KEY_RE = /^surface$/;
 /**
  * Cleanup counts on a connection-removal receipt (PAP-17119). Their names name
@@ -68,6 +71,7 @@ const PUBLIC_RECEIPT_TEXT_IDS = new Set([
 export const PAPERCLIP_PUBLIC_SCHEMA_IDS = new Set([
   "paperclip.artifact.generated.v1",
   "paperclip.artifact.viewed.v1",
+  "paperclip.auth.credentials.updated.v1",
   "paperclip.capability-discovery.v1",
   "paperclip.capability.authorization-record.v1",
   "paperclip.capability.control-plane.v1",
@@ -109,6 +113,9 @@ export const PAPERCLIP_PUBLIC_SCHEMA_IDS = new Set([
   "paperclip.native-execution-input.v3",
   "paperclip.native-execution-input.v4",
   "paperclip.native-execution-input.v5",
+  "paperclip.native-execution-input.v7",
+  "paperclip.native-execution-input.v8",
+  "paperclip.native-execution-input.v9",
   "paperclip.native-finalization.v1",
   "paperclip.native-finalization.v2",
   "paperclip.native-harness-backup-stamp.v1",
@@ -233,6 +240,7 @@ export const PRP_V1_EVENT_TYPES = new Set([
   "workspace.change.updated",
   "workspace.diff.recorded",
   "workspace.file.referenced",
+  "auth.credentials.updated",
   "harness.starting",
   "harness.ready",
   "harness.exited",
@@ -348,6 +356,17 @@ const NATIVE_RUN_SPAN_NAMES = new Set([
   "provider.time_to_first_agent_event",
   "provider.turn.queue",
   "question_response.to_run_created",
+  "harness_state.inspect",
+  "harness_state.path_check",
+  "harness_state.launch_material",
+  "provider_pack.select",
+  "provider_pack.discover",
+  "provider_pack.verify",
+  "provider_pack.verify_preinstalled",
+  "provider_pack.verify_uploaded",
+  "provider_pack.link_preinstalled",
+  "provider_pack.clear_stale",
+  "provider_pack.upload",
   "runner.artifact.discover",
   "runner.artifact.prepare",
   "runner.prp.authenticate",
@@ -361,7 +380,9 @@ const NATIVE_RUN_SPAN_NAMES = new Set([
   "runner.turn.submit",
   "task.prepare",
   "task.run",
+  "task.provider_session",
   "task.run.measured",
+  "task.provider_session.measured",
   "task.settle",
 ]);
 const CLI_SECRET_FLAG_RE = new RegExp(

@@ -25,6 +25,7 @@ declare global {
           status?: string;
         }>;
         isInstanceAdmin?: boolean;
+        canManageExperimentalSettings?: boolean;
         keyId?: string;
         keyScope?: AgentApiKeyScope;
         // Board-key scope. Only meaningful when source === "board_key".
@@ -39,6 +40,7 @@ declare global {
         boardKeyExpiresAt?: Date | null;
         runId?: string;
         onBehalfOfUserId?: string | null;
+        authorizingUserId?: string;
         identityContextId?: string | null;
         source?: "local_implicit" | "session" | "board_key" | "agent_key" | "agent_jwt" | "mcp_oauth" | "cloud_tenant" | "cloud_control" | "none";
       };

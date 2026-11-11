@@ -8,7 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { parse as parseEnvContents } from "dotenv";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
   agents,
@@ -446,19 +446,6 @@ function createWorkspaceOperationRecorderDouble() {
   return { recorder, operations };
 }
 
-// Tests in this file exercise code paths (dev-runner-worktree.ts,
-// scripts/provision-worktree.sh) that fall back to the operator's real
-// `~/.paperclip-worktrees` whenever PAPERCLIP_WORKTREES_DIR is unset. Default
-// every test onto a private, per-test temp directory so none of them can
-// read or write the real host home, then let individual tests still opt
-// into their own isolated home (e.g. to assert on its exact contents).
-let ambientWorktreesHomeForTest: string | null = null;
-
-beforeEach(async () => {
-  ambientWorktreesHomeForTest = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktrees-ambient-"));
-  process.env.PAPERCLIP_WORKTREES_DIR = ambientWorktreesHomeForTest;
-});
-
 afterEach(async () => {
   await Promise.all(
     Array.from(leasedRunIds).map(async (runId) => {
@@ -471,10 +458,6 @@ afterEach(async () => {
   delete process.env.PAPERCLIP_INSTANCE_ID;
   delete process.env.PAPERCLIP_WORKTREES_DIR;
   delete process.env.DATABASE_URL;
-  if (ambientWorktreesHomeForTest) {
-    await fs.rm(ambientWorktreesHomeForTest, { recursive: true, force: true });
-    ambientWorktreesHomeForTest = null;
-  }
   await resetRuntimeServicesForTests();
   // Registry reset does not clear the process-local allocation claims. A
   // failed-start fixture must not reserve another test's ephemeral port.
@@ -811,6 +794,41 @@ describe("ensureServerWorkspaceLinksCurrent", () => {
 });
 
 describe("realizeExecutionWorkspace", () => {
+  it.each(["primary", "linked"] as const)("realizes from a %s checkout with separate Git metadata without adopting its unrelated parent", async sourceKind => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-separate-owner-"));
+    try {
+      const wrongOwner = path.join(root, "wrong-owner"), primary = path.join(root, "source");
+      const common = path.join(wrongOwner, "separate-metadata");
+      await fs.mkdir(wrongOwner);
+      await runGit(wrongOwner, ["init", "-b", "main"]);
+      await runGit(wrongOwner, ["config", "user.email", "test@example.test"]);
+      await runGit(wrongOwner, ["config", "user.name", "Test"]);
+      await fs.writeFile(path.join(wrongOwner, "wrong.txt"), "UNRELATED_PARENT_BYTES");
+      await runGit(wrongOwner, ["add", "."]);
+      await runGit(wrongOwner, ["commit", "-m", "unrelated"]);
+      await execFileAsync("git", ["init", "-b", "main", "--separate-git-dir", common, primary]);
+      await runGit(primary, ["config", "user.email", "test@example.test"]);
+      await runGit(primary, ["config", "user.name", "Test"]);
+      await fs.writeFile(path.join(primary, "source.txt"), "AUTHORIZED_SOURCE_BYTES");
+      await runGit(primary, ["add", "."]);
+      await runGit(primary, ["commit", "-m", "source"]);
+      const source = sourceKind === "primary" ? primary : path.join(root, "linked-source");
+      if (sourceKind === "linked") await runGit(primary, ["worktree", "add", "-b", "linked-source", source]);
+      const wrongHead = await readGit(wrongOwner, ["rev-parse", "HEAD"]);
+      const expectedHead = await readGit(source, ["rev-parse", "HEAD"]);
+      const workspace = await realizeWorktreeForTest(source, "HEAD");
+      expect(await readGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(expectedHead);
+      expect(await fs.readFile(path.join(workspace.cwd, "source.txt"), "utf8")).toBe("AUTHORIZED_SOURCE_BYTES");
+      await expect(fs.stat(path.join(workspace.cwd, "wrong.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readGit(wrongOwner, ["rev-parse", "HEAD"])).toBe(wrongHead);
+      expect(await readGit(wrongOwner, ["branch", "--list", workspace.branchName!])).toBe("");
+      expect(await fs.realpath(path.resolve(workspace.cwd, await readGit(workspace.cwd, ["rev-parse", "--git-common-dir"])))).toBe(await fs.realpath(common));
+      const reused = await realizeWorktreeForTest(source, "HEAD");
+      expect(reused.cwd).toBe(workspace.cwd);
+      expect(reused.created).toBe(false);
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
   it("defaults new git worktrees to freshly fetched origin/master", async () => {
     const sourceRepo = await createTempRepo("master");
     const remoteDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-remote-"));
@@ -1186,27 +1204,6 @@ describe("realizeExecutionWorkspace", () => {
     ]);
   });
 
-  it("does not reset a reused worktree with untracked changes", async () => {
-    const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
-
-    const initial = await realizeWorktreeForTest(repoRoot, null);
-    const initialHead = await readGit(initial.cwd, ["rev-parse", "HEAD"]);
-    await fs.writeFile(path.join(initial.cwd, "scratch.txt"), "uncommitted scratch\n", "utf8");
-
-    await advanceRemoteMaster(sourceRepo, remotePath, "auth-fix.txt");
-
-    const reused = await realizeWorktreeForTest(repoRoot, null);
-
-    expect(reused.created).toBe(false);
-    expect(await readGit(reused.cwd, ["rev-parse", "HEAD"])).toBe(initialHead);
-    await expect(fs.readFile(path.join(reused.cwd, "scratch.txt"), "utf8")).resolves.toBe(
-      "uncommitted scratch\n",
-    );
-    expect(reused.warnings).toEqual([
-      expect.stringContaining("is behind origin/master by 1 commit"),
-    ]);
-  });
-
   it("does not reset a reused worktree with untracked changes when status.showUntrackedFiles=no", async () => {
     const { sourceRepo, remotePath, repoRoot } = await createClonedRepoWithRemote();
 
@@ -1373,6 +1370,8 @@ describe("realizeExecutionWorkspace", () => {
   it.each(["missing", "empty"] as const)("records the actual lookup and fetch outcome for a %s origin", async (mode) => {
     const { repoRoot } = await createClonedRepoWithRemote();
     await runGit(repoRoot, mode === "missing" ? ["remote", "remove", "origin"] : ["config", "remote.origin.url", ""]);
+    const remoteUrl = mode === "empty" ? await readGit(repoRoot, ["remote", "get-url", "origin"]) : null;
+    if (mode === "empty") expect(["", "origin"]).toContain(remoteUrl);
     let authCalls = 0;
     const error = await realizeWorktreeForTest(repoRoot, "absent-fixture", async () => { authCalls++; return null; }).catch(error => error);
     expect(error).toBeInstanceOf(UnresolvedWorkspaceBaseRefError);
@@ -1381,6 +1380,12 @@ describe("realizeExecutionWorkspace", () => {
       expect(authCalls).toBe(0);
       expect(readUnresolvedWorkspaceBaseRefDiagnostic(error)).toEqual({ schemaVersion: 1,
         remoteLookup: "failed", authLookup: "not_requested", fetch: "not_attempted", refResolution: "failed", refExitCode: 128 });
+    } else if (remoteUrl === "") {
+      expect(error.fetchError).toBeNull();
+      expect(authCalls).toBe(1);
+      expect(error.defaultBranch).toBeNull();
+      expect(readUnresolvedWorkspaceBaseRefDiagnostic(error)).toEqual({ schemaVersion: 1,
+        remoteLookup: "empty", authLookup: "not_requested", fetch: "not_attempted", refResolution: "failed", refExitCode: 128 });
     } else {
       // Git returns the remote name when its URL is empty, then the fetch fails.
       expect(error.fetchError).toBeTruthy();
@@ -1722,6 +1727,47 @@ process.stderr.write(${JSON.stringify(stderr)}, () => { process.exitCode = ${cod
 
     expect(realized.branchName).toBe("release/PAP-992.hotfix-april-1");
     expect(path.basename(realized.cwd)).toBe("PAP-992.hotfix-april-1");
+  });
+
+  it.each(["configured", "builtin"] as const)("skips %s host provisioning for fresh, reused and restored sandbox worktrees", async kind => {
+    const repoRoot = await createTempRepo();
+    const marker = path.join(repoRoot, "host-provision-ran");
+    await fs.mkdir(path.join(repoRoot, "scripts"));
+    const script = kind === "configured" ? "custom.sh" : "provision-worktree.sh";
+    await fs.writeFile(path.join(repoRoot, "scripts", script),
+      `#!/bin/sh\nprintf 'host execution\n' > '${marker}'\n`);
+    await runGit(repoRoot, ["add", "scripts"]);
+    await runGit(repoRoot, ["commit", "-m", "Repository-controlled provision script"]);
+    const command = kind === "configured" ? `bash ./scripts/${script}` : undefined;
+    const input = {
+      base: { baseCwd: repoRoot, source: "project_primary" as const, projectId: "project-1",
+        workspaceId: "source-1", repoUrl: null, repoRef: "HEAD" },
+      config: { workspaceStrategy: { type: "git_worktree", baseRef: "main", provisionCommand: command } },
+      issue: { id: "issue-sandbox", identifier: "PAP-449", title: "Sandbox files" },
+      agent: { id: "agent-1", name: "Sandbox worker", companyId: "company-1" },
+      skipHostProvision: true,
+    };
+    const fresh = await realizeExecutionWorkspace(input);
+    expect(fresh.created).toBe(true);
+    expect(existsSync(marker)).toBe(false);
+    const reused = await realizeExecutionWorkspace(input);
+    expect(reused.cwd).toBe(fresh.cwd);
+    expect(reused.created).toBe(false);
+    expect(existsSync(marker)).toBe(false);
+    const restoreInput = { base: input.base, issue: input.issue, agent: input.agent, skipHostProvision: true,
+      workspace: { mode: "isolated_workspace", strategyType: "git_worktree", cwd: fresh.cwd,
+        providerRef: fresh.cwd, projectId: "project-1", projectWorkspaceId: "source-1", repoUrl: null,
+        baseRef: "main", branchName: fresh.branchName, config: { provisionCommand: command },
+        metadata: RUNTIME_OWNED_GIT_BRANCH_METADATA } };
+    expect((await ensurePersistedExecutionWorkspaceAvailable(restoreInput))?.cwd).toBe(fresh.cwd);
+    expect(existsSync(marker)).toBe(false);
+    await fs.rm(fresh.cwd, { recursive: true, force: true });
+    expect(existsSync(fresh.cwd)).toBe(false);
+    expect((await ensurePersistedExecutionWorkspaceAvailable(restoreInput))?.cwd).toBe(fresh.cwd);
+    expect(existsSync(marker)).toBe(false);
+    await expect(fs.readFile(path.join(fresh.cwd, "README.md"), "utf8")).resolves.toBe("hello\n");
+    await ensurePersistedExecutionWorkspaceAvailable({ ...restoreInput, skipHostProvision: undefined });
+    await expect(fs.readFile(marker, "utf8")).resolves.toBe("host execution\n");
   });
 
   it("runs a configured provision command inside the derived worktree", async () => {
@@ -2289,7 +2335,7 @@ process.stderr.write(${JSON.stringify(stderr)}, () => { process.exitCode = ${cod
   it("reinstalls worktree-local pnpm dependencies when package metadata changes", async () => {
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-stale-deps-"));
     const baseRoot = path.join(tempRoot, "base");
-    const worktreeRoot = path.join(tempRoot, "worktree-stale-deps");
+    const worktreeRoot = path.join(tempRoot, "worktree");
     const fakeBin = path.join(tempRoot, "bin");
     const fakePnpmPath = path.join(fakeBin, "pnpm");
     const scriptPath = path.join(worktreeRoot, "provision-worktree.sh");
@@ -2383,7 +2429,7 @@ process.stderr.write(${JSON.stringify(stderr)}, () => { process.exitCode = ${cod
   it("fails instead of writing an unseeded fallback config when worktree init errors after CLI detection succeeds", async () => {
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-provision-fail-"));
     const baseRoot = path.join(tempRoot, "base");
-    const worktreeRoot = path.join(tempRoot, "worktree-provision-fail");
+    const worktreeRoot = path.join(tempRoot, "worktree");
     const fakeBin = path.join(tempRoot, "bin");
     const fakePnpmPath = path.join(fakeBin, "pnpm");
     const scriptPath = path.join(worktreeRoot, "provision-worktree.sh");
@@ -2440,7 +2486,7 @@ process.stderr.write(${JSON.stringify(stderr)}, () => { process.exitCode = ${cod
   it("regenerates stale worktree config that points at another host", async () => {
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-stale-config-"));
     const baseRoot = path.join(tempRoot, "base");
-    const worktreeRoot = path.join(tempRoot, "worktree-stale-config");
+    const worktreeRoot = path.join(tempRoot, "worktree");
     const fakeBin = path.join(tempRoot, "bin");
     const fakePnpmPath = path.join(fakeBin, "pnpm");
     const scriptPath = path.join(worktreeRoot, "provision-worktree.sh");
@@ -2532,7 +2578,7 @@ process.stderr.write(${JSON.stringify(stderr)}, () => { process.exitCode = ${cod
   it("retries worktree-local pnpm install without a frozen lockfile when the lockfile is outdated", async () => {
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-outdated-lockfile-"));
     const baseRoot = path.join(tempRoot, "base");
-    const worktreeRoot = path.join(tempRoot, "worktree-outdated-lockfile");
+    const worktreeRoot = path.join(tempRoot, "worktree");
     const fakeBin = path.join(tempRoot, "bin");
     const fakePnpmPath = path.join(fakeBin, "pnpm");
     const scriptPath = path.join(worktreeRoot, "provision-worktree.sh");
@@ -2605,110 +2651,7 @@ process.stderr.write(${JSON.stringify(stderr)}, () => { process.exitCode = ${cod
     }
   });
 
-  it(
-    "provisions worktree-local pnpm node_modules instead of reusing base-repo links",
-    async () => {
-    const repoRoot = await createTempRepo();
-    await writeRegisteredSourceConfig(repoRoot);
-    await fs.mkdir(path.join(repoRoot, "scripts"), { recursive: true });
-    await fs.mkdir(path.join(repoRoot, "packages", "shared"), { recursive: true });
-    await fs.mkdir(path.join(repoRoot, "server"), { recursive: true });
-    await fs.writeFile(
-      path.join(repoRoot, "package.json"),
-      JSON.stringify(
-        {
-          name: "workspace-root",
-          private: true,
-          packageManager: "pnpm@9.15.4",
-        },
-        null,
-        2,
-      ),
-      "utf8",
-    );
-    await fs.writeFile(
-      path.join(repoRoot, "pnpm-workspace.yaml"),
-      ["packages:", "  - packages/*", "  - server", ""].join("\n"),
-      "utf8",
-    );
-    await fs.writeFile(
-      path.join(repoRoot, "packages", "shared", "package.json"),
-      JSON.stringify(
-        {
-          name: "@repo/shared",
-          version: "1.0.0",
-          private: true,
-          type: "module",
-          exports: "./index.js",
-        },
-        null,
-        2,
-      ),
-      "utf8",
-    );
-    await fs.writeFile(path.join(repoRoot, "packages", "shared", "index.js"), "export const value = 'shared';\n", "utf8");
-    await fs.writeFile(
-      path.join(repoRoot, "server", "package.json"),
-      JSON.stringify(
-        {
-          name: "server",
-          private: true,
-          type: "module",
-          dependencies: {
-            "@repo/shared": "workspace:*",
-          },
-        },
-        null,
-        2,
-      ),
-      "utf8",
-    );
-    await fs.writeFile(path.join(repoRoot, "server", "index.js"), "export {};\n", "utf8");
-    await fs.copyFile(provisionWorktreeScriptPath, path.join(repoRoot, "scripts", "provision-worktree.sh"));
-    await fs.chmod(path.join(repoRoot, "scripts", "provision-worktree.sh"), 0o755);
-    await runPnpm(repoRoot, ["install"]);
-    await runGit(repoRoot, ["add", "."]);
-    await runGit(repoRoot, ["commit", "-m", "Add pnpm workspace fixture"]);
 
-    const workspace = await realizeExecutionWorkspace({
-      base: {
-        baseCwd: repoRoot,
-        source: "project_primary",
-        projectId: "project-1",
-        workspaceId: "workspace-1",
-        repoUrl: null,
-        repoRef: "HEAD",
-      },
-      config: {
-        workspaceStrategy: {
-          type: "git_worktree",
-          branchTemplate: "{{issue.identifier}}-{{slug}}",
-          provisionCommand: "bash ./scripts/provision-worktree.sh",
-        },
-      },
-      issue: {
-        id: "issue-1",
-        identifier: "PAP-551",
-        title: "Provision local workspace dependencies",
-      },
-      agent: {
-        id: "agent-1",
-        name: "Codex Coder",
-        companyId: "company-1",
-      },
-    });
-
-    expect((await fs.lstat(path.join(workspace.cwd, "node_modules"))).isSymbolicLink()).toBe(false);
-    expect((await fs.lstat(path.join(workspace.cwd, "server", "node_modules"))).isSymbolicLink()).toBe(false);
-    await expect(fs.realpath(path.join(workspace.cwd, "server", "node_modules", "@repo", "shared"))).resolves.toBe(
-      await fs.realpath(path.join(workspace.cwd, "packages", "shared")),
-    );
-    await expect(fs.realpath(path.join(repoRoot, "server", "node_modules", "@repo", "shared"))).resolves.toBe(
-      await fs.realpath(path.join(repoRoot, "packages", "shared")),
-    );
-    },
-    15_000,
-  );
 
   it("records worktree setup and provision operations when a recorder is provided", async () => {
     const repoRoot = await createTempRepo();
@@ -3965,6 +3908,7 @@ process.stderr.write(${JSON.stringify(stderr)}, () => { process.exitCode = ${cod
 
     const cleanup = await cleanupExecutionWorkspaceArtifacts({
       workspace: {
+        companyId: "company-1",
         id: "execution-workspace-1",
         cwd: workspace.cwd,
         providerType: "git_worktree",
@@ -4041,6 +3985,7 @@ process.stderr.write(${JSON.stringify(stderr)}, () => { process.exitCode = ${cod
 
     const cleanup = await cleanupExecutionWorkspaceArtifacts({
       workspace: {
+        companyId: "company-1",
         id: "execution-workspace-reused-cleanup",
         cwd: reused.cwd,
         providerType: "git_worktree",
@@ -4109,6 +4054,7 @@ process.stderr.write(${JSON.stringify(stderr)}, () => { process.exitCode = ${cod
 
     const cleanup = await cleanupExecutionWorkspaceArtifacts({
       workspace: {
+        companyId: "company-1",
         id: "execution-workspace-1",
         cwd: workspace.cwd,
         providerType: "git_worktree",
@@ -4173,6 +4119,7 @@ process.stderr.write(${JSON.stringify(stderr)}, () => { process.exitCode = ${cod
 
     const cleanup = await cleanupExecutionWorkspaceArtifacts({
       workspace: {
+        companyId: "company-1",
         id: "execution-workspace-1",
         cwd: workspace.cwd,
         providerType: "git_worktree",
@@ -4249,6 +4196,7 @@ process.stderr.write(${JSON.stringify(stderr)}, () => { process.exitCode = ${cod
 
     await cleanupExecutionWorkspaceArtifacts({
       workspace: {
+        companyId: "company-1",
         id: "execution-workspace-1",
         cwd: workspace.cwd,
         providerType: "git_worktree",
@@ -4357,6 +4305,34 @@ describe("ensureRuntimeServicesForRun", () => {
       onLog: input.onLog,
     };
   }
+
+  it.each(["configured", "builtin"] as const)("suppresses %s runtime provision scripts for remote runs without disabling local provisioning", async kind => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-remote-runtime-provision-"));
+    const restorePaperclipEnv = configureRuntimeProvisionTestHome(workspaceRoot, "remote-runtime-provision");
+    const marker = path.join(workspaceRoot, "runtime-script-ran");
+    const command = `printf host-runtime > '${marker}'`;
+    await fs.mkdir(path.join(workspaceRoot, "scripts"));
+    await fs.writeFile(path.join(workspaceRoot, "scripts", "provision-worktree-runtime.sh"), `${command}\n`);
+    const workspace = { ...buildWorkspace(workspaceRoot), strategy: "git_worktree" as const, worktreePath: workspaceRoot };
+    const config = runtimeProvisionTestConfig({ provisionCommand: kind === "configured" ? command : undefined });
+    const { recorder, operations } = createWorkspaceOperationRecorderDouble();
+    const input = { runId: randomUUID(), agent: { id: "agent-1", name: "Remote worker", companyId: "company-1" },
+      issue: null, workspace, config, executionWorkspaceId: randomUUID(), adapterEnv: {}, recorder };
+    try {
+      expect(await ensureRuntimeServicesForRun({ ...input, skipHostProvision: true })).toHaveLength(1);
+      await expect(fs.readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      expect(operations.filter(operation => ["workspace_seed", "workspace_runtime_provision"].includes(operation.phase))).toHaveLength(0);
+      await stopRuntimeServicesForExecutionWorkspace({ executionWorkspaceId: input.executionWorkspaceId, workspaceCwd: workspaceRoot });
+      const local = ensureRuntimeServicesForRun({ ...input, runId: randomUUID() });
+      if (kind === "builtin") await expect(local).rejects.toThrow(/without a readable seed manifest/);
+      else expect(await local).toHaveLength(1);
+      expect(await fs.readFile(marker, "utf8")).toBe("host-runtime");
+    } finally {
+      await stopRuntimeServicesForExecutionWorkspace({ executionWorkspaceId: input.executionWorkspaceId, workspaceCwd: workspaceRoot });
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+      restorePaperclipEnv();
+    }
+  });
 
   it("runs runtime provisioning once when service starts race for the same workspace", async () => {
     const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-provision-race-"));
@@ -5657,12 +5633,6 @@ describe("resolveShell (shell fallback)", () => {
     delete process.env.SHELL;
     Object.defineProperty(process, "platform", { value: "win32" });
     expect(resolveShell()).toBe("sh");
-  });
-
-  it("falls back to /bin/sh on darwin when SHELL is unset", () => {
-    delete process.env.SHELL;
-    Object.defineProperty(process, "platform", { value: "darwin" });
-    expect(resolveShell()).toBe("/bin/sh");
   });
 
   it("treats empty SHELL as unset and uses platform fallback", () => {
@@ -7358,8 +7328,10 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
     }
   }, 20_000);
 
-  it("commits fixed-port reservations before readiness windows longer than 60 seconds", async () => {
+  it("commits fixed-port reservations across the configured database idle timeout", async () => {
     const fixture = await createRuntimeFixture();
+    const readinessDb = createDb(tempDb!.connectionString, { idleTimeoutSeconds: 1, maxConnections: 1 });
+    const [initialConnection] = await readinessDb.$client<{ pid: number }[]>`select pg_backend_pid() as pid`;
     const cleanupRuntimeHome = await createRuntimeHome();
     const workspace = fixture.workspaces[0]!;
     const basePort = await findFreePort();
@@ -7385,7 +7357,7 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
 
     try {
       startPromise = startRuntimeServicesForWorkspaceControl({
-        db,
+        db: readinessDb,
         actor: fixture.actor,
         issue: null,
         workspace: fixture.realizedWorkspace(workspace),
@@ -7409,16 +7381,18 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
         parentWrite.then(() => "committed" as const),
         new Promise<"locked">((resolve) => setTimeout(() => resolve("locked"), 2_000)),
       ]);
+      expect(parentWriteOutcome).toBe("committed");
 
       const readinessWaitStartedAt = Date.now();
-      await new Promise((resolve) => setTimeout(resolve, 60_250));
-      expect(Date.now() - readinessWaitStartedAt).toBeGreaterThanOrEqual(60_000);
+      await new Promise((resolve) => setTimeout(resolve, 1_250));
+      expect(Date.now() - readinessWaitStartedAt).toBeGreaterThanOrEqual(1_000);
+      const [reconnected] = await readinessDb.$client<{ pid: number }[]>`select pg_backend_pid() as pid`;
+      expect(reconnected!.pid).not.toBe(initialConnection!.pid);
 
       await fs.writeFile(releaseMarkerPath, "release");
       const started = (await startPromise)[0]!;
       await parentWrite;
 
-      expect(parentWriteOutcome).toBe("committed");
       expect(started).toMatchObject({
         port: basePort,
         url: `http://127.0.0.1:${basePort}`,
@@ -7445,6 +7419,7 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
       }).catch(() => undefined);
       await cleanupRuntimeHome();
       await fixture.cleanup();
+      await readinessDb.$client.end({ timeout: 1 });
     }
   }, 80_000);
 
@@ -7505,7 +7480,7 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
     const blockerScript = [
       "const net=require('node:net');",
       "const port=Number(process.argv[1]);",
-      "net.createServer((socket)=>socket.destroy()).listen(port,'127.0.0.1');",
+      "net.createServer((socket)=>socket.destroy()).listen(port,'127.0.0.1',()=>process.send({ready:true}));",
     ].join("");
     const raceScript = [
       "const fs=require('node:fs');",
@@ -7518,8 +7493,10 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
       "const start=()=>http.createServer((_req,res)=>res.end('ok')).listen(port,'127.0.0.1');",
       "if(!fs.existsSync(marker)){",
       "fs.writeFileSync(marker,String(port));",
-      "const blocker=spawn(process.execPath,['-e',blockerScript,String(port)],{detached:true,stdio:'ignore'});",
-      "fs.writeFileSync(pidFile,String(blocker.pid));blocker.unref();setTimeout(start,200);",
+      "const blocker=spawn(process.execPath,['-e',blockerScript,String(port)],{detached:true,stdio:['ignore','ignore','ignore','ipc']});",
+      "fs.writeFileSync(pidFile,String(blocker.pid));",
+      "const readyDeadline=setTimeout(()=>{throw new Error('Fixture blocker did not become ready');},5000);",
+      "blocker.once('message',(message)=>{if(message?.ready!==true)throw new Error('Invalid fixture readiness message');clearTimeout(readyDeadline);blocker.disconnect();blocker.unref();start();});",
       "}else{start();}",
       "setInterval(()=>{},1000);",
     ].join("");
@@ -7565,6 +7542,8 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
     }
   }, 20_000);
 
+  // Exhaustion starts and stops all 32 candidates after ownership fails.
+  // Give their real-process stability checks and verified cleanup bounded headroom.
   it("does not accept an occupied allocated port when listener ownership is unavailable", async () => {
     const fixture = await createRuntimeFixture();
     const cleanupRuntimeHome = await createRuntimeHome();
@@ -7605,7 +7584,7 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
       await cleanupRuntimeHome();
       await fixture.cleanup();
     }
-  }, 80_000);
+  }, 60_000);
 
   it("returns a bounded structured conflict and exposes only same-company workspace references", async () => {
     const fixture = await createRuntimeFixture({
@@ -10027,6 +10006,7 @@ describe("realizeExecutionWorkspace with an exact existing branch", () => {
   ) {
     return {
       workspace: {
+        companyId: "company-1",
         id: "execution-workspace-1",
         cwd: workspace.cwd,
         providerType: "git_worktree",

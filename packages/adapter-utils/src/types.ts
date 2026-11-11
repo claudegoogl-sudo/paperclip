@@ -241,6 +241,8 @@ export interface AgentRuntimeIdentity {
 }
 
 export interface AdapterExecutionContext {
+  /** Company-owned exporter credentials. Transient; never persist or merge into config. */
+  observability?: import("./agent-observability.js").ProviderObservabilityLaunch;
   /** Server-owned credentials. Never persist this object or merge it into config. */
   agentIdentity?: AgentRuntimeIdentity;
   /** Synchronous, content-free diagnostic scope; never stop or collection authority. */
@@ -383,6 +385,7 @@ export interface AdapterEnvironmentTestContext {
   companyId: string;
   adapterType: string;
   config: Record<string, unknown>;
+  managedAiCredentialHome?: string;
   /**
    * Optional execution target the adapter should run probes against.
    *
@@ -735,8 +738,11 @@ export interface CLIAdapterModule {
 // ---------------------------------------------------------------------------
 
 export interface CreateConfigValues {
+  runner?: "auto" | "paperclip" | "legacy";
+  resolvedRunner?: "paperclip" | "legacy";
   adapterType: string;
   codexPermissionMode?: "never" | "on-request" | "untrusted";
+  codexLegacySandboxBypass?: boolean;
   paperclipRunnerLifecycleMode?: "per_turn" | "warm";
   paperclipRunnerIdleTimeoutMs?: number;
   cwd: string;

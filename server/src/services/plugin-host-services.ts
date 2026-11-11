@@ -1,3 +1,5 @@
+import { projectInstanceSecretService } from "./project-instance-secrets.js";
+import { pluginAgentRuntimeState } from "./plugin-agent-runtime-state.js";
 import { createAgentLifecycle } from "./agent-lifecycle.js";
 import type { Db } from "@paperclipai/db";
 import {
@@ -2220,7 +2222,7 @@ export function buildHostServices(
 
     events: {
       async listLifecycle(params) {
-        return lifecycleInbox.list(ensureCompanyId(params.companyId), params.limit, params.afterId);
+        return lifecycleInbox.list(ensureCompanyId(params.companyId), params.limit, params.afterId, options.manifest?.resourceLifecycle?.includes("agent_runtime") ? ["agent", "project", "agent_runtime"] : ["agent", "project"]);
       },
       async acknowledgeLifecycle(params) {
         await lifecycleInbox.acknowledge(ensureCompanyId(params.companyId), params.eventId);
@@ -2448,6 +2450,11 @@ export function buildHostServices(
     },
 
     projects: {
+      async getInstanceSecrets(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await noPluginAvailabilityGate(companyId);
+        return projectInstanceSecretService(db, pluginId).read(companyId, params.projectId);
+      },
       async list(params) {
         const companyId = ensureCompanyId(params.companyId);
         await noPluginAvailabilityGate(companyId);
@@ -3862,6 +3869,11 @@ export function buildHostServices(
     },
 
     agents: {
+      async getRuntime(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await noPluginAvailabilityGate(companyId);
+        return pluginAgentRuntimeState(db, pluginId, companyId, params.agentId);
+      },
       async list(params) {
         const companyId = ensureCompanyId(params.companyId);
         await noPluginAvailabilityGate(companyId);

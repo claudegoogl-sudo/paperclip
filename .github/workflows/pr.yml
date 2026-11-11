@@ -1,4 +1,6 @@
 name: PR
+run-name: >-
+  ${{ contains(github.event.pull_request.labels.*.name, 'profile-ci') && (github.event.action != 'labeled' || github.event.label.name == 'profile-ci') && format('CI profile · PR #{0}', github.event.pull_request.number) || '' }}
 
 on:
   pull_request:
