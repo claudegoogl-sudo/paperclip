@@ -717,7 +717,7 @@ suite("task project repository provisioning", () => {
       await heartbeat.resumeQueuedRuns();
       await heartbeat.drainActiveRunExecutions();
       expect((await heartbeat.getRun(last!.id))?.errorCode).toBe(code);
-      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(3);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(4); // fork retry ladder has one more attempt
       expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]).toMatchObject({ status: "blocked", assigneeAgentId: agentId });
       expect(execute.mock.calls.filter(([input]) => input.agent.id === agentId)).toHaveLength(0);
       return;
