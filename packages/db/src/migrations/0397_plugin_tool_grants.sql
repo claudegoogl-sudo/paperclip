@@ -15,4 +15,6 @@ CREATE TABLE IF NOT EXISTS "plugin_tool_grants" (
 CREATE UNIQUE INDEX IF NOT EXISTS "plugin_tool_grants_company_agent_tool_uq" ON "plugin_tool_grants" ("company_id","agent_id","tool_key");
 --> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "plugin_tool_grants_expires_idx" ON "plugin_tool_grants" ("expires_at");
--- DOWN (manual rollback): DROP TABLE IF EXISTS "plugin_tool_grants";
+-- DOWN (manual rollback, run BOTH or neither; dropping the table alone leaves 0397 recorded as applied and grant lookups then fail closed):
+--   DROP TABLE IF EXISTS "plugin_tool_grants";
+--   DELETE FROM drizzle.__drizzle_migrations WHERE hash = '<hash of 0397_plugin_tool_grants.sql>';
