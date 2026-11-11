@@ -697,7 +697,7 @@ export function createHeartbeatScheduling(
         );
       } catch (err) {
         // Release the claim so the monitor is not stuck, then surface the error.
-        await db.update(issues).set({ monitorWakeRequestedAt: null, updatedAt: input.now })
+        await db.update(issues).set({ monitorWakeRequestedAt: null })
           .where(issueMonitorOwnClaimCondition(claimed));
         throw err;
       }
@@ -722,7 +722,7 @@ export function createHeartbeatScheduling(
           .returning({ id: issues.id });
         if (skipped.length === 0) {
           // Snapshot or monitor changed after the claim: release our claim if we still hold it.
-          await db.update(issues).set({ monitorWakeRequestedAt: null, updatedAt: new Date() })
+          await db.update(issues).set({ monitorWakeRequestedAt: null })
             .where(issueMonitorOwnClaimCondition(claimed));
           return { outcome: "skipped" as const, reason: "monitor_replaced" };
         }
