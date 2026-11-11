@@ -30,7 +30,7 @@ import { Router } from "express";
 import type { Request, Response } from "express";
 import { and, desc, eq, gte } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { checkToolGrant, dbGrantLookup } from "../services/plugin-tool-grants.js";
+import { checkToolGrant, dbGrantLookup, unmatchedGrantRequirements } from "../services/plugin-tool-grants.js";
 import {
   agents,
   companies,
@@ -1194,6 +1194,12 @@ export function pluginRoutes(
 
     const filter = pluginId ? { pluginId } : undefined;
     const tools = toolDeps.toolDispatcher.listToolsForAgent(filter);
+    if (!pluginId) {
+      const missing = unmatchedGrantRequirements(
+        (tools as unknown as Array<{ name?: string }>).map((t) => t.name ?? ""),
+      );
+      if (missing.length > 0) logger.warn({ missing }, "plugin tool grant requirements match no registered tool");
+    }
     res.json(tools);
   });
 

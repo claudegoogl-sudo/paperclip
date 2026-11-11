@@ -20,7 +20,8 @@ export const GRANT_REQUIRED_PLUGINS: ReadonlySet<string> = new Set(["platform.va
 
 export function toolRequiresGrant(namespacedTool: string): boolean {
   if (GRANT_REQUIRED_TOOLS.has(namespacedTool)) return true;
-  const i = namespacedTool.indexOf(":");
+  // Same parser as the tool registry (parseName): split on the LAST ':'.
+  const i = namespacedTool.lastIndexOf(":");
   return i > 0 && GRANT_REQUIRED_PLUGINS.has(namespacedTool.slice(0, i));
 }
 
@@ -72,4 +73,17 @@ export async function checkToolGrant(opts: {
   } catch {
     return { allowed: false, required: true, reason: "lookup_error" };
   }
+}
+
+/**
+ * Returns GRANT_REQUIRED_TOOLS entries and plugin keys that match no registered
+ * tool (a misnamed entry would be a silent fail-open). Callers log a warning.
+ */
+export function unmatchedGrantRequirements(registered: readonly string[]): string[] {
+  const out: string[] = [];
+  for (const t of GRANT_REQUIRED_TOOLS) if (!registered.includes(t)) out.push(t);
+  for (const p of GRANT_REQUIRED_PLUGINS) {
+    if (!registered.some((r) => r.slice(0, r.lastIndexOf(":")) === p)) out.push(`${p}:*`);
+  }
+  return out;
 }

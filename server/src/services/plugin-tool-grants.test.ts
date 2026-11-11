@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { checkToolGrant, toolRequiresGrant, type GrantLookup } from "./plugin-tool-grants.js";
+import { checkToolGrant, toolRequiresGrant, unmatchedGrantRequirements, type GrantLookup } from "./plugin-tool-grants.js";
 
 const C = "c1", A = "agent-a", B = "agent-b";
 const CAD = "platform.cad:cad.run_script";
@@ -36,5 +36,23 @@ describe("plugin tool grants", () => {
   it("all vault tools require grant", () => {
     expect(toolRequiresGrant("platform.vault:vault.read")).toBe(true);
     expect(toolRequiresGrant("platform.vault:vault.future")).toBe(true);
+  });
+  // Real tool ids from the plugin manifests (platform.cad: cad.run_script, cad.export;
+  // platform.vault: vault.read, vault.list). Fails if a registered tool is not flagged.
+  it("every real cad/vault manifest tool is flagged", () => {
+    for (const k of ["platform.cad:cad.run_script", "platform.cad:cad.export", "platform.vault:vault.read", "platform.vault:vault.list"]) {
+      expect(toolRequiresGrant(k)).toBe(true);
+    }
+  });
+  it("uses last-colon parsing like the registry", () => {
+    // registry parses pluginId = everything before the last ':'
+    expect(toolRequiresGrant("platform.vault:evil:tool")).toBe(false);
+    expect(toolRequiresGrant("other:platform.vault:t")).toBe(false);
+  });
+  it("reports grant entries that match no registered tool", () => {
+    expect(unmatchedGrantRequirements([
+      "platform.cad:cad.run_script", "platform.cad:cad.export", "platform.vault:vault.read",
+    ])).toEqual([]);
+    expect(unmatchedGrantRequirements(["platform.cad:cad.run_script"])).toContain("platform.vault:*");
   });
 });
