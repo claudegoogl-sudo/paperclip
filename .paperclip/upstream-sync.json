@@ -1,13 +1,13 @@
 {
-  "lastSyncedTag": "v2026.1023.0",
-  "lastSyncedSha": "1b4c803816e82b0265c8422e1a804327a7ed8c54",
-  "lastSyncedAt": "2026-11-02T11:11:49Z",
-  "lastCheckedAt": "2026-11-02T11:11:49Z",
+  "lastSyncedTag": "v2026.1106.0",
+  "lastSyncedSha": "d69631b01b9c658f80bf8bed389863dce82643e1",
+  "lastSyncedAt": "2026-11-11T08:49:00Z",
+  "lastCheckedAt": "2026-11-12T20:55:00Z",
   "pendingPrUrl": null,
   "lastConflictBuckets": {
     "clean": 0,
     "reviewable": 0,
     "escalation": 0
   },
-  "_syncNote": "v2026.1023.0 cursor reconcile. Release reached fork master via PR #702 (merge 804a0f72fb). No content change, pure bookkeeping. lastSyncedSha is the upstream tag commit. etag dropped so the next tick refreshes it."
+  "_syncNote": "v2026.1106.0 cursor reconcile. Release reached fork master via PR #716 (merge 1c8925aead). No content change, pure bookkeeping. lastSyncedSha is the upstream tag commit. etag dropped so the next tick refreshes it."
 }
