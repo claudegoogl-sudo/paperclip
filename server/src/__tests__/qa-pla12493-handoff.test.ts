@@ -47,7 +47,10 @@ d("QA PLA-12493 handoff hold repro", () => {
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, s.runId));
     console.log("QA-A run", run!.status, run!.errorCode, JSON.stringify(Object.keys((run!.resultJson ?? {}) as object)));
     const h = await holds(s.issueId);
-    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, s.reviewerId));
+    let wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, s.reviewerId));
+    for (let i = 0; i < 40 && wakes.length === 0; i++) { await new Promise((r) => setTimeout(r, 250)); wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, s.reviewerId)); }
+    const rr = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, s.reviewerId));
+    console.log("QA-A reviewer runs", rr.map((x) => x.status), "wake reasons", wakes.map((w) => [w.reason, w.status]));
     console.log("QA-A holds", h.length, "reviewer wakes", wakes.map((w) => w.status));
     expect(res.status).toBe(200);
     expect(h.length).toBe(0);
