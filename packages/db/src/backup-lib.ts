@@ -735,7 +735,13 @@ function openGzipSink(filePath: string, counter: { bytes: number }): Promise<Bac
     async write(chunk) {
       const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
       counter.bytes += buf.length;
-      if (!gz.write(buf)) await new Promise<void>((res) => gz.once("drain", () => res()));
+      if (!gz.write(buf)) {
+        // Reject if the pipeline fails (e.g. ENOSPC): no drain follows a destroy.
+        await Promise.race([
+          new Promise<void>((res) => gz.once("drain", () => res())),
+          done.then(() => { throw new Error("gzip pipeline ended before drain"); }),
+        ]);
+      }
     },
     async close() {
       gz.end();
