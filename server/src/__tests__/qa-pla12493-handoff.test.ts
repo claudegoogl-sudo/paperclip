@@ -57,7 +57,7 @@ d("QA PLA-12493 handoff hold repro", () => {
     console.log("QA-A holds", h.length, "reviewer wakes", wakes.map((w) => w.status));
     expect(res.status).toBe(200);
     expect(h.length).toBe(0);
-    expect(wakes.length).toBeGreaterThan(0);
+    expect(wakes.length, "DIAG " + JSON.stringify({ allw: allw.map((w) => [w.agentId === s.reviewerId ? "reviewer" : "coder", w.reason, w.status]), acts: acts.map((a) => a.action), rr: rr.map((x) => x.status), runStatus: run!.status, runErr: run!.errorCode })).toBeGreaterThan(0);
     expect(wakes.every((w) => w.status !== "cancelled" && w.status !== "skipped")).toBe(true);
   });
 
