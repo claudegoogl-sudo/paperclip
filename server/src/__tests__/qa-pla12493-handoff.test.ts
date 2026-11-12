@@ -64,7 +64,8 @@ d("QA PLA-12493 handoff hold repro", () => {
     await request(app()).patch(`/api/issues/${s.issueId}`).send({ status: "in_review", assigneeAgentId: s.reviewerId });
     await new Promise((r) => setTimeout(r, 3000));
     const wakes = await db.select().from(agentWakeupRequests);
-    expect(wakes.length, "wake rows in harness").toBeGreaterThan(0);
+    const rr = await db.select().from(heartbeatRuns);
+    expect("DUMP " + JSON.stringify({ wakes: wakes.map((w) => [w.agentId === s.reviewerId ? "reviewer" : "coder", w.reason, w.status, w.source]), runs: rr.map((x) => [x.agentId === s.reviewerId ? "reviewer" : "coder", x.status, x.errorCode]) })).toBe("");
   });
 
   it("B: failed handoff transaction keeps the hold", async () => {
