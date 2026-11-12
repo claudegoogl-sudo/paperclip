@@ -3961,10 +3961,8 @@ describe("issue comment reopen routes", () => {
     expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("run-1", expect.any(String),
       expect.objectContaining({ resultJson: expect.objectContaining({
         handoffPending: expect.objectContaining({ runId: "run-1", toAgentId: reviewerId }) }) }));
-    expect(mockIssueService.update).toHaveBeenCalledWith(
-      "11111111-1111-4111-8111-111111111111",
-      expect.objectContaining({ handoffCommit: expect.objectContaining({ runId: "run-1", toAgentId: reviewerId }) }),
-    );
+    const updateCall = mockIssueService.update.mock.calls.find(([id]) => id === "11111111-1111-4111-8111-111111111111");
+    expect(updateCall?.[1]).toMatchObject({ handoffCommit: { runId: "run-1", toAgentId: reviewerId } });
     await waitForWakeup(() => {
       const calls = mockHeartbeatService.wakeup.mock.calls.filter(([id]) => id === reviewerId);
       expect(calls).toHaveLength(1);
