@@ -9,6 +9,7 @@ import {
   eq,
   getTableColumns,
   gt,
+  inArray,
   or,
   sql,
 } from "drizzle-orm";
@@ -52,6 +53,7 @@ import {
 import { isUuidLike } from "@paperclipai/shared";
 import { HEARTBEAT_RUN_LIST_DEFAULT_LIMIT, HEARTBEAT_RUN_LIST_MAX_LIMIT } from "@paperclipai/shared";
 import { isUnsafeSessionWorkspaceCwd } from "../session-workspace-cwd.js";
+import { sessionIdLookupCandidates } from "../session-id-lookup.js";
 import { stripPaperclipSessionMetadataFromSessionParams } from "./workspaces.js";
 
 export const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON =
@@ -191,6 +193,14 @@ const heartbeatRunListResultColumns = {
 const diagnosticRetrievalTitleBytes = 1024;
 
 const diagnosticRetrievalDetailsBytes = 8192;
+
+
+function sessionIdAfterMatches(sessionId: string) {
+  const ids = sessionIdLookupCandidates(sessionId);
+  return ids.length === 1
+    ? eq(heartbeatRuns.sessionIdAfter, ids[0])
+    : inArray(heartbeatRuns.sessionIdAfter, ids);
+}
 
 function boundedRunDiagnosticText(field: "title" | "details", maxBytes: number) {
   const value = sql`${heartbeatRuns.resultJson} #>> ARRAY['terminalSessionFailure', ${field}]`;
@@ -1184,7 +1194,7 @@ export function createHeartbeatRunState(db: Db) {
   ) {
     const conditions = [
       eq(heartbeatRuns.agentId, agentId),
-      eq(heartbeatRuns.sessionIdAfter, sessionId),
+      sessionIdAfterMatches(sessionId),
     ];
     if (opts?.excludeRunId) {
       conditions.push(sql`${heartbeatRuns.id} <> ${opts.excludeRunId}`);
@@ -1211,7 +1221,7 @@ export function createHeartbeatRunState(db: Db) {
       .where(
         and(
           eq(heartbeatRuns.agentId, agentId),
-          eq(heartbeatRuns.sessionIdAfter, sessionId),
+          sessionIdAfterMatches(sessionId),
         ),
       )
       .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
@@ -1294,7 +1304,7 @@ export function createHeartbeatRunState(db: Db) {
       .where(
         and(
           eq(heartbeatRuns.agentId, agent.id),
-          eq(heartbeatRuns.sessionIdAfter, sessionId),
+          sessionIdAfterMatches(sessionId),
         ),
       )
       .orderBy(desc(heartbeatRuns.createdAt))
