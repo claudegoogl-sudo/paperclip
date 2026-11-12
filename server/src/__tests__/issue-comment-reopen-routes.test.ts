@@ -3927,6 +3927,51 @@ describe("issue comment reopen routes", () => {
     );
   });
 
+  it("delivers exactly one reviewer wake and commits the handoff marker when the actor's run is stopped by the handoff (PLA-12409)", async () => {
+    const reviewerId = "33333333-3333-4333-8333-333333333333";
+    const executorId = "22222222-2222-4222-8222-222222222222";
+    const policy = await normalizePolicy({
+      stages: [{ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", type: "review", participants: [{ type: "agent", agentId: reviewerId }] }],
+    })!;
+    const issue = {
+      ...makeIssue("todo"),
+      status: "in_progress",
+      assigneeAgentId: executorId,
+      executionRunId: "run-1",
+      executionPolicy: policy,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue, ...patch, updatedAt: new Date(),
+    }));
+    mockHeartbeatService.getRun.mockResolvedValue({ id: "run-1", companyId: "company-1", agentId: executorId, status: "running" });
+    mockHeartbeatService.cancelRun.mockResolvedValue({ id: "run-1", companyId: "company-1", agentId: executorId, status: "cancelled" });
+
+    const res = await request(
+      await installActor(createApp(), { type: "agent", agentId: executorId, companyId: "company-1", runId: "run-1" }),
+    )
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ status: "in_review", assigneeAgentId: null, assigneeUserId: "local-board",
+        reviewRequest: { instructions: "Please verify the fix." } });
+
+    expect(res.status).toBe(200);
+    // The stopped run carries a pending handoff and the update commits its marker,
+    // so no recovery hold is minted for the reviewer's issue.
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("run-1", expect.any(String),
+      expect.objectContaining({ resultJson: expect.objectContaining({
+        handoffPending: expect.objectContaining({ runId: "run-1", toAgentId: reviewerId }) }) }));
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      expect.objectContaining({ handoffCommit: expect.objectContaining({ runId: "run-1", toAgentId: reviewerId }) }),
+    );
+    await waitForWakeup(() => {
+      const calls = mockHeartbeatService.wakeup.mock.calls.filter(([id]) => id === reviewerId);
+      expect(calls).toHaveLength(1);
+      expect(calls[0][1]).toMatchObject({ reason: "execution_review_requested" });
+    });
+  });
+
   it("wakes the return assignee with execution_changes_requested", async () => {
     const policy = await normalizePolicy({
       stages: [
