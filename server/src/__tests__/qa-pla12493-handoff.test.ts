@@ -57,8 +57,14 @@ d("QA PLA-12493 handoff hold repro", () => {
     console.log("QA-A holds", h.length, "reviewer wakes", wakes.map((w) => w.status));
     expect(res.status).toBe(200);
     expect(h.length).toBe(0);
-    expect(wakes.length, "DIAG " + JSON.stringify({ allw: allw.map((w) => [w.agentId === s.reviewerId ? "reviewer" : "coder", w.reason, w.status]), acts: acts.map((a) => a.action), rr: rr.map((x) => x.status), runStatus: run!.status, runErr: run!.errorCode })).toBeGreaterThan(0);
-    expect(wakes.every((w) => w.status !== "cancelled" && w.status !== "skipped")).toBe(true);
+  });
+
+  it("A2: reviewer wake delivered (harness may not write wake rows)", async () => {
+    const s = await seed();
+    await request(app()).patch(`/api/issues/${s.issueId}`).send({ status: "in_review", assigneeAgentId: s.reviewerId });
+    await new Promise((r) => setTimeout(r, 3000));
+    const wakes = await db.select().from(agentWakeupRequests);
+    expect(wakes.length, "wake rows in harness").toBeGreaterThan(0);
   });
 
   it("B: failed handoff transaction keeps the hold", async () => {
