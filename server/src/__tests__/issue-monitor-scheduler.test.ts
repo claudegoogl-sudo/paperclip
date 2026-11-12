@@ -155,6 +155,8 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     issueStatus?: "in_progress" | "in_review";
     monitorAttemptCount?: number;
     monitor?: Record<string, unknown>;
+    runtimeConfig?: Record<string, unknown>;
+    lastTriggeredAt?: Date;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -195,6 +197,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
           enabled: false,
           wakeOnDemand: true,
         },
+        ...(input?.runtimeConfig ?? {}),
       },
       permissions: {},
     });
@@ -242,6 +245,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
         },
       },
       monitorNextCheckAt: nextCheckAt,
+      monitorLastTriggeredAt: input?.lastTriggeredAt ?? null,
       monitorAttemptCount,
       monitorNotes: "Check deploy",
       monitorScheduledBy: "assignee",
@@ -249,6 +253,56 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
     return { companyId, agentId, issueId, nextCheckAt };
   }
+
+  describe("skipMonitorWhenNoActivity", () => {
+    const last = new Date("2026-04-11T11:00:00.000Z");
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+    let currentAgentId = "";
+    const monitorWakes = async () =>
+      (await db.select().from(agentWakeupRequests)).filter(
+        (w) => w.reason === "issue_monitor_due" && w.agentId === currentAgentId,
+      );
+
+    it("is off by default: still dispatches with no activity", async () => {
+      currentAgentId = (await seedFixture({ lastTriggeredAt: last })).agentId;
+      await heartbeatService(db).tickTimers(tickAt);
+      expect(await monitorWakes()).toHaveLength(1);
+    });
+
+    it("skips a flagged agent's monitor with no activity since the last run", async () => {
+      const { issueId, agentId } = await seedFixture({ lastTriggeredAt: last, runtimeConfig: { skipMonitorWhenNoActivity: true } });
+      currentAgentId = agentId;
+      await heartbeatService(db).tickTimers(tickAt);
+      expect(await monitorWakes()).toHaveLength(0);
+      const actions = (await db.select().from(activityLog).where(eq(activityLog.entityId, issueId))).map((r) => r.action);
+      expect(actions).toContain("issue.monitor_skipped");
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(issue.monitorNextCheckAt).toBeNull();
+    });
+
+    it("dispatches when a comment arrived since the last run", async () => {
+      const { issueId, companyId, agentId } = await seedFixture({ lastTriggeredAt: last, runtimeConfig: { skipMonitorWhenNoActivity: true } });
+      currentAgentId = agentId;
+      await db.insert(issueComments).values({
+        companyId,
+        issueId,
+        body: "new input",
+        createdAt: new Date("2026-04-11T12:00:00.000Z"),
+      } as never);
+      await heartbeatService(db).tickTimers(tickAt);
+      expect(await monitorWakes()).toHaveLength(1);
+    });
+
+    it("keeps external-service monitors (serviceName) running", async () => {
+      currentAgentId = (await seedFixture({
+        lastTriggeredAt: last,
+        runtimeConfig: { skipMonitorWhenNoActivity: true },
+        monitor: { kind: "external_service", serviceName: "github-actions" },
+      })).agentId;
+      await heartbeatService(db).tickTimers(tickAt);
+      expect(await monitorWakes()).toHaveLength(1);
+    });
+  });
 
   it("triggers due issue monitors once and clears the one-shot schedule", async () => {
     const { issueId, agentId } = await seedFixture();
