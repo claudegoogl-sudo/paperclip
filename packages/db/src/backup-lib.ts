@@ -754,9 +754,21 @@ export function createBufferedTextFileWriter(
   options: { gzip?: boolean } = {},
 ) {
   const counter = { bytes: 0 };
-  const filePromise: Promise<BackupSink> = options.gzip
-    ? openGzipSink(filePath, counter)
-    : (openFile(filePath, "w") as unknown as Promise<BackupSink>);
+  // gzip mode opens lazily: the pg_dump path creates the writer but never
+  // writes, and must not touch the shared <name>.sql.gz.partial path.
+  let lazySink: Promise<BackupSink> | null = null;
+  const sinkPromise = (): Promise<BackupSink> => {
+    if (!lazySink) {
+      lazySink = options.gzip
+        ? openGzipSink(filePath, counter)
+        : (openFile(filePath, "w") as unknown as Promise<BackupSink>);
+    }
+    return lazySink;
+  };
+  const filePromise = {
+    then: (f: (s: BackupSink) => unknown, r?: (e: unknown) => unknown) => sinkPromise().then(f, r),
+    catch: (r: (e: unknown) => unknown) => sinkPromise().catch(r),
+  } as unknown as Promise<BackupSink>;
   const flushThreshold = Math.max(1, Math.trunc(maxBufferedBytes));
   let bufferedLines: string[] = [];
   let bufferedBytes = 0;
@@ -817,8 +829,7 @@ export function createBufferedTextFileWriter(
       closed = true;
       flushBufferedLines();
       await pendingWrite;
-      const file = await filePromise;
-      await file.close();
+      if (lazySink || !options.gzip) await (await filePromise).close();
     },
     async abort() {
       if (closed) return;
@@ -826,8 +837,8 @@ export function createBufferedTextFileWriter(
       bufferedLines = [];
       bufferedBytes = 0;
       await pendingWrite.catch(() => {});
-      await filePromise.then((file) => file.close()).catch(() => {});
-      if (existsSync(filePath)) {
+      if (lazySink || !options.gzip) await filePromise.then((file) => file.close()).catch(() => {});
+      if ((lazySink || !options.gzip) && existsSync(filePath)) {
         try {
           unlinkSync(filePath);
         } catch {
