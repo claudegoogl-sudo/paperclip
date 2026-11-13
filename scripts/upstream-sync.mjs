@@ -53,27 +53,46 @@ const dryRun = args.has("--dry-run");
 const STATE_PATH_IN_REPO = ".paperclip/upstream-sync.json";
 
 /**
- * Read the sync baseline from `${FORK_REMOTE}/${FORK_BASE_BRANCH}` (never from
- * the working tree). Refuses to run when the local file disagrees, so a stale
- * checkout fails loudly instead of reporting a wrong baseline.
- * `gitFn` is injectable for tests.
+ * Newest upstream RELEASE tag that is an ancestor of `commit`. Filter: the tag
+ * must match `v20*` and contain no "-" (`--exclude '*-*'`), which drops fork
+ * tags (`v2026.1112.1-fork.77`) and prerelease/beta tags (`-beta.1`, `-rc.1`).
+ * Throws when none is found, so a sync never runs from a guessed cursor.
  */
-function loadBaseline(gitFn = git, localFile = stateFile) {
-  const ref = `${FORK_REMOTE}/${FORK_BASE_BRANCH}`;
-  gitFn(["fetch", FORK_REMOTE, FORK_BASE_BRANCH]);
-  const sha = gitFn(["rev-parse", ref]);
-  const remote = JSON.parse(gitFn(["show", `${ref}:${STATE_PATH_IN_REPO}`]));
-  if (existsSync(localFile)) {
-    const local = JSON.parse(readFileSync(localFile, "utf8"));
-    if (local.lastSyncedTag !== remote.lastSyncedTag || local.lastSyncedSha !== remote.lastSyncedSha) {
-      throw new Error(
-        `baseline mismatch: local ${local.lastSyncedTag}@${local.lastSyncedSha} vs ${ref} ${remote.lastSyncedTag}@${remote.lastSyncedSha}; run from a fresh worktree of ${ref}, not the shared checkout`,
-      );
-    }
+function describeReleaseTag(commit, gitFn = git) {
+  let tag = "";
+  try {
+    tag = gitFn(["describe", "--tags", "--abbrev=0", "--match", "v20*", "--exclude", "*-*", commit]);
+  } catch {
+    tag = "";
   }
+  if (!/^v20\d{2}\.\d+\.\d+$/.test(tag)) {
+    throw new Error(`no upstream release tag found at or before ${commit}; refusing to sync`);
+  }
+  return tag;
+}
+
+/**
+ * Derive the sync baseline from git, not from the state file:
+ * merge-base(origin/master, upstream/master) -> newest release tag at or before
+ * it. A hand merge therefore moves the cursor by itself. The state file only
+ * supplies the ETag / lastCheckedAt cache. `gitFn` is injectable for tests.
+ */
+function loadBaseline(gitFn = git) {
+  const ref = `${FORK_REMOTE}/${FORK_BASE_BRANCH}`;
+  const upstreamRef = `${UPSTREAM_REMOTE}/${FORK_BASE_BRANCH}`;
+  gitFn(["fetch", FORK_REMOTE, FORK_BASE_BRANCH]);
+  gitFn(["fetch", UPSTREAM_REMOTE, FORK_BASE_BRANCH, "--tags"]);
+  const sha = gitFn(["rev-parse", ref]);
+  const mergeBase = mergeBaseOrEmpty(ref, upstreamRef, gitFn);
+  if (!mergeBase) {
+    throw new Error(`no merge-base between ${ref} and ${upstreamRef}; refusing to sync`);
+  }
+  const tag = describeReleaseTag(mergeBase, gitFn);
+  const tagSha = gitFn(["rev-parse", `${tag}^{commit}`]);
+  const state = JSON.parse(gitFn(["show", `${ref}:${STATE_PATH_IN_REPO}`]));
   return {
-    state: remote,
-    baseline: { tag: remote.lastSyncedTag, sha: remote.lastSyncedSha, sourceRef: ref, sourceRefSha: sha },
+    state: { ...state, lastSyncedTag: tag, lastSyncedSha: tagSha },
+    baseline: { tag, sha: tagSha, mergeBase, sourceRef: ref, sourceRefSha: sha },
   };
 }
 
@@ -479,6 +498,7 @@ if (invokedDirectly) {
 
 export {
   loadBaseline,
+  describeReleaseTag,
   findOpenSyncPr,
   pickOpenSyncPr,
   remoteBranchExists,
