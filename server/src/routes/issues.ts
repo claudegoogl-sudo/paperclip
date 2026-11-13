@@ -14790,7 +14790,7 @@ export function issueRoutes(
         actorAgentId: actor.agentId ?? null,
         actorRunId: actor.agentId ? actor.runId : null,
         actorRunStopId: actor.agentId && interruptedRunId === actor.runId ? issueMutationStopId : null,
-        handoffCommit: handoffStop,
+        ...(handoffStop ? { handoffCommit: handoffStop } : {}),
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
       };
       const shouldCollectCompletionPublication =
