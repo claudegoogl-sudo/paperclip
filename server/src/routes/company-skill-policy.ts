@@ -7,6 +7,24 @@ import { accessService } from "../services/access.js";
 import { companySkillPolicyService, type SkillPolicyPrincipal } from "../services/company-skill-policy.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 
+/**
+ * Company-scoped routes for a company's skill-access policy document.
+ *
+ * - `GET .../skill-policy` returns the current policy to any caller with
+ *   company access.
+ * - `PUT .../skill-policy` replaces it with optimistic concurrency via
+ *   `expectedRevision`, and `DELETE .../skill-policy` resets it to default;
+ *   both require `users:manage_permissions` (or instance-admin/
+ *   local-implicit) via `assertCanAdministerPolicy`.
+ * - `POST .../skill-policy/evaluate` evaluates a hypothetical access
+ *   decision. Evaluating for the caller's own principal only requires
+ *   company access; evaluating on behalf of an explicit `principal` in the
+ *   body requires the same admin authority as replace/reset.
+ *
+ * All company-access checks additionally deny an agent actor whose
+ * `companyId` does not match the route's `:companyId`
+ * (`assertSkillPolicyCompanyAccess`).
+ */
 export function companySkillPolicyRoutes(db: Db) {
   const router = Router();
   const access = accessService(db);
