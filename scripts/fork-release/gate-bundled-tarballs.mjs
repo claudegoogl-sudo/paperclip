@@ -53,6 +53,12 @@ const PATCH_MARKERS = {
   "@chat-adapter/telegram": (readEntry) => {
     if (!readEntry("dist/index.js").includes("TELEGRAM_API_TIMEOUT_MS")) throw new Error("bundled @chat-adapter/telegram is missing the TELEGRAM_API_TIMEOUT_MS patch marker (pristine registry copy?)");
   },
+  "@agentclientprotocol/claude-agent-acp": (readEntry) => {
+    if (!readEntry("dist/acp-agent.js").includes("PAPERCLIP_ACPX_ISOLATED_CONTEXT")) throw new Error("bundled @agentclientprotocol/claude-agent-acp is missing the PAPERCLIP_ACPX_ISOLATED_CONTEXT patch marker (pristine registry copy?)");
+  },
+  "@agentclientprotocol/codex-acp": (readEntry) => {
+    if (!readEntry("dist/index.js").includes("paperclipBaseInstructions")) throw new Error("bundled @agentclientprotocol/codex-acp is missing the paperclipBaseInstructions patch marker (pristine registry copy?)");
+  },
   "@discordjs/ws": (readEntry) => {
     if (!readEntry("dist/defaultWorker.js").includes("connectionEpoch")) throw new Error("bundled @discordjs/ws is missing the connectionEpoch patch marker (pristine registry copy?)");
   },
