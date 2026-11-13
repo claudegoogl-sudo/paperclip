@@ -2,6 +2,7 @@ import { Command } from "commander";
 import {
   addCommonClientOptions,
   apiPath,
+  buildApiUrl,
   handleCommandError,
   printOutput,
   resolveCommandContext,
@@ -314,12 +315,6 @@ function addProjectRuntimeAction(parent: Command, name: string, description: str
         }
       }),
   );
-}
-
-function buildApiUrl(apiBase: string, path: string): string {
-  const url = new URL(apiBase);
-  url.pathname = `${url.pathname.replace(/\/+$/, "")}${path.startsWith("/") ? path : `/${path}`}`;
-  return url.toString();
 }
 
 function parseJson(value: string): unknown {
