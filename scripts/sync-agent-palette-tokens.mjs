@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import { fileURLToPath } from "node:url";
 const css = fs.readFileSync(new URL("../ui/src/index.css", import.meta.url), "utf8");
 const values = {};
 for (const [, name, channel, color] of css.matchAll(/--agent-cap-v1-([a-z-]+)-(a|b):\s*(#[0-9a-f]{6});/g)) {
