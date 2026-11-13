@@ -2,7 +2,7 @@ import type { RequestHandler } from "express";
 import { promisify } from "node:util";
 import { deflate, gzip } from "node:zlib";
 
-export const API_COMPRESSION_THRESHOLD_BYTES = 1024;
+const API_COMPRESSION_THRESHOLD_BYTES = 1024;
 
 const gzipAsync = promisify(gzip);
 const deflateAsync = promisify(deflate);
