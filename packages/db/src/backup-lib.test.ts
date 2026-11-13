@@ -76,6 +76,28 @@ describe("createBufferedTextFileWriter", () => {
   });
 });
 
+describe("createBufferedTextFileWriter gzip mode", () => {
+  it("streams straight into gzip: no plain file, counted size matches ISIZE", async () => {
+    const tempDir = createTempDir("paperclip-gz-writer-");
+    const outputPath = path.join(tempDir, "backup.sql.gz.partial");
+    const writer = createBufferedTextFileWriter(outputPath, 16, { gzip: true });
+    const lines = Array.from({ length: 2000 }, (_, i) => `INSERT INTO t VALUES (${i}, 'é');`);
+    let sawPlain = false;
+    for (const line of lines) {
+      writer.emit(line);
+      if (fs.readdirSync(tempDir).some((n) => n.endsWith(".sql"))) sawPlain = true;
+    }
+    await writer.writeRaw(Buffer.from("\n-- raw"));
+    await writer.close();
+    const expected = lines.join("\n") + "\n-- raw";
+    expect(sawPlain).toBe(false);
+    expect(fs.readdirSync(tempDir)).toEqual(["backup.sql.gz.partial"]);
+    expect(gunzipSync(fs.readFileSync(outputPath)).toString("utf8")).toBe(expected);
+    expect(writer.uncompressedBytes()).toBe(Buffer.byteLength(expected, "utf8"));
+    await verifyGzipUncompressedSize(outputPath, writer.uncompressedBytes());
+  });
+});
+
 describe("gzip archive verification read errors", () => {
   it("rejects verifyPgDumpArchive for a missing file instead of leaving the read error unhandled", async () => {
     const missing = path.join(os.tmpdir(), `paperclip-missing-${process.pid}-${Date.now()}.sql.gz`);

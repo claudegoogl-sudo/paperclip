@@ -721,8 +721,60 @@ async function* readRestoreStatements(backupFile: string): AsyncGenerator<string
   }
 }
 
-export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes = DEFAULT_BACKUP_WRITE_BUFFER_BYTES) {
-  const filePromise = openFile(filePath, "w");
+type BackupSink = {
+  write(chunk: string | Buffer, enc?: null, e2?: "utf8"): Promise<unknown>;
+  close(): Promise<void>;
+};
+
+function openGzipSink(filePath: string, counter: { bytes: number }): Promise<BackupSink> {
+  const gz = createGzip();
+  const out = createWriteStream(filePath);
+  const done = pipeline(gz, out);
+  done.catch(() => {});
+  return Promise.resolve({
+    async write(chunk) {
+      const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
+      counter.bytes += buf.length;
+      if (!gz.write(buf)) {
+        // Reject if the pipeline fails (e.g. ENOSPC): no drain follows a destroy.
+        await Promise.race([
+          new Promise<void>((res) => gz.once("drain", () => res())),
+          done.then(() => { throw new Error("gzip pipeline ended before drain"); }),
+        ]);
+      }
+    },
+    async close() {
+      gz.end();
+      await done;
+    },
+  });
+}
+
+/**
+ * With `gzip: true` the text is compressed while writing: no uncompressed file
+ * ever exists on disk. `uncompressedBytes()` reports the plain byte count.
+ */
+export function createBufferedTextFileWriter(
+  filePath: string,
+  maxBufferedBytes = DEFAULT_BACKUP_WRITE_BUFFER_BYTES,
+  options: { gzip?: boolean } = {},
+) {
+  const counter = { bytes: 0 };
+  // gzip mode opens lazily: the pg_dump path creates the writer but never
+  // writes, and must not touch the shared <name>.sql.gz.partial path.
+  let lazySink: Promise<BackupSink> | null = null;
+  const sinkPromise = (): Promise<BackupSink> => {
+    if (!lazySink) {
+      lazySink = options.gzip
+        ? openGzipSink(filePath, counter)
+        : (openFile(filePath, "w") as unknown as Promise<BackupSink>);
+    }
+    return lazySink;
+  };
+  const filePromise = {
+    then: (f: (s: BackupSink) => unknown, r?: (e: unknown) => unknown) => sinkPromise().then(f, r),
+    catch: (r: (e: unknown) => unknown) => sinkPromise().catch(r),
+  } as unknown as Promise<BackupSink>;
   const flushThreshold = Math.max(1, Math.trunc(maxBufferedBytes));
   let bufferedLines: string[] = [];
   let bufferedBytes = 0;
@@ -751,6 +803,7 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
   };
 
   return {
+    uncompressedBytes: () => counter.bytes,
     emit(line: string) {
       if (closed) {
         throw new Error(`Cannot write to closed backup file: ${filePath}`);
@@ -782,8 +835,7 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
       closed = true;
       flushBufferedLines();
       await pendingWrite;
-      const file = await filePromise;
-      await file.close();
+      if (lazySink || !options.gzip) await (await filePromise).close();
     },
     async abort() {
       if (closed) return;
@@ -791,8 +843,8 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
       bufferedLines = [];
       bufferedBytes = 0;
       await pendingWrite.catch(() => {});
-      await filePromise.then((file) => file.close()).catch(() => {});
-      if (existsSync(filePath)) {
+      if (lazySink || !options.gzip) await filePromise.then((file) => file.close()).catch(() => {});
+      if ((lazySink || !options.gzip) && existsSync(filePath)) {
         try {
           unlinkSync(filePath);
         } catch {
@@ -825,7 +877,9 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
   const checkpointSuffix = opts.verifyBeforePrune ? `-${randomUUID()}` : "";
   const sqlFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}${checkpointSuffix}.sql`);
   const backupFile = `${sqlFile}.gz`;
-  const writer = createBufferedTextFileWriter(sqlFile);
+  // Stream straight into <name>.sql.gz.partial: no uncompressed .sql on disk.
+  const partialFile = `${backupFile}.partial`;
+  const writer = createBufferedTextFileWriter(partialFile, undefined, { gzip: true });
 
   try {
     if (backupEngine === "pg_dump" || (backupEngine === "auto" && canUsePgDump)) {
@@ -1334,27 +1388,15 @@ effectiveBackupEngine = "javascript";
 
     await writer.close();
 
-    // Capture source size for verification
-    const sourceSize = statSync(sqlFile).size;
-
-    // Compress the SQL file with gzip to a .partial filename
-    const partialFile = `${backupFile}.partial`;
-    const sqlReadStream = createReadStream(sqlFile);
-    const gzWriteStream = createWriteStream(partialFile);
-    await pipeline(sqlReadStream, createGzip(), gzWriteStream);
+    const sourceSize = writer.uncompressedBytes();
 
     try {
-      // Verify uncompressed size matches source exactly
+      // Verify uncompressed size matches the counted bytes exactly
       await verifyGzipUncompressedSize(partialFile, sourceSize);
-
-      // Verification passed: delete raw SQL and atomically rename
-      unlinkSync(sqlFile);
       renameSync(partialFile, backupFile);
     } catch (verificationError) {
-      // Verification failed: keep raw SQL, delete partial, write marker, throw
       unlinkSync(partialFile);
-      const backupDir = opts.backupDir;
-      writeBackupFailureMarker(backupDir, String(verificationError), sqlFile);
+      writeBackupFailureMarker(opts.backupDir, String(verificationError), sqlFile);
       throw verificationError;
     }
 
@@ -1374,7 +1416,6 @@ effectiveBackupEngine = "javascript";
       try { unlinkSync(backupFile); } catch { /* ignore */ }
     }
     // Clean up any stray .partial file
-    const partialFile = `${backupFile}.partial`;
     if (existsSync(partialFile)) {
       try { unlinkSync(partialFile); } catch { /* ignore */ }
     }
