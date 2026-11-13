@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createDb } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -48,6 +48,14 @@ describeEmbeddedPostgres("environmentRuntimeService.readSandboxDuplexBridgeInput
     return async () => {
       await stopDb?.();
     };
+  });
+
+  beforeEach(async () => {
+    // Reset the kill switch before every test instead of relying on the
+    // order earlier tests in this file happened to run in: "defaults to the
+    // file bridge" only held because it ran before the tests that flip the
+    // switch on. Each test now starts from the same known baseline.
+    await settings.updateExperimental({ enableSandboxDuplexBridge: false });
   });
 
   it("defaults the per-run bridge input to the file bridge", async () => {
