@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   classifyMerge,
+  describeReleaseTag,
   loadBaseline,
   findOpenSyncPr,
   isUnrelatedHistoriesError,
@@ -228,17 +229,51 @@ test("pickOpenSyncPr matches open fold-round heads -rN (no-op) but not closed/un
   assert.equal(pickOpenSyncPr([openPr(`${BRANCH}-rx`), openPr(`${BRANCH}-r`), openPr(`${BRANCH}0-r1`)], BRANCH), null);
 });
 
-test("loadBaseline reads origin/master and reports tag+sha+ref", () => {
-  const remote = { lastSyncedTag: "v1", lastSyncedSha: "abc" };
-  const git = (a) => (a[0] === "show" ? JSON.stringify(remote) : a[0] === "rev-parse" ? "deadbeef" : "");
-  const r = loadBaseline(git, "/nonexistent/state.json");
-  assert.deepEqual(r.baseline, { tag: "v1", sha: "abc", sourceRef: "origin/master", sourceRefSha: "deadbeef" });
+function fakeGit({ mergeBase = "mb1", describe, state = { etag: "W/x", lastSyncedTag: "stale" } } = {}) {
+  return (a) => {
+    if (a[0] === "rev-parse") return a[1].endsWith("^{commit}") ? "tagsha" : "deadbeef";
+    if (a[0] === "merge-base") {
+      if (!mergeBase) throw new Error("no ancestor");
+      return mergeBase;
+    }
+    if (a[0] === "describe") {
+      if (describe instanceof Error) throw describe;
+      return describe;
+    }
+    if (a[0] === "show") return JSON.stringify(state);
+    return "";
+  };
+}
+
+test("loadBaseline: merge-base at a tag yields that tag, keeps etag, ignores stale state tag", () => {
+  const r = loadBaseline(fakeGit({ describe: "v2026.1106.0" }));
+  assert.equal(r.baseline.tag, "v2026.1106.0");
+  assert.equal(r.baseline.mergeBase, "mb1");
+  assert.equal(r.state.etag, "W/x");
+  assert.equal(r.state.lastSyncedTag, "v2026.1106.0");
 });
 
-test("loadBaseline refuses when the local file disagrees with origin/master", async () => {
-  const fs = await import("node:fs");
-  const f = "/tmp/us12284-local.json";
-  fs.writeFileSync(f, JSON.stringify({ lastSyncedTag: "old", lastSyncedSha: "x" }));
-  const git = (a) => (a[0] === "show" ? JSON.stringify({ lastSyncedTag: "v1", lastSyncedSha: "abc" }) : "h");
-  assert.throws(() => loadBaseline(git, f), /baseline mismatch/);
+test("loadBaseline: after a hand merge the cursor follows git (describe on merge-base)", () => {
+  const calls = [];
+  const g = fakeGit({ mergeBase: "handmerge", describe: "v2026.1106.0", state: { lastSyncedTag: "v2026.1023.0" } });
+  const r = loadBaseline((a) => (calls.push(a), g(a)));
+  assert.equal(r.baseline.tag, "v2026.1106.0");
+  const d = calls.find((a) => a[0] === "describe");
+  assert.equal(d.at(-1), "handmerge");
+  assert.ok(d.includes("--exclude") && d.includes("*-*"));
+});
+
+test("loadBaseline: no release tag found fails loudly", () => {
+  assert.throws(() => loadBaseline(fakeGit({ describe: new Error("fatal: No names found") })), /no upstream release tag/);
+  assert.throws(() => loadBaseline(fakeGit({ describe: "" })), /no upstream release tag/);
+});
+
+test("describeReleaseTag rejects fork and beta tag shapes", () => {
+  assert.throws(() => describeReleaseTag("c", () => "v2026.1112.1-fork.77"), /no upstream release tag/);
+  assert.throws(() => describeReleaseTag("c", () => "v2026.1112.0-beta.1"), /no upstream release tag/);
+  assert.equal(describeReleaseTag("c", () => "v2026.1106.0"), "v2026.1106.0");
+});
+
+test("loadBaseline: no merge-base fails loudly", () => {
+  assert.throws(() => loadBaseline(fakeGit({ mergeBase: "" })), /no merge-base/);
 });
