@@ -9,6 +9,9 @@ import {
   syncDirectoryToSsh,
 } from "./ssh.js";
 import {
+  asNumber,
+  asObject,
+  asString,
   mergeExcludes,
   referencedSourceIgnoreExcludeEntries,
   type SandboxAdditionalSource,
@@ -55,20 +58,6 @@ export interface PreparedRemoteManagedRuntime {
    */
   additionalSourceDirs: Record<string, string>;
   restoreWorkspace(onProgress?: RuntimeProgressSink): Promise<void>;
-}
-
-function asObject(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : {};
-}
-
-function asString(value: unknown): string {
-  return typeof value === "string" ? value : "";
-}
-
-function asNumber(value: unknown): number {
-  return typeof value === "number" ? value : Number(value);
 }
 
 function shellQuote(value: string): string {
