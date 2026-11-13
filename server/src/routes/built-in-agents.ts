@@ -69,6 +69,26 @@ function redactBuiltInAgentListState(state: BuiltInAgentState): BuiltInAgentStat
   };
 }
 
+/**
+ * Company-scoped routes for the built-in-agent feature, gated behind the
+ * `enableBuiltInAgents` experimental flag (every handler 404s via
+ * `assertBuiltInAgentsEnabled` while it is off).
+ *
+ * - `GET .../built-in-agents` and `.../:key/status` list/read agent state,
+ *   redacted of instructions/secrets/adapter+runtime config before
+ *   returning (`redactBuiltInAgentListState`).
+ * - `POST .../:key/reconcile` and `/provision` require `agents:create`
+ *   authority (`assertCanProvisionBuiltInAgents`); provisioning may return
+ *   202 with a pending `approval` instead of completing synchronously.
+ * - `POST .../:key/reset` also requires `agents:create` authority.
+ * - `POST .../:key/routines/:routineKey/enable|disable|run` require board
+ *   actor type plus `tasks:assign` authority (or instance-admin/
+ *   local-implicit) via `assertCanControlBuiltInRoutine`.
+ *
+ * Every mutation writes one or more `activity_log` rows through
+ * `logBuiltInAgentMutation` (including a separate `approval.created` row
+ * when provisioning creates an approval).
+ */
 export function builtInAgentRoutes(db: Db) {
   const router = Router();
   const access = accessService(db);
