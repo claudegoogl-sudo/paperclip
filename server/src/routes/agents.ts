@@ -340,6 +340,18 @@ function readRunLogLimitBytes(value: unknown) {
   return Math.max(1, Math.min(RUN_LOG_MAX_LIMIT_BYTES, Math.trunc(parsed)));
 }
 
+function parseNonNegativeIntQuery(value: unknown, name: string, fallback: number) {
+  if (value === undefined) return fallback;
+  if (typeof value !== "string" || !/^\d+$/.test(value)) {
+    throw badRequest(`${name} must be a non-negative integer`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    throw badRequest(`${name} must be a non-negative integer`);
+  }
+  return parsed;
+}
+
 function readLiveRunsQueryInt(value: unknown, max: number, fallback = 0) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
@@ -7694,9 +7706,9 @@ export function agentRoutes(
     if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
     if (!(await assertRunReadAllowed(req, res, run))) return;
 
-    const afterSeq = Number(req.query.afterSeq ?? 0);
-    const limit = Number(req.query.limit ?? 200);
-    const events = await heartbeat.listEvents(runId, Number.isFinite(afterSeq) ? afterSeq : 0, Number.isFinite(limit) ? limit : 200);
+    const afterSeq = parseNonNegativeIntQuery(req.query.afterSeq, "afterSeq", 0);
+    const limit = parseNonNegativeIntQuery(req.query.limit, "limit", 200);
+    const events = await heartbeat.listEvents(runId, afterSeq, limit);
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
     const redactedEvents = events.map((event) =>
       redactCurrentUserValue({
@@ -7714,12 +7726,9 @@ export function agentRoutes(
     if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
     if (!(await assertRunReadAllowed(req, res, run))) return;
 
-    const offset = Number(req.query.offset ?? 0);
+    const offset = parseNonNegativeIntQuery(req.query.offset, "offset", 0);
     const limitBytes = readRunLogLimitBytes(req.query.limitBytes);
-    const result = await heartbeat.readLog(run, {
-      offset: Number.isFinite(offset) ? offset : 0,
-      limitBytes,
-    });
+    const result = await heartbeat.readLog(run, { offset, limitBytes });
 
     res.set("Cache-Control", "no-cache, no-store");
     res.json(await runRedactions.redactForRun(run.companyId, run.id, result));
@@ -7752,12 +7761,9 @@ export function agentRoutes(
       return;
     }
 
-    const offset = Number(req.query.offset ?? 0);
+    const offset = parseNonNegativeIntQuery(req.query.offset, "offset", 0);
     const limitBytes = readRunLogLimitBytes(req.query.limitBytes);
-    const result = await workspaceOperations.readLog(operationId, {
-      offset: Number.isFinite(offset) ? offset : 0,
-      limitBytes,
-    });
+    const result = await workspaceOperations.readLog(operationId, { offset, limitBytes });
 
     res.set("Cache-Control", "no-cache, no-store");
     res.json(result);
