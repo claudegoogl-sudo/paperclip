@@ -16,7 +16,7 @@ import {
 } from "../../vendor/paperclip-runner/index.js";
 import { logger } from "../../middleware/logger.js";
 import { unprocessable } from "../../errors.js";
-import { logActivity } from "../activity-log.js";
+import { logActivity, projectInteractionForPluginEvent } from "../activity-log.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { questionResponseDeliveryService } from "../question-response-delivery.js";
 import type { NativeRunStoreBinding } from "./native-run-coordinator-store.js";
@@ -212,6 +212,7 @@ export async function projectNativeRuntimeRequest(input: {
       details: {
         interactionId: interaction.id,
         interactionKind: interaction.kind,
+        interaction: projectInteractionForPluginEvent(interaction),
         interactionStatus: interaction.status,
         runtimeMode: "native",
       },

@@ -17251,6 +17251,7 @@ export function issueRoutes(
         details: {
           interactionId: interaction.id,
           interactionKind: interaction.kind,
+          interaction: projectInteractionForPluginEvent(interaction),
           interactionStatus: interaction.status,
           continuationPolicy: interaction.continuationPolicy,
           addresseeAgentId: interaction.addresseeAgentId ?? null,

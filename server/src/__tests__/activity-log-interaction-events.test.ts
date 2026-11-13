@@ -327,6 +327,18 @@ describe("activity-log plugin event bridge — issue.interaction.*", () => {
       expect(projected?.questions[0].options[0].description?.length).toBe(200);
     });
 
+    it("clips a long prompt at a word boundary with an ellipsis", () => {
+      const prompt = Array.from({ length: 120 }, () => "wording").join(" ");
+      const projected = projectInteractionForPluginEvent({
+        id: "int-5",
+        kind: "request_confirmation",
+        payload: { version: 1, prompt },
+      });
+      const out = projected!.questions[0].prompt;
+      expect(out.length).toBeLessThanOrEqual(500);
+      expect(out.endsWith("wording…")).toBe(true);
+    });
+
     it("returns null for a missing or malformed interaction", () => {
       expect(projectInteractionForPluginEvent(null)).toBeNull();
       expect(projectInteractionForPluginEvent(undefined)).toBeNull();
