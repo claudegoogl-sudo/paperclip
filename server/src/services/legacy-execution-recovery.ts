@@ -79,6 +79,35 @@ export function legacyExecutionNeedsReconciliation(
   return true;
 }
 
+export const HANDOFF_PENDING_GRACE_MS = 5 * 60_000;
+
+/**
+ * A run the server stopped for its own handoff (PLA-12409) carries
+ * resultJson.handoffPending {runId, stopId, toAgentId, at}. No hold is minted
+ * while the handoff is committed (handoffCommitted, written in the same
+ * transaction as the assignment) or still inside the grace window. After the
+ * grace without a commit marker (failed update, crash) the normal hold applies.
+ */
+export function handoffSuppressesHold(
+  run: Pick<Run, "id" | "resultJson">, now: Date = new Date(),
+): boolean {
+  const rj = run.resultJson as Record<string, unknown> | null | undefined;
+  const p = rj?.handoffPending as Record<string, unknown> | undefined;
+  if (!p || p.runId !== run.id || typeof p.stopId !== "string" || typeof p.toAgentId !== "string" ||
+      p.stopId !== rj?.issueMutationStopId || typeof p.at !== "string") return false;
+  if (hasRequiredWorkspaceRecovery(rj) || hasWorkspaceRestoreFailure(rj)) return false;
+  const c = rj?.handoffCommitted as Record<string, unknown> | undefined;
+  if (c && c.runId === run.id && c.stopId === p.stopId && c.toAgentId === p.toAgentId) return true;
+  const at = Date.parse(p.at);
+  return Number.isFinite(at) && now.getTime() - at < HANDOFF_PENDING_GRACE_MS;
+}
+
+/** The handoff update failed: drop the pending marker and mint the normal hold. */
+export async function releaseFailedHandoffHold(db: Db, run: Run) {
+  return terminalizeLegacyExecution({ db, run, status: "cancelled", fromStatuses: ["cancelled"],
+    reconcileIfNeeded: true, dropHandoffPending: true });
+}
+
 /** Admission-wait receipts are only exempt after retained execution evidence agrees.
  * The synchronous classifier stays conservative for callers without a DB proof. */
 export async function legacyExecutionNeedsReconciliationWithEvidence(db: Db, run: Run): Promise<boolean> {
@@ -105,6 +134,8 @@ export async function terminalizeLegacyExecution(input: {
   /** Adapter settlement records a copy-back failure before host finalization. */
   recordRestoreFailureOnly?: boolean;
   workspaceRestoreSource?: LegacyWorkspaceRestoreSource;
+  /** Drop resultJson.handoffPending from the LOCKED run row (PLA-12409). */
+  dropHandoffPending?: boolean;
 }) {
   const { db, run, status } = input;
   let patch = input.patch;
@@ -131,6 +162,16 @@ export async function terminalizeLegacyExecution(input: {
     )).for("update");
     if (!current || (current.runtimeMode !== "legacy" && !(input.recordRestoreFailureOnly && current.runtimeMode === "native")) ||
         (!input.recordRestoreFailureOnly && !(input.fromStatuses ?? [run.status]).includes(current.status))) return null;
+    // Recheck under the run lock: a concurrent request may have committed the handoff.
+    if (input.dropHandoffPending && (current.resultJson as Record<string, unknown> | null)?.handoffCommitted) return current;
+    if (input.dropHandoffPending) {
+      const { handoffPending: _p, ...locked } = (current.resultJson ?? {}) as Record<string, unknown>;
+      patch = { ...patch, resultJson: locked };
+    }
+    // A late finalization snapshot must not erase the same-transaction commit marker.
+    const committedMarker = (current.resultJson as Record<string, unknown> | null)?.handoffCommitted;
+    if (committedMarker && patch?.resultJson !== undefined && !(patch.resultJson as Record<string, unknown>).handoffCommitted)
+      patch = { ...patch, resultJson: { ...(patch.resultJson ?? {}), handoffCommitted: committedMarker } };
     if (patch?.resultJson !== undefined) patch = { ...patch,
       resultJson: preserveWorkspaceRestoreRecoveryMetadata(current.resultJson,
         input.recordRestoreFailureOnly ? { ...current.resultJson, ...patch.resultJson } : patch.resultJson),
@@ -221,6 +262,7 @@ export async function terminalizeLegacyExecution(input: {
       review.currentParticipant?.type === "agent" && review.currentParticipant.agentId === run.agentId;
     if (
       task &&
+      !(retainedLeaseIds.length === 0 && handoffSuppressesHold(updated)) &&
       !isSupersededConversationRun(task, updated) &&
       (task.assigneeAgentId === run.agentId || isCurrentReviewer) &&
       (!["done", "cancelled"].includes(task.status) || retainedLeaseIds.length > 0)
