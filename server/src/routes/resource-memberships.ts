@@ -53,6 +53,25 @@ async function logMembershipChange(
   });
 }
 
+/**
+ * Per-board-user "my resource memberships" routes: a signed-in board user's
+ * join/leave and star state for projects, agents, and documents in a
+ * company. Every route requires a signed-in board user
+ * (`requireBoardUserId`); company access is not separately asserted here —
+ * membership state is scoped by the caller's own `userId` and `req.actor`.
+ *
+ * - `GET .../resource-memberships/me` lists the caller's memberships
+ *   across all three resource types for the company.
+ * - `PUT .../resource-memberships/me/projects/:projectId`,
+ *   `.../agents/:agentId`, and `.../documents/:documentId` each
+ *   update the caller's `state` (join/leave; documents only support
+ *   starring) and/or `starred` flag for that resource.
+ *
+ * A write only logs an `activity_log` row (`resource_membership.joined` /
+ * `.left` / `.starred` / `.unstarred`) when the underlying service reports
+ * an actual change (`result.changed`); a no-op write (e.g. re-joining an
+ * already-joined resource) does not log.
+ */
 export function resourceMembershipRoutes(db: Db) {
   const router = Router();
   const svc = resourceMembershipService(db);

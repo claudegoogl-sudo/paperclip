@@ -135,7 +135,8 @@
               "api/costs",
               "api/secrets",
               "api/activity",
-              "api/dashboard"
+              "api/dashboard",
+              "api/resource-memberships"
             ]
           }
         ]
