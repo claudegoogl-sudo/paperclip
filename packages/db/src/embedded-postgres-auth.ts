@@ -32,7 +32,7 @@ const CREDENTIAL_FILE_SUFFIX = ".pg-credential";
 // Name prefix for the per-install socket directory. The full name is
 // `<prefix><hash-of-dataDir>` (see socketDirectoryPathFor) — a fixed short
 // length that does NOT grow with the data-dir depth.
-export const SOCKET_DIRECTORY_NAME_PREFIX = "paperclip-pg-";
+const SOCKET_DIRECTORY_NAME_PREFIX = "paperclip-pg-";
 // Directory mode: only the data-dir owner may traverse or connect. The socket
 // file inside is also tightened via `unix_socket_permissions=0700` so the
 // cluster cannot accidentally inherit the libpq default `0777`.
