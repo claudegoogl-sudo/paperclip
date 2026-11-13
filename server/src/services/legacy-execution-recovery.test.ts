@@ -1,6 +1,7 @@
 import { isPreDispatchReviewWait } from "./pre-dispatch-review-wait.js";
 import { expect, it } from "vitest";
 import { legacyExecutionNeedsReconciliation } from "./legacy-execution-recovery.js";
+import { isConversationAdapter, CONVERSATION_CONTINUATION_POLICY } from "./conversation-continuation.js";
 
 const stopped = {
   runtimeMode: "legacy", status: "cancelled", errorCode: "cancelled",
@@ -111,4 +112,15 @@ it("recognizes only an unclaimed pre-dispatch review wait receipt", () => {
     { resultJson: { ...run.resultJson, stopReason: "cancelled" } },
     { resultJson: { ...run.resultJson, workspaceRestoreFailure: "restore_unsafe_archive" } },
   ]) expect(isPreDispatchReviewWait({ ...run, ...patch })).toBe(false);
+});
+
+it("treats prime_local as a conversation adapter, so a cancelled run opens no legacy hold", () => {
+  expect(isConversationAdapter("prime_local")).toBe(true);
+  expect(isConversationAdapter("process")).toBe(false);
+  expect(isConversationAdapter("http")).toBe(false);
+  for (const status of ["failed", "timed_out", "interrupted", "cancelled"]) {
+    const run = { runtimeMode: "legacy", status, errorCode: "cancelled", startedAt: new Date(), resultJson: {} };
+    expect(legacyExecutionNeedsReconciliation(run)).toBe(true); // no policy: held
+    expect(legacyExecutionNeedsReconciliation({ ...run, resultJson: { conversationContinuation: CONVERSATION_CONTINUATION_POLICY } })).toBe(false);
+  }
 });
