@@ -339,6 +339,17 @@ describe("activity-log plugin event bridge — issue.interaction.*", () => {
       expect(out.endsWith("wording…")).toBe(true);
     });
 
+    it("does not split a surrogate pair when clipping", () => {
+      const projected = projectInteractionForPluginEvent({
+        id: "int-6",
+        kind: "request_confirmation",
+        payload: { version: 1, prompt: "😀".repeat(250) + "x" },
+      });
+      const out = projected!.questions[0].prompt;
+      expect(out.endsWith("…")).toBe(true);
+      expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(out)).toBe(false);
+    });
+
     it("returns null for a missing or malformed interaction", () => {
       expect(projectInteractionForPluginEvent(null)).toBeNull();
       expect(projectInteractionForPluginEvent(undefined)).toBeNull();

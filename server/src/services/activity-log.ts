@@ -110,7 +110,9 @@ function clip(value: unknown, max: number): string {
   const s = typeof value === "string" ? value : String(value ?? "");
   if (s.length <= max) return s;
   // Cut at a word boundary (when one exists in the last 40%) and mark the cut.
-  const cut = s.slice(0, max - 1);
+  let cut = s.slice(0, max - 1);
+  // Never leave an unpaired high surrogate at the cut (jsonb rejects it).
+  if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
   const space = cut.search(/\s\S*$/);
   const base = space > max * 0.6 ? cut.slice(0, space) : cut;
   return `${base.trimEnd()}…`;
