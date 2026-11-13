@@ -3899,6 +3899,23 @@ export async function startWikiQuerySession(ctx: PluginContext, input: QuerySess
     question,
   });
 
+  // The terminal event runs outside any awaited call chain, so a rejected host call
+  // here would be an unhandled rejection. Log it instead.
+  const settleTerminalStep = (step: string, run: () => Promise<unknown>) => {
+    const warn = (error: unknown) => {
+      ctx.logger.warn("LLM Wiki query terminal step failed", {
+        step,
+        operationId: operation.operationId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    };
+    try {
+      void run().catch(warn);
+    } catch (error) {
+      warn(error);
+    }
+  };
+
   let answer = "";
   const sendResult = await ctx.agents.sessions.sendMessage(session.sessionId, input.companyId, {
     prompt,
@@ -3931,33 +3948,33 @@ export async function startWikiQuerySession(ctx: PluginContext, input: QuerySess
           message: event.message,
         });
         ctx.streams.close(channel);
-        void markOperation(ctx, {
+        settleTerminalStep("mark operation", () => markOperation(ctx, {
           companyId: input.companyId,
           operationId: operation.operationId,
           status: finalStatus,
           runId: event.runId,
           warning: event.eventType === "error" ? event.message : null,
           metadata: { answerLength: answer.length },
-        });
-        void ctx.db.execute(
+        }));
+        settleTerminalStep("update query session", () => ctx.db.execute(
           `UPDATE ${tableName(ctx.db.namespace, "wiki_query_sessions")}
               SET status = $3,
                   updated_at = now()
             WHERE company_id = $1 AND id = $2`,
           [input.companyId, operation.operationId, finalStatus === "done" ? "completed" : "failed"],
-        );
-        void ctx.issues.createComment(
+        ));
+        settleTerminalStep("comment on issue", () => ctx.issues.createComment(
           operation.issue.id,
           event.eventType === "done"
             ? `Query completed.\n\n${answer.trim() || "_No answer text was streamed._"}`
             : `Query failed: ${event.message ?? "agent session ended with an error"}`,
           input.companyId,
-        );
-        void ctx.issues.update(
+        ));
+        settleTerminalStep("update issue", () => ctx.issues.update(
           operation.issue.id,
           { status: event.eventType === "done" ? "done" : "blocked", originRunId: event.runId },
           input.companyId,
-        );
+        ));
       }
     },
   });
