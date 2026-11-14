@@ -200,6 +200,7 @@ const mockObserveCrossIssueInfluence = vi.hoisted(() => vi.fn(async () => null))
 
   vi.mock("../services/activity-log.js", () => ({
     logActivity: mockLogActivity,
+    projectInteractionForPluginEvent: () => null,
   }));
 
   vi.mock("../services/cross-issue-influence-limit.js", () => ({
@@ -219,6 +220,7 @@ const mockObserveCrossIssueInfluence = vi.hoisted(() => vi.fn(async () => null))
     agentService: () => mockAgentService,
     budgetService: () => mockBudgetService,
     clampIssueListLimit: (value: number) => Math.min(Math.max(value, 1), 500),
+    projectInteractionForPluginEvent: () => null,
     companySkillService: () => ({
   completeTestRunForIssue: vi.fn(async () => null),
     }),

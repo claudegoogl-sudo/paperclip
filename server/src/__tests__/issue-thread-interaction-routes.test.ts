@@ -657,6 +657,7 @@ describe("issue thread interaction routes", () => {
         details: expect.objectContaining({
           interactionId: "interaction-1",
           interactionKind: "suggest_tasks",
+          interaction: expect.objectContaining({ id: "interaction-1", kind: "suggest_tasks" }),
         }),
       }),
     );
