@@ -4193,7 +4193,9 @@ export function recoveryService(
     }, "legacy disposition repair suppressed at dispatch");
     if (!benign || !issue) return benign ? "benign" : "other";
     const active = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
-    if (active && active.kind === "deliberate_wait_without_target") {
+    const runActionId = readNonEmptyString(context.recoveryActionId);
+    // Bind to the suppressed run's own action: never cancel a replacement action.
+    if (active && runActionId && active.id === runActionId && active.kind === "deliberate_wait_without_target") {
       await recoveryActionsSvc.resolveActiveForIssue({
         companyId: issue.companyId, sourceIssueId: issue.id, actionId: active.id,
         status: "cancelled", outcome: "cancelled", resolutionNote: `repair_suppressed_benign:${reason}`,

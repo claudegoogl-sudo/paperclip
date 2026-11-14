@@ -233,6 +233,15 @@ describe("legacy continuation persisted authority", () => {
     expect(await f.createRecovery().settleSuppressedLegacyRepair(repair.id, reason)).toBe("benign");
     expect((await f.actions()).filter(a => a.status === "active")).toHaveLength(0);
   });
+  it("does not cancel a replacement action that is not the suppressed run's action", async () => {
+    const f = await fixture();
+    await f.createRecovery().reconcileLegacyContinuation(f.runId);
+    const repair = (await f.runs()).find(r => r.id !== f.runId)!;
+    await db.update(issues).set({ status: "backlog" }).where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ contextSnapshot: { ...repair.contextSnapshot, recoveryActionId: "00000000-0000-0000-0000-000000000000" } }).where(eq(heartbeatRuns.id, repair.id));
+    expect(await f.createRecovery().settleSuppressedLegacyRepair(repair.id, "recorded_disposition")).toBe("benign");
+    expect((await f.actions()).filter(a => a.status === "active")).toHaveLength(1);
+  });
   it("does not settle a non-benign suppression (durable_wait keeps its action)", async () => {
     const f = await fixture();
     await f.createRecovery().reconcileLegacyContinuation(f.runId);
