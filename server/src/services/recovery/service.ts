@@ -4165,6 +4165,45 @@ export function recoveryService(
     return decision.kind === "enqueue" ? null : decision.kind === "skip" ? decision.reason : "repair_exhausted";
   }
 
+  // Reasons that mean the issue state moved on after the repair was armed
+  // (status no longer todo/in_progress, or a new owner). The agent or operator
+  // already acted, so the suppressed repair is benign and must not hold the issue.
+  const BENIGN_LEGACY_REPAIR_SUPPRESSIONS = new Set(["recorded_disposition", "owner_changed"]);
+
+  /**
+   * Called when dispatch cancels a repair run as suppressed. Always logs the
+   * issue state the dispatcher saw; for benign reasons closes the active repair
+   * action as cancelled so no recovery hold is created.
+   */
+  async function settleSuppressedLegacyRepair(runId: string, reason: string): Promise<"benign" | "other"> {
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).limit(1);
+    const context = parseObject(run?.contextSnapshot);
+    const issueId = readNonEmptyString(context.issueId);
+    const [issue] = run && issueId
+      ? await db.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId))).limit(1)
+      : [];
+    const benign = BENIGN_LEGACY_REPAIR_SUPPRESSIONS.has(reason);
+    logger.info({
+      runId, issueId: issueId ?? null, reason, benign,
+      issueStatus: issue?.status ?? null,
+      issueAssigneeAgentId: issue?.assigneeAgentId ?? null,
+      issueStatusVersion: issue?.statusVersion ?? null,
+      runAgentId: run?.agentId ?? null,
+      sourceFingerprint: readNonEmptyString(context.dispositionRepairFingerprint) ?? null,
+    }, "legacy disposition repair suppressed at dispatch");
+    if (!benign || !issue) return benign ? "benign" : "other";
+    const active = await recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id);
+    const runActionId = readNonEmptyString(context.recoveryActionId);
+    // Bind to the suppressed run's own action: never cancel a replacement action.
+    if (active && runActionId && active.id === runActionId && active.kind === "deliberate_wait_without_target") {
+      await recoveryActionsSvc.resolveActiveForIssue({
+        companyId: issue.companyId, sourceIssueId: issue.id, actionId: active.id,
+        status: "cancelled", outcome: "cancelled", resolutionNote: `repair_suppressed_benign:${reason}`,
+      });
+    }
+    return "benign";
+  }
+
   async function reconcileLegacyContinuation(runId: string) {
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).limit(1);
     if (!run || run.runtimeMode === "native" || run.status !== "succeeded") return "skipped" as const;
@@ -7142,6 +7181,7 @@ export function recoveryService(
     hasActiveExecutionPath,
     reconcileLegacyContinuation,
     legacyRepairDispatchBlock,
+    settleSuppressedLegacyRepair,
     sweepStaleIssueLocks,
     reconcileResolvedDependencyWakeBackstop,
     readRecoveryTimerIntervalMs,

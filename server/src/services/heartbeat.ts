@@ -2906,6 +2906,7 @@ export function heartbeatService(
             error: `Disposition repair suppressed: ${repairBlock}`,
           });
           if (cancelled.updated) {
+            await recovery.settleSuppressedLegacyRepair(run.id, repairBlock);
             await setWakeupStatus(run.wakeupRequestId, "skipped", { finishedAt: new Date(), error: repairBlock });
             await releaseIssueExecutionAndPromote(cancelled.run!, { suppressImmediateRecovery: true });
             await finalizeAgentStatus(run.agentId, "cancelled");
