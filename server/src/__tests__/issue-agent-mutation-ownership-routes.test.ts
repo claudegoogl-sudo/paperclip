@@ -2833,6 +2833,29 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
+  it.each([["blocked", 200], ["in_review", 409]])("safe hand-back with a pending review stage on a %s issue -> %s", async (status, expected) => {
+    const src = makeIssue({ status, assigneeAgentId: ownerAgentId, executionState: { status: "pending", currentStageId: "s1", currentStageType: "review", currentParticipant: { type: "agent", agentId: ownerAgentId, userId: null }, returnAssignee: null, completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null, changesRequestedCount: 0 } });
+    mockIssueService.getById.mockResolvedValue(src);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({ ...src, ...patch }));
+    mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+      id: recoveryActionId,
+      ownerAgentId: peerAgentId,
+      returnOwnerAgentId: ownerAgentId,
+    });
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/recovery-actions/resolve`)
+      .send({ actionId: recoveryActionId, outcome: "restored", sourceIssueStatus: "todo" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(expected);
+    if (expected === 200) {
+      expect(mockIssueService.update).toHaveBeenCalledWith(issueId, expect.objectContaining({ status: "todo", executionState: null }), expect.anything(), expect.anything());
+    } else {
+      expect(res.body.details?.code).toBe("recovery_governed_stage_pending");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    }
+  });
+
   it("uses the authorization decision path for assignment changes", async () => {
     const decide = vi.fn(async () => ({
       allowed: false,

@@ -7267,6 +7267,7 @@ export function issueRoutes(
       id: string;
       companyId: string;
       projectId: string | null;
+      status?: string;
       assigneeAgentId: string | null;
       checkoutRunId?: string | null;
       executionRunId?: string | null;
@@ -7311,7 +7312,12 @@ export function issueRoutes(
         },
       );
     }
+    // A pending stage only gates hand-back while the review is live
+    // (in_review). A stage left behind on a blocked/other-status issue (e.g.
+    // reviewer run cancelled on reassignment) is stale and is cleared by the
+    // hand-back itself.
     if (
+      input.issue.status === "in_review" &&
       parseIssueExecutionState(input.issue.executionState)?.status === "pending"
     ) {
       throw conflict(
@@ -10196,6 +10202,9 @@ export function issueRoutes(
             status: sourceIssueStatus,
             ...(repairedWorkspaceSettings ? { executionWorkspaceSettings: repairedWorkspaceSettings } : {}),
           };
+          if (safeHandBack && parseIssueExecutionState(lockedIssue.executionState)?.status === "pending") {
+            updateFields.executionState = null;
+          }
           if (!safeHandBack) {
             await assertInReviewReviewPath({
               existing: lockedIssue,
