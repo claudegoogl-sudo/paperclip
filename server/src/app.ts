@@ -60,9 +60,9 @@ import {
 } from "@paperclipai/shared";
 import type { InspectDatabaseBackupHealthOptions } from "./services/database-backup-health.js";
 import type { StorageService } from "./storage/types.js";
-import { httpLogger, errorHandler } from "./middleware/index.js";
+import { httpLogger, errorHandler, requestQueryCancellation } from "./middleware/index.js";
+import { actorMiddleware, registerActorContext } from "./middleware/auth.js";
 import { skillAccessRequestContext } from "./services/skill-access.js";
-import { actorMiddleware } from "./middleware/auth.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
 import {
   privateHostnameGuard,
@@ -769,6 +769,30 @@ export async function createApp(
   // REPLACES whatever actor the request otherwise resolved to, and only on
   // the one endpoint it authorizes (see the middleware for the contract).
   app.use(cloudControlMiddleware());
+  // The dedicated proxy IP or CIDR allowlist for requests that arrive through
+  // a TLS-terminating proxy. The global `TRUST_PROXY` setting never satisfies
+  // anything that reads this list; an operator sets it to the real
+  // TLS-terminating proxy addresses. An empty value keeps the confidential
+  // setup-token login responses on direct TLS (or a `local_trusted` loopback
+  // peer) only, and keeps board-key auth-event rows pinned to the immediate
+  // socket peer. Declared here, before both consumers (the actor middleware
+  // and the setup-token login transport).
+  const setupTokenLoginProxyAllowlist = (process.env.CLAUDE_LOGIN_TRUSTED_PROXIES ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  // Resolve the acting credential (req.actor) and bind its provenance into
+  // AsyncLocalStorage so logActivity records it centrally. The provenance
+  // regression test drives the same registerActorContext, so removing the
+  // provenance registration turns that test red instead of silently logging NULL.
+  registerActorContext(app, db, {
+    deploymentMode: opts.deploymentMode,
+    resolveSession: opts.resolveSession,
+    // Same dedicated operator allowlist the confidential-transport guard uses
+    // (SR-7); the board-key auth-event log reads it only to derive
+    // source_ip. Never derived from the global TRUST_PROXY setting.
+    authEventTrustedProxies: setupTokenLoginProxyAllowlist,
+  });
   app.use(skillAccessRequestContext);
   app.use("/api/auth", authRoutes(db));
   if (opts.betterAuthHandler) {
@@ -1241,7 +1265,7 @@ export async function createApp(
       return plugin?.status === "ready" ? plugin.packagePath ?? null : null;
     },
     undefined,
-    { restartWorker: (pluginId) => devWatcherRestartLifecycle.restartWorker(pluginId) },
+    { restartWorker: (pluginId) => devWatcherRestartLifecycle.restartWorker(pluginId), unwatchedRoots: [bundledCatalogRoot] },
   ) : null;
   api.use(
     pluginRoutes(
@@ -1257,6 +1281,7 @@ export async function createApp(
   );
   api.use(
     adapterRoutes({
+      db,
       resolveRunnerTarget: (companyId, environmentId) => resolveAgentRunnerTargetForCompany(db, companyId, environmentId),
       getNativeRunnerEnabled: async () =>
         (await instanceSettingsService(db).getExperimental())
@@ -1588,13 +1613,6 @@ export async function createApp(
   void toolDispatcher.initialize().catch((err) => {
     logger.error({ err }, "Failed to initialize plugin tool dispatcher");
   });
-  const devWatcher = createPluginDevWatcher(
-    lifecycle,
-    async (pluginId) =>
-      (await pluginRegistry.getById(pluginId))?.packagePath ?? null,
-    undefined,
-    { unwatchedRoots: [bundledCatalogRoot] },
-  );
   // Auto-provision bundled plugins so their providers are registered for
   // agent runs. Bundles are excluded from the pnpm
   // workspace and built standalone into the image (see Dockerfile), then
@@ -1702,6 +1720,7 @@ export async function createApp(
       viteHmrServer?.close();
       hostServiceCleanup.disposeAll();
       hostServiceCleanup.teardown();
+      pluginRunContextRegistry.dispose();
       await stopMuseMaintenance();
       await emailChannels.shutdown();
       await chatChannels.shutdown();

@@ -12,8 +12,6 @@ import {
   agents,
   authAccounts,
   authUsers,
-  buildEmbeddedPostgresConnectionString,
-  buildEmbeddedPostgresConstructorOptions,
   companies,
   companyMemberships,
   createDb,
@@ -27,11 +25,13 @@ import {
   instanceUserRoles,
   projects,
   routines,
-  socketDirectoryPathFor,
-  resolveEmbeddedPostgresPasswordForStartup,
-  readEmbeddedPostgresCredential,
   routineTriggers,
   workspaceRuntimeServices,
+  buildEmbeddedPostgresConnectionString,
+  buildEmbeddedPostgresConstructorOptions,
+  readEmbeddedPostgresCredential,
+  resolveEmbeddedPostgresPasswordForStartup,
+  socketDirectoryPathFor,
 } from "@paperclipai/db";
 import {
   copyGitHooksToWorktreeGitDir,
@@ -316,6 +316,18 @@ function initializeTestRepo(repoRoot: string): void {
   fs.writeFileSync(path.join(repoRoot, "README.md"), "# temp\n", "utf8");
   execFileSync("git", ["add", "README.md"], { cwd: repoRoot, stdio: "ignore" });
   execFileSync("git", ["commit", "-m", "Initial commit"], { cwd: repoRoot, stdio: "ignore" });
+}
+
+// The fork's target clusters run socket-only with a per-install credential file;
+// resolve the real password and connect over the unix socket (not the legacy literal).
+function targetPgFixture(dataDir: string, port: number, onLog: (m: unknown) => void) {
+  const cred = readEmbeddedPostgresCredential(dataDir);
+  const password = cred?.password ?? resolveEmbeddedPostgresPasswordForStartup(dataDir).password;
+  const options = buildEmbeddedPostgresConstructorOptions({ dataDir, port, password, onLog, onError: onLog });
+  const url = buildEmbeddedPostgresConnectionString({
+    port, database: "paperclip", password, socketDir: socketDirectoryPathFor(dataDir),
+  });
+  return { options, url };
 }
 
 describe("worktree helpers", () => {

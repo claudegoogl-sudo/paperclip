@@ -80,6 +80,18 @@ export interface Config {
   databaseBackupIntervalMinutes: number;
   databaseBackupRetentionDays: number;
   databaseBackupDir: string;
+  runHistoryRetentionEnabled: boolean;
+  runHistoryRetentionDays: number;
+  runHistoryRetentionIntervalMinutes: number;
+  pluginWebhookDeliveryRetentionEnabled: boolean;
+  pluginWebhookDeliverySuccessRetentionDays: number;
+  pluginWebhookDeliveryFailedRetentionDays: number;
+  pluginWebhookDeliveryMaxRows: number;
+  pluginWebhookDeliveryRetentionIntervalMinutes: number;
+  boardApiKeyAuthEventRetentionEnabled: boolean;
+  boardApiKeyAuthEventRetentionDays: number;
+  boardApiKeyAuthEventMaxRows: number;
+  boardApiKeyAuthEventRetentionIntervalMinutes: number;
   gitCacheExpirationEnabled: boolean;
   gitBaseExpirationEnabled: boolean;
   gitCacheExpirationDryRun: boolean;
@@ -384,6 +396,26 @@ export function loadConfig(): Config {
   const gitRestorePointRetentionDays = Math.max(1, nonNegativeIntegerEnv("PAPERCLIP_GIT_RESTORE_POINT_RETENTION_DAYS", 90));
   const gitRestorePointTerminalDelayDays = nonNegativeIntegerEnv("PAPERCLIP_GIT_RESTORE_POINT_TERMINAL_DELAY_DAYS", 3);
   const gitRestorePointIdleDays = nonNegativeIntegerEnv("PAPERCLIP_GIT_RESTORE_POINT_IDLE_DAYS", 7);
+  const boardApiKeyAuthEventRetentionEnabled =
+    process.env.PAPERCLIP_BOARD_KEY_AUTH_EVENT_RETENTION_ENABLED !== "false";
+  // Auth events: 90 days. A quarter's look-back outlives the audit cycle that
+  // motivated the log (the credential-abuse investigation that drove it needed
+  // ~3 months of history) without letting the table drift toward activity_log's
+  // scale.
+  const boardApiKeyAuthEventRetentionDays = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_BOARD_KEY_AUTH_EVENT_RETENTION_DAYS) || 90,
+  );
+  // Load-bearing size bound: one row per source-minute under a sustained
+  // distributed attempt still has to stop somewhere. 500k rows is tens of MB.
+  const boardApiKeyAuthEventMaxRows = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_BOARD_KEY_AUTH_EVENT_MAX_ROWS) || 500_000,
+  );
+  const boardApiKeyAuthEventRetentionIntervalMinutes = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_BOARD_KEY_AUTH_EVENT_RETENTION_INTERVAL_MINUTES) || 60,
+  );
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -442,6 +474,18 @@ export function loadConfig(): Config {
     databaseBackupIntervalMinutes,
     databaseBackupRetentionDays,
     databaseBackupDir,
+    runHistoryRetentionEnabled,
+    runHistoryRetentionDays,
+    runHistoryRetentionIntervalMinutes,
+    pluginWebhookDeliveryRetentionEnabled,
+    pluginWebhookDeliverySuccessRetentionDays,
+    pluginWebhookDeliveryFailedRetentionDays,
+    pluginWebhookDeliveryMaxRows,
+    pluginWebhookDeliveryRetentionIntervalMinutes,
+    boardApiKeyAuthEventRetentionEnabled,
+    boardApiKeyAuthEventRetentionDays,
+    boardApiKeyAuthEventMaxRows,
+    boardApiKeyAuthEventRetentionIntervalMinutes,
     gitCacheExpirationEnabled: process.env.PAPERCLIP_GIT_CACHE_EXPIRATION_ENABLED === "true",
     gitBaseExpirationEnabled: process.env.PAPERCLIP_GIT_BASE_EXPIRATION_ENABLED === "true",
     gitCacheExpirationDryRun: process.env.PAPERCLIP_GIT_CACHE_EXPIRATION_DRY_RUN !== "false",

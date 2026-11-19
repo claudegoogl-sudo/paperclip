@@ -1,5 +1,5 @@
 import { createHash, timingSafeEqual } from "node:crypto";
-import type { Request, RequestHandler } from "express";
+import type { Application, Request, RequestHandler } from "express";
 import { and, eq, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -24,7 +24,13 @@ import {
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
 import { agentRunWritesRevoked } from "../agent-run-cancellation.js";
 import { loadAgentRunAuthentication } from "./agent-run-authentication.js";
-import { isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
+import {
+  isAgentApiKeyExpired,
+  isUuidLike,
+  normalizeAgentApiKeyScope,
+  normalizeBoardApiKeyScope,
+  type DeploymentMode,
+} from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { actorProvenanceMiddleware } from "./actor-context.js";
 import { logger } from "./logger.js";
@@ -168,6 +174,10 @@ async function auditAgentJwtRunHeaderMismatch(
           .where(eq(heartbeatRuns.id, input.claimRunId))
           .then((rows) => rows.length > 0)
       : false;
+    // F5: actor_source/actor_key_id are NULL here BY CONSTRUCTION, not by omission. This row
+    // audits the *failure* to establish an actor, and it is written from inside actorMiddleware,
+    // which runs before actorProvenanceMiddleware binds any provenance. There is no established
+    // credential provenance to record.
     await db.insert(activityLog).values({
       companyId: input.companyId,
       actorType: "agent",
@@ -763,6 +773,233 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
     }
     continueRequest?.();
   };
+}
+
+/**
+ * Routes a `{ kind: "plugin_ops" }` board API key is permitted to reach.
+ *
+ * The taxonomy is intentionally minimal — plugin lifecycle
+ * (install/enable/disable/upgrade/config) plus issue read/comment so the
+ * operator's CLI can still report status, plus the board-key self-service
+ * surface so the scoped key can mint a successor and revoke itself. This is
+ * not a general permission system.
+ *
+ * This list is allowlist-shaped and fail-closed: a scoped key hitting ANY route
+ * not listed here gets 403 with `code: "board_key_scope_violation"`. Add a route
+ * here only when a new plugin-ops flow genuinely requires it — never to "fix" a
+ * 403 a regression test caught, because that 403 is the control firing.
+ *
+ * Path matching is against `req.path` as seen at app root (this middleware runs
+ * before the `/api` mount strips the prefix), so patterns are written against
+ * `/api/plugins/install`, not `/plugins/install`.
+ */
+const PLUGIN_OPS_ALLOWED_ROUTES: ReadonlyArray<{
+  readonly method: string;
+  readonly pathPattern: RegExp;
+}> = [
+  // --- Plugin lifecycle (the actual reason this scope exists) ---
+  { method: "POST", pathPattern: /^\/api\/plugins\/install$/ },
+  {
+    method: "POST",
+    pathPattern: /^\/api\/plugins\/[^/]+\/(?:enable|disable|upgrade|config|config\/test)$/,
+  },
+  { method: "GET", pathPattern: /^\/api\/plugins(?:\/[^/]+)?$/ },
+  { method: "GET", pathPattern: /^\/api\/plugins\/[^/]+\/config$/ },
+  // Read-only per-company config overrides (host checkers). Writes stay denied.
+  { method: "GET", pathPattern: /^\/api\/plugins\/[^/]+\/companies\/[^/]+\/config-overrides$/ },
+  { method: "GET", pathPattern: /^\/api\/plugins\/examples$/ },
+  { method: "GET", pathPattern: /^\/api\/plugins\/ui-contributions$/ },
+
+  // --- Board API key self-service (mint a successor, list, revoke) ---
+  // POST /board-api-keys is allowed, but the force-inheritance branch below
+  // forces any successor this key mints to inherit this key's scope (no
+  // escalation).
+  { method: "POST", pathPattern: /^\/api\/board-api-keys$/ },
+  { method: "GET", pathPattern: /^\/api\/board-api-keys$/ },
+  { method: "DELETE", pathPattern: /^\/api\/board-api-keys\/[^/]+$/ },
+  { method: "POST", pathPattern: /^\/api\/cli-auth\/revoke-current$/ },
+  // Read-only self identity. The CLI's own login/whoami/connect flows call
+  // this with the key they just received; without it the CLI's default
+  // plugin_ops scope cannot complete its own login.
+  { method: "GET", pathPattern: /^\/api\/cli-auth\/me$/ },
+
+  // --- Issue read/comment (operator-readable activity surface) ---
+  // Allows GETs on issue detail/list/comments/documents and posting a comment.
+  // Issue create (POST /issues) and issue mutate (PATCH /issues/:id) are out
+  // of scope: this is plugin_ops, not a general operator surrogate.
+  { method: "GET", pathPattern: /^\/api\/issues(?:\/[^/]+)?(?:\/.*)?$/ },
+  { method: "POST", pathPattern: /^\/api\/issues\/[^/]+\/comments$/ },
+  { method: "GET", pathPattern: /^\/api\/companies\/[^/]+\/issues(?:\/.*)?$/ },
+
+  // --- Company list (board-read snapshot discovery; reads only) ---
+  // The board-read snapshot timer must enumerate companies before it reads
+  // each company's issues. Exact match on the list path only: company detail
+  // (GET /companies/:id), create, and update stay outside this scope.
+  { method: "GET", pathPattern: /^\/api\/companies$/ },
+];
+
+/**
+ * The scope a `{ kind: "plugin_ops" }` board key forces onto any new board key
+ * it mints via POST /api/board-api-keys. Without this, a scoped key could mint
+ * an unscoped owner key and silently escalate; with it, scoped-ness is sticky
+ * down the mint chain — a CLI using a scoped credential cannot mint an
+ * unscoped owner key on this instance.
+ */
+const PLUGIN_OPS_FORCED_SUCCESSOR_SCOPE = { kind: "plugin_ops" } as const;
+
+/**
+ * Board-key scope enforcement. Runs after actorMiddleware, so req.actor is
+ * populated. Only acts on a board API key that carries a non-standard scope —
+ * every other actor source (session, local_implicit, agent_key, agent_jwt,
+ * cloud_tenant, none) and every unscoped board key falls through unchanged.
+ *
+ * For a `{ kind: "plugin_ops" }` key: 403 with code
+ * `board_key_scope_violation` unless the request matches an entry in
+ * PLUGIN_OPS_ALLOWED_ROUTES. The route allowlist is the scope taxonomy made
+ * literal — an allowlist-shaped predicate is the required shape here, and
+ * this is that shape.
+ *
+ * As a side effect on POST /api/board-api-keys, the body's `scope` field is
+ * force-set to the acting key's scope, so a scoped key cannot mint a wider
+ * successor. This is the second half of "CLI unable to mint an unscoped
+ * owner key": even if the CLI did not request plugin_ops explicitly, the
+ * scoped successor inherits the acting scope.
+ */
+export function enforceBoardKeyScopeMiddleware(): RequestHandler {
+  return (req, _res, next) => {
+    const actor = req.actor;
+    if (
+      !actor ||
+      actor.type !== "board" ||
+      actor.source !== "board_key" ||
+      !actor.boardKeyScope ||
+      actor.boardKeyScope.kind !== "plugin_ops"
+    ) {
+      next();
+      return;
+    }
+
+    const matched = PLUGIN_OPS_ALLOWED_ROUTES.some(
+      (entry) =>
+        req.method.toUpperCase() === entry.method.toUpperCase() &&
+        entry.pathPattern.test(req.path),
+    );
+    if (!matched) {
+      next(
+        forbidden("Board API key scope does not permit this route", {
+          code: "board_key_scope_violation",
+          scope: actor.boardKeyScope.kind,
+          method: req.method.toUpperCase(),
+          path: req.path,
+        }),
+      );
+      return;
+    }
+
+    // Force-inherit the acting scope on any new board key this key mints. This
+    // is the server-side half of AC4: even with the CLI always requesting
+    // plugin_ops, a hand-rolled client cannot mint an unscoped owner key
+    // through a plugin_ops-scoped credential.
+    if (
+      req.method.toUpperCase() === "POST" &&
+      /^\/api\/board-api-keys$/.test(req.path) &&
+      req.body &&
+      typeof req.body === "object"
+    ) {
+      req.body.scope = PLUGIN_OPS_FORCED_SUCCESSOR_SCOPE;
+    }
+
+    next();
+  };
+}
+
+/**
+ * Routes a `{ kind: "notify_only" }` agent API key may reach. Each pattern
+ * captures the issue id, which must be one of the key's `issueIds` (UUIDs,
+ * compared case-insensitively; identifiers such as `ABC-1` are not accepted,
+ * so the allow-list check needs no DB lookup). Fail-closed: anything else is
+ * 403 `agent_key_scope_violation`.
+ */
+const NOTIFY_ONLY_ALLOWED_ROUTES: ReadonlyArray<{
+  readonly method: string;
+  readonly pathPattern: RegExp;
+}> = [
+  { method: "GET", pathPattern: /^\/api\/issues\/([^/]+)$/ },
+  { method: "POST", pathPattern: /^\/api\/issues\/([^/]+)\/interactions$/ },
+];
+
+/**
+ * Agent-key scope enforcement for `notify_only` keys. Runs after
+ * actorMiddleware. Every other actor (including every other agent-key scope)
+ * falls through unchanged. A notify_only key never carries a run id: any
+ * `X-Paperclip-Run-Id` header is dropped so run attribution cannot be forged.
+ */
+export function enforceAgentKeyScopeMiddleware(): RequestHandler {
+  return (req, _res, next) => {
+    const actor = req.actor;
+    if (
+      !actor ||
+      actor.type !== "agent" ||
+      actor.keyScope?.kind !== "notify_only"
+    ) {
+      next();
+      return;
+    }
+
+    actor.runId = undefined;
+    const allowed = new Set((actor.keyScope.issueIds ?? []).map((id) => id.toLowerCase()));
+    const method = req.method.toUpperCase();
+    const matched = NOTIFY_ONLY_ALLOWED_ROUTES.some((entry) => {
+      if (method !== entry.method) return false;
+      const m = entry.pathPattern.exec(req.path);
+      if (!m) return false;
+      let issueId: string;
+      try {
+        issueId = decodeURIComponent(m[1] ?? "").toLowerCase();
+      } catch {
+        return false;
+      }
+      return allowed.has(issueId);
+    });
+    if (!matched) {
+      logger.warn(
+        { agentId: actor.agentId, keyId: actor.keyId, method, path: req.path },
+        "agent key scope violation (notify_only)",
+      );
+      next(
+        forbidden("Agent API key scope does not permit this route", {
+          code: "agent_key_scope_violation",
+          scope: "notify_only",
+          method,
+          path: req.path,
+        }),
+      );
+      return;
+    }
+    next();
+  };
+}
+
+/**
+ * Registers the actor-resolution + provenance-capture middleware pair on `app`
+ * in the one order that works: `actorMiddleware` populates `req.actor`, then
+ * `enforceBoardKeyScopeMiddleware` narrows a scoped board key's reachable
+ * surface, then `actorProvenanceMiddleware` binds its credential provenance
+ * into AsyncLocalStorage so `logActivity` records it centrally.
+ *
+ * Both `createApp` (production wiring) and the provenance regression test go
+ * through this single function on purpose: dropping the provenance registration
+ * here turns that test red instead of letting production silently write NULL
+ * provenance forever — the failure mode an audit control cannot afford.
+ */
+export function registerActorContext(app: Application, db: Db, opts: ActorMiddlewareOptions): void {
+  app.use(actorMiddleware(db, opts));
+  // Must run after actorMiddleware, which is what populates req.actor. Must
+  // run before route handlers so scoped-key requests never reach a route the
+  // scope does not permit.
+  app.use(enforceBoardKeyScopeMiddleware());
+  app.use(enforceAgentKeyScopeMiddleware());
+  app.use(actorProvenanceMiddleware());
 }
 
 /**
