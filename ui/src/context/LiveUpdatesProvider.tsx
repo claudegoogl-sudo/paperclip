@@ -1,5 +1,5 @@
 import { LiveTranscriptInterests, DISCONNECTED_TRANSCRIPT_STREAM } from "../lib/live-transcript-interests";
-import { resolveAgentAppearance, TASK_IDENTITY_CHANGED_FIELD, issueActivityChangesTaskIdentity } from "@paperclipai/shared";
+import { resolveAgentAppearance, TASK_IDENTITY_CHANGED_FIELD, issueActivityChangesTaskIdentity, isTerminalHeartbeatRunStatus } from "@paperclipai/shared";
 import { getPageVisibility, usePageVisibility } from "../lib/page-visibility";
 import { createLiveQueryRecovery } from "../lib/live-query-recovery";
 import {
