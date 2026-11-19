@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { githubLauncherSource } from "./github-launcher.js";
+import type { AgentGitIdentityInput } from "./git-identity.js";
 import { ACP_PROCESS_TERMINAL_SIGNALS, type ACP_PROCESS_TERMINAL_SOURCES } from "./acpx-engine/constants.js";
 import type { SshRemoteExecutionSpec } from "./ssh.js";
 import {
@@ -93,6 +94,7 @@ import {
 import type { RuntimeProgressSink, RuntimeStatusSink } from "./runtime-progress.js";
 import type { LocalProcessSandboxOptions } from "./local-process-sandbox.js";
 import type { RunnerIngressEndpoint } from "./runner-connectivity.js";
+import { signingKeyScrubSource } from "./child-env-scrub.js";
 
 export type { RuntimeProgressSink } from "./runtime-progress.js";
 
@@ -914,7 +916,12 @@ export async function runAdapterExecutionTargetProcess(
 ): Promise<RunProcessResult> {
   if (target?.kind === "remote" && target.transport === "sandbox") {
     const runner = requireSandboxRunner(target);
-    const env = sanitizeRemoteExecutionEnv(options.env);
+    // Run clock context for the sandboxed agent process (mirrors the local
+    // spawn injection): both stamps are ISO-8601 UTC and host-controlled.
+    const env: Record<string, string> = {
+      ...sanitizeRemoteExecutionEnv(options.env),
+      PAPERCLIP_NOW: new Date().toISOString(),
+    };
     await options.onRuntimeProgress?.({
       phase: "adapter_startup",
       message: "Starting adapter in environment",
@@ -927,6 +934,7 @@ export async function runAdapterExecutionTargetProcess(
       runLogTail.start(options.onLog);
     }
     try {
+      env.PAPERCLIP_RUN_STARTED_AT = new Date().toISOString();
       const result = await runner.execute({
         command: execCommand,
         args: execArgs,
@@ -1504,6 +1512,8 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
   assets?: AdapterManagedRuntimeAsset[];
   /** Referenced (additional) projects to stage into the sandbox as plain, read-only trees. */
   additionalSources?: SandboxAdditionalSource[];
+  /** Run's agent, when one is known — attributes sync-created git commits to it. */
+  agent?: AgentGitIdentityInput | null;
   installCommand?: string | null;
   /** When provided alongside `installCommand`, skip the install if the binary is already on PATH. */
   detectCommand?: string | null;
@@ -1550,6 +1560,7 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
       workspaceExclude: input.workspaceExclude,
       assets: input.assets,
       additionalSources: input.additionalSources,
+      agent: input.agent,
       onProgress: input.onProgress,
     });
     return {
@@ -1600,6 +1611,7 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
     preserveAbsentOnRestore: input.preserveAbsentOnRestore,
     assets: input.assets,
     additionalSources: input.additionalSources,
+    agent: input.agent,
     installCommand: input.installCommand,
     detectCommand: input.detectCommand,
     onProgress: input.onProgress,
@@ -3287,6 +3299,8 @@ ${PROCESS_SESSION_READ_COMMAND}
 const childEnv = { ...process.env, ...(config.env || {}) };
 delete childEnv.PAPERCLIP_PROCESS_SESSION_DIR;
 delete childEnv.PAPERCLIP_PROCESS_SESSION_COMMAND_B64;
+// Never pass a signing-capable server secret to the session child.
+${signingKeyScrubSource("childEnv")}
 
 // I1: exactly one child process per emitted wrapper. Do not add a second
 // tracked child handle.
@@ -3378,6 +3392,8 @@ ${PROCESS_SESSION_READ_COMMAND}
 const childEnv = { ...process.env, ...(config.env || {}) };
 delete childEnv.PAPERCLIP_PROCESS_SESSION_DIR;
 delete childEnv.PAPERCLIP_PROCESS_SESSION_COMMAND_B64;
+// Never pass a signing-capable server secret to the session child.
+${signingKeyScrubSource("childEnv")}
 
 // I1: exactly one child process per emitted wrapper. Do not add a second
 // tracked child handle.
@@ -4802,7 +4818,9 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
             }
             const lossClass = anyStreamDispatched ? "post_dispatch" : "pre_dispatch";
             duplexObservability.recordLoss(lossClass, reason);
-            void onLog("stderr", `[paperclip] Sandbox HTTP/2 channel lost (${reason}). The run fails.\n`);
+            void onLog("stderr", `[paperclip] Sandbox HTTP/2 channel lost (${reason}). The run fails.\n`).catch(
+              () => undefined,
+            );
           };
 
           // The forward handler applies the real host token and the run id

@@ -50,6 +50,10 @@
     "check:module-boundaries": "node scripts/check-module-boundaries.mjs",
     "test:check-no-git-push": "node --test scripts/check-no-git-push.test.mjs",
     "test:install-sh-docker": "./scripts/test-install-sh-docker.sh",
+    "check:no-internal-ids": "node scripts/check-no-internal-ids.mjs",
+    "test:check-no-internal-ids": "node --test scripts/check-no-internal-ids.test.mjs",
+    "check:env-example-connection-string": "node scripts/check-env-example-connection-string.mjs",
+    "test:check-env-example-connection-string": "node --test scripts/check-env-example-connection-string.test.mjs",
     "test:hermes-gateway-smoke": "node --test scripts/smoke/hermes-gateway-smoke.test.mjs",
     "docs:dev": "cd docs && npx mintlify dev",
     "smoke:hermes-gateway-join": "./scripts/smoke/hermes-gateway-join.sh",
@@ -65,6 +69,9 @@
     "storybook-visual:baseline": "node scripts/storybook-visual-baseline.mjs",
     "test:storybook-visual": "node scripts/storybook-visual-baseline.mjs download && node scripts/storybook-visual-baseline.mjs verify && pnpm build-storybook && npx playwright test --config tests/storybook-visual/playwright.config.ts",
     "test:storybook-visual:update": "node scripts/storybook-visual-baseline.mjs download && pnpm build-storybook && npx playwright test --config tests/storybook-visual/playwright.config.ts --update-snapshots && node scripts/storybook-visual-baseline.mjs pack",
+    "test:upstream-sync": "node --test scripts/upstream-sync.test.mjs scripts/plugin-activation-soak.test.mjs scripts/resolve-trivial-sync-conflicts.test.mjs",
+    "test:plugin-activation-soak": "node --test scripts/plugin-activation-soak.test.mjs",
+    "test:scaffold-create-paperclip-plugin": "node --test scripts/smoke-create-paperclip-plugin.test.mjs",
     "test:e2e": "node scripts/ci-profile/run.mjs playwright npx playwright test --config tests/e2e/playwright.config.ts",
     "test:e2e:runner": "node cli/node_modules/tsx/dist/cli.mjs tests/runner-e2e/launch.ts",
     "test:e2e:runner:image-id": "node cli/node_modules/tsx/dist/cli.mjs tests/runner-e2e/daytona-image-content.ts",
@@ -95,6 +102,7 @@
     "test:lifecycle-baseline": "node tests/lifecycle-baseline/run.mjs",
     "test:lifecycle-baseline:support": "node --test tests/lifecycle-baseline/report.test.mjs",
     "test:lifecycle-baseline:typecheck": "node scripts/typecheck-test-projects.mjs tests/lifecycle-baseline",
+    "test:fork-drift": "node --test scripts/fork-release/commit-stamp.test.mjs scripts/fork-release/drift-check.test.mjs scripts/fork-release/drift-sweep.test.mjs",
     "verify": "node --import ./cli/node_modules/tsx/dist/loader.mjs scripts/ensure-workspace-package-links.ts && node scripts/local-verify.mjs"
   },
   "devDependencies": {

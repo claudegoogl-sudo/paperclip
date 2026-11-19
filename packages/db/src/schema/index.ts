@@ -13,6 +13,7 @@ export { agents } from "./agents.js";
 export { builtInManagedResources } from "./built_in_managed_resources.js";
 export { agentMemberships } from "./agent_memberships.js";
 export { boardApiKeys } from "./board_api_keys.js";
+export { boardApiKeyAuthEvents } from "./board_api_key_auth_events.js";
 export { cliAuthChallenges } from "./cli_auth_challenges.js";
 export { companyMemberships } from "./company_memberships.js";
 export { companyUserSidebarPreferences } from "./company_user_sidebar_preferences.js";
@@ -25,6 +26,7 @@ export { budgetIncidents } from "./budget_incidents.js";
 export { budgetResumeClaims } from "./budget_resume_claims.js";
 export { agentConfigRevisions } from "./agent_config_revisions.js";
 export { agentApiKeys } from "./agent_api_keys.js";
+export { agentKeyRenewalEvents } from "./agent_key_renewal_events.js";
 export { agentRuntimeState } from "./agent_runtime_state.js";
 export { agentTaskSessions, agentSessionGoalActions } from "./agent_task_sessions.js";
 export { agentWakeupRequests } from "./agent_wakeup_requests.js";
@@ -167,6 +169,10 @@ export { remoteAgentProfiles } from "./remote_agent_profiles.js";
 export { companySecretVersions } from "./company_secret_versions.js";
 export { companySecretBindings } from "./company_secret_bindings.js";
 export { companySecretProposals } from "./company_secret_proposals.js";
+export { companySecretBindingPostureAudit } from "./company_secret_binding_posture_audit.js";
+export { egressWouldDenyObservations } from "./egress_would_deny_observations.js";
+export { pluginConfigEgressAllowlist } from "./plugin_config_egress_allowlist.js";
+export { pluginConfigEgressWouldDenyObservations } from "./plugin_config_egress_would_deny_observations.js";
 export { userSecretDeclarations } from "./user_secret_declarations.js";
 export { secretAccessEvents } from "./secret_access_events.js";
 export {
@@ -233,6 +239,8 @@ export { aiConnectionDefaults } from "./ai_connection_defaults.js";
 export { aiProviderDefaults } from "./ai_provider_defaults.js";
 export * from "./email.js";
 export { announcementDismissals, announcementPublications } from "./announcement_dismissals.js";
+export { usageLimitParks } from "./usage_limit_parks.js";
+export { instanceAdmissionHolds } from "./instance_admission_holds.js";
 export { chatTaskHandoffs, chatCompletionDeliveries } from "./chat_completion_deliveries.js";
 
 export { agentInstructionRevisions, agentInstructionHeads, agentInstructionWorkingCopies } from "./agent_instruction_revisions.js";
@@ -273,6 +281,7 @@ export { companyObservability } from "./company_observability.js";
 
 export * from "./prompt_injection_prevention.js";
 export { workflows } from "./workflows.js";
+export { pluginToolGrants } from "./plugin_tool_grants.js";
 
 export { userWorkspacePreferences } from "./user_workspace_preferences.js";
 

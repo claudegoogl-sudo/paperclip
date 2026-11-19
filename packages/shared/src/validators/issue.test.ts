@@ -686,7 +686,11 @@ describe("issue validators", () => {
     expect(updateIssueSchema.safeParse(overrides).success).toBe(false);
   });
 
-  it("rejects retired model profiles in agent runtime config", () => {
+
+  // Fork divergence: upstream retired runtimeConfig.modelProfiles and rejects
+  // it. The fork keeps accepting it (see agentRuntimeConfigSchema in
+  // validators/agent.ts) because runtime-config handling still reads it.
+  it("keeps accepting model profiles in agent runtime config (fork carryover)", () => {
     const parsed = createAgentSchema.safeParse({
       name: "Coder",
       adapterType: "codex_local",
@@ -704,7 +708,7 @@ describe("issue validators", () => {
       },
     });
 
-    expect(parsed.success).toBe(false);
+    expect(parsed.success).toBe(true);
   });
 });
 

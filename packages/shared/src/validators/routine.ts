@@ -78,14 +78,18 @@ export const createRoutineSchema = z.object({
   activityGateScope: z.enum(ROUTINE_ACTIVITY_GATE_SCOPES).optional(),
   variables: z.array(routineVariableSchema).optional().default([]),
   env: envConfigSchema.optional().nullable(),
-});
+}).strict();
 
 export type CreateRoutine = z.infer<typeof createRoutineSchema>;
 
+// `.strict()` is repeated rather than inherited from createRoutineSchema: zod does
+// carry unknownKeys through .partial()/.extend() today, but that is undocumented,
+// and a silently stripped key here produces a routine that reports healthy and
+// never fires.
 export const updateRoutineSchema = objectWithoutDefaults(createRoutineSchema).partial().extend({
   baseRevisionId: z.string().guid().optional().nullable(),
   responsibleUserId: z.string().trim().min(1).optional(),
-});
+}).strict();
 export type UpdateRoutine = z.infer<typeof updateRoutineSchema>;
 
 export const routineRevisionSnapshotRoutineV1Schema = z.object({

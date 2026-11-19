@@ -214,7 +214,7 @@ test("a second spawn error still retires the live old child and removes its fixt
   const root = await mkdtemp(path.join(tmpdir(), "runnerd-stage-spawn-failure-"));
   let old;
   await assert.rejects(withOwnedChildren(root, async start => {
-    old = start("/bin/sleep", ["30"]); await old.spawned;
+    old = start(await sleepFixture(), ["30"]); await old.spawned;
     const failed = start(path.join(root, "missing-executable"), []);
     await failed.spawned;
   }), { code: "ENOENT" });
